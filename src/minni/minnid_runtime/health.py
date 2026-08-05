@@ -295,6 +295,39 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
     }, request_id)
 
 
+def resolution_mix_stats(cursor: Any) -> dict:
+    """#290: how accepted candidates were resolved — auto vs human vs the AFM loop.
+
+    Auto-acceptance writes durable memory with no human in the loop. A channel
+    like that must be observable, or "the operator turned the knob on once" and
+    "the knob has been accepting everything for a month" look identical from the
+    outside. Aggregate counts only: no content, no principal names.
+
+    The modes are distinguished by the ``resolved_by`` stamp each writer sets —
+    ``auto_accept_own(<agent>)`` here, ``afm-consolidation`` for the background
+    pass, and a bare principal id for a human resolve.
+    """
+    cursor.execute(
+        """
+        SELECT resolved_by, COUNT(*) AS n
+        FROM candidate_packets
+        WHERE status = 'accepted' AND resolved_by IS NOT NULL
+        GROUP BY resolved_by
+        """
+    )
+    mix = {"auto_accept_own": 0, "manual": 0, "afm_consolidation": 0}
+    for row in cursor.fetchall():
+        who = str(dict(row).get("resolved_by") or "")
+        count = int(dict(row).get("n") or 0)
+        if who.startswith("auto_accept_own("):
+            mix["auto_accept_own"] += count
+        elif who == "afm-consolidation":
+            mix["afm_consolidation"] += count
+        else:
+            mix["manual"] += count
+    return mix
+
+
 def handle_health_report(params: dict, request_id: Any, context: HealthContext) -> dict:
     """Return deeper read-only memory health diagnostics."""
     now = time.time()
@@ -327,6 +360,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             "afm_dead_letter": {"files": 0, "oldest_age_days": None},
             "afm_review_orphans": 0,
             "proposed_queue": {"depth": 0, "oldest_age_days": None, "stale": 0},
+            # #290: auto-acceptance is a channel that writes durable memory
+            # without a human in the loop, so it has to be COUNTED somewhere a
+            # human looks. Aggregate-only (counts by resolution mode, no
+            # content, no principals), matching the rest of this block.
+            "resolution_mix": {"auto_accept_own": 0, "manual": 0,
+                               "afm_consolidation": 0},
+
             # #307: how many inbox files the distillation pass currently
             # cannot read. A LIVE count, not the cumulative drop counter — a
             # dropped file is never archived, so it is re-dropped every tick
@@ -667,6 +707,7 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             with db.cursor() as c:
                 lifecycle["afm_review_orphans"] = count_orphaned_afm_review(c)
                 lifecycle["proposed_queue"] = proposed_queue_stats(c)
+                lifecycle["resolution_mix"] = resolution_mix_stats(c)
         except Exception as exc:
             lifecycle["afm_review_orphans"] = None
             lifecycle["proposed_queue"] = {
@@ -674,6 +715,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 "oldest_age_days": None,
                 "stale": None,
                 "unparseable_proposed_at": None,
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
+            lifecycle["resolution_mix"] = {
+                "auto_accept_own": None,
+                "manual": None,
+                "afm_consolidation": None,
                 "status": "unknown",
                 "error": type(exc).__name__,
             }

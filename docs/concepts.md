@@ -53,7 +53,7 @@ because Minni is developed using Minni. At that scale it holds up; the team
 harness is the untested frontier.
 
 **Approval.** Who gets to resolve candidates is decided per principal, and the
-operator can delegate it. Three resolution paths exist, all landing in the
+operator can delegate it. Four resolution paths exist, all landing in the
 same audit trail:
 
 1. **Manual (the default).** A human (or the local operator session) calls
@@ -97,6 +97,57 @@ same audit trail:
    / `consolidation_actions` if you rely on it. (`MINNI_AFM_MODE` is unrelated
    — mode only toggles an advisory triage annotation that the promotion gate
    never consults.)
+
+4. **Auto-accept an agent's own candidates** *(opt-in, per principal;
+   [#290](https://github.com/infektyd/minni/issues/290))*. Add
+   `"auto_accept_own": true` to `~/.minni/principals/<agent>.json`:
+
+   ```json
+   {"agent_id": "claude-code", "capabilities": ["learn"], "auto_accept_own": true}
+   ```
+
+   That agent's own `learn` candidates resolve to durable at store time,
+   stamped `resolved_by=auto_accept_own(<agent>)` so an audit can tell them
+   from a human resolve.
+
+   This exists because path 2 is a blunt instrument for the common case. If
+   what you want is "this agent's learnings are its own", granting
+   `resolve_candidate` also hands it governance authority over *every*
+   candidate, including other agents'. `auto_accept_own` grants strictly less:
+   the agent still cannot call `resolve_candidate(accept)` — on its own
+   candidates or anyone's — and still gets `operator_only` if it tries.
+
+   The gates stay on, and they are the same set path 3 uses: content that is
+   instruction-like, too short, a duplicate of an existing learning, outside
+   the safe privacy levels **as the author declared it**, or failing the
+   structural quality gate falls back to `proposed` for a human, and the
+   response names the check that withheld it in `auto_accept_withheld`.
+   Nothing is dropped. Auto-accepted learnings are embedded and hashed like
+   any other durable write, so contradiction detection and the duplicate gate
+   keep seeing them — an unattended writer that is invisible to its own guards
+   gets blinder the more it writes.
+
+   One consequence worth knowing before you opt an agent in: this is the first
+   path that lets a `learn`-only agent OWN a durable learning without a human
+   (a manual accept records the resolver as owner, not the proposer). Owning one
+   is the precondition for `resolve_contradiction`, so that handler now applies
+   the same floor to non-operators rather than being an unguarded way around it.
+   Counts land in `health_report` under
+   `memory_lifecycle.resolution_mix` (`auto_accept_own` / `manual` /
+   `afm_consolidation`) — check there to see whether the channel is doing what
+   you expected.
+
+   **The knob is operator configuration and is refused over the wire.** A
+   caller that passes `auto_accept_own` to `minni_learn` gets `operator_only`
+   — for every principal, operator included — because config an agent can set
+   per-call is a self-approval bypass with extra steps. Set it in the
+   principal file, which is 0600 and outside any agent-writable vault.
+
+   Per-agent only: a hosted agent listed in `platform_agent_ids` does **not**
+   inherit the operator's `auto_accept_own`. Opt one in explicitly with
+   `"platform_agent_auto_accept_own": {"codex": true}`, which mirrors how
+   `platform_agent_capabilities` works — so temporary and hosted agents stay
+   proposal-gated unless named.
 
 One operational caveat: creating your **first** `principals/*.json` file flips
 the daemon into strict identity mode, where the anonymous local caller is no

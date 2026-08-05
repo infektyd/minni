@@ -57,6 +57,47 @@ class ResolveRejected(Exception):
         self.response = response
 
 
+# #290: ``auto_accept_own`` is OPERATOR CONFIGURATION, read from
+# principals/<id>.json. It is never read from wire params, and a caller that
+# supplies it is refused rather than ignored.
+#
+# Refused for EVERY principal, operator included. A principal check would be
+# weaker for no benefit: config that can travel over the wire is config an agent
+# can reach the moment it obtains — or is mistaken for — a privileged stamp, and
+# this particular knob turns the -32004 self-approval gate off. Governance
+# config moves by filesystem/console only.
+#
+# Refusing loudly rather than silently dropping the key keeps the attempt
+# visible: a silent ignore looks identical to a working bypass from the caller's
+# side, and leaves nothing in the log for an audit to find.
+AUTO_ACCEPT_PARAM_KEYS = ("auto_accept_own", "learn.auto_accept_own")
+
+# One request must not be able to hold the daemon's write lock open writing an
+# event row per entry. See handle_resolve_contradiction.
+MAX_SUPERSEDE_IDS = 64
+
+
+def reject_wire_supplied_auto_accept(
+    params: dict, request_id: Any, context: "GovernanceContext"
+) -> Optional[dict]:
+    """Return an error response if a caller tried to set the #290 knob."""
+    for key in AUTO_ACCEPT_PARAM_KEYS:
+        if key in params:
+            context.logger.warning(
+                "AUTO_ACCEPT_KNOB_REFUSED key=%s (wire-supplied governance config; "
+                "the knob is operator-set in principals/<id>.json) (G15 audit)",
+                key,
+            )
+            return context.make_error(
+                -32004,
+                f"operator_only: '{key}' is operator configuration and cannot be "
+                "supplied by a caller; set auto_accept_own in "
+                "principals/<id>.json (filesystem/console only)",
+                request_id,
+            )
+    return None
+
+
 def extract_assertion(content: str) -> str:
     content = content.strip()
     if len(content) <= 120:
@@ -90,6 +131,10 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()
+
+    refusal = reject_wire_supplied_auto_accept(params, request_id, context)
+    if refusal is not None:
+        return refusal
 
     content = params.get("content", "")
     if not content:
@@ -176,6 +221,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
 
         now = time.time()
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
+
 
         emb_bytes = None
         if wb.model:
@@ -280,6 +326,89 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         validate_agent_id(agent_id)
     except ValueError as exc:
         return context.make_error(-32602, str(exc), request_id)
+
+    # This writes an ARBITRARY durable learning — embedded, active, FTS-indexed
+    # — and its only precondition is owning the learning being superseded.
+    #
+    # Measured on this branch: with #290's auto-accept enabled, a principal
+    # staged one benign learning (auto-accepted, so now OWNED), then superseded
+    # it with content the auto-accept floor had just refused — landing the
+    # refused text as 'active'. Owning a learning used to require a human accept,
+    # and that accept records the RESOLVER as owner, so a learn-only principal
+    # could not previously own one at all. Auto-acceptance is the first path that
+    # hands it ownership unattended, which makes this the same kind of
+    # unattended durable write and it needs the same floor.
+    #
+    # A first pass ported only the instruction_like rule. That was a fence with
+    # one plank: every other floor rule (too short, oversized, filler, low
+    # alphabetic ratio, author-declared privacy) was still one call away from
+    # irrelevant for exactly the principal docs/concepts.md tells operators to
+    # create. The whole floor applies now.
+    #
+    # Operators keep today's unrestricted correction machinery — they can
+    # already write durable memory directly via force=true. instruction_like is
+    # stricter than operator on purpose, mirroring resolve_candidate: it lifts
+    # only for the LITERAL 'accept_flagged' capability, so correcting a poisoned
+    # learning stays possible but never accidental.
+    if len(new_content) > MAX_LEARN_CHARS:
+        return context.make_error(
+            -32602,
+            f"new_content exceeds {MAX_LEARN_CHARS} chars",
+            request_id,
+        )
+
+    if is_instruction_like(new_content) and not explicitly_allowed_accept_flagged(
+        principal
+    ):
+        context.logger.warning(
+            "RESOLVE_CONTRADICTION_REFUSED principal=%s reason=instruction_like "
+            "(G15 audit)",
+            agent_id,
+        )
+        return context.make_error(
+            -32004,
+            "accept_flagged_required: new_content is instruction_like; writing it "
+            "as a durable learning requires the literal 'accept_flagged' capability",
+            request_id,
+        )
+
+    # DELIBERATELY only the safety rule, not the whole auto-accept floor.
+    #
+    # A previous round applied all five floor rules here and that was an
+    # overcorrection, measured against origin/main: it refused corrections that
+    # had always worked, from principals with no relationship to this feature —
+    # "Port: 8080" (too short), a JSON config line (low alphabetic ratio), a
+    # 10k-char runbook (oversized), "rollback rollback rollback" (too few
+    # distinct words). It also gated on `privacy_level`, a field this handler
+    # never stores, so the rule blocked an honest caller and was evaded by
+    # deleting the field.
+    #
+    # The right standard is the one the MANUAL accept path already sets:
+    # resolve_candidate enforces instruction_like and nothing else. The floor is
+    # an auto-PROMOTION quality gate — it decides whether newly authored content
+    # is good enough to store with nobody looking — and content failing it is
+    # low-quality, not dangerous. A correction names what it supersedes and is
+    # the agent's own tier, which is the whole point of the #290 ruling.
+    #
+    # RESIDUAL, stated rather than implied: an opted-in agent can therefore land
+    # content here that auto-accept would have withheld on quality. That is
+    # bounded to its own memory and to content a human accepting the same
+    # candidate would also have allowed. The class that is NOT allowed is the
+    # one that matters — prompt injection — and it is gated unconditionally
+    # below, lifting only for the literal accept_flagged capability.
+
+    # Unbounded and unde-duplicated, this wrote one contradiction_events row per
+    # (id, new learning) pair inside BEGIN IMMEDIATE: measured 400k rows and 2.1s
+    # of exclusive daemon write-lock from a single request under the 1 MiB body
+    # cap, with a 1.2 MB response echoing the list back.
+    supersede_ids = list(dict.fromkeys(supersede_ids))
+    if len(supersede_ids) > MAX_SUPERSEDE_IDS:
+        return context.make_error(
+            -32602,
+            f"supersede_ids exceeds {MAX_SUPERSEDE_IDS} entries",
+            request_id,
+        )
+
     category = params.get("category", "general")
     assertion = params.get("assertion")
     applies_when = params.get("applies_when")
@@ -296,6 +425,25 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
 
         now = time.time()
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
+
+        # Hoisted ABOVE the transaction on purpose. This helper opens a cursor,
+        # and SovereignDB.cursor() commits on exit on the same thread-local
+        # connection — calling it inside `with db.transaction()` ended the
+        # enclosing BEGIN IMMEDIATE, so the ownership checks committed early and
+        # the INSERT/UPDATE/event block silently ran in a separate deferred
+        # transaction. Measured: a rollback after that point left rows behind,
+        # and the docstring's "atomically supersede" had stopped being true.
+        # Fail-SOFT, matching stage_candidate: the INSERT below names
+        # content_hash unconditionally, so a failed column ensure (a transient
+        # SQLITE_BUSY on the DDL is enough) would otherwise make the whole
+        # CORRECTION fail. A correction is the mechanism for fixing poisoned
+        # memory; it must not be the thing that breaks when the DB is busy.
+        _have_hash_col = ensure_content_hash_column(wb.db)
+        _chash = None
+        if _have_hash_col:
+            from minni.afm_passes.consolidation import content_hash as _content_hash
+
+            _chash = _content_hash(new_content)
 
         emb_bytes = None
         if wb.model:
@@ -336,20 +484,22 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                         "explicitly allowed operator)",
                         request_id,
                     ))
-            c.execute("""
-                INSERT INTO learnings
-                (agent_id, category, content, source_doc_ids, source_query,
-                 confidence, embedding, created_at,
-                 assertion, applies_when, evidence_doc_ids, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                agent_id, category, new_content,
-                None, None,
-                params.get("confidence", 1.0),
-                emb_bytes, now,
-                assertion, applies_when, doc_ids_json,
-                "active",
-            ))
+            _cols = ("agent_id, category, content, source_doc_ids, source_query, "
+                     "confidence, embedding, created_at, assertion, applies_when, "
+                     "evidence_doc_ids, status")
+            _vals = [
+                agent_id, category, new_content, None, None,
+                params.get("confidence", 1.0), emb_bytes, now,
+                assertion, applies_when, doc_ids_json, "active",
+            ]
+            if _have_hash_col:
+                _cols += ", content_hash"
+                _vals.append(_chash)
+            c.execute(
+                f"INSERT INTO learnings ({_cols}) VALUES "
+                f"({', '.join('?' * len(_vals))})",
+                _vals,
+            )
             new_lid = c.lastrowid
 
             for sid in supersede_ids:
@@ -556,8 +706,150 @@ def handle_log_event(params: dict, request_id: Any, context: GovernanceContext) 
         return context.make_error(-32000, f"Log event error: {exc}", request_id)
 
 
+def apply_accepted_candidate_effects(cursor: Any, candidate_id: int) -> None:
+    """In-transaction side effects of accepting a candidate. ONE definition.
+
+    Every accept path must run this: resolve_candidate (manual), the AFM
+    promotion, and #290's auto-accept. It exists as a shared function rather
+    than three copies because the copies drift — the auto-accept branch
+    originally skipped `supersede_afm_review` on the reasoning that a candidate
+    staged microseconds earlier cannot carry a review marker. That reasoning is
+    true today and is exactly the kind of thing that silently stops being true
+    (a future staging path that fences on write, or inbox ingest reaching this
+    code). #305's M5 fixed the orphaned-marker class once; parity should not
+    depend on anyone re-deriving that argument.
+
+    M5: the review fence must not outlive the candidate it fences. Same cursor,
+    same transaction — a rolled-back accept takes the marker change with it.
+    """
+    supersede_afm_review(cursor, candidate_id)
+
+
+def settle_accepted_candidate(
+    context: "GovernanceContext",
+    db: Any,
+    candidate_id: int,
+    agent_id: str,
+    content: str,
+    learning_id: int,
+) -> bool:
+    """Post-COMMIT side effects. Returns whether indexing succeeded.
+
+    Never raises: the row is already committed by the time this runs, so an
+    exception here reports a failure for a learn that in fact succeeded — the
+    caller then retries and duplicates it while the first copy sits durable and
+    unindexed.
+    """
+    indexed_ok = True
+    try:
+        context.index_durable_learning(
+            agent_id, content, key=f"learning:{learning_id}", db=db
+        )
+    except Exception as exc:
+        indexed_ok = False
+        context.logger.warning(
+            "candidate=%s learning=%s indexed=FAILED (%s); durable but not "
+            "recallable until reindexed (G15 audit)",
+            candidate_id, learning_id, exc,
+        )
+    try:
+        context.maybe_archive_inbox_source(db, candidate_id)
+    except Exception as exc:
+        context.logger.warning(
+            "candidate=%s inbox archive failed (%s; non-fatal)", candidate_id, exc,
+        )
+    return indexed_ok
+
+
+def auto_accept_blockers(
+    content: str, instruction_like: bool, requested_privacy: str = "safe"
+) -> list[str]:
+    """Reasons to WITHHOLD #290 auto-acceptance. Empty list == eligible.
+
+    The floor reuses the repo's existing structural gate rather than inventing a
+    score: ``consolidation._quality_blockers`` already describes itself as "reasons
+    to WITHHOLD auto-promotion (the candidate is routed to review, never silently
+    dropped)", which is exactly this decision. Two safety rules from the manual
+    accept path join it:
+
+      * instruction_like — ``resolve_candidate`` refuses to accept flagged content
+        without an explicit ``accept_flagged`` capability. Auto-accept must not
+        become the way around that gate, so flagged content falls back to
+        proposed and a human still sees it.
+      * minimum length — consolidation's own auto-promotion floor; a three-word
+        fragment is not a durable learning.
+      * declared privacy — consolidation refuses to auto-promote anything outside
+        {safe, public, low}. Note this reads the AUTHOR'S declaration, not the
+        clamped value stored on the row: the clamp exists because "learn-only
+        callers are not trusted to create auto-promotable rows", and this knob is
+        the operator lifting THAT distrust. It is not the operator overruling a
+        writer that said "this is sensitive" about its own content — under the
+        old flow a human saw that declaration, and nothing else in the row
+        preserves it.
+
+    Withheld means the candidate stays ``proposed`` for a human. It is never
+    dropped, so the operator loses nothing by opting in.
+    """
+    # Cheap import: consolidation pulls only stdlib + minni.safety.
+    from minni.afm_passes.consolidation import (
+        _MIN_CONTENT_LEN,
+        _SAFE_PRIVACY,
+        _quality_blockers,
+    )
+
+    reasons: list[str] = []
+    if instruction_like:
+        reasons.append("instruction_like")
+    if len((content or "").strip()) < _MIN_CONTENT_LEN:
+        reasons.append("below minimum content length")
+    if str(requested_privacy or "").strip().lower() not in _SAFE_PRIVACY:
+        reasons.append(f"privacy={requested_privacy}")
+    reasons.extend(_quality_blockers(content))
+    return reasons
+
+
+def ensure_content_hash_column(db: Any) -> bool:
+    """Ensure learnings.content_hash + its index exist. No backfill.
+
+    Deliberately NOT consolidation._ensure_dedup_index: that one also backfills
+    every NULL hash in a per-row Python loop inside BEGIN IMMEDIATE. Measured at
+    ~2.9s of exclusive daemon write-lock on a 20k-row table — acceptable in a
+    background pass, not on a user-facing learn. This path only needs to write
+    and query its own hashes; legacy NULL rows simply do not dedup, which is
+    exactly where they already were.
+
+    The PRAGMA -> ALTER window is a TOCTOU across the daemon's thread-local
+    connections, so a losing racer is caught rather than surfaced as -32000.
+    """
+    try:
+        with db.cursor() as c:
+            c.execute("PRAGMA table_info(learnings)")
+            if "content_hash" not in [r["name"] for r in c.fetchall()]:
+                try:
+                    c.execute("ALTER TABLE learnings ADD COLUMN content_hash TEXT")
+                except Exception:
+                    pass  # concurrent writer won the race; the column exists now
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_learnings_content_hash "
+                "ON learnings(content_hash)"
+            )
+        return True
+    except Exception:
+        return False
+
+
 def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -> dict:
-    """Stage a candidate packet. No durable learning write."""
+    """Stage a candidate packet.
+
+    Normally no durable learning write. #290: when the OPERATOR has opted this
+    principal in via principals/<id>.json, the candidate the caller just staged
+    is promoted to accepted in the same transaction, stamped so an audit can
+    tell auto-acceptance from a human resolve.
+    """
+    refusal = reject_wire_supplied_auto_accept(params, request_id, context)
+    if refusal is not None:
+        return refusal
+
     principal, err = context.handler_principal(params, request_id)
     if err:
         return err
@@ -607,9 +899,87 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     else:
         stored_privacy = "review"
 
+    # #290: decided BEFORE the write so the promotion lands in the SAME
+    # transaction as the insert. A half-applied promotion — learning written,
+    # candidate still 'proposed' — would be accepted a second time by a later
+    # manual resolve and double-write the learning.
+    #
+    # Read from the STAMPED principal only. `params` was already refused above if
+    # it carried the knob, so there is no path from the wire to this decision.
+    #
+    # Note the privacy clamp above is deliberately NOT an additional gate here.
+    # It stamps 'review' because "learn-only callers are not trusted to create
+    # auto-promotable rows" — and this knob is precisely the operator lifting
+    # that distrust for one principal's own candidates. Gating on it would make
+    # the knob a no-op for exactly the principals it exists to serve.
+    withheld = auto_accept_blockers(stored_content, bool(instr), requested_privacy)
+    auto_accept = bool(getattr(principal, "auto_accept_own", False)) and not withheld
+    resolved_by = f"auto_accept_own({principal.agent_id})"
+
     try:
-        db = context.lazy_writeback().db
-        with db.cursor() as c:
+        wb = context.lazy_writeback()
+        db = wb.db
+        lid = None
+        chash = None
+        emb_bytes = None
+        if auto_accept:
+            # detect_contradictions filters `embedding IS NOT NULL`, so a
+            # learning stored without one is invisible to the only guard standing
+            # in front of this channel — and the more the knob writes, the
+            # blinder that guard gets. Consolidation, the other unattended
+            # writer, hashes and embeds for exactly this reason.
+            #
+            # ALL of it is fail-soft. Staging a candidate was pure SQL before
+            # this feature and never touched the embedder; a first pass left the
+            # column check and the `wb.model` property access outside the
+            # try, so a locked DB or an offline model turned a working learn
+            # into -32000 WITH NOTHING STAGED — the learning lost outright
+            # rather than routed to review. An optimisation must never take down
+            # the base path: on any failure the candidate still stages as
+            # proposed, which is exactly where it would have gone anyway.
+            try:
+                from minni.afm_passes.consolidation import content_hash as _content_hash
+
+                if not ensure_content_hash_column(db):
+                    # The INSERT below names content_hash unconditionally, so a
+                    # missing column is fatal to the durable write. Raise into
+                    # the handler right below rather than proceeding: a
+                    # transient SQLITE_BUSY on the DDL otherwise reached the
+                    # INSERT and lost the learn outright ("no column named
+                    # content_hash"), which is the exact regression this
+                    # fail-soft block exists to prevent.
+                    raise RuntimeError("content_hash column unavailable")
+                chash = _content_hash(stored_content)
+                model = getattr(wb, "model", None)
+                if model is None:
+                    # No embedder means no embedding, and detect_contradictions
+                    # filters `embedding IS NOT NULL` — an active learning
+                    # without one is invisible to the guard in front of this
+                    # channel, which is the F2 defect in a different costume.
+                    # Every other preparation failure stages as proposed; a
+                    # missing model must not be the one exception that writes
+                    # durable memory anyway.
+                    raise RuntimeError("embedder unavailable")
+                import numpy as np
+
+                from minni.models import get_embedder_lock
+
+                with get_embedder_lock():
+                    emb = model.encode(
+                        stored_content, show_progress_bar=False
+                    ).astype(np.float32)
+                emb_bytes = emb.tobytes()
+            except Exception as exc:
+                context.logger.warning(
+                    "auto_accept_own: could not prepare the durable write (%s); "
+                    "staging as proposed instead (G15 audit)", exc,
+                )
+                auto_accept = False
+                chash = None
+                emb_bytes = None
+                withheld = list(withheld) + ["durable-write preparation failed"]
+
+        with db.transaction() as c:
             c.execute(
                 """
                 INSERT INTO candidate_packets
@@ -630,20 +1000,107 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 ),
             )
             cid = c.lastrowid
-        context.logger.info(
-            "G16 stage_candidate #%d principal=%s privacy=%s (proposal-first, no durable learn yet)",
-            cid, principal.agent_id, stored_privacy,
-        )
-        return context.make_response(
-            {
-                "status": "proposed",
-                "candidate_id": cid,
-                "principal": principal.agent_id,
-                "workspace_id": ws,
-                "privacy_level": stored_privacy,
-            },
-            request_id,
-        )
+            if auto_accept and chash is not None:
+                # Inside the txn: a read-then-insert outside it races another
+                # auto-accept of the same content.
+                # Scoped to the caller, matching where the row is written. A
+                # global probe is an exact-match existence oracle over every
+                # agent's durable content, and the echoed "duplicate" reason
+                # confirms the hit — the same class this repo already closed on
+                # handle_learn's contradiction scan (R5, 2026-07-02 triage).
+                # status='active' matters: a superseded or rejected row is not
+                # a live duplicate, and matching it blocked re-learning content
+                # that no active learning carries any more — the correction
+                # machinery would have permanently poisoned the hash.
+                c.execute(
+                    "SELECT 1 FROM learnings WHERE content_hash=? AND agent_id=? "
+                    "AND status='active' LIMIT 1",
+                    (chash, principal.agent_id),
+                )
+                if c.fetchone() is not None:
+                    auto_accept = False
+                    withheld = ["duplicate of an existing learning"]
+            if auto_accept:
+                # 'general' matches both resolve_candidate and afm.py's
+                # promote, so the category cannot diverge by acceptance route.
+                #
+                # The OWNER does diverge, and it is worth being exact: a manual
+                # accept records the RESOLVER as agent_id, so a human accepting
+                # agent X's candidate produces a learning owned by the operator.
+                # This path records X. That is the intended reading of "the
+                # learnings are the agent's own" — and it is also why X can now
+                # own a learning at all, which is what made resolve_contradiction
+                # reachable and gave it the floor above.
+                c.execute(
+                    """
+                    INSERT INTO learnings
+                    (agent_id, category, content, created_at, embedding,
+                     content_hash, status)
+                    VALUES (?, 'general', ?, ?, ?, ?, 'active')
+                    """,
+                    (
+                        principal.agent_id, stored_content, now,
+                        emb_bytes, chash,
+                    ),
+                )
+                lid = c.lastrowid
+                c.execute(
+                    """
+                    UPDATE candidate_packets
+                    SET status='accepted', resolved_at=?, resolved_by=?,
+                        resolution_reason=?
+                    WHERE candidate_id=?
+                    """,
+                    (
+                        now,
+                        resolved_by,
+                        "auto_accept_own: operator-enabled auto-acceptance of the "
+                        "principal's own candidate (#290)",
+                        cid,
+                    ),
+                )
+                apply_accepted_candidate_effects(c, cid)
+
+        indexed_ok = True
+        if lid is not None:
+            indexed_ok = settle_accepted_candidate(
+                context, db, cid, principal.agent_id, stored_content, lid,
+            )
+            context.logger.warning(
+                "AUTO_ACCEPT_OWN candidate=%s learning=%s principal=%s "
+                "(operator-enabled; resolved_by=%s) (G15 audit)",
+                cid, lid, principal.agent_id, resolved_by,
+            )
+        else:
+            if getattr(principal, "auto_accept_own", False):
+                # Observable, not silent: the operator enabled the knob and this
+                # candidate still needs a human. Saying why is the difference
+                # between "withheld" and "quietly broken".
+                context.logger.warning(
+                    "AUTO_ACCEPT_OWN_WITHHELD candidate=%s principal=%s reasons=%s "
+                    "(routed to review, not dropped) (G15 audit)",
+                    cid, principal.agent_id, ",".join(withheld),
+                )
+            context.logger.info(
+                "G16 stage_candidate #%d principal=%s privacy=%s (proposal-first, no durable learn yet)",
+                cid, principal.agent_id, stored_privacy,
+            )
+
+        result = {
+            "status": "accepted" if lid is not None else "proposed",
+            "candidate_id": cid,
+            "principal": principal.agent_id,
+            "workspace_id": ws,
+            "privacy_level": stored_privacy,
+        }
+        if lid is not None:
+            result["learning_id"] = lid
+            result["resolved_by"] = resolved_by
+            if not indexed_ok:
+                result["indexed"] = False
+        elif withheld and getattr(principal, "auto_accept_own", False):
+            result["auto_accept_withheld"] = withheld
+        return context.make_response(result, request_id)
     except Exception as exc:
         context.logger.exception("stage_candidate failed")
         return context.make_error(-32000, f"stage_candidate error: {exc}", request_id)
@@ -918,25 +1375,21 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 """,
                 (new_status, now, principal.agent_id, resolution_reason, cid),
             )
-            # M5: the review fence must not outlive the candidate it fences.
-            # Same cursor, same transaction — a rolled-back resolve takes the
-            # marker change with it.
-            supersede_afm_review(c, cid)
+            apply_accepted_candidate_effects(c, cid)
 
         if lid is not None:
-            context.index_durable_learning(
-                principal.agent_id,
-                str(rowd.get("content") or ""),
-                key=f"learning:{lid}",
-                db=db,
+            settle_accepted_candidate(
+                context, db, cid, principal.agent_id,
+                str(rowd.get("content") or ""), lid,
             )
+        else:
+            # A non-accept resolution still archives its inbox source.
+            context.maybe_archive_inbox_source(db, cid)
 
         context.logger.warning(
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
             principal.agent_id, cid, decision, new_status, reason[:80],
         )
-
-        context.maybe_archive_inbox_source(db, cid)
 
         return context.make_response(
             {
