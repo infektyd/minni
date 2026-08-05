@@ -330,8 +330,13 @@ def _write_session_note(vault: Path, doc: Dict[str, Any], inbox_file: str,
 # skip branches in `distill` below that discard input with no archive and no
 # note — every one of them is deterministic, so the same file produces the
 # identical skip on every future tick and none can self-heal.
-COMPACT_UNREADABLE = "_compact_unreadable"
-COMPACT_MALFORMED = "_compact_malformed"
+# The first two are decided BEFORE the kind gate, so they apply to any *.json
+# in the shared inbox regardless of which writer owns it — an unparseable file
+# has no kind to dispatch on. Named for that reality rather than for this
+# channel: a corrupt handoff quarantined under a "compact" reason would
+# misroute an operator's triage.
+COMPACT_UNREADABLE = "_inbox_unreadable"
+COMPACT_MALFORMED = "_inbox_malformed"
 COMPACT_AGENT_MISMATCH = "_compact_agent_mismatch"
 COMPACT_EMPTY_SUMMARY = "_compact_empty_summary"
 
@@ -344,9 +349,15 @@ def classify_unusable_compact_file(path: Path, principal: str) -> Optional[str]:
     is a number that can never reach zero — a signal permanently overstating
     the problem it is meant to report.
 
-    Mirrors `distill`'s skip branches exactly. Files of another kind, and
-    compact summaries the pass can still consume, return None: draining a
-    usable file would destroy real memory input.
+    Mirrors `distill`'s skip branches exactly. A READABLE file of another
+    kind, and a compact summary the pass can still consume, return None:
+    draining either would destroy real memory input.
+
+    The unreadable/non-object cases are deliberately kind-AGNOSTIC — a file
+    that will not parse has no kind to dispatch on, and no consumer anywhere
+    can read it (inbox_ingest, handoff and the TS reader all apply the same
+    json.loads + isinstance(dict) test). They are reported under inbox-wide
+    reasons so triage is not misrouted to this channel.
     """
     try:
         doc = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -367,8 +378,8 @@ def classify_unusable_compact_file(path: Path, principal: str) -> Optional[str]:
 def count_unusable_compact_files(
     inboxes: Optional[List[Path]] = None,
     *,
+    fallback_principal: str,
     config: Any = None,
-    fallback_principal: str = "unknown",
 ) -> Dict[str, Any]:
     """How many inbox files the distillation pass currently cannot use.
 
@@ -376,6 +387,14 @@ def count_unusable_compact_files(
     because a dropped file used to stay in the inbox and be re-dropped every
     tick. This is the quantity that is actually true and that clears once the
     file is drained (#336).
+
+    ``fallback_principal`` is REQUIRED, not defaulted. For a bare
+    ``vault/inbox`` the principal IS the fallback, so a caller that let it
+    default while the drain passed the configured value would classify a
+    different set of files: the count would flag one the pass consumes happily
+    and miss the one actually drained, and it could never reach zero after a
+    drain. Making it required means that divergence cannot be reintroduced
+    silently — the two callers must agree or the code does not run.
     """
     if inboxes is None:
         inboxes = discover_inboxes(config)

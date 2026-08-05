@@ -81,6 +81,10 @@ REASON_SUFFIX = ".reason.json"
 # message) and this module must not create a reverse dependency on it.
 DEFAULT_RESIDUE_TTL_DAYS = 14.0
 
+# #336: floor under the compact drain's grace window, independent of the
+# operator's TTL. Guards the non-atomic-write race described at the use site.
+MIN_UNUSABLE_AGE_SECONDS = 60.0
+
 
 # M4 (#229): the AFM dead-letter cohort. ``afm_writer._write_batch`` writes
 # ``afm-drafts-<date>.json`` and ``afm_passes.pruning._write_inbox`` writes
@@ -381,7 +385,15 @@ def _unusable_compact_files(
             age = now - path.stat().st_mtime
         except OSError:
             continue
-        if age <= ttl_seconds:
+        # writeInbox is a non-atomic write to the final path, so a summary
+        # being written right now is transiently truncated and classifies
+        # unreadable. os.replace would move the inode out from under the open
+        # fd — the writer would then finish a complete, valid file inside
+        # quarantine/ and report success, and the pass would never see it.
+        # The TTL normally covers this by a wide margin, but it is a single
+        # operator-tunable knob and 0 is a defensible setting for the
+        # mismatch cohort, so floor it.
+        if age <= max(ttl_seconds, MIN_UNUSABLE_AGE_SECONDS):
             continue  # grace window: might still be corrected upstream
         out.append((
             path,

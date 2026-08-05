@@ -593,10 +593,10 @@ def test_unusable_count_clears_when_the_file_is_removed(tmp_path):
     inbox.mkdir(parents=True)
     bad = inbox / "c1.json"
     bad.write_text("{oops", encoding="utf-8")
-    assert count_unusable_compact_files([inbox])["files"] == 1
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 1
 
     bad.unlink()
-    assert count_unusable_compact_files([inbox])["files"] == 0
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 0
 
 
 def test_unusable_count_ignores_readable_files(tmp_path):

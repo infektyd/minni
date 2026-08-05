@@ -78,8 +78,8 @@ def test_all_four_unusable_cohorts_are_drained(tmp_path):
     assert not list(inbox.glob("*.json"))
     assert len(_moved(inbox)) == 4
     assert _reasons(inbox) == {
-        "_compact_unreadable",
-        "_compact_malformed",
+        "_inbox_unreadable",
+        "_inbox_malformed",
         "_compact_agent_mismatch",
         "_compact_empty_summary",
     }
@@ -187,11 +187,11 @@ def test_health_unusable_count_returns_to_zero_after_a_drain(tmp_path):
     _write(inbox, "c-malformed.json", "[]")
     _write(inbox, "c-mismatch.json", _summary(agent_id="other"))
 
-    assert count_unusable_compact_files([inbox])["files"] == 3
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 3
 
     quarantine_unusable_compact_summaries(None, [inbox], dry_run=False)
 
-    assert count_unusable_compact_files([inbox])["files"] == 0
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 0
 
 
 def test_the_count_and_the_drain_agree_on_the_cohort(tmp_path):
@@ -208,7 +208,7 @@ def test_the_count_and_the_drain_agree_on_the_cohort(tmp_path):
     _write(inbox, "c-good.json", _summary())
     _write(inbox, "handoff.json", {"kind": "handoff", "task": "t"})
 
-    counted = count_unusable_compact_files([inbox])["files"]
+    counted = count_unusable_compact_files([inbox], fallback_principal="unknown")["files"]
     drained = quarantine_unusable_compact_summaries(None, [inbox], dry_run=True)
 
     assert counted == drained["would_quarantine"] == 4
@@ -289,3 +289,161 @@ def test_a_loop_tick_leaves_a_usable_summary_in_place(tmp_path, monkeypatch):
         assert not (inbox / "quarantine" / good.name).exists()
     finally:
         obs.METRICS.reset()
+
+
+# ── the count and the drain must agree AT THE CALL SITES, not just in theory ─
+#
+# Every test above uses an `unknown-vault` inbox, where _principal_for_inbox
+# returns "unknown" whatever the fallback is — which is exactly why a health
+# caller that let fallback_principal default was invisible. A BARE vault/inbox
+# takes the fallback directly, so it discriminates.
+
+
+def _bare_vault_inbox(tmp_path: Path) -> Path:
+    return tmp_path / "vault" / "inbox"
+
+
+def test_a_bare_vault_classifies_by_the_fallback_principal(tmp_path):
+    """Divergence proof: with fallback 'unknown' the classifier flags the
+    codex-owned file (usable to a codex-principal pass) and misses the
+    unknown-owned one that actually drains."""
+    from minni.afm_passes.compact_distillation import count_unusable_compact_files
+
+    inbox = _bare_vault_inbox(tmp_path)
+    _write(inbox, "a.json", _summary(agent_id="codex"))
+    _write(inbox, "b.json", _summary(agent_id="unknown"))
+
+    as_unknown = count_unusable_compact_files([inbox], fallback_principal="unknown")
+    as_codex = count_unusable_compact_files([inbox], fallback_principal="codex")
+
+    assert as_unknown["files"] == 1
+    assert as_codex["files"] == 1
+    # Same total, DIFFERENT file — which is why the totals alone hid this.
+    drained = quarantine_for(inbox, fallback_principal="codex")
+    assert [p.name for p in drained] == ["b.json"]
+
+
+def quarantine_for(inbox: Path, *, fallback_principal: str):
+    from minni.afm_passes.inbox_quarantine import quarantine_unusable_compact_summaries
+
+    quarantine_unusable_compact_summaries(
+        None, [inbox], fallback_principal=fallback_principal, dry_run=False,
+    )
+    return _moved(inbox)
+
+
+def test_health_count_uses_the_same_fallback_as_the_drain(tmp_path, monkeypatch):
+    """Kills the shipped bug: the health caller defaulted fallback_principal
+    while the drain passed the configured value, so health flagged a file the
+    pass consumes and missed the one that drains — and never reached zero."""
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    from test_inbox_quarantine import _real_lifecycle_db  # noqa: E402
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+    import minni.config as cfg_mod
+
+    cons = (
+        (getattr(cfg_mod.DEFAULT_CONFIG, "afm_loop_schedule", {}) or {})
+        .setdefault("passes", {})
+        .setdefault("consolidation", {})
+    )
+    monkeypatch.setitem(cons, "inbox_fallback_principal", "codex")
+
+    inbox = _bare_vault_inbox(tmp_path)
+    _write(inbox, "usable-for-codex.json", _summary(agent_id="codex"))
+
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+
+    files = rep["memory_lifecycle"]["compact_distillation_unusable"]["files"]
+    assert files == 0, (
+        "a file the pass can consume under the configured principal must not "
+        f"be counted unusable: {rep['memory_lifecycle']}"
+    )
+
+
+def test_the_loop_passes_the_configured_ttl_to_the_drain(tmp_path, monkeypatch):
+    """The TTL is the guard against sweeping a file mid-write; a loop that
+    stopped forwarding it would be invisible."""
+    from minni.afm_passes import inbox_quarantine as iq
+
+    seen = {}
+
+    def _spy(config, inboxes=None, **kwargs):
+        seen.update(kwargs)
+        return {"quarantined": 0, "would_quarantine": 0, "quarantined_files": []}
+
+    monkeypatch.setattr(iq, "quarantine_unusable_compact_summaries", _spy)
+
+    import asyncio
+
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cons = cfg.afm_loop_schedule["passes"]["consolidation"]
+    cons["distill_compact_summaries"] = True
+    cons["inbox_quarantine_ttl_days"] = 3
+    cons["inbox_fallback_principal"] = "codex"
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    _write(inbox, "c-unreadable.json", "{oops")
+
+    ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+    asyncio.run(afm_loop_runner(ctx))
+
+    assert seen.get("ttl_days") == 3, seen
+    assert seen.get("fallback_principal") == "codex", seen
+
+
+def test_a_mismatch_only_backlog_still_reaches_the_drain(tmp_path, monkeypatch):
+    """The loop gate must watch every drop cohort: a backlog of only
+    agent-mismatch files would otherwise never drain and the count never
+    clear."""
+    import asyncio
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cons = cfg.afm_loop_schedule["passes"]["consolidation"]
+    cons["distill_compact_summaries"] = True
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    _write(inbox, "c-mismatch.json", _summary(agent_id="some-other-agent"))
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+        assert not list(inbox.glob("*.json")), "mismatch-only backlog must drain"
+    finally:
+        obs.METRICS.reset()
+
+
+def test_a_file_written_seconds_ago_is_never_swept(tmp_path):
+    """A summary being written is transiently truncated; os.replace would move
+    the inode out from under the writer's open fd and the completed file would
+    land in quarantine/."""
+    from minni.afm_passes.inbox_quarantine import quarantine_unusable_compact_summaries
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    mid_write = _write(inbox, "c-partial.json", '{"kind": "compact_su', age_days=0.0)
+
+    result = quarantine_unusable_compact_summaries(
+        None, [inbox], fallback_principal="unknown", ttl_days=0.0, dry_run=False,
+    )
+
+    assert result["quarantined"] == 0, "TTL=0 must not defeat the mid-write floor"
+    assert mid_write.exists()
