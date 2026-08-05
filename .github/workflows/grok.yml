@@ -207,7 +207,12 @@ jobs:
           # scanned before it is posted. Do not restate this as "the kernel
           # denies the credential path" — that wording is what produced the
           # earlier deny-rule mistakes.
+          # Model and effort pinned per operator model ladder — CI must not
+          # float on service defaults. Low volume (collaborator-only, one
+          # metered run per deliberate /grok), so HIGH costs little here.
           "$HOME/.grok/bin/grok" --prompt-file /tmp/grok-prompt.md \
+            --model grok-4.5 \
+            --reasoning-effort high \
             --always-approve \
             --no-subagents \
             --max-turns 60 \

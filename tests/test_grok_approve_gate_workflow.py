@@ -669,6 +669,33 @@ def _jobs_with_path_mutation() -> dict[str, dict]:
     return out
 
 
+@pytest.mark.parametrize(
+    "workflow", ["grok-review.yml", "grok.yml", "grok-boundary-test.yml"]
+)
+def test_grok_invocations_pin_model_and_effort(workflow):
+    """Per the operator model ladder, CI must not float on service defaults.
+
+    An unpinned invocation silently re-tiers the moment the service default
+    moves, and for grok-boundary-test.yml that would quietly change what the
+    containment claim was actually proven against.
+    """
+    doc = _load(ROOT / ".github" / "workflows" / workflow)
+    calls = []
+    for job in (doc.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            # Uncommented step bodies only: a mention in a comment must not
+            # read as a pin, and an unquoted invocation must not be skipped.
+            body = _uncommented(str(step.get("run", "")))
+            for call in re.finditer(r'"?\$HOME/\.grok/bin/grok"?((?:[^\n]*\\\n)*[^\n]*)', body):
+                calls.append(call.group(1))
+    # Without this the loop below is vacuous whenever the regex matches
+    # nothing — a green test that constrains exactly zero invocations.
+    assert calls, f"{workflow}: no grok invocation found to check"
+    for flags in calls:
+        assert "--model grok-4.5" in flags, f"{workflow}: model not pinned"
+        assert "--reasoning-effort high" in flags, f"{workflow}: effort not pinned"
+
+
 def test_every_path_mutating_job_is_covered():
     """A guard on the guard: if this set silently shrinks, the pinning test
     below keeps passing while covering less."""
