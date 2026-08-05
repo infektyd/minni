@@ -156,11 +156,32 @@ export async function bootstrapApprenticeVault(
       // A directory existing here is only a legitimate re-bootstrap if it
       // was created for THIS agent id — verify against the schema title
       // this bootstrapper itself writes rather than assuming idempotency.
+      //
+      // Bugbot round on #306: the first version of this guard only rejected
+      // a POSITIVELY-DIFFERENT owner (`owner !== undefined && owner !==
+      // permanentAgentId`) — an existing directory whose schema/AGENTS.md
+      // was missing, unreadable, or not in this bootstrapper's title format
+      // (`owner === undefined`) fell straight through to the silent
+      // `bootstrapped: false` success. That is the exact hazard this guard
+      // exists to close, just for "ownership can't be established" instead
+      // of "ownership is verified different" — an unrelated pre-existing
+      // directory at the same normalized slug (a live, non-apprentice agent
+      // vault; a stray directory) could be silently treated as this
+      // apprentice's vault. Idempotent re-bootstrap now requires a POSITIVE
+      // same-id match; anything else — including "can't tell" — is a loud
+      // collision, not a silent pass.
+      //
+      // No live apprentice vaults exist anywhere on this fleet (checked
+      // before #298 was filed and again here), so there is no pre-fix
+      // apprentice vault in the wild that legitimately lacks this title and
+      // needs a compatibility path. If one is ever discovered, add an
+      // explicit migration rather than silently loosening this guard again.
       const owner = await existingVaultOwner(fs, vaultPath);
-      if (owner !== undefined && owner !== input.permanentAgentId) {
+      if (owner !== input.permanentAgentId) {
         throw new Error(
-          `vaultPath collision: ${vaultPath} already belongs to agent ${JSON.stringify(owner)}, ` +
-          `not ${JSON.stringify(input.permanentAgentId)} (slug collision after normalization)`,
+          `vaultPath collision: ${vaultPath} already exists and its owner could not be verified as ` +
+          `${JSON.stringify(input.permanentAgentId)} (found: ${owner === undefined ? "unreadable/unparseable/missing schema" : JSON.stringify(owner)}) ` +
+          `— refusing to treat it as an idempotent re-bootstrap`,
         );
       }
       return { vaultPath, bootstrapped: false, filesCreated: [] };

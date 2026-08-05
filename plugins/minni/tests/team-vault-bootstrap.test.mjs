@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -243,6 +243,53 @@ test("#298 review: a slug collision between two different agent ids is rejected 
   });
   assert.equal(again.bootstrapped, false);
   assert.equal(again.vaultPath, first.vaultPath);
+});
+
+// Bugbot on #306 (Medium): the collision guard's first version only rejected
+// a POSITIVELY-DIFFERENT owner — an existing directory whose ownership could
+// not be established (missing/unreadable/unparseable schema) fell through to
+// silent bootstrapped:false, exactly the hazard the guard exists to close.
+test("#306 review: an existing directory with NO schema/AGENTS.md is a loud collision, not a silent pass", async () => {
+  const root = await makeTmpRoot();
+  const agentId = "unrelated-agent";
+  // Simulate an unrelated pre-existing directory at the EXACT slug
+  // agentIdToVaultSlug computes for this id — no schema/ subdirectory at
+  // all, so existingVaultOwner reads ENOENT. Compute the real slug rather
+  // than hand-guessing the directory name (agentIdToVaultSlug strips
+  // hyphens: "unrelated-agent" -> "unrelatedagent", not
+  // "unrelated-agent" — a hand-guessed mismatched path would silently miss
+  // the collision branch entirely and pass for the wrong reason).
+  const vaultPath = path.join(root, `${agentIdToVaultSlug(agentId)}-vault`);
+  await mkdir(vaultPath, { recursive: true });
+
+  await assert.rejects(
+    bootstrapApprenticeVault({
+      sovereignRoot: root,
+      permanentAgentId: agentId,
+      profile: makePermanentProfile(),
+    }),
+    /vaultPath collision/,
+  );
+});
+
+test("#306 review: an existing directory with an unparseable schema/AGENTS.md is a loud collision, not a silent pass", async () => {
+  const root = await makeTmpRoot();
+  const agentId = "garbled-agent";
+  const vaultPath = path.join(root, `${agentIdToVaultSlug(agentId)}-vault`);
+  await mkdir(path.join(vaultPath, "schema"), { recursive: true });
+  // Present, readable, but does not match the "# Apprentice Vault — <id>"
+  // title format this bootstrapper itself writes (a hand-edited or
+  // differently-shaped file at the collision slug).
+  await writeFile(path.join(vaultPath, "schema", "AGENTS.md"), "not a title line at all\njust prose\n", "utf8");
+
+  await assert.rejects(
+    bootstrapApprenticeVault({
+      sovereignRoot: root,
+      permanentAgentId: agentId,
+      profile: makePermanentProfile(),
+    }),
+    /vaultPath collision/,
+  );
 });
 
 test("bootstrapApprenticeVault throws when agentId reduces to empty after slugify", async () => {
