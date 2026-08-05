@@ -21,16 +21,23 @@ Audit result across all ten production sites (`grep -rn "_get_conn()" src/`):
   db.py:167, 179          the contract itself (cursor / transaction)
   db.py:529               init only — schema + migrations, which commit
   minnid.py:2095          init only — same, eager startup
-  minnid.py:1327          WRITE — reconcile_episodic_fts; commits explicitly
-                          at minnid.py:1322 and rolls back on exception
-  retrieval.py:864, 879   read-only — connection goes to compute_db_checksum
+  minnid.py:1327          WRITE — reconcile_episodic_fts; commits at
+                          minnid.py:1330, rolls back at :1332
+  retrieval.py:864        read-only — → try_load_from_disk(db_conn=) → checksum
+  retrieval.py:879        read-only — → compute_db_checksum directly
   sovereign_memory.py:292 read-only — save_to_disk(db_conn=...) → checksum
   vault_ingest.py:359     read-only — same
   faiss_disk.py:60        read-only — try_load_from_disk(db_conn=...) → checksum
 
 So exactly one raw write site remains outside db.py, and it is correct. These
-tests exist to keep it that way — the moment one of these paths writes without
-committing, they go red.
+tests exist to keep it that way.
+
+Coverage is per CALL SITE, not per callee, and that distinction is load-bearing:
+review demonstrated that testing `FAISSIndex.save_to_disk` directly left leaks at
+sovereign_memory.py:292 and vault_ingest.py:359 undetected, and that exercising
+only the disk-cache MISS path left the HIT branches at retrieval.py:864 and
+faiss_disk.py:60 unguarded. Each site is therefore driven through its own
+production entry point, with a precondition asserting the intended branch ran.
 
 Two distinct guards, because end-state cleanliness alone is NOT sufficient:
 
@@ -69,13 +76,15 @@ def _make_db(tmp_path):
 def _assert_connection_is_clean(conn, cfg, label):
     """No open transaction, and no held write lock.
 
-    Under WAL the second check is defence-in-depth rather than an independent
-    detector: a held write lock implies an open transaction, so the assert below
-    fires first in every leak this suite can construct. It is kept because it
-    states the consequence in the terms an operator experiences (other writers
-    block), and because it stops being redundant the moment the journal mode
-    changes. `test_the_lock_probe_detects_a_held_lock` exercises it directly, so
-    it cannot rot into a no-op.
+    The two checks are not redundant. For a same-connection leak the assert
+    fires first, so the probe adds nothing there. But a leak on ANOTHER
+    connection — a worker thread's thread-local connection, which is the real
+    multi-worker daemon shape — leaves this connection's `in_transaction` False
+    and is caught ONLY by the probe. That was demonstrated by review: a
+    `_get_conn()` write on a worker thread inside `_ensure_faiss_loaded`, thread
+    joined, passed the assert and failed the probe.
+    `test_the_lock_probe_detects_a_held_lock` exercises it directly, so it
+    cannot rot into a no-op.
     """
     assert conn.in_transaction is False, (
         f"{label} left an open transaction — its writes are invisible to every "
@@ -110,7 +119,6 @@ def _fails_if_a_write_is_pending_when_a_cursor_opens(db_obj, label):
     """
     import minni.db as db_mod
 
-    conn = db_obj._get_conn()
     originals = {
         name: getattr(db_mod.SovereignDB, name) for name in ("cursor", "transaction")
     }
@@ -119,7 +127,10 @@ def _fails_if_a_write_is_pending_when_a_cursor_opens(db_obj, label):
     def _wrap(original):
         @contextmanager
         def wrapper(self, *args, **kwargs):
-            if conn.in_transaction:
+            # self._get_conn(), not a connection captured up front: audited code
+            # may route through a different SovereignDB (e.g. shared()) or a
+            # worker thread, and a captured handle would silently pass.
+            if self._get_conn().in_transaction:
                 laundered.append(True)
             with original(self, *args, **kwargs) as c:
                 yield c
@@ -366,7 +377,10 @@ class TestTheContractGuardActuallyDetects:
                 "precondition: the assert half must not fire, so the probe is "
                 "the only thing that can detect this"
             )
-            with pytest.raises(BaseException) as caught:
+            # pytest.fail.Exception, not BaseException: the latter would also
+            # swallow a NameError from a broken helper — the same mistake the
+            # AssertionError narrowing above exists to avoid.
+            with pytest.raises(pytest.fail.Exception) as caught:
                 _assert_connection_is_clean(conn, cfg, "lock held elsewhere")
             assert "write lock" in str(caught.value)
         finally:
@@ -476,8 +490,8 @@ class TestNoLeakIsLaunderedByALaterCursor:
 
 class TestTheSweepWriteSite:
     """minnid.py:1327 — the one raw _get_conn() WRITE site outside db.py. It
-    commits explicitly at minnid.py:1322 and rolls back on exception; this is
-    the guard for that, independent of the #279 test that first pinned it."""
+    commits at minnid.py:1330 and rolls back at :1332; this is the guard for
+    that, independent of the #279 test that first pinned it."""
 
     def _db_with_unindexed_events(self, tmp_path):
         db_obj, cfg = _make_db(tmp_path)
@@ -553,3 +567,209 @@ class TestTheSweepWriteSite:
         assert "error" in results["episodic_fts"]
         _assert_connection_is_clean(conn, cfg, "_backfill_sweep_once (failed)")
         db_obj.close()
+
+
+def _seed_embeddings(db_obj, cfg, n=2):
+    """Enough chunk_embeddings for a real FAISS build, so warm-start paths have
+    something to save and reload."""
+    with db_obj.cursor() as c:
+        c.execute(
+            "INSERT INTO documents (path, agent, sigil, last_modified,"
+            " indexed_at, access_count, decay_score, whole_document)"
+            " VALUES ('/d.md', 'forge', 'F', 1.0, 1.0, 0, 1.0, 0)"
+        )
+        doc_id = c.lastrowid
+        for i in range(n):
+            vec = np.zeros(cfg.embedding_dim, dtype="float32")
+            vec[i] = 1.0
+            c.execute(
+                "INSERT INTO chunk_embeddings (doc_id, chunk_index, chunk_text,"
+                " embedding, model_name, computed_at)"
+                " VALUES (?, ?, ?, ?, 'test', 1.0)",
+                (doc_id, i, f"chunk {i}", vec.tobytes()),
+            )
+    return doc_id
+
+
+class TestWarmStartTakesTheDiskCacheHitBranch:
+    """The disk-cache HIT branch was completely unexercised.
+
+    Every earlier test ran against a cold cache, so `try_load_from_disk` always
+    returned False and the code inside the `if` never executed. Review proved a
+    leak planted in that branch passed the whole file — at retrieval.py:864 and
+    faiss_disk.py:60, two sites this file names as covered. Each test below
+    asserts the branch was actually taken, so it cannot silently revert to
+    testing the miss path again.
+    """
+
+    def test_ensure_faiss_loaded_warm_start(self, tmp_path):
+        from minni.retrieval import RetrievalEngine
+
+        db_obj, cfg = _make_db(tmp_path)
+        _seed_embeddings(db_obj, cfg)
+        conn = db_obj._get_conn()
+
+        # Cold pass: builds and persists the cache.
+        first = RetrievalEngine(db_obj, cfg)
+        first._ensure_faiss_loaded()
+        first.faiss_index.save_to_disk(db_conn=conn)
+
+        # Warm pass on a fresh engine: this is the HIT branch.
+        warm = RetrievalEngine(db_obj, cfg)
+
+        # The precondition has to prove the HIT, not infer it. `ready` and
+        # `count > 0` are equally true after a cache MISS followed by a rebuild
+        # from the DB, so asserting those would leave the raw _get_conn() take
+        # at retrieval.py:864 untested while the test looked strict. Verified:
+        # with try_load_from_disk stubbed to always return False, the
+        # ready/count version of this assertion still passed. Spy on the return
+        # value instead — that IS the branch condition.
+        loaded: list = []
+        original_load = warm.faiss_index.try_load_from_disk
+
+        def _spy(db_conn=None):
+            result = original_load(db_conn=db_conn)
+            loaded.append(result)
+            return result
+
+        warm.faiss_index.try_load_from_disk = _spy
+        try:
+            with _fails_if_a_write_is_pending_when_a_cursor_opens(
+                db_obj, "_ensure_faiss_loaded (warm start)"
+            ):
+                warm._ensure_faiss_loaded()
+        finally:
+            warm.faiss_index.try_load_from_disk = original_load
+
+        assert loaded == [True], (
+            "precondition: the disk-cache HIT branch must actually have run. "
+            f"try_load_from_disk returned {loaded} — [] means it was never "
+            "reached, [False] means this degraded to the rebuild path and the "
+            "raw connection take inside the `if` was never executed"
+        )
+        assert warm.faiss_index.ready and warm.faiss_index.count > 0
+        _assert_connection_is_clean(conn, cfg, "_ensure_faiss_loaded (warm start)")
+        db_obj.close()
+
+    def test_faiss_disk_backend_warm_start(self, tmp_path):
+        from minni.backends.faiss_disk import FaissDiskBackend
+
+        db_obj, cfg = _make_db(tmp_path)
+        _seed_embeddings(db_obj, cfg)
+        conn = db_obj._get_conn()
+
+        seed = FaissDiskBackend(config=cfg, db=db_obj)
+        seed._faiss.build_from_vectors(
+            [1, 2],
+            np.eye(2, cfg.embedding_dim, dtype="float32"),
+        )
+        seed._faiss.save_to_disk(db_conn=conn)
+
+        warm = FaissDiskBackend(config=cfg, db=db_obj)
+
+        assert warm._faiss.count > 0, (
+            "precondition: construction must have taken the disk-cache HIT "
+            "branch, not the miss path every other test exercises"
+        )
+        _assert_connection_is_clean(conn, cfg, "FaissDiskBackend (warm start)")
+        db_obj.close()
+
+
+class TestTheRemainingCallSitesRunTheirOwnCode:
+    """Coverage per CALL SITE, not per callee.
+
+    Testing FAISSIndex.save_to_disk directly does not execute
+    sovereign_memory.py:292 or vault_ingest.py:359 — review confirmed a leak at
+    either of those lines passed this file, and at vault_ingest also passed its
+    own two test modules. That site runs inside the AFM ingest pass, i.e.
+    daemon-resident: exactly #279's blast radius.
+    """
+
+    def test_vault_ingest_save_faiss(self, tmp_path):
+        """afm_passes/vault_ingest.py:359, via its own function."""
+        from minni.afm_passes.vault_ingest import _save_faiss
+
+        db_obj, cfg = _make_db(tmp_path)
+        conn = db_obj._get_conn()
+
+        class _StubIndexer:
+            """Stands in for WikiIndexer: _save_faiss only needs .db, a built
+            .faiss_index, and a _rebuild_faiss_index() it can call."""
+
+            def __init__(self, db, config):
+                from minni.faiss_index import FAISSIndex
+
+                self.db = db
+                self.config = config
+                self.faiss_index = FAISSIndex(config)
+
+            def _rebuild_faiss_index(self):
+                self.faiss_index.build_from_vectors(
+                    [1, 2], np.eye(2, self.config.embedding_dim, dtype="float32")
+                )
+
+        indexer = _StubIndexer(db_obj, cfg)
+        assert _save_faiss(indexer) is True, "precondition: the save must run"
+
+        _assert_connection_is_clean(conn, cfg, "vault_ingest._save_faiss")
+        db_obj.close()
+
+    def test_sovereign_memory_faiss_rebuild(self, tmp_path, monkeypatch, capsys):
+        """sovereign_memory.py:292, via cmd_faiss('--rebuild')."""
+        import minni.sovereign_memory as sm
+
+        db_obj, cfg = _make_db(tmp_path)
+        _seed_embeddings(db_obj, cfg)
+        conn = db_obj._get_conn()
+
+        monkeypatch.setattr(sm, "SovereignDB", lambda *a, **k: db_obj)
+        monkeypatch.setattr(db_obj, "close", lambda: None)
+        sm.cmd_faiss(["--rebuild"])
+
+        assert "rebuilt" in capsys.readouterr().out, (
+            "precondition: the rebuild branch must have run"
+        )
+        _assert_connection_is_clean(conn, cfg, "sovereign_memory.cmd_faiss")
+        db_obj.close()
+
+    def test_eager_startup_init_leaves_no_transaction(self, tmp_path):
+        """minnid.py:2094-2095 — the daemon's eager startup init, driven
+        through SovereignDB.shared() as production does.
+
+        An earlier version constructed SovereignDB directly, which mirrors
+        db.connect() rather than the call site it claimed to cover. shared()
+        goes through a process-wide registry keyed by absolute db_path, so the
+        path under test is genuinely different code — and an overstated
+        coverage claim is the thing this campaign exists to remove.
+        """
+        import os
+
+        import minni.db as db_mod
+        from minni.config import SovereignConfig
+        from minni.db import SovereignDB
+
+        cfg = SovereignConfig(db_path=str(tmp_path / "eager.db"))
+        key = os.path.abspath(cfg.db_path)
+        old_flag = db_mod._migrations_run
+        db_mod._migrations_run = False
+        db = None
+        try:
+            # Verbatim shape of minnid.py:2094-2095.
+            db = SovereignDB.shared(cfg)
+            db._get_conn()
+
+            _assert_connection_is_clean(db._get_conn(), cfg, "eager startup init")
+        finally:
+            # In a finally, not after the assertion: shared() registers this
+            # instance PROCESS-WIDE, so an assertion failure — or a raise from
+            # anything above — would otherwise leave a tmp_path database
+            # registered for the rest of the pytest worker, where the next
+            # shared() call for that path hands back a closed handle to an
+            # unrelated test. Cleanup on the failure path matters more than on
+            # the success path, because the failure path is the one that
+            # already has something going wrong.
+            db_mod._migrations_run = old_flag
+            if db is not None:
+                db.close()
+            with SovereignDB._shared_lock:
+                SovereignDB._shared_instances.pop(key, None)
