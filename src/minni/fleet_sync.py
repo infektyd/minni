@@ -27,7 +27,9 @@ import io
 import json
 import os
 import platform as py_platform
+import re
 import shutil
+import signal
 import subprocess
 import sys
 from argparse import Namespace
@@ -39,6 +41,10 @@ from typing import Any, Optional
 # timer runs it unattended every 6h, so a hung child must not pin a sync
 # process forever — every other subprocess here is already bounded.
 UPDATE_ROOT_TIMEOUT = 1800
+
+# launchctl's exit code when the label is not loaded in the domain.
+_LAUNCHCTL_NO_SUCH_SERVICE = 113
+_MINNID_LABEL = "com.minni.minnid"
 
 
 @dataclass
@@ -60,11 +66,17 @@ class SyncResult:
 
 
 def _source_checkout() -> Optional[Path]:
-    try:
-        from minni.minnid_runtime.deploy_honesty import _source_checkout
-        return _source_checkout()
-    except Exception:
+    """Editable checkout backing this install, or None if genuinely packaged.
+
+    A missing module means packaged. A module that exists but fails to import
+    is a broken install, and swallowing that would downgrade a checkout to
+    "packaged": wire would then redeploy from the stale bundled payload and
+    the deploy audit would skip, all while every step exits 0.
+    """
+    if importlib.util.find_spec("minni.minnid_runtime.deploy_honesty") is None:
         return None
+    from minni.minnid_runtime.deploy_honesty import _source_checkout
+    return _source_checkout()
 
 
 def _detect_install_kind() -> tuple[str, Optional[Path]]:
@@ -122,19 +134,26 @@ def _wire_status(text: str) -> Optional[str]:
     ``"gc": {}`` so the last ``{`` is the wrong anchor. Walk brace positions
     and keep the last WireOutput-shaped object.
     """
-    with contextlib.suppress(Exception):
-        doc = json.loads(text)
-        if _is_wire_output(doc):
-            return str(doc.get("status") or "") or None
-    found: Optional[str] = None
+    decoder = json.JSONDecoder()
+    found: list[str] = []
     idx = text.find("{")
     while idx >= 0:
-        with contextlib.suppress(Exception):
-            doc = json.loads(text[idx:])
+        # raw_decode, not loads: wire may print after the document, and a
+        # trailing line must not make the status unreadable.
+        with contextlib.suppress(ValueError):
+            doc, _end = decoder.raw_decode(text[idx:])
             if _is_wire_output(doc):
-                found = str(doc.get("status") or "") or None
+                found.append(str(doc.get("status") or ""))
         idx = text.find("{", idx + 1)
-    return found
+    # run_wire emits exactly one report. Two disagreeing documents means noise
+    # embedded something WireOutput-shaped, and picking either one lets a
+    # decoy "skipped" overwrite a real "failed" — the very laundering this
+    # module exists to stop. Unreadable is the safe answer: callers treat an
+    # unknown status on a nonzero exit as a failure.
+    unique = set(found)
+    if len(unique) != 1:
+        return None
+    return found[0] or None
 
 
 def _run_wire(
@@ -165,27 +184,34 @@ def _run_wire(
     # the operator still sees the report while we read the status out of it:
     # exit 1 alone cannot tell "wired nothing here" from "wiring failed".
     buf = io.StringIO()
+    failure: Optional[str] = None
+    code = 1
     try:
         with contextlib.redirect_stdout(buf):
             code = run_wire(ns)
+    except Exception as exc:
+        # `minni sync` owes its caller a JSON verdict, not a traceback — the
+        # launchd timer's log is the only place this is ever read.
+        failure = str(exc)
     finally:
         report = buf.getvalue()
         if report:
             sys.stdout.write(report)
-    status = _wire_status(report)
     step: dict[str, Any] = {
         "name": "wire_all",
         "exit_code": code,
-        "status": status,
         "from_repo": str(from_repo) if from_repo else None,
     }
+    if failure is not None:
+        return {**step, "exit_code": 1, "status": None, "error": failure}
+    status = _wire_status(report)
+    step["status"] = status
     if code != 0 and status == "skipped":
-        # D5: wire exits 1 when it wired nothing. On a host with no
-        # wire-managed surfaces that is expected — propagate still owns
-        # antigravity/cursor — so it is a skip, not a redeploy failure
-        # (scripts/update_root.sh makes the same distinction).
+        # D5: wire exits 1 when it wired nothing. Propagate still owns
+        # antigravity/cursor, so nothing to wire is a skip rather than a
+        # redeploy failure (scripts/update_root.sh makes the same call).
         step["skipped"] = True
-        step["reason"] = "no wire-managed host surfaces on this machine"
+        step["reason"] = "wire reported nothing to wire (status=skipped)"
     return step
 
 
@@ -297,9 +323,11 @@ def _restamp_grok_hooks(repo: Optional[Path], *, dry_run: bool) -> dict[str, Any
         spec.loader.exec_module(mod)
         hooks = mod.update_grok_hooks(root)
         rules = mod.write_grok_rules()
+        # Inside the try on purpose: a propagate.py whose return contract
+        # drifted must fail this step, not crash `minni sync`.
+        installed = bool(hooks.get("installed")) and bool(rules.get("installed"))
     except Exception as exc:
         return {**step, "exit_code": 1, "install_root": str(root), "error": str(exc)}
-    installed = bool(hooks.get("installed")) and bool(rules.get("installed"))
     return {
         **step,
         "exit_code": 0 if installed else 1,
@@ -309,6 +337,138 @@ def _restamp_grok_hooks(repo: Optional[Path], *, dry_run: bool) -> dict[str, Any
     }
 
 
+def _check_deployments_py(repo: Optional[Path]) -> Optional[Path]:
+    """Locate scripts/check_deployments.py in a checkout, if there is one."""
+    if repo is None:
+        return None
+    script = repo / "scripts" / "check_deployments.py"
+    return script if script.is_file() else None
+
+
+# Row shape from check_deployments.py: status, padded detail, then the label.
+_WORKTREE_ROW = re.compile(r"^\s*WORKTREE\s{2,}\S.*?\s{2,}(?P<label>\S.*?)\s*$")
+# Printed once per run, including "No deployments discovered." — its absence
+# means the audit did not complete and we must not read silence as clean.
+_AUDIT_COMPLETED = ("deployment(s):", "No deployments discovered.")
+_WORKTREE_TALLY = re.compile(r"(?P<n>\d+) dist symlinked at the working tree")
+
+
+def _worktree_linked_labels(report: str) -> list[str]:
+    """Deployment labels check_deployments.py classified WORKTREE."""
+    return [
+        m.group("label")
+        for m in (_WORKTREE_ROW.match(line) for line in report.splitlines())
+        if m is not None
+    ]
+
+
+def _audit_deploy_symlinks(repo: Optional[Path], *, dry_run: bool) -> dict[str, Any]:
+    """Fail the sync when a deployed dist is symlinked at the working tree.
+
+    Minni ships as a product: deployed artifacts are built, versioned copies,
+    never symlinks into a working tree. A WORKTREE-linked dist executes
+    uncommitted state and carries no reproducible version, so `git stash`
+    changes live behavior. scripts/check_deployments.py already makes that
+    call (including which symlinks are legitimate installed artifacts); this
+    only carries its judgment into the verdict.
+
+    Its exit code is deliberately not reused: it also fails on stale vintage
+    and content drift, which are not this step's business.
+    """
+    step: dict[str, Any] = {"name": "deploy_symlink_audit"}
+    if dry_run:
+        return {**step, "exit_code": 0, "skipped": True, "reason": "dry-run"}
+    script = _check_deployments_py(repo)
+    if script is None:
+        # No checkout, so no working tree for a dist to point into.
+        return {
+            **step,
+            "exit_code": 0,
+            "skipped": True,
+            "reason": "no checkout: scripts/check_deployments.py unavailable",
+        }
+    env = {
+        **os.environ,
+        # Parity with update_root.sh: the staged payload under the repo is a
+        # release artifact, not a live host surface.
+        "MINNI_CHECK_DEPLOYMENTS_SKIP_REPO": "1",
+    }
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {**step, "exit_code": 1, "error": f"audit inconclusive: {exc}"}
+    report = proc.stdout or ""
+    if not any(marker in report for marker in _AUDIT_COMPLETED):
+        return {
+            **step,
+            "exit_code": 1,
+            "error": "audit inconclusive: check_deployments.py produced no verdict",
+            "stderr_tail": (proc.stderr or "")[-400:],
+        }
+    linked = _worktree_linked_labels(report)
+    # Cross-check the row scrape against check_deployments' own tally: if it
+    # counted symlinked dists we failed to name, the parse is broken and a
+    # clean verdict would be fail-open.
+    tally = _WORKTREE_TALLY.search(report)
+    counted = int(tally.group("n")) if tally else 0
+    if counted > len(linked):
+        return {
+            **step,
+            "exit_code": 1,
+            "error": (
+                f"audit inconclusive: check_deployments counted {counted} "
+                f"worktree-symlinked dist(s) but {len(linked)} could be read"
+            ),
+            "worktree_linked": linked,
+        }
+    return {
+        **step,
+        "exit_code": 1 if linked else 0,
+        "worktree_linked": linked,
+        # A clean verdict must say what it did not judge: check_deployments
+        # excludes historical wire dirs, superseded marketplace caches and the
+        # legacy plugin/current path, and a symlink hiding there would not
+        # appear above.
+        "not_judged": [
+            # The repo payload exclusion is ours (SKIP_REPO below) and
+            # check_deployments emits no NOTE for it, so name it here or the
+            # blind-spot list would quietly under-report.
+            f"{repo}/src/minni/plugin_payload: skipped "
+            "(staged release artifact, not a live host surface)",
+            *(
+                line.removeprefix("NOTE").strip()
+                for line in report.splitlines()
+                if line.startswith("NOTE")
+            ),
+        ],
+    }
+
+
+def _minnid_is_live(timeout: float = 5.0) -> bool:
+    """True if minnid completes a ``ping`` round-trip.
+
+    A bare connect is not enough: the kernel completes connect() against a
+    listening socket while the daemon's event loop is wedged, so a daemon
+    broken by the very upgrade we just deployed would read as healthy and
+    excuse the restart we failed to perform.
+    """
+    from minni.minni_cli import RpcError, _rpc
+
+    path = Path.home() / ".minni" / "run" / "minnid.sock"
+    try:
+        _rpc(path, "ping", timeout=timeout)
+        return True
+    except (RpcError, OSError):
+        return False
+
+
 def _kickstart_daemon() -> dict[str, Any]:
     if py_platform.system() != "Darwin":
         return {
@@ -316,8 +476,10 @@ def _kickstart_daemon() -> dict[str, Any]:
             "exit_code": 0,
             "skipped": True,
             "reason": "not macOS launchd; restart with: minni down && minni up",
+            # Definitively not restarted here, so the operator must be told.
+            "manual_restart": True,
         }
-    label = f"gui/{os.getuid()}/com.minni.minnid"
+    label = f"gui/{os.getuid()}/{_MINNID_LABEL}"
     try:
         proc = subprocess.run(
             ["launchctl", "kickstart", "-k", label],
@@ -329,18 +491,51 @@ def _kickstart_daemon() -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"name": "restart_daemon", "exit_code": 1, "error": str(exc)}
     if proc.returncode != 0:
+        stderr = proc.stderr or ""
+        not_loaded = (
+            proc.returncode == _LAUNCHCTL_NO_SUCH_SERVICE
+            and _MINNID_LABEL in stderr
+        )
+        if not_loaded:
+            # The launchd unit is optional — `minni up` runs minnid from a PID
+            # file instead. But "no unit" only excuses the restart if a daemon
+            # is actually answering: an agent that was unloaded by a botched
+            # upgrade reports exactly the same way, and that IS a failure.
+            if _minnid_is_live():
+                return {
+                    "name": "restart_daemon",
+                    "exit_code": 0,
+                    "skipped": True,
+                    "reason": "minnid is not launchd-managed and is live",
+                    "manual_restart": True,
+                }
+            return {
+                "name": "restart_daemon",
+                "exit_code": 1,
+                "stderr_tail": stderr[-400:],
+                "hint": "no launchd unit and no daemon answering; start it: minni up",
+            }
         return {
             "name": "restart_daemon",
             "exit_code": proc.returncode,
-            "stderr_tail": (proc.stderr or "")[-400:],
-            "hint": "launchd agent not loaded; use: minni down && minni up",
+            "stderr_tail": stderr[-400:],
+            "hint": (
+                "launchd reports no such service"
+                if proc.returncode == _LAUNCHCTL_NO_SUCH_SERVICE
+                else "launchd agent loaded but kickstart failed"
+            ),
         }
     return {"name": "restart_daemon", "exit_code": 0, "via": "launchctl kickstart"}
 
 
 def _step_failed(step: dict[str, Any]) -> bool:
-    """A step failed unless it exited 0 or declared itself skipped."""
-    return not step.get("skipped") and step.get("exit_code", 0) != 0
+    """A step failed unless it exited 0 or declared itself skipped.
+
+    A step dict with no ``exit_code`` never established success, so it counts
+    as a failure: this is the trust boundary for the whole verdict and it must
+    not default to optimism.
+    """
+    return not step.get("skipped") and step.get("exit_code", 1) != 0
 
 
 def run_fleet_sync(
@@ -353,7 +548,17 @@ def run_fleet_sync(
     propagate_hosts: bool = True,
 ) -> SyncResult:
     """Redeploy plugin payload to every fleet surface this install manages."""
-    kind, checkout = _detect_install_kind()
+    try:
+        kind, checkout = _detect_install_kind()
+    except Exception as exc:
+        # Loud, but still a verdict: a half-installed package must not hand the
+        # launchd timer a traceback in place of machine-readable JSON.
+        return SyncResult(
+            ok=False,
+            install_kind="unknown",
+            message=f"cannot determine install kind (broken install?): {exc}",
+            next_actions=["Reinstall the package: pipx reinstall minni"],
+        )
     steps: list[dict[str, Any]] = []
     next_actions = [
         "Restart agent hosts (Claude Code / Codex / Cursor / Grok / Kilo) so they reload MCP.",
@@ -385,8 +590,19 @@ def run_fleet_sync(
         if dry_run:
             cmd.append("--dry-run")
         try:
-            proc = subprocess.run(cmd, check=False, timeout=UPDATE_ROOT_TIMEOUT)
+            # Own process group: update_root.sh spawns git/pip/npm, and killing
+            # only bash would leave a credential-blocked `git pull` holding
+            # .git/index.lock for the next timer run.
+            proc = subprocess.Popen(cmd, start_new_session=True)
+        except OSError as exc:
+            return SyncResult(ok=False, install_kind=kind, message=str(exc))
+        try:
+            returncode = proc.wait(timeout=UPDATE_ROOT_TIMEOUT)
         except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=30)
             return SyncResult(
                 ok=False,
                 install_kind=kind,
@@ -400,12 +616,8 @@ def run_fleet_sync(
                     "bash scripts/update_root.sh --repo <checkout>",
                 ],
             )
-        except OSError as exc:
-            return SyncResult(
-                ok=False, install_kind=kind, message=str(exc),
-            )
-        steps.append({"name": "update_root", "exit_code": proc.returncode})
-        ok = proc.returncode == 0
+        steps.append({"name": "update_root", "exit_code": returncode})
+        ok = returncode == 0
         return SyncResult(
             ok=ok,
             install_kind=kind,
@@ -445,7 +657,14 @@ def run_fleet_sync(
 
     # Grok hooks/rules are propagate-only; wire never installs them. Without
     # this the hook manifest keeps pointing at a pruned versioned tree.
-    steps.append(_restamp_grok_hooks(checkout, dry_run=dry_run))
+    # --wire-only means "propagate-managed surfaces are not mine to touch",
+    # and this is one of them.
+    if propagate_hosts:
+        steps.append(_restamp_grok_hooks(checkout, dry_run=dry_run))
+
+    # Deployed artifacts must be built copies; a dist symlinked at the working
+    # tree is a redeploy failure, not a convenience.
+    steps.append(_audit_deploy_symlinks(checkout, dry_run=dry_run))
 
     if restart_daemon and not dry_run:
         steps.append(_kickstart_daemon())
@@ -463,10 +682,29 @@ def run_fleet_sync(
     failed = [s for s in steps if _step_failed(s)]
     ok = not failed
 
+    # Say what actually ran. A run where every step skipped must not claim the
+    # payload was redeployed — that is the same overstatement in prose that
+    # ok=true used to make in JSON.
+    skipped = [s for s in steps if s.get("skipped")]
+    applied = [s for s in steps if not s.get("skipped")]
     msg = (
-        f"fleet sync ({kind}): plugin payload redeployed to wire-primary hosts"
-        + ("; cursor/antigravity propagate attempted" if propagate_hosts else "")
+        f"fleet sync ({kind}): {len(applied)} step(s) applied"
+        + (f", {len(skipped)} skipped ({', '.join(str(s.get('name')) for s in skipped)})"
+           if skipped else "")
     )
+    if not applied:
+        msg = f"fleet sync ({kind}): nothing to do — every step skipped"
+    if any(s.get("manual_restart") for s in steps):
+        next_actions.insert(0, (
+            "minnid is not launchd-managed and still runs the pre-sync code — "
+            "restart it: minni down && minni up"
+        ))
+    not_judged = [n for s in steps for n in s.get("not_judged", [])]
+    if not_judged:
+        next_actions.append(
+            f"Deploy audit did not judge {len(not_judged)} location(s) — see "
+            "steps[].not_judged",
+        )
     if kind == "editable-checkout":
         next_actions.insert(
             0,
@@ -487,6 +725,17 @@ def run_fleet_sync(
             "Re-run after fixing the failing step: minni sync",
             *next_actions,
         ]
+        linked = [
+            label
+            for s in failed
+            for label in s.get("worktree_linked", [])
+        ]
+        if linked:
+            next_actions.insert(0, (
+                "Deployed dists must be built copies, not symlinks into a "
+                "working tree — replace with a built artifact: "
+                + ", ".join(linked)
+            ))
 
     return SyncResult(
         ok=ok,
