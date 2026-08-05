@@ -473,6 +473,353 @@ def test_list_pending_handoffs_uses_file_channel_when_db_broken(monkeypatch, tmp
     assert result["handoffs"][0]["task"] == "file-channel pending"
 
 
+def test_list_pending_handoffs_merges_file_only_lease_with_healthy_db_leases(monkeypatch, tmp_path):
+    """PLUMB-T3 / #231: a file-only lease must not become invisible just because
+    the DB channel already holds a *different*, healthy lease for the same
+    recipient. Before the fix, `handle_list_pending_handoffs` early-returned
+    on the first non-empty SQLite result and never consulted the file
+    channel — so a lease that only made it to disk (e.g. its own
+    store_handoff_lease call degraded, independent of any other handoff)
+    stayed permanently hidden as soon as one unrelated DB lease existed.
+    """
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+
+    # Handoff A: normal dual-write — lands in both the DB and the file channel.
+    sent_a = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2320,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "packet": _packet(task="handoff A", trace_id="trace-a"),
+        },
+    })["result"]
+    assert sent_a["lease_persisted"] is True
+
+    # Handoff B: DB persistence deliberately fails for *this* handoff only —
+    # file-only, while the DB channel already has A's healthy row.
+    monkeypatch.setattr(minnid, "_store_handoff_lease", lambda *_a, **_kw: False)
+    sent_b = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2321,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "packet": _packet(task="handoff B", trace_id="trace-b"),
+        },
+    })["result"]
+    assert sent_b["lease_persisted"] is False
+
+    pending = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2322,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })["result"]
+
+    lease_ids = {item["lease_id"] for item in pending["handoffs"]}
+    assert sent_a["lease_id"] in lease_ids, "DB-channel lease must still be visible"
+    assert sent_b["lease_id"] in lease_ids, (
+        "PLUMB-T3: file-only lease must not be shadowed just because the DB "
+        "channel already had a healthy lease for this agent"
+    )
+    assert len(pending["handoffs"]) == 2
+
+
+def test_list_pending_handoffs_does_not_resurrect_an_acked_lease_via_stale_file_packet(
+    monkeypatch, tmp_path
+):
+    """PLUMB-T3 / #231 hardening: an acked lease must not reappear as pending
+    just because its on-disk packet never received the ack_status update.
+
+    This can happen when the recipient vault is resolved only through the
+    per-agent MINNI_<AGENT>_VAULT_PATH override: agent_vault() (used by the
+    file-channel read path) finds it, but known_agent_vaults() (used by the
+    ack path's write_matching_lease_packets sweep) does not, so the ack's DB
+    write succeeds while its file-packet write silently misses. Always
+    merging the file channel (the T3 fix above) must not turn that pre-
+    existing gap into a resurrected-as-pending lease: the DB's terminal
+    status has to be treated as authoritative and exclude that lease_id from
+    the file channel, not just from the live 'pending' query.
+    """
+    db_obj = _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    # Recipient vault resolved ONLY via the per-agent env var — not registered
+    # in MINNI_AGENT_VAULTS, so known_agent_vaults() (the ack sweep) can't see it.
+    recipient = tmp_path / "claude-code-side-vault"
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"codex": str(sender)}))
+    monkeypatch.setenv("MINNI_CLAUDE_CODE_VAULT_PATH", str(recipient))
+
+    sent_a = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2330,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "packet": _packet(task="handoff A (will be acked)", trace_id="trace-resurrect-a"),
+        },
+    })["result"]
+    assert sent_a["lease_persisted"] is True
+
+    ack = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2331,
+        "method": "minni_ack_handoff",
+        "params": {"lease_id": sent_a["lease_id"], "status": "accepted", "agent_id": "claude-code"},
+    })["result"]
+    assert ack["status"] == "accepted"
+    # Confirms the setup actually exercises the gap: the ack sweep DOES reach
+    # the sender's outbox copy (that vault is registered in MINNI_AGENT_VAULTS,
+    # so known_agent_vaults() finds it) but NOT the recipient's inbox copy —
+    # that vault is env-var-only, invisible to the ack sweep.
+    assert str(Path(sent_a["inbox_path"])) not in ack["updated_paths"], (
+        "test setup didn't exercise the gap: the recipient's inbox copy got "
+        "updated after all, so this test can't tell resurrection apart from "
+        "a working ack sweep"
+    )
+    assert Path(sent_a["inbox_path"]).exists()
+    assert "ack_status" not in json.loads(Path(sent_a["inbox_path"]).read_text())
+
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id = ?",
+            (sent_a["lease_id"],),
+        ).fetchone()
+    assert row["status"] == "accepted"
+
+    # A second, unrelated handoff keeps the DB channel non-empty for this
+    # agent — the exact shape that would have hidden the file channel
+    # entirely under the pre-merge early-return, and now must not let the
+    # stale acked packet ride back in alongside it.
+    sent_b = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2332,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "packet": _packet(task="handoff B (still pending)", trace_id="trace-resurrect-b"),
+        },
+    })["result"]
+    assert sent_b["lease_persisted"] is True
+
+    pending = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2333,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })["result"]
+
+    lease_ids = [item["lease_id"] for item in pending["handoffs"]]
+    assert sent_a["lease_id"] not in lease_ids, (
+        "acked lease resurrected as pending via a stale file-channel packet"
+    )
+    assert sent_b["lease_id"] in lease_ids
+    assert lease_ids.count(sent_b["lease_id"]) == 1
+
+
+def test_list_pending_handoffs_dedupes_self_handoff_across_inbox_and_outbox(monkeypatch, tmp_path):
+    """A self-handoff (from_agent == to_agent) writes the identical packet to
+    the same vault's inbox AND outbox — the file channel's own scan walks
+    both directories and yields the lease_id twice. The merge must not
+    surface a duplicate entry for one lease just because its DB persistence
+    happened to fail (forcing the file-channel path to run at all).
+    """
+    _patch_handoff_db(monkeypatch, tmp_path)
+    vault = tmp_path / "codex-vault"
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"codex": str(vault)}))
+    monkeypatch.setattr(minnid, "_store_handoff_lease", lambda *_a, **_kw: False)
+
+    sent = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2340,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "codex",
+            "packet": _packet(from_agent="codex", to_agent="codex", trace_id="trace-self"),
+        },
+    })["result"]
+    assert sent["lease_persisted"] is False
+
+    pending = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2341,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "codex"},
+    })["result"]
+
+    lease_ids = [item["lease_id"] for item in pending["handoffs"]]
+    assert lease_ids.count(sent["lease_id"]) == 1, (
+        f"self-handoff must not be listed twice (inbox + outbox copies): {lease_ids!r}"
+    )
+    # Pin which copy wins the dedupe (inbox, since iter_handoff_files walks
+    # ("inbox", "outbox") in that order and the merge keeps the first file
+    # entry seen for a given lease_id) — harmless either way today, but this
+    # locks the invariant down instead of leaving it to walk-order luck.
+    assert pending["handoffs"][0]["path"].endswith(f"/inbox/{Path(sent['inbox_path']).name}")
+
+
+def test_list_pending_handoffs_reactivates_a_resent_lease_after_terminal_ack(monkeypatch, tmp_path):
+    """#231 hardening: resending a handoff under a REUSED lease_id after it
+    was already acked must surface again as pending — not vanish on both
+    channels.
+
+    lease_id is caller-supplied (validate_handoff_packet only requires it be
+    a non-empty string), and store_handoff_lease's INSERT ... ON CONFLICT
+    upsert previously left `status` untouched on conflict, so the DB row
+    stayed 'accepted' forever after a resend. Combined with
+    `_known_lease_ids_for_agent` (which excludes any lease_id the DB has
+    EVER seen, any status, from the file-channel fallback), an unreset
+    status made the resend invisible in both channels even though
+    daemon.handoff reported lease_persisted=True for it.
+    """
+    db_obj = _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    reused_lease_id = "handoff-reused-lease-id"
+
+    sent_first = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2350,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "packet": _packet(task="first send", trace_id="trace-reuse-1", lease_id=reused_lease_id),
+        },
+    })["result"]
+    assert sent_first["lease_id"] == reused_lease_id
+    assert sent_first["lease_persisted"] is True
+
+    ack = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2351,
+        "method": "minni_ack_handoff",
+        "params": {"lease_id": reused_lease_id, "status": "accepted", "agent_id": "claude-code"},
+    })["result"]
+    assert ack["status"] == "accepted"
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id = ?",
+            (reused_lease_id,),
+        ).fetchone()
+    assert row["status"] == "accepted"
+
+    # Resend under the SAME lease_id — a legitimate re-issue of the same
+    # piece of work, not a new one.
+    sent_again = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2352,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "packet": _packet(task="resend", trace_id="trace-reuse-2", lease_id=reused_lease_id),
+        },
+    })["result"]
+    assert sent_again["lease_id"] == reused_lease_id
+    assert sent_again["lease_persisted"] is True, (
+        "daemon.handoff must not silently claim success while the row stays terminal"
+    )
+
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id = ?",
+            (reused_lease_id,),
+        ).fetchone()
+    assert row["status"] == "pending", (
+        "resend must reactivate the DB row, not leave the prior terminal status in place"
+    )
+
+    pending = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2353,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })["result"]
+    lease_ids = [item["lease_id"] for item in pending["handoffs"]]
+    assert reused_lease_id in lease_ids, (
+        "resent handoff must be visible again, not black-holed on both channels "
+        "while daemon.handoff reports lease_persisted=True"
+    )
+
+
+def test_list_pending_handoffs_tolerates_a_malformed_lease_id_in_a_stray_file(monkeypatch, tmp_path):
+    """#231 hardening: the file channel is an untrusted, possibly-malformed
+    mirror by design (iter_handoff_files already swallows unreadable/non-JSON
+    files) — a packet with a non-string lease_id must be skipped the same
+    way, not crash the whole RPC. The T3 merge uses lease_id as a dict/set
+    key (`in known_ids`, dict assignment), so a stray file with e.g. a list
+    for lease_id previously raised TypeError: unhashable type deep inside
+    list_pending_handoffs and took down the entire response for the agent,
+    even though a perfectly healthy DB lease existed alongside it.
+    """
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+
+    # A healthy handoff so the response has real, expected content.
+    sent = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2360,
+        "method": "daemon.handoff",
+        "params": {
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "packet": _packet(task="healthy lease", trace_id="trace-malformed-ok"),
+        },
+    })["result"]
+    assert sent["lease_persisted"] is True
+
+    # A stray, malformed packet in the recipient's inbox: lease_id is a list,
+    # not a string (as if a file got corrupted or hand-edited).
+    inbox = recipient / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "corrupt.json").write_text(
+        json.dumps({
+            "lease_id": ["not", "a", "string"],
+            "from_agent": "codex",
+            "to_agent": "claude-code",
+            "task": "corrupt packet",
+            "requires_ack": True,
+        }),
+        encoding="utf-8",
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2361,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })
+
+    assert "error" not in response, (
+        f"a malformed on-disk lease_id must not crash the RPC: {response!r}"
+    )
+    lease_ids = [item["lease_id"] for item in response["result"]["handoffs"]]
+    assert lease_ids == [sent["lease_id"]], (
+        "the healthy DB lease must still be returned, with the corrupt file skipped"
+    )
+
+
 def test_await_handoff_uses_file_ack_when_db_broken(monkeypatch, tmp_path):
     """Dual-channel: broken DB + terminal file ack returns accepted, not -32000."""
     _patch_handoff_db(monkeypatch, tmp_path)

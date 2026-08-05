@@ -281,6 +281,65 @@ test("getActivePlan discards a tampered pointer whose notePath escapes the vault
   }
 });
 
+test("getActivePlan audits a rejected traversal instead of discarding it silently (PLUMB-T4 / #231)", async () => {
+  const { activePointerPath } = await import("../dist/plan.js");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-tamper-audit-"));
+  const originalConsoleError = console.error;
+  const calls = [];
+  console.error = (...args) => {
+    calls.push(args.join(" "));
+  };
+  try {
+    await ensureVault(root);
+    await mkdir(path.dirname(activePointerPath(root)), { recursive: true });
+    const evil = "../../outside.md";
+    await writeFile(
+      activePointerPath(root),
+      JSON.stringify({ plan_id: "plan-x", notePath: evil, set_at: new Date().toISOString() }),
+      "utf8",
+    );
+
+    const result = await getActivePlan(root);
+
+    assert.equal(result, undefined, "the escaped pointer must still be discarded");
+    assert.equal(
+      calls.length,
+      1,
+      `traversal rejection must be audited exactly once, got: ${JSON.stringify(calls)}`,
+    );
+    assert.match(calls[0], /getActivePlan rejected/, "audit line must name the rejection");
+    assert.ok(
+      calls[0].includes(evil),
+      `audit line must include the offending notePath: ${calls[0]}`,
+    );
+  } finally {
+    console.error = originalConsoleError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("getActivePlan does not audit the routine absent-pointer case (no active plan yet)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-no-pointer-"));
+  const originalConsoleError = console.error;
+  const calls = [];
+  console.error = (...args) => {
+    calls.push(args.join(" "));
+  };
+  try {
+    await ensureVault(root);
+    const result = await getActivePlan(root);
+    assert.equal(result, undefined);
+    assert.equal(
+      calls.length,
+      0,
+      `routine "no pointer file yet" must not be logged as a security event: ${JSON.stringify(calls)}`,
+    );
+  } finally {
+    console.error = originalConsoleError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("addScar pure function and compactPlanView scars surfacing", () => {
   const plan = {
     plan_id: "test-plan",
