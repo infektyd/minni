@@ -683,5 +683,128 @@ test("SessionStart's handoff_context never surfaces a privacy:private note's bod
       !rawEnvelope.includes("CONFIDENTIAL-296B"),
       "SEC (#312): the private note's body text must not appear anywhere in the SessionStart envelope",
     );
+    // #340: this handoff withheld exactly one ref (the private note) —
+    // must be counted, without naming which ref or why.
+    assert.equal(
+      body.handoff_context_withheld,
+      1,
+      "#340: one ref was privacy-gated, so handoff_context_withheld must report 1",
+    );
+  });
+});
+
+// ── #340: handoff_context_withheld marker ────────────────────────────────────
+
+test("SessionStart (#340): an all-refs-gated handoff reports handoff_context_withheld instead of a silent empty array", async () => {
+  // Before this fix, a handoff whose EVERY ref was privacy-gated produced
+  // handoff_context: [] — byte-for-byte identical to a handoff that
+  // legitimately carried zero refs. An agent booting into it had no way to
+  // tell "this handoff had refs but none were safe to surface" from "this
+  // handoff never referenced anything at all".
+  await withFixture(async (fixture) => {
+    const decisionDir = path.join(fixture.vault, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "private-only-a.md"),
+      "---\ntitle: Private A\nprivacy: private\n---\n\nHandoff boot priming, CONFIDENTIAL-340A body text.",
+      "utf8",
+    );
+    await writeFile(
+      path.join(decisionDir, "private-only-b.md"),
+      "---\ntitle: Private B\nprivacy: private\n---\n\nHandoff boot priming, CONFIDENTIAL-340B body text.",
+      "utf8",
+    );
+    const inboxDir = path.join(fixture.vault, "inbox");
+    await mkdir(inboxDir, { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "") + "Z";
+    await writeFile(
+      path.join(inboxDir, `${stamp}-all-gated-handoff.json`),
+      JSON.stringify({
+        kind: "handoff",
+        wikilink_refs: [
+          "wiki/decisions/private-only-a",
+          "wiki/decisions/private-only-b",
+        ],
+      }),
+      "utf8",
+    );
+
+    const output = await runHook("SessionStart", BASE_ENV(fixture));
+    const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+
+    assert.deepEqual(body.handoff_context, [], "every ref was privacy-gated, so handoff_context is empty");
+    assert.equal(
+      body.handoff_context_withheld,
+      2,
+      "#340: both refs were withheld, so the marker must report 2 (not a silent empty array with no signal)",
+    );
+    const rawEnvelope = JSON.stringify(body);
+    assert.ok(
+      !rawEnvelope.includes("CONFIDENTIAL-340A") && !rawEnvelope.includes("CONFIDENTIAL-340B"),
+      "SEC: withheld note bodies must never appear anywhere in the envelope",
+    );
+    assert.ok(
+      !rawEnvelope.includes("private-only-a") && !rawEnvelope.includes("private-only-b"),
+      "#340: the marker is COUNT ONLY — it must never name which ref(s) were withheld",
+    );
+  });
+});
+
+test("SessionStart (#340): a clean handoff (nothing withheld) omits handoff_context_withheld entirely", async () => {
+  // H2 discipline: absent must mean "nothing withheld", never "zero,
+  // checked" — an emitted 0 the hook never actually withheld anything for
+  // would be exactly the false-all-clear this campaign's H2 class exists
+  // to prevent. A handoff with zero refs at all is the plainest case.
+  await withFixture(async (fixture) => {
+    const inboxDir = path.join(fixture.vault, "inbox");
+    await mkdir(inboxDir, { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "") + "Z";
+    await writeFile(
+      path.join(inboxDir, `${stamp}-no-refs-handoff.json`),
+      JSON.stringify({ kind: "handoff", wikilink_refs: [] }),
+      "utf8",
+    );
+
+    const output = await runHook("SessionStart", BASE_ENV(fixture));
+    const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+
+    assert.deepEqual(body.handoff_context, []);
+    assert.ok(
+      !("handoff_context_withheld" in body),
+      "#340: nothing was withheld, so the field must be ABSENT, not present-and-zero",
+    );
+  });
+});
+
+test("SessionStart (#340): a handoff with only safe refs omits handoff_context_withheld entirely", async () => {
+  // Complementary to the zero-refs case: even when refs DID resolve (and
+  // handoff_context is non-empty), the marker must still be absent when
+  // none of them were gated.
+  await withFixture(async (fixture) => {
+    const decisionDir = path.join(fixture.vault, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "clean-migration.md"),
+      "---\ntitle: Clean Migration\nprivacy: safe\n---\n\nHandoff boot priming, entirely safe note.",
+      "utf8",
+    );
+    const inboxDir = path.join(fixture.vault, "inbox");
+    await mkdir(inboxDir, { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "") + "Z";
+    await writeFile(
+      path.join(inboxDir, `${stamp}-clean-handoff.json`),
+      JSON.stringify({ kind: "handoff", wikilink_refs: ["wiki/decisions/clean-migration"] }),
+      "utf8",
+    );
+
+    const output = await runHook("SessionStart", BASE_ENV(fixture));
+    const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+
+    const refs = (body.handoff_context ?? []).map((entry) => entry.ref);
+    assert.ok(refs.includes("wiki/decisions/clean-migration"), "the safe note must resolve");
+    assert.ok(
+      !("handoff_context_withheld" in body),
+      "#340: nothing was withheld, so the field must be ABSENT even though handoff_context itself is non-empty",
+    );
   });
 });
