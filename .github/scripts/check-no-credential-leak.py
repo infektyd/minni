@@ -283,6 +283,26 @@ def decoded_views(text: str, budget: list[int]) -> list[str]:
     return views
 
 
+def auth_status(auth: object, auth_error: BaseException | None) -> str:
+    """Why the value and encoding checks could not run.
+
+    Shared by BOTH callers on purpose. These were two hand-written
+    explanations of the same condition and they drifted: the --require-auth
+    error distinguished "could not be parsed" from "parsed as null", while the
+    permissive warning collapsed them and reported a file that had parsed
+    perfectly well as "unreadable (None)" — naming the absence of an error as
+    if it were the error. A caller cannot get this wrong if there is only one
+    place to get it right.
+    """
+    if auth_error is not None:
+        return f"could not be parsed ({auth_error})"
+    if auth is None:
+        # `null` is valid JSON: the file was read and parsed, it just carries
+        # nothing. That is a different fact from an unreadable file.
+        return "parsed as null"
+    return "parsed but yielded no comparison values"
+
+
 def all_views(reply: str) -> dict[str, str]:
     """Every rendering of the reply that this gate is willing to certify.
 
@@ -446,14 +466,9 @@ def main() -> int:
         # GROK_CI_AUTH_JSON produces a successful-looking restore and an
         # unparseable auth file. Without this, that misconfiguration silently
         # downgraded the gate to shape-only and still reported a pass.
-        if auth is None:
-            # `null` parses fine, so distinguish it from an unreadable file
-            # rather than printing "(None)" as if it were the error.
-            why = f"could not be parsed ({auth_error})" if auth_error else "parsed as null"
-        else:
-            why = "parsed but yielded no comparison values"
-        print(f"::error::Auth file {auth_path} {why}; refusing to certify a "
-              "reply against a credential set this gate never loaded.")
+        print(f"::error::Auth file {auth_path} {auth_status(auth, auth_error)}; "
+              "refusing to certify a reply against a credential set this gate "
+              "never loaded.")
         return 1
 
     try:
@@ -482,8 +497,8 @@ def main() -> int:
         ran = ["value", "encoding", *ran]
     else:
         skipped = ["value", "encoding"]
-        detail = f"unreadable ({auth_error})" if auth is None else "held no comparison values"
-        print(f"::warning::Auth file {auth_path} {detail}; "
+        print(f"::warning::Auth file {auth_path} "
+              f"{auth_status(auth, auth_error)}; "
               f"the {' and '.join(skipped)} checks did NOT run.")
     summary = f"No credential material in reply ({', '.join(ran)} checks passed"
     summary += f"; {', '.join(skipped)} SKIPPED)." if skipped else ")."

@@ -477,3 +477,62 @@ def test_pathologically_nested_auth_fails_closed_without_a_traceback(tmp_path):
     assert res.returncode == 1
     assert "Traceback" not in res.stderr and "Traceback" not in res.stdout
     assert "::error::" in res.stdout
+
+
+# ── auth-status wording (Bugbot, #304) ─────────────────────────────────────
+# The two paths carried two hand-written explanations of the same condition and
+# drifted: --require-auth distinguished "could not be parsed" from "parsed as
+# null", while the permissive warning collapsed them and described a file that
+# had parsed perfectly well as "unreadable (None)" — naming the ABSENCE of an
+# error as if it were the error. Both paths now share one helper, and these
+# tests pin the message CLASS for every auth state on BOTH paths, so the two
+# cannot drift again.
+
+AUTH_STATES = [
+    ("null", "parsed as null"),
+    ("{}", "parsed but yielded no comparison values"),
+    ("[]", "parsed but yielded no comparison values"),
+    ('{"k":"short"}', "parsed but yielded no comparison values"),
+]
+
+
+@pytest.mark.parametrize("document, expected", AUTH_STATES)
+def test_permissive_path_describes_the_auth_state_accurately(tmp_path, document, expected):
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    out = _run(tmp_path, auth, "an ordinary review").stdout
+    assert expected in out, f"{document}: expected {expected!r} in {out!r}"
+    # The conflated wording, and the tell that produced it.
+    assert "unreadable" not in out
+    assert "(None)" not in out
+
+
+@pytest.mark.parametrize("document, expected", AUTH_STATES)
+def test_require_auth_path_describes_the_auth_state_accurately(tmp_path, document, expected):
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    out = _run(tmp_path, auth, "an ordinary review", "--require-auth").stdout
+    assert expected in out
+    assert "(None)" not in out
+
+
+@pytest.mark.parametrize("document, _expected", AUTH_STATES)
+def test_both_paths_agree_on_why_the_checks_did_not_run(tmp_path, document, _expected):
+    """The drift itself is the defect, so pin the agreement rather than two
+    independent strings: a future edit to one path alone fails here."""
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    warning = _run(tmp_path, auth, "review").stdout
+    error = _run(tmp_path, auth, "review", "--require-auth").stdout
+    reason = next(line for line in warning.splitlines() if "::warning::" in line)
+    reason = reason.split("auth.json ", 1)[1].split(";")[0]
+    assert reason in error, (
+        f"permissive says {reason!r}; --require-auth path disagrees: {error!r}"
+    )
+
+
+def test_a_genuinely_unreadable_auth_file_still_says_so(tmp_path):
+    """The accurate case must survive the fix — an absent file IS unparseable."""
+    out = _run(tmp_path, tmp_path / "absent.json", "an ordinary review").stdout
+    assert "could not be parsed" in out
+    assert "No such file" in out
