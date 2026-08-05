@@ -3614,13 +3614,39 @@ class TestEpisodicFtsBackfill:
         finally:
             minnid.DEFAULT_CONFIG = monkey_cfg
 
-        indexed = conn.execute(
-            "SELECT COUNT(*) FROM episodic_fts WHERE episodic_fts MATCH 'TurboQuant'"
-        ).fetchone()[0]
-        assert indexed == 1, (
-            "the sweep must reconcile episodic_fts, so an abandoned migration "
-            "repair is not permanent"
+        # Durability, read from an INDEPENDENT connection. Reading back through
+        # db_obj's own connection would see uncommitted rows and pass against a
+        # sweep that never commits — which is exactly what shipped in the first
+        # cut of this fix: _get_conn() opts out of db.cursor()'s auto-commit, so
+        # the INSERT sat in an open transaction, invisible to the rest of the
+        # daemon while holding a write lock against every other writer.
+        assert conn.in_transaction is False, (
+            "the sweep left an open write transaction — it blocks every other "
+            "daemon writer until some unrelated code path happens to commit"
         )
+
+        import sqlite3
+
+        other = sqlite3.connect(cfg.db_path, timeout=5)
+        try:
+            indexed = other.execute(
+                "SELECT COUNT(*) FROM episodic_fts"
+                " WHERE episodic_fts MATCH 'TurboQuant'"
+            ).fetchone()[0]
+            assert indexed == 1, (
+                "the sweep must COMMIT its reconcile — rows only the sweep's "
+                "own connection can see have not repaired anything"
+            )
+            # And the lock must be released, or recall and every write path
+            # stall behind the backfill.
+            other.execute(
+                "INSERT INTO episodic_events"
+                " (agent_id, event_type, content, created_at)"
+                " VALUES ('probe', 'message', 'writer probe', 1.0)"
+            )
+            other.commit()
+        finally:
+            other.close()
         db_obj.close()
 
 

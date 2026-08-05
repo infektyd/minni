@@ -212,9 +212,12 @@ def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
     a schema without episodic_fts must cost the caller the episodic fields, not
     the document coverage it came for.
     """
-    from minni.episodic import NON_MEMORY_EVENT_TYPES
-
     try:
+        # Inside the boundary: embedding_coverage now calls this OUTSIDE its own
+        # try, so an ImportError escaping here would propagate out of a function
+        # documented never to cost the caller the rest of the report.
+        from minni.episodic import NON_MEMORY_EVENT_TYPES
+
         placeholders = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
         # Trace rows are excluded from the ratio and reported on their own line,
         # the same honesty rule documents_deliberately_unembedded follows: they
