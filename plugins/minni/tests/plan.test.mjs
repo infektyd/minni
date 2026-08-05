@@ -1259,6 +1259,51 @@ test("appendHistorySnapshot: malformed MINNI_PLAN_HISTORY_CAP truly falls back t
   }
 });
 
+test("appendHistorySnapshot: an extremely large MINNI_PLAN_HISTORY_CAP is clamped to MAX_PLAN_HISTORY_CAP, not left unbounded", async () => {
+  // team-lead verification found this exact escaped mutant: changing
+  // MAX_PLAN_HISTORY_CAP from 100_000 to Number.MAX_SAFE_INTEGER left every
+  // existing test green, because nothing observed the clamp's effect — the
+  // fix that exists specifically to stop a huge/typo'd env value from
+  // silently disabling the whole #294 bound had no test pinning it. Force a
+  // real rotation past the clamped ceiling: seed just past
+  // MAX_PLAN_HISTORY_CAP + HISTORY_ROTATION_HYSTERESIS lines, set the cap to
+  // an astronomically large numeric string, and assert the file actually
+  // rotates down to the clamp (100000). If the clamp were removed (or
+  // widened to MAX_SAFE_INTEGER), the huge requested cap would never be
+  // crossed by this seed and rotation would never fire — the surviving line
+  // count would stay above 100000, catching the mutant directly.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-cap-ceiling-"));
+  try {
+    const historyFile = path.join(root, "ceiling.history.jsonl");
+    const MAX_CAP = 100_000;
+    const HYSTERESIS = 50; // must match HISTORY_ROTATION_HYSTERESIS in plan.ts
+    const SEED = MAX_CAP + HYSTERESIS; // one short of forcing rotation on its own
+    await seedHistoryFile(historyFile, SEED, 1); // revs 1..100050
+    process.env.MINNI_PLAN_HISTORY_CAP = "99999999999"; // huge, digit-only, would-be-valid cap
+    try {
+      // This append pushes the file to SEED + 1 lines, crossing the real
+      // (clamped) rotation threshold of MAX_CAP + HYSTERESIS.
+      await appendHistorySnapshot(historyFile, {
+        rev: SEED + 1,
+        at: `t${SEED + 1}`,
+        digest: "d",
+        plan: { plan_id: "p" },
+      });
+    } finally {
+      delete process.env.MINNI_PLAN_HISTORY_CAP;
+    }
+    const raw = await readFile(historyFile, "utf8");
+    const lines = raw.trim().split("\n").filter((l) => l.trim());
+    assert.equal(
+      lines.length,
+      MAX_CAP,
+      `MINNI_PLAN_HISTORY_CAP=99999999999 must clamp to MAX_PLAN_HISTORY_CAP (${MAX_CAP}) and actually rotate, got ${lines.length} lines`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("appendHistorySnapshot: rotation counting agrees with readHistory — garbage lines neither occupy cap slots nor survive a rotation", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-history-garbage-"));
   try {
