@@ -4,11 +4,14 @@
 // behaviors. hook-utils.ts holds the protocol leaf helpers; this module holds
 // the stateful handler logic, parameterized by a typed per-agent config, so
 // future changes (evidence envelope format, plan injection, inbox drain
-// logic) have ONE maintenance surface instead of four. hook.ts (claude-code)
-// diverges structurally (PreCompact cannot inject context) and keeps its own
-// handler set — but NOT its own Stop: that one is `handleStopCore` below, which
-// hook.ts imports, because the Stop governance posture must be identical on
-// every platform and the two copies had already drifted.
+// logic) have ONE maintenance surface instead of four. #283: hook.ts
+// (claude-code) migrated onto this factory too — it was the last platform
+// carrying its own copy of the four handler bodies, which is what let PR
+// #282's Layer 1 shelf change land in hook.ts:356 and hook-handlers.ts:679
+// separately instead of once. Claude-specific behavior (identity-recall boot
+// identity, the lifecycle representation, boot-time handoff acking) lives
+// behind opt-in `AgentHookConfig` knobs — see their doc comments — rather
+// than a forked handler set.
 //
 // Handlers here return INTENT, not wire shapes: what reaches the model is
 // decided per platform by hook-platform.ts. Emitting Claude Code's envelope
