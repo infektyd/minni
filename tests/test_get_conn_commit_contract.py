@@ -752,16 +752,24 @@ class TestTheRemainingCallSitesRunTheirOwnCode:
         key = os.path.abspath(cfg.db_path)
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
+        db = None
         try:
             # Verbatim shape of minnid.py:2094-2095.
             db = SovereignDB.shared(cfg)
             db._get_conn()
+
+            _assert_connection_is_clean(db._get_conn(), cfg, "eager startup init")
         finally:
+            # In a finally, not after the assertion: shared() registers this
+            # instance PROCESS-WIDE, so an assertion failure — or a raise from
+            # anything above — would otherwise leave a tmp_path database
+            # registered for the rest of the pytest worker, where the next
+            # shared() call for that path hands back a closed handle to an
+            # unrelated test. Cleanup on the failure path matters more than on
+            # the success path, because the failure path is the one that
+            # already has something going wrong.
             db_mod._migrations_run = old_flag
-
-        _assert_connection_is_clean(db._get_conn(), cfg, "eager startup init")
-
-        db.close()
-        # Don't leave this tmp database in the process-wide registry.
-        with SovereignDB._shared_lock:
-            SovereignDB._shared_instances.pop(key, None)
+            if db is not None:
+                db.close()
+            with SovereignDB._shared_lock:
+                SovereignDB._shared_instances.pop(key, None)
