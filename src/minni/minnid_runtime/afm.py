@@ -869,6 +869,37 @@ async def afm_loop_runner(context: AFMContext):
                                 )
                                 obs.incr("inbox_quarantine_failures_total")
                                 obs.record_error("afm_loop.inbox_quarantine", exc)
+                        # M4 (#229): afm-drafts-*/afm-pruning-* have writers but
+                        # no reader anywhere in the repo, so every tick re-skips
+                        # them as _unrecognized and they accumulate forever (107
+                        # files, oldest 61 days). Same drain contract as above:
+                        # move, never delete, past a TTL grace window.
+                        if (cfg or {}).get("ingest_inbox", True) and _skips.get("_unrecognized"):
+                            try:
+                                from minni.afm_passes.inbox_quarantine import (
+                                    quarantine_afm_dead_letter,
+                                )
+                                _d = quarantine_afm_dead_letter(
+                                    context.default_config,
+                                    ttl_days=(cfg or {}).get("inbox_quarantine_ttl_days"),
+                                )
+                                if _d.get("quarantined"):
+                                    obs.incr(
+                                        "inbox_afm_dead_letter_quarantined_total",
+                                        _d["quarantined"],
+                                    )
+                                    context.logger.warning(
+                                        "AFM loop: quarantined %d stale AFM "
+                                        "dead-letter inbox file(s): %s",
+                                        _d["quarantined"], _d["quarantined_files"],
+                                    )
+                            except Exception as exc:
+                                context.logger.exception(
+                                    "AFM loop: AFM dead-letter drain raised "
+                                    "(skipped; consolidation continues)"
+                                )
+                                obs.incr("inbox_quarantine_failures_total")
+                                obs.record_error("afm_loop.afm_dead_letter", exc)
                         # Inert-file sweep (2026-08 pile-up): a stop-candidate
                         # file whose EVERY candidate ingest rejects (audit
                         # echo / log_only / do_not_store / blank) can never

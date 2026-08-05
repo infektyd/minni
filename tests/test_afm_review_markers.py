@@ -331,34 +331,88 @@ def test_resolve_leaves_another_candidates_fence_alone(tmp_path):
         _reset_minnid_caches()
 
 
-def test_afm_consolidation_accept_supersedes_the_marker():
-    """The AFM loop's own accept path — not covered by the governance test,
-    and the review found a mutant removing it survived."""
-    from minni.minnid_runtime import afm as afm_mod
+def _afm_context(db_obj):
+    """Minimal AFMContext: these two paths only use lazy_writeback."""
+    import types
 
-    conn = _conn()
-    _candidate(conn, 1, "proposed")
-    _marker(conn, 1)
-    cur = conn.cursor()
-    cur.execute(
-        """UPDATE candidate_packets
-           SET status='accepted', resolved_at=?, resolved_by='afm-consolidation'
-           WHERE candidate_id=?""",
-        (time.time(), 1),
+    from minni.minnid_runtime.afm import AFMContext
+
+    wb = types.SimpleNamespace(db=db_obj, model=None)
+    return AFMContext(
+        make_error=lambda *a: {"error": a},
+        make_response=lambda r, i=None: {"result": r},
+        guard_vault_root=lambda *a, **k: None,
+        lazy_writeback=lambda: wb,
+        trace_ring=lambda: None,
+        record_latency=lambda *a: None,
+        maybe_archive_inbox_source=lambda *a, **k: None,
     )
-    afm_mod.supersede_afm_review(cur, 1)
-    assert _marker_status(conn, 1) == "superseded"
 
 
-def test_afm_module_uses_the_shared_supersede_helper():
-    """Both AFM resolve sites must route through the shared helper rather than
-    re-implementing the fence retirement."""
-    from minni.afm_review_markers import supersede_afm_review as shared
-    from minni.minnid_runtime import afm as afm_mod
-    from minni.minnid_runtime import governance as gov_mod
+def _db_with_fenced_candidate(tmp_path, cid: int = 1):
+    """Real SovereignDB with one fenced, proposed candidate.
 
-    assert afm_mod.supersede_afm_review is shared
-    assert gov_mod.supersede_afm_review is shared
+    Reuses the AFM loop suite's fixture so the schema is exactly what those
+    code paths run against — the learnings table in particular.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_afm_loop_promotion import _make_db as _make_loop_db
+
+    db_obj, _cfg = _make_loop_db(tmp_path)
+    with db_obj.cursor() as c:
+        # promote_candidate_durable writes learnings.content_hash, which no
+        # migration creates (installs acquire it out-of-band; see
+        # unpark_privacy_backlog, which probes for it). Out of scope for #229,
+        # but the column has to exist for the accept path to run at all.
+        cols = {r[1] for r in c.execute("PRAGMA table_info(learnings)")}
+        if "content_hash" not in cols:
+            c.execute("ALTER TABLE learnings ADD COLUMN content_hash TEXT")
+        c.execute(
+            """INSERT INTO candidate_packets
+               (candidate_id, principal, content, status, proposed_at)
+               VALUES (?, 'test', 'a durable lesson worth keeping', 'proposed', ?)""",
+            (cid, time.time()),
+        )
+        c.execute(
+            """INSERT INTO consolidation_actions
+               (action_type, claim, category, status, created_at)
+               VALUES ('afm_review', ?, 'general', 'pending', ?)""",
+            (str(cid), time.time()),
+        )
+    return db_obj
+
+
+def _fence_status(db_obj, cid: int) -> str:
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT status FROM consolidation_actions WHERE action_type='afm_review' AND claim=?",
+            (str(cid),),
+        )
+        return c.fetchone()[0]
+
+
+def test_afm_accept_path_retires_the_fence(tmp_path):
+    """Drives the real promote_candidate_durable. Covered only by identity
+    assertions before, so a mutant deleting the call survived."""
+    from minni.minnid_runtime.afm import promote_candidate_durable
+
+    db_obj = _db_with_fenced_candidate(tmp_path, 1)
+    promote_candidate_durable(1, "consolidation accepted it", _afm_context(db_obj))
+
+    assert _fence_status(db_obj, 1) == "superseded"
+
+
+def test_afm_dedup_reject_path_retires_the_fence(tmp_path):
+    """Drives the real reject_candidate_dedup."""
+    from minni.minnid_runtime.afm import reject_candidate_dedup
+
+    db_obj = _db_with_fenced_candidate(tmp_path, 2)
+    assert reject_candidate_dedup(2, _afm_context(db_obj)) is True
+
+    assert _fence_status(db_obj, 2) == "superseded"
 
 
 # ── the backlog has an operator drain path ─────────────────────────────────
