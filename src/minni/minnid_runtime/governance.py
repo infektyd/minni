@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from minni.afm_review_markers import supersede_afm_review
 from minni.db import SovereignDB
 from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
@@ -911,6 +912,10 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 """,
                 (new_status, now, principal.agent_id, resolution_reason, cid),
             )
+            # M5: the review fence must not outlive the candidate it fences.
+            # Same cursor, same transaction — a rolled-back resolve takes the
+            # marker change with it.
+            supersede_afm_review(c, cid)
 
         if lid is not None:
             context.index_durable_learning(

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import minni.obs as obs
+from minni.afm_review_markers import supersede_afm_review
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
 from minni.principal import (
@@ -285,6 +286,8 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
             """,
             (now, reason[:500], candidate_id),
         )
+        # M5: retire the review fence with the candidate it fenced.
+        supersede_afm_review(c, candidate_id)
         c.execute(
             """
             INSERT INTO consolidation_actions
@@ -324,6 +327,8 @@ def reject_candidate_dedup(candidate_id: int, context: AFMContext) -> bool:
             """,
             (now, candidate_id),
         )
+        # M5: retire the review fence with the candidate it fenced.
+        supersede_afm_review(c, candidate_id)
         c.execute(
             """
             INSERT INTO consolidation_actions
