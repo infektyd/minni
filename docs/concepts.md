@@ -117,9 +117,15 @@ same audit trail:
    the agent still cannot call `resolve_candidate(accept)` — on its own
    candidates or anyone's — and still gets `operator_only` if it tries.
 
-   The gates stay on. Content that is instruction-like, too short, or fails
-   the structural quality gate falls back to `proposed` for a human, and the
-   response says which check withheld it. Nothing is dropped.
+   The gates stay on, and they are the same set path 3 uses: content that is
+   instruction-like, too short, a duplicate of an existing learning, outside
+   the safe privacy levels **as the author declared it**, or failing the
+   structural quality gate falls back to `proposed` for a human, and the
+   response names the check that withheld it in `auto_accept_withheld`.
+   Nothing is dropped. Auto-accepted learnings are embedded and hashed like
+   any other durable write, so contradiction detection and the duplicate gate
+   keep seeing them — an unattended writer that is invisible to its own guards
+   gets blinder the more it writes.
 
    **The knob is operator configuration and is refused over the wire.** A
    caller that passes `auto_accept_own` to `minni_learn` gets `operator_only`

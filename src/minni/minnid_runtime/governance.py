@@ -321,6 +321,34 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         validate_agent_id(agent_id)
     except ValueError as exc:
         return context.make_error(-32602, str(exc), request_id)
+
+    # This writes an ARBITRARY durable learning — embedded, active, FTS-indexed
+    # — and its only precondition is owning the learning being superseded.
+    # resolve_candidate refuses instruction_like content without an explicit
+    # 'accept_flagged' capability; without the same rule here, that gate is a
+    # detour rather than a wall.
+    #
+    # Measured on this branch before the gate existed: with #290's auto-accept
+    # enabled, a principal staged one benign learning (auto-accepted, so now
+    # OWNED), then superseded it with content the auto-accept floor had just
+    # refused as instruction_like — landing the refused text as 'active'. Owning
+    # a learning used to require a human; auto-acceptance removed that step, so
+    # this path needed the gate the other durable writers already have.
+    if is_instruction_like(new_content) and not explicitly_allowed_accept_flagged(
+        principal
+    ):
+        context.logger.warning(
+            "RESOLVE_CONTRADICTION_REFUSED principal=%s reason=instruction_like "
+            "(G15 audit)",
+            agent_id,
+        )
+        return context.make_error(
+            -32004,
+            "accept_flagged_required: new_content is instruction_like; writing it "
+            "as a durable learning requires the literal 'accept_flagged' capability",
+            request_id,
+        )
+
     category = params.get("category", "general")
     assertion = params.get("assertion")
     applies_when = params.get("applies_when")
@@ -597,7 +625,9 @@ def handle_log_event(params: dict, request_id: Any, context: GovernanceContext) 
         return context.make_error(-32000, f"Log event error: {exc}", request_id)
 
 
-def auto_accept_blockers(content: str, instruction_like: bool) -> list[str]:
+def auto_accept_blockers(
+    content: str, instruction_like: bool, requested_privacy: str = "safe"
+) -> list[str]:
     """Reasons to WITHHOLD #290 auto-acceptance. Empty list == eligible.
 
     The floor reuses the repo's existing structural gate rather than inventing a
@@ -612,18 +642,32 @@ def auto_accept_blockers(content: str, instruction_like: bool) -> list[str]:
         proposed and a human still sees it.
       * minimum length — consolidation's own auto-promotion floor; a three-word
         fragment is not a durable learning.
+      * declared privacy — consolidation refuses to auto-promote anything outside
+        {safe, public, low}. Note this reads the AUTHOR'S declaration, not the
+        clamped value stored on the row: the clamp exists because "learn-only
+        callers are not trusted to create auto-promotable rows", and this knob is
+        the operator lifting THAT distrust. It is not the operator overruling a
+        writer that said "this is sensitive" about its own content — under the
+        old flow a human saw that declaration, and nothing else in the row
+        preserves it.
 
     Withheld means the candidate stays ``proposed`` for a human. It is never
     dropped, so the operator loses nothing by opting in.
     """
     # Cheap import: consolidation pulls only stdlib + minni.safety.
-    from minni.afm_passes.consolidation import _MIN_CONTENT_LEN, _quality_blockers
+    from minni.afm_passes.consolidation import (
+        _MIN_CONTENT_LEN,
+        _SAFE_PRIVACY,
+        _quality_blockers,
+    )
 
     reasons: list[str] = []
     if instruction_like:
         reasons.append("instruction_like")
     if len((content or "").strip()) < _MIN_CONTENT_LEN:
         reasons.append("below minimum content length")
+    if str(requested_privacy or "").strip().lower() not in _SAFE_PRIVACY:
+        reasons.append(f"privacy={requested_privacy}")
     reasons.extend(_quality_blockers(content))
     return reasons
 
@@ -702,13 +746,48 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     # auto-promotable rows" — and this knob is precisely the operator lifting
     # that distrust for one principal's own candidates. Gating on it would make
     # the knob a no-op for exactly the principals it exists to serve.
-    withheld = auto_accept_blockers(stored_content, bool(instr))
+    withheld = auto_accept_blockers(stored_content, bool(instr), requested_privacy)
     auto_accept = bool(getattr(principal, "auto_accept_own", False)) and not withheld
     resolved_by = f"auto_accept_own({principal.agent_id})"
 
     try:
-        db = context.lazy_writeback().db
+        wb = context.lazy_writeback()
+        db = wb.db
         lid = None
+        chash = None
+        emb_bytes = None
+        if auto_accept:
+            # detect_contradictions filters `embedding IS NOT NULL`, so a
+            # learning stored without one is invisible to the only guard standing
+            # in front of this channel — and the more the knob writes, the
+            # blinder that guard gets. Consolidation, the other unattended
+            # writer, hashes and embeds for exactly this reason.
+            from minni.afm_passes.consolidation import (
+                _ensure_dedup_index,
+                content_hash as _content_hash,
+            )
+
+            # learnings.content_hash is created lazily by the AFM pass, and that
+            # loop is OFF by default — so this path cannot assume the column
+            # exists. Idempotent and cheap after the first call.
+            _ensure_dedup_index(db)
+            chash = _content_hash(stored_content)
+            if getattr(wb, "model", None):
+                try:
+                    import numpy as np
+
+                    from minni.models import get_embedder_lock
+
+                    with get_embedder_lock():
+                        emb = wb.model.encode(
+                            stored_content, show_progress_bar=False
+                        ).astype(np.float32)
+                    emb_bytes = emb.tobytes()
+                except Exception as exc:
+                    context.logger.warning(
+                        "auto_accept_own: embedding failed (%s) - storing without", exc
+                    )
+
         with db.transaction() as c:
             c.execute(
                 """
@@ -730,6 +809,15 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 ),
             )
             cid = c.lastrowid
+            if auto_accept and chash is not None:
+                # Inside the txn: a read-then-insert outside it races another
+                # auto-accept of the same content.
+                c.execute(
+                    "SELECT 1 FROM learnings WHERE content_hash=? LIMIT 1", (chash,)
+                )
+                if c.fetchone() is not None:
+                    auto_accept = False
+                    withheld = ["duplicate of an existing learning"]
             if auto_accept:
                 # 'general' mirrors resolve_candidate: a candidate accepted by
                 # hand lands in the same category, so auto and manual
@@ -737,10 +825,14 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 c.execute(
                     """
                     INSERT INTO learnings
-                    (agent_id, category, content, created_at)
-                    VALUES (?, 'general', ?, ?)
+                    (agent_id, category, content, created_at, embedding,
+                     content_hash, status)
+                    VALUES (?, 'general', ?, ?, ?, ?, 'active')
                     """,
-                    (principal.agent_id, stored_content, now),
+                    (
+                        principal.agent_id, stored_content, now,
+                        emb_bytes, chash,
+                    ),
                 )
                 lid = c.lastrowid
                 c.execute(
