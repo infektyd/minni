@@ -63,7 +63,11 @@ void runHookMain({
   // file; #283 promoted it to a factory knob rather than duplicating it.
   lifecycleEnabled: true,
   // SessionStart lists and acks this agent's pending handoff leases,
-  // surfacing `handoff_acks` in the envelope. claude-code only.
+  // surfacing `handoff_acks` in the envelope. #296 generalized this to
+  // every platform sharing the factory except grok-build (see
+  // grok-hook.ts's CONFIG — its wire can't inject/note at SessionStart, so
+  // acking there would misreport acceptance before the content is ever
+  // actually surfaced).
   ackPendingHandoffsAtBoot: true,
   sessionStartHookTimeoutMs: CLAUDECODE_SESSION_START_TIMEOUT_MS,
   // promptHookTimeoutMs intentionally OMITTED (#283 residual, disclosed, not

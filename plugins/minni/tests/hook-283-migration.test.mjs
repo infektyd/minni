@@ -229,14 +229,26 @@ test("SessionStart degrades handoff_leases when the list RPC fails, without brea
   });
 });
 
-test("SessionStart handoff acking does not run for a platform without the knob (codex)", async () => {
-  // Regression guard for the knob's default-off contract: codex's config
-  // never sets ackPendingHandoffsAtBoot, so a fake daemon that WOULD answer
-  // list/ack RPCs must never actually be asked.
+test("SessionStart handoff acking now runs for every platform sharing the factory (codex) (#296)", async () => {
+  // #296: was claude-only before this fix — an unstated cross-platform
+  // inconsistency, not a deliberate design choice (see the issue). Every
+  // platform's shim now sets ackPendingHandoffsAtBoot: true, so codex
+  // (picked as the representative non-claude platform) must behave exactly
+  // like claude's own "acks a real pending handoff lease" test above.
   await withFixture(async (fixture) => {
     const { server, calls } = await startFakeDaemon(fixture.socketPath, {
       minni_list_pending_handoffs: (_request, { respond }) => {
-        respond({ handoffs: [{ lease_id: "should-not-be-seen", to_agent: "codex" }] });
+        respond({
+          handoffs: [
+            { lease_id: "handoff-296-abc", from_agent: "claude-code", to_agent: "codex", task: "test" },
+          ],
+        });
+      },
+      minni_ack_handoff: (request, { respond }) => {
+        assert.equal(request.params.lease_id, "handoff-296-abc");
+        assert.equal(request.params.status, "accepted");
+        assert.equal(request.params.agent_id, "codex", "ack must stamp codex's own server-side identity");
+        respond({ lease_id: request.params.lease_id, status: "accepted", updated_paths: [] });
       },
     });
     try {
@@ -248,17 +260,144 @@ test("SessionStart handoff acking does not run for a platform without the knob (
       }, {}, "codex-hook.js");
       assert.equal(output.continue, true);
       const body = envelopeJson(output.hookSpecificOutput.additionalContext);
-      assert.equal(body.handoff_acks, undefined, "codex must never surface handoff_acks");
-      // Prove the daemon connection actually worked (codex's other boot RPCs
-      // landed) — otherwise "0 list calls" could just as easily mean the
-      // socket never connected at all, which would pass this assertion
-      // vacuously regardless of whether the knob-off gate works.
-      assert.ok(calls.length > 0, "codex must actually reach the daemon for its other boot RPCs");
+      assert.deepEqual(body.handoff_acks, ["handoff-296-abc"]);
+      assert.equal(body.degraded, undefined, "a clean ack must not degrade anything");
+      assert.equal(
+        calls.filter((c) => c.method === "minni_ack_handoff").length,
+        1,
+        "exactly one ack RPC must have been sent",
+      );
+    } finally {
+      server.close();
+    }
+  });
+});
+
+test("SessionStart handoff acking deliberately does NOT run for grok-build (#296 carve-out)", async () => {
+  // grok-build is the one platform sharing this factory that does NOT set
+  // ackPendingHandoffsAtBoot (see grok-hook.ts's CONFIG comment): its wire
+  // can only inject/note at Stop, so acking a lease at SessionStart would
+  // tell the sending agent "grok accepted this" via the lease store before
+  // grok has ever actually surfaced the content anywhere it could act on
+  // it — a false acceptance signal. Confirms the carve-out is real and
+  // load-bearing, not just documented.
+  await withFixture(async (fixture) => {
+    const { server, calls } = await startFakeDaemon(fixture.socketPath, {
+      minni_list_pending_handoffs: (_request, { respond }) => {
+        respond({ handoffs: [{ lease_id: "should-not-be-acked", to_agent: "grok-build" }] });
+      },
+    });
+    try {
+      const output = await runHook("SessionStart", {
+        ...BASE_ENV(fixture),
+        MINNI_GROK_VAULT_PATH: fixture.vault,
+        MINNI_GROK_AGENT_ID: "grok-build",
+        MINNI_GROK_HOOKS: "on",
+      }, {}, "grok-hook.js");
+      // grokBuildWire cannot inject at SessionStart at all — the real
+      // observable output is the bare no-op, not an envelope.
+      assert.deepEqual(output, { continue: true });
+      assert.ok(calls.length > 0, "grok must actually reach the daemon for its other boot RPCs");
       assert.equal(
         calls.filter((c) => c.method === "minni_list_pending_handoffs").length,
         0,
-        "codex must never even call minni_list_pending_handoffs",
+        "grok must never even call minni_list_pending_handoffs",
       );
+      assert.equal(
+        calls.filter((c) => c.method === "minni_ack_handoff").length,
+        0,
+        "grok must never ack a lease it cannot show the model",
+      );
+    } finally {
+      server.close();
+    }
+  });
+});
+
+test("ackPendingHandoffsAtBoot still gates correctly when a config genuinely omits it", async () => {
+  // Regression guard for the underlying MECHANISM, now that no shipped
+  // platform config exercises the off state: createHookHandlers itself must
+  // still respect an omitted ackPendingHandoffsAtBoot, so a future change
+  // can't silently make the ack sweep unconditional regardless of config.
+  //
+  // Must run as a genuinely separate PROCESS, not an in-process
+  // createHookHandlers() call in this test file: config.ts's MINNI_HOME /
+  // socket-path constants are computed ONCE at module import time from
+  // process.env, and this test file's own top-level `import { auditTail,
+  // ensureVault } from "../dist/vault.js"` transitively imports config.js
+  // before any test body runs — so setting process.env.MINNI_SOCKET_PATH
+  // inside a test has no effect on the already-frozen constant. (Caught by
+  // running this exact scenario in-process first: the fake daemon received
+  // ZERO calls of ANY kind, not just no ack call — the RPC layer never
+  // reached it at all, which would have made this test pass for the wrong
+  // reason regardless of whether the knob gate actually worked.) A driver
+  // script run as its own `node` process gets its env at process start,
+  // same as every other subprocess-based test in this file.
+  await withFixture(async (fixture) => {
+    const { server, calls } = await startFakeDaemon(fixture.socketPath, {
+      minni_list_pending_handoffs: (_request, { respond }) => {
+        respond({ handoffs: [{ lease_id: "should-not-be-seen", to_agent: "synthetic-agent" }] });
+      },
+    });
+    const driverPath = path.join(fixture.home, "driver.mjs");
+    await writeFile(
+      driverPath,
+      [
+        `import { createHookHandlers } from ${JSON.stringify(path.join(PLUGIN_ROOT, "dist", "hook-handlers.js"))};`,
+        "const handlers = createHookHandlers({",
+        '  agentId: "synthetic-agent",',
+        `  vaultPath: ${JSON.stringify(fixture.vault)},`,
+        '  defaultWorkspaceId: "default",',
+        "  contextWindow: 200000,",
+        "  hooksEnabled: true,",
+        '  auditPrefix: "hook_synthetic",',
+        "  // ackPendingHandoffsAtBoot deliberately omitted.",
+        "});",
+        'const output = await handlers.handleSessionStart({ session_id: "s296" });',
+        "process.stdout.write(JSON.stringify(output) + \"\\n\");",
+      ].join("\n"),
+      "utf8",
+    );
+    try {
+      const output = await new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [driverPath], {
+          env: {
+            ...process.env,
+            MINNI_HOME: fixture.home,
+            MINNI_SOCKET_PATH: fixture.socketPath,
+            MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+            MINNI_BYPASS_AUDIT_LIMIT: "true",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => (stdout += chunk));
+        child.stderr.on("data", (chunk) => (stderr += chunk));
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`driver timed out; stderr=${stderr}`));
+        }, 30_000);
+        child.on("close", () => {
+          clearTimeout(timer);
+          try {
+            resolve(JSON.parse(stdout.trim().split("\n").pop() ?? ""));
+          } catch {
+            reject(new Error(`unparseable driver output: ${stdout} / ${stderr}`));
+          }
+        });
+      });
+      assert.equal(output.continue, true);
+      assert.equal(
+        calls.filter((c) => c.method === "minni_list_pending_handoffs").length,
+        0,
+        "a config that omits the knob must never call minni_list_pending_handoffs",
+      );
+      // Confirms the daemon connection genuinely worked for OTHER boot RPCs
+      // — otherwise "0 list calls" could just as easily mean the RPC layer
+      // never reached the fake daemon at all (exactly the failure mode this
+      // test's own comment above describes catching during development).
+      assert.ok(calls.length > 0, "the driver must actually reach the daemon for its other boot RPCs");
     } finally {
       server.close();
     }

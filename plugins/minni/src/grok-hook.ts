@@ -48,6 +48,19 @@ const CONFIG: AgentHookConfig = {
   // Mirrors hooks/hooks-grok.json SessionStart "timeout": 30 — edit both.
   sessionStartHookTimeoutMs: 30_000,
   precompactKind: "grok_precompact_handoff",
+  // #296 (deliberate exception, not an oversight): every OTHER platform sets
+  // ackPendingHandoffsAtBoot — Grok Build does not. grokBuildWire can only
+  // inject/note at Stop (GROK_INJECTABLE = {"Stop"} in hook-platform.ts);
+  // SessionStart's stdout is discarded outright ("passive-event stdout is
+  // ignored"). Acking a lease at SessionStart tells the SENDING agent "grok
+  // accepted this" via the lease store, even though grok never actually saw
+  // the handoff content anywhere it could act on it — a false acceptance
+  // signal, the same class of health-signal overstatement the rest of this
+  // codebase fails closed on rather than papers over. Grok's leases stay
+  // pending (still visible to a sender polling minni_list_pending_handoffs /
+  // minni_await_handoff) until something surfaces them somewhere grok can
+  // actually read — today that means a manual minni_ack_handoff call once
+  // the agent has genuinely processed the task.
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable (MINNI_GROK_AGENT_ID); deriving the wire from it would
   // disable Grok's Stop duplicate filter and drop-accounting.

@@ -228,13 +228,17 @@ export interface AgentHookConfig {
    */
   lifecycleEnabled?: boolean;
   /**
-   * #283 migration knob (claude-code only today): SessionStart lists this
-   * agent's pending handoff leases and acks each one (stopping when the boot
-   * budget runs out — an unacked lease just stays pending next boot), adding
-   * `handoff_acks` to the envelope. A failed LIST degrades `handoff_leases`;
-   * any lease left unacked (budget-cut or a failed ack) degrades
-   * `handoff_acks`. Omit (default false) — no other platform's SessionStart
-   * consults or acks pending handoffs today.
+   * #283/#296: SessionStart lists this agent's pending handoff leases and
+   * acks each one (stopping when the boot budget runs out — an unacked
+   * lease just stays pending next boot), adding `handoff_acks` to the
+   * envelope. A failed LIST degrades `handoff_leases`; any lease left
+   * unacked (budget-cut or a failed ack) degrades `handoff_acks`. Every
+   * platform sharing this factory sets this EXCEPT grok-build (see
+   * grok-hook.ts's CONFIG for why): omitting it is a deliberate signal
+   * that the wire cannot surface anything at SessionStart, not a default
+   * to leave unset casually — acking here always tells the sending agent
+   * "accepted" via the lease store, whether or not this platform can
+   * actually show the recipient the content.
    */
   ackPendingHandoffsAtBoot?: boolean;
 }
