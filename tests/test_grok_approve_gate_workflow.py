@@ -701,6 +701,24 @@ def test_grok_invocations_pin_model_and_effort(workflow):
         assert "--reasoning-effort high" in flags, f"{workflow}: effort not pinned"
 
 
+@pytest.mark.parametrize(
+    "workflow, reply",
+    [
+        ("grok-review.yml", "/tmp/grok-reply.md"),
+        ("grok.yml", "/tmp/grok-reply.md"),
+        ("grok-boundary-test.yml", "/tmp/attack-result.md"),
+    ],
+)
+def test_publish_gate_requires_a_parsed_auth_file(workflow, reply):
+    """SEC-G12: the step that decides whether a reply is published must not
+    accept a gate run that silently skipped two of its four checks. `base64 -d`
+    exits 0 on empty input, so an unset GROK_CI_AUTH_JSON reaches that state
+    through a restore step that looks like it succeeded."""
+    text = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+    call = f"/usr/bin/python3 -I - --require-auth {reply}"
+    assert call in text, f"{workflow}: publish gate does not pass --require-auth"
+
+
 GROK_CLI_WORKFLOWS = ("grok-review.yml", "grok.yml", "grok-boundary-test.yml")
 
 

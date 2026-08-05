@@ -63,6 +63,13 @@ were measured:
 child-process egress is blocked (verified on Linux) and the blast radius is
 small (short-lived token, collaborator-only triggers, ephemeral runner).
 
+WHAT A PASS MEANS: the success line names the checks that ACTUALLY ran. An
+earlier version printed "value + encoding + shape checks passed" unconditionally,
+including on runs where the auth file was unreadable and the value and encoding
+checks never executed — a pass that overstated its own coverage (SEC-G12).
+Production callers additionally pass --require-auth, which makes an unparseable
+auth file a failure rather than a silent downgrade to shape-only.
+
 Nothing secret is ever printed: findings are reported as a redacted prefix.
 """
 
@@ -76,6 +83,9 @@ import sys
 
 # Shorter than this and a "secret" is not distinctive enough to match on
 # without false positives (short config values, ids that also appear in prose).
+# Opt-in strictness for production callers — see main().
+REQUIRE_AUTH_FLAG = "--require-auth"
+
 MIN_SECRET_LEN = 20
 # Any window this long is unmistakably token material rather than prose.
 WINDOW = 24
@@ -375,8 +385,15 @@ def main() -> int:
         print("::error::usage: check-no-credential-leak.py <reply> [auth.json]")
         return 2
 
-    reply_path = sys.argv[1]
-    auth_path = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser(
+    args = [a for a in sys.argv[1:] if a != REQUIRE_AUTH_FLAG]
+    # Production callers pass --require-auth: for them an unreadable auth file
+    # is a broken run, not an absent credential. It lives here rather than in
+    # the workflow because this script is loaded from the default branch while
+    # the workflow YAML comes from the merge ref — a PR can delete a step it
+    # dislikes, but not this.
+    require_auth = REQUIRE_AUTH_FLAG in sys.argv[1:]
+    reply_path = args[0]
+    auth_path = args[1] if len(args) > 1 else os.path.expanduser(
         "~/.grok/auth.json"
     )
 
@@ -392,11 +409,24 @@ def main() -> int:
     try:
         with open(auth_path, encoding="utf-8") as handle:
             auth = json.load(handle)
-    except (OSError, ValueError):
-        # No auth file to compare against (or unreadable): the shape check
-        # below still runs. Do not fail here — a missing credential file is
-        # not evidence of a leak.
-        auth = None
+        auth_error = None
+    except (OSError, ValueError) as exc:
+        # No auth file to compare against (or unreadable): the shape and
+        # decoded checks below still run. A missing credential file is not by
+        # itself evidence of a leak, so this is not a failure on its own —
+        # but it IS two of four checks not running, and saying so is the whole
+        # point of the tier reporting below.
+        auth, auth_error = None, exc
+
+    if auth is None and require_auth:
+        # `base64 -d` exits 0 on empty input, so an empty or unset
+        # GROK_CI_AUTH_JSON produces a successful-looking restore and an
+        # unparseable auth file. Without this, that misconfiguration silently
+        # downgraded the gate to shape-only and still reported a pass.
+        print(f"::error::Auth file {auth_path} could not be parsed "
+              f"({auth_error}); refusing to certify a reply against a "
+              "credential set this gate never loaded.")
+        return 1
 
     try:
         views = all_views(reply)
@@ -414,8 +444,21 @@ def main() -> int:
             print(f"::error::  {hit}")
         return 1
 
-    print("No credential material in reply "
-          "(value + encoding + shape + decoded checks passed).")
+    # Name the checks that ACTUALLY ran. The previous message claimed every
+    # tier unconditionally, so a run with an unreadable auth file — where the
+    # value and encoding checks never executed — was indistinguishable from a
+    # full pass (SEC-G12).
+    ran = ["shape", "decoded"]
+    skipped = []
+    if auth is not None:
+        ran = ["value", "encoding", *ran]
+    else:
+        skipped = ["value", "encoding"]
+        print(f"::warning::Auth file {auth_path} unreadable ({auth_error}); "
+              f"the {' and '.join(skipped)} checks did NOT run.")
+    summary = f"No credential material in reply ({', '.join(ran)} checks passed"
+    summary += f"; {', '.join(skipped)} SKIPPED)." if skipped else ")."
+    print(summary)
     return 0
 
 

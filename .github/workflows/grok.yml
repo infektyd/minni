@@ -285,7 +285,11 @@ jobs:
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to post."
             exit 1
           fi
-          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - /tmp/grok-reply.md
+          # --require-auth: `base64 -d` exits 0 on empty input, so an unset or
+          # empty GROK_CI_AUTH_JSON yields a successful-looking restore and an
+          # unparseable auth.json. Without this the gate quietly degrades to
+          # shape-only and still reports a pass (SEC-G12).
+          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
 
       - name: Post reply
         env:

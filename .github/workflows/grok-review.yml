@@ -376,7 +376,10 @@ jobs:
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to post."
             exit 1
           fi
-          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - /tmp/grok-reply.md
+          # --require-auth: see the note in grok.yml. An unreadable auth file
+          # means two of the four checks never ran, which must not read as a
+          # pass on the path that decides whether a reply is published.
+          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
 
       # App identity posts REQUEST_CHANGES / COMMENT only. Merge trust is the
       # grok-mechanical-approve check run (see grok-approve-gate.yml). Bot

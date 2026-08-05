@@ -369,3 +369,65 @@ def test_short_values_do_not_trip_the_gate(tmp_path, auth_file):
 
 def test_missing_auth_file_is_not_itself_a_failure(tmp_path):
     assert check(tmp_path, tmp_path / "nope.json", "A perfectly ordinary reply.") == 0
+
+
+# ── tier honesty (SEC-G12) ─────────────────────────────────────────────────
+# The success line used to name every tier unconditionally, so a run whose auth
+# file was unreadable — value and encoding never executed — was indistinguishable
+# from a full pass. `base64 -d` exits 0 on empty input, so an unset
+# GROK_CI_AUTH_JSON reaches exactly that state via a successful-looking restore.
+
+
+def _run(tmp_path: Path, auth: Path | None, reply: str, *flags: str):
+    reply_path = tmp_path / "reply.md"
+    reply_path.write_text(reply)
+    args = [sys.executable, str(SCRIPT), str(reply_path)]
+    if auth is not None:
+        args.append(str(auth))
+    args.extend(flags)
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def test_pass_message_names_only_the_checks_that_ran(tmp_path):
+    out = _run(tmp_path, tmp_path / "absent.json", "an ordinary review").stdout
+    assert "SKIPPED" in out and "value, encoding SKIPPED" in out
+    assert "value, encoding, shape, decoded checks passed" not in out
+
+
+def test_pass_message_claims_all_checks_only_when_all_ran(tmp_path, auth_file):
+    out = _run(tmp_path, auth_file, "an ordinary review").stdout
+    assert "value, encoding, shape, decoded checks passed" in out
+    assert "SKIPPED" not in out
+
+
+def test_unreadable_auth_warns_on_the_permissive_path(tmp_path):
+    """Still exit 0 — a missing credential file is not evidence of a leak —
+    but it must be visible, not silent."""
+    res = _run(tmp_path, tmp_path / "absent.json", "an ordinary review")
+    assert res.returncode == 0
+    assert "::warning::" in res.stdout
+
+
+def test_require_auth_fails_closed_when_the_auth_file_is_unreadable(tmp_path):
+    res = _run(tmp_path, tmp_path / "absent.json", "an ordinary review",
+               "--require-auth")
+    assert res.returncode == 1
+    assert "::error::" in res.stdout
+
+
+def test_require_auth_fails_closed_on_an_empty_auth_file(tmp_path):
+    """The exact shape `base64 -d` produces from an empty secret."""
+    empty = tmp_path / "auth.json"
+    empty.write_text("")
+    res = _run(tmp_path, empty, "an ordinary review", "--require-auth")
+    assert res.returncode == 1
+
+
+def test_require_auth_still_passes_a_clean_reply_with_valid_auth(tmp_path, auth_file):
+    res = _run(tmp_path, auth_file, "an ordinary review", "--require-auth")
+    assert res.returncode == 0
+
+
+def test_require_auth_still_blocks_a_leak(tmp_path, auth_file):
+    res = _run(tmp_path, auth_file, f"leaked {FAKE_REFRESH}", "--require-auth")
+    assert res.returncode == 1

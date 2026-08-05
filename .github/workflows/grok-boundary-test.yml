@@ -349,7 +349,10 @@ jobs:
           # that clears its own output for publication, and executed from the
           # verified bytes under `-I` so it cannot be redirected by a planted
           # module either.
-          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - /tmp/attack-result.md
+          # --require-auth: this is THE step that decides whether the attack
+          # report may be published to a public log. A degraded gate must not
+          # clear it (SEC-G12).
+          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/attack-result.md
 
       - name: Assert egress is actually blocked
         run: |
