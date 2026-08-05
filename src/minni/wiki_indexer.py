@@ -376,9 +376,16 @@ class WikiIndexer:
                             doc_id = row["doc_id"]
                             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            # Advance last_modified too: the skip gate is
+                            # `last_modified >= mtime`, so stamping status
+                            # alone re-purged the same page on every run and
+                            # left excluded_purged permanently non-zero — the
+                            # never-returns-to-zero signal this PR removes.
                             c.execute(
-                                "UPDATE documents SET page_status=? WHERE doc_id=?",
-                                (page.frontmatter.status, doc_id),
+                                """UPDATE documents
+                                   SET page_status=?, last_modified=?
+                                   WHERE doc_id=?""",
+                                (page.frontmatter.status, mtime, doc_id),
                             )
                             stats["excluded_purged"] = stats.get("excluded_purged", 0) + 1
                         continue

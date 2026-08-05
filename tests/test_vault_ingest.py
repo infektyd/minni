@@ -803,3 +803,74 @@ def test_index_wiki_retracts_and_does_not_conflate(tmp_path, monkeypatch):
     assert row[0] == before, "doc_id identity must survive"
     assert row[1] == "complete"
     assert fts == 0
+
+
+def test_excluded_statuses_are_deliberately_unembedded():
+    """Contract pin: indexer.UNEMBEDDED_STATUSES spells 'complete' out because
+    wiki_indexer imports indexer and the reverse would be circular. A retracted
+    page counted as a MISSING vector manufactures a permanent gap no backfill
+    can close."""
+    from minni.indexer import UNEMBEDDED_STATUSES
+    from minni.wiki_indexer import WikiFrontmatter
+
+    assert WikiFrontmatter.EXCLUDED_STATUSES <= UNEMBEDDED_STATUSES
+
+
+def test_excluded_page_does_not_read_as_a_repairable_vector_gap(tmp_path, monkeypatch):
+    """The retracted row has no embedding by design, so embedding_coverage must
+    not report it as missing/unrecoverable forever."""
+    from minni.afm_passes.vault_ingest import run
+    from minni.backfill import embedding_coverage
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    plan = vault / "wiki" / "plan-abc.md"
+    _write_status_page(plan, "Plan", "accepted")
+    first = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+    time.sleep(0.01)
+    _write_status_page(plan, "Plan", "complete")
+    run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    import minni.db as db_mod
+    from minni.config import SovereignConfig
+
+    index_cfg = SovereignConfig(
+        db_path=first["index_db_path"],
+        vault_path=str(vault),
+        graph_export_dir=str(tmp_path / "g"),
+        faiss_index_path=str(tmp_path / "f.faiss"),
+        writeback_enabled=False,
+    )
+    old = db_mod._migrations_run
+    db_mod._migrations_run = True
+    try:
+        idx_db = db_mod.SovereignDB(index_cfg)
+        cov = embedding_coverage(idx_db)
+    finally:
+        db_mod._migrations_run = old
+    assert cov["documents_missing_vectors"] == 0, cov
+
+
+def test_index_wiki_retraction_settles_instead_of_repurging(tmp_path, monkeypatch):
+    """Stamping page_status without advancing last_modified left the skip gate
+    open, so the same page was re-purged on every run and excluded_purged never
+    returned to zero — the never-returns-to-zero signal this PR removes."""
+    from minni.wiki_indexer import WikiIndexer
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    plan = vault / "wiki" / "plan-abc.md"
+    _write_status_page(plan, "Plan", "accepted")
+
+    indexer = WikiIndexer(shared_db, cfg)
+    indexer.index_wiki(str(vault / "wiki"))
+    time.sleep(0.01)
+    _write_status_page(plan, "Plan", "complete")
+
+    first = indexer.index_wiki(str(vault / "wiki"))
+    second = indexer.index_wiki(str(vault / "wiki"))
+
+    assert first["excluded_purged"] == 1
+    assert second["excluded_purged"] == 0, "the retraction must settle"

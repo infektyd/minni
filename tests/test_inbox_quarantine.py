@@ -782,3 +782,27 @@ def test_a_corrupt_non_afm_file_is_still_left_alone(tmp_path):
     assert count_afm_dead_letter([inbox])["files"] == 0
     assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
     assert other.exists()
+
+
+def test_degraded_queue_half_reports_unknown_not_zero(tmp_path, monkeypatch):
+    """The DB half's failure shape needs its own pin: only the dead-letter
+    twin was covered, and a mutant restoring `orphans = 0` survived."""
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("queue scan failed")
+
+    monkeypatch.setattr("minni.afm_review_markers.count_orphaned_afm_review", _boom)
+
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+
+    ml = rep["memory_lifecycle"]
+    assert ml["afm_review_orphans"] is None, "a scan that never ran is not zero"
+    assert ml["proposed_queue"]["status"] == "unknown"
+    assert ml["proposed_queue"]["depth"] is None
+    # The independent filesystem half still succeeded.
+    assert ml["afm_dead_letter"]["files"] == 0

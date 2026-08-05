@@ -30,7 +30,16 @@ logger = logging.getLogger("sovereign.indexer")
 # Lifecycle states that are indexed and lexically searchable but deliberately
 # NOT embedded — retrieve() filters them out downstream of the FAISS window, so
 # embedding them costs accepted pages their candidate slots. See index_vault.
-UNEMBEDDED_STATUSES = frozenset({"draft", "expired"})
+# "complete" is WikiFrontmatter.EXCLUDED_STATUSES spelled out: wiki_indexer
+# imports this module, so importing it back would be circular. A contract test
+# pins the two together.
+#
+# #229 M6: a page excluded by design (a completed plan) keeps its documents
+# row so wikilinks and doc_id references survive, but its payload is retracted.
+# It is therefore DELIBERATELY unembedded — counting it as a missing vector
+# manufactures a permanent gap no backfill can ever close, which is the same
+# phantom-signal class this set already exists to avoid for draft/expired.
+UNEMBEDDED_STATUSES = frozenset({"draft", "expired", "complete"})
 
 
 class VaultIndexer:

@@ -605,6 +605,7 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             lifecycle["afm_dead_letter"] = {
                 "files": None,
                 "oldest_age_days": None,
+                "unreadable": None,
                 "status": "unknown",
                 "error": type(exc).__name__,
             }
@@ -626,6 +627,7 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 "depth": None,
                 "oldest_age_days": None,
                 "stale": None,
+                "unparseable_proposed_at": None,
                 "status": "unknown",
                 "error": type(exc).__name__,
             }
