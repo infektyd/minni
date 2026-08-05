@@ -6,6 +6,10 @@ import test from "node:test";
 
 import {
   updateSlice,
+  unmetDependencies,
+  diffDependsOn,
+  diffSupersededDependencies,
+  applySliceDelta,
   computePlanDigest,
   computePlanDigestV1,
   rehydratePlan,
@@ -1433,6 +1437,613 @@ test("persistPlan wires real plan writes through the capped history append (#294
     assert.ok(history.length <= 51, `history must stay bounded at cap+hysteresis, got ${history.length}`);
     assert.equal(history[history.length - 1].rev, plan.rev, "the newest entry must be the plan's current revision");
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #291 (audit N4): depends_on was advisory only — a slice whose dependency
+// was still open could be silently marked done. Pure-function coverage of
+// unmetDependencies()/updateSlice()'s hard block; a real-vault, real-server
+// E2E test for the journaled force override follows below (the journal
+// write itself is I/O performed in server.ts, not testable at the pure
+// plan.ts layer).
+// ---------------------------------------------------------------------------
+
+function dependsOnPlan() {
+  const plan = {
+    plan_id: "test-plan",
+    goal: "Test goal",
+    status: "draft",
+    constraints: [],
+    slices: [
+      { id: "a", title: "Slice A", status: "pending" },
+      { id: "b", title: "Slice B", status: "pending", depends_on: ["a"] },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "test",
+    plan_digest: "",
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    rev: 1,
+  };
+  plan.plan_digest = computePlanDigest(plan);
+  return plan;
+}
+
+test("unmetDependencies: reports an unresolved dependency, and none once it resolves", () => {
+  const plan = dependsOnPlan();
+  assert.deepEqual(unmetDependencies(plan, "b"), ["a"]);
+  assert.deepEqual(unmetDependencies(plan, "a"), [], "a has no depends_on of its own");
+
+  const aDone = updateSlice(plan, "a", "done", "verified via test output, exit 0");
+  assert.deepEqual(unmetDependencies(aDone, "b"), [], "a is now done — no longer unmet");
+});
+
+test("unmetDependencies: a depends_on id with no matching slice is unmet, not silently ignored (typo/removed-by-replan)", () => {
+  const plan = dependsOnPlan();
+  const withGhostDep = {
+    ...plan,
+    slices: plan.slices.map((s) => (s.id === "b" ? { ...s, depends_on: ["ghost-slice"] } : s)),
+  };
+  assert.deepEqual(unmetDependencies(withGhostDep, "b"), ["ghost-slice"]);
+});
+
+test("updateSlice: hard-blocks a transition to done when depends_on is unmet (#291)", () => {
+  const plan = dependsOnPlan();
+  assert.throws(
+    () => updateSlice(plan, "b", "done", "B is finished, verified via logs/b.log"),
+    /depends_on unmet: a/,
+    "marking b done while a is still pending must not be silently accepted",
+  );
+  // The framework must not have mutated anything on the way to throwing.
+  assert.equal(plan.slices.find((s) => s.id === "b").status, "pending");
+});
+
+test("updateSlice: superseded (not just done) also satisfies a dependency", () => {
+  const plan = dependsOnPlan();
+  const aSuperseded = updateSlice(plan, "a", "superseded", "replaced by a different approach, see replan");
+  const bDone = updateSlice(aSuperseded, "b", "done", "B is finished, verified via logs/b.log");
+  assert.equal(bDone.slices.find((s) => s.id === "b").status, "done");
+});
+
+test("updateSlice: succeeds once the dependency actually resolves, no force needed", () => {
+  const plan = dependsOnPlan();
+  const aDone = updateSlice(plan, "a", "done", "verified via test output, exit 0");
+  const bDone = updateSlice(aDone, "b", "done", "B is finished, verified via logs/b.log");
+  assert.equal(bDone.slices.find((s) => s.id === "b").status, "done");
+});
+
+test("updateSlice: force alone, without forceReason, still throws — cannot silently bypass", () => {
+  const plan = dependsOnPlan();
+  assert.throws(
+    () => updateSlice(plan, "b", "done", "B is finished, verified via logs/b.log", { force: true }),
+    /force override of depends_on requires a non-empty force reason/,
+  );
+  assert.throws(
+    () => updateSlice(plan, "b", "done", "B is finished, verified via logs/b.log", { force: true, forceReason: "   " }),
+    /force override of depends_on requires a non-empty force reason/,
+    "whitespace-only forceReason is not a real reason",
+  );
+});
+
+// #291 round-1 cassandra finding 6 (MEDIUM, confirmed with a real live-vault
+// example): every test above only used a "pending" dep status. A mutant
+// that widened the resolved-status predicate to also accept "blocked" or
+// "in_progress" survived the full suite untouched. Parameterize over every
+// non-resolved status so that predicate is actually pinned.
+test("updateSlice: every non-resolved dependency status (pending, in_progress, blocked) is unmet, not just pending", () => {
+  for (const depStatus of ["pending", "in_progress", "blocked"]) {
+    const plan = dependsOnPlan();
+    const withStatus = {
+      ...plan,
+      slices: plan.slices.map((s) => (s.id === "a" ? { ...s, status: depStatus } : s)),
+    };
+    assert.deepEqual(unmetDependencies(withStatus, "b"), ["a"], `dep status "${depStatus}" must count as unmet`);
+    assert.throws(
+      () => updateSlice(withStatus, "b", "done", "B is finished, verified via logs/b.log"),
+      /depends_on unmet: a/,
+      `dep status "${depStatus}" must still hard-block b`,
+    );
+  }
+});
+
+test("updateSlice: force + a real forceReason bypasses the hard block", () => {
+  const plan = dependsOnPlan();
+  const bDone = updateSlice(plan, "b", "done", "B is finished, verified via logs/b.log", {
+    force: true,
+    forceReason: "operator approved fast-tracking B ahead of A for the hotfix",
+  });
+  assert.equal(bDone.slices.find((s) => s.id === "b").status, "done");
+});
+
+// #291 round-1 cassandra finding 1 (HIGH): replan()'s `??` on depends_on
+// only guards null/undefined, not `[]` — a plan author can silently wipe an
+// existing slice's dependency instead of ever touching force/force_reason,
+// defeating the hard block above with no trace. diffDependsOn is the pure
+// building block the minni_thread_replan handler uses to make that edit
+// visible; the full silent-bypass-then-non-silent-fix path is covered by
+// the E2E test below (the journal write is server.ts's job).
+test("diffDependsOn: reports a depends_on change on an existing slice, ignores unrelated fields and new slices", () => {
+  const before = dependsOnPlan();
+  const after = {
+    ...before,
+    slices: [
+      before.slices[0],
+      { ...before.slices[1], depends_on: [] }, // b's dependency silently wiped
+      { id: "c", title: "Slice C", status: "pending" }, // brand new slice — not a "change"
+    ],
+  };
+  const changes = diffDependsOn(before, after);
+  assert.deepEqual(changes, [{ slice_id: "b", from: ["a"], to: [] }]);
+});
+
+test("diffDependsOn: reordering depends_on is not a change", () => {
+  const before = { ...dependsOnPlan(), slices: [{ id: "a", title: "A", status: "pending" }, { id: "b", title: "B", status: "pending", depends_on: ["a", "c"] }, { id: "c", title: "C", status: "pending" }] };
+  const after = { ...before, slices: before.slices.map((s) => (s.id === "b" ? { ...s, depends_on: ["c", "a"] } : s)) };
+  assert.deepEqual(diffDependsOn(before, after), []);
+});
+
+// #291 round-2 cassandra finding MEDIUM-3 (surviving mutant, confirmed): a
+// mutant that made unmetDependencies only ever check depends_on[0] passed
+// the entire suite untouched, because every existing test used a
+// single-dependency slice. A real live plan has a two-dependency slice
+// (interaction-e2e-verify). Pin the multi-dependency case directly.
+test("unmetDependencies: reports EVERY unmet dependency when a slice has more than one, not just the first", () => {
+  const plan = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "a", title: "A", status: "done", evidence: "verified" },
+      { id: "c", title: "C", status: "pending" },
+      { id: "b", title: "B", status: "pending", depends_on: ["a", "c"] },
+    ],
+  };
+  // a is done, c is pending — only c should be unmet, and it must not be
+  // masked by a's resolved status coming first in the array.
+  assert.deepEqual(unmetDependencies(plan, "b"), ["c"]);
+
+  const bothOpen = {
+    ...plan,
+    slices: plan.slices.map((s) => (s.id === "a" ? { ...s, status: "pending", evidence: undefined } : s)),
+  };
+  assert.deepEqual(unmetDependencies(bothOpen, "b"), ["a", "c"], "both unmet deps must be reported, not just the first");
+  assert.throws(
+    () => updateSlice(bothOpen, "b", "done", "B is finished, verified via logs/b.log"),
+    /depends_on unmet: a, c/,
+  );
+});
+
+// #291 round-2 cassandra finding HIGH-1 (confirmed by independent
+// reproduction against dist/plan.js before trusting the review):
+// diffDependsOn alone cannot see a dependency satisfied "for free" by
+// superseding the dependency slice itself (the ordinary way to replan —
+// omit a slice, or drop_slice_ids). diffSupersededDependencies closes that
+// visibility gap.
+test("diffSupersededDependencies: reports a dependency slice that became superseded while something still depends on it", () => {
+  const before = dependsOnPlan(); // a: pending, b: pending depends_on [a]
+  const after = { ...before, slices: [{ ...before.slices[0], status: "superseded", superseded_by: "replan-x" }, before.slices[1]] };
+  assert.deepEqual(diffSupersededDependencies(before, after), [{ slice_id: "a", depended_on_by: ["b"] }]);
+});
+
+test("diffSupersededDependencies: a slice that was ALREADY superseded before this operation is not re-reported", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "a", title: "A", status: "superseded", superseded_by: "earlier" },
+      { id: "b", title: "B", status: "pending", depends_on: ["a"] },
+    ],
+  };
+  const after = before; // nothing changed this operation
+  assert.deepEqual(diffSupersededDependencies(before, after), []);
+});
+
+test("diffSupersededDependencies: a superseded dependency with no surviving dependent produces no entry", () => {
+  const before = dependsOnPlan();
+  const after = {
+    ...before,
+    slices: [
+      { ...before.slices[0], status: "superseded", superseded_by: "replan-x" },
+      { ...before.slices[1], status: "done", evidence: "irrelevant, already resolved before a was touched" },
+    ],
+  };
+  assert.deepEqual(diffSupersededDependencies(before, after), [], "b is done — no longer a live dependent to report");
+});
+
+// #291 round-2 cassandra finding HIGH-2 (confirmed by independent
+// reproduction via applySliceDelta below, and matching a real duplicate-id
+// shape found in two live vaults). NOTE: replan()'s own new_slices path
+// does NOT have a reachable version of this bug — the "stillProposed"
+// check keys off `ns.id === slice.id` across every newSlices entry, so any
+// entry that names id "a" unconditionally keeps the original "a" alive
+// (never superseded), which means there is no newSlices shape that both
+// supersedes an id and re-adds a fresh entry under that same id in one
+// call. The guard added in replan() (see its comment) is defense-in-depth,
+// not a live exploit fix, so there is no test asserting it throws here —
+// that would assert an unreachable path.
+
+test("applySliceDelta: rejects an explicit slice id that collides with a slice just dropped in the same call", () => {
+  const plan = dependsOnPlan();
+  assert.throws(
+    () => applySliceDelta(plan, { drop_slice_ids: ["a"], add_slices: [{ id: "a", title: "A retry" }] }),
+    /applySliceDelta: cannot add slice with id "a"/,
+  );
+});
+
+test("depends_on hard block end-to-end: minni_thread_update refuses without force and journals a force override (#291)", async (t) => {
+  const { spawn } = await import("node:child_process");
+  const net = await import("node:net");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-depends-on-mcp-"));
+  const home = path.join(root, "home");
+  const socketPath = path.join(home, "minnid.sock");
+  await mkdir(home, { recursive: true });
+  // #291 round-2 cassandra finding MEDIUM-4 (surviving mutant, confirmed):
+  // round-1 finding 4 added force/force_reason to the plan.update gate
+  // call's details, but nothing observed the gate call's PAYLOAD — deleting
+  // that fix entirely left the whole suite green. Record every gate.shared
+  // call the real server makes so the test can assert on what actually
+  // reached the gate, not just that a gate call happened.
+  const gateCalls = [];
+  const fakeDaemon = net.createServer((socket) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      if (!buffer.includes("\n")) return;
+      const request = JSON.parse(buffer.split("\n")[0]);
+      const respond = (result) => {
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
+      };
+      if (request.method === "gate.shared") {
+        gateCalls.push(request.params);
+        respond({ ok: true, status: "allowed" });
+        return;
+      }
+      respond({ ok: true });
+    });
+  });
+  await new Promise((resolve) => fakeDaemon.listen(socketPath, resolve));
+  t.after(() => fakeDaemon.close());
+  const serverPath = new URL("../dist/server.js", import.meta.url).pathname;
+  const child = spawn(process.execPath, [serverPath], {
+    env: {
+      ...process.env,
+      MINNI_HOME: home,
+      MINNI_SOCKET_PATH: socketPath,
+      MINNI_VAULT_PATH: root,
+      MINNI_CLAUDECODE_VAULT_PATH: root,
+      MINNI_KILOCODE_VAULT_PATH: root,
+      MINNI_GROK_VAULT_PATH: root,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    const responses = new Map();
+    let buffered = "";
+    const waiters = new Map();
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      let nl;
+      while ((nl = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, nl).trim();
+        buffered = buffered.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id !== undefined) {
+            responses.set(msg.id, msg);
+            waiters.get(msg.id)?.(msg);
+          }
+        } catch {
+          // non-JSON noise on stdout would be a protocol bug; surface via timeout
+        }
+      }
+    });
+    const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+    const awaitResponse = (id, ms = 15000) =>
+      responses.get(id) ??
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timeout waiting for response ${id}`)), ms);
+        waiters.set(id, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
+      });
+
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "plan-291-e2e-test", version: "0.0.0" },
+      },
+    });
+    const init = await awaitResponse(1);
+    assert.ok(init.result, JSON.stringify(init));
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    let id = 2;
+    const call = async (name, args) => {
+      const thisId = id++;
+      send({ jsonrpc: "2.0", id: thisId, method: "tools/call", params: { name, arguments: args } });
+      return awaitResponse(thisId);
+    };
+
+    const created = await call("minni_thread_create", {
+      goal: "#291 depends_on hard block e2e",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B", depends_on: ["a"] },
+      ],
+    });
+    assert.ok(created.result && !created.result.isError, JSON.stringify(created));
+    const createdBody = JSON.parse(created.result.content[0].text);
+    const notePath = createdBody.notePath;
+
+    // 1. No force: the tool must refuse, not silently accept.
+    const blocked = await call("minni_thread_update", {
+      slice_id: "b",
+      status: "done",
+      evidence: "B is finished, verified via logs/b.log",
+    });
+    assert.ok(blocked.result?.isError, `expected an error result, got: ${JSON.stringify(blocked)}`);
+    assert.match(blocked.result.content[0].text, /depends_on unmet: a/);
+
+    // 2. force without a reason: still refused — force alone cannot bypass silently.
+    const forceNoReason = await call("minni_thread_update", {
+      slice_id: "b",
+      status: "done",
+      evidence: "B is finished, verified via logs/b.log",
+      force: true,
+    });
+    assert.ok(forceNoReason.result?.isError, `expected an error result, got: ${JSON.stringify(forceNoReason)}`);
+    // #291 round-1 cassandra finding 8: the refusal message must name the
+    // MCP-facing field (force_reason) a retrying model can actually pass,
+    // not the internal TS option name (forceReason).
+    // #291 round-2 cassandra finding LOW-6: the no-force error (scenario 1,
+    // above) ALSO contains the substring "force reason", so a loose /force
+    // reason/ regex here would pass even if this scenario's specific
+    // "force without a reason" refusal were silently replaced by the wrong
+    // error. Match the discriminating phrase instead.
+    assert.match(forceNoReason.result.content[0].text, /requires a non-empty force reason/);
+
+    // 2b. round-1 finding 7: a non-"done" transition with an unmet dep must
+    // NOT emit an override record even if force is set — there's nothing
+    // to override yet, and a bogus record here would pollute the audit
+    // trail. (in_progress doesn't go through the depends_on gate at all.)
+    const forceInProgress = await call("minni_thread_update", {
+      slice_id: "b",
+      status: "in_progress",
+      force: true,
+      force_reason: "should not matter — status isn't done",
+    });
+    assert.ok(forceInProgress.result && !forceInProgress.result.isError, JSON.stringify(forceInProgress));
+
+    // 3. force + force_reason: succeeds, AND must journal the override —
+    // folded atomically into the same status_changed event (round-1
+    // finding 5: two separate journal writes left a crash window where
+    // "done" could land durably with no override record at all).
+    const forced = await call("minni_thread_update", {
+      slice_id: "b",
+      status: "done",
+      evidence: "B is finished, verified via logs/b.log",
+      force: true,
+      force_reason: "operator approved fast-tracking B ahead of A for the hotfix",
+    });
+    assert.ok(forced.result && !forced.result.isError, JSON.stringify(forced));
+    const forcedBody = JSON.parse(forced.result.content[0].text);
+    assert.equal(forcedBody.plan.slices.find((s) => s.id === "b").status, "done");
+
+    const journalPath = path.join(path.dirname(notePath), `${createdBody.plan_id}.log.md`);
+    const journalText = await readFile(journalPath, "utf8");
+    const events = parseJournal(journalText);
+    const overrideEvent = events.find((e) => e.kind === "status_changed" && e.slice_id === "b" && e.to === "done");
+    assert.ok(overrideEvent, `expected the done status_changed event for b, got kinds: ${events.map((e) => e.kind).join(", ")}`);
+    assert.ok(overrideEvent.depends_on_override, `expected depends_on_override on the status_changed event, got: ${JSON.stringify(overrideEvent)}`);
+    assert.deepEqual(overrideEvent.depends_on_override.unmet, ["a"]);
+    assert.equal(overrideEvent.depends_on_override.reason, "operator approved fast-tracking B ahead of A for the hotfix");
+    assert.ok(overrideEvent.depends_on_override.forced_by, "override must record who forced it");
+
+    // 3a. round-1 finding 4 (must actually be pinned — round-2 finding
+    // MEDIUM-4 found the fix itself had no test): the shared-gate call for
+    // this update must have carried force/force_reason so an approval
+    // policy can see the override BEFORE it's applied, not just read it
+    // from the journal after the fact.
+    const updateGateCalls = gateCalls.filter((c) => c.operation === "plan.update" && c.details?.slice_id === "b");
+    // Scenarios 2 and 2b earlier ALSO had force:true (without this specific
+    // reason, or on a non-"done" status) — match on the exact force_reason
+    // this scenario sent, not just "some force:true call", or this
+    // assertion can silently check the wrong request.
+    const forcedGateCall = updateGateCalls.find(
+      (c) => c.details?.force === true && c.details?.force_reason === "operator approved fast-tracking B ahead of A for the hotfix",
+    );
+    assert.ok(forcedGateCall, `expected a plan.update gate call with force:true, got: ${JSON.stringify(updateGateCalls)}`);
+    assert.equal(forcedGateCall.details.force_reason, "operator approved fast-tracking B ahead of A for the hotfix");
+
+    // 2b's forced-but-not-done in_progress transition must not have carried
+    // an override record either — belt-and-suspenders on finding 7.
+    const inProgressEvent = events.find((e) => e.kind === "status_changed" && e.slice_id === "b" && e.to === "in_progress");
+    assert.ok(inProgressEvent, "expected the in_progress status_changed event for b");
+    assert.equal(inProgressEvent.depends_on_override, undefined, "force on a non-done transition must not fabricate an override record");
+
+    // 3b. round-1 finding 7 (other direction): force+force_reason when the
+    // dependency is ALREADY resolved must not emit an override record —
+    // there was nothing to override, so recording one would be a false
+    // "this was forced" claim in the audit trail.
+    const created1b = await call("minni_thread_create", {
+      goal: "#291 depends_on force-when-already-met e2e",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B", depends_on: ["a"] },
+      ],
+    });
+    const created1bBody = JSON.parse(created1b.result.content[0].text);
+    await call("minni_thread_update", {
+      plan_id: created1bBody.plan_id,
+      slice_id: "a",
+      status: "done",
+      evidence: "A is finished, verified via logs/a.log",
+    });
+    const forcedButMet = await call("minni_thread_update", {
+      plan_id: created1bBody.plan_id,
+      slice_id: "b",
+      status: "done",
+      evidence: "B is finished, verified via logs/b.log",
+      force: true,
+      force_reason: "force set defensively even though a is already done",
+    });
+    assert.ok(forcedButMet.result && !forcedButMet.result.isError, JSON.stringify(forcedButMet));
+    const journalPath1b = path.join(path.dirname(created1bBody.notePath), `${created1bBody.plan_id}.log.md`);
+    const events1b = parseJournal(await readFile(journalPath1b, "utf8"));
+    const bDoneEvent1b = events1b.find((e) => e.kind === "status_changed" && e.slice_id === "b" && e.to === "done");
+    assert.ok(bDoneEvent1b, "expected b's done status_changed event");
+    assert.equal(bDoneEvent1b.depends_on_override, undefined, "force with an already-met dependency must not fabricate an override record");
+
+    // 4. Happy path (no override): a second plan where the dependency is
+    // resolved first must NOT emit a depends_on_override event at all.
+    const created2 = await call("minni_thread_create", {
+      goal: "#291 depends_on happy path e2e",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B", depends_on: ["a"] },
+      ],
+    });
+    const created2Body = JSON.parse(created2.result.content[0].text);
+    const doneA = await call("minni_thread_update", {
+      plan_id: created2Body.plan_id,
+      slice_id: "a",
+      status: "done",
+      evidence: "A is finished, verified via logs/a.log",
+    });
+    assert.ok(doneA.result && !doneA.result.isError, JSON.stringify(doneA));
+    const doneB = await call("minni_thread_update", {
+      plan_id: created2Body.plan_id,
+      slice_id: "b",
+      status: "done",
+      evidence: "B is finished, verified via logs/b.log",
+    });
+    assert.ok(doneB.result && !doneB.result.isError, JSON.stringify(doneB));
+
+    const journalPath2 = path.join(path.dirname(created2Body.notePath), `${created2Body.plan_id}.log.md`);
+    const journalText2 = await readFile(journalPath2, "utf8");
+    const events2 = parseJournal(journalText2);
+    assert.ok(
+      !events2.some((e) => e.kind === "status_changed" && e.depends_on_override),
+      "resolving the dependency first must not produce a depends_on_override record",
+    );
+
+    // 5. round-1 cassandra finding 1 (HIGH): replan() can silently rewrite
+    // an existing slice's depends_on to [] — I independently reproduced
+    // this against the real compiled server before trusting the review.
+    // Without this fix, the exploit is: replan away the dependency, then
+    // mark done with no force, no reason, no journal trail at all. The fix
+    // does not re-gate the edit; it makes it visible via a depends_on_changed
+    // entry on the replan event, so it can never be silent.
+    const created3 = await call("minni_thread_create", {
+      goal: "#291 replan depends_on erasure e2e",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B", depends_on: ["a"] },
+      ],
+    });
+    const created3Body = JSON.parse(created3.result.content[0].text);
+    const replanned = await call("minni_thread_replan", {
+      plan_id: created3Body.plan_id,
+      new_slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B", depends_on: [] }, // erases the dependency
+      ],
+    });
+    assert.ok(replanned.result && !replanned.result.isError, JSON.stringify(replanned));
+    const replannedBody = JSON.parse(replanned.result.content[0].text);
+    assert.deepEqual(replannedBody.slices.find((s) => s.id === "b").depends_on, [], "sanity: the dependency really was erased");
+    // The erasure itself no longer requires force — that's an intentional
+    // scope boundary (see the comment on minni_thread_replan in server.ts)
+    // — but it must be journaled, unlike before this fix.
+    const doneBAfterReplan = await call("minni_thread_update", {
+      plan_id: created3Body.plan_id,
+      slice_id: "b",
+      status: "done",
+      evidence: "B is finished, verified via logs/b.log",
+    });
+    assert.ok(doneBAfterReplan.result && !doneBAfterReplan.result.isError, JSON.stringify(doneBAfterReplan));
+    const journalPath3 = path.join(path.dirname(created3Body.notePath), `${created3Body.plan_id}.log.md`);
+    const events3 = parseJournal(await readFile(journalPath3, "utf8"));
+    const replanEvent = events3.find((e) => e.kind === "replan");
+    assert.ok(replanEvent, "expected a replan journal event");
+    assert.ok(replanEvent.depends_on_changed, `expected depends_on_changed on the replan event, got: ${JSON.stringify(replanEvent)}`);
+    assert.deepEqual(replanEvent.depends_on_changed, [{ slice_id: "b", from: ["a"], to: [] }]);
+
+    // 6. round-2 cassandra finding HIGH-1 (confirmed by independent
+    // reproduction against dist/plan.js before trusting the review): the
+    // depends_on ARRAY isn't the only way to satisfy a dependency for
+    // free. Omitting the dependency slice from new_slices (the ordinary,
+    // more common way to replan than editing depends_on directly)
+    // supersedes it, which unmetDependencies already treats as resolved —
+    // and before this round's fix, that produced ZERO journal trail at
+    // all (b's depends_on array is untouched, so diffDependsOn alone sees
+    // nothing). Must now show up as depends_on_superseded.
+    const created4 = await call("minni_thread_create", {
+      goal: "#291 replan supersedes a live dependency e2e",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B", depends_on: ["a"] },
+      ],
+    });
+    const created4Body = JSON.parse(created4.result.content[0].text);
+    const replannedAway = await call("minni_thread_replan", {
+      plan_id: created4Body.plan_id,
+      new_slices: [{ id: "b", title: "Slice B", depends_on: ["a"] }], // a omitted -> superseded
+    });
+    assert.ok(replannedAway.result && !replannedAway.result.isError, JSON.stringify(replannedAway));
+    const replannedAwayBody = JSON.parse(replannedAway.result.content[0].text);
+    assert.equal(replannedAwayBody.slices.find((s) => s.id === "a").status, "superseded", "sanity: a really was superseded");
+    const doneBAfterSupersede = await call("minni_thread_update", {
+      plan_id: created4Body.plan_id,
+      slice_id: "b",
+      status: "done",
+      evidence: "B is finished, verified via logs/b.log",
+    });
+    assert.ok(doneBAfterSupersede.result && !doneBAfterSupersede.result.isError, JSON.stringify(doneBAfterSupersede));
+    const journalPath4 = path.join(path.dirname(created4Body.notePath), `${created4Body.plan_id}.log.md`);
+    const events4 = parseJournal(await readFile(journalPath4, "utf8"));
+    const replanEvent4 = events4.find((e) => e.kind === "replan");
+    assert.ok(replanEvent4, "expected a replan journal event");
+    assert.ok(replanEvent4.depends_on_superseded, `expected depends_on_superseded on the replan event, got: ${JSON.stringify(replanEvent4)}`);
+    assert.deepEqual(replanEvent4.depends_on_superseded, [{ slice_id: "a", depended_on_by: ["b"] }]);
+
+    // 7. round-2 cassandra finding HIGH-2 (confirmed by independent
+    // reproduction, and matching a real shape already present in two live
+    // vaults): dropping a slice and re-adding an explicit slice with the
+    // SAME id in the same replan call used to create a duplicate id, and
+    // enforcement resolved against whichever instance was found first —
+    // silently satisfying a dependency against the SUPERSEDED instance
+    // while the live one became unreachable. Must now be refused outright.
+    const created5 = await call("minni_thread_create", {
+      goal: "#291 duplicate slice id rejection e2e",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B", depends_on: ["a"] },
+      ],
+    });
+    const created5Body = JSON.parse(created5.result.content[0].text);
+    const dupIdAttempt = await call("minni_thread_replan", {
+      plan_id: created5Body.plan_id,
+      drop_slice_ids: ["a"],
+      add_slices: [{ id: "a", title: "A retry" }],
+    });
+    assert.ok(dupIdAttempt.result?.isError, `expected an error result, got: ${JSON.stringify(dupIdAttempt)}`);
+    assert.match(dupIdAttempt.result.content[0].text, /cannot add slice with id "a"/);
+    // And the plan itself must be unchanged on disk — the rejected replan
+    // (thrown before persistPlan is ever called) must not have partially
+    // applied (a is still live, pending, exactly one slice with that id).
+    const planAfterRejected = await rehydratePlan(created5Body.notePath);
+    assert.equal(planAfterRejected.slices.filter((s) => s.id === "a").length, 1, "no duplicate id must have been written");
+    assert.equal(planAfterRejected.slices.find((s) => s.id === "a").status, "pending", "the rejected replan must not have partially applied");
+  } finally {
+    child.kill("SIGKILL");
     await rm(root, { recursive: true, force: true });
   }
 });

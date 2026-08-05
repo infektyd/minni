@@ -57,8 +57,44 @@ export interface PlanArtifact {
 // (src, tests, docs) before removing and found zero downstream consumers —
 // no renderer, no test, no other agent's hook parser referenced the kind.
 export type PlanEvent =
-  | { kind: "status_changed"; slice_id: string; from: PlanSliceStatus; to: PlanSliceStatus; at: string; evidence?: string }
-  | { kind: "replan"; at: string; note?: string }
+  // #291: a hard-block override of depends_on must never be silent. Folded
+  // into status_changed itself (rather than a second, separate journal
+  // event/write) so the override record is atomic with the transition it
+  // describes — a round-1 cassandra review found that two sequential
+  // appendJournal calls left a crash window where "done" could land durably
+  // with no override record at all, which is exactly the silence this fix
+  // exists to prevent. depends_on_override is present only when force
+  // actually mattered (unmet was non-empty at the time of the transition).
+  | {
+      kind: "status_changed";
+      slice_id: string;
+      from: PlanSliceStatus;
+      to: PlanSliceStatus;
+      at: string;
+      evidence?: string;
+      depends_on_override?: { unmet: string[]; reason?: string; forced_by: string };
+    }
+  // #291 (round-1 cassandra finding 1): replan() can silently rewrite an
+  // existing slice's depends_on (including erasing it to []), which
+  // defeats the hard block above with no journal trail at all — a plan
+  // author never needs force/force_reason if they can just replan the
+  // dependency away first. depends_on_changed makes that edit visible: any
+  // slice whose depends_on differs before/after the replan is listed here.
+  // This does not BLOCK the edit (replan's whole purpose is restructuring
+  // the plan, and gating that is a larger, separate design decision) — it
+  // only guarantees the edit can never be silent, which is the actual
+  // invariant #291's design brief requires.
+  | {
+      kind: "replan";
+      at: string;
+      note?: string;
+      depends_on_changed?: Array<{ slice_id: string; from: string[]; to: string[] }>;
+      // #291 round-2 cassandra finding HIGH-1: a dependency slice being
+      // superseded (the ordinary way to replan) satisfies any surviving
+      // slice that depends on it just as much as depends_on being edited
+      // directly — must be equally non-silent.
+      depends_on_superseded?: Array<{ slice_id: string; depended_on_by: string[] }>;
+    }
   | { kind: "gate_passed"; slice_id: string; evidence: string; at: string }
   | { kind: "rehydrated"; at: string }
   | { kind: "restored"; from_rev: number; at: string }
@@ -882,12 +918,115 @@ function isTrivialEvidence(ev: string): boolean {
   return trivial.has(trimmed) || ev.trim().length < 8;
 }
 
+/**
+ * #291 (audit N4): depends_on was advisory only — updateSlice never read it,
+ * so a slice whose dependency was still open could be silently marked done.
+ * Pure lookup used by the hard-block below: a dependency counts as unmet
+ * unless it resolves to a slice that is itself "done" or "superseded"
+ * (matching allSlicesResolved's definition of resolved). A depends_on id
+ * that doesn't match any slice in the plan (typo, or a slice removed by
+ * replan) is also unmet — it can never be resolved, so it must not be
+ * silently ignored either.
+ */
+export function unmetDependencies(plan: PlanArtifact, slice_id: string): string[] {
+  const slice = plan.slices.find((s) => s.id === slice_id);
+  const depends_on = slice?.depends_on ?? [];
+  return depends_on.filter((depId) => {
+    const dep = plan.slices.find((s) => s.id === depId);
+    return !dep || (dep.status !== "done" && dep.status !== "superseded");
+  });
+}
+
+/**
+ * #291 (round-1 cassandra finding 1): replan() can rewrite an existing
+ * slice's depends_on with no journal trail — pure diff used by the
+ * minni_thread_replan handler to make that edit visible instead of silent.
+ * Compares by slice id present in BOTH before/after; a slice that no
+ * longer exists after replan is out of scope here (it is superseded, which
+ * unmetDependencies already treats as resolved — that's finding 2,
+ * accepted as a disclosed residual, not this function's job). Order-
+ * insensitive: [a, b] and [b, a] are not a change.
+ */
+export function diffDependsOn(
+  before: PlanArtifact,
+  after: PlanArtifact,
+): Array<{ slice_id: string; from: string[]; to: string[] }> {
+  const changes: Array<{ slice_id: string; from: string[]; to: string[] }> = [];
+  for (const afterSlice of after.slices) {
+    const beforeSlice = before.slices.find((s) => s.id === afterSlice.id);
+    if (!beforeSlice) continue;
+    const from = [...(beforeSlice.depends_on ?? [])].sort();
+    const to = [...(afterSlice.depends_on ?? [])].sort();
+    if (from.length !== to.length || from.some((v, i) => v !== to[i])) {
+      changes.push({ slice_id: afterSlice.id, from: beforeSlice.depends_on ?? [], to: afterSlice.depends_on ?? [] });
+    }
+  }
+  return changes;
+}
+
+/**
+ * #291 (round-2 cassandra finding HIGH-1, confirmed by independent
+ * reproduction against dist/plan.js before trusting the review):
+ * diffDependsOn only catches edits to a slice's depends_on ARRAY. It does
+ * NOT catch a dependency being satisfied "for free" by superseding the
+ * dependency slice itself — which is the ordinary, common way to replan
+ * (a slice omitted from new_slices, or listed in drop_slice_ids, becomes
+ * superseded, and unmetDependencies already treats superseded as
+ * resolved). That path is cheaper than editing depends_on directly and,
+ * before this function, produced NO journal trail at all — the plain
+ * "replan" event carries no payload. Pure diff used by the
+ * minni_thread_replan handler to make that supersession visible: for every
+ * slice that newly became superseded in this operation, list which
+ * still-open (not done/superseded) slices depend on it.
+ */
+export function diffSupersededDependencies(
+  before: PlanArtifact,
+  after: PlanArtifact,
+): Array<{ slice_id: string; depended_on_by: string[] }> {
+  const newlySuperseded = new Set(
+    after.slices
+      .filter((s) => s.status === "superseded")
+      .map((s) => s.id)
+      .filter((id) => {
+        const wasSlice = before.slices.find((b) => b.id === id);
+        return !!wasSlice && wasSlice.status !== "superseded";
+      }),
+  );
+  const result: Array<{ slice_id: string; depended_on_by: string[] }> = [];
+  for (const id of newlySuperseded) {
+    const dependedOnBy = after.slices
+      .filter((s) => s.status !== "done" && s.status !== "superseded")
+      .filter((s) => (s.depends_on ?? []).includes(id))
+      .map((s) => s.id);
+    if (dependedOnBy.length > 0) {
+      result.push({ slice_id: id, depended_on_by: dependedOnBy });
+    }
+  }
+  return result;
+}
+
+export interface UpdateSliceOptions {
+  /**
+   * Bypass the depends_on hard block for a transition to "done". Requires
+   * forceReason (below) — force alone is not enough to bypass, by design:
+   * the point of a journaled override is that it can never be silent, and a
+   * caller that can't articulate why shouldn't be able to force it either.
+   * The caller (server.ts's minni_thread_update) is responsible for
+   * recomputing unmetDependencies against the pre-update plan and appending
+   * a depends_on_override journal event when force actually mattered —
+   * updateSlice itself is pure and does no I/O, so it cannot journal.
+   */
+  force?: boolean;
+  forceReason?: string;
+}
+
 /** Immutable update of one slice. Evidence is mandatory to reach "done". Recomputes next_action + digest. */
 export function updateSlice(
   plan: PlanArtifact,
   slice_id: string,
   to: PlanSliceStatus,
   evidence?: string,
+  options?: UpdateSliceOptions,
 ): PlanArtifact {
   const idx = plan.slices.findIndex((s) => s.id === slice_id);
   if (idx < 0) {
@@ -899,6 +1038,23 @@ export function updateSlice(
       throw new Error(
         `updateSlice: substantive evidence is required before a slice may become "done" (e.g. refer to a file, command output, test ID, etc.)`
       );
+    }
+    const unmet = unmetDependencies(plan, slice_id);
+    if (unmet.length > 0) {
+      if (!options?.force) {
+        throw new Error(
+          // #291 round-1 cassandra finding 8: this message is the only guidance
+          // an MCP-calling model sees on refusal — name the MCP-facing field
+          // (force_reason on minni_thread_update), not the internal TS option
+          // name, so a model retrying doesn't pass a parameter that doesn't exist.
+          `updateSlice: cannot mark "${slice_id}" done — depends_on unmet: ${unmet.join(", ")} (must be "done" or "superseded" first). Pass force + a non-empty force reason to override.`
+        );
+      }
+      if (!options.forceReason || !options.forceReason.trim()) {
+        throw new Error(
+          `updateSlice: force override of depends_on requires a non-empty force reason explaining why (unmet: ${unmet.join(", ")})`
+        );
+      }
     }
   } else if (to === "blocked") {
     if (!evidence || !evidence.trim()) {
@@ -1011,6 +1167,23 @@ export function replan(
       return s.title.trim().toLowerCase() === (ns.title ?? "").trim().toLowerCase();
     });
     if (!hasMatch) {
+      // #291 (round-2 cassandra finding HIGH-2): applySliceDelta's sibling
+      // loop below has this exact collision independently reproduced and
+      // live in two real vaults (a slice dropped and re-added with the
+      // same explicit id in one call). In replan()'s own new_slices path
+      // specifically, I could NOT reproduce a live duplicate: the
+      // "stillProposed" check above already keys off `ns.id === slice.id`
+      // across every newSlices entry, so any entry carrying id "a"
+      // unconditionally keeps the original "a" alive (never superseded) —
+      // there is no newSlices shape that both supersedes an id and
+      // introduces a fresh entry under that same id in one replan() call.
+      // Kept here as defense-in-depth against that coupling changing later,
+      // not as a claim this branch is reachable today.
+      if (ns.id && usedIds.has(ns.id)) {
+        throw new Error(
+          `replan: cannot add slice with id "${ns.id}" — a slice with that id already exists in this plan (even if superseded). Choose a different id, or omit id to let one be generated.`,
+        );
+      }
       const id = ns.id || slugifySliceId(ns.title, usedIds);
       usedIds.add(id);
       nextSlices = [
@@ -1477,6 +1650,16 @@ export function applySliceDelta(
   const usedIds = new Set(nextSlices.map((s) => s.id));
 
   for (const ns of delta.add_slices ?? []) {
+    // #291 (round-2 cassandra finding HIGH-2): same collision as replan()'s
+    // sibling loop, reached here via drop_slice_ids + add_slices in a
+    // single call — e.g. dropping "a" and re-adding a slice explicitly
+    // id'd "a" in the same delta creates two slices sharing an id, and
+    // enforcement resolves against whichever .find() hits first.
+    if (ns.id && usedIds.has(ns.id)) {
+      throw new Error(
+        `applySliceDelta: cannot add slice with id "${ns.id}" — a slice with that id already exists in this plan (even if superseded/done, including one just dropped in this same call). Choose a different id, or omit id to let one be generated.`,
+      );
+    }
     const id = ns.id || slugifySliceId(ns.title, usedIds);
     usedIds.add(id);
     nextSlices.push({
