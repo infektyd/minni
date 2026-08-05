@@ -798,6 +798,93 @@ test("createPlan without shelf_ref leaves shelfDrift unconfigured (regression gu
   }
 });
 
+// ── #295 (June audit N8): shelf drift auto-checked at resolveActivePlanView ─
+//
+// shelfDrift() used to be reachable only by explicitly passing
+// live_shelf_content to minni_thread_status — drift was found only when
+// someone thought to check. resolveActivePlanView now optionally accepts the
+// live shelf content (the SessionStart handler's own already-read
+// layer1/core.md body) and attaches a shelf_drift result automatically.
+
+test("resolveActivePlanView attaches shelf_drift when live content is supplied and the plan has a shelf_ref", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-autodrift-"));
+  try {
+    await ensureVault(root);
+    const shelfContent = "# Identity shelf\nAgent: codex\nRole: worker";
+    await createPlan(
+      {
+        goal: "auto drift check",
+        vaultPath: root,
+        shelf_ref: {
+          agent: "codex",
+          wikilink: "[[wiki/identity/codex]]",
+          pull_hint: "pull before each session",
+          shelf_content: shelfContent,
+        },
+      },
+      { vaultPath: root },
+    );
+
+    const matched = await resolveActivePlanView(root, shelfContent);
+    assert.ok(matched);
+    assert.ok(matched.shelf_drift, "shelf_drift must be attached when live content is supplied");
+    assert.equal(matched.shelf_drift.configured, true);
+    assert.equal(matched.shelf_drift.drifted, false);
+
+    const drifted = await resolveActivePlanView(root, `${shelfContent}\nRole: reviewer`);
+    assert.ok(drifted);
+    assert.equal(drifted.shelf_drift.configured, true);
+    assert.equal(drifted.shelf_drift.drifted, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveActivePlanView omits shelf_drift entirely when no live content is supplied (not a misleading 'unconfigured')", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-nodrift-arg-"));
+  try {
+    await ensureVault(root);
+    await createPlan(
+      {
+        goal: "no live content passed",
+        vaultPath: root,
+        shelf_ref: {
+          agent: "codex",
+          wikilink: "[[wiki/identity/codex]]",
+          pull_hint: "pull before each session",
+          shelf_content: "# shelf",
+        },
+      },
+      { vaultPath: root },
+    );
+
+    const view = await resolveActivePlanView(root);
+    assert.ok(view);
+    assert.equal(
+      Object.hasOwn(view, "shelf_drift"),
+      false,
+      "shelf_drift must be OMITTED, not present as configured:false, when the caller passed no live content — " +
+        "a degraded/absent shelf read upstream must read as 'not checked', not 'checked and fine'",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveActivePlanView never crashes on a plan with no shelf_ref even when live content is supplied", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-noshelfref-drift-"));
+  try {
+    await ensureVault(root);
+    await createPlan({ goal: "no shelf attached at all", vaultPath: root }, { vaultPath: root });
+
+    const view = await resolveActivePlanView(root, "some live content nobody asked to compare against");
+    assert.ok(view);
+    assert.equal(Object.hasOwn(view, "shelf_drift"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // ── PLUMB-T4 / #231: active pointer is written atomically ───────────────────
 //
 // A crash mid-write used to leave a truncated `_active_plan.json` because
