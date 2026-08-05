@@ -130,8 +130,8 @@ If you run Minni from a source checkout (editable engine + wire-managed plugin t
 
 ```mermaid
 %% Budget: 18 nodes / 16 edges. Dashed = host-fired; solid = someone calls.
-%% Tool names re-verified 2026-08-01: the thread surface ships as minni_thread_*;
-%% the pre-rename minni_plan_* names remain as deprecated aliases until the release after next.
+%% Tool names re-verified 2026-08-04: the thread surface ships as minni_thread_*;
+%% the pre-rename minni_plan_* aliases are removed.
 flowchart TD
     Agents["Agent runtimes<br/>Claude Code · Codex · Gemini/Antigravity · Grok · Cursor · Kilo Code<br/>+ any MCP client"]
     Hooks["Host hooks<br/>session start · prompt submit · compaction · stop"]

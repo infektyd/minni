@@ -1,9 +1,5 @@
 import path from "node:path";
-import {
-  McpServer,
-  type RegisteredTool,
-  type ToolCallback,
-} from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
@@ -1242,7 +1238,7 @@ const planShelfRefInputSchema = z.object({
   shelf_content: z.string().optional(),
 });
 
-const threadCreateTool = server.registerTool(
+server.registerTool(
   "minni_thread_create",
   {
     title: "Minni Thread Create",
@@ -1317,7 +1313,7 @@ async function resolvePlanTarget(
   return { ok: true, plan_id, notePath };
 }
 
-const threadUpdateTool = server.registerTool(
+server.registerTool(
   "minni_thread_update",
   {
     title: "Minni Thread Update",
@@ -1385,7 +1381,7 @@ const threadUpdateTool = server.registerTool(
   },
 );
 
-const threadScarTool = server.registerTool(
+server.registerTool(
   "minni_thread_scar",
   {
     title: "Minni Thread Scar",
@@ -1418,7 +1414,7 @@ const threadScarTool = server.registerTool(
   },
 );
 
-const threadStatusTool = server.registerTool(
+server.registerTool(
   "minni_thread_status",
   {
     title: "Minni Thread Status",
@@ -1449,7 +1445,7 @@ const threadStatusTool = server.registerTool(
   },
 );
 
-const threadReplanTool = server.registerTool(
+server.registerTool(
   "minni_thread_replan",
   {
     title: "Minni Thread Replan",
@@ -1489,7 +1485,7 @@ const threadReplanTool = server.registerTool(
   },
 );
 
-const threadHistoryTool = server.registerTool(
+server.registerTool(
   "minni_thread_history",
   {
     title: "Minni Thread History",
@@ -1515,7 +1511,7 @@ const threadHistoryTool = server.registerTool(
   },
 );
 
-const threadRevisionTool = server.registerTool(
+server.registerTool(
   "minni_thread_revision",
   {
     title: "Minni Thread Revision",
@@ -1541,7 +1537,7 @@ const threadRevisionTool = server.registerTool(
   },
 );
 
-const threadDiffTool = server.registerTool(
+server.registerTool(
   "minni_thread_diff",
   {
     title: "Minni Thread Diff",
@@ -1573,7 +1569,7 @@ const threadDiffTool = server.registerTool(
   },
 );
 
-const threadRestoreTool = server.registerTool(
+server.registerTool(
   "minni_thread_restore",
   {
     title: "Minni Thread Restore",
@@ -1625,7 +1621,7 @@ const threadRestoreTool = server.registerTool(
   },
 );
 
-const threadActivateTool = server.registerTool(
+server.registerTool(
   "minni_thread_activate",
   {
     title: "Minni Thread Activate",
@@ -1652,7 +1648,7 @@ const threadActivateTool = server.registerTool(
   },
 );
 
-const threadDeactivateTool = server.registerTool(
+server.registerTool(
   "minni_thread_deactivate",
   {
     title: "Minni Thread Deactivate",
@@ -1668,47 +1664,6 @@ const threadDeactivateTool = server.registerTool(
   },
 );
 
-// ── Deprecation shim: minni_plan_* → minni_thread_* ────────────────────────
-// Alias window for the minni:plan → minni:threads rename, closing in the release
-// after next (see CHANGELOG). Each old
-// name re-registers the CANONICAL tool's own handler and schema, so behaviour
-// is byte-identical — only the description differs, leading with "DEPRECATED"
-// so the model reads the migration notice on every turn.
-//
-// REMOVE IN THE RELEASE AFTER NEXT: delete this block, the 11 `const
-// thread*Tool =` bindings above (back to bare `server.registerTool(`), and
-// tests/thread-alias.test.mjs; restore the tool-schema-boundary count to 37.
-//
-// The `as unknown as` casts are load-bearing: RegisteredTool.inputSchema is a
-// COMPILED zod schema (AnySchema), while registerTool's config is generic over
-// a raw shape. The SDK's getZodSchemaObject() passes a compiled schema through
-// unchanged (mcp.js:861), so this is a type-level bridge only, not a runtime
-// reinterpretation.
-const DEPRECATED_TOOL_ALIASES: ReadonlyArray<readonly [string, string, RegisteredTool]> = [
-  ["minni_plan_create", "minni_thread_create", threadCreateTool],
-  ["minni_plan_update", "minni_thread_update", threadUpdateTool],
-  ["minni_plan_scar", "minni_thread_scar", threadScarTool],
-  ["minni_plan_status", "minni_thread_status", threadStatusTool],
-  ["minni_plan_replan", "minni_thread_replan", threadReplanTool],
-  ["minni_plan_history", "minni_thread_history", threadHistoryTool],
-  ["minni_plan_revision", "minni_thread_revision", threadRevisionTool],
-  ["minni_plan_diff", "minni_thread_diff", threadDiffTool],
-  ["minni_plan_restore", "minni_thread_restore", threadRestoreTool],
-  ["minni_plan_activate", "minni_thread_activate", threadActivateTool],
-  ["minni_plan_deactivate", "minni_thread_deactivate", threadDeactivateTool],
-];
-
-for (const [oldName, newName, canonical] of DEPRECATED_TOOL_ALIASES) {
-  server.registerTool(
-    oldName,
-    {
-      title: canonical.title ? `${canonical.title} (deprecated)` : undefined,
-      description: `DEPRECATED — renamed to ${newName}. This alias is removed in the release after next; call the new name. ${canonical.description ?? ""}`,
-      inputSchema: canonical.inputSchema as unknown as Record<string, z.ZodTypeAny>,
-    },
-    canonical.handler as ToolCallback<Record<string, z.ZodTypeAny>>,
-  );
-}
 
 async function main() {
   const transport = new StdioServerTransport();

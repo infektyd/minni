@@ -8,6 +8,18 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Removed
+
+- **`minni_plan_*` deprecated tool aliases:** the 11 pre-rename aliases
+  (`minni_plan_create` … `minni_plan_deactivate`) registered since the
+  v0.4.0 `minni:plan` → `minni:threads` rename are gone, closing the alias
+  window on schedule ("the release after next"). Call the canonical
+  `minni_thread_*` names; the registered tool count returns to 37. The frozen
+  internals are untouched by design: `plan-` artifact id prefix, `plan_id`
+  param, `plan.*` gate keys, `plan_*` frontmatter, `_active_plan.json`
+  pointer filename, and the `hook_active_plan_error` audit name remain
+  permanent, guarded by the freeze test.
+
 ## [0.4.2] - 2026-08-03
 
 Campaign release: integrity, observability, deploy honesty, and CI trust
