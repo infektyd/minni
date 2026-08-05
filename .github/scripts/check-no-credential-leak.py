@@ -59,7 +59,13 @@ were measured:
   * A separator containing DIGITS (a markdown numbered list) survives every
     collapse, because digits are valid base64 and stripping them would destroy
     the encoding the collapse exists to recover. Eleven other separator
-    classes — including `-`, `_`, `=`, `+`, `/` and bullet lists — are caught. This gate is the last line, not the boundary — the boundary is that
+    classes — including `-`, `_`, `=`, `+`, `/` and bullet lists — are caught.
+  * `runs-joined` only welds fragments that are each at least MIN_B64_RUN long,
+    so a blob split into SHORTER pieces separated by prose is not recovered.
+    Measured: fragments of 22 characters with a sentence between them pass.
+    This is a weaker residual than "chunked character-by-character" implies,
+    and it is an easy instruction for an injection to emit; lowering the join
+    threshold trades it against welding ordinary prose into token shapes. This gate is the last line, not the boundary — the boundary is that
 child-process egress is blocked (verified on Linux) and the blast radius is
 small (short-lived token, collaborator-only triggers, ephemeral runner).
 

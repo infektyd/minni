@@ -175,6 +175,9 @@ jobs:
       - name: Install Grok Build CLI
         env:
           GROK_CLI_VERSION: 0.2.118
+          # Pin the channel where the installer reads it, rather than trying
+          # to verify it after the fact from a cache file that may not exist.
+          GROK_CHANNEL: stable
         run: |
           # PINNED, not latest (SEC-G10). grok-boundary-test.yml's header says
           # the boundary proof must re-run "whenever the sandbox profile, the
@@ -207,12 +210,21 @@ jobs:
             echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"
             exit 1
           fi
-          # The pin comment claims the stable channel; verify rather than assume.
+          # Channel: pinned at the SOURCE via GROK_CHANNEL above, not inferred
+          # from --version. The [stable]/[alpha] suffix is rendered from
+          # ~/.grok/version.json, which is an update-check CACHE that install.sh
+          # never writes — so on a fresh runner $HOME the tag is absent
+          # entirely, and requiring it would have failed every run of all three
+          # workflows. Measured on an isolated HOME: `grok 0.2.118 (1e1687c1cf6a)`
+          # with no suffix. Reject a known-bad tag if one is present; never
+          # require a good one.
           case "$INSTALLED" in
-            *"[stable]"*) : ;;
-            *) echo "::error::expected a stable-channel build, got: $INSTALLED"; exit 1 ;;
+            *"[alpha]"*|*"[enterprise]"*)
+              echo "::error::expected a stable-channel build, got: $INSTALLED"
+              exit 1
+              ;;
           esac
-          echo "grok CLI pinned at $GROK_CLI_VERSION (stable)"
+          echo "grok CLI pinned at $GROK_CLI_VERSION"
 
       - name: Restore Grok subscription auth
         env:
@@ -375,6 +387,17 @@ jobs:
           # --require-auth: this is THE step that decides whether the attack
           # report may be published to a public log. A degraded gate must not
           # clear it (SEC-G12).
+          #
+          # RESIDUAL, stated rather than implied: --require-auth tests that the
+          # auth document yields comparison VALUES, not that they are the real
+          # ones. The adversarial agent runs between the restore step and this
+          # one, so IF the read-only sandbox permits writing
+          # $HOME/.grok/auth.json, a decoy document would restore the
+          # full-coverage claim while the value check compares against the
+          # decoy — making overwrite strictly better for an attacker than
+          # delete. Whether that write is possible is UNVERIFIED; closing it
+          # means pinning a digest of auth.json across the agent step, the way
+          # the gate bytes already are.
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/attack-result.md
 
       - name: Assert egress is actually blocked

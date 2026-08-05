@@ -7,6 +7,7 @@ see, and each one corresponds to a defect that minted a false success.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -730,23 +731,46 @@ def test_publish_gate_requires_a_parsed_auth_file(workflow, reply):
     assert any(call in body for body in bodies), (
         f"{workflow}: publish gate does not pass --require-auth"
     )
+    # A step-level condition would disable the gate in CI while every string
+    # assertion above still passes.
+    gate_steps = [
+        step for job in doc["jobs"].values() for step in job.get("steps") or []
+        if call in _uncommented(str(step.get("run", "")))
+    ]
+    for step in gate_steps:
+        condition = str(step.get("if", "")).strip()
+        assert condition in ("", "steps.resolve.outputs.skip == 'false'"), (
+            f"{workflow}: publish gate carries a condition that could disable "
+            f"it: {condition!r}"
+        )
 
 
 def _extract_version_check(run: str) -> str:
     """The pin-verification shell from an install step, minus the install.
 
-    Everything from the INSTALLED_VERSION derivation onward; `INSTALLED` is
-    supplied by the caller instead of being read off a real binary.
+    Starts at the CAPTURE line, not at the comparison. Slicing from the
+    comparison left the capture untested, so inserting
+    `INSTALLED="grok $GROK_CLI_VERSION ..."` right after it — a tautology that
+    certifies any installed build — passed every assertion here.
     """
-    start = run.index('INSTALLED_VERSION="${INSTALLED#grok }"')
+    start = run.index('INSTALLED=$("$HOME/.grok/bin/grok" --version)')
     return "set -eu\n" + run[start:]
+
+
+def _stub_grok_home(tmp_path: Path, version_output: str) -> Path:
+    """A $HOME whose .grok/bin/grok prints `version_output`."""
+    binary = tmp_path / ".grok" / "bin" / "grok"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(f'#!/bin/sh\nprintf "%s\\n" {shlex.quote(version_output)}\n')
+    binary.chmod(0o755)
+    return tmp_path
 
 
 GROK_CLI_WORKFLOWS = ("grok-review.yml", "grok.yml", "grok-boundary-test.yml")
 
 
 @pytest.mark.parametrize("workflow", GROK_CLI_WORKFLOWS)
-def test_grok_cli_install_is_version_pinned(workflow):
+def test_grok_cli_install_is_version_pinned(workflow, tmp_path):
     """SEC-G10: an unpinned `curl | bash` installs whatever is current at run
     time, so "the CLI version changed" — the axis grok-boundary-test.yml's own
     header says must re-prove the boundary — could never fire its `paths`
@@ -777,14 +801,21 @@ def test_grok_cli_install_is_version_pinned(workflow):
         )
         check = _extract_version_check(run)
         for installed, should_pass in (
+            # No channel tag at all — what a FRESH runner $HOME actually
+            # prints, because the [stable]/[alpha] suffix comes from an
+            # update-check cache install.sh never writes. Requiring the tag
+            # took all three workflows offline; this case pins that lesson.
+            (f"grok {pin} (abc1234)", True),
             (f"grok {pin} (abc1234) [stable]", True),
-            (f"grok {pin}0 (abc1234) [stable]", False),   # X.Y.Z vs X.Y.Z0
-            ("grok 9.9.9 (abc1234) [stable]", False),
+            (f"grok {pin}0 (abc1234)", False),            # X.Y.Z vs X.Y.Z0
+            ("grok 9.9.9 (abc1234)", False),
             (f"grok {pin} (abc1234) [alpha]", False),     # wrong channel
         ):
+            home = _stub_grok_home(tmp_path / installed.replace(" ", "_").replace("/", "_"),
+                                   installed)
             rc = subprocess.run(
                 ["bash", "-c", check],
-                env={"GROK_CLI_VERSION": str(pin), "INSTALLED": installed,
+                env={"GROK_CLI_VERSION": str(pin), "HOME": str(home),
                      "PATH": "/usr/bin:/bin"},
                 capture_output=True, text=True,
             ).returncode

@@ -47,13 +47,19 @@ def test_content_scan_is_not_inside_the_required_file_check():
 
 
 def test_content_check_skips_forks_at_job_level_not_inside_the_step():
-    """A job-level skip is reported by GitHub as `skipped`. An `exit 0` inside
-    the step is reported as SUCCESS — a green tick for a scan that never ran."""
+    """A job-level skip is reported by GitHub as a distinct `skipped`
+    conclusion; an `exit 0` inside the step is reported as SUCCESS. That is
+    reporting honesty, not enforcement — GitHub counts a skipped required check
+    as satisfied, which is why enforcement comes from the needs-edge instead."""
     _, job = _job_containing("FORBIDDEN_CONTENT_PATTERN")
-    condition = str(job.get("if", ""))
-    assert "head.repo.full_name" in condition and "github.repository" in condition, (
-        f"content job has no same-repo guard: {condition!r}"
-    )
+    # EXACT, not a pair of substring checks: flipping `==` to `!=` satisfies
+    # both substrings while inverting enforcement completely — the scan would
+    # then run only on forks, where it hard-fails on the missing secret, and
+    # same-repo PRs would skip it entirely.
+    condition = str(job.get("if", "")).strip()
+    assert condition == (
+        "github.event.pull_request.head.repo.full_name == github.repository"
+    ), f"content job guard is not the same-repo condition: {condition!r}"
 
 
 def test_missing_secret_on_a_same_repo_pr_fails_rather_than_passes():
@@ -83,12 +89,14 @@ def test_the_file_scan_still_runs_on_forks():
     condition = str(job.get("if", "")).strip()
     assert "head.repo" not in condition, "the file scan must not skip forks"
     if job.get("needs"):
+        # `always()` and `!cancelled()` both keep this job running when the
+        # dependency is skipped, which is the property that matters.
         # The fatal combination is `needs` with NO condition: a skipped
         # dependency skips the dependent, so on every fork PR the only
         # protection-required hygiene context would itself be skipped — and
         # GitHub counts a skipped required check as satisfied. Fork PRs would
         # get no file scan and no content scan, silently.
-        assert condition == "always()", (
+        assert condition in ("always()", "${{ !cancelled() }}", "!cancelled()"), (
             f"job depends on {job['needs']} but its condition is {condition!r}; "
             "a skipped dependency would skip the required check itself"
         )
@@ -113,6 +121,18 @@ def test_the_required_check_consumes_the_content_verdict():
         (s for s in files_job["steps"] if "needs." in str(s.get("env", ""))), None
     )
     assert verdict, "no step consumes the content job's result"
+
+    # The subprocess below supplies CONTENT_RESULT itself, so without this the
+    # step could read a hardcoded value — or an unrelated `needs.` expression —
+    # and every execution assertion would still pass while enforcement is off.
+    assert verdict["env"]["CONTENT_RESULT"] == (
+        "${{ needs.forbidden-content.result }}"
+    ), f"verdict step is not bound to the content job: {verdict['env']!r}"
+    # A step-level condition is invisible to an isolated execution: `if: false`
+    # disables enforcement in CI while the test still passes.
+    assert "if" not in verdict, (
+        f"verdict step carries a condition that could disable it: {verdict.get('if')!r}"
+    )
 
     # BEHAVIOURAL, not a grep. Substring assertions on this step say nothing
     # about WHICH branch carries the exit: inverting the case arms reverses

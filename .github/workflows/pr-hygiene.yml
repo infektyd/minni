@@ -21,7 +21,12 @@ jobs:
     # enforces — a content hit would then merge. `always()` is required because
     # a skipped dependency otherwise skips this job too.
     needs: forbidden-content
-    if: always()
+    # NOT the bare default: a skipped dependency skips the dependent, and a
+    # skipped required check counts as SATISFIED — fork PRs would then get no
+    # hygiene gate at all. `!cancelled()` keeps this job running when the
+    # content job is skipped or failed, while letting a genuinely cancelled run
+    # stay cancelled instead of turning every superseded run red.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
