@@ -42,6 +42,14 @@ export interface RecallResponse {
    *  filtered a non-empty candidate set to zero — a scoped ANSWER, not a
    *  miss. isDaemonResultEmpty must treat it as non-empty. */
   auth_suppression?: unknown[];
+  /** R4/R5 (#226): one entry per corpus this recall touched, always present on
+   *  a daemon reply (recall.py response_payload). Declared here because a
+   *  field the renderer never reads is a field the AGENT never sees: an
+   *  FTS-only or half-failed recall arrived looking exactly like a healthy
+   *  hybrid one. formatRecall/formatRecallLean render it. */
+  degradation?: unknown[];
+  /** Roll-up of `degradation[].degraded` — the daemon's own verdict. */
+  degraded?: boolean;
   /** Learnings surface separately from document `results`/`count`; a
    *  learnings-only reply is still a live scoped answer. */
   learnings?: unknown[];
@@ -216,6 +224,14 @@ export const BOOT_RECALL_LAYERS: ReadonlyArray<string> = ["identity", "knowledge
  * inside document `results`. Forwarding only `results` dropped the channel
  * this surface asked for — the same "advertised but dead" class the RPC
  * wire already closed. Keep the document fields AND the episodic channel.
+ *
+ * F1 review round 1: the whitelist dropped `degradation`/`degraded` for
+ * exactly the same reason it once dropped episodic — boot is the AUTOMATIC
+ * recall surface, so a session hydrated from a half-failed or auth-blacked-out
+ * corpus opened looking perfectly healthy, and no one chose to ignore the
+ * warning because no one was shown one. Carried as rendered lines rather than
+ * the raw array, and only when something is actually wrong: the boot envelope
+ * is context-budgeted, and a healthy report is per-corpus noise nobody reads.
  */
 export function buildBootRecallSlice(
   data: RecallResponse,
@@ -228,10 +244,13 @@ export function buildBootRecallSlice(
   agent_origin: string;
   layer: RecallResponse["layer"];
   layers: ReadonlyArray<string>;
+  degraded?: true;
+  degradation_notes?: string[];
 } {
   const episodic = Array.isArray(data.episodic) ? data.episodic : [];
   const episodic_count =
     typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
+  const notes = formatDegradation(data);
   return {
     ok: true,
     results: data.results,
@@ -240,6 +259,7 @@ export function buildBootRecallSlice(
     agent_origin: data.agent_id ?? agentFallback,
     layer: data.layer,
     layers: BOOT_RECALL_LAYERS,
+    ...(notes ? { degraded: true as const, degradation_notes: notes.split("\n") } : {}),
   };
 }
 
@@ -805,6 +825,107 @@ export function formatEpisodic(response: RecallResponse, limit = 5): string | un
   );
 }
 
+/**
+ * The degrade kinds recall.py can put on a `degradation` entry, in the order
+ * they are rendered. Named explicitly rather than "every extra key" so a new
+ * daemon-side field cannot start leaking into the agent's context unreviewed.
+ */
+const DEGRADE_KINDS = [
+  "vector_degraded",
+  "rerank_degraded",
+  "query_expand_degraded",
+  "hyde_degraded",
+  "personal_index_failed",
+  "shared_index_failed",
+  "combined_index_failed",
+] as const;
+
+/**
+ * Render the daemon's per-corpus degrade report (#226 R4/R5).
+ *
+ * The daemon has written `degradation` on every search response since R8, but
+ * nothing on this side read it — so a lexical-only answer, a dead personal
+ * vault, or a failed HyDE leg reached the agent formatted exactly like a
+ * healthy hybrid recall. One line per degraded corpus, no line at all when
+ * everything is healthy (the daemon reports healthy corpora too, and echoing
+ * "all fine" every turn is pure context tax).
+ *
+ * `auth_suppression` gets the same treatment for the same reason: it was
+ * declared here only to keep isDaemonResultEmpty honest, never rendered, so a
+ * corpus blacked out by the read gate looked to the agent like a corpus that
+ * simply had nothing.
+ */
+/**
+ * Render one degrade detail as inert, quoted text.
+ *
+ * These strings are `str(exc)` from THIRD-PARTY provider calls (the rerank,
+ * query-expand and HyDE legs), and this change is what carries them into the
+ * agent's context — including the SessionStart boot envelope, the
+ * highest-trust surface there is. The daemon redacts secrets and paths out of
+ * them; it does not neutralize instructions. Collapse the whitespace so the
+ * line cannot fake a section break, strip backticks so it cannot escape its
+ * own code span, and cap it: a degrade detail is a diagnostic, not a document.
+ */
+function safeLabel(value: string): string {
+  return value.replace(/[`\r\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+function safeDetail(value: string): string {
+  return "`" + value.replace(/[`\r\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120) + "`";
+}
+
+export function formatDegradation(response: RecallResponse): string | undefined {
+  const lines: string[] = [];
+  const entries = Array.isArray(response.degradation) ? response.degradation : [];
+  for (const raw of entries) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    // Truthy, not `=== true`: the daemon rolls this up with Python's `any()`,
+    // so a strict compare here would silently drop an entry that reached the
+    // wire as 1 or a non-empty string and report the corpus as healthy.
+    const kindsPresent = DEGRADE_KINDS.some((kind) => Boolean(entry[kind]));
+    if (!entry.degraded && !kindsPresent) continue;
+    // Name WHICH vault when combined scope fanned out over several: without it
+    // N degraded vaults render as N identical lines and the reader cannot tell
+    // a fleet outage from a duplicated report.
+    const src = typeof entry.src === "string" ? entry.src : "?";
+    const agent = typeof entry.source_agent === "string" ? entry.source_agent : undefined;
+    // Sanitized for the same reason the detail is: a newline in either field
+    // forges a whole extra ⚠ line, and buildBootRecallSlice splits on "\n", so
+    // the forgery becomes its own top-level note in the boot envelope. Both
+    // fields are daemon-controlled and charset-validated today; this line is
+    // what stops that from being load-bearing.
+    const label = safeLabel(agent ? `${src}/${agent}` : src);
+    const kinds = DEGRADE_KINDS.filter((kind) => Boolean(entry[kind])).map((kind) => {
+      const value = entry[kind];
+      // Booleans carry no detail beyond the kind name; the failure strings do,
+      // and it is the detail that tells the agent whether to retry or re-scope.
+      if (typeof value !== "string") return kind;
+      return `${kind} (${safeDetail(value)})`;
+    });
+    lines.push(`⚠ degraded: ${label}: ${kinds.length ? kinds.join("; ") : "unspecified"}`);
+  }
+  const suppressions = Array.isArray(response.auth_suppression) ? response.auth_suppression : [];
+  for (const raw of suppressions) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    const src = safeLabel(typeof entry.src === "string" ? entry.src : "?");
+    const suppressed = typeof entry.suppressed === "number" ? entry.suppressed : undefined;
+    lines.push(
+      `⚠ auth-suppressed: ${src}: ${suppressed ?? "some"} candidate(s) withheld by the read gate`,
+    );
+  }
+  if (lines.length === 0) {
+    // The daemon's own roll-up, honored even when the per-corpus array is
+    // absent or was stripped by an intermediate whitelist. Without this, a
+    // report that loses its detail silently loses the verdict too — which is
+    // the exact failure mode this whole change exists to close.
+    // Truthy here too, for the same reason the per-entry check is.
+    return response.degraded
+      ? "⚠ degraded: the daemon reported a degraded recall with no per-corpus detail"
+      : undefined;
+  }
+  return lines.join("\n");
+}
+
 export function formatRecall(query: string, response: RecallResponse, vaultResults: VaultSearchResult[] = []): string {
   const backendBadge = response.backend ?? response.backend_badge;
   const results = Array.isArray(response.results)
@@ -822,6 +943,9 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     "# Minni Recall",
     `Query: ${query}${backendBadge ? ` [${backendBadge}]` : ""}`,
     provenance ? `Provenance: ${provenance}` : undefined,
+    // Above the results, not below: a caller who stops reading at the first
+    // hit must still have been told the corpus it came from was degraded.
+    formatDegradation(response),
     "## AI Context Pack",
     formatVaultContext(vaultResults),
     daemonLead ? `Daemon lead: ${daemonLead}` : undefined,
@@ -1071,8 +1195,14 @@ export async function recallCrossAgentDegrade(
  *  2. Omits identity-layer "shelf" hits (boot agent-envelopes): those are loaded
  *     once at SessionStart and never change, so re-injecting them every turn is
  *     pure redundancy.
- * Together this roughly halves the per-turn recall payload. SessionStart still
- * uses the full formatRecall so boot/rehydration keeps complete context.
+ * Together this roughly halves the per-turn recall payload.
+ *
+ * STALE CLAIM, corrected in review round 1 of the F1 fix: this describes an
+ * intent, not the wiring. The formatter has no production caller today — the
+ * live UserPromptSubmit path builds a recall pointer (hook-handlers.ts) and
+ * SessionStart uses buildBootRecallSlice, not a formatter. Left in place
+ * because it is exported and tested, but do not read its comments as a
+ * description of what the per-turn surface actually renders.
  */
 export function formatRecallLean(
   query: string,
@@ -1106,6 +1236,13 @@ export function formatRecallLean(
   const sections = [
     "# Recall (lean)",
     `Query: ${query}`,
+    // Lean drops provenance, never health. NOTE (review round 1): this
+    // formatter currently has no production caller — the live UserPromptSubmit
+    // path builds a recall pointer instead (hook-handlers.ts), and boot uses
+    // buildBootRecallSlice. Rendering it here keeps the formatter honest for
+    // whoever picks it up; it does NOT mean the per-turn surface shows
+    // degradation today. See the PR's residuals.
+    formatDegradation(response),
     "## AI Context Pack",
     formatVaultContext(vaultResults),
     lean.length

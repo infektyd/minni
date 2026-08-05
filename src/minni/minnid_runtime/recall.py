@@ -171,7 +171,9 @@ def resolve_backend(backend_param, config=None):
     )
 
 
-def _degradation_for(retrieval_engine: Any, src: str) -> dict:
+def _degradation_for(
+    retrieval_engine: Any, src: str, *, source_agent: Optional[str] = None
+) -> dict:
     """Describe what degraded on one corpus during this request.
 
     R4(a) (#226): the search response carried no ``vector_model`` or
@@ -179,6 +181,12 @@ def _degradation_for(retrieval_engine: Any, src: str) -> dict:
     was unavailable — a lexical-only answer was indistinguishable from a
     healthy hybrid one. Always reported (not only when something is wrong) so
     "the field is absent" can never be mistaken for "nothing degraded".
+
+    ``source_agent`` names WHICH vault this is when the corpus is one of many
+    fanned out by combined scope (review round 2). Without it every vault
+    reports as a bare ``src: "c"``, so N degraded vaults render as N identical
+    lines and the reader cannot tell a fleet outage from a duplicated report —
+    the same ambiguity the per-corpus report exists to remove.
     """
     config = getattr(retrieval_engine, "config", None)
     # Review round 2 on PR #260: read the THREAD-LOCAL per-request verdict, not
@@ -194,19 +202,48 @@ def _degradation_for(retrieval_engine: Any, src: str) -> dict:
         "vector_degraded": vector_down,
         "degraded": vector_down,
     }
-    rerank_degraded = getattr(retrieval_engine, "last_rerank_degraded", None)
-    if rerank_degraded:
-        entry["rerank_degraded"] = rerank_degraded
-        entry["degraded"] = True
-    expand_degraded = getattr(retrieval_engine, "last_query_expand_degraded", None)
-    if expand_degraded:
-        entry["query_expand_degraded"] = expand_degraded
-        entry["degraded"] = True
-    hyde_degraded = getattr(retrieval_engine, "last_hyde_degraded", None)
-    if hyde_degraded:
-        entry["hyde_degraded"] = hyde_degraded
-        entry["degraded"] = True
+    if source_agent:
+        entry["source_agent"] = source_agent
+    # F5 (review round 1): these three flags are set from a raw ``str(exc)`` in
+    # retrieval.py — and the rerank/expand legs do not even truncate it. They
+    # are also the PROVIDER-calling legs, so their exception text is the most
+    # likely to carry a path or an echoed credential. Scrubbing only the
+    # index-failure details left this the open half of the same hole, and it
+    # is now rendered into agent context by the plugin. Redact at the SINK, so
+    # every route onto the wire is covered by one rule.
+    for flag, key in (
+        ("last_rerank_degraded", "rerank_degraded"),
+        ("last_query_expand_degraded", "query_expand_degraded"),
+        ("last_hyde_degraded", "hyde_degraded"),
+    ):
+        value = getattr(retrieval_engine, flag, None)
+        if value:
+            # Only string details need scrubbing; a bare True must stay a bool
+            # rather than become the string "True", which reads as a detail.
+            entry[key] = _degrade_detail(value) if isinstance(value, str) else value
+            entry["degraded"] = True
     return entry
+
+
+def _degrade_detail(message: str) -> str:
+    """Scrub a degrade detail before it goes on the wire.
+
+    Every degrade detail is derived from ``str(exc)`` in a retrieval engine,
+    and those exceptions routinely carry the failing index/db PATH — and, when
+    the failure came out of a provider call, whatever the provider echoed back.
+    The same module already scrubs the trace surface and the durable recall
+    trace; the degrade details bypassed it and shipped raw, and the plugin now
+    renders them into agent context. Redact first, then truncate, so a secret
+    straddling the 400-char boundary cannot survive as a prefix — and so the
+    two flags that reached the wire with no length bound at all are capped.
+
+    Known limit (flagged, not fixed here): ``LOCAL_PATH_PATTERN`` in
+    redaction.py matches only /Users, /Volumes and /private, so a Linux
+    deployment's /home or /var paths still pass through. Widening the shared
+    pattern affects every redaction caller and belongs in its own change.
+    """
+    redacted, _ = redact_text(message)
+    return redacted[:400]
 
 
 def backend_badge(backends: Any) -> str:
@@ -324,11 +361,40 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # scored engines, and a degrade on one of them is not a degrade on all.
         degradations: list = []
 
+        # F4: the shared engine is reached by up to TWO legs in one request —
+        # the personal leg's soft fallback and retrieve_combined's shared tail
+        # — so one shared corpus produced two identical reports and a caller
+        # counting broken corpora read one outage as two.
+        #
+        # Two rejected shapes, both of which review caught as worse than the
+        # bug (this is the third):
+        #  - Deduping the WHOLE report by content collapsed N genuinely
+        #    degraded vaults into one whenever they failed alike, and a dead
+        #    embedder is process-wide, so failing alike is the common case.
+        #  - Letting the FIRST shared leg claim the report and silencing the
+        #    second dropped a second leg whose outcome DIFFERED — leg one
+        #    healthy, leg two throwing, reported as a healthy hybrid recall.
+        #    That is a health overstatement, strictly worse than an over-count.
+        #
+        # So: identity dedupe, scoped to the shared corpus only. Two identical
+        # shared reports are one report; a second shared report that differs is
+        # news and lands. Per-vault entries never enter this path.
+        _shared_seen: dict[str, set] = {"degradation": set(), "auth": set()}
+
+        def record_shared(entry: dict, *, bucket: str, sink: list) -> None:
+            key = json.dumps(entry, sort_keys=True, default=str)
+            if key in _shared_seen[bucket]:
+                return
+            _shared_seen[bucket].add(key)
+            sink.append(entry)
+
         def retrieve_from(
             retrieval_engine,
             *,
             src: str,
             principal_for_documents,
+            shared: bool = False,
+            source_agent: Optional[str] = None,
         ) -> list:
             rows = retrieval_engine.retrieve(
                 query=query,
@@ -353,8 +419,20 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             )
             suppression = getattr(retrieval_engine, "last_auth_suppression", None)
             if suppression:
-                auth_suppressions.append({"src": src, **suppression})
-            degradations.append(_degradation_for(retrieval_engine, src))
+                # Review round 2: the suppression channel had the same
+                # double-report on the same two-leg shared path, and the
+                # plugin now RENDERS it — one blackout of one corpus was
+                # about to be announced to the agent twice.
+                entry = {"src": src, **suppression}
+                if shared:
+                    record_shared(entry, bucket="auth", sink=auth_suppressions)
+                else:
+                    auth_suppressions.append(entry)
+            degradation = _degradation_for(retrieval_engine, src, source_agent=source_agent)
+            if shared:
+                record_shared(degradation, bucket="degradation", sink=degradations)
+            else:
+                degradations.append(degradation)
             return tag_document_results(rows, src=src)
 
         def retrieve_shared() -> list:
@@ -362,6 +440,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 engine,
                 src="c",
                 principal_for_documents=principal,
+                shared=True,
             )
 
         def retrieve_shared_soft() -> list:
@@ -377,7 +456,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             try:
                 return retrieve_shared()
             except Exception as exc:
-                detail = f"shared index failed: {exc}"[:400]
+                detail = _degrade_detail(f"shared index failed: {exc}")
                 context.logger.warning(
                     "search: shared index failed (%s); continuing with partial results",
                     exc,
@@ -393,7 +472,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         "embedding_model",
                         None,
                     )
-                degradations.append(
+                record_shared(
                     {
                         "src": "c",
                         "vector_model": emb_model,
@@ -401,7 +480,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         "degraded": True,
                         "shared_index_failed": detail,
                         "reason": detail,
-                    }
+                    },
+                    bucket="degradation",
+                    sink=degradations,
                 )
                 return []
 
@@ -432,7 +513,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     # the shared fallback could still report degraded:false —
                     # personal memory never ran, response looked healthy.
                     personal_failed = True
-                    detail = f"personal vault index failed: {exc}"[:400]
+                    detail = _degrade_detail(f"personal vault index failed: {exc}")
                     context.logger.warning(
                         "search: personal vault index failed for %s (%s); falling back to shared",
                         agent_id,
@@ -481,13 +562,14 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                             vault_engine,
                             src="c",
                             principal_for_documents=principal,
+                            source_agent=source_agent,
                         )
                     )
                 except Exception as exc:
-                    detail = (
+                    detail = _degrade_detail(
                         f"combined vault index failed"
                         f"{f' ({source_agent})' if source_agent else ''}: {exc}"
-                    )[:400]
+                    )
                     context.logger.warning(
                         "search: combined vault index failed for %s (%s); continuing with partial results",
                         source_agent,
