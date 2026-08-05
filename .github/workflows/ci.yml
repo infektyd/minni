@@ -22,6 +22,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          # This job executes PR-authored code (make setup / pytest); a credential in
+          # .git/config would be readable by it.
+          # Default checkout persists the token into .git/config as an http
+          # extraheader; nothing downstream needs it (the repo is public, so
+          # any git fetch here is anonymous).
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7

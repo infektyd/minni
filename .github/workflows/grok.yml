@@ -106,6 +106,13 @@ jobs:
         with:
           ref: ${{ steps.target.outputs.ref }}
           fetch-depth: 0
+          # See grok-review.yml for the full rationale. Short version: without
+          # this, checkout leaves the installation token in .git/config as an
+          # http extraheader, and the agent that reads this tree has its reply
+          # posted publicly. Nothing downstream needs the persisted credential
+          # — `gh` authenticates from env, and the trust-ref fetch below is
+          # anonymous because the repo is public.
+          persist-credentials: false
 
       - name: Install sandbox prerequisites
         run: |
@@ -133,9 +140,9 @@ jobs:
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
         run: |
-          mkdir -p "$HOME/.grok"
-          printf '%s' "$GROK_CI_AUTH_JSON" | base64 -d > "$HOME/.grok/auth.json"
-          chmod 600 "$HOME/.grok/auth.json"
+          /usr/bin/mkdir -p "$HOME/.grok"
+          printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
+          /usr/bin/chmod 600 "$HOME/.grok/auth.json"
 
       - name: Configure the sandbox profile
         run: |
@@ -148,7 +155,7 @@ jobs:
           # /grok request may want to write: a request that needs writes
           # should fail visibly rather than widen the profile for every run.
           # Written to $HOME, never to .grok/sandbox.toml in the checkout.
-          cat > "$HOME/.grok/sandbox.toml" <<'EOF'
+          /usr/bin/cat > "$HOME/.grok/sandbox.toml" <<'EOF'
           [profiles.ci]
           extends = "read-only"
           restrict_network = true
@@ -167,14 +174,14 @@ jobs:
             echo
             if [ -n "${{ steps.target.outputs.pr }}" ]; then
               echo "## Pull request #$NUM"
-              gh pr view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
+              /usr/bin/gh pr view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
               echo
               echo "## Diff"
-              gh pr diff "$NUM" | head -4000
+              /usr/bin/gh pr diff "$NUM" | /usr/bin/head -4000
               echo
             else
               echo "## Issue #$NUM"
-              gh issue view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
+              /usr/bin/gh issue view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
               echo
             fi
             echo "## Request (the /grok comment)"
@@ -200,7 +207,12 @@ jobs:
           # scanned before it is posted. Do not restate this as "the kernel
           # denies the credential path" — that wording is what produced the
           # earlier deny-rule mistakes.
-          grok --prompt-file /tmp/grok-prompt.md \
+          # Model and effort pinned per operator model ladder — CI must not
+          # float on service defaults. Low volume (collaborator-only, one
+          # metered run per deliberate /grok), so HIGH costs little here.
+          "$HOME/.grok/bin/grok" --prompt-file /tmp/grok-prompt.md \
+            --model grok-4.5 \
+            --reasoning-effort high \
             --always-approve \
             --no-subagents \
             --max-turns 60 \
@@ -257,9 +269,9 @@ jobs:
         run: |
           NUM="${{ github.event.issue.number || github.event.pull_request.number }}"
           {
-            cat /tmp/grok-reply.md
+            /usr/bin/cat /tmp/grok-reply.md
             echo
             echo "---"
             echo "_Grok Build (headless) via \`grok --single\` · [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_"
           } > /tmp/grok-comment.md
-          gh issue comment "$NUM" --repo "${{ github.repository }}" --body-file /tmp/grok-comment.md
+          /usr/bin/gh issue comment "$NUM" --repo "${{ github.repository }}" --body-file /tmp/grok-comment.md
