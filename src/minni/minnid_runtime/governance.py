@@ -57,6 +57,43 @@ class ResolveRejected(Exception):
         self.response = response
 
 
+# #290: ``auto_accept_own`` is OPERATOR CONFIGURATION, read from
+# principals/<id>.json. It is never read from wire params, and a caller that
+# supplies it is refused rather than ignored.
+#
+# Refused for EVERY principal, operator included. A principal check would be
+# weaker for no benefit: config that can travel over the wire is config an agent
+# can reach the moment it obtains — or is mistaken for — a privileged stamp, and
+# this particular knob turns the -32004 self-approval gate off. Governance
+# config moves by filesystem/console only.
+#
+# Refusing loudly rather than silently dropping the key keeps the attempt
+# visible: a silent ignore looks identical to a working bypass from the caller's
+# side, and leaves nothing in the log for an audit to find.
+AUTO_ACCEPT_PARAM_KEYS = ("auto_accept_own", "learn.auto_accept_own")
+
+
+def reject_wire_supplied_auto_accept(
+    params: dict, request_id: Any, context: "GovernanceContext"
+) -> Optional[dict]:
+    """Return an error response if a caller tried to set the #290 knob."""
+    for key in AUTO_ACCEPT_PARAM_KEYS:
+        if key in params:
+            context.logger.warning(
+                "AUTO_ACCEPT_KNOB_REFUSED key=%s (wire-supplied governance config; "
+                "the knob is operator-set in principals/<id>.json) (G15 audit)",
+                key,
+            )
+            return context.make_error(
+                -32004,
+                f"operator_only: '{key}' is operator configuration and cannot be "
+                "supplied by a caller; set auto_accept_own in "
+                "principals/<id>.json (filesystem/console only)",
+                request_id,
+            )
+    return None
+
+
 def extract_assertion(content: str) -> str:
     content = content.strip()
     if len(content) <= 120:
@@ -90,6 +127,10 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()
+
+    refusal = reject_wire_supplied_auto_accept(params, request_id, context)
+    if refusal is not None:
+        return refusal
 
     content = params.get("content", "")
     if not content:
@@ -556,8 +597,49 @@ def handle_log_event(params: dict, request_id: Any, context: GovernanceContext) 
         return context.make_error(-32000, f"Log event error: {exc}", request_id)
 
 
+def auto_accept_blockers(content: str, instruction_like: bool) -> list[str]:
+    """Reasons to WITHHOLD #290 auto-acceptance. Empty list == eligible.
+
+    The floor reuses the repo's existing structural gate rather than inventing a
+    score: ``consolidation._quality_blockers`` already describes itself as "reasons
+    to WITHHOLD auto-promotion (the candidate is routed to review, never silently
+    dropped)", which is exactly this decision. Two safety rules from the manual
+    accept path join it:
+
+      * instruction_like — ``resolve_candidate`` refuses to accept flagged content
+        without an explicit ``accept_flagged`` capability. Auto-accept must not
+        become the way around that gate, so flagged content falls back to
+        proposed and a human still sees it.
+      * minimum length — consolidation's own auto-promotion floor; a three-word
+        fragment is not a durable learning.
+
+    Withheld means the candidate stays ``proposed`` for a human. It is never
+    dropped, so the operator loses nothing by opting in.
+    """
+    # Cheap import: consolidation pulls only stdlib + minni.safety.
+    from minni.afm_passes.consolidation import _MIN_CONTENT_LEN, _quality_blockers
+
+    reasons: list[str] = []
+    if instruction_like:
+        reasons.append("instruction_like")
+    if len((content or "").strip()) < _MIN_CONTENT_LEN:
+        reasons.append("below minimum content length")
+    reasons.extend(_quality_blockers(content))
+    return reasons
+
+
 def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -> dict:
-    """Stage a candidate packet. No durable learning write."""
+    """Stage a candidate packet.
+
+    Normally no durable learning write. #290: when the OPERATOR has opted this
+    principal in via principals/<id>.json, the candidate the caller just staged
+    is promoted to accepted in the same transaction, stamped so an audit can
+    tell auto-acceptance from a human resolve.
+    """
+    refusal = reject_wire_supplied_auto_accept(params, request_id, context)
+    if refusal is not None:
+        return refusal
+
     principal, err = context.handler_principal(params, request_id)
     if err:
         return err
@@ -607,9 +689,27 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     else:
         stored_privacy = "review"
 
+    # #290: decided BEFORE the write so the promotion lands in the SAME
+    # transaction as the insert. A half-applied promotion — learning written,
+    # candidate still 'proposed' — would be accepted a second time by a later
+    # manual resolve and double-write the learning.
+    #
+    # Read from the STAMPED principal only. `params` was already refused above if
+    # it carried the knob, so there is no path from the wire to this decision.
+    #
+    # Note the privacy clamp above is deliberately NOT an additional gate here.
+    # It stamps 'review' because "learn-only callers are not trusted to create
+    # auto-promotable rows" — and this knob is precisely the operator lifting
+    # that distrust for one principal's own candidates. Gating on it would make
+    # the knob a no-op for exactly the principals it exists to serve.
+    withheld = auto_accept_blockers(stored_content, bool(instr))
+    auto_accept = bool(getattr(principal, "auto_accept_own", False)) and not withheld
+    resolved_by = f"auto_accept_own({principal.agent_id})"
+
     try:
         db = context.lazy_writeback().db
-        with db.cursor() as c:
+        lid = None
+        with db.transaction() as c:
             c.execute(
                 """
                 INSERT INTO candidate_packets
@@ -630,20 +730,74 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 ),
             )
             cid = c.lastrowid
-        context.logger.info(
-            "G16 stage_candidate #%d principal=%s privacy=%s (proposal-first, no durable learn yet)",
-            cid, principal.agent_id, stored_privacy,
-        )
-        return context.make_response(
-            {
-                "status": "proposed",
-                "candidate_id": cid,
-                "principal": principal.agent_id,
-                "workspace_id": ws,
-                "privacy_level": stored_privacy,
-            },
-            request_id,
-        )
+            if auto_accept:
+                # 'general' mirrors resolve_candidate: a candidate accepted by
+                # hand lands in the same category, so auto and manual
+                # acceptance of the SAME candidate cannot diverge.
+                c.execute(
+                    """
+                    INSERT INTO learnings
+                    (agent_id, category, content, created_at)
+                    VALUES (?, 'general', ?, ?)
+                    """,
+                    (principal.agent_id, stored_content, now),
+                )
+                lid = c.lastrowid
+                c.execute(
+                    """
+                    UPDATE candidate_packets
+                    SET status='accepted', resolved_at=?, resolved_by=?,
+                        resolution_reason=?
+                    WHERE candidate_id=?
+                    """,
+                    (
+                        now,
+                        resolved_by,
+                        "auto_accept_own: operator-enabled auto-acceptance of the "
+                        "principal's own candidate (#290)",
+                        cid,
+                    ),
+                )
+
+        if lid is not None:
+            # An unindexed durable learning is not recallable, which would make
+            # the feature look like it worked while delivering nothing.
+            context.index_durable_learning(
+                principal.agent_id, stored_content, key=f"learning:{lid}", db=db,
+            )
+            context.logger.warning(
+                "AUTO_ACCEPT_OWN candidate=%s learning=%s principal=%s "
+                "(operator-enabled; resolved_by=%s) (G15 audit)",
+                cid, lid, principal.agent_id, resolved_by,
+            )
+        else:
+            if getattr(principal, "auto_accept_own", False):
+                # Observable, not silent: the operator enabled the knob and this
+                # candidate still needs a human. Saying why is the difference
+                # between "withheld" and "quietly broken".
+                context.logger.warning(
+                    "AUTO_ACCEPT_OWN_WITHHELD candidate=%s principal=%s reasons=%s "
+                    "(routed to review, not dropped) (G15 audit)",
+                    cid, principal.agent_id, ",".join(withheld),
+                )
+            context.logger.info(
+                "G16 stage_candidate #%d principal=%s privacy=%s (proposal-first, no durable learn yet)",
+                cid, principal.agent_id, stored_privacy,
+            )
+
+        result = {
+            "status": "accepted" if lid is not None else "proposed",
+            "candidate_id": cid,
+            "principal": principal.agent_id,
+            "workspace_id": ws,
+            "privacy_level": stored_privacy,
+        }
+        if lid is not None:
+            result["learning_id"] = lid
+            result["resolved_by"] = resolved_by
+        elif withheld and getattr(principal, "auto_accept_own", False):
+            result["auto_accept_withheld"] = withheld
+        return context.make_response(result, request_id)
     except Exception as exc:
         context.logger.exception("stage_candidate failed")
         return context.make_error(-32000, f"stage_candidate error: {exc}", request_id)

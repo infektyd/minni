@@ -95,6 +95,16 @@ class EffectivePrincipal:
     transport: str = "uds"
     capabilities: List[str] = field(default_factory=lambda: ["*"])
     allowed_vault_roots: List[str] = field(default_factory=list)
+    # #290: operator opt-in — this principal's OWN learn candidates resolve to
+    # accepted at store time instead of waiting in the proposed queue.
+    #
+    # Deliberately NOT a capability. A capability grant would also unlock
+    # resolve_candidate(accept), letting the agent self-approve ANY of its
+    # candidates by hand; this grants only the narrow automatic path, and only
+    # for the candidate the same call just staged. It defaults False everywhere
+    # — synthesized principals, default-deny stamps, and platform agents — so
+    # an operator opts in explicitly or not at all.
+    auto_accept_own: bool = False
     # Why the resolver default-denied this stamp (None for capable principals):
     # "unknown_identity"  — supplied non-reserved id with no principals/<id>.json
     # "reserved_agent_id" — wire claim of an operator-reserved id ("main"/"operator")
@@ -227,6 +237,7 @@ def _principal_from_raw(
         transport=transport,
         capabilities=list(raw.get("capabilities", ["*"])),
         allowed_vault_roots=norm_roots,
+        auto_accept_own=bool(raw.get("auto_accept_own", False)),
     )
 
 
@@ -574,6 +585,15 @@ def resolve_effective_principal(
                         resolved_roots = list(_PLATFORM_NO_ROOTS)
             else:
                 resolved_roots = _default_platform_roots(supplied)
+            # #290: per-agent opt-in ONLY. Deliberately does not fall back to
+            # the operator file's top-level auto_accept_own — a hosted or
+            # temporary agent must never inherit the operator's grant, which is
+            # the same rule platform_agent_capabilities already applies to caps.
+            platform_auto = raw.get("platform_agent_auto_accept_own") or {}
+            platform_auto_map = (
+                platform_auto if isinstance(platform_auto, dict) else {}
+            )
+            resolved_auto = bool(platform_auto_map.get(supplied, False))
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(
@@ -583,6 +603,7 @@ def resolve_effective_principal(
                 transport=transport,
                 capabilities=list(resolved_caps),
                 allowed_vault_roots=resolved_roots,
+                auto_accept_own=resolved_auto,
             )
 
     # Check legacy aliases declared across ALL principal files that exist (union).
