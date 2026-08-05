@@ -1197,10 +1197,10 @@ export function createHookHandlers(
       ),
     ]);
     // SEC-006 (found during #283 review): searchVaultNotes returns every
-    // match regardless of privacy level — only `filterSafeVaultResults` (not
-    // yet applied here) keeps `local-only`/`private` notes and privacy-
-    // heuristic escalations (secrets/tokens/paths, see task.ts
-    // privacyForSource) out of the model-facing recall pointer, the
+    // match regardless of privacy level — only `filterSafeVaultResults`
+    // keeps `local-only`/`private` notes and privacy-heuristic escalations
+    // (secrets/tokens/paths, see task.ts privacyForSource) out of the
+    // model-facing recall pointer, the
     // persisted recall-state top_hits, and the PreToolUse guard's deny-
     // reason text (all three read from `strong`/`vaultResults` below). This
     // filter existed in claude-code's pre-#283 hook.ts but was never ported
