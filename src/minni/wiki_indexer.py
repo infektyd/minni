@@ -461,7 +461,10 @@ class WikiIndexer:
 
                         # Encode + store
                         if self.model:
-                            emb = self.model.encode(chunk.text)
+                            from minni.models import get_embedder_lock
+
+                            with get_embedder_lock():
+                                emb = self.model.encode(chunk.text, show_progress_bar=False)
                             emb_bytes = emb.astype("float32").tobytes()
 
                             c.execute(

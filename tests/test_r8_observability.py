@@ -287,7 +287,7 @@ def test_rerank_failure_is_recorded_not_swallowed(tmp_path, monkeypatch):
     engine = _engine_without_model(tmp_path, monkeypatch)
 
     class _ExplodingReranker:
-        def predict(self, pairs):
+        def predict(self, pairs, **kwargs):
             raise RuntimeError("reranker died")
 
     engine._reranker = _ExplodingReranker()
@@ -2122,7 +2122,7 @@ def test_encode_query_encode_raise_keeps_vector_down_and_empty_vector(
     import minni.retrieval as retrieval_mod
 
     class _BoomModel:
-        def encode(self, query):
+        def encode(self, query, **kwargs):
             raise RuntimeError("OOM during encode")
 
     boom = _BoomModel()

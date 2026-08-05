@@ -27,7 +27,7 @@ def test_semantic_merge_is_opt_in_and_merges_adjacent_same_heading(monkeypatch):
     assert len(base_chunks) == 2
 
     class FakeEmbedder:
-        def encode(self, value):
+        def encode(self, value, **kwargs):
             if "epsilon" in value:
                 return np.array([1.0, 0.01, 0.0, 0.0], dtype=np.float32)
             return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -55,7 +55,7 @@ def test_semantic_merge_respects_max_tokens(monkeypatch):
     from minni.config import SovereignConfig
 
     class FakeEmbedder:
-        def encode(self, value):
+        def encode(self, value, **kwargs):
             return np.ones(4, dtype=np.float32)
 
     monkeypatch.setattr(chunker_mod, "get_embedder", lambda: FakeEmbedder(), raising=False)

@@ -16,17 +16,30 @@ Usage:
 
 Both functions are safe to call from multiple threads; functools.cache
 provides the lock-free singleton guarantee after the first call completes.
+
+Inference is NOT thread-safe on these shared instances: callers must hold
+get_embedder_lock() / get_cross_encoder_lock() / get_attribution_lock()
+around .encode() / .predict(). See issue #284 (MPS allocator leak under
+concurrent unlocked encode on Apple Silicon).
 """
 
 import functools
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
+from typing import Optional
 
 from minni.config import DEFAULT_CONFIG
 
 logger = logging.getLogger("sovereign.models")
+
+# One lock per singleton so unrelated models can still run concurrently;
+# only same-model encode/predict calls serialize (#284).
+_EMBEDDER_LOCK = threading.Lock()
+_CROSS_ENCODER_LOCK = threading.Lock()
+_ATTRIBUTION_LOCK = threading.Lock()
 
 # Packaging-only first-run visibility (PACKAGING_PLAN.md §3, approved hook):
 # sentence-transformers downloads model weights silently on first use, which
@@ -37,6 +50,39 @@ _APPROX_SIZES = {
     "reranker": "~90 MB",
     "attribution": "~140 MB",
 }
+
+
+def get_embedder_lock() -> threading.Lock:
+    """Lock guarding encode() on the process-wide embedder singleton."""
+    return _EMBEDDER_LOCK
+
+
+def get_cross_encoder_lock() -> threading.Lock:
+    """Lock guarding predict() on the process-wide reranker singleton."""
+    return _CROSS_ENCODER_LOCK
+
+
+def get_attribution_lock() -> threading.Lock:
+    """Lock guarding predict() on the process-wide attribution singleton."""
+    return _ATTRIBUTION_LOCK
+
+
+def _resolve_model_device() -> Optional[str]:
+    """Device for ST constructors, or None to omit device= (library auto-select).
+
+    Reads the live env first so minnid's ``setdefault("MINNI_MODEL_DEVICE",
+    "cpu")`` in main() wins even though DEFAULT_CONFIG was snapshotted at
+    import. Empty/unset → None → no ``device=`` kwarg (indexer/backfill keep
+    MPS auto-select). Explicit ``mps``/``cuda``/``cpu`` always honored.
+    """
+    raw = (os.environ.get("MINNI_MODEL_DEVICE") or "").strip()
+    if raw:
+        return raw
+    cfg = getattr(DEFAULT_CONFIG, "model_device", None)
+    if cfg is None:
+        return None
+    cfg_s = str(cfg).strip()
+    return cfg_s or None
 
 
 def _announce_download_once(model_name: str, role: str) -> None:
@@ -76,8 +122,16 @@ def get_embedder():
     try:
         from sentence_transformers import SentenceTransformer
         _announce_download_once(DEFAULT_CONFIG.embedding_model, "embedding")
-        model = SentenceTransformer(DEFAULT_CONFIG.embedding_model)
-        logger.info("Embedding model loaded (singleton): %s", DEFAULT_CONFIG.embedding_model)
+        device = _resolve_model_device()
+        kwargs = {}
+        if device is not None:
+            kwargs["device"] = device
+        model = SentenceTransformer(DEFAULT_CONFIG.embedding_model, **kwargs)
+        logger.info(
+            "Embedding model loaded (singleton): %s device=%s",
+            DEFAULT_CONFIG.embedding_model,
+            device if device is not None else "auto",
+        )
         return model
     except ImportError:
         logger.warning(
@@ -103,8 +157,16 @@ def get_cross_encoder():
     try:
         from sentence_transformers import CrossEncoder
         _announce_download_once(DEFAULT_CONFIG.reranker_model, "reranker")
-        model = CrossEncoder(DEFAULT_CONFIG.reranker_model)
-        logger.info("Cross-encoder loaded (singleton): %s", DEFAULT_CONFIG.reranker_model)
+        device = _resolve_model_device()
+        kwargs = {}
+        if device is not None:
+            kwargs["device"] = device
+        model = CrossEncoder(DEFAULT_CONFIG.reranker_model, **kwargs)
+        logger.info(
+            "Cross-encoder loaded (singleton): %s device=%s",
+            DEFAULT_CONFIG.reranker_model,
+            device if device is not None else "auto",
+        )
         return model
     except ImportError:
         logger.warning(
@@ -130,8 +192,16 @@ def get_attribution_cross_encoder():
     try:
         from sentence_transformers import CrossEncoder
         _announce_download_once(DEFAULT_CONFIG.attribution_model, "attribution")
-        model = CrossEncoder(DEFAULT_CONFIG.attribution_model)
-        logger.info("Attribution cross-encoder loaded (singleton): %s", DEFAULT_CONFIG.attribution_model)
+        device = _resolve_model_device()
+        kwargs = {}
+        if device is not None:
+            kwargs["device"] = device
+        model = CrossEncoder(DEFAULT_CONFIG.attribution_model, **kwargs)
+        logger.info(
+            "Attribution cross-encoder loaded (singleton): %s device=%s",
+            DEFAULT_CONFIG.attribution_model,
+            device if device is not None else "auto",
+        )
         return model
     except ImportError:
         logger.warning(

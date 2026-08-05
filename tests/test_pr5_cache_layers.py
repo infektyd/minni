@@ -101,7 +101,7 @@ class CountingReranker:
     def __init__(self):
         self.calls = 0
 
-    def predict(self, pairs):
+    def predict(self, pairs, **kwargs):
         self.calls += 1
         return [float(len(pairs) - i) for i, _ in enumerate(pairs)]
 

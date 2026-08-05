@@ -251,7 +251,10 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
     emb_bytes = None
     if getattr(wb, "model", None):
         try:
-            emb = wb.model.encode(content).astype(np.float32)
+            from minni.models import get_embedder_lock
+
+            with get_embedder_lock():
+                emb = wb.model.encode(content, show_progress_bar=False).astype(np.float32)
             emb_bytes = emb.tobytes()
         except Exception as exc:
             context.logger.warning("consolidation: embedding failed (%s) - storing without", exc)

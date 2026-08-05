@@ -529,7 +529,13 @@ class RetrievalEngine:
         if model is None:
             return None
         try:
-            raw = model.predict([(str(evidence_text or ""), claim_text)])
+            from minni.models import get_attribution_lock
+
+            with get_attribution_lock():
+                raw = model.predict(
+                    [(str(evidence_text or ""), claim_text)],
+                    show_progress_bar=False,
+                )
         except Exception as exc:  # noqa: BLE001 - recall degrades when NLI is unavailable.
             logger.debug("attribution scoring skipped: %s", exc)
             return None
@@ -1008,7 +1014,12 @@ class RetrievalEngine:
                     ]
                 for chunk in chunks:
                     try:
-                        emb = self.model.encode(chunk.text).astype(np.float32)
+                        from minni.models import get_embedder_lock
+
+                        with get_embedder_lock():
+                            emb = self.model.encode(
+                                chunk.text, show_progress_bar=False
+                            ).astype(np.float32)
                     except Exception as exc:
                         logger.warning(
                             "durable-index: embed failed for doc %r chunk %s "
@@ -1413,7 +1424,10 @@ class RetrievalEngine:
             pairs.append([query, passage])
 
         try:
-            scores = reranker.predict(pairs)
+            from minni.models import get_cross_encoder_lock
+
+            with get_cross_encoder_lock():
+                scores = reranker.predict(pairs, show_progress_bar=False)
 
             for score_index, c, score_value in zip(missing_indexes, missing, scores):
                 score = float(score_value)
@@ -1935,7 +1949,10 @@ class RetrievalEngine:
         # health reading "encoder up" and hard-failed the request instead of
         # FTS-only degrade with last_vector_degraded set (R4(b) throw path).
         try:
-            vec = self.model.encode(query).astype(np.float32)
+            from minni.models import get_embedder_lock
+
+            with get_embedder_lock():
+                vec = self.model.encode(query, show_progress_bar=False).astype(np.float32)
         except Exception as exc:
             if not self.vector_model_down:
                 logger.warning(

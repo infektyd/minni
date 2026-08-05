@@ -446,7 +446,10 @@ class MarkdownChunker:
 
     @staticmethod
     def _encode_for_merge(embedder, text: str) -> np.ndarray:
-        vec = embedder.encode(text)
+        from minni.models import get_embedder_lock
+
+        with get_embedder_lock():
+            vec = embedder.encode(text, show_progress_bar=False)
         return np.asarray(vec, dtype=np.float32)
 
     @staticmethod

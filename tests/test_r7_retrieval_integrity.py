@@ -399,7 +399,7 @@ class TestCalibrationActivationIsObservable:
 class _StubEmbedder:
     """Deterministic encoder — the backfill only needs a vector, not a good one."""
 
-    def encode(self, text):
+    def encode(self, text, **kwargs):
         import numpy as np
 
         vec = np.zeros(384, dtype="float32")
@@ -1011,7 +1011,7 @@ class TestLayerStamping:
         from minni.vault_index import vault_index_paths
 
         class _FakeEmbedder:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 import numpy as np
 
                 vec = np.zeros(384, dtype="float32")
@@ -1103,7 +1103,7 @@ class TestLayerStamping:
         from minni.wiki_indexer import WikiIndexer
 
         class _FakeEmbedder:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 import numpy as np
 
                 vec = np.zeros(384, dtype="float32")
@@ -1153,7 +1153,7 @@ class TestLayerStamping:
         from minni.wiki_indexer import WikiIndexer
 
         class _FakeEmbedder:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 import numpy as np
 
                 vec = np.zeros(384, dtype="float32")
@@ -1532,7 +1532,7 @@ class TestDecayRerankParity:
         engine, _db, _cfg = _make_engine(tmp_path)
 
         class _StubReranker:
-            def predict(self, pairs):
+            def predict(self, pairs, **kwargs):
                 return [1.0] * len(pairs)
 
         # `reranker` is a lazy singleton property with no setter; seed its
@@ -1589,7 +1589,7 @@ class TestDecayIsAppliedOnce:
         engine, _db, _cfg = _make_engine(tmp_path)
 
         class _StubReranker:
-            def predict(self, pairs):
+            def predict(self, pairs, **kwargs):
                 return [2.0] * len(pairs)
 
         engine._reranker = _StubReranker()
@@ -1654,7 +1654,7 @@ class TestDecayIsAppliedOnce:
         monkeypatch.setattr(minnid, "_retrieval", engine)
 
         class _StubReranker:
-            def predict(self, pairs):
+            def predict(self, pairs, **kwargs):
                 return [2.0] * len(pairs)
 
         engine._reranker = _StubReranker()
@@ -1853,7 +1853,7 @@ class TestShortDocumentBackfill:
 class _PoisonEmbedder:
     """Raises for poison content — the permanent-encode-failure shape."""
 
-    def encode(self, text):
+    def encode(self, text, **kwargs):
         import numpy as np
 
         if "POISONROW" in text:

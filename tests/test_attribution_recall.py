@@ -20,7 +20,7 @@ def test_attribution_scoring_skips_model_without_claim():
     engine = _engine_for_attribution()
 
     class ExplodingModel:
-        def predict(self, _pairs):
+        def predict(self, _pairs, **kwargs):
             raise AssertionError("attribution model should not be called without a claim")
 
     engine._attribution_model = ExplodingModel()
@@ -33,7 +33,7 @@ def test_attribution_scoring_uses_nli_cross_encoder_for_claim():
     engine = _engine_for_attribution()
 
     class FakeNLI:
-        def predict(self, pairs):
+        def predict(self, pairs, **kwargs):
             assert pairs == [("Evidence says Paris is in France.", "Paris is in France.")]
             return [[0.01, 3.0, 0.02]]
 
@@ -51,7 +51,7 @@ def test_attribution_config_flag_disables_scoring():
     engine.config.attribution_enabled = False
 
     class ExplodingModel:
-        def predict(self, _pairs):
+        def predict(self, _pairs, **kwargs):
             raise AssertionError("disabled attribution must not call the model")
 
     engine._attribution_model = ExplodingModel()

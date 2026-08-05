@@ -118,8 +118,11 @@ class WriteBackMemory:
         # Embed the learning for semantic search
         emb_bytes = None
         if self.model:
+            from minni.models import get_embedder_lock
+
             np = _numpy()
-            emb = self.model.encode(content).astype(np.float32)
+            with get_embedder_lock():
+                emb = self.model.encode(content, show_progress_bar=False).astype(np.float32)
             emb_bytes = emb.tobytes()
 
         with self.db.cursor() as c:
@@ -351,8 +354,11 @@ class WriteBackMemory:
         if not self.model:
             return []
 
+        from minni.models import get_embedder_lock
+
         np = _numpy()
-        query_emb = self.model.encode(query).astype(np.float32)
+        with get_embedder_lock():
+            query_emb = self.model.encode(query, show_progress_bar=False).astype(np.float32)
         query_norm = np.linalg.norm(query_emb)
         if query_norm < 1e-8:
             return []
@@ -503,7 +509,12 @@ created: {dt.isoformat()}
         )
 
         try:
-            query_emb = self.model.encode(content_or_assertion).astype(np.float32)
+            from minni.models import get_embedder_lock
+
+            with get_embedder_lock():
+                query_emb = self.model.encode(
+                    content_or_assertion, show_progress_bar=False
+                ).astype(np.float32)
         except Exception as exc:
             logger.warning(
                 "detect_contradictions: failed to embed assertion (%s) — skipping detection",
