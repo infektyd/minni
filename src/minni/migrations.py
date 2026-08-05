@@ -389,6 +389,11 @@ def _apply_migration_018_episodic_fts_backfill(conn: sqlite3.Connection) -> None
     # why the retry lives elsewhere: minnid._backfill_sweep_once calls
     # reconcile_episodic_fts on every periodic pass, so a transient failure (a
     # locked DB on a contended start) self-heals instead of being abandoned.
+    #
+    # Consequence worth stating: MINNI_BACKFILL=off disables that sweep, and so
+    # silently removes the ONLY retry channel for this repair. On such an
+    # install a failed 018 is permanent, and episodic_index_ratio in the health
+    # report is the only thing that will say so.
     try:
         result = reconcile_episodic_fts(conn)
     except Exception:

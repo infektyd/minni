@@ -3565,6 +3565,86 @@ class TestEpisodicFtsBackfill:
         assert coverage["episodic_index_ratio"] == 0.0
         db_obj.close()
 
+    def test_a_failed_sweep_reconcile_releases_the_write_lock(self, tmp_path):
+        """The rollback on the sweep's failure path is load-bearing, not tidy
+        housekeeping. reconcile_episodic_fts writes before it can fail, and
+        _get_conn() opts out of db.cursor()'s auto-commit, so without the
+        rollback a mid-INSERT failure leaves an open write transaction holding
+        the lock until the next sweep — MINNI_BACKFILL_INTERVAL is 3600s by
+        default. Every other daemon writer blocks for that whole window."""
+        import sqlite3
+
+        import minni.episodic as episodic_mod
+        import minni.minnid as minnid
+
+        db_obj, cfg = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        conn.execute("DELETE FROM episodic_fts")
+        conn.commit()
+
+        def _write_then_fail(c):
+            # Writes first, exactly as the real reconcile does, so the rollback
+            # has something to undo and the open transaction is real.
+            c.execute(
+                "INSERT INTO episodic_fts(event_id, agent_id, content)"
+                " VALUES (424242, 'claude-code', 'half-written row')"
+            )
+            raise sqlite3.OperationalError("disk I/O error mid-backfill")
+
+        from minni.db import SovereignDB
+
+        monkey_cfg = minnid.DEFAULT_CONFIG
+        shared_original = SovereignDB.shared
+        episodic_original = episodic_mod.reconcile_episodic_fts
+        minnid.DEFAULT_CONFIG = cfg
+        episodic_mod.reconcile_episodic_fts = _write_then_fail
+        SovereignDB.shared = staticmethod(lambda *a, **k: db_obj)
+        try:
+            # The sweep records the failure rather than propagating it.
+            results = minnid._backfill_sweep_once()
+        finally:
+            episodic_mod.reconcile_episodic_fts = episodic_original
+            SovereignDB.shared = shared_original
+            minnid.DEFAULT_CONFIG = monkey_cfg
+
+        assert "error" in results["episodic_fts"], "the failure must be reported"
+        assert conn.in_transaction is False, (
+            "the failed sweep left an open write transaction — it holds the "
+            "write lock until the next sweep (3600s by default)"
+        )
+
+        other = sqlite3.connect(cfg.db_path, timeout=5)
+        try:
+            # The half-written row must be gone, and the lock released.
+            assert other.execute(
+                "SELECT COUNT(*) FROM episodic_fts WHERE episodic_fts MATCH 'half'"
+            ).fetchone()[0] == 0, "the partial write must be rolled back"
+            other.execute(
+                "INSERT INTO episodic_events"
+                " (agent_id, event_type, content, created_at)"
+                " VALUES ('probe', 'message', 'writer probe', 1.0)"
+            )
+            other.commit()
+        finally:
+            other.close()
+        db_obj.close()
+
+    def test_empty_episodic_log_reports_no_ratio_not_perfect_coverage(self, tmp_path):
+        """None, not 1.0. Claiming perfect coverage over zero rows is the
+        health-signal overstatement this whole field exists to remove — the
+        same rule _ratio applies to documents and learnings."""
+        from minni.backfill import episodic_index_coverage
+
+        db_obj, _ = _make_db(tmp_path)
+
+        coverage = episodic_index_coverage(db_obj)
+        assert coverage["episodic_events_total"] == 0
+        assert coverage["episodic_index_ratio"] is None, (
+            "an empty episodic log has no coverage to report; 1.0 would claim "
+            "perfect coverage over nothing"
+        )
+        db_obj.close()
+
     def test_coverage_counts_every_agent(self, tmp_path):
         """The metric is machine-wide, not per-agent. Every fixture above uses a
         single agent, which made the whole agent dimension structurally

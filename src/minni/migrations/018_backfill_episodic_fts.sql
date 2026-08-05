@@ -38,6 +38,8 @@
 -- repair is never retried BY MIGRATIONS. The retry lives in
 -- minnid._backfill_sweep_once, which calls reconcile_episodic_fts on every
 -- periodic backfill pass — that is what makes a transient failure self-heal.
+-- Note the coupling: MINNI_BACKFILL=off disables that sweep and therefore
+-- silently removes the only retry channel this repair has.
 --
 -- Deliberately one-directional. episodic_fts also holds orphan rows whose
 -- events have been deleted (7 on the operator's DB — cleanup_expired removes
