@@ -53,12 +53,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no such database: {args.db}", file=sys.stderr)
         return 2
 
-    conn = sqlite3.connect(args.db)
+    # 30s to match SovereignDB: the default --db IS the live database, so
+    # contending with minnid is the expected case, not an exception.
+    try:
+        conn = sqlite3.connect(args.db, timeout=30.0)
+    except sqlite3.OperationalError as exc:
+        print(f"cannot open {args.db}: {exc}", file=sys.stderr)
+        return 3
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
         before = count_orphaned_afm_review(cursor)
-        queue = proposed_queue_stats(cursor, stale_after_days=args.stale_after_days)
+        # The queue report is advisory. It must never be able to block the
+        # drain it is printed next to — a single unparseable timestamp used to
+        # take the whole reconcile down with a traceback before it superseded
+        # anything.
+        try:
+            queue = proposed_queue_stats(cursor, stale_after_days=args.stale_after_days)
+        except Exception as exc:
+            queue = {"status": "unknown", "error": type(exc).__name__, "detail": str(exc)}
         result = reconcile_orphaned_afm_review(cursor, dry_run=not args.apply)
         if args.apply:
             conn.commit()
@@ -68,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
             "proposed_queue": queue,
             **result,
         }
+    except sqlite3.OperationalError as exc:
+        print(f"database error: {exc}", file=sys.stderr)
+        return 3
     finally:
         conn.close()
 

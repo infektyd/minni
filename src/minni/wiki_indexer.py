@@ -369,10 +369,17 @@ class WikiIndexer:
                         # is the normal plan lifecycle, and leaving the old row
                         # keeps a finished plan recallable (H6).
                         if row:
+                            # Payload only — deleting the row would CASCADE
+                            # memory_links and mint a new doc_id on the way
+                            # back (accepted -> complete -> accepted is a
+                            # normal plan round trip).
                             doc_id = row["doc_id"]
                             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
-                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                            c.execute(
+                                "UPDATE documents SET page_status=? WHERE doc_id=?",
+                                (page.frontmatter.status, doc_id),
+                            )
                             stats["excluded_purged"] = stats.get("excluded_purged", 0) + 1
                         continue
 

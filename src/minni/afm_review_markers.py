@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import sqlite3
 import time
+
+from minni.timestamps import parse_epoch_or_report
 from typing import Any, Dict, Optional
 
 # A marker is active until it is explicitly superseded. NULL/'' count as
@@ -164,6 +166,7 @@ def proposed_queue_stats(cursor: Any, *, stale_after_days: float = 14.0) -> Dict
         "depth": 0,
         "oldest_age_days": None,
         "stale": 0,
+        "unparseable_proposed_at": 0,
         "stale_after_days": stale_after_days,
     }
     now = time.time()
@@ -180,17 +183,34 @@ def proposed_queue_stats(cursor: Any, *, stale_after_days: float = 14.0) -> Dict
     if not row or not row[0]:
         return empty
     depth = int(row[0])
-    oldest: Optional[float] = None
-    if row[1] is not None:
-        oldest = max((now - float(row[1])) / 86400.0, 0.0)
+
+    # REAL is an affinity, not a constraint: a non-numeric string stays TEXT.
+    # float() on one raised ValueError straight out of the operator drain
+    # (which reports before it reconciles), and `proposed_at < ?` never
+    # matches a TEXT row because SQLite sorts text above every number — so a
+    # poisoned timestamp both crashed the drain and hid staleness. Read the
+    # ages in Python through the same parser the indexers use, and count the
+    # unparseable ones instead of dropping them.
     cursor.execute(
-        "SELECT COUNT(*) FROM candidate_packets WHERE status = ? AND proposed_at < ?",
-        (PENDING_STATUS, now - stale_after_days * 86400.0),
+        "SELECT proposed_at FROM candidate_packets WHERE status = ?",
+        (PENDING_STATUS,),
     )
-    stale_row = cursor.fetchone()
+    ages: list[float] = []
+    unparseable = 0
+    for (raw,) in cursor.fetchall():
+        parsed = parse_epoch_or_report(
+            raw, field="proposed_at", source="afm_review_markers.proposed_queue_stats",
+        )
+        if parsed is None:
+            unparseable += 1
+            continue
+        ages.append(max((now - float(parsed)) / 86400.0, 0.0))
+
+    stale_days = stale_after_days
     return {
         "depth": depth,
-        "oldest_age_days": oldest,
-        "stale": int(stale_row[0]) if stale_row else 0,
+        "oldest_age_days": max(ages) if ages else None,
+        "stale": sum(1 for age in ages if age > stale_days),
+        "unparseable_proposed_at": unparseable,
         "stale_after_days": stale_after_days,
     }

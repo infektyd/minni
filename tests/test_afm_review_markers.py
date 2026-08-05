@@ -18,6 +18,7 @@ in it. A fictional fixture is how a query against a non-existent column ships.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -448,6 +449,14 @@ def test_reconcile_cli_defaults_to_dry_run(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
 
+    # Pin the FLAG itself, not only the absence of a write: the commit guard
+    # also suppresses the write, so asserting "still pending" alone let a
+    # mutant that flips the default to --apply pass unnoticed.
+    report = json.loads(proc.stdout)
+    assert report["dry_run"] is True
+    assert report["would_supersede"] == 1
+    assert report["superseded"] == 0
+
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     status = conn.execute(
@@ -492,3 +501,89 @@ def test_reconcile_cli_applies_when_asked(tmp_path):
     ).fetchone()["status"]
     conn.close()
     assert status == "superseded"
+
+
+# ── round 2: poisoned timestamps must not crash or hide staleness ──────────
+
+
+def test_a_text_proposed_at_does_not_crash_the_report():
+    """REAL is an affinity, not a constraint: a non-numeric string stays TEXT.
+    float() on one raised straight out of the operator drain, which reports
+    before it reconciles — so one poisoned row disarmed the whole drain.
+
+    An ISO string is recovered (parse_epoch_or_report understands it); only a
+    genuinely unreadable value is counted separately, never silently dropped.
+    """
+    conn = _conn()
+    _candidate(conn, 1, "proposed", age_days=40.0)
+    conn.execute(
+        "UPDATE candidate_packets SET proposed_at='banana' WHERE candidate_id=1"
+    )
+    _candidate(conn, 2, "proposed", age_days=30.0)
+
+    stats = proposed_queue_stats(conn.cursor(), stale_after_days=14.0)
+
+    assert stats["depth"] == 2, "an unreadable row is still IN the queue"
+    assert stats["unparseable_proposed_at"] == 1
+    assert stats["stale"] == 1
+    assert stats["oldest_age_days"] == pytest.approx(30.0, abs=0.1)
+
+
+def test_an_iso_proposed_at_is_recovered_not_discarded():
+    """SQLite sorts TEXT above every number, so `proposed_at < ?` never
+    matched a TEXT row — an ISO-stamped candidate could never read as stale."""
+    conn = _conn()
+    _candidate(conn, 1, "proposed", age_days=0.0)
+    conn.execute(
+        "UPDATE candidate_packets SET proposed_at='2020-01-01T00:00:00Z' WHERE candidate_id=1"
+    )
+
+    stats = proposed_queue_stats(conn.cursor(), stale_after_days=14.0)
+
+    assert stats["unparseable_proposed_at"] == 0
+    assert stats["stale"] == 1
+    assert stats["oldest_age_days"] > 365
+
+
+def test_a_poisoned_timestamp_does_not_disarm_the_drain(tmp_path):
+    """End-to-end through the CLI: the queue report is advisory and must never
+    block the reconcile printed next to it."""
+    from minni.migrations import run_migrations
+
+    db_path = tmp_path / "poison.db"
+    conn = sqlite3.connect(db_path)
+    run_migrations(conn)
+    conn.execute(
+        """INSERT INTO candidate_packets
+           (candidate_id, principal, content, status, proposed_at)
+           VALUES (1, 'test', 'c', 'proposed', '2026-01-01T00:00:00Z')"""
+    )
+    conn.execute(
+        """INSERT INTO candidate_packets
+           (candidate_id, principal, content, status, proposed_at)
+           VALUES (2, 'test', 'c', 'accepted', ?)""",
+        (time.time(),),
+    )
+    conn.execute(
+        """INSERT INTO consolidation_actions
+           (action_type, claim, category, status, created_at)
+           VALUES ('afm_review', '2', 'general', 'pending', ?)""",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "reconcile_afm_review.py"),
+         "--db", str(db_path), "--apply"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    status = conn.execute(
+        "SELECT status FROM consolidation_actions WHERE claim='2'"
+    ).fetchone()["status"]
+    conn.close()
+    assert status == "superseded", "the orphan must still be drained"

@@ -598,18 +598,37 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 config=context.default_config,
             )
         except Exception as exc:
-            lifecycle["afm_dead_letter_error"] = type(exc).__name__
+            # Replace the sub-dict rather than adding a sibling key: leaving
+            # the zero-valued default in place meant a scan that never ran
+            # read as "0 files", which is the health overstatement this block
+            # exists to remove. Mirrors the inbox_quarantine precedent above.
+            lifecycle["afm_dead_letter"] = {
+                "files": None,
+                "oldest_age_days": None,
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
         try:
             from minni.afm_review_markers import (
                 count_orphaned_afm_review,
                 proposed_queue_stats,
             )
 
-            with context.sovereign_db(context.default_config).cursor() as c:
+            # `db` is already open in this scope (line ~383) and closed in
+            # the finally below — opening a second SovereignDB here re-ran
+            # PRAGMA journal_mode=WAL on every health call for nothing.
+            with db.cursor() as c:
                 lifecycle["afm_review_orphans"] = count_orphaned_afm_review(c)
                 lifecycle["proposed_queue"] = proposed_queue_stats(c)
         except Exception as exc:
-            lifecycle["queue_error"] = type(exc).__name__
+            lifecycle["afm_review_orphans"] = None
+            lifecycle["proposed_queue"] = {
+                "depth": None,
+                "oldest_age_days": None,
+                "stale": None,
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
         report["memory_lifecycle"] = lifecycle
 
         try:

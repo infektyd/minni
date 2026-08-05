@@ -7,6 +7,7 @@ Follows the test_inbox_ingest.py / test_inbox_archive.py harness pattern
 """
 
 import json
+import sqlite3
 import os
 import sys
 from datetime import datetime, timezone
@@ -580,18 +581,75 @@ def test_afm_loop_drains_the_dead_letter_and_increments_its_counter(tmp_path, mo
         obs.METRICS.reset()
 
 
-def test_health_report_surfaces_the_memory_lifecycle_queues(tmp_path, monkeypatch):
-    """M4/M5 (#229): each queue must appear on a health surface. The live
-    dead-letter backlog in particular is only visible BEFORE it is drained."""
-    import minni.config as cfg_mod
-    import minni.minnid as minnid
-    from minni.principal import EffectivePrincipal
+def _real_lifecycle_db(tmp_path, monkeypatch):
+    """A REAL migrated DB behind the health handler.
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    The _FakeCursor used by the quarantine tests returns a dict from
+    fetchone(), so count_orphaned_afm_review raised KeyError and the queue
+    half of the block never actually ran — every assertion about it was
+    vacuous, and mutants hard-coding the counts survived.
+    """
+    import minni.config as cfg_mod
+    import minni.db as db_mod
+    import minni.minnid as minnid
+
+    # Build via SovereignDB, not raw run_migrations: health_report reads
+    # columns the full initializer creates (contradicts_id and friends), so a
+    # migrations-only fixture degrades the whole report and hides the block
+    # under test.
+    db_path = tmp_path / "health.db"
+    cfg = cfg_mod.SovereignConfig(
+        db_path=str(db_path),
+        vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        faiss_index_path=str(tmp_path / "f.faiss"),
+        writeback_enabled=False,
+    )
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        seed = db_mod.SovereignDB(cfg)
+        seed._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+    with seed.cursor() as c:
+        c.execute(
+            """INSERT INTO candidate_packets
+               (candidate_id, principal, content, status, proposed_at)
+               VALUES (1, 'test', 'c', 'proposed', ?)""",
+            (_time.time() - 40 * 86400,),
+        )
+        c.execute(
+            """INSERT INTO candidate_packets
+               (candidate_id, principal, content, status, proposed_at)
+               VALUES (2, 'test', 'c', 'accepted', ?)""",
+            (_time.time(),),
+        )
+        c.execute(
+            """INSERT INTO consolidation_actions
+               (action_type, claim, category, status, created_at)
+               VALUES ('afm_review', '2', 'general', 'pending', ?)""",
+            (_time.time(),),
+        )
+    seed.close()
+
+    monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "db_path", str(db_path), raising=False)
     monkeypatch.setattr(
         cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
     )
+    monkeypatch.setattr(db_mod, "_migrations_run", False, raising=False)
+    monkeypatch.setattr(minnid, "SovereignDB", db_mod.SovereignDB)
+    return db_path
 
+
+def test_health_report_surfaces_the_memory_lifecycle_queues(tmp_path, monkeypatch):
+    """M4/M5 (#229): each queue must appear on a health surface with a REAL
+    count — the live dead-letter backlog is only visible before it is drained,
+    and an orphaned fence is only visible if the DB half actually runs."""
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
     inbox = tmp_path / "unknown-vault" / "inbox"
     _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
     _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0)
@@ -602,19 +660,19 @@ def test_health_report_surfaces_the_memory_lifecycle_queues(tmp_path, monkeypatc
     ml = rep["memory_lifecycle"]
     assert ml["afm_dead_letter"]["files"] == 2, ml
     assert ml["afm_dead_letter"]["oldest_age_days"] >= 60.0, ml
+    assert ml["afm_review_orphans"] == 1, ml
+    assert ml["proposed_queue"]["depth"] == 1, ml
+    assert ml["proposed_queue"]["stale"] == 1, ml
 
 
-def test_memory_lifecycle_block_keeps_its_shape_when_it_degrades(tmp_path, monkeypatch):
-    """A consumer reading memory_lifecycle["proposed_queue"]["depth"] must not
-    KeyError just because the scan failed."""
-    import minni.config as cfg_mod
+def test_memory_lifecycle_reports_unknown_rather_than_a_healthy_zero(tmp_path, monkeypatch):
+    """A scan that never ran must not read as '0 files' / 'depth 0'. Leaving
+    the zero-valued default in place is the overstatement this block exists
+    to remove."""
     import minni.minnid as minnid
     from minni.principal import EffectivePrincipal
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
-    monkeypatch.setattr(
-        cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
-    )
+    _real_lifecycle_db(tmp_path, monkeypatch)
 
     def _boom(*a, **k):
         raise RuntimeError("scan failed")
@@ -626,12 +684,12 @@ def test_memory_lifecycle_block_keeps_its_shape_when_it_degrades(tmp_path, monke
     op = EffectivePrincipal(agent_id="main", capabilities=["*"])
     rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
 
-    ml = rep["memory_lifecycle"]
-    assert ml["afm_dead_letter_error"] == "RuntimeError"
-    # The sub-scans fail independently: a broken filesystem scan must not
-    # blank out the queue depths, and the default shape survives either way.
-    assert ml["proposed_queue"]["depth"] == 0
-    assert ml["afm_dead_letter"]["files"] == 0
+    dead = rep["memory_lifecycle"]["afm_dead_letter"]
+    assert dead["status"] == "unknown"
+    assert dead["error"] == "RuntimeError"
+    assert dead["files"] is None, "a failed scan must not report zero files"
+    # The independent DB half still succeeded.
+    assert rep["memory_lifecycle"]["afm_review_orphans"] == 1
 
 
 def test_memory_lifecycle_block_reports_no_paths(tmp_path, monkeypatch):
@@ -639,14 +697,10 @@ def test_memory_lifecycle_block_reports_no_paths(tmp_path, monkeypatch):
     _HEALTH_REPORT_SENSITIVE_KEYS, so it must never carry a filesystem path."""
     import json as _json
 
-    import minni.config as cfg_mod
     import minni.minnid as minnid
     from minni.principal import EffectivePrincipal
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
-    monkeypatch.setattr(
-        cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
-    )
+    _real_lifecycle_db(tmp_path, monkeypatch)
     inbox = tmp_path / "unknown-vault" / "inbox"
     _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
 
@@ -656,3 +710,75 @@ def test_memory_lifecycle_block_reports_no_paths(tmp_path, monkeypatch):
     blob = _json.dumps(rep["memory_lifecycle"])
     assert str(tmp_path) not in blob
     assert "afm-pruning" not in blob
+
+
+def test_a_corrupt_dead_letter_file_is_counted_and_drainable(tmp_path):
+    """Both writers do a non-atomic read-modify-write on the same dated file,
+    so a crash mid-write leaves a truncated payload. Skipping those made them
+    invisible to the count AND undrainable — permanently stuck, which is the
+    exact class this drain exists to remove."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    good = _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0)
+    truncated = inbox / "afm-drafts-2026-01-02.json"
+    truncated.write_text('{"pass_name": "drafts", "dra', encoding="utf-8")
+    listish = inbox / "afm-pruning-2026-01-03.json"
+    listish.write_text("[]", encoding="utf-8")
+    for p in (truncated, listish):
+        old = _time.time() - 61 * 86400
+        os.utime(p, (old, old))
+
+    stats = count_afm_dead_letter([inbox])
+    assert stats["files"] == 3, stats
+    assert stats["unreadable"] == 2, stats
+
+    result = quarantine_afm_dead_letter(None, [inbox], dry_run=False)
+    assert result["quarantined"] == 3
+    assert not list(inbox.glob("*.json")), "nothing may be left stuck"
+    assert good.name in {p.name for p in _moved(inbox)}
+
+    reasons = {
+        json.loads(s.read_text())["reason"]
+        for s in (inbox / "quarantine").glob("*.reason.json")
+    }
+    assert reasons == {"_afm_dead_letter", "_afm_dead_letter_unreadable"}
+
+
+def test_a_different_afm_prefixed_writer_is_left_alone(tmp_path):
+    """Scoped to the two NAMES, not to the `afm-` prefix: a future afm-* writer
+    that does have a reader must not be swept up by this drain."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-handoffs-2026-01-01.json", age_days=61.0)
+
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+    assert count_afm_dead_letter([inbox])["files"] == 0
+    assert list(inbox.glob("afm-handoffs-*.json"))
+
+
+def test_a_corrupt_non_afm_file_is_still_left_alone(tmp_path):
+    """Claiming unreadable files must not widen the drain past the two names."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    other = inbox / "some-other-writer-2026-01-01.json"
+    other.write_text('{"truncated', encoding="utf-8")
+    old = _time.time() - 61 * 86400
+    os.utime(other, (old, old))
+
+    assert count_afm_dead_letter([inbox])["files"] == 0
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+    assert other.exists()

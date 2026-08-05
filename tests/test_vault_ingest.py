@@ -617,7 +617,13 @@ def test_completing_an_indexed_plan_retracts_it_from_recall(tmp_path, monkeypatc
 
     assert second["excluded"] == 1
     assert second["excluded_purged"] == 1
-    assert not any("plan-abc" in r["path"] for r in _doc_rows(index_db))
+    # The row survives (doc_id identity + wikilinks); the searchable payload
+    # does not, and recall filters the status.
+    with sqlite3.connect(index_db) as conn:
+        fts = conn.execute(
+            "SELECT COUNT(*) FROM vault_fts WHERE path LIKE '%plan-abc%'"
+        ).fetchone()[0]
+    assert fts == 0
 
 
 def test_genuinely_invalid_frontmatter_is_still_rejected(tmp_path, monkeypatch):
@@ -686,3 +692,114 @@ def test_hygiene_accepts_the_terminal_plan_status(tmp_path):
         if "Unknown status" in f.get("message", "")
     ]
     assert unknown == []
+
+
+def test_excluding_preserves_doc_identity_and_wikilinks(tmp_path, monkeypatch):
+    """Retract the payload, not the row. Deleting the documents row CASCADEs
+    memory_links away and mints a new doc_id on the way back — and
+    accepted -> complete -> accepted is a normal plan round trip, so every
+    inbound wikilink and stored doc_id reference would dangle permanently."""
+    from minni.afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    plan = vault / "wiki" / "plan-abc.md"
+    _write_status_page(plan, "Plan", "accepted")
+    _write_page(vault / "wiki" / "note.md", "Note", _long_body("note", link="[[plan-abc]]"))
+
+    first = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+    index_db = Path(first["index_db_path"])
+
+    def _doc_id(path_fragment):
+        with sqlite3.connect(index_db) as conn:
+            conn.row_factory = sqlite3.Row
+            for r in conn.execute("SELECT doc_id, path FROM documents"):
+                if path_fragment in r["path"]:
+                    return r["doc_id"]
+        return None
+
+    def _links():
+        with sqlite3.connect(index_db) as conn:
+            return conn.execute("SELECT COUNT(*) FROM memory_links").fetchone()[0]
+
+    plan_id = _doc_id("plan-abc")
+    assert plan_id is not None
+    assert _links() >= 1, "fixture must produce a wikilink edge"
+
+    time.sleep(0.01)
+    _write_status_page(plan, "Plan", "complete")
+    second = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    assert second["excluded_purged"] == 1
+    assert _doc_id("plan-abc") == plan_id, "doc_id identity must survive exclusion"
+    assert _links() >= 1, "memory_links must not be CASCADE-deleted"
+
+
+def test_excluded_page_is_not_recallable_even_though_its_row_survives(tmp_path, monkeypatch):
+    """Keeping the row moves the H6 guarantee to recall, so recall has to
+    actually filter it."""
+    from minni.afm_passes.vault_ingest import run
+    from minni.wiki_indexer import WikiFrontmatter
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    plan = vault / "wiki" / "plan-abc.md"
+    _write_status_page(plan, "Plan", "accepted")
+    run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    time.sleep(0.01)
+    _write_status_page(plan, "Plan", "complete")
+    result = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    with sqlite3.connect(Path(result["index_db_path"])) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT page_status FROM documents WHERE path LIKE '%plan-abc%'"
+        ).fetchone()
+        fts = conn.execute(
+            "SELECT COUNT(*) FROM vault_fts WHERE path LIKE '%plan-abc%'"
+        ).fetchone()[0]
+
+    assert row["page_status"] in WikiFrontmatter.EXCLUDED_STATUSES
+    assert fts == 0, "the searchable payload must be gone"
+
+
+def test_index_wiki_retracts_and_does_not_conflate(tmp_path, monkeypatch):
+    """The WikiIndexer path needs its own pins: the retraction and the
+    rejected/errors split were only covered in the vault_ingest mirror."""
+    from minni.wiki_indexer import WikiIndexer
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    plan = vault / "wiki" / "plan-abc.md"
+    _write_status_page(plan, "Plan", "accepted")
+    _write_status_page(vault / "wiki" / "junk.md", "Junk", "banana")
+
+    indexer = WikiIndexer(shared_db, cfg)
+    indexer.index_wiki(str(vault / "wiki"))
+
+    with shared_db.cursor() as c:
+        c.execute("SELECT doc_id FROM documents WHERE path LIKE '%plan-abc%'")
+        before = c.fetchone()[0]
+
+    time.sleep(0.01)
+    _write_status_page(plan, "Plan", "complete")
+    stats = indexer.index_wiki(str(vault / "wiki"))
+
+    assert stats["excluded"] == 1
+    assert stats["excluded_purged"] == 1
+    assert stats["rejected"] == 1, "the malformed page is still refused"
+    assert stats["errors"] == 0, "a refusal is not an error"
+
+    with shared_db.cursor() as c:
+        c.execute("SELECT doc_id, page_status FROM documents WHERE path LIKE '%plan-abc%'")
+        row = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM vault_fts WHERE doc_id = ?", (before,))
+        fts = c.fetchone()[0]
+
+    assert row[0] == before, "doc_id identity must survive"
+    assert row[1] == "complete"
+    assert fts == 0
