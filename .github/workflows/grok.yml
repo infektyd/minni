@@ -287,6 +287,12 @@ jobs:
           # Model and effort pinned per operator model ladder — CI must not
           # float on service defaults. Low volume (collaborator-only, one
           # metered run per deliberate /grok), so HIGH costs little here.
+          # An empty-but-set XAI_API_KEY makes the CLI select ApiKey auth and
+          # fail 401 even when auth.json holds a valid credential (measured:
+          # "Auth: ApiKey ... Bad credentials" with XAI_API_KEY=""). GitHub
+          # expands a missing secret to "" but still exports the variable, so
+          # OAuth-only operation would break. Review finding 1 on #350.
+          if [ -z "${XAI_API_KEY:-}" ]; then unset XAI_API_KEY; fi
           "$HOME/.grok/bin/grok" --prompt-file /tmp/grok-prompt.md \
             --model grok-4.5 \
             --reasoning-effort high \
@@ -301,6 +307,7 @@ jobs:
 
       - name: Fail closed on credential leakage
         env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           # The DEFAULT branch, never github.base_ref: the base of a PR is
           # chosen by its author, so anchoring trust there lets someone push a
           # branch carrying a neutered gate and open a PR into it — the gate
@@ -342,6 +349,24 @@ jobs:
           # empty GROK_CI_AUTH_JSON yields a successful-looking restore and an
           # unparseable auth.json. Without this the gate quietly degrades to
           # shape-only and still reports a pass (SEC-G12).
+          # Re-materialize the needle set from the secret AFTER the agent ran
+          # (review finding 2 on #350): the agent can potentially rewrite
+          # auth.json (the read-only-profile write block is a stated
+          # UNVERIFIED residual), and a swapped file desyncs the gate's value
+          # needles from the live key — which has no shape-check backstop the
+          # way JWT-shaped OAuth tokens do. Same shape guard as the restore
+          # step; skipped entirely in OAuth mode, where the restored blob is
+          # already the live credential.
+          if [ -n "${XAI_API_KEY:-}" ]; then
+            case "$XAI_API_KEY" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::XAI_API_KEY contains characters outside [A-Za-z0-9._-]; refusing to rebuild the needle set."
+                exit 1
+                ;;
+            esac
+            printf '{"xai_api_key": "%s"}' "$XAI_API_KEY" > "$HOME/.grok/auth.json"
+            /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          fi
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
 
       - name: Post reply
