@@ -69,7 +69,7 @@ test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async
       "utf8",
     );
 
-    const snippets = await resolveInboxHandoffContext(root, [
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(root, [
       {
         slug: "auth-handoff",
         filePath: path.join(root, "inbox", "auth.json"),
@@ -84,6 +84,7 @@ test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async
     assert.equal(snippets.length, 1);
     assert.equal(snippets[0].ref, "wiki/decisions/auth-migration");
     assert.match(snippets[0].snippet, /short-lived credential exchange/);
+    assert.equal(withheldCount, 0, "#340: nothing was privacy-gated, so withheldCount must be 0");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -113,7 +114,7 @@ test("#312: resolveInboxHandoffContext never surfaces a privacy:private note's b
       "utf8",
     );
 
-    const snippets = await resolveInboxHandoffContext(root, [
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(root, [
       {
         slug: "mixed-handoff",
         filePath: path.join(root, "inbox", "mixed.json"),
@@ -137,6 +138,11 @@ test("#312: resolveInboxHandoffContext never surfaces a privacy:private note's b
     assert.ok(
       !snippets.some((s) => /CONFIDENTIAL/.test(s.snippet)),
       "SEC (#312): the private note's body text must never appear in any returned snippet",
+    );
+    assert.equal(
+      withheldCount,
+      1,
+      "#340: exactly one ref (the private note) was withheld, and it must be counted without naming it",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -169,7 +175,7 @@ test("#312: a leading blank line before the frontmatter delimiter must not bypas
       await writeFile(path.join(decisionDir, `${name}.md`), body, "utf8");
     }
 
-    const snippets = await resolveInboxHandoffContext(root, [
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(root, [
       {
         slug: "leadnl-handoff",
         filePath: path.join(root, "inbox", "leadnl.json"),
@@ -185,6 +191,11 @@ test("#312: a leading blank line before the frontmatter delimiter must not bypas
       snippets.length,
       0,
       "SEC (#312): every case declares privacy: private in frontmatter — none may resolve, regardless of leading whitespace/BOM/CRLF noise before the delimiter",
+    );
+    assert.equal(
+      withheldCount,
+      3,
+      "#340: all three privacy-gated refs must be counted as withheld, not silently dropped",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -214,7 +225,7 @@ test("#312: heuristic-only privacy (no frontmatter declaration) still gates a ha
       "utf8",
     );
 
-    const snippets = await resolveInboxHandoffContext(root, [
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(root, [
       {
         slug: "heuristic-handoff",
         filePath: path.join(root, "inbox", "heuristic.json"),
@@ -238,6 +249,109 @@ test("#312: heuristic-only privacy (no frontmatter declaration) still gates a ha
     assert.ok(
       !snippets.some((s) => /api_key/.test(s.snippet)),
       "SEC (#312): the heuristically-blocked note's body text must never appear in any returned snippet",
+    );
+    assert.equal(withheldCount, 1, "#340: the heuristically-gated ref must be counted as withheld");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#340: withheldCount does not double-count the same note referenced under multiple spellings", async () => {
+  // Adversarial review finding: the ref-dedup Set stored the RAW string,
+  // but normalizeWikilinkRef (applied inside resolveVaultRef) strips
+  // "[[ ]]", "|alias", ".md", and a leading "/" — so "wiki/x",
+  // "[[wiki/x]]", "wiki/x.md", and "[[wiki/x|Alias]]" all name the SAME
+  // note but landed as four distinct Set entries, each independently
+  // resolved and each incrementing withheldCount. One gated note reported
+  // as 4 withheld — a wrong number published to the model-facing envelope,
+  // worse than the original silent-empty gap since it looked authoritative.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-dedup-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "one-gated-note.md"),
+      "---\ntitle: One Gated Note\nprivacy: private\n---\n\nBoot priming marker phrase, CONFIDENTIAL-340-DEDUP body text.",
+      "utf8",
+    );
+
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(root, [
+      {
+        slug: "dedup-handoff",
+        filePath: path.join(root, "inbox", "dedup.json"),
+        createdAt: "2026-04-26T00:00:00.000Z",
+        payload: {
+          kind: "handoff",
+          wikilink_refs: [
+            "wiki/decisions/one-gated-note",
+            "[[wiki/decisions/one-gated-note]]",
+            "wiki/decisions/one-gated-note.md",
+            "[[wiki/decisions/one-gated-note|Alias]]",
+          ],
+        },
+      },
+    ]);
+
+    assert.equal(snippets.length, 0);
+    assert.equal(
+      withheldCount,
+      1,
+      `#340: four spellings of the SAME note must count as one withheld, not ${withheldCount}`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#340: a gated ref beyond the snippet limit still increments withheldCount", async () => {
+  // Adversarial review finding: the old loop broke out entirely once
+  // snippets.length reached `limit`, so a gated ref that would only be
+  // reached AFTER 8 safe refs already filled the snippet array was never
+  // even looked at — withheldCount silently stayed 0, the exact false
+  // all-clear this field exists to prevent, just relocated past the limit.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-limit-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    for (let i = 0; i < 8; i++) {
+      await writeFile(
+        path.join(decisionDir, `safe-${i}.md`),
+        `---\ntitle: Safe ${i}\nprivacy: safe\n---\n\nBoot priming marker phrase ${i}.`,
+        "utf8",
+      );
+    }
+    await writeFile(
+      path.join(decisionDir, "gated-past-limit.md"),
+      "---\ntitle: Gated Past Limit\nprivacy: private\n---\n\nBoot priming marker phrase, CONFIDENTIAL-340-LIMIT body text.",
+      "utf8",
+    );
+
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(
+      root,
+      [
+        {
+          slug: "limit-handoff",
+          filePath: path.join(root, "inbox", "limit.json"),
+          createdAt: "2026-04-26T00:00:00.000Z",
+          payload: {
+            kind: "handoff",
+            wikilink_refs: [
+              ...Array.from({ length: 8 }, (_, i) => `wiki/decisions/safe-${i}`),
+              "wiki/decisions/gated-past-limit",
+            ],
+          },
+        },
+      ],
+      8, // limit
+    );
+
+    assert.equal(snippets.length, 8, "the snippet cap of 8 must still be honored");
+    assert.equal(
+      withheldCount,
+      1,
+      "#340: the gated ref must still be counted even though it was reached after the snippet limit filled up",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -512,11 +626,16 @@ test("resolveInboxHandoffContext and search reject symlink escape from vault (RC
         wikilink_refs: ["evil", "[[evil]]"],
       },
     };
-    const snippets = await resolveInboxHandoffContext(root, [fakeHandoff], 8);
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(root, [fakeHandoff], 8);
     assert.equal(
       snippets.length,
       0,
       "escaped symlink must not resolve to content",
+    );
+    assert.equal(
+      withheldCount,
+      0,
+      "#340: a containment reject is ABSENT, not privacy-WITHHELD — must not be counted as withheld",
     );
 
     // via search (uses listMarkdownFiles which guards)

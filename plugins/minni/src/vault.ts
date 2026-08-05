@@ -2305,10 +2305,20 @@ export function assertWriteTargetUnder(targetPath: string, rootPath: string): vo
   }
 }
 
+// #340: a ref that resolves to a real file but is privacy-gated must be
+// distinguishable from a ref that never resolved at all (broken link,
+// outside the vault, genuinely absent) — resolveInboxHandoffContext below
+// needs to count the former without resolveVaultRef leaking WHICH ref or
+// WHY it was withheld (that stays fail-closed/silent, same as #312).
+type ResolvedVaultRef =
+  | { status: "resolved"; snippet: HandoffContextSnippet }
+  | { status: "withheld" }
+  | { status: "absent" };
+
 async function resolveVaultRef(
   vaultPath: string,
   ref: string,
-): Promise<HandoffContextSnippet | undefined> {
+): Promise<ResolvedVaultRef> {
   const normalized = normalizeWikilinkRef(ref);
   const candidates = [
     path.join(vaultPath, `${normalized}.md`),
@@ -2338,48 +2348,82 @@ async function resolveVaultRef(
       };
       if (filterSafeVaultResults([candidate]).length === 0) {
         // Fail closed exactly like a containment reject below: this ref
-        // resolves to a real file, but it's not safe to surface, so it's
-        // treated as unresolved — same silent-omission precedent #308 set
-        // for vault_matches (H2 concern considered and rejected there: this
-        // is the system correctly declining to show content it was never
-        // entitled to show, not a degraded/error state masquerading as
-        // clean).
-        continue;
+        // resolves to a real file, but it's not safe to surface, so its
+        // BODY/PATH/REASON are still never returned — only the fact that
+        // one withholding happened is countable by the caller (#340).
+        return { status: "withheld" };
       }
       return {
-        ref: normalized,
-        relativePath,
-        notePath,
-        snippet: candidate.snippet,
+        status: "resolved",
+        snippet: {
+          ref: normalized,
+          relativePath,
+          notePath,
+          snippet: candidate.snippet,
+        },
       };
     } catch {
       // try the next (or containment reject -> fail closed, treat as absent)
     }
   }
-  return undefined;
+  return { status: "absent" };
+}
+
+export interface InboxHandoffContext {
+  snippets: HandoffContextSnippet[];
+  // #340: count of refs that resolved to a real note but were withheld by
+  // the privacy gate (#312) — distinguishes "this handoff had refs but none
+  // were safe to surface" from "this handoff never referenced anything" (an
+  // all-refs-gated handoff previously emitted an empty snippets array
+  // indistinguishable from a handoff with none at all). Callers must omit
+  // this from any model-facing payload when it is 0 — an emitted zero the
+  // hook never actually withheld anything for is the same false all-clear
+  // the campaign's H2 discipline exists to prevent elsewhere; absent means
+  // "nothing withheld", not "zero, checked". Never carries which ref(s) or
+  // why — only the count.
+  withheldCount: number;
 }
 
 export async function resolveInboxHandoffContext(
   vaultPath: string,
   entries: InboxEntry[],
   limit = 8,
-): Promise<HandoffContextSnippet[]> {
+): Promise<InboxHandoffContext> {
   const refs = new Set<string>();
   for (const entry of entries) {
     if (entry.payload.kind !== "handoff") continue;
     const rawRefs = entry.payload.wikilink_refs;
     if (!Array.isArray(rawRefs)) continue;
     for (const ref of rawRefs) {
-      if (typeof ref === "string" && ref.trim()) refs.add(ref.trim());
+      // #340 review: dedup on the NORMALIZED ref, not the raw string —
+      // "wiki/x", "[[wiki/x]]", "wiki/x.md", and "[[wiki/x|Alias]]" all name
+      // the same note. Deduping on the raw string let one gated note be
+      // counted multiple times in withheldCount (e.g. the RCM-005 symlink
+      // fixture's own ["evil", "[[evil]]"] pair) — a wrong count published
+      // to the model-facing envelope, worse than the original silent-empty
+      // gap since it looked authoritative.
+      if (typeof ref === "string" && ref.trim()) refs.add(normalizeWikilinkRef(ref.trim()));
     }
   }
   const snippets: HandoffContextSnippet[] = [];
+  let withheldCount = 0;
+  // #340 review: iterate every ref for the WITHHELD count, only cap what
+  // gets pushed into `snippets`. The previous `break` on snippets.length
+  // reaching `limit` stopped resolving refs entirely once enough safe ones
+  // were found — a handoff with 8 safe refs followed by a 9th, gated ref
+  // never looked at the 9th at all, so withheldCount silently under-reported
+  // (0 instead of 1) exactly the case this field exists to surface. Handoffs
+  // name a small, bounded number of refs in practice; trading a little extra
+  // per-ref I/O for a correct count is the right side of that tradeoff here.
   for (const ref of refs) {
     const resolved = await resolveVaultRef(vaultPath, ref);
-    if (resolved) snippets.push(resolved);
-    if (snippets.length >= limit) break;
+    if (resolved.status === "resolved") {
+      if (snippets.length < limit) snippets.push(resolved.snippet);
+    } else if (resolved.status === "withheld") {
+      withheldCount += 1;
+    }
   }
-  return snippets;
+  return { snippets, withheldCount };
 }
 
 /**

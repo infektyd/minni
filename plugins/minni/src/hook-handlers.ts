@@ -727,16 +727,22 @@ export function createHookHandlers(
     // refs", which is the false all-clear this whole section exists to avoid.
     const handoffRead = await withBudget<{
       ok: boolean;
-      snippets: Awaited<ReturnType<typeof resolveInboxHandoffContext>>;
+      result: Awaited<ReturnType<typeof resolveInboxHandoffContext>>;
     }>(
-      resolveInboxHandoffContext(config.vaultPath, pending).then((snippets) => ({
+      resolveInboxHandoffContext(config.vaultPath, pending).then((result) => ({
         ok: true,
-        snippets,
+        result,
       })),
       remainingMs(),
-      { ok: false, snippets: [] },
+      { ok: false, result: { snippets: [], withheldCount: 0 } },
     );
-    const handoffContext = handoffRead.snippets;
+    const handoffContext = handoffRead.result.snippets;
+    // #340: count of handoff_context refs withheld by #312's privacy gate
+    // this boot. Zero and "budget cut this read" both read as "omit the
+    // field" below — a budget-cut read genuinely has no withheld count to
+    // report, and reporting 0 there would be the same false all-clear
+    // degradedSections exists to prevent for handoff_context itself.
+    const handoffContextWithheld = handoffRead.ok ? handoffRead.result.withheldCount : 0;
 
     // #283 (config.ackPendingHandoffsAtBoot): list this agent's pending
     // handoff leases and ack each one at boot. Sequential per-lease RPCs,
@@ -985,6 +991,15 @@ export function createHookHandlers(
         path: snippet.relativePath,
         snippet: snippet.snippet,
       })),
+      // #340: present only when this boot actually withheld something —
+      // absent means "nothing withheld", never "zero, checked" (same
+      // omit-vs-zero discipline as pending_learnings/expired_handoffs
+      // above). Distinguishes an all-refs-gated handoff (handoff_context:
+      // [] because every ref was privacy-gated) from a handoff that
+      // legitimately carried no refs at all — both previously produced the
+      // identical empty array with no way to tell them apart. Count only:
+      // never which ref(s) or why.
+      ...(handoffContextWithheld > 0 ? { handoff_context_withheld: handoffContextWithheld } : {}),
       // config.ackPendingHandoffsAtBoot only.
       ...(config.ackPendingHandoffsAtBoot ? { handoff_acks: ackedLeases } : {}),
       // hooks-PL-1: discriminated stale-belief payload (matched /
