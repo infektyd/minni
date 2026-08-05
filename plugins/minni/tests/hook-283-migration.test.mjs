@@ -325,7 +325,16 @@ test("PostCompact is a genuine no-op (not an unrouted-event drop) when the summa
 
 // ── SEC-006: filterSafeVaultResults must actually be applied ───────────────
 
-test("UserPromptSubmit never surfaces a privacy:private vault note (SEC-006)", async () => {
+test("UserPromptSubmit never surfaces a frontmatter-private vault note (SEC-006)", async () => {
+  // Review round 2: the file/title MUST NOT contain any word
+  // heuristicPrivacyForSource's regexes key on ("private", "raw session",
+  // "secret", "token", "/users/", ...) — a fixture named e.g.
+  // "private-note.md" gets excluded by the STRING HEURISTIC regardless of
+  // whether frontmatter-authored privacy is parsed/applied at all, so it
+  // cannot prove this test's actual claim (that the FRONTMATTER `privacy:`
+  // field itself is respected). Neutral constellation names isolate the
+  // frontmatter path specifically — a broken/no-op privacy parser passes the
+  // heuristic-named case but fails this one.
   await withFixture(async (fixture) => {
     const dir = path.join(fixture.vault, "wiki", "concepts");
     await mkdir(dir, { recursive: true });
@@ -335,8 +344,9 @@ test("UserPromptSubmit never surfaces a privacy:private vault note (SEC-006)", a
         `---\ntitle: ${name}\nprivacy: ${privacy}\nstatus: accepted\n---\n\n# ${name}\n\nshared hook283 sec006 marker phrase\n`,
         "utf8",
       );
-    await note("safe-note.md", "safe");
-    await note("private-note.md", "private");
+    await note("borealis-topic.md", "safe");
+    await note("atlas-topic.md", "private");
+    await note("cygnus-topic.md", "local-only");
 
     const output = await runHook("UserPromptSubmit", BASE_ENV(fixture), {
       prompt: "shared hook283 sec006 marker phrase",
@@ -348,24 +358,74 @@ test("UserPromptSubmit never surfaces a privacy:private vault note (SEC-006)", a
     // vaultResults array on BOTH the salient and nothing-salient paths — the
     // most direct, threshold-independent signal that the filter actually ran.
     const tail = await auditTail(fixture.vault, 20);
-    assert.match(tail.text, /safe-note\.md/, "the safe note must still be found and reported");
+    assert.match(tail.text, /borealis-topic\.md/, "the safe note must still be found and reported");
     assert.doesNotMatch(
       tail.text,
-      /private-note\.md/,
+      /atlas-topic\.md/,
       "SEC-006: a privacy:private note must never reach vault_matches, let alone the model-facing envelope",
     );
+    assert.doesNotMatch(
+      tail.text,
+      /cygnus-topic\.md/,
+      "SEC-006: a privacy:local-only note must never reach vault_matches either",
+    );
 
-    // If this turn happened to cross the strong-recall threshold on the safe
-    // note alone, the envelope's recall pointer / persisted recall-state must
-    // not name the private note either.
-    if (output.hookSpecificOutput?.additionalContext) {
-      const body = envelopeJson(output.hookSpecificOutput.additionalContext);
-      const pointer = body.recall_pointer ?? "";
-      assert.doesNotMatch(
-        pointer,
-        /private-note/,
-        "SEC-006: the private note must not leak into the model-facing recall pointer",
-      );
-    }
+    // At equal vault-match scores the safe note alone still clears the
+    // strong-recall threshold, so this branch is expected to run every time
+    // — assert that positively (not just "if it happens to run") so the
+    // check can't quietly rot into a no-op if scoring ever shifts.
+    assert.ok(
+      output.hookSpecificOutput?.additionalContext,
+      "expected this turn to cross the strong-recall threshold on the safe note alone",
+    );
+    const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+    const pointer = body.recall_pointer ?? "";
+    assert.match(pointer, /borealis-topic/, "the safe note's pointer must actually be present");
+    assert.doesNotMatch(
+      pointer,
+      /atlas-topic|cygnus-topic/,
+      "SEC-006: neither non-safe note may leak into the model-facing recall pointer",
+    );
+  });
+});
+
+test("UserPromptSubmit never surfaces a note the PRIVACY HEURISTIC flags (no authored privacy field)", async () => {
+  // Complementary to the frontmatter-isolated test above: a note with NO
+  // `privacy:` frontmatter at all still gets excluded when its content trips
+  // heuristicPrivacyForSource's defense-in-depth string match (task.ts).
+  //
+  // Deliberately uses "raw session content" (-> heuristic level "private",
+  // /private|raw session|session content/), NOT a secrets-style phrase like
+  // "api_key"/"password" (-> heuristic level "blocked"). "blocked" results
+  // are already excluded a layer earlier, inside searchVaultNotes itself
+  // (see security-floor.test.mjs) — using that phrase here would test the
+  // WRONG layer and pass even if filterSafeVaultResults (the function round
+  // 1 fixed) were deleted entirely.
+  await withFixture(async (fixture) => {
+    const dir = path.join(fixture.vault, "wiki", "concepts");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "deploy-notes.md"),
+      "# Deploy notes\n\nshared hook283 heuristic marker phrase — raw session content from a debug run\n",
+      "utf8",
+    );
+    await writeFile(
+      path.join(dir, "onboarding.md"),
+      "# Onboarding\n\nshared hook283 heuristic marker phrase for new teammates\n",
+      "utf8",
+    );
+
+    const output = await runHook("UserPromptSubmit", BASE_ENV(fixture), {
+      prompt: "shared hook283 heuristic marker phrase",
+    });
+    assert.equal(output.continue, true);
+
+    const tail = await auditTail(fixture.vault, 20);
+    assert.match(tail.text, /onboarding\.md/, "the unflagged note must still be found and reported");
+    assert.doesNotMatch(
+      tail.text,
+      /deploy-notes\.md/,
+      "SEC-006: a note whose content trips the sensitive-content heuristic must never reach vault_matches",
+    );
   });
 });
