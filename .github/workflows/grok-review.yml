@@ -474,6 +474,12 @@ jobs:
           elif [ -n "${GROK_CI_AUTH_JSON:-}" ]; then
             printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
             /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          else
+            # Restore already fails closed when neither secret exists, so
+            # this is dead today — but if restore and gate ever diverge, the
+            # gate must not run against agent-reachable on-disk state.
+            echo "::error::No credential secret available to rebuild the needle set — refusing to certify the reply."
+            exit 1
           fi
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
 

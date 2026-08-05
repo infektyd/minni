@@ -1174,6 +1174,26 @@ def test_publish_gates_rebuild_needles_from_secrets(workflow):
         assert oauth_rebuild != -1 and oauth_rebuild < gate_call, (
             f"{workflow}::{step.get('name')}: no OAuth needle rebuild before the gate"
         )
+        # ORDERING is load-bearing (round-4 review): restore prefers the key,
+        # so the agent only ever held the key — a gate rebuild that prefers
+        # OAuth when both secrets exist scans the wrong credential and fails
+        # OPEN on the one the agent actually had. Mirror the restore pin.
+        key_branch = body.find('if [ -n "${XAI_API_KEY:-}" ]')
+        oauth_branch = body.find('elif [ -n "${GROK_CI_AUTH_JSON:-}" ]')
+        assert -1 < key_branch < oauth_branch < gate_call, (
+            f"{workflow}::{step.get('name')}: gate rebuild does not prefer the "
+            "API key before the OAuth blob"
+        )
+        # And no silent fallthrough: if restore and gate ever diverge, a run
+        # with neither secret must refuse rather than certify against
+        # agent-reachable on-disk state.
+        fallthrough_guard = body.find(
+            "No credential secret available to rebuild the needle set"
+        )
+        assert -1 < fallthrough_guard < gate_call, (
+            f"{workflow}::{step.get('name')}: rebuild lacks the fail-closed "
+            "else branch before the gate"
+        )
         env = step.get("env") or {}
         assert env.get("XAI_API_KEY") == "${{ secrets.XAI_API_KEY }}", (
             f"{workflow}::{step.get('name')}: gate step lacks the key secret"

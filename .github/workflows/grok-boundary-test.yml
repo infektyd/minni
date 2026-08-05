@@ -442,16 +442,13 @@ jobs:
           # report may be published to a public log. A degraded gate must not
           # clear it (SEC-G12).
           #
-          # RESIDUAL, stated rather than implied: --require-auth tests that the
-          # auth document yields comparison VALUES, not that they are the real
-          # ones. The adversarial agent runs between the restore step and this
-          # one, so IF the read-only sandbox permits writing
-          # $HOME/.grok/auth.json, a decoy document would restore the
-          # full-coverage claim while the value check compares against the
-          # decoy — making overwrite strictly better for an attacker than
-          # delete. Whether that write is possible is UNVERIFIED; closing it
-          # means pinning a digest of auth.json across the agent step, the way
-          # the gate bytes already are.
+          # The decoy-overwrite hole this step used to carry as an UNVERIFIED
+          # residual is closed by the rebuild below: the needle set is
+          # re-sourced from the SECRETS after the agent ran, so whatever the
+          # agent did to the on-disk file, the value scan compares against
+          # the live credentials. The remaining residual is the gate's own
+          # documented scope — transform/encoding attacks beyond the encoded
+          # forms it checks — not auth.json desync.
           # Re-materialize the needle set from the SECRETS after the agent
           # ran (review findings on #350): the agent can potentially rewrite
           # auth.json (the read-only-profile write block is a stated
@@ -472,6 +469,12 @@ jobs:
           elif [ -n "${GROK_CI_AUTH_JSON:-}" ]; then
             printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
             /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          else
+            # Restore already fails closed when neither secret exists, so
+            # this is dead today — but if restore and gate ever diverge, the
+            # gate must not run against agent-reachable on-disk state.
+            echo "::error::No credential secret available to rebuild the needle set — refusing to certify the reply."
+            exit 1
           fi
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/attack-result.md
 

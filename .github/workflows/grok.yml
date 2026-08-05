@@ -14,7 +14,10 @@ name: Grok
 # later and recreate the same pollution.
 #
 # Auth notes:
-# * The secret is the base64 of an auth.json minted via
+# * PREFERRED: repository secret XAI_API_KEY — a pay-per-use key from
+#   console.x.ai. When both secrets are set the key wins (and bills);
+#   delete it to fall back to subscription OAuth.
+# * OAuth fallback: the secret is the base64 of an auth.json minted via
 #   `grok login --device-auth` in an ISOLATED home (never the operator's live
 #   ~/.grok, so day-to-day local use cannot rotate the CI token stale).
 # * When the token eventually expires/rotates server-side, re-mint the same
@@ -370,6 +373,12 @@ jobs:
           elif [ -n "${GROK_CI_AUTH_JSON:-}" ]; then
             printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
             /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          else
+            # Restore already fails closed when neither secret exists, so
+            # this is dead today — but if restore and gate ever diverge, the
+            # gate must not run against agent-reachable on-disk state.
+            echo "::error::No credential secret available to rebuild the needle set — refusing to certify the reply."
+            exit 1
           fi
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
 

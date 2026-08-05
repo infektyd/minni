@@ -116,7 +116,8 @@ Prefer **Only select repositories** (`minni` ± canary). If install is
 |---|---|---|
 | `GROK_APP_ID` | Repository **variable** | numeric App ID |
 | `GROK_APP_PRIVATE_KEY` | Repository **secret** | full PEM text |
-| `GROK_CI_AUTH_JSON` | Repository **secret** | Grok CLI auth (see `.github/workflows/grok.yml`) |
+| `GROK_CI_AUTH_JSON` | Repository **secret** | Grok CLI subscription OAuth fallback (see `.github/workflows/grok.yml`) |
+| `XAI_API_KEY` | Repository **secret** | PREFERRED: pay-per-use console.x.ai key; wins over the OAuth blob when both are set (and bills per run) |
 
 ## Branch protection (operator — propose, don't silent-apply)
 
