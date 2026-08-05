@@ -72,6 +72,10 @@ class ResolveRejected(Exception):
 # side, and leaves nothing in the log for an audit to find.
 AUTO_ACCEPT_PARAM_KEYS = ("auto_accept_own", "learn.auto_accept_own")
 
+# One request must not be able to hold the daemon's write lock open writing an
+# event row per entry. See handle_resolve_contradiction.
+MAX_SUPERSEDE_IDS = 64
+
 
 def reject_wire_supplied_auto_accept(
     params: dict, request_id: Any, context: "GovernanceContext"
@@ -324,16 +328,34 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
 
     # This writes an ARBITRARY durable learning — embedded, active, FTS-indexed
     # — and its only precondition is owning the learning being superseded.
-    # resolve_candidate refuses instruction_like content without an explicit
-    # 'accept_flagged' capability; without the same rule here, that gate is a
-    # detour rather than a wall.
     #
-    # Measured on this branch before the gate existed: with #290's auto-accept
-    # enabled, a principal staged one benign learning (auto-accepted, so now
-    # OWNED), then superseded it with content the auto-accept floor had just
-    # refused as instruction_like — landing the refused text as 'active'. Owning
-    # a learning used to require a human; auto-acceptance removed that step, so
-    # this path needed the gate the other durable writers already have.
+    # Measured on this branch: with #290's auto-accept enabled, a principal
+    # staged one benign learning (auto-accepted, so now OWNED), then superseded
+    # it with content the auto-accept floor had just refused — landing the
+    # refused text as 'active'. Owning a learning used to require a human accept,
+    # and that accept records the RESOLVER as owner, so a learn-only principal
+    # could not previously own one at all. Auto-acceptance is the first path that
+    # hands it ownership unattended, which makes this the same kind of
+    # unattended durable write and it needs the same floor.
+    #
+    # A first pass ported only the instruction_like rule. That was a fence with
+    # one plank: every other floor rule (too short, oversized, filler, low
+    # alphabetic ratio, author-declared privacy) was still one call away from
+    # irrelevant for exactly the principal docs/concepts.md tells operators to
+    # create. The whole floor applies now.
+    #
+    # Operators keep today's unrestricted correction machinery — they can
+    # already write durable memory directly via force=true. instruction_like is
+    # stricter than operator on purpose, mirroring resolve_candidate: it lifts
+    # only for the LITERAL 'accept_flagged' capability, so correcting a poisoned
+    # learning stays possible but never accidental.
+    if len(new_content) > MAX_LEARN_CHARS:
+        return context.make_error(
+            -32602,
+            f"new_content exceeds {MAX_LEARN_CHARS} chars",
+            request_id,
+        )
+
     if is_instruction_like(new_content) and not explicitly_allowed_accept_flagged(
         principal
     ):
@@ -346,6 +368,40 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
             -32004,
             "accept_flagged_required: new_content is instruction_like; writing it "
             "as a durable learning requires the literal 'accept_flagged' capability",
+            request_id,
+        )
+
+    if not is_operator_principal(principal) and not explicitly_allowed_operator(
+        principal
+    ):
+        withheld = [
+            r
+            for r in auto_accept_blockers(
+                new_content, False, params.get("privacy_level", "safe")
+            )
+            if r != "instruction_like"
+        ]
+        if withheld:
+            context.logger.warning(
+                "RESOLVE_CONTRADICTION_REFUSED principal=%s reasons=%s (G15 audit)",
+                agent_id, ",".join(withheld),
+            )
+            return context.make_error(
+                -32004,
+                "quality_floor: new_content cannot be written as a durable "
+                f"learning ({'; '.join(withheld)}); an operator may still write it",
+                request_id,
+            )
+
+    # Unbounded and unde-duplicated, this wrote one contradiction_events row per
+    # (id, new learning) pair inside BEGIN IMMEDIATE: measured 400k rows and 2.1s
+    # of exclusive daemon write-lock from a single request under the 1 MiB body
+    # cap, with a 1.2 MB response echoing the list back.
+    supersede_ids = list(dict.fromkeys(supersede_ids))
+    if len(supersede_ids) > MAX_SUPERSEDE_IDS:
+        return context.make_error(
+            -32602,
+            f"supersede_ids exceeds {MAX_SUPERSEDE_IDS} entries",
             request_id,
         )
 
@@ -405,19 +461,28 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                         "explicitly allowed operator)",
                         request_id,
                     ))
+            # content_hash so this writer is visible to the duplicate gate too
+            # — omitting it reintroduced a NULL-hash row on every correction.
+            _chash = None
+            if ensure_content_hash_column(wb.db):
+                from minni.afm_passes.consolidation import (
+                    content_hash as _content_hash,
+                )
+
+                _chash = _content_hash(new_content)
             c.execute("""
                 INSERT INTO learnings
                 (agent_id, category, content, source_doc_ids, source_query,
                  confidence, embedding, created_at,
-                 assertion, applies_when, evidence_doc_ids, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 assertion, applies_when, evidence_doc_ids, status, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 agent_id, category, new_content,
                 None, None,
                 params.get("confidence", 1.0),
                 emb_bytes, now,
                 assertion, applies_when, doc_ids_json,
-                "active",
+                "active", _chash,
             ))
             new_lid = c.lastrowid
 
@@ -672,6 +737,36 @@ def auto_accept_blockers(
     return reasons
 
 
+def ensure_content_hash_column(db: Any) -> bool:
+    """Ensure learnings.content_hash + its index exist. No backfill.
+
+    Deliberately NOT consolidation._ensure_dedup_index: that one also backfills
+    every NULL hash in a per-row Python loop inside BEGIN IMMEDIATE. Measured at
+    ~2.9s of exclusive daemon write-lock on a 20k-row table — acceptable in a
+    background pass, not on a user-facing learn. This path only needs to write
+    and query its own hashes; legacy NULL rows simply do not dedup, which is
+    exactly where they already were.
+
+    The PRAGMA -> ALTER window is a TOCTOU across the daemon's thread-local
+    connections, so a losing racer is caught rather than surfaced as -32000.
+    """
+    try:
+        with db.cursor() as c:
+            c.execute("PRAGMA table_info(learnings)")
+            if "content_hash" not in [r["name"] for r in c.fetchall()]:
+                try:
+                    c.execute("ALTER TABLE learnings ADD COLUMN content_hash TEXT")
+                except Exception:
+                    pass  # concurrent writer won the race; the column exists now
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_learnings_content_hash "
+                "ON learnings(content_hash)"
+            )
+        return True
+    except Exception:
+        return False
+
+
 def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -> dict:
     """Stage a candidate packet.
 
@@ -762,31 +857,40 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             # in front of this channel — and the more the knob writes, the
             # blinder that guard gets. Consolidation, the other unattended
             # writer, hashes and embeds for exactly this reason.
-            from minni.afm_passes.consolidation import (
-                _ensure_dedup_index,
-                content_hash as _content_hash,
-            )
+            #
+            # ALL of it is fail-soft. Staging a candidate was pure SQL before
+            # this feature and never touched the embedder; a first pass left the
+            # column check and the `wb.model` property access outside the
+            # try, so a locked DB or an offline model turned a working learn
+            # into -32000 WITH NOTHING STAGED — the learning lost outright
+            # rather than routed to review. An optimisation must never take down
+            # the base path: on any failure the candidate still stages as
+            # proposed, which is exactly where it would have gone anyway.
+            try:
+                from minni.afm_passes.consolidation import content_hash as _content_hash
 
-            # learnings.content_hash is created lazily by the AFM pass, and that
-            # loop is OFF by default — so this path cannot assume the column
-            # exists. Idempotent and cheap after the first call.
-            _ensure_dedup_index(db)
-            chash = _content_hash(stored_content)
-            if getattr(wb, "model", None):
-                try:
+                if ensure_content_hash_column(db):
+                    chash = _content_hash(stored_content)
+                model = getattr(wb, "model", None)
+                if model is not None:
                     import numpy as np
 
                     from minni.models import get_embedder_lock
 
                     with get_embedder_lock():
-                        emb = wb.model.encode(
+                        emb = model.encode(
                             stored_content, show_progress_bar=False
                         ).astype(np.float32)
                     emb_bytes = emb.tobytes()
-                except Exception as exc:
-                    context.logger.warning(
-                        "auto_accept_own: embedding failed (%s) - storing without", exc
-                    )
+            except Exception as exc:
+                context.logger.warning(
+                    "auto_accept_own: could not prepare the durable write (%s); "
+                    "staging as proposed instead (G15 audit)", exc,
+                )
+                auto_accept = False
+                chash = None
+                emb_bytes = None
+                withheld = list(withheld) + ["durable-write preparation failed"]
 
         with db.transaction() as c:
             c.execute(
@@ -819,9 +923,16 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                     auto_accept = False
                     withheld = ["duplicate of an existing learning"]
             if auto_accept:
-                # 'general' mirrors resolve_candidate: a candidate accepted by
-                # hand lands in the same category, so auto and manual
-                # acceptance of the SAME candidate cannot diverge.
+                # 'general' matches both resolve_candidate and afm.py's
+                # promote, so the category cannot diverge by acceptance route.
+                #
+                # The OWNER does diverge, and it is worth being exact: a manual
+                # accept records the RESOLVER as agent_id, so a human accepting
+                # agent X's candidate produces a learning owned by the operator.
+                # This path records X. That is the intended reading of "the
+                # learnings are the agent's own" — and it is also why X can now
+                # own a learning at all, which is what made resolve_contradiction
+                # reachable and gave it the floor above.
                 c.execute(
                     """
                     INSERT INTO learnings

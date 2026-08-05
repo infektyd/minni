@@ -127,6 +127,16 @@ same audit trail:
    keep seeing them — an unattended writer that is invisible to its own guards
    gets blinder the more it writes.
 
+   One consequence worth knowing before you opt an agent in: this is the first
+   path that lets a `learn`-only agent OWN a durable learning without a human
+   (a manual accept records the resolver as owner, not the proposer). Owning one
+   is the precondition for `resolve_contradiction`, so that handler now applies
+   the same floor to non-operators rather than being an unguarded way around it.
+   Counts land in `health_report` under
+   `memory_lifecycle.resolution_mix` (`auto_accept_own` / `manual` /
+   `afm_consolidation`) — check there to see whether the channel is doing what
+   you expected.
+
    **The knob is operator configuration and is refused over the wire.** A
    caller that passes `auto_accept_own` to `minni_learn` gets `operator_only`
    — for every principal, operator included — because config an agent can set

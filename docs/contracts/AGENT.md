@@ -98,7 +98,7 @@ Two RPCs write durable learnings and both live in
 |--------|-----------------|-------|
 | Approve candidate | `resolve_candidate` | Operator-gated by default (delegable — see [docs/concepts.md#delegating-approval](../concepts.md#delegating-approval)). Accepts, rejects, redacts, merges, or supersedes a staged `learn` candidate. |
 | Auto-accept own candidates | *(none — operator config)* | `auto_accept_own` in `principals/<agent>.json` resolves that agent's OWN `learn` candidates at store time, stamped `resolved_by=auto_accept_own(<agent>)`. Narrower than granting `resolve_candidate`: it confers no authority over anyone else's candidates. Refused if supplied over the wire ([#290](https://github.com/infektyd/minni/issues/290)). |
-| Resolve contradiction | `resolve_contradiction` | Agent-first correction machinery — **no operator gate**. Any principal may call it for its own learnings. |
+| Resolve contradiction | `resolve_contradiction` | Agent-first correction machinery — **no operator gate** for ordinary corrections; any principal may call it for its own learnings. Two limits apply to non-operators: `new_content` that is instruction_like needs the literal `accept_flagged` capability, and content failing the durable-write quality floor is refused ([#290](https://github.com/infektyd/minni/issues/290)) — an unattended writer gets the same floor everywhere. |
 
 `resolve_contradiction` (`handle_resolve_contradiction`) lets an agent write a
 new learning that atomically supersedes one or more of its prior ones when it
