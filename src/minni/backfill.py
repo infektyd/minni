@@ -110,6 +110,11 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
     the drain must not close.
     """
     coverage: Dict[str, object] = {}
+    # Computed OUTSIDE the try below, and merged into both the success and the
+    # error return. The boundary has to hold in both directions: the episodic
+    # block already survives a broken documents/learnings schema, and a broken
+    # chunk_embeddings table must not take the episodic fields with it either.
+    episodic = episodic_index_coverage(db)
     try:
         with db.cursor() as c:
             # grok-review (post-rebase tip, finding 1): align document coverage
@@ -160,7 +165,7 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
             ).fetchone()["n"]
     except Exception as exc:
         logger.debug("embedding_coverage unavailable: %s", exc)
-        return {"error": str(exc)}
+        return {"error": str(exc), **episodic}
 
     def _ratio(have: int, total: int) -> Optional[float]:
         # None, not 1.0: an empty index has no coverage to report, and claiming
@@ -184,7 +189,7 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
         learnings_with_embedding, total_learnings
     )
     coverage["learnings_terminal_null_embedding"] = learnings_terminal_null
-    coverage.update(episodic_index_coverage(db))
+    coverage.update(episodic)
     return coverage
 
 
@@ -222,22 +227,35 @@ def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
         # does NOT claim anything about whether traces are themselves indexed,
         # because that is not measured here. Their index state cannot move
         # episodic_index_ratio in either direction.
-        memory_only = (
-            f"content IS NOT NULL AND (event_type IS NULL"
-            f" OR event_type NOT IN ({placeholders}))"
-        )
-        indexed_ids = (
-            "SELECT CAST(event_id AS INTEGER) FROM episodic_fts"
-            " WHERE event_id IS NOT NULL"
-        )
+        # Alias-qualified: the indexed count below joins episodic_fts, which has
+        # its own `content` column, so an unqualified predicate is ambiguous.
+        def _memory_only(alias: str) -> str:
+            return (
+                f"{alias}.content IS NOT NULL AND ({alias}.event_type IS NULL"
+                f" OR {alias}.event_type NOT IN ({placeholders}))"
+            )
+
         with db.cursor() as c:
             total_events = c.execute(
-                f"SELECT COUNT(*) AS n FROM episodic_events WHERE {memory_only}",
+                f"SELECT COUNT(*) AS n FROM episodic_events e"
+                f" WHERE {_memory_only('e')}",
                 NON_MEMORY_EVENT_TYPES,
             ).fetchone()["n"]
+            # Joined on agent_id as well as event_id, because presence in the
+            # index is not the same as reachability. search_episodic filters on
+            # ef.agent_id — the FTS copy, not the event's — and recall's default
+            # path always passes an agent_id. An index row carrying the wrong
+            # agent is unreachable through the production path while still being
+            # "present", so an event_id-only count would report ratio 1.0 over a
+            # channel that returns nothing: the exact health overstatement this
+            # field exists to prevent.
             indexed_events = c.execute(
-                f"SELECT COUNT(*) AS n FROM episodic_events"
-                f" WHERE {memory_only} AND event_id IN ({indexed_ids})",
+                f"""SELECT COUNT(DISTINCT e.event_id) AS n
+                      FROM episodic_events e
+                      JOIN episodic_fts f
+                        ON CAST(f.event_id AS INTEGER) = e.event_id
+                       AND f.agent_id IS e.agent_id
+                     WHERE {_memory_only('e')}""",
                 NON_MEMORY_EVENT_TYPES,
             ).fetchone()["n"]
             observability_events = c.execute(

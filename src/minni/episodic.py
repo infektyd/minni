@@ -380,18 +380,23 @@ class EpisodicMemory:
         advertised TTL without depending on a global cleanup pass (which
         nothing schedules today); other event types are untouched."""
         cutoff = time.time() - max_age_seconds
+        # Reads NON_MEMORY_EVENT_TYPES rather than repeating 'recall': a trace
+        # type added to the shared list would otherwise be filtered out of
+        # search, health and Recent Activity but never reaped, accumulating
+        # forever in the one table this method exists to bound.
+        marks = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
         with self.db.cursor() as c:
-            c.execute("""
+            c.execute(f"""
                 DELETE FROM episodic_fts
                 WHERE event_id IN (
                     SELECT event_id FROM episodic_events
-                    WHERE event_type = 'recall' AND created_at < ?
+                    WHERE event_type IN ({marks}) AND created_at < ?
                 )
-            """, (cutoff,))
+            """, (*NON_MEMORY_EVENT_TYPES, cutoff))
             c.execute(
-                "DELETE FROM episodic_events"
-                " WHERE event_type = 'recall' AND created_at < ?",
-                (cutoff,))
+                f"DELETE FROM episodic_events"
+                f" WHERE event_type IN ({marks}) AND created_at < ?",
+                (*NON_MEMORY_EVENT_TYPES, cutoff))
             return c.rowcount
 
     def cleanup_expired(self, max_age_seconds: int = 604800) -> int:

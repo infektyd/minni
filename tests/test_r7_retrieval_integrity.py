@@ -117,6 +117,10 @@ class _StubLoop:
         return [name for kind, name in self.events[mark:] if kind == "cancel"]
 
     def run_until_complete(self, task):
+        # Recorded: a main() that creates every task and then never runs the
+        # loop schedules nothing, and an assertion that only inspects
+        # create_task cannot tell the difference.
+        self.events.append(("run", getattr(task, "name", None)))
         return None
 
     def close(self):
@@ -1525,6 +1529,17 @@ class TestDecayIsScheduled:
         assert task.cancelled, "shutdown must cancel the decay task"
         assert "_decay_runner" in loop.cancels_since(mark), (
             "the cancel must be caused by the shutdown handler, not by main()"
+        )
+
+    def test_main_actually_runs_the_loop(self, monkeypatch, tmp_path):
+        """Creating tasks is only half of scheduling. A main() that builds every
+        task and returns without running the loop starts nothing, and the
+        create_task assertions alone cannot see it."""
+        _, loop, _ = _run_main_with_stub_loop(monkeypatch, tmp_path)
+
+        assert ("run", "_serve_unix_socket") in loop.events, (
+            "main() must run the loop, not merely populate it "
+            f"(events: {loop.events})"
         )
 
     def test_the_harness_never_reaches_the_live_database(self, monkeypatch, tmp_path):
@@ -3402,10 +3417,38 @@ class TestEpisodicFtsBackfill:
 
         coverage = episodic_index_coverage(db_obj)
         assert "episodic_error" in coverage, "the failure must be stated"
-        assert coverage["episodic_index_ratio"] is None
-        assert "episodic_events_total" in coverage, (
-            "dropping the keys makes 'unknown' indistinguishable from 'empty'"
+        # Every count must be None, not 0. A healthy empty log also reports
+        # ratio None, so a regression returning total=0 alongside the error
+        # would re-collapse "unknown" into "empty" for any consumer keying off
+        # the counts — the exact confusion the stable key set exists to prevent.
+        for key in (
+            "episodic_events_total",
+            "episodic_events_indexed",
+            "episodic_events_missing_index",
+            "episodic_index_ratio",
+            "episodic_observability_events",
+            "episodic_fts_orphans",
+        ):
+            assert key in coverage, f"{key} dropped — unknown reads as empty"
+            assert coverage[key] is None, f"{key} must be None on failure, not a count"
+        db_obj.close()
+
+    def test_episodic_coverage_survives_broken_document_coverage(self, tmp_path):
+        """The boundary has to hold both ways. Migration 018's warning promises
+        the residual gap stays visible in episodic_index_ratio — a promise that
+        fails if a broken chunk_embeddings table takes the episodic keys with
+        it on its way out."""
+        from minni.backfill import embedding_coverage
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        db_obj._get_conn().execute("DROP TABLE chunk_embeddings")
+
+        coverage = embedding_coverage(db_obj)
+        assert "error" in coverage, "the document-side failure must be stated"
+        assert coverage["episodic_events_total"] == len(self._PRE_TRIGGER) + 1, (
+            "episodic coverage must survive a document-coverage failure"
         )
+        assert coverage["episodic_index_ratio"] is not None
         db_obj.close()
 
     def test_a_failed_backfill_does_not_freeze_the_migration_ladder(self, tmp_path):
@@ -3442,4 +3485,266 @@ class TestEpisodicFtsBackfill:
             "a failed data repair must not block the schema ladder — 019 and "
             "later would batch with it and roll back forever"
         )
+
+        # The other half of that trade, stated rather than left implicit:
+        # stamping the version means run_migrations will NEVER retry the repair.
+        # The events stay unindexed until something else reconciles them, which
+        # is why the periodic backfill sweep also calls it (see
+        # test_a_failed_migration_repair_is_retried_by_the_backfill_sweep).
+        run_migrations(conn)
+        conn.commit()
+        still_missing = conn.execute(
+            "SELECT COUNT(*) FROM episodic_fts WHERE episodic_fts MATCH 'TurboQuant'"
+        ).fetchone()[0]
+        assert still_missing == 0, (
+            "migrations re-ran the repair — if that ever becomes true, the "
+            "sweep-based retry is no longer the only healing path and this "
+            "test's premise needs revisiting"
+        )
+        db_obj.close()
+
+    def test_backfill_preserves_agent_scope(self, tmp_path):
+        """search_episodic filters on ef.agent_id — the FTS copy, not the
+        event's — and recall's default path always passes an agent_id. A
+        backfill that indexed the right text under the wrong agent would leave
+        scoped recall returning nothing while looking fully repaired."""
+        from minni.episodic import reconcile_episodic_fts
+        from minni.retrieval import RetrievalEngine
+
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_insert")
+            for agent in ("claude-code", "codex"):
+                c.execute(
+                    "INSERT INTO episodic_events"
+                    " (agent_id, event_type, content, created_at)"
+                    " VALUES (?, 'message', ?, ?)",
+                    (agent, f"{agent} says TurboQuant", time.time()),
+                )
+
+        reconcile_episodic_fts(db_obj._get_conn())
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+
+        for agent in ("claude-code", "codex"):
+            hits = engine.search_episodic("TurboQuant", agent_id=agent)
+            assert len(hits) == 1, (
+                f"agent-scoped recall — the call recall actually makes — found "
+                f"{len(hits)} rows for {agent}"
+            )
+            assert hits[0]["agent_id"] == agent
+            assert agent in hits[0]["content"], "wrong agent's row returned"
+        db_obj.close()
+
+    def test_coverage_measures_reachability_not_mere_presence(self, tmp_path):
+        """An index row under the wrong agent_id is unreachable through the
+        production path. Counting it as covered would report ratio 1.0 over a
+        channel that returns nothing."""
+        from minni.backfill import episodic_index_coverage
+
+        db_obj, _ = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_insert")
+            c.execute(
+                "INSERT INTO episodic_events"
+                " (agent_id, event_type, content, created_at)"
+                " VALUES ('claude-code', 'message', 'scoped text', ?)",
+                (time.time(),),
+            )
+            event_id = c.lastrowid
+            # Present in the index, but filed under the wrong agent.
+            c.execute(
+                "INSERT INTO episodic_fts(event_id, agent_id, content)"
+                " VALUES (?, 'someone-else', 'scoped text')",
+                (event_id,),
+            )
+
+        coverage = episodic_index_coverage(db_obj)
+        assert coverage["episodic_events_indexed"] == 0, (
+            "an index row under the wrong agent is not coverage"
+        )
+        assert coverage["episodic_index_ratio"] == 0.0
+        db_obj.close()
+
+    def test_coverage_does_not_invent_a_gap_for_null_content_events(self, tmp_path):
+        """A NULL-content event can never be indexed — the trigger skips it and
+        so does the backfill. Counting it as missing would manufacture a
+        permanent phantom gap no drain could close, the same honesty failure
+        the document and learning ratios explicitly refuse."""
+        from minni.backfill import episodic_index_coverage
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        conn.execute(
+            "INSERT INTO episodic_events (agent_id, event_type, content, created_at)"
+            " VALUES ('claude-code', 'message', NULL, ?)",
+            (time.time(),),
+        )
+        reconcile_episodic_fts(conn)
+
+        coverage = episodic_index_coverage(db_obj)
+        assert coverage["episodic_index_ratio"] == 1.0, (
+            f"fully repaired DB must report full coverage, got {coverage}"
+        )
+        db_obj.close()
+
+    def test_a_failed_migration_repair_is_retried_by_the_backfill_sweep(self, tmp_path):
+        """Migration 018 swallows its own exceptions so a failed repair cannot
+        roll back the schema batch — which also stamps the version, so nothing
+        would ever retry. The periodic backfill sweep is the queue that makes a
+        transient failure (a locked DB on a contended start) self-heal."""
+        import minni.minnid as minnid
+
+        db_obj, cfg = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        conn.execute("DELETE FROM episodic_fts")
+        conn.commit()
+
+        monkey_cfg = minnid.DEFAULT_CONFIG
+        minnid.DEFAULT_CONFIG = cfg
+        try:
+            from minni.db import SovereignDB
+
+            original = SovereignDB.shared
+            SovereignDB.shared = staticmethod(lambda *a, **k: db_obj)
+            try:
+                minnid._backfill_sweep_once()
+            finally:
+                SovereignDB.shared = original
+        finally:
+            minnid.DEFAULT_CONFIG = monkey_cfg
+
+        indexed = conn.execute(
+            "SELECT COUNT(*) FROM episodic_fts WHERE episodic_fts MATCH 'TurboQuant'"
+        ).fetchone()[0]
+        assert indexed == 1, (
+            "the sweep must reconcile episodic_fts, so an abandoned migration "
+            "repair is not permanent"
+        )
+        db_obj.close()
+
+
+class TestSchedulerRunnersActuallySweep:
+    """Scheduling a coroutine that returns immediately is the same dead channel
+    as never scheduling one. The stub-loop tests prove main() queues the runner;
+    these prove the runner body does a pass."""
+
+    def _drive_one_pass(self, monkeypatch, runner, sweep_attr):
+        """Run a single iteration of *runner*, then break out of its while-loop.
+
+        asyncio.sleep is neutralised so the initial delay does not stall the
+        test, and to_thread runs inline so the sweep is observed directly.
+        """
+        import asyncio
+
+        import minni.minnid as minnid
+
+        calls = []
+
+        def _sweep():
+            calls.append(True)
+            raise asyncio.CancelledError
+
+        async def _no_sleep(_delay):
+            return None
+
+        async def _inline(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr(minnid, sweep_attr, _sweep)
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(asyncio, "to_thread", _inline)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(runner())
+        return calls
+
+    def test_backfill_runner_calls_the_sweep(self, monkeypatch):
+        import minni.minnid as minnid
+
+        calls = self._drive_one_pass(
+            monkeypatch, minnid._backfill_runner, "_backfill_sweep_once"
+        )
+        assert calls, "_backfill_runner scheduled but never swept"
+
+    def test_decay_runner_calls_the_sweep(self, monkeypatch):
+        import minni.minnid as minnid
+
+        calls = self._drive_one_pass(
+            monkeypatch, minnid._decay_runner, "_decay_sweep_once"
+        )
+        assert calls, "_decay_runner scheduled but never swept"
+
+
+class TestTraceReapingFollowsTheSharedList:
+    """trim_recall_traces bounds the one table that grows without limit. It
+    hardcoded 'recall' twice — in the very module that declares the shared
+    list — so a newly added trace type would be filtered out of search, health
+    and Recent Activity but never reaped, accumulating forever."""
+
+    def _episodic(self, tmp_path):
+        from minni.episodic import EpisodicMemory
+
+        db_obj, cfg = _make_db(tmp_path)
+        return EpisodicMemory(db_obj, cfg), db_obj
+
+    def _seed(self, db_obj, age_seconds):
+        now = time.time()
+        with db_obj.cursor() as c:
+            for event_type in ("recall", "audit_probe", "message"):
+                c.execute(
+                    "INSERT INTO episodic_events"
+                    " (agent_id, event_type, content, created_at)"
+                    " VALUES ('claude-code', ?, ?, ?)",
+                    (event_type, f"{event_type} text", now - age_seconds),
+                )
+
+    def _surviving(self, db_obj):
+        with db_obj.cursor() as c:
+            return {
+                r["event_type"]
+                for r in c.execute("SELECT event_type FROM episodic_events").fetchall()
+            }
+
+    def test_traces_are_reaped_and_real_memory_is_not(self, tmp_path):
+        episodic, db_obj = self._episodic(tmp_path)
+        self._seed(db_obj, age_seconds=999_999)
+
+        episodic.trim_recall_traces(max_age_seconds=60)
+
+        survivors = self._surviving(db_obj)
+        assert "recall" not in survivors, "expired traces must be reaped"
+        assert "message" in survivors, "agent memory must never be reaped here"
+        db_obj.close()
+
+    def test_a_new_trace_type_is_reaped_too(self, tmp_path, monkeypatch):
+        """The whole point of the shared list: adding a type must move the
+        reaper with the search filter, or the table grows forever."""
+        import minni.episodic as episodic_mod
+
+        episodic, db_obj = self._episodic(tmp_path)
+        self._seed(db_obj, age_seconds=999_999)
+        monkeypatch.setattr(
+            episodic_mod,
+            "NON_MEMORY_EVENT_TYPES",
+            episodic_mod.NON_MEMORY_EVENT_TYPES + ("audit_probe",),
+        )
+
+        episodic.trim_recall_traces(max_age_seconds=60)
+
+        survivors = self._surviving(db_obj)
+        assert "audit_probe" not in survivors, (
+            "trim_recall_traces kept its own copy of the trace list — a new "
+            "trace type is filtered everywhere but reaped nowhere"
+        )
+        assert "message" in survivors
+        db_obj.close()
+
+    def test_fresh_traces_survive_the_ttl(self, tmp_path):
+        episodic, db_obj = self._episodic(tmp_path)
+        self._seed(db_obj, age_seconds=0)
+
+        episodic.trim_recall_traces(max_age_seconds=604800)
+
+        assert "recall" in self._surviving(db_obj), "unexpired traces must stay"
         db_obj.close()
