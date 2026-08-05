@@ -21,7 +21,7 @@ import {
   appendJournal,
   parseJournal
 } from "../dist/plan.js";
-import { ensureVault } from "../dist/vault.js";
+import { ensureVault, writeVaultPage } from "../dist/vault.js";
 
 test("isTrivialEvidence check in updateSlice prevents trivial/empty evidence for done status", () => {
   const plan = {
@@ -857,19 +857,53 @@ test("setActivePlan writes _active_plan.json via writeFileAtomic (PLUMB-T4 / #23
 // journal/note behind it or truncated. Same durability guarantee as the
 // pointer write #231 already fixed.
 
-test("appendJournal writes through appendFileWithFsync/writeFileAtomic (#293)", async () => {
-  const src = await readFile(new URL("../src/plan.ts", import.meta.url), "utf8");
-  assert.match(
-    src,
-    /await appendFileWithFsync\(journalPath/,
-    "appendJournal's append branch must use appendFileWithFsync, not plain appendFile",
-  );
-  assert.match(
-    src,
-    /await writeFileAtomic\(journalPath/,
-    "appendJournal's init branch must use writeFileAtomic, not plain writeFile",
-  );
+// Bugbot on #309 (campaign scar #3 — source-grep tests are false confidence):
+// the original version of this test read plan.ts's source text and regex-
+// matched the helper names. A mutant that RENAMES the call trips a regex but
+// proves nothing about behavior, and a mutant that keeps the name/signature
+// but swaps the durable helper's internals for a plain write sails straight
+// past a text assertion. Spy on the actual injected dependency instead: prove
+// the caller invokes appendFileWithFsync/writeFileAtomic — with the right
+// path and content — as an observed call, not grepped text.
+test("appendJournal invokes appendFileWithFsync/writeFileAtomic with the right path and content (#293)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-journal-spy-"));
+  try {
+    const journalPath = path.join(root, "spy.log.md");
+    const appendCalls = [];
+    const atomicCalls = [];
+    const deps = {
+      appendFileWithFsync: async (p, c) => {
+        appendCalls.push([p, c]);
+      },
+      writeFileAtomic: async (p, c) => {
+        atomicCalls.push([p, c]);
+      },
+    };
 
+    // Init path: file does not exist yet -> writeFileAtomic, not appendFileWithFsync.
+    await appendJournal(journalPath, { kind: "rehydrated", at: "2026-01-01T00:00:00.000Z" }, deps);
+    assert.equal(appendCalls.length, 0, "init path must not call appendFileWithFsync");
+    assert.equal(atomicCalls.length, 1, "init path must call writeFileAtomic exactly once");
+    assert.equal(atomicCalls[0][0], journalPath, "writeFileAtomic must be called with the journal path");
+    assert.match(atomicCalls[0][1], /# Minni Plan Journal/, "init write must include the header");
+    assert.match(atomicCalls[0][1], /"kind":"rehydrated"/, "init write must include the first event");
+
+    // Real write so the file genuinely exists for the append branch below —
+    // the spy above recorded the call but never touched the filesystem.
+    await writeFile(journalPath, atomicCalls[0][1], "utf8");
+
+    // Append path: file now exists -> appendFileWithFsync, not writeFileAtomic again.
+    await appendJournal(journalPath, { kind: "rehydrated", at: "2026-01-01T00:01:00.000Z" }, deps);
+    assert.equal(atomicCalls.length, 1, "append path must not call writeFileAtomic again");
+    assert.equal(appendCalls.length, 1, "append path must call appendFileWithFsync exactly once");
+    assert.equal(appendCalls[0][0], journalPath, "appendFileWithFsync must be called with the journal path");
+    assert.match(appendCalls[0][1], /"kind":"rehydrated".*"at":"2026-01-01T00:01/, "append write must be the second event's line");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("appendJournal round-trips real init + append with no leftover .tmp siblings (#293)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-plan-journal-durable-"));
   try {
     const journalPath = path.join(root, "test.log.md");
@@ -904,22 +938,38 @@ test("appendJournal writes through appendFileWithFsync/writeFileAtomic (#293)", 
   }
 });
 
-test("writeVaultPage writes the plan note through writeFileAtomic, not plain writeFile (#293)", async () => {
-  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
-  assert.match(
-    src,
-    /await writeFileAtomic\(notePath, body\)/,
-    "writeVaultPage must write notePath through writeFileAtomic",
-  );
-  assert.doesNotMatch(
-    src,
-    // Loose on trailing args deliberately — a mutant that dropped the
-    // `"utf8"` third arg (still non-atomic) must not slip past an
-    // exact-string match.
-    /await writeFile\(notePath, body/,
-    "writeVaultPage must not use non-atomic writeFile for the note body",
-  );
+// Bugbot on #309 (campaign scar #3 — source-grep tests are false confidence):
+// same lesson as appendJournal's test above. Spy on the injected dependency
+// to prove writeVaultPage actually invokes writeFileAtomic with the note's
+// real path and rendered body, rather than grepping vault.ts's source text.
+test("writeVaultPage invokes writeFileAtomic with the note's path and rendered body (#293)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-note-spy-"));
+  try {
+    await ensureVault(root);
+    const calls = [];
+    const result = await writeVaultPage(
+      {
+        vaultPath: root,
+        title: "Spy Note",
+        content: "durability spy body",
+        section: "concepts",
+      },
+      {
+        writeFileAtomic: async (p, c) => {
+          calls.push([p, c]);
+        },
+      },
+    );
+    assert.equal(calls.length, 1, "writeVaultPage must call writeFileAtomic exactly once for the note body");
+    assert.equal(calls[0][0], result.notePath, "writeFileAtomic must be called with the note's own path");
+    assert.match(calls[0][1], /durability spy body/, "writeFileAtomic must be called with the rendered note body");
+    assert.match(calls[0][1], /^---\n/, "the rendered body must include frontmatter");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
+test("writeVaultPage (plan note) round-trips real content with no leftover .tmp siblings (#293)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-plan-note-durable-"));
   try {
     await ensureVault(root);

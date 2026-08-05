@@ -1215,8 +1215,18 @@ async function appendIndex(
   await appendFile(indexPath, line, "utf8");
 }
 
+// Bugbot on #309 (campaign scar #3): the durability of this write must be
+// pinned by observing that writeFileAtomic is ACTUALLY invoked with the
+// right path/content, not by grepping vault.ts's source text for its name —
+// a rename-class mutant (or one that keeps the name but swaps the internals
+// for a plain write) would sail straight past a text assertion.
+export interface WriteVaultPageDeps {
+  writeFileAtomic?: typeof writeFileAtomic;
+}
+
 export async function writeVaultPage(
   input: WriteVaultPageInput,
+  deps: WriteVaultPageDeps = {},
 ): Promise<VaultWriteResult> {
   await ensureVault(input.vaultPath);
   const relativePath = sectionPath(input.section, input.title);
@@ -1255,7 +1265,8 @@ export async function writeVaultPage(
   // covers all of them with the same atomic temp+rename #231 already uses
   // for the active-plan pointer, rather than special-casing just the plan
   // caller.
-  await writeFileAtomic(notePath, body);
+  const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
+  await doWriteAtomic(notePath, body);
 
   await appendIndex(input.vaultPath, input.title, relativePath, input.content);
   await recordAudit(input.vaultPath, {

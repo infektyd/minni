@@ -491,22 +491,40 @@ function extractGoalFromBody(body: string): string {
 // Journal (append-only, replayable NDJSON lines; tolerant parser)
 // ---------------------------------------------------------------------------
 
+// Bugbot on #309 (campaign scar #3 — source-grep tests are false confidence:
+// a mutant that RENAMES the call site trips a regex but proves nothing about
+// behavior, and a mutant that swaps the durable helper's own internals for a
+// plain write while keeping its name and signature would sail straight past
+// a source-text assertion). Injectable seam so tests can spy on the ACTUAL
+// call — path, content, and that it fires at all — rather than grepping
+// plan.ts's source text for the helper's name.
+export interface AppendJournalDeps {
+  appendFileWithFsync?: typeof appendFileWithFsync;
+  writeFileAtomic?: typeof writeFileAtomic;
+}
+
 /** Append a PlanEvent as a single JSON line. Creates header on first write. */
-export async function appendJournal(journalPath: string, event: PlanEvent): Promise<void> {
+export async function appendJournal(
+  journalPath: string,
+  event: PlanEvent,
+  deps: AppendJournalDeps = {},
+): Promise<void> {
   // #293 (June audit N6, sibling of PLUMB-T4/#231): this used to be a plain
   // appendFile/writeFile, unlike history.jsonl's appendFileWithFsync
   // (plan.ts's historyFile write, below) — a crash could leave history
   // durable and the journal behind it or truncated. Same durability
   // guarantee as the sibling now: fsync'd append, atomic temp+rename init.
+  const doAppendWithFsync = deps.appendFileWithFsync ?? appendFileWithFsync;
+  const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
   const line = JSON.stringify(event) + "\n";
   try {
     // exists -> append
     await readFile(journalPath, "utf8");
-    await appendFileWithFsync(journalPath, line);
+    await doAppendWithFsync(journalPath, line);
   } catch {
     // missing or unreadable -> init
     const header = `# Minni Plan Journal\n\n## events\n`;
-    await writeFileAtomic(journalPath, header + line);
+    await doWriteAtomic(journalPath, header + line);
   }
 }
 
