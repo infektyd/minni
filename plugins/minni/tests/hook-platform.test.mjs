@@ -234,6 +234,45 @@ test("factory-driven entrypoints pin their platform wire, not agentId lookup", a
   }
 });
 
+test("#296: ackPendingHandoffsAtBoot is set everywhere except grok-build's deliberate carve-out", async () => {
+  // Mechanical guard against a future "cleanup" silently re-uniforming
+  // grok-build back onto the flag it was deliberately carved out of (see
+  // grok-hook.ts's CONFIG comment — its wire can't inject/note at
+  // SessionStart, so acking there would misreport acceptance to the sender
+  // before the content is ever surfaced). Behavioral coverage for both
+  // sides already lives in hook-283-migration.test.mjs; this pins the
+  // SOURCE-level shape so the set of configs setting the flag can't drift
+  // without a test noticing, even before anyone runs the behavioral suite.
+  const { readFile } = await import("node:fs/promises");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+
+  const shouldSet = ["hook.ts", "codex-hook.ts", "cursor-hook.ts", "gemini-hook.ts", "kilocode-hook.ts"];
+  const shouldOmit = ["grok-hook.ts"];
+
+  for (const file of shouldSet) {
+    const src = (await readFile(path.join(SRC, file), "utf8"))
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    assert.match(
+      src,
+      /ackPendingHandoffsAtBoot:\s*true\b/,
+      `${file} must set ackPendingHandoffsAtBoot: true`,
+    );
+  }
+  for (const file of shouldOmit) {
+    const src = (await readFile(path.join(SRC, file), "utf8"))
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    assert.doesNotMatch(
+      src,
+      /ackPendingHandoffsAtBoot\s*:/,
+      `${file} must not set ackPendingHandoffsAtBoot at all (deliberate carve-out, #296)`,
+    );
+  }
+});
+
 test("every platform's audit prefix is distinct and namespaced", async () => {
   // kilocode shipped `auditPrefix: "hook"`, so its entries were shaped exactly
   // like claude-code's. Separate vaults hid the collision, but it defeats any
