@@ -105,12 +105,21 @@ _COMPILE_FAILURE_STATUSES = frozenset(
 # schedule while the writer was stuck. The writer's in-flight guard is what
 # prevents duplicate drafts; this longer backoff (well past the 30s wait plus
 # drain margin) keeps the loop from burning compute against a blocked queue.
-# #307: which compact_distillation skip buckets are genuine DROPS (input
-# discarded and unrecoverable) rather than routine routing. `_other_kind` is
-# routing — other kinds share that inbox and have their own pass — and
-# counting it would produce an alarm that never returns to zero, which is the
-# failure mode this counter exists to avoid.
-COMPACT_DROP_REASONS = ("_unreadable", "_malformed")
+# #307: which compact_distillation skip buckets are genuine DROPS — input
+# discarded, unrecoverable, and never self-healing — rather than routine
+# routing or work that landed.
+#
+# Excluded and why: `_other_kind` is ROUTING (other kinds share that inbox and
+# are drained by their own pass, and the kind-less dead letters among them are
+# already surfaced by memory_lifecycle.afm_dead_letter); `_no_candidates` is
+# not loss at all (the note is written and the file archived).
+#
+# `_agent_mismatch` and `_empty_summary` ARE included: both `continue` with no
+# archive and no note, and both are deterministic — the same file produces the
+# identical skip forever — so they are exactly as lost as a corrupt payload.
+COMPACT_DROP_REASONS = (
+    "_unreadable", "_malformed", "_agent_mismatch", "_empty_summary",
+)
 
 _WRITE_STALL_STATUSES = frozenset({"write_timeout", "write_in_flight"})
 _WRITE_STALL_RETRY_SECONDS = 1800
@@ -1000,6 +1009,13 @@ async def afm_loop_runner(context: AFMContext):
                             # kinds legitimately share this inbox and are
                             # drained by their own pass, so counting it would
                             # manufacture an alarm that never clears.
+                            # NOTE: this is a count of drop EVENTS, not of
+                            # files. A dropped file is never archived or
+                            # quarantined, so it is re-dropped on every tick;
+                            # the cumulative total is files x ticks. The
+                            # FILE count — the quantity that is true and that
+                            # clears when the file is removed — is reported
+                            # separately on health.
                             _skipped = _dc.get("skipped") or {}
                             _dropped = sum(
                                 int(_skipped.get(k) or 0)
