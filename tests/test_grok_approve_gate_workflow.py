@@ -687,13 +687,68 @@ def test_grok_invocations_pin_model_and_effort(workflow):
             # read as a pin, and an unquoted invocation must not be skipped.
             body = _uncommented(str(step.get("run", "")))
             for call in re.finditer(r'"?\$HOME/\.grok/bin/grok"?((?:[^\n]*\\\n)*[^\n]*)', body):
-                calls.append(call.group(1))
+                flags = call.group(1)
+                # Only AGENT runs carry a model lane. `grok --version`, used by
+                # the install step to verify its pin, has no model to pin.
+                if "--prompt-file" not in flags:
+                    continue
+                calls.append(flags)
     # Without this the loop below is vacuous whenever the regex matches
     # nothing — a green test that constrains exactly zero invocations.
     assert calls, f"{workflow}: no grok invocation found to check"
     for flags in calls:
         assert "--model grok-4.5" in flags, f"{workflow}: model not pinned"
         assert "--reasoning-effort high" in flags, f"{workflow}: effort not pinned"
+
+
+GROK_CLI_WORKFLOWS = ("grok-review.yml", "grok.yml", "grok-boundary-test.yml")
+
+
+@pytest.mark.parametrize("workflow", GROK_CLI_WORKFLOWS)
+def test_grok_cli_install_is_version_pinned(workflow):
+    """SEC-G10: an unpinned `curl | bash` installs whatever is current at run
+    time, so "the CLI version changed" — the axis grok-boundary-test.yml's own
+    header says must re-prove the boundary — could never fire its `paths`
+    filter. Pinning makes a CLI change a FILE change, which that filter sees.
+    """
+    doc = _load(ROOT / ".github" / "workflows" / workflow)
+    steps = [s for job in doc["jobs"].values() for s in job.get("steps") or []
+             if "x.ai/cli/install.sh" in str(s.get("run", ""))]
+    assert steps, f"{workflow}: no CLI install step found to check"
+    for step in steps:
+        pin = (step.get("env") or {}).get("GROK_CLI_VERSION")
+        assert pin, f"{workflow}: install step declares no GROK_CLI_VERSION"
+        assert re.fullmatch(r"\d+\.\d+\.\d+", str(pin)), f"{workflow}: {pin!r}"
+        run = step["run"]
+        assert 'bash -s "$GROK_CLI_VERSION"' in run, (
+            f"{workflow}: install does not pass the pin to the installer"
+        )
+        # Without this the pin is decorative: the installer falls back to the
+        # channel's latest whenever the argument is absent or dropped.
+        assert "--version" in run and "::error::expected grok" in run, (
+            f"{workflow}: install does not verify the installed version"
+        )
+
+
+def test_every_grok_workflow_pins_the_same_cli_version():
+    """A boundary proven against one build says nothing about another."""
+    pins = set()
+    for workflow in GROK_CLI_WORKFLOWS:
+        doc = _load(ROOT / ".github" / "workflows" / workflow)
+        for job in doc["jobs"].values():
+            for step in job.get("steps") or []:
+                if "x.ai/cli/install.sh" in str(step.get("run", "")):
+                    pins.add((step.get("env") or {}).get("GROK_CLI_VERSION"))
+    assert len(pins) == 1, f"grok workflows disagree on the CLI version: {pins}"
+
+
+def test_boundary_test_has_a_trigger_that_does_not_need_a_diff():
+    """The pinned CLI covers repo-visible change; the sandbox's server-side
+    behaviour and the pinned artifact's availability can still move with no
+    diff at all, and the last green run would stand as current evidence."""
+    triggers = _triggers(_load(ROOT / ".github" / "workflows" / "grok-boundary-test.yml"))
+    assert "schedule" in triggers, "no trigger can fire without a file change"
+    assert triggers["schedule"], "schedule declared but empty"
 
 
 def test_every_path_mutating_job_is_covered():

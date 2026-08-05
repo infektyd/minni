@@ -132,9 +132,33 @@ jobs:
           bwrap --ro-bind / / --dev /dev true && echo "bwrap namespace OK"
 
       - name: Install Grok Build CLI
+        env:
+          GROK_CLI_VERSION: 0.2.118
         run: |
-          curl -fsSL https://x.ai/cli/install.sh | bash
+          # PINNED, not latest (SEC-G10). grok-boundary-test.yml's header says
+          # the boundary proof must re-run "whenever the sandbox profile, the
+          # CLI version, or the flag set changes" — but its trigger is a
+          # `paths` filter, and a paths filter can never observe a CLI release.
+          # An unpinned `| bash` therefore made the one axis the header names
+          # the one axis nothing could fire on. Pinning converts a CLI change
+          # into a FILE change, which the existing paths filter already
+          # catches. Bumping this line is the deliberate act of re-proving the
+          # boundary against a new CLI.
+          #
+          # Stable channel, not alpha: the installer defaults to stable and
+          # `grok models`/`--reasoning-effort` were verified present on this
+          # exact build before pinning.
+          curl -fsSL https://x.ai/cli/install.sh | bash -s "$GROK_CLI_VERSION"
           echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+          # Assert we got what we pinned. The installer silently falls back to
+          # the channel's latest when the version argument is absent or
+          # dropped, and a quietly-newer CLI is exactly what this pin exists to
+          # prevent — so a mismatch has to fail rather than proceed.
+          INSTALLED=$("$HOME/.grok/bin/grok" --version)
+          case "$INSTALLED" in
+            *"$GROK_CLI_VERSION"*) echo "grok CLI pinned at $GROK_CLI_VERSION" ;;
+            *) echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"; exit 1 ;;
+          esac
 
       - name: Restore Grok subscription auth
         env:

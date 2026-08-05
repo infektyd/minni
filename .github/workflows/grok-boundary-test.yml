@@ -4,6 +4,13 @@ name: Grok Boundary Test
 # sandbox profile, the CLI version, or the flag set changes — it is the proof
 # that the boundary actually holds on the runner, rather than an assumption.
 #
+# All three of those are now OBSERVABLE from this repository. The CLI version
+# used to be the exception: the workflows installed whatever was current at run
+# time, so "the CLI version changed" could never fire a `paths` filter and this
+# proof silently stayed green across releases that could have changed sandbox
+# semantics (SEC-G10). The CLI is pinned in the install step below, so a CLI
+# change is now a file change, and the paths filter catches it.
+#
 # WHY THIS EXISTS (measured 2026-08-01, grok 0.2.117 locally):
 # under --always-approve the built-in `read_file` tool reads
 # $HOME/.grok/auth.json outright — no shell required. A `--tools` allowlist
@@ -14,6 +21,14 @@ name: Grok Boundary Test
 
 on:
   workflow_dispatch:
+  # A pinned CLI makes a CLI release observable, but not everything this proof
+  # depends on lives in the repository: the sandbox's server-side behaviour, the
+  # model behind the agent, and the availability of the pinned artifact can all
+  # move with no diff at all. A slow heartbeat catches that drift instead of
+  # letting the last green run stand indefinitely as current evidence. Weekly,
+  # not daily — this burns a metered agent run each time.
+  schedule:
+    - cron: '0 5 * * 1'
   pull_request:
     # Any change to the Grok CI surface re-proves the boundary. macOS cannot
     # stand in for this: `restrict_network` is seccomp-based and Linux-only,
@@ -153,9 +168,33 @@ jobs:
           bwrap --ro-bind / / --dev /dev true && echo "bwrap namespace OK"
 
       - name: Install Grok Build CLI
+        env:
+          GROK_CLI_VERSION: 0.2.118
         run: |
-          curl -fsSL https://x.ai/cli/install.sh | bash
+          # PINNED, not latest (SEC-G10). grok-boundary-test.yml's header says
+          # the boundary proof must re-run "whenever the sandbox profile, the
+          # CLI version, or the flag set changes" — but its trigger is a
+          # `paths` filter, and a paths filter can never observe a CLI release.
+          # An unpinned `| bash` therefore made the one axis the header names
+          # the one axis nothing could fire on. Pinning converts a CLI change
+          # into a FILE change, which the existing paths filter already
+          # catches. Bumping this line is the deliberate act of re-proving the
+          # boundary against a new CLI.
+          #
+          # Stable channel, not alpha: the installer defaults to stable and
+          # `grok models`/`--reasoning-effort` were verified present on this
+          # exact build before pinning.
+          curl -fsSL https://x.ai/cli/install.sh | bash -s "$GROK_CLI_VERSION"
           echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+          # Assert we got what we pinned. The installer silently falls back to
+          # the channel's latest when the version argument is absent or
+          # dropped, and a quietly-newer CLI is exactly what this pin exists to
+          # prevent — so a mismatch has to fail rather than proceed.
+          INSTALLED=$("$HOME/.grok/bin/grok" --version)
+          case "$INSTALLED" in
+            *"$GROK_CLI_VERSION"*) echo "grok CLI pinned at $GROK_CLI_VERSION" ;;
+            *) echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"; exit 1 ;;
+          esac
 
       - name: Restore Grok subscription auth
         env:
