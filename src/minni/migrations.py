@@ -205,6 +205,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                     _apply_migration_013_legacy_main_rewrite(conn)
                 if version == 18:
                     _apply_migration_018_episodic_fts_backfill(conn)
+                if version == 19:
+                    _apply_migration_019_episodic_fts_update_trigger(conn)
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, os.path.basename(filepath), now),
@@ -363,6 +365,40 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _apply_migration_019_episodic_fts_update_trigger(conn: sqlite3.Connection) -> None:
+    """Install trg_episodic_fts_update on databases that predate it (#287).
+
+    Guarded on both episodic tables existing. SQLite resolves trigger-body
+    tables at FIRE time, not CREATE time, so creating this on a schema with
+    episodic_events but no episodic_fts succeeds silently and then breaks every
+    subsequent UPDATE with "no such table: main.episodic_fts" —
+    _execute_tolerant cannot help, because there is no error at CREATE time to
+    tolerate. Partial schemas are real; see the .sql file for the full
+    rationale, including why there is deliberately no DELETE counterpart.
+    """
+    from minni.episodic import _episodic_tables_present
+
+    if not _episodic_tables_present(conn):
+        logger.info(
+            "Migration 019: episodic tables incomplete — skipping FTS update "
+            "trigger (creating it would break later UPDATEs on this schema)"
+        )
+        return
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_update
+        AFTER UPDATE OF agent_id, content ON episodic_events
+        BEGIN
+            DELETE FROM episodic_fts WHERE event_id = OLD.event_id;
+            INSERT INTO episodic_fts(event_id, agent_id, content)
+            SELECT NEW.event_id, NEW.agent_id, NEW.content
+            WHERE NEW.content IS NOT NULL;
+        END
+        """
+    )
+    logger.info("Migration 019: episodic_fts UPDATE trigger present")
 
 
 def _apply_migration_018_episodic_fts_backfill(conn: sqlite3.Connection) -> None:

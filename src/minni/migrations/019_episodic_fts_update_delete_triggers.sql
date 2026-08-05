@@ -1,0 +1,51 @@
+-- Migration 019: give episodic_events the UPDATE FTS trigger it never had.
+--
+-- Issue #287, found during adversarial review of PR #279. episodic_events
+-- carried an AFTER INSERT trigger only, while learnings has carried
+-- insert/update/delete since migration 011. The asymmetry was latent — nothing
+-- in src/ UPDATEs episodic_events today — but the failure mode is silent, and
+-- the coverage metric added in #279 cannot see it: episodic_index_coverage
+-- checks that an event_id is PRESENT in the index, not that the indexed text
+-- still matches the row. Reproduced against the shipped schema:
+--
+--   UPDATE episodic_events SET content='revised beta text' WHERE event_id=1
+--   -> events content: revised beta text
+--   -> fts    content: original alpha text
+--   -> MATCH 'beta'  = 0 rows   (the current text is unfindable)
+--   -> MATCH 'alpha' = 1 row    (the superseded text still matches)
+--   -> episodic_index_ratio: 1.0 (reports healthy)
+--
+-- The trigger is DELETE-then-conditional-INSERT rather than learnings'
+-- UPDATE-in-place. episodic's insert trigger is guarded on
+-- `WHEN NEW.content IS NOT NULL`, so an UPDATE clearing content must REMOVE the
+-- index row; an in-place UPDATE would write NULL content into fts5 and keep a
+-- row the insert path would never have created.
+--
+-- Note what this migration does NOT add: the matching AFTER DELETE trigger.
+-- That symmetry is a trap. episodic_fts.event_id is an UNINDEXED fts5 column,
+-- so `DELETE ... WHERE event_id = OLD.event_id` is a full scan of the content
+-- shadow table once PER DELETED ROW, and episodic's prune path runs on the
+-- user-facing search path (recall calls trim_recall_traces() on every search).
+-- Measured, 5000 expiring traces against 50000 retained events: 0.014s without
+-- the trigger, 16.674s with it. Orphan collection lives in
+-- reconcile_episodic_fts instead, which does it set-wise once per sweep and
+-- also catches rows filed under the wrong agent. See db.py.
+--
+-- Applied from Python (_apply_migration_019_episodic_fts_update_trigger) rather
+-- than as SQL here, because SQLite resolves trigger-body tables at FIRE time,
+-- not CREATE time: `CREATE TRIGGER` succeeds on a schema that has
+-- episodic_events but no episodic_fts, and _execute_tolerant never sees an
+-- error — but every later UPDATE on episodic_events then dies with
+-- "no such table: main.episodic_fts". Partial schemas are real (test fixtures
+-- build subsets), and _execute_tolerant's own docstring records being bitten by
+-- exactly this hazard with trg_learnings_fts_delete. The Python hook checks
+-- both tables exist first and no-ops otherwise.
+--
+-- Idempotent: CREATE TRIGGER IF NOT EXISTS, matching db._init_schema, so a
+-- fresh database (which gets the trigger from _init_schema directly) is a
+-- no-op. This file is a marker so the version stays discoverable and recorded
+-- in schema_migrations, matching migrations 015 and 018.
+--
+-- See migrations.py:_apply_migration_019_episodic_fts_update_trigger.
+
+SELECT 1;
