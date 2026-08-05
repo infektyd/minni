@@ -48,11 +48,18 @@ export interface PlanArtifact {
   rev: number;
 }
 
+// #292 (June audit N5): "shelf_pulled" was declared here and never emitted —
+// there is no code anywhere that resolves shelf_ref.pull_hint into an actual
+// content fetch as a distinct action; it is only ever stored and rendered as
+// a display string for an agent to read and manually follow. A declared
+// event kind nothing can emit is a channel indistinguishable from "this
+// never happens." Removed rather than wired up: re-grepped the whole repo
+// (src, tests, docs) before removing and found zero downstream consumers —
+// no renderer, no test, no other agent's hook parser referenced the kind.
 export type PlanEvent =
   | { kind: "status_changed"; slice_id: string; from: PlanSliceStatus; to: PlanSliceStatus; at: string; evidence?: string }
   | { kind: "replan"; at: string; note?: string }
   | { kind: "gate_passed"; slice_id: string; evidence: string; at: string }
-  | { kind: "shelf_pulled"; at: string; reason: string }
   | { kind: "rehydrated"; at: string }
   | { kind: "restored"; from_rev: number; at: string }
   | { kind: "scar_added"; signal: string; at: string }
