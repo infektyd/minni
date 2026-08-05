@@ -57,7 +57,11 @@ def test_ci_completion_uses_workflow_run_not_check_suite(gate):
     assert "check_suite" not in triggers
     listed = set(triggers["workflow_run"]["workflows"])
     # Every workflow producing a required context must re-trigger the gate.
-    assert {"Public CI", "PR Hygiene", "Claude Code Review"} <= listed
+    # "Claude Code Review" used to be listed here and never belonged: it
+    # produced no required context (live protection requires Forbidden Files,
+    # Free public cloud smoke and grok-mechanical-approve), and the workflow
+    # was removed in #240 for reporting success without ever reviewing.
+    assert {"Public CI", "PR Hygiene"} <= listed
     assert "Grok Code Review" in listed
 
 

@@ -24,7 +24,6 @@ on:
       - "Grok Code Review"
       - "Public CI"
       - "PR Hygiene"
-      - "Claude Code Review"
     types: [completed]
     # Branch filters here match the TRIGGERING run's head branch. CI completing
     # on main starts a gate run that resolves main's SHA, finds no open PR and

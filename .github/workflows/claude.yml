@@ -6,7 +6,14 @@ on:
   pull_request_review_comment:
     types: [created]
   issues:
-    types: [opened, assigned]
+    # `assigned` removed alongside the author gate below: on that event the
+    # gate reads the ISSUE AUTHOR's association, never the assigner's, so it
+    # could only ever fire for collaborator-authored issues — which `opened`
+    # already covers. The delegation case it existed for (a maintainer assigns
+    # an outsider's issue to the agent) is exactly what the gate must refuse,
+    # since it would spend the token on outsider-authored content. Leaving the
+    # trigger would be dead config that reads as a working path.
+    types: [opened]
   pull_request_review:
     types: [submitted]
 

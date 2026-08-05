@@ -1,32 +1,32 @@
-"""Workflow-shape invariants for the Claude pair.
-
-Two issues meet here.
+"""Workflow-shape invariants for the Claude agent path.
 
 SEC-G9 (#236): the Claude workflows were added in #214 and never received the
-guards the Grok workflows got in #215 — author-association gate, same-repo and
-draft gates, `concurrency`, `timeout-minutes`. Four guards on the Grok pair,
-zero of the four on the Claude pair. The asymmetry is a direct config read;
-whether the missing author gate was EXPLOITABLE is unverified, and these tests
-pin the guards rather than any exploit claim.
+guards the Grok workflows got in #215 — author-association gate, `concurrency`,
+`timeout-minutes`. The ASYMMETRY is a direct config read and is not in doubt;
+whether the missing author gate was EXPLOITABLE is unverified, so these tests
+pin the guards, not an exploit claim.
 
-#240: `Claude Code Review` reported success 12+ times while posting nothing —
-`claude[bot]` has zero comments repo-wide — with one permission denial per run
-and ~$0.29 billed each time. `pull-requests: read` cannot post a review, so the
-model did the work, was denied at the post, and the step still exited 0.
+#240: `Claude Code Review` reported success 12+ times while posting nothing,
+billing ~$0.29 a run. It was removed rather than repaired — see
+`test_the_review_workflow_that_never_reviewed_is_gone` for why the permission
+theory was not acted on.
 """
 
 from __future__ import annotations
 
-import subprocess
+import json
+import re
 from pathlib import Path
 
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-CLAUDE = ROOT / ".github" / "workflows" / "claude.yml"
-REVIEW = ROOT / ".github" / "workflows" / "claude-code-review.yml"
-GROK = ROOT / ".github" / "workflows" / "grok.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
+CLAUDE = WORKFLOWS / "claude.yml"
+GROK = WORKFLOWS / "grok.yml"
+
+ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 
 def _load(path: Path) -> dict:
@@ -37,109 +37,113 @@ def _job(path: Path) -> dict:
     return next(iter(_load(path)["jobs"].values()))
 
 
-@pytest.mark.parametrize("path", [CLAUDE, REVIEW])
-def test_agent_jobs_are_bounded(path):
-    """An agent job with no timeout sits at the 6h default while metered."""
-    assert _job(path).get("timeout-minutes"), f"{path.name}: no timeout-minutes"
+def test_agent_job_is_bounded():
+    """An agent job with no timeout sits at the 6h default while metered.
+    Bounded ABOVE too: raising it to 360 is the same defect restated."""
+    timeout = _job(CLAUDE).get("timeout-minutes")
+    assert timeout, "claude.yml: no timeout-minutes"
+    assert 0 < int(timeout) <= 30, f"claude.yml: timeout of {timeout} is not a bound"
 
 
-@pytest.mark.parametrize("path", [CLAUDE, REVIEW])
-def test_agent_workflows_declare_concurrency(path):
-    """claude-code-review also triggers on `synchronize`, which grok-review
-    declines on cost grounds — without a group, every push starts another
-    metered review and none of them cancel."""
-    group = (_load(path).get("concurrency") or {}).get("group")
-    assert group, f"{path.name}: no concurrency group"
+def test_agent_workflow_declares_concurrency():
+    """Two rapid @claude mentions otherwise run two metered agents over the
+    same context. A constant group would serialise every issue in the repo."""
+    group = (_load(CLAUDE).get("concurrency") or {}).get("group")
+    assert group, "claude.yml: no concurrency group"
+    assert "${{" in group and "number" in group, (
+        f"concurrency group is not keyed on the issue/PR: {group!r}"
+    )
 
 
 def test_mention_handler_gates_on_author_association():
     """Mirrors grok.yml. The job holds CLAUDE_CODE_OAUTH_TOKEN; without this a
     drive-by commenter spends it."""
     condition = _job(CLAUDE)["if"]
-    for role in ("OWNER", "MEMBER", "COLLABORATOR"):
-        assert role in condition, f"claude.yml: {role} missing from author gate"
+    match = re.search(r"fromJSON\('(\[.*?\])'\)", condition, re.S)
+    assert match, "claude.yml: no fromJSON role list in the author gate"
+    # The exact SET, not a substring scan: appending "CONTRIBUTOR" or "NONE"
+    # opens the gate to anyone while every substring assertion still passes.
+    assert set(json.loads(match.group(1))) == ALLOWED_ASSOCIATIONS
     assert "author_association" in condition
-    # The same roles the Grok counterpart uses — divergence here is the bug.
-    assert all(r in _load(GROK)["jobs"]["decide"]["if"]
-               for r in ("OWNER", "MEMBER", "COLLABORATOR"))
 
 
-def test_mention_handler_still_requires_the_mention():
-    """The author gate must be ANDed with the trigger match, not replace it:
-    every collaborator comment would otherwise spend a metered agent."""
+def test_the_author_gate_is_ANDed_with_the_mention_match():
+    """Structural, not `"&&" in condition` — `&&` already appears inside every
+    inner clause, so a substring check cannot tell AND from OR. Flipping the
+    join to `||` disables the gate entirely while reading almost identically."""
     condition = _job(CLAUDE)["if"]
+    start = condition.index("contains(fromJSON(")
+    # Walk to the matching paren that closes the author-gate `contains(...)`,
+    # then read the operator that joins it to the rest.
+    depth, i = 0, start + len("contains")
+    while i < len(condition):
+        if condition[i] == "(":
+            depth += 1
+        elif condition[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    join = condition[i + 1:].lstrip()
+    assert join.startswith("&&"), (
+        f"author gate is not ANDed with the trigger match; joined by: "
+        f"{join[:20]!r}"
+    )
     assert "@claude" in condition, "claude.yml: mention match lost"
-    assert "&&" in condition, "claude.yml: author gate is not ANDed with the match"
 
 
-def test_review_workflow_skips_forks_and_drafts():
-    """Fork PRs get no secrets, so the token is empty and the job can only fail
-    or no-op; drafts are not ready to review. grok-review.yml gates both."""
-    condition = _job(REVIEW)["if"]
-    assert "head.repo.full_name == github.repository" in condition
-    assert "draft == false" in condition
+def test_author_gate_matches_the_grok_counterpart():
+    """Divergence between the two agent paths is the bug #236 filed."""
+    grok = _load(GROK)["jobs"]["decide"]["if"]
+    grok_roles = set(json.loads(re.search(r"fromJSON\('(\[.*?\])'\)", grok, re.S).group(1)))
+    assert grok_roles == ALLOWED_ASSOCIATIONS
 
 
-def test_review_workflow_can_actually_post():
-    """#240's root cause: posting a review requires write. With `read` the
-    model did the work, was denied, and the step exited 0 anyway."""
-    perms = _job(REVIEW)["permissions"]
-    assert perms["pull-requests"] == "write", (
-        "claude-code-review cannot post a review, so success means nothing"
+def test_no_dead_trigger_that_the_gate_can_never_admit():
+    """`issues: assigned` reads the ISSUE AUTHOR's association, never the
+    assigner's, so with the gate it could only fire for collaborator-authored
+    issues — which `opened` already covers. A trigger that can never do
+    anything reads as a working path."""
+    triggers = _load(CLAUDE).get("on") or _load(CLAUDE)[True]
+    assert "assigned" not in (triggers["issues"]["types"] or [])
+
+
+def test_the_review_workflow_that_never_reviewed_is_gone():
+    """#240 offers two endings: make it post, or remove it. Removal was chosen.
+
+    The permission theory (`pull-requests: read` cannot post) was never
+    confirmed, and two measurements argue against acting on it: `claude[bot]`
+    has posted ZERO comments repo-wide, and claude.yml carries the SAME
+    `pull-requests: read` — so `read` does not distinguish the two. Granting
+    write on an unconfirmed cause would have handed an agent that reads
+    PR-authored content the ability to publish anything it read, dismiss a
+    blocking review, and retarget the PR base — on the one agent path with no
+    leak gate, which grok.yml has and this never did.
+    """
+    assert not (WORKFLOWS / "claude-code-review.yml").exists(), (
+        "the review workflow is back; if it is revived it needs the fail-closed "
+        "leak gate ported first, not just a permission change"
     )
 
 
-def test_review_workflow_fails_when_no_review_was_posted():
-    """A gate must never pass by not checking. The permission fix is the
-    believed cause; this assertion is what makes a recurrence visible."""
-    steps = _job(REVIEW)["steps"]
-    assert_step = next(
-        (s for s in steps if "no review and no comment" in str(s.get("run", ""))), None
-    )
-    assert assert_step, "no step asserts that a review was actually delivered"
-    assert "if" not in assert_step, "the assertion carries a disabling condition"
-
-    # BEHAVIOURAL: run the decision logic with synthetic counts. Substring
-    # assertions here would survive inverting the condition.
-    logic = (
-        'if [ "$REVIEWS" -eq 0 ] && [ "$COMMENTS" -eq 0 ]; then exit 1; fi'
-    )
-    assert logic.split("; then")[0] in assert_step["run"].replace("\\\n", ""), (
-        "the emptiness condition is not the one this test verifies"
-    )
-    for reviews, comments, should_pass in (
-        (0, 0, False),   # the #240 state: green for nothing
-        (1, 0, True),
-        (0, 1, True),
-        (2, 3, True),
-    ):
-        rc = subprocess.run(
-            ["bash", "-c", f'set -eu\nREVIEWS={reviews}\nCOMMENTS={comments}\n{logic}'],
-            capture_output=True, text=True,
-        ).returncode
-        assert (rc == 0) is should_pass, (
-            f"reviews={reviews} comments={comments} -> rc={rc}"
-        )
+def test_the_gate_does_not_wait_on_a_workflow_that_no_longer_exists():
+    """grok-approve-gate re-evaluates on workflow_run completions. Naming a
+    deleted workflow there is stale config that reads as coverage."""
+    gate = _load(WORKFLOWS / "grok-approve-gate.yml")
+    listed = set((gate.get("on") or gate[True])["workflow_run"]["workflows"])
+    existing = {_load(p).get("name") for p in WORKFLOWS.glob("*.yml")}
+    assert listed <= existing, f"gate waits on missing workflows: {listed - existing}"
 
 
-def test_review_workflow_does_not_publish_the_full_transcript():
-    """#240 suggests show_full_output for diagnosis; Actions logs are PUBLIC on
-    this repo, so enabling it permanently would publish the SDK transcript."""
-    # The SETTING, not the word: the workflow comments explain why the flag is
-    # deliberately absent, and a raw text search fires on that explanation.
-    for job in _load(REVIEW)["jobs"].values():
-        for step in job["steps"]:
-            assert "show_full_output" not in (step.get("with") or {}), (
-                "the full SDK transcript would be published to a public log"
-            )
-
-
-@pytest.mark.parametrize("path", [CLAUDE, REVIEW])
-def test_no_commented_out_guard_masquerading_as_one(path):
-    """The template shipped a commented-out author filter with no explanation,
-    which reads as a guard that exists. #236 asks for a real gate or a stated
-    reason — never a commented-out one."""
-    for line in path.read_text(encoding="utf-8").splitlines():
+def test_no_commented_out_guard_masquerading_as_one():
+    """A commented-out condition with no explanation reads as a guard that
+    exists. #236 asks for a real gate or a stated reason — never this."""
+    for line in CLAUDE.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
-        if stripped.startswith("#") and "if:" in stripped:
-            raise AssertionError(f"{path.name}: commented-out condition: {stripped}")
+        if stripped.startswith("#") and re.match(r"#\s*if:", stripped):
+            raise AssertionError(f"claude.yml: commented-out condition: {stripped}")
+
+
+@pytest.mark.parametrize("path", sorted(WORKFLOWS.glob("*.yml")))
+def test_every_workflow_still_parses(path):
+    assert _load(path)["jobs"], f"{path.name}: no jobs"
