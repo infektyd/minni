@@ -616,15 +616,38 @@ class TestWarmStartTakesTheDiskCacheHitBranch:
 
         # Warm pass on a fresh engine: this is the HIT branch.
         warm = RetrievalEngine(db_obj, cfg)
-        with _fails_if_a_write_is_pending_when_a_cursor_opens(
-            db_obj, "_ensure_faiss_loaded (warm start)"
-        ):
-            warm._ensure_faiss_loaded()
 
-        assert warm.faiss_index.ready and warm.faiss_index.count > 0, (
-            "precondition: the warm-start HIT branch must actually have run — "
-            "without this the test silently degrades to the miss path"
+        # The precondition has to prove the HIT, not infer it. `ready` and
+        # `count > 0` are equally true after a cache MISS followed by a rebuild
+        # from the DB, so asserting those would leave the raw _get_conn() take
+        # at retrieval.py:864 untested while the test looked strict. Verified:
+        # with try_load_from_disk stubbed to always return False, the
+        # ready/count version of this assertion still passed. Spy on the return
+        # value instead — that IS the branch condition.
+        loaded: list = []
+        original_load = warm.faiss_index.try_load_from_disk
+
+        def _spy(db_conn=None):
+            result = original_load(db_conn=db_conn)
+            loaded.append(result)
+            return result
+
+        warm.faiss_index.try_load_from_disk = _spy
+        try:
+            with _fails_if_a_write_is_pending_when_a_cursor_opens(
+                db_obj, "_ensure_faiss_loaded (warm start)"
+            ):
+                warm._ensure_faiss_loaded()
+        finally:
+            warm.faiss_index.try_load_from_disk = original_load
+
+        assert loaded == [True], (
+            "precondition: the disk-cache HIT branch must actually have run. "
+            f"try_load_from_disk returned {loaded} — [] means it was never "
+            "reached, [False] means this degraded to the rebuild path and the "
+            "raw connection take inside the `if` was never executed"
         )
+        assert warm.faiss_index.ready and warm.faiss_index.count > 0
         _assert_connection_is_clean(conn, cfg, "_ensure_faiss_loaded (warm start)")
         db_obj.close()
 
@@ -709,22 +732,36 @@ class TestTheRemainingCallSitesRunTheirOwnCode:
         _assert_connection_is_clean(conn, cfg, "sovereign_memory.cmd_faiss")
         db_obj.close()
 
-    def test_eager_startup_init_leaves_no_transaction(self, tmp_path, monkeypatch):
-        """minnid.py:2095 — the daemon's eager init. Same shape as
-        db.connect(): acquires a connection purely to run schema init and
-        migrations, both of which write and must commit."""
+    def test_eager_startup_init_leaves_no_transaction(self, tmp_path):
+        """minnid.py:2094-2095 — the daemon's eager startup init, driven
+        through SovereignDB.shared() as production does.
+
+        An earlier version constructed SovereignDB directly, which mirrors
+        db.connect() rather than the call site it claimed to cover. shared()
+        goes through a process-wide registry keyed by absolute db_path, so the
+        path under test is genuinely different code — and an overstated
+        coverage claim is the thing this campaign exists to remove.
+        """
+        import os
+
         import minni.db as db_mod
         from minni.config import SovereignConfig
         from minni.db import SovereignDB
 
         cfg = SovereignConfig(db_path=str(tmp_path / "eager.db"))
+        key = os.path.abspath(cfg.db_path)
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
-            db_obj = SovereignDB(cfg)
-            db_obj._get_conn()  # the minnid.py:2095 call, verbatim
+            # Verbatim shape of minnid.py:2094-2095.
+            db = SovereignDB.shared(cfg)
+            db._get_conn()
         finally:
             db_mod._migrations_run = old_flag
 
-        _assert_connection_is_clean(db_obj._get_conn(), cfg, "eager startup init")
-        db_obj.close()
+        _assert_connection_is_clean(db._get_conn(), cfg, "eager startup init")
+
+        db.close()
+        # Don't leave this tmp database in the process-wide registry.
+        with SovereignDB._shared_lock:
+            SovereignDB._shared_instances.pop(key, None)
