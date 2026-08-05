@@ -99,7 +99,7 @@ def _cursor_batch(c, sql: str, key: Tuple[str, str], limit: int):
 
 
 def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
-    """Document- and learning-level vector coverage.
+    """Document- and learning-level vector coverage, plus episodic FTS coverage.
 
     Counts only — no paths, no learning text — so this is safe to expose in the
     pre-identity health report alongside the other aggregate liveness fields.
@@ -110,6 +110,11 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
     the drain must not close.
     """
     coverage: Dict[str, object] = {}
+    # Computed OUTSIDE the try below, and merged into both the success and the
+    # error return. The boundary has to hold in both directions: the episodic
+    # block already survives a broken documents/learnings schema, and a broken
+    # chunk_embeddings table must not take the episodic fields with it either.
+    episodic = episodic_index_coverage(db)
     try:
         with db.cursor() as c:
             # grok-review (post-rebase tip, finding 1): align document coverage
@@ -160,7 +165,7 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
             ).fetchone()["n"]
     except Exception as exc:
         logger.debug("embedding_coverage unavailable: %s", exc)
-        return {"error": str(exc)}
+        return {"error": str(exc), **episodic}
 
     def _ratio(have: int, total: int) -> Optional[float]:
         # None, not 1.0: an empty index has no coverage to report, and claiming
@@ -184,7 +189,127 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
         learnings_with_embedding, total_learnings
     )
     coverage["learnings_terminal_null_embedding"] = learnings_terminal_null
+    coverage.update(episodic)
     return coverage
+
+
+def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
+    """Episodic events versus what episodic_fts can actually find.
+
+    Slice R7: embedding_coverage compared documents against vectors and
+    learnings against embeddings, and stopped there. Episodic memory has no
+    embeddings at all — search_episodic reads episodic_fts — so an events/FTS
+    desync was invisible to every health surface. It was also real: 35 of 43
+    non-trace events on the operator's database were absent from the index
+    because they predate the AFTER-INSERT trigger, and the only way to see that
+    was to write the join by hand. Migration 018 repairs the existing gap; this
+    is what stops the next one being silent.
+
+    Counts and ratios only — no event content — so it stays exposable next to
+    the document and learning fields.
+
+    Carries its own error boundary rather than joining embedding_coverage's:
+    a schema without episodic_fts must cost the caller the episodic fields, not
+    the document coverage it came for.
+    """
+    try:
+        # Inside the boundary: embedding_coverage now calls this OUTSIDE its own
+        # try, so an ImportError escaping here would propagate out of a function
+        # documented never to cost the caller the rest of the report.
+        from minni.episodic import NON_MEMORY_EVENT_TYPES
+
+        placeholders = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
+        # Trace rows are excluded from the ratio and reported on their own line,
+        # the same honesty rule documents_deliberately_unembedded follows: they
+        # are not agent memory, search_episodic filters them out by the same
+        # list, and folding thousands of them into the denominator would drown
+        # the gap this field exists to expose (2597 traces against 43 real
+        # events on the operator's DB).
+        #
+        # episodic_observability_events is a row count only — it deliberately
+        # does NOT claim anything about whether traces are themselves indexed,
+        # because that is not measured here. Their index state cannot move
+        # episodic_index_ratio in either direction.
+        # Alias-qualified: the indexed count below joins episodic_fts, which has
+        # its own `content` column, so an unqualified predicate is ambiguous.
+        def _memory_only(alias: str) -> str:
+            return (
+                f"{alias}.content IS NOT NULL AND ({alias}.event_type IS NULL"
+                f" OR {alias}.event_type NOT IN ({placeholders}))"
+            )
+
+        with db.cursor() as c:
+            total_events = c.execute(
+                f"SELECT COUNT(*) AS n FROM episodic_events e"
+                f" WHERE {_memory_only('e')}",
+                NON_MEMORY_EVENT_TYPES,
+            ).fetchone()["n"]
+            # Joined on agent_id as well as event_id, because presence in the
+            # index is not the same as reachability. search_episodic filters on
+            # ef.agent_id — the FTS copy, not the event's — and recall's default
+            # path always passes an agent_id. An index row carrying the wrong
+            # agent is unreachable through the production path while still being
+            # "present", so an event_id-only count would report ratio 1.0 over a
+            # channel that returns nothing: the exact health overstatement this
+            # field exists to prevent.
+            indexed_events = c.execute(
+                f"""SELECT COUNT(DISTINCT e.event_id) AS n
+                      FROM episodic_events e
+                      JOIN episodic_fts f
+                        ON CAST(f.event_id AS INTEGER) = e.event_id
+                       AND f.agent_id IS e.agent_id
+                     WHERE {_memory_only('e')}""",
+                NON_MEMORY_EVENT_TYPES,
+            ).fetchone()["n"]
+            observability_events = c.execute(
+                f"SELECT COUNT(*) AS n FROM episodic_events"
+                f" WHERE event_type IN ({placeholders})",
+                NON_MEMORY_EVENT_TYPES,
+            ).fetchone()["n"]
+            # Index residue: FTS rows whose event is gone. Harmless to recall —
+            # search_episodic INNER JOINs episodic_events — but reported rather
+            # than hidden, since a climbing count means a delete path is
+            # skipping the index.
+            # A NULL event_id counts as an orphan too: it joins to no event and
+            # the backfill can never claim it. Excluding it would leave
+            # indexed + orphans failing to reconcile against the FTS row count,
+            # which is how index junk stays invisible.
+            orphans = c.execute(
+                "SELECT COUNT(*) AS n FROM episodic_fts f"
+                " WHERE f.event_id IS NULL"
+                " OR CAST(f.event_id AS INTEGER) NOT IN"
+                " (SELECT event_id FROM episodic_events)"
+            ).fetchone()["n"]
+    except Exception as exc:
+        # warning, not debug: at the default level a debug line means a broken
+        # coverage query is indistinguishable from a healthy one.
+        logger.warning("episodic_index_coverage unavailable: %s", exc)
+        # The key set stays stable so "unknown" cannot be misread as "empty".
+        # Dropping the keys entirely would leave a consumer's
+        # coverage.get("episodic_index_ratio") returning None — the exact value
+        # this function uses to mean "no episodic events yet".
+        return {
+            "episodic_events_total": None,
+            "episodic_events_indexed": None,
+            "episodic_events_missing_index": None,
+            "episodic_index_ratio": None,
+            "episodic_observability_events": None,
+            "episodic_fts_orphans": None,
+            "episodic_error": str(exc),
+        }
+
+    return {
+        "episodic_events_total": total_events,
+        "episodic_events_indexed": indexed_events,
+        "episodic_events_missing_index": max(0, total_events - indexed_events),
+        # None rather than 1.0 on an empty table, matching _ratio above: an
+        # empty episodic log has no coverage to report.
+        "episodic_index_ratio": (
+            round(indexed_events / total_events, 4) if total_events > 0 else None
+        ),
+        "episodic_observability_events": observability_events,
+        "episodic_fts_orphans": orphans,
+    }
 
 
 def vault_embedding_coverage(

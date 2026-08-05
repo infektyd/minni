@@ -114,7 +114,7 @@ itself runs with `MINNI_LOCAL_OPERATOR` set. Named agents (`claude-code`,
 Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → thread → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill
-before context is flushed (`plan` / `minni_plan_*` remain deprecated aliases).
+before context is flushed.
 Durable, evidence-gated threads (`minni_thread_*`) survive sessions and
 compaction.
 

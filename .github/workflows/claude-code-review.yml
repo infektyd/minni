@@ -29,6 +29,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          # An agent reads this checkout and its reply is posted publicly — same threat
+          # model as grok-review.yml, and there is no leak gate on this path.
+          # Default checkout persists the token into .git/config as an http
+          # extraheader; nothing downstream needs it (the repo is public, so
+          # any git fetch here is anonymous).
+          persist-credentials: false
           fetch-depth: 1
 
       - name: Run Claude Code Review

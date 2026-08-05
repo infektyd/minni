@@ -69,11 +69,29 @@ GATHER_ROUNDS = 3
 # it can weaken a required check the gate trusts, or post as github-actions[bot].
 PATH_DENY_PREFIXES = (
     ".github/",
+    # Approval policy and review rules. Cursor's approval agents and Bugbot
+    # read these from repository contents, so they are instructions to an
+    # approver in the same way .github/ is instructions to CI: a PR that can
+    # rewrite "never auto-approve trust paths" into "approve on green CI" has
+    # rewritten the merge gate, whatever the diff to the code looks like.
+    ".cursor/",
+    "APPROVAL_POLICY.md",
+    "tests/test_approval_policies.py",
+    # The reviewing agent's own configuration surface, and executable: #272
+    # landed 472 lines of agent-orchestration workflow here with capability
+    # mode "all". grok-review.yml deliberately writes its sandbox profile to
+    # $HOME precisely so a PR cannot supply .grok/sandbox.toml — denying the
+    # directory is the same reasoning applied to everything else under it.
+    ".grok/",
     # The gate's own tripwires. Not under .github/, so without these a PR could
     # delete the tests that pin every invariant above and still go green.
     "tests/test_grok_approve_gate.py",
     "tests/test_grok_approve_gate_workflow.py",
     "tests/test_parse_grok_verdict.py",
+    # The leak gate's only tripwire. Its three siblings above were denied and
+    # this one was not, which is the whole deny list's logic applied to every
+    # gate except the one guarding the credential path.
+    "tests/test_credential_leak_check.py",
     # Collection config can disable every tripwire above without touching a
     # single test file: `addopts = "--ignore=..."`, dropping `testpaths`, or
     # `collect_ignore_glob`. CI runs bare pytest inside the proposed-required
@@ -460,8 +478,17 @@ def fetch_pr_files_denied(owner: str, repo: str, pr: int, token: str) -> bool:
     return False
 
 
+# Filenames that are trust surface WHEREVER they sit. Cursor discovers policies
+# per-directory (closest wins, ancestors apply), so denying only the repo-root
+# copy let a PR add src/APPROVAL_POLICY.md saying "auto-approve changes under
+# src/" alongside its payload and touch no denied path at all.
+DENY_BASENAMES = ("APPROVAL_POLICY.md", "BUGBOT.md")
+
+
 def path_denied(path: str) -> bool:
-    """True if `path` is a gate/trust path (exact file or directory prefix)."""
+    """True if `path` is a gate/trust path (exact file, prefix, or basename)."""
+    if path.rsplit("/", 1)[-1] in DENY_BASENAMES:
+        return True
     for prefix in PATH_DENY_PREFIXES:
         if prefix.endswith("/"):
             if path.startswith(prefix):

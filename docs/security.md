@@ -76,8 +76,10 @@ Two consequences worth knowing when auditing the trust boundary:
   operator/govern staging only; learn-only `stage_candidate` clamps privacy to
   `review`. See the threat model.
 - Health reporting is redacted to aggregate counts for non-operator callers.
-  Secret redaction elsewhere is best-effort and label-oriented (JSON-quoted
-  and bare high-entropy tokens may slip through).
+  Secret redaction elsewhere is best-effort: keyword assignment + JSON-quoted
+  labels, common bare prefixes (`sk-`/`ghp_`/`github_pat_`/`AKIA`/`xox*`), PEM,
+  and common absolute paths — see `docs/contracts/POLICY.md` §2. Unknown-prefix
+  high-entropy blobs and non-listed path layouts may still slip through.
 
 ## Audit trail
 

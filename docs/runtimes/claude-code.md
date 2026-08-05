@@ -35,8 +35,7 @@ Claude Code is the most deeply integrated runtime:
 
 - Session hooks inject the `<minni:context>` envelope with identity, active
   thread/plan state, correction re-assertions, and the lifecycle spine
-  (`prepare_task → prepare_outcome → thread → learn`; `plan` / `minni_plan_*`
-  remain deprecated aliases).
+  (`prepare_task → prepare_outcome → thread → learn`).
 - A deny-capable `PreToolUse` **recall guard** nudges recall before tool use.
   Host **deny capability** is broader than Claude (Kilo, Cursor, Grok,
   Antigravity/agy also expose pre-tool deny; Codex deny is Bash-only). **Live

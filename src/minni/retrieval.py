@@ -33,6 +33,7 @@ import numpy as np
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
 from minni.db import SovereignDB
+from minni.episodic import NON_MEMORY_EVENT_TYPES as _NON_MEMORY_EVENT_TYPES
 from minni.faiss_index import FAISSIndex
 from minni.query_expand import expand as expand_query
 from minni.query_expand import expand_with_status as expand_query_with_status
@@ -3747,7 +3748,10 @@ class RetrievalEngine:
     #: `recall` rows are the durable recall trace (minnid_runtime.recall writes
     #: one per search, TTL'd by trim_recall_traces) — surfacing them would make
     #: every episodic search return a log of its own past searches.
-    EPISODIC_NON_MEMORY_TYPES: tuple = ("recall",)
+    #: Defined in episodic.py so this filter and the episodic coverage metric in
+    #: health read one list — a trace type added to one but not the other would
+    #: mean health counting rows search can never return.
+    EPISODIC_NON_MEMORY_TYPES: tuple = _NON_MEMORY_EVENT_TYPES
 
     def search_episodic(
         self,

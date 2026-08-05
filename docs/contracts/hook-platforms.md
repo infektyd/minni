@@ -370,10 +370,14 @@ hooks and is silently dropped by hosts that ignore it.
 | Surface | `instructions` drives turn-1 hydration? |
 |---|---|
 | Claude Code | ✅ delivered and visible in-session |
-| Codex | documented as read; not yet re-tested |
+| Codex | documented as read; **not re-measured** as of 2026-08-04 (local residual pass) |
 | **Cowork** | ❌ **no** — asked permission instead |
 | **Claude Desktop Chat** | ❌ **no** — asked permission instead |
-| Grok Build / Cursor | **untested** since it shipped |
+| Grok Build / Cursor | **untested** since ship; **still not re-measured** as of 2026-08-04 |
+
+Honesty: a local residual pass did **not** run live host probes for Codex/Grok/Cursor.
+Do not treat the dated “not re-measured” cells as a new measurement — only as
+an explicit refresh of the backlog timestamp.
 
 Both Claude desktop surfaces were tested on Opus — the strongest model, chosen
 so a null result could not be blamed on compliance — and both declined to act.
