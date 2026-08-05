@@ -464,13 +464,26 @@ class SovereignDB:
             END
         """)
 
-        c.execute("""
-            CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_delete
-            AFTER DELETE ON episodic_events
-            BEGIN
-                DELETE FROM episodic_fts WHERE event_id = OLD.event_id;
-            END
-        """)
+        # NO delete trigger here, deliberately — see #287. The obvious
+        # symmetry with trg_learnings_fts_delete is a trap: episodic_fts.event_id
+        # is an UNINDEXED fts5 column, so `DELETE ... WHERE event_id = OLD.event_id`
+        # is a full scan of the content shadow table, once PER DELETED ROW.
+        # episodic_events is the high-volume table and its prune path runs on
+        # the user-facing search path (recall.handle_* calls
+        # trim_recall_traces() on every search), so a row trigger turns a
+        # set-wise delete into a quadratic one. Measured, 5000 expiring traces
+        # against 50000 retained events:
+        #
+        #   without the trigger   trim_recall_traces -> 5000 rows in  0.014s
+        #   with the trigger      trim_recall_traces -> 5000 rows in 16.674s
+        #
+        # learnings does not have this problem because nothing bulk-prunes it
+        # on a hot path. Both episodic prune paths (trim_recall_traces,
+        # cleanup_expired) already delete their FTS rows set-wise first, and
+        # reconcile_episodic_fts sweeps up any index row that matches no event —
+        # set-wise, once per sweep — so orphans are collected without paying a
+        # scan per deleted row. episodic_fts_orphans in the health report is the
+        # backstop that makes a regression here visible.
 
         # Auto-index learnings into FTS
         c.execute("""

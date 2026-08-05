@@ -3195,6 +3195,7 @@ class TestEpisodicFtsBackfill:
         assert reconcile_episodic_fts(sqlite3.connect(":memory:")) == {
             "missing_before": 0,
             "inserted": 0,
+            "removed": 0,
         }
 
     def test_migration_018_runs_the_backfill(self, tmp_path):
@@ -3377,7 +3378,9 @@ class TestEpisodicFtsBackfill:
             " VALUES ('a', 'message', 'text', 1.0)"
         )
 
-        assert reconcile_episodic_fts(conn) == {"missing_before": 0, "inserted": 0}
+        assert reconcile_episodic_fts(conn) == {
+            "missing_before": 0, "inserted": 0, "removed": 0,
+        }
         conn.close()
 
     def test_coverage_counts_orphaned_index_rows(self, tmp_path):

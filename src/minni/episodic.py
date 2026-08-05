@@ -58,58 +58,84 @@ def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
     FTS table — could not return it. On the operator's own database that was 35
     of the 43 non-trace events, so ~81% of real episodic memory was unreachable.
 
-    Idempotent by construction: it inserts exactly the rows the index lacks, so a
-    second run inserts nothing. Safe on a fresh or partial schema (no-op).
+    Runs in two set-wise passes and returns {missing_before, inserted, removed}:
+
+      1. remove index rows that match no event on BOTH event_id and agent_id —
+         orphans whose event is gone, and rows filed under the wrong agent;
+      2. index every content-bearing event the cleaned index still lacks.
+
+    Pass 1 is why episodic_events has no AFTER DELETE FTS trigger (see db.py):
+    doing it here is one set-wise statement per sweep instead of a full scan of
+    the fts content table per deleted row on the search hot path.
+
+    Idempotent by construction: it repairs exactly the rows that disagree with
+    episodic_events, so a second run changes nothing. Safe on a fresh or partial
+    schema (no-op).
     """
     if not _episodic_tables_present(conn):
         logger.debug("reconcile_episodic_fts: episodic tables absent — no-op")
-        return {"missing_before": 0, "inserted": 0}
+        return {"missing_before": 0, "inserted": 0, "removed": 0}
 
-    # #287: "missing" is defined on event_id AND agent_id, matching
-    # episodic_index_coverage's "indexed" predicate exactly. Keying the repair
-    # set on event_id alone made the two disagree: an index row filed under the
-    # wrong agent_id counted as present here (nothing to repair) while the
-    # metric counted it as uncovered, so the ratio sat below 1.0 and no number
-    # of sweeps could move it — reproduced as missing_before: 0 against a stuck
-    # ratio of 0.0, with the event invisible to its owner through
-    # search_episodic and still returned to the wrong agent. A repair set that
-    # cannot close the gap its own metric reports is worse than no repair: it
-    # reports success forever.
-    #
-    # `agent_id IS e.agent_id` rather than `=`: episodic_fts.agent_id is an
-    # UNINDEXED fts5 column with no NOT NULL constraint, so a NULL there must
-    # compare false against a real agent rather than yielding NULL.
-    #
-    # The event_id NULL guard below is load-bearing for the same reason it was
-    # in the original: episodic_fts.event_id has no affinity and no NOT NULL, so
-    # a NULL would poison a NOT IN. This formulation uses NOT EXISTS, which is
-    # NULL-safe by construction, and the guard stays as documentation of the
-    # hazard for anyone who refactors it back.
+    # NOT EXISTS rather than the original NOT IN: it is NULL-safe by
+    # construction, so a NULL event_id in the index (an UNINDEXED fts5 column
+    # has no affinity and no NOT NULL constraint) can no longer make the whole
+    # predicate evaluate to NULL and silently repair nothing.
     unmatched = (
         "NOT EXISTS (SELECT 1 FROM episodic_fts f"
-        "            WHERE f.event_id IS NOT NULL"
-        "              AND CAST(f.event_id AS INTEGER) = e.event_id"
-        "              AND f.agent_id IS e.agent_id)"
+        "            WHERE CAST(f.event_id AS INTEGER) = e.event_id"
+        "              AND f.agent_id = e.agent_id)"
     )
+
+    # Pass 1 — drop index rows that match no event on BOTH columns. This is the
+    # sweep-side replacement for a per-row AFTER DELETE trigger (see db.py):
+    # set-wise and once per sweep, rather than a full scan of the fts content
+    # table per deleted event on the search hot path. It collects two classes at
+    # once — orphans whose event is gone, and rows filed under the wrong agent,
+    # which are unreachable by their owner AND returned to an agent that never
+    # recorded them. The second class is why a delete-then-insert inside the
+    # repair below was not enough: an event carrying BOTH a correct row and an
+    # intruder row satisfied the repair predicate, so nothing was ever in the
+    # repair set and the leak persisted at a reported ratio of 1.0.
+    removed = conn.execute(
+        """DELETE FROM episodic_fts
+            WHERE event_id IS NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM episodic_events e
+                    WHERE e.event_id = CAST(episodic_fts.event_id AS INTEGER)
+                      AND e.agent_id = episodic_fts.agent_id)"""
+    ).rowcount
+    removed = removed if removed and removed > 0 else 0
+
+    # Pass 2 — index every content-bearing event the cleaned index still lacks.
+    #
+    # "Missing" is spelled on event_id AND agent_id so this predicate reads
+    # identically to episodic_index_coverage's "indexed" predicate: the repair
+    # and the metric must not be able to disagree about what coverage means.
+    # Keyed on event_id alone, they did — a wrong-agent row counted as present
+    # here (nothing to repair) while the metric counted it as uncovered, so the
+    # ratio sat below 1.0 and no number of sweeps could move it. A repair set
+    # that cannot close the gap its own metric reports is worse than no repair:
+    # it reports success forever.
+    #
+    # Honest note on the agent_id half: after Pass 1 it is redundant, because
+    # every surviving index row already matches its event on both columns —
+    # dropping it here leaves the suite green, and that mutant is equivalent
+    # rather than escaped. It stays because the two predicates being literally
+    # the same text is the property worth protecting; if Pass 1 is ever
+    # narrowed, this half stops being redundant and starts being the fix again.
     missing_before = conn.execute(
         f"SELECT COUNT(*) FROM episodic_events e"
         f" WHERE e.content IS NOT NULL AND {unmatched}"
     ).fetchone()[0]
 
     if not missing_before:
-        return {"missing_before": 0, "inserted": 0}
+        if removed:
+            logger.info(
+                "reconcile_episodic_fts: removed %d unreachable index row(s)",
+                removed,
+            )
+        return {"missing_before": 0, "inserted": 0, "removed": removed}
 
-    # Stale rows for the repaired events are removed first, so an event whose
-    # index row carries the wrong agent ends with exactly one correct row rather
-    # than two contradictory ones. Events already matching on both columns are
-    # not in the repair set, so their rows are never touched.
-    conn.execute(
-        f"""DELETE FROM episodic_fts
-             WHERE event_id IS NOT NULL
-               AND CAST(event_id AS INTEGER) IN (
-                   SELECT e.event_id FROM episodic_events e
-                    WHERE e.content IS NOT NULL AND {unmatched})"""
-    )
     cur = conn.execute(
         f"""INSERT INTO episodic_fts(event_id, agent_id, content)
             SELECT e.event_id, e.agent_id, e.content
@@ -122,7 +148,11 @@ def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
         "reconcile_episodic_fts: indexed %d episodic event(s) the trigger never saw",
         inserted,
     )
-    return {"missing_before": missing_before, "inserted": inserted}
+    return {
+        "missing_before": missing_before,
+        "inserted": inserted,
+        "removed": removed,
+    }
 
 
 class EpisodicMemory:

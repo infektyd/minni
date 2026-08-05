@@ -146,19 +146,180 @@ class TestUpdateKeepsTheIndexFaithful:
         db_obj.close()
 
 
-class TestDeleteRemovesTheIndexRow:
-    def test_deleting_an_event_removes_its_index_row(self, tmp_path):
-        """episodic.py's two prune paths hand-delete FTS rows first, so this
-        trigger is redundant for them by design — it is what protects a third
-        prune path written later, and the orphan count in health from drifting
-        upward for no reason anyone can find."""
+class TestUpdateDoesNotTouchBystanders:
+    """The UPDATE trigger's WHERE clause is what stops one event's edit from
+    rewriting the whole index. A single-event fixture cannot see the
+    difference: `DELETE FROM episodic_fts` and
+    `DELETE FROM episodic_fts WHERE event_id = OLD.event_id` behave identically
+    when there is only one row. Verified — that mutant survived the full suite
+    before this test existed."""
+
+    def test_updating_one_event_leaves_every_other_row_intact(self, tmp_path):
+        db_obj, _ = _make_db(tmp_path)
+        _add_event(db_obj, agent_id="forge", content="bystander alpha")
+        _add_event(db_obj, agent_id="codex", content="bystander beta")
+        target = _add_event(db_obj, agent_id="forge", content="target gamma")
+
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE episodic_events SET content = 'target delta'"
+                " WHERE event_id = ?",
+                (target,),
+            )
+
+        assert _match(db_obj, "alpha") == 1, "a bystander row was destroyed"
+        assert _match(db_obj, "beta") == 1, "a bystander row was destroyed"
+        assert _match(db_obj, "delta") == 1
+        assert _match(db_obj, "gamma") == 0
+        with db_obj.cursor() as c:
+            total = c.execute("SELECT COUNT(*) AS n FROM episodic_fts").fetchone()["n"]
+        assert total == 3, f"index row count must be preserved (got {total})"
+        db_obj.close()
+
+    def test_a_multi_row_update_reindexes_every_matched_row(self, tmp_path):
+        db_obj, _ = _make_db(tmp_path)
+        for i in range(4):
+            _add_event(db_obj, agent_id="forge", content=f"alpha row {i}")
+        _add_event(db_obj, agent_id="codex", content="untouched beta")
+
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE episodic_events SET content = 'bulk gamma'"
+                " WHERE agent_id = 'forge'"
+            )
+
+        assert _match(db_obj, "gamma") == 4
+        assert _match(db_obj, "alpha") == 0
+        assert _match(db_obj, "beta") == 1
+        db_obj.close()
+
+
+class TestMisfiledIndexRowsAreCollected:
+    """An event carrying BOTH a correct row and an intruder row filed under
+    another agent satisfied the repair predicate, so nothing was ever in the
+    repair set — a cross-agent leak reported as ratio 1.0 with zero orphans,
+    self-describing as nothing-to-do forever."""
+
+    def _correct_plus_intruder(self, tmp_path):
+        db_obj, cfg = _make_db(tmp_path)
+        event_id = _add_event(db_obj, agent_id="forge", content="gamma scoped text")
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO episodic_fts(event_id, agent_id, content)"
+                " VALUES (?, 'intruder', 'gamma scoped text')",
+                (event_id,),
+            )
+        return db_obj, cfg, event_id
+
+    def test_the_intruder_row_is_removed(self, tmp_path):
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _, event_id = self._correct_plus_intruder(tmp_path)
+        conn = db_obj._get_conn()
+
+        assert reconcile_episodic_fts(conn)["removed"] == 1
+
+        rows = conn.execute(
+            "SELECT agent_id FROM episodic_fts WHERE CAST(event_id AS INTEGER) = ?",
+            (event_id,),
+        ).fetchall()
+        assert [r[0] for r in rows] == ["forge"], (
+            f"exactly the owner's row must remain (got {rows})"
+        )
+        db_obj.close()
+
+    def test_the_event_stops_leaking_to_the_wrong_agent(self, tmp_path):
+        from minni.episodic import reconcile_episodic_fts
+        from minni.retrieval import RetrievalEngine
+
+        db_obj, cfg, _ = self._correct_plus_intruder(tmp_path)
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+        assert len(engine.search_episodic("gamma", agent_id="intruder")) == 1
+
+        reconcile_episodic_fts(db_obj._get_conn())
+
+        assert len(engine.search_episodic("gamma", agent_id="intruder")) == 0, (
+            "an agent that never recorded this event can still read it"
+        )
+        assert len(engine.search_episodic("gamma", agent_id="forge")) == 1, (
+            "the owner lost its own memory"
+        )
+        db_obj.close()
+
+
+class TestOrphanCollectionIsSetWise:
+    """Orphan index rows are collected by reconcile_episodic_fts, not by an
+    AFTER DELETE trigger. The trigger is the obvious symmetry with learnings and
+    it is the wrong tool here: episodic_fts.event_id is UNINDEXED, so a keyed
+    delete scans the whole content table once per deleted row, and episodic's
+    prune path runs on the search hot path."""
+
+    def test_a_delete_leaves_an_orphan_that_the_sweep_collects(self, tmp_path):
+        from minni.episodic import reconcile_episodic_fts
+
         db_obj, _ = _make_db(tmp_path)
         event_id = _add_event(db_obj)
-
         with db_obj.cursor() as c:
             c.execute("DELETE FROM episodic_events WHERE event_id = ?", (event_id,))
 
-        assert _match(db_obj, "alpha") == 0, "the index row outlived its event"
+        assert _match(db_obj, "alpha") == 1, (
+            "documenting the trade: with no delete trigger the row lingers"
+        )
+        assert reconcile_episodic_fts(db_obj._get_conn())["removed"] == 1
+        assert _match(db_obj, "alpha") == 0, "the sweep must collect the orphan"
+        db_obj.close()
+
+    def test_the_sweep_does_not_collect_live_rows(self, tmp_path):
+        """The bystander case: a cleanup that over-deletes would wipe the index
+        of every other agent, and a single-event fixture cannot see it."""
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _ = _make_db(tmp_path)
+        keep_a = _add_event(db_obj, agent_id="forge", content="bystander alpha")
+        keep_b = _add_event(db_obj, agent_id="codex", content="bystander beta")
+        doomed = _add_event(db_obj, agent_id="forge", content="doomed gamma")
+        with db_obj.cursor() as c:
+            c.execute("DELETE FROM episodic_events WHERE event_id = ?", (doomed,))
+
+        result = reconcile_episodic_fts(db_obj._get_conn())
+
+        assert result["removed"] == 1, (
+            f"exactly the orphan must go, not the whole index (got {result})"
+        )
+        assert _match(db_obj, "alpha") == 1, "another agent's row was collateral"
+        assert _match(db_obj, "beta") == 1, "another agent's row was collateral"
+        assert _match(db_obj, "gamma") == 0
+        del keep_a, keep_b
+        db_obj.close()
+
+    def test_the_perf_trade_is_real(self, tmp_path):
+        """Pins the reason there is no delete trigger. A per-row trigger made
+        trim_recall_traces quadratic (0.014s -> 16.674s at 5000 expiring /
+        50000 retained); the set-wise sweep must stay linear enough that a
+        realistic prune is not a user-visible stall."""
+        import time as _time
+
+        from minni.episodic import EpisodicMemory
+
+        db_obj, cfg = _make_db(tmp_path)
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.executemany(
+                "INSERT INTO episodic_events (agent_id, event_type, content, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                [("forge", "recall", f"trace {i}", now - 999_999) for i in range(2000)]
+                + [("forge", "message", f"kept {i}", now) for i in range(20_000)],
+            )
+
+        started = _time.perf_counter()
+        removed = EpisodicMemory(db_obj, cfg).trim_recall_traces(max_age_seconds=60)
+        elapsed = _time.perf_counter() - started
+
+        assert removed == 2000
+        assert elapsed < 2.0, (
+            f"pruning 2000 traces against 20000 retained took {elapsed:.2f}s — "
+            "this is the quadratic delete path returning"
+        )
         db_obj.close()
 
     def test_existing_prune_paths_still_work(self, tmp_path):
@@ -271,7 +432,9 @@ class TestRepairSetMatchesTheCoveragePredicate:
         conn = db_obj._get_conn()
         reconcile_episodic_fts(conn)
 
-        assert reconcile_episodic_fts(conn) == {"missing_before": 0, "inserted": 0}
+        assert reconcile_episodic_fts(conn) == {
+            "missing_before": 0, "inserted": 0, "removed": 0,
+        }
         db_obj.close()
 
     def test_correctly_indexed_rows_are_never_rewritten(self, tmp_path):
@@ -283,7 +446,9 @@ class TestRepairSetMatchesTheCoveragePredicate:
         _add_event(db_obj, content="healthy row")
         conn = db_obj._get_conn()
 
-        assert reconcile_episodic_fts(conn) == {"missing_before": 0, "inserted": 0}
+        assert reconcile_episodic_fts(conn) == {
+            "missing_before": 0, "inserted": 0, "removed": 0,
+        }
         assert _match(db_obj, "healthy") == 1
         db_obj.close()
 
@@ -326,9 +491,15 @@ class TestFreshSchemaCarriesTheTriggers:
         ).fetchone()[0] == 0, "run_migrations was not neutralised"
         return db_obj, conn
 
-    def test_init_schema_installs_all_three_episodic_fts_triggers(
+    def test_init_schema_installs_insert_and_update_triggers_only(
         self, tmp_path, monkeypatch
     ):
+        """No DELETE trigger, deliberately — the symmetry with learnings_fts is
+        a trap. episodic_fts.event_id is UNINDEXED, so a keyed delete is a full
+        scan of the content table per deleted row, and episodic's prune path
+        runs on the search hot path. Measured at 5000 expiring / 50000 retained:
+        0.014s without the trigger, 16.674s with it. Orphan collection moved to
+        reconcile_episodic_fts, which does it set-wise once per sweep."""
         db_obj, conn = self._bare_schema_conn(tmp_path, monkeypatch)
         names = {
             r[0]
@@ -340,11 +511,7 @@ class TestFreshSchemaCarriesTheTriggers:
         assert names == {
             "trg_episodic_fts_insert",
             "trg_episodic_fts_update",
-            "trg_episodic_fts_delete",
-        }, (
-            "a fresh database must carry insert/update/delete on episodic_fts, "
-            f"matching learnings_fts (got {names})"
-        )
+        }, f"unexpected episodic FTS trigger set (got {names})"
         db_obj.close()
 
     def test_the_fresh_schema_triggers_actually_fire(self, tmp_path, monkeypatch):
@@ -370,8 +537,15 @@ class TestFreshSchemaCarriesTheTriggers:
         )
         assert match("beta") == 1 and match("alpha") == 0, "update trigger"
 
+        # No delete trigger by design, so the index row outlives the event
+        # until a sweep collects it — that is the trade db.py documents.
         conn.execute("DELETE FROM episodic_events WHERE event_id = ?", (event_id,))
-        assert match("beta") == 0, "delete trigger"
+        assert match("beta") == 1, "no delete trigger: the row is expected to linger"
+
+        from minni.episodic import reconcile_episodic_fts
+
+        assert reconcile_episodic_fts(conn)["removed"] == 1
+        assert match("beta") == 0, "the sweep must collect the orphan"
         db_obj.close()
 
 
@@ -384,7 +558,6 @@ class TestMigration019:
         db_obj, _ = _make_db(tmp_path)
         conn = db_obj._get_conn()
         conn.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_update")
-        conn.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_delete")
         conn.execute("DELETE FROM schema_migrations WHERE version = 19")
         conn.commit()
 
@@ -401,8 +574,7 @@ class TestMigration019:
         assert names == {
             "trg_episodic_fts_insert",
             "trg_episodic_fts_update",
-            "trg_episodic_fts_delete",
-        }, f"migration 019 did not install both triggers (got {names})"
+        }, f"migration 019 did not install the update trigger (got {names})"
 
         # And they work, not merely exist.
         event_id = _add_event(db_obj, content="post migration text")
@@ -414,6 +586,39 @@ class TestMigration019:
             )
         assert _match(db_obj, "updated") == 1
         db_obj.close()
+
+    def test_migration_skips_a_schema_without_episodic_fts(self):
+        """SQLite resolves trigger-body tables at FIRE time, so CREATE TRIGGER
+        succeeds on a partial schema and _execute_tolerant sees no error — then
+        every later UPDATE dies with "no such table: main.episodic_fts". The
+        migration must decline to install the trigger it cannot support."""
+        import sqlite3
+
+        from minni.migrations import run_migrations
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE episodic_events ("
+            " event_id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL,"
+            " event_type TEXT NOT NULL, content TEXT, created_at REAL)"
+        )
+
+        run_migrations(conn)
+        conn.commit()
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'"
+            " AND name = 'trg_episodic_fts_update'"
+        ).fetchone()[0] == 0, "the trigger was installed with no table to back it"
+
+        conn.execute(
+            "INSERT INTO episodic_events (agent_id, event_type, content, created_at)"
+            " VALUES ('a', 'message', 'x', 1.0)"
+        )
+        # The point of the guard: this must not raise.
+        conn.execute("UPDATE episodic_events SET content = 'y' WHERE event_id = 1")
+        conn.execute("DELETE FROM episodic_events WHERE event_id = 1")
+        conn.close()
 
     def test_migration_is_idempotent(self, tmp_path):
         from minni.migrations import run_migrations
