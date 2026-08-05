@@ -39,6 +39,10 @@ const CONFIG = {
   sessionStartHookTimeoutMs: 30_000,
   precompactKind: "cursor_precompact_handoff",
   recallGuardMode: CURSOR_GUARD_MODE,
+  // #296: SessionStart acks this agent's pending handoff leases at boot, the
+  // same as every other platform sharing this factory — was claude-only
+  // before #296, an unstated inconsistency rather than a deliberate choice.
+  ackPendingHandoffsAtBoot: true,
   // Without this, wireFor("cursor") fell through to the Claude profile and the
   // handlers emitted Claude envelopes that adaptCursorOutput then quietly threw
   // away -- a real drop with no record of it.

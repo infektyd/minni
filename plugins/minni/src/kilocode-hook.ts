@@ -29,6 +29,10 @@ void runHookMain({
   auditPrefix: "hook_kilocode",
   bootIdentity: "identity-recall",
   stopCommitHint: "Use /minni:learn to commit.",
+  // #296: SessionStart acks this agent's pending handoff leases at boot, the
+  // same as every other platform sharing this factory — was claude-only
+  // before #296, an unstated inconsistency rather than a deliberate choice.
+  ackPendingHandoffsAtBoot: true,
   // Review-panel fix (shared root cause of five findings): Stop previously
   // wrote an inbox file UNCONDITIONALLY (zero-candidate litter) and without
   // the canonical stop_candidates kind or agent_id/workspace_id stamps. The

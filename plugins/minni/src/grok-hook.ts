@@ -48,6 +48,10 @@ const CONFIG: AgentHookConfig = {
   // Mirrors hooks/hooks-grok.json SessionStart "timeout": 30 — edit both.
   sessionStartHookTimeoutMs: 30_000,
   precompactKind: "grok_precompact_handoff",
+  // #296: SessionStart acks this agent's pending handoff leases at boot, the
+  // same as every other platform sharing this factory — was claude-only
+  // before #296, an unstated inconsistency rather than a deliberate choice.
+  ackPendingHandoffsAtBoot: true,
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable (MINNI_GROK_AGENT_ID); deriving the wire from it would
   // disable Grok's Stop duplicate filter and drop-accounting.

@@ -27,6 +27,10 @@ void runHookMain({
   // Mirrors hooks/hooks-codex.json SessionStart "timeout": 30 — edit both.
   sessionStartHookTimeoutMs: 30_000,
   precompactKind: "codex_precompact_handoff",
+  // #296: SessionStart acks this agent's pending handoff leases at boot, the
+  // same as every other platform sharing this factory — was claude-only
+  // before #296, an unstated inconsistency rather than a deliberate choice.
+  ackPendingHandoffsAtBoot: true,
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable; deriving the wire from it would fall through to the
   // Claude shape under a custom MINNI_CODEX_AGENT_ID.

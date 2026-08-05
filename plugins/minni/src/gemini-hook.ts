@@ -76,6 +76,10 @@ const CONFIG: AgentHookConfig = {
   // stashes stale-belief events as a precompact_reassert entry instead of a
   // durable handoff file.
   recallGuardMode: GEMINI_GUARD_MODE,
+  // #296: SessionStart acks this agent's pending handoff leases at boot, the
+  // same as every other platform sharing this factory — was claude-only
+  // before #296, an unstated inconsistency rather than a deliberate choice.
+  ackPendingHandoffsAtBoot: true,
   wire: geminiWire,
 };
 
