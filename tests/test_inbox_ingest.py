@@ -537,3 +537,33 @@ def test_issue_193_real_candidates_still_ingest(tmp_path):
         c.execute("SELECT content FROM candidate_packets WHERE principal='claude-code'")
         rows = [dict(r)["content"] for r in c.fetchall()]
     assert rows == ["Use WAL mode for SQLite performance"], rows
+
+
+def test_ingest_counts_an_unreadable_file_instead_of_dropping_it(tmp_path):
+    """A truncated payload used to hit a bare `continue`, incrementing nothing
+    — invisible to every counter AND to any drain gated on them (Bugbot #305).
+    Pinned on its own, because a list-shaped file exercises a DIFFERENT line."""
+    from minni.afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "truncated.json").write_text('{"kind": "stop_candidates", "cand', encoding="utf-8")
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+
+    assert res["skipped_by_kind"] == {"_unparseable": 1}, res
+
+
+def test_ingest_counts_a_non_object_payload_instead_of_dropping_it(tmp_path):
+    """The other corrupt shape: valid JSON that is not an object."""
+    from minni.afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "listish.json").write_text("[]", encoding="utf-8")
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+
+    assert res["skipped_by_kind"] == {"_unparseable": 1}, res

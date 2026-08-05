@@ -874,7 +874,14 @@ async def afm_loop_runner(context: AFMContext):
                         # them as _unrecognized and they accumulate forever (107
                         # files, oldest 61 days). Same drain contract as above:
                         # move, never delete, past a TTL grace window.
-                        if (cfg or {}).get("ingest_inbox", True) and _skips.get("_unrecognized"):
+                        # Both cohorts: a corrupt afm-drafts-*/afm-pruning-*
+                        # file counts as _unparseable, never _unrecognized, so
+                        # gating on the latter alone left a corrupt-only
+                        # backlog permanently unreachable — exactly the files
+                        # the drain was taught to claim.
+                        if (cfg or {}).get("ingest_inbox", True) and (
+                            _skips.get("_unrecognized") or _skips.get("_unparseable")
+                        ):
                             try:
                                 from minni.afm_passes.inbox_quarantine import (
                                     quarantine_afm_dead_letter,

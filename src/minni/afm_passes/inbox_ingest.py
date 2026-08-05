@@ -391,11 +391,18 @@ def _scan_inbox(
     skipped_by_kind: Dict[str, int] = {}
     inbox_principal = _principal_for_inbox(inbox, fallback_principal)
     for path in sorted(inbox.glob("*.json")):
+        # An unreadable or non-object payload used to be dropped with a bare
+        # `continue`, incrementing nothing — so it was invisible to every
+        # counter AND to any drain gated on those counters (Bugbot, #305).
+        # Count it like every other excluded file: the drop is observable
+        # rather than silent, which is this module's stated contract.
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
+            skipped_by_kind["_unparseable"] = skipped_by_kind.get("_unparseable", 0) + 1
             continue
         if not isinstance(doc, dict):
+            skipped_by_kind["_unparseable"] = skipped_by_kind.get("_unparseable", 0) + 1
             continue
         kind = doc.get("kind")
         # `kind` must be a hashable, comparable value (str or None) before it

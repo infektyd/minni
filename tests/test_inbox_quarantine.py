@@ -806,3 +806,47 @@ def test_degraded_queue_half_reports_unknown_not_zero(tmp_path, monkeypatch):
     assert ml["proposed_queue"]["depth"] is None
     # The independent filesystem half still succeeded.
     assert ml["afm_dead_letter"]["files"] == 0
+
+
+def test_a_corrupt_only_backlog_still_reaches_the_drain(tmp_path, monkeypatch):
+    """Bugbot #305: a corrupt file hits inbox_ingest's bare `continue` and
+    increments NO skip counter, so a drain gated solely on _unrecognized never
+    fires. With only corrupt files left, the very files the drain was taught to
+    claim became unreachable — they accumulate past TTL forever."""
+    import asyncio
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cons_cfg = cfg.afm_loop_schedule["passes"]["consolidation"]
+    cons_cfg["ingest_inbox"] = True
+    cons_cfg["inbox_quarantine_ttl_days"] = 14
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    # ONLY corrupt files: nothing here can increment _unrecognized.
+    truncated = inbox / "afm-drafts-2026-01-01.json"
+    truncated.write_text('{"pass_name": "drafts", "dra', encoding="utf-8")
+    listish = inbox / "afm-pruning-2026-01-02.json"
+    listish.write_text("[]", encoding="utf-8")
+    old = _time.time() - 61 * 86400
+    for p in (truncated, listish):
+        os.utime(p, (old, old))
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+
+        assert not list(inbox.glob("*.json")), "corrupt files must still be drained"
+        assert (inbox / "quarantine" / truncated.name).is_file()
+    finally:
+        obs.METRICS.reset()
