@@ -982,16 +982,23 @@ export async function callAfmPrepareTask(
 // cut. searchVaultNotes reads/scores/snippets every markdown file in the
 // vault's wiki tree regardless of `limit` (the limit is a post-scoring slice
 // only), so this costs nothing beyond a few extra object references — NOT a
-// wider file scan. VAULT_SEARCH_OVERFETCH_CAP guards against a pathological
-// caller-supplied `limit` ballooning the candidate array further than any
-// realistic vault needs.
+// wider file scan.
 //
-// Narrows the gap, does not close it: a note that would still rank outside
-// the overfetch window on RAW LEXICAL score alone remains invisible to the
-// re-ranker. A durable fix would move the whole re-ranking (or at minimum
-// the privacy gate) inside searchVaultNotes itself, ahead of its own
-// sort→slice.
+// Narrows the gap, does not close it (same disclosure discipline as #338):
+// a note that would still rank outside the overfetch window on RAW LEXICAL
+// score alone remains invisible to the re-ranker. Both call sites already
+// clamp `limit` to 12 before this helper runs, so today the worst case is
+// exactly 36 candidates for prepareTask (default profile: 37+ higher-
+// lexical-scoring notes reproduce the discard) and, tighter, 15 for
+// buildHandoffPacket's default `limit` of 5 (16+ reproduce it there, feeding
+// a `compact` budget whose sourceLimit is only 3 — the narrowest window of
+// the three #339 sites). A durable fix would move the whole re-ranking (or
+// at minimum the privacy gate) inside searchVaultNotes itself, ahead of its
+// own sort→slice.
 const VAULT_SEARCH_OVERFETCH_MULTIPLIER = 3;
+// Not reachable today (both callers already clamp `limit` to 12, so the
+// multiplier alone tops out at 36) — kept as defense-in-depth for a future
+// caller that doesn't clamp its own `limit` before calling in.
 const VAULT_SEARCH_OVERFETCH_CAP = 40;
 
 function vaultSearchOverfetchLimit(limit: number): number {

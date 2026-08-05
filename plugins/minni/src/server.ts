@@ -569,8 +569,9 @@ server.registerTool(
     // dropping it before filterSafeVaultResults ever saw it. Over-fetch a
     // wider pre-filter set, filter, THEN slice to the cap this tool has
     // always exposed — same external cap, same behavior for the common
-    // case. Narrows the gap, does not close it (a sufficiently private-
-    // heavy vault can still exceed the overfetch multiplier); see #339 for
+    // case. Narrows the gap, does not close it: the cap tops out at 8, so
+    // the widened fetch tops out at 24 — 25+ higher-scored non-safe notes
+    // outscoring a safe match still reproduce the crowd-out. See #339 for
     // the durable fix (gate inside searchVaultNotes itself).
     const vaultResultCap = Math.min(limit ?? 5, 8);
     const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
