@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # An agent reads this checkout and its reply is posted publicly — same threat
           # model as grok-review.yml, and there is no leak gate on this path.

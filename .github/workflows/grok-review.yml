@@ -153,7 +153,7 @@ jobs:
 
       - name: Checkout PR head
         if: steps.resolve.outputs.skip == 'false'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.resolve.outputs.sha }}
           fetch-depth: 0

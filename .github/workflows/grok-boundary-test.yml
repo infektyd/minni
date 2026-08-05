@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # This job runs an ADVERSARIAL agent and prints its output to a public log;
           # a persisted token in .git/config is the single most valuable thing it could find.
