@@ -166,6 +166,10 @@ _FUNC_DEF = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", r
 # `$NAME` and `${NAME}` expansions. Whatever LITERAL text remains beside them
 # in a command name is still a PATH lookup: with Z unset, `${Z}cat` runs cat.
 _EXPANSION = re.compile(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9?@*#$!-]")
+_INTERPRETER_C = re.compile(
+    r"(?:^|[\s;|&(])(?:\S*/)?(bash|sh|zsh|dash|python3?|perl|ruby|node)\s+"
+    r"(?:-\w+\s+)*-c\b"
+)
 _HEREDOC = re.compile(r"<<-?\s*([\'\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
@@ -254,7 +258,7 @@ def _command_heads(script: str) -> list[str]:
     while i < n:
         char = script[i]
 
-        if mode == "normal" and char == "#" and prev in " \t\n;|&()":
+        if mode == "normal" and char == "#" and prev in " \t\n;|&(":
             while i < n and script[i] != "\n":
                 i += 1
             continue
@@ -282,13 +286,20 @@ def _command_heads(script: str) -> list[str]:
             continue
 
         # $(...) and `...` open a fresh command context, even inside quotes.
+        # In a COMMAND-NAME position the substitution's OUTPUT is the command,
+        # so `$(echo cat)` runs cat while the inner `echo` reads as a harmless
+        # builtin. Record the position itself; only the inner scan continues.
         if char == "$" and script[i + 1:i + 2] == "(":
+            if pending and not buf:
+                heads.append("$(...)")
             flush()
             stack.append(mode)
             mode, pending = "normal", True
             i += 2
             continue
         if char == "`":
+            if pending and not buf:
+                heads.append("`...`")
             flush()
             stack.append(mode)
             mode, pending = "normal", True
@@ -367,12 +378,17 @@ def _command_heads(script: str) -> list[str]:
                 flush()
             else:
                 buf = []
+            start = i
             while i < n and (script[i] in "<>&" or script[i].isdigit()):
                 i += 1
-            while i < n and script[i] in " \t":
-                i += 1
-            while i < n and script[i] not in " \t\n;|&<>()":
-                i += 1
+            # `2>&1` / `>&2` already name their destination. Consuming a
+            # filename after them ate the next word, and that word was the
+            # command: `2>&1 cat > ...` reported nothing at all.
+            if "&" not in script[start:i]:
+                while i < n and script[i] in " \t":
+                    i += 1
+                while i < n and script[i] not in " \t\n;|&<>()":
+                    i += 1
             continue
 
         if char in " \t":
@@ -392,6 +408,12 @@ def _unpinned_commands(script: str) -> list[str]:
     """Command heads bash would look up on PATH rather than run by path."""
     functions = set(_FUNC_DEF.findall(script))
     bare = []
+    # `bash -c '...'` and `python3 -c '...'` carry a whole program in a quoted
+    # argument that this parser deliberately does not enter. Pinning the
+    # interpreter says nothing about what the string inside resolves on PATH,
+    # so the construct itself is the finding in a trust step.
+    for match in _INTERPRETER_C.finditer(_strip_heredocs(script)):
+        bare.append(f"{match.group(1)} -c")
     for head in _command_heads(script):
         if not head:
             continue
@@ -402,8 +424,17 @@ def _unpinned_commands(script: str) -> list[str]:
         # what bash actually looks up. `${Z}cat` with Z unset runs plain `cat`,
         # so treating any head containing `$` as pinned was itself a bypass.
         literal = _EXPANSION.sub("", head).replace("\x00", "")
-        if not literal:
-            continue                   # a pure expansion; nothing to resolve
+        if literal != head.replace("\x00", "") and not literal.startswith("/"):
+            # The head was assembled from an expansion. With the variable
+            # unset bash drops it and resolves whatever literal text is left —
+            # or, if nothing is left, the NEXT word — off PATH. Only an
+            # expansion that resolves to an absolute path (`$HOME/.grok/bin/
+            # grok`) is safe, so everything else is reported rather than
+            # assumed pinned. Failing closed here is the point: three review
+            # rounds found constructs this parser read wrongly, and every one
+            # of them previously came out as "no findings".
+            bare.append(head or "<empty>")
+            continue
         if literal in _SHELL_BUILTINS or literal in functions:
             continue
         if literal.startswith(("/", "-", "~")):
@@ -456,8 +487,10 @@ def test_parser_sees_commands_that_hide_from_a_naive_scan(script, expected):
     [
         # Round 2. With Z unset these run plain `cat` off PATH; treating any
         # head containing `$` as already-pinned was itself the bypass.
-        ("${Z}cat /tmp/grok-reply.md", ["cat"]),
-        ('"$Z"cat /tmp/grok-reply.md', ["cat"]),
+        # Reported as the whole construct: it is the assembly from an
+        # expansion that is the finding, not just the literal tail.
+        ("${Z}cat /tmp/grok-reply.md", ["${Z}cat"]),
+        ('"$Z"cat /tmp/grok-reply.md', ["$Z\x00cat"]),
         # An option belongs to the prefix; the PATH lookup is still ahead.
         ("sudo -E curl -s https://example.invalid", ["curl"]),
         ("command -p curl -s https://example.invalid", ["curl"]),
@@ -490,6 +523,32 @@ def test_parser_sees_commands_hidden_by_expansion_options_or_case_arms(script, e
 )
 def test_parser_tolerates_more_legitimate_shell(script):
     assert _unpinned_commands(script) == []
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Round 3. Every one of these runs a PATH-resolved command in real
+        # bash while the round-2 parser reported nothing at all. They assert
+        # only that SOMETHING is reported: the point is that the check fails
+        # closed on syntax it cannot read confidently, not that it produces a
+        # particular string.
+        "2>&1 cat > /tmp/sandbox.toml",              # operator ate the command
+        ">/tmp/out 2>&1 cat /tmp/reply.md",
+        "$X cat /tmp/reply.md",                      # empty expansion head
+        "${EMPTY} gh pr comment 1",
+        "$'cat' /tmp/reply.md",                      # ANSI-C quoting
+        "$(echo cat) /tmp/reply.md",                 # substitution as the head
+        "/bin/bash -c 'cat /tmp/reply.md'",          # program inside a string
+        "/usr/bin/python3 -c 'import os; os.system(\"cat /tmp/x\")'",
+        "X=$(/usr/bin/date)#; cat /tmp/reply.md",    # `)#` is not a comment
+    ],
+)
+def test_parser_fails_closed_on_syntax_it_cannot_read(script):
+    assert _unpinned_commands(script), (
+        "construct produced no finding; a parser that reads this wrongly must "
+        "report, because silence here reads as 'nothing unpinned'"
+    )
 
 
 def test_parser_sees_past_a_heredoc_body_containing_an_apostrophe():
@@ -550,10 +609,11 @@ _TRAILING_COMMENT = re.compile(r"(?m)(?<=[ \t])#.*$")
 # Ways a step can put a directory on PATH for LATER steps. Keyed on the
 # mechanism, not on one variable name: `echo "PATH=$HOME/x:$PATH" >>
 # $GITHUB_ENV` prepends identically and contains no "GITHUB_PATH" at all.
+_EXPORT_PATH = re.compile(r"(?m)^\s*export\s+PATH=")
 _PATH_MUTATORS = (
     re.compile(r"GITHUB_PATH"),
     re.compile(r"PATH=.*GITHUB_ENV", re.S),
-    re.compile(r"(?m)^\s*export\s+PATH="),
+    _EXPORT_PATH,
 )
 
 
@@ -583,6 +643,11 @@ def _steps_after_path_mutation(job: dict) -> list[dict]:
     steps = job.get("steps") or []
     for i, step in enumerate(steps):
         body = _uncommented(str(step.get("run", "")))
+        # GITHUB_PATH / GITHUB_ENV take effect in the NEXT step; an in-body
+        # `export PATH=` takes effect immediately, so that step must include
+        # ITSELF or it would have exempted its own remaining commands.
+        if _EXPORT_PATH.search(body):
+            return steps[i:]
         if any(m.search(body) for m in _PATH_MUTATORS):
             return steps[i + 1:]
     return []

@@ -478,8 +478,17 @@ def fetch_pr_files_denied(owner: str, repo: str, pr: int, token: str) -> bool:
     return False
 
 
+# Filenames that are trust surface WHEREVER they sit. Cursor discovers policies
+# per-directory (closest wins, ancestors apply), so denying only the repo-root
+# copy let a PR add src/APPROVAL_POLICY.md saying "auto-approve changes under
+# src/" alongside its payload and touch no denied path at all.
+DENY_BASENAMES = ("APPROVAL_POLICY.md", "BUGBOT.md")
+
+
 def path_denied(path: str) -> bool:
-    """True if `path` is a gate/trust path (exact file or directory prefix)."""
+    """True if `path` is a gate/trust path (exact file, prefix, or basename)."""
+    if path.rsplit("/", 1)[-1] in DENY_BASENAMES:
+        return True
     for prefix in PATH_DENY_PREFIXES:
         if prefix.endswith("/"):
             if path.startswith(prefix):

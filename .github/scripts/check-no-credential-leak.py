@@ -50,10 +50,16 @@ CHECKS
 
 RESIDUAL RISK, STATED PLAINLY: this cannot be complete. A model asked to
 rot13, reverse, or describe a token in words will defeat any substring
-matcher. One residual is deliberate rather than merely unhandled: a token
-chunked character-by-character in PLAINTEXT (`g,h,s,_,F,...`) is not caught,
-because the only view that would catch it also collapses ordinary prose into
-token-shaped strings and blocked a review of this very file. This gate is the last line, not the boundary — the boundary is that
+matcher. Two residuals are deliberate rather than merely unhandled, and both
+were measured:
+  * A token chunked character-by-character in PLAINTEXT (`g,h,s,_,F,...`) is
+    not SHAPE-matched, because the only view that would catch it also
+    collapses ordinary prose into token-shaped strings and blocked a review of
+    this very file. Chunked auth VALUES are still caught.
+  * A separator containing DIGITS (a markdown numbered list) survives every
+    collapse, because digits are valid base64 and stripping them would destroy
+    the encoding the collapse exists to recover. Eleven other separator
+    classes — including `-`, `_`, `=`, `+`, `/` and bullet lists — are caught. This gate is the last line, not the boundary — the boundary is that
 child-process egress is blocked (verified on Linux) and the blast radius is
 small (short-lived token, collaborator-only triggers, ephemeral runner).
 
@@ -280,7 +286,16 @@ def all_views(reply: str) -> dict[str, str]:
     plaintext = {
         "reply": reply,
         "reply(no-whitespace)": re.sub(r"\s+", "", reply),
+        # One collapse per alphabet. `alphabet-only` keeps -, _, =, + and /
+        # because they are base64 alphabet, which means chunking the credential
+        # WITH one of those characters survives it — and "put a dash between
+        # every three characters", or a markdown bullet list, is as easy an
+        # instruction as the comma this originally closed. Each narrower
+        # collapse removes a different separator class.
         "reply(alphabet-only)": _NOT_ENCODED_RE.sub("", reply),
+        "reply(b64std-only)": re.sub(r"[^A-Za-z0-9+/=]+", "", reply),
+        "reply(b64url-only)": re.sub(r"[^A-Za-z0-9_=-]+", "", reply),
+        "reply(alnum-only)": re.sub(r"[^A-Za-z0-9]+", "", reply),
         "reply(runs-joined)": "".join(m.group(0) for m in B64_RUN_RE.finditer(reply)),
     }
     views = dict(plaintext)
@@ -299,7 +314,12 @@ def all_views(reply: str) -> dict[str, str]:
 # The cost is that a token chunked character-by-character in PLAINTEXT is not
 # caught; that is the documented residual, and it is worth paying to keep every
 # review of this file postable.
-_NO_SHAPE_SCAN = ("reply(alphabet-only)",)
+_NO_SHAPE_SCAN = (
+    "reply(alphabet-only)",
+    "reply(b64std-only)",
+    "reply(b64url-only)",
+    "reply(alnum-only)",
+)
 
 
 def shape_hits(views: dict[str, str]) -> list[str]:

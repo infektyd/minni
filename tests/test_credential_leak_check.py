@@ -13,6 +13,7 @@ review, which is how a gate gets switched off.
 """
 
 import base64
+import importlib.util
 import json
 import subprocess
 import sys
@@ -225,6 +226,52 @@ def test_double_encoded_auth_value_is_caught(tmp_path, auth_file):
 def test_comma_chunked_auth_value_is_caught(tmp_path, auth_file):
     chunked = ",".join(FAKE_REFRESH[i:i + 3] for i in range(0, len(FAKE_REFRESH), 3))
     assert check(tmp_path, auth_file, f"spread: {chunked}") == 1
+
+
+# Round 3. `alphabet-only` keeps -, _, =, + and / because those ARE base64
+# alphabet, so chunking the credential with one of them survived the collapse
+# that the comma case had closed. A markdown bullet list does it by accident.
+
+
+@pytest.mark.parametrize(
+    "sep", [",", "-", "_", "=", "+", "/", ".", " ", " | ", "\n", "\n- "]
+)
+def test_auth_value_chunked_with_any_separator_is_caught(tmp_path, auth_file, sep):
+    chunked = sep.join(FAKE_REFRESH[i:i + 3] for i in range(0, len(FAKE_REFRESH), 3))
+    assert check(tmp_path, auth_file, f"spread: {chunked}") == 1
+
+
+@pytest.mark.parametrize("sep", ["-", "_", "=", "+", "/", ".", "\n- "])
+def test_extraheader_chunked_with_any_separator_is_caught(tmp_path, sep):
+    chunked = sep.join(
+        FAKE_EXTRAHEADER[i:i + 8] for i in range(0, len(FAKE_EXTRAHEADER), 8)
+    )
+    assert check(tmp_path, None, f"config:\n{chunked}\n") == 1
+
+
+def test_digit_bearing_separators_remain_a_known_residual(tmp_path, auth_file):
+    """Not a passing case to be proud of — a pin on a KNOWN limit, so that it
+    stays a deliberate decision. A numbered list interleaves digits, and digits
+    are valid base64, so no alphabet collapse can strip them without destroying
+    the encoding it is trying to recover. Documented in the module docstring."""
+    chunked = "\n1. ".join(FAKE_REFRESH[i:i + 3] for i in range(0, len(FAKE_REFRESH), 3))
+    assert check(tmp_path, auth_file, f"x:\n{chunked}\n") == 0
+
+
+def test_budget_overrun_fails_closed_rather_than_truncating(tmp_path, auth_file):
+    """The docstring calls truncation a REPRODUCED bypass, but nothing tested
+    the fail-closed path — swapping the raise for a silent `return views` left
+    every test green. Driven through the module so the budget is reachable
+    without a multi-megabyte fixture."""
+    spec = importlib.util.spec_from_file_location("leakgate", SCRIPT)
+    gate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = gate
+    spec.loader.exec_module(gate)
+
+    monkey = base64.b64encode(b"A" * 4096).decode()
+    gate.MAX_DECODE_BYTES = 64
+    with pytest.raises(gate.ScanBudgetExceeded):
+        gate.all_views(f"padding {monkey}")
 
 
 def test_base64url_extraheader_is_caught(tmp_path):

@@ -118,6 +118,16 @@ def test_every_policy_is_path_denied_by_the_mechanical_gate():
         rel = path.relative_to(ROOT).as_posix()
         assert gate.path_denied(rel), f"{rel} is not in PATH_DENY_PREFIXES"
 
+    # Discovery is per-directory, so a policy anywhere is a policy.
+    for elsewhere in ("src/APPROVAL_POLICY.md", "docs/BUGBOT.md",
+                      "src/minni/APPROVAL_POLICY.md"):
+        assert gate.path_denied(elsewhere), (
+            f"{elsewhere} would let a PR ship its own approval rules"
+        )
+    for path in paths:
+        rel = path.relative_to(ROOT).as_posix()
+        assert gate.path_denied(rel), f"{rel} is not in PATH_DENY_PREFIXES"
+
 
 def test_policy_basenames_are_exact():
     """Cursor ignores POLICY.md, approval_policy.md, *.bak and team_* during
