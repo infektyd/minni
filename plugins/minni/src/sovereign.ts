@@ -89,7 +89,17 @@ export interface StatusReport {
   afmProvider: AfmProviderResolution;
   extractor: ExtractorStatus;
   audit: {
+    /**
+     * Count of `## ` audit entries in the active rolling log file
+     * (`logs/YYYY-MM-DD.md` or fallback `log.md`) — not a presence bit.
+     * Soft-capped at the last 10_000 headers of that file (status path only).
+     */
     entries: number;
+    /**
+     * Headline line only (`## [ts] tool | summary`). Never the full multi-line
+     * audit entry body (paths, details JSON, stack). Full bodies: `minni_audit_tail`
+     * or `auditReport({ includeLatest: true })` on the opt-in path.
+     */
     latest?: string;
     volume: number;
   };
@@ -1143,7 +1153,10 @@ export async function buildStatusReport(input?: {
     networkDeadline === undefined ? undefined : Math.max(0, networkDeadline - Date.now());
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
-  const tail = await auditTail(vaultPath, 1);
+  // One wide tail: entry *count* needs more than limit=1 (that was a 0|1 lie),
+  // and auditTail already readFile+splits the whole active log — don't pay it
+  // twice on this hot path. Headline comes from the last entry in the same window.
+  const countedTail = await auditTail(vaultPath, 10_000);
 
   // Fetch the daemon socket status BEFORE computing our own AFM verdict: when
   // the daemon is reachable it has ALREADY run afm_runtime_status() with its
@@ -1326,8 +1339,15 @@ export async function buildStatusReport(input?: {
       probeAgeMs: generation.probeAgeMs,
     },
     audit: {
-      entries: tail.entries.length,
-      latest: tail.entries.at(-1),
+      entries: countedTail.entries.length,
+      // X10: never return the full last audit body on status (paths/metadata
+      // in free-form markdown). Headline line only — same posture as hooks.
+      latest: (() => {
+        const last = countedTail.entries.at(-1);
+        if (!last) return undefined;
+        const headline = last.split("\n")[0]?.trim() ?? "";
+        return headline.length > 0 ? headline : undefined;
+      })(),
       volume,
     },
   };
@@ -1335,10 +1355,18 @@ export async function buildStatusReport(input?: {
 
 export async function statusAndAudit(vaultPath = DEFAULT_VAULT_PATH): Promise<StatusReport> {
   const report = await buildStatusReport({ vaultPath });
+  // Do not dump the full StatusReport into audit details — that re-introduces
+  // vault paths and nested payloads into the full-body audit_tail channel (X10).
   await recordAudit(vaultPath, {
     tool: "minni_status",
     summary: `socket=${report.socket.ok ? "ok" : "error"} afm=${report.afm.ok ? "ok" : "error"}`,
-    details: report as unknown as Record<string, unknown>,
+    details: {
+      socket_ok: report.socket.ok,
+      afm_ok: report.afm.ok,
+      audit_entries: report.audit.entries,
+      audit_volume: report.audit.volume,
+      audit_latest_headline: report.audit.latest,
+    },
   });
   return report;
 }

@@ -39,3 +39,16 @@ Then restart agent apps so they reload `server.js` / hook entrypoints.
 - Truth policy (honesty vs goals): [docs-truth-policy.md](docs-truth-policy.md)
 - Fleet update: `minni sync` / [install.md](../install.md)
 - Grok App (personal CI gate): [grok-reviewer-app.md](grok-reviewer-app.md)
+
+## Verification bar (Grok cold-tool guard)
+
+**2026-08-04 (local, post-#274):** Unit bar accepted for dogfood gate —
+
+```bash
+cd plugins/minni && node --test tests/grok-hook.test.mjs
+# 8 pass, including: native Grok read_file denied when strong recall pending;
+# stdout is {decision,reason} (not Claude permissionDecision).
+```
+
+Wet session proof (live Grok Build + pending strong recall → deny `read_file`)
+remains optional follow-up; host restart after `minni sync` required first.

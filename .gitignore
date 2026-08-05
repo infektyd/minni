@@ -222,3 +222,6 @@ scripts/run_harvest.py
 *.excalidraw
 .worktrees/
 .venv
+
+# local dogfood notes (not for remote)
+scratchpad/
