@@ -84,6 +84,48 @@ import pytest  # noqa: E402  (import after MINNI_HOME redirect, by design)
 _REPO_SRC = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir, "src"))
 
 
+def _is_inside(path: str, ancestor: str) -> bool:
+    """True when *path* lies inside *ancestor*, decided by the FILESYSTEM (#331).
+
+    The obvious spelling — ``realpath(path).startswith(realpath(ancestor))`` —
+    is a string compare, and ``realpath`` resolves symlinks but does NOT
+    normalise case. On case-insensitive APFS (the macOS default)
+    ``~/Projects/minni`` and ``~/Projects/Minni`` are the same directory and
+    compare unequal, so invoking pytest through the lowercase spelling tripped
+    this guard as a false positive and blocked a legitimate run. Observed live
+    during PR verification; the workaround was retyping the path in canonical
+    case, which is not something a guard should demand.
+
+    ``os.path.samestat`` compares st_dev/st_ino, so it answers "is this the
+    same directory" the way the kernel does. That is also why this is not
+    ``normcase``: normcase would hardcode case-insensitive semantics for every
+    macOS run, which is wrong on a case-SENSITIVE volume (APFS can be
+    formatted that way, and /Volumes mounts often are) — there two spellings
+    really are different directories and the guard must still refuse.
+
+    Walks parents rather than comparing the leaf, because the question is
+    containment, not identity.
+    """
+    try:
+        ancestor_stat = os.stat(ancestor)
+    except OSError:
+        # No ancestor to be inside of. Refuse rather than pass by accident —
+        # a missing src/ is itself a broken checkout.
+        return False
+
+    current = os.path.realpath(path)
+    while True:
+        try:
+            if os.path.samestat(os.stat(current), ancestor_stat):
+                return True
+        except OSError:
+            pass  # a path component we cannot stat is simply not the ancestor
+        parent = os.path.dirname(current)
+        if parent == current:  # reached the filesystem root
+            return False
+        current = parent
+
+
 def pytest_configure(config):
     """Fail the whole session, before collection, if ``minni`` resolved wrong.
 
@@ -115,7 +157,7 @@ def pytest_configure(config):
         )
 
     resolved = os.path.realpath(minni_file)
-    if not resolved.startswith(_REPO_SRC + os.sep):
+    if not _is_inside(resolved, _REPO_SRC):
         raise pytest.UsageError(
             "worktree import resolution (#258): `import minni` resolved to "
             f"{resolved!r}, outside this rootdir's src/ ({_REPO_SRC!r}). An "
