@@ -327,6 +327,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             "afm_dead_letter": {"files": 0, "oldest_age_days": None},
             "afm_review_orphans": 0,
             "proposed_queue": {"depth": 0, "oldest_age_days": None, "stale": 0},
+            # #307: how many inbox files the distillation pass currently
+            # cannot read. A LIVE count, not the cumulative drop counter — a
+            # dropped file is never archived, so it is re-dropped every tick
+            # and a cumulative total is files x ticks-since-boot, which would
+            # overstate corruption by ~96x/day per file. This clears when the
+            # file is removed.
+            "compact_distillation_unusable": {"files": 0},
         },
         # #225-R6 / GA1-1: health never compared document count against vector
         # count, so a 43% document-vector gap (381/879, all knowledge layer) and
@@ -618,6 +625,22 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 "files": None,
                 "oldest_age_days": None,
                 "unreadable": None,
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
+        try:
+            from minni.afm_passes.compact_distillation import (
+                count_unusable_compact_files,
+            )
+
+            lifecycle["compact_distillation_unusable"] = count_unusable_compact_files(
+                config=context.default_config,
+            )
+        except Exception as exc:
+            # Replace the sub-dict, matching the sibling blocks: leaving the
+            # zero default would report a scan that never ran as "0 files".
+            lifecycle["compact_distillation_unusable"] = {
+                "files": None,
                 "status": "unknown",
                 "error": type(exc).__name__,
             }

@@ -326,6 +326,38 @@ def _write_session_note(vault: Path, doc: Dict[str, Any], inbox_file: str,
     return path
 
 
+def count_unusable_compact_files(
+    inboxes: Optional[List[Path]] = None,
+    *,
+    config: Any = None,
+) -> Dict[str, Any]:
+    """How many inbox files the distillation pass currently cannot read.
+
+    #307: a dropped file is never archived or quarantined — it stays in the
+    inbox and is re-dropped on every tick — so a cumulative counter of drop
+    EVENTS is files x ticks-since-boot, not a file count. At a 900s
+    consolidation interval one corrupt file drives such a counter up ~96/day,
+    and an operator reading it hunts for corruption that does not exist.
+
+    This is the quantity that is actually true and that clears itself once the
+    file is removed: a live filesystem count, the same shape
+    ``inbox_quarantine.count_afm_dead_letter`` reports.
+    """
+    if inboxes is None:
+        inboxes = discover_inboxes(config)
+    files = 0
+    for inbox in inboxes:
+        for path in sorted(Path(inbox).glob("*.json")):
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                files += 1
+                continue
+            if not isinstance(doc, dict):
+                files += 1
+    return {"files": files}
+
+
 def distill(db, config, inboxes: Optional[List[Path]] = None,
             fallback_principal: str = "unknown", dry_run: bool = False) -> Dict[str, Any]:
     """Distill eligible compact_summary inbox files into candidate_packets.
