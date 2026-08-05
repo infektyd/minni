@@ -47,6 +47,15 @@ class WikiFrontmatter:
 
     # PR-2: Valid values for validation
     VALID_STATUSES = frozenset({"draft", "candidate", "accepted", "superseded", "rejected", "expired"})
+    # M6 (#229): statuses that are VALID on the vault contract (vault.ts
+    # PageStatus) but are deliberately never indexed. "complete" is the
+    # terminal state plan.ts moves a plan into once every slice resolves; it
+    # is kept out of recallable memory on purpose (H6 — a model-driven
+    # completion must not self-promote its own plan into recall), and it is
+    # NOT in retrieval's skip_statuses, so INDEXING one would make it
+    # recallable. Excluding these is a decision, not a defect: they are
+    # counted as `excluded`, never as `rejected` (malformed) or `errors`.
+    EXCLUDED_STATUSES = frozenset({"complete"})
     VALID_PRIVACIES = frozenset({"safe", "local-only", "private", "blocked"})
     VALID_TYPES = frozenset({"entity", "concept", "decision", "procedure", "session", "artifact", "handoff", "synthesis", "unknown"})
 
@@ -268,7 +277,8 @@ class WikiIndexer:
 
         stats = {
             "indexed": 0, "skipped": 0, "deleted": 0,
-            "chunks": 0, "wikilinks": 0, "errors": 0, "rejected": 0
+            "chunks": 0, "wikilinks": 0, "errors": 0, "rejected": 0,
+            "excluded": 0, "excluded_purged": 0
         }
 
         # Resolve log.md path for rejected page logging
@@ -346,6 +356,26 @@ class WikiIndexer:
                         stats["errors"] += 1
                         continue
 
+                    # M6 (#229): excluded by design — checked BEFORE validation
+                    # so a completed plan is neither "rejected" nor an "error",
+                    # and so it never appends a REJECTED block to log.md. It
+                    # used to: a rejected page never gets a documents row, so
+                    # the mtime skip never fires and every run re-appended one,
+                    # growing log.md without bound (and log.md is itself
+                    # watched, so the write re-triggered indexing).
+                    if not is_meta and page.frontmatter.status in WikiFrontmatter.EXCLUDED_STATUSES:
+                        stats["excluded"] = stats.get("excluded", 0) + 1
+                        # Retract an already-indexed page: accepted -> complete
+                        # is the normal plan lifecycle, and leaving the old row
+                        # keeps a finished plan recallable (H6).
+                        if row:
+                            doc_id = row["doc_id"]
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                            stats["excluded_purged"] = stats.get("excluded_purged", 0) + 1
+                        continue
+
                     # PR-2: Validate frontmatter (reject invalid pages)
                     if not is_meta:
                         errors = self.parser.validate_frontmatter(page.frontmatter, path)
@@ -364,8 +394,9 @@ class WikiIndexer:
                                     )
                             except Exception:
                                 pass
+                            # rejected != errors: conflating them left the
+                            # error signal permanently non-zero (#229 M6).
                             stats["rejected"] += 1
-                            stats["errors"] += 1
                             continue
 
                     # PR-2: blocked pages must purge stale index rows, not just skip

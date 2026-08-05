@@ -12,11 +12,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+from minni.wiki_indexer import WikiFrontmatter
 
 
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]")
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?", re.DOTALL)
-VALID_STATUSES = {"draft", "candidate", "accepted", "superseded", "rejected"}
+# Single source of truth (#229 M6). This set had drifted twice from the
+# indexer's contract: it was missing "expired" (long-standing) and "complete"
+# (the terminal plan state), so every completed plan page produced a permanent
+# block-severity "Unknown status" finding on the hygiene health surface — the
+# same never-returns-to-zero signal M6 removes from the ingest counters.
+VALID_STATUSES = set(
+    WikiFrontmatter.VALID_STATUSES | WikiFrontmatter.EXCLUDED_STATUSES
+)
 VALID_PRIVACY = {"safe", "private", "sensitive", "blocked"}
 
 

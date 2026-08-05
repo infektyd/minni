@@ -538,3 +538,151 @@ def test_default_agent_vault_matches_agent_vault_dirs():
         "default_agent_vault disagrees with AGENT_VAULT_DIRS -- personal recall "
         f"and handoffs will miss these vaults: {mismatched}"
     )
+
+
+# ── M6 (#229): intentional exclusions are not indexing errors ───────────────
+#
+# plan.ts writes plan pages with the terminal, deliberately NON-recallable
+# status "complete" (H6: a model-completed plan must not self-promote into
+# recallable memory). The Python contract never learned that value, so every
+# plan page was rejected AND counted as an error — an error signal that can
+# never return to zero carries no information about real errors.
+
+
+def _write_status_page(path: Path, title: str, status: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            ["---", f"title: {title}", "type: artifact", f"status: {status}",
+             "privacy: safe", "---", "", _long_body(title)],
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_complete_status_is_excluded_by_design_not_an_error(tmp_path, monkeypatch):
+    from minni.afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    _write_page(vault / "wiki" / "ok.md", "Ok", _long_body("ok"))
+    _write_status_page(vault / "wiki" / "artifacts" / "plan-abc.md", "Plan", "complete")
+
+    result = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    assert result["errors"] == 0, "an intentional exclusion is not an error"
+    assert result["rejected"] == 0, "an intentional exclusion is not a rejection"
+    assert result["excluded"] == 1
+
+
+def test_completed_plan_pages_stay_out_of_the_index(tmp_path, monkeypatch):
+    """`complete` is not in retrieval's skip_statuses, so an indexed plan page
+    would be recallable — exactly the self-promotion H6 forbids."""
+    from minni.afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    _write_status_page(vault / "wiki" / "artifacts" / "plan-abc.md", "Plan", "complete")
+
+    result = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    index_db = Path(result["index_db_path"])
+    paths = [r["path"] for r in _doc_rows(index_db)] if index_db.exists() else []
+    assert not any("plan-abc" in p for p in paths)
+
+
+def test_completing_an_indexed_plan_retracts_it_from_recall(tmp_path, monkeypatch):
+    """accepted -> complete is the NORMAL plan lifecycle. Skipping without
+    retracting leaves the old row indexed at `accepted`, which is in neither
+    skip_statuses nor UNEMBEDDED_STATUSES — a finished plan that stays
+    recallable forever."""
+    from minni.afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    page = vault / "wiki" / "artifacts" / "plan-abc.md"
+
+    _write_status_page(page, "Plan", "accepted")
+    first = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+    assert first["indexed"] == 1
+    index_db = Path(first["index_db_path"])
+    assert any("plan-abc" in r["path"] for r in _doc_rows(index_db))
+
+    time.sleep(0.01)
+    _write_status_page(page, "Plan", "complete")
+    second = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    assert second["excluded"] == 1
+    assert second["excluded_purged"] == 1
+    assert not any("plan-abc" in r["path"] for r in _doc_rows(index_db))
+
+
+def test_genuinely_invalid_frontmatter_is_still_rejected(tmp_path, monkeypatch):
+    """The fix must not blanket-excuse bad frontmatter: an unknown status is
+    still a rejection, it just is not an 'error'."""
+    from minni.afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    _write_status_page(vault / "wiki" / "junk.md", "Junk", "banana")
+
+    result = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    assert result["rejected"] == 1
+    assert result["excluded"] == 0
+    assert result["errors"] == 0
+
+
+def test_index_wiki_excludes_complete_without_growing_log_md(tmp_path, monkeypatch):
+    """The OTHER indexing path (WikiIndexer.index_wiki, used by the watcher and
+    index_all). A rejected page never gets a documents row, so the mtime skip
+    never fires and every run re-appended a REJECTED block to wiki/log.md —
+    unbounded growth, and log.md is itself watched, so the write re-triggered
+    indexing."""
+    from minni.wiki_indexer import WikiIndexer
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    _write_status_page(vault / "wiki" / "plan-abc.md", "Plan", "complete")
+    _write_page(vault / "wiki" / "ok.md", "Ok", _long_body("ok"))
+
+    indexer = WikiIndexer(shared_db, cfg)
+    for _ in range(3):
+        stats = indexer.index_wiki(str(vault / "wiki"))
+
+    assert stats["errors"] == 0
+    assert stats["rejected"] == 0
+    assert stats["excluded"] == 1
+
+    log_path = vault / "wiki" / "log.md"
+    rejected_lines = (
+        log_path.read_text(encoding="utf-8").count("REJECTED") if log_path.exists() else 0
+    )
+    assert rejected_lines == 0, "an intentional exclusion must not write a REJECTED block"
+
+
+def test_hygiene_accepts_the_terminal_plan_status(tmp_path):
+    """hygiene.py had drifted from the indexer contract, so every completed
+    plan raised a permanent block-severity 'Unknown status' finding on the
+    health surface."""
+    from minni.hygiene import run_hygiene_report
+
+    vault = tmp_path / "codex-vault"
+    _write_status_page(vault / "wiki" / "plan-a.md", "Plan A", "complete")
+    (vault / "wiki" / "plan-a.md").write_text(
+        "\n".join(["---", "title: Plan A", "type: artifact", "status: complete",
+                   "privacy: safe", "sources: [x]", "---", "", "body"]),
+        encoding="utf-8",
+    )
+
+    report = run_hygiene_report(vault)
+    unknown = [
+        f for f in report["findings"]["block"]
+        if "Unknown status" in f.get("message", "")
+    ]
+    assert unknown == []
