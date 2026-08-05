@@ -138,7 +138,6 @@ gh api -X PUT repos/infektyd/minni/branches/main/protection \
     "checks": [
       { "context": "Forbidden Files",         "app_id": 15368 },
       { "context": "Free public cloud smoke", "app_id": 15368 },
-      { "context": "claude-review",           "app_id": 15368 },
       { "context": "grok-mechanical-approve", "app_id": 4456296 }
     ]
   },
@@ -317,7 +316,6 @@ gh api -X PATCH repos/infektyd/minni/branches/main/protection/required_status_ch
   "checks": [
     { "context": "Forbidden Files",         "app_id": 15368 },
     { "context": "Free public cloud smoke", "app_id": 15368 },
-    { "context": "claude-review",           "app_id": 15368 },
     { "context": "grok-mechanical-approve", "app_id": 4456296 }
   ]
 }

@@ -1,7 +1,9 @@
 name: Grok Code Review
 
-# Auto-review on PRs — mirrors .github/workflows/claude-code-review.yml but
-# runs xAI's Grok Build CLI headless on the runner, burning the operator's
+# Auto-review on PRs. It began as a mirror of claude-code-review.yml; that
+# workflow was REMOVED in #240 for reporting success across 12+ runs while
+# never posting a review. This one runs xAI's Grok Build CLI headless on the
+# runner, burning the operator's
 # Grok subscription (device-auth OAuth secret GROK_CI_AUTH_JSON — minting and
 # rotation notes in .github/workflows/grok.yml).
 #

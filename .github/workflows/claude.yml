@@ -53,8 +53,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # An agent reads this checkout and its reply is posted publicly — same threat
-          # model as grok-review.yml, and there is no leak gate on this path.
+          # An agent reads this checkout and its reply is posted publicly —
+          # MEASURED, not assumed: claude[bot] commented on PR #216 from run
+          # 30700780377, i.e. from THIS workflow, while carrying only
+          # `pull-requests: read`. claude-code-action posts through its own App
+          # installation, so job permissions do not govern the publish at all.
+          #
+          # SEC-G9-EXEMPT (#236, knowingly deferred): grok-review.yml runs a
+          # fail-closed leak gate loaded from the default branch before it
+          # posts; this path has none, and porting one is not mechanical —
+          # claude-code-action composes AND posts internally, leaving no
+          # interception point between the model's output and the public
+          # comment. The real mitigation is bounding what the agent can read
+          # (claude_args: --allowed-tools), not scanning what it emits.
           # Default checkout persists the token into .git/config as an http
           # extraheader; nothing downstream needs it (the repo is public, so
           # any git fetch here is anonymous).
