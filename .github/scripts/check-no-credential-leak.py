@@ -412,7 +412,9 @@ def main() -> int:
         with open(auth_path, encoding="utf-8") as handle:
             auth = json.load(handle)
         auth_error = None
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
+        # RecursionError included: a pathologically nested auth document must
+        # produce the annotation below, not a traceback out of walk().
         # No auth file to compare against (or unreadable): the shape and
         # decoded checks below still run. A missing credential file is not by
         # itself evidence of a leak, so this is not a failure on its own —
@@ -426,7 +428,12 @@ def main() -> int:
     # values at all — the value and encoding checks then iterate an empty list
     # and verify nothing, while the summary claimed both tiers ran. Coverage is
     # derived from the VALUES from here on, never from the file parsing.
-    values = secret_values(auth) if auth is not None else []
+    try:
+        values = secret_values(auth) if auth is not None else []
+    except RecursionError as exc:
+        # Same reasoning as the parse above: walk() is unbounded recursion, and
+        # a deep document must fail closed with an annotation, not a traceback.
+        auth, auth_error, values = None, exc, []
 
     if not values and require_auth:
         # `base64 -d` exits 0 on empty input, so an empty or unset

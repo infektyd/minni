@@ -10,6 +10,7 @@ where it meant nothing.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -80,8 +81,19 @@ def test_the_file_scan_still_runs_on_forks():
     appear is a same-repo narrowing."""
     _, job = _job_containing("No forbidden files in PR diff")
     condition = str(job.get("if", "")).strip()
-    assert condition in ("", "always()"), f"file scan narrowed by: {condition!r}"
     assert "head.repo" not in condition, "the file scan must not skip forks"
+    if job.get("needs"):
+        # The fatal combination is `needs` with NO condition: a skipped
+        # dependency skips the dependent, so on every fork PR the only
+        # protection-required hygiene context would itself be skipped — and
+        # GitHub counts a skipped required check as satisfied. Fork PRs would
+        # get no file scan and no content scan, silently.
+        assert condition == "always()", (
+            f"job depends on {job['needs']} but its condition is {condition!r}; "
+            "a skipped dependency would skip the required check itself"
+        )
+    else:
+        assert condition == "", f"file scan narrowed by: {condition!r}"
 
 
 def test_the_required_check_consumes_the_content_verdict():
@@ -101,9 +113,29 @@ def test_the_required_check_consumes_the_content_verdict():
         (s for s in files_job["steps"] if "needs." in str(s.get("env", ""))), None
     )
     assert verdict, "no step consumes the content job's result"
-    run = verdict["run"]
-    assert "exit 1" in run, "a failed content gate does not fail the required check"
-    assert "skipped" in run, "a skipped content gate is not reported"
+
+    # BEHAVIOURAL, not a grep. Substring assertions on this step say nothing
+    # about WHICH branch carries the exit: inverting the case arms reverses
+    # enforcement completely (content failures merge, forks go hard-red) and
+    # every string assertion still passes.
+    for result, should_pass in (
+        ("success", True),
+        ("skipped", True),      # fork: reported, not enforced — see the docstring
+        ("failure", False),
+        ("cancelled", False),
+        ("", False),
+        ("bogus", False),
+        ("SUCCESS", False),
+    ):
+        rc = subprocess.run(
+            ["bash", "-c", verdict["run"]],
+            env={"CONTENT_RESULT": result, "PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True,
+        ).returncode
+        assert (rc == 0) is should_pass, (
+            f"verdict step returned {rc} for content result {result!r}; "
+            f"expected {'pass' if should_pass else 'fail'}"
+        )
 
 
 def test_workflow_triggers_are_pinned():

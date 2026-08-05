@@ -466,3 +466,14 @@ def test_usage_error_when_only_the_flag_is_given(tmp_path):
     assert res.returncode == 2, "should be a usage error, not a traceback"
     assert "Traceback" not in res.stderr
     assert "usage:" in res.stdout
+
+
+def test_pathologically_nested_auth_fails_closed_without_a_traceback(tmp_path):
+    """walk() is unbounded recursion. A deep document must produce the
+    annotation the module promises, not a stack trace."""
+    auth = tmp_path / "auth.json"
+    auth.write_text("[" * 100000 + "]" * 100000)
+    res = _run(tmp_path, auth, "an ordinary review", "--require-auth")
+    assert res.returncode == 1
+    assert "Traceback" not in res.stderr and "Traceback" not in res.stdout
+    assert "::error::" in res.stdout

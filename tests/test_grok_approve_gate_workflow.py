@@ -718,9 +718,18 @@ def test_publish_gate_requires_a_parsed_auth_file(workflow, reply):
     accept a gate run that silently skipped two of its four checks. `base64 -d`
     exits 0 on empty input, so an unset GROK_CI_AUTH_JSON reaches that state
     through a restore step that looks like it succeeded."""
-    text = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+    doc = _load(ROOT / ".github" / "workflows" / workflow)
     call = f"/usr/bin/python3 -I - --require-auth {reply}"
-    assert call in text, f"{workflow}: publish gate does not pass --require-auth"
+    # Uncommented step bodies, not raw file text: a commented-out `# was: ...
+    # --require-auth ...` line above a stripped invocation satisfied a plain
+    # substring match over the file.
+    bodies = [
+        _uncommented(str(step.get("run", "")))
+        for job in doc["jobs"].values() for step in job.get("steps") or []
+    ]
+    assert any(call in body for body in bodies), (
+        f"{workflow}: publish gate does not pass --require-auth"
+    )
 
 
 def _extract_version_check(run: str) -> str:
@@ -760,6 +769,12 @@ def test_grok_cli_install_is_version_pinned(workflow):
         # of this test asserted only that the strings "--version" and
         # "::error::expected grok" appeared, and passed after `exit 1` was
         # removed from the mismatch branch — an annotation is not a failure.
+        # The capture line itself is outside the executed region below, so
+        # pin it exactly: replacing it with a hardcoded string, or with a
+        # PATH-resolved `grok --version`, would otherwise certify any build.
+        assert 'INSTALLED=$("$HOME/.grok/bin/grok" --version)' in run, (
+            f"{workflow}: version is not captured from the pinned binary"
+        )
         check = _extract_version_check(run)
         for installed, should_pass in (
             (f"grok {pin} (abc1234) [stable]", True),
