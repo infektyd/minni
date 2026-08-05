@@ -14,6 +14,12 @@ import path from "node:path";
 import os from "node:os";
 import * as fs from "node:fs"; // RCM-005: for realpathSync in assertUnder (G23 equivalent)
 import type { LearningQualityReport } from "./policy.js";
+// #312: task.ts already imports FROM this module (recordAudit,
+// searchVaultNotes, PrivacyLevel, VaultSearchResult) — this is a function-
+// scoped-use-only import (see resolveVaultRef below) so the circularity
+// resolves fine under Node's ESM live-binding semantics; neither module
+// touches the other's binding at top-level/module-evaluation time.
+import { filterSafeVaultResults } from "./task.js";
 
 export type VaultSection =
   | "raw"
@@ -2296,11 +2302,38 @@ async function resolveVaultRef(
       assertUnder(notePath, vaultPath);
       const markdown = await readFile(notePath, "utf8");
       const relativePath = path.relative(vaultPath, notePath);
+      // #312: a handoff's wikilink_refs can name ANY note in the vault,
+      // including one authored (or heuristically flagged) privacy:private —
+      // this read had no privacy gate at all before, worse than the SEC-006
+      // gap #308 fixed for UserPromptSubmit's recall pointer, since this one
+      // surfaces the note's BODY TEXT (a 520-char snippet), not just a
+      // title/path. Gate through the exact same filterSafeVaultResults
+      // machinery #308 already established (not a duplicated check), so the
+      // two call sites can't silently drift the way the pre-#308 gap did.
+      const candidate: VaultSearchResult = {
+        notePath,
+        relativePath,
+        wikilink: normalized,
+        title: titleFromMarkdown(relativePath, markdown),
+        snippet: snippetFor(markdown, queryTerms(normalized), 520),
+        score: 0,
+        privacy: privacyFromMarkdown(markdown),
+      };
+      if (filterSafeVaultResults([candidate]).length === 0) {
+        // Fail closed exactly like a containment reject below: this ref
+        // resolves to a real file, but it's not safe to surface, so it's
+        // treated as unresolved — same silent-omission precedent #308 set
+        // for vault_matches (H2 concern considered and rejected there: this
+        // is the system correctly declining to show content it was never
+        // entitled to show, not a degraded/error state masquerading as
+        // clean).
+        continue;
+      }
       return {
         ref: normalized,
         relativePath,
         notePath,
-        snippet: snippetFor(markdown, queryTerms(normalized), 520),
+        snippet: candidate.snippet,
       };
     } catch {
       // try the next (or containment reject -> fail closed, treat as absent)

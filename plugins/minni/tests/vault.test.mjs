@@ -60,7 +60,12 @@ test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async
     await mkdir(decisionDir, { recursive: true });
     await writeFile(
       path.join(decisionDir, "auth-migration.md"),
-      "---\ntitle: Auth Migration\n---\n\nUse the short-lived token exchange for auth migration.",
+      // #312: plain body text, deliberately free of any word
+      // heuristicPrivacyForSource (task.ts) escalates on — this test is
+      // about wikilink ref resolution, not the privacy gate; a body
+      // mentioning "token" would now be correctly excluded by the #312 fix
+      // and this fixture would stop testing what its name says.
+      "---\ntitle: Auth Migration\n---\n\nUse the short-lived credential exchange for auth migration.",
       "utf8",
     );
 
@@ -78,7 +83,61 @@ test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async
 
     assert.equal(snippets.length, 1);
     assert.equal(snippets[0].ref, "wiki/decisions/auth-migration");
-    assert.match(snippets[0].snippet, /short-lived token exchange/);
+    assert.match(snippets[0].snippet, /short-lived credential exchange/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#312: resolveInboxHandoffContext never surfaces a privacy:private note's body text", async () => {
+  // resolveInboxHandoffContext feeds hook-handlers.ts's SessionStart
+  // envelope handoff_context field directly (a 1:1 map, no filtering in
+  // between) — before this fix, a handoff's wikilink_refs could name ANY
+  // note in the vault, including privacy:private ones, and their BODY TEXT
+  // (a 520-char snippet) reached the model-facing envelope with zero
+  // gating. Worse than the SEC-006 gap #308 fixed for UserPromptSubmit's
+  // recall pointer, since that one only leaked titles/paths.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-privacy-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "safe-migration.md"),
+      "---\ntitle: Safe Migration\nprivacy: safe\n---\n\nBoot priming marker phrase, safe note.",
+      "utf8",
+    );
+    await writeFile(
+      path.join(decisionDir, "private-migration.md"),
+      "---\ntitle: Private Migration\nprivacy: private\n---\n\nBoot priming marker phrase, CONFIDENTIAL body text that must never leave this vault.",
+      "utf8",
+    );
+
+    const snippets = await resolveInboxHandoffContext(root, [
+      {
+        slug: "mixed-handoff",
+        filePath: path.join(root, "inbox", "mixed.json"),
+        createdAt: "2026-04-26T00:00:00.000Z",
+        payload: {
+          kind: "handoff",
+          wikilink_refs: [
+            "wiki/decisions/safe-migration",
+            "wiki/decisions/private-migration",
+          ],
+        },
+      },
+    ]);
+
+    const refs = snippets.map((s) => s.ref);
+    assert.ok(refs.includes("wiki/decisions/safe-migration"), "the safe note must still resolve");
+    assert.ok(
+      !refs.includes("wiki/decisions/private-migration"),
+      "SEC (#312): a privacy:private note's ref must not resolve at all",
+    );
+    assert.ok(
+      !snippets.some((s) => /CONFIDENTIAL/.test(s.snippet)),
+      "SEC (#312): the private note's body text must never appear in any returned snippet",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
