@@ -308,6 +308,7 @@ jobs:
       - name: Fail closed on credential leakage
         env:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
           # The DEFAULT branch, never github.base_ref: the base of a PR is
           # chosen by its author, so anchoring trust there lets someone push a
           # branch carrying a neutered gate and open a PR into it — the gate
@@ -349,14 +350,14 @@ jobs:
           # empty GROK_CI_AUTH_JSON yields a successful-looking restore and an
           # unparseable auth.json. Without this the gate quietly degrades to
           # shape-only and still reports a pass (SEC-G12).
-          # Re-materialize the needle set from the secret AFTER the agent ran
-          # (review finding 2 on #350): the agent can potentially rewrite
+          # Re-materialize the needle set from the SECRETS after the agent
+          # ran (review findings on #350): the agent can potentially rewrite
           # auth.json (the read-only-profile write block is a stated
-          # UNVERIFIED residual), and a swapped file desyncs the gate's value
-          # needles from the live key — which has no shape-check backstop the
-          # way JWT-shaped OAuth tokens do. Same shape guard as the restore
-          # step; skipped entirely in OAuth mode, where the restored blob is
-          # already the live credential.
+          # UNVERIFIED residual), and a swapped file desyncs the gate's
+          # value scan. Post-agent, only the secrets are known-live — the
+          # on-disk blob is not. BOTH modes rebuild: API keys have no shape
+          # backstop at all, and OAuth refresh tokens are opaque (not
+          # JWT-shaped), so shape checks cover neither.
           if [ -n "${XAI_API_KEY:-}" ]; then
             case "$XAI_API_KEY" in
               *[!A-Za-z0-9._-]*)
@@ -365,6 +366,9 @@ jobs:
                 ;;
             esac
             printf '{"xai_api_key": "%s"}' "$XAI_API_KEY" > "$HOME/.grok/auth.json"
+            /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          elif [ -n "${GROK_CI_AUTH_JSON:-}" ]; then
+            printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
             /usr/bin/chmod 600 "$HOME/.grok/auth.json"
           fi
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
