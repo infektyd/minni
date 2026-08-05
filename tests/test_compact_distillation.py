@@ -500,3 +500,132 @@ def test_dry_run_does_not_archive_file_with_shared_candidates(tmp_path, monkeypa
     assert res["archived_with_shared"] == 0
     assert (inbox / "shared.json").is_file()
     assert not (inbox / ".archive").exists()
+
+
+# ── #307: the pass counts its drops; the AFM caller must not discard them ───
+
+
+def test_afm_loop_surfaces_compact_distillation_drops(tmp_path, monkeypatch):
+    """compact_distillation counts _unreadable/_malformed correctly (AFM-9,
+    #230), but the AFM loop only logged when work LANDED and never read
+    _dc["skipped"] — no counter, nothing on any health surface. A writer that
+    starts emitting corrupt payloads was discoverable only by grepping the
+    daemon log for a warning string."""
+    import asyncio
+    import json as _json
+    import os as _os
+    import sys as _sys
+    import time as _time
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cons_cfg = cfg.afm_loop_schedule["passes"]["consolidation"]
+    cons_cfg["distill_compact_summaries"] = True
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "compact-truncated.json").write_text(
+        '{"kind": "compact_summary", "summ', encoding="utf-8",
+    )
+    (inbox / "compact-listish.json").write_text("[]", encoding="utf-8")
+    old = _time.time() - 3600
+    for p in inbox.glob("*.json"):
+        _os.utime(p, (old, old))
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+
+        snap = obs.metrics_snapshot()
+        assert snap.get("compact_distillation_dropped_total") == 2, snap
+    finally:
+        obs.METRICS.reset()
+        del _json
+
+
+def test_health_report_surfaces_the_compact_drop_count(tmp_path, monkeypatch):
+    """The counter has to reach an operator-readable surface, not just obs."""
+    import minni.obs as obs
+
+    from test_inbox_quarantine import _FakeDB, _real_lifecycle_db  # noqa: E402
+
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+    obs.METRICS.reset()
+    try:
+        obs.incr("compact_distillation_dropped_total", 3)
+        op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+        rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+        assert rep["memory_lifecycle"]["compact_distillation_dropped"] == 3, rep["memory_lifecycle"]
+    finally:
+        obs.METRICS.reset()
+        del _FakeDB
+
+
+def test_compact_drop_count_is_zero_on_a_healthy_system(tmp_path, monkeypatch):
+    import minni.obs as obs
+
+    from test_inbox_quarantine import _real_lifecycle_db  # noqa: E402
+
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+    obs.METRICS.reset()
+    try:
+        op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+        rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+        assert rep["memory_lifecycle"]["compact_distillation_dropped"] == 0
+    finally:
+        obs.METRICS.reset()
+
+
+def test_routine_other_kind_routing_is_not_counted_as_a_drop(tmp_path, monkeypatch):
+    """_other_kind is routing, not loss: other kinds legitimately share this
+    inbox and have their own pass. Counting it would produce an alarm that
+    never returns to zero — the exact failure this counter exists to avoid."""
+    import asyncio
+    import os as _os
+    import sys as _sys
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cfg.afm_loop_schedule["passes"]["consolidation"]["distill_compact_summaries"] = True
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "handoff.json").write_text(
+        json.dumps({"kind": "handoff", "task": "t"}), encoding="utf-8",
+    )
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+        snap = obs.metrics_snapshot()
+        assert not snap.get("compact_distillation_dropped_total"), snap
+    finally:
+        obs.METRICS.reset()
