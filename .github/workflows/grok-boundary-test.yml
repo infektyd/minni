@@ -11,7 +11,12 @@ name: Grok Boundary Test
 # semantics (SEC-G10). The CLI is pinned in the install step below, so a CLI
 # change is now a file change, and the paths filter catches it.
 #
-# WHY THIS EXISTS (measured 2026-08-01, grok 0.2.117 locally):
+# WHY THIS EXISTS (measured 2026-08-01, grok 0.2.117 locally). NOTE the pin
+# below is 0.2.118: the measurement predates it, and the pin was chosen as the
+# stable channel's current head rather than by re-measuring. The first run on
+# 0.2.118 is what re-establishes this evidence — until then the finding above
+# is carried over from a neighbouring build, which is exactly the assumption
+# this job exists to remove. Re-measure and update this line when it runs.
 # under --always-approve the built-in `read_file` tool reads
 # $HOME/.grok/auth.json outright — no shell required. A `--tools` allowlist
 # does NOT stop it, and neither does `--deny "Read(...)"`. The kernel sandbox
@@ -191,10 +196,23 @@ jobs:
           # dropped, and a quietly-newer CLI is exactly what this pin exists to
           # prevent — so a mismatch has to fail rather than proceed.
           INSTALLED=$("$HOME/.grok/bin/grok" --version)
+          # EXACT compare, not a substring. `grok --version` prints
+          # "grok 0.2.118 (<sha>) [stable]", and a glob would let a pin of
+          # 0.2.12 accept 0.2.120 — the X.Y.Z / X.Y.Z0 collision is live in this
+          # CLI's own series, and it fails open in precisely the case the
+          # assertion exists for. Parameter expansion only: no PATH lookup.
+          INSTALLED_VERSION="${INSTALLED#grok }"
+          INSTALLED_VERSION="${INSTALLED_VERSION%% *}"
+          if [ "$INSTALLED_VERSION" != "$GROK_CLI_VERSION" ]; then
+            echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"
+            exit 1
+          fi
+          # The pin comment claims the stable channel; verify rather than assume.
           case "$INSTALLED" in
-            *"$GROK_CLI_VERSION"*) echo "grok CLI pinned at $GROK_CLI_VERSION" ;;
-            *) echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"; exit 1 ;;
+            *"[stable]"*) : ;;
+            *) echo "::error::expected a stable-channel build, got: $INSTALLED"; exit 1 ;;
           esac
+          echo "grok CLI pinned at $GROK_CLI_VERSION (stable)"
 
       - name: Restore Grok subscription auth
         env:
@@ -314,7 +332,12 @@ jobs:
             > /tmp/fixture-auth.json
           printf 'leaked: POSITIVECONTROLSECRETvalue1234567890abcdefGHIJK\n' \
             > /tmp/fixture-reply.md
-          if printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - \
+          # --require-auth, matching the publish gates byte-for-byte: this
+          # control is the only artifact proving the DEPLOYED gate fires on a
+          # real leak, so it must exercise the invocation that actually guards
+          # publication. The fixture auth file below parses, so the flag is a
+          # no-op here beyond keeping the two paths identical.
+          if printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth \
                /tmp/fixture-reply.md /tmp/fixture-auth.json; then
             echo "::error::Leak gate did NOT flag a planted secret — the gate is broken."
             exit 1

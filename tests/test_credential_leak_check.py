@@ -431,3 +431,38 @@ def test_require_auth_still_passes_a_clean_reply_with_valid_auth(tmp_path, auth_
 def test_require_auth_still_blocks_a_leak(tmp_path, auth_file):
     res = _run(tmp_path, auth_file, f"leaked {FAKE_REFRESH}", "--require-auth")
     assert res.returncode == 1
+
+
+@pytest.mark.parametrize(
+    "document",
+    ['{}', '[]', 'null', '0', '{"k":"short"}', '{"a":{"b":[]}}'],
+)
+def test_require_auth_rejects_an_auth_document_with_nothing_to_compare(tmp_path, document):
+    """SEC-G12 one layer down. `auth is not None` is not the same as "there was
+    something to compare against": these documents parse fine and yield zero
+    comparison values, so the value and encoding checks iterate an empty list
+    and verify nothing — while the summary previously claimed both tiers ran
+    and --require-auth still certified the reply."""
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    res = _run(tmp_path, auth, "an ordinary review", "--require-auth")
+    assert res.returncode == 1, f"{document} certified as a full-coverage pass"
+
+
+@pytest.mark.parametrize("document", ['{}', 'null'])
+def test_valueless_auth_is_reported_as_skipped_on_the_permissive_path(tmp_path, document):
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    out = _run(tmp_path, auth, "an ordinary review").stdout
+    assert "value, encoding SKIPPED" in out
+    assert "::warning::" in out
+
+
+def test_usage_error_when_only_the_flag_is_given(tmp_path):
+    res = subprocess.run(
+        [sys.executable, str(SCRIPT), "--require-auth"],
+        capture_output=True, text=True,
+    )
+    assert res.returncode == 2, "should be a usage error, not a traceback"
+    assert "Traceback" not in res.stderr
+    assert "usage:" in res.stdout

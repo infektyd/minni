@@ -23,6 +23,10 @@ def _doc() -> dict:
     return yaml.safe_load(HYGIENE.read_text(encoding="utf-8"))
 
 
+def _triggers(doc: dict) -> dict:
+    return doc.get("on") or doc[True]
+
+
 def _job_containing(needle: str) -> tuple[str, dict]:
     for name, job in _doc()["jobs"].items():
         for step in job.get("steps") or []:
@@ -69,10 +73,46 @@ def test_missing_secret_on_a_same_repo_pr_fails_rather_than_passes():
 
 def test_the_file_scan_still_runs_on_forks():
     """It needs no secret, and it is the check required for merge — narrowing
-    it to same-repo PRs would leave forks with no hygiene gate at all."""
+    it to same-repo PRs would leave forks with no hygiene gate at all.
+
+    `if: always()` is expected and required: the job depends on the content job,
+    and a skipped dependency would otherwise skip this one too. What must NOT
+    appear is a same-repo narrowing."""
     _, job = _job_containing("No forbidden files in PR diff")
-    assert not job.get("if"), (
-        "the file scan gained a condition; it must run on every PR"
+    condition = str(job.get("if", "")).strip()
+    assert condition in ("", "always()"), f"file scan narrowed by: {condition!r}"
+    assert "head.repo" not in condition, "the file scan must not skip forks"
+
+
+def test_the_required_check_consumes_the_content_verdict():
+    """The split moved a blocking failure onto a context nobody enforces.
+    Branch protection requires Forbidden Files, Free public cloud smoke and
+    grok-mechanical-approve — not Forbidden Content — so without this the
+    content gate could fail and the PR would still merge."""
+    files_job_name, files_job = _job_containing("No forbidden files in PR diff")
+    content_job_name, _ = _job_containing("FORBIDDEN_CONTENT_PATTERN")
+    needs = files_job.get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    assert content_job_name in needs, (
+        f"{files_job_name} does not depend on {content_job_name}, so a content "
+        "failure lands only on a context branch protection does not require"
+    )
+    verdict = next(
+        (s for s in files_job["steps"] if "needs." in str(s.get("env", ""))), None
+    )
+    assert verdict, "no step consumes the content job's result"
+    run = verdict["run"]
+    assert "exit 1" in run, "a failed content gate does not fail the required check"
+    assert "skipped" in run, "a skipped content gate is not reported"
+
+
+def test_workflow_triggers_are_pinned():
+    """The content job's guard reads github.event.pull_request. On any event
+    without that context — merge_group, workflow_dispatch — the expression is
+    false and the scan silently never runs, including for same-repo PRs."""
+    assert set(_triggers(_doc())) == {"pull_request"}, (
+        "a new trigger would make the content job's same-repo guard "
+        "unconditionally false; re-derive the guard before adding one"
     )
 
 

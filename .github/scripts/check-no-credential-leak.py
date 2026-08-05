@@ -381,10 +381,6 @@ def value_hits(views: dict[str, str], auth: object) -> list[str]:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("::error::usage: check-no-credential-leak.py <reply> [auth.json]")
-        return 2
-
     args = [a for a in sys.argv[1:] if a != REQUIRE_AUTH_FLAG]
     # Production callers pass --require-auth: for them an unreadable auth file
     # is a broken run, not an absent credential. It lives here rather than in
@@ -392,6 +388,12 @@ def main() -> int:
     # the workflow YAML comes from the merge ref — a PR can delete a step it
     # dislikes, but not this.
     require_auth = REQUIRE_AUTH_FLAG in sys.argv[1:]
+    # After the filter, not before: `check-no-credential-leak.py --require-auth`
+    # otherwise passed a `len(sys.argv) < 2` guard and died on an IndexError.
+    if not args:
+        print("::error::usage: check-no-credential-leak.py <reply> "
+              f"[auth.json] [{REQUIRE_AUTH_FLAG}]")
+        return 2
     reply_path = args[0]
     auth_path = args[1] if len(args) > 1 else os.path.expanduser(
         "~/.grok/auth.json"
@@ -418,19 +420,32 @@ def main() -> int:
         # point of the tier reporting below.
         auth, auth_error = None, exc
 
-    if auth is None and require_auth:
+    # SEC-G12 one layer down: `auth is not None` is not the same as "there was
+    # something to compare against". An auth document of {}, [], null, 0, or one
+    # whose strings are all shorter than MIN_SECRET_LEN yields no comparison
+    # values at all — the value and encoding checks then iterate an empty list
+    # and verify nothing, while the summary claimed both tiers ran. Coverage is
+    # derived from the VALUES from here on, never from the file parsing.
+    values = secret_values(auth) if auth is not None else []
+
+    if not values and require_auth:
         # `base64 -d` exits 0 on empty input, so an empty or unset
         # GROK_CI_AUTH_JSON produces a successful-looking restore and an
         # unparseable auth file. Without this, that misconfiguration silently
         # downgraded the gate to shape-only and still reported a pass.
-        print(f"::error::Auth file {auth_path} could not be parsed "
-              f"({auth_error}); refusing to certify a reply against a "
-              "credential set this gate never loaded.")
+        if auth is None:
+            # `null` parses fine, so distinguish it from an unreadable file
+            # rather than printing "(None)" as if it were the error.
+            why = f"could not be parsed ({auth_error})" if auth_error else "parsed as null"
+        else:
+            why = "parsed but yielded no comparison values"
+        print(f"::error::Auth file {auth_path} {why}; refusing to certify a "
+              "reply against a credential set this gate never loaded.")
         return 1
 
     try:
         views = all_views(reply)
-        if auth is not None:
+        if values:
             hits.extend(value_hits(views, auth))
         hits.extend(shape_hits(views))
     except ScanBudgetExceeded:
@@ -450,11 +465,12 @@ def main() -> int:
     # full pass (SEC-G12).
     ran = ["shape", "decoded"]
     skipped = []
-    if auth is not None:
+    if values:
         ran = ["value", "encoding", *ran]
     else:
         skipped = ["value", "encoding"]
-        print(f"::warning::Auth file {auth_path} unreadable ({auth_error}); "
+        detail = f"unreadable ({auth_error})" if auth is None else "held no comparison values"
+        print(f"::warning::Auth file {auth_path} {detail}; "
               f"the {' and '.join(skipped)} checks did NOT run.")
     summary = f"No credential material in reply ({', '.join(ran)} checks passed"
     summary += f"; {', '.join(skipped)} SKIPPED)." if skipped else ")."

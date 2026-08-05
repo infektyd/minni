@@ -7,6 +7,7 @@ see, and each one corresponds to a defect that minted a false success.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -690,7 +691,10 @@ def test_grok_invocations_pin_model_and_effort(workflow):
                 flags = call.group(1)
                 # Only AGENT runs carry a model lane. `grok --version`, used by
                 # the install step to verify its pin, has no model to pin.
-                if "--prompt-file" not in flags:
+                # Keyed on --version rather than on the presence of
+                # --prompt-file: an agent call written another way must still
+                # be checked, not silently skipped past the non-vacuity guard.
+                if "--version" in flags:
                     continue
                 calls.append(flags)
     # Without this the loop below is vacuous whenever the regex matches
@@ -719,6 +723,16 @@ def test_publish_gate_requires_a_parsed_auth_file(workflow, reply):
     assert call in text, f"{workflow}: publish gate does not pass --require-auth"
 
 
+def _extract_version_check(run: str) -> str:
+    """The pin-verification shell from an install step, minus the install.
+
+    Everything from the INSTALLED_VERSION derivation onward; `INSTALLED` is
+    supplied by the caller instead of being read off a real binary.
+    """
+    start = run.index('INSTALLED_VERSION="${INSTALLED#grok }"')
+    return "set -eu\n" + run[start:]
+
+
 GROK_CLI_WORKFLOWS = ("grok-review.yml", "grok.yml", "grok-boundary-test.yml")
 
 
@@ -741,11 +755,28 @@ def test_grok_cli_install_is_version_pinned(workflow):
         assert 'bash -s "$GROK_CLI_VERSION"' in run, (
             f"{workflow}: install does not pass the pin to the installer"
         )
-        # Without this the pin is decorative: the installer falls back to the
-        # channel's latest whenever the argument is absent or dropped.
-        assert "--version" in run and "::error::expected grok" in run, (
-            f"{workflow}: install does not verify the installed version"
-        )
+        # BEHAVIOURAL, not a grep: the version check is extracted and executed
+        # under bash with synthetic `grok --version` output. An earlier version
+        # of this test asserted only that the strings "--version" and
+        # "::error::expected grok" appeared, and passed after `exit 1` was
+        # removed from the mismatch branch — an annotation is not a failure.
+        check = _extract_version_check(run)
+        for installed, should_pass in (
+            (f"grok {pin} (abc1234) [stable]", True),
+            (f"grok {pin}0 (abc1234) [stable]", False),   # X.Y.Z vs X.Y.Z0
+            ("grok 9.9.9 (abc1234) [stable]", False),
+            (f"grok {pin} (abc1234) [alpha]", False),     # wrong channel
+        ):
+            rc = subprocess.run(
+                ["bash", "-c", check],
+                env={"GROK_CLI_VERSION": str(pin), "INSTALLED": installed,
+                     "PATH": "/usr/bin:/bin"},
+                capture_output=True, text=True,
+            ).returncode
+            assert (rc == 0) is should_pass, (
+                f"{workflow}: version check returned {rc} for {installed!r}; "
+                f"expected {'accept' if should_pass else 'reject'}"
+            )
 
 
 def test_every_grok_workflow_pins_the_same_cli_version():

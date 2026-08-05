@@ -214,10 +214,23 @@ jobs:
           # dropped, and a quietly-newer CLI is exactly what this pin exists to
           # prevent — so a mismatch has to fail rather than proceed.
           INSTALLED=$("$HOME/.grok/bin/grok" --version)
+          # EXACT compare, not a substring. `grok --version` prints
+          # "grok 0.2.118 (<sha>) [stable]", and a glob would let a pin of
+          # 0.2.12 accept 0.2.120 — the X.Y.Z / X.Y.Z0 collision is live in this
+          # CLI's own series, and it fails open in precisely the case the
+          # assertion exists for. Parameter expansion only: no PATH lookup.
+          INSTALLED_VERSION="${INSTALLED#grok }"
+          INSTALLED_VERSION="${INSTALLED_VERSION%% *}"
+          if [ "$INSTALLED_VERSION" != "$GROK_CLI_VERSION" ]; then
+            echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"
+            exit 1
+          fi
+          # The pin comment claims the stable channel; verify rather than assume.
           case "$INSTALLED" in
-            *"$GROK_CLI_VERSION"*) echo "grok CLI pinned at $GROK_CLI_VERSION" ;;
-            *) echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"; exit 1 ;;
+            *"[stable]"*) : ;;
+            *) echo "::error::expected a stable-channel build, got: $INSTALLED"; exit 1 ;;
           esac
+          echo "grok CLI pinned at $GROK_CLI_VERSION (stable)"
 
       - name: Restore Grok subscription auth
         if: steps.resolve.outputs.skip == 'false'
