@@ -528,6 +528,63 @@ test("UserPromptSubmit never surfaces a frontmatter-private vault note (SEC-006)
   });
 });
 
+test("UserPromptSubmit (#313): a private-heavy vault must not crowd a lower-ranked safe match out entirely", async () => {
+  // searchVaultNotes scores and sorts across the WHOLE vault before slicing
+  // to its `limit` argument — privacy is not part of that ordering (it only
+  // drops `blocked` notes internally; `private`/`local-only` ride along).
+  // Before the fix, this call site asked for exactly 6, so a vault where 6+
+  // non-safe notes outscore a genuinely safe match meant the safe note never
+  // even reached filterSafeVaultResults — not a leak (nothing unsafe
+  // escaped) but a silent availability gap: the agent should have received
+  // that memory and didn't. Eight decoys here each outrank the single safe
+  // note (title repeats the query phrase for the +3-per-term title bonus the
+  // safe note's plain title doesn't get), so under the pre-fix top-6 raw
+  // fetch, all six of vaultResultsRaw's slots would have gone to decoys and
+  // the safe note would never surface at all.
+  await withFixture(async (fixture) => {
+    const dir = path.join(fixture.vault, "wiki", "concepts");
+    await mkdir(dir, { recursive: true });
+    const phrase = "shared hook313 topn crowd marker phrase";
+    for (let i = 0; i < 8; i++) {
+      await writeFile(
+        path.join(dir, `decoy-${i}.md`),
+        `---\ntitle: Decoy ${phrase}\nprivacy: private\nstatus: accepted\n---\n\n# Decoy\n\n${phrase} ${phrase} ${phrase}\n`,
+        "utf8",
+      );
+    }
+    await writeFile(
+      path.join(dir, "outranked-safe-note.md"),
+      `---\ntitle: Outranked topic\nprivacy: safe\nstatus: accepted\n---\n\n# Outranked topic\n\n${phrase}\n`,
+      "utf8",
+    );
+
+    const output = await runHook("UserPromptSubmit", BASE_ENV(fixture), {
+      prompt: phrase,
+    });
+    assert.equal(output.continue, true);
+
+    const tail = await auditTail(fixture.vault, 30);
+    // Parse the actual vault_matches array rather than pattern-matching the
+    // raw audit text — a filename substring could in principle match some
+    // other field, so pin the assertion to the field this fix targets.
+    const entry = tail.entries.find((e) => e.includes("hook_user_prompt_submit"));
+    assert.ok(entry, "expected a hook_user_prompt_submit audit entry for this turn");
+    const jsonBlock = entry.match(/```json\n([\s\S]*?)\n```/)?.[1];
+    assert.ok(jsonBlock, "expected the audit entry to carry a JSON details block");
+    const details = JSON.parse(jsonBlock);
+    assert.ok(
+      Array.isArray(details.vault_matches) && details.vault_matches.includes("wiki/concepts/outranked-safe-note.md"),
+      `#313: the safe note must still surface even though 8 higher-scored private notes outrank it (got vault_matches: ${JSON.stringify(details.vault_matches)})`,
+    );
+    for (let i = 0; i < 8; i++) {
+      assert.ok(
+        !details.vault_matches.includes(`wiki/concepts/decoy-${i}.md`),
+        `SEC-006: decoy-${i}.md is privacy:private and must never reach vault_matches`,
+      );
+    }
+  });
+});
+
 test("UserPromptSubmit never surfaces a note the PRIVACY HEURISTIC flags (no authored privacy field)", async () => {
   // Complementary to the frontmatter-isolated test above: a note with NO
   // `privacy:` frontmatter at all still gets excluded when its content trips

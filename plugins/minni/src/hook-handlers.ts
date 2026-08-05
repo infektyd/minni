@@ -1201,8 +1201,34 @@ export function createHookHandlers(
     const budgetMs = effectiveHookBudgetMs(config.promptHookTimeoutMs);
     const deadline = Date.now() + budgetMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
+    // #313: searchVaultNotes scores and ranks across the WHOLE vault, then
+    // slices to `limit` before privacy is ever considered (it only drops
+    // `blocked` notes internally; `private`/`local-only` ride along, see
+    // vault.ts). Asking for exactly 6 here meant a private-heavy vault could
+    // fill all 6 slots with non-safe notes that outscore a genuinely safe
+    // match ranked 7th+ — filterSafeVaultResults below would then correctly
+    // exclude every one of those 6, and the safe note never even reached
+    // this function to be considered. Not a privacy leak (nothing unsafe
+    // escaped) but a silent availability gap: memory the agent should have
+    // received was dropped because filtering ran on the wrong side of the
+    // truncation. Over-fetch a wider pre-filter set, filter, THEN slice to
+    // the actual 6 this call site has always exposed downstream (recall
+    // pointer, recall-state top_hits, PreToolUse deny-reason text) — same
+    // external cap, same behavior for the common case.
+    //
+    // NARROWS the gap, does not close it: a vault where 19+ non-safe notes
+    // (frontmatter-authored OR heuristic-escalated — see task.ts
+    // privacyForSource, a materially larger population than just explicit
+    // `privacy: private` notes) all outscore the safe match reproduces the
+    // identical crowd-out, just needing more decoys. A durable fix would
+    // move the safe/non-safe gate inside searchVaultNotes itself, ahead of
+    // its own sort→slice, so no caller-side limit can ever crowd out a
+    // lower-scored safe note. Left as a follow-up (adversarial review
+    // finding) rather than expanding this fix's scope.
+    const VAULT_RESULT_LIMIT = 6;
+    const VAULT_SEARCH_OVERFETCH = 18;
     const [vaultResultsRaw, recall] = await Promise.all([
-      withBudget(searchVaultNotes(config.vaultPath, prompt, 6), remainingMs(), []),
+      withBudget(searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH), remainingMs(), []),
       withBudget(
         recallMemory({
           query: prompt,
@@ -1229,7 +1255,7 @@ export function createHookHandlers(
     // here when codex/grok-build/cursor/gemini/kilocode were extracted onto
     // this factory — every platform sharing this handler has been leaking
     // non-safe notes into UserPromptSubmit. Fixed once, for all six.
-    const vaultResults = filterSafeVaultResults(vaultResultsRaw);
+    const vaultResults = filterSafeVaultResults(vaultResultsRaw).slice(0, VAULT_RESULT_LIMIT);
     // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
     // the weak-turn path below, which CLEARS recall-state.
     const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
