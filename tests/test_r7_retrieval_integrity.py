@@ -905,7 +905,15 @@ class TestEmbeddingBackfillAndCoverage:
             "the degraded status was logged but no retry was queued — a log "
             "line is not a queue"
         )
-        assert "backfill_task.cancel()" in src
+        # #284: per-task `.cancel()` calls were factored into the shared
+        # _initiate_graceful_shutdown() helper (reused by the footprint
+        # watchdog) — the invariant is now "reaches that helper's task list"
+        # plus "that helper actually cancels what it's given."
+        assert "backfill_task" in src and "_initiate_graceful_shutdown" in src, (
+            "backfill_task must be included in the shutdown task list"
+        )
+        shutdown_src = inspect.getsource(minnid._initiate_graceful_shutdown)
+        assert "task.cancel()" in shutdown_src, "shutdown must cancel background tasks"
 
     def test_health_report_declares_the_coverage_field(self):
         import inspect
@@ -1349,7 +1357,13 @@ class TestDecayIsScheduled:
 
         src = inspect.getsource(minnid.main)
         assert "_decay_runner()" in src, "main() must create the decay task"
-        assert "decay_task.cancel()" in src, "shutdown must cancel the decay task"
+        # #284: see test_daemon_schedules_the_backfill — cancellation moved
+        # into the shared _initiate_graceful_shutdown() helper.
+        assert "decay_task" in src and "_initiate_graceful_shutdown" in src, (
+            "decay_task must be included in the shutdown task list"
+        )
+        shutdown_src = inspect.getsource(minnid._initiate_graceful_shutdown)
+        assert "task.cancel()" in shutdown_src, "shutdown must cancel the decay task"
 
     def test_decay_enabled_by_default_and_env_disablable(self, monkeypatch):
         import minni.minnid as minnid

@@ -1402,6 +1402,12 @@ def _current_footprint_bytes() -> int:
 
     macOS ``ru_maxrss`` is already bytes; Linux reports kilobytes. Match the
     platform, never guess.
+
+    Deliberately per-process (getrusage), never system-wide VM stats: on this
+    fleet's macOS 27 beta, ``host_statistics64(HOST_VM_INFO64)`` is a
+    confirmed-broken API (Apple Developer Forums thread 796568). Do not
+    "simplify" this to host_statistics64/psutil.virtual_memory() — it would
+    silently report garbage on this OS build.
     """
     import resource
     import sys
