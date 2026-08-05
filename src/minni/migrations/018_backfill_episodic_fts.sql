@@ -32,6 +32,13 @@
 -- inserts nothing. This file is a no-op marker so the version stays
 -- discoverable and recorded in schema_migrations, matching migration 015.
 --
+-- Retry story, stated plainly because it is easy to assume the opposite: the
+-- Python hook catches its own exceptions so a failed data repair cannot roll
+-- back the schema batch, and _flush_batch stamps 018 either way. So a FAILED
+-- repair is never retried BY MIGRATIONS. The retry lives in
+-- minnid._backfill_sweep_once, which calls reconcile_episodic_fts on every
+-- periodic backfill pass — that is what makes a transient failure self-heal.
+--
 -- Deliberately one-directional. episodic_fts also holds orphan rows whose
 -- events have been deleted (7 on the operator's DB — cleanup_expired removes
 -- both sides, but some earlier delete path did not). Those are NOT removed

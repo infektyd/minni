@@ -383,13 +383,20 @@ def _apply_migration_018_episodic_fts_backfill(conn: sqlite3.Connection) -> None
     # _episodic_tables_present covers absent tables; this covers a table that is
     # present but unwritable (wrong shape, corrupt index). An unindexed episodic
     # log is a degraded search channel. A frozen migration ladder is worse.
+    #
+    # Swallowing the error means _flush_batch still stamps version 018, so
+    # run_migrations will NEVER retry this repair. That is deliberate, and it is
+    # why the retry lives elsewhere: minnid._backfill_sweep_once calls
+    # reconcile_episodic_fts on every periodic pass, so a transient failure (a
+    # locked DB on a contended start) self-heals instead of being abandoned.
     try:
         result = reconcile_episodic_fts(conn)
     except Exception:
         logger.warning(
             "Migration 018: episodic FTS backfill failed — schema migration "
-            "continues; episodic_index_ratio in the health report will show "
-            "the gap.", exc_info=True,
+            "continues. Migrations will NOT retry it (version 018 is stamped); "
+            "the periodic backfill sweep will, and episodic_index_ratio in the "
+            "health report shows the gap until it does.", exc_info=True,
         )
         return
     logger.info(

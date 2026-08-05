@@ -3565,6 +3565,44 @@ class TestEpisodicFtsBackfill:
         assert coverage["episodic_index_ratio"] == 0.0
         db_obj.close()
 
+    def test_coverage_counts_every_agent(self, tmp_path):
+        """The metric is machine-wide, not per-agent. Every fixture above uses a
+        single agent, which made the whole agent dimension structurally
+        invisible: scoping the denominator to one agent_id passed the entire
+        suite while the report silently stopped counting every other agent's
+        memory."""
+        from minni.backfill import episodic_index_coverage
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _ = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_insert")
+            for agent, count in (("claude-code", 2), ("forge", 3)):
+                for i in range(count):
+                    c.execute(
+                        "INSERT INTO episodic_events"
+                        " (agent_id, event_type, content, created_at)"
+                        " VALUES (?, 'message', ?, ?)",
+                        (agent, f"{agent} memory {i}", time.time()),
+                    )
+
+        gapped = episodic_index_coverage(db_obj)
+        assert gapped["episodic_events_total"] == 5, (
+            "the denominator must span every agent, not just one "
+            f"(got {gapped['episodic_events_total']})"
+        )
+        assert gapped["episodic_events_indexed"] == 0
+
+        reconcile_episodic_fts(db_obj._get_conn())
+
+        healed = episodic_index_coverage(db_obj)
+        assert healed["episodic_events_total"] == 5
+        assert healed["episodic_events_indexed"] == 5, (
+            "the backfill must cover every agent, and the metric must see it"
+        )
+        assert healed["episodic_index_ratio"] == 1.0
+        db_obj.close()
+
     def test_coverage_does_not_invent_a_gap_for_null_content_events(self, tmp_path):
         """A NULL-content event can never be indexed — the trigger skips it and
         so does the backfill. Counting it as missing would manufacture a
