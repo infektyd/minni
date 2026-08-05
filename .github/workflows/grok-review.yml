@@ -360,7 +360,7 @@ jobs:
       - name: Mint GitHub App installation token
         id: app-token
         if: steps.resolve.outputs.skip == 'false' && vars.GROK_APP_ID != ''
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.GROK_APP_ID }}
           private-key: ${{ secrets.GROK_APP_PRIVATE_KEY }}
