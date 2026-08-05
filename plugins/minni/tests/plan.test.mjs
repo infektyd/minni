@@ -19,7 +19,10 @@ import {
   compactPlanView,
   shelfDrift,
   appendJournal,
-  parseJournal
+  parseJournal,
+  appendHistorySnapshot,
+  historyPathFor,
+  readHistory
 } from "../dist/plan.js";
 import { ensureVault, writeVaultPage } from "../dist/vault.js";
 
@@ -1123,6 +1126,267 @@ test("freeze guard: createPlan still mints plan- prefixed ids after the threads 
     await setActivePlan(root, plan.plan_id, write.notePath);
     const pointer = await readFile(path.join(root, "wiki", "artifacts", "_active_plan.json"), "utf8");
     assert.equal(JSON.parse(pointer).plan_id, plan.plan_id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+// ── #294 (June audit N7): history.jsonl is capped, not unbounded ───────────
+//
+// history.jsonl stored one full plan snapshot per revision with no bound —
+// a long-running/frequently-updated plan grew this file forever (H4). Cap it
+// to the most recent MINNI_PLAN_HISTORY_CAP (default 200) lines on write,
+// with hysteresis (rotate only once cap+50 over, trim back to cap) so a
+// long-running plan doesn't pay a full-file rewrite on every single edit.
+// Behavioral, not source-grep (campaign scar #3, per #309's Bugbot round):
+// these tests spy on the injected dependency to prove real invocation, and
+// separately prove the real bound holds by writing real files and reading
+// them back — including a real concurrent-write test proving the per-file
+// lock (added after a cassandra round REPRODUCED data loss without it)
+// actually prevents an already-durable revision from being erased by a
+// racing rotation.
+//
+// HISTORY_ROTATION_HYSTERESIS (50) is an internal, unexported constant —
+// these tests reference the literal 50 and must be updated together if that
+// constant ever changes.
+
+function historyLine(rev) {
+  return JSON.stringify({ rev, at: `t${rev}`, digest: `d${rev}`, plan: { plan_id: "p" } });
+}
+
+async function seedHistoryFile(historyFile, count, startRev = 1) {
+  const lines = [];
+  for (let i = 0; i < count; i++) lines.push(historyLine(startRev + i));
+  await writeFile(historyFile, lines.join("\n") + "\n", "utf8");
+}
+
+test("appendHistorySnapshot: hysteresis — no rotation at cap+50, rotation fires at cap+51", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-hyst-"));
+  try {
+    process.env.MINNI_PLAN_HISTORY_CAP = "2";
+    try {
+      // Just at the threshold: 2 (cap) + 50 (hysteresis) = 52 lines total
+      // after this append must NOT trigger rotation.
+      const belowFile = path.join(root, "below.history.jsonl");
+      await seedHistoryFile(belowFile, 51, 1); // 51 existing + 1 new = 52
+      const belowCalls = [];
+      await appendHistorySnapshot(belowFile, { rev: 52, at: "t52", digest: "d", plan: { plan_id: "p" } }, {
+        writeFileAtomic: async (p, c) => belowCalls.push([p, c]),
+      });
+      assert.equal(belowCalls.length, 0, "52 lines (== cap+hysteresis) must not trigger rotation yet");
+
+      // One more line past the threshold: 52 existing + 1 new = 53 must rotate.
+      const overFile = path.join(root, "over.history.jsonl");
+      await seedHistoryFile(overFile, 52, 1); // 52 existing + 1 new = 53
+      const overCalls = [];
+      await appendHistorySnapshot(overFile, { rev: 53, at: "t53", digest: "d", plan: { plan_id: "p" } }, {
+        writeFileAtomic: async (p, c) => overCalls.push([p, c]),
+      });
+      assert.equal(overCalls.length, 1, "53 lines (cap+hysteresis+1) must trigger rotation");
+      const keptRevs = overCalls[0][1].trim().split("\n").map((l) => JSON.parse(l).rev);
+      assert.equal(keptRevs.length, 2, "rotation must trim back down to the cap (2), not to cap+hysteresis");
+      assert.deepEqual(keptRevs, [52, 53], "must keep the 2 MOST RECENT revisions");
+    } finally {
+      delete process.env.MINNI_PLAN_HISTORY_CAP;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("appendHistorySnapshot: real repeated appends stay bounded at cap+hysteresis, settle at cap after rotation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-real-"));
+  try {
+    const historyFile = path.join(root, "real.history.jsonl");
+    process.env.MINNI_PLAN_HISTORY_CAP = "5";
+    try {
+      for (let rev = 1; rev <= 60; rev++) {
+        await appendHistorySnapshot(historyFile, { rev, at: `t${rev}`, digest: "d", plan: { plan_id: "p" } });
+      }
+    } finally {
+      delete process.env.MINNI_PLAN_HISTORY_CAP;
+    }
+
+    const raw = await readFile(historyFile, "utf8");
+    const lines = raw.trim().split("\n");
+    // After 60 appends with cap=5, hysteresis=50: rotation first fires once
+    // the file exceeds 55 lines (at the 56th append), trimming to 5, then
+    // grows again to 60-56+5=9 by the last append (no second rotation since
+    // 9 < 55). Assert the STRUCTURAL invariant (bounded, newest present,
+    // monotonically increasing) rather than a fragile exact count, since the
+    // exact number depends on the hysteresis arithmetic.
+    assert.ok(lines.length <= 55, `history must never exceed cap+hysteresis (55), got ${lines.length}`);
+    const revs = lines.map((l) => JSON.parse(l).rev);
+    assert.equal(revs[revs.length - 1], 60, "the newest revision must always be present");
+    assert.deepEqual(revs, [...revs].sort((a, b) => a - b), "revisions must stay in order after rotation");
+
+    const history = await readHistory(path.join(root, "real.md"));
+    assert.deepEqual(history.map((h) => h.rev), revs, "readHistory must agree with the raw file exactly");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("appendHistorySnapshot: malformed MINNI_PLAN_HISTORY_CAP truly falls back to the DEFAULT cap (200), not a smaller value", async () => {
+  // Cassandra review round: a prior version of this test only asserted
+  // doesNotReject — a mutant that made planHistoryCap() return 1 instead of
+  // the real default (200) passed every existing test while destroying
+  // nearly all history on the next write. Assert the EFFECTIVE cap value by
+  // observing real rotation behavior, not just "no exception was thrown".
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-malformed-"));
+  try {
+    for (const badValue of ["not-a-number", "0", "-5", "", "1e9", "1e3", "2.9", "0x10"]) {
+      const historyFile = path.join(root, `bad-${Buffer.from(badValue || "empty").toString("hex")}.history.jsonl`);
+      // Seed comfortably past DEFAULT_PLAN_HISTORY_CAP(200) + hysteresis(50).
+      await seedHistoryFile(historyFile, 251, 1);
+      process.env.MINNI_PLAN_HISTORY_CAP = badValue;
+      try {
+        await appendHistorySnapshot(historyFile, { rev: 252, at: "t252" });
+      } finally {
+        delete process.env.MINNI_PLAN_HISTORY_CAP;
+      }
+      const raw = await readFile(historyFile, "utf8");
+      const lines = raw.trim().split("\n");
+      assert.equal(
+        lines.length,
+        200,
+        `MINNI_PLAN_HISTORY_CAP=${JSON.stringify(badValue)} must fall back to the real default (200), got ${lines.length} lines`,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("appendHistorySnapshot: rotation counting agrees with readHistory — garbage lines neither occupy cap slots nor survive a rotation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-garbage-"));
+  try {
+    const historyFile = path.join(root, "garbage.history.jsonl");
+    process.env.MINNI_PLAN_HISTORY_CAP = "3";
+    try {
+      // 60 garbage lines (malformed JSON + schema-invalid JSON) interleaved
+      // with cap(3) + hysteresis(50) = 53 VALID lines — enough valid lines
+      // to force rotation, proving garbage does not inflate the trigger
+      // count (if it did, 60 garbage + a handful of valid lines would also
+      // trigger rotation, which this setup cannot distinguish) NOR survive
+      // once rotation actually runs.
+      const lines = [];
+      for (let i = 0; i < 60; i++) lines.push(`not even json ${i}`);
+      lines.push(JSON.stringify({ rev: 9999 })); // valid JSON, missing required fields
+      for (let rev = 1; rev <= 53; rev++) lines.push(historyLine(rev));
+      await writeFile(historyFile, lines.join("\n") + "\n", "utf8");
+
+      // 53 valid + 1 new = 54 > cap(3)+hysteresis(50)=53 -> rotation fires.
+      await appendHistorySnapshot(historyFile, { rev: 54, at: "t54", digest: "d", plan: { plan_id: "p" } });
+    } finally {
+      delete process.env.MINNI_PLAN_HISTORY_CAP;
+    }
+
+    const raw = await readFile(historyFile, "utf8");
+    const survivingLines = raw.trim().split("\n").filter((l) => l.trim());
+    for (const line of survivingLines) {
+      assert.ok(isValidJsonHistoryLineForTest(line), `every surviving line must be a valid history entry, garbage must not survive rotation: ${line}`);
+    }
+    const revs = survivingLines.map((l) => JSON.parse(l).rev);
+    assert.equal(revs.length, 3, "rotation must trim to exactly the cap (3), counting only valid lines");
+    assert.deepEqual(revs, [52, 53, 54], "must keep the 3 most recent VALID revisions — garbage never occupied a slot");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function isValidJsonHistoryLineForTest(line) {
+  try {
+    const p = JSON.parse(line);
+    return typeof p.rev === "number" && typeof p.at === "string" && typeof p.digest === "string" && p.plan && typeof p.plan.plan_id === "string";
+  } catch {
+    return false;
+  }
+}
+
+test("appendHistorySnapshot: concurrent writers to the same history file do not lose an already-durable revision", async () => {
+  // Cassandra review round REPRODUCED this exact loss without the per-file
+  // lock: caller A's read-then-rewrite rotation clobbered caller B's
+  // already-fsync'd append that landed in the window between A's read and
+  // A's write. That race only opens during an actual rotation — a round-2
+  // review caught that the original version of this test never crossed the
+  // rotation threshold (cap 3 + hysteresis 50 = 53 lines needed, only 40
+  // appends fired) and so never exercised the race it claimed to prove: a
+  // lock-removed mutant still passed every assertion here except ordering,
+  // which isn't a real invariant across unserialized concurrent callers in
+  // the first place. Fixed by pre-seeding the file to just under the
+  // rotation threshold so the concurrent appends are guaranteed to force at
+  // least one real rotation, and asserting on the one invariant that
+  // actually matters: the newest durable revision must survive.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-race-"));
+  const CAP = 3;
+  const HYSTERESIS = 50; // must match HISTORY_ROTATION_HYSTERESIS in plan.ts
+  const SEED = CAP + HYSTERESIS - 1; // 52: one short of the rotation trigger
+  const N = 40;
+  try {
+    const historyFile = path.join(root, "race.history.jsonl");
+    await seedHistoryFile(historyFile, SEED, 1); // revs 1..52
+    process.env.MINNI_PLAN_HISTORY_CAP = String(CAP);
+    try {
+      await Promise.all(
+        Array.from({ length: N }, (_, i) =>
+          appendHistorySnapshot(historyFile, {
+            rev: SEED + i + 1, // revs 53..92 — crosses the 53-line rotation threshold
+            at: `t${SEED + i + 1}`,
+            digest: "d",
+            plan: { plan_id: "p" },
+          }),
+        ),
+      );
+    } finally {
+      delete process.env.MINNI_PLAN_HISTORY_CAP;
+    }
+
+    const raw = await readFile(historyFile, "utf8");
+    const lines = raw.trim().split("\n").filter((l) => l.trim());
+    // Every surviving line must be well-formed (a torn/corrupted rewrite
+    // from an unsynchronized race would produce a line that fails to parse).
+    for (const line of lines) {
+      assert.doesNotThrow(() => JSON.parse(line), `every line must be valid JSON, got: ${line}`);
+    }
+    const revs = lines.map((l) => JSON.parse(l).rev);
+    const expectedMax = SEED + N; // 92 — the newest revision that was appended
+    // The concrete, checkable invariant a lock-less rotation race breaks:
+    // the newest already-fsync'd revision goes missing when a concurrent
+    // rotation's read-then-rewrite clobbers it. Reproduced without the lock
+    // (5/5 runs clean with it, data loss in 3/5 without, per round-2
+    // review's independent reproduction).
+    assert.ok(revs.includes(expectedMax), `the newest revision (${expectedMax}) must survive — a lock-less rotation race can erase it`);
+    assert.ok(new Set(revs).size === revs.length, "no duplicate revisions from a torn concurrent write");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("persistPlan wires real plan writes through the capped history append (#294 end-to-end)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-cap-e2e-"));
+  try {
+    await ensureVault(root);
+    process.env.MINNI_PLAN_HISTORY_CAP = "1";
+    let plan, write;
+    try {
+      const created = await createPlan({ goal: "#294 e2e history cap", vaultPath: root }, { vaultPath: root });
+      plan = created.plan;
+      write = created.write;
+      // cap(1) + hysteresis(50) = 51 — need to cross that via real
+      // persistPlan calls (the actual production call site) to observe a
+      // real rotation end-to-end, not just through the lower-level function.
+      for (let i = 0; i < 55; i++) {
+        write = await persistPlan(plan, { vaultPath: root, notePath: write.notePath });
+      }
+    } finally {
+      delete process.env.MINNI_PLAN_HISTORY_CAP;
+    }
+
+    const history = await readHistory(write.notePath);
+    assert.ok(history.length <= 51, `history must stay bounded at cap+hysteresis, got ${history.length}`);
+    assert.equal(history[history.length - 1].rev, plan.rev, "the newest entry must be the plan's current revision");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
