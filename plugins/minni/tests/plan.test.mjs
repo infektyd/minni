@@ -17,7 +17,9 @@ import {
   resolveActivePlanView,
   addScar,
   compactPlanView,
-  shelfDrift
+  shelfDrift,
+  appendJournal,
+  parseJournal
 } from "../dist/plan.js";
 import { ensureVault } from "../dist/vault.js";
 
@@ -842,6 +844,99 @@ test("setActivePlan writes _active_plan.json via writeFileAtomic (PLUMB-T4 / #23
       0,
       "atomic write must not leave .tmp siblings",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── #293 (June audit N6, sibling of PLUMB-T4/#231): journal + plan note ────
+//
+// history.jsonl was fsync'd (appendFileWithFsync) but the journal
+// (appendJournal) and the plan note (writeVaultPage) were plain
+// appendFile/writeFile — a crash could leave history durable and the
+// journal/note behind it or truncated. Same durability guarantee as the
+// pointer write #231 already fixed.
+
+test("appendJournal writes through appendFileWithFsync/writeFileAtomic (#293)", async () => {
+  const src = await readFile(new URL("../src/plan.ts", import.meta.url), "utf8");
+  assert.match(
+    src,
+    /await appendFileWithFsync\(journalPath/,
+    "appendJournal's append branch must use appendFileWithFsync, not plain appendFile",
+  );
+  assert.match(
+    src,
+    /await writeFileAtomic\(journalPath/,
+    "appendJournal's init branch must use writeFileAtomic, not plain writeFile",
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-journal-durable-"));
+  try {
+    const journalPath = path.join(root, "test.log.md");
+
+    // Init path: first event creates the file atomically, no leftover .tmp.
+    await appendJournal(journalPath, { kind: "rehydrated", at: "2026-01-01T00:00:00.000Z" });
+    let siblings = await readdir(root);
+    assert.equal(
+      siblings.filter((name) => name.startsWith("test.log.md.") && name.endsWith(".tmp")).length,
+      0,
+      "journal init must not leave .tmp siblings",
+    );
+
+    // Append path: second event appends without disturbing the first.
+    await appendJournal(journalPath, { kind: "rehydrated", at: "2026-01-01T00:01:00.000Z" });
+    siblings = await readdir(root);
+    assert.equal(
+      siblings.filter((name) => name.startsWith("test.log.md.") && name.endsWith(".tmp")).length,
+      0,
+      "journal append must not leave .tmp siblings",
+    );
+
+    const text = await readFile(journalPath, "utf8");
+    const events = parseJournal(text);
+    assert.deepEqual(
+      events.map((e) => e.at),
+      ["2026-01-01T00:00:00.000Z", "2026-01-01T00:01:00.000Z"],
+      "both events must be present, in order, after init + append",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("writeVaultPage writes the plan note through writeFileAtomic, not plain writeFile (#293)", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  assert.match(
+    src,
+    /await writeFileAtomic\(notePath, body\)/,
+    "writeVaultPage must write notePath through writeFileAtomic",
+  );
+  assert.doesNotMatch(
+    src,
+    // Loose on trailing args deliberately — a mutant that dropped the
+    // `"utf8"` third arg (still non-atomic) must not slip past an
+    // exact-string match.
+    /await writeFile\(notePath, body/,
+    "writeVaultPage must not use non-atomic writeFile for the note body",
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-note-durable-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "atomic plan note", vaultPath: root },
+      { vaultPath: root },
+    );
+    assert.ok(plan.plan_id);
+    const noteDir = path.dirname(write.notePath);
+    const siblings = await readdir(noteDir);
+    assert.equal(
+      siblings.filter((name) => name.startsWith(path.basename(write.notePath) + ".") && name.endsWith(".tmp")).length,
+      0,
+      "plan note write must not leave .tmp siblings",
+    );
+    const body = await readFile(write.notePath, "utf8");
+    assert.match(body, /atomic plan note/, "the note's full content must be readable immediately");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

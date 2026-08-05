@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,8 +16,9 @@ import {
   sessionReceipt,
   vaultFirstLearn,
   writeVaultPage,
+  writeFileAtomic,
 } from "../dist/vault.js";
-import { symlink } from "node:fs/promises"; // for RCM-005 escape test
+import { chmod, stat, symlink } from "node:fs/promises"; // for RCM-005 escape test
 
 // Hermetic guard: recordAudit writes per-agent rate-limit state under
 // MINNI_HOME (falling back to ~/.minni) — point it at a temp dir so the
@@ -194,6 +195,50 @@ test("writeVaultPage supports raw and wiki pages without treating them as learni
 
     const rawNote = await readFile(raw.notePath, "utf8");
     assert.match(rawNote, /immutable: true/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// #293 review round: writeFileAtomic's rename onto an existing file used to
+// silently discard whatever mode the destination had, re-widening it to the
+// umask default on every atomic rewrite — a permanent, silent permission
+// downgrade for any operator-hardened vault page.
+test("writeFileAtomic preserves the destination's existing file mode across a rewrite", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-atomic-mode-"));
+  try {
+    const target = path.join(root, "note.md");
+    await writeFile(target, "first version", "utf8");
+    await chmod(target, 0o600);
+    const before = (await stat(target)).mode & 0o777;
+    assert.equal(before, 0o600, "test setup: chmod did not take");
+
+    await writeFileAtomic(target, "second version");
+
+    const after = (await stat(target)).mode & 0o777;
+    assert.equal(
+      after,
+      0o600,
+      "writeFileAtomic must preserve the destination's mode across a rewrite, not reset it to the umask default",
+    );
+    assert.equal(await readFile(target, "utf8"), "second version");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("writeFileAtomic on a brand-new file: content lands, no leftover .tmp sibling", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-atomic-newmode-"));
+  try {
+    const target = path.join(root, "brand-new.md");
+    await writeFileAtomic(target, "content");
+    assert.equal(await readFile(target, "utf8"), "content");
+    const siblings = await readdir(root);
+    assert.deepEqual(
+      siblings.filter((name) => name.endsWith(".tmp")),
+      [],
+      "writeFileAtomic must not leave a temp file behind",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

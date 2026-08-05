@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, readFile, readdir, writeFile, unlink } from "node:fs/promises";
+import { readFile, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import { DEFAULT_VAULT_PATH } from "./config.js";
@@ -493,15 +493,20 @@ function extractGoalFromBody(body: string): string {
 
 /** Append a PlanEvent as a single JSON line. Creates header on first write. */
 export async function appendJournal(journalPath: string, event: PlanEvent): Promise<void> {
+  // #293 (June audit N6, sibling of PLUMB-T4/#231): this used to be a plain
+  // appendFile/writeFile, unlike history.jsonl's appendFileWithFsync
+  // (plan.ts's historyFile write, below) — a crash could leave history
+  // durable and the journal behind it or truncated. Same durability
+  // guarantee as the sibling now: fsync'd append, atomic temp+rename init.
   const line = JSON.stringify(event) + "\n";
   try {
     // exists -> append
     await readFile(journalPath, "utf8");
-    await appendFile(journalPath, line, "utf8");
+    await appendFileWithFsync(journalPath, line);
   } catch {
     // missing or unreadable -> init
     const header = `# Minni Plan Journal\n\n## events\n`;
-    await writeFile(journalPath, header + line, "utf8");
+    await writeFileAtomic(journalPath, header + line);
   }
 }
 
