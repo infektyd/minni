@@ -1,6 +1,6 @@
 """Engine test hygiene.
 
-Two isolation guarantees are established here:
+Three isolation guarantees are established here:
 
 1. MINNI_HOME isolation (PR92-4). ``config.py`` freezes ``CANONICAL_SOVEREIGN_HOME``
    and the ``SovereignConfig`` field defaults (``db_path`` / ``vault_path`` /
@@ -16,6 +16,21 @@ Two isolation guarantees are established here:
 2. The AFM generation-probe cache persists across processes under
    ``~/.minni/run/afm-probe-cache.json`` (see ``afm_provider.py``); every test
    gets a per-test override pointed at its own tmpdir.
+
+3. Worktree import resolution (#258). An editable install (``pip install -e .``)
+   pins ``import minni`` to whichever checkout ran ``make setup`` last via a
+   ``.pth`` file in site-packages — usually the primary checkout, not a git
+   worktree. ``make test-engine`` / ``check`` / ``coverage-engine`` paper over
+   this with ``PYTHONPATH=src`` on the recipe line (see Makefile), but a bare
+   ``pytest`` (or ``pytest <one file>``) invoked from a worktree with no
+   PYTHONPATH set silently imports the OTHER checkout's ``minni`` — green
+   output that validated the wrong tree. ``pytest_configure`` below is a
+   collection-independent hook (unlike a regular test, it always runs, even
+   for `-k`-filtered or single-file invocations) that fails the whole session
+   loudly, before any test executes, if the imported ``minni`` did not
+   resolve under *this* rootdir's ``src/``. It intentionally does not
+   silently fix ``sys.path`` — see #258 discussion: forcing resolution would
+   paper over a wrong-tree pytest environment instead of surfacing it.
 """
 
 import os
@@ -33,6 +48,52 @@ if not _configured_home or os.path.abspath(_configured_home) == _LIVE_MINNI_HOME
     atexit.register(shutil.rmtree, _session_home, ignore_errors=True)
 
 import pytest  # noqa: E402  (import after MINNI_HOME redirect, by design)
+
+# --- (3) Worktree import resolution guard (#258).
+_REPO_SRC = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir, "src"))
+
+
+def pytest_configure(config):
+    """Fail the whole session, before collection, if ``minni`` resolved wrong.
+
+    Runs unconditionally — this is a pytest hook, not a collected test, so it
+    cannot be skipped by scoping the run to one file or a ``-k`` filter (the
+    gap a same-named test in test_worktree_import_resolution.py cannot close
+    on its own). ``pytest.UsageError`` aborts before any test runs, so a
+    wrong-tree run never gets to report a false green.
+    """
+    try:
+        import minni
+    except Exception:
+        # No resolved import to check; whatever's importing minni downstream
+        # (directly or via a broken module) will raise its own, more precise
+        # error. Not this guard's job to paper over a different failure.
+        return
+
+    minni_file = getattr(minni, "__file__", None)
+    if minni_file is None:
+        # A namespace package (no __init__.py) has no __file__ — e.g. a stray
+        # top-level minni/ directory shadowing the real package before
+        # `make setup` has run an editable install at all. That is a real
+        # setup problem, just not the #258 wrong-tree failure this guard
+        # targets; surface it plainly instead of crashing on os.path.realpath(None).
+        raise pytest.UsageError(
+            "worktree import resolution (#258): `import minni` resolved to a "
+            "namespace package with no __file__ (no minni package is actually "
+            "installed/importable here). Run `make setup` first."
+        )
+
+    resolved = os.path.realpath(minni_file)
+    if not resolved.startswith(_REPO_SRC + os.sep):
+        raise pytest.UsageError(
+            "worktree import resolution (#258): `import minni` resolved to "
+            f"{resolved!r}, outside this rootdir's src/ ({_REPO_SRC!r}). An "
+            "editable install from another checkout is winning the import. "
+            "Run `make test-engine` / `make check` / `make coverage-engine` "
+            f"(they set PYTHONPATH=src), or set "
+            f"PYTHONPATH={_REPO_SRC!r} yourself before running "
+            "`python -m pytest` from this worktree."
+        )
 
 
 @pytest.fixture(autouse=True)
