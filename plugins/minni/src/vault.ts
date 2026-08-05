@@ -2574,3 +2574,197 @@ export async function vaultExists(vaultPath: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Cap on the Layer 1 shelf content inlined into the SessionStart envelope
+ * (bytes). SKILL.md documents a strict <4096 TOKEN budget for layer1/, but a
+ * well-curated, scar-laden core.md runs close to that in bytes too — an 8KB
+ * ceiling leaves headroom above a realistic full shelf while still bounding a
+ * pathological or over-curated file. Same posture as compact-harvest's
+ * SUMMARY_TEXT_MAX_CHARS: a safety ceiling, not a target.
+ */
+export const LAYER1_SHELF_MAX_BYTES = 8192;
+
+export interface Layer1ShelfResult {
+  ok: boolean;
+  content?: string;
+  truncated?: boolean;
+  omittedBytes?: number;
+  /** Set only when ok=false. Always prefixed "absent: " so a missing or
+   * unreadable shelf is grep-able and never a silently missing envelope key. */
+  reason?: string;
+}
+
+/**
+ * Read `<vault>/layer1/core.md` for inlining into the SessionStart envelope.
+ * ALWAYS a bounded read (never the unbounded `readFile` a "file fits under
+ * the cap" shortcut would tempt): one `open`, one `fstat` on that same
+ * descriptor (file-type check only — never the truncation source of truth,
+ * see below), one `read`. `bytesRead` (not the buffer's allocated length) is
+ * what becomes `content`, so a short read can never pad the boot envelope
+ * with trailing NUL bytes. No RPC, no timers — this is local FS only, same
+ * class of read as the reassert inbox scan the SessionStart handler already
+ * runs unbudgeted.
+ *
+ * TRUNCATION IS DERIVED FROM THE READ ITSELF, NOT A PRE-READ `fstat`. The
+ * probe buffer is LAYER1_SHELF_MAX_BYTES + 1: if the read fills all of it,
+ * the file had at least one byte beyond the cap AT THE MOMENT OF THE READ —
+ * the only claim `truncated` needs to make. Sizing the cap off an earlier
+ * `fstat` instead (an earlier version of this function) let a file that
+ * GREW between stat and read produce silently-incomplete content with
+ * `truncated: false` (the exact H5 failure this field exists to prevent),
+ * and a file that SHRANK produce a false `truncated: true` with a wrong
+ * `omittedBytes`. `omittedBytes` itself still needs a size figure, so it
+ * takes a SECOND fstat AFTER the read — a closer, but not perfectly
+ * atomic, snapshot — and clamps to a 1-byte floor so it is always an honest
+ * lower bound even if that snapshot disagrees with what was actually read.
+ *
+ * THE PROBE READ ITSELF IS LOOPED, NOT A SINGLE `handle.read` CALL. POSIX
+ * (and Node's fs.read, which is a thin wrapper over it) permits a SHORT read
+ * on a perfectly normal regular file — nothing guarantees one call fills the
+ * buffer even when more bytes are available. A single-call version (an
+ * earlier revision of this function) could read some bytesRead <= cap on a
+ * file actually larger than the cap and report `truncated: false` on
+ * incomplete content — the H5 failure one layer deeper than the fstat one
+ * above. The loop keeps reading into the buffer at the current offset until
+ * either the buffer is full (cap+1 bytes seen — truncated) or a read
+ * returns 0 (genuine EOF — not truncated, whatever was accumulated is the
+ * whole file).
+ *
+ * Known limitation: the byte cut is not UTF-8-boundary-aware, so a cap that
+ * lands mid multi-byte character renders as U+FFFD in `content`. Acceptable
+ * for ASCII-heavy markdown shelves; revisit if core.md content routinely
+ * carries non-ASCII near the cap.
+ */
+
+/** Signature shared with `FileHandle.read` — narrowed to what `readFullOrEof`
+ * needs so it can be driven by a real handle or a test double. */
+export type BufferReadFn = (
+  buffer: Buffer,
+  offset: number,
+  length: number,
+  position: number,
+) => Promise<{ bytesRead: number }>;
+
+/**
+ * Read repeatedly into `buffer` (from `buffer` offset 0, file position 0)
+ * until `length` bytes have landed or `read` reports EOF (`bytesRead === 0`).
+ * Exists because a single call to `FileHandle.read` is permitted by POSIX to
+ * return FEWER bytes than requested even on an ordinary regular file — a
+ * short read is not EOF, and treating it as the whole file is the same H5
+ * silent-truncation failure one layer below the fstat-vs-read race
+ * `readLayer1Shelf` already closed. Exported as its own function (not
+ * inlined into `readLayer1Shelf`) so the accumulation logic can be pinned
+ * directly against a fake short-read producer, not only through real
+ * filesystem calls that rarely short-read in a test environment. Returns
+ * the number of bytes actually accumulated, which may be less than `length`
+ * on genuine EOF.
+ */
+export async function readFullOrEof(
+  read: BufferReadFn,
+  buffer: Buffer,
+  length: number,
+): Promise<number> {
+  let totalRead = 0;
+  while (totalRead < length) {
+    const { bytesRead } = await read(buffer, totalRead, length - totalRead, totalRead);
+    if (bytesRead === 0) break; // genuine EOF — a short read alone means nothing
+    totalRead += bytesRead;
+  }
+  return totalRead;
+}
+
+export async function readLayer1Shelf(vaultPath: string): Promise<Layer1ShelfResult> {
+  const corePath = path.join(vaultPath, "layer1", "core.md");
+  let handle;
+  try {
+    handle = await open(corePath, "r");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return {
+      ok: false,
+      reason:
+        code === "ENOENT"
+          ? "absent: no layer1/core.md in this vault"
+          : `absent: open failed (${code ?? String((err as Error)?.message ?? err)})`,
+    };
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      return { ok: false, reason: "absent: layer1/core.md is not a regular file" };
+    }
+    // One byte beyond the cap: filling the probe buffer (or not) is what
+    // tells `truncated` apart, not a size fetched before reading started.
+    const probe = LAYER1_SHELF_MAX_BYTES + 1;
+    const buffer = Buffer.alloc(probe);
+    const totalRead = await readFullOrEof(
+      (buf, offset, len, pos) => handle!.read(buf, offset, len, pos),
+      buffer,
+      probe,
+    );
+    // Emptiness read off the ACTUAL accumulated read, not the pre-read fstat
+    // above — same TOCTOU posture as the truncation decision below.
+    if (totalRead === 0) {
+      return { ok: false, reason: "absent: layer1/core.md is empty" };
+    }
+    const truncated = totalRead > LAYER1_SHELF_MAX_BYTES;
+    const contentBytes = truncated ? LAYER1_SHELF_MAX_BYTES : totalRead;
+    const content = buffer.subarray(0, contentBytes).toString("utf8");
+    if (!truncated) {
+      return { ok: true, content, truncated: false };
+    }
+    // Best-effort omitted-byte count: a post-read fstat, clamped to a
+    // 1-byte floor (the probe byte alone proves at least that much was
+    // omitted) so the number is always truthful even under a concurrent
+    // writer this snapshot cannot perfectly pin down.
+    let omittedBytes = 1;
+    try {
+      const after = await handle.stat();
+      omittedBytes = Math.max(after.size - LAYER1_SHELF_MAX_BYTES, 1);
+    } catch {
+      // Keep the honest 1-byte floor.
+    }
+    return { ok: true, content, truncated: true, omittedBytes };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `absent: read failed (${String((err as Error)?.message ?? err)})`,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Envelope body for the `layer1_shelf` SessionStart section. Always present
+ * (never a silently missing key, defect class H2): ok:false carries the
+ * "absent: <reason>" string, ok:true carries the content plus an explicit
+ * truncation marker whenever the cap trimmed it (defect class H5 — no silent
+ * truncation).
+ */
+export function layer1ShelfBody(result: Layer1ShelfResult): Record<string, unknown> {
+  if (!result.ok) {
+    // JSON.stringify DROPS keys whose value is undefined — an unset `reason`
+    // would silently degrade to `{"ok":false}` with no "absent:" string,
+    // exactly the H2 failure mode this field exists to prevent. Every
+    // production path above sets one; this default only guards a future
+    // caller that forgets to.
+    return { ok: false, reason: result.reason ?? "absent: unknown (no reason recorded)" };
+  }
+  return {
+    ok: true,
+    content: result.content,
+    truncated: result.truncated ?? false,
+    ...(result.truncated
+      ? {
+          omitted_bytes: result.omittedBytes,
+          // "at least": omitted_bytes is a post-read fstat snapshot, not a
+          // value pinned atomically to the read — truthful as a floor under
+          // a concurrent writer, not a promise of exactness. See
+          // readLayer1Shelf's docstring for why this can't be exact.
+          note: `layer1/core.md exceeds the ${LAYER1_SHELF_MAX_BYTES}-byte inline cap; at least ${result.omittedBytes} byte(s) omitted from the tail.`,
+        }
+      : {}),
+  };
+}
