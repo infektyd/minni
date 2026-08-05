@@ -625,3 +625,63 @@ test("UserPromptSubmit never surfaces a note the PRIVACY HEURISTIC flags (no aut
     );
   });
 });
+
+// ── #312: handoff_context (SessionStart) privacy gate ───────────────────────
+
+test("SessionStart's handoff_context never surfaces a privacy:private note's body text (#312)", async () => {
+  // End-to-end version of the vault.test.mjs unit test for the same fix:
+  // resolveInboxHandoffContext feeds SessionStart's envelope handoff_context
+  // field with no filtering in between (a 1:1 map in hook-handlers.ts), so
+  // this proves the gate holds all the way out to the real, model-facing
+  // envelope a platform actually receives — not just the function in
+  // isolation. Missing daemon socket (BASE_ENV) is fine: resolving a
+  // handoff's wikilink_refs is pure local filesystem I/O, no RPC involved.
+  await withFixture(async (fixture) => {
+    const decisionDir = path.join(fixture.vault, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "safe-migration.md"),
+      "---\ntitle: Safe Migration\nprivacy: safe\n---\n\nHandoff boot priming, safe note.",
+      "utf8",
+    );
+    await writeFile(
+      path.join(decisionDir, "private-migration.md"),
+      "---\ntitle: Private Migration\nprivacy: private\n---\n\nHandoff boot priming, CONFIDENTIAL-296B body text.",
+      "utf8",
+    );
+    const inboxDir = path.join(fixture.vault, "inbox");
+    await mkdir(inboxDir, { recursive: true });
+    // Fresh timestamp, not a hardcoded one: SessionStart TTL-reaps stale file
+    // handoffs BEFORE reading the inbox (expireStaleInboxHandoffs runs
+    // first) — an old-dated fixture gets silently archived as expired
+    // before resolveInboxHandoffContext ever sees it, which would make this
+    // test fail for the wrong reason entirely.
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "") + "Z";
+    await writeFile(
+      path.join(inboxDir, `${stamp}-mixed-handoff.json`),
+      JSON.stringify({
+        kind: "handoff",
+        wikilink_refs: [
+          "wiki/decisions/safe-migration",
+          "wiki/decisions/private-migration",
+        ],
+      }),
+      "utf8",
+    );
+
+    const output = await runHook("SessionStart", BASE_ENV(fixture));
+    const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+
+    const refs = (body.handoff_context ?? []).map((entry) => entry.ref);
+    assert.ok(refs.includes("wiki/decisions/safe-migration"), "the safe note must still resolve");
+    assert.ok(
+      !refs.includes("wiki/decisions/private-migration"),
+      "SEC (#312): a privacy:private note's ref must not resolve in the real envelope either",
+    );
+    const rawEnvelope = JSON.stringify(body);
+    assert.ok(
+      !rawEnvelope.includes("CONFIDENTIAL-296B"),
+      "SEC (#312): the private note's body text must not appear anywhere in the SessionStart envelope",
+    );
+  });
+});
