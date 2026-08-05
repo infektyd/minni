@@ -1,5 +1,6 @@
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { agentIdToVaultSlug, resolveAgentVaultPathOverride } from "./agent_ping.js";
 import type { PermanentAgentProfile } from "./team.js";
 
 export interface BootstrapApprenticeVaultInput {
@@ -20,15 +21,36 @@ export interface BootstrapDeps {
     mkdir: (p: string, opts?: { recursive?: boolean }) => Promise<void>;
     writeFile: (p: string, contents: string) => Promise<void>;
     stat: (p: string) => Promise<{ isDirectory: () => boolean }>;
+    readFile?: (p: string) => Promise<string>;
   };
 }
 
-function slugifyAgentId(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
+function hasSlugMaterial(value: string): boolean {
+  return /[a-zA-Z0-9]/.test(value);
+}
+
+// #298 review round: agentIdToVaultSlug strips ALL punctuation (matching the
+// reader's fallback transform), so ids that differ only by hyphen/underscore/
+// dot/case now collide on the same slug where the old writer's
+// hyphen-preserving transform would not have — e.g. "my-agent" and
+// "my_agent" both become "myagent". Combined with the idempotency branch
+// below (an existing directory silently returns bootstrapped:false), a
+// promoting caller could be silently handed a DIFFERENT agent's vault
+// instead of an error. Read back the schema title this bootstrapper itself
+// writes and refuse the collision instead of pretending it's a re-bootstrap.
+const AGENTS_MD_TITLE_RE = /^# Apprentice Vault — (.+)$/m;
+
+async function existingVaultOwner(
+  fs: { readFile?: (p: string) => Promise<string> },
+  vaultPath: string,
+): Promise<string | undefined> {
+  if (!fs.readFile) return undefined;
+  try {
+    const schema = await fs.readFile(path.join(vaultPath, "schema", "AGENTS.md"));
+    return AGENTS_MD_TITLE_RE.exec(schema)?.[1];
+  } catch {
+    return undefined;
+  }
 }
 
 function slugifyInboxSlug(value: string): string {
@@ -97,24 +119,60 @@ export async function bootstrapApprenticeVault(
     mkdir: deps.fs?.mkdir ?? ((p: string, opts?: { recursive?: boolean }) => mkdir(p, opts).then(() => undefined)),
     writeFile: deps.fs?.writeFile ?? ((p: string, contents: string) => writeFile(p, contents, "utf8")),
     stat: deps.fs?.stat ?? ((p: string) => stat(p)),
+    readFile: deps.fs?.readFile ?? ((p: string) => readFile(p, "utf8")),
   };
 
-  const safeId = slugifyAgentId(input.permanentAgentId);
-  if (!safeId) {
+  if (!hasSlugMaterial(input.permanentAgentId)) {
     throw new Error("bootstrapApprenticeVault requires a permanentAgentId with at least one alphanumeric character.");
   }
 
-  const vaultPath = path.join(input.sovereignRoot, "agents", `${safeId}-vault`);
+  // #298 (June audit F8): this used to hand-roll its own slug transform and
+  // write to sovereignRoot/agents/<slug>-vault, while every reader
+  // (agent_ping.ts's resolveAgentVaultPath) resolves <sovereignRoot>/<slug>-vault
+  // with a DIFFERENT slug algorithm — a promoted apprentice's vault was
+  // written where nothing reads it. Use the reader's own exported slug
+  // function so the two can never drift apart again, and drop the "agents"
+  // segment to match the flat layout every other agent vault already uses
+  // on disk (e.g. ~/.minni/codex-vault, not ~/.minni/agents/codex-vault).
+  //
+  // Review round: an operator-set MINNI_AGENT_VAULTS / MINNI_<ID>_VAULT_PATH
+  // override was still invisible here even after the slug/shape unification —
+  // the writer would ignore it and write to sovereignRoot/<slug>-vault
+  // regardless, leaving this exact issue alive under an override. Check for
+  // one first, same precedence resolveAgentVaultPath itself uses.
+  const override = resolveAgentVaultPathOverride(input.permanentAgentId);
+  const safeId = agentIdToVaultSlug(input.permanentAgentId);
+  const vaultPath = override ?? path.join(input.sovereignRoot, `${safeId}-vault`);
 
   // Idempotency: existing directory means a prior bootstrap; do not touch contents.
   // A non-directory at this path is a programmer/operator error worth surfacing
   // explicitly rather than letting mkdir fail with a confusing EEXIST/ENOTDIR.
   try {
     const st = await fs.stat(vaultPath);
-    if (st.isDirectory()) return { vaultPath, bootstrapped: false, filesCreated: [] };
+    if (st.isDirectory()) {
+      // Review round: agentIdToVaultSlug strips all punctuation, so two
+      // DIFFERENT agent ids (e.g. "my-agent" / "my_agent") can now collide
+      // on the same slug where the old writer's transform would not have.
+      // A directory existing here is only a legitimate re-bootstrap if it
+      // was created for THIS agent id — verify against the schema title
+      // this bootstrapper itself writes rather than assuming idempotency.
+      const owner = await existingVaultOwner(fs, vaultPath);
+      if (owner !== undefined && owner !== input.permanentAgentId) {
+        throw new Error(
+          `vaultPath collision: ${vaultPath} already belongs to agent ${JSON.stringify(owner)}, ` +
+          `not ${JSON.stringify(input.permanentAgentId)} (slug collision after normalization)`,
+        );
+      }
+      return { vaultPath, bootstrapped: false, filesCreated: [] };
+    }
     throw new Error(`vaultPath exists but is not a directory: ${vaultPath}`);
   } catch (err) {
-    if (err instanceof Error && err.message.startsWith("vaultPath exists but is not a directory")) throw err;
+    if (
+      err instanceof Error &&
+      (err.message.startsWith("vaultPath exists but is not a directory") || err.message.startsWith("vaultPath collision"))
+    ) {
+      throw err;
+    }
     // Otherwise: stat failed because it does not exist; proceed with creation.
   }
 
