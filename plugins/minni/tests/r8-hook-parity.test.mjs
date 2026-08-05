@@ -22,6 +22,7 @@ import { promisify } from "node:util";
 
 import { CURSOR_EVENTS } from "../dist/cursor-adapter.js";
 import { AGY_EVENTS } from "../dist/gemini-adapter.js";
+import { createHookHandlers } from "../dist/hook-handlers.js";
 import * as hookUtils from "../dist/hook-utils.js";
 import { auditTail, ensureVault, recordAudit } from "../dist/vault.js";
 
@@ -86,8 +87,10 @@ async function runCodexHook(event, vault, payload) {
   );
 }
 
-/** Drive the Claude Code entry point — hook.ts, the PRIMARY manifest, which
- *  carries its own copy of both swallows rather than using the factory. */
+/** Drive the Claude Code entry point — hook.ts, the PRIMARY manifest. #283:
+ *  now a thin runHookMain(CONFIG) shim like every other platform, so it
+ *  shares the factory's routing and both swallow paths (VALID_EVENTS gate,
+ *  dispatch default) rather than carrying its own copies. */
 async function runClaudeHook(event, vault, payload) {
   return runHookEntry(
     "hook.js",
@@ -103,31 +106,28 @@ async function runClaudeHook(event, vault, payload) {
 test("P4: every event a platform manifest declares is routed by the hook it invokes", async () => {
   // "What done looks like": a manifest/handler divergence must fail CI rather
   // than ship. Pre-R8 nothing cross-checked these two sets at all.
+  //
+  // #283: claude-code migrated onto runHookMain/createHookHandlers, so
+  // hooks/hooks.json is checked against the SAME routed set as every other
+  // generic-factory manifest below — it no longer carries its own dispatch
+  // switch to extract separately.
   const manifests = [
-    ["hooks/hooks.json", "hook.js"],
+    ["hooks/hooks.json", null],
     ["hooks/hooks-codex.json", null],
     ["hooks/hooks-grok.json", null],
     [".kilocode-plugin/hooks/hooks.json", null],
   ];
 
   // Round 5 (PR #260): the generic set used to be VALID_EVENTS ∪ {PreToolUse},
-  // which only proves an event gets past the envelope GATE. VALID_EVENTS
-  // includes PostCompact/CompactSummary, but the factory dispatch has no
-  // PostCompact case — a manifest declaring it passed this gate while the
-  // hook only audited a drop. "Routed" must mean an actual dispatch arm, so
-  // the consumed set is read from createHookHandlers' switch, same as hook.ts.
+  // which only proves an event gets past the envelope GATE. "Routed" must
+  // mean an actual dispatch arm, so the consumed set is read from
+  // createHookHandlers' switch — #283 closed the PostCompact gap this test
+  // used to pin as a precondition (every VALID_EVENTS member now has a case).
   const generic = await routedEventsFor(
     path.join(PLUGIN_ROOT, "src", "hook-handlers.ts"),
   );
-  const claudeRouted = await routedEventsFor(path.join(PLUGIN_ROOT, "src", "hook.ts"));
-  assert.ok(
-    VALID_EVENTS.includes("PostCompact") && !generic.has("PostCompact"),
-    "precondition: PostCompact passes the envelope gate but has no factory " +
-      "dispatch arm — the exact gap that made the old VALID_EVENTS-based " +
-      "check overstate routing",
-  );
 
-  for (const [relative, entry] of manifests) {
+  for (const [relative] of manifests) {
     const raw = await readFile(path.join(PLUGIN_ROOT, relative), "utf8");
     const parsed = JSON.parse(raw);
     // Two manifest shapes in the tree: a `hooks` wrapper (Claude/Codex/Grok)
@@ -136,9 +136,8 @@ test("P4: every event a platform manifest declares is routed by the hook it invo
     assert.ok(declared.length > 0, `${relative} declares no events`);
 
     for (const event of declared) {
-      const consumed = entry === "hook.js" ? claudeRouted : generic;
       assert.ok(
-        consumed.has(event),
+        generic.has(event),
         `${relative} declares "${event}" but the hook it invokes does not route it — ` +
           "a declared-but-unhandled event exits clean and carries nothing",
       );
@@ -210,16 +209,30 @@ test("P4: an unrouted event records a drop marker instead of exiting clean", asy
 test("P4: a valid event with no dispatch case records a drop marker", async () => {
   // Pre-R8: `default: return render(noIntent)` — a clean, successful no-op for
   // an event that passed the VALID_EVENTS gate and then found no handler.
-  // PostCompact is exactly that shape: in VALID_EVENTS, no factory dispatch arm.
+  // #283 gave every VALID_EVENTS member a real dispatch case (closing the
+  // PostCompact gap this test used to demonstrate via the CLI), so there is
+  // no real platform event left that reaches `default:` through the normal
+  // runHookMain gate. The gate itself stays covered by the "an unrouted
+  // event" test above; this one calls dispatch() directly (bypassing the
+  // gate) so the default branch's own audit-and-continue behavior stays
+  // proven rather than becoming untested dead code — regression insurance
+  // for a FUTURE VALID_EVENTS addition that outpaces its dispatch case.
   await withVault(async (vault) => {
-    assert.ok(
-      VALID_EVENTS.includes("PostCompact"),
-      "precondition: PostCompact passes the envelope gate, so it reaches dispatch",
-    );
-    await runCodexHook("PostCompact", vault, {});
+    const handlers = createHookHandlers({
+      agentId: "codex",
+      vaultPath: vault,
+      defaultWorkspaceId: "default",
+      contextWindow: 200_000,
+      hooksEnabled: true,
+      runtime: "codex",
+      hookScript: "codex-hook.js",
+      auditPrefix: "hook_codex",
+    });
+    const output = await handlers.dispatch("SomeFutureEventNoCaseHandlesYet", {});
+    assert.equal(output.continue, true, "the handler must still exit clean for the platform");
     const tail = await auditTail(vault, 20);
     assert.match(tail.text, /hook_codex_intent_dropped/);
-    assert.match(tail.text, /PostCompact/);
+    assert.match(tail.text, /SomeFutureEventNoCaseHandlesYet/);
   });
 });
 
@@ -724,13 +737,28 @@ test("P4: every platform entry point with its own gate records the drop", async 
   }
 });
 
-test("P4: hook.js records the drop on its dispatch default too", async () => {
-  // Two separate swallows in hook.ts; the gate test above cannot reach this one.
+test("P4: claude-code's dispatch default records the drop too, with its own audit prefix", async () => {
+  // #283: hook.ts shares the factory's dispatch default rather than carrying
+  // its own copy — CompactSummary (this test's old vehicle) is now genuinely
+  // routed for claude too (handleCompactSummary), so it can no longer reach
+  // this branch via the CLI. Direct dispatch() call, claude's own config
+  // shape (bare "hook" audit prefix, not "hook_claude-code"), same reasoning
+  // as the codex-shaped version of this test above: proves the shared
+  // default branch still threads claude's specific config correctly.
   await withVault(async (vault) => {
-    await runClaudeHook("CompactSummary", vault, {});
+    const handlers = createHookHandlers({
+      agentId: "claude-code",
+      vaultPath: vault,
+      defaultWorkspaceId: "default",
+      contextWindow: 200_000,
+      hooksEnabled: true,
+      auditPrefix: "hook",
+    });
+    const output = await handlers.dispatch("SomeFutureEventNoCaseHandlesYet", {});
+    assert.equal(output.continue, true, "the handler must still exit clean for the platform");
     const tail = await auditTail(vault, 20);
     assert.match(tail.text, /hook_intent_dropped/);
-    assert.match(tail.text, /CompactSummary/);
+    assert.match(tail.text, /SomeFutureEventNoCaseHandlesYet/);
   });
 });
 
