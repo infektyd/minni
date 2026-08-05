@@ -1,8 +1,10 @@
 name: Grok
 
 # /grok slash-command handler — mirrors .github/workflows/claude.yml but runs
-# xAI's Grok Build CLI headless on the runner, authenticated with a dedicated
-# subscription OAuth token (device-auth flow) stored as GROK_CI_AUTH_JSON.
+# xAI's Grok Build CLI headless on the runner, authenticated with either a
+# pay-per-use console.x.ai key (secret XAI_API_KEY, preferred when set) or a
+# dedicated subscription OAuth token (device-auth flow) stored as
+# GROK_CI_AUTH_JSON.
 #
 # Trigger is intentionally a SLASH command (/grok), not an @mention. Bare
 # @handles are GitHub user mentions: they resolve to whoever owns that login
@@ -185,12 +187,34 @@ jobs:
           esac
           echo "grok CLI pinned at $GROK_CLI_VERSION"
 
-      - name: Restore Grok subscription auth
+      - name: Restore Grok auth (API key or subscription OAuth)
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
+          # Dual-mode auth; full rationale in grok-review.yml. API key wins
+          # when both secrets are set; it is written into auth.json so the
+          # leak gate's needle set covers the live credential.
           /usr/bin/mkdir -p "$HOME/.grok"
-          printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
+          if [ -n "$XAI_API_KEY" ]; then
+            # printf into a JSON template, not an interpreter -c one-liner:
+            # the pinning test rightly rejects inline programs in trust
+            # steps. Safe only because the character class below is enforced
+            # first — a key containing a quote or backslash would corrupt
+            # the JSON, so anything outside [A-Za-z0-9._-] refuses instead.
+            case "$XAI_API_KEY" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::XAI_API_KEY contains characters outside [A-Za-z0-9._-]; refusing to write auth.json."
+                exit 1
+                ;;
+            esac
+            printf '{"xai_api_key": "%s"}' "$XAI_API_KEY" > "$HOME/.grok/auth.json"
+          elif [ -n "$GROK_CI_AUTH_JSON" ]; then
+            printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
+          else
+            echo "::error::No Grok credential: set the XAI_API_KEY or GROK_CI_AUTH_JSON secret."
+            exit 1
+          fi
           /usr/bin/chmod 600 "$HOME/.grok/auth.json"
 
       - name: Configure the sandbox profile
@@ -248,6 +272,10 @@ jobs:
           } > /tmp/grok-prompt.md
 
       - name: Run Grok
+        env:
+          # API-key auth path; empty in OAuth mode (auth.json then carries
+          # the credential).
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
           # Shell stays available here — a /grok request often needs it.
           # To be precise about what protects what: the credential path is
