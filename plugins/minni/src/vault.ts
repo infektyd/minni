@@ -944,8 +944,24 @@ export async function appendFileWithFsync(filePath: string, content: string): Pr
 }
 
 export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  // #293 review round found two real gaps against callers (#231's active-plan
+  // pointer, this fix's journal init + plan/vault note) that assumed this
+  // helper's guarantee was complete:
+  //
+  // 1. Preserve the destination's existing mode. `open(tempPath, "w")` with no
+  //    explicit mode creates the temp file at the umask default; renaming it
+  //    onto an existing, differently-permissioned file (e.g. operator-tightened
+  //    to 0600) would silently widen it back to the default on every write —
+  //    a permanent, silent permission downgrade nobody asked for.
+  let mode: number | undefined;
+  try {
+    mode = (await stat(filePath)).mode & 0o777;
+  } catch {
+    // Destination does not exist yet — first write, default mode is correct.
+  }
+
   const tempPath = `${filePath}.${Math.random().toString(36).substring(2)}.tmp`;
-  const fh = await open(tempPath, "w");
+  const fh = await open(tempPath, "w", mode);
   try {
     await fh.writeFile(content, "utf8");
     await fh.sync();
@@ -953,6 +969,25 @@ export async function writeFileAtomic(filePath: string, content: string): Promis
     await fh.close();
   }
   await rename(tempPath, filePath);
+
+  // 2. fsync the parent directory. fsync'ing the temp file's data (above)
+  //    makes the CONTENT durable, but on POSIX the rename's directory-entry
+  //    update is a separate write that a crash can still lose — the file can
+  //    come back missing (or pointing at the old inode) even though its data
+  //    was fsync'd, defeating the whole point of "atomic" for a crash that
+  //    lands between rename() returning and the directory block hitting disk.
+  try {
+    const dirHandle = await open(path.dirname(filePath));
+    try {
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close();
+    }
+  } catch {
+    // Directory fsync is best-effort hardening on top of the rename itself
+    // (e.g. unsupported on some filesystems/platforms) — never let it turn a
+    // successful write into a thrown error.
+  }
 }
 
 const auditLocks = new Map<string, Promise<void>>();
@@ -1180,8 +1215,18 @@ async function appendIndex(
   await appendFile(indexPath, line, "utf8");
 }
 
+// Bugbot on #309 (campaign scar #3): the durability of this write must be
+// pinned by observing that writeFileAtomic is ACTUALLY invoked with the
+// right path/content, not by grepping vault.ts's source text for its name —
+// a rename-class mutant (or one that keeps the name but swaps the internals
+// for a plain write) would sail straight past a text assertion.
+export interface WriteVaultPageDeps {
+  writeFileAtomic?: typeof writeFileAtomic;
+}
+
 export async function writeVaultPage(
   input: WriteVaultPageInput,
+  deps: WriteVaultPageDeps = {},
 ): Promise<VaultWriteResult> {
   await ensureVault(input.vaultPath);
   const relativePath = sectionPath(input.section, input.title);
@@ -1213,7 +1258,15 @@ export async function writeVaultPage(
     ...input.frontmatter,
   });
   const body = `${fm}\n# ${input.title}\n\n${input.content.trim()}\n`;
-  await writeFile(notePath, body, "utf8");
+  // #293 (June audit N6): the plan note this function writes for a plan's
+  // `writeVaultPage` call was a plain writeFile — a crash could leave a
+  // truncated note behind. writeVaultPage is the single shared write path
+  // for every vault page (not just plan notes), so fixing it here durably
+  // covers all of them with the same atomic temp+rename #231 already uses
+  // for the active-plan pointer, rather than special-casing just the plan
+  // caller.
+  const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
+  await doWriteAtomic(notePath, body);
 
   await appendIndex(input.vaultPath, input.title, relativePath, input.content);
   await recordAudit(input.vaultPath, {
