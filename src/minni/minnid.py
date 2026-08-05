@@ -883,6 +883,7 @@ def _health_context() -> HealthContext:
         default_config=DEFAULT_CONFIG,
         logger=logger,
         retrieval_engine=_lazy_retrieval,
+        watchdog_state=_read_watchdog_state,
     )
 
 
@@ -1389,6 +1390,229 @@ async def _backfill_runner():
             raise
 
 
+# ── Footprint watchdog (#284) ─────────────────────────────────────────────
+# PyTorch MPS can accumulate IOAccelerator regions without bound under
+# concurrent encode. Cap process maxrss and exit cleanly so launchd restarts;
+# persist restart_count so health surfaces the loop (H5).
+
+_DEFAULT_FOOTPRINT_CAP_MB = 4096  # well under the 15.5GB incident; operator override via env
+_DEFAULT_FOOTPRINT_WATCH_INTERVAL_S = 30
+
+
+def _footprint_watchdog_enabled() -> bool:
+    """Periodic footprint self-check (MINNI_FOOTPRINT_WATCHDOG=off to disable)."""
+    return (os.environ.get("MINNI_FOOTPRINT_WATCHDOG", "on") or "on").strip().lower() != "off"
+
+
+def _footprint_cap_bytes(default_mb: int = _DEFAULT_FOOTPRINT_CAP_MB) -> int:
+    """Parse MINNI_FOOTPRINT_CAP_MB defensively; malformed → default. Never crash."""
+    raw = (os.environ.get("MINNI_FOOTPRINT_CAP_MB") or "").strip()
+    if not raw:
+        return default_mb * 1024 * 1024
+    try:
+        mb = int(raw)
+        if mb > 0:
+            return mb * 1024 * 1024
+    except ValueError:
+        logger.warning(
+            "MINNI_FOOTPRINT_CAP_MB=%r is not a positive integer; using default %d",
+            raw, default_mb,
+        )
+    return default_mb * 1024 * 1024
+
+
+def _footprint_watch_interval() -> float:
+    raw = (os.environ.get("MINNI_FOOTPRINT_WATCH_INTERVAL") or "").strip()
+    if not raw:
+        return float(_DEFAULT_FOOTPRINT_WATCH_INTERVAL_S)
+    try:
+        value = float(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    return float(_DEFAULT_FOOTPRINT_WATCH_INTERVAL_S)
+
+
+def _current_footprint_bytes() -> int:
+    """Process max RSS in bytes.
+
+    macOS ``ru_maxrss`` is already bytes; Linux reports kilobytes. Match the
+    platform, never guess.
+
+    Deliberately per-process (getrusage), never system-wide VM stats: on this
+    fleet's macOS 27 beta, ``host_statistics64(HOST_VM_INFO64)`` is a
+    confirmed-broken API (Apple Developer Forums thread 796568). Do not
+    "simplify" this to host_statistics64/psutil.virtual_memory() — it would
+    silently report garbage on this OS build.
+    """
+    import resource
+    import sys
+
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(usage)
+    return int(usage) * 1024
+
+
+def _footprint_exceeds_cap(current_bytes: int, cap_bytes: int) -> bool:
+    return current_bytes > cap_bytes
+
+
+def _watchdog_state_path() -> Path:
+    """Persist under the same secure run/ dir as the Unix socket."""
+    override = (os.environ.get("MINNI_WATCHDOG_STATE_PATH") or "").strip()
+    if override:
+        return Path(override)
+    return SECURE_RUN_DIR / "watchdog_state.json"
+
+
+def _default_watchdog_state() -> dict:
+    return {
+        "restart_count": 0,
+        "last_restart_reason": None,
+        "last_restart_at": None,
+    }
+
+
+def _read_watchdog_state(path: Optional[Path] = None) -> dict:
+    """Load restart state; missing/corrupt → clean default, never raises."""
+    state_path = path if path is not None else _watchdog_state_path()
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return _default_watchdog_state()
+        count = data.get("restart_count", 0)
+        try:
+            count_i = int(count)
+            if count_i < 0:
+                count_i = 0
+        except (TypeError, ValueError):
+            count_i = 0
+        return {
+            "restart_count": count_i,
+            "last_restart_reason": data.get("last_restart_reason"),
+            "last_restart_at": data.get("last_restart_at"),
+        }
+    except FileNotFoundError:
+        return _default_watchdog_state()
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return _default_watchdog_state()
+
+
+def _record_watchdog_trip(reason: str, path: Optional[Path] = None) -> dict:
+    """Increment restart_count and persist; returns the new state dict."""
+    from datetime import datetime, timezone
+
+    state_path = path if path is not None else _watchdog_state_path()
+    prior = _read_watchdog_state(state_path)
+    state = {
+        "restart_count": int(prior.get("restart_count") or 0) + 1,
+        "last_restart_reason": reason,
+        "last_restart_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(state_path)
+    except OSError:
+        logger.exception("footprint watchdog: failed to persist state at %s", state_path)
+    return state
+
+
+def _footprint_watchdog_tick(
+    *,
+    measure=_current_footprint_bytes,
+    cap_bytes: Optional[int] = None,
+    state_path: Optional[Path] = None,
+    on_trip=None,
+) -> Optional[str]:
+    """One check. On trip: persist state, call on_trip(reason), return reason.
+
+    Pure(ish) for tests — inject measure/cap/state_path/on_trip. Returns None
+    when under cap.
+    """
+    current = int(measure())
+    cap = int(cap_bytes if cap_bytes is not None else _footprint_cap_bytes())
+    if not _footprint_exceeds_cap(current, cap):
+        return None
+    current_mb = current / (1024 * 1024)
+    cap_mb = cap / (1024 * 1024)
+    reason = (
+        f"footprint_cap_exceeded: {current_mb:.0f}MB > {cap_mb:.0f}MB cap"
+    )
+    _record_watchdog_trip(reason, path=state_path)
+    if on_trip is not None:
+        on_trip(reason)
+    return reason
+
+
+def _initiate_graceful_shutdown(reason: str, *, tasks=None, level: str = "warning") -> None:
+    """Flip _running, close the socket, cancel background tasks.
+
+    Shared by the SIGTERM/SIGINT handler and the footprint watchdog so a
+    watchdog trip takes the same cleanup path as an operator signal — never
+    ``sys.exit()`` raw.
+    """
+    global _running
+    log = logger.warning if level == "warning" else logger.info
+    log("%s", reason)
+    _running = False
+    if _server is not None:
+        _server.close()
+    for task in list(tasks or []):
+        if task is not None:
+            task.cancel()
+
+
+async def _footprint_watchdog_runner(
+    *,
+    measure=_current_footprint_bytes,
+    cap_bytes: Optional[int] = None,
+    state_path: Optional[Path] = None,
+    interval: Optional[float] = None,
+    on_trip=None,
+    shutdown_tasks=None,
+):
+    """Periodic footprint self-check. Trips → persist + graceful shutdown."""
+    wait = interval if interval is not None else _footprint_watch_interval()
+    cap = cap_bytes if cap_bytes is not None else _footprint_cap_bytes()
+    logger.info(
+        "Footprint watchdog enabled: cap=%dMB interval=%ss",
+        cap // (1024 * 1024), wait,
+    )
+
+    def _default_on_trip(reason: str) -> None:
+        _initiate_graceful_shutdown(
+            f"Footprint watchdog: {reason} — shutting down for launchd restart",
+            tasks=shutdown_tasks() if callable(shutdown_tasks) else shutdown_tasks,
+        )
+
+    trip_cb = on_trip if on_trip is not None else _default_on_trip
+
+    while True:
+        try:
+            tripped = await asyncio.to_thread(
+                _footprint_watchdog_tick,
+                measure=measure,
+                cap_bytes=cap,
+                state_path=state_path,
+                on_trip=trip_cb,
+            )
+            if tripped:
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Footprint watchdog pass failed")
+        try:
+            await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            raise
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1800,6 +2024,12 @@ def main():
 
     _start_time = time.time()
 
+    # #284: pin daemon models to CPU by default BEFORE any singleton warmup.
+    # setdefault preserves an explicit operator override (e.g. launchd plist
+    # MINNI_MODEL_DEVICE=mps). Indexer/backfill never enter main(), so they
+    # keep library auto-select (MPS on Apple Silicon).
+    os.environ.setdefault("MINNI_MODEL_DEVICE", "cpu")
+
     # Deploy honesty (GA1-3): snapshot which code this process is running —
     # checkout + HEAD sha at start — so `status` can later report truthfully
     # when the checkout has moved on and the daemon is executing stale code.
@@ -1920,26 +2150,25 @@ def main():
     if _warmup_enabled():
         warmup_task = loop.create_task(_warmup_runner())
 
+    # Footprint watchdog (#284). Cap maxrss and restart cleanly via launchd
+    # rather than silently eating the machine. On by default.
+    footprint_task = None
+    background_tasks = lambda: [
+        main_task, http_task, afm_task, vault_watch_task,
+        decay_task, backfill_task, warmup_task, footprint_task,
+    ]
+    if _footprint_watchdog_enabled():
+        footprint_task = loop.create_task(
+            _footprint_watchdog_runner(shutdown_tasks=background_tasks)
+        )
+
     def _shutdown(signum, frame):
-        nonlocal _running
         sig_name = signal.Signals(signum).name
-        logger.info("Received %s, shutting down…", sig_name)
-        _running = False
-        if _server is not None:
-            _server.close()
-        main_task.cancel()
-        if http_task is not None:
-            http_task.cancel()
-        if afm_task is not None:
-            afm_task.cancel()
-        if vault_watch_task is not None:
-            vault_watch_task.cancel()
-        if decay_task is not None:
-            decay_task.cancel()
-        if backfill_task is not None:
-            backfill_task.cancel()
-        if warmup_task is not None:
-            warmup_task.cancel()
+        _initiate_graceful_shutdown(
+            f"Received {sig_name}, shutting down…",
+            tasks=background_tasks(),
+            level="info",
+        )
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)

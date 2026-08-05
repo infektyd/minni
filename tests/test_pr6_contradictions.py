@@ -284,7 +284,7 @@ class TestDetectContradictions:
 
         # Patch the model to return a deterministic near-identical embedding
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return close_emb
 
         wb._model = _FakeModel()
@@ -317,7 +317,7 @@ class TestDetectContradictions:
         query_emb = base_emb  # orthogonal to orth_emb
 
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return query_emb
 
         wb._model = _FakeModel()
@@ -355,7 +355,7 @@ class TestDetectContradictions:
             """, (base_emb.tobytes(), now, new_id))
 
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return _nearly_identical_embedding(base_emb, noise=0.001)
 
         wb._model = _FakeModel()
@@ -385,7 +385,7 @@ class TestDetectContradictions:
             """, (base_emb.tobytes(), now))
 
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return _nearly_identical_embedding(base_emb, noise=0.001)
 
         wb._model = _FakeModel()
@@ -422,7 +422,7 @@ class TestDetectContradictions:
             """, (emb_b.tobytes(), now))
 
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return emb_a  # identical to emb_a → sim=1.0
 
         wb._model = _FakeModel()
@@ -467,7 +467,7 @@ class TestDetectContradictionsGraceful:
         wb = WriteBackMemory(db_obj, cfg)
 
         class _BrokenModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 raise RuntimeError("GPU exploded")
 
         wb._model = _BrokenModel()
@@ -567,7 +567,7 @@ class TestHandleLearn:
 
         import minni.writeback as wb_mod
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return close_emb
         wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
         try:
@@ -607,7 +607,7 @@ class TestHandleLearn:
 
         import minni.writeback as wb_mod
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return close_emb
         wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
         try:
@@ -643,7 +643,7 @@ class TestHandleLearn:
 
         import minni.writeback as wb_mod
         class _FakeModel:
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 return close_emb
         wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
         try:
@@ -1214,7 +1214,7 @@ class TestFullWorkflow:
 
         class _SeqModel:
             """Returns jwt_emb for the first call, cookie_emb for subsequent calls."""
-            def encode(self, text):
+            def encode(self, text, **kwargs):
                 call_count[0] += 1
                 if call_count[0] == 1:
                     return jwt_emb
@@ -1310,7 +1310,7 @@ class TestFullWorkflow:
             seeded_id = c.lastrowid
 
         class _FakeModel:
-            def encode(self, _text):
+            def encode(self, _text, **kwargs):
                 return _nearly_identical_embedding(base_emb, noise=0.001)
 
         original_model_prop = wb_mod.WriteBackMemory.model.fget

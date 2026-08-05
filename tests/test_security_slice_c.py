@@ -152,7 +152,7 @@ def test_detect_contradictions_excludes_rejected(tmp_path):
     _seed_learning(db_obj, "codex", "the sky is green", status="rejected", emb=emb.tobytes())
 
     class _FakeModel:
-        def encode(self, text):
+        def encode(self, text, **kwargs):
             return emb
 
     wb_model_backup = type(wb).model

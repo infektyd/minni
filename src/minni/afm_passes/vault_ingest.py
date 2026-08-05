@@ -302,8 +302,11 @@ def _index_changed_pages(
                 heading_prefix = indexer._build_heading_prefix(page)
                 chunks = indexer.chunker.chunk_document(page.body)
                 if indexer.model:
+                    from minni.models import get_embedder_lock
+
                     for chunk in chunks:
-                        emb = indexer.model.encode(chunk.text)
+                        with get_embedder_lock():
+                            emb = indexer.model.encode(chunk.text, show_progress_bar=False)
                         c.execute(
                             """INSERT INTO chunk_embeddings
                                (doc_id, chunk_index, chunk_text, embedding,

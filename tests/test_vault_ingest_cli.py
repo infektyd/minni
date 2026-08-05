@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 
 class _FakeEmbedder:
-    def encode(self, text: str):
+    def encode(self, text: str, **kwargs):
         vec = np.zeros(384, dtype=np.float32)
         vec[sum(text.encode("utf-8")) % 384] = 1.0
         return vec

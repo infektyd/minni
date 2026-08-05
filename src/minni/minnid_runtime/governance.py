@@ -179,8 +179,11 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         emb_bytes = None
         if wb.model:
             try:
+                from minni.models import get_embedder_lock
+
                 embedding_started_at = time.perf_counter()
-                emb = wb.model.encode(content).astype(np.float32)
+                with get_embedder_lock():
+                    emb = wb.model.encode(content, show_progress_bar=False).astype(np.float32)
                 emb_bytes = emb.tobytes()
                 context.record_latency("embedding", time.perf_counter() - embedding_started_at)
             except Exception as exc:
@@ -296,7 +299,10 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         emb_bytes = None
         if wb.model:
             try:
-                emb = wb.model.encode(new_content).astype(np.float32)
+                from minni.models import get_embedder_lock
+
+                with get_embedder_lock():
+                    emb = wb.model.encode(new_content, show_progress_bar=False).astype(np.float32)
                 emb_bytes = emb.tobytes()
             except Exception as exc:
                 context.logger.warning(

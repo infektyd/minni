@@ -72,6 +72,14 @@ class SovereignConfig:
     # Optional downstream FAISS quantization. SQLite remains float32 truth.
     # Supported: "fp32" (default), "int8". Changing this requires reindex/rebuild.
     embedding_quantization: str = "fp32"
+    # Device for SentenceTransformer / CrossEncoder constructors.
+    # None → omit device= kwarg so sentence-transformers auto-selects (MPS on
+    # Apple Silicon). minnid main() setdefaults MINNI_MODEL_DEVICE=cpu before
+    # warmup so the daemon path pins CPU; indexer/backfill leave this unset.
+    # See issue #284 (MPS allocator leak under concurrent daemon encode).
+    model_device: Optional[str] = field(
+        default_factory=lambda: (os.environ.get("MINNI_MODEL_DEVICE") or "").strip() or None
+    )
 
     # FAISS indexing
     # "flat" = brute-force (exact), "hnsw" = approximate (fast at scale)

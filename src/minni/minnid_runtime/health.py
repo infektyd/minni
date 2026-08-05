@@ -105,6 +105,14 @@ class HealthContext:
     # P0-B (2026-07-19 blackout): lets status surface the live engine's
     # vector_model_down flag. Optional so tests/legacy wiring keep working.
     retrieval_engine: Callable[[], Any] | None = None
+    # #284 footprint watchdog: restart_count survives process restart via a
+    # JSON state file. Default returns a clean never-tripped shape so tests
+    # and legacy HealthContext constructors stay valid without wiring.
+    watchdog_state: Callable[[], dict] = lambda: {
+        "restart_count": 0,
+        "last_restart_reason": None,
+        "last_restart_at": None,
+    }
 
 
 def faiss_cache_status(config=DEFAULT_CONFIG) -> tuple[Path, bool]:
@@ -271,6 +279,8 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
             "counter_deltas": deltas,
             "health_flags": flags,
             "deploy": deploy,
+            # #284 H5 guard: restart count must be visible in status, not silent.
+            "footprint_watchdog": context.watchdog_state(),
         },
         "engine": {
             "db_ok": db_ok,
@@ -294,6 +304,8 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         "never_recalled": [],
         "contradicting_learnings": [],
         "vector_backend_lag": [],
+        # #284 H5: footprint restarts must surface here too, not only on status.
+        "footprint_watchdog": context.watchdog_state(),
         # Audit R0: non-numeric values sitting in the REAL-affinity timestamp
         # columns. The readers are defensive now, but a skipped row must stay
         # VISIBLE here rather than being silently tolerated.

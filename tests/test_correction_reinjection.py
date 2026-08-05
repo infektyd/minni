@@ -277,7 +277,7 @@ class TestCorrectionSalience:
         class FakeReranker:
             model_name = "fake-ce"
 
-            def predict(self, pairs):
+            def predict(self, pairs, **kwargs):
                 # habitual hit scores slightly above the correction raw.
                 return [1.0, 0.9]
 
@@ -303,7 +303,7 @@ class TestCorrectionSalience:
         class FakeReranker:
             model_name = "fake-ce"
 
-            def predict(self, pairs):
+            def predict(self, pairs, **kwargs):
                 return [-0.9, -1.0]
 
         engine._reranker = FakeReranker()
@@ -324,7 +324,7 @@ class TestCorrectionSalience:
         class FakeReranker:
             model_name = "fake-ce"
 
-            def predict(self, pairs):
+            def predict(self, pairs, **kwargs):
                 return [0.0, 0.0]
 
         engine._reranker = FakeReranker()
@@ -350,7 +350,7 @@ class TestCorrectionSalience:
         class ExplodingReranker:
             model_name = "fake-ce"
 
-            def predict(self, pairs):
+            def predict(self, pairs, **kwargs):
                 raise AssertionError("cache-hit branch must not call the model")
 
         engine._reranker = ExplodingReranker()

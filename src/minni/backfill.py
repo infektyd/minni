@@ -408,7 +408,10 @@ def backfill_learning_embeddings(
     for row in rows:
         content = row["content"] or ""
         try:
-            emb = model.encode(content).astype(np.float32)
+            from minni.models import get_embedder_lock
+
+            with get_embedder_lock():
+                emb = model.encode(content, show_progress_bar=False).astype(np.float32)
             with db.cursor() as c:
                 c.execute(
                     "UPDATE learnings SET embedding = ? WHERE learning_id = ?",
@@ -548,10 +551,13 @@ def backfill_document_vectors(
             # the encode duration and not merely the INSERT duration — exactly
             # the contention the per-pass batch bound exists to avoid. The
             # learnings path above already had this shape; the two now agree.
-            encoded = [
-                (chunk, model.encode(chunk.text).astype(np.float32))
-                for chunk in chunks
-            ]
+            from minni.models import get_embedder_lock
+
+            encoded = []
+            for chunk in chunks:
+                with get_embedder_lock():
+                    emb = model.encode(chunk.text, show_progress_bar=False).astype(np.float32)
+                encoded.append((chunk, emb))
             with db.transaction() as c:
                 for chunk, emb in encoded:
                     c.execute(

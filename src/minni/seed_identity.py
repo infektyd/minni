@@ -142,7 +142,10 @@ def get_embedding(text, model=None):
             model = get_embedder()
         if model is None:
             raise ImportError("embedding model unavailable")
-        emb = model.encode(text)
+        from minni.models import get_embedder_lock
+
+        with get_embedder_lock():
+            emb = model.encode(text, show_progress_bar=False)
         import numpy as np
         return emb.astype(np.float32).tobytes()
     except ImportError:

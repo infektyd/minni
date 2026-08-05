@@ -390,8 +390,11 @@ class VaultIndexer:
                 )
                 prepared = []
                 if self.model and not unendorsed:
+                    from minni.models import get_embedder_lock
+
                     for chunk in self.chunker.chunk_document(content):
-                        emb = self.model.encode(chunk.text)
+                        with get_embedder_lock():
+                            emb = self.model.encode(chunk.text, show_progress_bar=False)
                         prepared.append((chunk, emb.astype(np.float32).tobytes()))
 
                 layer = meta.get("layer", "knowledge")
