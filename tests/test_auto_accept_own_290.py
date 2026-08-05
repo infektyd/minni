@@ -569,32 +569,54 @@ def test_dedup_backstop_fires_when_contradiction_detection_is_skipped(db_path):
 
 
 @pytest.mark.parametrize(
-    "content, kwargs, why",
+    "content",
     [
-        ("a b", {}, "below minimum content length"),
-        ("a" * 30, {}, "low character diversity (filler)"),
-        ("!!!!!!!!!!!!!!! ????????????????", {}, "low alphabetic ratio"),
-        ("x" * 9000, {}, "oversized blob"),
-        ("A perfectly ordinary durable learning.", {"privacy_level": "private"}, "privacy"),
+        "Port: 8080",                                   # too short for the floor
+        '{"port": 8080, "host": "127.0.0.1", "tls": 1}',  # low alphabetic ratio
+        "rollback rollback rollback rollback",          # too few distinct words
+        "x" * 9000,                                     # oversized for the floor
     ],
 )
-def test_the_whole_floor_applies_to_resolve_contradiction(db_path, content, kwargs, why):
-    """F9: the first fix ported only the instruction_like rule — a fence with
-    one plank. Every OTHER floor rule was still one call away from irrelevant
-    for exactly the principal the docs tell operators to create."""
+def test_corrections_are_not_held_to_the_auto_promotion_floor(db_path, content):
+    """DELIBERATE, and a reversal of an earlier overcorrection.
+
+    A previous round applied the whole auto-accept floor here. Measured against
+    origin/main, that refused corrections which had always worked, from
+    principals with no relationship to this feature — a port number, a JSON
+    config line, a repeated-word rollback note, a long runbook.
+
+    The right standard is the one the MANUAL accept path sets: resolve_candidate
+    enforces instruction_like and nothing else. The floor decides whether newly
+    authored content is good enough to store with nobody looking; a correction
+    names what it supersedes and lands in the agent's own tier. Content failing
+    the floor is low-quality, not dangerous — and the dangerous class is gated
+    unconditionally by the next test.
+    """
     principal = _principal(auto_accept_own=True)
     owned, _r, _ = _learn(principal, db_path,
                           content="Pin the CLI version so a release is a file change.")
-    assert owned["status"] == "accepted"
     context, _ = _context(principal, db_path)
     out = governance.handle_resolve_contradiction(
-        {"new_content": content, "supersede_ids": [owned["learning_id"]], **kwargs},
+        {"new_content": content, "supersede_ids": [owned["learning_id"]]}, 3, context,
+    )
+    assert "error" not in out, f"a legitimate correction was refused: {out}"
+
+
+def test_privacy_level_is_not_consulted_on_corrections(db_path):
+    """It was, briefly. `resolve_contradiction` never stores privacy — the row
+    it writes has no such column — so the rule blocked an honest caller while
+    being evaded by deleting the field. A gate with zero security value and real
+    breakage is worse than no gate."""
+    principal = _principal(auto_accept_own=True)
+    owned, _r, _ = _learn(principal, db_path,
+                          content="Pin the CLI version so a release is a file change.")
+    context, _ = _context(principal, db_path)
+    out = governance.handle_resolve_contradiction(
+        {"new_content": "A corrected and perfectly reasonable learning.",
+         "supersede_ids": [owned["learning_id"]], "privacy_level": "sensitive"},
         3, context,
     )
-    assert "error" in out, f"{why}: floor-refused content landed durable: {out}"
-    assert out["error"]["code"] == -32004
-    stored = [r["content"] for r in _rows(db_path, "SELECT content FROM learnings")]
-    assert content not in stored
+    assert "error" not in out, out
 
 
 def test_an_operator_may_still_correct_freely(db_path):
@@ -735,3 +757,138 @@ def test_new_content_is_size_capped_even_for_an_operator(db_path):
     )
     assert out["error"]["code"] == -32602, out
     assert max(len(r["content"]) for r in _rows(db_path, "SELECT content FROM learnings")) <= MAX_LEARN_CHARS
+
+
+# ── round 3 of the adversarial pass ────────────────────────────────────────
+
+
+def test_a_missing_hash_column_stages_instead_of_losing_the_learn(db_path, monkeypatch):
+    """R1: the INSERT names content_hash unconditionally, so a False return from
+    the column check reached it and raised "no such column" — losing the learn
+    outright. A transient SQLITE_BUSY on the DDL is a mundane trigger, and this
+    is the exact regression the fail-soft block exists to prevent."""
+    monkeypatch.setattr(
+        "minni.minnid_runtime.governance.ensure_content_hash_column",
+        lambda db: False,
+    )
+    res, _resp, _ = _learn(_principal(auto_accept_own=True), db_path)
+    assert res["status"] == "proposed", f"the learning was lost: {res}"
+    assert _rows(db_path, "SELECT * FROM candidate_packets")
+    assert _rows(db_path, "SELECT * FROM learnings") == []
+
+
+def test_a_committed_learning_is_not_reported_as_a_failure(db_path):
+    """R4: index_durable_learning sits after the COMMIT. Letting it raise
+    returned -32000 for a learn that had in fact succeeded — so the caller
+    retried and staged a duplicate while the first copy sat durable and
+    unindexed, which is the state the indexing exists to prevent."""
+    from minni.db import SovereignDB
+    from minni.writeback import WriteBackMemory
+    import minni.config as cfg
+
+    def boom(*a, **k):
+        raise RuntimeError("faiss index unavailable")
+
+    def handler_principal(params, request_id, **kwargs):
+        return _principal(auto_accept_own=True), None
+
+    class _Logger:
+        def __getattr__(self, _n):
+            return lambda *a, **k: None
+
+    context = governance.GovernanceContext(
+        handler_principal=handler_principal,
+        lazy_writeback=lambda: WriteBackMemory(SovereignDB(), cfg.DEFAULT_CONFIG),
+        sovereign_db=SovereignDB,
+        make_response=lambda r, i: {"result": r},
+        make_error=lambda c, m, i: {"error": {"code": c, "message": m}},
+        logger=_Logger(),
+        index_durable_learning=boom,
+        maybe_archive_inbox_source=lambda *a, **k: None,
+        lazy_episodic=lambda: None,
+        record_latency=lambda *a, **k: None,
+        increment_request_count=None,
+    )
+    resp = governance.handle_learn({"content": "A durable learning worth keeping."}, 1, context)
+    res = resp.get("result") or resp
+    assert "error" not in resp, f"a committed write was reported as failed: {resp}"
+    assert res["status"] == "accepted"
+    assert res.get("indexed") is False, "the caller is not told indexing failed"
+    assert len(_rows(db_path, "SELECT * FROM learnings")) == 1
+
+
+def test_the_duplicate_probe_does_not_leak_across_principals(db_path):
+    """R5: the dedup SELECT was global and its reason is echoed back — an
+    exact-match existence oracle over every agent's durable content. Same class
+    this repo already closed on handle_learn's contradiction scan."""
+    secret = "The prod database rotation happens every thirty seven days exactly."
+    owner, _r, _ = _learn(_principal("codex", auto_accept_own=True), db_path,
+                          content=secret)
+    assert owner["status"] == "accepted"
+
+    other, _r, _ = _learn(_principal("claude-code", auto_accept_own=True), db_path,
+                          content=secret)
+    assert "duplicate of an existing learning" not in other.get(
+        "auto_accept_withheld", []
+    ), "the probe confirmed another principal's content"
+    owners = {r["agent_id"] for r in _rows(db_path, "SELECT agent_id FROM learnings")}
+    assert owners == {"codex", "claude-code"}
+
+
+def test_knobless_callers_get_no_new_response_fields(db_path):
+    """A surviving mutant: dropping the knob check from the response branch
+    added `auto_accept_withheld` to EVERY caller's learn response — a wire
+    contract change for principals with no relationship to this feature. The
+    "no-op when off" guarantee has to be pinned at the response level, not just
+    on status and DB rows."""
+    res, _resp, _ = _learn(_principal(auto_accept_own=False), db_path, content="a b")
+    assert res["status"] == "proposed"
+    assert "auto_accept_withheld" not in res, res
+    assert "resolved_by" not in res
+    assert "indexed" not in res
+
+
+def test_the_supersede_cap_is_pinned_at_its_boundary(db_path):
+    """A surviving mutant: the test used 5000 against a cap of 64, so widening
+    the cap to 4999 passed. Deriving the boundary from the constant is not
+    enough on its own — the mutant moves the constant AND the boundary
+    together, so the constant's own range has to be asserted."""
+    from minni.minnid_runtime.governance import MAX_SUPERSEDE_IDS
+
+    # The point of the cap is bounding one request's write-lock hold and its
+    # contradiction_events fan-out. A cap in the thousands is not a cap.
+    assert 1 < MAX_SUPERSEDE_IDS <= 256, MAX_SUPERSEDE_IDS
+
+    principal = _principal(auto_accept_own=True, capabilities=["*"])
+    owned, _r, _ = _learn(principal, db_path,
+                          content="Pin the CLI version so a release is a file change.")
+    context, _ = _context(principal, db_path)
+    out = governance.handle_resolve_contradiction(
+        {"new_content": "A replacement learning that is perfectly fine.",
+         "supersede_ids": list(range(1, MAX_SUPERSEDE_IDS + 2))},
+        3, context,
+    )
+    assert out["error"]["code"] == -32602, out
+
+
+def test_resolution_mix_requires_the_full_auto_stamp(db_path):
+    """A surviving mutant: loosening the prefix to "auto_accept" would count any
+    future `auto_*` stamp as this channel. The grammar is the contract."""
+    import sqlite3
+
+    from minni.minnid_runtime.health import resolution_mix_stats
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            "INSERT INTO candidate_packets (principal, workspace_id, content, "
+            "status, proposed_at, resolved_by) VALUES "
+            "('a','default','x','accepted', 1.0, 'auto_accept_elsewhere')"
+        )
+        conn.commit()
+        mix = resolution_mix_stats(conn.cursor())
+    finally:
+        conn.close()
+    assert mix["auto_accept_own"] == 0, "a foreign auto_* stamp counted as this channel"
+    assert mix["manual"] == 1

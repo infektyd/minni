@@ -222,6 +222,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         now = time.time()
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
 
+
         emb_bytes = None
         if wb.model:
             try:
@@ -371,27 +372,30 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
             request_id,
         )
 
-    if not is_operator_principal(principal) and not explicitly_allowed_operator(
-        principal
-    ):
-        withheld = [
-            r
-            for r in auto_accept_blockers(
-                new_content, False, params.get("privacy_level", "safe")
-            )
-            if r != "instruction_like"
-        ]
-        if withheld:
-            context.logger.warning(
-                "RESOLVE_CONTRADICTION_REFUSED principal=%s reasons=%s (G15 audit)",
-                agent_id, ",".join(withheld),
-            )
-            return context.make_error(
-                -32004,
-                "quality_floor: new_content cannot be written as a durable "
-                f"learning ({'; '.join(withheld)}); an operator may still write it",
-                request_id,
-            )
+    # DELIBERATELY only the safety rule, not the whole auto-accept floor.
+    #
+    # A previous round applied all five floor rules here and that was an
+    # overcorrection, measured against origin/main: it refused corrections that
+    # had always worked, from principals with no relationship to this feature —
+    # "Port: 8080" (too short), a JSON config line (low alphabetic ratio), a
+    # 10k-char runbook (oversized), "rollback rollback rollback" (too few
+    # distinct words). It also gated on `privacy_level`, a field this handler
+    # never stores, so the rule blocked an honest caller and was evaded by
+    # deleting the field.
+    #
+    # The right standard is the one the MANUAL accept path already sets:
+    # resolve_candidate enforces instruction_like and nothing else. The floor is
+    # an auto-PROMOTION quality gate — it decides whether newly authored content
+    # is good enough to store with nobody looking — and content failing it is
+    # low-quality, not dangerous. A correction names what it supersedes and is
+    # the agent's own tier, which is the whole point of the #290 ruling.
+    #
+    # RESIDUAL, stated rather than implied: an opted-in agent can therefore land
+    # content here that auto-accept would have withheld on quality. That is
+    # bounded to its own memory and to content a human accepting the same
+    # candidate would also have allowed. The class that is NOT allowed is the
+    # one that matters — prompt injection — and it is gated unconditionally
+    # below, lifting only for the literal accept_flagged capability.
 
     # Unbounded and unde-duplicated, this wrote one contradiction_events row per
     # (id, new learning) pair inside BEGIN IMMEDIATE: measured 400k rows and 2.1s
@@ -421,6 +425,19 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
 
         now = time.time()
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
+
+        # Hoisted ABOVE the transaction on purpose. This helper opens a cursor,
+        # and SovereignDB.cursor() commits on exit on the same thread-local
+        # connection — calling it inside `with db.transaction()` ended the
+        # enclosing BEGIN IMMEDIATE, so the ownership checks committed early and
+        # the INSERT/UPDATE/event block silently ran in a separate deferred
+        # transaction. Measured: a rollback after that point left rows behind,
+        # and the docstring's "atomically supersede" had stopped being true.
+        _chash = None
+        if ensure_content_hash_column(wb.db):
+            from minni.afm_passes.consolidation import content_hash as _content_hash
+
+            _chash = _content_hash(new_content)
 
         emb_bytes = None
         if wb.model:
@@ -461,15 +478,6 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                         "explicitly allowed operator)",
                         request_id,
                     ))
-            # content_hash so this writer is visible to the duplicate gate too
-            # — omitting it reintroduced a NULL-hash row on every correction.
-            _chash = None
-            if ensure_content_hash_column(wb.db):
-                from minni.afm_passes.consolidation import (
-                    content_hash as _content_hash,
-                )
-
-                _chash = _content_hash(new_content)
             c.execute("""
                 INSERT INTO learnings
                 (agent_id, category, content, source_doc_ids, source_query,
@@ -869,8 +877,16 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             try:
                 from minni.afm_passes.consolidation import content_hash as _content_hash
 
-                if ensure_content_hash_column(db):
-                    chash = _content_hash(stored_content)
+                if not ensure_content_hash_column(db):
+                    # The INSERT below names content_hash unconditionally, so a
+                    # missing column is fatal to the durable write. Raise into
+                    # the handler right below rather than proceeding: a
+                    # transient SQLITE_BUSY on the DDL otherwise reached the
+                    # INSERT and lost the learn outright ("no column named
+                    # content_hash"), which is the exact regression this
+                    # fail-soft block exists to prevent.
+                    raise RuntimeError("content_hash column unavailable")
+                chash = _content_hash(stored_content)
                 model = getattr(wb, "model", None)
                 if model is not None:
                     import numpy as np
@@ -916,8 +932,15 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             if auto_accept and chash is not None:
                 # Inside the txn: a read-then-insert outside it races another
                 # auto-accept of the same content.
+                # Scoped to the caller, matching where the row is written. A
+                # global probe is an exact-match existence oracle over every
+                # agent's durable content, and the echoed "duplicate" reason
+                # confirms the hit — the same class this repo already closed on
+                # handle_learn's contradiction scan (R5, 2026-07-02 triage).
                 c.execute(
-                    "SELECT 1 FROM learnings WHERE content_hash=? LIMIT 1", (chash,)
+                    "SELECT 1 FROM learnings WHERE content_hash=? AND agent_id=? "
+                    "LIMIT 1",
+                    (chash, principal.agent_id),
                 )
                 if c.fetchone() is not None:
                     auto_accept = False
@@ -962,12 +985,25 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                     ),
                 )
 
+        indexed_ok = True
         if lid is not None:
             # An unindexed durable learning is not recallable, which would make
-            # the feature look like it worked while delivering nothing.
-            context.index_durable_learning(
-                principal.agent_id, stored_content, key=f"learning:{lid}", db=db,
-            )
+            # the feature look like it worked while delivering nothing — but the
+            # row is already COMMITTED by here. Letting this raise returned
+            # -32000 for a learn that had in fact succeeded, so the caller
+            # retried and staged a duplicate while the first copy sat durable
+            # and unindexed. Report the truth instead.
+            try:
+                context.index_durable_learning(
+                    principal.agent_id, stored_content, key=f"learning:{lid}", db=db,
+                )
+            except Exception as exc:
+                indexed_ok = False
+                context.logger.warning(
+                    "AUTO_ACCEPT_OWN_UNINDEXED candidate=%s learning=%s (%s); the "
+                    "learning is durable but not recallable until reindexed "
+                    "(G15 audit)", cid, lid, exc,
+                )
             context.logger.warning(
                 "AUTO_ACCEPT_OWN candidate=%s learning=%s principal=%s "
                 "(operator-enabled; resolved_by=%s) (G15 audit)",
@@ -998,6 +1034,8 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
         if lid is not None:
             result["learning_id"] = lid
             result["resolved_by"] = resolved_by
+            if not indexed_ok:
+                result["indexed"] = False
         elif withheld and getattr(principal, "auto_accept_own", False):
             result["auto_accept_withheld"] = withheld
         return context.make_response(result, request_id)
