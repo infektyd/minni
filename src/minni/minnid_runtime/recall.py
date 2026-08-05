@@ -1624,14 +1624,20 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                         )
 
         with db.cursor() as c:
-            c.execute("""
+            # Reads NON_MEMORY_EVENT_TYPES rather than hardcoding 'recall': a
+            # third literal here would drift from the search filter and the
+            # episodic coverage metric the moment a trace type is added.
+            from minni.episodic import NON_MEMORY_EVENT_TYPES
+
+            _traces = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
+            c.execute(f"""
                 SELECT event_type, content, created_at
                 FROM episodic_events
                 WHERE agent_id = ?
-                  AND event_type != 'recall'
+                  AND event_type NOT IN ({_traces})
                 ORDER BY created_at DESC
                 LIMIT 5
-            """, (agent_id,))
+            """, (agent_id, *NON_MEMORY_EVENT_TYPES))
             rows = c.fetchall()
             if rows:
                 lines.append(f"\n## Recent Activity ({agent_id})")

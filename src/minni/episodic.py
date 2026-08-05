@@ -9,6 +9,7 @@ V3.1 changes:
 """
 
 import json
+import sqlite3
 import time
 import zlib
 import logging
@@ -21,6 +22,79 @@ from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.db import SovereignDB
 
 logger = logging.getLogger("sovereign.episodic")
+
+# Observability-only event types: written by the recall trace, not agent memory.
+# The single source of truth for "this row is not a memory" — retrieval's
+# RetrievalEngine.EPISODIC_NON_MEMORY_TYPES and the episodic coverage metric
+# both read this, so an added trace type cannot mean one thing to the search
+# filter and another to the health surface.
+NON_MEMORY_EVENT_TYPES: tuple = ("recall",)
+
+
+def _episodic_tables_present(conn: sqlite3.Connection) -> bool:
+    """True only when both episodic_events and episodic_fts exist.
+
+    Partial schemas are real: migrations run against test fixtures that build a
+    subset of tables, and the reconcile below must be a no-op there rather than
+    taking the whole migration batch down.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE name IN ('episodic_events', 'episodic_fts')"
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    return len({r[0] for r in rows}) == 2
+
+
+def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
+    """Insert every content-bearing episodic_events row missing from episodic_fts.
+
+    trg_episodic_fts_insert keeps the index in step going forward, but a trigger
+    only sees rows written after it exists. Every event logged before the trigger
+    was added stayed out of episodic_fts permanently, and nothing reconciled it:
+    the text sat in episodic_events while search_episodic — which reads only the
+    FTS table — could not return it. On the operator's own database that was 35
+    of the 43 non-trace events, so ~81% of real episodic memory was unreachable.
+
+    Idempotent by construction: it inserts exactly the rows the index lacks, so a
+    second run inserts nothing. Safe on a fresh or partial schema (no-op).
+    """
+    if not _episodic_tables_present(conn):
+        logger.debug("reconcile_episodic_fts: episodic tables absent — no-op")
+        return {"missing_before": 0, "inserted": 0}
+
+    # `event_id IS NOT NULL` is load-bearing, not defensive noise: episodic_fts
+    # stores event_id as an UNINDEXED fts5 column, which has no affinity and no
+    # NOT NULL constraint. A single NULL in that column makes `NOT IN` evaluate
+    # to NULL for every candidate row, and the backfill would silently insert
+    # nothing while reporting success.
+    indexed_ids = (
+        "SELECT CAST(event_id AS INTEGER) FROM episodic_fts"
+        " WHERE event_id IS NOT NULL"
+    )
+    missing_before = conn.execute(
+        f"SELECT COUNT(*) FROM episodic_events"
+        f" WHERE content IS NOT NULL AND event_id NOT IN ({indexed_ids})"
+    ).fetchone()[0]
+
+    if not missing_before:
+        return {"missing_before": 0, "inserted": 0}
+
+    cur = conn.execute(
+        f"""INSERT INTO episodic_fts(event_id, agent_id, content)
+            SELECT event_id, agent_id, content
+              FROM episodic_events
+             WHERE content IS NOT NULL
+               AND event_id NOT IN ({indexed_ids})"""
+    )
+    inserted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    logger.info(
+        "reconcile_episodic_fts: indexed %d episodic event(s) the trigger never saw",
+        inserted,
+    )
+    return {"missing_before": missing_before, "inserted": inserted}
 
 
 class EpisodicMemory:
@@ -306,18 +380,23 @@ class EpisodicMemory:
         advertised TTL without depending on a global cleanup pass (which
         nothing schedules today); other event types are untouched."""
         cutoff = time.time() - max_age_seconds
+        # Reads NON_MEMORY_EVENT_TYPES rather than repeating 'recall': a trace
+        # type added to the shared list would otherwise be filtered out of
+        # search, health and Recent Activity but never reaped, accumulating
+        # forever in the one table this method exists to bound.
+        marks = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
         with self.db.cursor() as c:
-            c.execute("""
+            c.execute(f"""
                 DELETE FROM episodic_fts
                 WHERE event_id IN (
                     SELECT event_id FROM episodic_events
-                    WHERE event_type = 'recall' AND created_at < ?
+                    WHERE event_type IN ({marks}) AND created_at < ?
                 )
-            """, (cutoff,))
+            """, (*NON_MEMORY_EVENT_TYPES, cutoff))
             c.execute(
-                "DELETE FROM episodic_events"
-                " WHERE event_type = 'recall' AND created_at < ?",
-                (cutoff,))
+                f"DELETE FROM episodic_events"
+                f" WHERE event_type IN ({marks}) AND created_at < ?",
+                (*NON_MEMORY_EVENT_TYPES, cutoff))
             return c.rowcount
 
     def cleanup_expired(self, max_age_seconds: int = 604800) -> int:

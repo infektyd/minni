@@ -203,6 +203,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                         _execute_tolerant(conn, statement)
                 if version == 13:
                     _apply_migration_013_legacy_main_rewrite(conn)
+                if version == 18:
+                    _apply_migration_018_episodic_fts_backfill(conn)
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, os.path.basename(filepath), now),
@@ -361,6 +363,51 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _apply_migration_018_episodic_fts_backfill(conn: sqlite3.Connection) -> None:
+    """Index the episodic events written before trg_episodic_fts_insert existed.
+
+    Delegates to episodic.reconcile_episodic_fts so the repair and the
+    episodic coverage metric in health measure the same thing. No-op on a
+    schema without both episodic tables, and on a database already in step.
+    See migrations/018_backfill_episodic_fts.sql for the full rationale.
+    """
+    from minni.episodic import reconcile_episodic_fts
+
+    # A data repair must never gate schema evolution. _flush_batch runs every
+    # pending migration in ONE transaction, so an exception here would roll back
+    # 018 *and* every later version with it — and because the version is never
+    # recorded, 019/020/... would re-batch with the same failing repair on every
+    # start, freezing the ladder permanently behind one logged warning.
+    # _episodic_tables_present covers absent tables; this covers a table that is
+    # present but unwritable (wrong shape, corrupt index). An unindexed episodic
+    # log is a degraded search channel. A frozen migration ladder is worse.
+    #
+    # Swallowing the error means _flush_batch still stamps version 018, so
+    # run_migrations will NEVER retry this repair. That is deliberate, and it is
+    # why the retry lives elsewhere: minnid._backfill_sweep_once calls
+    # reconcile_episodic_fts on every periodic pass, so a transient failure (a
+    # locked DB on a contended start) self-heals instead of being abandoned.
+    #
+    # Consequence worth stating: MINNI_BACKFILL=off disables that sweep, and so
+    # silently removes the ONLY retry channel for this repair. On such an
+    # install a failed 018 is permanent, and episodic_index_ratio in the health
+    # report is the only thing that will say so.
+    try:
+        result = reconcile_episodic_fts(conn)
+    except Exception:
+        logger.warning(
+            "Migration 018: episodic FTS backfill failed — schema migration "
+            "continues. Migrations will NOT retry it (version 018 is stamped); "
+            "the periodic backfill sweep will, and episodic_index_ratio in the "
+            "health report shows the gap until it does.", exc_info=True,
+        )
+        return
+    logger.info(
+        "Migration 018: %d episodic event(s) backfilled into episodic_fts",
+        result["inserted"],
+    )
 
 
 def _apply_migration_013_legacy_main_rewrite(conn: sqlite3.Connection) -> None:
