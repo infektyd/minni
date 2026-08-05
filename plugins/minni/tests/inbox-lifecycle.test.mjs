@@ -471,20 +471,21 @@ test("all four hooks build their SessionStart pending_learnings through the shar
   // its SessionStart path, so no hook can quietly revert to an inline
   // pending.map(...) or skip the pre-reap while every test stays green.
   const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+  // #283: claude-code migrated onto the shared factory too, so it is now
+  // checked the same way as codex/grok/kilocode below rather than being
+  // special-cased as a source of its own inline copy.
   for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
     let source = await readFile(path.join(srcDir, hook), "utf8");
-    if (hook !== "hook.ts") {
-      // codex/kilocode: bare runHookMain. grok (and platform adapters): compose
-      // createHookHandlers + payload/output adapters — still the shared factory
-      // for SessionStart/Stop/etc., not a forked near-clone.
-      assert.ok(
-        source.includes('from "./hook-handlers.js"') &&
-          (source.includes("runHookMain(") || source.includes("createHookHandlers(")),
-        `${hook} must delegate to the shared hook-handlers factory ` +
-          "(runHookMain or createHookHandlers)",
-      );
-      source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
-    }
+    // hook.ts/codex/kilocode: bare runHookMain. grok (and platform adapters):
+    // compose createHookHandlers + payload/output adapters — still the shared
+    // factory for SessionStart/Stop/etc., not a forked near-clone.
+    assert.ok(
+      source.includes('from "./hook-handlers.js"') &&
+        (source.includes("runHookMain(") || source.includes("createHookHandlers(")),
+      `${hook} must delegate to the shared hook-handlers factory ` +
+        "(runHookMain or createHookHandlers)",
+    );
+    source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
     for (const call of [
       "buildPendingLearningsSection(",
       "expireStaleInboxHandoffs(",
@@ -630,18 +631,18 @@ test("expireStaleInboxHandoffs reads the env TTL at call time (C8 behavioral)", 
 
 test("all four hooks inject the active plan through the shared plan helpers (C5 hook-drift pin)", async () => {
   const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+  // #283: claude-code migrated onto the shared factory too — checked the
+  // same way as codex/grok/kilocode below, no special-case.
   for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
     let source = await readFile(path.join(srcDir, hook), "utf8");
-    if (hook !== "hook.ts") {
-      // codex/kilocode: runHookMain; grok: createHookHandlers + adapters.
-      assert.ok(
-        source.includes('from "./hook-handlers.js"') &&
-          (source.includes("runHookMain(") || source.includes("createHookHandlers(")),
-        `${hook} must delegate to the shared hook-handlers factory ` +
-          "(runHookMain or createHookHandlers)",
-      );
-      source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
-    }
+    // hook.ts/codex/kilocode: runHookMain; grok: createHookHandlers + adapters.
+    assert.ok(
+      source.includes('from "./hook-handlers.js"') &&
+        (source.includes("runHookMain(") || source.includes("createHookHandlers(")),
+      `${hook} must delegate to the shared hook-handlers factory ` +
+        "(runHookMain or createHookHandlers)",
+    );
+    source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
     assert.ok(
       source.includes("resolveActivePlanView("),
       `${hook} must resolve the active plan`,

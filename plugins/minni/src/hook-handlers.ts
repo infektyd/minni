@@ -4,11 +4,14 @@
 // behaviors. hook-utils.ts holds the protocol leaf helpers; this module holds
 // the stateful handler logic, parameterized by a typed per-agent config, so
 // future changes (evidence envelope format, plan injection, inbox drain
-// logic) have ONE maintenance surface instead of four. hook.ts (claude-code)
-// diverges structurally (PreCompact cannot inject context) and keeps its own
-// handler set — but NOT its own Stop: that one is `handleStopCore` below, which
-// hook.ts imports, because the Stop governance posture must be identical on
-// every platform and the two copies had already drifted.
+// logic) have ONE maintenance surface instead of four. #283: hook.ts
+// (claude-code) migrated onto this factory too — it was the last platform
+// carrying its own copy of the four handler bodies, which is what let PR
+// #282's Layer 1 shelf change land in hook.ts:356 and hook-handlers.ts:679
+// separately instead of once. Claude-specific behavior (identity-recall boot
+// identity, the lifecycle representation, boot-time handoff acking) lives
+// behind opt-in `AgentHookConfig` knobs — see their doc comments — rather
+// than a forked handler set.
 //
 // Handlers here return INTENT, not wire shapes: what reaches the model is
 // decided per platform by hook-platform.ts. Emitting Claude Code's envelope
@@ -16,11 +19,15 @@
 // Grok Build's memory outright.
 import {
   MEMORY_CONTRACT,
+  MINNI_LIFECYCLE_LINE,
+  buildLifecycleEmphasis,
   envelopeBudgetFor,
   hashTaskSignature,
+  lifecycleNudgeMode,
+  lifecycleSurfaceForIntent,
   wrapEnvelope,
 } from "./agent_envelope.js";
-import type { EnvelopeEvent } from "./agent_envelope.js";
+import type { EnvelopeEvent, LifecycleSurface } from "./agent_envelope.js";
 import {
   BRIDGE_FAILURE_EVENT,
   VALID_EVENTS,
@@ -56,9 +63,11 @@ import {
   clearRecallState,
   extractStrongRecall,
   markRecallConsumed,
+  readLifecycleState,
   readRecallState,
   recallPointerThreshold,
   recallStatePath,
+  writeLifecycleState,
   writeRecallState,
 } from "./recall-state.js";
 import {
@@ -74,6 +83,7 @@ import type {
 } from "./recall-guard.js";
 import {
   BOOT_RECALL_LAYERS,
+  ackHandoff,
   buildBootRecallSlice,
   buildStatusReport,
   extractIdentityBody,
@@ -81,13 +91,14 @@ import {
   truncateToTokenCharBudget,
   fetchStaleBeliefEvents,
   formatRecall,
+  listPendingHandoffs,
   readAgentContext,
   JSON_RPC_TIMEOUT_ERROR,
   recallMemory,
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import { extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
+import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -203,6 +214,29 @@ export interface AgentHookConfig {
    * `sessionstart-delivery.test.mjs` pins each value to its manifest.
    */
   sessionStartHookTimeoutMs?: number;
+  /**
+   * #283 migration knob (claude-code only today): the standing 4-surface
+   * lifecycle line (`prepare_task -> prepare_outcome -> plan -> learn`) rides
+   * SessionStart's envelope (mode-gated by `MINNI_LIFECYCLE_NUDGE_MODE`), and
+   * UserPromptSubmit computes/persists a once-per-session emphasis surface
+   * and injects a lifecycle-only envelope on the two turns that would
+   * otherwise be a bare no-op (write-intent gate, nothing-salient gate) so
+   * the line survives every turn. Omit (default false) to leave a platform's
+   * envelope untouched by this feature — it was never on for any agent but
+   * claude-code, and this knob keeps it that way rather than threading a new
+   * per-platform branch through every other hook.
+   */
+  lifecycleEnabled?: boolean;
+  /**
+   * #283 migration knob (claude-code only today): SessionStart lists this
+   * agent's pending handoff leases and acks each one (stopping when the boot
+   * budget runs out — an unacked lease just stays pending next boot), adding
+   * `handoff_acks` to the envelope. A failed LIST degrades `handoff_leases`;
+   * any lease left unacked (budget-cut or a failed ack) degrades
+   * `handoff_acks`. Omit (default false) — no other platform's SessionStart
+   * consults or acks pending handoffs today.
+   */
+  ackPendingHandoffsAtBoot?: boolean;
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -417,6 +451,7 @@ export interface AgentHookHandlers {
   handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
+  handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput>;
   handleStop(payload: Record<string, unknown>): Promise<HookOutput>;
   dispatch(
@@ -449,6 +484,36 @@ const COMPACT_HARVEST_PATH_ONLY_BUDGET_MS = 250;
 export function isPathOnlyCompactHarvestAllowed(platform: string | undefined): boolean {
   const id = (platform ?? "").trim().toLowerCase();
   return id.length > 0 && PATH_ONLY_COMPACT_HARVEST_ALLOW.has(id);
+}
+
+/**
+ * #283 (`config.lifecycleEnabled`): build this turn's lifecycle
+ * representation fields. The PERSISTENT line is always present in "soft"
+ * mode so the 4 surfaces stay in view; the situational `lifecycle_focus` is
+ * added when the prompt's ambition intent maps to a surface NOT yet
+ * emphasized this session. "off" mode returns `{}` — fully silent. The
+ * caller must persist any returned `emphasizedSurface` so the focus fires at
+ * most once per surface per session. Representation only — never a
+ * permission decision. Pure / agent-agnostic (reads the env mode directly),
+ * so it lives at module scope rather than inside `createHookHandlers`.
+ */
+function lifecycleFieldsFor(
+  prompt: string,
+  emphasized: Set<string>,
+): {
+  fields: { lifecycle?: string; lifecycle_focus?: string };
+  emphasizedSurface?: LifecycleSurface;
+} {
+  if (lifecycleNudgeMode() === "off") return { fields: {} };
+  const fields: { lifecycle?: string; lifecycle_focus?: string } = {
+    lifecycle: MINNI_LIFECYCLE_LINE,
+  };
+  const surface = lifecycleSurfaceForIntent(classifyIntent(prompt));
+  if (surface && !emphasized.has(surface)) {
+    fields.lifecycle_focus = buildLifecycleEmphasis(surface);
+    return { fields, emphasizedSurface: surface };
+  }
+  return { fields };
 }
 
 export function createHookHandlers(
@@ -585,6 +650,16 @@ export function createHookHandlers(
       );
     }
 
+    // #283 (config.lifecycleEnabled): reset the once-per-session lifecycle
+    // emphasis on a fresh session, so the situational focus can fire again
+    // this session. Best-effort — a state-write failure must not break boot.
+    if (config.lifecycleEnabled) {
+      await writeLifecycleState(config.vaultPath, {
+        session_id: sessionId,
+        emphasized: [],
+      }).catch(() => {});
+    }
+
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
     //
@@ -658,6 +733,54 @@ export function createHookHandlers(
       { ok: false, snippets: [] },
     );
     const handoffContext = handoffRead.snippets;
+
+    // #283 (config.ackPendingHandoffsAtBoot): list this agent's pending
+    // handoff leases and ack each one at boot. Sequential per-lease RPCs,
+    // deliberately: unbounded in the number of pending handoffs, so it is
+    // the loop most able to blow the deadline. Stop acking when the budget
+    // is gone — an unacked lease is still pending next boot; a killed hook
+    // is not. A FAILED ack is an unacked lease too — counting only the
+    // budget-skip path would report a timed-out or refused ack as clean.
+    let pendingHandoffs: { ok: boolean; data?: unknown; error?: unknown } = {
+      ok: true,
+      data: { handoffs: [] },
+    };
+    const ackedLeases: string[] = [];
+    let unackedLeases = 0;
+    if (config.ackPendingHandoffsAtBoot) {
+      pendingHandoffs = await withBudget(
+        listPendingHandoffs({ agentId: config.agentId, timeoutMs: remainingMs() }),
+        remainingMs(),
+        rpcTimedOut,
+      );
+      const pendingHandoffData =
+        pendingHandoffs.ok && pendingHandoffs.data
+          ? (pendingHandoffs.data as {
+              handoffs?: Array<{ lease_id?: string; leaseId?: string }>;
+            })
+          : { handoffs: [] };
+      for (const handoff of pendingHandoffData.handoffs ?? []) {
+        const leaseId = handoff.lease_id ?? handoff.leaseId;
+        if (!leaseId) continue;
+        if (remainingMs() <= 0) {
+          unackedLeases += 1;
+          continue;
+        }
+        const ack = await withBudget(
+          ackHandoff({
+            leaseId,
+            status: "accepted",
+            agentId: config.agentId,
+            timeoutMs: remainingMs(),
+          }),
+          remainingMs(),
+          rpcTimedOut,
+        );
+        if (ack.ok) ackedLeases.push(leaseId);
+        else unackedLeases += 1;
+      }
+    }
+
     // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
     // post-compaction boot re-injects them even if the daemon is down now.
     // Consumed entries are settled (exactly-once re-injection, no unbounded
@@ -794,12 +917,18 @@ export function createHookHandlers(
       status === undefined ? "status" : undefined,
       tail === undefined ? "audit_tail" : undefined,
       inboxStatus === undefined ? "pending_learnings" : undefined,
+      // config.ackPendingHandoffsAtBoot only: a no-op (always undefined) on
+      // every other platform, since unackedLeases stays 0 there.
+      config.ackPendingHandoffsAtBoot && unackedLeases > 0 ? "handoff_acks" : undefined,
       // Also degraded when the PARENT read was cut: handoffContext is resolved
       // from inboxStatus.entries, so a cut inbox read makes it vacuously empty.
       // ok:true over an empty set the hook never actually had inputs for is the
       // same false all-clear this section exists to prevent.
       handoffRead.ok && inboxStatus !== undefined ? undefined : "handoff_context",
       planRead.ok ? undefined : "active_thread",
+      // config.ackPendingHandoffsAtBoot only: a no-op (pendingHandoffs.ok
+      // stays true) on every other platform.
+      config.ackPendingHandoffsAtBoot && !pendingHandoffs.ok ? "handoff_leases" : undefined,
     ].filter((section): section is string => section !== undefined);
 
     const envelopeBody: Record<string, unknown> = {
@@ -834,6 +963,8 @@ export function createHookHandlers(
         path: snippet.relativePath,
         snippet: snippet.snippet,
       })),
+      // config.ackPendingHandoffsAtBoot only.
+      ...(config.ackPendingHandoffsAtBoot ? { handoff_acks: ackedLeases } : {}),
       // hooks-PL-1: discriminated stale-belief payload (matched /
       // checked_no_match from the daemon; explicit status:"error" here so
       // events:[] can never masquerade as "checked and clean").
@@ -854,6 +985,13 @@ export function createHookHandlers(
       // silent truncation). See vault.ts readLayer1Shelf / layer1ShelfBody.
       layer1_shelf: layer1ShelfBody(layer1Shelf),
     };
+
+    // #283 (config.lifecycleEnabled): the standing 4-surface lifecycle line
+    // at boot so the agent sees the spine from session start (unless the
+    // feature is off). No other platform's SessionStart carries this field.
+    if (config.lifecycleEnabled && lifecycleNudgeMode() !== "off") {
+      envelopeBody.lifecycle = MINNI_LIFECYCLE_LINE;
+    }
 
     if (correctionsReassert.length > 0) {
       envelopeBody.corrections_reassert = correctionsReassert;
@@ -971,6 +1109,52 @@ export function createHookHandlers(
     const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
     const signature = hashTaskSignature(prompt);
 
+    // #283 (config.lifecycleEnabled): compute the lifecycle representation
+    // once for this turn, BEFORE the early-return gates, so the persistent
+    // line survives them. Read the once-per-session emphasis set and persist
+    // any newly-emphasized surface. `lifecycleFields` stays `{}` — a no-op —
+    // on every other platform.
+    let lifecycleFields: { lifecycle?: string; lifecycle_focus?: string } = {};
+    if (config.lifecycleEnabled) {
+      const lifecycleStatePrev = await readLifecycleState(config.vaultPath);
+      const emphasizedSurfaces = new Set(lifecycleStatePrev?.emphasized ?? []);
+      const computed = lifecycleFieldsFor(prompt, emphasizedSurfaces);
+      lifecycleFields = computed.fields;
+      if (computed.emphasizedSurface) {
+        emphasizedSurfaces.add(computed.emphasizedSurface);
+        await writeLifecycleState(config.vaultPath, {
+          session_id: lifecycleStatePrev?.session_id ?? "session",
+          emphasized: [...emphasizedSurfaces],
+        }).catch(() => {});
+      }
+    }
+
+    // #283: emit an envelope carrying the lifecycle representation only —
+    // used at this handler's two early-returns (write-intent and
+    // nothing-salient gates) so the 4 surfaces survive turns that would
+    // otherwise inject nothing. Degrades to a plain no-op when
+    // `lifecycleFields` is empty (lifecycleEnabled is off, feature mode is
+    // "off", or no fields were computed this turn) — safe to call
+    // unconditionally on every platform.
+    const lifecycleOnlyOutput = (): Promise<HookOutput> => {
+      if (lifecycleFields.lifecycle === undefined && lifecycleFields.lifecycle_focus === undefined) {
+        return render(noIntent);
+      }
+      const envelope = wrapEnvelope({
+        event: "UserPromptSubmit",
+        agent: config.agentId,
+        body: {
+          identity: {
+            agent: config.agentId,
+            workspace: workspaceId,
+            task_signature: signature,
+          },
+          ...lifecycleFields,
+        },
+      });
+      return render(injectIntent("UserPromptSubmit", envelope));
+    };
+
     const intent = routeMemoryIntent(prompt);
     // Explicit WRITE intents (learn/vault_write carry automaticAllowed:false) are
     // the user dictating memory, not asking the agent to recall — inject no
@@ -981,7 +1165,9 @@ export function createHookHandlers(
       // s6 guard deny an unrelated read/search here (parity with the weak-turn
       // path below, which also clears).
       await clearRecallState(config.vaultPath).catch(() => {});
-      return render(noIntent);
+      // #283: the persistent lifecycle visibility must survive this
+      // write-intent early-return.
+      return lifecycleOnlyOutput();
     }
 
     const threshold = recallPointerThreshold();
@@ -993,7 +1179,7 @@ export function createHookHandlers(
     const budgetMs = effectiveHookBudgetMs(config.promptHookTimeoutMs);
     const deadline = Date.now() + budgetMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
-    const [vaultResults, recall] = await Promise.all([
+    const [vaultResultsRaw, recall] = await Promise.all([
       withBudget(searchVaultNotes(config.vaultPath, prompt, 6), remainingMs(), []),
       withBudget(
         recallMemory({
@@ -1010,6 +1196,18 @@ export function createHookHandlers(
         { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
       ),
     ]);
+    // SEC-006 (found during #283 review): searchVaultNotes returns every
+    // match regardless of privacy level — only `filterSafeVaultResults`
+    // keeps `local-only`/`private` notes and privacy-heuristic escalations
+    // (secrets/tokens/paths, see task.ts privacyForSource) out of the
+    // model-facing recall pointer, the
+    // persisted recall-state top_hits, and the PreToolUse guard's deny-
+    // reason text (all three read from `strong`/`vaultResults` below). This
+    // filter existed in claude-code's pre-#283 hook.ts but was never ported
+    // here when codex/grok-build/cursor/gemini/kilocode were extracted onto
+    // this factory — every platform sharing this handler has been leaking
+    // non-safe notes into UserPromptSubmit. Fixed once, for all six.
+    const vaultResults = filterSafeVaultResults(vaultResultsRaw);
     // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
     // the weak-turn path below, which CLEARS recall-state.
     const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
@@ -1076,10 +1274,16 @@ export function createHookHandlers(
           ...(rawSessionId ? { session_id: rawSessionId } : {}),
         },
       });
-      return render(noIntent);
+      // #283: even with nothing salient (no strong recall, no active plan)
+      // the persistent lifecycle line still rides this turn's envelope.
+      return lifecycleOnlyOutput();
     }
 
     const envelopeBody: Record<string, unknown> = {
+      // #283 (config.lifecycleEnabled): persistent lifecycle line (+
+      // situational focus) rides the salient turn too. `{}` on every other
+      // platform.
+      ...lifecycleFields,
       identity: {
         agent: config.agentId,
         workspace: workspaceId,
@@ -1132,6 +1336,7 @@ export function createHookHandlers(
         task_signature: signature,
         workspace: workspaceId,
         recall_strong: Boolean(strong),
+        top_score: strong?.topScore,
         // RAW id only — see the weak-path comment above.
         ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
@@ -1298,6 +1503,38 @@ export function createHookHandlers(
     return { continue: true };
   }
 
+  // #283: primary compaction-summary delivery for platforms whose native
+  // hook system fires a dedicated post-compaction event with the finished
+  // summary attached directly (Claude Code's `PostCompact`, which hands it
+  // over as `compact_summary` — documented 2026-07-29). Distinct from
+  // `handleCompactSummary` above (Kilo's bridge-specific `CompactSummary`
+  // event, `summary_text`/`summary_id` fields) because the two are genuinely
+  // different wire-level triggers with different payload shapes that both
+  // funnel into the same `harvestSummaryText` sink. The SessionStart
+  // tail-read backstop above stays as the fallback for what this can miss
+  // (hook not yet registered when compaction ran, older CLI, crash between
+  // compaction and hook); the shared content-hash dedup keeps the two paths
+  // from double-harvesting. Injects nothing — there is no model turn to
+  // inject into. Raw storage only; the daemon's compact_distillation pass
+  // does the AFM review on its own timer.
+  async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
+    await ensureVault(config.vaultPath);
+    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    await harvestSummaryText(
+      {
+        vaultPath: config.vaultPath,
+        workspaceId: workspaceFor(payload),
+        auditPrefix: config.auditPrefix,
+        platform: config.runtime ?? config.agentId,
+      },
+      {
+        summaryText: asString(payload.compact_summary),
+        sessionId,
+      },
+    );
+    return { continue: true };
+  }
+
   // Stop lives in the shared handleStopCore (above) so the governance posture
   // has exactly one implementation across all five entrypoints — see its
   // doc comment for why hook.ts routes here too.
@@ -1414,6 +1651,13 @@ export function createHookHandlers(
         return handlePreToolUse(payload);
       case "PreCompact":
         return handlePreCompact(payload);
+      // #283 / #227: primary compaction-summary delivery for a platform
+      // whose own hook system fires a dedicated post-compaction event
+      // (Claude Code's PostCompact). Harmless to route unconditionally —
+      // no other platform's manifest declares this event today, so this
+      // case simply never fires for them.
+      case "PostCompact":
+        return handlePostCompact(payload);
       case "CompactSummary":
         return handleCompactSummary(payload);
       case "Stop":
@@ -1422,9 +1666,7 @@ export function createHookHandlers(
         // P4 (#228): `render(noIntent)` reports a clean, successful no-op —
         // which is honest for "ran fine, nothing to say" but a lie for "this
         // event passed the VALID_EVENTS gate and then found no handler".
-        // PostCompact is exactly that case on this generic path: it is a valid
-        // envelope event, so it gets in here, and then falls through to a
-        // silent success. Record it, then continue as before.
+        // Record it, then continue as before.
         await recordUnroutedEvent(config.vaultPath, config.auditPrefix, event);
         return render(noIntent);
     }
@@ -1434,6 +1676,7 @@ export function createHookHandlers(
     handleSessionStart,
     handleUserPromptSubmit,
     handlePreCompact,
+    handlePostCompact,
     handleCompactSummary,
     handleStop,
     handlePreToolUse,

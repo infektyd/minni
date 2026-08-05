@@ -221,6 +221,9 @@ test("factory-driven entrypoints pin their platform wire, not agentId lookup", a
     "kilocode-hook.ts": "kilocodeWire",
     "cursor-hook.ts": "cursorWire",
     "gemini-hook.ts": "geminiWire",
+    // #283: claude-code migrated onto runHookMain too, so it is now a
+    // factory-driven entrypoint like every other platform here.
+    "hook.ts": "claudeCodeWire",
   };
 
   for (const [file, wire] of Object.entries(entries)) {
