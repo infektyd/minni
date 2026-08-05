@@ -1477,9 +1477,28 @@ export async function resolvePlanIdOrActive(
   return { plan_id: active.plan_id };
 }
 
+// #295 (June audit N8): shelfDrift() was reachable only by explicitly calling
+// minni_thread_status with live_shelf_content supplied by hand — drift was
+// found only when someone thought to check. resolveActivePlanView is the one
+// function both hook.ts (claude-code) and hook-handlers.ts (every other
+// wired platform) already call at SessionStart to inject the active plan, so
+// wiring the check in here — rather than adding a new call site per
+// platform, which #296's hook.ts/hook-handlers.ts duplication makes
+// expensive — covers every platform uniformly regardless of the #283
+// migration. `liveShelfContent` is the SessionStart handler's own
+// already-read layer1/core.md body (readLayer1Shelf), passed in rather than
+// re-read here: this function does no I/O beyond the plan note itself, and
+// the whole point of shelfDrift's "never pulls" contract is that it compares
+// against content the caller already has, not content it goes and fetches.
 export async function resolveActivePlanView(
-  vaultPath: string
-): Promise<{ plan_id: string; rev: number; view: ReturnType<typeof compactPlanView> } | undefined> {
+  vaultPath: string,
+  liveShelfContent?: string,
+): Promise<{
+  plan_id: string;
+  rev: number;
+  view: ReturnType<typeof compactPlanView>;
+  shelf_drift?: ReturnType<typeof shelfDrift>;
+} | undefined> {
   try {
     const active = await getActivePlan(vaultPath);
     if (!active) return undefined;
@@ -1520,6 +1539,14 @@ export async function resolveActivePlanView(
       plan_id: active.plan_id,
       rev: plan.rev,
       view: compactPlanView(plan),
+      // #295: only computed (and only non-undefined) when the caller supplied
+      // live shelf content AND the plan actually has a shelf_ref configured —
+      // omitted entirely rather than a misleading "configured: false" when the
+      // caller didn't pass anything, so a degraded/budget-cut layer1Shelf read
+      // upstream reads as "not checked", not "checked and fine".
+      ...(liveShelfContent !== undefined && plan.shelf_ref
+        ? { shelf_drift: shelfDrift(plan, liveShelfContent) }
+        : {}),
     };
   } catch {
     return undefined;

@@ -903,8 +903,26 @@ export function createHookHandlers(
     // Note the honest limit that leaves: a plan FS failure is indistinguishable
     // from 'no active plan', because resolveActivePlanView conflates them at
     // source. Pre-existing and out of scope here — fixing it belongs in plan.ts.
+    // #295: reuse the layer1Shelf body already read above (readLayer1Shelf)
+    // rather than a second read — shelfDrift's "never pulls" contract means
+    // this is a comparison against content the boot already has, not a new
+    // fetch. Omitted (undefined) when the shelf read itself failed, so a
+    // degraded shelf read reads as "drift not checked", not "checked clean".
+    //
+    // Review round: also omit on `truncated`. readLayer1Shelf caps at
+    // LAYER1_SHELF_MAX_BYTES and still returns ok:true with the truncated
+    // prefix — hashing that prefix as if it were the whole file makes
+    // shelfDrift compare against content the stored hash was never computed
+    // from, producing a PERMANENT false "drifted" that pulling can never
+    // clear (the live hash can never match the stored one again, since the
+    // stored hash covers bytes this reader will never see again). That is
+    // the exact false-confidence inversion this feature exists to avoid —
+    // "not checked" must win over "checked, but on the wrong bytes."
     planRead = await withBudget(
-      resolveActivePlanView(config.vaultPath).then((view) => ({ ok: true, view })),
+      resolveActivePlanView(
+        config.vaultPath,
+        layer1Shelf.ok && !layer1Shelf.truncated ? layer1Shelf.content : undefined,
+      ).then((view) => ({ ok: true, view })),
       remainingMs(),
       { ok: false, view: undefined },
     );
