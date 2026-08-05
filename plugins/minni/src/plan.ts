@@ -642,6 +642,172 @@ export async function createPlan(
   return { plan, write: writeRes, displaced_active };
 }
 
+// #294 (June audit N7): history.jsonl stored one full plan snapshot per
+// revision, unbounded — a long-running or frequently-updated plan grows this
+// file forever, and a completed plan's history was never archived either
+// (H4 unbounded growth). Cap it to the most recent N revisions on write;
+// older snapshots are dropped. A revision-count cap alone satisfies the
+// issue's acceptance criteria ("a bound ... exists"); archive-on-complete
+// was considered and deliberately NOT added on top of it — it would need to
+// decide where archived history lives, whether readHistory/minni_thread_history
+// check both locations, and how it interacts with a plan being reopened
+// after completion, none of which this issue's finding required solving.
+// A bounded rolling window is the smaller, sufficient fix; full historical
+// retention is a real but separate feature if an operator ever wants it.
+// getRevision/minni_thread_revision already handle a rotated-out revision as
+// a graceful "not found" (server.ts), so capping never surfaces as silently
+// wrong data — checked, not assumed.
+//
+// Configurable via MINNI_PLAN_HISTORY_CAP, parsed the same defensively-never-
+// breaks-a-write way as this codebase's other env-tunable caps (e.g.
+// MINNI_RPC_WORKERS in minnid.py): malformed or non-positive values fall
+// back to the default rather than failing the plan write that triggered it.
+// Strict digit-only validation (not Number.parseInt's lenient prefix
+// parsing) — a cassandra review round found parseInt silently reads
+// "1e9"/"1e3" as 1, so an operator RAISING the cap via that env var would
+// have gotten a cap of 1 instead — the opposite of their intent, and the
+// most destructive possible misparse of a size knob.
+const DEFAULT_PLAN_HISTORY_CAP = 200;
+// Rotate only once meaningfully over the cap, trimming back down to the cap.
+// Without this, a long-running plan sitting AT the cap triggers a full
+// read+rewrite+fsync on every single subsequent append forever (measured:
+// tens of KB to multi-MB per edit at realistic plan sizes) — hysteresis
+// amortizes that to roughly one rotation per HYSTERESIS_MARGIN appends, and
+// shrinks how often the read-then-rewrite race window (below) opens at all.
+// One consequence, noted here rather than left implicit: the cap is a soft
+// ceiling, not exact — between rotations a history file can hold up to
+// cap + HISTORY_ROTATION_HYSTERESIS valid lines (250 at the default), and
+// readHistory() will return all of them. That's the intended trade for
+// amortizing rewrite cost, not a bug.
+const HISTORY_ROTATION_HYSTERESIS = 50;
+// Upper bound on an operator-supplied cap. Without this, a huge value (e.g.
+// a typo'd extra digit) parses as a valid positive integer and silently
+// disables the whole feature this issue exists to add — a round-2 cassandra
+// finding. MAX is generous enough that no real deployment should hit it
+// deliberately, while still bounding worst-case file growth.
+const MAX_PLAN_HISTORY_CAP = 100_000;
+
+function planHistoryCap(): number {
+  const raw = (process.env.MINNI_PLAN_HISTORY_CAP ?? "").trim();
+  if (!/^\d+$/.test(raw)) return DEFAULT_PLAN_HISTORY_CAP;
+  const parsed = Number.parseInt(raw, 10);
+  if (!(parsed > 0)) return DEFAULT_PLAN_HISTORY_CAP;
+  return Math.min(parsed, MAX_PLAN_HISTORY_CAP);
+}
+
+/**
+ * The same validity predicate readHistory() applies when parsing lines, used
+ * here too so rotation's line count agrees with what readHistory actually
+ * reports. A cassandra round found rotation originally counted ANY non-blank
+ * line toward the cap while readHistory silently drops malformed/schema-
+ * invalid ones — a garbage line could occupy a cap slot and evict a genuine
+ * revision that readHistory would have returned. Filtering here the same way
+ * also means a garbage line is correctly dropped by rotation rather than
+ * preserved forever.
+ */
+function isValidHistoryLine(trimmed: string): boolean {
+  if (!trimmed) return false;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return (
+      typeof parsed.rev === "number" &&
+      typeof parsed.at === "string" &&
+      typeof parsed.digest === "string" &&
+      parsed.plan &&
+      typeof parsed.plan.plan_id === "string"
+    );
+  } catch {
+    return false;
+  }
+}
+
+export interface AppendHistorySnapshotDeps {
+  appendFileWithFsync?: typeof appendFileWithFsync;
+  writeFileAtomic?: typeof writeFileAtomic;
+  readFile?: typeof readFile;
+}
+
+// Per-history-file promise-chain lock, same shape as vault.ts's
+// withAuditLock. A cassandra review round REPRODUCED data loss without this:
+// appendHistorySnapshot's rotation does a separate read-then-rewrite: caller
+// A appends (durably, fsync'd), reads the file, then WHILE A is deciding/
+// writing the rotated file, caller B's append lands and fsyncs — A's stale
+// read still wins the race and A's writeFileAtomic overwrites B's already-
+// durable revision. persistPlan's call sites in server.ts are unserialized
+// async RPC handlers, so two edits to the SAME plan_id landing back-to-back
+// is a real, reachable interleaving within one daemon process, not a
+// theoretical one. This lock closes that window for same-process callers,
+// which is the reachable case in this codebase's concurrency model (one
+// daemon process serving multiple RPC/MCP requests). It does NOT close a
+// cross-process race (two independent OS processes editing the identical
+// plan_id at the same instant) — closing that would need a real filesystem
+// lock (flock/O_EXCL), a larger change this issue's scope does not require;
+// documented here as a known, narrow, disclosed residual rather than
+// silently assumed away.
+const historyLocks = new Map<string, Promise<void>>();
+
+async function withHistoryLock<T>(historyFile: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(historyFile);
+  const previous = historyLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current, () => current);
+  historyLocks.set(key, tail);
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (historyLocks.get(key) === tail) {
+      historyLocks.delete(key);
+    }
+  }
+}
+
+/**
+ * Append one history snapshot line, then cap the file to the most recent
+ * MINNI_PLAN_HISTORY_CAP (default 200) lines once meaningfully over the cap
+ * (see HISTORY_ROTATION_HYSTERESIS). The append itself is always durable
+ * (appendFileWithFsync) regardless of whether capping runs this call; capping
+ * rewrites the file atomically (writeFileAtomic) so a crash mid-rotation
+ * leaves the OLDER, uncapped file intact rather than a truncated one.
+ * Serialized per history file (withHistoryLock) so two concurrent callers
+ * for the same plan cannot interleave an append with another's rotation and
+ * lose an already-durable revision — see withHistoryLock's comment for the
+ * reproduced race this closes and the narrower cross-process gap it does not.
+ * If the post-append read fails for any reason, the append has already
+ * landed durably and capping is simply skipped for this call (self-heals on
+ * the next successful append).
+ */
+export async function appendHistorySnapshot(
+  historyFile: string,
+  snapshot: unknown,
+  deps: AppendHistorySnapshotDeps = {},
+): Promise<void> {
+  const doAppendWithFsync = deps.appendFileWithFsync ?? appendFileWithFsync;
+  const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
+  const doReadFile = deps.readFile ?? readFile;
+
+  await withHistoryLock(historyFile, async () => {
+    await doAppendWithFsync(historyFile, JSON.stringify(snapshot) + "\n");
+
+    const cap = planHistoryCap();
+    let raw: string;
+    try {
+      raw = await doReadFile(historyFile, "utf8");
+    } catch {
+      return;
+    }
+    const lines = raw.split(/\r?\n/).filter((line) => isValidHistoryLine(line.trim()));
+    if (lines.length <= cap + HISTORY_ROTATION_HYSTERESIS) return;
+    const kept = lines.slice(lines.length - cap);
+    await doWriteAtomic(historyFile, kept.join("\n") + "\n");
+  });
+}
+
 /** Write plan artifact back to vault (create or update). Recomputes updated + plan_digest. */
 export async function persistPlan(
   plan: PlanArtifact,
@@ -675,7 +841,7 @@ export async function persistPlan(
     );
   }
 
-  // append snapshot line to history file
+  // append snapshot line to history file, capped (#294) at MINNI_PLAN_HISTORY_CAP
   const historyFile = historyPathFor(writeRes.notePath);
   const snapshot = {
     rev: plan.rev,
@@ -683,7 +849,7 @@ export async function persistPlan(
     digest: plan.plan_digest,
     plan,
   };
-  await appendFileWithFsync(historyFile, JSON.stringify(snapshot) + "\n");
+  await appendHistorySnapshot(historyFile, snapshot);
 
   return writeRes;
 }
@@ -1163,20 +1329,15 @@ export async function readHistory(
     const results: Array<{ rev: number; at: string; digest: string; plan: PlanArtifact }> = [];
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed) continue;
+      // Shared with appendHistorySnapshot's rotation cap so the two agree on
+      // which lines count — a round-2 cassandra finding caught this as two
+      // independently-maintained copies of the same check (drift risk, not a
+      // live bug at the time) and asked for one real shared predicate.
+      if (!isValidHistoryLine(trimmed)) continue;
       try {
-        const parsed = JSON.parse(trimmed);
-        if (
-          typeof parsed.rev === "number" &&
-          typeof parsed.at === "string" &&
-          typeof parsed.digest === "string" &&
-          parsed.plan &&
-          typeof parsed.plan.plan_id === "string"
-        ) {
-          results.push(parsed);
-        }
+        results.push(JSON.parse(trimmed));
       } catch {
-        // tolerate malformed/blank lines
+        // unreachable: isValidHistoryLine already proved this parses
       }
     }
     return results;
