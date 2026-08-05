@@ -353,3 +353,88 @@ def quarantine_afm_dead_letter(
         "ttl_days": ttl,
         "dry_run": dry_run,
     }
+
+
+def _unusable_compact_files(
+    inbox: Path, fallback_principal: str, ttl_seconds: float, now: float,
+) -> List[Tuple[Path, Dict[str, Any]]]:
+    """``(path, reason_payload)`` for stale unusable compact-summary files.
+
+    #336: these had NO drain. ``quarantine_stale_agent_mismatch`` gates on
+    STOP_KINDS, so an explicit ``compact_summary`` kind is excluded, and
+    ``quarantine_afm_dead_letter`` is filename-scoped — so such a file stayed
+    in the inbox and was re-processed and re-dropped on every tick, ~96
+    times/day at the 900s consolidation interval, each with its own warning.
+
+    Classification is delegated to compact_distillation so the drain and the
+    health count cannot disagree about which files are unusable.
+    """
+    from minni.afm_passes.compact_distillation import classify_unusable_compact_file
+
+    out: List[Tuple[Path, Dict[str, Any]]] = []
+    principal = _principal_for_inbox(inbox, fallback_principal)
+    for path in sorted(inbox.glob("*.json")):
+        reason = classify_unusable_compact_file(path, principal)
+        if reason is None:
+            continue
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age <= ttl_seconds:
+            continue  # grace window: might still be corrected upstream
+        out.append((
+            path,
+            {
+                "reason": reason,
+                "resolved_vault_principal": principal,
+                "quarantined_at": _iso(now),
+                "age_days": round(age / 86400.0, 6),
+                "ttl_days": round(ttl_seconds / 86400.0, 6),
+            },
+        ))
+    return out
+
+
+def quarantine_unusable_compact_summaries(
+    config,
+    inboxes: Optional[List[Path]] = None,
+    *,
+    fallback_principal: str = "unknown",
+    ttl_days: Optional[float] = None,
+    now: Optional[float] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Drain stale unusable compact-summary files into ``quarantine/``.
+
+    Same contract as the two sibling drains: ``os.replace`` only (never an
+    unlink), a ``<name>.reason.json`` sidecar naming the cohort, and a TTL
+    grace window rather than an instant trigger.
+    """
+    if inboxes is None:
+        inboxes = discover_inboxes(config)
+    ttl = DEFAULT_RESIDUE_TTL_DAYS if ttl_days is None else float(ttl_days)
+    ttl_seconds = ttl * 86400.0
+    now = time.time() if now is None else now
+
+    would_quarantine = 0
+    quarantined_files: List[str] = []
+    for inbox in inboxes:
+        for path, reason_payload in _unusable_compact_files(
+            Path(inbox), fallback_principal, ttl_seconds, now,
+        ):
+            would_quarantine += 1
+            if dry_run:
+                continue
+            target = quarantine_inbox_file(path, reason_payload)
+            if target:
+                quarantined_files.append(target)
+
+    return {
+        "inboxes": [str(p) for p in inboxes],
+        "would_quarantine": would_quarantine,
+        "quarantined": len(quarantined_files),
+        "quarantined_files": quarantined_files,
+        "ttl_days": ttl,
+        "dry_run": dry_run,
+    }

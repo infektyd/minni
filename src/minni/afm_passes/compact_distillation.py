@@ -326,34 +326,64 @@ def _write_session_note(vault: Path, doc: Dict[str, Any], inbox_file: str,
     return path
 
 
+# #336: why a compact-summary inbox file is unusable. These mirror the four
+# skip branches in `distill` below that discard input with no archive and no
+# note — every one of them is deterministic, so the same file produces the
+# identical skip on every future tick and none can self-heal.
+COMPACT_UNREADABLE = "_compact_unreadable"
+COMPACT_MALFORMED = "_compact_malformed"
+COMPACT_AGENT_MISMATCH = "_compact_agent_mismatch"
+COMPACT_EMPTY_SUMMARY = "_compact_empty_summary"
+
+
+def classify_unusable_compact_file(path: Path, principal: str) -> Optional[str]:
+    """Why this inbox file is unusable to the distillation pass, or None.
+
+    ONE classifier, used by both the health count and the quarantine drain.
+    Two implementations would drift, and a count that disagrees with its drain
+    is a number that can never reach zero — a signal permanently overstating
+    the problem it is meant to report.
+
+    Mirrors `distill`'s skip branches exactly. Files of another kind, and
+    compact summaries the pass can still consume, return None: draining a
+    usable file would destroy real memory input.
+    """
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return COMPACT_UNREADABLE
+    if not isinstance(doc, dict):
+        return COMPACT_MALFORMED
+    if doc.get("kind") != COMPACT_SUMMARY_KIND:
+        return None  # routing: another kind's pass owns this file
+    file_agent = str(doc.get("agent_id") or "").strip()
+    if file_agent and file_agent != principal:
+        return COMPACT_AGENT_MISMATCH
+    if not str(doc.get("summary_text") or "").strip():
+        return COMPACT_EMPTY_SUMMARY
+    return None
+
+
 def count_unusable_compact_files(
     inboxes: Optional[List[Path]] = None,
     *,
     config: Any = None,
+    fallback_principal: str = "unknown",
 ) -> Dict[str, Any]:
-    """How many inbox files the distillation pass currently cannot read.
+    """How many inbox files the distillation pass currently cannot use.
 
-    #307: a dropped file is never archived or quarantined — it stays in the
-    inbox and is re-dropped on every tick — so a cumulative counter of drop
-    EVENTS is files x ticks-since-boot, not a file count. At a 900s
-    consolidation interval one corrupt file drives such a counter up ~96/day,
-    and an operator reading it hunts for corruption that does not exist.
-
-    This is the quantity that is actually true and that clears itself once the
-    file is removed: a live filesystem count, the same shape
-    ``inbox_quarantine.count_afm_dead_letter`` reports.
+    #307: a cumulative counter of drop EVENTS is files x ticks-since-boot,
+    because a dropped file used to stay in the inbox and be re-dropped every
+    tick. This is the quantity that is actually true and that clears once the
+    file is drained (#336).
     """
     if inboxes is None:
         inboxes = discover_inboxes(config)
     files = 0
     for inbox in inboxes:
+        principal = _principal_for_inbox(Path(inbox), fallback_principal)
         for path in sorted(Path(inbox).glob("*.json")):
-            try:
-                doc = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                files += 1
-                continue
-            if not isinstance(doc, dict):
+            if classify_unusable_compact_file(path, principal) is not None:
                 files += 1
     return {"files": files}
 

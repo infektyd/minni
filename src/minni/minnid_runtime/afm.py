@@ -1036,6 +1036,43 @@ async def afm_loop_runner(context: AFMContext):
                                         if _skipped.get(k)
                                     },
                                 )
+                                # #336: give those files a DRAIN. Without one
+                                # they stay in the inbox and are re-dropped on
+                                # every tick (~96/day at a 900s interval), and
+                                # the health count could never reach zero.
+                                # Same fail-open contract as the sibling
+                                # drains: a failure here must not stop
+                                # consolidation.
+                                try:
+                                    from minni.afm_passes.inbox_quarantine import (
+                                        quarantine_unusable_compact_summaries,
+                                    )
+                                    _cq = quarantine_unusable_compact_summaries(
+                                        context.default_config,
+                                        fallback_principal=str((cfg or {}).get(
+                                            "inbox_fallback_principal", "unknown")),
+                                        ttl_days=(cfg or {}).get(
+                                            "inbox_quarantine_ttl_days"),
+                                    )
+                                    if _cq.get("quarantined"):
+                                        obs.incr(
+                                            "compact_summary_quarantined_total",
+                                            _cq["quarantined"],
+                                        )
+                                        context.logger.warning(
+                                            "AFM loop: quarantined %d unusable "
+                                            "compact-summary file(s): %s",
+                                            _cq["quarantined"], _cq["quarantined_files"],
+                                        )
+                                except Exception as exc:
+                                    context.logger.exception(
+                                        "AFM loop: compact-summary drain raised "
+                                        "(skipped; consolidation continues)"
+                                    )
+                                    obs.incr("inbox_quarantine_failures_total")
+                                    obs.record_error(
+                                        "afm_loop.compact_summary_drain", exc,
+                                    )
                         except Exception as exc:
                             context.logger.exception(
                                 "AFM loop: compact distillation raised "
