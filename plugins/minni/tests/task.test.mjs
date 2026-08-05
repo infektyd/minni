@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { buildAfmChatPayload, prepareOutcome, callAfmPrepareTask, prepareTask } from "../dist/task.js";
+import { buildAfmChatPayload, buildHandoffPacket, prepareOutcome, callAfmPrepareTask, prepareTask } from "../dist/task.js";
 import { ProviderChain } from "../dist/providers.js";
 
 const vaultMatch = {
@@ -174,6 +174,238 @@ test("prepareTask profile budgets shape source counts and snippets", async () =>
   assert.equal(deep.budgetTokens, 12000);
   assert.ok(compact.relevantSources.length < deep.relevantSources.length);
   assert.ok(compact.relevantSources[0].snippet.length < deep.relevantSources[0].snippet.length);
+});
+
+test("prepareTask (#339): a lexically-outranked schema-authority note is not discarded before re-ranking", async () => {
+  // taskSourcesFromVault already re-ranks by score + authority + freshness +
+  // privacy (a schema-authority note gets a flat +60 bonus) and only THEN
+  // slices to budget.sourceLimit — that logic was always correct. The bug
+  // was upstream: prepareTask asked searchVault for exactly `limit` (raw
+  // lexical score only, no authority/freshness/privacy awareness), so a
+  // note that would rank first once re-ranked could be truncated away
+  // before taskSourcesFromVault ever saw it. This mock mimics
+  // searchVaultNotes' own sort-then-slice(0, limit) behavior so the test
+  // actually exercises whether prepareTask requests a wide enough limit —
+  // it does not just capture the argument.
+  //
+  // Adversarial review found the earlier 12-decoy version only proved
+  // "wider than the old limit of 12", not the actual x3 overfetch shape —
+  // any multiplier above ~1.1 made it pass. 30 decoys (31 candidates total,
+  // authority note ranked last) pins the specific multiplier: prepareTask's
+  // limit is 12, so a x2 overfetch (24) still excludes the authority note
+  // at rank 31, but the real x3 overfetch (36) includes the whole pool.
+  const rawPool = [
+    ...Array.from({ length: 30 }, (_, i) =>
+      vaultSource({
+        notePath: `/tmp/vault/wiki/artifacts/decoy-${i}.md`,
+        relativePath: `wiki/artifacts/decoy-${i}.md`,
+        wikilink: `[[wiki/artifacts/decoy-${i}]]`,
+        title: `Decoy ${i}`,
+        snippet: "shared 339 marker phrase",
+        score: 31 - i, // 31..2, strictly above the authority note's raw score
+      }),
+    ),
+    vaultSource({
+      notePath: "/tmp/vault/schema/AGENTS.md",
+      relativePath: "schema/AGENTS.md",
+      wikilink: "[[schema/AGENTS]]",
+      title: "AGENTS.md",
+      snippet: "shared 339 marker phrase",
+      score: 1, // lowest raw lexical score of all 31 candidates
+    }),
+  ];
+
+  const packet = await prepareTask(
+    {
+      task: "shared 339 marker phrase",
+      budgetTokens: 30000,
+      vaultPath: "/tmp/vault",
+      useAfm: false,
+    },
+    {
+      searchVault: async (_vaultPath, _query, limit) =>
+        rawPool
+          .slice()
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit),
+      recall: async () => ({ ok: true, data: { results: "", agent_id: "codex" } }),
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  assert.equal(packet.profile, "standard"); // sourceLimit 6, old raw-fetch limit was 12
+  const paths = packet.relevantSources.map((s) => s.relativePath);
+  assert.ok(
+    paths.includes("schema/AGENTS.md"),
+    `#339: the schema-authority note must survive re-ranking even though it ranked 13th by raw lexical score alone (got: ${JSON.stringify(paths)})`,
+  );
+  assert.equal(
+    packet.relevantSources[0].relativePath,
+    "schema/AGENTS.md",
+    "the schema authority bonus (+60) must win it the top rank once re-ranking actually runs",
+  );
+});
+
+test("buildHandoffPacket (#339): a lexically-outranked schema-authority note is not discarded before re-ranking", async () => {
+  const rawPool = [
+    ...Array.from({ length: 12 }, (_, i) =>
+      vaultSource({
+        notePath: `/tmp/vault/wiki/artifacts/decoy-${i}.md`,
+        relativePath: `wiki/artifacts/decoy-${i}.md`,
+        wikilink: `[[wiki/artifacts/decoy-${i}]]`,
+        title: `Decoy ${i}`,
+        snippet: "shared 339 handoff marker phrase",
+        score: 13 - i,
+      }),
+    ),
+    vaultSource({
+      notePath: "/tmp/vault/schema/AGENTS.md",
+      relativePath: "schema/AGENTS.md",
+      wikilink: "[[schema/AGENTS]]",
+      title: "AGENTS.md",
+      snippet: "shared 339 handoff marker phrase",
+      score: 1,
+    }),
+  ];
+
+  const packet = await buildHandoffPacket(
+    {
+      task: "shared 339 handoff marker phrase",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      searchVault: async (_vaultPath, _query, limit) =>
+        rawPool
+          .slice()
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit),
+      recall: async () => ({ ok: true, data: { results: "", agent_id: "codex" } }),
+    },
+  );
+
+  const paths = packet.topRecalls.map((s) => s.relativePath);
+  assert.ok(
+    paths.includes("schema/AGENTS.md"),
+    `#339: the schema-authority note must survive re-ranking even though it ranked 13th by raw lexical score alone (got: ${JSON.stringify(paths)})`,
+  );
+  assert.equal(
+    packet.topRecalls[0].relativePath,
+    "schema/AGENTS.md",
+    "the schema authority bonus must win it the top rank once re-ranking actually runs",
+  );
+});
+
+// Adversarial review of #339 found the authority-discard tests above never
+// exercised the PRIVACY axis at these two call sites — enhancedSourceFromVault
+// (task.ts) drops non-safe notes entirely (unlike server.ts's minni_recall,
+// which only filters, these never even score into relevantSources), so a
+// private-heavy pool should be able to crowd out a lower-ranked safe note the
+// same way #313 fixed at the UserPromptSubmit hook site.
+test("prepareTask (#339): a private-heavy vault must not crowd a lower-ranked safe match out entirely", async () => {
+  const rawPool = [
+    ...Array.from({ length: 12 }, (_, i) =>
+      vaultSource({
+        notePath: `/tmp/vault/wiki/artifacts/decoy-${i}.md`,
+        relativePath: `wiki/artifacts/decoy-${i}.md`,
+        wikilink: `[[wiki/artifacts/decoy-${i}]]`,
+        title: `Decoy ${i}`,
+        snippet: "shared 339 privacy marker phrase",
+        score: 13 - i, // 13..2, all outrank the safe note lexically
+        privacy: "private",
+      }),
+    ),
+    vaultSource({
+      notePath: "/tmp/vault/wiki/concepts/outranked-safe-note.md",
+      relativePath: "wiki/concepts/outranked-safe-note.md",
+      wikilink: "[[wiki/concepts/outranked-safe-note]]",
+      title: "Outranked topic",
+      snippet: "shared 339 privacy marker phrase",
+      score: 1, // lowest raw lexical score of all 13 candidates
+      privacy: "safe",
+    }),
+  ];
+
+  const packet = await prepareTask(
+    {
+      task: "shared 339 privacy marker phrase",
+      budgetTokens: 30000,
+      vaultPath: "/tmp/vault",
+      useAfm: false,
+    },
+    {
+      searchVault: async (_vaultPath, _query, limit) =>
+        rawPool
+          .slice()
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit),
+      recall: async () => ({ ok: true, data: { results: "", agent_id: "codex" } }),
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  const paths = packet.relevantSources.map((s) => s.relativePath);
+  assert.ok(
+    paths.includes("wiki/concepts/outranked-safe-note.md"),
+    `#339: the safe note must still surface even though 12 higher-scored private notes outrank it (got: ${JSON.stringify(paths)})`,
+  );
+  for (let i = 0; i < 12; i++) {
+    assert.ok(
+      !paths.includes(`wiki/artifacts/decoy-${i}.md`),
+      `SEC-006: decoy-${i}.md is privacy:private and must never reach relevantSources`,
+    );
+  }
+});
+
+test("buildHandoffPacket (#339): a private-heavy vault must not crowd a lower-ranked safe match out entirely", async () => {
+  const rawPool = [
+    ...Array.from({ length: 12 }, (_, i) =>
+      vaultSource({
+        notePath: `/tmp/vault/wiki/artifacts/decoy-${i}.md`,
+        relativePath: `wiki/artifacts/decoy-${i}.md`,
+        wikilink: `[[wiki/artifacts/decoy-${i}]]`,
+        title: `Decoy ${i}`,
+        snippet: "shared 339 handoff privacy marker phrase",
+        score: 13 - i,
+        privacy: "private",
+      }),
+    ),
+    vaultSource({
+      notePath: "/tmp/vault/wiki/concepts/outranked-safe-note.md",
+      relativePath: "wiki/concepts/outranked-safe-note.md",
+      wikilink: "[[wiki/concepts/outranked-safe-note]]",
+      title: "Outranked topic",
+      snippet: "shared 339 handoff privacy marker phrase",
+      score: 1,
+      privacy: "safe",
+    }),
+  ];
+
+  const packet = await buildHandoffPacket(
+    {
+      task: "shared 339 handoff privacy marker phrase",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      searchVault: async (_vaultPath, _query, limit) =>
+        rawPool
+          .slice()
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit),
+      recall: async () => ({ ok: true, data: { results: "", agent_id: "codex" } }),
+    },
+  );
+
+  const paths = packet.topRecalls.map((s) => s.relativePath);
+  assert.ok(
+    paths.includes("wiki/concepts/outranked-safe-note.md"),
+    `#339: the safe note must still surface even though 12 higher-scored private notes outrank it (got: ${JSON.stringify(paths)})`,
+  );
+  for (let i = 0; i < 12; i++) {
+    assert.ok(
+      !paths.includes(`wiki/artifacts/decoy-${i}.md`),
+      `SEC-006: decoy-${i}.md is privacy:private and must never reach topRecalls`,
+    );
+  }
 });
 
 test("AFM payload omits blocked and private sources while keeping safe source reasons", () => {

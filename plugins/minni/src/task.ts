@@ -963,6 +963,48 @@ export async function callAfmPrepareTask(
     : { ok: false, data: normalizeAfmResponse(finalResult.data), error: finalResult.error };
 }
 
+// #339: both prepareTask and buildHandoffPacket below feed searchVaultNotes's
+// output straight into taskSourcesFromVault, which ALREADY does the right
+// thing — it re-ranks by score + authority + freshness + privacy
+// (enhancedSourceFromVault, ~line 418) and only THEN slices to
+// budget.sourceLimit. The bug was never in that re-ranking; it's that
+// searchVaultNotes itself sorts and truncates to its `limit` argument on RAW
+// LEXICAL score alone, before taskSourcesFromVault ever gets a chance to
+// re-rank. A note that would score highest once authority/freshness/privacy
+// are factored in — a `schema`-authority note gets a flat +60 bonus, more
+// than the entire lexical range most queries produce — could be discarded by
+// that raw-lexical cut, independent of privacy. And a privacy-heavy vault can
+// still crowd out a safe note the same way #313 fixed at the
+// UserPromptSubmit call site.
+//
+// Widen the raw candidate pool searchVaultNotes returns and let
+// taskSourcesFromVault's existing sort-then-slice do the real, re-ranked
+// cut. searchVaultNotes reads/scores/snippets every markdown file in the
+// vault's wiki tree regardless of `limit` (the limit is a post-scoring slice
+// only), so this costs nothing beyond a few extra object references — NOT a
+// wider file scan.
+//
+// Narrows the gap, does not close it (same disclosure discipline as #338):
+// a note that would still rank outside the overfetch window on RAW LEXICAL
+// score alone remains invisible to the re-ranker. Both call sites already
+// clamp `limit` to 12 before this helper runs, so today the worst case is
+// exactly 36 candidates for prepareTask (default profile: 37+ higher-
+// lexical-scoring notes reproduce the discard) and, tighter, 15 for
+// buildHandoffPacket's default `limit` of 5 (16+ reproduce it there, feeding
+// a `compact` budget whose sourceLimit is only 3 — the narrowest window of
+// the three #339 sites). A durable fix would move the whole re-ranking (or
+// at minimum the privacy gate) inside searchVaultNotes itself, ahead of its
+// own sort→slice.
+const VAULT_SEARCH_OVERFETCH_MULTIPLIER = 3;
+// Not reachable today (both callers already clamp `limit` to 12, so the
+// multiplier alone tops out at 36) — kept as defense-in-depth for a future
+// caller that doesn't clamp its own `limit` before calling in.
+const VAULT_SEARCH_OVERFETCH_CAP = 40;
+
+function vaultSearchOverfetchLimit(limit: number): number {
+  return Math.min(limit * VAULT_SEARCH_OVERFETCH_MULTIPLIER, VAULT_SEARCH_OVERFETCH_CAP);
+}
+
 export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps = {}): Promise<PreparedTaskPacket> {
   const vaultPath = input.vaultPath ?? DEFAULT_VAULT_PATH;
   const agentId = input.agentId ?? DEFAULT_AGENT_ID;
@@ -987,7 +1029,9 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
     : resolveAfmProvider("off");
 
   const [vaultResults, recallResult] = await Promise.all([
-    input.includeVault === false ? Promise.resolve([]) : search(vaultPath, input.task, limit),
+    input.includeVault === false
+      ? Promise.resolve([])
+      : search(vaultPath, input.task, vaultSearchOverfetchLimit(limit)),
     recall({
       query: input.task,
       layer: input.layer,
@@ -1285,7 +1329,7 @@ export async function buildHandoffPacket(
   const budget = resolveBudget("compact", undefined);
 
   const [vaultResults, recallResult] = await Promise.all([
-    search(vaultPath, input.task, limit),
+    search(vaultPath, input.task, vaultSearchOverfetchLimit(limit)),
     recall({ query: input.task, limit, agentId, workspaceId }),
   ]);
 
