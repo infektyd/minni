@@ -42,7 +42,8 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
    (goals remaining is OK).
 6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.
-7. **Report** — **Honesty shipped** + **Goals preserved for next PRs**.
+7. **Report** — **Honesty shipped** + **Goals preserved for next PRs** +
+   **Re-checks filed** (state N/A explicitly when none).
 
 ## Run
 

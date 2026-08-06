@@ -101,6 +101,14 @@ Not covered:
 
 ## Backfill at adoption
 
-Filed 2026-08-05, due 2026-10-04, covering the four dispositions carried
-forward at campaign close: #346 (for #227), #347 (for #311), #348 (for #316),
-#349 (for #317).
+Filed at adoption, due 2026-10-04:
+
+- the four dispositions carried forward at campaign close: #346 (for #227),
+  #347 (for #311), #348 (for #316), #349 (for #317);
+- the two live in-tree acceptances this page itself names: #355 (for the
+  `SEC-G9-EXEMPT` deferral, finding #236) and #356 (for the SEC-021
+  deferral in THREAT_MODEL §7).
+
+This inventory is the acceptances known at adoption, not a claim that no
+older acceptance hides elsewhere — anything surfaced later gets its re-check
+filed on discovery, dated from its original acceptance where known.
