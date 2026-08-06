@@ -62,8 +62,11 @@ if the *intent* was legitimate.
    [disposition-expiry-policy.md](disposition-expiry-policy.md) NOW — before
    any report is written; manual until the workflow emits it (#354).
 3. Report (after filing, never before): sections **Honesty shipped**,
-   **Goals preserved for next PRs**, and **Re-checks filed** (state N/A
-   explicitly when none — and N/A is only true if step 2 filed nothing).
+   **Goals preserved for next PRs**, and **Re-checks filed**. Until #354
+   wires these sections into the `.rhai` report builder, wright/operator
+   appends them to the scratch report and/or the PR-body Follow-ups after
+   the run — machine silence is not N/A. State N/A explicitly when none,
+   and N/A is only true if step 2 filed nothing.
 
 See also: personal Grok App playbook in [grok-reviewer-app.md](grok-reviewer-app.md)
 (“Assumptions that became next PR goals”).

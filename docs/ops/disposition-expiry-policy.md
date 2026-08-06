@@ -37,6 +37,12 @@ discoverable, not aspirational:
   adoption: `gh label create re-check`); every re-check issue carries it —
   an unlabeled dated issue is invisible to the query and therefore a filing
   defect, not a lapse.
+- **Title format is the machine-readable field:** exactly
+  `Re-check by YYYY-MM-DD: <subject>` with zero-padded month and day. The
+  due date lives in the title, not only the body, so
+  `gh issue list --label re-check --json title` is scriptably sortable; a
+  malformed or missing title date is a filing defect caught at the next
+  cadence run.
 - **Owner and cadence:** the operator (or an agent acting on the operator's
   standing instructions) runs the query at every campaign close-out and at
   least monthly between campaigns; any lapsed re-check gets raised as a
