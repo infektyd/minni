@@ -381,7 +381,7 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally; pr_number=0. ";
 }
-imp += "PLAN_JSON entries with risk_acceptance=true whose re_check_issue is a proposed title, empty, or missing: for empty/missing, compute the title yourself first (`date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` for the date); then file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Return every filing you performed in re_checks_filed as {id, issue_ref}, where id is the EXACT loom entry id you filed for (list both twin ids if a residual appears in ordered_fixes and goals_next_pr) so the report reflects reality. ";
+imp += "PLAN_JSON entries with risk_acceptance=true whose re_check_issue is a proposed title, empty, or missing: for empty/missing, compute the title yourself first (`date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` for the date); then file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Run ONE gh issue create per UNIQUE re_check_issue string — never create twice for dual-track twins sharing a title. Return every filing in re_checks_filed as {id, issue_ref}, emitting one row per loom entry id covered (twins share the same issue_ref), so the report reflects reality. ";
 imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved, re_checks_filed (every filing as {id, issue_ref}; empty array when none — walk BOTH ordered_fixes and goals_next_pr). Effort guidance: medium.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
@@ -589,55 +589,17 @@ for r in risk_rows {
         if r_filed && !cur_filed {
             merged[i].artifact = r.artifact;
             merged[i].id = r.id;
+        } else if r_filed && cur_filed && merged[i].artifact != r.artifact {
+            // Two DISTINCT filed refs under one key (double-file or divergent
+            // twins): keep both rows visible — hiding a real issue is worse
+            // than an extra line.
+            group_index[key] = merged.len();
+            merged.push(r);
         }
     } else {
         group_index[key] = merged.len();
         merged.push(r);
     }
-}
-// Title drift between dual-track twins defeats exact-string merging; a
-// filed row whose declared title prefixes (or is prefixed by) a still-
-// proposed row's title marks that row as a possible twin — warn, never
-// auto-merge on fuzz.
-let filed_rows = 0;
-let lone_filed_id = "";
-let fi = 0;
-while fi < merged.len() {
-    if merged[fi].artifact != ""
-        && (merged[fi].artifact.starts_with("#") || merged[fi].artifact.contains("/issues/")) {
-        filed_rows += 1;
-        lone_filed_id = merged[fi].id;
-    }
-    fi += 1;
-}
-let mi = 0;
-while mi < merged.len() {
-    let m_filed = merged[mi].artifact != ""
-        && (merged[mi].artifact.starts_with("#") || merged[mi].artifact.contains("/issues/"));
-    // A ref-declared twin (#NNN) and a title-declared twin never share a
-    // merge key, and an empty-declared row has no title to prefix-match —
-    // when exactly ONE filed row exists in the whole run, an unfiled row is
-    // most plausibly its dual-track twin: warn.
-    if !m_filed && filed_rows == 1 && merged[mi].id != lone_filed_id
-        && merged[mi].twin_of == () {
-        merged[mi].twin_of = lone_filed_id;
-    }
-    if !m_filed && merged[mi].declared != "" {
-        let mj = 0;
-        while mj < merged.len() {
-            if mj != mi {
-                let o_filed = merged[mj].artifact != ""
-                    && (merged[mj].artifact.starts_with("#") || merged[mj].artifact.contains("/issues/"));
-                if o_filed && merged[mj].declared != ""
-                    && (merged[mi].declared.starts_with(merged[mj].declared)
-                        || merged[mj].declared.starts_with(merged[mi].declared)) {
-                    merged[mi].twin_of = merged[mj].id;
-                }
-            }
-            mj += 1;
-        }
-    }
-    mi += 1;
 }
 for m in merged {
     re_count += 1;
@@ -649,13 +611,7 @@ for m in merged {
         if m.artifact.starts_with("#") || m.artifact.contains("/issues/") {
             report += " (filed ref)";
         } else {
-            report += " (PROPOSED — not yet filed";
-            if m.twin_of != () {
-                report += "; possible twin of ";
-                report += m.twin_of;
-                report += " — verify before filing";
-            }
-            report += ")";
+            report += " (PROPOSED — not yet filed)";
         }
     } else {
         report += "(MISSING — same gate as PROPOSED. Construct the title per ";
@@ -663,13 +619,7 @@ for m in merged {
         report += "(date -u -v+60d +%F || date -u -d '+60 days' +%F) and file ";
         report += "\"Re-check by <that date>: <one-line residual for ";
         report += m.id;
-        report += ">\". This line is an instruction, NOT a copy-paste title.";
-        if m.twin_of != () {
-            report += " Possible twin of ";
-            report += m.twin_of;
-            report += " — verify before filing.";
-        }
-        report += ")";
+        report += ">\". This line is an instruction, NOT a copy-paste title.)";
     }
     report += "\n";
 }
