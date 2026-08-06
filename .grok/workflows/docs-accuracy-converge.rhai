@@ -354,7 +354,7 @@ if n_gaps == 0 {
 // --- Phase: Loom ---
 phase("Loom");
 let loom_p = pin;
-loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. For EVERY entry in BOTH ordered_fixes and goals_next_pr, set risk_acceptance (boolean, ALWAYS present): true only when the item leaves a RISK accepted with a rationale (deferred exposure, known gap tolerated for a stated reason) — false for pure feature ambition with no risk; a goal_next_pr that papers over an accepted risk is TRUE. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — prefer the re_check the audit lane carried when it is a \"#NNN\" ref, an issue URL, or matches \"Re-check by YYYY-MM-DD: ...\"; when it is missing OR malformed (wrong prefix or a date that is not ~60 days out), rebuild it — compute the date yourself with `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` and build the title (do-not-guess means do not invent a calendar day, never leave the field empty on a true row). Effort guidance: high.\n\nGAPS:\n";
+loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. When the SAME residual appears in both ordered_fixes and goals_next_pr, both entries MUST carry the IDENTICAL re_check_issue string (same ref or same exact title) so the report can merge them. For EVERY entry in BOTH ordered_fixes and goals_next_pr, set risk_acceptance (boolean, ALWAYS present): true only when the item leaves a RISK accepted with a rationale (deferred exposure, known gap tolerated for a stated reason) — false for pure feature ambition with no risk; a goal_next_pr that papers over an accepted risk is TRUE. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — prefer the re_check the audit lane carried when it is a \"#NNN\" ref, an issue URL, or matches \"Re-check by YYYY-MM-DD: ...\"; when it is missing OR malformed (wrong prefix or a date that is not ~60 days out), rebuild it — compute the date yourself with `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` and build the title (do-not-guess means do not invent a calendar day, never leave the field empty on a true row). Effort guidance: high.\n\nGAPS:\n";
 loom_p += gap_blob;
 let loom = agent(loom_p, #{
     label: "loom-plan",
@@ -599,10 +599,29 @@ for r in risk_rows {
 // filed row whose declared title prefixes (or is prefixed by) a still-
 // proposed row's title marks that row as a possible twin — warn, never
 // auto-merge on fuzz.
+let filed_rows = 0;
+let lone_filed_id = "";
+let fi = 0;
+while fi < merged.len() {
+    if merged[fi].artifact != ""
+        && (merged[fi].artifact.starts_with("#") || merged[fi].artifact.contains("/issues/")) {
+        filed_rows += 1;
+        lone_filed_id = merged[fi].id;
+    }
+    fi += 1;
+}
 let mi = 0;
 while mi < merged.len() {
     let m_filed = merged[mi].artifact != ""
         && (merged[mi].artifact.starts_with("#") || merged[mi].artifact.contains("/issues/"));
+    // A ref-declared twin (#NNN) and a title-declared twin never share a
+    // merge key, and an empty-declared row has no title to prefix-match —
+    // when exactly ONE filed row exists in the whole run, an unfiled row is
+    // most plausibly its dual-track twin: warn.
+    if !m_filed && filed_rows == 1 && merged[mi].id != lone_filed_id
+        && merged[mi].twin_of == () {
+        merged[mi].twin_of = lone_filed_id;
+    }
     if !m_filed && merged[mi].declared != "" {
         let mj = 0;
         while mj < merged.len() {
@@ -639,10 +658,18 @@ for m in merged {
             report += ")";
         }
     } else {
-        report += "(MISSING — file manually, same gate as PROPOSED; title template: ";
-        report += "\"Re-check by $(date -u -v+60d +%F 2>/dev/null || date -u -d '+60 days' +%F): <one-line residual for ";
+        report += "(MISSING — same gate as PROPOSED. Construct the title per ";
+        report += "disposition-expiry-policy.md: run the date command yourself ";
+        report += "(date -u -v+60d +%F || date -u -d '+60 days' +%F) and file ";
+        report += "\"Re-check by <that date>: <one-line residual for ";
         report += m.id;
-        report += ">\")";
+        report += ">\". This line is an instruction, NOT a copy-paste title.";
+        if m.twin_of != () {
+            report += " Possible twin of ";
+            report += m.twin_of;
+            report += " — verify before filing.";
+        }
+        report += ")";
     }
     report += "\n";
 }
@@ -674,7 +701,7 @@ report += "If wright needed >2 pongs: bump wright. If spend high and clean: chea
 report += "Update agent-roster.md Changelog after this run.\n";
 report += "\n## Operator next\n";
 report += "1. Review honesty PR; do not agent-merge.\n";
-report += "2. File every PROPOSED or MISSING entry in Re-checks required that has no #NNN in wright Follow-ups (label re-check, title exactly as listed, body citing disposition, gap id, rationale, and code anchor per disposition-expiry-policy.md) BEFORE merging yourself; check `gh issue list --label re-check` first to avoid duplicates. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
+report += "2. Before merging yourself, clear every PROPOSED and MISSING entry in Re-checks required that has no #NNN in wright Follow-ups. PROPOSED: file with the title exactly as listed. MISSING: construct the dated title per disposition-expiry-policy.md first (never copy the MISSING line). Both: label re-check, body citing disposition, gap id, rationale, and code anchor; check `gh issue list --label re-check` first to avoid duplicates — dual-track twins may carry different artifact forms. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
 report += "3. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
 report += "4. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
 report += "5. Bare /grok-review only after tip freeze if App ELIG needed.\n";

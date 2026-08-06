@@ -59,7 +59,9 @@ if the *intent* was legitimate.
    workflow).
 2. Wright: apply **honesty now** edits; for `implement_now` only when High and
    scoped; never drop goals on the floor. For risk-accepting residuals
-   (`goal_next_pr` / `honesty_partial` carrying an accepted risk), wright or
+   (any disposition leaving an accepted risk — `goal_next_pr` /
+   `honesty_partial` carrying one, or a scoped `implement_now` with a known
+   residual), wright or
    the operator files the dated `re-check` issue per
    [disposition-expiry-policy.md](disposition-expiry-policy.md). The converge
    workflow binds the reference in-schema (`risk_acceptance`/`re_check_issue`,
