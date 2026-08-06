@@ -812,3 +812,32 @@ def test_wired_record_returns_the_platform_entry(home):
 
     assert wired_record("claude-code")["install_root"] == str(root)
     assert wired_record("codex") is None
+
+
+def test_dry_run_wired_bookkeeping_writes_nothing(tmp_path, monkeypatch):
+    """Dry-run must not touch HOME — the mkdir + O_CREAT on wired.lock were
+    themselves writes, measured as a stray ~/.minni/plugin/wired.lock left by
+    a dry-run `wire all` on a payload-present source tree. This pins the
+    contract independent of whether the checkout has a staged payload (the
+    original catch only manifested on dogfood trees)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from minni.wire.wired import WireRecord, retire_platform, upsert_wire
+
+    record = WireRecord(
+        platform="claude-code",
+        config_path=str(tmp_path / ".claude.json"),
+        install_root=str(tmp_path / ".minni/plugin/9.9.9"),
+        version="9.9.9",
+        workspace=None,
+        wired_at="2026-08-06T00:00:00Z",
+    )
+    data, warning = upsert_wire(record, dry_run=True)
+    assert warning is None
+    assert data["generation"] == 1
+    assert [w["platform"] for w in data["wires"]] == ["claude-code"]
+
+    data, removed = retire_platform("claude-code", dry_run=True)
+    assert removed == 0  # nothing durable existed to remove
+    assert not list(tmp_path.iterdir()), (
+        "dry-run wired bookkeeping wrote into HOME"
+    )
