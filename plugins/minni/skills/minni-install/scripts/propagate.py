@@ -426,17 +426,22 @@ def copy_tree(source: Path, dest: Path) -> None:
         raise SystemExit(f"Missing plugin source: {source}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     rsync = shutil.which("rsync")
-    if rsync:
-        cmd = [rsync, "-a", "--delete", "--exclude", "node_modules"]
-        for name in GENERATED_INSTALL_FILES:
-            cmd += ["--exclude", name]
-        run(cmd + [f"{source}/", f"{dest}/"])
-        return
+    # Root-level generated files must survive the refresh, but never via rsync
+    # --exclude: macOS's openrsync matches even a /-anchored pattern at any
+    # depth, so excluding by name also skipped the SOURCE file
+    # .gemini-plugin/gemini-extension.json and the deployed hidden manifest
+    # went stale forever (#359). Preserve-and-restore instead, on both paths.
     preserved = {
         name: (dest / name).read_bytes()
         for name in GENERATED_INSTALL_FILES
         if (dest / name).exists()
     }
+    if rsync:
+        cmd = [rsync, "-a", "--delete", "--exclude", "node_modules"]
+        run(cmd + [f"{source}/", f"{dest}/"])
+        for name, blob in preserved.items():
+            (dest / name).write_bytes(blob)
+        return
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(source, dest, ignore=shutil.ignore_patterns("node_modules", ".git"))

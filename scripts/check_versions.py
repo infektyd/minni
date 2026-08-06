@@ -351,6 +351,43 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                 )
                 continue
             versions.setdefault(str(ver), []).append(str(rel))
+        # Root-vs-hidden divergence for Gemini (#359): the root-level generated
+        # manifest (gemini-extension.json) and the dotdir manifest
+        # (.gemini-plugin/gemini-extension.json) must agree with each other.
+        # Check this explicitly so the report says divergence rather than a
+        # plain version mismatch.
+        _gemini_hidden_rel = Path(".gemini-plugin") / "gemini-extension.json"
+        _gemini_root_path = root / "gemini-extension.json"
+        _gemini_hidden_path = root / _gemini_hidden_rel
+        _root_gem_ver: str | None = None
+        _hidden_gem_ver: str | None = None
+        if _gemini_root_path.is_file() and _gemini_hidden_path.is_file():
+            try:
+                _root_gem_ver = json.loads(_gemini_root_path.read_text(encoding="utf-8")).get(
+                    "version"
+                )
+                _root_gem_ver = str(_root_gem_ver) if _root_gem_ver is not None else None
+            except Exception:
+                _root_gem_ver = None
+            try:
+                _hidden_gem_ver = json.loads(
+                    _gemini_hidden_path.read_text(encoding="utf-8")
+                ).get("version")
+                _hidden_gem_ver = str(_hidden_gem_ver) if _hidden_gem_ver is not None else None
+            except Exception:
+                _hidden_gem_ver = None
+            if (
+                _root_gem_ver is not None
+                and _hidden_gem_ver is not None
+                and not _version_agrees(_root_gem_ver, _hidden_gem_ver)
+            ):
+                mismatches.append(
+                    f"deployed: {label} root-vs-hidden divergence: "
+                    f"gemini-extension.json at {_root_gem_ver!r} != "
+                    f"{_gemini_hidden_rel} at {_hidden_gem_ver!r} "
+                    f"(canonical {canonical!r})"
+                )
+                continue
         if not versions:
             mismatches.append(
                 f"deployed: UNINSPECTABLE — {label} carries no readable plugin manifest; "
@@ -371,7 +408,11 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                     f"deployed: {label} at {shown!r} (public version agrees with {canonical})"
                 )
         elif len(versions) == 1:
-            mismatches.append(f"deployed: {label} at {next(iter(versions))!r} != {canonical!r}")
+            ver = next(iter(versions))
+            files = sorted(versions[ver])
+            mismatches.append(
+                f"deployed: {label} at {ver!r} != {canonical!r} in {', '.join(files)}"
+            )
         else:
             for ver, files in sorted(off.items()):
                 mismatches.append(
