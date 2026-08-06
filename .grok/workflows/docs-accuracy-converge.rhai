@@ -595,6 +595,31 @@ for r in risk_rows {
         merged.push(r);
     }
 }
+// Title drift between dual-track twins defeats exact-string merging; a
+// filed row whose declared title prefixes (or is prefixed by) a still-
+// proposed row's title marks that row as a possible twin — warn, never
+// auto-merge on fuzz.
+let mi = 0;
+while mi < merged.len() {
+    let m_filed = merged[mi].artifact != ""
+        && (merged[mi].artifact.starts_with("#") || merged[mi].artifact.contains("/issues/"));
+    if !m_filed && merged[mi].declared != "" {
+        let mj = 0;
+        while mj < merged.len() {
+            if mj != mi {
+                let o_filed = merged[mj].artifact != ""
+                    && (merged[mj].artifact.starts_with("#") || merged[mj].artifact.contains("/issues/"));
+                if o_filed && merged[mj].declared != ""
+                    && (merged[mi].declared.starts_with(merged[mj].declared)
+                        || merged[mj].declared.starts_with(merged[mi].declared)) {
+                    merged[mi].twin_of = merged[mj].id;
+                }
+            }
+            mj += 1;
+        }
+    }
+    mi += 1;
+}
 for m in merged {
     re_count += 1;
     report += "- ";
@@ -605,10 +630,19 @@ for m in merged {
         if m.artifact.starts_with("#") || m.artifact.contains("/issues/") {
             report += " (filed ref)";
         } else {
-            report += " (PROPOSED — not yet filed)";
+            report += " (PROPOSED — not yet filed";
+            if m.twin_of != () {
+                report += "; possible twin of ";
+                report += m.twin_of;
+                report += " — verify before filing";
+            }
+            report += ")";
         }
     } else {
-        report += "(MISSING — file manually, same gate as PROPOSED)";
+        report += "(MISSING — file manually, same gate as PROPOSED; title template: ";
+        report += "\"Re-check by $(date -u -v+60d +%F 2>/dev/null || date -u -d '+60 days' +%F): <one-line residual for ";
+        report += m.id;
+        report += ">\")";
     }
     report += "\n";
 }
@@ -640,7 +674,7 @@ report += "If wright needed >2 pongs: bump wright. If spend high and clean: chea
 report += "Update agent-roster.md Changelog after this run.\n";
 report += "\n## Operator next\n";
 report += "1. Review honesty PR; do not agent-merge.\n";
-report += "2. File every PROPOSED or MISSING entry in Re-checks required that has no #NNN in wright Follow-ups (label re-check, title exactly as listed) BEFORE merging yourself; check `gh issue list --label re-check` first to avoid duplicates. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
+report += "2. File every PROPOSED or MISSING entry in Re-checks required that has no #NNN in wright Follow-ups (label re-check, title exactly as listed, body citing disposition, gap id, rationale, and code anchor per disposition-expiry-policy.md) BEFORE merging yourself; check `gh issue list --label re-check` first to avoid duplicates. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
 report += "3. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
 report += "4. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
 report += "5. Bare /grok-review only after tip freeze if App ELIG needed.\n";

@@ -54,7 +54,9 @@ if the *intent* was legitimate.
 `docs-accuracy-converge` must:
 
 1. Tag each gap with `disposition` (and `goal_title` when disposition is
-   `goal_next_pr` or `honesty_partial`).
+   `goal_next_pr` or `honesty_partial`), plus `risk_acceptance` and
+   `re_check_issue` on every gap (#354 — schema-required in the converge
+   workflow).
 2. Wright: apply **honesty now** edits; for `implement_now` only when High and
    scoped; never drop goals on the floor. For risk-accepting residuals
    (`goal_next_pr` / `honesty_partial` carrying an accepted risk), wright or
