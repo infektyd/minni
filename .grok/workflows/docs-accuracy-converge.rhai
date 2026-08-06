@@ -192,7 +192,20 @@ fn is_filed_ref(s) {
         }
         return true;
     }
-    s.starts_with("http") && s.contains("/issues/")
+    // URL form must end in a numeric issue id — an arbitrary /issues/ link
+    // (search page, non-ticket path) is not a filing.
+    if s.starts_with("http") && s.contains("/issues/") {
+        let tail_i = s.index_of("/issues/") + 8;
+        if tail_i >= s.len() { return false; }
+        let j = tail_i;
+        while j < s.len() {
+            let c = s[j];
+            if c < '0' || c > '9' { return false; }
+            j += 1;
+        }
+        return true;
+    }
+    false
 }
 
 let a = args;
@@ -595,19 +608,33 @@ for lst in re_lists {
         }
     }
 }
-// Pass 2: merge dual-track twins on the residual key (declared title, else
-// artifact, else id). A filed ref always beats a proposed title regardless
-// of walk order — merging never drops the stronger artifact.
+// Pass 1.5: propagate a filed artifact across every row sharing the same
+// non-empty declared title — wright may upgrade only ONE twin id after its
+// single create for a shared title, and without propagation the upgraded
+// row keys by ref while its twin keys by title and never merges.
+let filed_for_declared = #{};
+for r in risk_rows {
+    if r.declared != "" && is_filed_ref(r.artifact) {
+        filed_for_declared[r.declared] = r.artifact;
+    }
+}
+let ri = 0;
+while ri < risk_rows.len() {
+    if risk_rows[ri].declared != ""
+        && !is_filed_ref(risk_rows[ri].artifact)
+        && filed_for_declared.contains(risk_rows[ri].declared) {
+        risk_rows[ri].artifact = filed_for_declared[risk_rows[ri].declared];
+    }
+    ri += 1;
+}
+// Pass 2: merge dual-track twins — primary key is the declared title when
+// set (twins share it by loom's rule), else the artifact, else the id. A
+// filed ref always beats a proposed title; merging never drops it.
 let group_index = #{};
 let merged = [];
 for r in risk_rows {
     let r_filed = is_filed_ref(r.artifact);
-    // Key on the filed ref when one exists: a #NNN-declared twin and a
-    // title-declared twin never share a declared string, but after upgrade
-    // they share the ref — ref-first keying merges them.
-    let key = "";
-    if r_filed { key = r.artifact; }
-    if key == "" { key = r.declared; }
+    let key = r.declared;
     if key == "" { key = r.artifact; }
     if key == "" { key = r.id; }
     if group_index.contains(key) {

@@ -15,7 +15,7 @@ overclaims that describe wanted capabilities become `goal_next_pr` /
 | `~/.grok/workflows/docs-accuracy-converge.rhai` | User copy for global discovery |
 | `docs/ops/agent-roster.md` | **Adaptive** model min/max roster |
 | `docs/ops/docs-truth-policy.md` | Dual-track honesty + goal preservation |
-| `docs/ops/disposition-expiry-policy.md` | 60-day re-check on accept-with-rationale dispositions — required for risk-accepting `goal_next_pr` / `honesty_partial`; the converge workflow binds `risk_acceptance`/`re_check_issue` in-schema (both gap arrays) and emits the `Re-checks required` section (#354); the issue itself is still filed by wright/operator |
+| `docs/ops/disposition-expiry-policy.md` | 60-day re-check on accept-with-rationale dispositions — required for ANY residual accepted with rationale (risk-accepting `goal_next_pr` / `honesty_partial`, scoped `implement_now` leftovers); the converge workflow binds `risk_acceptance`/`re_check_issue` in-schema (both gap arrays) and emits the `Re-checks required` section (#354); the issue itself is still filed by wright/operator |
 
 ## Adaptive model roster
 
