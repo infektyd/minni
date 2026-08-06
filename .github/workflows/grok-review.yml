@@ -3,8 +3,9 @@ name: Grok Code Review
 # Auto-review on PRs. It began as a mirror of claude-code-review.yml; that
 # workflow was REMOVED in #240 for reporting success across 12+ runs while
 # never posting a review. This one runs xAI's Grok Build CLI headless on the
-# runner, burning the operator's
-# Grok subscription (device-auth OAuth secret GROK_CI_AUTH_JSON — minting and
+# runner, on the operator's credit: either a pay-per-use console.x.ai key
+# (secret XAI_API_KEY, preferred when set) or the Grok subscription
+# (device-auth OAuth secret GROK_CI_AUTH_JSON — minting and
 # rotation notes in .github/workflows/grok.yml).
 #
 # Formal Reviews API events: REQUEST_CHANGES / COMMENT only. VERDICT: APPROVE
@@ -20,10 +21,11 @@ name: Grok Code Review
 # * Skips draft PRs. Concurrency group cancels in-progress runs if a second
 #   trigger fires for the same PR (e.g. ready_for_review while opened runs).
 
-# METERING MODEL: exactly one subscription-metered review per deliberate
-# request. Those are: opened / ready_for_review / reopened, and an explicit
-# `/grok-review` comment from a collaborator. Deliberately NOT `synchronize` —
-# that would bill a review per push.
+# METERING MODEL: exactly one metered review per deliberate request —
+# subscription quota in OAuth mode, real dollars in XAI_API_KEY mode. Those
+# are: opened / ready_for_review / reopened, and an explicit `/grok-review`
+# comment from a collaborator. Deliberately NOT `synchronize` — that would
+# bill a review per push.
 #
 # The comment command exists because eligibility is bound to the head SHA: once
 # agents push fixes, the previous review's stamp is worthless and the only ways
@@ -246,13 +248,55 @@ jobs:
           esac
           echo "grok CLI pinned at $GROK_CLI_VERSION"
 
-      - name: Restore Grok subscription auth
+      - name: Restore Grok auth (API key or subscription OAuth)
         if: steps.resolve.outputs.skip == 'false'
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
+          # Two credential modes; XAI_API_KEY (pay-per-use console.x.ai key)
+          # wins when both are set, because setting it is the deliberate
+          # choice to spend money instead of subscription quota.
+          #  * API key: the CLI authenticates from the environment (exported
+          #    on the run step; measured on grok 0.2.118 that env auth works
+          #    even with an unusable auth.json present). The key is ALSO
+          #    written into auth.json because the leak gate derives its
+          #    needle set from auth.json VALUES — this keeps the live
+          #    credential scanned and --require-auth honest with no gate
+          #    change, on this PR's own run included (the gate loads from the
+          #    default branch).
+          #  * OAuth: base64 device-auth capture, rotation notes in grok.yml.
+          # Neither set → fail HERE with a named cause instead of three
+          # steps later as the CLI's generic "Not signed in".
           /usr/bin/mkdir -p "$HOME/.grok"
-          printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
+          # Normalize before mode selection (round-5 review): secrets commonly
+          # pick up a trailing newline (echo | gh secret set) or CR from the
+          # UI, and a valid key plus stray whitespace must not hard-fail the
+          # shape guard while a working OAuth blob sits in the elif. Pure
+          # parameter expansion — no PATH lookup, safe under set -u.
+          XAI_API_KEY="${XAI_API_KEY:-}"
+          XAI_API_KEY="${XAI_API_KEY//$'\r'/}"
+          XAI_API_KEY="${XAI_API_KEY//$'\n'/}"
+          XAI_API_KEY="${XAI_API_KEY%"${XAI_API_KEY##*[![:space:]]}"}"
+          if [ -n "$XAI_API_KEY" ]; then
+            # printf into a JSON template, not an interpreter -c one-liner:
+            # the pinning test rightly rejects inline programs in trust
+            # steps. Safe only because the character class below is enforced
+            # first — a key containing a quote or backslash would corrupt
+            # the JSON, so anything outside [A-Za-z0-9._-] refuses instead.
+            case "$XAI_API_KEY" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::XAI_API_KEY contains characters outside [A-Za-z0-9._-]; refusing to write auth.json."
+                exit 1
+                ;;
+            esac
+            printf '{"xai_api_key": "%s"}' "$XAI_API_KEY" > "$HOME/.grok/auth.json"
+          elif [ -n "$GROK_CI_AUTH_JSON" ]; then
+            printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
+          else
+            echo "::error::No Grok credential: set the XAI_API_KEY or GROK_CI_AUTH_JSON secret."
+            exit 1
+          fi
           /usr/bin/chmod 600 "$HOME/.grok/auth.json"
 
       - name: Configure the sandbox profile
@@ -342,6 +386,11 @@ jobs:
 
       - name: Run Grok review
         if: steps.resolve.outputs.skip == 'false'
+        env:
+          # API-key auth path; empty in OAuth mode (auth.json then carries
+          # the credential). Same exposure posture either way: readable by
+          # the agent by necessity, containment is exits (see below).
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
           # --always-approve keeps the tool loop unstarved (dontAsk cancels the
           # whole prompt on the first approval-needing tool). The boundary that
@@ -351,6 +400,19 @@ jobs:
           # No debug instrumentation: Actions logs are public on this repo.
           # Model and effort pinned per operator model ladder — CI must not
           # float on service defaults (adversarial review lane = 4.5 HIGH).
+          # An empty-but-set XAI_API_KEY makes the CLI select ApiKey auth and
+          # fail 401 even when auth.json holds a valid credential (measured:
+          # "Auth: ApiKey ... Bad credentials" with XAI_API_KEY=""). GitHub
+          # expands a missing secret to "" but still exports the variable, so
+          # OAuth-only operation would break. Review finding 1 on #350.
+          # Same normalization as restore (round-5): this step re-imports the
+          # RAW secret env in its own shell, so without trimming here the CLI
+          # would still receive a newline-tainted key. Safe under set -u.
+          XAI_API_KEY="${XAI_API_KEY:-}"
+          XAI_API_KEY="${XAI_API_KEY//$'\r'/}"
+          XAI_API_KEY="${XAI_API_KEY//$'\n'/}"
+          XAI_API_KEY="${XAI_API_KEY%"${XAI_API_KEY##*[![:space:]]}"}"
+          if [ -z "${XAI_API_KEY:-}" ]; then unset XAI_API_KEY; fi
           "$HOME/.grok/bin/grok" --prompt-file /tmp/grok-prompt.md \
             --model grok-4.5 \
             --reasoning-effort high \
@@ -366,6 +428,8 @@ jobs:
       - name: Fail closed on credential leakage
         if: steps.resolve.outputs.skip == 'false'
         env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
           # The DEFAULT branch, never github.base_ref: the base of a PR is
           # chosen by its author, so anchoring trust there lets someone push a
           # branch carrying a neutered gate and open a PR into it — the gate
@@ -406,6 +470,42 @@ jobs:
           # --require-auth: see the note in grok.yml. An unreadable auth file
           # means two of the four checks never ran, which must not read as a
           # pass on the path that decides whether a reply is published.
+          # Re-materialize the needle set from the SECRETS after the agent
+          # ran (review findings on #350): the agent can potentially rewrite
+          # auth.json (the read-only-profile write block is a stated
+          # UNVERIFIED residual), and a swapped file desyncs the gate's
+          # value scan. Post-agent, only the secrets are known-live — the
+          # on-disk blob is not. BOTH modes rebuild: API keys have no shape
+          # backstop at all, and OAuth refresh tokens are opaque (not
+          # JWT-shaped), so shape checks cover neither.
+          # Normalize before mode selection (round-5 review): secrets commonly
+          # pick up a trailing newline (echo | gh secret set) or CR from the
+          # UI, and a valid key plus stray whitespace must not hard-fail the
+          # shape guard while a working OAuth blob sits in the elif. Pure
+          # parameter expansion — no PATH lookup, safe under set -u.
+          XAI_API_KEY="${XAI_API_KEY:-}"
+          XAI_API_KEY="${XAI_API_KEY//$'\r'/}"
+          XAI_API_KEY="${XAI_API_KEY//$'\n'/}"
+          XAI_API_KEY="${XAI_API_KEY%"${XAI_API_KEY##*[![:space:]]}"}"
+          if [ -n "${XAI_API_KEY:-}" ]; then
+            case "$XAI_API_KEY" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::XAI_API_KEY contains characters outside [A-Za-z0-9._-]; refusing to rebuild the needle set."
+                exit 1
+                ;;
+            esac
+            printf '{"xai_api_key": "%s"}' "$XAI_API_KEY" > "$HOME/.grok/auth.json"
+            /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          elif [ -n "${GROK_CI_AUTH_JSON:-}" ]; then
+            printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
+            /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          else
+            # Restore already fails closed when neither secret exists, so
+            # this is dead today — but if restore and gate ever diverge, the
+            # gate must not run against agent-reachable on-disk state.
+            echo "::error::No credential secret available to rebuild the needle set — refusing to certify the reply."
+            exit 1
+          fi
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
 
       # App identity posts REQUEST_CHANGES / COMMENT only. Merge trust is the

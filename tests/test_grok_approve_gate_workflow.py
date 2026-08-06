@@ -1095,3 +1095,149 @@ def test_relay_approve_token_is_passed_to_the_gate(gate):
 def test_workflow_github_token_stays_read_only_on_prs(gate):
     """The mechanical approval must come from the App, never GITHUB_TOKEN."""
     assert gate["permissions"]["pull-requests"] == "read"
+
+
+# --- dual-mode auth pins (#350) ----------------------------------------------
+# Grok's round-3 review: the dual-mode controls were load-bearing but unpinned
+# — removing the empty-key unset, the post-agent needle rebuild, the shape
+# guard, or the key-wins ordering left this suite green. Each invariant below
+# is one of those controls, asserted over UNCOMMENTED run bodies so a comment
+# mentioning the construct cannot satisfy the pin.
+
+_DUAL_MODE_WORKFLOWS = ["grok-review.yml", "grok.yml", "grok-boundary-test.yml"]
+
+
+def _steps_of(workflow: str):
+    doc = _load(ROOT / ".github" / "workflows" / workflow)
+    for job in (doc.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            yield step
+
+
+@pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
+def test_restore_prefers_api_key_over_oauth(workflow):
+    """The paid key is the deliberate choice; OAuth is the fallback branch."""
+    restores = [
+        _uncommented(str(s.get("run", "")))
+        for s in _steps_of(workflow)
+        if "Restore Grok auth" in str(s.get("name", ""))
+    ]
+    assert restores, f"{workflow}: restore step missing"
+    for body in restores:
+        key_branch = body.find('if [ -n "$XAI_API_KEY" ]')
+        oauth_branch = body.find('elif [ -n "$GROK_CI_AUTH_JSON" ]')
+        assert key_branch != -1 and oauth_branch != -1, (
+            f"{workflow}: restore is not dual-mode"
+        )
+        assert key_branch < oauth_branch, (
+            f"{workflow}: OAuth branch precedes the API key — key-wins ordering lost"
+        )
+
+
+@pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
+def test_every_agent_step_unsets_an_empty_api_key(workflow):
+    """GitHub exports a missing secret as "" and the CLI then selects ApiKey
+    auth and 401s even beside a valid auth.json (measured on 0.2.118/0.2.120).
+    """
+    for step in _steps_of(workflow):
+        body = _uncommented(str(step.get("run", "")))
+        if "--prompt-file" not in body:
+            continue
+        invoke = body.find("--prompt-file")
+        guard = body.find('if [ -z "${XAI_API_KEY:-}" ]; then unset XAI_API_KEY; fi')
+        assert guard != -1 and guard < invoke, (
+            f"{workflow}::{step.get('name')}: agent invocation without the "
+            "empty-key unset guard before it"
+        )
+        trim = body.find("XAI_API_KEY=\"${XAI_API_KEY//$'\\n'/}\"")
+        assert trim != -1 and trim < guard, (
+            f"{workflow}::{step.get('name')}: no CR/LF trim before the "
+            "empty-key guard — the CLI would receive a newline-tainted key"
+        )
+
+
+@pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
+def test_publish_gates_rebuild_needles_from_secrets(workflow):
+    """After the agent ran, only the secrets are known-live — the on-disk
+    auth.json is agent-reachable state. Every gate run against the DEFAULT
+    auth path must rebuild it, in both modes: API keys have no shape
+    backstop, and OAuth refresh tokens are opaque (not JWT-shaped).
+    The positive control is exempt — it feeds an explicit fixture pair.
+    """
+    found = 0
+    for step in _steps_of(workflow):
+        body = _uncommented(str(step.get("run", "")))
+        if "--require-auth" not in body or "fixture-auth.json" in body:
+            continue
+        found += 1
+        gate_call = body.find("--require-auth")
+        key_rebuild = body.find("printf '{\"xai_api_key\": \"%s\"}'")
+        oauth_rebuild = body.find('"$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d')
+        assert key_rebuild != -1 and key_rebuild < gate_call, (
+            f"{workflow}::{step.get('name')}: no API-key needle rebuild before the gate"
+        )
+        assert oauth_rebuild != -1 and oauth_rebuild < gate_call, (
+            f"{workflow}::{step.get('name')}: no OAuth needle rebuild before the gate"
+        )
+        # ORDERING is load-bearing (round-4 review): restore prefers the key,
+        # so the agent only ever held the key — a gate rebuild that prefers
+        # OAuth when both secrets exist scans the wrong credential and fails
+        # OPEN on the one the agent actually had. Mirror the restore pin.
+        key_branch = body.find('if [ -n "${XAI_API_KEY:-}" ]')
+        oauth_branch = body.find('elif [ -n "${GROK_CI_AUTH_JSON:-}" ]')
+        assert -1 < key_branch < oauth_branch < gate_call, (
+            f"{workflow}::{step.get('name')}: gate rebuild does not prefer the "
+            "API key before the OAuth blob"
+        )
+        # And no silent fallthrough: if restore and gate ever diverge, a run
+        # with neither secret must refuse rather than certify against
+        # agent-reachable on-disk state.
+        fallthrough_guard = body.find(
+            "No credential secret available to rebuild the needle set"
+        )
+        assert -1 < fallthrough_guard < gate_call, (
+            f"{workflow}::{step.get('name')}: rebuild lacks the fail-closed "
+            "else branch before the gate"
+        )
+        env = step.get("env") or {}
+        assert env.get("XAI_API_KEY") == "${{ secrets.XAI_API_KEY }}", (
+            f"{workflow}::{step.get('name')}: gate step lacks the key secret"
+        )
+        assert env.get("GROK_CI_AUTH_JSON") == "${{ secrets.GROK_CI_AUTH_JSON }}", (
+            f"{workflow}::{step.get('name')}: gate step lacks the OAuth secret"
+        )
+    assert found, f"{workflow}: no publish gate step found — pin is vacuous"
+
+
+@pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
+def test_shape_guard_precedes_every_key_json_write(workflow):
+    """A key containing a quote or backslash corrupts the printf JSON template,
+    so the character-class refusal must run first, at every write site."""
+    writes = 0
+    for step in _steps_of(workflow):
+        body = _uncommented(str(step.get("run", "")))
+        start = 0
+        while True:
+            write = body.find("printf '{\"xai_api_key\": \"%s\"}'", start)
+            if write == -1:
+                break
+            writes += 1
+            guard = body.rfind("*[!A-Za-z0-9._-]*", 0, write)
+            assert guard != -1, (
+                f"{workflow}::{step.get('name')}: xai_api_key JSON write "
+                "without a preceding shape guard"
+            )
+            # Trim must precede the guard: a valid key with a stray trailing
+            # newline (echo | gh secret set) must be normalized, not treated
+            # as a fatal shape violation that also blocks the OAuth elif.
+            trim = body.rfind("XAI_API_KEY=\"${XAI_API_KEY//$'\\n'/}\"", 0, write)
+            assert trim != -1, (
+                f"{workflow}::{step.get('name')}: xai_api_key write without a "
+                "preceding CR/LF trim"
+            )
+            start = write + 1
+    # Round-5 review: without a floor this pin is vacuous the moment every
+    # write disappears. Restore + publish gate = at least two per workflow.
+    assert writes >= 2, (
+        f"{workflow}: expected >=2 shape-guarded key writes, found {writes}"
+    )
