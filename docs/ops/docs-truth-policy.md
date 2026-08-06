@@ -60,15 +60,17 @@ if the *intent* was legitimate.
    (`goal_next_pr` / `honesty_partial` carrying an accepted risk), wright or
    the operator files the dated `re-check` issue per
    [disposition-expiry-policy.md](disposition-expiry-policy.md) NOW — before
-   any report is written; manual until the workflow emits it (#354).
+   any report is written. The converge workflow binds the reference in-schema
+   (`risk_acceptance`/`re_check_issue`, #354) and emits the Re-checks filed
+   section, but the issue itself is still filed by wright/operator — on every
+   report path.
 3. Report (after filing, never before): sections **Honesty shipped**,
    **Goals preserved for next PRs**, and **Re-checks filed**. The `.rhai`
-   builder already emits Goals preserved; **Honesty shipped** and
-   **Re-checks filed** it does not — wright/operator appends those two to
-   the scratch report and/or the PR-body Follow-ups after the run, until
-   #354 wires them in. For those two manual sections machine silence is
-   not N/A; state N/A explicitly when none, and Re-checks N/A is only true
-   if step 2 filed nothing.
+   builder already emits Goals preserved and Re-checks filed (#354);
+   **Honesty shipped** it does not — wright/operator appends it to the
+   scratch report and/or the PR-body Follow-ups after the run, manual for
+   other report paths. For that manual section machine silence is not N/A;
+   state N/A explicitly when none.
 
 See also: personal Grok App playbook in [grok-reviewer-app.md](grok-reviewer-app.md)
 (“Assumptions that became next PR goals”).

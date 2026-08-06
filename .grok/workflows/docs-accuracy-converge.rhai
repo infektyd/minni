@@ -61,6 +61,8 @@ let lane_schema = #{
                     "disposition": #{ "type": "string" },
                     "goal_title": #{ "type": "string" },
                     "fix_hint": #{ "type": "string" },
+                    "risk_acceptance": #{ "type": "boolean" },
+                    "re_check_issue": #{ "type": "string" },
                 },
             },
         },
@@ -84,6 +86,8 @@ let loom_schema = #{
                     "paths": #{ "type": "array", "items": #{ "type": "string" } },
                     "action": #{ "type": "string" },
                     "disposition": #{ "type": "string" },
+                    "risk_acceptance": #{ "type": "boolean" },
+                    "re_check_issue": #{ "type": "string" },
                 },
             },
         },
@@ -258,7 +262,7 @@ for lane in lanes {
     lp += ". Focus: ";
     lp += lane.focus;
     lp += "\nMUST use grep/read_file/run git show on the live tree — do not answer from memory. ";
-    lp += "For each real gap return severity High|Med|Low, claim quote, doc_path, code_anchor, disposition (honesty_cut|honesty_partial|implement_now|goal_next_pr|underclaim_add|ops_fleet), goal_title when disposition is goal_next_pr or honesty_partial, and fix_hint (honesty edit and/or code PR sketch). ";
+    lp += "For each real gap return severity High|Med|Low, claim quote, doc_path, code_anchor, disposition (honesty_cut|honesty_partial|implement_now|goal_next_pr|underclaim_add|ops_fleet), goal_title when disposition is goal_next_pr or honesty_partial, and fix_hint (honesty edit and/or code PR sketch). risk_acceptance (boolean) true when the disposition accepts a risk instead of fixing it now (any gap the lane recommends leaving unfixed with rationale rather than implement_now/honesty_cut); when risk_acceptance=true, re_check_issue (string) is REQUIRED — existing issue ref \"#NNN\" or exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days from today. ";
     lp += "Prefer honesty_partial+goal over bare honesty_cut when the claim was a legitimate ambition. Empty gaps only after greps confirm no false present-tense claims. ";
     lp += "Effort guidance: low-medium — thorough greps over long essays.";
     audit_jobs.push(#{
@@ -320,7 +324,7 @@ if n_gaps == 0 {
 // --- Phase: Loom ---
 phase("Loom");
 let loom_p = pin;
-loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. Effort guidance: high.\n\nGAPS:\n";
+loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. For each ordered_fixes entry, populate risk_acceptance (boolean; true when the disposition accepts a risk instead of fixing it now — deferral/accept-with-rationale, i.e. any gap left unfixed with rationale rather than implement_now/honesty_cut) and when risk_acceptance=true, re_check_issue (string) is REQUIRED — existing issue ref \"#NNN\" or exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days from today. Effort guidance: high.\n\nGAPS:\n";
 loom_p += gap_blob;
 let loom = agent(loom_p, #{
     label: "loom-plan",
@@ -496,6 +500,27 @@ if impl.output.goals_preserved != () {
         report += gp;
         report += "\n";
     }
+}
+report += "\n## Re-checks filed\n";
+let re_count = 0;
+if loom.output.ordered_fixes != () {
+    for f in loom.output.ordered_fixes {
+        if f.risk_acceptance == true {
+            re_count += 1;
+            report += "- ";
+            report += f.id;
+            report += ": ";
+            if f.re_check_issue != () {
+                report += f.re_check_issue;
+            } else {
+                report += "(missing re_check_issue)";
+            }
+            report += "\n";
+        }
+    }
+}
+if re_count == 0 {
+    report += "Re-checks filed: none required\n";
 }
 report += "\n## Adaptive roster feedback\n";
 report += "If audit missed Highs cass found: bump audit model (see docs/ops/agent-roster.md).\n";

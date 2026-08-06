@@ -15,7 +15,7 @@ overclaims that describe wanted capabilities become `goal_next_pr` /
 | `~/.grok/workflows/docs-accuracy-converge.rhai` | User copy for global discovery |
 | `docs/ops/agent-roster.md` | **Adaptive** model min/max roster |
 | `docs/ops/docs-truth-policy.md` | Dual-track honesty + goal preservation |
-| `docs/ops/disposition-expiry-policy.md` | 60-day re-check on accept-with-rationale dispositions — required for risk-accepting `goal_next_pr` / `honesty_partial`; filing is manual until wired into the `.rhai` (#354) |
+| `docs/ops/disposition-expiry-policy.md` | 60-day re-check on accept-with-rationale dispositions — required for risk-accepting `goal_next_pr` / `honesty_partial`; the converge workflow binds `risk_acceptance`/`re_check_issue` in-schema and emits the `Re-checks filed` section (#354); the issue itself is still filed by wright/operator |
 
 ## Adaptive model roster
 
@@ -37,18 +37,18 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
    (not pure ambition), wright or the operator must file the dated
    `re-check` issue per
    [disposition-expiry-policy.md](disposition-expiry-policy.md) and list it
-   in the report under "Re-checks filed" — manual until the `.rhai` emits
-   that section itself.
+   in the report under "Re-checks filed" — now emitted by the `.rhai`'s
+   `Re-checks filed` section (#354).
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
    (goals remaining is OK).
 6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.
 7. **Report** — three sections. Emitted today by the `.rhai` builder:
-   **Goals preserved for next PRs** (plus loom summary / roster / operator
-   next) — do not re-author it except to correct loom/wright output. NOT
-   emitted today, appended manually until #354: **Honesty shipped**
-   (summarize the honesty edits wright applied in step 4) and **Re-checks
-   filed** (the issues filed in step 4; state N/A explicitly when none —
-   for these manual sections, machine silence is not N/A).
+   **Goals preserved for next PRs**, **Re-checks filed**, plus loom summary /
+   roster / operator next — do not re-author them except to correct
+   loom/wright output. NOT emitted today, appended manually: **Honesty
+   shipped** (summarize the honesty edits wright applied in step 4; state
+   N/A explicitly when none — machine silence is not N/A) — manual for
+   other report paths.
 
 ## Run
 
