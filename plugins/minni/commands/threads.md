@@ -46,6 +46,5 @@ On-disk naming (deliberate, do not "fix"):
   The minni:threads rename is a tool/command-layer rename only — those strings are baked into existing
   vault filenames, wikilinks, journals and audit history, and changing them would orphan them.
 
-Deprecation: the old `minni_plan_*` tool names still resolve as aliases of these tools until the
-release after next.
-Call the `minni_thread_*` names.
+The old `minni_plan_*` tool names were removed in v0.5.0 — they no longer
+resolve. Call the `minni_thread_*` names.

@@ -58,11 +58,10 @@ the first failing layer; everything below it will look broken too.
   `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`, `MINNI_WORKSPACE_ID`.
 - Missing env = the platform may silently fall back to another agent's
   defaults. That is an identity-boundary failure, not a cosmetic one.
-- Tool count sanity: a current server registers **48 `minni_*` tools during the
-  minni:threads alias window** — 37 canonical registrations (including the 11
-  `minni_thread_*` tools) plus 11 deprecated `minni_plan_*` aliases. The count
-  returns to **37** when the aliases are dropped in the release after next.
-  Far fewer visible = stale plugin build or cache.
+- Tool count sanity: a current server registers **37 `minni_*` tools**
+  (including the 11 `minni_thread_*` tools; the 11 deprecated `minni_plan_*`
+  aliases were removed in v0.5.0). Materially fewer visible = stale plugin
+  build or cache; exactly 48 visible = a pre-0.5.0 alias-window build.
 
 ## Layer 4 — Hooks (per platform, shared semantics)
 
