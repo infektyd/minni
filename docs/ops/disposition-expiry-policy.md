@@ -63,7 +63,7 @@ re-asserts them or catches their decay.
 - Issue left open with a written disposition ("carry forward: …")
 - In-code exemption markers — the marker's justification is the rationale.
   Concrete instance: `SEC-G9-EXEMPT` in `.github/workflows/claude.yml`
-  (landed in #314). Note for anyone inventorying markers: `rg` skips hidden
+  (finding #236, knowingly deferred; marker landed in PR #314). Note for anyone inventorying markers: `rg` skips hidden
   directories like `.github/` by default — use `rg --hidden` or `grep -r`
 - Plan-slice evidence that accepts a residual ("known gap, tolerable
   because …")
