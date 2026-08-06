@@ -21,9 +21,9 @@ Silent erase of ambition is a process defect.
 | `disposition` | Meaning | This PR may… | Must also… |
 |---------------|---------|--------------|------------|
 | `honesty_cut` | Claim was wrong and **not** a goal | Rewrite/cut docs | Optional: note “not pursuing” |
-| `honesty_partial` | Goal exists; ship is incomplete | Mark PARTIAL / provisional + what works | Open or list **goal_next_pr** |
+| `honesty_partial` | Goal exists; ship is incomplete | Mark PARTIAL / provisional + what works | Open or list **goal_next_pr**; residuals that accept a risk also need the 60-day re-check ([disposition-expiry-policy.md](disposition-expiry-policy.md)) |
 | `implement_now` | Clear defect vs an **accepted** contract (hooks matrix, security must) | Fix **code** (+ tighten docs) | Stay scoped; no drive-by features |
-| `goal_next_pr` | Wanted capability; not this PR’s job | Minimal honesty so docs don’t overclaim | Write goal title + acceptance sketch |
+| `goal_next_pr` | Wanted capability; not this PR’s job | Minimal honesty so docs don’t overclaim | Write goal title + acceptance sketch; if the gap being carried is an **accepted risk** (not pure ambition), file the 60-day re-check per [disposition-expiry-policy.md](disposition-expiry-policy.md) |
 | `underclaim_add` | Code has feature docs omit | Add docs with anchors | — |
 | `ops_fleet` | Install/fleet lag, not prose | Point at the fix command (`minni sync`, etc.) | — |
 

@@ -7,11 +7,16 @@ campaign (R13). Tracking issue: #345.
 
 Any finding that is **accepted with a rationale** — dispositioned as
 "won't fix / fix later / exempt, because X" rather than fixed — must record a
-**re-check due 60 days from the acceptance date**, at accept time, as either:
+**re-check due 60 days from the acceptance date**, at accept time, as a
+**dated GitHub issue labeled `re-check`** whose title carries the due date
+("Re-check by YYYY-MM-DD: …") and whose body cites the original disposition
+and the evidence that justified acceptance.
 
-- a slice in the active governing plan, or
-- a dated GitHub issue labeled `re-check` whose body cites the original
-  disposition and the evidence that justified acceptance.
+The issue is the **system of record**. A plan slice may point at the issue
+(and should, when a campaign is active), but must never be the only copy:
+plans complete, get superseded, and get replaced — which is exactly how the
+June backlog vanished. If a plan carrying open re-check slices is closed or
+superseded, each open slice becomes a dated issue **before** the plan dies.
 
 The re-check verifies the rationale still holds against **current** code and
 measurements — not against the state of the world when it was written.
@@ -23,7 +28,15 @@ Allowed outcomes:
    to work.
 3. **Escalate** — the situation changed shape; re-triage from scratch.
 
-A re-check that silently lapses is itself a finding.
+A re-check that silently lapses is itself a finding — and lapses must be
+discoverable, not aspirational:
+
+- **Query:** `gh issue list --label re-check` (open = outstanding; a due date
+  in the past on an open issue = lapsed).
+- **Owner and cadence:** the operator (or an agent acting on the operator's
+  standing instructions) runs the query at every campaign close-out and at
+  least monthly between campaigns; any lapsed re-check gets raised as a
+  finding in the next session, not silently re-dated.
 
 ## Why (the evidence)
 
@@ -53,8 +66,21 @@ re-asserts them or catches their decay.
 - Plan-slice evidence that accepts a residual ("known gap, tolerable
   because …")
 
-Not covered: items actually fixed (their tests are the re-check), and
-log-only observations that dispositioned nothing.
+Not covered:
+
+- items actually fixed — their tests are the re-check;
+- log-only observations that dispositioned nothing;
+- **permanent architectural residuals** already recorded as accepted scope in
+  the threat model (e.g. THREAT_MODEL.md §7: same-uid owner is inside the
+  boundary, no multi-tenant hardening). Perpetual 60-day churn on explicit
+  non-goals is noise, not vigilance. These re-enter scope only when the
+  residual's *boundary* changes (new tenant class, new privilege boundary,
+  the deferred item's preconditions materializing);
+- `goal_next_pr` items that are pure feature ambition with no risk
+  acceptance — goals are tracked by the truth policy's own mechanism. A
+  `goal_next_pr` that *papers over an accepted risk*, and any
+  `honesty_partial` whose residual is a risk acceptance, DOES need the
+  re-check.
 
 ## Bookkeeping
 

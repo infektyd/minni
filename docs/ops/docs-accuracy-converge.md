@@ -15,6 +15,7 @@ overclaims that describe wanted capabilities become `goal_next_pr` /
 | `~/.grok/workflows/docs-accuracy-converge.rhai` | User copy for global discovery |
 | `docs/ops/agent-roster.md` | **Adaptive** model min/max roster |
 | `docs/ops/docs-truth-policy.md` | Dual-track honesty + goal preservation |
+| `docs/ops/disposition-expiry-policy.md` | 60-day re-check on accept-with-rationale dispositions (binds `goal_next_pr` / `honesty_partial` when a risk is being accepted) |
 
 ## Adaptive model roster
 
