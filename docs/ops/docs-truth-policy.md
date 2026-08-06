@@ -64,9 +64,10 @@ if the *intent* was legitimate.
    both gap arrays, #354), instructs wright to file proposed titles during
    implement, and emits a Re-checks required section that marks filed refs
    (`#NNN`) apart from PROPOSED titles. Emission may precede filing — a
-   PROPOSED row is the owed-work signal, not a process bug — but no merge
-   happens while one remains, and N/A is claimable only when the section
-   says none.
+   PROPOSED row is the owed-work signal, not a process bug. Nothing in the
+   workflow or CI enforces this: clearing every PROPOSED row (or confirming
+   wright's `#NNN` in Follow-ups) before merging is the OPERATOR's gate, and
+   N/A is claimable only when the section says none.
 3. Report: sections **Honesty shipped**,
    **Goals preserved for next PRs**, and **Re-checks required**. The `.rhai`
    builder emits Goals preserved and Re-checks required (#354); **Honesty
