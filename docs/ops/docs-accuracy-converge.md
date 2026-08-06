@@ -42,10 +42,13 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
    (goals remaining is OK).
 6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.
-7. **Report** — **Honesty shipped** + **Goals preserved for next PRs** +
-   **Re-checks filed** (state N/A explicitly when none). The `.rhai`
-   builder does not emit these last sections yet — wright/operator appends
-   them manually per step 4 until #354 lands; machine silence is not N/A.
+7. **Report** — three sections. Emitted today by the `.rhai` builder:
+   **Goals preserved for next PRs** (plus loom summary / roster / operator
+   next) — do not re-author it except to correct loom/wright output. NOT
+   emitted today, appended manually until #354: **Honesty shipped**
+   (summarize the honesty edits wright applied in step 4) and **Re-checks
+   filed** (the issues filed in step 4; state N/A explicitly when none —
+   for these manual sections, machine silence is not N/A).
 
 ## Run
 
