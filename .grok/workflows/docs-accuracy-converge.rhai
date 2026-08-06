@@ -322,6 +322,9 @@ for ar in audit_results {
             }
             if g.risk_acceptance == true || g.risk_acceptance == "true" {
                 gap_blob += " | risk_acceptance=true";
+                if g.re_check_issue == () || g.re_check_issue == "" {
+                    gap_blob += " | re_check=(missing)";
+                }
             } else if g.risk_acceptance == false || g.risk_acceptance == "false" {
                 gap_blob += " | risk_acceptance=false";
             } else {
@@ -351,7 +354,7 @@ if n_gaps == 0 {
 // --- Phase: Loom ---
 phase("Loom");
 let loom_p = pin;
-loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. For EVERY entry in BOTH ordered_fixes and goals_next_pr, set risk_acceptance (boolean, ALWAYS present): true only when the item leaves a RISK accepted with a rationale (deferred exposure, known gap tolerated for a stated reason) — false for pure feature ambition with no risk; a goal_next_pr that papers over an accepted risk is TRUE. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out (carry the date the audit lanes computed; do not guess). Effort guidance: high.\n\nGAPS:\n";
+loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. For EVERY entry in BOTH ordered_fixes and goals_next_pr, set risk_acceptance (boolean, ALWAYS present): true only when the item leaves a RISK accepted with a rationale (deferred exposure, known gap tolerated for a stated reason) — false for pure feature ambition with no risk; a goal_next_pr that papers over an accepted risk is TRUE. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — prefer the re_check the audit lane carried; when the lane shows re_check=(missing), compute the date yourself with `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` and build the title (do-not-guess means do not invent a calendar day, never leave the field empty on a true row). Effort guidance: high.\n\nGAPS:\n";
 loom_p += gap_blob;
 let loom = agent(loom_p, #{
     label: "loom-plan",
@@ -378,7 +381,7 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally; pr_number=0. ";
 }
-imp += "PLAN_JSON entries with risk_acceptance=true and a re_check_issue that is a proposed title (not a #NNN ref): file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Return every filing you performed in re_checks_filed as {id, issue_ref} so the report reflects reality. ";
+imp += "PLAN_JSON entries with risk_acceptance=true and a re_check_issue that is a proposed title (not a #NNN ref): file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Return every filing you performed in re_checks_filed as {id, issue_ref}, where id is the EXACT loom entry id you filed for (list both twin ids if a residual appears in ordered_fixes and goals_next_pr) so the report reflects reality. ";
 imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved, re_checks_filed (every filing as {id, issue_ref}; empty array when none — walk BOTH ordered_fixes and goals_next_pr). Effort guidance: medium.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
@@ -554,7 +557,16 @@ for lst in re_lists {
             let declared = "";
             if f.re_check_issue != () { declared = f.re_check_issue; }
             let artifact = declared;
-            if filed_by_id.contains(f.id) { artifact = filed_by_id[f.id]; }
+            if filed_by_id.contains(f.id) {
+                let filed = filed_by_id[f.id];
+                // Upgrade ONLY on a filed-shaped ref: an empty or junk
+                // issue_ref from a failed wright must never clobber loom's
+                // declared title — the operator needs that exact title.
+                if filed != () && filed != ""
+                    && (filed.starts_with("#") || filed.contains("/issues/")) {
+                    artifact = filed;
+                }
+            }
             risk_rows.push(#{ id: f.id, declared: declared, artifact: artifact });
         }
     }
@@ -599,6 +611,25 @@ for m in merged {
         report += "(missing re_check_issue — schema gap, file manually)";
     }
     report += "\n";
+}
+// Wright filings whose id matched no declared risk row: surface rather
+// than silently drop — a mismatched id would otherwise leave a real issue
+// invisible and the twin row PROPOSED, prompting a duplicate filing.
+let matched_ids = [];
+for r in risk_rows { matched_ids.push(r.id); }
+if impl.output.re_checks_filed != () {
+    for rc in impl.output.re_checks_filed {
+        if !matched_ids.contains(rc.id) && rc.issue_ref != ()
+            && rc.issue_ref != ""
+            && (rc.issue_ref.starts_with("#") || rc.issue_ref.contains("/issues/")) {
+            re_count += 1;
+            report += "- ";
+            report += rc.id;
+            report += ": ";
+            report += rc.issue_ref;
+            report += " (filed ref — id matched no declared risk row; verify before filing anything new)\n";
+        }
+    }
 }
 if re_count == 0 {
     report += "Re-checks required: none (no risk-accepting dispositions declared)\n";
