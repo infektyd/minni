@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minni"
-version = "0.4.2"
+version = "0.5.0"
 description = "Minni (ᛗ): local-first, multi-agent memory daemon — recall is evidence, not instruction."
 readme = { text = "Minni is a local-first, multi-agent memory daemon. Full documentation: https://github.com/infektyd/minni", content-type = "text/markdown" }
 requires-python = ">=3.14"

@@ -1,5 +1,12 @@
 # MCP 2026-07-28 readiness for the Minni plugin server
 
+> **Historical snapshot (2026-08-01).** Inventory figures below predate
+> v0.5.0: the 11 deprecated `minni_plan_*` aliases and the 48-tool count
+> they produced were REMOVED in v0.5.0 — the live surface is **37 canonical
+> tools** and `tool-schema-boundary.test.mjs` pins 37. Do not use this
+> document's 48/alias inventory as a live verification target; the decided
+> plan and tripwire remain valid.
+
 Status: proposed, 2026-08-01
 Scope: assess what the MCP `2026-07-28` specification revision requires of
 Minni's MCP surface (`plugins/minni/src/server.ts`), decide what lands now and

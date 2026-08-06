@@ -121,8 +121,11 @@ Prefer **Only select repositories** (`minni` ± canary). If install is
 
 ## Branch protection (operator — propose, don't silent-apply)
 
-To stop needing `--admin` for solo merges, make the mechanical check + real CI
-required, and drop the approving-review count that bots cannot satisfy:
+The live design (since the 2026-08 campaign close): the mechanical check and
+real CI are required, `required_approving_review_count` stays at `1` —
+satisfied by the relay-approval channel, which is the intentional satisfier,
+not an optional extra — and `enforce_admins` is `true`, so no standing admin
+bypass exists:
 
 Use `checks` with an `app_id` per context — **never** the bare `contexts` array.
 A name-only requirement is mintable by any same-repo workflow; see the next
@@ -142,9 +145,9 @@ gh api -X PUT repos/infektyd/minni/branches/main/protection \
       { "context": "grok-mechanical-approve", "app_id": 4456296 }
     ]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": {
-    "required_approving_review_count": 0,
+    "required_approving_review_count": 1,
     "dismiss_stale_reviews": true
   },
   "required_conversation_resolution": true,
@@ -165,15 +168,14 @@ gh api repos/infektyd/minni/branches/main/protection > /tmp/prot-after.json
 diff <(jq -S . /tmp/prot-before.json) <(jq -S . /tmp/prot-after.json)
 ```
 
-**Use PUT, not PATCH, for this change.** `PATCH .../protection/required_status_checks`
-only edits the status-check block: it leaves `required_approving_review_count`
-at its current value, which is `1` — so merges would still need `--admin` and
-the whole exercise fails to achieve its goal. Only the full `PUT` above sets the
-count to `0`. Reach for the PATCH form solely when adding or re-binding a
-context and you intend everything else to stay as-is.
-
-Keep `required_approving_review_count: 1` only if you still want a **human**
-review in addition to the mechanical check (bots still will not count).
+**Use PUT, not PATCH, when re-applying the full configuration.**
+`PATCH .../protection/required_status_checks` only edits the status-check
+block; a full re-apply (e.g. after an emergency `enforce_admins` disable)
+must be the complete `PUT` above so you do not silently drop
+`enforce_admins`, `required_conversation_resolution`, or the review count.
+The body above IS the live target — count `1`, `enforce_admins: true`.
+Reach for the PATCH form solely when adding or re-binding a context and you
+intend everything else to stay as-is.
 
 ### The App private key is the real trust root — and push access reaches it
 
@@ -331,10 +333,11 @@ run: none exists under the App until after step 1 lands, so that lookup returns
 the GitHub Actions id and would bind the context to precisely the integration
 you are trying to exclude.
 
-`strict: true` is load-bearing and is **not** the current setting (`strict` is
-`false` on `main` today). At `required_approving_review_count: 0` it is the only
-thing forcing re-evaluation after the base branch moves; without it a check
-evaluated against an older `main` still authorises the merge.
+`strict: true` is load-bearing and IS the live setting on `main` (enabled
+2026-08-01, preserved through the campaign's R14 close). It forces
+re-evaluation after the base branch moves; without it a check evaluated
+against an older `main` still authorises the merge. The live review count is
+`1`, satisfied by the relay-approval channel.
 
 **Do not add `boundary` to this list.** Grok Boundary Test only runs on PRs
 touching `.github/workflows/grok*.yml` or `check-no-credential-leak.py`. On an
@@ -547,8 +550,12 @@ the one that still applies if the gate is ever bypassed.
 
 A green mechanical check means “eligible Grok verdict + required CI green” —
 **not** correctness. Agent-authored PRs can still ship bad-but-green code.
-Keep `enforce_admins: false` as a manual escape hatch. Path filter forces
-human attention on gate/workflow changes.
+`enforce_admins` is ON since the 2026-08 campaign close: the protection
+binds administrators too, and there is deliberately no standing bypass.
+Disabling it (`gh api -X DELETE .../protection/enforce_admins`) is an
+explicit, temporary operator action for emergencies — re-enable when done;
+it is not the default recipe. Path filter forces human attention on
+gate/workflow changes.
 
 ## Recovery
 
@@ -623,22 +630,34 @@ App `APPROVE` does not count (settled above). Green path is:
 posted ELIG is **normal** until the mechanical check and/or relay APPROVE
 land. Do not re-fire `/grok-review` just to “fix” reviewDecision.
 
-### PATH_DENY → mechanical stays red (use admin consciously)
+### PATH_DENY → mechanical stays red (trust-surface merges are operator ceremonies)
 
 `PATH_DENY_PREFIXES` includes `.github/`, gate tests, **and** `pyproject.toml`
 / pytest root configs (so collection config cannot silence tripwires).
 
 **Implication:** a PR that only *stamps* `pyproject.toml` for a release
-(e.g. 0.4.1 → 0.4.2) can be App-ELIG + Public CI green and still have
-`grok-mechanical-approve` **failure by design**. That is not a flaky gate.
+(e.g. 0.4.x → 0.5.0) can be App-ELIG + Public CI green and still have
+`grok-mechanical-approve` **failure by design**. That is not a flaky gate —
+and with `enforce_admins` on, `--admin` is **not** a bypass anymore: the
+old "honest path" of `gh pr merge --admin` is refused outright.
 
-Personal rule:
+The documented sequence for an intentional trust-surface merge
+(App-ELIG + CI green, gate red only on the path filter):
 
-- Prefer **split** release-stamp PR vs large docs/code PR when possible.
-- When a stamp stack is intentional and App+CI are green: **`gh pr merge
-  --admin --squash`** is the honest path — not dismiss thrash or another
-  metered review.
-- Agent policy elsewhere: never self-admin unless the operator said so.
+1. Verify everything else earned: current-head APPROVE stamp, Bugbot, CI,
+   reviewDecision.
+2. Temporarily lift admin binding:
+   `gh api -X DELETE repos/OWNER/REPO/branches/main/protection/enforce_admins`
+3. Merge: `gh pr merge N --admin --squash --match-head-commit <head-sha>`
+4. **Immediately** re-enable:
+   `gh api -X POST repos/OWNER/REPO/branches/main/protection/enforce_admins`
+5. Verify the full protection JSON against the PUT recipe above (strict,
+   checks, count 1, enforce_admins true).
+
+The disable window is the ceremony: deliberate, seconds long, logged in the
+audit trail, and always paired with the re-enable + verify. Prefer a
+**split** release-stamp PR over folding stamps into large docs/code PRs, so
+the ceremony covers the smallest possible diff.
 
 ### Campaign hygiene (reduces App bills)
 

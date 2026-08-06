@@ -9,7 +9,7 @@
 // That is the trap this file guards. Because the migration is a package swap
 // rather than a version bump, the wire protocol Minni speaks can change without
 // any obvious signal in package.json — a transitive resolution, an inattentive
-// dependency edit, or an unexpected v1 release. Under 48 registered tools, that
+// dependency edit, or an unexpected v1 release. Under 37 registered tools, that
 // change would otherwise be invisible until something failed in the field.
 //
 // These assertions therefore lock a CURRENT-STATE FACT rather than correcting a
