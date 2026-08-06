@@ -8,6 +8,15 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-06
+
+Close of the 2026-08 audit remediation campaign (81 findings, 15 slices,
+~35 reviewed PRs since v0.4.1). The theme of this release is **removal of
+false confidence**: memory that was written but unreachable is now
+reachable, health signals that were constants now derive from state, queues
+that only accumulated now drain, and rules that were advisory now bind.
+**Minor** version per the pre-1.0 convention: it contains a breaking removal.
+
 ### Removed
 
 - **`minni_plan_*` deprecated tool aliases:** the 11 pre-rename aliases
@@ -19,6 +28,89 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   param, `plan.*` gate keys, `plan_*` frontmatter, `_active_plan.json`
   pointer filename, and the `hook_active_plan_error` audit name remain
   permanent, guarded by the freeze test.
+
+### Added
+
+- **Per-principal `auto_accept_own` opt-in (#290, #344):** an operator can
+  now delegate the narrow self-accept case — a principal auto-accepting its
+  own learn candidates — by setting `auto_accept_own: true` in that
+  principal's file. Off by default, `0600`-protected, parsed strictly
+  (`is True`, never truthy), and refused when supplied over the wire: the
+  knob cannot be flipped remotely. Auto and manual acceptance share one
+  choreography, so both paths get the same in-transaction review-marker
+  supersede and post-commit index/archive settlement.
+- **Plan dependencies are enforced (#291, #333):** marking a slice done with
+  unmet `depends_on` is hard-blocked (a dependency counts only when `done`
+  or `superseded`). Overriding requires `force` **plus** a non-empty
+  `forceReason`, and writes a `depends_on_override` journal record naming
+  what was unmet and who forced it. At enforcement time this protected 92
+  open slices across 119 existing plans.
+- **`memory_lifecycle` health block (#229, #305):** every memory queue
+  (inbox, dead-letter quarantine, review markers) is now a first-class
+  health surface with counts and age readings — no queue without a drain
+  and an age.
+- **Episodic index coverage in health (#225, #279):** the episodic layer
+  reports measured FTS coverage with an agent-scoped denominator.
+- **Accept-with-rationale expiry policy (#345, #353):** any finding
+  accepted with a rationale now files a dated 60-day re-check issue
+  (label `re-check`, due date in the title) at accept time — the issue is
+  the system of record. Adopted because both June acceptances proved wrong
+  on re-measurement. Documented in `docs/ops/disposition-expiry-policy.md`
+  and bound into the docs-truth-policy disposition enum.
+
+### Fixed
+
+- **Episodic memory is reachable (#225, #279):** events written before the
+  FTS triggers existed were never indexed — only 8 of 43 real memories were
+  findable. A migration backfills them (43/43), a reconcile sweep keeps the
+  index converged, and the relevance-decay runner is actually scheduled.
+- **Recall admits degradation (#226, #281):** vector-backend loss and
+  auth-suppressed results are now distinguishable from a complete answer at
+  every call site (including the SessionStart boot slice); degrade details
+  are redacted at the sink; shared-corpus results are de-duplicated across
+  search legs instead of double-counting.
+- **Cross-agent handoff honesty (#231, #289):** database errors no longer
+  read as an empty inbox; the DB no longer shadows the file channel; the
+  active-thread pointer is written atomically; expired leases return
+  `expired` immediately (status derived from `expires_at` at read) instead
+  of hanging callers for the full timeout.
+- **Memory-lifecycle queues drain (#229, #305):** the dead-letter inbox
+  (107 files with writers and no readers) drains via quarantine claim —
+  move-never-delete with a reason sidecar per file; 480 orphaned
+  `afm_review` markers reconciled; *rejected by governance* and *errored*
+  are now distinct terminal statuses, both excluded from recall.
+- **June-carryover defect wave (#291–#298):** eight 2026-06-10 findings
+  fixed rather than re-deferred, including: inbox quarantine moves files
+  with `os.replace` (never unlink), the unusable-compact-file health count
+  is live (not tick-multiplied), `compact_distillation` skip counts surface
+  to the caller, worktree containment decided on the filesystem
+  (`samestat`) rather than string prefixes, vault frontmatter/snippet
+  regexes unified so the privacy gate cannot be bypassed by formatting
+  (#312), vault search filters and re-ranks before its lexical truncation
+  (#313, #339), and handoff context withheld under budget is marked with a
+  count instead of dropped silently (#340).
+- **Native-runtime stability (#300, #322, #323):** the two-libomp SIGSEGV
+  class is closed — FAISS/torch tests run the entrypoint in a subprocess,
+  and the OMP single-runtime pin is applied before any native import.
+
+### Security
+
+- **CI trust surface hardened (#235, #236, #240, #304, #314):** the
+  fork-PR path inside the required check reports an honest skip instead of
+  a silent no-op; the Claude workflow gained an author-association gate,
+  concurrency group, and timeout; a review check that had never reviewed
+  anything was removed; leak-gate tier claims match what actually ran; the
+  reviewer CLI is version-pinned so a CLI release is a visible file change.
+- **Adversarial review pipeline on dual-mode auth (#350):** the Grok
+  reviewer accepts a pay-per-use `XAI_API_KEY` (preferred) or the
+  subscription OAuth capture, with whitespace normalization, empty-secret
+  guards, and leak-gate needle rebuild from secrets after the agent runs —
+  in both auth modes. The boundary probe now exercises the environment
+  surface with a liveness marker.
+- **Branch protection binds administrators:** with the campaign's health
+  and CI signals honest, `enforce_admins` is on — every merge, including
+  the operator's, passes the review + mechanical-gate + relay-approval
+  chain. Proven end-to-end before enabling.
 
 ## [0.4.2] - 2026-08-03
 
@@ -384,7 +476,8 @@ commit.
   model-download notices, contributor/security hygiene files, and a rewritten
   README with a `docs/` tree.
 
-[Unreleased]: https://github.com/infektyd/minni/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/infektyd/minni/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/infektyd/minni/releases/tag/v0.5.0
 [0.4.2]: https://github.com/infektyd/minni/releases/tag/v0.4.2
 [0.4.1]: https://github.com/infektyd/minni/releases/tag/v0.4.1
 [0.1.0]: https://github.com/infektyd/minni/releases/tag/v0.1.0
