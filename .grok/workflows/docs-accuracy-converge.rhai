@@ -51,7 +51,7 @@ let lane_schema = #{
             "maxItems": 12,
             "items": #{
                 "type": "object",
-                "required": ["id", "severity", "claim", "doc_path", "code_anchor", "disposition", "fix_hint"],
+                "required": ["id", "severity", "claim", "doc_path", "code_anchor", "disposition", "fix_hint", "risk_acceptance"],
                 "properties": #{
                     "id": #{ "type": "string" },
                     "severity": #{ "type": "string" },
@@ -311,10 +311,14 @@ for ar in audit_results {
             }
             if g.risk_acceptance == true || g.risk_acceptance == "true" {
                 gap_blob += " | risk_acceptance=true";
-                if g.re_check_issue != () && g.re_check_issue != "" {
-                    gap_blob += " | re_check=";
-                    gap_blob += g.re_check_issue;
-                }
+            } else {
+                // Forward the explicit bit either way: an omitted field must
+                // not read the same as a considered false downstream.
+                gap_blob += " | risk_acceptance=false";
+            }
+            if g.re_check_issue != () && g.re_check_issue != "" {
+                gap_blob += " | re_check=";
+                gap_blob += g.re_check_issue;
             }
             gap_blob += "\n";
         }
@@ -360,6 +364,7 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally; pr_number=0. ";
 }
+imp += "PLAN_JSON entries with risk_acceptance=true and a re_check_issue that is a proposed title (not a #NNN ref): file the dated issue now — `gh issue create --label re-check --title \"<exact title>\"` — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. ";
 imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved. Effort guidance: medium.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
@@ -531,7 +536,8 @@ for lst in re_lists {
             report += ": ";
             if f.re_check_issue != () && f.re_check_issue != "" {
                 report += f.re_check_issue;
-                if f.re_check_issue.starts_with("#") {
+                if f.re_check_issue.starts_with("#")
+                    || f.re_check_issue.contains("/issues/") {
                     report += " (filed ref)";
                 } else {
                     report += " (PROPOSED — not yet filed)";
@@ -552,9 +558,10 @@ report += "If wright needed >2 pongs: bump wright. If spend high and clean: chea
 report += "Update agent-roster.md Changelog after this run.\n";
 report += "\n## Operator next\n";
 report += "1. Review honesty PR; do not agent-merge.\n";
-report += "2. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
-report += "3. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
-report += "4. Bare /grok-review only after tip freeze if App ELIG needed.\n";
+report += "2. File every PROPOSED entry in Re-checks required (label re-check, title exactly as listed) BEFORE merge; N/A only if that section says none.\n";
+report += "3. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
+report += "4. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
+report += "5. Bare /grok-review only after tip freeze if App ELIG needed.\n";
 
 let path = write_scratch_file("docs-accuracy-report.md", report);
 complete(#{

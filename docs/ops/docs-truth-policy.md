@@ -59,13 +59,15 @@ if the *intent* was legitimate.
    scoped; never drop goals on the floor. For risk-accepting residuals
    (`goal_next_pr` / `honesty_partial` carrying an accepted risk), wright or
    the operator files the dated `re-check` issue per
-   [disposition-expiry-policy.md](disposition-expiry-policy.md) NOW — before
-   any report is written. The converge workflow binds the reference in-schema
-   (`risk_acceptance`/`re_check_issue`, both gap arrays, #354) and emits a
-   Re-checks required section that marks filed refs (`#NNN`) apart from
-   PROPOSED titles — but the issue itself is still filed by wright/operator,
-   on every report path.
-3. Report (after filing, never before): sections **Honesty shipped**,
+   [disposition-expiry-policy.md](disposition-expiry-policy.md). The converge
+   workflow binds the reference in-schema (`risk_acceptance`/`re_check_issue`,
+   both gap arrays, #354), instructs wright to file proposed titles during
+   implement, and emits a Re-checks required section that marks filed refs
+   (`#NNN`) apart from PROPOSED titles. Emission may precede filing — a
+   PROPOSED row is the owed-work signal, not a process bug — but no merge
+   happens while one remains, and N/A is claimable only when the section
+   says none.
+3. Report: sections **Honesty shipped**,
    **Goals preserved for next PRs**, and **Re-checks required**. The `.rhai`
    builder emits Goals preserved and Re-checks required (#354); **Honesty
    shipped** it does not — wright/operator appends it to the scratch report
