@@ -56,14 +56,14 @@ if the *intent* was legitimate.
 1. Tag each gap with `disposition` (and `goal_title` when disposition is
    `goal_next_pr` or `honesty_partial`).
 2. Wright: apply **honesty now** edits; for `implement_now` only when High and
-   scoped; never drop goals on the floor.
-3. Report: sections **Honesty shipped**, **Goals preserved for next PRs**,
-   and **Re-checks filed** (state N/A explicitly when none).
-4. For risk-accepting residuals (`goal_next_pr` / `honesty_partial` carrying
-   an accepted risk): file the dated `re-check` issue per
-   [disposition-expiry-policy.md](disposition-expiry-policy.md). Wright or
-   the operator does the filing — manual until the workflow emits it
-   (#354).
+   scoped; never drop goals on the floor. For risk-accepting residuals
+   (`goal_next_pr` / `honesty_partial` carrying an accepted risk), wright or
+   the operator files the dated `re-check` issue per
+   [disposition-expiry-policy.md](disposition-expiry-policy.md) NOW — before
+   any report is written; manual until the workflow emits it (#354).
+3. Report (after filing, never before): sections **Honesty shipped**,
+   **Goals preserved for next PRs**, and **Re-checks filed** (state N/A
+   explicitly when none — and N/A is only true if step 2 filed nothing).
 
 See also: personal Grok App playbook in [grok-reviewer-app.md](grok-reviewer-app.md)
 (“Assumptions that became next PR goals”).

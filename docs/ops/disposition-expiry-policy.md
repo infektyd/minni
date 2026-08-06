@@ -33,6 +33,10 @@ discoverable, not aspirational:
 
 - **Query:** `gh issue list --label re-check` (open = outstanding; a due date
   in the past on an open issue = lapsed).
+- **Bootstrap:** the `re-check` label must exist on the repo (created at
+  adoption: `gh label create re-check`); every re-check issue carries it —
+  an unlabeled dated issue is invisible to the query and therefore a filing
+  defect, not a lapse.
 - **Owner and cadence:** the operator (or an agent acting on the operator's
   standing instructions) runs the query at every campaign close-out and at
   least monthly between campaigns; any lapsed re-check gets raised as a
