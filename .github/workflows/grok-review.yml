@@ -52,9 +52,13 @@ permissions:
 
 concurrency:
   # issue_comment carries no pull_request payload; both events land on the PR
-  # number so two rapid commands coalesce instead of double-billing.
+  # number. cancel-in-progress must stay FALSE (#351): EVERY comment on the PR
+  # enters this group before the job-level `if` decides to skip, so with
+  # cancel-in-progress a plain comment cancels an in-flight metered review
+  # (measured on PR #350). Rapid commands still coalesce via the group's single
+  # pending slot, and Resolve PR's per-SHA dedup absorbs double-billing.
   group: grok-review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   grok-review:

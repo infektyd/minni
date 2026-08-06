@@ -50,6 +50,23 @@ def test_concurrency_group_is_keyed_on_head_sha_for_every_trigger(gate):
         assert expr in group, f"{expr} missing from concurrency group: {group}"
 
 
+def test_review_concurrency_never_cancels_an_inflight_run(review):
+    """EVERY issue_comment on the PR enters the review concurrency group before
+    the job-level `if` decides to skip, so cancel-in-progress would let a plain
+    comment cancel an in-flight metered review — measured on PR #350, where a
+    `bugbot run` comment killed the auto-review run mid-flight (#351). The
+    group's single pending slot still coalesces rapid commands, and Resolve
+    PR's per-SHA dedup absorbs double-billing."""
+    conc = review["concurrency"]
+    assert conc["cancel-in-progress"] is False, (
+        "cancel-in-progress on grok-review reintroduces the paid-review kill (#351)"
+    )
+    group = str(conc["group"])
+    assert "pull_request.number" in group and "issue.number" in group, (
+        f"review group must key both PR events onto one PR-number group: {group}"
+    )
+
+
 def test_ci_completion_uses_workflow_run_not_check_suite(gate):
     """check_suite does NOT trigger a workflow when the suite was created by
     GitHub Actions, and every CI suite here is Actions-created. Measured on this
