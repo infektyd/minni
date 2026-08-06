@@ -61,8 +61,10 @@ re-asserts them or catches their decay.
 
 - Issue closed as "working as intended, because …"
 - Issue left open with a written disposition ("carry forward: …")
-- In-code exemption markers (e.g. `SEC-G9-EXEMPT`) — the marker's
-  justification is the rationale
+- In-code exemption markers — the marker's justification is the rationale.
+  Concrete instance: `SEC-G9-EXEMPT` in `.github/workflows/claude.yml`
+  (landed in #314). Note for anyone inventorying markers: `rg` skips hidden
+  directories like `.github/` by default — use `rg --hidden` or `grep -r`
 - Plan-slice evidence that accepts a residual ("known gap, tolerable
   because …")
 
@@ -70,12 +72,17 @@ Not covered:
 
 - items actually fixed — their tests are the re-check;
 - log-only observations that dispositioned nothing;
-- **permanent architectural residuals** already recorded as accepted scope in
-  the threat model (e.g. THREAT_MODEL.md §7: same-uid owner is inside the
-  boundary, no multi-tenant hardening). Perpetual 60-day churn on explicit
+- **permanent non-goals** recorded as accepted scope in
+  [`../contracts/THREAT_MODEL.md`](../contracts/THREAT_MODEL.md) §7 — the
+  same-uid owner being inside the boundary, no multi-tenant hardening,
+  `gate.shared` not being an ACL. Perpetual 60-day churn on explicit
   non-goals is noise, not vigilance. These re-enter scope only when the
-  residual's *boundary* changes (new tenant class, new privilege boundary,
-  the deferred item's preconditions materializing);
+  residual's *boundary* changes (new tenant class, new privilege boundary).
+  **This exemption is item-by-item, never section-by-section**: §7 also
+  contains *deferred* work (e.g. SEC-021 cryptographic agent
+  authentication), and a deferral is a risk acceptance that goes stale on
+  its own — deferred items take the 60-day re-check until fixed, or until a
+  fresh operator decision reclassifies them as a permanent non-goal;
 - `goal_next_pr` items that are pure feature ambition with no risk
   acceptance — goals are tracked by the truth policy's own mechanism. A
   `goal_next_pr` that *papers over an accepted risk*, and any

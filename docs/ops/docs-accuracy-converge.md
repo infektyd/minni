@@ -32,7 +32,10 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
 2. **AuditFanout** — 6 parallel **explore** lanes (stamps, deny matrix, AFM/install, fleet/cursor, team rename, runtimes/release).
 3. **Loom** — dedupe/rank; split **honesty_now** vs **goal_next_pr** lists.
 4. **Implement** — **wright** applies honesty (+ scoped `implement_now` only);
-   goals preserved in report / plan slices, not deleted.
+   goals preserved in report / plan slices, not deleted. Any disposition
+   that accepts a risk (not pure ambition) files its dated `re-check` issue
+   per [disposition-expiry-policy.md](disposition-expiry-policy.md) — the
+   report lists them under "Re-checks filed".
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
    (goals remaining is OK).
 6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.
