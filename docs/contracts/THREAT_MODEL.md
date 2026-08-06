@@ -270,6 +270,11 @@ embedding/AFM/Deep Research remain local DoS/egress targets.
 
 ## 7. Explicit non-goals / accepted residuals
 
+Entries marked **deferred** are risk acceptances, not non-goals: each one
+requires a dated 60-day re-check issue per
+`docs/ops/disposition-expiry-policy.md` (SEC-021's is #356). Adding a new
+deferred entry here without filing its re-check is a filing defect.
+
 - Cryptographic agent authentication (SEC-021 deferred)
 - Protecting memory from the account owner or malware running as that user
 - Multi-tenant remote service hardening

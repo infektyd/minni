@@ -21,9 +21,9 @@ Silent erase of ambition is a process defect.
 | `disposition` | Meaning | This PR may… | Must also… |
 |---------------|---------|--------------|------------|
 | `honesty_cut` | Claim was wrong and **not** a goal | Rewrite/cut docs | Optional: note “not pursuing” |
-| `honesty_partial` | Goal exists; ship is incomplete | Mark PARTIAL / provisional + what works | Open or list **goal_next_pr** |
+| `honesty_partial` | Goal exists; ship is incomplete | Mark PARTIAL / provisional + what works | Open or list **goal_next_pr**; residuals that accept a risk also need the 60-day re-check ([disposition-expiry-policy.md](disposition-expiry-policy.md)) |
 | `implement_now` | Clear defect vs an **accepted** contract (hooks matrix, security must) | Fix **code** (+ tighten docs) | Stay scoped; no drive-by features |
-| `goal_next_pr` | Wanted capability; not this PR’s job | Minimal honesty so docs don’t overclaim | Write goal title + acceptance sketch |
+| `goal_next_pr` | Wanted capability; not this PR’s job | Minimal honesty so docs don’t overclaim | Write goal title + acceptance sketch; if the gap being carried is an **accepted risk** (not pure ambition), file the 60-day re-check per [disposition-expiry-policy.md](disposition-expiry-policy.md) |
 | `underclaim_add` | Code has feature docs omit | Add docs with anchors | — |
 | `ops_fleet` | Install/fleet lag, not prose | Point at the fix command (`minni sync`, etc.) | — |
 
@@ -56,8 +56,19 @@ if the *intent* was legitimate.
 1. Tag each gap with `disposition` (and `goal_title` when disposition is
    `goal_next_pr` or `honesty_partial`).
 2. Wright: apply **honesty now** edits; for `implement_now` only when High and
-   scoped; never drop goals on the floor.
-3. Report: sections **Honesty shipped** and **Goals preserved for next PRs**.
+   scoped; never drop goals on the floor. For risk-accepting residuals
+   (`goal_next_pr` / `honesty_partial` carrying an accepted risk), wright or
+   the operator files the dated `re-check` issue per
+   [disposition-expiry-policy.md](disposition-expiry-policy.md) NOW — before
+   any report is written; manual until the workflow emits it (#354).
+3. Report (after filing, never before): sections **Honesty shipped**,
+   **Goals preserved for next PRs**, and **Re-checks filed**. The `.rhai`
+   builder already emits Goals preserved; **Honesty shipped** and
+   **Re-checks filed** it does not — wright/operator appends those two to
+   the scratch report and/or the PR-body Follow-ups after the run, until
+   #354 wires them in. For those two manual sections machine silence is
+   not N/A; state N/A explicitly when none, and Re-checks N/A is only true
+   if step 2 filed nothing.
 
 See also: personal Grok App playbook in [grok-reviewer-app.md](grok-reviewer-app.md)
 (“Assumptions that became next PR goals”).
