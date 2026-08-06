@@ -142,9 +142,9 @@ gh api -X PUT repos/infektyd/minni/branches/main/protection \
       { "context": "grok-mechanical-approve", "app_id": 4456296 }
     ]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": {
-    "required_approving_review_count": 0,
+    "required_approving_review_count": 1,
     "dismiss_stale_reviews": true
   },
   "required_conversation_resolution": true,
@@ -547,8 +547,12 @@ the one that still applies if the gate is ever bypassed.
 
 A green mechanical check means “eligible Grok verdict + required CI green” —
 **not** correctness. Agent-authored PRs can still ship bad-but-green code.
-Keep `enforce_admins: false` as a manual escape hatch. Path filter forces
-human attention on gate/workflow changes.
+`enforce_admins` is ON since the 2026-08 campaign close: the protection
+binds administrators too, and there is deliberately no standing bypass.
+Disabling it (`gh api -X DELETE .../protection/enforce_admins`) is an
+explicit, temporary operator action for emergencies — re-enable when done;
+it is not the default recipe. Path filter forces human attention on
+gate/workflow changes.
 
 ## Recovery
 

@@ -42,7 +42,8 @@ that only accumulated now drain, and rules that were advisory now bind.
 - **Plan dependencies are enforced (#291, #333):** marking a slice done with
   unmet `depends_on` is hard-blocked (a dependency counts only when `done`
   or `superseded`). Overriding requires `force` **plus** a non-empty
-  `forceReason`, and writes a `depends_on_override` journal record naming
+  `force_reason` (the wire-schema field name), and writes a
+  `depends_on_override` journal record naming
   what was unmet and who forced it. At enforcement time this protected 92
   open slices across 119 existing plans.
 - **`memory_lifecycle` health block (#229, #305):** every memory queue
@@ -51,12 +52,14 @@ that only accumulated now drain, and rules that were advisory now bind.
   and an age.
 - **Episodic index coverage in health (#225, #279):** the episodic layer
   reports measured FTS coverage with an agent-scoped denominator.
-- **Accept-with-rationale expiry policy (#345, #353):** any finding
-  accepted with a rationale now files a dated 60-day re-check issue
-  (label `re-check`, due date in the title) at accept time — the issue is
-  the system of record. Adopted because both June acceptances proved wrong
-  on re-measurement. Documented in `docs/ops/disposition-expiry-policy.md`
-  and bound into the docs-truth-policy disposition enum.
+- **Accept-with-rationale expiry policy (#345, #353):** operators (or the
+  agent acting for them) must file a dated 60-day re-check issue (label
+  `re-check`, due date in the title) at accept time for any finding
+  accepted with a rationale — the issue is the system of record. This is
+  process, not automation: workflow emission is still open as #354.
+  Adopted because both June acceptances proved wrong on re-measurement.
+  Documented in `docs/ops/disposition-expiry-policy.md` and bound into the
+  docs-truth-policy disposition enum.
 
 ### Fixed
 
@@ -107,12 +110,18 @@ that only accumulated now drain, and rules that were advisory now bind.
   guards, and leak-gate needle rebuild from secrets after the agent runs —
   in both auth modes. The boundary probe now exercises the environment
   surface with a liveness marker.
-- **Branch protection binds administrators:** with the campaign's health
-  and CI signals honest, `enforce_admins` is on — every merge, including
-  the operator's, passes the review + mechanical-gate + relay-approval
-  chain. Proven end-to-end before enabling.
+- **Branch protection binds administrators (ops change, not package
+  code):** with the campaign's health and CI signals honest, the operator
+  enabled `enforce_admins` on `main` at campaign close — every merge,
+  including the operator's, passes the review + mechanical-gate +
+  relay-approval chain. Proven end-to-end before enabling;
+  `docs/ops/grok-reviewer-app.md` reflects the live configuration.
 
 ## [0.4.2] - 2026-08-03
+
+> Tree stamp only — never tagged or published. Users upgrading from PyPI
+> jump 0.4.1 → 0.5.0; this section records what the 0.4.2-stamped tree
+> contained.
 
 Campaign release: integrity, observability, deploy honesty, and CI trust
 hardening landed on `main` after v0.4.1 — **patch** version, same pattern as
