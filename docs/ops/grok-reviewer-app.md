@@ -331,10 +331,11 @@ run: none exists under the App until after step 1 lands, so that lookup returns
 the GitHub Actions id and would bind the context to precisely the integration
 you are trying to exclude.
 
-`strict: true` is load-bearing and is **not** the current setting (`strict` is
-`false` on `main` today). At `required_approving_review_count: 0` it is the only
-thing forcing re-evaluation after the base branch moves; without it a check
-evaluated against an older `main` still authorises the merge.
+`strict: true` is load-bearing and IS the live setting on `main` (enabled
+2026-08-01, preserved through the campaign's R14 close). It forces
+re-evaluation after the base branch moves; without it a check evaluated
+against an older `main` still authorises the merge. The live review count is
+`1`, satisfied by the relay-approval channel.
 
 **Do not add `boundary` to this list.** Grok Boundary Test only runs on PRs
 touching `.github/workflows/grok*.yml` or `check-no-credential-leak.py`. On an
