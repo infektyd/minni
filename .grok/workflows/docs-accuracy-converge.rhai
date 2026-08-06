@@ -114,7 +114,7 @@ let loom_schema = #{
 
 let implement_schema = #{
     "type": "object",
-    "required": ["branch", "head_sha", "files_changed", "summary", "pr_number", "goals_preserved"],
+    "required": ["branch", "head_sha", "files_changed", "summary", "pr_number", "goals_preserved", "re_checks_filed"],
     "properties": #{
         "branch": #{ "type": "string" },
         "head_sha": #{ "type": "string" },
@@ -322,10 +322,13 @@ for ar in audit_results {
             }
             if g.risk_acceptance == true || g.risk_acceptance == "true" {
                 gap_blob += " | risk_acceptance=true";
-            } else {
-                // Forward the explicit bit either way: an omitted field must
-                // not read the same as a considered false downstream.
+            } else if g.risk_acceptance == false || g.risk_acceptance == "false" {
                 gap_blob += " | risk_acceptance=false";
+            } else {
+                // Missing/invalid is a third state: it must not read as a
+                // considered false downstream (schema requires the bit, so
+                // this is a degraded-lane signal loom should treat as unset).
+                gap_blob += " | risk_acceptance=?";
             }
             if g.re_check_issue != () && g.re_check_issue != "" {
                 gap_blob += " | re_check=";
@@ -375,8 +378,8 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally; pr_number=0. ";
 }
-imp += "PLAN_JSON entries with risk_acceptance=true and a re_check_issue that is a proposed title (not a #NNN ref): file the dated issue now — `gh issue create --label re-check --title \"<exact title>\"` — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Return every filing you performed in re_checks_filed as {id, issue_ref} so the report reflects reality. ";
-imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved. Effort guidance: medium.\n\nPLAN_JSON:\n";
+imp += "PLAN_JSON entries with risk_acceptance=true and a re_check_issue that is a proposed title (not a #NNN ref): file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Return every filing you performed in re_checks_filed as {id, issue_ref} so the report reflects reality. ";
+imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved, re_checks_filed (every filing as {id, issue_ref}; empty array when none — walk BOTH ordered_fixes and goals_next_pr). Effort guidance: medium.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
     label: "wright-implement",
@@ -533,8 +536,6 @@ if impl.output.goals_preserved != () {
 // it anywhere — the issue is the system of record.
 report += "\n## Re-checks required\n";
 let re_count = 0;
-let re_seen_ids = [];
-let re_seen_artifacts = [];
 let filed_by_id = #{};
 if impl.output.re_checks_filed != () {
     for rc in impl.output.re_checks_filed {
@@ -544,46 +545,60 @@ if impl.output.re_checks_filed != () {
 let re_lists = [];
 if loom.output.ordered_fixes != () { re_lists.push(loom.output.ordered_fixes); }
 if loom.output.goals_next_pr != () { re_lists.push(loom.output.goals_next_pr); }
+// Pass 1: collect risk rows with the best per-id artifact (wright's filed
+// ref, else loom's declared title).
+let risk_rows = [];
 for lst in re_lists {
     for f in lst {
-        if (f.risk_acceptance == true || f.risk_acceptance == "true")
-            && !re_seen_ids.contains(f.id) {
-            re_seen_ids.push(f.id);
+        if f.risk_acceptance == true || f.risk_acceptance == "true" {
             let declared = "";
             if f.re_check_issue != () { declared = f.re_check_issue; }
             let artifact = declared;
             if filed_by_id.contains(f.id) { artifact = filed_by_id[f.id]; }
-            // Dual-track split: the same residual often lands in both arrays
-            // under different ids — dedupe on the artifact too, not id alone.
-            // Record BOTH forms: when wright's #NNN replaces the declared
-            // title, the twin entry still carries the title.
-            if artifact != "" && re_seen_artifacts.contains(artifact) {
-                continue;
-            }
-            if declared != "" && re_seen_artifacts.contains(declared) {
-                continue;
-            }
-            if artifact != "" { re_seen_artifacts.push(artifact); }
-            if declared != "" && declared != artifact {
-                re_seen_artifacts.push(declared);
-            }
-            re_count += 1;
-            report += "- ";
-            report += f.id;
-            report += ": ";
-            if artifact != "" {
-                report += artifact;
-                if artifact.starts_with("#") || artifact.contains("/issues/") {
-                    report += " (filed ref)";
-                } else {
-                    report += " (PROPOSED — not yet filed)";
-                }
-            } else {
-                report += "(missing re_check_issue — schema gap, file manually)";
-            }
-            report += "\n";
+            risk_rows.push(#{ id: f.id, declared: declared, artifact: artifact });
         }
     }
+}
+// Pass 2: merge dual-track twins on the residual key (declared title, else
+// artifact, else id). A filed ref always beats a proposed title regardless
+// of walk order — merging never drops the stronger artifact.
+let group_index = #{};
+let merged = [];
+for r in risk_rows {
+    let key = r.declared;
+    if key == "" { key = r.artifact; }
+    if key == "" { key = r.id; }
+    let r_filed = r.artifact != ""
+        && (r.artifact.starts_with("#") || r.artifact.contains("/issues/"));
+    if group_index.contains(key) {
+        let i = group_index[key];
+        let cur_filed = merged[i].artifact != ""
+            && (merged[i].artifact.starts_with("#") || merged[i].artifact.contains("/issues/"));
+        if r_filed && !cur_filed {
+            merged[i].artifact = r.artifact;
+            merged[i].id = r.id;
+        }
+    } else {
+        group_index[key] = merged.len();
+        merged.push(r);
+    }
+}
+for m in merged {
+    re_count += 1;
+    report += "- ";
+    report += m.id;
+    report += ": ";
+    if m.artifact != "" {
+        report += m.artifact;
+        if m.artifact.starts_with("#") || m.artifact.contains("/issues/") {
+            report += " (filed ref)";
+        } else {
+            report += " (PROPOSED — not yet filed)";
+        }
+    } else {
+        report += "(missing re_check_issue — schema gap, file manually)";
+    }
+    report += "\n";
 }
 if re_count == 0 {
     report += "Re-checks required: none (no risk-accepting dispositions declared)\n";
