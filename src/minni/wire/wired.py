@@ -106,9 +106,6 @@ def upsert_wire(
             wires.append(entry)
         data["wires"] = wires
         data["generation"] = start_gen + 1
-        if dry_run:
-            return data, warning
-
         pre_write = _load_wired(wired_json)
         warning = _detect_out_of_band(
             int(pre_write.get("generation", 0)),
