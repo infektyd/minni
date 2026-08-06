@@ -36,9 +36,11 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
    for any disposition that accepts a risk (not pure ambition), wright or
    the operator must file the dated `re-check` issue per
    [disposition-expiry-policy.md](disposition-expiry-policy.md). #354 wired
-   the schema binding and the `Re-checks required` report section — the
-   FILING itself stays manual; the section marks each entry as a filed ref
-   (`#NNN`) or PROPOSED, and PROPOSED entries must be filed before merge.
+   the schema binding, the `Re-checks required` report section, and wright
+   as the primary filer (it runs `gh issue create` during implement and
+   returns `re_checks_filed`); the operator's gate is clearing every row
+   still marked PROPOSED or MISSING before merge — those rows are the
+   failure signal, not noise.
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
    (goals remaining is OK).
 6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.

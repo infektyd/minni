@@ -275,7 +275,7 @@ for lane in lanes {
     lp += ". Focus: ";
     lp += lane.focus;
     lp += "\nMUST use grep/read_file/run git show on the live tree — do not answer from memory. ";
-    lp += "For each real gap return severity High|Med|Low, claim quote, doc_path, code_anchor, disposition (honesty_cut|honesty_partial|implement_now|goal_next_pr|underclaim_add|ops_fleet), goal_title when disposition is goal_next_pr or honesty_partial, and fix_hint (honesty edit and/or code PR sketch). risk_acceptance (boolean, ALWAYS set): true only when the disposition leaves a RISK accepted with a rationale (deferred security/correctness exposure, known gap tolerated because of a stated reason) — false for pure feature ambition with no risk, whatever the disposition name; a scoped implement_now that knowingly leaves a residual risk is also true. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out (get today via `date -u +%F` with your run tool; do not guess the date). ";
+    lp += "For each real gap return severity High|Med|Low, claim quote, doc_path, code_anchor, disposition (honesty_cut|honesty_partial|implement_now|goal_next_pr|underclaim_add|ops_fleet), goal_title when disposition is goal_next_pr or honesty_partial, and fix_hint (honesty edit and/or code PR sketch). risk_acceptance (boolean, ALWAYS set): true only when the disposition leaves a RISK accepted with a rationale (deferred security/correctness exposure, known gap tolerated because of a stated reason) — false for pure feature ambition with no risk, whatever the disposition name; a scoped implement_now that knowingly leaves a residual risk is also true. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — compute it with your run tool: `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F`; do not guess the date. ";
     lp += "Prefer honesty_partial+goal over bare honesty_cut when the claim was a legitimate ambition. Empty gaps only after greps confirm no false present-tense claims. ";
     lp += "Effort guidance: low-medium — thorough greps over long essays.";
     audit_jobs.push(#{
@@ -354,7 +354,7 @@ if n_gaps == 0 {
 // --- Phase: Loom ---
 phase("Loom");
 let loom_p = pin;
-loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. For EVERY entry in BOTH ordered_fixes and goals_next_pr, set risk_acceptance (boolean, ALWAYS present): true only when the item leaves a RISK accepted with a rationale (deferred exposure, known gap tolerated for a stated reason) — false for pure feature ambition with no risk; a goal_next_pr that papers over an accepted risk is TRUE. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — prefer the re_check the audit lane carried; when the lane shows re_check=(missing), compute the date yourself with `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` and build the title (do-not-guess means do not invent a calendar day, never leave the field empty on a true row). Effort guidance: high.\n\nGAPS:\n";
+loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. For EVERY entry in BOTH ordered_fixes and goals_next_pr, set risk_acceptance (boolean, ALWAYS present): true only when the item leaves a RISK accepted with a rationale (deferred exposure, known gap tolerated for a stated reason) — false for pure feature ambition with no risk; a goal_next_pr that papers over an accepted risk is TRUE. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — prefer the re_check the audit lane carried when it is a \"#NNN\" ref, an issue URL, or matches \"Re-check by YYYY-MM-DD: ...\"; when it is missing OR malformed (wrong prefix or a date that is not ~60 days out), rebuild it — compute the date yourself with `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` and build the title (do-not-guess means do not invent a calendar day, never leave the field empty on a true row). Effort guidance: high.\n\nGAPS:\n";
 loom_p += gap_blob;
 let loom = agent(loom_p, #{
     label: "loom-plan",
@@ -381,7 +381,7 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally; pr_number=0. ";
 }
-imp += "PLAN_JSON entries with risk_acceptance=true and a re_check_issue that is a proposed title (not a #NNN ref): file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Return every filing you performed in re_checks_filed as {id, issue_ref}, where id is the EXACT loom entry id you filed for (list both twin ids if a residual appears in ordered_fixes and goals_next_pr) so the report reflects reality. ";
+imp += "PLAN_JSON entries with risk_acceptance=true whose re_check_issue is a proposed title, empty, or missing: for empty/missing, compute the title yourself first (`date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` for the date); then file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Return every filing you performed in re_checks_filed as {id, issue_ref}, where id is the EXACT loom entry id you filed for (list both twin ids if a residual appears in ordered_fixes and goals_next_pr) so the report reflects reality. ";
 imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved, re_checks_filed (every filing as {id, issue_ref}; empty array when none — walk BOTH ordered_fixes and goals_next_pr). Effort guidance: medium.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
@@ -608,7 +608,7 @@ for m in merged {
             report += " (PROPOSED — not yet filed)";
         }
     } else {
-        report += "(missing re_check_issue — schema gap, file manually)";
+        report += "(MISSING — file manually, same gate as PROPOSED)";
     }
     report += "\n";
 }
@@ -640,7 +640,7 @@ report += "If wright needed >2 pongs: bump wright. If spend high and clean: chea
 report += "Update agent-roster.md Changelog after this run.\n";
 report += "\n## Operator next\n";
 report += "1. Review honesty PR; do not agent-merge.\n";
-report += "2. File every PROPOSED entry in Re-checks required that has no #NNN in wright Follow-ups (label re-check, title exactly as listed) BEFORE merging yourself; check `gh issue list --label re-check` first to avoid duplicates. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
+report += "2. File every PROPOSED or MISSING entry in Re-checks required that has no #NNN in wright Follow-ups (label re-check, title exactly as listed) BEFORE merging yourself; check `gh issue list --label re-check` first to avoid duplicates. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
 report += "3. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
 report += "4. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
 report += "5. Bare /grok-review only after tip freeze if App ELIG needed.\n";
