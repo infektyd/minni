@@ -58,3 +58,22 @@ test("deterministicBuiltAt with SOURCE_DATE_EPOCH=0 yields epoch", () => {
     else process.env.SOURCE_DATE_EPOCH = prev;
   }
 });
+
+test("strict parse rejects what both sides must reject (parity table)", () => {
+  const prev = process.env.SOURCE_DATE_EPOCH;
+  try {
+    delete process.env.SOURCE_DATE_EPOCH;
+    const expected = deterministicBuiltAt();
+    for (const bad of ["1.5", "0x10", "1_000", "1e30", "Infinity",
+                       "99999999999999999999", "1754447207000000", " ", "abc"]) {
+      process.env.SOURCE_DATE_EPOCH = bad;
+      assert.equal(deterministicBuiltAt(), expected, `epoch ${bad} must fall through`);
+    }
+    // Boundary accepted on both sides (year 9999) — mirrors the Python pin.
+    process.env.SOURCE_DATE_EPOCH = "253402300799";
+    assert.equal(deterministicBuiltAt(), "9999-12-31T23:59:59Z");
+  } finally {
+    if (prev === undefined) delete process.env.SOURCE_DATE_EPOCH;
+    else process.env.SOURCE_DATE_EPOCH = prev;
+  }
+});

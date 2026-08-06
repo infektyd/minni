@@ -85,13 +85,12 @@ def sha256_file(path: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
-# Wire re-stamps .mcp.json post-install; dist/build-manifest.json is pure
-# build metadata whose built_from embeds the absolute checkout path, so
-# wiring the same content from a different checkout (worktree vs main)
-# would otherwise demand --force-reinstall over a cosmetic field (#352).
-# Both are excluded from idempotency hash checks; real content drift
-# still shows through every other hashed file.
-_INSTALL_MUTABLE_PATHS = frozenset({".mcp.json", "dist/build-manifest.json"})
+# Wire re-stamps this file post-install; exclude from idempotency hash checks.
+# NOT extended to dist/build-manifest.json for cross-checkout wiring: the
+# payload manifest embeds that file's hash in its files map, so excluding the
+# leaf alone cannot absorb a built_from path difference — the mismatch just
+# cascades into payload-manifest.json, and excluding THAT would gut the check.
+_INSTALL_MUTABLE_PATHS = frozenset({".mcp.json"})
 
 
 def verify_manifest_hashes(manifest: PayloadManifest, root: Path) -> list[str]:

@@ -53,3 +53,21 @@ def test_deterministic_built_at_epoch_wins_even_without_repo(monkeypatch):
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "0")
     assert deterministic_built_at(None) == "1970-01-01T00:00:00Z"
     assert deterministic_built_at() == "1970-01-01T00:00:00Z"
+
+
+def test_strict_parse_rejects_what_both_sides_must_reject(tmp_path, monkeypatch):
+    """Parity table (#361 review): every lenient-parse divergence between
+    Number() and int() must fall through to the git date on the Python side.
+    The mjs counterpart pins the same set in deterministic-build.test.mjs."""
+    from minni.wire.manifest import deterministic_built_at
+
+    repo = Path(__file__).resolve().parent.parent
+    monkeypatch.delenv("SOURCE_DATE_EPOCH", raising=False)
+    expected = deterministic_built_at(repo)
+    for bad in ("1.5", "0x10", "1_000", "1e30", "Infinity", "99999999999999999999",
+                "1754447207000000", " ", "abc"):
+        monkeypatch.setenv("SOURCE_DATE_EPOCH", bad)
+        assert deterministic_built_at(repo) == expected, f"epoch {bad!r} must fall through"
+    # Boundary that must be ACCEPTED on both sides (year 9999).
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "253402300799")
+    assert deterministic_built_at(repo) == "9999-12-31T23:59:59Z"
