@@ -121,8 +121,11 @@ Prefer **Only select repositories** (`minni` ± canary). If install is
 
 ## Branch protection (operator — propose, don't silent-apply)
 
-To stop needing `--admin` for solo merges, make the mechanical check + real CI
-required, and drop the approving-review count that bots cannot satisfy:
+The live design (since the 2026-08 campaign close): the mechanical check and
+real CI are required, `required_approving_review_count` stays at `1` —
+satisfied by the relay-approval channel, which is the intentional satisfier,
+not an optional extra — and `enforce_admins` is `true`, so no standing admin
+bypass exists:
 
 Use `checks` with an `app_id` per context — **never** the bare `contexts` array.
 A name-only requirement is mintable by any same-repo workflow; see the next
@@ -165,15 +168,14 @@ gh api repos/infektyd/minni/branches/main/protection > /tmp/prot-after.json
 diff <(jq -S . /tmp/prot-before.json) <(jq -S . /tmp/prot-after.json)
 ```
 
-**Use PUT, not PATCH, for this change.** `PATCH .../protection/required_status_checks`
-only edits the status-check block: it leaves `required_approving_review_count`
-at its current value, which is `1` — so merges would still need `--admin` and
-the whole exercise fails to achieve its goal. Only the full `PUT` above sets the
-count to `0`. Reach for the PATCH form solely when adding or re-binding a
-context and you intend everything else to stay as-is.
-
-Keep `required_approving_review_count: 1` only if you still want a **human**
-review in addition to the mechanical check (bots still will not count).
+**Use PUT, not PATCH, when re-applying the full configuration.**
+`PATCH .../protection/required_status_checks` only edits the status-check
+block; a full re-apply (e.g. after an emergency `enforce_admins` disable)
+must be the complete `PUT` above so you do not silently drop
+`enforce_admins`, `required_conversation_resolution`, or the review count.
+The body above IS the live target — count `1`, `enforce_admins: true`.
+Reach for the PATCH form solely when adding or re-binding a context and you
+intend everything else to stay as-is.
 
 ### The App private key is the real trust root — and push access reaches it
 
