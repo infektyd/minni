@@ -119,13 +119,19 @@ function emitBuildManifest() {
   );
 }
 
-// realpathSync, not path.resolve: argv[1] may reach this file through a
-// symlink while the ESM loader realpaths import.meta.url — a resolve-only
-// compare silently skips emission and the build "succeeds" with no manifest.
-const _isMain =
-  process.argv[1] !== undefined &&
-  existsSync(process.argv[1]) &&
-  realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
-if (_isMain) {
+// realpath BOTH sides: argv[1] may reach this file through a symlink while
+// the default ESM loader realpaths import.meta.url (a resolve-only compare
+// then skips emission silently) — but under --preserve-symlinks the loader
+// KEEPS the symlink path, so a one-sided realpath fails in the opposite
+// direction. Two-sided realpath matches in both modes.
+export function isMainInvocation(argv1, moduleUrl) {
+  return (
+    argv1 !== undefined &&
+    existsSync(argv1) &&
+    realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl))
+  );
+}
+
+if (isMainInvocation(process.argv[1], import.meta.url)) {
   emitBuildManifest();
 }

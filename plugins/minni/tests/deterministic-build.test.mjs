@@ -77,3 +77,24 @@ test("strict parse rejects what both sides must reject (parity table)", () => {
     else process.env.SOURCE_DATE_EPOCH = prev;
   }
 });
+
+test("isMainInvocation matches through a symlinked argv[1]", async () => {
+  const { isMainInvocation } = await import("../scripts/emit_build_manifest.mjs");
+  const { symlinkSync, mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const scriptUrl = new URL("../scripts/emit_build_manifest.mjs", import.meta.url);
+  const scriptPath = fileURLToPath(scriptUrl);
+  const dir = mkdtempSync(pathMod.join(tmpdir(), "emit-link-"));
+  try {
+    const link = pathMod.join(dir, "emit-link.mjs");
+    symlinkSync(scriptPath, link);
+    assert.equal(isMainInvocation(link, scriptUrl.href), true,
+      "symlinked argv[1] must still be recognized as the main module");
+    assert.equal(isMainInvocation(pathMod.join(dir, "missing.mjs"), scriptUrl.href), false);
+    assert.equal(isMainInvocation(undefined, scriptUrl.href), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

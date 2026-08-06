@@ -71,3 +71,35 @@ def test_strict_parse_rejects_what_both_sides_must_reject(tmp_path, monkeypatch)
     # Boundary that must be ACCEPTED on both sides (year 9999).
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "253402300799")
     assert deterministic_built_at(repo) == "9999-12-31T23:59:59Z"
+
+
+def test_cross_runtime_parity_joint_assertion(tmp_path, monkeypatch):
+    """Run BOTH runtimes on one vector list and assert byte-identical output —
+    mirrored constant tables can drift if one side is edited alone (#361
+    round-3 review)."""
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node unavailable in this environment")
+    from minni.wire.manifest import deterministic_built_at
+
+    repo = Path(__file__).resolve().parent.parent
+    script = repo / "plugins" / "minni" / "scripts" / "emit_build_manifest.mjs"
+    vectors = ["", "0", "1609459200", "253402300799", "1.5", "0x10", "1_000",
+               "1e30", "Infinity", "1754447207000", "99999999999999999999", "abc"]
+    for vec in vectors:
+        if vec:
+            monkeypatch.setenv("SOURCE_DATE_EPOCH", vec)
+        else:
+            monkeypatch.delenv("SOURCE_DATE_EPOCH", raising=False)
+        py = deterministic_built_at(repo)
+        js = subprocess.check_output(
+            [node, "-e",
+             f'import("file://{script}").then(m => console.log(m.deterministicBuiltAt()))'],
+            text=True, cwd=str(repo),
+        ).strip()
+        assert py == js, f"runtime divergence on epoch {vec!r}: py={py} js={js}"

@@ -17,8 +17,6 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "src"))
-from minni.wire.manifest import deterministic_built_at  # noqa: E402
 
 PLUGIN_DIR = REPO_ROOT / "plugins" / "minni"
 PAYLOAD_ROOT = REPO_ROOT / "src" / "minni" / "plugin_payload"
@@ -107,6 +105,18 @@ def stamp_version(path: Path, version: str) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def _deterministic_built_at() -> str:
+    # Lazy import: this module is also loaded by tests purely for its glob
+    # helpers, and an import-time sys.path mutation would leak this checkout's
+    # src/ into unrelated test paths (worktree import discipline, #258).
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    try:
+        from minni.wire.manifest import deterministic_built_at
+    finally:
+        sys.path.remove(str(REPO_ROOT / "src"))
+    return deterministic_built_at(REPO_ROOT)
+
+
 def copy_payload_tree(version: str) -> dict[str, str]:
     if PAYLOAD_ROOT.exists():
         shutil.rmtree(PAYLOAD_ROOT)
@@ -139,7 +149,7 @@ def copy_payload_tree(version: str) -> dict[str, str]:
         "schema": 1,
         "version": version,
         "git_sha": git_sha(),
-        "built_at": deterministic_built_at(REPO_ROOT),
+        "built_at": _deterministic_built_at(),
         "node_engine": ">=20",
         "files": file_hashes,
     }
