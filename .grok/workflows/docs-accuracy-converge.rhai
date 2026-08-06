@@ -419,7 +419,7 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally; pr_number=0. ";
 }
-imp += "PLAN_JSON entries with risk_acceptance=true whose re_check_issue is a proposed title, empty, or missing: FIRST run `gh issue list --label re-check --state open --json number,title` and reuse the #NNN of any open issue whose subject (text after the date) matches this residual — never open a second re-check for a residual that already has one live. Only when nothing matches: for empty/missing, compute the title yourself first (`date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` for the date); then file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Run ONE gh issue create per UNIQUE re_check_issue string — never create twice for dual-track twins sharing a title. Return every filing in re_checks_filed as {id, issue_ref}, emitting one row per loom entry id covered (twins share the same issue_ref), so the report reflects reality. ";
+imp += "PLAN_JSON entries with risk_acceptance=true carrying an existing-looking #NNN or issue URL: run `gh issue view <ref>` to confirm it exists and matches the residual, and echo every CONFIRMED ref in re_checks_filed (that is what upgrades it past unverified in the report). Entries whose re_check_issue is a proposed title, empty, or missing: FIRST run `gh issue list --label re-check --state open --json number,title` and reuse the #NNN of any open issue whose subject (text after the date) matches this residual — never open a second re-check for a residual that already has one live. Only when nothing matches: for empty/missing, compute the title yourself first (`date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` for the date); then file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Run ONE gh issue create per UNIQUE re_check_issue string — never create twice for dual-track twins sharing a title. Return every filing in re_checks_filed as {id, issue_ref}, emitting one row per loom entry id covered (twins share the same issue_ref), so the report reflects reality. ";
 imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved, re_checks_filed (every filing as {id, issue_ref}; empty array when none — walk BOTH ordered_fixes and goals_next_pr). Effort guidance: medium.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
@@ -595,6 +595,11 @@ for lst in re_lists {
             let declared = "";
             if f.re_check_issue != () { declared = f.re_check_issue; }
             let artifact = declared;
+            // Provenance matters: a loom-declared #NNN may be hallucinated
+            // or stale — only a wright-confirmed ref earns the trusted
+            // label. src: "wright" | "declared" | "".
+            let src = "";
+            if is_filed_ref(declared) { src = "declared"; }
             if filed_by_id.contains(f.id) {
                 let filed = filed_by_id[f.id];
                 // Upgrade ONLY on a filed-shaped ref: an empty or junk
@@ -602,9 +607,10 @@ for lst in re_lists {
                 // declared title — the operator needs that exact title.
                 if is_filed_ref(filed) {
                     artifact = filed;
+                    src = "wright";
                 }
             }
-            risk_rows.push(#{ id: f.id, declared: declared, artifact: artifact });
+            risk_rows.push(#{ id: f.id, declared: declared, artifact: artifact, src: src });
         }
     }
 }
@@ -614,16 +620,16 @@ for lst in re_lists {
 // row keys by ref while its twin keys by title and never merges.
 let filed_for_declared = #{};
 for r in risk_rows {
-    if r.declared != "" && is_filed_ref(r.artifact) {
+    if r.declared != "" && r.src == "wright" {
         filed_for_declared[r.declared] = r.artifact;
     }
 }
 let ri = 0;
 while ri < risk_rows.len() {
-    if risk_rows[ri].declared != ""
-        && !is_filed_ref(risk_rows[ri].artifact)
+    if risk_rows[ri].declared != "" && risk_rows[ri].src != "wright"
         && filed_for_declared.contains(risk_rows[ri].declared) {
         risk_rows[ri].artifact = filed_for_declared[risk_rows[ri].declared];
+        risk_rows[ri].src = "wright";
     }
     ri += 1;
 }
@@ -643,6 +649,10 @@ for r in risk_rows {
         if r_filed && !cur_filed {
             merged[i].artifact = r.artifact;
             merged[i].id = r.id;
+            merged[i].src = r.src;
+        } else if r.src == "wright" && merged[i].src != "wright"
+            && merged[i].artifact == r.artifact {
+            merged[i].src = "wright";
         } else if r_filed && cur_filed && merged[i].artifact != r.artifact {
             // Two DISTINCT filed refs under one key (double-file or divergent
             // twins): keep both rows visible — hiding a real issue is worse
@@ -655,6 +665,7 @@ for r in risk_rows {
         merged.push(r);
     }
 }
+let wright_confirmed = 0;
 for m in merged {
     re_count += 1;
     report += "- ";
@@ -663,7 +674,12 @@ for m in merged {
     if m.artifact != "" {
         report += m.artifact;
         if is_filed_ref(m.artifact) {
-            report += " (filed ref)";
+            if m.src == "wright" {
+                wright_confirmed += 1;
+                report += " (wright-filed)";
+            } else {
+                report += " (declared ref — VERIFY LIVE with gh issue view before merge; loom refs are unconfirmed)";
+            }
         } else {
             report += " (PROPOSED — not yet filed)";
         }
@@ -690,9 +706,20 @@ if impl.output.re_checks_filed != () {
             report += rc.id;
             report += ": ";
             report += rc.issue_ref;
-            report += " (filed ref — id matched no declared risk row; verify before filing anything new)\n";
+            report += " (wright-filed — id matched no declared risk row; verify before filing anything new)\n";
         }
     }
+}
+if re_count > 0 {
+    report += "Wright coverage: ";
+    report += wright_confirmed.to_string();
+    report += " of ";
+    report += re_count.to_string();
+    report += " risk rows confirmed by re_checks_filed";
+    if wright_confirmed < re_count {
+        report += " — check wright Follow-ups and `gh issue list --label re-check` before filing anything, to avoid duplicates";
+    }
+    report += "\n";
 }
 if re_count == 0 {
     report += "Re-checks required: none (no risk-accepting dispositions declared)\n";
@@ -703,7 +730,7 @@ report += "If wright needed >2 pongs: bump wright. If spend high and clean: chea
 report += "Update agent-roster.md Changelog after this run.\n";
 report += "\n## Operator next\n";
 report += "1. Review honesty PR; do not agent-merge.\n";
-report += "2. Before merging yourself, clear every PROPOSED and MISSING entry in Re-checks required that has no #NNN in wright Follow-ups. PROPOSED: file with the title exactly as listed. MISSING: construct the dated title per disposition-expiry-policy.md first (never copy the MISSING line). Both: label re-check, body citing disposition, gap id, rationale, and code anchor; check `gh issue list --label re-check` first to avoid duplicates — dual-track twins may carry different artifact forms. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
+report += "2. Before merging yourself, clear every PROPOSED and MISSING entry in Re-checks required that has no #NNN in wright Follow-ups. PROPOSED: file with the title exactly as listed. MISSING: construct the dated title per disposition-expiry-policy.md first (never copy the MISSING line). Rows marked declared-ref: `gh issue view` the ref and confirm it matches the residual — an unconfirmed #NNN may be hallucinated. Both filing cases: label re-check, body citing disposition, gap id, rationale, and code anchor; check `gh issue list --label re-check` first to avoid duplicates — dual-track twins may carry different artifact forms. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
 report += "3. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
 report += "4. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
 report += "5. Bare /grok-review only after tip freeze if App ELIG needed.\n";
