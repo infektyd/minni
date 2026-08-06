@@ -37,8 +37,9 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
    the operator must file the dated `re-check` issue per
    [disposition-expiry-policy.md](disposition-expiry-policy.md). #354 wired
    the schema binding, the `Re-checks required` report section, and wright
-   as the primary filer (it runs `gh issue create` during implement and
-   returns `re_checks_filed`); the operator's gate is clearing every row
+   as the primary filer (it checks `gh issue list --label re-check
+   --state open` first, reuses a live matching issue, creates only when
+   none matches, and returns `re_checks_filed`); the operator's gate is clearing every row
    still marked PROPOSED or MISSING before merge — those rows are the
    failure signal, not noise.
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
