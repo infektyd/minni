@@ -269,6 +269,15 @@ jobs:
           # Neither set → fail HERE with a named cause instead of three
           # steps later as the CLI's generic "Not signed in".
           /usr/bin/mkdir -p "$HOME/.grok"
+          # Normalize before mode selection (round-5 review): secrets commonly
+          # pick up a trailing newline (echo | gh secret set) or CR from the
+          # UI, and a valid key plus stray whitespace must not hard-fail the
+          # shape guard while a working OAuth blob sits in the elif. Pure
+          # parameter expansion — no PATH lookup, safe under set -u.
+          XAI_API_KEY="${XAI_API_KEY:-}"
+          XAI_API_KEY="${XAI_API_KEY//$'\r'/}"
+          XAI_API_KEY="${XAI_API_KEY//$'\n'/}"
+          XAI_API_KEY="${XAI_API_KEY%"${XAI_API_KEY##*[![:space:]]}"}"
           if [ -n "$XAI_API_KEY" ]; then
             # printf into a JSON template, not an interpreter -c one-liner:
             # the pinning test rightly rejects inline programs in trust
@@ -396,6 +405,13 @@ jobs:
           # "Auth: ApiKey ... Bad credentials" with XAI_API_KEY=""). GitHub
           # expands a missing secret to "" but still exports the variable, so
           # OAuth-only operation would break. Review finding 1 on #350.
+          # Same normalization as restore (round-5): this step re-imports the
+          # RAW secret env in its own shell, so without trimming here the CLI
+          # would still receive a newline-tainted key. Safe under set -u.
+          XAI_API_KEY="${XAI_API_KEY:-}"
+          XAI_API_KEY="${XAI_API_KEY//$'\r'/}"
+          XAI_API_KEY="${XAI_API_KEY//$'\n'/}"
+          XAI_API_KEY="${XAI_API_KEY%"${XAI_API_KEY##*[![:space:]]}"}"
           if [ -z "${XAI_API_KEY:-}" ]; then unset XAI_API_KEY; fi
           "$HOME/.grok/bin/grok" --prompt-file /tmp/grok-prompt.md \
             --model grok-4.5 \
@@ -462,6 +478,15 @@ jobs:
           # on-disk blob is not. BOTH modes rebuild: API keys have no shape
           # backstop at all, and OAuth refresh tokens are opaque (not
           # JWT-shaped), so shape checks cover neither.
+          # Normalize before mode selection (round-5 review): secrets commonly
+          # pick up a trailing newline (echo | gh secret set) or CR from the
+          # UI, and a valid key plus stray whitespace must not hard-fail the
+          # shape guard while a working OAuth blob sits in the elif. Pure
+          # parameter expansion — no PATH lookup, safe under set -u.
+          XAI_API_KEY="${XAI_API_KEY:-}"
+          XAI_API_KEY="${XAI_API_KEY//$'\r'/}"
+          XAI_API_KEY="${XAI_API_KEY//$'\n'/}"
+          XAI_API_KEY="${XAI_API_KEY%"${XAI_API_KEY##*[![:space:]]}"}"
           if [ -n "${XAI_API_KEY:-}" ]; then
             case "$XAI_API_KEY" in
               *[!A-Za-z0-9._-]*)

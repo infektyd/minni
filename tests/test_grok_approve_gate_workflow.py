@@ -1149,6 +1149,11 @@ def test_every_agent_step_unsets_an_empty_api_key(workflow):
             f"{workflow}::{step.get('name')}: agent invocation without the "
             "empty-key unset guard before it"
         )
+        trim = body.find("XAI_API_KEY=\"${XAI_API_KEY//$'\\n'/}\"")
+        assert trim != -1 and trim < guard, (
+            f"{workflow}::{step.get('name')}: no CR/LF trim before the "
+            "empty-key guard — the CLI would receive a newline-tainted key"
+        )
 
 
 @pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
@@ -1208,6 +1213,7 @@ def test_publish_gates_rebuild_needles_from_secrets(workflow):
 def test_shape_guard_precedes_every_key_json_write(workflow):
     """A key containing a quote or backslash corrupts the printf JSON template,
     so the character-class refusal must run first, at every write site."""
+    writes = 0
     for step in _steps_of(workflow):
         body = _uncommented(str(step.get("run", "")))
         start = 0
@@ -1215,9 +1221,23 @@ def test_shape_guard_precedes_every_key_json_write(workflow):
             write = body.find("printf '{\"xai_api_key\": \"%s\"}'", start)
             if write == -1:
                 break
+            writes += 1
             guard = body.rfind("*[!A-Za-z0-9._-]*", 0, write)
             assert guard != -1, (
                 f"{workflow}::{step.get('name')}: xai_api_key JSON write "
                 "without a preceding shape guard"
             )
+            # Trim must precede the guard: a valid key with a stray trailing
+            # newline (echo | gh secret set) must be normalized, not treated
+            # as a fatal shape violation that also blocks the OAuth elif.
+            trim = body.rfind("XAI_API_KEY=\"${XAI_API_KEY//$'\\n'/}\"", 0, write)
+            assert trim != -1, (
+                f"{workflow}::{step.get('name')}: xai_api_key write without a "
+                "preceding CR/LF trim"
+            )
             start = write + 1
+    # Round-5 review: without a floor this pin is vacuous the moment every
+    # write disappears. Restore + publish gate = at least two per workflow.
+    assert writes >= 2, (
+        f"{workflow}: expected >=2 shape-guarded key writes, found {writes}"
+    )
