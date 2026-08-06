@@ -630,22 +630,34 @@ App `APPROVE` does not count (settled above). Green path is:
 posted ELIG is **normal** until the mechanical check and/or relay APPROVE
 land. Do not re-fire `/grok-review` just to “fix” reviewDecision.
 
-### PATH_DENY → mechanical stays red (use admin consciously)
+### PATH_DENY → mechanical stays red (trust-surface merges are operator ceremonies)
 
 `PATH_DENY_PREFIXES` includes `.github/`, gate tests, **and** `pyproject.toml`
 / pytest root configs (so collection config cannot silence tripwires).
 
 **Implication:** a PR that only *stamps* `pyproject.toml` for a release
-(e.g. 0.4.1 → 0.4.2) can be App-ELIG + Public CI green and still have
-`grok-mechanical-approve` **failure by design**. That is not a flaky gate.
+(e.g. 0.4.x → 0.5.0) can be App-ELIG + Public CI green and still have
+`grok-mechanical-approve` **failure by design**. That is not a flaky gate —
+and with `enforce_admins` on, `--admin` is **not** a bypass anymore: the
+old "honest path" of `gh pr merge --admin` is refused outright.
 
-Personal rule:
+The documented sequence for an intentional trust-surface merge
+(App-ELIG + CI green, gate red only on the path filter):
 
-- Prefer **split** release-stamp PR vs large docs/code PR when possible.
-- When a stamp stack is intentional and App+CI are green: **`gh pr merge
-  --admin --squash`** is the honest path — not dismiss thrash or another
-  metered review.
-- Agent policy elsewhere: never self-admin unless the operator said so.
+1. Verify everything else earned: current-head APPROVE stamp, Bugbot, CI,
+   reviewDecision.
+2. Temporarily lift admin binding:
+   `gh api -X DELETE repos/OWNER/REPO/branches/main/protection/enforce_admins`
+3. Merge: `gh pr merge N --admin --squash --match-head-commit <head-sha>`
+4. **Immediately** re-enable:
+   `gh api -X POST repos/OWNER/REPO/branches/main/protection/enforce_admins`
+5. Verify the full protection JSON against the PUT recipe above (strict,
+   checks, count 1, enforce_admins true).
+
+The disable window is the ceremony: deliberate, seconds long, logged in the
+audit trail, and always paired with the re-enable + verify. Prefer a
+**split** release-stamp PR over folding stamps into large docs/code PRs, so
+the ceremony covers the smallest possible diff.
 
 ### Campaign hygiene (reduces App bills)
 
