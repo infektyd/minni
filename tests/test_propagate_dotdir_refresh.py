@@ -1,9 +1,12 @@
 """#359 — copy_tree must refresh .gemini-plugin/gemini-extension.json.
 
-Root cause: rsync --exclude gemini-extension.json matched the basename at any
-depth, so the source dotdir manifest was never copied and the dest's stale
-copy survived --delete. The fix anchors the exclude to /gemini-extension.json
-and the fallback path already preserved only the root-level file.
+Root cause: the rsync path excluded the generated root-level
+gemini-extension.json by BARE basename, which rsync matches at any depth —
+so the source dotdir manifest was never copied and the dest's stale copy
+survived every refresh. The fix anchors the exclude to /gemini-extension.json
+(root-only match, verified on macOS openrsync), which also keeps the generated
+file protected from --delete no matter how the copy exits. The copytree
+fallback preserves-and-restores the root file and never had the depth bug.
 """
 
 from __future__ import annotations
@@ -71,41 +74,39 @@ def _assert_hidden_refreshed_and_root_preserved(dest: Path, root_blob: bytes):
 
 
 def test_copy_tree_refreshes_hidden_manifest_via_rsync(tmp_path):
-    """Rsync path (default): hidden manifest refreshed, root preserved."""
+    """Rsync path (default when rsync exists): hidden refreshed, root preserved."""
+    import pytest
+
+    if propagate.shutil.which("rsync") is None:
+        pytest.skip("no rsync on this machine; fallback path covered below")
     root_blob = b'{"name":"minni","version":"0.9.9-root","extra":1}\n'
     src = _make_source(tmp_path)
     dest = _make_dest(tmp_path, root_blob)
-    # rsync is present on macOS (openrsync); if missing, this still exercises
-    # fallback but we explicitly want the rsync branch — skip if not present.
-    import shutil as _sh
-
-    if _sh.which("rsync") is None:
-        # Fallback-only machine: assert fallback still satisfies contract.
-        propagate.copy_tree(src, dest)
-        _assert_hidden_refreshed_and_root_preserved(dest, root_blob)
-        return
     propagate.copy_tree(src, dest)
     _assert_hidden_refreshed_and_root_preserved(dest, root_blob)
 
 
 def test_copy_tree_refreshes_hidden_manifest_via_fallback(tmp_path, monkeypatch):
-    """Non-rsync fallback: forced by making shutil.which return None."""
-    root_blob = b'{"name":"minni","version":"0.9.9-root","extra":2}\n'
+    """Copytree fallback (no rsync): hidden refreshed, root preserved."""
+    root_blob = b'{"name":"minni","version":"0.9.9-root","extra":1}\n'
     src = _make_source(tmp_path)
     dest = _make_dest(tmp_path, root_blob)
-    monkeypatch.setattr(propagate.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(propagate.shutil, "which", lambda name: None)
     propagate.copy_tree(src, dest)
     _assert_hidden_refreshed_and_root_preserved(dest, root_blob)
 
 
-def test_copy_tree_rsync_passes_no_generated_file_excludes(tmp_path, monkeypatch):
-    """Regression (#359): no rsync --exclude may name a generated install file.
+def test_copy_tree_rsync_excludes_are_anchored_not_bare(tmp_path, monkeypatch):
+    """Regression (#359): generated-file excludes must be /-anchored.
 
-    An exclude by name — bare OR /-anchored — skips the SOURCE dotdir manifest
-    on macOS's openrsync, which matches anchored patterns at any depth. The
-    generated root-level file survives via preserve-and-restore instead, so
-    the only legitimate exclude left is node_modules.
+    A bare basename exclude matches at any depth and skips the SOURCE dotdir
+    manifest; the anchored form shields only the root-level generated file and
+    keeps it protected from --delete even when the copy dies mid-run.
     """
+    import pytest
+
+    if propagate.shutil.which("rsync") is None:
+        pytest.skip("no rsync on this machine; fallback path covered above")
     root_blob = b"root-preserved\n"
     src = _make_source(tmp_path)
     dest = _make_dest(tmp_path, root_blob)
@@ -117,14 +118,10 @@ def test_copy_tree_rsync_passes_no_generated_file_excludes(tmp_path, monkeypatch
         return orig_run(cmd, cwd=cwd)
 
     monkeypatch.setattr(propagate, "run", capture_run)
-    if propagate.shutil.which("rsync") is None:
-        import pytest
-
-        pytest.skip("no rsync on this machine; fallback path covered elsewhere")
     propagate.copy_tree(src, dest)
     cmd = captured.get("cmd", [])
     excludes = [cmd[i + 1] for i, v in enumerate(cmd) if v == "--exclude" and i + 1 < len(cmd)]
     for name in propagate.GENERATED_INSTALL_FILES:
-        offenders = [e for e in excludes if e.lstrip("/") == name]
-        assert offenders == [], f"generated file excluded from refresh: {offenders}"
+        assert f"/{name}" in excludes, f"anchored exclude /{name} missing: {excludes}"
+        assert name not in excludes, f"bare exclude {name!r} reintroduces #359: {excludes}"
     _assert_hidden_refreshed_and_root_preserved(dest, root_blob)

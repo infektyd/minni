@@ -387,7 +387,8 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                     f"{_gemini_hidden_rel} at {_hidden_gem_ver!r} "
                     f"(canonical {canonical!r})"
                 )
-                continue
+                # No continue: the divergence line is additive, so drift in the
+                # root's OTHER manifests still reports in the same run.
         if not versions:
             mismatches.append(
                 f"deployed: UNINSPECTABLE — {label} carries no readable plugin manifest; "
