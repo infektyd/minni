@@ -14,10 +14,12 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from minni.wire.manifest import deterministic_built_at  # noqa: E402
+
 PLUGIN_DIR = REPO_ROOT / "plugins" / "minni"
 PAYLOAD_ROOT = REPO_ROOT / "src" / "minni" / "plugin_payload"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -137,7 +139,7 @@ def copy_payload_tree(version: str) -> dict[str, str]:
         "schema": 1,
         "version": version,
         "git_sha": git_sha(),
-        "built_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "built_at": deterministic_built_at(REPO_ROOT),
         "node_engine": ">=20",
         "files": file_hashes,
     }
