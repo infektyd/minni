@@ -39,6 +39,11 @@ let thread_schema = #{
     },
 };
 
+// NOTE: "required" binds field PRESENCE only — risk_acceptance=true with
+// re_check_issue="" is schema-valid (no if-then support here). The empty-true
+// case is handled downstream: wright computes-and-files, the report marks
+// MISSING, and the operator gate covers it. Do not assume the schema alone
+// enforces the policy invariant.
 // Dual-track: honesty now + preserve next-PR goals (docs/ops/docs-truth-policy.md).
 // disposition: honesty_cut | honesty_partial | implement_now | goal_next_pr | underclaim_add | ops_fleet
 let lane_schema = #{
@@ -169,6 +174,26 @@ let app_schema = #{
         "summary": #{ "type": "string" },
     },
 };
+
+// Filed-ref predicate — the ONLY definition; every filed/unfiled decision
+// in this file must call it. "#" must be followed by digits only, and a URL
+// must be an http(s) link containing /issues/ — a bare substring match let
+// a proposed TITLE that merely mentioned "/issues/" render as (filed ref),
+// silently turning the operator gate off for that row.
+fn is_filed_ref(s) {
+    if s == () || s == "" { return false; }
+    if s.starts_with("#") {
+        if s.len() < 2 { return false; }
+        let i = 1;
+        while i < s.len() {
+            let c = s[i];
+            if c < '0' || c > '9' { return false; }
+            i += 1;
+        }
+        return true;
+    }
+    s.starts_with("http") && s.contains("/issues/")
+}
 
 let a = args;
 if a == () { a = #{}; }
@@ -562,8 +587,7 @@ for lst in re_lists {
                 // Upgrade ONLY on a filed-shaped ref: an empty or junk
                 // issue_ref from a failed wright must never clobber loom's
                 // declared title — the operator needs that exact title.
-                if filed != () && filed != ""
-                    && (filed.starts_with("#") || filed.contains("/issues/")) {
+                if is_filed_ref(filed) {
                     artifact = filed;
                 }
             }
@@ -577,15 +601,18 @@ for lst in re_lists {
 let group_index = #{};
 let merged = [];
 for r in risk_rows {
-    let key = r.declared;
+    let r_filed = is_filed_ref(r.artifact);
+    // Key on the filed ref when one exists: a #NNN-declared twin and a
+    // title-declared twin never share a declared string, but after upgrade
+    // they share the ref — ref-first keying merges them.
+    let key = "";
+    if r_filed { key = r.artifact; }
+    if key == "" { key = r.declared; }
     if key == "" { key = r.artifact; }
     if key == "" { key = r.id; }
-    let r_filed = r.artifact != ""
-        && (r.artifact.starts_with("#") || r.artifact.contains("/issues/"));
     if group_index.contains(key) {
         let i = group_index[key];
-        let cur_filed = merged[i].artifact != ""
-            && (merged[i].artifact.starts_with("#") || merged[i].artifact.contains("/issues/"));
+        let cur_filed = is_filed_ref(merged[i].artifact);
         if r_filed && !cur_filed {
             merged[i].artifact = r.artifact;
             merged[i].id = r.id;
@@ -608,7 +635,7 @@ for m in merged {
     report += ": ";
     if m.artifact != "" {
         report += m.artifact;
-        if m.artifact.starts_with("#") || m.artifact.contains("/issues/") {
+        if is_filed_ref(m.artifact) {
             report += " (filed ref)";
         } else {
             report += " (PROPOSED — not yet filed)";
@@ -630,9 +657,7 @@ let matched_ids = [];
 for r in risk_rows { matched_ids.push(r.id); }
 if impl.output.re_checks_filed != () {
     for rc in impl.output.re_checks_filed {
-        if !matched_ids.contains(rc.id) && rc.issue_ref != ()
-            && rc.issue_ref != ""
-            && (rc.issue_ref.starts_with("#") || rc.issue_ref.contains("/issues/")) {
+        if !matched_ids.contains(rc.id) && is_filed_ref(rc.issue_ref) {
             re_count += 1;
             report += "- ";
             report += rc.id;
