@@ -15,7 +15,7 @@ overclaims that describe wanted capabilities become `goal_next_pr` /
 | `~/.grok/workflows/docs-accuracy-converge.rhai` | User copy for global discovery |
 | `docs/ops/agent-roster.md` | **Adaptive** model min/max roster |
 | `docs/ops/docs-truth-policy.md` | Dual-track honesty + goal preservation |
-| `docs/ops/disposition-expiry-policy.md` | 60-day re-check on accept-with-rationale dispositions — required for risk-accepting `goal_next_pr` / `honesty_partial`; the converge workflow binds `risk_acceptance`/`re_check_issue` in-schema and emits the `Re-checks filed` section (#354); the issue itself is still filed by wright/operator |
+| `docs/ops/disposition-expiry-policy.md` | 60-day re-check on accept-with-rationale dispositions — required for risk-accepting `goal_next_pr` / `honesty_partial`; the converge workflow binds `risk_acceptance`/`re_check_issue` in-schema (both gap arrays) and emits the `Re-checks required` section (#354); the issue itself is still filed by wright/operator |
 
 ## Adaptive model roster
 
@@ -32,23 +32,25 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
 2. **AuditFanout** — 6 parallel **explore** lanes (stamps, deny matrix, AFM/install, fleet/cursor, team rename, runtimes/release).
 3. **Loom** — dedupe/rank; split **honesty_now** vs **goal_next_pr** lists.
 4. **Implement** — **wright** applies honesty (+ scoped `implement_now` only);
-   goals preserved in report / plan slices, not deleted. REQUIRED PROCESS,
-   not yet workflow-wired (#354): for any disposition that accepts a risk
-   (not pure ambition), wright or the operator must file the dated
-   `re-check` issue per
-   [disposition-expiry-policy.md](disposition-expiry-policy.md) and list it
-   in the report under "Re-checks filed" — now emitted by the `.rhai`'s
-   `Re-checks filed` section (#354).
+   goals preserved in report / plan slices, not deleted. REQUIRED PROCESS:
+   for any disposition that accepts a risk (not pure ambition), wright or
+   the operator must file the dated `re-check` issue per
+   [disposition-expiry-policy.md](disposition-expiry-policy.md). #354 wired
+   the schema binding and the `Re-checks required` report section — the
+   FILING itself stays manual; the section marks each entry as a filed ref
+   (`#NNN`) or PROPOSED, and PROPOSED entries must be filed before merge.
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
    (goals remaining is OK).
 6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.
-7. **Report** — three sections. Emitted today by the `.rhai` builder:
-   **Goals preserved for next PRs**, **Re-checks filed**, plus loom summary /
-   roster / operator next — do not re-author them except to correct
-   loom/wright output. NOT emitted today, appended manually: **Honesty
-   shipped** (summarize the honesty edits wright applied in step 4; state
-   N/A explicitly when none — machine silence is not N/A) — manual for
-   other report paths.
+7. **Report** — emitted today by the `.rhai` builder: **Goals preserved for
+   next PRs**, **Re-checks required** (risk-accepting entries from both loom
+   arrays, filed refs marked distinctly from PROPOSED titles), plus loom
+   summary / roster / operator next — do not re-author them except to
+   correct loom/wright output. Appended manually, here and on every other
+   report path: **Honesty shipped** (summarize the honesty edits wright
+   applied in step 4) and the confirmation that PROPOSED re-checks were
+   actually filed; state N/A explicitly when none — machine silence is not
+   N/A.
 
 ## Run
 

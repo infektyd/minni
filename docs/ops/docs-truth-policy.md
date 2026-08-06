@@ -61,16 +61,18 @@ if the *intent* was legitimate.
    the operator files the dated `re-check` issue per
    [disposition-expiry-policy.md](disposition-expiry-policy.md) NOW — before
    any report is written. The converge workflow binds the reference in-schema
-   (`risk_acceptance`/`re_check_issue`, #354) and emits the Re-checks filed
-   section, but the issue itself is still filed by wright/operator — on every
-   report path.
+   (`risk_acceptance`/`re_check_issue`, both gap arrays, #354) and emits a
+   Re-checks required section that marks filed refs (`#NNN`) apart from
+   PROPOSED titles — but the issue itself is still filed by wright/operator,
+   on every report path.
 3. Report (after filing, never before): sections **Honesty shipped**,
-   **Goals preserved for next PRs**, and **Re-checks filed**. The `.rhai`
-   builder already emits Goals preserved and Re-checks filed (#354);
-   **Honesty shipped** it does not — wright/operator appends it to the
-   scratch report and/or the PR-body Follow-ups after the run, manual for
-   other report paths. For that manual section machine silence is not N/A;
-   state N/A explicitly when none.
+   **Goals preserved for next PRs**, and **Re-checks required**. The `.rhai`
+   builder emits Goals preserved and Re-checks required (#354); **Honesty
+   shipped** it does not — wright/operator appends it to the scratch report
+   and/or the PR-body Follow-ups after the run, manual for other report
+   paths. Any PROPOSED entry in Re-checks required means filing is still
+   owed. For the manual section machine silence is not N/A; state N/A
+   explicitly when none.
 
 See also: personal Grok App playbook in [grok-reviewer-app.md](grok-reviewer-app.md)
 (“Assumptions that became next PR goals”).
