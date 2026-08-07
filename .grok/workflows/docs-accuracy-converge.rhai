@@ -181,7 +181,7 @@ let app_schema = #{
 // link with a numeric tail — a bare substring match let a proposed TITLE
 // that merely mentioned "/issues/" render as (filed ref), silently turning
 // the operator gate off for that row, and an un-pinned host/repo let
-// wrong-repo URLs arrive as merge-clearing (wright-filed) rows.
+// wrong-repo URLs arrive carrying the strongest (wright-reported) label.
 fn is_filed_ref(s, repo) {
     if s == () || s == "" { return false; }
     if s.starts_with("#") {
@@ -198,7 +198,7 @@ fn is_filed_ref(s, repo) {
     // github.com issue on any other repo (or any non-ticket path) is not a
     // filing here: `gh issue view <url>` "confirms" cross-repo URLs, so a
     // shape check that ignored the repo would let a wrong-repo ref arrive
-    // labeled (wright-filed), a merge-clearing state. #NNN stays the
+    // labeled (wright-reported), the strongest label. #NNN stays the
     // same-repo shorthand.
     let pre_https = "https://github.com/" + repo + "/issues/";
     let pre_http = "http://github.com/" + repo + "/issues/";
@@ -696,7 +696,7 @@ for m in merged {
         if is_filed_ref(m.artifact, repo) {
             if m.src == "wright" {
                 wright_confirmed += 1;
-                report += " (wright-filed)";
+                report += " (wright-reported — VERIFY LIVE with gh issue view before merge; wright refs are agent output, not proof of filing)";
             } else {
                 report += " (declared ref — VERIFY LIVE with gh issue view before merge; loom refs are unconfirmed)";
             }
@@ -722,7 +722,7 @@ if impl.output.re_checks_filed != () {
     for rc in impl.output.re_checks_filed {
         if !matched_ids.contains(rc.id) && is_filed_ref(rc.issue_ref, repo) {
             re_count += 1;
-            // This row IS wright-filed: count it in the numerator too, or an
+            // This row IS wright-reported: count it in the numerator too, or an
             // all-confirmed run plus one orphan reads "N of N+1" and nudges
             // the operator toward a duplicate filing.
             wright_confirmed += 1;
@@ -730,7 +730,7 @@ if impl.output.re_checks_filed != () {
             report += rc.id;
             report += ": ";
             report += rc.issue_ref;
-            report += " (wright-filed — id matched no declared risk row; verify before filing anything new)\n";
+            report += " (wright-reported — id matched no declared risk row; VERIFY LIVE, and check before filing anything new)\n";
         }
     }
 }
@@ -739,7 +739,7 @@ if re_count > 0 {
     report += wright_confirmed.to_string();
     report += " of ";
     report += re_count.to_string();
-    report += " risk rows confirmed by re_checks_filed";
+    report += " risk rows reported filed by re_checks_filed (labels are provenance, not verification)";
     if wright_confirmed < re_count {
         report += " — check wright Follow-ups and `gh issue list --label re-check` before filing anything, to avoid duplicates";
     }
@@ -765,7 +765,7 @@ report += "If wright needed >2 pongs: bump wright. If spend high and clean: chea
 report += "Update agent-roster.md Changelog after this run.\n";
 report += "\n## Operator next\n";
 report += "1. Review honesty PR; do not agent-merge.\n";
-report += "2. Before merging yourself, clear every PROPOSED and MISSING entry in Re-checks required that has no #NNN in wright Follow-ups. PROPOSED: file with the title exactly as listed. MISSING: construct the dated title per disposition-expiry-policy.md first (never copy the MISSING line). Rows marked declared-ref: `gh issue view` the ref and confirm it matches the residual — an unconfirmed #NNN may be hallucinated. Both filing cases: label re-check, body citing disposition, gap id, rationale, and code anchor; check `gh issue list --label re-check` first to avoid duplicates — dual-track twins may carry different artifact forms. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
+report += "2. Before merging yourself, walk Re-checks required ROW BY ROW. Filed-shaped refs (wright-reported and declared alike): `gh issue view` the ref and confirm a live re-check issue matching THAT row's residual — wright output is agent output, so a #NNN clears nothing until you have seen the issue; no label arrives pre-verified. PROPOSED: file with the title exactly as listed, unless `gh issue list --label re-check --state open` already shows an open issue matching that same residual. MISSING: construct the dated title per disposition-expiry-policy.md first (never copy the MISSING line). A #NNN in Follow-ups for one residual clears nothing for any other row. Both filing cases: label re-check, body citing disposition, gap id, rationale, and code anchor — dual-track twins may carry different artifact forms. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
 report += "3. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
 report += "4. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
 report += "5. Bare /grok-review only after tip freeze if App ELIG needed.\n";

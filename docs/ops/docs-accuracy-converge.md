@@ -39,12 +39,12 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
    the schema binding, the `Re-checks required` report section, and wright
    as the primary filer (it checks `gh issue list --label re-check
    --state open` first, reuses a live matching issue, creates only when
-   none matches, and returns `re_checks_filed`); the operator's gate is that
-   every row reaches one of two end states before merge: `(wright-filed)`
-   with a live matching issue, or a `(declared ref)` confirmed by hand with
-   `gh issue view` — PROPOSED and MISSING rows get filed, and a declared ref
-   is not cleared by the absence of PROPOSED rows. Non-clear rows are the
-   failure signal, not noise.
+   none matches, and returns `re_checks_filed`); the operator's gate is per
+   row: every filed-shaped ref — `(wright-reported)` and `(declared ref)`
+   alike, both being agent output — confirmed by hand with `gh issue view`
+   against that row's residual, and every PROPOSED or MISSING row filed.
+   No label arrives pre-verified, and a ref for one residual clears nothing
+   for any other row. Non-clear rows are the failure signal, not noise.
 5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
    (goals remaining is OK).
 6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.
