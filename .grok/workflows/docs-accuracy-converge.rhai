@@ -176,11 +176,13 @@ let app_schema = #{
 };
 
 // Filed-ref predicate — the ONLY definition; every filed/unfiled decision
-// in this file must call it. "#" must be followed by digits only, and a URL
-// must be an http(s) link containing /issues/ — a bare substring match let
-// a proposed TITLE that merely mentioned "/issues/" render as (filed ref),
-// silently turning the operator gate off for that row.
-fn is_filed_ref(s) {
+// in this file must call it (passing the workflow's repo pin). "#" must be
+// followed by digits only, and a URL must be THIS repo's github.com issue
+// link with a numeric tail — a bare substring match let a proposed TITLE
+// that merely mentioned "/issues/" render as (filed ref), silently turning
+// the operator gate off for that row, and an un-pinned host/repo let
+// wrong-repo URLs arrive as merge-clearing (wright-filed) rows.
+fn is_filed_ref(s, repo) {
     if s == () || s == "" { return false; }
     if s.starts_with("#") {
         if s.len() < 2 { return false; }
@@ -192,23 +194,26 @@ fn is_filed_ref(s) {
         }
         return true;
     }
-    // URL form must be a github.com link ending in a numeric issue id — an
-    // arbitrary /issues/ link (search page, non-ticket path, non-GitHub
-    // host) is not a filing. Host-pinned so a lane cannot mint filed-shaped
-    // refs against a domain nobody checks.
-    if (s.starts_with("https://github.com/") || s.starts_with("http://github.com/"))
-        && s.contains("/issues/") {
-        let tail_i = s.index_of("/issues/") + 8;
-        if tail_i >= s.len() { return false; }
-        let j = tail_i;
-        while j < s.len() {
-            let c = s[j];
-            if c < '0' || c > '9' { return false; }
-            j += 1;
-        }
-        return true;
+    // URL form must be THIS repo's issue link ending in a numeric id — a
+    // github.com issue on any other repo (or any non-ticket path) is not a
+    // filing here: `gh issue view <url>` "confirms" cross-repo URLs, so a
+    // shape check that ignored the repo would let a wrong-repo ref arrive
+    // labeled (wright-filed), a merge-clearing state. #NNN stays the
+    // same-repo shorthand.
+    let pre_https = "https://github.com/" + repo + "/issues/";
+    let pre_http = "http://github.com/" + repo + "/issues/";
+    let tail_i = 0;
+    if s.starts_with(pre_https) { tail_i = pre_https.len(); }
+    else if s.starts_with(pre_http) { tail_i = pre_http.len(); }
+    else { return false; }
+    if tail_i >= s.len() { return false; }
+    let j = tail_i;
+    while j < s.len() {
+        let c = s[j];
+        if c < '0' || c > '9' { return false; }
+        j += 1;
     }
-    false
+    true
 }
 
 let a = args;
@@ -333,6 +338,7 @@ let audit_results = parallel(audit_jobs);
 
 let gap_blob = "";
 let n_gaps = 0;
+let failed_lanes = 0;
 let ai = 0;
 for ar in audit_results {
     if ar != () && ar.success && ar.output.gaps != () {
@@ -381,15 +387,23 @@ for ar in audit_results {
             gap_blob += "\n";
         }
     } else {
+        failed_lanes += 1;
         log("audit lane failed or empty slot index=" + ai.to_string());
     }
     ai += 1;
 }
-log("audit collected gaps≈" + n_gaps.to_string());
+log("audit collected gaps≈" + n_gaps.to_string() + " failed_lanes=" + failed_lanes.to_string());
 
 if n_gaps == 0 {
-    let p = write_scratch_file("docs-accuracy-report.md", "# Docs accuracy converge\n\nNo gaps from audit fan-out. Already tight or audit failed closed.\nplan_id=" + plan_id + "\n");
-    complete(#{ summary: "No gaps — already tight or audit failed", path: p, plan_id: plan_id, gaps: 0 });
+    // Zero gaps is only a clean "already tight" when every lane actually
+    // reported. A failed/schema-rejected lane at zero gaps is the audit
+    // failing CLOSED — completing with a tidy report here would print a
+    // green story precisely when re-check binding never ran.
+    if failed_lanes > 0 {
+        pause("verification", failed_lanes.to_string() + " audit lane(s) failed or returned no output at zero gaps — audit failed closed, NOT 'already tight'. Re-run the audit before trusting this.");
+    }
+    let p = write_scratch_file("docs-accuracy-report.md", "# Docs accuracy converge\n\nNo gaps from audit fan-out; all lanes reported. Docs are tight.\nplan_id=" + plan_id + "\n");
+    complete(#{ summary: "No gaps — all audit lanes reported clean", path: p, plan_id: plan_id, gaps: 0 });
 }
 
 // --- Phase: Loom ---
@@ -602,13 +616,13 @@ for lst in re_lists {
             // or stale — only a wright-confirmed ref earns the trusted
             // label. src: "wright" | "declared" | "".
             let src = "";
-            if is_filed_ref(declared) { src = "declared"; }
+            if is_filed_ref(declared, repo) { src = "declared"; }
             if filed_by_id.contains(f.id) {
                 let filed = filed_by_id[f.id];
                 // Upgrade ONLY on a filed-shaped ref: an empty or junk
                 // issue_ref from a failed wright must never clobber loom's
                 // declared title — the operator needs that exact title.
-                if is_filed_ref(filed) {
+                if is_filed_ref(filed, repo) {
                     artifact = filed;
                     src = "wright";
                 }
@@ -642,13 +656,13 @@ while ri < risk_rows.len() {
 let group_index = #{};
 let merged = [];
 for r in risk_rows {
-    let r_filed = is_filed_ref(r.artifact);
+    let r_filed = is_filed_ref(r.artifact, repo);
     let key = r.declared;
     if key == "" { key = r.artifact; }
     if key == "" { key = r.id; }
     if group_index.contains(key) {
         let i = group_index[key];
-        let cur_filed = is_filed_ref(merged[i].artifact);
+        let cur_filed = is_filed_ref(merged[i].artifact, repo);
         if r_filed && !cur_filed {
             merged[i].artifact = r.artifact;
             merged[i].id = r.id;
@@ -676,7 +690,7 @@ for m in merged {
     report += ": ";
     if m.artifact != "" {
         report += m.artifact;
-        if is_filed_ref(m.artifact) {
+        if is_filed_ref(m.artifact, repo) {
             if m.src == "wright" {
                 wright_confirmed += 1;
                 report += " (wright-filed)";
@@ -703,7 +717,7 @@ let matched_ids = [];
 for r in risk_rows { matched_ids.push(r.id); }
 if impl.output.re_checks_filed != () {
     for rc in impl.output.re_checks_filed {
-        if !matched_ids.contains(rc.id) && is_filed_ref(rc.issue_ref) {
+        if !matched_ids.contains(rc.id) && is_filed_ref(rc.issue_ref, repo) {
             re_count += 1;
             // This row IS wright-filed: count it in the numerator too, or an
             // all-confirmed run plus one orphan reads "N of N+1" and nudges
