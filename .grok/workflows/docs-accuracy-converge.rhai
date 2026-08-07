@@ -397,13 +397,16 @@ log("audit collected gaps≈" + n_gaps.to_string() + " failed_lanes=" + failed_l
 if n_gaps == 0 {
     // Zero gaps is only a clean "already tight" when every lane actually
     // reported. A failed/schema-rejected lane at zero gaps is the audit
-    // failing CLOSED — completing with a tidy report here would print a
-    // green story precisely when re-check binding never ran.
+    // failing CLOSED. The two arms are fully split because pause() RESUMES:
+    // a shared fall-through would complete with the green artifact right
+    // after a human acknowledged the failure text (round-15 finding).
     if failed_lanes > 0 {
+        let p = write_scratch_file("docs-accuracy-report.md", "# Docs accuracy converge\n\nAUDIT FAILED CLOSED: " + failed_lanes.to_string() + " audit lane(s) failed or returned no output, zero gaps collected. This is NOT 'already tight' — re-run the audit.\nplan_id=" + plan_id + "\n");
         pause("verification", failed_lanes.to_string() + " audit lane(s) failed or returned no output at zero gaps — audit failed closed, NOT 'already tight'. Re-run the audit before trusting this.");
+        complete(#{ summary: "Audit FAILED CLOSED — " + failed_lanes.to_string() + " lane(s) failed at zero gaps; docs NOT verified tight", path: p, plan_id: plan_id, gaps: 0, failed_lanes: failed_lanes });
     }
     let p = write_scratch_file("docs-accuracy-report.md", "# Docs accuracy converge\n\nNo gaps from audit fan-out; all lanes reported. Docs are tight.\nplan_id=" + plan_id + "\n");
-    complete(#{ summary: "No gaps — all audit lanes reported clean", path: p, plan_id: plan_id, gaps: 0 });
+    complete(#{ summary: "No gaps — all audit lanes reported clean", path: p, plan_id: plan_id, gaps: 0, failed_lanes: 0 });
 }
 
 // --- Phase: Loom ---
@@ -741,9 +744,20 @@ if re_count > 0 {
         report += " — check wright Follow-ups and `gh issue list --label re-check` before filing anything, to avoid duplicates";
     }
     report += "\n";
+    if failed_lanes > 0 {
+        report += "NOTE: audit was PARTIAL (" + failed_lanes.to_string() + " lane(s) failed) — rows above cover surviving lanes only; the failed lane(s) may hold further risk-accepting residuals\n";
+    }
 }
 if re_count == 0 {
-    report += "Re-checks required: none (no risk-accepting dispositions declared)\n";
+    // "none" is a NEGATIVE claim over the full audit: with any lane missing
+    // it was never fully audited, and the dead lane may have held the only
+    // risk-accepting residual (round-15 finding). Stricter lane schema makes
+    // whole-lane rejection likelier, so refuse the confident wording.
+    if failed_lanes > 0 {
+        report += "Re-checks required: UNKNOWN — " + failed_lanes.to_string() + " audit lane(s) failed, so 'none' is not claimable; re-run the audit before treating this as clear\n";
+    } else {
+        report += "Re-checks required: none (no risk-accepting dispositions declared)\n";
+    }
 }
 report += "\n## Adaptive roster feedback\n";
 report += "If audit missed Highs cass found: bump audit model (see docs/ops/agent-roster.md).\n";
