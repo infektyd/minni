@@ -89,8 +89,10 @@ Budget: plan for ~40–80 agent slots on a full run (`agent_budget` 96–128 is 
 
 ## Discipline scars (do not relearn the hard way)
 
-- **Bare** `/grok-review` only (exact body). Prose comments skip or cancel.
-- **One** re-request owner; concurrency group cancels in-flight App runs.
+- **Bare** `/grok-review` only (exact body). Prose comments are skipped and
+  never touch the review's concurrency group (job-level, #351).
+- **One** re-request owner; in-flight App runs always finish — a second
+  legitimate trigger queues, it does not cancel (#351).
 - **Freeze tip** before App command.
 - Stamp PRs that touch `pyproject.toml` → mechanical PATH_DENY → **human/admin merge**, not thrash.
 - Marketplace must stamp with pyproject (CI `check-versions`).

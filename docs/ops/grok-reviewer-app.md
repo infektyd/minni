@@ -603,9 +603,13 @@ especially #271). Use them so agents and humans stop thrashing the gate.
    trailing prose). Job `if` uses `startsWith`; Resolve step uses **exact**
    equality — multi-line “re-request” comments **skip** and still look like
    success in the UI.
-2. **One re-request owner per PR.** `concurrency` is
-   `grok-review-${PR}` with `cancel-in-progress: true`. Dual shepherd +
-   orchestrator comments cancel each other.
+2. **One re-request owner per PR.** Concurrency sits on the `grok-review`
+   JOB as `grok-review-${PR}` with `cancel-in-progress: false` (#351):
+   in-flight runs always finish, a second legitimate trigger QUEUES behind
+   the running one (up to its 20-minute timeout), and skipped jobs (plain
+   comments) never enter the group. Nothing cancels a stuck run anymore —
+   wait out the timeout or cancel the workflow run in the Actions UI.
+   A second command only ever replaces a still-PENDING queued job.
 3. **Freeze the tip** before the command. Eligibility is tip-bound (invariant
    9). Push after APPROVE/ELIG → stamp dead; you pay another metered review.
 4. **Same SHA is not re-billed** (including dismissed reviews on that SHA).

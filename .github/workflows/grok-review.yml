@@ -18,8 +18,9 @@ name: Grok Code Review
 # Scope guards:
 # * Same-repo PRs only — `pull_request` from forks gets no secrets from
 #   GitHub anyway, and the job's if-gate skips them outright.
-# * Skips draft PRs. Concurrency group cancels in-progress runs if a second
-#   trigger fires for the same PR (e.g. ready_for_review while opened runs).
+# * Skips draft PRs. Job-level concurrency queues (never cancels) a second
+#   trigger for the same PR; skipped jobs never enter the group, so plain
+#   comments cannot steal the pending slot from a queued /grok-review (#351).
 
 # METERING MODEL: exactly one metered review per deliberate request —
 # subscription quota in OAuth mode, real dollars in XAI_API_KEY mode. Those
@@ -50,14 +51,23 @@ permissions:
   # issues-scoped write even when the comment lives on a PR.
   issues: write
 
-concurrency:
-  # issue_comment carries no pull_request payload; both events land on the PR
-  # number so two rapid commands coalesce instead of double-billing.
-  group: grok-review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
-
 jobs:
   grok-review:
+    # JOB-level concurrency, deliberately not workflow-level (#351). Two
+    # stacked hazards at workflow level: (a) with cancel-in-progress, EVERY
+    # comment on the PR entered the group before the job `if` decided to
+    # skip, so a plain comment cancelled an in-flight metered review
+    # (measured on PR #350); (b) even with cancel-in-progress false, the
+    # group's single PENDING slot is stolen by any newer run — a queued
+    # /grok-review silently vanished when ordinary comment noise arrived.
+    # Skipped jobs never take the job-level lock, so only real review runs
+    # enter the group: in-flight runs are never cancelled, two legitimate
+    # triggers queue, and Resolve PR's per-SHA dedup absorbs same-head
+    # doubles. issue_comment carries no pull_request payload; both events
+    # land on the PR number so the group is per-PR either way.
+    concurrency:
+      group: grok-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
     # Cheap pre-filter only. The authoritative command match is the exact
     # trimmed comparison in `Resolve PR`; `startsWith` here just avoids spinning
     # a runner for every comment on the repo. Neither path spends a metered
