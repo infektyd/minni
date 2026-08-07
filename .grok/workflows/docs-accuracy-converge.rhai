@@ -192,9 +192,12 @@ fn is_filed_ref(s) {
         }
         return true;
     }
-    // URL form must end in a numeric issue id — an arbitrary /issues/ link
-    // (search page, non-ticket path) is not a filing.
-    if s.starts_with("http") && s.contains("/issues/") {
+    // URL form must be a github.com link ending in a numeric issue id — an
+    // arbitrary /issues/ link (search page, non-ticket path, non-GitHub
+    // host) is not a filing. Host-pinned so a lane cannot mint filed-shaped
+    // refs against a domain nobody checks.
+    if (s.starts_with("https://github.com/") || s.starts_with("http://github.com/"))
+        && s.contains("/issues/") {
         let tail_i = s.index_of("/issues/") + 8;
         if tail_i >= s.len() { return false; }
         let j = tail_i;
@@ -702,6 +705,10 @@ if impl.output.re_checks_filed != () {
     for rc in impl.output.re_checks_filed {
         if !matched_ids.contains(rc.id) && is_filed_ref(rc.issue_ref) {
             re_count += 1;
+            // This row IS wright-filed: count it in the numerator too, or an
+            // all-confirmed run plus one orphan reads "N of N+1" and nudges
+            // the operator toward a duplicate filing.
+            wright_confirmed += 1;
             report += "- ";
             report += rc.id;
             report += ": ";
