@@ -54,21 +54,39 @@ if the *intent* was legitimate.
 `docs-accuracy-converge` must:
 
 1. Tag each gap with `disposition` (and `goal_title` when disposition is
-   `goal_next_pr` or `honesty_partial`).
+   `goal_next_pr` or `honesty_partial`), plus `risk_acceptance` and
+   `re_check_issue` on every gap (#354 — schema-required in the converge
+   workflow).
 2. Wright: apply **honesty now** edits; for `implement_now` only when High and
    scoped; never drop goals on the floor. For risk-accepting residuals
-   (`goal_next_pr` / `honesty_partial` carrying an accepted risk), wright or
+   (any disposition leaving an accepted risk — `goal_next_pr` /
+   `honesty_partial` carrying one, or a scoped `implement_now` with a known
+   residual), wright or
    the operator files the dated `re-check` issue per
-   [disposition-expiry-policy.md](disposition-expiry-policy.md) NOW — before
-   any report is written; manual until the workflow emits it (#354).
-3. Report (after filing, never before): sections **Honesty shipped**,
-   **Goals preserved for next PRs**, and **Re-checks filed**. The `.rhai`
-   builder already emits Goals preserved; **Honesty shipped** and
-   **Re-checks filed** it does not — wright/operator appends those two to
-   the scratch report and/or the PR-body Follow-ups after the run, until
-   #354 wires them in. For those two manual sections machine silence is
-   not N/A; state N/A explicitly when none, and Re-checks N/A is only true
-   if step 2 filed nothing.
+   [disposition-expiry-policy.md](disposition-expiry-policy.md). The converge
+   workflow binds the reference in-schema (`risk_acceptance`/`re_check_issue`,
+   both gap arrays, #354), instructs wright to file proposed titles during
+   implement, and emits a Re-checks required section that labels every row
+   with its provenance: `(wright-reported)`, `(declared ref)`, `(PROPOSED —
+   not yet filed)`, or `(MISSING — instruction)`. Emission may precede
+   filing — a PROPOSED row is the owed-work signal, not a process bug.
+   Provenance labels are lineage, NOT verification: wright refs and loom
+   refs are both agent output, and no row arrives pre-verified. Nothing in
+   the workflow or CI enforces this: the OPERATOR's gate is per row —
+   every filed-shaped ref (wright-reported and declared alike) confirmed
+   with `gh issue view` against that row's residual, and every PROPOSED or
+   MISSING row filed. A ref for one residual clears nothing for any other
+   row. N/A is claimable only when the section says none.
+3. Report: sections **Honesty shipped**,
+   **Goals preserved for next PRs**, and **Re-checks required**. The `.rhai`
+   builder emits Goals preserved and Re-checks required (#354); **Honesty
+   shipped** it does not — wright/operator appends it to the scratch report
+   and/or the PR-body Follow-ups after the run, manual for other report
+   paths. A PROPOSED or MISSING entry in Re-checks required means filing is
+   still owed; every filed-shaped ref — `wright-reported` and `declared`
+   alike — means live verification (`gh issue view`) is still owed. No row
+   arrives pre-verified. For the manual section machine silence is not N/A;
+   state N/A explicitly when none.
 
 See also: personal Grok App playbook in [grok-reviewer-app.md](grok-reviewer-app.md)
 (“Assumptions that became next PR goals”).
