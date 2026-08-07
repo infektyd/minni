@@ -51,13 +51,19 @@ def test_concurrency_group_is_keyed_on_head_sha_for_every_trigger(gate):
 
 
 def test_review_concurrency_never_cancels_an_inflight_run(review):
-    """EVERY issue_comment on the PR enters the review concurrency group before
-    the job-level `if` decides to skip, so cancel-in-progress would let a plain
-    comment cancel an in-flight metered review — measured on PR #350, where a
-    `bugbot run` comment killed the auto-review run mid-flight (#351). The
-    group's single pending slot still coalesces rapid commands, and Resolve
-    PR's per-SHA dedup absorbs double-billing."""
-    conc = review["concurrency"]
+    """Concurrency must sit on the JOB, queue-not-cancel (#351). At workflow
+    level every issue_comment entered the group before the job `if` decided
+    to skip: with cancel-in-progress a plain comment cancelled an in-flight
+    metered review (measured on PR #350, `bugbot run` killed the auto-review
+    mid-flight), and even without it, comment noise stole the group's single
+    pending slot so a queued /grok-review silently vanished. Skipped jobs
+    never take the job-level lock, so only real review runs enter the
+    group; Resolve PR's per-SHA dedup absorbs same-head doubles."""
+    assert "concurrency" not in review, (
+        "workflow-level concurrency on grok-review lets ordinary comments "
+        "steal the pending slot from a queued /grok-review (#351)"
+    )
+    conc = review["jobs"]["grok-review"]["concurrency"]
     assert conc["cancel-in-progress"] is False, (
         "cancel-in-progress on grok-review reintroduces the paid-review kill (#351)"
     )
