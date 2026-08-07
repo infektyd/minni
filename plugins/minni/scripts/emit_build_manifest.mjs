@@ -14,7 +14,7 @@
  * deployment against source HEAD.
  */
 import { execFileSync } from "node:child_process";
-import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -55,23 +55,83 @@ function version() {
   }
 }
 
-if (!existsSync(DIST)) {
-  console.error(`emit_build_manifest: no dist at ${DIST} — run the build first`);
-  process.exit(1);
+// #352 — reproducible builds: built_at must be deterministic so consecutive
+// builds from an identical tree are byte-identical. Honor SOURCE_DATE_EPOCH
+// (https://reproducible-builds.org/specs/source-date-epoch/) when set;
+// otherwise use the repo HEAD commit date (git log -1 --format=%cI) normalized
+// to UTC Z; fall back to wall-clock only when git is unavailable (tarball).
+export function deterministicBuiltAt() {
+  const epoch = process.env.SOURCE_DATE_EPOCH;
+  if (epoch !== undefined && epoch !== "") {
+    // Strict integer parse, mirrored on the Python side: Number() accepts
+    // "1.5"/"0x10"/"1e30" and out-of-range values make toISOString throw
+    // (or emit expanded-year forms for millisecond-style epochs). Invalid or
+    // unrepresentable values fall through to the git date instead of
+    // diverging from Python or crashing the build.
+    if (/^[+-]?\d+$/.test(epoch.trim())) {
+      const secs = Number(epoch.trim());
+      // Range-capped to Python's datetime (years 1..9999), not JS Date's much
+      // wider span — otherwise a milliseconds-style epoch yields an
+      // expanded-year date here while Python falls through to the git date.
+      if (Number.isSafeInteger(secs) && secs >= -62135596800 && secs <= 253402300799) {
+        try {
+          return new Date(secs * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+        } catch {
+          // fall through to git
+        }
+      }
+    }
+  }
+  try {
+    const raw = execFileSync("git", ["log", "-1", "--format=%cI"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    }).trim();
+    if (raw) {
+      return new Date(raw).toISOString().replace(/\.\d{3}Z$/, "Z");
+    }
+  } catch {
+    // git unavailable — fall through to wall-clock
+  }
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-const manifest = {
-  schema: 1,
-  version: version(),
-  git_sha: gitSha(),
-  git_dirty: gitDirty(),
-  built_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-  built_from: REPO_ROOT,
-};
+function emitBuildManifest() {
+  if (!existsSync(DIST)) {
+    console.error(`emit_build_manifest: no dist at ${DIST} — run the build first`);
+    process.exit(1);
+  }
 
-const out = path.join(DIST, "build-manifest.json");
-writeFileSync(out, JSON.stringify(manifest, null, 2) + "\n", "utf8");
-console.log(
-  `build manifest: ${manifest.version} ${manifest.git_sha.slice(0, 8)}` +
-    `${manifest.git_dirty ? "-dirty" : ""} -> ${path.relative(REPO_ROOT, out)}`,
-);
+  const manifest = {
+    schema: 1,
+    version: version(),
+    git_sha: gitSha(),
+    git_dirty: gitDirty(),
+    built_at: deterministicBuiltAt(),
+    built_from: REPO_ROOT,
+  };
+
+  const out = path.join(DIST, "build-manifest.json");
+  writeFileSync(out, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+  console.log(
+    `build manifest: ${manifest.version} ${manifest.git_sha.slice(0, 8)}` +
+      `${manifest.git_dirty ? "-dirty" : ""} -> ${path.relative(REPO_ROOT, out)}`,
+  );
+}
+
+// realpath BOTH sides: argv[1] may reach this file through a symlink while
+// the default ESM loader realpaths import.meta.url (a resolve-only compare
+// then skips emission silently) — but under --preserve-symlinks the loader
+// KEEPS the symlink path, so a one-sided realpath fails in the opposite
+// direction. Two-sided realpath matches in both modes.
+export function isMainInvocation(argv1, moduleUrl) {
+  return (
+    argv1 !== undefined &&
+    existsSync(argv1) &&
+    realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl))
+  );
+}
+
+if (isMainInvocation(process.argv[1], import.meta.url)) {
+  emitBuildManifest();
+}

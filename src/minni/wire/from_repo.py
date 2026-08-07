@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from minni.wire.manifest import PayloadManifest, dev_version, sha256_file, utc_now_iso
+from minni.wire.manifest import PayloadManifest, deterministic_built_at, dev_version, sha256_file
 
 PAYLOAD_ITEMS = (
     "dist", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin",
@@ -81,7 +81,7 @@ def build_from_repo(repo_root: Path) -> tuple[Path, PayloadManifest]:
             schema=1,
             version=version,
             git_sha=_git_sha(repo_root),
-            built_at=utc_now_iso(),
+            built_at=deterministic_built_at(repo_root),
             node_engine=">=20",
             files=files,
             path=tmp / "payload-manifest.json",

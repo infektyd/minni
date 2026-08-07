@@ -456,3 +456,28 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
     assert "0.3.0" in out
     # Version honesty: still-live cache must mismatch, not be skipped.
     assert proc.returncode != 0, out
+
+
+def test_root_vs_hidden_gemini_divergence_is_named_and_additive(tmp_path):
+    """#359: a stale .gemini-plugin/gemini-extension.json must be reported as
+    root-vs-hidden divergence, and the line is ADDITIVE — drift in the root's
+    other manifests still reports in the same run (no whack-a-mole)."""
+    home = tmp_path / "home"
+    root = home / ".config" / "kilo" / "plugins" / "minni"
+    (root / "dist").mkdir(parents=True)
+    (root / "gemini-extension.json").write_text(
+        json.dumps({"name": "minni", "version": _canonical()}), encoding="utf-8"
+    )
+    (root / ".gemini-plugin").mkdir()
+    (root / ".gemini-plugin" / "gemini-extension.json").write_text(
+        json.dumps({"name": "minni", "version": "0.3.0"}), encoding="utf-8"
+    )
+    (root / ".claude-plugin").mkdir()
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": "0.1.0"}), encoding="utf-8"
+    )
+    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "root-vs-hidden divergence" in out
+    assert "0.1.0" in out, f"other-manifest drift suppressed by divergence: {out}"

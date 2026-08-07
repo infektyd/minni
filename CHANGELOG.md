@@ -8,6 +8,14 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- `docs-accuracy-converge.rhai` now binds `risk_acceptance`/`re_check_issue`
+  into both loom gap arrays and emits a `Re-checks required` report section
+  (filed refs marked apart from PROPOSED titles) (#354) — superseding the
+  0.5.0 note below that workflow emission "is still open as #354". Filing
+  the issue itself remains a wright/operator act.
+
 ## [0.5.0] - 2026-08-06
 
 Close of the 2026-08 audit remediation campaign (81 findings, 15 slices,

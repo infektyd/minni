@@ -39,6 +39,11 @@ let thread_schema = #{
     },
 };
 
+// NOTE: "required" binds field PRESENCE only — risk_acceptance=true with
+// re_check_issue="" is schema-valid (no if-then support here). The empty-true
+// case is handled downstream: wright computes-and-files, the report marks
+// MISSING, and the operator gate covers it. Do not assume the schema alone
+// enforces the policy invariant.
 // Dual-track: honesty now + preserve next-PR goals (docs/ops/docs-truth-policy.md).
 // disposition: honesty_cut | honesty_partial | implement_now | goal_next_pr | underclaim_add | ops_fleet
 let lane_schema = #{
@@ -51,7 +56,7 @@ let lane_schema = #{
             "maxItems": 12,
             "items": #{
                 "type": "object",
-                "required": ["id", "severity", "claim", "doc_path", "code_anchor", "disposition", "fix_hint"],
+                "required": ["id", "severity", "claim", "doc_path", "code_anchor", "disposition", "fix_hint", "risk_acceptance", "re_check_issue"],
                 "properties": #{
                     "id": #{ "type": "string" },
                     "severity": #{ "type": "string" },
@@ -61,6 +66,8 @@ let lane_schema = #{
                     "disposition": #{ "type": "string" },
                     "goal_title": #{ "type": "string" },
                     "fix_hint": #{ "type": "string" },
+                    "risk_acceptance": #{ "type": "boolean" },
+                    "re_check_issue": #{ "type": "string" },
                 },
             },
         },
@@ -77,13 +84,15 @@ let loom_schema = #{
             "maxItems": 40,
             "items": #{
                 "type": "object",
-                "required": ["id", "severity", "paths", "action", "disposition"],
+                "required": ["id", "severity", "paths", "action", "disposition", "risk_acceptance", "re_check_issue"],
                 "properties": #{
                     "id": #{ "type": "string" },
                     "severity": #{ "type": "string" },
                     "paths": #{ "type": "array", "items": #{ "type": "string" } },
                     "action": #{ "type": "string" },
                     "disposition": #{ "type": "string" },
+                    "risk_acceptance": #{ "type": "boolean" },
+                    "re_check_issue": #{ "type": "string" },
                 },
             },
         },
@@ -92,12 +101,14 @@ let loom_schema = #{
             "maxItems": 30,
             "items": #{
                 "type": "object",
-                "required": ["id", "title", "acceptance_sketch"],
+                "required": ["id", "title", "acceptance_sketch", "risk_acceptance", "re_check_issue"],
                 "properties": #{
                     "id": #{ "type": "string" },
                     "title": #{ "type": "string" },
                     "acceptance_sketch": #{ "type": "string" },
                     "from_claim": #{ "type": "string" },
+                    "risk_acceptance": #{ "type": "boolean" },
+                    "re_check_issue": #{ "type": "string" },
                 },
             },
         },
@@ -108,7 +119,7 @@ let loom_schema = #{
 
 let implement_schema = #{
     "type": "object",
-    "required": ["branch", "head_sha", "files_changed", "summary", "pr_number", "goals_preserved"],
+    "required": ["branch", "head_sha", "files_changed", "summary", "pr_number", "goals_preserved", "re_checks_filed"],
     "properties": #{
         "branch": #{ "type": "string" },
         "head_sha": #{ "type": "string" },
@@ -117,6 +128,17 @@ let implement_schema = #{
         "pr_number": #{ "type": "integer" },
         "pushed": #{ "type": "boolean" },
         "goals_preserved": #{ "type": "array", "items": #{ "type": "string" } },
+        "re_checks_filed": #{
+            "type": "array",
+            "items": #{
+                "type": "object",
+                "required": ["id", "issue_ref"],
+                "properties": #{
+                    "id": #{ "type": "string" },
+                    "issue_ref": #{ "type": "string" },
+                },
+            },
+        },
     },
 };
 
@@ -152,6 +174,47 @@ let app_schema = #{
         "summary": #{ "type": "string" },
     },
 };
+
+// Filed-ref predicate — the ONLY definition; every filed/unfiled decision
+// in this file must call it (passing the workflow's repo pin). "#" must be
+// followed by digits only, and a URL must be THIS repo's github.com issue
+// link with a numeric tail — a bare substring match let a proposed TITLE
+// that merely mentioned "/issues/" render as (filed ref), silently turning
+// the operator gate off for that row, and an un-pinned host/repo let
+// wrong-repo URLs arrive carrying the strongest (wright-reported) label.
+fn is_filed_ref(s, repo) {
+    if s == () || s == "" { return false; }
+    if s.starts_with("#") {
+        if s.len() < 2 { return false; }
+        let i = 1;
+        while i < s.len() {
+            let c = s[i];
+            if c < '0' || c > '9' { return false; }
+            i += 1;
+        }
+        return true;
+    }
+    // URL form must be THIS repo's issue link ending in a numeric id — a
+    // github.com issue on any other repo (or any non-ticket path) is not a
+    // filing here: `gh issue view <url>` "confirms" cross-repo URLs, so a
+    // shape check that ignored the repo would let a wrong-repo ref arrive
+    // labeled (wright-reported), the strongest label. #NNN stays the
+    // same-repo shorthand.
+    let pre_https = "https://github.com/" + repo + "/issues/";
+    let pre_http = "http://github.com/" + repo + "/issues/";
+    let tail_i = 0;
+    if s.starts_with(pre_https) { tail_i = pre_https.len(); }
+    else if s.starts_with(pre_http) { tail_i = pre_http.len(); }
+    else { return false; }
+    if tail_i >= s.len() { return false; }
+    let j = tail_i;
+    while j < s.len() {
+        let c = s[j];
+        if c < '0' || c > '9' { return false; }
+        j += 1;
+    }
+    true
+}
 
 let a = args;
 if a == () { a = #{}; }
@@ -258,7 +321,7 @@ for lane in lanes {
     lp += ". Focus: ";
     lp += lane.focus;
     lp += "\nMUST use grep/read_file/run git show on the live tree — do not answer from memory. ";
-    lp += "For each real gap return severity High|Med|Low, claim quote, doc_path, code_anchor, disposition (honesty_cut|honesty_partial|implement_now|goal_next_pr|underclaim_add|ops_fleet), goal_title when disposition is goal_next_pr or honesty_partial, and fix_hint (honesty edit and/or code PR sketch). ";
+    lp += "For each real gap return severity High|Med|Low, claim quote, doc_path, code_anchor, disposition (honesty_cut|honesty_partial|implement_now|goal_next_pr|underclaim_add|ops_fleet), goal_title when disposition is goal_next_pr or honesty_partial, and fix_hint (honesty edit and/or code PR sketch). risk_acceptance (boolean, ALWAYS set): true only when the disposition leaves a RISK accepted with a rationale (deferred security/correctness exposure, known gap tolerated because of a stated reason) — false for pure feature ambition with no risk, whatever the disposition name; a scoped implement_now that knowingly leaves a residual risk is also true. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — compute it with your run tool: `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F`; do not guess the date. ";
     lp += "Prefer honesty_partial+goal over bare honesty_cut when the claim was a legitimate ambition. Empty gaps only after greps confirm no false present-tense claims. ";
     lp += "Effort guidance: low-medium — thorough greps over long essays.";
     audit_jobs.push(#{
@@ -275,6 +338,7 @@ let audit_results = parallel(audit_jobs);
 
 let gap_blob = "";
 let n_gaps = 0;
+let failed_lanes = 0;
 let ai = 0;
 for ar in audit_results {
     if ar != () && ar.success && ar.output.gaps != () {
@@ -303,24 +367,52 @@ for ar in audit_results {
                 gap_blob += " | goal=";
                 gap_blob += g.goal_title;
             }
+            if g.risk_acceptance == true || g.risk_acceptance == "true" {
+                gap_blob += " | risk_acceptance=true";
+                if g.re_check_issue == () || g.re_check_issue == "" {
+                    gap_blob += " | re_check=(missing)";
+                }
+            } else if g.risk_acceptance == false || g.risk_acceptance == "false" {
+                gap_blob += " | risk_acceptance=false";
+            } else {
+                // Missing/invalid is a third state: it must not read as a
+                // considered false downstream (schema requires the bit, so
+                // this is a degraded-lane signal loom should treat as unset).
+                gap_blob += " | risk_acceptance=?";
+            }
+            if g.re_check_issue != () && g.re_check_issue != "" {
+                gap_blob += " | re_check=";
+                gap_blob += g.re_check_issue;
+            }
             gap_blob += "\n";
         }
     } else {
+        failed_lanes += 1;
         log("audit lane failed or empty slot index=" + ai.to_string());
     }
     ai += 1;
 }
-log("audit collected gaps≈" + n_gaps.to_string());
+log("audit collected gaps≈" + n_gaps.to_string() + " failed_lanes=" + failed_lanes.to_string());
 
 if n_gaps == 0 {
-    let p = write_scratch_file("docs-accuracy-report.md", "# Docs accuracy converge\n\nNo gaps from audit fan-out. Already tight or audit failed closed.\nplan_id=" + plan_id + "\n");
-    complete(#{ summary: "No gaps — already tight or audit failed", path: p, plan_id: plan_id, gaps: 0 });
+    // Zero gaps is only a clean "already tight" when every lane actually
+    // reported. A failed/schema-rejected lane at zero gaps is the audit
+    // failing CLOSED. The two arms are fully split because pause() RESUMES:
+    // a shared fall-through would complete with the green artifact right
+    // after a human acknowledged the failure text (round-15 finding).
+    if failed_lanes > 0 {
+        let p = write_scratch_file("docs-accuracy-report.md", "# Docs accuracy converge\n\nAUDIT FAILED CLOSED: " + failed_lanes.to_string() + " audit lane(s) failed or returned no output, zero gaps collected. This is NOT 'already tight' — re-run the audit.\nplan_id=" + plan_id + "\n");
+        pause("verification", failed_lanes.to_string() + " audit lane(s) failed or returned no output at zero gaps — audit failed closed, NOT 'already tight'. Re-run the audit before trusting this.");
+        complete(#{ summary: "Audit FAILED CLOSED — " + failed_lanes.to_string() + " lane(s) failed at zero gaps; docs NOT verified tight", path: p, plan_id: plan_id, gaps: 0, failed_lanes: failed_lanes });
+    }
+    let p = write_scratch_file("docs-accuracy-report.md", "# Docs accuracy converge\n\nNo gaps from audit fan-out; all lanes reported. Docs are tight.\nplan_id=" + plan_id + "\n");
+    complete(#{ summary: "No gaps — all audit lanes reported clean", path: p, plan_id: plan_id, gaps: 0, failed_lanes: 0 });
 }
 
 // --- Phase: Loom ---
 phase("Loom");
 let loom_p = pin;
-loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. Effort guidance: high.\n\nGAPS:\n";
+loom_p += "You are LOOM. Dual-track (docs-truth-policy): (1) ordered_fixes = honesty_now work for THIS pass (honesty_cut, honesty_partial doc marks, underclaim_add, ops_fleet pointers, implement_now only if High+scoped). (2) goals_next_pr = EVERY goal_next_pr and honesty_partial ambition with title + acceptance_sketch — NEVER drop goals just because docs will be softened. Prefer High first. rg_banlist = false PRESENT-TENSE substrings that must leave operator docs. When the SAME residual appears in both ordered_fixes and goals_next_pr, both entries MUST carry the IDENTICAL re_check_issue string (same ref or same exact title) so the report can merge them. For every risk_acceptance=true entry, the action (or acceptance_sketch) text must carry the disposition, source gap id, rationale, and code anchor from the lane gap — wright needs them for the issue body. For EVERY entry in BOTH ordered_fixes and goals_next_pr, set risk_acceptance (boolean, ALWAYS present): true only when the item leaves a RISK accepted with a rationale (deferred exposure, known gap tolerated for a stated reason) — false for pure feature ambition with no risk; a goal_next_pr that papers over an accepted risk is TRUE. re_check_issue (string) is ALWAYS present: empty string \"\" when risk_acceptance=false; when true it MUST be an existing issue ref \"#NNN\" or the exact proposed title \"Re-check by YYYY-MM-DD: ...\" dated 60 days out — prefer the re_check the audit lane carried when it is a \"#NNN\" ref, an issue URL, or matches \"Re-check by YYYY-MM-DD: ...\"; when it is missing OR malformed (wrong prefix or a date that is not ~60 days out), rebuild it — compute the date yourself with `date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` and build the title (do-not-guess means do not invent a calendar day, never leave the field empty on a true row). Effort guidance: high.\n\nGAPS:\n";
 loom_p += gap_blob;
 let loom = agent(loom_p, #{
     label: "loom-plan",
@@ -347,7 +439,8 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally; pr_number=0. ";
 }
-imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved. Effort guidance: medium.\n\nPLAN_JSON:\n";
+imp += "PLAN_JSON entries with risk_acceptance=true carrying an existing-looking #NNN or issue URL: run `gh issue view <ref>` to confirm it exists and matches the residual, and echo every CONFIRMED ref in re_checks_filed (that is what upgrades it past unverified in the report). Entries whose re_check_issue is a proposed title, empty, or missing: FIRST run `gh issue list --label re-check --state open --json number,title` and reuse the #NNN of any open issue whose subject (text after the date) matches this residual — never open a second re-check for a residual that already has one live. Only when nothing matches: for empty/missing, compute the title yourself first (`date -u -v+60d +%F 2>/dev/null || date -u -d \"+60 days\" +%F` for the date); then file the dated issue now — `gh issue create --label re-check --title \"<exact title>\" --body \"<disposition, gap id, rationale/fix_hint, code anchor>\"` (the body must cite the original disposition and acceptance evidence per disposition-expiry-policy.md) — and use the returned #NNN in your PR-body Follow-ups; if filing is impossible, list the title under Follow-ups as UNFILED so the operator step catches it. Run ONE gh issue create per UNIQUE re_check_issue string — never create twice for dual-track twins sharing a title. Return every filing in re_checks_filed as {id, issue_ref}, emitting one row per loom entry id covered (twins share the same issue_ref), so the report reflects reality. ";
+imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed, goals_preserved, re_checks_filed (every filing as {id, issue_ref}; empty array when none — walk BOTH ordered_fixes and goals_next_pr). Effort guidance: medium.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
     label: "wright-implement",
@@ -497,15 +590,185 @@ if impl.output.goals_preserved != () {
         report += "\n";
     }
 }
+// "Re-checks required", NOT "filed": sourced from loom's risk declarations,
+// upgraded with wright's re_checks_filed refs when present (the builder runs
+// after wright but loom is the declaration of record; wright's array is the
+// filing of record). A row stays PROPOSED only when no filed ref exists for
+// it anywhere — the issue is the system of record.
+report += "\n## Re-checks required\n";
+let re_count = 0;
+let filed_by_id = #{};
+if impl.output.re_checks_filed != () {
+    for rc in impl.output.re_checks_filed {
+        filed_by_id[rc.id] = rc.issue_ref;
+    }
+}
+let re_lists = [];
+if loom.output.ordered_fixes != () { re_lists.push(loom.output.ordered_fixes); }
+if loom.output.goals_next_pr != () { re_lists.push(loom.output.goals_next_pr); }
+// Pass 1: collect risk rows with the best per-id artifact (wright's filed
+// ref, else loom's declared title).
+let risk_rows = [];
+for lst in re_lists {
+    for f in lst {
+        if f.risk_acceptance == true || f.risk_acceptance == "true" {
+            let declared = "";
+            if f.re_check_issue != () { declared = f.re_check_issue; }
+            let artifact = declared;
+            // Provenance matters: a loom-declared #NNN may be hallucinated
+            // or stale — only a wright-confirmed ref earns the trusted
+            // label. src: "wright" | "declared" | "".
+            let src = "";
+            if is_filed_ref(declared, repo) { src = "declared"; }
+            if filed_by_id.contains(f.id) {
+                let filed = filed_by_id[f.id];
+                // Upgrade ONLY on a filed-shaped ref: an empty or junk
+                // issue_ref from a failed wright must never clobber loom's
+                // declared title — the operator needs that exact title.
+                if is_filed_ref(filed, repo) {
+                    artifact = filed;
+                    src = "wright";
+                }
+            }
+            risk_rows.push(#{ id: f.id, declared: declared, artifact: artifact, src: src });
+        }
+    }
+}
+// Pass 1.5: propagate a filed artifact across every row sharing the same
+// non-empty declared title — wright may upgrade only ONE twin id after its
+// single create for a shared title, and without propagation the upgraded
+// row keys by ref while its twin keys by title and never merges.
+let filed_for_declared = #{};
+for r in risk_rows {
+    if r.declared != "" && r.src == "wright" {
+        filed_for_declared[r.declared] = r.artifact;
+    }
+}
+let ri = 0;
+while ri < risk_rows.len() {
+    if risk_rows[ri].declared != "" && risk_rows[ri].src != "wright"
+        && filed_for_declared.contains(risk_rows[ri].declared) {
+        risk_rows[ri].artifact = filed_for_declared[risk_rows[ri].declared];
+        risk_rows[ri].src = "wright";
+    }
+    ri += 1;
+}
+// Pass 2: merge dual-track twins — primary key is the declared title when
+// set (twins share it by loom's rule), else the artifact, else the id. A
+// filed ref always beats a proposed title; merging never drops it.
+let group_index = #{};
+let merged = [];
+for r in risk_rows {
+    let r_filed = is_filed_ref(r.artifact, repo);
+    let key = r.declared;
+    if key == "" { key = r.artifact; }
+    if key == "" { key = r.id; }
+    if group_index.contains(key) {
+        let i = group_index[key];
+        let cur_filed = is_filed_ref(merged[i].artifact, repo);
+        if r_filed && !cur_filed {
+            merged[i].artifact = r.artifact;
+            merged[i].id = r.id;
+            merged[i].src = r.src;
+        } else if r.src == "wright" && merged[i].src != "wright"
+            && merged[i].artifact == r.artifact {
+            merged[i].src = "wright";
+        } else if r_filed && cur_filed && merged[i].artifact != r.artifact {
+            // Two DISTINCT filed refs under one key (double-file or divergent
+            // twins): keep both rows visible — hiding a real issue is worse
+            // than an extra line.
+            group_index[key] = merged.len();
+            merged.push(r);
+        }
+    } else {
+        group_index[key] = merged.len();
+        merged.push(r);
+    }
+}
+let wright_confirmed = 0;
+for m in merged {
+    re_count += 1;
+    report += "- ";
+    report += m.id;
+    report += ": ";
+    if m.artifact != "" {
+        report += m.artifact;
+        if is_filed_ref(m.artifact, repo) {
+            if m.src == "wright" {
+                wright_confirmed += 1;
+                report += " (wright-reported — VERIFY LIVE with gh issue view before merge; wright refs are agent output, not proof of filing)";
+            } else {
+                report += " (declared ref — VERIFY LIVE with gh issue view before merge; loom refs are unconfirmed)";
+            }
+        } else {
+            report += " (PROPOSED — not yet filed)";
+        }
+    } else {
+        report += "(MISSING — same gate as PROPOSED. Construct the title per ";
+        report += "disposition-expiry-policy.md: run the date command yourself ";
+        report += "(date -u -v+60d +%F || date -u -d '+60 days' +%F) and file ";
+        report += "\"Re-check by <that date>: <one-line residual for ";
+        report += m.id;
+        report += ">\". This line is an instruction, NOT a copy-paste title.)";
+    }
+    report += "\n";
+}
+// Wright filings whose id matched no declared risk row: surface rather
+// than silently drop — a mismatched id would otherwise leave a real issue
+// invisible and the twin row PROPOSED, prompting a duplicate filing.
+let matched_ids = [];
+for r in risk_rows { matched_ids.push(r.id); }
+if impl.output.re_checks_filed != () {
+    for rc in impl.output.re_checks_filed {
+        if !matched_ids.contains(rc.id) && is_filed_ref(rc.issue_ref, repo) {
+            re_count += 1;
+            // This row IS wright-reported: count it in the numerator too, or an
+            // all-confirmed run plus one orphan reads "N of N+1" and nudges
+            // the operator toward a duplicate filing.
+            wright_confirmed += 1;
+            report += "- ";
+            report += rc.id;
+            report += ": ";
+            report += rc.issue_ref;
+            report += " (wright-reported — id matched no declared risk row; VERIFY LIVE, and check before filing anything new)\n";
+        }
+    }
+}
+if re_count > 0 {
+    report += "Wright coverage: ";
+    report += wright_confirmed.to_string();
+    report += " of ";
+    report += re_count.to_string();
+    report += " risk rows reported filed by re_checks_filed (labels are provenance, not verification)";
+    if wright_confirmed < re_count {
+        report += " — check wright Follow-ups and `gh issue list --label re-check` before filing anything, to avoid duplicates";
+    }
+    report += "\n";
+    if failed_lanes > 0 {
+        report += "NOTE: audit was PARTIAL (" + failed_lanes.to_string() + " lane(s) failed) — rows above cover surviving lanes only; the failed lane(s) may hold further risk-accepting residuals\n";
+    }
+}
+if re_count == 0 {
+    // "none" is a NEGATIVE claim over the full audit: with any lane missing
+    // it was never fully audited, and the dead lane may have held the only
+    // risk-accepting residual (round-15 finding). Stricter lane schema makes
+    // whole-lane rejection likelier, so refuse the confident wording.
+    if failed_lanes > 0 {
+        report += "Re-checks required: UNKNOWN — " + failed_lanes.to_string() + " audit lane(s) failed, so 'none' is not claimable; re-run the audit before treating this as clear\n";
+    } else {
+        report += "Re-checks required: none (no risk-accepting dispositions declared)\n";
+    }
+}
 report += "\n## Adaptive roster feedback\n";
 report += "If audit missed Highs cass found: bump audit model (see docs/ops/agent-roster.md).\n";
 report += "If wright needed >2 pongs: bump wright. If spend high and clean: cheapen audit.\n";
 report += "Update agent-roster.md Changelog after this run.\n";
 report += "\n## Operator next\n";
 report += "1. Review honesty PR; do not agent-merge.\n";
-report += "2. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
-report += "3. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
-report += "4. Bare /grok-review only after tip freeze if App ELIG needed.\n";
+report += "2. Before merging yourself, walk Re-checks required ROW BY ROW. Filed-shaped refs (wright-reported and declared alike): `gh issue view` the ref and confirm a live re-check issue matching THAT row's residual — wright output is agent output, so a #NNN clears nothing until you have seen the issue; no label arrives pre-verified. PROPOSED: file with the title exactly as listed, unless `gh issue list --label re-check --state open` already shows an open issue matching that same residual. MISSING: construct the dated title per disposition-expiry-policy.md first (never copy the MISSING line). A #NNN in Follow-ups for one residual clears nothing for any other row. Both filing cases: label re-check, body citing disposition, gap id, rationale, and code anchor — dual-track twins may carry different artifact forms. N/A only if that section says none. The workflow does not enforce this — it is your gate.\n";
+report += "3. Schedule goals_next_pr — honesty cut is not the end of the idea.\n";
+report += "4. Stamps touching pyproject: PATH_DENY; admin merge only if intentional.\n";
+report += "5. Bare /grok-review only after tip freeze if App ELIG needed.\n";
 
 let path = write_scratch_file("docs-accuracy-report.md", report);
 complete(#{

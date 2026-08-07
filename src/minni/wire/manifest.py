@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -85,6 +86,10 @@ def sha256_file(path: Path) -> str:
 
 
 # Wire re-stamps this file post-install; exclude from idempotency hash checks.
+# NOT extended to dist/build-manifest.json for cross-checkout wiring: the
+# payload manifest embeds that file's hash in its files map, so excluding the
+# leaf alone cannot absorb a built_from path difference — the mismatch just
+# cascades into payload-manifest.json, and excluding THAT would gut the check.
 _INSTALL_MUTABLE_PATHS = frozenset({".mcp.json"})
 
 
@@ -121,3 +126,47 @@ def hash_mismatches(
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _git_commit_date_iso(repo_root: Path) -> str | None:
+    try:
+        raw = subprocess.check_output(
+            ["git", "log", "-1", "--format=%cI"], cwd=repo_root, text=True,
+        ).strip()
+        if not raw:
+            return None
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None
+
+
+# #352 — reproducible builds: built_at must be deterministic so consecutive
+# builds from an identical tree are byte-identical. Honors SOURCE_DATE_EPOCH
+# (https://reproducible-builds.org/specs/source-date-epoch/) when set;
+# otherwise uses the repo HEAD commit date, falling back to wall-clock only
+# when git is unavailable (e.g. tarball).
+def deterministic_built_at(repo_root: Path | None = None) -> str:
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch is not None and epoch != "":
+        # Strict integer parse, mirrored on the mjs side: int() accepts
+        # "1_000" which Number() rejects, and lenient parsing lets the two
+        # manifests of one build disagree on built_at. Invalid values fall
+        # through to the git date on both sides.
+        if re.fullmatch(r"[+-]?\d+", epoch.strip()):
+            try:
+                secs = int(epoch.strip())
+                return datetime.fromtimestamp(secs, tz=UTC).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            except (ValueError, OSError, OverflowError):
+                pass
+    if repo_root is not None:
+        git_date = _git_commit_date_iso(repo_root)
+        if git_date is not None:
+            return git_date
+    return utc_now_iso()

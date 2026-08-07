@@ -429,7 +429,15 @@ def copy_tree(source: Path, dest: Path) -> None:
     if rsync:
         cmd = [rsync, "-a", "--delete", "--exclude", "node_modules"]
         for name in GENERATED_INSTALL_FILES:
-            cmd += ["--exclude", name]
+            # The exclude MUST be /-anchored. A bare basename matches at any
+            # depth, which also excluded the SOURCE file
+            # .gemini-plugin/gemini-extension.json — so the deployed hidden
+            # manifest was copied once at install and never refreshed (#359).
+            # Anchored, the pattern only shields the root-level generated file
+            # (verified on macOS openrsync and per GNU rsync docs), and the
+            # exclusion also protects it from --delete no matter how the copy
+            # exits — no restore step to lose in a crash.
+            cmd += ["--exclude", f"/{name}"]
         run(cmd + [f"{source}/", f"{dest}/"])
         return
     preserved = {
