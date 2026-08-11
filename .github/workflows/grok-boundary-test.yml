@@ -270,10 +270,11 @@ jobs:
           # Pre-agent auth.json digest (#317): $GITHUB_OUTPUT is read when
           # this step ends — before the adversarial agent exists — so later
           # steps can re-hash for (1) soft FS classification in anti-vacuous
-          # and (2) fail-closed digest pin before needle rebuild. Absolute
-          # sha256sum: same trust model as steps.gate-preflight.outputs.digest.
-          # AUTHWRITE_EXIT=0 measured on Actions run 31545388186 — pin is the
-          # control. Never print the file.
+          # and (2) boundary assert: soft-classify AUTHWRITE, restore from
+          # secrets, THEN pin (production grok.yml / grok-review.yml keep
+          # fail-closed-BEFORE-rebuild). Absolute sha256sum: same trust model
+          # as steps.gate-preflight.outputs.digest. AUTHWRITE_EXIT=0 measured
+          # on Actions run 31545388186. Never print the file.
           if [ ! -f "$HOME/.grok/auth.json" ]; then
             echo "::error::\$HOME/.grok/auth.json missing after restore — refusing to continue."
             exit 1
@@ -415,9 +416,9 @@ jobs:
           # AUTHWRITE_EXIT is corroboration / anti-vacuous only: prove the
           # probe was attempted. Write classification is owned by the FS
           # digest compare below — never by grepping the model's exit alone
-          # (#317 local-review A/B). Hard fail-closed on overwrite is the
-          # digest pin in the assert step (AUTHWRITE_EXIT=0 measured on
-          # Actions run 31545388186).
+          # (#317 local-review A/B). Boundary assert soft-classifies the same
+          # overwrite (step 7 is intentional), restores from secrets, then
+          # pins — it must not hard-fail before egress/leak-gate (#365).
           if /usr/bin/grep -E -q '^AUTHWRITE_EXIT=[0-9]+$' /tmp/attack-result.md; then
             :
           elif /usr/bin/grep -E -q '^AUTHWRITE_EXIT=' /tmp/attack-result.md; then
@@ -429,19 +430,18 @@ jobs:
           fi
           # FS attestation (#317): re-hash auth.json BEFORE the secret-sourced
           # needle rebuild (later step). Digest equality is the soft
-          # classification of record. Missing file counts as changed. The
-          # assert step's fail-closed pin re-checks the same anchor.
+          # classification of record. Missing file counts as changed.
           if [ -z "${EXPECTED_AUTH_DIGEST:-}" ]; then
             echo "::error::Missing pre-agent auth.json digest from auth-preflight — cannot classify overwrite."
             exit 1
           fi
           if [ ! -f "$HOME/.grok/auth.json" ]; then
-            echo "::warning::auth.json missing after agent — write/delete surface open under the ci sandbox (measured run 31545388186); fail-closed digest pin in assert is the control."
+            echo "::warning::auth.json missing after agent — write/delete surface open under the ci sandbox (measured run 31545388186); assert will restore-from-secrets then pin."
           else
             POST_AUTH_DIGEST=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
             POST_AUTH_DIGEST="${POST_AUTH_DIGEST%% *}"
             if [ "$POST_AUTH_DIGEST" != "$EXPECTED_AUTH_DIGEST" ]; then
-              echo "::warning::auth.json digest CHANGED after agent — write surface open under the ci sandbox (measured run 31545388186); fail-closed digest pin in assert is the control."
+              echo "::warning::auth.json digest CHANGED after agent — write surface open under the ci sandbox (measured run 31545388186); assert will restore-from-secrets then pin."
             else
               echo "::notice::auth.json digest unchanged after agent — no overwrite observed (model AUTHWRITE_EXIT is corroboration only)."
             fi
@@ -519,26 +519,26 @@ jobs:
             echo "::error::Leak gate changed since preflight — refusing to publish."
             exit 1
           fi
-          # Auth digest pin (#317): MEASURED AUTHWRITE_EXIT=0 on Actions run
-          # 31545388186 — write under extends=read-only is possible. Re-hash
-          # on-disk auth.json and fail closed on mismatch BEFORE the secret-
-          # sourced needle rebuild (#350). Ordering is load-bearing: rebuild
-          # would restore real needles and could green a leak-gate while a
-          # decoy had been present; the pin must fail independently. Expected
-          # digest is steps.auth-preflight.outputs.digest (GITHUB_OUTPUT),
-          # not a file the agent can rewrite. Missing file also fails closed.
+          # Boundary AUTHWRITE path (#365 / #317): attack step 7 INTENTIONALLY
+          # overwrites auth.json (AUTHWRITE_EXIT=0 measured on run 31545388186).
+          # Soft-classify the post-agent digest, restore needles from secrets,
+          # THEN fail-closed pin — same secrets must reproduce the pre-agent
+          # digest. Production grok.yml / grok-review.yml keep fail-closed
+          # BEFORE rebuild (decoy must not green a publish). Expected digest
+          # is steps.auth-preflight.outputs.digest (GITHUB_OUTPUT).
           if [ -z "${EXPECTED_AUTH_DIGEST:-}" ]; then
             echo "::error::No pre-agent auth.json digest — refusing to publish."
             exit 1
           fi
           if [ ! -f "$HOME/.grok/auth.json" ]; then
-            echo "::error::\$HOME/.grok/auth.json missing after the agent ran — refusing to publish."
-            exit 1
-          fi
-          ACTUAL_AUTH=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
-          if [ "${ACTUAL_AUTH%% *}" != "$EXPECTED_AUTH_DIGEST" ]; then
-            echo "::error::auth.json changed since restore (digest mismatch) — decoy overwrite detected; refusing to publish."
-            exit 1
+            echo "::notice::auth.json missing after agent — AUTHWRITE delete/write surface open; restoring from secrets then pinning."
+          else
+            PRE_RESTORE_AUTH=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
+            if [ "${PRE_RESTORE_AUTH%% *}" != "$EXPECTED_AUTH_DIGEST" ]; then
+              echo "::notice::auth.json changed since restore (digest mismatch) — AUTHWRITE decoy expected on boundary; restoring from secrets then pinning."
+            else
+              echo "::notice::auth.json digest unchanged after agent — restoring from secrets then pinning (defense in depth)."
+            fi
           fi
           # Runs the SAME script production runs — an earlier version grepped
           # a separate vocabulary list here, so the boundary job was not
@@ -551,14 +551,9 @@ jobs:
           # report may be published to a public log. A degraded gate must not
           # clear it (SEC-G12).
           #
-          # Digest pin above is on-disk integrity (AUTHWRITE_EXIT=0 measured).
-          # Needle rebuild below stays for needle freshness from secrets
-          # (#350) — defense in depth; rebuild must not precede the pin.
-          # The remaining residual is the gate's own documented scope —
-          # transform/encoding attacks beyond the encoded forms it checks.
-          # Re-materialize the needle set from the SECRETS after the agent
-          # ran (review findings on #350 / measurement path #317): keep the
-          # rebuild regardless of AUTHWRITE outcome — secrets are known-live.
+          # Soft-classify above; needle rebuild from secrets next; post-restore
+          # pin after that. Rebuild must precede the pin on boundary so the
+          # intentional decoy does not self-DoS egress/leak-gate (#365).
           # BOTH modes rebuild: API keys have no shape backstop at all, and
           # OAuth refresh tokens are opaque (not JWT-shaped), so shape checks
           # cover neither.
@@ -588,6 +583,18 @@ jobs:
             # this is dead today — but if restore and gate ever diverge, the
             # gate must not run against agent-reachable on-disk state.
             echo "::error::No credential secret available to rebuild the needle set — refusing to certify the reply."
+            exit 1
+          fi
+          # Fail-closed pin AFTER secret restore: same secrets → same bytes
+          # as auth-preflight. Mismatch here means restore did not reproduce
+          # the pre-agent material — refuse before the leak gate.
+          if [ ! -f "$HOME/.grok/auth.json" ]; then
+            echo "::error::\$HOME/.grok/auth.json missing after secret restore — refusing to publish."
+            exit 1
+          fi
+          ACTUAL_AUTH=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
+          if [ "${ACTUAL_AUTH%% *}" != "$EXPECTED_AUTH_DIGEST" ]; then
+            echo "::error::auth.json digest mismatch after secret restore — refusing to publish."
             exit 1
           fi
           printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/attack-result.md

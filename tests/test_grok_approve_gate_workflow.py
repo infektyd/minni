@@ -1128,6 +1128,9 @@ def test_workflow_github_token_stays_read_only_on_prs(gate):
 # mentioning the construct cannot satisfy the pin.
 
 _DUAL_MODE_WORKFLOWS = ["grok-review.yml", "grok.yml", "grok-boundary-test.yml"]
+# Publish paths that must fail closed on AUTHWRITE BEFORE needle rebuild.
+# Boundary is excluded: step 7 intentionally overwrites auth.json (#365).
+_PRODUCTION_AUTH_PIN_WORKFLOWS = ["grok-review.yml", "grok.yml"]
 
 
 def _steps_of(workflow: str):
@@ -1232,7 +1235,7 @@ def test_publish_gates_rebuild_needles_from_secrets(workflow):
     assert found, f"{workflow}: no publish gate step found — pin is vacuous"
 
 
-@pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
+@pytest.mark.parametrize("workflow", _PRODUCTION_AUTH_PIN_WORKFLOWS)
 def test_auth_json_digest_pinned_across_agent_step(workflow):
     """#317 / #349: AUTHWRITE_EXIT=0 was measured (Actions run 31545388186),
     so on-disk auth.json must be digest-pinned across the agent step.
@@ -1242,6 +1245,10 @@ def test_auth_json_digest_pinned_across_agent_step(workflow):
     re-hash and fail closed BEFORE the secret-sourced rebuild (Cassandra:
     rebuild must not hide a decoy). Missing-file and empty-expected paths
     must both refuse.
+
+    Boundary is intentionally excluded (#365): attack step 7 overwrites
+    auth.json, so that workflow soft-classifies then restores THEN pins —
+    see test_boundary_auth_digest_soft_classify_then_restore_then_pin.
     """
     restores = [
         s for s in _steps_of(workflow) if "Restore Grok auth" in str(s.get("name", ""))
@@ -1306,7 +1313,76 @@ def test_auth_json_digest_pinned_across_agent_step(workflow):
         assert -1 < mismatch < gate_call, (
             f"{workflow}::{step.get('name')}: digest mismatch must fail closed"
         )
+        # Production must refuse with exit 1 on pre-rebuild mismatch — not soft notice.
+        assert 'echo "::error::auth.json changed since restore (digest mismatch)' in body, (
+            f"{workflow}::{step.get('name')}: pre-rebuild mismatch must ::error:: "
+            "(boundary soft-classify is not allowed on publish paths)"
+        )
     assert found, f"{workflow}: no publish gate step found — auth digest pin is vacuous"
+
+
+def test_boundary_auth_digest_soft_classify_then_restore_then_pin():
+    """#365: boundary attack step 7 intentionally overwrites auth.json.
+
+    Assert must soft-classify the post-agent digest, restore needles from
+    secrets, THEN fail-closed pin (same secrets → pre-agent digest). A
+    hard pin BEFORE rebuild self-DoSes egress + leak-gate on the happy path.
+    Production publish paths keep fail-closed-before-rebuild.
+    """
+    workflow = "grok-boundary-test.yml"
+    restores = [
+        s for s in _steps_of(workflow) if "Restore Grok auth" in str(s.get("name", ""))
+    ]
+    assert restores and restores[0].get("id") == "auth-preflight"
+    restore_body = _uncommented(str(restores[0].get("run", "")))
+    assert 'echo "digest=$AUTH_DIGEST" >> "$GITHUB_OUTPUT"' in restore_body
+
+    assert_step = None
+    for step in _steps_of(workflow):
+        if str(step.get("name", "")) == "Assert no credential material escaped":
+            assert_step = step
+            break
+    assert assert_step is not None, "boundary assert step missing"
+    env = assert_step.get("env") or {}
+    assert (
+        env.get("EXPECTED_AUTH_DIGEST")
+        == "${{ steps.auth-preflight.outputs.digest }}"
+    )
+    body = _uncommented(str(assert_step.get("run", "")))
+    raw = str(assert_step.get("run", ""))
+    gate_call = body.find("--require-auth")
+    key_rebuild = body.find("printf '{\"xai_api_key\": \"%s\"}'")
+    oauth_rebuild = body.find('"$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d')
+    soft_notice = body.find("AUTHWRITE decoy expected on boundary")
+    post_restore_mismatch = body.find("digest mismatch after secret restore")
+    post_restore_missing = body.find("missing after secret restore")
+    empty_expected = body.find("No pre-agent auth.json digest")
+    # Soft-classify BEFORE rebuild (notice, not hard abort on decoy).
+    assert -1 < soft_notice < key_rebuild < gate_call, (
+        "boundary must soft-classify AUTHWRITE before secret restore"
+    )
+    assert 'echo "::notice::auth.json changed since restore (digest mismatch)' in body, (
+        "boundary pre-restore mismatch must ::notice:: (not refuse to publish)"
+    )
+    assert 'echo "::error::auth.json changed since restore (digest mismatch)' not in body, (
+        "boundary must not fail-closed on intentional AUTHWRITE before restore"
+    )
+    # Pin AFTER both rebuild paths, before the leak gate.
+    assert -1 < key_rebuild < post_restore_mismatch < gate_call, (
+        "boundary digest pin must follow API-key needle rebuild"
+    )
+    assert -1 < oauth_rebuild < post_restore_mismatch < gate_call, (
+        "boundary digest pin must follow OAuth needle rebuild"
+    )
+    assert -1 < empty_expected < key_rebuild, (
+        "empty EXPECTED_AUTH_DIGEST must fail closed before restore"
+    )
+    assert -1 < post_restore_missing < gate_call, (
+        "missing auth.json after secret restore must fail closed"
+    )
+    assert "refusing to publish" in raw and "after secret restore" in raw, (
+        "post-restore pin must refuse to publish on mismatch/missing"
+    )
 
 
 def test_boundary_authwrite_marker_is_strict_and_fs_attested():
@@ -1315,7 +1391,7 @@ def test_boundary_authwrite_marker_is_strict_and_fs_attested():
     Present-but-malformed markers (e.g. literal AUTHWRITE_EXIT=$?) fail closed.
     Soft classification prefers FS attestation against auth-preflight digest.
     Prompt must not invite echoing AUTHWRITE_EXIT=$? as prose.
-    Fail-closed digest pin remains in the assert step (separate from notices).
+    Assert soft-classifies then restores then pins (not hard pin before rebuild).
     """
     doc = _load(ROOT / ".github" / "workflows" / "grok-boundary-test.yml")
     steps = {str(s.get("name", "")): s for s in (doc["jobs"]["boundary"]["steps"] or [])}
