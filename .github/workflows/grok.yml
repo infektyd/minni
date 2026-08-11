@@ -193,6 +193,7 @@ jobs:
           echo "grok CLI pinned at $GROK_CLI_VERSION"
 
       - name: Restore Grok auth (API key or subscription OAuth)
+        id: restore-auth
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
@@ -230,6 +231,22 @@ jobs:
             exit 1
           fi
           /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          # Auth digest pin (#317 / #349): AUTHWRITE_EXIT=0 measured on Actions
+          # run 31545388186 — write is possible under extends=read-only. Publish
+          # sha256 as a STEP OUTPUT (mirrors gate-preflight digest): captured
+          # when this step ends, before the agent exists. Never print the file.
+          if [ ! -f "$HOME/.grok/auth.json" ]; then
+            echo "::error::\$HOME/.grok/auth.json missing after restore — refusing to continue."
+            exit 1
+          fi
+          AUTH_DIGEST=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
+          AUTH_DIGEST="${AUTH_DIGEST%% *}"
+          if [ -z "$AUTH_DIGEST" ]; then
+            echo "::error::Could not digest \$HOME/.grok/auth.json — refusing to continue."
+            exit 1
+          fi
+          echo "auth_digest=$AUTH_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "auth.json digest pinned (sha256 ${AUTH_DIGEST:0:12}…)."
 
       - name: Configure the sandbox profile
         run: |
@@ -337,6 +354,7 @@ jobs:
           # PR diff need not touch the gate at all. The default branch is the
           # one ref the PR author does not get to pick.
           TRUST_REF: ${{ github.event.repository.default_branch }}
+          EXPECTED_AUTH_DIGEST: ${{ steps.restore-auth.outputs.auth_digest }}
         run: |
           # Load the gate from the DEFAULT branch, never from the PR's checkout.
           # TWO reasons, one of which is a real hole:
@@ -367,18 +385,35 @@ jobs:
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to post."
             exit 1
           fi
+          # Auth digest pin (#317): MEASURED AUTHWRITE_EXIT=0 on Actions run
+          # 31545388186 — write under extends=read-only is possible. Re-hash
+          # on-disk auth.json and fail closed on mismatch BEFORE the secret-
+          # sourced needle rebuild (#350). Ordering is load-bearing: rebuild
+          # would restore real needles and could green a leak-gate while a
+          # decoy had been present; the pin must fail independently. Expected
+          # digest is steps.restore-auth.outputs.auth_digest (GITHUB_OUTPUT).
+          if [ -z "${EXPECTED_AUTH_DIGEST:-}" ]; then
+            echo "::error::No pre-agent auth.json digest — refusing to post."
+            exit 1
+          fi
+          if [ ! -f "$HOME/.grok/auth.json" ]; then
+            echo "::error::\$HOME/.grok/auth.json missing after the agent ran — refusing to post."
+            exit 1
+          fi
+          ACTUAL_AUTH=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
+          if [ "${ACTUAL_AUTH%% *}" != "$EXPECTED_AUTH_DIGEST" ]; then
+            echo "::error::auth.json changed since restore (digest mismatch) — decoy overwrite detected; refusing to post."
+            exit 1
+          fi
           # --require-auth: `base64 -d` exits 0 on empty input, so an unset or
           # empty GROK_CI_AUTH_JSON yields a successful-looking restore and an
           # unparseable auth.json. Without this the gate quietly degrades to
           # shape-only and still reports a pass (SEC-G12).
-          # Re-materialize the needle set from the SECRETS after the agent
-          # ran (review findings on #350): the agent can potentially rewrite
-          # auth.json (the read-only-profile write block is a stated
-          # UNVERIFIED residual), and a swapped file desyncs the gate's
-          # value scan. Post-agent, only the secrets are known-live — the
-          # on-disk blob is not. BOTH modes rebuild: API keys have no shape
-          # backstop at all, and OAuth refresh tokens are opaque (not
-          # JWT-shaped), so shape checks cover neither.
+          # Digest pin above is on-disk integrity; needle rebuild below stays
+          # for needle freshness from secrets (#350) — defense in depth.
+          # BOTH modes rebuild: API keys have no shape backstop at all, and
+          # OAuth refresh tokens are opaque (not JWT-shaped), so shape checks
+          # cover neither.
           # Normalize before mode selection (round-5 review): secrets commonly
           # pick up a trailing newline (echo | gh secret set) or CR from the
           # UI, and a valid key plus stray whitespace must not hard-fail the

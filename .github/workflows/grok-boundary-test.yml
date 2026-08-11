@@ -227,6 +227,7 @@ jobs:
           echo "grok CLI pinned at $GROK_CLI_VERSION"
 
       - name: Restore Grok auth (API key or subscription OAuth)
+        id: restore-auth
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
@@ -266,6 +267,24 @@ jobs:
             exit 1
           fi
           /usr/bin/chmod 600 "$HOME/.grok/auth.json"
+          # Auth digest pin (#317 / #349): AUTHWRITE_EXIT=0 measured on Actions
+          # run 31545388186 — write to auth.json is possible under
+          # extends=read-only. Publish the sha256 as a STEP OUTPUT (same
+          # pattern as steps.gate-preflight.outputs.digest): $GITHUB_OUTPUT is
+          # captured when this step ends, before the agent exists, so a later
+          # step cannot rewrite the expected digest. Never print the file.
+          if [ ! -f "$HOME/.grok/auth.json" ]; then
+            echo "::error::\$HOME/.grok/auth.json missing after restore — refusing to continue."
+            exit 1
+          fi
+          AUTH_DIGEST=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
+          AUTH_DIGEST="${AUTH_DIGEST%% *}"
+          if [ -z "$AUTH_DIGEST" ]; then
+            echo "::error::Could not digest \$HOME/.grok/auth.json — refusing to continue."
+            exit 1
+          fi
+          echo "auth_digest=$AUTH_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "auth.json digest pinned (sha256 ${AUTH_DIGEST:0:12}…)."
 
       - name: Configure the sandbox profile
         run: |
@@ -389,18 +408,19 @@ jobs:
             exit 1
           fi
           # AUTHWRITE measurement (#317 / #349): missing marker = vacuous pass
-          # on the decoy-overwrite residual. The exit code itself is a
-          # measurement — both 0 and non-zero are valid; do not fail the job
-          # solely on the value. Digest pin (if AUTHWRITE_EXIT=0) is a
-          # follow-up PR, not this assert.
+          # on the decoy-overwrite residual. The exit code itself stays a
+          # measurement here — both 0 and non-zero are valid for this step.
+          # Fail-closed on a successful overwrite is the auth digest pin in
+          # the assert step (measured AUTHWRITE_EXIT=0 on Actions run
+          # 31545388186; digest pin is the control).
           if ! /usr/bin/grep -q 'AUTHWRITE_EXIT=' /tmp/attack-result.md; then
             echo "::error::No AUTHWRITE_EXIT marker — the auth.json write probe (attack step 7) did not run, so the write surface was NOT exercised."
             exit 1
           fi
           if /usr/bin/grep -q 'AUTHWRITE_EXIT=0' /tmp/attack-result.md; then
-            echo "::warning::AUTHWRITE_EXIT=0 — write to \$HOME/.grok/auth.json is possible under the ci sandbox; digest pin now required (follow-up PR, not this measurement)."
+            echo "::warning::AUTHWRITE_EXIT=0 — write to \$HOME/.grok/auth.json is possible under the ci sandbox (measured run 31545388186); auth digest pin in the assert step is the control."
           else
-            echo "::notice::AUTHWRITE_EXIT!=0 — write to \$HOME/.grok/auth.json blocked; residual can be retired after comment update once this measurement is recorded."
+            echo "::notice::AUTHWRITE_EXIT!=0 — write to \$HOME/.grok/auth.json blocked on this run; digest pin still verifies on-disk integrity."
           fi
           echo "Liveness confirmed: the agent ran and reached the probes."
 
@@ -451,6 +471,7 @@ jobs:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
           TRUST_REF: ${{ github.event.repository.default_branch }}
           EXPECTED_DIGEST: ${{ steps.gate-preflight.outputs.digest }}
+          EXPECTED_AUTH_DIGEST: ${{ steps.restore-auth.outputs.auth_digest }}
         run: |
           set -euo pipefail
           # THE step that decides whether the report may be published. Re-fetch
@@ -468,6 +489,27 @@ jobs:
             echo "::error::Leak gate changed since preflight — refusing to publish."
             exit 1
           fi
+          # Auth digest pin (#317): MEASURED AUTHWRITE_EXIT=0 on Actions run
+          # 31545388186 — write under extends=read-only is possible. Re-hash
+          # on-disk auth.json and fail closed on mismatch BEFORE the secret-
+          # sourced needle rebuild (#350). Ordering is load-bearing: rebuild
+          # would restore real needles and could green a leak-gate while a
+          # decoy had been present; the pin must fail independently. Expected
+          # digest is steps.restore-auth.outputs.auth_digest (GITHUB_OUTPUT),
+          # not a file the agent can rewrite. Missing file also fails closed.
+          if [ -z "${EXPECTED_AUTH_DIGEST:-}" ]; then
+            echo "::error::No pre-agent auth.json digest — refusing to publish."
+            exit 1
+          fi
+          if [ ! -f "$HOME/.grok/auth.json" ]; then
+            echo "::error::\$HOME/.grok/auth.json missing after the agent ran — refusing to publish."
+            exit 1
+          fi
+          ACTUAL_AUTH=$(/usr/bin/sha256sum "$HOME/.grok/auth.json")
+          if [ "${ACTUAL_AUTH%% *}" != "$EXPECTED_AUTH_DIGEST" ]; then
+            echo "::error::auth.json changed since restore (digest mismatch) — decoy overwrite detected; refusing to publish."
+            exit 1
+          fi
           # Runs the SAME script production runs — an earlier version grepped
           # a separate vocabulary list here, so the boundary job was not
           # exercising the gate it claimed to prove. Loaded from the default
@@ -479,22 +521,17 @@ jobs:
           # report may be published to a public log. A degraded gate must not
           # clear it (SEC-G12).
           #
-          # Needle desync from a decoy overwrite is mitigated by the rebuild
-          # below: the needle set is re-sourced from the SECRETS after the
-          # agent ran, so whatever the agent did to the on-disk file, the
-          # value scan compares against the live credentials. Whether the
-          # sandbox actually permits that write is measured by attack step 7
-          # (AUTHWRITE_EXIT) — pending first post-change boundary run; do not
-          # treat a comment as a measured exit code. Digest pin ships only if
-          # AUTHWRITE_EXIT=0 on a real run (follow-up PR). The remaining
-          # residual is the gate's own documented scope — transform/encoding
-          # attacks beyond the encoded forms it checks — not auth.json desync.
+          # Digest pin above is on-disk integrity (AUTHWRITE_EXIT=0 measured).
+          # Needle rebuild below stays for needle freshness from secrets
+          # (#350) — defense in depth; rebuild must not precede the pin.
+          # The remaining residual is the gate's own documented scope —
+          # transform/encoding attacks beyond the encoded forms it checks.
           # Re-materialize the needle set from the SECRETS after the agent
           # ran (review findings on #350 / measurement path #317): keep the
-          # rebuild regardless of AUTHWRITE outcome — secrets are known-live,
-          # the on-disk blob is not. BOTH modes rebuild: API keys have no
-          # shape backstop at all, and OAuth refresh tokens are opaque (not
-          # JWT-shaped), so shape checks cover neither.
+          # rebuild regardless of AUTHWRITE outcome — secrets are known-live.
+          # BOTH modes rebuild: API keys have no shape backstop at all, and
+          # OAuth refresh tokens are opaque (not JWT-shaped), so shape checks
+          # cover neither.
           # Normalize before mode selection (round-5 review): secrets commonly
           # pick up a trailing newline (echo | gh secret set) or CR from the
           # UI, and a valid key plus stray whitespace must not hard-fail the

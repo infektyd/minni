@@ -1233,6 +1233,82 @@ def test_publish_gates_rebuild_needles_from_secrets(workflow):
 
 
 @pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
+def test_auth_json_digest_pinned_across_agent_step(workflow):
+    """#317 / #349: AUTHWRITE_EXIT=0 was measured (Actions run 31545388186),
+    so on-disk auth.json must be digest-pinned across the agent step.
+
+    Non-vacuity: restore must publish auth_digest via GITHUB_OUTPUT; every
+    publish gate that rebuilds needles must re-hash and fail closed BEFORE
+    the secret-sourced rebuild (Cassandra: rebuild must not hide a decoy).
+    Missing-file and empty-expected paths must both refuse.
+    """
+    restores = [
+        s for s in _steps_of(workflow) if "Restore Grok auth" in str(s.get("name", ""))
+    ]
+    assert restores, f"{workflow}: restore step missing"
+    assert len(restores) == 1, f"{workflow}: expected one restore step"
+    restore = restores[0]
+    assert restore.get("id") == "restore-auth", (
+        f"{workflow}: restore step id must be restore-auth for step-output pin"
+    )
+    restore_body = _uncommented(str(restore.get("run", "")))
+    publish = restore_body.find('echo "auth_digest=$AUTH_DIGEST" >> "$GITHUB_OUTPUT"')
+    assert publish != -1, (
+        f"{workflow}: restore does not publish auth_digest to GITHUB_OUTPUT"
+    )
+    hash_restore = restore_body.find('/usr/bin/sha256sum "$HOME/.grok/auth.json"')
+    assert -1 < hash_restore < publish, (
+        f"{workflow}: restore must sha256sum auth.json before publishing digest"
+    )
+
+    found = 0
+    for step in _steps_of(workflow):
+        body = _uncommented(str(step.get("run", "")))
+        if "--require-auth" not in body or "fixture-auth.json" in body:
+            continue
+        found += 1
+        env = step.get("env") or {}
+        assert (
+            env.get("EXPECTED_AUTH_DIGEST")
+            == "${{ steps.restore-auth.outputs.auth_digest }}"
+        ), (
+            f"{workflow}::{step.get('name')}: gate step must consume "
+            "steps.restore-auth.outputs.auth_digest (not a file the agent can rewrite)"
+        )
+        gate_call = body.find("--require-auth")
+        digest_cmp = body.find('!= "$EXPECTED_AUTH_DIGEST"')
+        assert -1 < digest_cmp < gate_call, (
+            f"{workflow}::{step.get('name')}: auth digest compare must precede the gate"
+        )
+        # Ordering vs needle rebuild: digest check before either write path.
+        key_rebuild = body.find("printf '{\"xai_api_key\": \"%s\"}'")
+        oauth_rebuild = body.find('"$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d')
+        assert -1 < digest_cmp < key_rebuild < gate_call, (
+            f"{workflow}::{step.get('name')}: digest pin must precede API-key "
+            "needle rebuild (rebuild would hide a decoy)"
+        )
+        assert -1 < digest_cmp < oauth_rebuild < gate_call, (
+            f"{workflow}::{step.get('name')}: digest pin must precede OAuth "
+            "needle rebuild (rebuild would hide a decoy)"
+        )
+        missing_file = body.find(
+            "$HOME/.grok/auth.json missing after the agent ran"
+        )
+        empty_expected = body.find("No pre-agent auth.json digest")
+        mismatch = body.find("digest mismatch")
+        assert -1 < empty_expected < gate_call, (
+            f"{workflow}::{step.get('name')}: empty EXPECTED_AUTH_DIGEST must fail closed"
+        )
+        assert -1 < missing_file < gate_call, (
+            f"{workflow}::{step.get('name')}: missing auth.json must fail closed"
+        )
+        assert -1 < mismatch < gate_call, (
+            f"{workflow}::{step.get('name')}: digest mismatch must fail closed"
+        )
+    assert found, f"{workflow}: no publish gate step found — auth digest pin is vacuous"
+
+
+@pytest.mark.parametrize("workflow", _DUAL_MODE_WORKFLOWS)
 def test_shape_guard_precedes_every_key_json_write(workflow):
     """A key containing a quote or backslash corrupts the printf JSON template,
     so the character-class refusal must run first, at every write site."""
