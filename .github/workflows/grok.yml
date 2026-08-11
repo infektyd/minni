@@ -193,7 +193,7 @@ jobs:
           echo "grok CLI pinned at $GROK_CLI_VERSION"
 
       - name: Restore Grok auth (API key or subscription OAuth)
-        id: restore-auth
+        id: auth-preflight
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
@@ -233,8 +233,9 @@ jobs:
           /usr/bin/chmod 600 "$HOME/.grok/auth.json"
           # Auth digest pin (#317 / #349): AUTHWRITE_EXIT=0 measured on Actions
           # run 31545388186 — write is possible under extends=read-only. Publish
-          # sha256 as a STEP OUTPUT (mirrors gate-preflight digest): captured
-          # when this step ends, before the agent exists. Never print the file.
+          # sha256 as steps.auth-preflight.outputs.digest (mirrors boundary-test
+          # measurement shape / gate-preflight): captured when this step ends,
+          # before the agent exists. Never print the file.
           if [ ! -f "$HOME/.grok/auth.json" ]; then
             echo "::error::\$HOME/.grok/auth.json missing after restore — refusing to continue."
             exit 1
@@ -245,8 +246,8 @@ jobs:
             echo "::error::Could not digest \$HOME/.grok/auth.json — refusing to continue."
             exit 1
           fi
-          echo "auth_digest=$AUTH_DIGEST" >> "$GITHUB_OUTPUT"
-          echo "auth.json digest pinned (sha256 ${AUTH_DIGEST:0:12}…)."
+          echo "digest=$AUTH_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Pre-agent auth.json digest recorded (sha256 ${AUTH_DIGEST:0:12}…)."
 
       - name: Configure the sandbox profile
         run: |
@@ -354,7 +355,7 @@ jobs:
           # PR diff need not touch the gate at all. The default branch is the
           # one ref the PR author does not get to pick.
           TRUST_REF: ${{ github.event.repository.default_branch }}
-          EXPECTED_AUTH_DIGEST: ${{ steps.restore-auth.outputs.auth_digest }}
+          EXPECTED_AUTH_DIGEST: ${{ steps.auth-preflight.outputs.digest }}
         run: |
           # Load the gate from the DEFAULT branch, never from the PR's checkout.
           # TWO reasons, one of which is a real hole:
@@ -391,7 +392,7 @@ jobs:
           # sourced needle rebuild (#350). Ordering is load-bearing: rebuild
           # would restore real needles and could green a leak-gate while a
           # decoy had been present; the pin must fail independently. Expected
-          # digest is steps.restore-auth.outputs.auth_digest (GITHUB_OUTPUT).
+          # digest is steps.auth-preflight.outputs.digest (GITHUB_OUTPUT).
           if [ -z "${EXPECTED_AUTH_DIGEST:-}" ]; then
             echo "::error::No pre-agent auth.json digest — refusing to post."
             exit 1
