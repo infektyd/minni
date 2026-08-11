@@ -482,13 +482,13 @@ jobs:
           # pass on the path that decides whether a reply is published.
           # Re-materialize the needle set from the SECRETS after the agent
           # ran (review findings on #350): the agent can potentially rewrite
-          # auth.json (AUTHWRITE_EXIT in grok-boundary-test.yml measures
-          # whether the read-only write block holds — pending first
-          # post-change boundary run), and a swapped file desyncs the gate's
-          # value scan. Post-agent, only the secrets are known-live — the
-          # on-disk blob is not. BOTH modes rebuild: API keys have no shape
-          # backstop at all, and OAuth refresh tokens are opaque (not
-          # JWT-shaped), so shape checks cover neither.
+          # auth.json (grok-boundary-test.yml classifies overwrite via
+          # pre/post auth.json digest — pending first post-change boundary
+          # run; AUTHWRITE_EXIT is corroboration only), and a swapped file
+          # desyncs the gate's value scan. Post-agent, only the secrets are
+          # known-live — the on-disk blob is not. BOTH modes rebuild: API
+          # keys have no shape backstop at all, and OAuth refresh tokens are
+          # opaque (not JWT-shaped), so shape checks cover neither.
           # Normalize before mode selection (round-5 review): secrets commonly
           # pick up a trailing newline (echo | gh secret set) or CR from the
           # UI, and a valid key plus stray whitespace must not hard-fail the
