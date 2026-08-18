@@ -138,8 +138,7 @@ export async function withThreadLock<T>(
     if (
       ageMs !== undefined &&
       ageMs > staleMs &&
-      observedOwner !== undefined &&
-      !isProcessAlive(observedOwner.pid)
+      (observedOwner === undefined || !isProcessAlive(observedOwner.pid))
     ) {
       const quarantineDir = `${lockDir}.stale-${randomUUID()}`;
       try {
