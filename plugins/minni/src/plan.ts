@@ -14,6 +14,34 @@ import { stableStringify } from "./agent_envelope.js";
 
 export type PlanSliceStatus = "pending" | "in_progress" | "done" | "blocked" | "superseded";
 
+/**
+ * Thread Phase 1 (worker slice metadata, digest v3): the private claim a
+ * worker currently holds on a slice. NEVER carries the claim token itself —
+ * the token lives only in the private mode-0600 envelope under
+ * `.runtime/thread-claims/` (thread-claims.ts, a later task). This ref is
+ * durable metadata (who/when/expiry) so ready-set and scope checks can run
+ * from the plan note alone; it is intentionally silent on secret material.
+ */
+export interface ThreadClaimRef {
+  claim_id: string;
+  worker_agent_id: string;
+  claimed_at: string;
+  expires_at: string;
+}
+
+/**
+ * Thread Phase 1: attributed worker proposals for topology change. Only the
+ * orchestrator applies a proposal (through existing replan/supersession
+ * behavior, per the V2 design's "Expansion and contraction" section) — a
+ * proposal recorded on a slice is a durable request, never a mutation by
+ * itself. `slices` reuses CreatePlanInput's slice shape so a proposal can be
+ * fed straight into the existing replan() input without another mapping
+ * layer.
+ */
+export type StructuralProposal =
+  | { kind: "expand" | "split"; reason: string; slices: CreatePlanInput["slices"] }
+  | { kind: "contract"; reason: string; slice_ids: string[] };
+
 export interface PlanSlice {
   id: string;
   title: string;
@@ -22,6 +50,19 @@ export interface PlanSlice {
   depends_on?: string[];
   evidence?: string;
   superseded_by?: string;
+  // Thread Phase 1 (worker slice metadata, digest v3) — all optional so a
+  // note persisted before this task, or a slice literal built by an older
+  // test/caller, remains a valid PlanSlice with no backfill required on
+  // read. `generation`/`attempt` are conceptually "0 unless recorded"; pure
+  // helpers (e.g. computePlanDigestHexV3) default a missing value to 0
+  // in-memory rather than writing a materialized 0 back into the note.
+  requirements?: string[];
+  assigned_to?: string;
+  assignment_profile?: string;
+  generation?: number;
+  attempt?: number;
+  claim?: ThreadClaimRef;
+  proposals?: StructuralProposal[];
 }
 
 export interface ShelfRef {
@@ -156,8 +197,13 @@ export function computePlanDigestV1(plan: PlanArtifact): string {
  * The payload is versioned ("v2") so rehydratePlan can distinguish a genuine
  * tamper from a pre-H7 plan (which validates against computePlanDigestV1) and
  * upgrade the latter gracefully.
+ *
+ * Exported (like computePlanDigestV1) so tests can stamp a note as declared
+ * v2 — v2 is now itself a legacy algorithm superseded by v3 below, and the
+ * declared-v2-stays-readable-without-mutation contract needs a real v2 hex
+ * to fabricate a fixture with.
  */
-function computePlanDigestHexV2(plan: PlanArtifact): string {
+export function computePlanDigestHexV2(plan: PlanArtifact): string {
   const slices = plan.slices
     .map((sl) => ({
       id: sl.id,
@@ -198,28 +244,101 @@ function computePlanDigestHexV2(plan: PlanArtifact): string {
 }
 
 /**
+ * Thread Phase 1 (Task 2, worker slice metadata): widens the H7 v2 payload
+ * with every new PlanSlice field (requirements, assigned_to,
+ * assignment_profile, generation, attempt, claim, proposals) so a vault edit
+ * to any of them — an unauthorized reassignment, a forged claim, a silently
+ * dropped structural proposal — is caught by digest verification exactly
+ * like every pre-existing field is (Gate T2: every new durable field affects
+ * v3). `generation`/`attempt` default to 0 in this pure computation only;
+ * that default is never written back into the slice itself (see the
+ * rehydratePlan declared-version gate below, which returns a declared-older
+ * note unmodified rather than upgrading it on a mere read).
+ */
+function computePlanDigestHexV3(plan: PlanArtifact): string {
+  const slices = plan.slices
+    .map((sl) => ({
+      id: sl.id,
+      title: sl.title,
+      status: sl.status,
+      gate: sl.gate,
+      depends_on: sl.depends_on ? [...sl.depends_on].sort() : undefined,
+      evidence: sl.evidence,
+      superseded_by: sl.superseded_by,
+      requirements: sl.requirements ? [...sl.requirements].sort() : undefined,
+      assigned_to: sl.assigned_to,
+      assignment_profile: sl.assignment_profile,
+      generation: sl.generation ?? 0,
+      attempt: sl.attempt ?? 0,
+      claim: sl.claim
+        ? {
+            claim_id: sl.claim.claim_id,
+            worker_agent_id: sl.claim.worker_agent_id,
+            claimed_at: sl.claim.claimed_at,
+            expires_at: sl.claim.expires_at,
+          }
+        : undefined,
+      proposals: sl.proposals ?? undefined,
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const scar_tissue = (plan.scar_tissue ?? []).map((sc) => ({
+    kind: sc.kind,
+    signal: sc.signal,
+    resolution: sc.resolution,
+  }));
+  const shelf_ref = plan.shelf_ref
+    ? {
+        agent: plan.shelf_ref.agent,
+        wikilink: plan.shelf_ref.wikilink,
+        pull_hint: plan.shelf_ref.pull_hint,
+        approx_tokens: plan.shelf_ref.approx_tokens,
+        shelf_hash: plan.shelf_ref.shelf_hash,
+      }
+    : undefined;
+  const payload = {
+    v: 3,
+    goal: plan.goal,
+    next_action: plan.next_action,
+    constraints: plan.constraints ?? [],
+    open_questions: plan.open_questions ?? [],
+    scar_tissue,
+    shelf_ref,
+    slices,
+  };
+  const str = stableStringify(payload);
+  return createHash("sha256").update(str).digest("hex").slice(0, 16);
+}
+
+/**
  * #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130): the
  * persisted plan_digest VALUE stays a bare hex so pre-tagging readers on other
  * hosts keep validating it during a rolling update; the algorithm version
  * travels in the separate plan_digest_v frontmatter field (old readers ignore
  * unknown fields). Read-time recognition dispatches on the declared version
- * through a registry of every historical algorithm, so a future payload
- * widening (v3) cannot re-open the single-legacy-fn cliff that transiently
- * bricked plan tools during the v1->v2 rollout. Notes without plan_digest_v
- * are still recognized as bare v2-or-v1 exactly as before, and "vN:<hex>"
- * digest prefixes (written by interim builds of this PR) are accepted on read
- * and normalized to bare hex on the next write.
+ * through a registry of every historical algorithm, so payload widening
+ * (v2->v3, and any future version) cannot re-open the single-legacy-fn cliff
+ * that transiently bricked plan tools during the v1->v2 rollout. Notes
+ * without plan_digest_v are still recognized as bare v2-or-v1 exactly as
+ * before, and "vN:<hex>" digest prefixes (written by interim builds of a
+ * version bump) are accepted on read and normalized to bare hex on the next
+ * write — but ONLY when the declared version is the CURRENT one. A note that
+ * DECLARES an older version (v1 or v2) validates against that older
+ * algorithm and is returned as-is: rehydratePlan must never write-on-read a
+ * note a still-running older-plugin host declares itself the owner of during
+ * a rolling upgrade (Task 2 / Thread Phase 1). The next explicit mutation
+ * naturally advances such a note to v3 through the normal persistPlan path.
  */
-export const PLAN_DIGEST_VERSION = 2;
+export const PLAN_DIGEST_VERSION = 3;
 
 const PLAN_DIGEST_ALGORITHMS: Record<number, (plan: PlanArtifact) => string> = {
   1: computePlanDigestV1,
   2: computePlanDigestHexV2,
+  3: computePlanDigestHexV3,
 };
 
 /** Current digest (bare hex; the algorithm version is persisted separately as plan_digest_v). */
 export function computePlanDigest(plan: PlanArtifact): string {
-  return computePlanDigestHexV2(plan);
+  return computePlanDigestHexV3(plan);
 }
 
 function parsePlanDigestTag(stored: string): { version: number; hex: string } | undefined {
@@ -1387,13 +1506,24 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
 
   // Check for digest mismatch instead of silent repair.
   //
-  // #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130):
-  // dispatch on the DECLARED algorithm version (resolved above, before any
-  // current-schema validation) through the algorithm registry. A KNOWN
-  // version verifies with that exact algorithm; a note with NO declared
-  // version validates against bare v2-or-v1 exactly as before. Anything but
-  // the current bare-hex form is upgraded/normalized in place on a successful
-  // read (re-persist stamps plan_digest_v and a bare-hex plan_digest).
+  // #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130,
+  // extended by Task 2 / digest v3): dispatch on the DECLARED algorithm
+  // version (resolved above, before any current-schema validation) through
+  // the algorithm registry. A KNOWN version verifies with that exact
+  // algorithm; a note with NO declared version validates against bare
+  // v2-or-v1 exactly as before.
+  //
+  // Task 2: a declared version OLDER than current (v1 or v2) that verifies
+  // is returned UNCHANGED — no persistPlan side effect on a mere read. A
+  // rolling upgrade can have an older-plugin host still reading/writing that
+  // note at its own declared version; silently rewriting it to the current
+  // schema here would race that host and, for v1/v2, would also strip the
+  // newer-only slice fields (assigned_to, generation, claim, ...) that
+  // reader has never written, corrupting data it doesn't yet know exists.
+  // The next EXPLICIT mutation (updateSlice/replan/persistPlan) is what
+  // naturally advances such a note to v3. Only an interim "vN:<hex>" TAG on
+  // an ALREADY-current declaration is normalized to bare hex here, mirroring
+  // the pre-existing v1->v2 interim-tag behavior.
   const storedHex = storedTag ? storedTag.hex : plan.plan_digest;
   const recomputed = computePlanDigest(plan);
   let needsUpgrade = false;
@@ -1402,9 +1532,12 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     if (algo(plan) !== storedHex) {
       throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
     }
-    needsUpgrade = storedTag !== undefined || storedHex !== recomputed;
+    needsUpgrade = declaredVersion === PLAN_DIGEST_VERSION && storedTag !== undefined;
   } else if (plan.plan_digest !== recomputed) {
     // No declared version: legacy recognition (pre-H7 v1 upgrades in place).
+    // Unchanged by Task 2 — a note with no version marker at all predates
+    // the rolling-upgrade contract this task's declared-version guard
+    // protects, so it keeps the original upgrade-on-read behavior.
     if (plan.plan_digest === computePlanDigestV1(plan)) {
       needsUpgrade = true;
     } else {

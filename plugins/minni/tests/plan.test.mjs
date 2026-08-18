@@ -12,6 +12,8 @@ import {
   applySliceDelta,
   computePlanDigest,
   computePlanDigestV1,
+  computePlanDigestHexV2,
+  PlanDigestVersionError,
   rehydratePlan,
   createPlan,
   persistPlan,
@@ -750,6 +752,201 @@ test("H7: rehydratePlan upgrades a pre-H7 (v1-digest) plan instead of hard-faili
     const after = await readFile(notePath, "utf8");
     assert.match(after, new RegExp(`^plan_digest: ${v2}$`, "m"), "note must be re-persisted with the v2 digest");
     assert.doesNotMatch(after, new RegExp(`^plan_digest: ${v1}$`, "m"), "legacy digest must be replaced");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Task 2 (Thread Phase 1): worker slice metadata + digest v3 compatibility.
+// ---------------------------------------------------------------------------
+
+/** Minimal two-slice plan for pure digest-coverage assertions (no I/O). */
+function makePlan() {
+  const plan = {
+    plan_id: "digest-v3-plan",
+    goal: "digest v3 coverage",
+    status: "draft",
+    constraints: [],
+    slices: [
+      { id: "a", title: "Slice A", status: "pending" },
+      { id: "b", title: "Slice B", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "test",
+    plan_digest: "",
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    rev: 1,
+  };
+  plan.plan_digest = computePlanDigest(plan);
+  return plan;
+}
+
+test("digest v3 changes for assignment, generation, claim metadata, and proposals", () => {
+  const base = makePlan();
+  const variants = [
+    { assigned_to: "worker-a" },
+    { generation: 2 },
+    { attempt: 1 },
+    { claim: {
+      claim_id: "claim-a",
+      worker_agent_id: "worker-a",
+      claimed_at: "2026-08-18T00:00:00.000Z",
+      expires_at: "2026-08-18T00:10:00.000Z",
+    }},
+    { proposals: [{ kind: "contract", reason: "enough evidence", slice_ids: ["b"] }] },
+  ];
+  for (const extra of variants) {
+    const changed = {
+      ...base,
+      slices: [{ ...base.slices[0], ...extra }],
+    };
+    assert.notEqual(computePlanDigest(base), computePlanDigest(changed));
+  }
+});
+
+// Gate T2 requires EVERY new durable slice field to affect v3, not just the
+// five exercised above — `requirements` and `assignment_profile` are the
+// remaining two named in the interface (plan.ts PlanSlice).
+test("digest v3 also changes for requirements and assignment_profile", () => {
+  const base = makePlan();
+  const variants = [
+    { requirements: ["needs-shell-access"] },
+    { assignment_profile: "profile-research" },
+  ];
+  for (const extra of variants) {
+    const changed = {
+      ...base,
+      slices: [{ ...base.slices[0], ...extra }],
+    };
+    assert.notEqual(computePlanDigest(base), computePlanDigest(changed));
+  }
+});
+
+/**
+ * Writes a real vault note that DECLARES digest v2 (plan_digest_v: 2, bare
+ * v2-computed hex) — simulating a note still owned by an older-plugin host
+ * mid rolling-upgrade. Caller is responsible for removing the returned root.
+ */
+async function writeDeclaredV2Plan() {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v2-"));
+  await ensureVault(root);
+  const { plan, write } = await createPlan(
+    { goal: "declared v2 compatibility", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+    { vaultPath: root },
+  );
+  const raw = await readFile(write.notePath, "utf8");
+  const v2Hex = computePlanDigestHexV2(plan);
+  const rewritten = raw
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${v2Hex}`)
+    .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 2");
+  assert.notEqual(rewritten, raw, "expected to actually stamp a declared v2 note for this fixture");
+  await writeFile(write.notePath, rewritten, "utf8");
+  return { notePath: write.notePath, plan, root };
+}
+
+test("rehydratePlan reads declared v2 without write-on-read upgrade", async () => {
+  const fixture = await writeDeclaredV2Plan();
+  try {
+    const before = await readFile(fixture.notePath, "utf8");
+    const plan = await rehydratePlan(fixture.notePath);
+    const after = await readFile(fixture.notePath, "utf8");
+    assert.equal(plan.plan_id, fixture.plan.plan_id);
+    assert.equal(after, before);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan reads declared v1 without write-on-read upgrade", async () => {
+  // Same contract as declared v2 above, but for a note that declares the
+  // OLDEST known algorithm via plan_digest_v: 1 (v1 predates the plan_digest_v
+  // tagging field, but the declared-version gate treats it uniformly through
+  // PLAN_DIGEST_ALGORITHMS — this must not be special-cased into a write).
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v1-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "declared v1 compatibility", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    const v1Hex = computePlanDigestV1(plan);
+    const rewritten = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${v1Hex}`)
+      .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 1");
+    assert.notEqual(rewritten, raw, "expected to actually stamp a declared v1 note for this fixture");
+    await writeFile(write.notePath, rewritten, "utf8");
+
+    const before = await readFile(write.notePath, "utf8");
+    const rehydrated = await rehydratePlan(write.notePath);
+    const after = await readFile(write.notePath, "utf8");
+    assert.equal(rehydrated.plan_id, plan.plan_id);
+    assert.equal(after, before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan still normalizes an interim 'v3:<hex>' tag on the CURRENT declared version", async () => {
+  // The no-write-on-read rule above applies only to a declared OLDER
+  // algorithm. A note whose EFFECTIVE declared version is already current
+  // (v3) but still carries an interim "v3:<hex>" prefix (as an in-flight
+  // build of this task might emit transiently) keeps normalizing to bare
+  // hex on read, exactly like the pre-existing v1->v2 interim-tag behavior.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v3-tag-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "declared v3 interim tag", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    assert.match(raw, /^plan_digest_v: 3$/m, "new plans must declare the current v3 algorithm");
+    const bare = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)?.[1];
+    assert.ok(bare, "expected a bare-hex digest to prefix");
+    await writeFile(
+      write.notePath,
+      raw.replace(/^plan_digest:.*$/m, `plan_digest: v3:${bare}`),
+      "utf8",
+    );
+
+    const rehydrated = await rehydratePlan(write.notePath);
+    assert.equal(rehydrated.plan_digest, bare, "in-memory digest must be normalized bare hex");
+    const rewritten = await readFile(write.notePath, "utf8");
+    assert.match(rewritten, /^plan_digest: "?[0-9a-f]{16}"?$/m, "note must be re-stamped bare hex");
+    assert.match(rewritten, /^plan_digest_v: 3$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan still rejects a newer-than-current declared digest version", async () => {
+  // Preserve the existing newer-version fail-closed contract across the v3
+  // bump: a plugin build that has never heard of v4 must refuse to guess at
+  // it, not treat it as tampered and not silently downgrade-write it.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-newer-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "newer than v3", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"), "utf8");
+    await assert.rejects(
+      () => rehydratePlan(write.notePath),
+      (err) => {
+        assert.ok(err instanceof PlanDigestVersionError, "must be the typed newer-version error");
+        assert.equal(err.code, "PLAN_DIGEST_NEWER");
+        assert.match(err.message, /newer than this plugin/);
+        return true;
+      },
+    );
+    const untouched = await readFile(write.notePath, "utf8");
+    assert.match(untouched, /^plan_digest_v: 4$/m, "newer-version note must not be rewritten");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

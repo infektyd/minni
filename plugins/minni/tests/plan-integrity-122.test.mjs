@@ -13,6 +13,7 @@ import {
   activatePlanChecked,
   clearActivePlan,
   computePlanDigest,
+  computePlanDigestHexV2,
   createPlan,
   PlanDigestVersionError,
   getActivePlan,
@@ -172,7 +173,8 @@ test("#122/2: createPlan conservatively warns when the incumbent is a newer-vers
       { vaultPath: root },
     );
     const raw = await readFile(a.write.notePath, "utf8");
-    await writeFile(a.write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    // Task 2 (digest v3): v3 is now current, so "one more than current" is 4.
+    await writeFile(a.write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"), "utf8");
 
     const b = await createPlan({ goal: "plan B", vaultPath: root }, { vaultPath: root });
     assert.equal(b.displaced_active, a.plan.plan_id, "unjudgeable incumbent must be reported, not silent");
@@ -264,7 +266,8 @@ test("#122/3: activatePlanChecked refuses a newer-version note instead of activa
     );
     await clearActivePlan(root);
     const raw = await readFile(write.notePath, "utf8");
-    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    // Task 2 (digest v3): v3 is now current, so "one more than current" is 4.
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"), "utf8");
 
     await assert.rejects(
       () => activatePlanChecked(root, plan.plan_id, write.notePath),
@@ -305,10 +308,11 @@ test("#122/4: new plans persist a bare-hex digest plus plan_digest_v and stay re
     );
     const raw = await readFile(write.notePath, "utf8");
     assert.match(raw, /^plan_digest: "?[0-9a-f]{16}"?$/m, "stored digest must stay bare hex for old readers");
-    assert.match(raw, /^plan_digest_v: 2$/m, "algorithm version must travel in plan_digest_v");
+    // Task 2 (digest v3): new plans now declare the current v3 algorithm.
+    assert.match(raw, /^plan_digest_v: 3$/m, "algorithm version must travel in plan_digest_v");
     const rehydrated = await rehydratePlan(write.notePath);
     // Simulated pre-tagging reader check: an old reader compares the stored
-    // value byte-for-byte against its own bare v2 computation — which is
+    // value byte-for-byte against its own bare v3 computation — which is
     // exactly computePlanDigest here, so equality proves old-reader compat.
     const storedHex = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)[1];
     assert.equal(computePlanDigest(rehydrated), storedHex, "old readers must match the stored digest");
@@ -318,7 +322,7 @@ test("#122/4: new plans persist a bare-hex digest plus plan_digest_v and stay re
   }
 });
 
-test("#122/4: note without plan_digest_v (pre-tagging writer) is recognized as bare v2, as before", async () => {
+test("#122/4: note without plan_digest_v (pre-tagging writer) is recognized as bare current-version hex, as before", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-untagged-"));
   try {
     await ensureVault(root);
@@ -328,7 +332,7 @@ test("#122/4: note without plan_digest_v (pre-tagging writer) is recognized as b
     );
     // Simulate a note written by a pre-tagging build: drop the version field.
     const raw = await readFile(write.notePath, "utf8");
-    assert.match(raw, /^plan_digest_v: 2$/m);
+    assert.match(raw, /^plan_digest_v: 3$/m);
     await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*\n/m, ""), "utf8");
     const rehydrated = await rehydratePlan(write.notePath);
     assert.equal(rehydrated.plan_digest, computePlanDigest(rehydrated));
@@ -337,7 +341,12 @@ test("#122/4: note without plan_digest_v (pre-tagging writer) is recognized as b
   }
 });
 
-test("#122/4: 'v2:<hex>'-prefixed stored digest (interim PR build) is accepted and normalized to bare hex", async () => {
+test("#122/4: 'v3:<hex>'-prefixed stored digest (interim build) is accepted and normalized to bare hex", async () => {
+  // Task 2 (digest v3): the interim-tag normalization contract only applies
+  // to a note whose EFFECTIVE declared version is the CURRENT one — this
+  // fixture's plan_digest_v field is left as whatever createPlan wrote
+  // (v3, current), so prefixing the digest with "v3:" declares the SAME
+  // version via both channels and must still normalize on read.
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-prefixed-"));
   try {
     await ensureVault(root);
@@ -346,18 +355,54 @@ test("#122/4: 'v2:<hex>'-prefixed stored digest (interim PR build) is accepted a
       { vaultPath: root },
     );
     const raw = await readFile(write.notePath, "utf8");
+    assert.match(raw, /^plan_digest_v: 3$/m, "new plans must declare the current v3 algorithm");
     const bare = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)?.[1];
     assert.ok(bare, "expected a bare-hex digest to prefix");
     await writeFile(
       write.notePath,
-      raw.replace(/^plan_digest:.*$/m, `plan_digest: v2:${bare}`),
+      raw.replace(/^plan_digest:.*$/m, `plan_digest: v3:${bare}`),
       "utf8",
     );
     const rehydrated = await rehydratePlan(write.notePath);
     assert.match(rehydrated.plan_digest, /^[0-9a-f]{16}$/, "in-memory digest must be normalized bare hex");
     const rewritten = await readFile(write.notePath, "utf8");
     assert.match(rewritten, /^plan_digest: "?[0-9a-f]{16}"?$/m, "note must be re-stamped bare hex");
-    assert.match(rewritten, /^plan_digest_v: 2$/m);
+    assert.match(rewritten, /^plan_digest_v: 3$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#122/4: a 'v2:<hex>'-prefixed digest declaring an OLDER version than current validates but is NOT rewritten", async () => {
+  // Task 2 (digest v3): this is the behavior change from the test above —
+  // an interim tag alone can declare an OLDER (not current) version. That
+  // must still validate against its own declared algorithm, but per the
+  // Task 2 rolling-upgrade contract it must NOT be silently upgraded to the
+  // current schema on a mere read (see the "declared v2" tests in
+  // plan.test.mjs for the full no-write-on-read contract).
+  const root = await mkdtemp(path.join(tmpdir(), "i122-digest-prefixed-older-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "prefixed older compat", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    // Recompute what a genuinely-v2 note would have stored, then declare
+    // BOTH channels as v2 so there is no dual-declaration ambiguity.
+    const plan = await rehydratePlan(write.notePath);
+    const v2Hex = computePlanDigestHexV2(plan);
+    const rewrittenInput = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: v2:${v2Hex}`)
+      .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 2");
+    await writeFile(write.notePath, rewrittenInput, "utf8");
+    const before = await readFile(write.notePath, "utf8");
+
+    const rehydrated = await rehydratePlan(write.notePath);
+    assert.equal(rehydrated.plan_id, plan.plan_id);
+
+    const after = await readFile(write.notePath, "utf8");
+    assert.equal(after, before, "a declared-older note must not be rewritten on a mere read");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -371,9 +416,10 @@ test("#122/4: unknown newer plan_digest_v degrades gracefully with a typed error
       { goal: "future version", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
       { vaultPath: root },
     );
-    // Leave the (valid v2) digest untouched: the version field alone must gate.
+    // Leave the (valid v3) digest untouched: the version field alone must gate.
     const raw = await readFile(write.notePath, "utf8");
-    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    // Task 2 (digest v3): v3 is now current, so "one more than current" is 4.
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"), "utf8");
     await assert.rejects(
       () => rehydratePlan(write.notePath),
       (err) => {
@@ -426,7 +472,7 @@ test("#122/4: declared-version digest with wrong hex is still rejected as tamper
       { vaultPath: root },
     );
     const raw = await readFile(write.notePath, "utf8");
-    // plan_digest_v: 2 stays; the hex itself is wrong -> genuine tamper.
+    // plan_digest_v: 3 stays; the hex itself is wrong -> genuine tamper.
     await writeFile(
       write.notePath,
       raw.replace(/^plan_digest:.*$/m, 'plan_digest: "deadbeefdeadbeef"'),
@@ -454,25 +500,27 @@ test("#122/4: restore refuses a newer-version note instead of downgrade-writing 
       { vaultPath: root },
     );
     const raw = await readFile(write.notePath, "utf8");
-    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    // Task 2 (digest v3): v3 is now current, so "one more than current" is 4.
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"), "utf8");
     // The typed error is what the restore handler re-throws instead of healing.
     await assert.rejects(
       () => rehydratePlan(write.notePath),
       (err) => err instanceof PlanDigestVersionError && err.code === "PLAN_DIGEST_NEWER",
     );
     const untouched = await readFile(write.notePath, "utf8");
-    assert.match(untouched, /^plan_digest_v: 3$/m, "newer-version note must not be rewritten");
+    assert.match(untouched, /^plan_digest_v: 4$/m, "newer-version note must not be rewritten");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
 test("#122/4: newer-version gate fires BEFORE current-schema validations (evidence check)", async () => {
-  // Codex re-review round 3: a plan_digest_v: 3 note whose slice shape is
-  // invalid under the CURRENT schema (e.g. v3 moved evidence elsewhere) must
-  // throw the typed PlanDigestVersionError, not the generic evidence error —
-  // otherwise minni_thread_restore's downgrade guard (which keys on the typed
-  // error) falls through to the bare-scalar heal path and can persist a v2
+  // Codex re-review round 3: a plan_digest_v note declaring a version newer
+  // than current, whose slice shape is invalid under the CURRENT schema
+  // (e.g. a future version moved evidence elsewhere), must throw the typed
+  // PlanDigestVersionError, not the generic evidence error — otherwise
+  // minni_thread_restore's downgrade guard (which keys on the typed error)
+  // falls through to the bare-scalar heal path and can persist an older
   // restore over a newer writer's note.
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-newer-schema-"));
   try {
@@ -491,7 +539,8 @@ test("#122/4: newer-version gate fires BEFORE current-schema validations (eviden
     await assert.rejects(() => rehydratePlan(write.notePath), /without evidence/);
     // Declare a newer version: the version gate must now fire first.
     const raw = await readFile(write.notePath, "utf8");
-    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    // Task 2 (digest v3): v3 is now current, so "one more than current" is 4.
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"), "utf8");
     await assert.rejects(
       () => rehydratePlan(write.notePath),
       (err) => {
@@ -501,18 +550,19 @@ test("#122/4: newer-version gate fires BEFORE current-schema validations (eviden
       },
     );
     const untouched = await readFile(write.notePath, "utf8");
-    assert.match(untouched, /^plan_digest_v: 3$/m, "newer-version note must not be rewritten");
+    assert.match(untouched, /^plan_digest_v: 4$/m, "newer-version note must not be rewritten");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("#122/4: dual declaration — 'v2:' prefix plus newer plan_digest_v: 3 gates as newer everywhere, nothing rewritten", async () => {
-  // Codex round 6 (PR #130): when a note carries BOTH an interim prefixed
-  // digest (plan_digest: v2:<hex>) AND a newer plan_digest_v: 3, the effective
-  // version is the NEWEST declared. Preferring the prefix would let this older
-  // build verify the note as v2 and the normalization path rewrite it back
-  // with plan_digest_v: 2, bypassing the downgrade guard.
+test("#122/4: dual declaration — 'v2:' prefix plus newer plan_digest_v: 4 gates as newer everywhere, nothing rewritten", async () => {
+  // Codex round 6 (PR #130), version bumped for Task 2 (digest v3): when a
+  // note carries BOTH an interim prefixed digest (plan_digest: v2:<hex>) AND
+  // a newer plan_digest_v (4, one past current v3), the effective version is
+  // the NEWEST declared. Preferring the prefix would let this build verify
+  // the note as v2 and the normalization path rewrite it back with
+  // plan_digest_v: 2, bypassing the downgrade guard.
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-dual-"));
   try {
     await ensureVault(root);
@@ -527,7 +577,7 @@ test("#122/4: dual declaration — 'v2:' prefix plus newer plan_digest_v: 3 gate
       write.notePath,
       raw
         .replace(/^plan_digest:.*$/m, `plan_digest: v2:${bare}`)
-        .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"),
+        .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"),
       "utf8",
     );
 
@@ -540,14 +590,20 @@ test("#122/4: dual declaration — 'v2:' prefix plus newer plan_digest_v: 3 gate
     assert.equal(await getActivePlan(root), undefined, "pointer must NOT be written");
 
     const untouched = await readFile(write.notePath, "utf8");
-    assert.match(untouched, /^plan_digest_v: 3$/m, "plan_digest_v: 3 must survive untouched");
+    assert.match(untouched, /^plan_digest_v: 4$/m, "plan_digest_v: 4 must survive untouched");
     assert.match(untouched, new RegExp(`^plan_digest: v2:${bare}$`, "m"), "digest must not be normalized");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("#122/4: dual declaration that AGREES ('v2:' prefix + plan_digest_v: 2) still verifies and normalizes", async () => {
+test("#122/4: dual declaration that AGREES ('v3:' prefix + plan_digest_v: 3) still verifies and normalizes", async () => {
+  // Task 2 (digest v3): this scenario used to agree at v2 (the then-current
+  // version); it now agrees at v3. A dual declaration that agrees on the
+  // CURRENT version is exactly the "interim tag on a current declaration"
+  // case that keeps normalizing on read — unlike a dual declaration that
+  // agrees on an OLDER version (covered separately in plan.test.mjs's
+  // declared-v2 no-write-on-read test).
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-dual-agree-"));
   try {
     await ensureVault(root);
@@ -556,19 +612,20 @@ test("#122/4: dual declaration that AGREES ('v2:' prefix + plan_digest_v: 2) sti
       { vaultPath: root },
     );
     const raw = await readFile(write.notePath, "utf8");
+    assert.match(raw, /^plan_digest_v: 3$/m, "new plans must declare the current v3 algorithm");
     const bare = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)?.[1];
     assert.ok(bare, "expected a bare-hex digest to prefix");
-    // plan_digest_v: 2 already present; only prefix the digest.
+    // plan_digest_v: 3 already present; only prefix the digest.
     await writeFile(
       write.notePath,
-      raw.replace(/^plan_digest:.*$/m, `plan_digest: v2:${bare}`),
+      raw.replace(/^plan_digest:.*$/m, `plan_digest: v3:${bare}`),
       "utf8",
     );
     const rehydrated = await rehydratePlan(write.notePath);
     assert.equal(rehydrated.plan_digest, bare, "in-memory digest must be normalized bare hex");
     const rewritten = await readFile(write.notePath, "utf8");
     assert.match(rewritten, /^plan_digest: "?[0-9a-f]{16}"?$/m, "note must be re-stamped bare hex");
-    assert.match(rewritten, /^plan_digest_v: 2$/m);
+    assert.match(rewritten, /^plan_digest_v: 3$/m);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
