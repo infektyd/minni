@@ -1571,7 +1571,7 @@ export interface RehydratePlanDeps {
   beforeUpgradePersist?: (plan: PlanArtifact) => Promise<void>;
 }
 
-/** Rehydrate snapshot from vault note (frontmatter + body). Appends a rehydrated journal event as side effect. */
+/** Rehydrate snapshot from vault note (frontmatter + body). Read-only: does not append journal events. */
 export async function rehydratePlan(
   notePath: string,
   deps: RehydratePlanDeps = {},
@@ -1758,14 +1758,6 @@ export async function rehydratePlan(
     } catch {
       // advisory: the in-memory upgraded digest is enough for this read to proceed
     }
-  }
-
-  // Record access (best-effort, append-only journal lives next to the note)
-  const journalPath = journalPathFor(notePath, plan_id);
-  try {
-    await appendJournal(journalPath, { kind: "rehydrated", at: new Date().toISOString() });
-  } catch {
-    // journal is advisory; do not fail rehydrate
   }
 
   return plan;

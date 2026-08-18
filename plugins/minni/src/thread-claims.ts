@@ -10,6 +10,7 @@ import {
   mkdir,
   open,
   rename,
+  rm,
   stat,
   unlink,
   type FileHandle,
@@ -177,12 +178,13 @@ export interface WorkerUpdateReceiptIdentity {
   planId: string;
   sliceId: string;
   workerAgentId: string;
-  claimId: string;
+  claimId?: string;
   generation: number;
   idempotencyKey: string;
 }
 
 export interface WriteWorkerUpdateReceiptInput extends WorkerUpdateReceiptIdentity {
+  claimId: string;
   kind: string;
   tokenDigest: string;
   rev: number;
@@ -274,16 +276,15 @@ function claimIdFor(
     .slice(0, 32);
 }
 
-// Deliberately binds to claim generation and claim_id: a claim-clearing action
-// invalidates the slice's generation for future claims, and a retry of THAT
-// SAME action must still resolve to the SAME receipt for the SAME claim
-// generation. plan/slice/worker/claim/generation/idempotency_key is exactly
-// what the request itself declares.
+/**
+ * Receipt file identity: plan/slice/worker/generation/idempotency. claim_id is
+ * stored and validated inside the envelope, not hashed into the path — a
+ * same-generation replay (including post-complete) opens one known file.
+ */
 function receiptIdFor(
   planId: string,
   sliceId: string,
   workerAgentId: string,
-  claimId: string,
   generation: number,
   idempotencyKey: string,
 ): string {
@@ -292,12 +293,15 @@ function receiptIdFor(
       plan_id: planId,
       slice_id: sliceId,
       worker_agent_id: workerAgentId,
-      claim_id: claimId,
       generation,
       idempotency_key: idempotencyKey,
     }))
     .digest("hex")
     .slice(0, 32);
+}
+
+function generationDirName(generation: number): string {
+  return `g${generation}`;
 }
 
 function tokenDigestOf(token: string): string {
@@ -503,32 +507,37 @@ interface ReceiptLocation {
   runtimeHandle: FileHandle;
   claimsHandle: FileHandle;
   planHandle: FileHandle;
-  updatesHandle: FileHandle;
+  sliceHandle: FileHandle;
+  generationHandle: FileHandle;
   vaultPath: string;
   runtimePath: string;
   claimsPath: string;
   planPath: string;
-  updatesPath: string;
+  slicePath: string;
+  generationPath: string;
   filePath: string;
   fileName: string;
 }
 
 /**
  * Same descriptor-anchored authority as withClaimLocation (vault ->
- * .runtime -> thread-claims -> <planHash>), one level deeper into an
- * "updates" child so a receipt file can never collide with, or be
- * confused for, a claim secret's <claimId>.json in the same plan
- * directory.
+ * .runtime -> thread-claims -> <planHash> -> updates -> <sliceHash> ->
+ * g<generation>), one level deeper than claim secrets so receipt files never
+ * collide with <claimId>.json in the plan directory.
  */
 async function withReceiptLocation<T>(
   vaultPath: string,
   planId: string,
+  sliceId: string,
+  generation: number,
   receiptId: string,
   create: boolean,
   fn: (location: ReceiptLocation | undefined) => Promise<T>,
 ): Promise<T> {
   requireNonEmpty(vaultPath, "vault path");
   requireNonEmpty(planId, "plan id");
+  requireNonEmpty(sliceId, "slice id");
+  requireNonNegativeInteger(generation, "generation");
   if (!RECEIPT_ID_PATTERN.test(receiptId)) {
     throw pathMismatch();
   }
@@ -587,10 +596,31 @@ async function withReceiptLocation<T>(
     if (!updatesHandle) return await fn(undefined);
     handles.push(updatesHandle);
 
+    const sliceHash = hashSegment(sliceId);
+    const sliceHandle = await openPrivateChildDirectory(
+      updatesHandle,
+      fdAliasRoot,
+      sliceHash,
+      create,
+    );
+    if (!sliceHandle) return await fn(undefined);
+    handles.push(sliceHandle);
+
+    const generationDir = generationDirName(generation);
+    const generationHandle = await openPrivateChildDirectory(
+      sliceHandle,
+      fdAliasRoot,
+      generationDir,
+      create,
+    );
+    if (!generationHandle) return await fn(undefined);
+    handles.push(generationHandle);
+
     const runtimePath = path.join(logicalVaultPath, ".runtime");
     const claimsPath = path.join(runtimePath, "thread-claims");
     const planPath = path.join(claimsPath, planHash);
-    const updatesPath = path.join(planPath, "updates");
+    const slicePath = path.join(planPath, "updates", sliceHash);
+    const generationPath = path.join(slicePath, generationDir);
     const fileName = `${receiptId}.json`;
     return await fn({
       fdAliasRoot,
@@ -598,13 +628,15 @@ async function withReceiptLocation<T>(
       runtimeHandle,
       claimsHandle,
       planHandle,
-      updatesHandle,
+      sliceHandle,
+      generationHandle,
       vaultPath: logicalVaultPath,
       runtimePath,
       claimsPath,
       planPath,
-      updatesPath,
-      filePath: path.join(updatesPath, fileName),
+      slicePath,
+      generationPath,
+      filePath: path.join(generationPath, fileName),
       fileName,
     });
   } finally {
@@ -667,7 +699,8 @@ async function assertReceiptLocationStillAttached(
     logicalPathMatchesHandle(location.runtimePath, location.runtimeHandle),
     logicalPathMatchesHandle(location.claimsPath, location.claimsHandle),
     logicalPathMatchesHandle(location.planPath, location.planHandle),
-    logicalPathMatchesHandle(location.updatesPath, location.updatesHandle),
+    logicalPathMatchesHandle(location.slicePath, location.sliceHandle),
+    logicalPathMatchesHandle(location.generationPath, location.generationHandle),
   ]);
   if (matches.some((match) => !match)) {
     throw new ClaimStoreParentChangedError();
@@ -949,7 +982,6 @@ function parseReceiptEnvelope(
     envelope.plan_id,
     envelope.slice_id,
     envelope.worker_agent_id,
-    envelope.claim_id,
     envelope.generation,
     envelope.idempotency_key,
   );
@@ -958,10 +990,15 @@ function parseReceiptEnvelope(
     envelope.plan_id !== expected.planId ||
     envelope.slice_id !== expected.sliceId ||
     envelope.worker_agent_id !== expected.workerAgentId ||
-    envelope.claim_id !== expected.claimId ||
     envelope.generation !== expected.generation ||
     envelope.idempotency_key !== expected.idempotencyKey ||
     envelope.response.rev !== envelope.rev
+  ) {
+    throw metadataMismatch();
+  }
+  if (
+    expected.claimId !== undefined &&
+    envelope.claim_id !== expected.claimId
   ) {
     throw metadataMismatch();
   }
@@ -977,7 +1014,7 @@ async function readReceiptEnvelopeRaw(
     handle = await open(
       childOfHandle(
         location.fdAliasRoot,
-        location.updatesHandle,
+        location.generationHandle,
         location.fileName,
       ),
       constants.O_RDONLY | constants.O_NOFOLLOW,
@@ -1014,7 +1051,6 @@ async function readReceiptEnvelopeRaw(
       envelope.plan_id,
       envelope.slice_id,
       envelope.worker_agent_id,
-      envelope.claim_id,
       envelope.generation,
       envelope.idempotency_key,
     );
@@ -1058,12 +1094,12 @@ async function writeReceiptEnvelopeAtomic(
   const temporaryName = `.${location.fileName}.${randomBytes(16).toString("hex")}.tmp`;
   const temporaryPath = childOfHandle(
     location.fdAliasRoot,
-    location.updatesHandle,
+    location.generationHandle,
     temporaryName,
   );
   const finalPath = childOfHandle(
     location.fdAliasRoot,
-    location.updatesHandle,
+    location.generationHandle,
     location.fileName,
   );
 
@@ -1084,7 +1120,7 @@ async function writeReceiptEnvelopeAtomic(
     handle = undefined;
 
     await rename(temporaryPath, finalPath);
-    await location.updatesHandle.sync();
+    await location.generationHandle.sync();
   } finally {
     if (handle) await handle.close().catch(() => {});
     await unlink(temporaryPath).catch((error) => {
@@ -1096,14 +1132,24 @@ async function writeReceiptEnvelopeAtomic(
 async function withReceiptLock<T>(
   vaultPath: string,
   planId: string,
+  sliceId: string,
+  generation: number,
   receiptId: string,
   fn: (location: ReceiptLocation) => Promise<T>,
 ): Promise<T> {
   let anchoredVaultPath = "";
-  await withReceiptLocation(vaultPath, planId, receiptId, true, async (location) => {
-    if (!location) throw pathMismatch();
-    anchoredVaultPath = location.vaultPath;
-  });
+  await withReceiptLocation(
+    vaultPath,
+    planId,
+    sliceId,
+    generation,
+    receiptId,
+    true,
+    async (location) => {
+      if (!location) throw pathMismatch();
+      anchoredVaultPath = location.vaultPath;
+    },
+  );
   return withThreadLock(
     anchoredVaultPath,
     `update:${hashSegment(planId)}:${receiptId}`,
@@ -1112,6 +1158,8 @@ async function withReceiptLock<T>(
       withReceiptLocation(
         anchoredVaultPath,
         planId,
+        sliceId,
+        generation,
         receiptId,
         true,
         async (lockedLocation) => {
@@ -1127,54 +1175,43 @@ export interface WorkerUpdateReceiptLookupInput {
   planId: string;
   sliceId: string;
   workerAgentId: string;
+  generation: number;
   idempotencyKey: string;
   claimId?: string;
-  generation?: number;
 }
 
-async function scanWorkerUpdateReceipts(
-  input: WorkerUpdateReceiptLookupInput,
-): Promise<WorkerUpdateReceiptEnvelope | undefined> {
-  const planHash = hashSegment(input.planId);
-  const updatesPath = path.join(
-    path.resolve(input.vaultPath),
+/**
+ * Best-effort delete of every receipt file for one slice generation. Called
+ * only when a slice's generation advances (reassign, replan, restore, expiry)
+ * — never on the hot worker-update path.
+ */
+export async function pruneWorkerUpdateReceiptsForGeneration(
+  vaultPath: string,
+  planId: string,
+  sliceId: string,
+  generation: number,
+): Promise<void> {
+  requireNonEmpty(vaultPath, "vault path");
+  requireNonEmpty(planId, "plan id");
+  requireNonEmpty(sliceId, "slice id");
+  requireNonNegativeInteger(generation, "generation");
+  const planHash = hashSegment(planId);
+  const sliceHash = hashSegment(sliceId);
+  const generationDir = generationDirName(generation);
+  const generationPath = path.join(
+    path.resolve(vaultPath),
     ".runtime",
     "thread-claims",
     planHash,
     "updates",
+    sliceHash,
+    generationDir,
   );
-  let entries: string[];
   try {
-    const { readdir } = await import("node:fs/promises");
-    entries = await readdir(updatesPath);
-  } catch {
-    return undefined;
+    await rm(generationPath, { recursive: true, force: true });
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) throw error;
   }
-  for (const entry of entries) {
-    if (!entry.endsWith(".json") || entry.startsWith(".")) continue;
-    const receiptId = entry.slice(0, -".json".length);
-    if (!RECEIPT_ID_PATTERN.test(receiptId)) continue;
-    const envelope = await withReceiptLocation(
-      input.vaultPath,
-      input.planId,
-      receiptId,
-      false,
-      async (location) => {
-        if (!location) return undefined;
-        return readReceiptEnvelopeRaw(location, receiptId);
-      },
-    );
-    if (
-      envelope &&
-      envelope.plan_id === input.planId &&
-      envelope.slice_id === input.sliceId &&
-      envelope.worker_agent_id === input.workerAgentId &&
-      envelope.idempotency_key === input.idempotencyKey
-    ) {
-      return envelope;
-    }
-  }
-  return undefined;
 }
 
 export async function readWorkerUpdateReceipt(
@@ -1185,43 +1222,39 @@ export async function readWorkerUpdateReceipt(
   requireNonEmpty(input.sliceId, "slice id");
   requireNonEmpty(input.workerAgentId, "worker agent id");
   requireNonEmpty(input.idempotencyKey, "idempotency key");
-  if (
-    input.claimId !== undefined &&
-    input.generation !== undefined
-  ) {
+  requireNonNegativeInteger(input.generation, "generation");
+  if (input.claimId !== undefined) {
     requireNonEmpty(input.claimId, "claim id");
     if (!CLAIM_ID_PATTERN.test(input.claimId)) {
       throw pathMismatch();
     }
-    requireNonNegativeInteger(input.generation, "generation");
-    const receiptId = receiptIdFor(
-      input.planId,
-      input.sliceId,
-      input.workerAgentId,
-      input.claimId,
-      input.generation,
-      input.idempotencyKey,
-    );
-    const direct = await withReceiptLocation(
-      input.vaultPath,
-      input.planId,
-      receiptId,
-      false,
-      (location) =>
-        readReceiptEnvelope(location, {
-          vaultPath: input.vaultPath,
-          planId: input.planId,
-          sliceId: input.sliceId,
-          workerAgentId: input.workerAgentId,
-          idempotencyKey: input.idempotencyKey,
-          claimId: input.claimId!,
-          generation: input.generation!,
-          receiptId,
-        }),
-    );
-    if (direct) return direct;
   }
-  return scanWorkerUpdateReceipts(input);
+  const receiptId = receiptIdFor(
+    input.planId,
+    input.sliceId,
+    input.workerAgentId,
+    input.generation,
+    input.idempotencyKey,
+  );
+  return withReceiptLocation(
+    input.vaultPath,
+    input.planId,
+    input.sliceId,
+    input.generation,
+    receiptId,
+    false,
+    (location) =>
+      readReceiptEnvelope(location, {
+        vaultPath: input.vaultPath,
+        planId: input.planId,
+        sliceId: input.sliceId,
+        workerAgentId: input.workerAgentId,
+        idempotencyKey: input.idempotencyKey,
+        claimId: input.claimId,
+        generation: input.generation,
+        receiptId,
+      }),
+  );
 }
 
 function validateReceiptWriteInput(
@@ -1249,7 +1282,6 @@ function validateReceiptWriteInput(
     input.planId,
     input.sliceId,
     input.workerAgentId,
-    input.claimId,
     input.generation,
     input.idempotencyKey,
   );
@@ -1260,7 +1292,13 @@ async function writeWorkerUpdateReceipt(
   status: WorkerUpdateReceiptStatus,
 ): Promise<WorkerUpdateReceiptEnvelope> {
   const receiptId = validateReceiptWriteInput(input);
-  return withReceiptLock(input.vaultPath, input.planId, receiptId, async (location) => {
+  return withReceiptLock(
+    input.vaultPath,
+    input.planId,
+    input.sliceId,
+    input.generation,
+    receiptId,
+    async (location) => {
     const envelope: WorkerUpdateReceiptEnvelope = {
       schema: RECEIPT_SCHEMA,
       plan_id: input.planId,

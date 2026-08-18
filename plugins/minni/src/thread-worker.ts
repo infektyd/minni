@@ -26,6 +26,7 @@ import {
   findOrderedEventByIdempotencyKey,
   reconcileThreadJournal,
   readOrderedThreadEvents,
+  type OrderedThreadEvent,
   ThreadEventIdempotencyConflictError,
   type ReadySummaryPayload,
 } from "./thread-events.js";
@@ -34,6 +35,7 @@ import {
   createClaimSecret,
   deleteClaimSecret,
   hashWorkerUpdateToken,
+  pruneWorkerUpdateReceiptsForGeneration,
   readClaimByIdempotency,
   readWorkerUpdateReceipt,
   verifyClaimToken,
@@ -271,6 +273,44 @@ export async function deleteClaimSecretsBestEffort(
   );
 }
 
+/** Best-effort prune of receipts for a superseded slice generation. */
+export async function pruneSliceReceiptsOnGenerationAdvance(
+  vaultPath: string,
+  planId: string,
+  sliceId: string,
+  previousGeneration: number,
+): Promise<void> {
+  await pruneWorkerUpdateReceiptsForGeneration(
+    vaultPath,
+    planId,
+    sliceId,
+    previousGeneration,
+  ).catch(() => {});
+}
+
+/** Prune receipt generations for every slice whose generation advanced. */
+export async function pruneSliceReceiptsAfterPlanMutation(
+  vaultPath: string,
+  planId: string,
+  before: PlanArtifact,
+  after: PlanArtifact,
+): Promise<void> {
+  for (const slice of before.slices) {
+    const afterSlice = after.slices.find((candidate) => candidate.id === slice.id);
+    if (!afterSlice) continue;
+    const beforeGen = slice.generation ?? 0;
+    const afterGen = afterSlice.generation ?? 0;
+    if (afterGen > beforeGen) {
+      await pruneSliceReceiptsOnGenerationAdvance(
+        vaultPath,
+        planId,
+        slice.id,
+        beforeGen,
+      );
+    }
+  }
+}
+
 function findSlice(plan: PlanArtifact, sliceId: string): PlanSlice {
   const matches = plan.slices.filter((candidate) => candidate.id === sliceId);
   if (matches.length > 1) {
@@ -458,9 +498,13 @@ export async function prepareThreadMutation(
   input: ThreadPlanTarget & { actor: string },
   plan: PlanArtifact,
   now: Date,
-): Promise<{ journalPath: string; ordered: Awaited<ReturnType<typeof readOrderedThreadEvents>> }> {
+): Promise<{
+  journalPath: string;
+  ordered: OrderedThreadEvent[];
+}> {
   const journalPath = journalPathFor(input.notePath, input.planId);
   const summary = readySummary(plan, now);
+  const ordered = await readOrderedThreadEvents(journalPath);
   await reconcileThreadJournal({
     journalPath,
     notePath: input.notePath,
@@ -468,6 +512,7 @@ export async function prepareThreadMutation(
     rev: plan.rev,
     actor: input.actor,
     readySummary: summary,
+    orderedSnapshot: ordered,
   });
   await ensureOrderedBaseline({
     journalPath,
@@ -475,11 +520,9 @@ export async function prepareThreadMutation(
     rev: plan.rev,
     actor: input.actor,
     readySummary: summary,
+    orderedSnapshot: ordered,
   });
-  return {
-    journalPath,
-    ordered: await readOrderedThreadEvents(journalPath),
-  };
+  return { journalPath, ordered };
 }
 
 function workerEventKind(action: WorkerUpdateAction): string {
@@ -524,6 +567,7 @@ export async function recordThreadMutationEvents(input: {
   plan: PlanArtifact;
   planBefore?: PlanArtifact;
   now: Date;
+  orderedSnapshot?: OrderedThreadEvent[];
   supplementalEvents?: Array<{
     idempotencyKey: string;
     kind: string;
@@ -576,6 +620,7 @@ export async function recordThreadMutationEvents(input: {
       actor: input.actor,
       at,
       events,
+      orderedSnapshot: input.orderedSnapshot,
     });
   } catch (error) {
     if (error instanceof ThreadEventIdempotencyConflictError) {
@@ -596,8 +641,10 @@ async function repairClaimSchedulerEvents(input: {
   readyAfter: string[];
   plan: PlanArtifact;
   now: Date;
+  orderedSnapshot?: OrderedThreadEvent[];
 }): Promise<void> {
-  const ordered = await readOrderedThreadEvents(input.journalPath);
+  const ordered =
+    input.orderedSnapshot ?? await readOrderedThreadEvents(input.journalPath);
   const summary = readySummary(input.plan, input.now);
   await ensureOrderedBaseline({
     journalPath: input.journalPath,
@@ -605,6 +652,7 @@ async function repairClaimSchedulerEvents(input: {
     rev: input.rev,
     actor: input.actor,
     readySummary: summary,
+    orderedSnapshot: ordered,
   });
   const claimed = findOrderedEventByIdempotencyKey(ordered, input.operationKey);
   if (!claimed) {
@@ -620,6 +668,7 @@ async function repairClaimSchedulerEvents(input: {
       readyAfter: input.readyAfter,
       plan: input.plan,
       now: input.now,
+      orderedSnapshot: ordered,
     });
     return;
   }
@@ -645,6 +694,7 @@ async function repairClaimSchedulerEvents(input: {
             payload: { slices: summary.slices },
           },
         ],
+        orderedSnapshot: ordered,
       });
     }
   }
@@ -672,7 +722,8 @@ async function expireStaleClaimForSlice(input: {
   }
   const readyBefore = readyIds(input.plan, input.now);
   const revokedClaimId = slice.claim.claim_id;
-  const generation = requireGeneration(slice) + 1;
+  const previousGeneration = requireGeneration(slice);
+  const generation = previousGeneration + 1;
   const nextSlice: PlanSlice = {
     ...slice,
     generation,
@@ -688,6 +739,12 @@ async function expireStaleClaimForSlice(input: {
     input.planId,
     [revokedClaimId],
     input.deleteSecret,
+  );
+  await pruneSliceReceiptsOnGenerationAdvance(
+    input.vaultPath,
+    input.planId,
+    input.sliceId,
+    previousGeneration,
   );
   const readyAfter = readyIds(next, input.now);
   const operationKey = deriveSystemEventKey(
@@ -859,7 +916,7 @@ export async function assignSlice(
     },
     async (plan) => {
       const now = sampleNow(input.now);
-      const { journalPath } = await prepareThreadMutation(
+      const { journalPath, ordered } = await prepareThreadMutation(
         { ...input, planId, actor: actorAgentId },
         plan,
         now,
@@ -875,6 +932,14 @@ export async function assignSlice(
 
       const generation = requireGeneration(slice);
       const reassigned = slice.assigned_to !== undefined;
+      if (reassigned) {
+        await pruneSliceReceiptsOnGenerationAdvance(
+          input.vaultPath,
+          planId,
+          sliceId,
+          generation,
+        );
+      }
       const nextSlice: PlanSlice = {
         ...slice,
         assigned_to: workerAgentId,
@@ -925,6 +990,7 @@ export async function assignSlice(
         readyAfter: result.ready_after,
         plan: next,
         now,
+        orderedSnapshot: ordered,
         supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
       });
       return result;
@@ -980,7 +1046,7 @@ export async function claimSlice(
     },
     async (initialPlan) => {
       const now = sampleNow(input.now);
-      const { journalPath } = await prepareThreadMutation(
+      const { journalPath, ordered } = await prepareThreadMutation(
         { ...input, planId, actor: workerAgentId },
         initialPlan,
         now,
@@ -1011,7 +1077,14 @@ export async function claimSlice(
 
       if (slice.claim && !hasLiveClaim(slice, now)) {
         staleClaimIds.push(slice.claim.claim_id);
+        const staleGeneration = generation;
         generation += 1;
+        await pruneSliceReceiptsOnGenerationAdvance(
+          input.vaultPath,
+          planId,
+          sliceId,
+          staleGeneration,
+        );
         const expiredSlice: PlanSlice = {
           ...slice,
           generation,
@@ -1060,6 +1133,7 @@ export async function claimSlice(
             readyAfter,
             plan,
             now,
+            orderedSnapshot: ordered,
           });
           return publicClaimResponse(existing.response);
         }
@@ -1098,7 +1172,14 @@ export async function claimSlice(
           break;
         }
         staleClaimIds.push(candidate.envelope.claim_id);
+        const staleGeneration = generation;
         generation += 1;
+        await pruneSliceReceiptsOnGenerationAdvance(
+          input.vaultPath,
+          planId,
+          sliceId,
+          staleGeneration,
+        );
         slice = {
           ...slice,
           generation,
@@ -1194,6 +1275,7 @@ export async function claimSlice(
         readyAfter,
         plan: next,
         now,
+        orderedSnapshot: ordered,
       });
       return response;
     },
@@ -1413,13 +1495,17 @@ async function loadWorkerUpdateReceipt(
   idempotencyKey: string,
   kind: string,
   token: string,
+  generation: number,
+  claimId?: string,
 ): Promise<WorkerUpdateReceiptEnvelope | undefined> {
   const receipt = await readWorkerUpdateReceipt({
     vaultPath: input.vaultPath,
     planId,
     sliceId,
     workerAgentId,
+    generation,
     idempotencyKey,
+    claimId,
   });
   if (!receipt) return undefined;
   if (receipt.kind !== kind) {
@@ -1465,6 +1551,9 @@ export async function updateClaimedSlice(
         workerAgentId,
         idempotencyKey,
       );
+      const receiptSlice = findSlice(initialPlan, sliceId);
+      const receiptGeneration = requireGeneration(receiptSlice);
+      const receiptClaimId = receiptSlice.claim?.claim_id;
 
       // Authenticate any existing receipt BEFORE journal reconciliation so a
       // wrong-token retry cannot append state.recovered.
@@ -1476,24 +1565,27 @@ export async function updateClaimedSlice(
         idempotencyKey,
         kind,
         token,
+        receiptGeneration,
+        receiptClaimId,
       );
       if (
         existingReceipt?.status === "committed" &&
         committedReceiptAuthoritative(findSlice(initialPlan, sliceId), existingReceipt)
       ) {
-        const { journalPath } = await prepareThreadMutation(
+        const { journalPath, ordered } = await prepareThreadMutation(
           { ...input, planId, actor: workerAgentId },
           initialPlan,
           now,
         );
         void journalPath;
+        void ordered;
         return receiptMutationResult(initialPlan, existingReceipt);
       }
       if (existingReceipt?.status === "committed") {
         throw new Error("claim scope mismatch");
       }
 
-      const { journalPath } = await prepareThreadMutation(
+      const { journalPath, ordered } = await prepareThreadMutation(
         { ...input, planId, actor: workerAgentId },
         initialPlan,
         now,
@@ -1707,6 +1799,7 @@ export async function updateClaimedSlice(
         plan: next,
         planBefore,
         now,
+        orderedSnapshot: ordered,
         supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
       });
       return result;

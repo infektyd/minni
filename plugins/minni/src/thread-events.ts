@@ -34,6 +34,7 @@ export interface AppendOrderedEventBatchInput {
   rev: number;
   actor: string;
   at?: string;
+  orderedSnapshot?: OrderedThreadEvent[];
   events: Array<{
     idempotencyKey: string;
     kind: string;
@@ -49,6 +50,7 @@ export interface EnsureOrderedBaselineInput {
   actor: string;
   at?: string;
   readySummary: ReadySummaryPayload;
+  orderedSnapshot?: OrderedThreadEvent[];
 }
 
 export interface ReconcileThreadJournalInput {
@@ -59,6 +61,7 @@ export interface ReconcileThreadJournalInput {
   actor: string;
   at?: string;
   readySummary: ReadySummaryPayload;
+  orderedSnapshot?: OrderedThreadEvent[];
 }
 
 export class ThreadInconsistentError extends Error {
@@ -254,9 +257,17 @@ export function parseOrderedThreadEvents(
   return events.sort((left, right) => left.seq - right.seq);
 }
 
+/** Incremented on each ordered-journal load in readOrderedThreadEvents (test contract). */
+export let orderedJournalParseCount = 0;
+
+export function resetOrderedJournalParseCountForTests(): void {
+  orderedJournalParseCount = 0;
+}
+
 export async function readOrderedThreadEvents(
   journalPath: string,
 ): Promise<OrderedThreadEvent[]> {
+  orderedJournalParseCount += 1;
   try {
     const journalText = await readFile(journalPath, "utf8");
     return parseOrderedThreadEvents(journalText);
@@ -270,6 +281,7 @@ export async function readThreadEvents(
   sinceSeq = 0,
   limit = 100,
 ): Promise<{ events: OrderedThreadEvent[]; next_seq: number }> {
+  // Phase 1 bound: one journal read + parse per minni_thread_events call.
   const ordered = await readOrderedThreadEvents(journalPath);
   const filtered = ordered.filter((event) => event.seq > sinceSeq);
   const page = filtered.slice(0, limit);
@@ -375,7 +387,8 @@ export async function appendOrderedEventBatch(
   input: AppendOrderedEventBatchInput,
   deps: AppendJournalDeps = {},
 ): Promise<OrderedThreadEvent[]> {
-  const ordered = await readOrderedThreadEvents(input.journalPath);
+  const ordered =
+    input.orderedSnapshot ?? await readOrderedThreadEvents(input.journalPath);
   const allExisting = input.events.every((spec) =>
     findOrderedEventByIdempotencyKey(ordered, spec.idempotencyKey)
   );
@@ -411,6 +424,11 @@ export async function appendOrderedEventBatch(
     thread_event_batch: fresh,
   };
   await appendJournalLine(input.journalPath, batchLine, deps);
+  if (input.orderedSnapshot) {
+    for (const event of fresh) {
+      input.orderedSnapshot.push(event);
+    }
+  }
   return materialized;
 }
 
@@ -454,7 +472,8 @@ export async function ensureOrderedBaseline(
   input: EnsureOrderedBaselineInput,
   deps: AppendJournalDeps = {},
 ): Promise<OrderedThreadEvent | undefined> {
-  const ordered = await readOrderedThreadEvents(input.journalPath);
+  const ordered =
+    input.orderedSnapshot ?? await readOrderedThreadEvents(input.journalPath);
   if (ordered.length > 0) {
     return undefined;
   }
@@ -465,6 +484,7 @@ export async function ensureOrderedBaseline(
       rev: input.rev,
       actor: input.actor,
       at: input.at,
+      orderedSnapshot: input.orderedSnapshot ?? ordered,
       events: [
         {
           idempotencyKey: deriveSystemEventKey("state.baseline", String(input.rev)),
@@ -482,7 +502,8 @@ export async function reconcileThreadJournal(
   input: ReconcileThreadJournalInput,
   deps: AppendJournalDeps = {},
 ): Promise<"ok" | "recovered"> {
-  const ordered = await readOrderedThreadEvents(input.journalPath);
+  const ordered =
+    input.orderedSnapshot ?? await readOrderedThreadEvents(input.journalPath);
   if (ordered.length === 0) {
     return "ok";
   }
@@ -511,6 +532,7 @@ export async function reconcileThreadJournal(
       rev: input.rev,
       actor: input.actor,
       at: input.at,
+      orderedSnapshot: input.orderedSnapshot ?? ordered,
       events: [
         {
           idempotencyKey: recoveryKey,

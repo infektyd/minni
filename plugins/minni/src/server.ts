@@ -93,6 +93,8 @@ import {
   claimIds,
   claimSlice,
   deleteClaimSecretsBestEffort,
+  pruneSliceReceiptsAfterPlanMutation,
+  pruneSliceReceiptsOnGenerationAdvance,
   prepareThreadMutation,
   readyIds,
   readySlices,
@@ -1429,7 +1431,7 @@ server.registerTool(
           ? unmetDependencies(plan, slice_id)
           : [];
         const readyBefore = readyIds(plan, now);
-        const { journalPath } = await prepareThreadMutation(
+        const { journalPath, ordered } = await prepareThreadMutation(
           { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
           plan,
           now,
@@ -1451,6 +1453,12 @@ server.registerTool(
             effectiveVaultPath,
             plan_id,
             [applied.revoked_claim_id],
+          );
+          await pruneSliceReceiptsOnGenerationAdvance(
+            effectiveVaultPath,
+            plan_id,
+            slice_id,
+            applied.previous_slice.generation ?? 0,
           );
         }
         // #291: keep the dependency override in the same status event.
@@ -1527,6 +1535,7 @@ server.registerTool(
           plan: updated,
           planBefore: plan,
           now,
+          orderedSnapshot: ordered,
           supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
         });
         // P10/H6: terminal plans stop being injected.
@@ -1586,7 +1595,7 @@ server.registerTool(
       async (plan) => {
         const now = new Date();
         const readyBefore = readyIds(plan, now);
-        const { journalPath } = await prepareThreadMutation(
+        const { journalPath, ordered } = await prepareThreadMutation(
           { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
           plan,
           now,
@@ -1619,6 +1628,7 @@ server.registerTool(
           readyAfter: readyIds(updated, now),
           plan: updated,
           now,
+          orderedSnapshot: ordered,
         });
         return updated;
       },
@@ -1720,7 +1730,7 @@ server.registerTool(
       async (plan) => {
         const now = new Date();
         const readyBefore = readyIds(plan, now);
-        const { journalPath } = await prepareThreadMutation(
+        const { journalPath, ordered } = await prepareThreadMutation(
           { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
           plan,
           now,
@@ -1758,6 +1768,12 @@ server.registerTool(
           effectiveVaultPath,
           plan_id,
           revokedClaimIdList,
+        );
+        await pruneSliceReceiptsAfterPlanMutation(
+          effectiveVaultPath,
+          plan_id,
+          plan,
+          updated,
         );
         // Legacy appendJournal line unchanged.
         await appendJournal(journalPath, {
@@ -1805,6 +1821,7 @@ server.registerTool(
           readyAfter: readyIds(updated, now),
           plan: updated,
           now,
+          orderedSnapshot: ordered,
           supplementalEvents:
             replanSupplemental.length > 0 ? replanSupplemental : undefined,
         });
@@ -1944,7 +1961,7 @@ server.registerTool(
         // still fully inside this same withThreadLock — reconcile/ensure
         // the ordered baseline here before persisting the restored state,
         // exactly like every other locked mutation.
-        const { journalPath } = await prepareThreadMutation(
+        const { journalPath, ordered } = await prepareThreadMutation(
           { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
           current,
           now,
@@ -1963,6 +1980,12 @@ server.registerTool(
           effectiveVaultPath,
           plan_id,
           restoreRevoked,
+        );
+        await pruneSliceReceiptsAfterPlanMutation(
+          effectiveVaultPath,
+          plan_id,
+          current,
+          restored,
         );
         // Legacy appendJournal line unchanged.
         await appendJournal(journalPath, {
@@ -1998,6 +2021,7 @@ server.registerTool(
           readyAfter: readyIds(restored, now),
           plan: restored,
           now,
+          orderedSnapshot: ordered,
           supplementalEvents:
             restoreSupplemental.length > 0 ? restoreSupplemental : undefined,
         });
