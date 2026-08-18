@@ -17,6 +17,8 @@ import {
 import {
   appendOrderedEventBatch,
   appendOrderedThreadEvent,
+  deriveClientEventKey,
+  deriveSystemEventKey,
   readThreadEvents,
   reconcileThreadJournal,
 } from "../dist/thread-events.js";
@@ -351,4 +353,69 @@ test("state.recovered carries the safe ready-set summary", async (t) => {
   assert.deepEqual(recovered?.payload, {
     ready: { slices: [{ id: "a", title: "Slice A" }] },
   });
+});
+
+test("reconcile recovers by kind and rev when a conflicting recovery-shaped key exists", async (t) => {
+  const fixture = await createThread(t);
+  const plan = await seedNoteAtRev(fixture, 5);
+  await seedOrderedEvents(fixture.journalPath, [
+    {
+      seq: 1,
+      rev: 4,
+      event_id: "evt-seed",
+      idempotency_key: "state.recovered:5",
+      actor: "attacker",
+      kind: "slice.claimed",
+      at: THREAD_START.toISOString(),
+    },
+  ]);
+
+  const input = reconcileInput(fixture, plan);
+  await withThreadLock(fixture.vaultPath, fixture.planId, "reconcile-conflict", async () => {
+    assert.equal(await reconcileThreadJournal(input), "recovered");
+  });
+
+  const { events } = await readThreadEvents(fixture.journalPath, 0, 100);
+  const recovered = events.filter(
+    (event) => event.kind === "state.recovered" && event.rev === 5,
+  );
+  assert.equal(recovered.length, 1);
+  assert.notEqual(recovered[0].idempotency_key, "state.recovered:5");
+  assert.match(recovered[0].idempotency_key, /^system:state\.recovered:5/);
+  const planted = events.find((event) => event.idempotency_key === "state.recovered:5");
+  assert.equal(planted?.kind, "slice.claimed");
+});
+
+test("client claim idempotency keys are namespaced and cannot squat system recovery keys", async (t) => {
+  const fixture = await createThread(t);
+  const clientKey = "state.recovered:5";
+  await withThreadLock(fixture.vaultPath, fixture.planId, "client-key-claim", async () => {
+    await appendOrderedThreadEvent({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      idempotencyKey: deriveClientEventKey("claim", {
+        plan_id: fixture.planId,
+        slice_id: "a",
+        worker_agent_id: "worker-a",
+        idempotency_key: clientKey,
+      }),
+      actor: "worker-a",
+      kind: "slice.claimed",
+      sliceId: "a",
+      at: THREAD_START.toISOString(),
+    });
+  });
+  const { events } = await readThreadEvents(fixture.journalPath, 0, 100);
+  assert.equal(
+    events.some((event) => event.idempotency_key === clientKey),
+    false,
+  );
+  assert.ok(
+    events.some(
+      (event) =>
+        event.kind === "slice.claimed" &&
+        event.idempotency_key.startsWith("client:claim:"),
+    ),
+  );
 });

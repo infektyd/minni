@@ -98,11 +98,12 @@ import {
   readySlices,
   recordThreadMutationEvents,
   revokedClaimIds,
+  synchronizeExpiredClaimsAndReadReady,
   updateClaimedSlice,
   withThreadPlanLock,
   type WorkerUpdateAction,
 } from "./thread-worker.js";
-import { readThreadEvents } from "./thread-events.js";
+import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
 import { withThreadLock } from "./thread-lock.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
@@ -1428,12 +1429,6 @@ server.registerTool(
           ? unmetDependencies(plan, slice_id)
           : [];
         const readyBefore = readyIds(plan, now);
-        // Final-fix finding 2: reconcile/ensure the ordered baseline BEFORE
-        // this structural mutation persists — same "before persistence" half
-        // of the Task 5 event lifecycle every worker mutation already uses,
-        // via the shared thread-worker.ts helper (no duplicate scheduling
-        // logic, no nested Thread lock — this call happens INSIDE the plan
-        // lock already held above).
         const { journalPath } = await prepareThreadMutation(
           { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
           plan,
@@ -1494,19 +1489,45 @@ server.registerTool(
         // status enum values — never the freeform evidence string). Stable
         // derived idempotency key (plan/slice/resulting rev) rather than a
         // client-supplied one — this tool has no idempotency_key input.
+        const supplemental: Array<{
+          idempotencyKey: string;
+          kind: string;
+          sliceId?: string;
+          payload?: Record<string, unknown>;
+        }> = [];
+        if (applied.revoked_claim_id) {
+          supplemental.push({
+            idempotencyKey: deriveSystemEventKey(
+              "slice.claim_revoked",
+              plan_id,
+              slice_id,
+              String(updated.rev),
+            ),
+            kind: "slice.claim_revoked",
+            sliceId: slice_id,
+            payload: { slice_id },
+          });
+        }
         await recordThreadMutationEvents({
           journalPath,
           planId: plan_id,
           rev: updated.rev,
           actor: DEFAULT_AGENT_ID,
-          operationKey: `status_changed:${plan_id}:${slice_id}:${updated.rev}`,
+          operationKey: deriveSystemEventKey(
+            "status_changed",
+            plan_id,
+            slice_id,
+            String(updated.rev),
+          ),
           kind: "status_changed",
           sliceId: slice_id,
           payload: { from, to: status },
           readyBefore,
           readyAfter: readyIds(updated, now),
           plan: updated,
+          planBefore: plan,
           now,
+          supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
         });
         // P10/H6: terminal plans stop being injected.
         if (updated.status === "complete" || updated.status === "accepted") {
@@ -1591,7 +1612,7 @@ server.registerTool(
           planId: plan_id,
           rev: updated.rev,
           actor: DEFAULT_AGENT_ID,
-          operationKey: `scar_added:${plan_id}:${updated.rev}`,
+          operationKey: deriveSystemEventKey("scar_added", plan_id, String(updated.rev)),
           kind: "scar_added",
           payload: { kind },
           readyBefore,
@@ -1732,10 +1753,11 @@ server.registerTool(
           vaultPath: effectiveVaultPath,
           notePath,
         });
+        const revokedClaimIdList = revokedClaimIds(plan, updated);
         await deleteClaimSecretsBestEffort(
           effectiveVaultPath,
           plan_id,
-          revokedClaimIds(plan, updated),
+          revokedClaimIdList,
         );
         // Legacy appendJournal line unchanged.
         await appendJournal(journalPath, {
@@ -1754,18 +1776,37 @@ server.registerTool(
         const replanPayload: Record<string, unknown> = {};
         if (dependsOnChanged.length > 0) replanPayload.depends_on_changed = dependsOnChanged;
         if (dependsOnSuperseded.length > 0) replanPayload.depends_on_superseded = dependsOnSuperseded;
+        const replanSupplemental = plan.slices
+          .filter(
+            (slice) =>
+              slice.claim &&
+              revokedClaimIdList.includes(slice.claim.claim_id),
+          )
+          .map((slice) => ({
+            idempotencyKey: deriveSystemEventKey(
+              "slice.claim_revoked",
+              plan_id,
+              slice.id,
+              String(updated.rev),
+            ),
+            kind: "slice.claim_revoked",
+            sliceId: slice.id,
+            payload: { slice_id: slice.id },
+          }));
         await recordThreadMutationEvents({
           journalPath,
           planId: plan_id,
           rev: updated.rev,
           actor: DEFAULT_AGENT_ID,
-          operationKey: `replan:${plan_id}:${updated.rev}`,
+          operationKey: deriveSystemEventKey("replan", plan_id, String(updated.rev)),
           kind: "replan",
           payload: Object.keys(replanPayload).length > 0 ? replanPayload : undefined,
           readyBefore,
           readyAfter: readyIds(updated, now),
           plan: updated,
           now,
+          supplementalEvents:
+            replanSupplemental.length > 0 ? replanSupplemental : undefined,
         });
         return updated;
       },
@@ -1917,10 +1958,11 @@ server.registerTool(
           vaultPath: effectiveVaultPath,
           notePath,
         });
+        const restoreRevoked = [...claimIds(current), ...claimIds(snapshot)];
         await deleteClaimSecretsBestEffort(
           effectiveVaultPath,
           plan_id,
-          [...claimIds(current), ...claimIds(snapshot)],
+          restoreRevoked,
         );
         // Legacy appendJournal line unchanged.
         await appendJournal(journalPath, {
@@ -1931,18 +1973,33 @@ server.registerTool(
         // Ordered mirror: only the numeric from_rev (never scar/evidence
         // text or claim identity). Coalesces ready.changed when the
         // restored slice statuses/dependencies change what's ready.
+        const restoreSupplemental = current.slices
+          .filter((slice) => slice.claim)
+          .map((slice) => ({
+            idempotencyKey: deriveSystemEventKey(
+              "slice.claim_revoked",
+              plan_id,
+              slice.id,
+              String(restored.rev),
+            ),
+            kind: "slice.claim_revoked",
+            sliceId: slice.id,
+            payload: { slice_id: slice.id },
+          }));
         await recordThreadMutationEvents({
           journalPath,
           planId: plan_id,
           rev: restored.rev,
           actor: DEFAULT_AGENT_ID,
-          operationKey: `restored:${plan_id}:${restored.rev}`,
+          operationKey: deriveSystemEventKey("restored", plan_id, String(restored.rev)),
           kind: "restored",
           payload: { from_rev: rev },
           readyBefore,
           readyAfter: readyIds(restored, now),
           plan: restored,
           now,
+          supplementalEvents:
+            restoreSupplemental.length > 0 ? restoreSupplemental : undefined,
         });
         return restored;
       },
@@ -2029,18 +2086,15 @@ server.registerTool(
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
     try {
-      const plan = await withThreadPlanLock(
-        {
-          vaultPath: DEFAULT_VAULT_PATH,
-          notePath,
-          planId: plan_id,
-          operationId: `server-ready:${randomUUID()}`,
-        },
-        async (lockedPlan) => lockedPlan,
-      );
+      const { plan, ready } = await synchronizeExpiredClaimsAndReadReady({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        actor: DEFAULT_AGENT_ID,
+      });
       return textResult(
         JSON.stringify(
-          { plan_id, rev: plan.rev, ready: readySlices(plan, new Date()) },
+          { plan_id, rev: plan.rev, ready },
           null,
           2,
         ),

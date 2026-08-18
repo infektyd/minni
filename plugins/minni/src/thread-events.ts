@@ -83,6 +83,81 @@ export class ThreadEventIdempotencyConflictError extends Error {
   }
 }
 
+/** Namespaced journal key for client-supplied idempotency (claim/worker). */
+export function deriveClientEventKey(
+  scope: string,
+  identity: Record<string, unknown>,
+): string {
+  const hash = createHash("sha256")
+    .update(stableStringify(identity))
+    .digest("hex")
+    .slice(0, 32);
+  return `client:${scope}:${hash}`;
+}
+
+/** Namespaced journal key for structural/system events (never raw client keys). */
+export function deriveSystemEventKey(kind: string, ...parts: string[]): string {
+  return `system:${kind}:${parts.join(":")}`;
+}
+
+export function deriveReadyChangedKey(operationKey: string): string {
+  return `${operationKey}:ready`;
+}
+
+export function findRecoveryEvent(
+  ordered: OrderedThreadEvent[],
+  noteRev: number,
+): OrderedThreadEvent | undefined {
+  return ordered.find(
+    (event) => event.kind === "state.recovered" && event.rev === noteRev,
+  );
+}
+
+function recoveryKeyCollisionSuffix(
+  primaryKey: string,
+  conflicting: OrderedThreadEvent,
+): string {
+  return createHash("sha256")
+    .update(
+      stableStringify({
+        key: primaryKey,
+        event_id: conflicting.event_id,
+        kind: conflicting.kind,
+        rev: conflicting.rev,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/** Pick a system recovery key, avoiding a historical client-key collision. */
+export function deriveRecoveryEventKey(
+  ordered: OrderedThreadEvent[],
+  rev: number,
+): string {
+  const primary = deriveSystemEventKey("state.recovered", String(rev));
+  const existing = findOrderedEventByIdempotencyKey(ordered, primary);
+  if (!existing) return primary;
+  if (existing.kind === "state.recovered" && existing.rev === rev) {
+    return primary;
+  }
+  const suffix = recoveryKeyCollisionSuffix(primary, existing);
+  const alternate = deriveSystemEventKey("state.recovered", String(rev), suffix);
+  const alternateExisting = findOrderedEventByIdempotencyKey(ordered, alternate);
+  if (
+    !alternateExisting ||
+    (alternateExisting.kind === "state.recovered" &&
+      alternateExisting.rev === rev)
+  ) {
+    return alternate;
+  }
+  return deriveSystemEventKey(
+    "state.recovered",
+    String(rev),
+    recoveryKeyCollisionSuffix(alternate, alternateExisting),
+  );
+}
+
 interface ThreadEventBatchLine {
   thread_event_batch: OrderedThreadEvent[];
 }
@@ -392,7 +467,7 @@ export async function ensureOrderedBaseline(
       at: input.at,
       events: [
         {
-          idempotencyKey: `state.baseline:${input.rev}`,
+          idempotencyKey: deriveSystemEventKey("state.baseline", String(input.rev)),
           kind: "state.baseline",
           payload: { ready: input.readySummary },
         },
@@ -424,12 +499,11 @@ export async function reconcileThreadJournal(
     return "ok";
   }
 
-  const recoveryKey = `state.recovered:${input.rev}`;
-  const existingRecovery = findOrderedEventByIdempotencyKey(ordered, recoveryKey);
-  if (existingRecovery) {
+  if (findRecoveryEvent(ordered, input.rev)) {
     return "recovered";
   }
 
+  const recoveryKey = deriveRecoveryEventKey(ordered, input.rev);
   await appendOrderedEventBatch(
     {
       journalPath: input.journalPath,

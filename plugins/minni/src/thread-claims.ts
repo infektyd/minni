@@ -60,6 +60,8 @@ const RECEIPT_ID_PATTERN = /^[0-9a-f]{32}$/;
 const TOKEN_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_RECEIPT_BYTES = 64 * 1024;
 const RECEIPT_ENVELOPE_KEYS = [
+  "claim_id",
+  "generation",
   "idempotency_key",
   "kind",
   "plan_id",
@@ -160,6 +162,8 @@ export interface WorkerUpdateReceiptEnvelope {
   plan_id: string;
   slice_id: string;
   worker_agent_id: string;
+  claim_id: string;
+  generation: number;
   idempotency_key: string;
   kind: string;
   token_digest: string;
@@ -173,6 +177,8 @@ export interface WorkerUpdateReceiptIdentity {
   planId: string;
   sliceId: string;
   workerAgentId: string;
+  claimId: string;
+  generation: number;
   idempotencyKey: string;
 }
 
@@ -268,14 +274,17 @@ function claimIdFor(
     .slice(0, 32);
 }
 
-// Deliberately omits generation: a claim-clearing action invalidates the
-// slice's generation for future claims, but a retry of THAT SAME action
-// must still resolve to the SAME receipt regardless. plan/slice/worker/
-// idempotency_key alone is exactly what the request itself declares.
+// Deliberately binds to claim generation and claim_id: a claim-clearing action
+// invalidates the slice's generation for future claims, and a retry of THAT
+// SAME action must still resolve to the SAME receipt for the SAME claim
+// generation. plan/slice/worker/claim/generation/idempotency_key is exactly
+// what the request itself declares.
 function receiptIdFor(
   planId: string,
   sliceId: string,
   workerAgentId: string,
+  claimId: string,
+  generation: number,
   idempotencyKey: string,
 ): string {
   return createHash("sha256")
@@ -283,6 +292,8 @@ function receiptIdFor(
       plan_id: planId,
       slice_id: sliceId,
       worker_agent_id: workerAgentId,
+      claim_id: claimId,
+      generation,
       idempotency_key: idempotencyKey,
     }))
     .digest("hex")
@@ -911,6 +922,10 @@ function parseReceiptEnvelope(
     value.slice_id.trim().length === 0 ||
     typeof value.worker_agent_id !== "string" ||
     value.worker_agent_id.trim().length === 0 ||
+    typeof value.claim_id !== "string" ||
+    !CLAIM_ID_PATTERN.test(value.claim_id) ||
+    !Number.isSafeInteger(value.generation) ||
+    (value.generation as number) < 0 ||
     typeof value.idempotency_key !== "string" ||
     value.idempotency_key.trim().length === 0 ||
     typeof value.kind !== "string" ||
@@ -934,6 +949,8 @@ function parseReceiptEnvelope(
     envelope.plan_id,
     envelope.slice_id,
     envelope.worker_agent_id,
+    envelope.claim_id,
+    envelope.generation,
     envelope.idempotency_key,
   );
   if (
@@ -941,6 +958,8 @@ function parseReceiptEnvelope(
     envelope.plan_id !== expected.planId ||
     envelope.slice_id !== expected.sliceId ||
     envelope.worker_agent_id !== expected.workerAgentId ||
+    envelope.claim_id !== expected.claimId ||
+    envelope.generation !== expected.generation ||
     envelope.idempotency_key !== expected.idempotencyKey ||
     envelope.response.rev !== envelope.rev
   ) {
@@ -949,12 +968,10 @@ function parseReceiptEnvelope(
   return envelope;
 }
 
-async function readReceiptEnvelope(
-  location: ReceiptLocation | undefined,
-  expected: WorkerUpdateReceiptIdentity & { receiptId: string },
+async function readReceiptEnvelopeRaw(
+  location: ReceiptLocation,
+  receiptId: string,
 ): Promise<WorkerUpdateReceiptEnvelope | undefined> {
-  if (!location) return undefined;
-
   let handle;
   try {
     handle = await open(
@@ -983,18 +1000,48 @@ async function readReceiptEnvelope(
       throw metadataMismatch();
     }
     const raw = await handle.readFile("utf8");
-    const afterReadStat = await handle.stat();
-    if (
-      !afterReadStat.isFile() ||
-      afterReadStat.nlink !== 1 ||
-      (afterReadStat.mode & 0o777) !== 0o600
-    ) {
-      throw new Error("worker update receipt permissions mismatch");
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw metadataMismatch();
     }
-    return parseReceiptEnvelope(raw, expected);
+    if (!isRecord(value) || !isRecord(value.response)) {
+      throw metadataMismatch();
+    }
+    const envelope = value as unknown as WorkerUpdateReceiptEnvelope;
+    const derivedReceiptId = receiptIdFor(
+      envelope.plan_id,
+      envelope.slice_id,
+      envelope.worker_agent_id,
+      envelope.claim_id,
+      envelope.generation,
+      envelope.idempotency_key,
+    );
+    if (derivedReceiptId !== receiptId) {
+      throw metadataMismatch();
+    }
+    return parseReceiptEnvelope(raw, {
+      vaultPath: location.vaultPath,
+      planId: envelope.plan_id,
+      sliceId: envelope.slice_id,
+      workerAgentId: envelope.worker_agent_id,
+      idempotencyKey: envelope.idempotency_key,
+      claimId: envelope.claim_id,
+      generation: envelope.generation,
+      receiptId,
+    });
   } finally {
     await handle.close();
   }
+}
+
+async function readReceiptEnvelope(
+  location: ReceiptLocation | undefined,
+  expected: WorkerUpdateReceiptIdentity & { receiptId: string },
+): Promise<WorkerUpdateReceiptEnvelope | undefined> {
+  if (!location) return undefined;
+  return readReceiptEnvelopeRaw(location, expected.receiptId);
 }
 
 /**
@@ -1075,27 +1122,106 @@ async function withReceiptLock<T>(
   );
 }
 
+export interface WorkerUpdateReceiptLookupInput {
+  vaultPath: string;
+  planId: string;
+  sliceId: string;
+  workerAgentId: string;
+  idempotencyKey: string;
+  claimId?: string;
+  generation?: number;
+}
+
+async function scanWorkerUpdateReceipts(
+  input: WorkerUpdateReceiptLookupInput,
+): Promise<WorkerUpdateReceiptEnvelope | undefined> {
+  const planHash = hashSegment(input.planId);
+  const updatesPath = path.join(
+    path.resolve(input.vaultPath),
+    ".runtime",
+    "thread-claims",
+    planHash,
+    "updates",
+  );
+  let entries: string[];
+  try {
+    const { readdir } = await import("node:fs/promises");
+    entries = await readdir(updatesPath);
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith(".json") || entry.startsWith(".")) continue;
+    const receiptId = entry.slice(0, -".json".length);
+    if (!RECEIPT_ID_PATTERN.test(receiptId)) continue;
+    const envelope = await withReceiptLocation(
+      input.vaultPath,
+      input.planId,
+      receiptId,
+      false,
+      async (location) => {
+        if (!location) return undefined;
+        return readReceiptEnvelopeRaw(location, receiptId);
+      },
+    );
+    if (
+      envelope &&
+      envelope.plan_id === input.planId &&
+      envelope.slice_id === input.sliceId &&
+      envelope.worker_agent_id === input.workerAgentId &&
+      envelope.idempotency_key === input.idempotencyKey
+    ) {
+      return envelope;
+    }
+  }
+  return undefined;
+}
+
 export async function readWorkerUpdateReceipt(
-  input: WorkerUpdateReceiptIdentity,
+  input: WorkerUpdateReceiptLookupInput,
 ): Promise<WorkerUpdateReceiptEnvelope | undefined> {
   requireNonEmpty(input.vaultPath, "vault path");
   requireNonEmpty(input.planId, "plan id");
   requireNonEmpty(input.sliceId, "slice id");
   requireNonEmpty(input.workerAgentId, "worker agent id");
   requireNonEmpty(input.idempotencyKey, "idempotency key");
-  const receiptId = receiptIdFor(
-    input.planId,
-    input.sliceId,
-    input.workerAgentId,
-    input.idempotencyKey,
-  );
-  return withReceiptLocation(
-    input.vaultPath,
-    input.planId,
-    receiptId,
-    false,
-    (location) => readReceiptEnvelope(location, { ...input, receiptId }),
-  );
+  if (
+    input.claimId !== undefined &&
+    input.generation !== undefined
+  ) {
+    requireNonEmpty(input.claimId, "claim id");
+    if (!CLAIM_ID_PATTERN.test(input.claimId)) {
+      throw pathMismatch();
+    }
+    requireNonNegativeInteger(input.generation, "generation");
+    const receiptId = receiptIdFor(
+      input.planId,
+      input.sliceId,
+      input.workerAgentId,
+      input.claimId,
+      input.generation,
+      input.idempotencyKey,
+    );
+    const direct = await withReceiptLocation(
+      input.vaultPath,
+      input.planId,
+      receiptId,
+      false,
+      (location) =>
+        readReceiptEnvelope(location, {
+          vaultPath: input.vaultPath,
+          planId: input.planId,
+          sliceId: input.sliceId,
+          workerAgentId: input.workerAgentId,
+          idempotencyKey: input.idempotencyKey,
+          claimId: input.claimId!,
+          generation: input.generation!,
+          receiptId,
+        }),
+    );
+    if (direct) return direct;
+  }
+  return scanWorkerUpdateReceipts(input);
 }
 
 function validateReceiptWriteInput(
@@ -1106,6 +1232,11 @@ function validateReceiptWriteInput(
   requireNonEmpty(input.sliceId, "slice id");
   requireNonEmpty(input.workerAgentId, "worker agent id");
   requireNonEmpty(input.idempotencyKey, "idempotency key");
+  requireNonEmpty(input.claimId, "claim id");
+  if (!CLAIM_ID_PATTERN.test(input.claimId)) {
+    throw pathMismatch();
+  }
+  requireNonNegativeInteger(input.generation, "generation");
   requireNonEmpty(input.kind, "operation kind");
   if (!TOKEN_DIGEST_PATTERN.test(input.tokenDigest)) {
     throw new Error("worker update receipt requires a valid token digest");
@@ -1118,6 +1249,8 @@ function validateReceiptWriteInput(
     input.planId,
     input.sliceId,
     input.workerAgentId,
+    input.claimId,
+    input.generation,
     input.idempotencyKey,
   );
 }
@@ -1133,6 +1266,8 @@ async function writeWorkerUpdateReceipt(
       plan_id: input.planId,
       slice_id: input.sliceId,
       worker_agent_id: input.workerAgentId,
+      claim_id: input.claimId,
+      generation: input.generation,
       idempotency_key: input.idempotencyKey,
       kind: input.kind,
       token_digest: input.tokenDigest,

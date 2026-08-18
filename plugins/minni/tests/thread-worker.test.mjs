@@ -34,7 +34,12 @@ import {
   replan,
   restorePlan,
 } from "../dist/plan.js";
-import { readThreadEvents } from "../dist/thread-events.js";
+import {
+  deriveClientEventKey,
+  deriveReadyChangedKey,
+  deriveSystemEventKey,
+  readThreadEvents,
+} from "../dist/thread-events.js";
 import {
   createClaimSecret,
   deleteClaimSecret,
@@ -54,6 +59,24 @@ const BEFORE_EXPIRY = new Date("2026-08-18T14:59:00.000Z");
 const AT_EXPIRY = new Date("2026-08-18T15:00:00.000Z");
 const execFileAsync = promisify(execFile);
 const THREAD_START = new Date("2026-08-18T12:00:00.000Z");
+
+function clientClaimKey(planId, sliceId, workerAgentId, idempotencyKey) {
+  return deriveClientEventKey("claim", {
+    plan_id: planId,
+    slice_id: sliceId,
+    worker_agent_id: workerAgentId,
+    idempotency_key: idempotencyKey,
+  });
+}
+
+function clientWorkerKey(planId, sliceId, workerAgentId, idempotencyKey) {
+  return deriveClientEventKey("worker", {
+    plan_id: planId,
+    slice_id: sliceId,
+    worker_agent_id: workerAgentId,
+    idempotency_key: idempotencyKey,
+  });
+}
 const THREAD_WORKER_MODULE_URL = new URL(
   "../dist/thread-worker.js",
   import.meta.url,
@@ -2268,18 +2291,25 @@ test("worker mutations append ordered operation and ready.changed events", async
   assert.ok(kinds.includes("slice.completed"));
   assert.ok(kinds.includes("ready.changed"));
 
+  const completeKey = clientWorkerKey(
+    fixture.planId,
+    "a",
+    "worker-a",
+    "complete-a",
+  );
   const readyEvent = events.find(
-    (event) => event.idempotency_key === "complete-a:ready",
+    (event) => event.idempotency_key === deriveReadyChangedKey(completeKey),
   );
   assert.ok(readyEvent);
   assert.deepEqual(readyEvent.payload, {
     slices: [{ id: "b", title: "Slice B" }],
   });
+  const claimKey = clientClaimKey(fixture.planId, "a", "worker-a", "claim-a");
   assert.ok(
     events.some(
       (event) =>
         event.kind === "ready.changed" &&
-        event.idempotency_key === "claim-a:ready",
+        event.idempotency_key === deriveReadyChangedKey(claimKey),
     ),
   );
 });
@@ -2317,7 +2347,13 @@ test("operation and ready.changed idempotency keys replay exact events", async (
   });
   const after = await readThreadEvents(journalPath, 0, 100);
   assert.deepEqual(after.events, before.events);
-  assert.ok(after.events.some((event) => event.idempotency_key === "start-exact"));
+  assert.ok(
+    after.events.some(
+      (event) =>
+        event.idempotency_key ===
+        clientWorkerKey(fixture.planId, "a", "worker-a", "start-exact"),
+    ),
+  );
 });
 
 test("failed event append is recovered on the next locked mutation", async (t) => {
@@ -2352,7 +2388,13 @@ test("claim emits ready.changed when the claimed slice leaves ready", async (t) 
   const journalPath = journalPathFor(fixture.notePath, fixture.planId);
   const beforeClaim = await readThreadEvents(journalPath, 0, 100);
   assert.equal(
-    beforeClaim.events.some((event) => event.idempotency_key === "claim-ready:ready"),
+    beforeClaim.events.some(
+      (event) =>
+        event.idempotency_key ===
+        deriveReadyChangedKey(
+          clientClaimKey(fixture.planId, "a", "worker-a", "claim-ready"),
+        ),
+    ),
     false,
   );
 
@@ -2365,8 +2407,14 @@ test("claim emits ready.changed when the claimed slice leaves ready", async (t) 
   });
 
   const { events } = await readThreadEvents(journalPath, 0, 100);
+  const claimReadyKey = clientClaimKey(
+    fixture.planId,
+    "a",
+    "worker-a",
+    "claim-ready",
+  );
   const readyEvent = events.find(
-    (event) => event.idempotency_key === "claim-ready:ready",
+    (event) => event.idempotency_key === deriveReadyChangedKey(claimReadyKey),
   );
   assert.ok(readyEvent);
   assert.deepEqual(readyEvent.payload, { slices: [] });
@@ -2409,7 +2457,11 @@ test("duplicate worker start does not rev-bump or emit false recovery", async (t
   const { events } = await readThreadEvents(journalPath, 0, 100);
   assert.equal(events.filter((event) => event.kind === "state.recovered").length, 0);
   assert.equal(
-    events.filter((event) => event.idempotency_key === "dup-start").length,
+    events.filter(
+      (event) =>
+        event.idempotency_key ===
+        clientWorkerKey(fixture.planId, "a", "worker-a", "dup-start"),
+    ).length,
     1,
   );
 });
@@ -2442,9 +2494,17 @@ test("claim idempotent retry repairs missing slice.claimed and ready delta", asy
   assert.equal(replay.token, claim.token);
 
   const { events } = await readThreadEvents(journalPath, 0, 100);
-  assert.ok(events.some((event) => event.idempotency_key === "repair-claim"));
+  const repairKey = clientClaimKey(
+    fixture.planId,
+    "a",
+    "worker-a",
+    "repair-claim",
+  );
+  assert.ok(events.some((event) => event.idempotency_key === repairKey));
   assert.ok(
-    events.some((event) => event.idempotency_key === "repair-claim:ready"),
+    events.some(
+      (event) => event.idempotency_key === deriveReadyChangedKey(repairKey),
+    ),
   );
 });
 
@@ -2565,4 +2625,364 @@ test("first ordered mutation writes baseline before operation batch", async (t) 
   const assignedIndex = events.findIndex((event) => event.kind === "slice.assigned");
   assert.ok(baselineIndex >= 0);
   assert.ok(assignedIndex > baselineIndex);
+});
+
+test("final-fix-2: client claim key cannot squat system status_changed namespace", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const attackKey = `status_changed:${fixture.planId}:a:99`;
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: attackKey,
+    now: new Date(THREAD_START),
+  });
+  assert.ok(claim.token);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    events.some((event) => event.idempotency_key === attackKey),
+    false,
+  );
+  assert.ok(
+    events.some(
+      (event) =>
+        event.kind === "slice.claimed" &&
+        event.idempotency_key ===
+          clientClaimKey(fixture.planId, "a", "worker-a", attackKey),
+    ),
+  );
+});
+
+test("final-fix-2: wrong-token receipt retry does not append state.recovered", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-wrong-token",
+    now: new Date(THREAD_START),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "complete-wrong-token",
+    action: {
+      action: "complete",
+      evidence: "Verified in final-fix wrong-token reproduction output",
+    },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  const bumped = await rehydratePlan(fixture.notePath);
+  bumped.next_action = "note-ahead for wrong-token receipt test";
+  await persistPlan(bumped, {
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+  });
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const before = await readThreadEvents(journalPath, 0, 100);
+  const recoveredBefore = before.events.filter(
+    (event) => event.kind === "state.recovered",
+  ).length;
+
+  await assert.rejects(
+    workerUpdate({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: "wrong-token-value-not-the-claim-secret",
+      idempotencyKey: "complete-wrong-token",
+      action: {
+        action: "complete",
+        evidence: "Should never land",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /claim token mismatch/,
+  );
+
+  const after = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    after.events.filter((event) => event.kind === "state.recovered").length,
+    recoveredBefore,
+  );
+});
+
+test("final-fix-2: generation-bound receipts replay same-generation complete", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "gen-receipt-claim",
+    now: new Date(THREAD_START),
+  });
+  const done = await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "gen-receipt-complete",
+    action: {
+      action: "complete",
+      evidence: "Generation-bound receipt complete reproduction output",
+    },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  const replay = await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "gen-receipt-complete",
+    action: {
+      action: "complete",
+      evidence: "Generation-bound receipt complete reproduction output",
+    },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  assert.equal(replay.slice.status, "done");
+  assert.equal(replay.plan.rev, done.plan.rev);
+});
+
+test("final-fix-2: reassignment blocks generation-bound receipt replay", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "gen-receipt-claim-2",
+    now: new Date(THREAD_START),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "gen-receipt-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  await assignWorker(fixture, "a", "worker-b");
+  await assert.rejects(
+    workerUpdate({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      idempotencyKey: "gen-receipt-start",
+      action: { action: "start" },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /claim scope mismatch/,
+  );
+});
+
+test("final-fix-2: replan invalidates generation-bound worker receipt replay", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A", gate: "old gate" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "receipt-replan-claim",
+    now: new Date(THREAD_START),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "receipt-replan-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  const current = await rehydratePlan(fixture.notePath);
+  const replanned = replan(current, [
+    { id: "a", title: "Slice A revised", gate: "new gate" },
+  ]);
+  await persistPlan(replanned, {
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+  });
+  await assert.rejects(
+    workerUpdate({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      idempotencyKey: "receipt-replan-start",
+      action: { action: "start" },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /claim scope mismatch/,
+  );
+});
+
+test("final-fix-2: restore invalidates generation-bound worker receipt replay", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "receipt-restore-claim",
+    now: new Date(THREAD_START),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "receipt-restore-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  const claimedSnapshot = await rehydratePlan(fixture.notePath);
+  const restored = restorePlan(claimedSnapshot, claimedSnapshot);
+  await persistPlan(restored, {
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+  });
+  await assert.rejects(
+    workerUpdate({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      idempotencyKey: "receipt-restore-start",
+      action: { action: "start" },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /claim scope mismatch/,
+  );
+});
+
+test("final-fix-2: lazy expiry on ready emits lease_expired and attention without leaking evidence", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "ready-expiry-claim",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+  const { synchronizeExpiredClaimsAndReadReady } = threadWorkerRuntime;
+  const { plan, ready } = await synchronizeExpiredClaimsAndReadReady({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  assert.ok(ready.some((slice) => slice.id === "a"));
+  assert.equal(plan.slices[0].claim, undefined);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.ok(events.some((event) => event.kind === "slice.lease_expired"));
+  assert.ok(events.some((event) => event.kind === "thread.attention_required"));
+  assert.ok(events.some((event) => event.kind === "ready.changed"));
+  for (const event of events) {
+    const payload = JSON.stringify(event.payload ?? {});
+    assert.doesNotMatch(payload, /token|evidence|\.runtime/i);
+  }
+});
+
+test("final-fix-2: block and completion lifecycle events are single-shot on retry", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "lifecycle-claim",
+    now: new Date(THREAD_START),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "lifecycle-block",
+    action: {
+      action: "block",
+      evidence: "SENTINEL_BLOCK_EVIDENCE_FINAL_FIX_2",
+    },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "lifecycle-block",
+    action: {
+      action: "block",
+      evidence: "SENTINEL_BLOCK_EVIDENCE_FINAL_FIX_2",
+    },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  let { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    events.filter((event) => event.kind === "thread.attention_required").length,
+    1,
+  );
+  assert.ok(
+    !JSON.stringify(events).includes("SENTINEL_BLOCK_EVIDENCE_FINAL_FIX_2"),
+  );
+
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "lifecycle-complete",
+    action: {
+      action: "complete",
+      evidence: "Slice A verified for thread.completed single-shot test",
+    },
+    now: new Date("2026-08-18T12:03:00.000Z"),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "lifecycle-complete",
+    action: {
+      action: "complete",
+      evidence: "Slice A verified for thread.completed single-shot test",
+    },
+    now: new Date("2026-08-18T12:04:00.000Z"),
+  });
+  ({ events } = await readThreadEvents(journalPath, 0, 100));
+  assert.equal(
+    events.filter((event) => event.kind === "thread.completed").length,
+    1,
+  );
+});
+
+test("final-fix-2: reassignment emits slice.claim_revoked in the ordered journal", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "revoke-claim",
+    now: new Date(THREAD_START),
+  });
+  await assignWorker(fixture, "a", "worker-b");
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.ok(events.some((event) => event.kind === "slice.claim_revoked"));
 });

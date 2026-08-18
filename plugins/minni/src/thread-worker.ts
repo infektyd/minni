@@ -19,6 +19,9 @@ import type { ScarTissueEntry } from "./task.js";
 import {
   appendOrderedEventBatch,
   assertOperationIdentity,
+  deriveClientEventKey,
+  deriveReadyChangedKey,
+  deriveSystemEventKey,
   ensureOrderedBaseline,
   findOrderedEventByIdempotencyKey,
   reconcileThreadJournal,
@@ -383,6 +386,56 @@ function readyIdsEqual(left: string[], right: string[]): boolean {
   return sortedLeft.every((id, index) => id === sortedRight[index]);
 }
 
+function deriveClaimEventKey(
+  planId: string,
+  sliceId: string,
+  workerAgentId: string,
+  idempotencyKey: string,
+): string {
+  return deriveClientEventKey("claim", {
+    plan_id: planId,
+    slice_id: sliceId,
+    worker_agent_id: workerAgentId,
+    idempotency_key: idempotencyKey,
+  });
+}
+
+function deriveWorkerEventKey(
+  planId: string,
+  sliceId: string,
+  workerAgentId: string,
+  idempotencyKey: string,
+): string {
+  return deriveClientEventKey("worker", {
+    plan_id: planId,
+    slice_id: sliceId,
+    worker_agent_id: workerAgentId,
+    idempotency_key: idempotencyKey,
+  });
+}
+
+function planJustCompleted(before: PlanArtifact, after: PlanArtifact): boolean {
+  return before.status !== "complete" && after.status === "complete";
+}
+
+type AttentionKind = "block" | "lease_expired";
+
+function attentionPayload(sliceId: string, attentionKind: AttentionKind): Record<string, unknown> {
+  return { slice_id: sliceId, attention_kind: attentionKind };
+}
+
+function committedReceiptAuthoritative(
+  slice: PlanSlice,
+  receipt: WorkerUpdateReceiptEnvelope,
+): boolean {
+  const generation = requireGeneration(slice);
+  if (receipt.generation !== generation) return false;
+  if (slice.claim) {
+    return slice.claim.claim_id === receipt.claim_id;
+  }
+  return structurallyEqual(slice, receipt.response.slice);
+}
+
 function readySummary(plan: PlanArtifact, now: Date): ReadySummaryPayload {
   return {
     slices: readySlices(plan, now).map((slice) => ({
@@ -469,10 +522,22 @@ export async function recordThreadMutationEvents(input: {
   readyBefore: string[];
   readyAfter: string[];
   plan: PlanArtifact;
+  planBefore?: PlanArtifact;
   now: Date;
+  supplementalEvents?: Array<{
+    idempotencyKey: string;
+    kind: string;
+    sliceId?: string;
+    payload?: Record<string, unknown>;
+  }>;
 }): Promise<void> {
   const at = input.now.toISOString();
-  const events = [
+  const events: Array<{
+    idempotencyKey: string;
+    kind: string;
+    sliceId?: string;
+    payload?: Record<string, unknown>;
+  }> = [
     {
       idempotencyKey: input.operationKey,
       kind: input.kind,
@@ -480,9 +545,22 @@ export async function recordThreadMutationEvents(input: {
       payload: input.payload,
     },
   ];
+  if (input.supplementalEvents) {
+    events.push(...input.supplementalEvents);
+  }
+  if (input.planBefore && planJustCompleted(input.planBefore, input.plan)) {
+    events.push({
+      idempotencyKey: deriveSystemEventKey(
+        "thread.completed",
+        input.planId,
+        String(input.rev),
+      ),
+      kind: "thread.completed",
+    });
+  }
   if (!readyIdsEqual(input.readyBefore, input.readyAfter)) {
     events.push({
-      idempotencyKey: `${input.operationKey}:ready`,
+      idempotencyKey: deriveReadyChangedKey(input.operationKey),
       kind: "ready.changed",
       sliceId: undefined,
       payload: {
@@ -499,7 +577,10 @@ export async function recordThreadMutationEvents(input: {
       at,
       events,
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof ThreadEventIdempotencyConflictError) {
+      throw error;
+    }
     // The note is already durable; the next locked mutation reconciles first.
   }
 }
@@ -549,7 +630,7 @@ async function repairClaimSchedulerEvents(input: {
     sliceId: input.sliceId,
   });
   if (!readyIdsEqual(input.readyBefore, input.readyAfter)) {
-    const readyKey = `${input.operationKey}:ready`;
+    const readyKey = deriveReadyChangedKey(input.operationKey);
     if (!findOrderedEventByIdempotencyKey(ordered, readyKey)) {
       await appendOrderedEventBatch({
         journalPath: input.journalPath,
@@ -567,6 +648,167 @@ async function repairClaimSchedulerEvents(input: {
       });
     }
   }
+}
+
+async function expireStaleClaimForSlice(input: {
+  vaultPath: string;
+  notePath: string;
+  planId: string;
+  sliceId: string;
+  actor: string;
+  journalPath: string;
+  plan: PlanArtifact;
+  now: Date;
+  persist: typeof persistPlan;
+  deleteSecret: typeof deleteClaimSecret;
+}): Promise<{ plan: PlanArtifact; expired: boolean; readyBefore: string[] }> {
+  const slice = findSlice(input.plan, input.sliceId);
+  if (!slice.claim || hasLiveClaim(slice, input.now)) {
+    return {
+      plan: input.plan,
+      expired: false,
+      readyBefore: readyIds(input.plan, input.now),
+    };
+  }
+  const readyBefore = readyIds(input.plan, input.now);
+  const revokedClaimId = slice.claim.claim_id;
+  const generation = requireGeneration(slice) + 1;
+  const nextSlice: PlanSlice = {
+    ...slice,
+    generation,
+    claim: undefined,
+  };
+  const next = replaceSlice(input.plan, input.sliceId, nextSlice);
+  await input.persist(next, {
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
+  });
+  await deleteClaimSecretsBestEffort(
+    input.vaultPath,
+    input.planId,
+    [revokedClaimId],
+    input.deleteSecret,
+  );
+  const readyAfter = readyIds(next, input.now);
+  const operationKey = deriveSystemEventKey(
+    "slice.lease_expired",
+    input.planId,
+    input.sliceId,
+    String(next.rev),
+  );
+  await recordThreadMutationEvents({
+    journalPath: input.journalPath,
+    planId: input.planId,
+    rev: next.rev,
+    actor: input.actor,
+    operationKey,
+    kind: "slice.lease_expired",
+    sliceId: input.sliceId,
+    readyBefore,
+    readyAfter,
+    plan: next,
+    now: input.now,
+    supplementalEvents: [
+      {
+        idempotencyKey: deriveSystemEventKey(
+          "thread.attention_required",
+          input.planId,
+          input.sliceId,
+          "lease_expired",
+          String(next.rev),
+        ),
+        kind: "thread.attention_required",
+        sliceId: input.sliceId,
+        payload: attentionPayload(input.sliceId, "lease_expired"),
+      },
+    ],
+  });
+  return { plan: next, expired: true, readyBefore };
+}
+
+async function synchronizeExpiredClaimsForPlan(input: {
+  vaultPath: string;
+  notePath: string;
+  planId: string;
+  actor: string;
+  journalPath: string;
+  plan: PlanArtifact;
+  now: Date;
+  persist: typeof persistPlan;
+  deleteSecret: typeof deleteClaimSecret;
+}): Promise<PlanArtifact> {
+  let plan = input.plan;
+  for (const slice of plan.slices) {
+    if (!slice.claim || hasLiveClaim(slice, input.now)) continue;
+    const result = await expireStaleClaimForSlice({
+      ...input,
+      plan,
+      sliceId: slice.id,
+    });
+    plan = result.plan;
+  }
+  return plan;
+}
+
+/**
+ * Lazily expire stale claims under the Thread lock, then return the ready set.
+ * Used by minni_thread_ready and any path that must observe expiry durably.
+ */
+export async function synchronizeExpiredClaimsAndReadReady(
+  input: ThreadPlanTarget & { actor: string; now?: Date | (() => Date) },
+  deps: ThreadWorkerDeps = {},
+): Promise<{ plan: PlanArtifact; ready: PlanSlice[] }> {
+  const planId = requireNonEmpty(input.planId, "plan id");
+  const actor = requireNonEmpty(input.actor, "actor");
+  const persist = deps.persistPlan ?? persistPlan;
+  const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
+
+  return withThreadPlanLock(
+    {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId,
+      operationId: `sync-expiry:${randomUUID()}`,
+    },
+    async (initialPlan) => {
+      const now = sampleNow(input.now);
+      const { journalPath } = await prepareThreadMutation(
+        { ...input, planId, actor },
+        initialPlan,
+        now,
+      );
+      const plan = await synchronizeExpiredClaimsForPlan({
+        vaultPath: input.vaultPath,
+        notePath: input.notePath,
+        planId,
+        actor,
+        journalPath,
+        plan: initialPlan,
+        now,
+        persist,
+        deleteSecret,
+      });
+      return { plan, ready: readySlices(plan, now) };
+    },
+  );
+}
+
+function claimRevokedEvent(
+  planId: string,
+  sliceId: string,
+  rev: number,
+): { idempotencyKey: string; kind: string; sliceId: string; payload: Record<string, unknown> } {
+  return {
+    idempotencyKey: deriveSystemEventKey(
+      "slice.claim_revoked",
+      planId,
+      sliceId,
+      String(rev),
+    ),
+    kind: "slice.claim_revoked",
+    sliceId,
+    payload: { slice_id: sliceId },
+  };
 }
 
 function publicClaimResponse(
@@ -654,18 +896,36 @@ export async function assignSlice(
         );
       }
       const result = mutationResult(next, sliceId, readyBefore, now);
+      const supplemental: Array<{
+        idempotencyKey: string;
+        kind: string;
+        sliceId?: string;
+        payload?: Record<string, unknown>;
+      }> = [];
+      if (slice.claim) {
+        supplemental.push(
+          claimRevokedEvent(planId, sliceId, next.rev),
+        );
+      }
       await recordThreadMutationEvents({
         journalPath,
         planId,
         rev: next.rev,
         actor: actorAgentId,
-        operationKey: `assign:${sliceId}:${workerAgentId}:${nextSlice.generation}`,
+        operationKey: deriveSystemEventKey(
+          "slice.assigned",
+          planId,
+          sliceId,
+          workerAgentId,
+          String(nextSlice.generation),
+        ),
         kind: "slice.assigned",
         sliceId,
         readyBefore: result.ready_before,
         readyAfter: result.ready_after,
         plan: next,
         now,
+        supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
       });
       return result;
     },
@@ -726,6 +986,17 @@ export async function claimSlice(
         now,
       );
       let plan = initialPlan;
+      plan = await synchronizeExpiredClaimsForPlan({
+        vaultPath: input.vaultPath,
+        notePath: input.notePath,
+        planId,
+        actor: workerAgentId,
+        journalPath,
+        plan,
+        now,
+        persist,
+        deleteSecret,
+      });
       let slice = findSlice(plan, sliceId);
       if (!isNonTerminal(slice)) {
         throw new Error(`slice "${sliceId}" is not claimable`);
@@ -772,12 +1043,18 @@ export async function claimSlice(
           });
           const readyBefore = readyIds(unclaimedPlan, now);
           const readyAfter = readyIds(plan, now);
+          const operationKey = deriveClaimEventKey(
+            planId,
+            sliceId,
+            workerAgentId,
+            idempotencyKey,
+          );
           await repairClaimSchedulerEvents({
             journalPath,
             planId,
             rev: plan.rev,
             actor: workerAgentId,
-            operationKey: idempotencyKey,
+            operationKey,
             sliceId,
             readyBefore,
             readyAfter,
@@ -899,12 +1176,18 @@ export async function claimSlice(
       );
       const response = publicClaimResponse(stored.envelope.response);
       const readyAfter = readyIds(next, now);
+      const claimOperationKey = deriveClaimEventKey(
+        planId,
+        sliceId,
+        workerAgentId,
+        idempotencyKey,
+      );
       await recordThreadMutationEvents({
         journalPath,
         planId,
         rev: next.rev,
         actor: workerAgentId,
-        operationKey: idempotencyKey,
+        operationKey: claimOperationKey,
         kind: "slice.claimed",
         sliceId,
         readyBefore,
@@ -1174,29 +1457,17 @@ export async function updateClaimedSlice(
       planId,
       operationId: `worker-update:${randomUUID()}`,
     },
-    async (plan) => {
+    async (initialPlan) => {
       const now = sampleNow(input.now);
-
-      // Reconcile the ordered scheduler journal against this LOCKED, strict
-      // note read before ever consulting (let alone returning) a private
-      // receipt. A committed receipt only proves the canonical note write
-      // landed — it says nothing about whether recordThreadMutationEvents
-      // ever ran afterwards (a PlanHistoryAppendError thrown mid-persist, or
-      // a swallowed appendOrderedEventBatch failure, both leave the note
-      // ahead of the journal). Without this, an immediate committed-receipt
-      // return would replay the exact same public result forever while the
-      // scheduler journal stayed silently behind it. reconcileThreadJournal
-      // is exactly the existing "note ahead of journal" repair used by every
-      // other locked mutation: at most one state.recovered event, carrying
-      // only the current ready summary (never a fabricated slice.completed
-      // or ready.changed), and it throws thread_inconsistent instead if the
-      // journal is somehow AHEAD of this strict note read.
-      const { journalPath } = await prepareThreadMutation(
-        { ...input, planId, actor: workerAgentId },
-        plan,
-        now,
+      const workerOperationKey = deriveWorkerEventKey(
+        planId,
+        sliceId,
+        workerAgentId,
+        idempotencyKey,
       );
 
+      // Authenticate any existing receipt BEFORE journal reconciliation so a
+      // wrong-token retry cannot append state.recovered.
       const existingReceipt = await loadWorkerUpdateReceipt(
         input,
         planId,
@@ -1206,15 +1477,49 @@ export async function updateClaimedSlice(
         kind,
         token,
       );
-      if (existingReceipt?.status === "committed") {
-        return receiptMutationResult(plan, existingReceipt);
+      if (
+        existingReceipt?.status === "committed" &&
+        committedReceiptAuthoritative(findSlice(initialPlan, sliceId), existingReceipt)
+      ) {
+        const { journalPath } = await prepareThreadMutation(
+          { ...input, planId, actor: workerAgentId },
+          initialPlan,
+          now,
+        );
+        void journalPath;
+        return receiptMutationResult(initialPlan, existingReceipt);
       }
+      if (existingReceipt?.status === "committed") {
+        throw new Error("claim scope mismatch");
+      }
+
+      const { journalPath } = await prepareThreadMutation(
+        { ...input, planId, actor: workerAgentId },
+        initialPlan,
+        now,
+      );
+      let plan = await synchronizeExpiredClaimsForPlan({
+        vaultPath: input.vaultPath,
+        notePath: input.notePath,
+        planId,
+        actor: workerAgentId,
+        journalPath,
+        plan: initialPlan,
+        now,
+        persist,
+        deleteSecret,
+      });
+      const sliceBeforeExpiry = findSlice(initialPlan, sliceId);
+      const sliceAfterExpiry = findSlice(plan, sliceId);
+      if (
+        sliceBeforeExpiry.claim &&
+        !sliceAfterExpiry.claim &&
+        !hasLiveClaim(sliceBeforeExpiry, now)
+      ) {
+        throw new Error("claim expired");
+      }
+
       if (existingReceipt) {
-        // Pending: an earlier attempt wrote this receipt before calling
-        // persist, then crashed (or is still in flight in another process)
-        // before it could be promoted to committed. Trust it only if the
-        // Thread's own strict current state already shows the exact result
-        // it recorded — never take the receipt's word for it.
         let looksCommitted = false;
         try {
           looksCommitted =
@@ -1232,6 +1537,8 @@ export async function updateClaimedSlice(
             planId,
             sliceId,
             workerAgentId,
+            claimId: existingReceipt.claim_id,
+            generation: existingReceipt.generation,
             idempotencyKey,
             kind,
             tokenDigest: existingReceipt.token_digest,
@@ -1240,9 +1547,6 @@ export async function updateClaimedSlice(
           });
           return receiptMutationResult(plan, committed);
         }
-        // Otherwise the recorded attempt never actually landed. Fall through
-        // and reprocess from the live claim; the stale pending receipt is
-        // unconditionally overwritten by the fresh attempt below.
       }
 
       const slice = findSlice(plan, sliceId);
@@ -1275,6 +1579,7 @@ export async function updateClaimedSlice(
         throw new Error(`slice "${sliceId}" is not worker-updatable`);
       }
 
+      const planBefore = plan;
       const readyBefore = readyIds(plan, now);
       const applied = applyWorkerAction(plan, sliceId, input.action);
       let next = applied.plan;
@@ -1286,9 +1591,6 @@ export async function updateClaimedSlice(
         });
       }
 
-      // persistPlan bumps `next.rev` in place only once it is called below;
-      // predict the value it will land on so the receipt written BEFORE
-      // that call already carries the exact rev/response a replay must see.
       const intendedRev = plan.rev + 1;
       const tokenDigest = hashWorkerUpdateToken(token);
       const publicResponse: WorkerUpdateReceiptResponse = {
@@ -1303,6 +1605,8 @@ export async function updateClaimedSlice(
         planId,
         sliceId,
         workerAgentId,
+        claimId: claim.claim_id,
+        generation,
         idempotencyKey,
         kind,
         tokenDigest,
@@ -1316,12 +1620,6 @@ export async function updateClaimedSlice(
           notePath: input.notePath,
         });
       } catch (error) {
-        // Mirrors claimSlice's own committed-despite-error detection: the
-        // typed PlanHistoryAppendError proves the note itself already
-        // landed; anything else is judged by reconciling a fresh strict
-        // read while still holding the Thread lock. A pending receipt that
-        // is NOT promoted here is not lost — the next locked attempt
-        // performs the exact same reconciliation before trusting it.
         let committed = error instanceof PlanHistoryAppendError;
         if (!committed) {
           try {
@@ -1342,6 +1640,8 @@ export async function updateClaimedSlice(
             planId,
             sliceId,
             workerAgentId,
+            claimId: claim.claim_id,
+            generation,
             idempotencyKey,
             kind,
             tokenDigest,
@@ -1349,8 +1649,6 @@ export async function updateClaimedSlice(
             response: publicResponse,
           }).catch(() => {});
         }
-        // Either way this is surfaced to the caller below — a post-commit
-        // failure must never be silently swallowed into a success return.
         throw error;
       }
 
@@ -1367,6 +1665,8 @@ export async function updateClaimedSlice(
         planId,
         sliceId,
         workerAgentId,
+        claimId: claim.claim_id,
+        generation,
         idempotencyKey,
         kind,
         tokenDigest,
@@ -1374,18 +1674,40 @@ export async function updateClaimedSlice(
         response: publicResponse,
       });
       const result = mutationResult(next, sliceId, readyBefore, now);
+      const supplemental: Array<{
+        idempotencyKey: string;
+        kind: string;
+        sliceId?: string;
+        payload?: Record<string, unknown>;
+      }> = [];
+      if (input.action.action === "block") {
+        supplemental.push({
+          idempotencyKey: deriveSystemEventKey(
+            "thread.attention_required",
+            planId,
+            sliceId,
+            "block",
+            String(next.rev),
+          ),
+          kind: "thread.attention_required",
+          sliceId,
+          payload: attentionPayload(sliceId, "block"),
+        });
+      }
       await recordThreadMutationEvents({
         journalPath,
         planId,
         rev: next.rev,
         actor: workerAgentId,
-        operationKey: idempotencyKey,
+        operationKey: workerOperationKey,
         kind,
         sliceId,
         readyBefore: result.ready_before,
         readyAfter: result.ready_after,
         plan: next,
+        planBefore,
         now,
+        supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
       });
       return result;
     },
