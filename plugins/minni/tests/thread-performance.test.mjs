@@ -325,3 +325,55 @@ test("final-fix-3: prepareThreadMutation parses the ordered journal once per loc
     "one locked assign must parse the ordered journal once",
   );
 });
+
+test("final-fix-4: one journal parse holds even when claiming A also durably expires sibling B's claim in the same lock", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+    { id: "b", title: "Slice B" },
+  ]);
+  await assignSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "a",
+    actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+    workerAgentId: "worker-a",
+    now: THREAD_START,
+  });
+  await assignSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "b",
+    actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+    workerAgentId: "worker-b",
+    now: THREAD_START,
+  });
+  await claimSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "b",
+    workerAgentId: "worker-b",
+    idempotencyKey: "perf-claim-b-will-expire",
+    ttlSeconds: 60,
+    now: THREAD_START,
+  });
+
+  resetOrderedJournalParseCountForTests();
+  await claimSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "perf-claim-a-expires-sibling-b",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START.getTime() + 10 * 60_000),
+  });
+  assert.equal(
+    orderedJournalParseCount,
+    1,
+    "claiming A must parse the ordered journal once even though it also durably expires sibling B's claim in the same lock",
+  );
+});

@@ -41,10 +41,15 @@ import {
   readThreadEvents,
 } from "../dist/thread-events.js";
 import {
+  commitWorkerUpdateReceipt,
   createClaimSecret,
   deleteClaimSecret,
+  hashWorkerUpdateToken,
+  pruneWorkerUpdateReceiptsForGeneration,
   readClaimByIdempotency,
+  readWorkerUpdateReceipt,
   verifyClaimToken,
+  writePendingWorkerUpdateReceipt,
 } from "../dist/thread-claims.js";
 import {
   assignSlice,
@@ -2985,4 +2990,712 @@ test("final-fix-2: reassignment emits slice.claim_revoked in the ordered journal
   const journalPath = journalPathFor(fixture.notePath, fixture.planId);
   const { events } = await readThreadEvents(journalPath, 0, 100);
   assert.ok(events.some((event) => event.kind === "slice.claim_revoked"));
+});
+
+// --- final-fix-4 ------------------------------------------------------------
+//
+// Regression 1: in-lock sibling expiry must land its events in the SAME
+// mutable ordered snapshot the outer claim/update batch allocates seqs from.
+
+test("final-fix-4: claiming slice A durably expires sibling slice B's claim inside the same lock, preserving strictly increasing unique seqs", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+    { id: "b", title: "Slice B" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  await assignWorker(fixture, "b", "worker-b");
+  await claimSlice({
+    ...fixture,
+    sliceId: "b",
+    workerAgentId: "worker-b",
+    idempotencyKey: "final-fix-4-claim-b-will-expire",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+
+  // B's claim will have expired well before A is claimed, forcing the
+  // in-lock sibling expiry inside claimSlice("a")'s own locked mutation.
+  const laterNow = new Date(THREAD_START.getTime() + 10 * 60_000);
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-claim-a-triggers-sibling-expiry",
+    ttlSeconds: 60,
+    now: laterNow,
+  });
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events: allEvents } = await readThreadEvents(journalPath, 0, 1000);
+  assert.ok(allEvents.length > 0);
+
+  const seqs = allEvents.map((event) => event.seq);
+  assert.equal(
+    new Set(seqs).size,
+    seqs.length,
+    `expected every seq to be unique, got ${JSON.stringify(seqs)}`,
+  );
+  for (let index = 1; index < seqs.length; index += 1) {
+    assert.ok(
+      seqs[index] > seqs[index - 1],
+      `seq must strictly increase across the journal: ${seqs[index - 1]} -> ${seqs[index]}`,
+    );
+  }
+
+  // A cursor walking the journal with limit=1 must surface every event
+  // exactly once — a duplicate/non-increasing seq would let this pagination
+  // silently skip (hide) an event forever.
+  const paged = [];
+  let sinceSeq = 0;
+  for (let guard = 0; guard < allEvents.length + 5; guard += 1) {
+    const { events, next_seq } = await readThreadEvents(journalPath, sinceSeq, 1);
+    if (events.length === 0) break;
+    paged.push(...events);
+    sinceSeq = next_seq;
+  }
+  assert.deepEqual(
+    paged.map((event) => event.event_id),
+    allEvents.map((event) => event.event_id),
+    "limit=1 pagination must surface every event exactly once, in order",
+  );
+
+  const leaseExpired = allEvents.find(
+    (event) => event.kind === "slice.lease_expired" && event.slice_id === "b",
+  );
+  assert.ok(leaseExpired, "expected slice B's lease_expired event to be recorded");
+  const claimed = allEvents.find(
+    (event) => event.kind === "slice.claimed" && event.slice_id === "a",
+  );
+  assert.ok(claimed, "expected slice A's claimed event to be recorded");
+  assert.ok(
+    leaseExpired.seq < claimed.seq,
+    "the in-lock sibling expiry must be ordered strictly before the triggering claim event",
+  );
+});
+
+test("final-fix-4: an in-lock sibling expiry during a worker update also preserves strictly increasing unique seqs", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+    { id: "b", title: "Slice B" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  await assignWorker(fixture, "b", "worker-b");
+  const claimA = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-worker-update-claim-a",
+    ttlSeconds: 3600,
+    now: new Date(THREAD_START),
+  });
+  await claimSlice({
+    ...fixture,
+    sliceId: "b",
+    workerAgentId: "worker-b",
+    idempotencyKey: "final-fix-4-worker-update-claim-b-will-expire",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+
+  const laterNow = new Date(THREAD_START.getTime() + 10 * 60_000);
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claimA.token,
+    idempotencyKey: "final-fix-4-worker-update-start-a",
+    action: { action: "start" },
+    now: laterNow,
+  });
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events: allEvents } = await readThreadEvents(journalPath, 0, 1000);
+  const seqs = allEvents.map((event) => event.seq);
+  assert.equal(new Set(seqs).size, seqs.length, `expected unique seqs, got ${JSON.stringify(seqs)}`);
+  for (let index = 1; index < seqs.length; index += 1) {
+    assert.ok(seqs[index] > seqs[index - 1], "seq must strictly increase across the journal");
+  }
+  assert.ok(
+    allEvents.some((event) => event.kind === "slice.lease_expired" && event.slice_id === "b"),
+  );
+  assert.ok(
+    allEvents.some((event) => event.kind === "slice.started" && event.slice_id === "a"),
+  );
+});
+
+// Regression 2: receipt pruning must occur only after a durable generation
+// advance — never before persist, and never on a non-committed failure.
+
+test("final-fix-4: a non-committed reassignment persist failure leaves the previous generation's receipts intact for an idempotent same-key worker replay", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-prune-guard-claim",
+    now: new Date(THREAD_START),
+  });
+  const started = await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "final-fix-4-prune-guard-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(started.slice.generation, 0);
+
+  await assert.rejects(
+    assignSlice(
+      {
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-b",
+        actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+        now: new Date("2026-08-18T12:02:00.000Z"),
+      },
+      {
+        persistPlan: async () => {
+          throw new Error("injected non-committed reassignment failure");
+        },
+      },
+    ),
+    /injected non-committed reassignment failure/,
+  );
+
+  const unchanged = await rehydratePlan(fixture.notePath);
+  assert.equal(unchanged.slices[0].assigned_to, "worker-a");
+  assert.equal(unchanged.slices[0].generation, 0);
+
+  const receipt = await readWorkerUpdateReceipt({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    generation: 0,
+    idempotencyKey: "final-fix-4-prune-guard-start",
+    claimId: claim.claim_id,
+  });
+  assert.ok(
+    receipt,
+    "the generation-0 receipt must survive a non-committed reassignment failure",
+  );
+
+  const replay = await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "final-fix-4-prune-guard-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:03:00.000Z"),
+  });
+  assert.equal(replay.slice.status, "in_progress");
+  assert.equal(
+    replay.plan.rev,
+    started.plan.rev,
+    "a same-key replay must never appear to advance rev",
+  );
+});
+
+test("final-fix-4: a reassignment that commits via a history-append error still prunes the previous generation's receipts once durability is confirmed", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-prune-commit-claim",
+    now: new Date(THREAD_START),
+  });
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "final-fix-4-prune-commit-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  await assert.rejects(
+    assignSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-b",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    (error) => error instanceof PlanHistoryAppendError,
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(durable.slices[0].assigned_to, "worker-b");
+  assert.equal(
+    durable.slices[0].generation,
+    1,
+    "the reassignment note write is durable despite the thrown error",
+  );
+
+  const receipt = await readWorkerUpdateReceipt({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    generation: 0,
+    idempotencyKey: "final-fix-4-prune-commit-start",
+    claimId: claim.claim_id,
+  });
+  assert.equal(
+    receipt,
+    undefined,
+    "generation 0's receipt must be pruned once the reassignment is confirmed durable",
+  );
+});
+
+test("final-fix-4: a failed reassignment attempt does not cause a real retry to double-bump generation or rev", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const beforeAttempt = await rehydratePlan(fixture.notePath);
+
+  await assert.rejects(
+    assignSlice(
+      {
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-b",
+        actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+        now: new Date("2026-08-18T12:01:00.000Z"),
+      },
+      {
+        persistPlan: async () => {
+          throw new Error("injected reassignment failure before retry");
+        },
+      },
+    ),
+    /injected reassignment failure before retry/,
+  );
+
+  const afterFailure = await rehydratePlan(fixture.notePath);
+  assert.deepEqual(afterFailure.slices[0], beforeAttempt.slices[0]);
+  assert.equal(afterFailure.rev, beforeAttempt.rev);
+
+  const retried = await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-b",
+    actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  assert.equal(retried.slice.assigned_to, "worker-b");
+  assert.equal(
+    retried.slice.generation,
+    (beforeAttempt.slices[0].generation ?? 0) + 1,
+    "generation must bump exactly once across the failed attempt and the real retry",
+  );
+  assert.equal(
+    retried.plan.rev,
+    beforeAttempt.rev + 1,
+    "rev must bump exactly once across the failed attempt and the real retry",
+  );
+});
+
+function finalFix4ClaimId(seed) {
+  return createHash("sha256").update(seed).digest("hex").slice(0, 32);
+}
+
+test("final-fix-4: claimSlice's response-loss orphan generation-skip leaves that generation's receipts intact when the new claim fails to persist", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const before = await rehydratePlan(fixture.notePath);
+  const generation = before.slices[0].generation ?? 0;
+
+  // A response-loss orphan: the secret is durably written, but the
+  // corresponding plan update never landed, so slice.claim stays unset.
+  await createClaimSecret({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    generation,
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-orphan-persist-guard",
+    expiresAt: "2026-08-18T12:00:30.000Z",
+    rev: before.rev + 1,
+  });
+
+  // A receipt at that same generation that must not be deleted unless the
+  // new claim's generation advance is confirmed durable.
+  const claimIdForReceipt = finalFix4ClaimId("final-fix-4-orphan-persist-guard-receipt");
+  await writePendingWorkerUpdateReceipt({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    claimId: claimIdForReceipt,
+    generation,
+    idempotencyKey: "final-fix-4-orphan-persist-guard-receipt",
+    kind: "slice.started",
+    tokenDigest: hashWorkerUpdateToken("final-fix-4-orphan-persist-guard-token"),
+    rev: before.rev + 1,
+    response: {
+      slice: { id: "a", title: "Slice A", status: "in_progress" },
+      ready_before: [],
+      ready_after: [],
+      rev: before.rev + 1,
+    },
+  });
+
+  await assert.rejects(
+    claimSlice(
+      {
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-a",
+        idempotencyKey: "final-fix-4-orphan-persist-guard",
+        ttlSeconds: 60,
+        now: () => new Date("2026-08-18T12:01:00.000Z"),
+      },
+      {
+        persistPlan: async () => {
+          throw new Error("injected non-committed claim failure");
+        },
+      },
+    ),
+    /injected non-committed claim failure/,
+  );
+
+  const receipt = await readWorkerUpdateReceipt({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    generation,
+    idempotencyKey: "final-fix-4-orphan-persist-guard-receipt",
+    claimId: claimIdForReceipt,
+  });
+  assert.ok(
+    receipt,
+    "the orphaned generation's receipt must survive a non-committed claim failure",
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(
+    durable.slices[0].generation,
+    generation,
+    "generation must not have durably advanced",
+  );
+  assert.equal(durable.slices[0].claim, undefined);
+});
+
+test("final-fix-4: claimSlice's response-loss orphan generation-skip prunes that generation's receipts once a history-append error confirms durability", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const before = await rehydratePlan(fixture.notePath);
+  const generation = before.slices[0].generation ?? 0;
+
+  await createClaimSecret({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    generation,
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-orphan-commit-guard",
+    expiresAt: "2026-08-18T12:00:30.000Z",
+    rev: before.rev + 1,
+  });
+
+  const claimIdForReceipt = finalFix4ClaimId("final-fix-4-orphan-commit-guard-receipt");
+  await writePendingWorkerUpdateReceipt({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    claimId: claimIdForReceipt,
+    generation,
+    idempotencyKey: "final-fix-4-orphan-commit-guard-receipt",
+    kind: "slice.started",
+    tokenDigest: hashWorkerUpdateToken("final-fix-4-orphan-commit-guard-token"),
+    rev: before.rev + 1,
+    response: {
+      slice: { id: "a", title: "Slice A", status: "in_progress" },
+      ready_before: [],
+      ready_after: [],
+      rev: before.rev + 1,
+    },
+  });
+
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  await assert.rejects(
+    claimSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      idempotencyKey: "final-fix-4-orphan-commit-guard",
+      ttlSeconds: 60,
+      now: () => new Date("2026-08-18T12:01:00.000Z"),
+    }),
+    (error) => error instanceof PlanHistoryAppendError,
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(
+    durable.slices[0].generation,
+    generation + 1,
+    "the new claim's generation advance is durable despite the thrown error",
+  );
+  assert.ok(durable.slices[0].claim, "the durable note must already carry the new claim");
+
+  const receipt = await readWorkerUpdateReceipt({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    generation,
+    idempotencyKey: "final-fix-4-orphan-commit-guard-receipt",
+    claimId: claimIdForReceipt,
+  });
+  assert.equal(
+    receipt,
+    undefined,
+    "the orphaned generation's receipt must be pruned once the new claim is confirmed durable",
+  );
+});
+
+test("final-fix-4: workerUpdate surfaces a real persistPlan history-append failure on progress, then an identical retry replays the same committed result", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-claim-a-progress-history",
+    now: new Date(THREAD_START),
+  });
+
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  const updateInput = {
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "final-fix-4-progress-a-history-eisdir",
+    action: {
+      action: "progress",
+      evidence: "Made progress despite a broken history append",
+    },
+    now: () => new Date("2026-08-18T12:05:00.000Z"),
+  };
+
+  const failure = await workerUpdate(updateInput).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+  assert.equal(failure.ok, false, JSON.stringify(failure));
+  assert.ok(
+    failure.error instanceof PlanHistoryAppendError,
+    `expected PlanHistoryAppendError, got ${failure.error?.constructor?.name}: ${failure.error?.message}`,
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(durable.slices[0].status, "in_progress");
+  assert.equal(
+    durable.slices[0].evidence,
+    "Made progress despite a broken history append",
+  );
+  assert.ok(durable.slices[0].claim, "progress does not clear the live claim");
+
+  const retried = await workerUpdate(updateInput);
+  assert.equal(retried.slice.status, "in_progress");
+  assert.equal(
+    retried.slice.evidence,
+    "Made progress despite a broken history append",
+  );
+  assert.equal(
+    retried.plan.rev,
+    durable.rev,
+    "a receipt replay must never appear to advance rev",
+  );
+
+  // persist threw before recordThreadMutationEvents ever ran on the first
+  // attempt, and the retry is satisfied entirely by the committed receipt
+  // (no re-entry into recordThreadMutationEvents either) — the ordered
+  // journal must never carry a false slice.progressed event for this
+  // operation, exactly like the existing "complete" reproduction above.
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  const operationKey = clientWorkerKey(
+    fixture.planId,
+    "a",
+    "worker-a",
+    "final-fix-4-progress-a-history-eisdir",
+  );
+  assert.equal(
+    events.filter((event) => event.idempotency_key === operationKey).length,
+    0,
+    "a history-append failure must never leave a false slice.progressed event behind",
+  );
+});
+
+test("final-fix-4: workerUpdate surfaces a real persistPlan history-append failure on propose_structure, then an identical retry never duplicates the proposal", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "final-fix-4-claim-a-propose-history",
+    now: new Date(THREAD_START),
+  });
+
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  const updateInput = {
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "final-fix-4-propose-a-history-eisdir",
+    action: {
+      action: "propose_structure",
+      proposal: {
+        kind: "split",
+        reason: "Needs to be split despite a broken history append",
+        slices: [{ title: "New sub-slice" }],
+      },
+    },
+    now: () => new Date("2026-08-18T12:05:00.000Z"),
+  };
+
+  const failure = await workerUpdate(updateInput).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+  assert.equal(failure.ok, false, JSON.stringify(failure));
+  assert.ok(
+    failure.error instanceof PlanHistoryAppendError,
+    `expected PlanHistoryAppendError, got ${failure.error?.constructor?.name}: ${failure.error?.message}`,
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(
+    durable.slices[0].proposals?.length,
+    1,
+    "the proposal is already durable despite the thrown error",
+  );
+  assert.ok(durable.slices[0].claim, "propose_structure does not clear the live claim");
+
+  const retried = await workerUpdate(updateInput);
+  assert.equal(
+    retried.slice.proposals?.length,
+    1,
+    "a same-key replay must never duplicate the proposal",
+  );
+  assert.equal(
+    retried.plan.rev,
+    durable.rev,
+    "a receipt replay must never advance rev",
+  );
+});
+
+// Regression 3: hardened, descriptor-anchored receipt-generation pruning.
+
+test("final-fix-4: parent swap during receipt-generation pruning deletes the real directory and never redirects outside the vault", async (t) => {
+  const vaultPath = await mkdtemp(path.join(tmpdir(), "minni-receipt-prune-"));
+  t.after(() => rm(vaultPath, { recursive: true, force: true }));
+  const planId = "plan-prune-swap";
+  const sliceId = "slice-prune-swap";
+  const generation = 0;
+  const claimId = finalFix4ClaimId("final-fix-4-prune-swap-claim");
+
+  await writePendingWorkerUpdateReceipt({
+    vaultPath,
+    planId,
+    sliceId,
+    workerAgentId: "worker-prune-swap",
+    claimId,
+    generation,
+    idempotencyKey: "final-fix-4-prune-swap-key",
+    kind: "slice.started",
+    tokenDigest: hashWorkerUpdateToken("final-fix-4-prune-swap-token"),
+    rev: 1,
+    response: {
+      slice: { id: sliceId, title: "Slice", status: "in_progress" },
+      ready_before: [],
+      ready_after: [],
+      rev: 1,
+    },
+  });
+
+  const planHash = createHash("sha256").update(planId).digest("hex").slice(0, 32);
+  const sliceHash = createHash("sha256").update(sliceId).digest("hex").slice(0, 32);
+  const runtimePath = path.join(vaultPath, ".runtime");
+  const movedRuntimePath = path.join(vaultPath, ".runtime-original");
+  const generationPath = path.join(
+    runtimePath,
+    "thread-claims",
+    planHash,
+    "updates",
+    sliceHash,
+    `g${generation}`,
+  );
+  const outside = await mkdtemp(path.join(tmpdir(), "minni-receipt-prune-outside-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+
+  const before = await readdir(generationPath);
+  assert.equal(before.length, 1);
+
+  const originalOpen = fs.promises.open;
+  let swapped = false;
+  fs.promises.open = async (target, flags, ...args) => {
+    if (
+      !swapped &&
+      String(target).endsWith(`g${generation}`) &&
+      (Number(flags) & constants.O_DIRECTORY) !== 0
+    ) {
+      swapped = true;
+      await rename(runtimePath, movedRuntimePath);
+      await symlink(outside, runtimePath, "dir");
+    }
+    return originalOpen(target, flags, ...args);
+  };
+  syncBuiltinESMExports();
+
+  try {
+    await assert.rejects(
+      pruneWorkerUpdateReceiptsForGeneration(vaultPath, planId, sliceId, generation),
+      /claim store parent changed during operation/,
+    );
+  } finally {
+    fs.promises.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(swapped, true);
+  assert.deepEqual(await readdir(outside), []);
+  const originalGenerationPath = path.join(
+    movedRuntimePath,
+    "thread-claims",
+    planHash,
+    "updates",
+    sliceHash,
+    `g${generation}`,
+  );
+  await assert.rejects(
+    readdir(originalGenerationPath),
+    (error) => error?.code === "ENOENT",
+  );
 });

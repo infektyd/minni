@@ -9,8 +9,9 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   rename,
-  rm,
+  rmdir,
   stat,
   unlink,
   type FileHandle,
@@ -519,6 +520,125 @@ interface ReceiptLocation {
   fileName: string;
 }
 
+interface ReceiptSliceLocation {
+  fdAliasRoot: string;
+  vaultHandle: FileHandle;
+  runtimeHandle: FileHandle;
+  claimsHandle: FileHandle;
+  planHandle: FileHandle;
+  sliceHandle: FileHandle;
+  vaultPath: string;
+  runtimePath: string;
+  claimsPath: string;
+  planPath: string;
+  slicePath: string;
+}
+
+/**
+ * Same descriptor-anchored authority as withReceiptLocation, stopping one
+ * level higher — at updates/<sliceHash> — the exact parent directory whose
+ * child g<generation> directories pruneWorkerUpdateReceiptsForGeneration
+ * deletes. Used only for pruning, never for reading/writing a receipt file.
+ */
+async function withReceiptSliceLocation<T>(
+  vaultPath: string,
+  planId: string,
+  sliceId: string,
+  create: boolean,
+  fn: (location: ReceiptSliceLocation | undefined) => Promise<T>,
+): Promise<T> {
+  requireNonEmpty(vaultPath, "vault path");
+  requireNonEmpty(planId, "plan id");
+  requireNonEmpty(sliceId, "slice id");
+
+  const logicalVaultPath = path.resolve(vaultPath);
+  const handles: FileHandle[] = [];
+  try {
+    let vaultHandle: FileHandle;
+    try {
+      vaultHandle = await open(logicalVaultPath, directoryOpenFlags());
+    } catch (error) {
+      if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
+        throw pathMismatch();
+      }
+      throw error;
+    }
+    handles.push(vaultHandle);
+    const vaultStat = await vaultHandle.stat();
+    if (!vaultStat.isDirectory()) throw pathMismatch();
+    const fdAliasRoot = await detectFdAliasRoot(vaultHandle);
+
+    const runtimeHandle = await openPrivateChildDirectory(
+      vaultHandle,
+      fdAliasRoot,
+      ".runtime",
+      create,
+    );
+    if (!runtimeHandle) return await fn(undefined);
+    handles.push(runtimeHandle);
+
+    const claimsHandle = await openPrivateChildDirectory(
+      runtimeHandle,
+      fdAliasRoot,
+      "thread-claims",
+      create,
+    );
+    if (!claimsHandle) return await fn(undefined);
+    handles.push(claimsHandle);
+
+    const planHash = hashSegment(planId);
+    const planHandle = await openPrivateChildDirectory(
+      claimsHandle,
+      fdAliasRoot,
+      planHash,
+      create,
+    );
+    if (!planHandle) return await fn(undefined);
+    handles.push(planHandle);
+
+    const updatesHandle = await openPrivateChildDirectory(
+      planHandle,
+      fdAliasRoot,
+      "updates",
+      create,
+    );
+    if (!updatesHandle) return await fn(undefined);
+    handles.push(updatesHandle);
+
+    const sliceHash = hashSegment(sliceId);
+    const sliceHandle = await openPrivateChildDirectory(
+      updatesHandle,
+      fdAliasRoot,
+      sliceHash,
+      create,
+    );
+    if (!sliceHandle) return await fn(undefined);
+    handles.push(sliceHandle);
+
+    const runtimePath = path.join(logicalVaultPath, ".runtime");
+    const claimsPath = path.join(runtimePath, "thread-claims");
+    const planPath = path.join(claimsPath, planHash);
+    const slicePath = path.join(planPath, "updates", sliceHash);
+    return await fn({
+      fdAliasRoot,
+      vaultHandle,
+      runtimeHandle,
+      claimsHandle,
+      planHandle,
+      sliceHandle,
+      vaultPath: logicalVaultPath,
+      runtimePath,
+      claimsPath,
+      planPath,
+      slicePath,
+    });
+  } finally {
+    for (const handle of handles.reverse()) {
+      await handle.close().catch(() => {});
+    }
+  }
+}
+
 /**
  * Same descriptor-anchored authority as withClaimLocation (vault ->
  * .runtime -> thread-claims -> <planHash> -> updates -> <sliceHash> ->
@@ -701,6 +821,21 @@ async function assertReceiptLocationStillAttached(
     logicalPathMatchesHandle(location.planPath, location.planHandle),
     logicalPathMatchesHandle(location.slicePath, location.sliceHandle),
     logicalPathMatchesHandle(location.generationPath, location.generationHandle),
+  ]);
+  if (matches.some((match) => !match)) {
+    throw new ClaimStoreParentChangedError();
+  }
+}
+
+async function assertReceiptSliceLocationStillAttached(
+  location: ReceiptSliceLocation,
+): Promise<void> {
+  const matches = await Promise.all([
+    logicalPathMatchesHandle(location.vaultPath, location.vaultHandle),
+    logicalPathMatchesHandle(location.runtimePath, location.runtimeHandle),
+    logicalPathMatchesHandle(location.claimsPath, location.claimsHandle),
+    logicalPathMatchesHandle(location.planPath, location.planHandle),
+    logicalPathMatchesHandle(location.slicePath, location.sliceHandle),
   ]);
   if (matches.some((match) => !match)) {
     throw new ClaimStoreParentChangedError();
@@ -1181,9 +1316,63 @@ export interface WorkerUpdateReceiptLookupInput {
 }
 
 /**
+ * Deletes every file directly inside one already fd-anchored directory, then
+ * removes the directory itself through its parent's descriptor — never via
+ * a raw logical path. A generation directory only ever holds flat receipt
+ * (and transient atomic-write temp) files; an unexpected nested directory is
+ * treated as a shape mismatch and fails closed rather than being followed or
+ * recursively deleted.
+ */
+async function removeAnchoredGenerationDirectory(
+  fdAliasRoot: string,
+  parentHandle: FileHandle,
+  childName: string,
+): Promise<void> {
+  const childPath = childOfHandle(fdAliasRoot, parentHandle, childName);
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(childPath, directoryOpenFlags());
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return;
+    if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) return;
+    throw error;
+  }
+  try {
+    const openedStat = await handle.stat();
+    if (!openedStat.isDirectory()) return;
+    const entries = await readdir(childPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        throw pathMismatch();
+      }
+      await unlink(childOfHandle(fdAliasRoot, handle, entry.name)).catch(
+        (error) => {
+          if (!isErrno(error, "ENOENT")) throw error;
+        },
+      );
+    }
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  await rmdir(childPath).catch((error) => {
+    if (!isErrno(error, "ENOENT")) throw error;
+  });
+}
+
+/**
  * Best-effort delete of every receipt file for one slice generation. Called
  * only when a slice's generation advances (reassign, replan, restore, expiry)
  * — never on the hot worker-update path.
+ *
+ * Deletion is anchored to the already-opened, verified `updates/<sliceHash>`
+ * directory descriptor returned by withReceiptSliceLocation — the same
+ * descriptor-anchored, no-follow private-directory traversal thread-claims
+ * uses for every read/write above — never a raw path-based recursive `rm`
+ * through `.runtime`'s logical (and therefore swappable) ancestors. A parent
+ * swap or symlink mid-operation cannot redirect this deletion outside the
+ * vault: the generation directory is opened and removed via the slice
+ * handle's descriptor alias, which always resolves to the original directory
+ * regardless of what the logical path is later made to point at.
  */
 export async function pruneWorkerUpdateReceiptsForGeneration(
   vaultPath: string,
@@ -1195,23 +1384,26 @@ export async function pruneWorkerUpdateReceiptsForGeneration(
   requireNonEmpty(planId, "plan id");
   requireNonEmpty(sliceId, "slice id");
   requireNonNegativeInteger(generation, "generation");
-  const planHash = hashSegment(planId);
-  const sliceHash = hashSegment(sliceId);
   const generationDir = generationDirName(generation);
-  const generationPath = path.join(
-    path.resolve(vaultPath),
-    ".runtime",
-    "thread-claims",
-    planHash,
-    "updates",
-    sliceHash,
-    generationDir,
+  await withReceiptSliceLocation(
+    vaultPath,
+    planId,
+    sliceId,
+    false,
+    async (location) => {
+      if (!location) return;
+      await removeAnchoredGenerationDirectory(
+        location.fdAliasRoot,
+        location.sliceHandle,
+        generationDir,
+      );
+      // Detect (rather than silently trust) a parent swap/symlink that
+      // occurred mid-operation. The deletion above already landed on the
+      // real, originally-opened directory regardless — this only decides
+      // whether the caller can additionally trust the surrounding tree.
+      await assertReceiptSliceLocationStillAttached(location);
+    },
   );
-  try {
-    await rm(generationPath, { recursive: true, force: true });
-  } catch (error) {
-    if (!isErrno(error, "ENOENT")) throw error;
-  }
 }
 
 export async function readWorkerUpdateReceipt(

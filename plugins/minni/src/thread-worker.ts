@@ -288,6 +288,27 @@ export async function pruneSliceReceiptsOnGenerationAdvance(
   ).catch(() => {});
 }
 
+/**
+ * Best-effort prune of receipts for every generation collected while a
+ * mutation walked past stale/expired generations in memory. Callers MUST
+ * call this only once the corresponding generation advance is durable
+ * (persisted, or independently confirmed committed) — never before, or a
+ * precommit failure would delete receipts a same-key retry still needs.
+ */
+async function pruneCollectedGenerationsBestEffort(
+  vaultPath: string,
+  planId: string,
+  sliceId: string,
+  generations: number[],
+): Promise<void> {
+  const unique = [...new Set(generations)];
+  await Promise.all(
+    unique.map((generation) =>
+      pruneSliceReceiptsOnGenerationAdvance(vaultPath, planId, sliceId, generation),
+    ),
+  );
+}
+
 /** Prune receipt generations for every slice whose generation advanced. */
 export async function pruneSliceReceiptsAfterPlanMutation(
   vaultPath: string,
@@ -711,6 +732,7 @@ async function expireStaleClaimForSlice(input: {
   now: Date;
   persist: typeof persistPlan;
   deleteSecret: typeof deleteClaimSecret;
+  orderedSnapshot?: OrderedThreadEvent[];
 }): Promise<{ plan: PlanArtifact; expired: boolean; readyBefore: string[] }> {
   const slice = findSlice(input.plan, input.sliceId);
   if (!slice.claim || hasLiveClaim(slice, input.now)) {
@@ -765,6 +787,11 @@ async function expireStaleClaimForSlice(input: {
     readyAfter,
     plan: next,
     now: input.now,
+    // Same mutable snapshot the outer claim/update batch will allocate seqs
+    // from — a sibling's in-lock expiry must land its events in that shared
+    // array (not a fresh re-parse) so the outer append computes seqs that
+    // are strictly higher than these, never colliding with them.
+    orderedSnapshot: input.orderedSnapshot,
     supplementalEvents: [
       {
         idempotencyKey: deriveSystemEventKey(
@@ -793,6 +820,7 @@ async function synchronizeExpiredClaimsForPlan(input: {
   now: Date;
   persist: typeof persistPlan;
   deleteSecret: typeof deleteClaimSecret;
+  orderedSnapshot?: OrderedThreadEvent[];
 }): Promise<PlanArtifact> {
   let plan = input.plan;
   for (const slice of plan.slices) {
@@ -829,7 +857,7 @@ export async function synchronizeExpiredClaimsAndReadReady(
     },
     async (initialPlan) => {
       const now = sampleNow(input.now);
-      const { journalPath } = await prepareThreadMutation(
+      const { journalPath, ordered } = await prepareThreadMutation(
         { ...input, planId, actor },
         initialPlan,
         now,
@@ -844,6 +872,7 @@ export async function synchronizeExpiredClaimsAndReadReady(
         now,
         persist,
         deleteSecret,
+        orderedSnapshot: ordered,
       });
       return { plan, ready: readySlices(plan, now) };
     },
@@ -932,26 +961,58 @@ export async function assignSlice(
 
       const generation = requireGeneration(slice);
       const reassigned = slice.assigned_to !== undefined;
-      if (reassigned) {
-        await pruneSliceReceiptsOnGenerationAdvance(
-          input.vaultPath,
-          planId,
-          sliceId,
-          generation,
-        );
-      }
+      const previousGeneration = generation;
+      const nextGeneration = generation + (reassigned ? 1 : 0);
       const nextSlice: PlanSlice = {
         ...slice,
         assigned_to: workerAgentId,
         assignment_profile: profile,
-        generation: generation + (reassigned ? 1 : 0),
+        generation: nextGeneration,
         claim: undefined,
       };
       const next = replaceSlice(plan, sliceId, nextSlice);
-      await persist(next, {
-        vaultPath: input.vaultPath,
-        notePath: input.notePath,
-      });
+      // Receipts at previousGeneration are pruned only once this generation
+      // advance is durable — never before persist, and never on a persist
+      // failure unless a strict reread confirms the note actually committed.
+      const intendedRev = plan.rev + 1;
+      try {
+        await persist(next, {
+          vaultPath: input.vaultPath,
+          notePath: input.notePath,
+        });
+      } catch (error) {
+        let committed = error instanceof PlanHistoryAppendError;
+        if (!committed) {
+          try {
+            const canonical = await rehydrateAuthority(input);
+            const durableSlice = findSlice(canonical, sliceId);
+            committed =
+              canonical.rev === intendedRev &&
+              requireGeneration(durableSlice) === nextGeneration &&
+              durableSlice.assigned_to === workerAgentId &&
+              durableSlice.assignment_profile === profile;
+          } catch {
+            committed = false;
+          }
+        }
+        if (committed && reassigned) {
+          await pruneCollectedGenerationsBestEffort(
+            input.vaultPath,
+            planId,
+            sliceId,
+            [previousGeneration],
+          );
+        }
+        throw error;
+      }
+      if (reassigned) {
+        await pruneCollectedGenerationsBestEffort(
+          input.vaultPath,
+          planId,
+          sliceId,
+          [previousGeneration],
+        );
+      }
       if (slice.claim) {
         await deleteClaimSecretsBestEffort(
           input.vaultPath,
@@ -1062,6 +1123,7 @@ export async function claimSlice(
         now,
         persist,
         deleteSecret,
+        orderedSnapshot: ordered,
       });
       let slice = findSlice(plan, sliceId);
       if (!isNonTerminal(slice)) {
@@ -1074,17 +1136,18 @@ export async function claimSlice(
       }
       let generation = requireGeneration(slice);
       const staleClaimIds: string[] = [];
+      // Generations walked past in-memory while probing for a live claim
+      // slot. Collected, never pruned here — pruning must wait until the
+      // persist below durably lands (or a post-commit reread confirms it
+      // did), otherwise a precommit failure would delete receipts a
+      // same-key retry still needs against the still-durable old generation.
+      const generationsToPrune: number[] = [];
 
       if (slice.claim && !hasLiveClaim(slice, now)) {
         staleClaimIds.push(slice.claim.claim_id);
         const staleGeneration = generation;
         generation += 1;
-        await pruneSliceReceiptsOnGenerationAdvance(
-          input.vaultPath,
-          planId,
-          sliceId,
-          staleGeneration,
-        );
+        generationsToPrune.push(staleGeneration);
         const expiredSlice: PlanSlice = {
           ...slice,
           generation,
@@ -1174,12 +1237,7 @@ export async function claimSlice(
         staleClaimIds.push(candidate.envelope.claim_id);
         const staleGeneration = generation;
         generation += 1;
-        await pruneSliceReceiptsOnGenerationAdvance(
-          input.vaultPath,
-          planId,
-          sliceId,
-          staleGeneration,
-        );
+        generationsToPrune.push(staleGeneration);
         slice = {
           ...slice,
           generation,
@@ -1247,6 +1305,14 @@ export async function claimSlice(
           committed ? staleClaimIds : [stored.envelope.claim_id, ...staleClaimIds],
           deleteSecret,
         );
+        if (committed) {
+          await pruneCollectedGenerationsBestEffort(
+            input.vaultPath,
+            planId,
+            sliceId,
+            generationsToPrune,
+          );
+        }
         throw error;
       }
       await deleteClaimSecretsBestEffort(
@@ -1254,6 +1320,12 @@ export async function claimSlice(
         planId,
         staleClaimIds,
         deleteSecret,
+      );
+      await pruneCollectedGenerationsBestEffort(
+        input.vaultPath,
+        planId,
+        sliceId,
+        generationsToPrune,
       );
       const response = publicClaimResponse(stored.envelope.response);
       const readyAfter = readyIds(next, now);
@@ -1600,6 +1672,7 @@ export async function updateClaimedSlice(
         now,
         persist,
         deleteSecret,
+        orderedSnapshot: ordered,
       });
       const sliceBeforeExpiry = findSlice(initialPlan, sliceId);
       const sliceAfterExpiry = findSlice(plan, sliceId);
