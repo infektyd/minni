@@ -1037,8 +1037,8 @@ test("reassignment revokes the old token and increments generation", async (t) =
   assert.equal(reassigned.slice.generation, claim.generation + 1);
   assert.equal(reassigned.slice.claim, undefined);
 
-  await assert.rejects(
-    updateClaimedSlice({
+  const [staleResult] = await releaseTogether([
+    startBarrierWorker("updateClaimedSlice", {
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
@@ -1047,10 +1047,11 @@ test("reassignment revokes the old token and increments generation", async (t) =
         action: "complete",
         evidence: "Stale generation must not be accepted as completion",
       },
-      now: new Date("2026-08-18T12:01:00.000Z"),
+      now: "2026-08-18T12:01:00.000Z",
     }),
-    /claim scope mismatch/,
-  );
+  ]);
+  assert.equal(staleResult.ok, false);
+  assert.match(staleResult.error, /claim scope mismatch/);
   await assert.rejects(
     verifyClaimToken({
       vaultPath: fixture.vaultPath,
@@ -1114,19 +1115,16 @@ test("worker token cannot mutate a sibling or Thread topology", async (t) => {
   });
   const before = await rehydratePlan(fixture.notePath);
 
-  await assert.rejects(
-    updateClaimedSlice({
+  const rejectedWorkers = [
+    startBarrierWorker("updateClaimedSlice", {
       ...fixture,
       sliceId: "b",
       workerAgentId: "worker-a",
       token: claim.token,
       action: { action: "start" },
-      now: new Date("2026-08-18T12:01:00.000Z"),
+      now: "2026-08-18T12:01:00.000Z",
     }),
-    /claim scope mismatch/,
-  );
-  await assert.rejects(
-    updateClaimedSlice({
+    startBarrierWorker("updateClaimedSlice", {
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
@@ -1135,24 +1133,32 @@ test("worker token cannot mutate a sibling or Thread topology", async (t) => {
         action: "replan",
         slices: [{ id: "owned-by-caller", title: "Injected topology" }],
       },
-      now: new Date("2026-08-18T12:01:00.000Z"),
+      now: "2026-08-18T12:01:00.000Z",
     }),
-    /unsupported worker action/,
-  );
-  const started = await updateClaimedSlice({
-    ...fixture,
-    sliceId: "a",
-    workerAgentId: "worker-a",
-    token: claim.token,
-    action: {
-      action: "start",
-      depends_on: [],
-      gate: "caller-controlled gate",
-      assigned_to: "attacker",
-      slices: [{ id: "injected", title: "Injected sibling" }],
-    },
-    now: new Date("2026-08-18T12:01:00.000Z"),
-  });
+  ];
+  const rejected = await releaseTogether(rejectedWorkers);
+  assert.deepEqual(rejected.map((result) => result.ok), [false, false]);
+  assert.match(rejected[0].error, /claim scope mismatch/);
+  assert.match(rejected[1].error, /unsupported worker action/);
+
+  const [startedResult] = await releaseTogether([
+    startBarrierWorker("updateClaimedSlice", {
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      action: {
+        action: "start",
+        depends_on: [],
+        gate: "caller-controlled gate",
+        assigned_to: "attacker",
+        slices: [{ id: "injected", title: "Injected sibling" }],
+      },
+      now: "2026-08-18T12:01:00.000Z",
+    }),
+  ]);
+  assert.equal(startedResult.ok, true, JSON.stringify(startedResult));
+  const started = startedResult.value;
   assert.equal(started.slice.status, "in_progress");
   assert.equal(started.slice.assigned_to, "worker-a");
   assert.equal(started.slice.gate, before.slices[0].gate);
