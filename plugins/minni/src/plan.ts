@@ -400,6 +400,32 @@ export class PlanDigestVersionError extends Error {
 }
 
 /**
+ * persistPlan writes the canonical vault note, then appends a history
+ * snapshot as a second, separate durable step. If the note write succeeds
+ * but the history append throws (e.g. EISDIR/EACCES on the history file),
+ * the plan mutation is ALREADY durable — this is never a pre-commit
+ * failure. Typed (not a bare Error) so a caller holding a freshly staged
+ * secret (claimSlice) can tell "committed, journal degraded" apart from
+ * "nothing was written" without re-deriving that distinction from message
+ * text, and so it never mistakes this for a rollback signal that would
+ * license deleting the only token for a now-durable claim.
+ */
+export class PlanHistoryAppendError extends Error {
+  readonly code = "PLAN_HISTORY_APPEND_FAILED" as const;
+  readonly notePath: string;
+  readonly rev: number;
+  constructor(notePath: string, rev: number, cause: unknown) {
+    super(
+      `persistPlan: note ${notePath} committed at rev ${rev}, but appending the history snapshot failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      cause instanceof Error ? { cause } : undefined,
+    );
+    this.name = "PlanHistoryAppendError";
+    this.notePath = notePath;
+    this.rev = rev;
+  }
+}
+
+/**
  * #122 (codex round 5): single declared-version gate for EVERY path that reads
  * plan frontmatter — strict or lenient. A note declaring an unknown (newer)
  * digest version, via plan_digest_v or a "vN:<hex>" digest prefix, throws the
@@ -1070,7 +1096,14 @@ export async function persistPlan(
     digest: plan.plan_digest,
     plan,
   };
-  await appendHistorySnapshot(historyFile, snapshot);
+  try {
+    await appendHistorySnapshot(historyFile, snapshot);
+  } catch (cause) {
+    // The note above is already durable — never swallow this into a bare
+    // Error a caller could mistake for "nothing was written". See
+    // PlanHistoryAppendError's doc comment.
+    throw new PlanHistoryAppendError(writeRes.notePath, plan.rev, cause);
+  }
 
   return writeRes;
 }

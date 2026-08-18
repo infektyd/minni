@@ -7,6 +7,7 @@ import {
   rehydratePlan,
   unmetDependencies,
   updateSlice,
+  PlanHistoryAppendError,
   type PlanArtifact,
   type PlanSlice,
   type PlanSliceStatus,
@@ -560,39 +561,40 @@ export async function claimSlice(
           notePath: input.notePath,
         });
       } catch (error) {
-        // persistPlan writes the canonical note before appending history. An
-        // EISDIR/permission failure at history therefore reports an error
-        // after the claim is already authoritative. Reconcile against a fresh
-        // strict read while still holding the Thread lock before deciding
-        // whether the staged secret is safe to delete.
-        let committed = false;
-        try {
-          const canonical = await rehydrateAuthority(input);
-          const durableSlice = findSlice(canonical, sliceId);
-          committed =
-            canonical.rev === stored.envelope.response.rev &&
-            requireGeneration(durableSlice) === generation &&
-            durableSlice.attempt === nextSlice.attempt &&
-            durableSlice.claim?.claim_id === stored.envelope.claim_id &&
-            durableSlice.claim.worker_agent_id === workerAgentId &&
-            durableSlice.claim.claimed_at === now.toISOString() &&
-            durableSlice.claim.expires_at === stored.envelope.expires_at;
-        } catch {
-          committed = false;
+        // persistPlan writes the canonical note before appending history, and
+        // now throws the typed PlanHistoryAppendError specifically for that
+        // ordering — never a bare Error a caller could mistake for "nothing
+        // was written". Its own construction proves the note write already
+        // succeeded, so it is trusted directly. Any OTHER propagated failure
+        // shape has no such guarantee, so it is instead judged by reconciling
+        // against a fresh strict read while still holding the Thread lock.
+        let committed = error instanceof PlanHistoryAppendError;
+        if (!committed) {
+          try {
+            const canonical = await rehydrateAuthority(input);
+            const durableSlice = findSlice(canonical, sliceId);
+            committed =
+              canonical.rev === stored.envelope.response.rev &&
+              requireGeneration(durableSlice) === generation &&
+              durableSlice.attempt === nextSlice.attempt &&
+              durableSlice.claim?.claim_id === stored.envelope.claim_id &&
+              durableSlice.claim.worker_agent_id === workerAgentId &&
+              durableSlice.claim.claimed_at === now.toISOString() &&
+              durableSlice.claim.expires_at === stored.envelope.expires_at;
+          } catch {
+            committed = false;
+          }
         }
-        if (committed) {
-          await deleteClaimSecretsBestEffort(
-            input.vaultPath,
-            planId,
-            staleClaimIds,
-            deleteSecret,
-          );
-          return publicClaimResponse(stored.envelope.response);
-        }
+        // Either way this is surfaced to the caller below — a post-commit
+        // failure must never be silently swallowed into a success return,
+        // even though the claim is durable. What differs is only whether the
+        // newly staged secret is safe to keep: on a committed write, retaining
+        // it lets an identical idempotency retry replay the same token
+        // against the now-durable claim instead of orphaning it.
         await deleteClaimSecretsBestEffort(
           input.vaultPath,
           planId,
-          [stored.envelope.claim_id],
+          committed ? staleClaimIds : [stored.envelope.claim_id, ...staleClaimIds],
           deleteSecret,
         );
         throw error;
