@@ -481,6 +481,33 @@ export function slugifySliceId(title: string, taken: Set<string>): string {
   }
 }
 
+function assertUniqueSliceIds(
+  slices: Array<{ id: string }>,
+  context: string,
+): void {
+  const seen = new Set<string>();
+  for (const slice of slices) {
+    if (seen.has(slice.id)) {
+      throw new Error(`${context}: duplicate slice id "${slice.id}"`);
+    }
+    seen.add(slice.id);
+  }
+}
+
+function assertUniqueExplicitSliceIds(
+  slices: Array<{ id?: string }>,
+  context: string,
+): void {
+  const seen = new Set<string>();
+  for (const slice of slices) {
+    if (!slice.id) continue;
+    if (seen.has(slice.id)) {
+      throw new Error(`${context}: duplicate explicit slice id "${slice.id}"`);
+    }
+    seen.add(slice.id);
+  }
+}
+
 function computeNextAction(slices: PlanSlice[]): string {
   const active = slices.find(
     (s) => s.status === "pending" || s.status === "in_progress" || s.status === "blocked",
@@ -754,6 +781,7 @@ export async function createPlan(
   const nowFn = deps.now ?? (() => new Date());
   const vaultPath = deps.vaultPath ?? input.vaultPath ?? DEFAULT_VAULT_PATH;
 
+  assertUniqueExplicitSliceIds(input.slices ?? [], "createPlan");
   const used = new Set<string>();
   const initialSlices: PlanSlice[] = (input.slices ?? []).map((s) => {
     const id = s.id || slugifySliceId(s.title, used);
@@ -1011,6 +1039,7 @@ export async function persistPlan(
 ): Promise<VaultWriteResult> {
   const writeFn = opts.writeVaultPage ?? writeVaultPage;
   const updated = new Date().toISOString();
+  assertUniqueSliceIds(plan.slices, "persistPlan");
 
   // mutate in-place so caller gets updated rev, updated time and digest
   plan.rev = (plan.rev ?? 0) + 1;
@@ -1184,6 +1213,7 @@ export function updateSlice(
   evidence?: string,
   options?: UpdateSliceOptions,
 ): PlanArtifact {
+  assertUniqueSliceIds(plan.slices, "updateSlice");
   const idx = plan.slices.findIndex((s) => s.id === slice_id);
   if (idx < 0) {
     throw new Error(`updateSlice: no slice with id ${slice_id}`);
@@ -1318,6 +1348,8 @@ export function replan(
   if (!Array.isArray(newSlices)) {
     return { ...plan, updated: new Date().toISOString() };
   }
+  assertUniqueSliceIds(plan.slices, "replan");
+  assertUniqueExplicitSliceIds(newSlices, "replan");
   const updated = new Date().toISOString();
   // Deterministic marker (no clock in id)
   const titlesKey = stableStringify(newSlices.map((s) => (s.title ?? s.id ?? "")).sort());
@@ -1501,8 +1533,16 @@ export function compactPlanView(plan: PlanArtifact): {
   };
 }
 
+export interface RehydratePlanDeps {
+  persistPlan?: typeof persistPlan;
+  beforeUpgradePersist?: (plan: PlanArtifact) => Promise<void>;
+}
+
 /** Rehydrate snapshot from vault note (frontmatter + body). Appends a rehydrated journal event as side effect. */
-export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
+export async function rehydratePlan(
+  notePath: string,
+  deps: RehydratePlanDeps = {},
+): Promise<PlanArtifact> {
   const raw = await readFile(notePath, "utf8");
   const { frontmatter: fm } = parseFrontmatter(raw);
 
@@ -1567,6 +1607,8 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     updated,
     rev,
   };
+
+  assertUniqueSliceIds(plan.slices, "rehydratePlan");
 
   // Validate that any 'done' slice has non-empty evidence
   for (const s of plan.slices) {
@@ -1678,7 +1720,8 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     // read still succeeds.
     try {
       const vaultPath = path.resolve(path.dirname(notePath), "..", "..");
-      await persistPlan(plan, { vaultPath, notePath });
+      await deps.beforeUpgradePersist?.(plan);
+      await (deps.persistPlan ?? persistPlan)(plan, { vaultPath, notePath });
     } catch {
       // advisory: the in-memory upgraded digest is enough for this read to proceed
     }
@@ -1862,6 +1905,8 @@ export function diffPlans(a: PlanArtifact, b: PlanArtifact): PlanDiff {
 }
 
 export function restorePlan(current: PlanArtifact, snapshot: PlanArtifact): PlanArtifact {
+  assertUniqueSliceIds(current.slices, "restorePlan current");
+  assertUniqueSliceIds(snapshot.slices, "restorePlan snapshot");
   const generations = [...current.slices, ...snapshot.slices]
     .map((slice) => slice.generation)
     .filter(
@@ -1912,6 +1957,8 @@ export function applySliceDelta(
     drop_slice_ids?: string[];
   },
 ): PlanArtifact {
+  assertUniqueSliceIds(plan.slices, "applySliceDelta");
+  assertUniqueExplicitSliceIds(delta.add_slices ?? [], "applySliceDelta");
   const deltaKey = stableStringify({
     add: (delta.add_slices ?? []).map((s) => s.title ?? s.id ?? "").sort(),
     drop: (delta.drop_slice_ids ?? []).sort(),

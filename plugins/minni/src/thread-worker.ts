@@ -9,7 +9,9 @@ import {
   updateSlice,
   type PlanArtifact,
   type PlanSlice,
+  type PlanSliceStatus,
   type StructuralProposal,
+  type UpdateSliceOptions,
 } from "./plan.js";
 import type { ScarTissueEntry } from "./task.js";
 import {
@@ -162,12 +164,13 @@ function assertNoteUnderVault(vaultPath: string, notePath: string): void {
 
 async function rehydrateAuthority(
   input: ThreadPlanTarget,
+  rehydrate: typeof rehydratePlan = rehydratePlan,
 ): Promise<PlanArtifact> {
   assertNoteUnderVault(input.vaultPath, input.notePath);
   // Authority paths intentionally use only strict rehydration. In particular,
   // rehydratePlanScalars is a recovery helper whose lenient assignment/claim
   // metadata must never authorize a worker.
-  const plan = await rehydratePlan(input.notePath);
+  const plan = await rehydrate(input.notePath);
   if (plan.plan_id !== input.planId) {
     throw new Error(
       `thread plan scope mismatch: expected ${input.planId}, found ${plan.plan_id}`,
@@ -180,6 +183,10 @@ export interface ThreadPlanLockInput extends ThreadPlanTarget {
   operationId: string;
 }
 
+export interface ThreadPlanLockDeps {
+  rehydratePlan?: typeof rehydratePlan;
+}
+
 /**
  * Shared lock-before-read primitive for every production Thread
  * read-modify-write path. Callers receive only a strict, digest-verified plan
@@ -188,12 +195,14 @@ export interface ThreadPlanLockInput extends ThreadPlanTarget {
 export async function withThreadPlanLock<T>(
   input: ThreadPlanLockInput,
   fn: (plan: PlanArtifact) => Promise<T>,
+  deps: ThreadPlanLockDeps = {},
 ): Promise<T> {
   return withThreadLock(
     input.vaultPath,
     requireNonEmpty(input.planId, "plan id"),
     requireNonEmpty(input.operationId, "operation id"),
-    async () => fn(await rehydrateAuthority(input)),
+    async () =>
+      fn(await rehydrateAuthority(input, deps.rehydratePlan ?? rehydratePlan)),
   );
 }
 
@@ -230,7 +239,11 @@ export async function deleteClaimSecretsBestEffort(
 }
 
 function findSlice(plan: PlanArtifact, sliceId: string): PlanSlice {
-  const slice = plan.slices.find((candidate) => candidate.id === sliceId);
+  const matches = plan.slices.filter((candidate) => candidate.id === sliceId);
+  if (matches.length > 1) {
+    throw new Error(`thread worker: duplicate slice id "${sliceId}"`);
+  }
+  const slice = matches[0];
   if (!slice) {
     throw new Error(`thread worker: no slice with id ${sliceId}`);
   }
@@ -242,11 +255,57 @@ function replaceSlice(
   sliceId: string,
   replacement: PlanSlice,
 ): PlanArtifact {
+  if (
+    plan.slices.filter((slice) => slice.id === sliceId).length !== 1
+  ) {
+    throw new Error(
+      `thread worker: slice "${sliceId}" must identify exactly one slice`,
+    );
+  }
   return {
     ...plan,
     slices: plan.slices.map((slice) =>
       slice.id === sliceId ? replacement : slice
     ),
+  };
+}
+
+export interface OrchestratorSliceUpdateResult {
+  plan: PlanArtifact;
+  slice: PlanSlice;
+  previous_slice: PlanSlice;
+  revoked_claim_id?: string;
+}
+
+/**
+ * Pure direct-orchestrator slice transition. Unlike a claimed worker update,
+ * any orchestrator transition revokes extant worker authority, even when the
+ * status will later be reopened.
+ */
+export function applyOrchestratorSliceUpdate(
+  plan: PlanArtifact,
+  sliceId: string,
+  status: PlanSliceStatus,
+  evidence?: string,
+  options?: UpdateSliceOptions,
+): OrchestratorSliceUpdateResult {
+  const previousSlice = findSlice(plan, sliceId);
+  let next = updateSlice(plan, sliceId, status, evidence, options);
+  if (previousSlice.claim) {
+    const transitioned = findSlice(next, sliceId);
+    next = replaceSlice(next, sliceId, {
+      ...transitioned,
+      generation: requireGeneration(previousSlice) + 1,
+      claim: undefined,
+    });
+  }
+  return {
+    plan: next,
+    slice: findSlice(next, sliceId),
+    previous_slice: previousSlice,
+    ...(previousSlice.claim
+      ? { revoked_claim_id: previousSlice.claim.claim_id }
+      : {}),
   };
 }
 
@@ -501,6 +560,35 @@ export async function claimSlice(
           notePath: input.notePath,
         });
       } catch (error) {
+        // persistPlan writes the canonical note before appending history. An
+        // EISDIR/permission failure at history therefore reports an error
+        // after the claim is already authoritative. Reconcile against a fresh
+        // strict read while still holding the Thread lock before deciding
+        // whether the staged secret is safe to delete.
+        let committed = false;
+        try {
+          const canonical = await rehydrateAuthority(input);
+          const durableSlice = findSlice(canonical, sliceId);
+          committed =
+            canonical.rev === stored.envelope.response.rev &&
+            requireGeneration(durableSlice) === generation &&
+            durableSlice.attempt === nextSlice.attempt &&
+            durableSlice.claim?.claim_id === stored.envelope.claim_id &&
+            durableSlice.claim.worker_agent_id === workerAgentId &&
+            durableSlice.claim.claimed_at === now.toISOString() &&
+            durableSlice.claim.expires_at === stored.envelope.expires_at;
+        } catch {
+          committed = false;
+        }
+        if (committed) {
+          await deleteClaimSecretsBestEffort(
+            input.vaultPath,
+            planId,
+            staleClaimIds,
+            deleteSecret,
+          );
+          return publicClaimResponse(stored.envelope.response);
+        }
         await deleteClaimSecretsBestEffort(
           input.vaultPath,
           planId,

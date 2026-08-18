@@ -51,7 +51,6 @@ import {
   rehydratePlanScalars,
   replan,
   shelfDrift,
-  updateSlice,
   unmetDependencies,
   diffDependsOn,
   diffSupersededDependencies,
@@ -88,6 +87,7 @@ import {
 } from "./agent_ping.js";
 import { planHandoffDelivery } from "./handoff_guard.js";
 import {
+  applyOrchestratorSliceUpdate,
   claimIds,
   deleteClaimSecretsBestEffort,
   revokedClaimIds,
@@ -1386,17 +1386,25 @@ server.registerTool(
         const unmetBeforeUpdate = status === "done"
           ? unmetDependencies(plan, slice_id)
           : [];
-        const updated = updateSlice(
+        const applied = applyOrchestratorSliceUpdate(
           plan,
           slice_id,
           status,
           evidence,
           { force, forceReason: force_reason },
         );
+        const updated = applied.plan;
         await persistPlan(updated, {
           vaultPath: effectiveVaultPath,
           notePath,
         });
+        if (applied.revoked_claim_id) {
+          await deleteClaimSecretsBestEffort(
+            effectiveVaultPath,
+            plan_id,
+            [applied.revoked_claim_id],
+          );
+        }
         const journalPath = path.join(
           path.dirname(notePath),
           `${plan_id}.log.md`,
@@ -1526,13 +1534,25 @@ server.registerTool(
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
+    const { plan, active } = await withThreadPlanLock(
+      {
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        operationId: `server-status-read:${randomUUID()}`,
+      },
+      async (lockedPlan) => {
+        const activePointer = await getActivePlan(effectiveVaultPath);
+        return {
+          plan: lockedPlan,
+          active: activePointer?.plan_id === plan_id,
+        };
+      },
+    );
     const view = compactPlanView(plan);
     const drift = live_shelf_content
       ? shelfDrift(plan, live_shelf_content)
       : undefined;
-    const activePointer = await getActivePlan(effectiveVaultPath);
-    const active = activePointer?.plan_id === plan_id;
     return textResult(
       JSON.stringify({ view, drift, status: plan.status, rev: plan.rev, active }, null, 2),
     );
