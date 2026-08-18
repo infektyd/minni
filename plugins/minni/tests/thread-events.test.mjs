@@ -15,6 +15,7 @@ import {
   rehydratePlan,
 } from "../dist/plan.js";
 import {
+  appendOrderedEventBatch,
   appendOrderedThreadEvent,
   readThreadEvents,
   reconcileThreadJournal,
@@ -89,6 +90,7 @@ function reconcileInput(fixture, plan, actor = "test-orchestrator") {
     planId: fixture.planId,
     rev: plan.rev,
     actor,
+    readySummary: { slices: [{ id: "a", title: "Slice A" }] },
   };
 }
 
@@ -233,7 +235,7 @@ test("legacy journal events without seq are ignored for ordering", async (t) => 
   assert.equal(events[0].seq, 1);
 });
 
-test("journal with no ordered events reconciles at current note revision", async (t) => {
+test("journal with no ordered events reconciles without assuming alignment", async (t) => {
   const fixture = await createThread(t);
   const plan = await seedNoteAtRev(fixture, 3);
   await appendJournal(fixture.journalPath, {
@@ -243,6 +245,110 @@ test("journal with no ordered events reconciles at current note revision", async
 
   const input = reconcileInput(fixture, plan);
   await withThreadLock(fixture.vaultPath, fixture.planId, "legacy-only", async () => {
-    assert.equal(await reconcileThreadJournal(input), "ok");
+    assert.equal(await reconcileThreadJournal({
+      ...input,
+      readySummary: { slices: [{ id: "a", title: "Slice A" }] },
+    }), "ok");
+  });
+});
+
+test("conflicting duplicate idempotency key fails typed", async (t) => {
+  const fixture = await createThread(t);
+  const input = {
+    journalPath: fixture.journalPath,
+    planId: fixture.planId,
+    rev: fixture.rev,
+    idempotencyKey: "conflict-key",
+    actor: "worker-a",
+    kind: "slice.started",
+    at: THREAD_START.toISOString(),
+  };
+
+  await withThreadLock(fixture.vaultPath, fixture.planId, "conflict-1", async () => {
+    await appendOrderedThreadEvent(input);
+    await assert.rejects(
+      appendOrderedThreadEvent({
+        ...input,
+        kind: "slice.completed",
+      }),
+      /thread_event_idempotency_conflict/,
+    );
+  });
+});
+
+test("truncated tail is ignored and later appends stay monotonic", async (t) => {
+  const fixture = await createThread(t);
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const completeBatch = {
+    thread_event_batch: [{
+      seq: 1,
+      rev: fixture.rev,
+      event_id: "evt-1",
+      idempotency_key: "batch-one",
+      actor: "test",
+      kind: "test.one",
+      at: THREAD_START.toISOString(),
+    }],
+  };
+  await writeFile(
+    fixture.journalPath,
+    `${header}${JSON.stringify(completeBatch)}\n{"thread_event_batch":[{"seq":2`,
+    "utf8",
+  );
+
+  await withThreadLock(fixture.vaultPath, fixture.planId, "tail-repair", async () => {
+    await appendOrderedEventBatch({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      actor: "test",
+      events: [
+        { idempotencyKey: "batch-two", kind: "test.two" },
+        { idempotencyKey: "batch-two:ready", kind: "ready.changed", payload: { slices: [] } },
+      ],
+    });
+    await appendOrderedEventBatch({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      actor: "test",
+      events: [{ idempotencyKey: "batch-three", kind: "test.three" }],
+    });
+  });
+
+  const { events } = await readThreadEvents(fixture.journalPath, 0, 100);
+  assert.deepEqual(events.map((event) => event.seq), [1, 2, 3, 4]);
+  assert.deepEqual(
+    events.map((event) => event.idempotency_key),
+    ["batch-one", "batch-two", "batch-two:ready", "batch-three"],
+  );
+});
+
+test("state.recovered carries the safe ready-set summary", async (t) => {
+  const fixture = await createThread(t);
+  const plan = await seedNoteAtRev(fixture, 5);
+  await seedOrderedEvents(fixture.journalPath, [
+    {
+      seq: 1,
+      rev: 4,
+      event_id: "evt-1",
+      idempotency_key: "seed-1",
+      actor: "test",
+      kind: "slice.assigned",
+      at: THREAD_START.toISOString(),
+    },
+  ]);
+
+  const input = {
+    ...reconcileInput(fixture, plan),
+    readySummary: { slices: [{ id: "a", title: "Slice A" }] },
+  };
+  await withThreadLock(fixture.vaultPath, fixture.planId, "recovery-summary", async () => {
+    await reconcileThreadJournal(input);
+  });
+  const { events } = await readThreadEvents(fixture.journalPath, 0, 100);
+  const recovered = events.find((event) => event.kind === "state.recovered");
+  assert.deepEqual(recovered?.payload, {
+    ready: { slices: [{ id: "a", title: "Slice A" }] },
   });
 });

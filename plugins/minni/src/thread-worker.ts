@@ -17,8 +17,14 @@ import {
 } from "./plan.js";
 import type { ScarTissueEntry } from "./task.js";
 import {
-  appendOrderedThreadEvent,
+  appendOrderedEventBatch,
+  assertOperationIdentity,
+  ensureOrderedBaseline,
+  findOrderedEventByIdempotencyKey,
   reconcileThreadJournal,
+  readOrderedThreadEvents,
+  type OperationEventIdentity,
+  type ReadySummaryPayload,
 } from "./thread-events.js";
 import {
   createClaimSecret,
@@ -77,7 +83,7 @@ export interface UpdateClaimedSliceInput extends ThreadMutationTarget {
   workerAgentId: string;
   token: string;
   action: WorkerUpdateAction;
-  idempotencyKey?: string;
+  idempotencyKey: string;
 }
 
 export interface ThreadWorkerDeps {
@@ -337,17 +343,41 @@ function readyIdsEqual(left: string[], right: string[]): boolean {
   return sortedLeft.every((id, index) => id === sortedRight[index]);
 }
 
-async function reconcileThreadState(
+function readySummary(plan: PlanArtifact, now: Date): ReadySummaryPayload {
+  return {
+    slices: readySlices(plan, now).map((slice) => ({
+      id: slice.id,
+      title: slice.title,
+    })),
+  };
+}
+
+async function prepareThreadMutation(
   input: ThreadPlanTarget & { actor: string },
   plan: PlanArtifact,
-): Promise<void> {
+  now: Date,
+): Promise<{ journalPath: string; ordered: Awaited<ReturnType<typeof readOrderedThreadEvents>> }> {
+  const journalPath = journalPathFor(input.notePath, input.planId);
+  const summary = readySummary(plan, now);
   await reconcileThreadJournal({
-    journalPath: journalPathFor(input.notePath, input.planId),
+    journalPath,
     notePath: input.notePath,
     planId: input.planId,
     rev: plan.rev,
     actor: input.actor,
+    readySummary: summary,
   });
+  await ensureOrderedBaseline({
+    journalPath,
+    planId: input.planId,
+    rev: plan.rev,
+    actor: input.actor,
+    readySummary: summary,
+  });
+  return {
+    journalPath,
+    ordered: await readOrderedThreadEvents(journalPath),
+  };
 }
 
 function workerEventKind(action: WorkerUpdateAction): string {
@@ -370,7 +400,7 @@ function workerEventKind(action: WorkerUpdateAction): string {
 }
 
 async function recordThreadMutationEvents(input: {
-  notePath: string;
+  journalPath: string;
   planId: string;
   rev: number;
   actor: string;
@@ -383,40 +413,115 @@ async function recordThreadMutationEvents(input: {
   plan: PlanArtifact;
   now: Date;
 }): Promise<void> {
-  const journalPath = journalPathFor(input.notePath, input.planId);
   const at = input.now.toISOString();
-  try {
-    await appendOrderedThreadEvent({
-      journalPath,
-      planId: input.planId,
-      rev: input.rev,
+  const events = [
+    {
       idempotencyKey: input.operationKey,
-      actor: input.actor,
       kind: input.kind,
-      at,
       sliceId: input.sliceId,
       payload: input.payload,
+    },
+  ];
+  if (!readyIdsEqual(input.readyBefore, input.readyAfter)) {
+    events.push({
+      idempotencyKey: `${input.operationKey}:ready`,
+      kind: "ready.changed",
+      sliceId: undefined,
+      payload: {
+        slices: readySummary(input.plan, input.now).slices,
+      },
     });
-    if (!readyIdsEqual(input.readyBefore, input.readyAfter)) {
-      await appendOrderedThreadEvent({
-        journalPath,
-        planId: input.planId,
-        rev: input.rev,
-        idempotencyKey: `${input.operationKey}:ready`,
-        actor: input.actor,
-        kind: "ready.changed",
-        at,
-        payload: {
-          slices: readySlices(input.plan, input.now).map((slice) => ({
-            id: slice.id,
-            title: slice.title,
-          })),
-        },
-      });
-    }
+  }
+  try {
+    await appendOrderedEventBatch({
+      journalPath: input.journalPath,
+      planId: input.planId,
+      rev: input.rev,
+      actor: input.actor,
+      at,
+      events,
+    });
   } catch {
     // The note is already durable; the next locked mutation reconciles first.
   }
+}
+
+async function repairClaimSchedulerEvents(input: {
+  journalPath: string;
+  planId: string;
+  rev: number;
+  actor: string;
+  operationKey: string;
+  sliceId: string;
+  readyBefore: string[];
+  readyAfter: string[];
+  plan: PlanArtifact;
+  now: Date;
+}): Promise<void> {
+  const ordered = await readOrderedThreadEvents(input.journalPath);
+  const summary = readySummary(input.plan, input.now);
+  await ensureOrderedBaseline({
+    journalPath: input.journalPath,
+    planId: input.planId,
+    rev: input.rev,
+    actor: input.actor,
+    readySummary: summary,
+  });
+  const claimed = findOrderedEventByIdempotencyKey(ordered, input.operationKey);
+  if (!claimed) {
+    await recordThreadMutationEvents({
+      journalPath: input.journalPath,
+      planId: input.planId,
+      rev: input.rev,
+      actor: input.actor,
+      operationKey: input.operationKey,
+      kind: "slice.claimed",
+      sliceId: input.sliceId,
+      readyBefore: input.readyBefore,
+      readyAfter: input.readyAfter,
+      plan: input.plan,
+      now: input.now,
+    });
+    return;
+  }
+  assertOperationIdentity(claimed, {
+    idempotencyKey: input.operationKey,
+    kind: "slice.claimed",
+    actor: input.actor,
+    sliceId: input.sliceId,
+  });
+  if (!readyIdsEqual(input.readyBefore, input.readyAfter)) {
+    const readyKey = `${input.operationKey}:ready`;
+    if (!findOrderedEventByIdempotencyKey(ordered, readyKey)) {
+      await appendOrderedEventBatch({
+        journalPath: input.journalPath,
+        planId: input.planId,
+        rev: input.rev,
+        actor: input.actor,
+        at: input.now.toISOString(),
+        events: [
+          {
+            idempotencyKey: readyKey,
+            kind: "ready.changed",
+            payload: { slices: summary.slices },
+          },
+        ],
+      });
+    }
+  }
+}
+
+function findWorkerUpdateIdempotency(
+  ordered: Awaited<ReturnType<typeof readOrderedThreadEvents>>,
+  identity: OperationEventIdentity,
+): boolean {
+  const existing = findOrderedEventByIdempotencyKey(
+    ordered,
+    identity.idempotencyKey,
+  );
+  if (!existing) return false;
+  assertOperationIdentity(existing, identity);
+  return true;
 }
 
 function publicClaimResponse(
@@ -463,9 +568,10 @@ export async function assignSlice(
     },
     async (plan) => {
       const now = sampleNow(input.now);
-      await reconcileThreadState(
+      const { journalPath } = await prepareThreadMutation(
         { ...input, planId, actor: workerAgentId },
         plan,
+        now,
       );
       const slice = findSlice(plan, sliceId);
       const readyBefore = readyIds(plan, now);
@@ -500,7 +606,7 @@ export async function assignSlice(
       }
       const result = mutationResult(next, sliceId, readyBefore, now);
       await recordThreadMutationEvents({
-        notePath: input.notePath,
+        journalPath,
         planId,
         rev: next.rev,
         actor: workerAgentId,
@@ -565,9 +671,10 @@ export async function claimSlice(
     },
     async (initialPlan) => {
       const now = sampleNow(input.now);
-      await reconcileThreadState(
+      const { journalPath } = await prepareThreadMutation(
         { ...input, planId, actor: workerAgentId },
         initialPlan,
+        now,
       );
       let plan = initialPlan;
       let slice = findSlice(plan, sliceId);
@@ -610,11 +717,30 @@ export async function claimSlice(
             workerAgentId,
           )
         ) {
+          const unclaimedPlan = replaceSlice(plan, sliceId, {
+            ...slice,
+            claim: undefined,
+          });
+          const readyBefore = readyIds(unclaimedPlan, now);
+          const readyAfter = readyIds(plan, now);
+          await repairClaimSchedulerEvents({
+            journalPath,
+            planId,
+            rev: plan.rev,
+            actor: workerAgentId,
+            operationKey: idempotencyKey,
+            sliceId,
+            readyBefore,
+            readyAfter,
+            plan,
+            now,
+          });
           return publicClaimResponse(existing.response);
         }
         throw new Error(`slice "${sliceId}" is already claimed`);
       }
 
+      const readyBefore = readyIds(plan, now);
       const unmet = unmetDependencies(plan, sliceId);
       if (unmet.length > 0) {
         throw new Error(
@@ -725,14 +851,14 @@ export async function claimSlice(
       const response = publicClaimResponse(stored.envelope.response);
       const readyAfter = readyIds(next, now);
       await recordThreadMutationEvents({
-        notePath: input.notePath,
+        journalPath,
         planId,
         rev: next.rev,
         actor: workerAgentId,
         operationKey: idempotencyKey,
         kind: "slice.claimed",
         sliceId,
-        readyBefore: readyAfter,
+        readyBefore,
         readyAfter,
         plan: next,
         now,
@@ -948,6 +1074,10 @@ export async function updateClaimedSlice(
     "worker agent id",
   );
   const token = requireNonEmpty(input.token, "claim token");
+  const idempotencyKey = requireNonEmpty(
+    input.idempotencyKey,
+    "idempotency key",
+  );
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
 
@@ -960,9 +1090,10 @@ export async function updateClaimedSlice(
     },
     async (plan) => {
       const now = sampleNow(input.now);
-      await reconcileThreadState(
+      const { journalPath, ordered } = await prepareThreadMutation(
         { ...input, planId, actor: workerAgentId },
         plan,
+        now,
       );
       const slice = findSlice(plan, sliceId);
       const claim = slice.claim;
@@ -994,6 +1125,17 @@ export async function updateClaimedSlice(
         throw new Error(`slice "${sliceId}" is not worker-updatable`);
       }
 
+      const operationIdentity: OperationEventIdentity = {
+        idempotencyKey,
+        kind: workerEventKind(input.action),
+        actor: workerAgentId,
+        sliceId,
+      };
+      if (findWorkerUpdateIdempotency(ordered, operationIdentity)) {
+        const readyBefore = readyIds(plan, now);
+        return mutationResult(plan, sliceId, readyBefore, now);
+      }
+
       const readyBefore = readyIds(plan, now);
       const applied = applyWorkerAction(plan, sliceId, input.action);
       let next = applied.plan;
@@ -1017,15 +1159,12 @@ export async function updateClaimedSlice(
         );
       }
       const result = mutationResult(next, sliceId, readyBefore, now);
-      const operationKey =
-        input.idempotencyKey?.trim() ||
-        `${sliceId}:${input.action.action}:${generation}`;
       await recordThreadMutationEvents({
-        notePath: input.notePath,
+        journalPath,
         planId,
         rev: next.rev,
         actor: workerAgentId,
-        operationKey,
+        operationKey: idempotencyKey,
         kind: workerEventKind(input.action),
         sliceId,
         readyBefore: result.ready_before,

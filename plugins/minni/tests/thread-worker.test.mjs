@@ -45,7 +45,7 @@ import {
   assignSlice,
   claimSlice,
   readySlices,
-  updateClaimedSlice,
+  updateClaimedSlice as updateClaimedSliceImpl,
 } from "../dist/thread-worker.js";
 import * as threadWorkerRuntime from "../dist/thread-worker.js";
 import { withThreadLock } from "../dist/thread-lock.js";
@@ -58,6 +58,19 @@ const THREAD_WORKER_MODULE_URL = new URL(
   "../dist/thread-worker.js",
   import.meta.url,
 ).href;
+
+let workerUpdateSeq = 0;
+function workerUpdate(input, deps) {
+  return updateClaimedSliceImpl(
+    {
+      idempotencyKey:
+        input.idempotencyKey ??
+        `test-worker-update-${(workerUpdateSeq += 1)}`,
+      ...input,
+    },
+    deps,
+  );
+}
 
 async function claimFixture(t, overrides = {}) {
   const vaultPath = await mkdtemp(path.join(tmpdir(), "minni-thread-claim-"));
@@ -895,6 +908,7 @@ test("two real processes completing independent slices preserve both results", a
       sliceId: "a",
       workerAgentId: "worker-a",
       token: claimA.token,
+      idempotencyKey: "complete-a-process",
       action: {
         action: "complete",
         evidence: "Slice A verified in deterministic child-process output",
@@ -906,6 +920,7 @@ test("two real processes completing independent slices preserve both results", a
       sliceId: "b",
       workerAgentId: "worker-b",
       token: claimB.token,
+      idempotencyKey: "complete-b-process",
       action: {
         action: "complete",
         evidence: "Slice B verified in deterministic child-process output",
@@ -963,7 +978,7 @@ test("completion after expiry is rejected without a sweeper", async (t) => {
   });
 
   await assert.rejects(
-    updateClaimedSlice({
+    workerUpdate({
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
@@ -999,6 +1014,7 @@ test("barrier expiry-versus-complete race commits exactly one outcome", async (t
       sliceId: "a",
       workerAgentId: "worker-a",
       token: original.token,
+      idempotencyKey: "barrier-complete-before-expiry",
       action: {
         action: "complete",
         evidence: "Completion won before the deterministic lease deadline",
@@ -1064,6 +1080,7 @@ test("reassignment revokes the old token and increments generation", async (t) =
       sliceId: "a",
       workerAgentId: "worker-a",
       token: claim.token,
+      idempotencyKey: "stale-generation-complete",
       action: {
         action: "complete",
         evidence: "Stale generation must not be accepted as completion",
@@ -1112,7 +1129,7 @@ test("replan invalidates claims and generations when slice meaning changes", asy
   });
 
   await assert.rejects(
-    updateClaimedSlice({
+    workerUpdate({
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
@@ -1142,6 +1159,7 @@ test("worker token cannot mutate a sibling or Thread topology", async (t) => {
       sliceId: "b",
       workerAgentId: "worker-a",
       token: claim.token,
+      idempotencyKey: "sibling-start-reject",
       action: { action: "start" },
       now: "2026-08-18T12:01:00.000Z",
     }),
@@ -1150,6 +1168,7 @@ test("worker token cannot mutate a sibling or Thread topology", async (t) => {
       sliceId: "a",
       workerAgentId: "worker-a",
       token: claim.token,
+      idempotencyKey: "replan-injection-reject",
       action: {
         action: "replan",
         slices: [{ id: "owned-by-caller", title: "Injected topology" }],
@@ -1168,6 +1187,7 @@ test("worker token cannot mutate a sibling or Thread topology", async (t) => {
       sliceId: "a",
       workerAgentId: "worker-a",
       token: claim.token,
+      idempotencyKey: "start-with-extra-fields",
       action: {
         action: "start",
         depends_on: [],
@@ -1211,7 +1231,7 @@ test("worker actions copy only discriminated scar and proposal fields", async (t
     now: new Date("2026-08-18T12:01:00.000Z"),
   };
 
-  await updateClaimedSlice({
+  await workerUpdate({
     ...baseInput,
     action: {
       action: "scar",
@@ -1221,7 +1241,7 @@ test("worker actions copy only discriminated scar and proposal fields", async (t
       injected: "must not persist",
     },
   });
-  const proposed = await updateClaimedSlice({
+  const proposed = await workerUpdate({
     ...baseInput,
     action: {
       action: "propose_structure",
@@ -1309,7 +1329,7 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
     fixture.planId,
     "hold-until-claim-expires",
     async () => {
-      queuedUpdate = updateClaimedSlice({
+      queuedUpdate = workerUpdate({
         ...fixture,
         sliceId: "a",
         workerAgentId: "worker-a",
@@ -1407,7 +1427,7 @@ test("assignment persistence failure leaves the previous claim fully usable", as
   const unchanged = await rehydratePlan(fixture.notePath);
   assert.equal(unchanged.slices[0].assigned_to, "worker-a");
   assert.equal(unchanged.slices[0].claim.claim_id, claim.claim_id);
-  const started = await updateClaimedSlice({
+  const started = await workerUpdate({
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-a",
@@ -1456,7 +1476,7 @@ test("cleanup failures cannot undo reassignment or completion", async (t) => {
     });
     assert.equal(orphan.envelope.claim_id, claim.claim_id);
     await assert.rejects(
-      updateClaimedSlice({
+      workerUpdate({
         ...fixture,
         sliceId: "a",
         workerAgentId: "worker-a",
@@ -1480,11 +1500,12 @@ test("cleanup failures cannot undo reassignment or completion", async (t) => {
       idempotencyKey: "cleanup-failure-complete",
       now: new Date(THREAD_START),
     });
-    const completed = await updateClaimedSlice({
+    const completed = await workerUpdate({
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
       token: claim.token,
+      idempotencyKey: "cleanup-failure-complete-update",
       action: {
         action: "complete",
         evidence: "Completion remains committed after cleanup failure",
@@ -1546,7 +1567,7 @@ test("restore clears historical claims and advances beyond every old generation"
   });
   assert.equal(orphan.envelope.claim_id, claim.claim_id);
   await assert.rejects(
-    updateClaimedSlice({
+    workerUpdate({
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
@@ -1629,6 +1650,7 @@ test("locked orchestrator scar and replan cannot clobber a worker completion", a
         sliceId: "a",
         workerAgentId: "worker-a",
         token: claim.token,
+        idempotencyKey: `worker-complete-${operation}`,
         action: {
           action: "complete",
           evidence: `Worker completion survives concurrent ${operation}`,
@@ -1745,7 +1767,7 @@ test("strict duplicate-id rejection prevents a claimed worker from replacing a s
   await writeFile(fixture.notePath, tampered, "utf8");
 
   await assert.rejects(
-    updateClaimedSlice({
+    workerUpdate({
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
@@ -1821,7 +1843,7 @@ test("orchestrator slice transitions revoke a claim across terminal reopen", asy
   assert.equal(reopened.plan.slices.find((slice) => slice.id === "b").status, "pending");
 
   await assert.rejects(
-    updateClaimedSlice({
+    workerUpdate({
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
@@ -1997,7 +2019,7 @@ test("worker mutations append ordered operation and ready.changed events", async
     idempotencyKey: "claim-a",
     now: new Date(THREAD_START),
   });
-  await updateClaimedSlice({
+  await workerUpdate({
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-a",
@@ -2018,14 +2040,19 @@ test("worker mutations append ordered operation and ready.changed events", async
   assert.ok(kinds.includes("slice.completed"));
   assert.ok(kinds.includes("ready.changed"));
 
-  const readyEvent = events.find((event) => event.kind === "ready.changed");
+  const readyEvent = events.find(
+    (event) => event.idempotency_key === "complete-a:ready",
+  );
   assert.ok(readyEvent);
   assert.deepEqual(readyEvent.payload, {
     slices: [{ id: "b", title: "Slice B" }],
   });
-  assert.equal(
-    events.filter((event) => event.idempotency_key.endsWith(":ready")).length,
-    1,
+  assert.ok(
+    events.some(
+      (event) =>
+        event.kind === "ready.changed" &&
+        event.idempotency_key === "claim-a:ready",
+    ),
   );
 });
 
@@ -2039,7 +2066,7 @@ test("operation and ready.changed idempotency keys replay exact events", async (
     idempotencyKey: "claim-exact",
     now: new Date(THREAD_START),
   });
-  await updateClaimedSlice({
+  await workerUpdate({
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-a",
@@ -2051,7 +2078,7 @@ test("operation and ready.changed idempotency keys replay exact events", async (
 
   const journalPath = journalPathFor(fixture.notePath, fixture.planId);
   const before = await readThreadEvents(journalPath, 0, 100);
-  await updateClaimedSlice({
+  await workerUpdate({
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-a",
@@ -2071,7 +2098,8 @@ test("failed event append is recovered on the next locked mutation", async (t) =
   const journalPath = journalPathFor(fixture.notePath, fixture.planId);
   const planAfterAssign = await rehydratePlan(fixture.notePath);
   const { events: afterAssign } = await readThreadEvents(journalPath, 0, 100);
-  assert.equal(afterAssign.length, 1);
+  assert.ok(afterAssign.some((event) => event.kind === "state.baseline"));
+  assert.ok(afterAssign.some((event) => event.kind === "slice.assigned"));
 
   const bumped = await rehydratePlan(fixture.notePath);
   bumped.next_action = "simulate note-ahead crash gap";
@@ -2088,4 +2116,155 @@ test("failed event append is recovered on the next locked mutation", async (t) =
   assert.ok(recovered);
   assert.equal(recovered.rev, planAhead.rev);
   assert.ok(events.some((event) => event.kind === "slice.assigned"));
+});
+
+test("claim emits ready.changed when the claimed slice leaves ready", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const beforeClaim = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    beforeClaim.events.some((event) => event.idempotency_key === "claim-ready:ready"),
+    false,
+  );
+
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-ready",
+    now: new Date(THREAD_START),
+  });
+
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  const readyEvent = events.find(
+    (event) => event.idempotency_key === "claim-ready:ready",
+  );
+  assert.ok(readyEvent);
+  assert.deepEqual(readyEvent.payload, { slices: [] });
+});
+
+test("duplicate worker start does not rev-bump or emit false recovery", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "dup-start-claim",
+    now: new Date(THREAD_START),
+  });
+  const before = await rehydratePlan(fixture.notePath);
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "dup-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  const afterFirst = await rehydratePlan(fixture.notePath);
+  await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "dup-start",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  const afterSecond = await rehydratePlan(fixture.notePath);
+  assert.equal(afterSecond.rev, afterFirst.rev);
+  assert.equal(afterSecond.rev, before.rev + 1);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(events.filter((event) => event.kind === "state.recovered").length, 0);
+  assert.equal(
+    events.filter((event) => event.idempotency_key === "dup-start").length,
+    1,
+  );
+});
+
+test("claim idempotent retry repairs missing slice.claimed and ready delta", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "repair-claim",
+    now: new Date(THREAD_START),
+  });
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  let raw = await readFile(journalPath, "utf8");
+  raw = raw
+    .split("\n")
+    .filter((line) => !line.includes("repair-claim"))
+    .join("\n");
+  await writeFile(journalPath, raw, "utf8");
+
+  const replay = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "repair-claim",
+    now: new Date(THREAD_START),
+  });
+  assert.equal(replay.token, claim.token);
+
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.ok(events.some((event) => event.idempotency_key === "repair-claim"));
+  assert.ok(
+    events.some((event) => event.idempotency_key === "repair-claim:ready"),
+  );
+});
+
+test("worker paths reject journal-ahead state as thread_inconsistent", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const plan = await rehydratePlan(fixture.notePath);
+  await writeFile(
+    journalPath,
+    `# Minni Plan Journal\n\n## events\n${JSON.stringify({
+      thread_event_batch: [{
+        seq: 99,
+        rev: plan.rev + 5,
+        event_id: "ahead",
+        idempotency_key: "ahead",
+        actor: "test",
+        kind: "slice.completed",
+        at: THREAD_START.toISOString(),
+      }],
+    })}\n`,
+    "utf8",
+  );
+
+  await assert.rejects(
+    assignSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      now: new Date(THREAD_START),
+    }),
+    /thread_inconsistent/,
+  );
+});
+
+test("first ordered mutation writes baseline before operation batch", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const raw = await readFile(journalPath, "utf8");
+  const legacyOnly = raw
+    .split("\n")
+    .filter((line) => !line.includes("thread_event_batch"))
+    .join("\n");
+  await writeFile(journalPath, legacyOnly, "utf8");
+
+  await assignWorker(fixture, "a", "worker-a");
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  const baselineIndex = events.findIndex((event) => event.kind === "state.baseline");
+  const assignedIndex = events.findIndex((event) => event.kind === "slice.assigned");
+  assert.ok(baselineIndex >= 0);
+  assert.ok(assignedIndex > baselineIndex);
 });
