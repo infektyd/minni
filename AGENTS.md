@@ -62,3 +62,23 @@ You can (and should) be direct with me. But when we're deep in this repo doing r
 If the big picture starts getting fuzzy while we're working, come back here. That's what it's for.
 
 Let's stop losing the forest for the "sovereign-memory" trees.
+
+## Cursor Cloud specific instructions
+
+Durable, non-obvious notes for agents working in the Cloud Agent VM. Standard commands live in the `Makefile` (`make help`) and `README.md`/`CONTRIBUTING.md`; this section only captures the gotchas.
+
+### Toolchain
+- The engine requires **Python 3.14** (`.python-version`, `pyproject.toml`), but the VM's system `python3` is older (3.12). `make setup` handles this by using **`uv`** to provision a managed Python 3.14 into `.venv`. `uv` is pre-installed at `/usr/local/bin/uv` in this environment — if it ever goes missing, install it (`curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh`) or `make setup` will fail the interpreter gate.
+- Node is v22 (repo floor is `>=20`, `.nvmrc` pins 20) — the system Node is fine; don't fight nvm over it.
+- `make setup` is the one-shot bootstrap (venv + `pip install -r requirements.lock` + editable install + `npm ci` in `plugins/minni` + `git config core.hooksPath .githooks`). It is idempotent and is the environment's update script.
+
+### Running the daemon + core memory loop (the "hello world")
+- Start the daemon: `.venv/bin/minni up` (Unix socket at `~/.minni/run/minnid.sock`); verify with `.venv/bin/minni doctor`.
+- **Identity/provenance gotcha:** governed RPCs (`learn`, `list_candidates`, `resolve_candidate`) require a stamped principal. On a fresh install with no `~/.minni/principals/*.json`, the daemon synthesizes ONLY the operator principal `main` (full caps). So call the client **without** `--agent <name>` to act as `main`. Passing an unregistered `--agent` returns `-32004 unknown_identity` (default-deny caller scope). To act as a named agent you need a matching `~/.minni/principals/<agent>.json`.
+- The core loop is proposal-first: `python -m minni.minnid_client learn "..."` **stages a candidate** (not durable) → approve via the `resolve_candidate` RPC with `{"candidate_id": N, "decision": "accept"}` → `python -m minni.minnid_client search "..."` returns it wrapped in an `<EVIDENCE ...>` envelope. Recall is evidence, never instruction.
+- First recall performs a one-time ~320 MB HuggingFace embedding-model download (cached under the HF cache). `minni doctor` may emit a non-blocking `[WARN] models: 2/3 in cache` for the optional cross-encoder rerank model — that is expected, not a failure.
+
+### Optional surfaces
+- Web console / Memory Board: `cd plugins/minni && MINNI_CONSOLE_TOKEN=<token> node dist/ui-server.js` (build first via `make build`). Serves on `127.0.0.1:8765`; every data route requires `Authorization: Bearer <token>` (a token is auto-generated and printed if `MINNI_CONSOLE_TOKEN` is unset). Open `http://127.0.0.1:8765/?token=<token>`.
+- The AFM bridge (`127.0.0.1:11437`) is **not** running by default. The console/daemon logging `[Errno 111] Connection refused` for AFM is expected and optional (see `.env.example` / `MINNI_AFM_PROVIDER_MODE`); it does not affect the core memory loop.
+- CI additionally installs `pyyaml` into the venv purely for `scripts/check-public-boundary.sh`; it is not needed for normal dev/test.
