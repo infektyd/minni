@@ -5,6 +5,7 @@ _private/
 
 # Tool/IDE per-session state — never committed
 .antigravitycli/
+.superpowers/
 
 # Local archives and reversible cleanup bins
 _archive/
