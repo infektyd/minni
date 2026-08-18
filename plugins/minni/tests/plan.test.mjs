@@ -14,6 +14,7 @@ import {
   computePlanDigestV1,
   computePlanDigestHexV2,
   PlanDigestVersionError,
+  PlanHistoryAppendError,
   rehydratePlan,
   createPlan,
   replan,
@@ -2072,6 +2073,53 @@ test("persistPlan wires real plan writes through the capped history append (#294
     const history = await readHistory(write.notePath);
     assert.ok(history.length <= 51, `history must stay bounded at cap+hysteresis, got ${history.length}`);
     assert.equal(history[history.length - 1].rev, plan.rev, "the newest entry must be the plan's current revision");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// persistPlan performs two durable steps: it writes the canonical vault note,
+// then appends a history snapshot line. A real EISDIR on the history file
+// proves the note write itself already committed while the second step
+// throws — this must surface as the typed PlanHistoryAppendError (never a
+// bare Error a caller could mistake for "nothing was written"), so a caller
+// holding a freshly staged secret (thread-worker's claimSlice) can tell this
+// apart from a genuine pre-commit failure without guessing from message text.
+test("persistPlan throws the typed PlanHistoryAppendError when the note commits but history append fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-append-error-"));
+  try {
+    await ensureVault(root);
+    const created = await createPlan(
+      { goal: "Reproduce a real post-commit history failure", vaultPath: root },
+      { vaultPath: root },
+    );
+    const { plan, write } = created;
+    const historyFile = historyPathFor(write.notePath);
+    await rm(historyFile, { force: true });
+    await mkdir(historyFile);
+
+    const before = await rehydratePlan(write.notePath);
+    await assert.rejects(
+      persistPlan(plan, { vaultPath: root, notePath: write.notePath }),
+      (error) => {
+        assert.ok(
+          error instanceof PlanHistoryAppendError,
+          `expected PlanHistoryAppendError, got ${error?.constructor?.name}`,
+        );
+        assert.equal(error.code, "PLAN_HISTORY_APPEND_FAILED");
+        assert.equal(error.notePath, write.notePath);
+        assert.match(error.message, /committed at rev/);
+        return true;
+      },
+    );
+
+    // The note write already landed durably despite the thrown error.
+    // persistPlan mutates `plan` in place before the history append is
+    // attempted, so the in-memory rev/digest already match what is on disk.
+    const after = await rehydratePlan(write.notePath);
+    assert.equal(after.rev, before.rev + 1);
+    assert.equal(after.rev, plan.rev);
+    assert.equal(after.plan_digest, plan.plan_digest);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

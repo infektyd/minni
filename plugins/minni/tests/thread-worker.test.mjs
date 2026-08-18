@@ -28,6 +28,7 @@ import {
   createPlan,
   historyPathFor,
   persistPlan,
+  PlanHistoryAppendError,
   rehydratePlan,
   replan,
   restorePlan,
@@ -1844,7 +1845,7 @@ test("orchestrator slice transitions revoke a claim across terminal reopen", asy
   );
 });
 
-test("claimSlice preserves a committed secret when real history append fails", async (t) => {
+test("claimSlice surfaces a real persistPlan history-append failure, then an identical retry replays the same durable token", async (t) => {
   const fixture = await threadFixture(t, [
     { id: "a", title: "Slice A" },
   ]);
@@ -1853,27 +1854,59 @@ test("claimSlice preserves a committed secret when real history append fails", a
   await rm(historyPath, { force: true });
   await mkdir(historyPath);
 
-  const claim = await claimSlice({
+  const claimInput = {
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-a",
     idempotencyKey: "history-eisdir",
     now: () => new Date("2026-08-18T12:01:00.000Z"),
-  });
+  };
+
+  // The first call must NOT silently return a success response — the note
+  // committed but the history journal for this revision is missing, and
+  // that must be visible to the caller, not swallowed.
+  const failure = await claimSlice(claimInput).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+  assert.equal(failure.ok, false, JSON.stringify(failure));
+  assert.ok(
+    failure.error instanceof PlanHistoryAppendError,
+    `expected PlanHistoryAppendError, got ${failure.error?.constructor?.name}: ${failure.error?.message}`,
+  );
+  assert.match(failure.error.message, /history snapshot failed/);
+
+  // The note write itself is durable despite the thrown error: the claim,
+  // generation, and attempt are already on disk, and the private secret for
+  // that durable claim was NOT deleted.
   const durable = await rehydratePlan(fixture.notePath);
-  assert.equal(durable.slices[0].claim.claim_id, claim.claim_id);
-  assert.equal(durable.slices[0].generation, claim.generation);
+  const durableClaim = durable.slices[0].claim;
+  assert.ok(durableClaim, "the durable note must already carry the claim");
+  assert.equal(durable.slices[0].attempt, 1);
+
+  // Identical idempotency retry must return the SAME usable token against
+  // the durable claim — it must not mint a second claim or find the secret
+  // missing.
+  const retry = await claimSlice(claimInput);
+  assert.equal(retry.claim_id, durableClaim.claim_id);
+  assert.equal(retry.generation, durable.slices[0].generation);
+  assert.equal(retry.worker_agent_id, "worker-a");
+  assert.equal(retry.expires_at, durableClaim.expires_at);
+
+  const afterRetry = await rehydratePlan(fixture.notePath);
+  assert.equal(afterRetry.slices[0].attempt, 1, "retry must not mint a second attempt");
+
   const stored = await verifyClaimToken({
     vaultPath: fixture.vaultPath,
     planId: fixture.planId,
     sliceId: "a",
-    generation: claim.generation,
+    generation: retry.generation,
     workerAgentId: "worker-a",
-    token: claim.token,
-    claimId: claim.claim_id,
+    token: retry.token,
+    claimId: retry.claim_id,
     now: new Date("2026-08-18T12:02:00.000Z"),
   });
-  assert.equal(stored.envelope.claim_id, claim.claim_id);
+  assert.equal(stored.envelope.claim_id, retry.claim_id);
 });
 
 test("upgrade-eligible status reads hold the Thread lock through upgrade persistence", async (t) => {
