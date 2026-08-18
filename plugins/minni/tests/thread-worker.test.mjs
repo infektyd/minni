@@ -27,12 +27,14 @@ import {
   computePlanDigestHexV2,
   createPlan,
   historyPathFor,
+  journalPathFor,
   persistPlan,
   PlanHistoryAppendError,
   rehydratePlan,
   replan,
   restorePlan,
 } from "../dist/plan.js";
+import { readThreadEvents } from "../dist/thread-events.js";
 import {
   createClaimSecret,
   deleteClaimSecret,
@@ -1980,4 +1982,110 @@ test("upgrade-eligible status reads hold the Thread lock through upgrade persist
   const final = await rehydratePlan(fixture.notePath);
   assert.equal(final.slices[0].assigned_to, "worker-a");
   assert.equal(final.slices[0].generation, 0);
+});
+
+test("worker mutations append ordered operation and ready.changed events", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+    { id: "b", title: "Slice B", depends_on: ["a"] },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-a",
+    now: new Date(THREAD_START),
+  });
+  await updateClaimedSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "complete-a",
+    action: {
+      action: "complete",
+      evidence: "Slice A verified in thread-worker event test output",
+    },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  const kinds = events.map((event) => event.kind);
+  assert.ok(kinds.includes("slice.assigned"));
+  assert.ok(kinds.includes("slice.claimed"));
+  assert.ok(kinds.includes("slice.completed"));
+  assert.ok(kinds.includes("ready.changed"));
+
+  const readyEvent = events.find((event) => event.kind === "ready.changed");
+  assert.ok(readyEvent);
+  assert.deepEqual(readyEvent.payload, {
+    slices: [{ id: "b", title: "Slice B" }],
+  });
+  assert.equal(
+    events.filter((event) => event.idempotency_key.endsWith(":ready")).length,
+    1,
+  );
+});
+
+test("operation and ready.changed idempotency keys replay exact events", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-exact",
+    now: new Date(THREAD_START),
+  });
+  await updateClaimedSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "start-exact",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const before = await readThreadEvents(journalPath, 0, 100);
+  await updateClaimedSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "start-exact",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  const after = await readThreadEvents(journalPath, 0, 100);
+  assert.deepEqual(after.events, before.events);
+  assert.ok(after.events.some((event) => event.idempotency_key === "start-exact"));
+});
+
+test("failed event append is recovered on the next locked mutation", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const planAfterAssign = await rehydratePlan(fixture.notePath);
+  const { events: afterAssign } = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(afterAssign.length, 1);
+
+  const bumped = await rehydratePlan(fixture.notePath);
+  bumped.next_action = "simulate note-ahead crash gap";
+  await persistPlan(bumped, {
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+  });
+  const planAhead = await rehydratePlan(fixture.notePath);
+  assert.ok(planAhead.rev > planAfterAssign.rev);
+
+  await assignWorker(fixture, "a", "worker-a");
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  const recovered = events.find((event) => event.kind === "state.recovered");
+  assert.ok(recovered);
+  assert.equal(recovered.rev, planAhead.rev);
+  assert.ok(events.some((event) => event.kind === "slice.assigned"));
 });

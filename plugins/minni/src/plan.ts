@@ -882,7 +882,7 @@ export async function createPlan(
 
   await setActivePlan(vaultPath, plan.plan_id, writeRes.notePath);
 
-  const journalPath = path.join(path.dirname(writeRes.notePath), `${plan.plan_id}.log.md`);
+  const journalPath = journalPathFor(writeRes.notePath, plan.plan_id);
   await appendJournal(journalPath, { kind: "rehydrated", at: plan.created });
 
   return { plan, write: writeRes, displaced_active };
@@ -1761,7 +1761,7 @@ export async function rehydratePlan(
   }
 
   // Record access (best-effort, append-only journal lives next to the note)
-  const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
+  const journalPath = journalPathFor(notePath, plan_id);
   try {
     await appendJournal(journalPath, { kind: "rehydrated", at: new Date().toISOString() });
   } catch {
@@ -1825,6 +1825,11 @@ export function historyPathFor(notePath: string): string {
   const dir = path.dirname(notePath);
   const base = path.basename(notePath, ext);
   return path.join(dir, `${base}.history.jsonl`);
+}
+
+/** Adjacent append-only journal for a plan artifact note. */
+export function journalPathFor(notePath: string, planId: string): string {
+  return path.join(path.dirname(notePath), `${planId}.log.md`);
 }
 
 export async function readHistory(
@@ -2264,10 +2269,7 @@ export async function resolveActivePlanView(
           // H6: terminal, non-recallable completion (not "accepted").
           plan.status = "complete";
           await persistPlan(plan, { vaultPath, notePath: active.notePath });
-          const journalPath = path.join(
-            path.dirname(active.notePath),
-            `${plan.plan_id}.log.md`,
-          );
+          const journalPath = journalPathFor(active.notePath, plan.plan_id);
           try {
             await appendJournal(journalPath, {
               kind: "status_reconciled",

@@ -3,6 +3,7 @@ import path from "node:path";
 
 import {
   addScar,
+  journalPathFor,
   persistPlan,
   rehydratePlan,
   unmetDependencies,
@@ -15,6 +16,10 @@ import {
   type UpdateSliceOptions,
 } from "./plan.js";
 import type { ScarTissueEntry } from "./task.js";
+import {
+  appendOrderedThreadEvent,
+  reconcileThreadJournal,
+} from "./thread-events.js";
 import {
   createClaimSecret,
   deleteClaimSecret,
@@ -72,6 +77,7 @@ export interface UpdateClaimedSliceInput extends ThreadMutationTarget {
   workerAgentId: string;
   token: string;
   action: WorkerUpdateAction;
+  idempotencyKey?: string;
 }
 
 export interface ThreadWorkerDeps {
@@ -324,6 +330,95 @@ function mutationResult(
   };
 }
 
+function readyIdsEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((id, index) => id === sortedRight[index]);
+}
+
+async function reconcileThreadState(
+  input: ThreadPlanTarget & { actor: string },
+  plan: PlanArtifact,
+): Promise<void> {
+  await reconcileThreadJournal({
+    journalPath: journalPathFor(input.notePath, input.planId),
+    notePath: input.notePath,
+    planId: input.planId,
+    rev: plan.rev,
+    actor: input.actor,
+  });
+}
+
+function workerEventKind(action: WorkerUpdateAction): string {
+  switch (action.action) {
+    case "start":
+      return "slice.started";
+    case "progress":
+      return "slice.progressed";
+    case "block":
+      return "slice.blocked";
+    case "complete":
+      return "slice.completed";
+    case "scar":
+      return "scar_added";
+    case "propose_structure":
+      return "structure.proposed";
+    default:
+      throw new Error("unsupported worker action");
+  }
+}
+
+async function recordThreadMutationEvents(input: {
+  notePath: string;
+  planId: string;
+  rev: number;
+  actor: string;
+  operationKey: string;
+  kind: string;
+  sliceId?: string;
+  payload?: Record<string, unknown>;
+  readyBefore: string[];
+  readyAfter: string[];
+  plan: PlanArtifact;
+  now: Date;
+}): Promise<void> {
+  const journalPath = journalPathFor(input.notePath, input.planId);
+  const at = input.now.toISOString();
+  try {
+    await appendOrderedThreadEvent({
+      journalPath,
+      planId: input.planId,
+      rev: input.rev,
+      idempotencyKey: input.operationKey,
+      actor: input.actor,
+      kind: input.kind,
+      at,
+      sliceId: input.sliceId,
+      payload: input.payload,
+    });
+    if (!readyIdsEqual(input.readyBefore, input.readyAfter)) {
+      await appendOrderedThreadEvent({
+        journalPath,
+        planId: input.planId,
+        rev: input.rev,
+        idempotencyKey: `${input.operationKey}:ready`,
+        actor: input.actor,
+        kind: "ready.changed",
+        at,
+        payload: {
+          slices: readySlices(input.plan, input.now).map((slice) => ({
+            id: slice.id,
+            title: slice.title,
+          })),
+        },
+      });
+    }
+  } catch {
+    // The note is already durable; the next locked mutation reconciles first.
+  }
+}
+
 function publicClaimResponse(
   response: ThreadClaimResponse,
 ): ThreadClaimResponse {
@@ -368,6 +463,10 @@ export async function assignSlice(
     },
     async (plan) => {
       const now = sampleNow(input.now);
+      await reconcileThreadState(
+        { ...input, planId, actor: workerAgentId },
+        plan,
+      );
       const slice = findSlice(plan, sliceId);
       const readyBefore = readyIds(plan, now);
       const structurallyReady =
@@ -399,7 +498,21 @@ export async function assignSlice(
           deleteSecret,
         );
       }
-      return mutationResult(next, sliceId, readyBefore, now);
+      const result = mutationResult(next, sliceId, readyBefore, now);
+      await recordThreadMutationEvents({
+        notePath: input.notePath,
+        planId,
+        rev: next.rev,
+        actor: workerAgentId,
+        operationKey: `assign:${sliceId}:${workerAgentId}:${nextSlice.generation}`,
+        kind: "slice.assigned",
+        sliceId,
+        readyBefore: result.ready_before,
+        readyAfter: result.ready_after,
+        plan: next,
+        now,
+      });
+      return result;
     },
   );
 }
@@ -452,6 +565,10 @@ export async function claimSlice(
     },
     async (initialPlan) => {
       const now = sampleNow(input.now);
+      await reconcileThreadState(
+        { ...input, planId, actor: workerAgentId },
+        initialPlan,
+      );
       let plan = initialPlan;
       let slice = findSlice(plan, sliceId);
       if (!isNonTerminal(slice)) {
@@ -605,7 +722,22 @@ export async function claimSlice(
         staleClaimIds,
         deleteSecret,
       );
-      return publicClaimResponse(stored.envelope.response);
+      const response = publicClaimResponse(stored.envelope.response);
+      const readyAfter = readyIds(next, now);
+      await recordThreadMutationEvents({
+        notePath: input.notePath,
+        planId,
+        rev: next.rev,
+        actor: workerAgentId,
+        operationKey: idempotencyKey,
+        kind: "slice.claimed",
+        sliceId,
+        readyBefore: readyAfter,
+        readyAfter,
+        plan: next,
+        now,
+      });
+      return response;
     },
   );
 }
@@ -828,6 +960,10 @@ export async function updateClaimedSlice(
     },
     async (plan) => {
       const now = sampleNow(input.now);
+      await reconcileThreadState(
+        { ...input, planId, actor: workerAgentId },
+        plan,
+      );
       const slice = findSlice(plan, sliceId);
       const claim = slice.claim;
       if (!claim || claim.worker_agent_id !== workerAgentId) {
@@ -880,7 +1016,24 @@ export async function updateClaimedSlice(
           deleteSecret,
         );
       }
-      return mutationResult(next, sliceId, readyBefore, now);
+      const result = mutationResult(next, sliceId, readyBefore, now);
+      const operationKey =
+        input.idempotencyKey?.trim() ||
+        `${sliceId}:${input.action.action}:${generation}`;
+      await recordThreadMutationEvents({
+        notePath: input.notePath,
+        planId,
+        rev: next.rev,
+        actor: workerAgentId,
+        operationKey,
+        kind: workerEventKind(input.action),
+        sliceId,
+        readyBefore: result.ready_before,
+        readyAfter: result.ready_after,
+        plan: next,
+        now,
+      });
+      return result;
     },
   );
 }
