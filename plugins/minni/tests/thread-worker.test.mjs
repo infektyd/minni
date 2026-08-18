@@ -223,6 +223,25 @@ test("claim store rejects tampered or group-readable envelopes", async (t) => {
     );
   });
 
+  await t.test("extra model-facing response fields are rejected", async (st) => {
+    const input = await claimFixture(st);
+    const claim = await createClaimSecret(input);
+    const tampered = JSON.parse(await readFile(claim.filePath, "utf8"));
+    tampered.response.private_path = claim.filePath;
+    await writeFile(claim.filePath, `${JSON.stringify(tampered)}\n`);
+
+    await assert.rejects(
+      readClaimByIdempotency(
+        input.vaultPath,
+        input.planId,
+        input.sliceId,
+        input.generation,
+        input.idempotencyKey,
+      ),
+      /claim metadata mismatch/,
+    );
+  });
+
   await t.test("secret file becomes group-readable", async (st) => {
     const input = await claimFixture(st);
     const claim = await createClaimSecret(input);
