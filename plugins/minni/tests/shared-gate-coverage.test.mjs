@@ -44,6 +44,11 @@ test("shared model-facing tools gate before local shared work", async () => {
     ["minni_thread_restore", "plan.restore"],
     ["minni_thread_activate", "plan.activate"],
     ["minni_thread_deactivate", "plan.deactivate"],
+    ["minni_thread_ready", "plan.ready"],
+    ["minni_thread_assign", "plan.assign"],
+    ["minni_thread_claim", "plan.claim"],
+    ["minni_thread_worker_update", "plan.worker_update"],
+    ["minni_thread_events", "plan.events"],
   ]);
 
   for (const [toolName, operation] of expected) {

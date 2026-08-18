@@ -63,6 +63,7 @@ import {
   clearActivePlan,
   getActivePlan,
   resolvePlanIdOrActive,
+  journalPathFor,
   type PlanArtifact,
 } from "./plan.js";
 import {
@@ -88,11 +89,17 @@ import {
 import { planHandoffDelivery } from "./handoff_guard.js";
 import {
   applyOrchestratorSliceUpdate,
+  assignSlice,
   claimIds,
+  claimSlice,
   deleteClaimSecretsBestEffort,
+  readySlices,
   revokedClaimIds,
+  updateClaimedSlice,
   withThreadPlanLock,
+  type WorkerUpdateAction,
 } from "./thread-worker.js";
+import { readThreadEvents } from "./thread-events.js";
 import { withThreadLock } from "./thread-lock.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
@@ -156,6 +163,36 @@ async function requireSharedGate(
         status: "gate-rejected",
         operation,
         gate,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+// Task 6: every minni_thread_{ready,assign,claim,worker_update,events} handler
+// funnels its thread-worker/thread-events failures through here instead of
+// letting a thrown error become a raw JSON-RPC transport error. Only
+// `.message` and a typed `.code` (ThreadInconsistentError,
+// ThreadEventIdempotencyConflictError, PlanHistoryAppendError, ...) are ever
+// read off the error — never the whole object, so an error subclass that
+// happens to carry a local path (e.g. PlanHistoryAppendError.notePath) cannot
+// be serialized as a side effect of a generic catch.
+function threadWorkerErrorResult(
+  operation: string,
+  error: unknown,
+): ReturnType<typeof textResult> {
+  const message = error instanceof Error ? error.message : String(error);
+  const errorCode =
+    error instanceof Error ? (error as unknown as { code?: unknown }).code : undefined;
+  const code = typeof errorCode === "string" ? errorCode : undefined;
+  return textResult(
+    JSON.stringify(
+      {
+        status: "error",
+        operation,
+        error: message,
+        ...(code ? { code } : {}),
       },
       null,
       2,
@@ -1859,6 +1896,339 @@ server.registerTool(
   },
 );
 
+// Task 6: typed MCP worker surface. These five tools are the ONLY
+// model-facing entry points into thread-worker.ts's slice-scoped claim/lease
+// machinery. Every handler: (1) calls requireSharedGate with its exact
+// plan.* key before touching thread-worker/thread-events; (2) pins vaultPath
+// (DEFAULT_VAULT_PATH) and resolves plan_id via the same id-less
+// resolvePlanTarget contract every other optional-plan_id Thread tool
+// already uses; (3) passes only schema-discriminated fields into
+// thread-worker — never the raw parsed request object; (4) turns a thrown
+// domain error into a typed { error, code? } result via
+// threadWorkerErrorResult instead of letting it escape as a transport-level
+// JSON-RPC error; (5) never serializes a claim secret's file path — claimSlice
+// already returns the safe ThreadClaimResponse shape (thread-claims.ts),
+// which this file forwards unmodified.
+
+server.registerTool(
+  "minni_thread_ready",
+  {
+    title: "Minni Thread Ready",
+    description:
+      "List Thread slices that are structurally ready for a worker to claim: non-terminal, dependencies resolved, no live claim. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+    },
+  },
+  async ({ plan_id: planIdInput }) => {
+    const gated = await requireSharedGate("plan.ready", { plan_id: planIdInput });
+    if (gated) return gated;
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
+    try {
+      const plan = await withThreadPlanLock(
+        {
+          vaultPath: DEFAULT_VAULT_PATH,
+          notePath,
+          planId: plan_id,
+          operationId: `server-ready:${randomUUID()}`,
+        },
+        async (lockedPlan) => lockedPlan,
+      );
+      return textResult(
+        JSON.stringify(
+          { plan_id, rev: plan.rev, ready: readySlices(plan, new Date()) },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.ready", error);
+    }
+  },
+);
+
+server.registerTool(
+  "minni_thread_assign",
+  {
+    title: "Minni Thread Assign",
+    description:
+      "Assign a Thread slice to a worker agent (clears any existing claim). This only records who may claim the slice next; it does not itself lease it. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      slice_id: z.string().min(1),
+      worker_agent_id: z.string().min(1),
+      assignment_profile: z.string().min(1).optional(),
+    },
+  },
+  async ({ plan_id: planIdInput, slice_id, worker_agent_id, assignment_profile }) => {
+    const gated = await requireSharedGate("plan.assign", {
+      plan_id: planIdInput,
+      slice_id,
+      worker_agent_id,
+      assignment_profile,
+    });
+    if (gated) return gated;
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
+    try {
+      const result = await assignSlice({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        sliceId: slice_id,
+        workerAgentId: worker_agent_id,
+        assignmentProfile: assignment_profile,
+      });
+      return textResult(
+        JSON.stringify(
+          {
+            slice: result.slice,
+            ready_before: result.ready_before,
+            ready_after: result.ready_after,
+            rev: result.plan.rev,
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.assign", error);
+    }
+  },
+);
+
+server.registerTool(
+  "minni_thread_claim",
+  {
+    title: "Minni Thread Claim",
+    description:
+      "Claim an assigned, dependency-clear Thread slice with an idempotent worker lease. Returns a one-time claim token the worker must present to minni_thread_worker_update. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      slice_id: z.string().min(1),
+      worker_agent_id: z.string().min(1),
+      idempotency_key: z.string().min(1),
+      ttl_seconds: z.number().int().positive().optional(),
+    },
+  },
+  async ({ plan_id: planIdInput, slice_id, worker_agent_id, idempotency_key, ttl_seconds }) => {
+    const gated = await requireSharedGate("plan.claim", {
+      plan_id: planIdInput,
+      slice_id,
+      worker_agent_id,
+      idempotency_key,
+    });
+    if (gated) return gated;
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
+    try {
+      // claimSlice already returns thread-claims.ts's ThreadClaimResponse —
+      // the one shape in this whole surface that is allowed to carry a
+      // secret (the one-time token). It never carries the envelope's
+      // filePath or any other internal metadata; forwarded verbatim.
+      const response = await claimSlice({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        sliceId: slice_id,
+        workerAgentId: worker_agent_id,
+        idempotencyKey: idempotency_key,
+        ttlSeconds: ttl_seconds,
+      });
+      return textResult(JSON.stringify(response, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.claim", error);
+    }
+  },
+);
+
+// Task 6 Step 3: the structural-proposal slice shape a worker may propose.
+// Reuses the same fields createPlan/replan accept (planSliceInputSchema)
+// so a proposal can only ever describe a durable REQUEST for the
+// orchestrator to apply later (plan.ts's StructuralProposal contract) —
+// propose_structure below never mutates plan topology itself.
+const workerProposalInputSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("expand"),
+    reason: z.string().min(1),
+    slices: z.array(planSliceInputSchema).min(1),
+  }),
+  z.object({
+    kind: z.literal("split"),
+    reason: z.string().min(1),
+    slices: z.array(planSliceInputSchema).min(1),
+  }),
+  z.object({
+    kind: z.literal("contract"),
+    reason: z.string().min(1),
+    slice_ids: z.array(z.string().min(1)).min(1),
+  }),
+]);
+
+// Task 6 Step 3: discriminated union by `action`, matching thread-worker.ts's
+// WorkerUpdateAction type field-for-field. Each branch is a closed z.object —
+// zod strips any key not declared on the matched branch — so no dependency,
+// gate, assignee, constraint, sibling-slice, force, or replan field can ever
+// reach thread-worker.ts's updateClaimedSlice, no matter what an caller sends
+// alongside a valid action.
+const workerUpdateActionSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("start") }),
+  z.object({ action: z.literal("progress"), evidence: z.string().min(1) }),
+  z.object({ action: z.literal("block"), evidence: z.string().min(1) }),
+  z.object({
+    action: z.literal("scar"),
+    kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]),
+    signal: z.string().min(1),
+    resolution: z.string().optional(),
+  }),
+  z.object({
+    action: z.literal("propose_structure"),
+    proposal: workerProposalInputSchema,
+  }),
+  z.object({ action: z.literal("complete"), evidence: z.string().min(1) }),
+]);
+
+server.registerTool(
+  "minni_thread_worker_update",
+  {
+    title: "Minni Thread Worker Update",
+    description:
+      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the one-time claim token from minni_thread_claim. idempotency_key is required and must be non-empty — retries with the same key replay the original result rather than re-applying. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      slice_id: z.string().min(1),
+      worker_agent_id: z.string().min(1),
+      claim_token: z.string().min(1),
+      idempotency_key: z.string().min(1),
+      action: z.enum([
+        "start",
+        "progress",
+        "block",
+        "scar",
+        "propose_structure",
+        "complete",
+      ]),
+      evidence: z.string().min(1).optional(),
+      kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]).optional(),
+      signal: z.string().min(1).optional(),
+      resolution: z.string().optional(),
+      proposal: workerProposalInputSchema.optional(),
+    },
+  },
+  async ({
+    plan_id: planIdInput,
+    slice_id,
+    worker_agent_id,
+    claim_token,
+    idempotency_key,
+    action,
+    evidence,
+    kind,
+    signal,
+    resolution,
+    proposal,
+  }) => {
+    const gated = await requireSharedGate("plan.worker_update", {
+      plan_id: planIdInput,
+      slice_id,
+      worker_agent_id,
+      action,
+    });
+    if (gated) return gated;
+    // Re-validate through the discriminated union so ONLY the fields that
+    // belong to this action are ever constructed into a WorkerUpdateAction —
+    // e.g. a "complete" call that also sent `signal` never lets `signal`
+    // reach thread-worker.ts, because the "complete" branch does not declare it.
+    const parsedAction = workerUpdateActionSchema.safeParse({
+      action,
+      evidence,
+      kind,
+      signal,
+      resolution,
+      proposal,
+    });
+    if (!parsedAction.success) {
+      return textResult(
+        JSON.stringify(
+          {
+            status: "error",
+            operation: "plan.worker_update",
+            error: `invalid worker update action: ${parsedAction.error.issues
+              .map((issue) => issue.message)
+              .join("; ")}`,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
+    try {
+      const result = await updateClaimedSlice({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        sliceId: slice_id,
+        workerAgentId: worker_agent_id,
+        token: claim_token,
+        idempotencyKey: idempotency_key,
+        action: parsedAction.data as WorkerUpdateAction,
+      });
+      return textResult(
+        JSON.stringify(
+          {
+            slice: result.slice,
+            ready_before: result.ready_before,
+            ready_after: result.ready_after,
+            rev: result.plan.rev,
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.worker_update", error);
+    }
+  },
+);
+
+server.registerTool(
+  "minni_thread_events",
+  {
+    title: "Minni Thread Events",
+    description:
+      "Read durable, ordered Thread events after a cursor (since_seq) for scheduler/worker replay. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      since_seq: z.number().int().min(0).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+  },
+  async ({ plan_id: planIdInput, since_seq, limit }) => {
+    const gated = await requireSharedGate("plan.events", {
+      plan_id: planIdInput,
+      since_seq,
+      limit,
+    });
+    if (gated) return gated;
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
+    try {
+      const journalPath = journalPathFor(notePath, plan_id);
+      const result = await readThreadEvents(journalPath, since_seq, limit);
+      return textResult(JSON.stringify({ plan_id, ...result }, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.events", error);
+    }
+  },
+);
 
 async function main() {
   const transport = new StdioServerTransport();
