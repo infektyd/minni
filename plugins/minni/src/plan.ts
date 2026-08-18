@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -7,6 +7,7 @@ import { writeVaultPage, appendFileWithFsync, writeFileAtomic, type VaultWriteRe
 import type { PageStatus } from "./vault.js";
 import type { ScarTissueEntry } from "./task.js";
 import { stableStringify } from "./agent_envelope.js";
+import { withThreadLock } from "./thread-lock.js";
 
 // ---------------------------------------------------------------------------
 // Types (exported per spec)
@@ -1861,11 +1862,31 @@ export function diffPlans(a: PlanArtifact, b: PlanArtifact): PlanDiff {
 }
 
 export function restorePlan(current: PlanArtifact, snapshot: PlanArtifact): PlanArtifact {
+  const generations = [...current.slices, ...snapshot.slices]
+    .map((slice) => slice.generation)
+    .filter(
+      (generation): generation is number =>
+        Number.isSafeInteger(generation) && (generation ?? -1) >= 0,
+    );
+  // A forward restore must never roll claim identity backward. current.rev is
+  // monotonic across durable mutations, while the global generation maximum
+  // carries the high-water mark even when the restored snapshot omitted a
+  // currently claimed slice. Every restored slice advances beyond both.
+  const generationFloor = Math.max(
+    Number.isSafeInteger(current.rev) && current.rev >= 0
+      ? current.rev + 1
+      : 1,
+    ...generations.map((generation) => generation + 1),
+  );
   return {
     ...current,
     goal: snapshot.goal,
     constraints: [...snapshot.constraints],
-    slices: snapshot.slices.map((s) => ({ ...s })),
+    slices: snapshot.slices.map((slice) => ({
+      ...slice,
+      generation: generationFloor,
+      claim: undefined,
+    })),
     open_questions: [...snapshot.open_questions],
     scar_tissue: snapshot.scar_tissue.map((s) => ({ ...s })),
     shelf_ref: snapshot.shelf_ref ? { ...snapshot.shelf_ref } : undefined,
@@ -2131,52 +2152,65 @@ export async function resolveActivePlanView(
   try {
     const active = await getActivePlan(vaultPath);
     if (!active) return undefined;
-    const plan = await rehydratePlan(active.notePath);
-    if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
-      return undefined;
-    }
-    // Honest-health self-heal (audit C4): plans completed under a stale plugin
-    // deploy can be stuck with every slice terminal but status still
-    // 'draft'/'candidate' (live evidence: plan-3da1b00ca39d2500,
-    // plan-512ee7225dbb1c6f, plan-9fd20af5bc87bee2 — all 100% done, status
-    // draft). Re-derive the terminal status at load time, persist it through
-    // persistPlan (journaled; never a direct file write) and stop injecting
-    // the finished plan.
-    const allResolved = allSlicesResolved(plan.slices);
-    if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
-      const from = plan.status;
-      // H6: terminal, non-recallable completion (not the recallable "accepted").
-      plan.status = "complete";
-      await persistPlan(plan, { vaultPath, notePath: active.notePath });
-      const journalPath = path.join(
-        path.dirname(active.notePath),
-        `${plan.plan_id}.log.md`,
-      );
-      try {
-        await appendJournal(journalPath, {
-          kind: "status_reconciled",
-          from,
-          to: "complete",
-          at: new Date().toISOString(),
-        });
-      } catch {
-        // journal is advisory; the persisted status is the durable fix
-      }
-      return undefined;
-    }
-    return {
-      plan_id: active.plan_id,
-      rev: plan.rev,
-      view: compactPlanView(plan),
-      // #295: only computed (and only non-undefined) when the caller supplied
-      // live shelf content AND the plan actually has a shelf_ref configured —
-      // omitted entirely rather than a misleading "configured: false" when the
-      // caller didn't pass anything, so a degraded/budget-cut layer1Shelf read
-      // upstream reads as "not checked", not "checked and fine".
-      ...(liveShelfContent !== undefined && plan.shelf_ref
-        ? { shelf_drift: shelfDrift(plan, liveShelfContent) }
-        : {}),
-    };
+    return await withThreadLock(
+      vaultPath,
+      active.plan_id,
+      `active-plan-view:${randomUUID()}`,
+      async () => {
+        // The active pointer can change while this reader queues. Never use a
+        // stale pointer after acquiring the old plan's lock.
+        const lockedActive = await getActivePlan(vaultPath);
+        if (
+          !lockedActive ||
+          lockedActive.plan_id !== active.plan_id ||
+          lockedActive.notePath !== active.notePath
+        ) {
+          return undefined;
+        }
+        const plan = await rehydratePlan(active.notePath);
+        if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
+          return undefined;
+        }
+        // Honest-health self-heal (audit C4): plans completed under a stale
+        // plugin deploy can be stuck with every slice terminal but status
+        // still 'draft'/'candidate'. Lock before strict rehydrate so this
+        // repair cannot overwrite a concurrent worker mutation.
+        const allResolved = allSlicesResolved(plan.slices);
+        if (
+          allResolved &&
+          (plan.status === "draft" || plan.status === "candidate")
+        ) {
+          const from = plan.status;
+          // H6: terminal, non-recallable completion (not "accepted").
+          plan.status = "complete";
+          await persistPlan(plan, { vaultPath, notePath: active.notePath });
+          const journalPath = path.join(
+            path.dirname(active.notePath),
+            `${plan.plan_id}.log.md`,
+          );
+          try {
+            await appendJournal(journalPath, {
+              kind: "status_reconciled",
+              from,
+              to: "complete",
+              at: new Date().toISOString(),
+            });
+          } catch {
+            // journal is advisory; the persisted status is the durable fix
+          }
+          return undefined;
+        }
+        return {
+          plan_id: active.plan_id,
+          rev: plan.rev,
+          view: compactPlanView(plan),
+          // #295: omitted when the caller did not provide live shelf content.
+          ...(liveShelfContent !== undefined && plan.shelf_ref
+            ? { shelf_drift: shelfDrift(plan, liveShelfContent) }
+            : {}),
+        };
+      },
+    );
   } catch {
     return undefined;
   }

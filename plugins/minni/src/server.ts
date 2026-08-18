@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -86,6 +87,13 @@ import {
   listAgentPingInbox,
 } from "./agent_ping.js";
 import { planHandoffDelivery } from "./handoff_guard.js";
+import {
+  claimIds,
+  deleteClaimSecretsBestEffort,
+  revokedClaimIds,
+  withThreadPlanLock,
+} from "./thread-worker.js";
+import { withThreadLock } from "./thread-lock.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
 // vault's wiki tree regardless of `limit` — the limit is a post-scoring
@@ -1363,69 +1371,81 @@ server.registerTool(
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
-    const targetSlice = plan.slices.find((s) => s.id === slice_id);
-    const from = targetSlice?.status ?? ("pending" as const);
-    // #291: compute against the PRE-update plan — this is the only point
-    // that still has "what was unmet" available; updateSlice is pure and
-    // does no I/O, so it cannot journal the override itself.
-    const unmetBeforeUpdate = status === "done" ? unmetDependencies(plan, slice_id) : [];
-    const next = updateSlice(plan, slice_id, status, evidence, { force, forceReason: force_reason });
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    // #291 round-1 cassandra finding 5: a force override past an unmet
-    // depends_on gate must never be silent. updateSlice already refuses to
-    // force without a force reason, so reaching here with
-    // unmetBeforeUpdate non-empty means the transition succeeded only
-    // because force+force_reason were both supplied. This used to be a
-    // SECOND appendJournal call after status_changed — reproduced with a
-    // mutant, but also true in the unmutated code: a crash between the two
-    // writes left "done" durable with no override record at all. Folded
-    // into the single status_changed write instead, so the override record
-    // can never be missing from the journal ENTRY that describes the
-    // transition (journal-vs-journal atomicity). This does NOT close the
-    // window between persistPlan (above) and this appendJournal call —
-    // round-2 cassandra finding MEDIUM-5 caught an earlier version of this
-    // comment overclaiming that it did. A crash in that window still
-    // leaves "done" durable in the vault note with no journal entry at
-    // all (state-vs-journal), the same pre-existing property every other
-    // status_changed write in this handler already has — not new to
-    // #291, and closing it is a separate, larger durability design
-    // (journal-before-persist + reconciliation on rehydrate), out of scope
-    // here. Who: server-stamped DEFAULT_AGENT_ID (G11 pattern elsewhere in
-    // this file — the model cannot spoof this).
-    await appendJournal(journalPath, {
-      kind: "status_changed",
-      slice_id,
-      from,
-      to: status,
-      evidence,
-      at: new Date().toISOString(),
-      ...(unmetBeforeUpdate.length > 0
-        ? { depends_on_override: { unmet: unmetBeforeUpdate, reason: force_reason, forced_by: DEFAULT_AGENT_ID } }
-        : {}),
-    });
-    if (status === "done" && targetSlice && targetSlice.gate && targetSlice.gate.trim()) {
-      await appendJournal(journalPath, {
-        kind: "gate_passed",
-        slice_id,
-        evidence: evidence ?? "",
-        at: new Date().toISOString(),
-      });
-    }
-    // P10: if updateSlice moved the plan to a terminal status (all slices resolved), clear the
-    // active pointer when it still points at this plan, so a finished plan stops being injected.
-    // H6: model-driven completion lands in "complete" (not "accepted").
-    if (next.status === "complete" || next.status === "accepted") {
-      try {
-        const active = await getActivePlan(effectiveVaultPath);
-        if (active && active.plan_id === plan_id) {
-          await clearActivePlan(effectiveVaultPath);
+    const next = await withThreadPlanLock(
+      {
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        operationId: `server-status-update:${randomUUID()}`,
+      },
+      async (plan) => {
+        const targetSlice = plan.slices.find((s) => s.id === slice_id);
+        const from = targetSlice?.status ?? ("pending" as const);
+        // #291: compute against the PRE-update plan — this is the only point
+        // that still has "what was unmet" available.
+        const unmetBeforeUpdate = status === "done"
+          ? unmetDependencies(plan, slice_id)
+          : [];
+        const updated = updateSlice(
+          plan,
+          slice_id,
+          status,
+          evidence,
+          { force, forceReason: force_reason },
+        );
+        await persistPlan(updated, {
+          vaultPath: effectiveVaultPath,
+          notePath,
+        });
+        const journalPath = path.join(
+          path.dirname(notePath),
+          `${plan_id}.log.md`,
+        );
+        // #291: keep the dependency override in the same status event.
+        await appendJournal(journalPath, {
+          kind: "status_changed",
+          slice_id,
+          from,
+          to: status,
+          evidence,
+          at: new Date().toISOString(),
+          ...(unmetBeforeUpdate.length > 0
+            ? {
+                depends_on_override: {
+                  unmet: unmetBeforeUpdate,
+                  reason: force_reason,
+                  forced_by: DEFAULT_AGENT_ID,
+                },
+              }
+            : {}),
+        });
+        if (
+          status === "done" &&
+          targetSlice &&
+          targetSlice.gate &&
+          targetSlice.gate.trim()
+        ) {
+          await appendJournal(journalPath, {
+            kind: "gate_passed",
+            slice_id,
+            evidence: evidence ?? "",
+            at: new Date().toISOString(),
+          });
         }
-      } catch {
-        // active pointer maintenance is advisory; never fail the update on it
-      }
-    }
+        // P10/H6: terminal plans stop being injected.
+        if (updated.status === "complete" || updated.status === "accepted") {
+          try {
+            const active = await getActivePlan(effectiveVaultPath);
+            if (active && active.plan_id === plan_id) {
+              await clearActivePlan(effectiveVaultPath);
+            }
+          } catch {
+            // active pointer maintenance is advisory
+          }
+        }
+        return updated;
+      },
+    );
     // P3: lead the response with plan-level progress so closing one slice is never misread as
     // closing the whole plan.
     const view = compactPlanView(next);
@@ -1459,15 +1479,31 @@ server.registerTool(
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
-    const next = addScar(plan, { kind, signal, resolution });
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    await appendJournal(journalPath, {
-      kind: "scar_added",
-      signal,
-      at: new Date().toISOString(),
-    });
+    const next = await withThreadPlanLock(
+      {
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        operationId: `server-scar:${randomUUID()}`,
+      },
+      async (plan) => {
+        const updated = addScar(plan, { kind, signal, resolution });
+        await persistPlan(updated, {
+          vaultPath: effectiveVaultPath,
+          notePath,
+        });
+        const journalPath = path.join(
+          path.dirname(notePath),
+          `${plan_id}.log.md`,
+        );
+        await appendJournal(journalPath, {
+          kind: "scar_added",
+          signal,
+          at: new Date().toISOString(),
+        });
+        return updated;
+      },
+    );
     return textResult(JSON.stringify(next, null, 2));
   },
 );
@@ -1538,16 +1574,22 @@ server.registerTool(
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
-    let next: PlanArtifact;
-    if (add_slices || drop_slice_ids) {
-      next = applySliceDelta(plan, { add_slices, drop_slice_ids });
-    } else {
-      if (!new_slices) {
-        return textResult(JSON.stringify({ error: "Either new_slices or add_slices/drop_slice_ids must be provided" }, null, 2));
-      }
-      next = replan(plan, new_slices);
+    if (!new_slices && !add_slices && !drop_slice_ids) {
+      return textResult(JSON.stringify({
+        error: "Either new_slices or add_slices/drop_slice_ids must be provided",
+      }, null, 2));
     }
+    const next = await withThreadPlanLock(
+      {
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        operationId: `server-replan:${randomUUID()}`,
+      },
+      async (plan) => {
+        const updated = add_slices || drop_slice_ids
+          ? applySliceDelta(plan, { add_slices, drop_slice_ids })
+          : replan(plan, new_slices!);
     // #291 round-1 cassandra finding 1 (HIGH, confirmed by independent
     // reproduction against the real compiled server): replan()'s `??` on
     // depends_on only guards null/undefined, not `[]` — a caller can wipe
@@ -1557,7 +1599,7 @@ server.registerTool(
     // plan; hard-blocking dependency edits themselves is a separate, larger
     // design decision outside this fix's brief) — it makes the edit visible
     // instead of silent, which is the actual invariant #291 requires.
-    const dependsOnChanged = diffDependsOn(plan, next);
+    const dependsOnChanged = diffDependsOn(plan, updated);
     // #291 round-2 cassandra finding HIGH-1 (confirmed by independent
     // reproduction before trusting the review): diffDependsOn alone missed
     // the ordinary, cheaper way to satisfy a dependency for free — omitting
@@ -1568,15 +1610,33 @@ server.registerTool(
     // the plan, and hard-gating supersession itself is a separate, larger
     // design decision outside this fix's brief (see diffSupersededDependencies'
     // docstring).
-    const dependsOnSuperseded = diffSupersededDependencies(plan, next);
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    await appendJournal(journalPath, {
-      kind: "replan",
-      at: new Date().toISOString(),
-      ...(dependsOnChanged.length > 0 ? { depends_on_changed: dependsOnChanged } : {}),
-      ...(dependsOnSuperseded.length > 0 ? { depends_on_superseded: dependsOnSuperseded } : {}),
-    });
+        const dependsOnSuperseded = diffSupersededDependencies(plan, updated);
+        await persistPlan(updated, {
+          vaultPath: effectiveVaultPath,
+          notePath,
+        });
+        await deleteClaimSecretsBestEffort(
+          effectiveVaultPath,
+          plan_id,
+          revokedClaimIds(plan, updated),
+        );
+        const journalPath = path.join(
+          path.dirname(notePath),
+          `${plan_id}.log.md`,
+        );
+        await appendJournal(journalPath, {
+          kind: "replan",
+          at: new Date().toISOString(),
+          ...(dependsOnChanged.length > 0
+            ? { depends_on_changed: dependsOnChanged }
+            : {}),
+          ...(dependsOnSuperseded.length > 0
+            ? { depends_on_superseded: dependsOnSuperseded }
+            : {}),
+        });
+        return updated;
+      },
+    );
     return textResult(JSON.stringify(next, null, 2));
   },
 );
@@ -1683,36 +1743,55 @@ server.registerTool(
     if (!notePath) {
       return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
     }
-    // #122 F-PLAN-RESTORE-SELFBLOCK: the recovery tool must not be gated on the
-    // corrupt state it exists to heal. restorePlan consumes only frontmatter
-    // scalars from `current` (every digest-covered field comes from the history
-    // snapshot, and persistPlan recomputes the digest on write), so when the
-    // strict rehydrate throws — e.g. a bricked plan_digest — fall back to the
-    // bare-scalar read and proceed with the restore. EXCEPT for the typed
-    // PlanDigestVersionError: a note declaring a NEWER digest version belongs
-    // to a newer writer, and restoring through this (older) plugin would
-    // silently downgrade fields the newer schema introduced — refuse instead.
-    let current: PlanArtifact;
-    try {
-      current = await rehydratePlan(notePath);
-    } catch (err) {
-      if (err instanceof PlanDigestVersionError) {
-        return textResult(JSON.stringify({ error: err.message }, null, 2));
-      }
-      current = await rehydratePlanScalars(notePath);
-    }
-    const snapshot = await getRevision(notePath, rev);
-    if (!snapshot) {
-      return textResult(JSON.stringify({ error: `revision ${rev} not found` }, null, 2));
-    }
-    const next = restorePlan(current, snapshot);
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    await appendJournal(journalPath, {
-      kind: "restored",
-      from_rev: rev,
-      at: new Date().toISOString(),
+    const next = await withThreadLock(
+      effectiveVaultPath,
+      plan_id,
+      `server-restore:${randomUUID()}`,
+      async () => {
+        // #122 F-PLAN-RESTORE-SELFBLOCK: strict rehydrate remains first. A
+        // digest-bricked note may use the recovery scalar read, but restorePlan
+        // never copies claim authority from either source: every restored
+        // claim is cleared and every generation advances beyond the current
+        // and historical high-water marks.
+        let current: PlanArtifact;
+        try {
+          current = await rehydratePlan(notePath);
+        } catch (err) {
+          if (err instanceof PlanDigestVersionError) {
+            throw err;
+          }
+          current = await rehydratePlanScalars(notePath);
+        }
+        const snapshot = await getRevision(notePath, rev);
+        if (!snapshot) {
+          throw new Error(`revision ${rev} not found`);
+        }
+        const restored = restorePlan(current, snapshot);
+        await persistPlan(restored, {
+          vaultPath: effectiveVaultPath,
+          notePath,
+        });
+        await deleteClaimSecretsBestEffort(
+          effectiveVaultPath,
+          plan_id,
+          [...claimIds(current), ...claimIds(snapshot)],
+        );
+        const journalPath = path.join(
+          path.dirname(notePath),
+          `${plan_id}.log.md`,
+        );
+        await appendJournal(journalPath, {
+          kind: "restored",
+          from_rev: rev,
+          at: new Date().toISOString(),
+        });
+        return restored;
+      },
+    ).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      return textResult(JSON.stringify({ error: message }, null, 2));
     });
+    if ("content" in next) return next;
     return textResult(JSON.stringify(next, null, 2));
   },
 );

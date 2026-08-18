@@ -43,12 +43,15 @@ export interface ThreadMutationResult {
   ready_after: string[];
 }
 
-interface ThreadMutationTarget {
+interface ThreadPlanTarget {
   vaultPath: string;
   notePath: string;
   planId: string;
+}
+
+interface ThreadMutationTarget extends ThreadPlanTarget {
   sliceId: string;
-  now?: Date;
+  now?: Date | (() => Date);
 }
 
 export interface AssignSliceInput extends ThreadMutationTarget {
@@ -70,6 +73,7 @@ export interface UpdateClaimedSliceInput extends ThreadMutationTarget {
 
 export interface ThreadWorkerDeps {
   persistPlan?: typeof persistPlan;
+  deleteClaimSecret?: typeof deleteClaimSecret;
 }
 
 function requireNonEmpty(value: string, label: string): string {
@@ -79,8 +83,8 @@ function requireNonEmpty(value: string, label: string): string {
   return value.trim();
 }
 
-function requireNow(value: Date | undefined): Date {
-  const now = value ?? new Date();
+function sampleNow(value: Date | (() => Date) | undefined): Date {
+  const now = typeof value === "function" ? value() : (value ?? new Date());
   if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
     throw new Error("thread worker time is invalid");
   }
@@ -127,7 +131,7 @@ function isNonTerminal(slice: PlanSlice): boolean {
  * claimSlice performs the corresponding locked durable cleanup.
  */
 export function readySlices(plan: PlanArtifact, now: Date): PlanSlice[] {
-  const checkedNow = requireNow(now);
+  const checkedNow = sampleNow(now);
   return plan.slices
     .filter(
       (slice) =>
@@ -157,7 +161,7 @@ function assertNoteUnderVault(vaultPath: string, notePath: string): void {
 }
 
 async function rehydrateAuthority(
-  input: ThreadMutationTarget,
+  input: ThreadPlanTarget,
 ): Promise<PlanArtifact> {
   assertNoteUnderVault(input.vaultPath, input.notePath);
   // Authority paths intentionally use only strict rehydration. In particular,
@@ -170,6 +174,59 @@ async function rehydrateAuthority(
     );
   }
   return plan;
+}
+
+export interface ThreadPlanLockInput extends ThreadPlanTarget {
+  operationId: string;
+}
+
+/**
+ * Shared lock-before-read primitive for every production Thread
+ * read-modify-write path. Callers receive only a strict, digest-verified plan
+ * loaded after this process owns the plan lock.
+ */
+export async function withThreadPlanLock<T>(
+  input: ThreadPlanLockInput,
+  fn: (plan: PlanArtifact) => Promise<T>,
+): Promise<T> {
+  return withThreadLock(
+    input.vaultPath,
+    requireNonEmpty(input.planId, "plan id"),
+    requireNonEmpty(input.operationId, "operation id"),
+    async () => fn(await rehydrateAuthority(input)),
+  );
+}
+
+export function claimIds(plan: PlanArtifact): string[] {
+  return [
+    ...new Set(
+      plan.slices
+        .map((slice) => slice.claim?.claim_id)
+        .filter((claimId): claimId is string => typeof claimId === "string"),
+    ),
+  ];
+}
+
+export function revokedClaimIds(
+  before: PlanArtifact,
+  after: PlanArtifact,
+): string[] {
+  const afterClaimIds = new Set(claimIds(after));
+  return claimIds(before).filter((claimId) => !afterClaimIds.has(claimId));
+}
+
+export async function deleteClaimSecretsBestEffort(
+  vaultPath: string,
+  planId: string,
+  claimIdsToDelete: Iterable<string>,
+  deleteSecret: typeof deleteClaimSecret = deleteClaimSecret,
+): Promise<void> {
+  const uniqueClaimIds = new Set(claimIdsToDelete);
+  await Promise.all(
+    [...uniqueClaimIds].map((claimId) =>
+      deleteSecret({ vaultPath, planId, claimId }).catch(() => {})
+    ),
+  );
 }
 
 function findSlice(plan: PlanArtifact, sliceId: string): PlanSlice {
@@ -238,16 +295,19 @@ export async function assignSlice(
     input.workerAgentId,
     "worker agent id",
   );
-  const now = requireNow(input.now);
   const profile = assignmentProfile(input.assignmentProfile);
   const persist = deps.persistPlan ?? persistPlan;
+  const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
 
-  return withThreadLock(
-    input.vaultPath,
-    planId,
-    `assign:${randomUUID()}`,
-    async () => {
-      const plan = await rehydrateAuthority(input);
+  return withThreadPlanLock(
+    {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId,
+      operationId: `assign:${randomUUID()}`,
+    },
+    async (plan) => {
+      const now = sampleNow(input.now);
       const slice = findSlice(plan, sliceId);
       const readyBefore = readyIds(plan, now);
       const structurallyReady =
@@ -255,14 +315,6 @@ export async function assignSlice(
         unmetDependencies(plan, sliceId).length === 0;
       if (slice.status !== "pending" && !structurallyReady) {
         throw new Error(`slice "${sliceId}" is not assignable`);
-      }
-
-      if (slice.claim) {
-        await deleteClaimSecret({
-          vaultPath: input.vaultPath,
-          planId,
-          claimId: slice.claim.claim_id,
-        });
       }
 
       const generation = requireGeneration(slice);
@@ -279,6 +331,14 @@ export async function assignSlice(
         vaultPath: input.vaultPath,
         notePath: input.notePath,
       });
+      if (slice.claim) {
+        await deleteClaimSecretsBestEffort(
+          input.vaultPath,
+          planId,
+          [slice.claim.claim_id],
+          deleteSecret,
+        );
+      }
       return mutationResult(next, sliceId, readyBefore, now);
     },
   );
@@ -320,15 +380,19 @@ export async function claimSlice(
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0) {
     throw new Error("claim ttlSeconds must be a positive safe integer");
   }
-  const now = requireNow(input.now);
   const persist = deps.persistPlan ?? persistPlan;
+  const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
 
-  return withThreadLock(
-    input.vaultPath,
-    planId,
-    `claim:${randomUUID()}`,
-    async () => {
-      let plan = await rehydrateAuthority(input);
+  return withThreadPlanLock(
+    {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId,
+      operationId: `claim:${randomUUID()}`,
+    },
+    async (initialPlan) => {
+      const now = sampleNow(input.now);
+      let plan = initialPlan;
       let slice = findSlice(plan, sliceId);
       if (!isNonTerminal(slice)) {
         throw new Error(`slice "${sliceId}" is not claimable`);
@@ -338,16 +402,15 @@ export async function claimSlice(
           `slice "${sliceId}" is assigned to ${slice.assigned_to ?? "nobody"}, not ${workerAgentId}`,
         );
       }
-      const generation = requireGeneration(slice);
+      let generation = requireGeneration(slice);
+      const staleClaimIds: string[] = [];
 
       if (slice.claim && !hasLiveClaim(slice, now)) {
-        await deleteClaimSecret({
-          vaultPath: input.vaultPath,
-          planId,
-          claimId: slice.claim.claim_id,
-        });
+        staleClaimIds.push(slice.claim.claim_id);
+        generation += 1;
         const expiredSlice: PlanSlice = {
           ...slice,
+          generation,
           claim: undefined,
         };
         plan = replaceSlice(plan, sliceId, expiredSlice);
@@ -385,18 +448,43 @@ export async function claimSlice(
       const expiresAt = new Date(
         now.getTime() + ttlSeconds * 1_000,
       ).toISOString();
-      const stored = await createClaimSecret({
-        vaultPath: input.vaultPath,
-        planId,
-        sliceId,
-        generation,
-        workerAgentId,
-        idempotencyKey,
-        expiresAt,
-        rev: plan.rev + 1,
-      });
+      let stored: Awaited<ReturnType<typeof createClaimSecret>> | undefined;
+      // A response-loss orphan may occupy the deterministic idempotency path.
+      // Never reattach an expired envelope: advance generation so the stale
+      // token's identity can never collide with the new claim, even when its
+      // best-effort deletion fails.
+      for (let staleGenerations = 0; staleGenerations < 100; staleGenerations += 1) {
+        const candidate = await createClaimSecret({
+          vaultPath: input.vaultPath,
+          planId,
+          sliceId,
+          generation,
+          workerAgentId,
+          idempotencyKey,
+          expiresAt,
+          rev: plan.rev + 1,
+        });
+        if (Date.parse(candidate.envelope.expires_at) > now.getTime()) {
+          stored = candidate;
+          break;
+        }
+        staleClaimIds.push(candidate.envelope.claim_id);
+        generation += 1;
+        slice = {
+          ...slice,
+          generation,
+          claim: undefined,
+        };
+        plan = replaceSlice(plan, sliceId, slice);
+      }
+      if (!stored) {
+        throw new Error(
+          `slice "${sliceId}" has too many stale idempotency generations`,
+        );
+      }
       const nextSlice: PlanSlice = {
         ...slice,
+        generation,
         attempt: requireAttempt(slice) + 1,
         claim: {
           claim_id: stored.envelope.claim_id,
@@ -413,13 +501,20 @@ export async function claimSlice(
           notePath: input.notePath,
         });
       } catch (error) {
-        await deleteClaimSecret({
-          vaultPath: input.vaultPath,
+        await deleteClaimSecretsBestEffort(
+          input.vaultPath,
           planId,
-          claimId: stored.envelope.claim_id,
-        }).catch(() => {});
+          [stored.envelope.claim_id],
+          deleteSecret,
+        );
         throw error;
       }
+      await deleteClaimSecretsBestEffort(
+        input.vaultPath,
+        planId,
+        staleClaimIds,
+        deleteSecret,
+      );
       return publicClaimResponse(stored.envelope.response);
     },
   );
@@ -631,15 +726,18 @@ export async function updateClaimedSlice(
     "worker agent id",
   );
   const token = requireNonEmpty(input.token, "claim token");
-  const now = requireNow(input.now);
   const persist = deps.persistPlan ?? persistPlan;
+  const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
 
-  return withThreadLock(
-    input.vaultPath,
-    planId,
-    `worker-update:${randomUUID()}`,
-    async () => {
-      const plan = await rehydrateAuthority(input);
+  return withThreadPlanLock(
+    {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId,
+      operationId: `worker-update:${randomUUID()}`,
+    },
+    async (plan) => {
+      const now = sampleNow(input.now);
       const slice = findSlice(plan, sliceId);
       const claim = slice.claim;
       if (!claim || claim.worker_agent_id !== workerAgentId) {
@@ -685,11 +783,12 @@ export async function updateClaimedSlice(
         notePath: input.notePath,
       });
       if (applied.completed) {
-        await deleteClaimSecret({
-          vaultPath: input.vaultPath,
+        await deleteClaimSecretsBestEffort(
+          input.vaultPath,
           planId,
-          claimId: claim.claim_id,
-        });
+          [claim.claim_id],
+          deleteSecret,
+        );
       }
       return mutationResult(next, sliceId, readyBefore, now);
     },

@@ -1278,7 +1278,10 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
           claimClockSamples += 1;
           return new Date("2026-08-18T12:05:00.000Z");
         },
-      });
+      }).then(
+        (value) => ({ ok: true, value }),
+        (error) => ({ ok: false, error }),
+      );
       await Promise.resolve();
       assert.equal(
         claimClockSamples,
@@ -1287,7 +1290,9 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
       );
     },
   );
-  const claim = await queuedClaim;
+  const claimResult = await queuedClaim;
+  assert.equal(claimResult.ok, true, claimResult.error?.message);
+  const claim = claimResult.value;
   assert.equal(claimClockSamples, 1);
   assert.equal(claim.expires_at, "2026-08-18T12:06:00.000Z");
 
