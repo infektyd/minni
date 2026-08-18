@@ -784,6 +784,24 @@ function makePlan() {
   return plan;
 }
 
+/**
+ * Applies `extra` to slice index 0 ONLY, leaving slice count, slice "b", and
+ * every other plan-level field byte-for-byte identical to `base`. This is
+ * the isolation review finding #1 fixed: the original version of this
+ * helper replaced the whole `slices` array with a ONE-element array
+ * (dropping slice "b" entirely), so every assertion below would have passed
+ * even if computePlanDigestHexV3 ignored every new field completely — the
+ * digest would still have changed purely because the slice COUNT changed.
+ * Preserving slice "b" and everything else means the *only* possible cause
+ * of a digest change is the specific field(s) in `extra`.
+ */
+function withSliceZeroField(base, extra) {
+  return {
+    ...base,
+    slices: base.slices.map((slice, i) => (i === 0 ? { ...slice, ...extra } : slice)),
+  };
+}
+
 test("digest v3 changes for assignment, generation, claim metadata, and proposals", () => {
   const base = makePlan();
   const variants = [
@@ -799,11 +817,13 @@ test("digest v3 changes for assignment, generation, claim metadata, and proposal
     { proposals: [{ kind: "contract", reason: "enough evidence", slice_ids: ["b"] }] },
   ];
   for (const extra of variants) {
-    const changed = {
-      ...base,
-      slices: [{ ...base.slices[0], ...extra }],
-    };
-    assert.notEqual(computePlanDigest(base), computePlanDigest(changed));
+    const changed = withSliceZeroField(base, extra);
+    // Sanity guard for the isolation itself: slice count and slice "b" must
+    // be untouched, so a failure below can only be explained by the
+    // specific field in `extra`, never a structural side effect.
+    assert.equal(changed.slices.length, base.slices.length, JSON.stringify(extra));
+    assert.deepEqual(changed.slices[1], base.slices[1], JSON.stringify(extra));
+    assert.notEqual(computePlanDigest(base), computePlanDigest(changed), JSON.stringify(extra));
   }
 });
 
@@ -817,11 +837,10 @@ test("digest v3 also changes for requirements and assignment_profile", () => {
     { assignment_profile: "profile-research" },
   ];
   for (const extra of variants) {
-    const changed = {
-      ...base,
-      slices: [{ ...base.slices[0], ...extra }],
-    };
-    assert.notEqual(computePlanDigest(base), computePlanDigest(changed));
+    const changed = withSliceZeroField(base, extra);
+    assert.equal(changed.slices.length, base.slices.length, JSON.stringify(extra));
+    assert.deepEqual(changed.slices[1], base.slices[1], JSON.stringify(extra));
+    assert.notEqual(computePlanDigest(base), computePlanDigest(changed), JSON.stringify(extra));
   }
 });
 
@@ -885,6 +904,128 @@ test("rehydratePlan reads declared v1 without write-on-read upgrade", async () =
     const after = await readFile(write.notePath, "utf8");
     assert.equal(rehydrated.plan_id, plan.plan_id);
     assert.equal(after, before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const V3_ONLY_FIELD_SAMPLES = {
+  requirements: ["needs-shell-access"],
+  assigned_to: "worker-a",
+  assignment_profile: "profile-research",
+  generation: 2,
+  attempt: 1,
+  claim: {
+    claim_id: "claim-a",
+    worker_agent_id: "worker-a",
+    claimed_at: "2026-08-18T00:00:00.000Z",
+    expires_at: "2026-08-18T00:10:00.000Z",
+  },
+  proposals: [{ kind: "contract", reason: "enough evidence", slice_ids: ["s1"] }],
+};
+
+/**
+ * Writes a note that DECLARES an older digest version (1 or 2) whose
+ * declared-algorithm digest genuinely validates — computed over a slice that
+ * ALSO carries one v3-only field the older algorithm never looks at. This is
+ * exactly the review's tamper scenario: a real v1/v2 algorithm run (proven
+ * below) picks specific known keys and ignores anything else, so the
+ * declared hash matching says nothing about whether the field was
+ * injected/edited outside a genuine older writer's reach.
+ */
+async function writeDeclaredOlderPlanWithV3Field(declaredVersion, field) {
+  const root = await mkdtemp(path.join(tmpdir(), `sm-plan-declared-v${declaredVersion}-v3field-`));
+  await ensureVault(root);
+  const { plan, write } = await createPlan(
+    { goal: `declared v${declaredVersion} tamper probe`, slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+    { vaultPath: root },
+  );
+  const mutatedSlices = [{ ...plan.slices[0], [field]: V3_ONLY_FIELD_SAMPLES[field] }];
+  const mutatedPlan = { ...plan, slices: mutatedSlices };
+  const olderAlgo = declaredVersion === 1 ? computePlanDigestV1 : computePlanDigestHexV2;
+  const olderHex = olderAlgo(mutatedPlan);
+  // Prove the older algorithm truly ignores this field — otherwise this
+  // fixture would not be testing what it claims to.
+  assert.equal(olderHex, olderAlgo(plan), `expected declared-v${declaredVersion} digest to be blind to "${field}"`);
+
+  const raw = await readFile(write.notePath, "utf8");
+  const rewritten = raw
+    .replace(/^plan_slices:.*$/m, `plan_slices: ${JSON.stringify(JSON.stringify(mutatedSlices))}`)
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${olderHex}`)
+    .replace(/^plan_digest_v:.*$/m, `plan_digest_v: ${declaredVersion}`);
+  assert.notEqual(rewritten, raw, "expected to actually inject a v3-only field into this fixture");
+  await writeFile(write.notePath, rewritten, "utf8");
+  return { notePath: write.notePath, root };
+}
+
+test("rehydratePlan rejects a declared v2 note whose slice carries a v3-only field outside v2's digest coverage", async (t) => {
+  for (const field of Object.keys(V3_ONLY_FIELD_SAMPLES)) {
+    await t.test(field, async () => {
+      const fixture = await writeDeclaredOlderPlanWithV3Field(2, field);
+      try {
+        const before = await readFile(fixture.notePath, "utf8");
+        await assert.rejects(
+          () => rehydratePlan(fixture.notePath),
+          (err) => {
+            assert.match(err.message, /v3-only field/);
+            assert.match(err.message, new RegExp(field));
+            assert.match(err.message, /tampered/);
+            return true;
+          },
+        );
+        const after = await readFile(fixture.notePath, "utf8");
+        assert.equal(after, before, "a rejected read must not rewrite the note either");
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("rehydratePlan rejects a declared v1 note whose slice carries a v3-only field outside v1's digest coverage", async () => {
+  const fixture = await writeDeclaredOlderPlanWithV3Field(1, "assigned_to");
+  try {
+    const before = await readFile(fixture.notePath, "utf8");
+    await assert.rejects(
+      () => rehydratePlan(fixture.notePath),
+      (err) => {
+        assert.match(err.message, /v3-only field/);
+        assert.match(err.message, /assigned_to/);
+        return true;
+      },
+    );
+    const after = await readFile(fixture.notePath, "utf8");
+    assert.equal(after, before);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan normalizes a declared v1 note's interim 'v1:<hex>' tag to bare hex in memory without writing the note", async () => {
+  // Focused assertion for the review's second ask: the no-write-on-read
+  // contract only says the FILE is left alone for a declared-older version.
+  // The returned in-memory plan.plan_digest must still be the bare hex, not
+  // leak the "v1:" on-disk tag encoding to callers.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v1-tag-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "declared v1 interim tag", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const v1Hex = computePlanDigestV1(plan);
+    const raw = await readFile(write.notePath, "utf8");
+    const rewritten = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: v1:${v1Hex}`)
+      .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 1");
+    assert.notEqual(rewritten, raw);
+    await writeFile(write.notePath, rewritten, "utf8");
+
+    const before = await readFile(write.notePath, "utf8");
+    const rehydrated = await rehydratePlan(write.notePath);
+    const after = await readFile(write.notePath, "utf8");
+    assert.equal(rehydrated.plan_digest, v1Hex, "in-memory digest must be normalized to bare hex");
+    assert.equal(after, before, "the note itself must not be rewritten for a declared-older version");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

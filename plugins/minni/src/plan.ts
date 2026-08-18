@@ -341,6 +341,42 @@ export function computePlanDigest(plan: PlanArtifact): string {
   return computePlanDigestHexV3(plan);
 }
 
+/**
+ * Every PlanSlice key that ONLY v3 knows how to hash. Review finding
+ * (Task 2 follow-up): the v1/v2 algorithms pick specific known keys into
+ * their payload and silently ignore anything else — so a slice can carry
+ * one of these keys (an unauthorized reassignment, a forged claim, an
+ * injected structural proposal) while the note's DECLARED v1/v2 digest still
+ * validates, because that older algorithm never looked at the key in the
+ * first place. A genuine v1/v2 writer's PlanSlice type never had these
+ * fields, so JSON.stringify of a real one never emits them — their mere
+ * presence on a note that declares an older version is itself the tamper
+ * signal, independent of what the declared algorithm's hash covers.
+ */
+const V3_ONLY_SLICE_FIELDS = [
+  "requirements",
+  "assigned_to",
+  "assignment_profile",
+  "generation",
+  "attempt",
+  "claim",
+  "proposals",
+] as const;
+
+function findV3OnlySliceField(
+  slices: PlanSlice[],
+): { sliceId: string; field: string } | undefined {
+  for (const slice of slices) {
+    const record = slice as unknown as Record<string, unknown>;
+    for (const field of V3_ONLY_SLICE_FIELDS) {
+      if (record[field] !== undefined) {
+        return { sliceId: slice.id, field };
+      }
+    }
+  }
+  return undefined;
+}
+
 function parsePlanDigestTag(stored: string): { version: number; hex: string } | undefined {
   const m = stored.match(/^v(\d+):([0-9a-f]+)$/);
   return m ? { version: Number(m[1]), hex: m[2] } : undefined;
@@ -1532,6 +1568,27 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     if (algo(plan) !== storedHex) {
       throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
     }
+    // Review finding (Task 2 follow-up): a declared OLDER algorithm having
+    // validated proves only that the fields IT covers are intact — it says
+    // nothing about a v3-only slice key, which that algorithm never hashed
+    // and therefore could not have caught being added, changed, or removed.
+    // A genuine v1/v2 writer's slices can never contain one of these keys at
+    // all, so their mere presence on a declared-older note is tampering,
+    // not a legitimate value this build should trust or silently accept.
+    if (declaredVersion < PLAN_DIGEST_VERSION) {
+      const v3Field = findV3OnlySliceField(plan.slices);
+      if (v3Field) {
+        throw new Error(
+          `rehydratePlan: slice "${v3Field.sliceId}" carries v3-only field "${v3Field.field}" outside declared digest v${declaredVersion}'s coverage; note may be tampered`,
+        );
+      }
+    }
+    // Normalize the RETURNED in-memory digest to bare hex regardless of the
+    // write decision below — an interim "vN:<hex>" tag is an on-disk
+    // encoding detail, never something a caller of rehydratePlan should see
+    // in plan.plan_digest. This does not touch the note file; needsUpgrade
+    // (just below) is the only thing that decides whether persistPlan runs.
+    plan.plan_digest = storedHex;
     needsUpgrade = declaredVersion === PLAN_DIGEST_VERSION && storedTag !== undefined;
   } else if (plan.plan_digest !== recomputed) {
     // No declared version: legacy recognition (pre-H7 v1 upgrades in place).

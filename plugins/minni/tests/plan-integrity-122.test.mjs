@@ -400,6 +400,11 @@ test("#122/4: a 'v2:<hex>'-prefixed digest declaring an OLDER version than curre
 
     const rehydrated = await rehydratePlan(write.notePath);
     assert.equal(rehydrated.plan_id, plan.plan_id);
+    // Focused assertion (Task 2 review follow-up): the no-write-on-read
+    // contract only protects the FILE for a declared-older version — the
+    // returned in-memory digest must still be normalized to bare hex, not
+    // leak the "v2:" tag encoding to a caller that never asked for it.
+    assert.equal(rehydrated.plan_digest, v2Hex, "in-memory digest must be normalized to bare hex even though the note is not rewritten");
 
     const after = await readFile(write.notePath, "utf8");
     assert.equal(after, before, "a declared-older note must not be rewritten on a mere read");
