@@ -1591,24 +1591,43 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     plan.plan_digest = storedHex;
     needsUpgrade = declaredVersion === PLAN_DIGEST_VERSION && storedTag !== undefined;
   } else if (plan.plan_digest !== recomputed) {
-    // No declared version: legacy recognition (pre-H7 v1 upgrades in place).
-    // The upgrade-on-read behavior itself is unchanged by Task 2 — a note
-    // with no version marker at all predates the rolling-upgrade contract
-    // this task's declared-version guard protects.
-    //
-    // Review finding (Task 2 second follow-up): this path used to skip the
-    // v3-only-field tamper check entirely, because that check originally
-    // lived only inside the `declaredVersion !== undefined` branch above.
-    // But an undeclared note validating against v1 is exactly as blind to
-    // the seven v3-only slice keys as a DECLARED v1 note is — and, worse,
-    // it was about to be upgraded (persisted) below, which would silently
-    // BLESS an injected assigned_to/claim/proposals/etc. as legitimate v3
-    // data. So the same guard applies here too, before needsUpgrade is set.
-    if (plan.plan_digest === computePlanDigestV1(plan)) {
+    // No declared version: legacy recognition. This has ALWAYS meant "bare
+    // v2-or-v1" (see the doc comment on PLAN_DIGEST_VERSION above) — a note
+    // with no plan_digest_v field at all predates the tagging field itself,
+    // and could genuinely have been written by EITHER a pre-H7 v1 host or a
+    // v2-era host that predated plan_digest_v (the tagging field and v1->v2
+    // both landed together; a note written between the v2 payload widening
+    // and the tagging field's own rollout has a bare v2 hex and no version
+    // marker). Task 2's second follow-up regressed this to "v1 only",
+    // which made a genuine bare-v2 note fail closed as tampered. Fixed by
+    // trying every REGISTERED algorithm older than current, not just v1 —
+    // this also means any future intermediate version added to
+    // PLAN_DIGEST_ALGORITHMS is automatically covered here too.
+    const legacyVersions = Object.keys(PLAN_DIGEST_ALGORITHMS)
+      .map(Number)
+      .filter((v) => v < PLAN_DIGEST_VERSION)
+      .sort((a, b) => a - b);
+    let matchedLegacyVersion: number | undefined;
+    for (const v of legacyVersions) {
+      if (PLAN_DIGEST_ALGORITHMS[v](plan) === plan.plan_digest) {
+        matchedLegacyVersion = v;
+        break;
+      }
+    }
+    if (matchedLegacyVersion !== undefined) {
+      // Review finding (Task 2 second follow-up): this path used to skip the
+      // v3-only-field tamper check entirely, because that check originally
+      // lived only inside the `declaredVersion !== undefined` branch above.
+      // But an undeclared note validating against a legacy algorithm is
+      // exactly as blind to the seven v3-only slice keys as a DECLARED
+      // older note is — and, worse, it was about to be upgraded (persisted)
+      // below, which would silently BLESS an injected
+      // assigned_to/claim/proposals/etc. as legitimate v3 data. So the same
+      // guard applies here too, before needsUpgrade is set.
       const v3Field = findV3OnlySliceField(plan.slices);
       if (v3Field) {
         throw new Error(
-          `rehydratePlan: slice "${v3Field.sliceId}" carries v3-only field "${v3Field.field}" outside undeclared-v1 digest coverage; note may be tampered`,
+          `rehydratePlan: slice "${v3Field.sliceId}" carries v3-only field "${v3Field.field}" outside undeclared-v${matchedLegacyVersion} digest coverage; note may be tampered`,
         );
       }
       needsUpgrade = true;

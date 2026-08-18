@@ -341,6 +341,48 @@ test("#122/4: note without plan_digest_v (pre-tagging writer) is recognized as b
   }
 });
 
+test("#122/4: note without plan_digest_v carrying a REAL bare v2 hex (genuine pre-tagging v2-era writer) is recognized and upgraded to current", async () => {
+  // Task 2 final review: the undeclared-legacy fallback had regressed to
+  // "v1 only" (the second follow-up's fix only widened the tamper guard,
+  // not the RECOGNITION set), when the documented contract on
+  // PLAN_DIGEST_VERSION has always been "bare v2-or-v1" — a note with NO
+  // plan_digest_v field at all predates the tagging field itself, and the
+  // v2 payload widening + the tagging field did not land in the exact same
+  // build, so a genuine v2-era host could have written a bare v2 hex with
+  // no version marker at all. This fixture forces a REAL
+  // computePlanDigestHexV2 hex (not "whatever computePlanDigest/current
+  // happens to compute today", which the pre-existing untagged test above
+  // already covers) so it fails the instant the fallback stops trying v2.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-digest-bare-v2-untagged-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "bare v2 pre-tagging compat", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const v2Hex = computePlanDigestHexV2(plan);
+    const v3Hex = computePlanDigest(plan);
+    assert.notEqual(v2Hex, v3Hex, "v2 and v3 digests must differ for this to be a real compatibility case");
+
+    const raw = await readFile(write.notePath, "utf8");
+    const rewritten = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${v2Hex}`)
+      .replace(/^plan_digest_v:.*\n/m, "");
+    assert.notEqual(rewritten, raw, "expected to actually stamp a bare-v2, no-version-marker note for this fixture");
+    await writeFile(write.notePath, rewritten, "utf8");
+
+    const rehydrated = await rehydratePlan(write.notePath);
+    assert.equal(rehydrated.plan_id, plan.plan_id);
+    assert.equal(rehydrated.plan_digest, v3Hex, "a genuine bare-v2 note must be upgraded to the current digest on read");
+
+    const after = await readFile(write.notePath, "utf8");
+    assert.match(after, new RegExp(`^plan_digest: ${v3Hex}$`, "m"), "note must be re-persisted with the current digest");
+    assert.match(after, /^plan_digest_v: 3$/m, "upgrade must stamp the current plan_digest_v going forward");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#122/4: 'v3:<hex>'-prefixed stored digest (interim build) is accepted and normalized to bare hex", async () => {
   // Task 2 (digest v3): the interim-tag normalization contract only applies
   // to a note whose EFFECTIVE declared version is the CURRENT one — this
