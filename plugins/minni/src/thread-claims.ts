@@ -324,7 +324,7 @@ async function withClaimLocation<T>(
       ".runtime",
       create,
     );
-    if (!runtimeHandle) return fn(undefined);
+    if (!runtimeHandle) return await fn(undefined);
     handles.push(runtimeHandle);
 
     const claimsHandle = await openPrivateChildDirectory(
@@ -333,7 +333,7 @@ async function withClaimLocation<T>(
       "thread-claims",
       create,
     );
-    if (!claimsHandle) return fn(undefined);
+    if (!claimsHandle) return await fn(undefined);
     handles.push(claimsHandle);
 
     const planHash = hashSegment(planId);
@@ -343,14 +343,14 @@ async function withClaimLocation<T>(
       planHash,
       create,
     );
-    if (!planHandle) return fn(undefined);
+    if (!planHandle) return await fn(undefined);
     handles.push(planHandle);
 
     const runtimePath = path.join(logicalVaultPath, ".runtime");
     const claimsPath = path.join(runtimePath, "thread-claims");
     const planPath = path.join(claimsPath, planHash);
     const fileName = `${claimId}.json`;
-    return fn({
+    return await fn({
       fdAliasRoot,
       vaultHandle,
       runtimeHandle,
