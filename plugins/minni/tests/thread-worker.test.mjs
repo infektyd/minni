@@ -59,6 +59,10 @@ const THREAD_WORKER_MODULE_URL = new URL(
   import.meta.url,
 ).href;
 
+function jsonRoundTrip(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 let workerUpdateSeq = 0;
 function workerUpdate(input, deps) {
   return updateClaimedSliceImpl(
@@ -2012,6 +2016,136 @@ test("workerUpdate surfaces a real persistPlan history-append failure on complet
     0,
     "a history-append failure must never leave a false slice.completed event behind",
   );
+  // The receipt hit must still repair the scheduler journal it left behind:
+  // the note is ahead of the journal (completion landed, but
+  // recordThreadMutationEvents never ran because persist threw first), so
+  // the receipt-hit path must run the exact same "note ahead of journal"
+  // reconciliation every other locked mutation runs, appending exactly one
+  // state.recovered carrying the CURRENT ready summary at the note's own
+  // rev — never a fabricated slice.completed or ready.changed.
+  const recovered = events.filter((event) => event.kind === "state.recovered");
+  assert.equal(
+    recovered.length,
+    1,
+    "exactly one state.recovered must repair the note-ahead-of-journal gap",
+  );
+  assert.equal(recovered[0].rev, durable.rev);
+  assert.deepEqual(recovered[0].payload, { ready: { slices: [] } });
+  assert.equal(
+    events.some((event) => event.kind === "slice.completed"),
+    false,
+    "a receipt replay must never mint a fabricated slice.completed event",
+  );
+
+  // A second identical retry must add nothing further: the journal is now
+  // aligned with the note, so reconciliation is a no-op and the committed
+  // receipt keeps replaying the exact same result. Compare via a JSON
+  // round trip: the receipt itself is a JSON file, so an explicit
+  // `claim: undefined` key on the in-memory slice (never observable over
+  // the wire, and dropped by JSON.stringify) must not register as a
+  // content difference.
+  const retriedAgain = await workerUpdate(updateInput);
+  assert.deepEqual(jsonRoundTrip(retriedAgain), jsonRoundTrip(retried));
+  const { events: eventsAfterSecondRetry } = await readThreadEvents(
+    journalPath,
+    0,
+    100,
+  );
+  assert.deepEqual(eventsAfterSecondRetry, events);
+});
+
+test("workerUpdate receipt replay on the clean happy path adds no recovery event", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-a-happy",
+    now: new Date(THREAD_START),
+  });
+
+  const updateInput = {
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "complete-a-happy",
+    action: { action: "complete", evidence: "Completed cleanly" },
+    now: () => new Date("2026-08-18T12:05:00.000Z"),
+  };
+
+  const completed = await workerUpdate(updateInput);
+  assert.equal(completed.slice.status, "done");
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const before = await readThreadEvents(journalPath, 0, 100);
+  assert.ok(
+    before.events.some((event) => event.kind === "slice.completed"),
+    "the clean completion itself must record a real slice.completed event",
+  );
+  assert.equal(
+    before.events.filter((event) => event.kind === "state.recovered").length,
+    0,
+  );
+
+  // The journal is already aligned with the note (recordThreadMutationEvents
+  // ran successfully), so a same-key retry's reconciliation step must be a
+  // pure no-op: no state.recovered, no other new event, byte-identical
+  // response (compared over its JSON wire shape, see jsonRoundTrip above).
+  const retried = await workerUpdate(updateInput);
+  assert.deepEqual(jsonRoundTrip(retried), jsonRoundTrip(completed));
+  const after = await readThreadEvents(journalPath, 0, 100);
+  assert.deepEqual(after.events, before.events);
+});
+
+test("a committed worker-update receipt still fails thread_inconsistent when the journal is ahead of the note", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-a-ahead",
+    now: new Date(THREAD_START),
+  });
+
+  const updateInput = {
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "complete-a-ahead",
+    action: { action: "complete", evidence: "Completed before journal tampering" },
+    now: () => new Date("2026-08-18T12:05:00.000Z"),
+  };
+
+  // Establish a real committed receipt via a clean completion first.
+  await workerUpdate(updateInput);
+  const durable = await rehydratePlan(fixture.notePath);
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  await writeFile(
+    journalPath,
+    `# Minni Plan Journal\n\n## events\n${JSON.stringify({
+      thread_event_batch: [{
+        seq: 999,
+        rev: durable.rev + 5,
+        event_id: "ahead",
+        idempotency_key: "ahead",
+        actor: "test",
+        kind: "slice.completed",
+        at: THREAD_START.toISOString(),
+      }],
+    })}\n`,
+    "utf8",
+  );
+
+  // A matching committed receipt exists for this exact token/idempotency
+  // key, but the strict Thread-lock reconciliation step must still run
+  // FIRST and must still fail closed: a receipt can never be trusted to
+  // paper over a journal that is ahead of this locked, strict note read.
+  await assert.rejects(workerUpdate(updateInput), /thread_inconsistent/);
 });
 
 test("upgrade-eligible status reads hold the Thread lock through upgrade persistence", async (t) => {

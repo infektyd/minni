@@ -1146,6 +1146,26 @@ export async function updateClaimedSlice(
     async (plan) => {
       const now = sampleNow(input.now);
 
+      // Reconcile the ordered scheduler journal against this LOCKED, strict
+      // note read before ever consulting (let alone returning) a private
+      // receipt. A committed receipt only proves the canonical note write
+      // landed — it says nothing about whether recordThreadMutationEvents
+      // ever ran afterwards (a PlanHistoryAppendError thrown mid-persist, or
+      // a swallowed appendOrderedEventBatch failure, both leave the note
+      // ahead of the journal). Without this, an immediate committed-receipt
+      // return would replay the exact same public result forever while the
+      // scheduler journal stayed silently behind it. reconcileThreadJournal
+      // is exactly the existing "note ahead of journal" repair used by every
+      // other locked mutation: at most one state.recovered event, carrying
+      // only the current ready summary (never a fabricated slice.completed
+      // or ready.changed), and it throws thread_inconsistent instead if the
+      // journal is somehow AHEAD of this strict note read.
+      const { journalPath } = await prepareThreadMutation(
+        { ...input, planId, actor: workerAgentId },
+        plan,
+        now,
+      );
+
       const existingReceipt = await loadWorkerUpdateReceipt(
         input,
         planId,
@@ -1194,11 +1214,6 @@ export async function updateClaimedSlice(
         // unconditionally overwritten by the fresh attempt below.
       }
 
-      const { journalPath } = await prepareThreadMutation(
-        { ...input, planId, actor: workerAgentId },
-        plan,
-        now,
-      );
       const slice = findSlice(plan, sliceId);
       const claim = slice.claim;
       if (!claim || claim.worker_agent_id !== workerAgentId) {
