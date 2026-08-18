@@ -22,10 +22,12 @@ import { promisify } from "node:util";
 
 import { stableStringify } from "../dist/agent_envelope.js";
 import {
+  addScar,
   createPlan,
   persistPlan,
   rehydratePlan,
   replan,
+  restorePlan,
 } from "../dist/plan.js";
 import {
   createClaimSecret,
@@ -39,6 +41,8 @@ import {
   readySlices,
   updateClaimedSlice,
 } from "../dist/thread-worker.js";
+import * as threadWorkerRuntime from "../dist/thread-worker.js";
+import { withThreadLock } from "../dist/thread-lock.js";
 
 const BEFORE_EXPIRY = new Date("2026-08-18T14:59:00.000Z");
 const AT_EXPIRY = new Date("2026-08-18T15:00:00.000Z");
@@ -137,6 +141,7 @@ function startBarrierWorker(operation, input) {
     if (input.now !== undefined) input.now = new Date(input.now);
     process.stdout.write(JSON.stringify({ phase: "ready" }) + "\\n");
     await once(process.stdin, "data");
+    process.stdout.write(JSON.stringify({ phase: "started" }) + "\\n");
     try {
       const value = await worker[operation](input);
       process.stdout.write(JSON.stringify({ phase: "result", ok: true, value }) + "\\n");
@@ -166,11 +171,17 @@ function startBarrierWorker(operation, input) {
   let stderr = "";
   let readyResolve;
   let readyReject;
+  let startedResolve;
+  let startedReject;
   let resultResolve;
   let resultReject;
   const ready = new Promise((resolve, reject) => {
     readyResolve = resolve;
     readyReject = reject;
+  });
+  const started = new Promise((resolve, reject) => {
+    startedResolve = resolve;
+    startedReject = reject;
   });
   const result = new Promise((resolve, reject) => {
     resultResolve = resolve;
@@ -189,11 +200,13 @@ function startBarrierWorker(operation, input) {
       if (!line) continue;
       const message = JSON.parse(line);
       if (message.phase === "ready") readyResolve();
+      if (message.phase === "started") startedResolve();
       if (message.phase === "result") resultResolve(message);
     }
   });
   child.on("error", (error) => {
     readyReject(error);
+    startedReject(error);
     resultReject(error);
   });
   child.on("close", (code) => {
@@ -202,6 +215,7 @@ function startBarrierWorker(operation, input) {
         `barrier worker exited ${code}: ${stderr || stdout}`,
       );
       readyReject(error);
+      startedReject(error);
       resultReject(error);
     } else if (stderr) {
       resultReject(new Error(`barrier worker wrote stderr: ${stderr}`));
@@ -210,6 +224,7 @@ function startBarrierWorker(operation, input) {
 
   return {
     ready,
+    started,
     release() {
       child.stdin.end("go\n");
     },
@@ -1238,4 +1253,453 @@ test("worker actions copy only discriminated scar and proposal fields", async (t
       evidence: "proposal evidence",
     }],
   });
+});
+
+test("queued claim and update clocks are sampled only after the Thread lock", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+
+  let claimClockSamples = 0;
+  let queuedClaim;
+  await withThreadLock(
+    fixture.vaultPath,
+    fixture.planId,
+    "hold-before-claim",
+    async () => {
+      queuedClaim = claimSlice({
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-a",
+        idempotencyKey: "post-lock-clock",
+        ttlSeconds: 60,
+        now: () => {
+          claimClockSamples += 1;
+          return new Date("2026-08-18T12:05:00.000Z");
+        },
+      });
+      await Promise.resolve();
+      assert.equal(
+        claimClockSamples,
+        0,
+        "a queued claim must not sample its lease clock before lock acquisition",
+      );
+    },
+  );
+  const claim = await queuedClaim;
+  assert.equal(claimClockSamples, 1);
+  assert.equal(claim.expires_at, "2026-08-18T12:06:00.000Z");
+
+  let updateClockSamples = 0;
+  let queuedUpdate;
+  await withThreadLock(
+    fixture.vaultPath,
+    fixture.planId,
+    "hold-until-claim-expires",
+    async () => {
+      queuedUpdate = updateClaimedSlice({
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-a",
+        token: claim.token,
+        action: {
+          action: "complete",
+          evidence: "Queued completion must use post-lock lease time",
+        },
+        now: () => {
+          updateClockSamples += 1;
+          return new Date("2026-08-18T12:07:00.000Z");
+        },
+      }).then(
+        (value) => ({ ok: true, value }),
+        (error) => ({ ok: false, error }),
+      );
+      await Promise.resolve();
+      assert.equal(
+        updateClockSamples,
+        0,
+        "a queued update must not sample its verification clock before lock acquisition",
+      );
+    },
+  );
+  const update = await queuedUpdate;
+  assert.equal(updateClockSamples, 1);
+  assert.equal(update.ok, false);
+  assert.match(update.error.message, /claim expired/);
+  const final = await rehydratePlan(fixture.notePath);
+  assert.equal(final.slices[0].status, "pending");
+});
+
+test("expired orphan idempotency envelopes cannot be replayed into a new claim", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  const before = await rehydratePlan(fixture.notePath);
+  const generation = before.slices[0].generation ?? 0;
+  const stale = await createClaimSecret({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    generation,
+    workerAgentId: "worker-a",
+    idempotencyKey: "orphan-retry",
+    expiresAt: "2026-08-18T12:00:30.000Z",
+    rev: before.rev + 1,
+  });
+
+  const fresh = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "orphan-retry",
+    ttlSeconds: 60,
+    now: () => new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(fresh.generation, generation + 1);
+  assert.notEqual(fresh.claim_id, stale.envelope.claim_id);
+  assert.notEqual(fresh.token, stale.envelope.token);
+  assert.equal(fresh.expires_at, "2026-08-18T12:02:00.000Z");
+  const final = await rehydratePlan(fixture.notePath);
+  assert.equal(final.slices[0].generation, generation + 1);
+  assert.equal(final.slices[0].claim.claim_id, fresh.claim_id);
+});
+
+test("assignment persistence failure leaves the previous claim fully usable", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "survives-failed-reassignment",
+    now: new Date(THREAD_START),
+  });
+
+  await assert.rejects(
+    assignSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-b",
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    }, {
+      persistPlan: async () => {
+        throw new Error("injected reassignment persistence failure");
+      },
+    }),
+    /injected reassignment persistence failure/,
+  );
+
+  const unchanged = await rehydratePlan(fixture.notePath);
+  assert.equal(unchanged.slices[0].assigned_to, "worker-a");
+  assert.equal(unchanged.slices[0].claim.claim_id, claim.claim_id);
+  const started = await updateClaimedSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(started.slice.status, "in_progress");
+});
+
+test("cleanup failures cannot undo reassignment or completion", async (t) => {
+  await t.test("reassignment", async (st) => {
+    const fixture = await threadFixture(st, [
+      { id: "a", title: "Slice A" },
+    ]);
+    await assignWorker(fixture, "a", "worker-a");
+    const claim = await claimSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      idempotencyKey: "cleanup-failure-reassign",
+      now: new Date(THREAD_START),
+    });
+    const reassigned = await assignSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-b",
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    }, {
+      deleteClaimSecret: async () => {
+        throw new Error("injected cleanup failure");
+      },
+    });
+    assert.equal(reassigned.slice.assigned_to, "worker-b");
+    assert.equal(reassigned.slice.claim, undefined);
+    assert.equal(reassigned.slice.generation, claim.generation + 1);
+    const orphan = await verifyClaimToken({
+      vaultPath: fixture.vaultPath,
+      planId: fixture.planId,
+      sliceId: "a",
+      generation: claim.generation,
+      workerAgentId: "worker-a",
+      token: claim.token,
+      claimId: claim.claim_id,
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    });
+    assert.equal(orphan.envelope.claim_id, claim.claim_id);
+    await assert.rejects(
+      updateClaimedSlice({
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-a",
+        token: claim.token,
+        action: { action: "start" },
+        now: new Date("2026-08-18T12:01:00.000Z"),
+      }),
+      /claim scope mismatch/,
+    );
+  });
+
+  await t.test("completion", async (st) => {
+    const fixture = await threadFixture(st, [
+      { id: "a", title: "Slice A" },
+    ]);
+    await assignWorker(fixture, "a", "worker-a");
+    const claim = await claimSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      idempotencyKey: "cleanup-failure-complete",
+      now: new Date(THREAD_START),
+    });
+    const completed = await updateClaimedSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      action: {
+        action: "complete",
+        evidence: "Completion remains committed after cleanup failure",
+      },
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    }, {
+      deleteClaimSecret: async () => {
+        throw new Error("injected cleanup failure");
+      },
+    });
+    assert.equal(completed.slice.status, "done");
+    assert.equal(completed.slice.claim, undefined);
+    const final = await rehydratePlan(fixture.notePath);
+    assert.equal(final.slices[0].status, "done");
+    const orphan = await verifyClaimToken({
+      vaultPath: fixture.vaultPath,
+      planId: fixture.planId,
+      sliceId: "a",
+      generation: claim.generation,
+      workerAgentId: "worker-a",
+      token: claim.token,
+      claimId: claim.claim_id,
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    });
+    assert.equal(orphan.envelope.claim_id, claim.claim_id);
+  });
+});
+
+test("restore clears historical claims and advances beyond every old generation", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "historical-claim",
+    now: new Date(THREAD_START),
+  });
+  const claimedSnapshot = await rehydratePlan(fixture.notePath);
+  const restored = restorePlan(claimedSnapshot, claimedSnapshot);
+  assert.equal(restored.slices[0].claim, undefined);
+  assert.ok(restored.slices[0].generation > claim.generation);
+  await persistPlan(restored, {
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+  });
+
+  const orphan = await verifyClaimToken({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    generation: claim.generation,
+    workerAgentId: "worker-a",
+    token: claim.token,
+    claimId: claim.claim_id,
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(orphan.envelope.claim_id, claim.claim_id);
+  await assert.rejects(
+    updateClaimedSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      action: { action: "start" },
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    }),
+    /claim scope mismatch/,
+  );
+
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  const fresh = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "historical-claim",
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.ok(fresh.generation > claim.generation);
+  assert.notEqual(fresh.claim_id, claim.claim_id);
+  assert.notEqual(fresh.token, claim.token);
+});
+
+test("locked orchestrator scar and replan cannot clobber a worker completion", async (t) => {
+  for (const operation of ["scar", "replan"]) {
+    await t.test(operation, async (st) => {
+      const fixture = await threadFixture(st);
+      await Promise.all([
+        assignWorker(fixture, "a", "worker-a"),
+        assignWorker(fixture, "b", "worker-b"),
+      ]);
+      const claim = await claimSlice({
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-a",
+        idempotencyKey: `worker-a-${operation}`,
+        now: new Date(THREAD_START),
+      });
+
+      let resolveRead;
+      const read = new Promise((resolve) => {
+        resolveRead = resolve;
+      });
+      let releaseMutation;
+      const mutationMayCommit = new Promise((resolve) => {
+        releaseMutation = resolve;
+      });
+      const mutation = threadWorkerRuntime.withThreadPlanLock({
+        vaultPath: fixture.vaultPath,
+        notePath: fixture.notePath,
+        planId: fixture.planId,
+        operationId: `server-${operation}-regression`,
+      }, async (plan) => {
+        resolveRead();
+        await mutationMayCommit;
+        const next = operation === "scar"
+          ? addScar(plan, {
+              kind: "dead_end",
+              signal: "Exact stale unlocked scar reproduction",
+            })
+          : replan(plan, [
+              { id: "a", title: "Slice A" },
+              { id: "b", title: "Slice B revised" },
+            ]);
+        await persistPlan(next, {
+          vaultPath: fixture.vaultPath,
+          notePath: fixture.notePath,
+        });
+        return next;
+      });
+      await read;
+
+      const worker = startBarrierWorker("updateClaimedSlice", {
+        ...fixture,
+        sliceId: "a",
+        workerAgentId: "worker-a",
+        token: claim.token,
+        action: {
+          action: "complete",
+          evidence: `Worker completion survives concurrent ${operation}`,
+        },
+        now: "2026-08-18T12:01:00.000Z",
+      });
+      await worker.ready;
+      worker.release();
+      await worker.started;
+      const completedWhileMutationHeldLock = await Promise.race([
+        worker.result.then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 150)),
+      ]);
+      assert.equal(
+        completedWhileMutationHeldLock,
+        false,
+        "worker must remain blocked after the orchestrator read and before its commit",
+      );
+
+      releaseMutation();
+      const [, workerResult] = await Promise.all([mutation, worker.result]);
+      assert.equal(workerResult.ok, true, JSON.stringify(workerResult));
+      const final = await rehydratePlan(fixture.notePath);
+      assert.equal(final.slices.find((slice) => slice.id === "a").status, "done");
+      if (operation === "scar") {
+        assert.equal(
+          final.scar_tissue.some(
+            (scar) => scar.signal === "Exact stale unlocked scar reproduction",
+          ),
+          true,
+        );
+      } else {
+        assert.equal(
+          final.slices.find((slice) => slice.id === "b").title,
+          "Slice B revised",
+        );
+      }
+    });
+  }
+});
+
+test("every production Thread read-modify-write path enters the shared lock", async () => {
+  const serverSource = await readFile(
+    new URL("../src/server.ts", import.meta.url),
+    "utf8",
+  );
+  const planSource = await readFile(
+    new URL("../src/plan.ts", import.meta.url),
+    "utf8",
+  );
+  const handlerBlock = (name) => {
+    const start = serverSource.indexOf(`"${name}"`);
+    const end = serverSource.indexOf("server.registerTool", start + 1);
+    return serverSource.slice(start, end < 0 ? undefined : end);
+  };
+
+  for (const name of [
+    "minni_thread_update",
+    "minni_thread_scar",
+    "minni_thread_replan",
+  ]) {
+    assert.match(
+      handlerBlock(name),
+      /withThreadPlanLock/,
+      `${name} must use the strict lock-before-rehydrate helper`,
+    );
+  }
+  const restoreBlock = handlerBlock("minni_thread_restore");
+  assert.match(restoreBlock, /withThreadLock/);
+  assert.ok(
+    restoreBlock.indexOf("withThreadLock") <
+      restoreBlock.indexOf("rehydratePlan(notePath)"),
+    "restore must acquire the Thread lock before strict rehydration",
+  );
+  const resolveViewStart = planSource.indexOf(
+    "export async function resolveActivePlanView",
+  );
+  const resolveViewBlock = planSource.slice(resolveViewStart);
+  assert.match(resolveViewBlock, /withThreadLock/);
+  assert.ok(
+    resolveViewBlock.indexOf("withThreadLock") <
+      resolveViewBlock.indexOf("rehydratePlan(active.notePath)"),
+    "resolveActivePlanView self-heal must lock before strict rehydration",
+  );
 });
