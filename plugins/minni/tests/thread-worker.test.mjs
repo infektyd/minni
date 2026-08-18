@@ -23,7 +23,10 @@ import { promisify } from "node:util";
 import { stableStringify } from "../dist/agent_envelope.js";
 import {
   addScar,
+  computePlanDigest,
+  computePlanDigestHexV2,
   createPlan,
+  historyPathFor,
   persistPlan,
   rehydratePlan,
   replan,
@@ -1682,6 +1685,7 @@ test("every production Thread read-modify-write path enters the shared lock", as
   for (const name of [
     "minni_thread_update",
     "minni_thread_scar",
+    "minni_thread_status",
     "minni_thread_replan",
   ]) {
     assert.match(
@@ -1707,4 +1711,240 @@ test("every production Thread read-modify-write path enters the shared lock", as
       resolveViewBlock.indexOf("rehydratePlan(active.notePath)"),
     "resolveActivePlanView self-heal must lock before strict rehydration",
   );
+});
+
+test("strict duplicate-id rejection prevents a claimed worker from replacing a sibling", async (t) => {
+  const fixture = await threadFixture(t);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "duplicate-sibling",
+    now: new Date(THREAD_START),
+  });
+  const canonical = await rehydratePlan(fixture.notePath);
+  const duplicate = {
+    ...canonical,
+    slices: [
+      { ...canonical.slices[0] },
+      { ...canonical.slices[1], id: "a" },
+    ],
+  };
+  duplicate.plan_digest = computePlanDigest(duplicate);
+  const raw = await readFile(fixture.notePath, "utf8");
+  const tampered = raw
+    .replace(
+      /^plan_slices:.*$/m,
+      `plan_slices: ${JSON.stringify(duplicate.slices)}`,
+    )
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${duplicate.plan_digest}`);
+  await writeFile(fixture.notePath, tampered, "utf8");
+
+  await assert.rejects(
+    updateClaimedSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      action: {
+        action: "complete",
+        evidence: "Duplicate sibling must remain untouched by worker update",
+      },
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    }),
+    /duplicate slice id "a"/,
+  );
+  assert.equal(
+    await readFile(fixture.notePath, "utf8"),
+    tampered,
+    "strict rejection must happen before either duplicate is persisted",
+  );
+});
+
+test("orchestrator slice transitions revoke a claim across terminal reopen", async (t) => {
+  const fixture = await threadFixture(t);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "orchestrator-transition",
+    now: new Date(THREAD_START),
+  });
+
+  const terminal = await threadWorkerRuntime.withThreadPlanLock({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    operationId: "test-orchestrator-terminal",
+  }, async (plan) => {
+    const applied = threadWorkerRuntime.applyOrchestratorSliceUpdate(
+      plan,
+      "a",
+      "done",
+      "Orchestrator terminal transition verified in server path",
+    );
+    await persistPlan(applied.plan, {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+    });
+    return applied;
+  });
+  assert.equal(terminal.slice.status, "done");
+  assert.equal(terminal.slice.claim, undefined);
+  assert.equal(terminal.slice.generation, claim.generation + 1);
+  assert.equal(terminal.revoked_claim_id, claim.claim_id);
+
+  const reopened = await threadWorkerRuntime.withThreadPlanLock({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    operationId: "test-orchestrator-reopen",
+  }, async (plan) => {
+    const applied = threadWorkerRuntime.applyOrchestratorSliceUpdate(
+      plan,
+      "a",
+      "pending",
+    );
+    await persistPlan(applied.plan, {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+    });
+    return applied;
+  });
+  assert.equal(reopened.slice.status, "pending");
+  assert.equal(reopened.slice.generation, claim.generation + 1);
+  assert.equal(reopened.plan.slices.find((slice) => slice.id === "b").status, "pending");
+
+  await assert.rejects(
+    updateClaimedSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      token: claim.token,
+      action: { action: "start" },
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    }),
+    /claim scope mismatch/,
+  );
+
+  const serverSource = await readFile(
+    new URL("../src/server.ts", import.meta.url),
+    "utf8",
+  );
+  const start = serverSource.indexOf('"minni_thread_update"');
+  const end = serverSource.indexOf("server.registerTool", start + 1);
+  const block = serverSource.slice(start, end);
+  assert.match(block, /applyOrchestratorSliceUpdate/);
+  assert.match(block, /deleteClaimSecretsBestEffort/);
+  assert.ok(
+    block.indexOf("persistPlan") < block.indexOf("deleteClaimSecretsBestEffort"),
+    "server update must persist revoked metadata before best-effort cleanup",
+  );
+});
+
+test("claimSlice preserves a committed secret when real history append fails", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "history-eisdir",
+    now: () => new Date("2026-08-18T12:01:00.000Z"),
+  });
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(durable.slices[0].claim.claim_id, claim.claim_id);
+  assert.equal(durable.slices[0].generation, claim.generation);
+  const stored = await verifyClaimToken({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "a",
+    generation: claim.generation,
+    workerAgentId: "worker-a",
+    token: claim.token,
+    claimId: claim.claim_id,
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  assert.equal(stored.envelope.claim_id, claim.claim_id);
+});
+
+test("upgrade-eligible status reads hold the Thread lock through upgrade persistence", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+  ]);
+  const canonical = await rehydratePlan(fixture.notePath);
+  const legacyDigest = computePlanDigestHexV2(canonical);
+  const raw = await readFile(fixture.notePath, "utf8");
+  const legacy = raw
+    .replace(/^plan_digest_v:.*\n/m, "")
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${legacyDigest}`);
+  await writeFile(fixture.notePath, legacy, "utf8");
+
+  let signalUpgradeRead;
+  const upgradeRead = new Promise((resolve) => {
+    signalUpgradeRead = resolve;
+  });
+  let releaseUpgradePersist;
+  const upgradeMayPersist = new Promise((resolve) => {
+    releaseUpgradePersist = resolve;
+  });
+  const statusRead = threadWorkerRuntime.withThreadPlanLock({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    operationId: "server-status-upgrade-race",
+  }, async (plan) => plan, {
+    rehydratePlan: (notePath) => rehydratePlan(notePath, {
+      beforeUpgradePersist: async () => {
+        signalUpgradeRead();
+        await upgradeMayPersist;
+      },
+    }),
+  });
+  const firstPhase = await Promise.race([
+    upgradeRead.then(() => "upgrade-paused"),
+    statusRead.then(() => "status-completed"),
+  ]);
+  assert.equal(
+    firstPhase,
+    "upgrade-paused",
+    "the test seam must pause after stale status read and before upgrade write",
+  );
+
+  const assignment = startBarrierWorker("assignSlice", {
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    now: "2026-08-18T12:01:00.000Z",
+  });
+  await assignment.ready;
+  assignment.release();
+  await assignment.started;
+  const assignedInsideStaleWindow = await Promise.race([
+    assignment.result.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 150)),
+  ]);
+  assert.equal(
+    assignedInsideStaleWindow,
+    false,
+    "assignment must not commit between status rehydrate and upgrade persistence",
+  );
+
+  releaseUpgradePersist();
+  const [, assignmentResult] = await Promise.all([
+    statusRead,
+    assignment.result,
+  ]);
+  assert.equal(assignmentResult.ok, true, JSON.stringify(assignmentResult));
+  const final = await rehydratePlan(fixture.notePath);
+  assert.equal(final.slices[0].assigned_to, "worker-a");
+  assert.equal(final.slices[0].generation, 0);
 });

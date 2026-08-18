@@ -16,6 +16,7 @@ import {
   PlanDigestVersionError,
   rehydratePlan,
   createPlan,
+  replan,
   persistPlan,
   setActivePlan,
   clearActivePlan,
@@ -31,6 +32,98 @@ import {
   readHistory
 } from "../dist/plan.js";
 import { ensureVault, writeVaultPage } from "../dist/vault.js";
+
+test("createPlan rejects duplicate explicit slice ids before writing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-duplicate-create-"));
+  try {
+    await assert.rejects(
+      createPlan({
+        goal: "Reject duplicate explicit slice ids",
+        slices: [
+          { id: "same", title: "First" },
+          { id: "same", title: "Second" },
+        ],
+        vaultPath: root,
+      }, { vaultPath: root }),
+      /duplicate explicit slice id "same"/,
+    );
+    await assert.rejects(
+      readdir(path.join(root, "wiki", "artifacts")),
+      /ENOENT/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("replan rejects duplicate explicit slice ids before graph mutation", () => {
+  const plan = {
+    plan_id: "duplicate-replan",
+    goal: "Reject duplicate replan ids",
+    status: "draft",
+    constraints: [],
+    slices: [
+      { id: "a", title: "Original A", status: "pending" },
+      { id: "b", title: "Original B", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "a",
+    plan_digest: "",
+    created: "2026-08-18T12:00:00.000Z",
+    updated: "2026-08-18T12:00:00.000Z",
+    rev: 1,
+  };
+  plan.plan_digest = computePlanDigest(plan);
+  assert.throws(
+    () => replan(plan, [
+      { id: "a", title: "First A" },
+      { id: "a", title: "Second A" },
+    ]),
+    /duplicate explicit slice id "a"/,
+  );
+  assert.deepEqual(plan.slices.map((slice) => slice.title), [
+    "Original A",
+    "Original B",
+  ]);
+});
+
+test("strict rehydrate rejects a digest-valid note with duplicate slice ids", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-duplicate-note-"));
+  try {
+    const { plan, write } = await createPlan({
+      goal: "Reject persisted duplicate ids",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B" },
+      ],
+      vaultPath: root,
+    }, { vaultPath: root });
+    const duplicate = {
+      ...plan,
+      slices: [
+        { ...plan.slices[0] },
+        { ...plan.slices[1], id: "a" },
+      ],
+    };
+    duplicate.plan_digest = computePlanDigest(duplicate);
+    const raw = await readFile(write.notePath, "utf8");
+    const tampered = raw
+      .replace(
+        /^plan_slices:.*$/m,
+        `plan_slices: ${JSON.stringify(duplicate.slices)}`,
+      )
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${duplicate.plan_digest}`);
+    await writeFile(write.notePath, tampered, "utf8");
+
+    await assert.rejects(
+      rehydratePlan(write.notePath),
+      /duplicate slice id "a"/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("isTrivialEvidence check in updateSlice prevents trivial/empty evidence for done status", () => {
   const plan = {
