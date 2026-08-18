@@ -1,8 +1,17 @@
 # Agent-First Thread Orchestration
 
-Status: proposed for operator review  
+Status: superseded after G0 review
 Date: 2026-08-18  
 Scope: make Minni Threads the durable graph shared by orchestrators and temporary workers without turning Minni into a host-specific agent runner
+
+> Superseded by
+> `docs/superpowers/specs/2026-08-18-thread-orchestration-v2-design.md`.
+> G0 found that moving canonical Thread state into the Python daemon would
+> duplicate the TypeScript domain, create a file/SQLite split-brain with hooks,
+> and still fail to distinguish same-platform subagents. The replacement keeps
+> the existing vault Thread authoritative, fixes its real multi-writer gap
+> first, and introduces daemon notification delivery only after ordered Thread
+> events are proven.
 
 ## 1. Decision
 
