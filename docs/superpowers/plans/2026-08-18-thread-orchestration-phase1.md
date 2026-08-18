@@ -19,9 +19,10 @@
 - Every implementation child uses the exact non-`inherit` model and effort listed for its task.
 - At most one implementation child runs at once because these tasks modify shared Thread files.
 - G1 is NO-GO on any lost update, token leak, unsafe stale-lock theft, duplicate ordered event, or existing Thread regression.
-- From Task 3 review onward, child work and review use only explicitly selected
-  GPT-5.6 Sol or GPT-5.6 Luna variants. Each task receives an adversarial review;
-  Critical or Important findings trigger a fix and re-review loop until clean.
+- From the Task 4 corrective pass onward, child work and review use explicitly
+  selected Grok, Composer, Sonnet, or Gemini 3.7 Flash variants. Opus is
+  excluded. Each task receives an adversarial review; Critical or Important
+  findings trigger a fix and re-review loop until clean.
 
 ---
 
@@ -367,7 +368,8 @@ notes remain readable without mutation, and newer notes still fail closed.
 
 ### Task 3: Private idempotent claim store
 
-**Execution assignment:** GPT-5.6 Sol XHigh, xhigh effort.
+**Execution assignment:** completed before the corrected model selection; do
+not redispatch this task.
 
 **Files:**
 - Create: `plugins/minni/src/thread-claims.ts`
@@ -514,7 +516,7 @@ secret reaches an indexed or group-readable surface.
 
 ### Task 4: Slice assignment, ready set, and claimed worker updates
 
-**Execution assignment:** GPT-5.6 Sol XHigh, xhigh effort.
+**Execution assignment:** Claude Sonnet 5 Thinking XHigh, xhigh effort.
 
 **Files:**
 - Create: `plugins/minni/src/thread-worker.ts`
@@ -672,7 +674,7 @@ has one winner, and no worker input can alter topology or a sibling slice.
 
 ### Task 5: Ordered scheduler events and cursor reads
 
-**Execution assignment:** GPT-5.6 Sol High, high effort.
+**Execution assignment:** Composer 2.5, high effort.
 
 **Files:**
 - Create: `plugins/minni/src/thread-events.ts`
@@ -820,7 +822,7 @@ cursor reads are exact, and note/journal crash gaps cannot remain silent.
 
 ### Task 6: Typed MCP worker surface
 
-**Execution assignment:** GPT-5.6 Luna High, high effort.
+**Execution assignment:** Claude Sonnet 5 Thinking High, high effort.
 
 **Files:**
 - Modify: `plugins/minni/src/server.ts:1244-1762`
@@ -932,8 +934,8 @@ mutation and every tool passes the existing daemon shared gate.
 
 ### Task 7: Agent-facing workflow documentation and G1 gate
 
-**Execution assignment:** GPT-5.6 Luna High, medium effort for docs audit;
-GPT-5.6 Sol XHigh Fast, xhigh effort for adversarial gate review. Run
+**Execution assignment:** Gemini 3.7 Flash High, medium effort for docs audit;
+Cursor Grok 4.6 High Fast, xhigh effort for adversarial gate review. Run
 sequentially.
 
 **Files:**
@@ -1008,7 +1010,7 @@ Expected:
 
 - [ ] **Step 4: Run adversarial review**
 
-Dispatch GPT-5.6 Sol XHigh Fast with the exact instruction:
+Dispatch Cursor Grok 4.6 High Fast with the exact instruction:
 
 ```text
 Review only Phase-1 Thread changes against
