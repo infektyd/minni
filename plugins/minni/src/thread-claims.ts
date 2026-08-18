@@ -6,13 +6,13 @@ import {
 } from "node:crypto";
 import { constants } from "node:fs";
 import {
-  chmod,
   lstat,
   mkdir,
   open,
-  realpath,
   rename,
+  stat,
   unlink,
+  type FileHandle,
 } from "node:fs/promises";
 import path from "node:path";
 
@@ -109,10 +109,17 @@ export interface DeleteClaimSecretInput {
 }
 
 interface ClaimLocation {
-  vaultRoot: string;
-  claimsRoot: string;
-  planDir: string;
+  fdAliasRoot: string;
+  vaultHandle: FileHandle;
+  runtimeHandle: FileHandle;
+  claimsHandle: FileHandle;
+  planHandle: FileHandle;
+  vaultPath: string;
+  runtimePath: string;
+  claimsPath: string;
+  planPath: string;
   filePath: string;
+  fileName: string;
 }
 
 interface ExpectedClaimIdentity {
@@ -134,6 +141,13 @@ function pathMismatch(): Error {
 
 function metadataMismatch(): Error {
   return new Error("claim metadata mismatch");
+}
+
+class ClaimStoreParentChangedError extends Error {
+  constructor() {
+    super("claim store parent changed during operation");
+    this.name = "ClaimStoreParentChangedError";
+  }
 }
 
 function requireNonEmpty(value: string, label: string): void {
@@ -158,13 +172,6 @@ function requireIsoTimestamp(value: string, label: string): void {
   }
 }
 
-function assertContained(candidate: string, root: string): void {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw pathMismatch();
-  }
-}
-
 function hashSegment(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
 }
@@ -186,80 +193,226 @@ function claimIdFor(
     .slice(0, 32);
 }
 
-async function secureDirectory(
-  directory: string,
-  vaultRoot: string,
-  create: boolean,
-  makePrivate: boolean,
-): Promise<boolean> {
-  let directoryStat;
-  try {
-    directoryStat = await lstat(directory);
-  } catch (error) {
-    if (!isErrno(error, "ENOENT")) throw error;
-    if (!create) return false;
+function directoryOpenFlags(): number {
+  if (
+    typeof constants.O_DIRECTORY !== "number" ||
+    typeof constants.O_NOFOLLOW !== "number"
+  ) {
+    throw new Error(
+      "claim store requires POSIX O_DIRECTORY and O_NOFOLLOW support",
+    );
+  }
+  return constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+}
+
+function fdAliasPath(fdAliasRoot: string, handle: FileHandle): string {
+  return path.join(fdAliasRoot, String(handle.fd));
+}
+
+function childOfHandle(
+  fdAliasRoot: string,
+  parent: FileHandle,
+  childName: string,
+): string {
+  if (
+    childName.length === 0 ||
+    childName === "." ||
+    childName === ".." ||
+    childName.includes("/") ||
+    childName.includes("\\")
+  ) {
+    throw pathMismatch();
+  }
+  return path.join(fdAliasPath(fdAliasRoot, parent), childName);
+}
+
+async function detectFdAliasRoot(handle: FileHandle): Promise<string> {
+  const expected = await handle.stat();
+  for (const root of ["/proc/self/fd", "/dev/fd"]) {
     try {
-      await mkdir(directory, { mode: makePrivate ? 0o700 : 0o755 });
-    } catch (mkdirError) {
-      if (!isErrno(mkdirError, "EEXIST")) throw mkdirError;
+      const aliasStat = await stat(path.join(root, String(handle.fd)));
+      if (
+        aliasStat.isDirectory() &&
+        aliasStat.dev === expected.dev &&
+        aliasStat.ino === expected.ino
+      ) {
+        return root;
+      }
+    } catch {
+      // Try the next well-known descriptor alias.
     }
-    directoryStat = await lstat(directory);
+  }
+  throw new Error(
+    "claim store requires a verified /proc/self/fd or /dev/fd descriptor alias",
+  );
+}
+
+async function openPrivateChildDirectory(
+  parent: FileHandle,
+  fdAliasRoot: string,
+  childName: string,
+  create: boolean,
+): Promise<FileHandle | undefined> {
+  const anchoredPath = childOfHandle(fdAliasRoot, parent, childName);
+  if (create) {
+    try {
+      await mkdir(anchoredPath, { mode: 0o700 });
+    } catch (error) {
+      if (!isErrno(error, "EEXIST")) throw error;
+    }
   }
 
-  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
-    throw pathMismatch();
+  let handle: FileHandle;
+  try {
+    handle = await open(anchoredPath, directoryOpenFlags());
+  } catch (error) {
+    if (!create && isErrno(error, "ENOENT")) return undefined;
+    if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
+      throw pathMismatch();
+    }
+    throw error;
   }
 
-  const canonical = await realpath(directory);
-  if (canonical !== path.resolve(directory)) {
-    throw pathMismatch();
-  }
-  assertContained(canonical, vaultRoot);
-
-  if (makePrivate) {
-    await chmod(canonical, 0o700);
-    const privateStat = await lstat(canonical);
+  try {
+    const openedStat = await handle.stat();
+    if (!openedStat.isDirectory()) throw pathMismatch();
+    await handle.chmod(0o700);
+    const privateStat = await handle.stat();
     if ((privateStat.mode & 0o777) !== 0o700) {
       throw new Error("claim store permissions mismatch");
     }
+    return handle;
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
   }
-  return true;
 }
 
-async function claimLocation(
+async function withClaimLocation<T>(
   vaultPath: string,
   planId: string,
   claimId: string,
   create: boolean,
-): Promise<ClaimLocation | undefined> {
+  fn: (location: ClaimLocation | undefined) => Promise<T>,
+): Promise<T> {
   requireNonEmpty(vaultPath, "vault path");
   requireNonEmpty(planId, "plan id");
   if (!CLAIM_ID_PATTERN.test(claimId)) {
     throw pathMismatch();
   }
 
-  const vaultRoot = await realpath(path.resolve(vaultPath));
-  const vaultStat = await lstat(vaultRoot);
-  if (!vaultStat.isDirectory() || vaultStat.isSymbolicLink()) {
-    throw pathMismatch();
-  }
+  const logicalVaultPath = path.resolve(vaultPath);
+  const handles: FileHandle[] = [];
+  try {
+    let vaultHandle: FileHandle;
+    try {
+      vaultHandle = await open(logicalVaultPath, directoryOpenFlags());
+    } catch (error) {
+      if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
+        throw pathMismatch();
+      }
+      throw error;
+    }
+    handles.push(vaultHandle);
+    const vaultStat = await vaultHandle.stat();
+    if (!vaultStat.isDirectory()) throw pathMismatch();
+    const fdAliasRoot = await detectFdAliasRoot(vaultHandle);
 
-  const runtimeRoot = path.join(vaultRoot, ".runtime");
-  if (!(await secureDirectory(runtimeRoot, vaultRoot, create, false))) {
-    return undefined;
-  }
-  const claimsRoot = path.join(runtimeRoot, "thread-claims");
-  if (!(await secureDirectory(claimsRoot, vaultRoot, create, true))) {
-    return undefined;
-  }
-  const planDir = path.join(claimsRoot, hashSegment(planId));
-  if (!(await secureDirectory(planDir, vaultRoot, create, true))) {
-    return undefined;
-  }
+    const runtimeHandle = await openPrivateChildDirectory(
+      vaultHandle,
+      fdAliasRoot,
+      ".runtime",
+      create,
+    );
+    if (!runtimeHandle) return fn(undefined);
+    handles.push(runtimeHandle);
 
-  const filePath = path.join(planDir, `${claimId}.json`);
-  assertContained(filePath, claimsRoot);
-  return { vaultRoot, claimsRoot, planDir, filePath };
+    const claimsHandle = await openPrivateChildDirectory(
+      runtimeHandle,
+      fdAliasRoot,
+      "thread-claims",
+      create,
+    );
+    if (!claimsHandle) return fn(undefined);
+    handles.push(claimsHandle);
+
+    const planHash = hashSegment(planId);
+    const planHandle = await openPrivateChildDirectory(
+      claimsHandle,
+      fdAliasRoot,
+      planHash,
+      create,
+    );
+    if (!planHandle) return fn(undefined);
+    handles.push(planHandle);
+
+    const runtimePath = path.join(logicalVaultPath, ".runtime");
+    const claimsPath = path.join(runtimePath, "thread-claims");
+    const planPath = path.join(claimsPath, planHash);
+    const fileName = `${claimId}.json`;
+    return fn({
+      fdAliasRoot,
+      vaultHandle,
+      runtimeHandle,
+      claimsHandle,
+      planHandle,
+      vaultPath: logicalVaultPath,
+      runtimePath,
+      claimsPath,
+      planPath,
+      filePath: path.join(planPath, fileName),
+      fileName,
+    });
+  } finally {
+    for (const handle of handles.reverse()) {
+      await handle.close().catch(() => {});
+    }
+  }
+}
+
+async function logicalPathMatchesHandle(
+  logicalPath: string,
+  expectedHandle: FileHandle,
+): Promise<boolean> {
+  let currentHandle: FileHandle;
+  try {
+    currentHandle = await open(logicalPath, directoryOpenFlags());
+  } catch {
+    return false;
+  }
+  try {
+    const [current, expected] = await Promise.all([
+      currentHandle.stat(),
+      expectedHandle.stat(),
+    ]);
+    return (
+      current.isDirectory() &&
+      current.dev === expected.dev &&
+      current.ino === expected.ino
+    );
+  } finally {
+    await currentHandle.close().catch(() => {});
+  }
+}
+
+/**
+ * Descriptor aliases make the secret operation itself race-safe. This
+ * postcondition serves a different purpose: StoredClaimSecret.filePath is a
+ * logical path, so never return it after an attacker detached the opened
+ * directory tree from that path.
+ */
+async function assertLocationStillAttached(
+  location: ClaimLocation,
+): Promise<void> {
+  const matches = await Promise.all([
+    logicalPathMatchesHandle(location.vaultPath, location.vaultHandle),
+    logicalPathMatchesHandle(location.runtimePath, location.runtimeHandle),
+    logicalPathMatchesHandle(location.claimsPath, location.claimsHandle),
+    logicalPathMatchesHandle(location.planPath, location.planHandle),
+  ]);
+  if (matches.some((match) => !match)) {
+    throw new ClaimStoreParentChangedError();
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -367,7 +520,11 @@ async function readEnvelope(
   let handle;
   try {
     handle = await open(
-      location.filePath,
+      childOfHandle(
+        location.fdAliasRoot,
+        location.planHandle,
+        location.fileName,
+      ),
       constants.O_RDONLY | constants.O_NOFOLLOW,
     );
   } catch (error) {
@@ -402,27 +559,22 @@ async function readEnvelope(
   }
 }
 
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(
-    directory,
-    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-  );
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
 async function writeEnvelopeAtomic(
   location: ClaimLocation,
   envelope: ClaimSecretEnvelope,
 ): Promise<void> {
-  const temporaryPath = path.join(
-    location.planDir,
-    `.${envelope.claim_id}.${randomBytes(16).toString("hex")}.tmp`,
+  const temporaryName =
+    `.${envelope.claim_id}.${randomBytes(16).toString("hex")}.tmp`;
+  const temporaryPath = childOfHandle(
+    location.fdAliasRoot,
+    location.planHandle,
+    temporaryName,
   );
-  assertContained(temporaryPath, location.claimsRoot);
+  const finalPath = childOfHandle(
+    location.fdAliasRoot,
+    location.planHandle,
+    location.fileName,
+  );
 
   let handle;
   try {
@@ -441,14 +593,14 @@ async function writeEnvelopeAtomic(
     handle = undefined;
 
     try {
-      await lstat(location.filePath);
+      await lstat(finalPath);
       throw metadataMismatch();
     } catch (error) {
       if (!isErrno(error, "ENOENT")) throw error;
     }
 
-    await rename(temporaryPath, location.filePath);
-    await syncDirectory(location.planDir);
+    await rename(temporaryPath, finalPath);
+    await location.planHandle.sync();
   } finally {
     if (handle) await handle.close().catch(() => {});
     await unlink(temporaryPath).catch((error) => {
@@ -457,28 +609,47 @@ async function writeEnvelopeAtomic(
   }
 }
 
+async function unlinkEnvelope(location: ClaimLocation): Promise<void> {
+  try {
+    await unlink(
+      childOfHandle(
+        location.fdAliasRoot,
+        location.planHandle,
+        location.fileName,
+      ),
+    );
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) throw error;
+  }
+  await location.planHandle.sync();
+}
+
 async function withClaimLock<T>(
   vaultPath: string,
   planId: string,
   claimId: string,
   fn: (location: ClaimLocation) => Promise<T>,
 ): Promise<T> {
-  const initialLocation = await claimLocation(vaultPath, planId, claimId, true);
-  if (!initialLocation) throw pathMismatch();
+  let anchoredVaultPath = "";
+  await withClaimLocation(vaultPath, planId, claimId, true, async (location) => {
+    if (!location) throw pathMismatch();
+    anchoredVaultPath = location.vaultPath;
+  });
   return withThreadLock(
-    initialLocation.vaultRoot,
+    anchoredVaultPath,
     `claim:${hashSegment(planId)}:${claimId}`,
     randomUUID(),
-    async () => {
-      const lockedLocation = await claimLocation(
-        initialLocation.vaultRoot,
+    () =>
+      withClaimLocation(
+        anchoredVaultPath,
         planId,
         claimId,
         true,
-      );
-      if (!lockedLocation) throw pathMismatch();
-      return fn(lockedLocation);
-    },
+        async (lockedLocation) => {
+          if (!lockedLocation) throw pathMismatch();
+          return fn(lockedLocation);
+        },
+      ),
   );
 }
 
@@ -510,14 +681,20 @@ export async function readClaimByIdempotency(
   requireNonEmpty(idempotencyKey, "idempotency key");
   requireNonNegativeInteger(generation, "generation");
   const claimId = claimIdFor(planId, sliceId, generation, idempotencyKey);
-  const location = await claimLocation(vaultPath, planId, claimId, false);
-  return readEnvelope(location, {
+  return withClaimLocation(
+    vaultPath,
     planId,
-    sliceId,
     claimId,
-    generation,
-    idempotencyKey,
-  });
+    false,
+    (location) =>
+      readEnvelope(location, {
+        planId,
+        sliceId,
+        claimId,
+        generation,
+        idempotencyKey,
+      }),
+  );
 }
 
 export async function createClaimSecret(
@@ -539,6 +716,7 @@ export async function createClaimSecret(
       };
       const existing = await readEnvelope(location, expected);
       if (existing) {
+        await assertLocationStillAttached(location);
         return { envelope: existing, filePath: location.filePath };
       }
 
@@ -566,10 +744,20 @@ export async function createClaimSecret(
         response,
       };
 
-      await writeEnvelopeAtomic(location, envelope);
-      const stored = await readEnvelope(location, expected);
-      if (!stored) throw metadataMismatch();
-      return { envelope: stored, filePath: location.filePath };
+      let created = false;
+      try {
+        await writeEnvelopeAtomic(location, envelope);
+        created = true;
+        const stored = await readEnvelope(location, expected);
+        if (!stored) throw metadataMismatch();
+        await assertLocationStillAttached(location);
+        return { envelope: stored, filePath: location.filePath };
+      } catch (error) {
+        if (created) {
+          await unlinkEnvelope(location).catch(() => {});
+        }
+        throw error;
+      }
     },
   );
 }
@@ -604,38 +792,41 @@ export async function verifyClaimToken(
     throw new Error("claim verification requires claim id or idempotency key");
   }
 
-  const location = await claimLocation(
+  return withClaimLocation(
     input.vaultPath,
     input.planId,
     claimId,
     false,
+    async (location) => {
+      const envelope = await readEnvelope(location, {
+        planId: input.planId,
+        sliceId: input.sliceId,
+        claimId,
+        generation: input.generation,
+        workerAgentId: input.workerAgentId,
+        idempotencyKey: input.idempotencyKey,
+      });
+      if (!envelope || !location) {
+        throw new Error("claim not found");
+      }
+
+      const suppliedDigest = createHash("sha256").update(input.token).digest();
+      const storedDigest = createHash("sha256").update(envelope.token).digest();
+      if (!timingSafeEqual(suppliedDigest, storedDigest)) {
+        throw new Error("claim token mismatch");
+      }
+
+      const now = input.now ?? new Date();
+      if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+        throw new Error("claim verification time is invalid");
+      }
+      if (Date.parse(envelope.expires_at) <= now.getTime()) {
+        throw new Error("claim expired");
+      }
+      await assertLocationStillAttached(location);
+      return { envelope, filePath: location.filePath };
+    },
   );
-  const envelope = await readEnvelope(location, {
-    planId: input.planId,
-    sliceId: input.sliceId,
-    claimId,
-    generation: input.generation,
-    workerAgentId: input.workerAgentId,
-    idempotencyKey: input.idempotencyKey,
-  });
-  if (!envelope || !location) {
-    throw new Error("claim not found");
-  }
-
-  const suppliedDigest = createHash("sha256").update(input.token).digest();
-  const storedDigest = createHash("sha256").update(envelope.token).digest();
-  if (!timingSafeEqual(suppliedDigest, storedDigest)) {
-    throw new Error("claim token mismatch");
-  }
-
-  const now = input.now ?? new Date();
-  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
-    throw new Error("claim verification time is invalid");
-  }
-  if (Date.parse(envelope.expires_at) <= now.getTime()) {
-    throw new Error("claim expired");
-  }
-  return { envelope, filePath: location.filePath };
 }
 
 export async function deleteClaimSecret(
@@ -646,16 +837,22 @@ export async function deleteClaimSecret(
     throw pathMismatch();
   }
 
-  const existingLocation = await claimLocation(
+  let anchoredVaultPath = "";
+  const hasClaimDirectory = await withClaimLocation(
     input.vaultPath,
     input.planId,
     input.claimId,
     false,
+    async (location) => {
+      if (!location) return false;
+      anchoredVaultPath = location.vaultPath;
+      return true;
+    },
   );
-  if (!existingLocation) return;
+  if (!hasClaimDirectory) return;
 
   await withClaimLock(
-    existingLocation.vaultRoot,
+    anchoredVaultPath,
     input.planId,
     input.claimId,
     async (location) => {
@@ -664,12 +861,8 @@ export async function deleteClaimSecret(
         claimId: input.claimId,
       });
       if (!existing) return;
-      try {
-        await unlink(location.filePath);
-      } catch (error) {
-        if (!isErrno(error, "ENOENT")) throw error;
-      }
-      await syncDirectory(location.planDir);
+      await unlinkEnvelope(location);
+      await assertLocationStillAttached(location);
     },
   );
 }
