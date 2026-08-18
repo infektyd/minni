@@ -93,7 +93,10 @@ import {
   claimIds,
   claimSlice,
   deleteClaimSecretsBestEffort,
+  prepareThreadMutation,
+  readyIds,
   readySlices,
+  recordThreadMutationEvents,
   revokedClaimIds,
   updateClaimedSlice,
   withThreadPlanLock,
@@ -1416,6 +1419,7 @@ server.registerTool(
         operationId: `server-status-update:${randomUUID()}`,
       },
       async (plan) => {
+        const now = new Date();
         const targetSlice = plan.slices.find((s) => s.id === slice_id);
         const from = targetSlice?.status ?? ("pending" as const);
         // #291: compute against the PRE-update plan — this is the only point
@@ -1423,6 +1427,18 @@ server.registerTool(
         const unmetBeforeUpdate = status === "done"
           ? unmetDependencies(plan, slice_id)
           : [];
+        const readyBefore = readyIds(plan, now);
+        // Final-fix finding 2: reconcile/ensure the ordered baseline BEFORE
+        // this structural mutation persists — same "before persistence" half
+        // of the Task 5 event lifecycle every worker mutation already uses,
+        // via the shared thread-worker.ts helper (no duplicate scheduling
+        // logic, no nested Thread lock — this call happens INSIDE the plan
+        // lock already held above).
+        const { journalPath } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          plan,
+          now,
+        );
         const applied = applyOrchestratorSliceUpdate(
           plan,
           slice_id,
@@ -1442,18 +1458,15 @@ server.registerTool(
             [applied.revoked_claim_id],
           );
         }
-        const journalPath = path.join(
-          path.dirname(notePath),
-          `${plan_id}.log.md`,
-        );
         // #291: keep the dependency override in the same status event.
+        // Legacy appendJournal line and frozen history behavior unchanged.
         await appendJournal(journalPath, {
           kind: "status_changed",
           slice_id,
           from,
           to: status,
           evidence,
-          at: new Date().toISOString(),
+          at: now.toISOString(),
           ...(unmetBeforeUpdate.length > 0
             ? {
                 depends_on_override: {
@@ -1474,9 +1487,27 @@ server.registerTool(
             kind: "gate_passed",
             slice_id,
             evidence: evidence ?? "",
-            at: new Date().toISOString(),
+            at: now.toISOString(),
           });
         }
+        // Ordered mirror, after persistence: safe payload only (from/to
+        // status enum values — never the freeform evidence string). Stable
+        // derived idempotency key (plan/slice/resulting rev) rather than a
+        // client-supplied one — this tool has no idempotency_key input.
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: updated.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: `status_changed:${plan_id}:${slice_id}:${updated.rev}`,
+          kind: "status_changed",
+          sliceId: slice_id,
+          payload: { from, to: status },
+          readyBefore,
+          readyAfter: readyIds(updated, now),
+          plan: updated,
+          now,
+        });
         // P10/H6: terminal plans stop being injected.
         if (updated.status === "complete" || updated.status === "accepted") {
           try {
@@ -1532,19 +1563,41 @@ server.registerTool(
         operationId: `server-scar:${randomUUID()}`,
       },
       async (plan) => {
+        const now = new Date();
+        const readyBefore = readyIds(plan, now);
+        const { journalPath } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          plan,
+          now,
+        );
         const updated = addScar(plan, { kind, signal, resolution });
         await persistPlan(updated, {
           vaultPath: effectiveVaultPath,
           notePath,
         });
-        const journalPath = path.join(
-          path.dirname(notePath),
-          `${plan_id}.log.md`,
-        );
+        // Legacy appendJournal line unchanged.
         await appendJournal(journalPath, {
           kind: "scar_added",
           signal,
-          at: new Date().toISOString(),
+          at: now.toISOString(),
+        });
+        // Ordered mirror: only the scar KIND (an enum), never the freeform
+        // signal/resolution text. addScar never changes slice status or
+        // dependencies, so the ready set is provably unchanged here and
+        // recordThreadMutationEvents's own before/after equality check
+        // never emits a ready.changed for a scar — no special-casing needed.
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: updated.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: `scar_added:${plan_id}:${updated.rev}`,
+          kind: "scar_added",
+          payload: { kind },
+          readyBefore,
+          readyAfter: readyIds(updated, now),
+          plan: updated,
+          now,
         });
         return updated;
       },
@@ -1644,6 +1697,13 @@ server.registerTool(
         operationId: `server-replan:${randomUUID()}`,
       },
       async (plan) => {
+        const now = new Date();
+        const readyBefore = readyIds(plan, now);
+        const { journalPath } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          plan,
+          now,
+        );
         const updated = add_slices || drop_slice_ids
           ? applySliceDelta(plan, { add_slices, drop_slice_ids })
           : replan(plan, new_slices!);
@@ -1677,19 +1737,35 @@ server.registerTool(
           plan_id,
           revokedClaimIds(plan, updated),
         );
-        const journalPath = path.join(
-          path.dirname(notePath),
-          `${plan_id}.log.md`,
-        );
+        // Legacy appendJournal line unchanged.
         await appendJournal(journalPath, {
           kind: "replan",
-          at: new Date().toISOString(),
+          at: now.toISOString(),
           ...(dependsOnChanged.length > 0
             ? { depends_on_changed: dependsOnChanged }
             : {}),
           ...(dependsOnSuperseded.length > 0
             ? { depends_on_superseded: dependsOnSuperseded }
             : {}),
+        });
+        // Ordered mirror: ids only (never evidence/scar text). Coalesces
+        // ready.changed automatically when supersession or a depends_on
+        // edit frees or blocks a dependent.
+        const replanPayload: Record<string, unknown> = {};
+        if (dependsOnChanged.length > 0) replanPayload.depends_on_changed = dependsOnChanged;
+        if (dependsOnSuperseded.length > 0) replanPayload.depends_on_superseded = dependsOnSuperseded;
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: updated.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: `replan:${plan_id}:${updated.rev}`,
+          kind: "replan",
+          payload: Object.keys(replanPayload).length > 0 ? replanPayload : undefined,
+          readyBefore,
+          readyAfter: readyIds(updated, now),
+          plan: updated,
+          now,
         });
         return updated;
       },
@@ -1819,6 +1895,19 @@ server.registerTool(
           }
           current = await rehydratePlanScalars(notePath);
         }
+        const now = new Date();
+        const readyBefore = readyIds(current, now);
+        // Restore does not go through thread-worker.ts's withThreadPlanLock
+        // (it must survive a digest-bricked note via the scalar-read
+        // fallback above, which strict rehydration cannot do) but it is
+        // still fully inside this same withThreadLock — reconcile/ensure
+        // the ordered baseline here before persisting the restored state,
+        // exactly like every other locked mutation.
+        const { journalPath } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          current,
+          now,
+        );
         const snapshot = await getRevision(notePath, rev);
         if (!snapshot) {
           throw new Error(`revision ${rev} not found`);
@@ -1833,14 +1922,27 @@ server.registerTool(
           plan_id,
           [...claimIds(current), ...claimIds(snapshot)],
         );
-        const journalPath = path.join(
-          path.dirname(notePath),
-          `${plan_id}.log.md`,
-        );
+        // Legacy appendJournal line unchanged.
         await appendJournal(journalPath, {
           kind: "restored",
           from_rev: rev,
-          at: new Date().toISOString(),
+          at: now.toISOString(),
+        });
+        // Ordered mirror: only the numeric from_rev (never scar/evidence
+        // text or claim identity). Coalesces ready.changed when the
+        // restored slice statuses/dependencies change what's ready.
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: restored.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: `restored:${plan_id}:${restored.rev}`,
+          kind: "restored",
+          payload: { from_rev: rev },
+          readyBefore,
+          readyAfter: readyIds(restored, now),
+          plan: restored,
+          now,
         });
         return restored;
       },
@@ -1980,6 +2082,10 @@ server.registerTool(
         planId: plan_id,
         sliceId: slice_id,
         workerAgentId: worker_agent_id,
+        // Server-stamped orchestrator actor — never model-supplied. The
+        // input schema above has no actor-like field, so there is nothing
+        // for a caller to override here.
+        actorAgentId: DEFAULT_AGENT_ID,
         assignmentProfile: assignment_profile,
       });
       return textResult(

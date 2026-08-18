@@ -9,12 +9,19 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { createPlan } from "../dist/plan.js";
+import {
+  createPlan,
+  findPlanNote,
+  journalPathFor,
+  persistPlan,
+  rehydratePlan,
+} from "../dist/plan.js";
+import { DEFAULT_AGENT_ID } from "../dist/config.js";
 
 const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
 const SRC_PATH = new URL("../src/server.ts", import.meta.url);
@@ -278,6 +285,36 @@ test("minni_thread_assign -> claim -> worker_update completes a slice end to end
   });
 });
 
+test("minni_thread_assign stamps the server-side orchestrator actor on slice.assigned, never the assignment target worker", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "research", title: "Research the approach" },
+    ]);
+
+    await call("minni_thread_assign", {
+      plan_id,
+      slice_id: "research",
+      worker_agent_id: "worker-a",
+      // Even if a caller tries to smuggle an actor-shaped field alongside
+      // the declared schema, zod's default "strip unknown keys" behavior
+      // must drop it before it ever reaches assignSlice.
+      actor_agent_id: "attempted-model-supplied-actor",
+      agent_id: "attempted-model-supplied-actor",
+    });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    const assigned = events.events.find((e) => e.kind === "slice.assigned");
+    assert.ok(assigned, "expected a slice.assigned ordered event");
+    assert.equal(assigned.actor, DEFAULT_AGENT_ID);
+    assert.notEqual(assigned.actor, "worker-a");
+    assert.notEqual(assigned.actor, "attempted-model-supplied-actor");
+
+    const baseline = events.events.find((e) => e.kind === "state.baseline");
+    assert.ok(baseline, "expected a state.baseline ordered event");
+    assert.equal(baseline.actor, DEFAULT_AGENT_ID);
+  });
+});
+
 test("minni_thread_ready reflects claim state and defaults plan_id to the active plan", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
@@ -335,6 +372,349 @@ test("minni_thread_events is journal-backed and its cursor excludes seq at or be
     const cursor = await call("minni_thread_events", { plan_id, since_seq: events.next_seq });
     assert.deepEqual(cursor.events, [], "cursor read must exclude seq at or below since_seq");
     assert.equal(cursor.next_seq, events.next_seq);
+  });
+});
+
+// Final-fix Important finding 2: structural/legacy orchestrator mutations
+// (minni_thread_update/scar/replan/restore) previously never touched the
+// ordered cursor at all — a caller consuming minni_thread_events had no way
+// to see a status change, scar, replan, or restore alongside slice.*/claim
+// events. These tests prove: (1) each of the four kinds appears via
+// minni_thread_events in order with a server-stamped actor, (2) ready.changed
+// is coalesced for update/replan/restore but never for scar, (3) reconcile-
+// before/append-after crash-gap semantics apply to these tools too, and (4)
+// no evidence/scar text/token/path ever leaks into an ordered payload.
+
+test("minni_thread_update appends an ordered status_changed mirror with the server actor and coalesces ready.changed", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "a", title: "Slice A" },
+      { id: "b", title: "Slice B", depends_on: ["a"] },
+    ]);
+
+    const before = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    assert.equal(before.events.length, 0, "no ordered events exist before the first orchestrator mutation");
+
+    await call("minni_thread_update", {
+      plan_id,
+      slice_id: "a",
+      status: "done",
+      evidence: "Verified against docs/source-a.md",
+    });
+
+    const after = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    const kinds = after.events.map((e) => e.kind);
+    assert.ok(kinds.includes("state.baseline"), `expected state.baseline in ${kinds}`);
+
+    const statusChanged = after.events.find((e) => e.kind === "status_changed");
+    assert.ok(statusChanged, `expected an ordered status_changed event, got kinds: ${kinds}`);
+    assert.equal(statusChanged.actor, DEFAULT_AGENT_ID);
+    assert.equal(statusChanged.slice_id, "a");
+    assert.deepEqual(statusChanged.payload, { from: "pending", to: "done" });
+    assert.doesNotMatch(
+      JSON.stringify(statusChanged),
+      /source-a\.md/,
+      "evidence text must never leak into the ordered status_changed payload",
+    );
+
+    const readyChanged = after.events.find((e) => e.kind === "ready.changed");
+    assert.ok(readyChanged, "expected a coalesced ready.changed event when b becomes ready");
+    assert.deepEqual(readyChanged.payload, { slices: [{ id: "b", title: "Slice B" }] });
+
+    const cursor = await call("minni_thread_events", { plan_id, since_seq: after.next_seq });
+    assert.deepEqual(cursor.events, [], "cursor read must exclude seq at or below since_seq for these mirrored kinds too");
+  });
+});
+
+test("minni_thread_scar appends an ordered scar_added mirror without emitting ready.changed or leaking the scar signal", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+
+    await call("minni_thread_scar", {
+      plan_id,
+      kind: "dead_end",
+      signal: "sentinel-scar-signal-do-not-leak-9f2c",
+      resolution: "sentinel-scar-resolution-do-not-leak-4b1a",
+    });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    const kinds = events.events.map((e) => e.kind);
+    const scarAdded = events.events.find((e) => e.kind === "scar_added");
+    assert.ok(scarAdded, `expected an ordered scar_added event, got kinds: ${kinds}`);
+    assert.equal(scarAdded.actor, DEFAULT_AGENT_ID);
+
+    const serialized = JSON.stringify(events.events);
+    assert.doesNotMatch(serialized, /sentinel-scar-signal-do-not-leak-9f2c/);
+    assert.doesNotMatch(serialized, /sentinel-scar-resolution-do-not-leak-4b1a/);
+
+    assert.equal(
+      kinds.includes("ready.changed"),
+      false,
+      "a scar never changes the ready set and must never emit ready.changed",
+    );
+  });
+});
+
+test("minni_thread_replan appends an ordered replan mirror and coalesces ready.changed when supersession frees a dependent", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "a", title: "Slice A" },
+      { id: "b", title: "Slice B", depends_on: ["a"] },
+    ]);
+
+    const readyBefore = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(readyBefore.ready.map((s) => s.id), ["a"]);
+
+    await call("minni_thread_replan", { plan_id, drop_slice_ids: ["a"] });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    const kinds = events.events.map((e) => e.kind);
+    const replanEvent = events.events.find((e) => e.kind === "replan");
+    assert.ok(replanEvent, `expected an ordered replan event, got kinds: ${kinds}`);
+    assert.equal(replanEvent.actor, DEFAULT_AGENT_ID);
+    assert.ok(
+      replanEvent.payload?.depends_on_superseded,
+      `expected depends_on_superseded in the replan payload, got: ${JSON.stringify(replanEvent)}`,
+    );
+
+    const readyChanged = events.events.find((e) => e.kind === "ready.changed");
+    assert.ok(readyChanged, "expected a coalesced ready.changed event when b's dependency is superseded");
+    assert.deepEqual(readyChanged.payload, { slices: [{ id: "b", title: "Slice B" }] });
+
+    const readyAfter = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(readyAfter.ready.map((s) => s.id), ["b"]);
+  });
+});
+
+test("minni_thread_restore appends an ordered restored mirror reflecting the ready-set delta", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "a", title: "Slice A" },
+      { id: "b", title: "Slice B", depends_on: ["a"] },
+    ]);
+
+    const doneA = await call("minni_thread_update", {
+      plan_id,
+      slice_id: "a",
+      status: "done",
+      evidence: "Verified against docs/source-a.md",
+    });
+    const revAfterADone = doneA.plan.rev;
+    // b is ready now that a is done.
+
+    await call("minni_thread_replan", { plan_id, drop_slice_ids: ["b"] });
+    const readyAfterDrop = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(readyAfterDrop.ready.map((s) => s.id), []);
+
+    await call("minni_thread_restore", { plan_id, rev: revAfterADone });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 50 });
+    const kinds = events.events.map((e) => e.kind);
+    const restoredEvent = events.events.find((e) => e.kind === "restored");
+    assert.ok(restoredEvent, `expected an ordered restored event, got kinds: ${kinds}`);
+    assert.equal(restoredEvent.actor, DEFAULT_AGENT_ID);
+    assert.deepEqual(restoredEvent.payload, { from_rev: revAfterADone });
+
+    const readyChangedEvents = events.events.filter((e) => e.kind === "ready.changed");
+    assert.ok(
+      readyChangedEvents.some((e) => e.payload?.slices?.some((s) => s.id === "b")),
+      "expected restore's ready.changed to show b becoming ready again",
+    );
+
+    const readyAfterRestore = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(readyAfterRestore.ready.map((s) => s.id), ["b"]);
+  });
+});
+
+test("minni_thread_update recovers a note-ahead-of-journal gap via state.recovered", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    await call("minni_thread_update", { plan_id, slice_id: "a", status: "in_progress" });
+
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    const planBeforeGap = await rehydratePlan(notePath);
+    planBeforeGap.next_action = "simulate note-ahead crash gap";
+    await persistPlan(planBeforeGap, { vaultPath, notePath });
+    const planAhead = await rehydratePlan(notePath);
+
+    await call("minni_thread_update", {
+      plan_id,
+      slice_id: "a",
+      status: "blocked",
+      evidence: "blocked for recovery check",
+    });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const kinds = events.events.map((e) => e.kind);
+    const recovered = events.events.find((e) => e.kind === "state.recovered");
+    assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
+    assert.equal(recovered.rev, planAhead.rev);
+    assert.ok(events.events.some((e) => e.kind === "status_changed" && e.payload?.to === "blocked"));
+  });
+});
+
+test("minni_thread_scar recovers a note-ahead-of-journal gap via state.recovered", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    await call("minni_thread_scar", { plan_id, kind: "dead_end", signal: "first scar before gap" });
+
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    const planBeforeGap = await rehydratePlan(notePath);
+    planBeforeGap.next_action = "simulate note-ahead crash gap";
+    await persistPlan(planBeforeGap, { vaultPath, notePath });
+    const planAhead = await rehydratePlan(notePath);
+
+    await call("minni_thread_scar", { plan_id, kind: "failed_command", signal: "second scar after gap" });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const kinds = events.events.map((e) => e.kind);
+    const recovered = events.events.find((e) => e.kind === "state.recovered");
+    assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
+    assert.equal(recovered.rev, planAhead.rev);
+    assert.equal(events.events.filter((e) => e.kind === "scar_added").length, 2);
+  });
+});
+
+test("minni_thread_replan recovers a note-ahead-of-journal gap via state.recovered", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    await call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice B" }] });
+
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    const planBeforeGap = await rehydratePlan(notePath);
+    planBeforeGap.next_action = "simulate note-ahead crash gap";
+    await persistPlan(planBeforeGap, { vaultPath, notePath });
+    const planAhead = await rehydratePlan(notePath);
+
+    await call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice C" }] });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const kinds = events.events.map((e) => e.kind);
+    const recovered = events.events.find((e) => e.kind === "state.recovered");
+    assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
+    assert.equal(recovered.rev, planAhead.rev);
+    assert.equal(events.events.filter((e) => e.kind === "replan").length, 2);
+  });
+});
+
+test("minni_thread_restore recovers a note-ahead-of-journal gap via state.recovered", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    const doneA = await call("minni_thread_update", {
+      plan_id,
+      slice_id: "a",
+      status: "done",
+      evidence: "Verified against docs/source-a.md",
+    });
+    const targetRev = doneA.plan.rev;
+    await call("minni_thread_update", {
+      plan_id,
+      slice_id: "a",
+      status: "blocked",
+      evidence: "reopen for restore recovery test",
+    });
+
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    const planBeforeGap = await rehydratePlan(notePath);
+    planBeforeGap.next_action = "simulate note-ahead crash gap";
+    await persistPlan(planBeforeGap, { vaultPath, notePath });
+    const planAhead = await rehydratePlan(notePath);
+
+    await call("minni_thread_restore", { plan_id, rev: targetRev });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const kinds = events.events.map((e) => e.kind);
+    const recovered = events.events.find((e) => e.kind === "state.recovered");
+    assert.ok(recovered, `expected a state.recovered event, got kinds: ${kinds}`);
+    assert.equal(recovered.rev, planAhead.rev);
+    assert.ok(events.events.some((e) => e.kind === "restored"));
+  });
+});
+
+test("journal-ahead-of-note blocks minni_thread_update, scar, replan, and restore as thread_inconsistent", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    const journalPath = journalPathFor(notePath, plan_id);
+    const plan = await rehydratePlan(notePath);
+
+    await writeFile(
+      journalPath,
+      `# Minni Plan Journal\n\n## events\n${JSON.stringify({
+        thread_event_batch: [{
+          seq: 99,
+          rev: plan.rev + 5,
+          event_id: "ahead",
+          idempotency_key: "ahead",
+          actor: "test",
+          kind: "slice.completed",
+          at: new Date().toISOString(),
+        }],
+      })}\n`,
+      "utf8",
+    );
+
+    await assert.rejects(
+      call("minni_thread_update", { plan_id, slice_id: "a", status: "in_progress" }),
+      /thread_inconsistent/,
+    );
+    await assert.rejects(
+      call("minni_thread_scar", { plan_id, kind: "dead_end", signal: "must not commit" }),
+      /thread_inconsistent/,
+    );
+    await assert.rejects(
+      call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice C" }] }),
+      /thread_inconsistent/,
+    );
+    // minni_thread_restore pre-existing behavior (unrelated to this fix):
+    // it wraps every thrown error from its withThreadLock body — including
+    // "revision not found" — into a soft { error } result rather than an
+    // MCP-level isError response, so it never rejects via call().
+    const restoreResult = await call("minni_thread_restore", { plan_id, rev: plan.rev });
+    assert.match(restoreResult.error, /thread_inconsistent/);
+  });
+});
+
+test("no evidence, scar text, claim token, or private path leaks into ordered payloads from update/scar/replan/restore", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "a", title: "Slice A" },
+      { id: "b", title: "Slice B" },
+    ]);
+    const SENTINEL_EVIDENCE = "sentinel-evidence-9f2c-do-not-leak";
+    const SENTINEL_SIGNAL = "sentinel-signal-4b1a-do-not-leak";
+    const SENTINEL_RESOLUTION = "sentinel-resolution-77aa-do-not-leak";
+
+    const doneA = await call("minni_thread_update", {
+      plan_id,
+      slice_id: "a",
+      status: "done",
+      evidence: SENTINEL_EVIDENCE,
+    });
+    await call("minni_thread_scar", {
+      plan_id,
+      kind: "dead_end",
+      signal: SENTINEL_SIGNAL,
+      resolution: SENTINEL_RESOLUTION,
+    });
+    await call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice C" }] });
+    await call("minni_thread_restore", { plan_id, rev: doneA.plan.rev });
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const serialized = JSON.stringify(events.events);
+    for (const sentinel of [SENTINEL_EVIDENCE, SENTINEL_SIGNAL, SENTINEL_RESOLUTION]) {
+      assert.doesNotMatch(serialized, new RegExp(sentinel), `ordered payloads leaked sentinel text: ${sentinel}`);
+    }
+    assert.doesNotMatch(
+      serialized,
+      /\.runtime[\\/]thread-claims/,
+      "ordered payloads must never reference the private claim envelope path",
+    );
+    assert.doesNotMatch(
+      serialized,
+      /\btoken\b/i,
+      "ordered payloads must never reference a claim token field",
+    );
   });
 });
 

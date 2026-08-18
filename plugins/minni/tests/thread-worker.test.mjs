@@ -144,13 +144,21 @@ async function threadFixture(t, slices = [
   };
 }
 
-async function assignWorker(fixture, sliceId, workerAgentId) {
+const TEST_ORCHESTRATOR_ACTOR = "orchestrator-test";
+
+async function assignWorker(
+  fixture,
+  sliceId,
+  workerAgentId,
+  actorAgentId = TEST_ORCHESTRATOR_ACTOR,
+) {
   return assignSlice({
     vaultPath: fixture.vaultPath,
     notePath: fixture.notePath,
     planId: fixture.planId,
     sliceId,
     workerAgentId,
+    actorAgentId,
     now: new Date(THREAD_START),
   });
 }
@@ -1070,6 +1078,7 @@ test("reassignment revokes the old token and increments generation", async (t) =
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-b",
+    actorAgentId: TEST_ORCHESTRATOR_ACTOR,
     assignmentProfile: "adversarial-review",
     now: new Date("2026-08-18T12:01:00.000Z"),
   });
@@ -1419,6 +1428,7 @@ test("assignment persistence failure leaves the previous claim fully usable", as
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-b",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
       now: new Date("2026-08-18T12:01:00.000Z"),
     }, {
       persistPlan: async () => {
@@ -1459,6 +1469,7 @@ test("cleanup failures cannot undo reassignment or completion", async (t) => {
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-b",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
       now: new Date("2026-08-18T12:01:00.000Z"),
     }, {
       deleteClaimSecret: async () => {
@@ -1586,6 +1597,7 @@ test("restore clears historical claims and advances beyond every old generation"
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-a",
+    actorAgentId: TEST_ORCHESTRATOR_ACTOR,
     now: new Date("2026-08-18T12:01:00.000Z"),
   });
   const fresh = await claimSlice({
@@ -2195,6 +2207,7 @@ test("upgrade-eligible status reads hold the Thread lock through upgrade persist
     ...fixture,
     sliceId: "a",
     workerAgentId: "worker-a",
+    actorAgentId: TEST_ORCHESTRATOR_ACTOR,
     now: "2026-08-18T12:01:00.000Z",
   });
   await assignment.ready;
@@ -2460,10 +2473,80 @@ test("worker paths reject journal-ahead state as thread_inconsistent", async (t)
       ...fixture,
       sliceId: "a",
       workerAgentId: "worker-a",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
       now: new Date(THREAD_START),
     }),
     /thread_inconsistent/,
   );
+});
+
+test("assignSlice stamps the caller-supplied orchestrator actor, never the assignment target", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+    { id: "b", title: "Slice B" },
+  ]);
+  const result = await assignSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-target",
+    actorAgentId: "orchestrator-caller",
+    now: new Date(THREAD_START),
+  });
+  assert.equal(result.slice.assigned_to, "worker-target");
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  const assigned = events.find((event) => event.kind === "slice.assigned");
+  assert.ok(assigned, "expected a slice.assigned ordered event");
+  assert.equal(assigned.actor, "orchestrator-caller");
+  assert.notEqual(assigned.actor, "worker-target");
+
+  // The baseline/reconciliation actor recorded alongside the very first
+  // ordered mutation must also reflect the caller, not the assignment
+  // target — a worker never "acts" on the Thread journal merely by being
+  // assigned to it.
+  const baseline = events.find((event) => event.kind === "state.baseline");
+  assert.ok(baseline, "expected a state.baseline ordered event");
+  assert.equal(baseline.actor, "orchestrator-caller");
+
+  // Assignment target/idempotency semantics are unchanged: reassigning the
+  // same slice to the SAME worker with the SAME actor is still a no-op
+  // idempotency-wise (generation only increments on a genuine reassignment).
+  assert.equal(result.slice.generation, 0);
+});
+
+test("reassigning the same slice to a different worker with the same orchestrator actor still attributes the caller", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-one",
+    actorAgentId: "orchestrator-caller",
+    now: new Date(THREAD_START),
+  });
+  await assignSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "a",
+    workerAgentId: "worker-two",
+    actorAgentId: "orchestrator-caller",
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  const assignedEvents = events.filter((event) => event.kind === "slice.assigned");
+  assert.equal(assignedEvents.length, 2);
+  for (const event of assignedEvents) {
+    assert.equal(event.actor, "orchestrator-caller");
+    assert.notEqual(event.actor, "worker-one");
+    assert.notEqual(event.actor, "worker-two");
+  }
 });
 
 test("first ordered mutation writes baseline before operation batch", async (t) => {

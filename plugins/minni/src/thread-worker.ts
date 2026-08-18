@@ -77,6 +77,15 @@ interface ThreadMutationTarget extends ThreadPlanTarget {
 }
 
 export interface AssignSliceInput extends ThreadMutationTarget {
+  /**
+   * The orchestrator/caller identity that is PERFORMING the assignment.
+   * This is distinct from `workerAgentId` (the assignment TARGET) and is
+   * what the ordered journal must record as the event actor — a worker
+   * does not "act" on the Thread merely by being assigned to it. Server
+   * callers (server.ts's minni_thread_assign) must stamp this server-side
+   * (DEFAULT_AGENT_ID); it is never model-suppliable.
+   */
+  actorAgentId: string;
   workerAgentId: string;
   assignmentProfile?: string;
 }
@@ -166,7 +175,7 @@ export function readySlices(plan: PlanArtifact, now: Date): PlanSlice[] {
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function readyIds(plan: PlanArtifact, now: Date): string[] {
+export function readyIds(plan: PlanArtifact, now: Date): string[] {
   return readySlices(plan, now).map((slice) => slice.id);
 }
 
@@ -383,7 +392,16 @@ function readySummary(plan: PlanArtifact, now: Date): ReadySummaryPayload {
   };
 }
 
-async function prepareThreadMutation(
+/**
+ * Reconcile the ordered scheduler journal against the just-rehydrated,
+ * PRE-mutation plan, then ensure an ordered baseline exists — the exact
+ * "before persistence" half of every locked mutation's event lifecycle.
+ * Exported so every locked Thread mutation path (worker AND orchestrator —
+ * assign/claim/worker_update as well as server.ts's
+ * update/scar/replan/restore handlers) shares one scheduling implementation
+ * instead of re-deriving reconcile/baseline logic per call site.
+ */
+export async function prepareThreadMutation(
   input: ThreadPlanTarget & { actor: string },
   plan: PlanArtifact,
   now: Date,
@@ -430,7 +448,16 @@ function workerEventKind(action: WorkerUpdateAction): string {
   }
 }
 
-async function recordThreadMutationEvents(input: {
+/**
+ * Append one operation event plus, when the ready set actually changed, one
+ * coalesced ready.changed event — the "after persistence" half of every
+ * locked mutation's event lifecycle. A caught append failure is swallowed
+ * here on purpose: the note is already durable, and the next locked
+ * mutation's prepareThreadMutation reconciles the resulting note-ahead gap
+ * via state.recovered rather than ever silently hiding it. Exported for
+ * the same cross-call-site reuse reason as prepareThreadMutation above.
+ */
+export async function recordThreadMutationEvents(input: {
   journalPath: string;
   planId: string;
   rev: number;
@@ -573,6 +600,10 @@ export async function assignSlice(
     input.workerAgentId,
     "worker agent id",
   );
+  const actorAgentId = requireNonEmpty(
+    input.actorAgentId,
+    "actor agent id",
+  );
   const profile = assignmentProfile(input.assignmentProfile);
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
@@ -587,7 +618,7 @@ export async function assignSlice(
     async (plan) => {
       const now = sampleNow(input.now);
       const { journalPath } = await prepareThreadMutation(
-        { ...input, planId, actor: workerAgentId },
+        { ...input, planId, actor: actorAgentId },
         plan,
         now,
       );
@@ -627,7 +658,7 @@ export async function assignSlice(
         journalPath,
         planId,
         rev: next.rev,
-        actor: workerAgentId,
+        actor: actorAgentId,
         operationKey: `assign:${sliceId}:${workerAgentId}:${nextSlice.generation}`,
         kind: "slice.assigned",
         sliceId,
