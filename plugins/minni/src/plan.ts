@@ -1592,10 +1592,25 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     needsUpgrade = declaredVersion === PLAN_DIGEST_VERSION && storedTag !== undefined;
   } else if (plan.plan_digest !== recomputed) {
     // No declared version: legacy recognition (pre-H7 v1 upgrades in place).
-    // Unchanged by Task 2 — a note with no version marker at all predates
-    // the rolling-upgrade contract this task's declared-version guard
-    // protects, so it keeps the original upgrade-on-read behavior.
+    // The upgrade-on-read behavior itself is unchanged by Task 2 — a note
+    // with no version marker at all predates the rolling-upgrade contract
+    // this task's declared-version guard protects.
+    //
+    // Review finding (Task 2 second follow-up): this path used to skip the
+    // v3-only-field tamper check entirely, because that check originally
+    // lived only inside the `declaredVersion !== undefined` branch above.
+    // But an undeclared note validating against v1 is exactly as blind to
+    // the seven v3-only slice keys as a DECLARED v1 note is — and, worse,
+    // it was about to be upgraded (persisted) below, which would silently
+    // BLESS an injected assigned_to/claim/proposals/etc. as legitimate v3
+    // data. So the same guard applies here too, before needsUpgrade is set.
     if (plan.plan_digest === computePlanDigestV1(plan)) {
+      const v3Field = findV3OnlySliceField(plan.slices);
+      if (v3Field) {
+        throw new Error(
+          `rehydratePlan: slice "${v3Field.sliceId}" carries v3-only field "${v3Field.field}" outside undeclared-v1 digest coverage; note may be tampered`,
+        );
+      }
       needsUpgrade = true;
     } else {
       throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);

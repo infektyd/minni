@@ -1001,6 +1001,105 @@ test("rehydratePlan rejects a declared v1 note whose slice carries a v3-only fie
   }
 });
 
+/**
+ * Writes a note with NO plan_digest_v field at all (the pre-H7 legacy
+ * shape) whose plan_digest genuinely equals computePlanDigestV1 — but one
+ * slice ALSO carries a v3-only field the v1 algorithm never looks at. This
+ * is the re-review's scenario: an UNDECLARED note is just as blind to the
+ * seven v3-only keys as a declared-v1 note is, and — unlike the declared
+ * case — it was about to be silently upgraded (persisted) as a genuine v3
+ * note, which would bless the injected field permanently.
+ */
+async function writeUndeclaredV1PlanWithV3Field(field) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-undeclared-v1-v3field-"));
+  await ensureVault(root);
+  const { write } = await createPlan(
+    { goal: "undeclared v1 tamper probe", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+    { vaultPath: root },
+  );
+  const canonical = await rehydratePlan(write.notePath);
+  const mutatedSlices = [{ ...canonical.slices[0], [field]: V3_ONLY_FIELD_SAMPLES[field] }];
+  const mutatedPlan = { ...canonical, slices: mutatedSlices };
+  const v1Hex = computePlanDigestV1(mutatedPlan);
+  // Prove v1 is genuinely blind to this field, exactly as for the declared
+  // case above — otherwise this fixture would not test what it claims.
+  assert.equal(v1Hex, computePlanDigestV1(canonical), `expected undeclared-v1 digest to be blind to "${field}"`);
+
+  const raw = await readFile(write.notePath, "utf8");
+  const rewritten = raw
+    .replace(/^plan_slices:.*$/m, `plan_slices: ${JSON.stringify(JSON.stringify(mutatedSlices))}`)
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${v1Hex}`)
+    // A real pre-H7 note carries no plan_digest_v field either (see the H7
+    // test above) — with it present this would hit the DECLARED branch,
+    // not the undeclared-legacy fallback this test targets.
+    .replace(/^plan_digest_v:.*\n/m, "");
+  assert.notEqual(rewritten, raw, "expected to actually inject a v3-only field into this fixture");
+  await writeFile(write.notePath, rewritten, "utf8");
+  return { notePath: write.notePath, root };
+}
+
+test("rehydratePlan rejects an undeclared legacy (no plan_digest_v) valid-v1 note whose slice carries a v3-only field", async (t) => {
+  for (const field of ["assigned_to", "claim"]) {
+    await t.test(field, async () => {
+      const fixture = await writeUndeclaredV1PlanWithV3Field(field);
+      try {
+        const before = await readFile(fixture.notePath, "utf8");
+        await assert.rejects(
+          () => rehydratePlan(fixture.notePath),
+          (err) => {
+            assert.match(err.message, /v3-only field/);
+            assert.match(err.message, new RegExp(field));
+            assert.match(err.message, /tampered/);
+            return true;
+          },
+        );
+        const after = await readFile(fixture.notePath, "utf8");
+        assert.equal(after, before, "a rejected read must not upgrade/rewrite the note either");
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("rehydratePlan still upgrades a CLEAN undeclared legacy (no plan_digest_v) valid-v1 note on read", async () => {
+  // The new legacy-path guard above must not be a false positive: a genuine
+  // pre-H7 note with none of the seven v3-only keys must keep upgrading in
+  // place exactly as the pre-existing H7 test already proves — this test
+  // re-confirms that specifically alongside the new tamper guard, using the
+  // same note shape (single slice, no plan_digest_v) as the rejection test
+  // above so the only variable between "clean" and "tampered" is the
+  // injected field itself.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-undeclared-v1-clean-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "undeclared v1 clean upgrade", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const canonical = await rehydratePlan(write.notePath);
+    const v1Hex = computePlanDigestV1(canonical);
+    const v3Hex = computePlanDigest(canonical);
+    assert.notEqual(v1Hex, v3Hex, "v1 and v3 digests must differ for this to be a real migration");
+
+    const raw = await readFile(write.notePath, "utf8");
+    const withLegacy = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${v1Hex}`)
+      .replace(/^plan_digest_v:.*\n/m, "");
+    assert.notEqual(withLegacy, raw, "expected to actually rewrite plan_digest to the legacy v1 hex");
+    await writeFile(write.notePath, withLegacy, "utf8");
+
+    const upgraded = await rehydratePlan(write.notePath);
+    assert.equal(upgraded.plan_digest, v3Hex, "a clean undeclared v1 note must still upgrade to the current digest");
+
+    const after = await readFile(write.notePath, "utf8");
+    assert.match(after, new RegExp(`^plan_digest: ${v3Hex}$`, "m"), "note must be re-persisted with the current digest");
+    assert.match(after, /^plan_digest_v: 3$/m, "upgrade must stamp the current plan_digest_v going forward");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("rehydratePlan normalizes a declared v1 note's interim 'v1:<hex>' tag to bare hex in memory without writing the note", async () => {
   // Focused assertion for the review's second ask: the no-write-on-read
   // contract only says the FILE is left alone for a declared-older version.
