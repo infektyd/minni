@@ -9,6 +9,7 @@ import {
   unmetDependencies,
   updateSlice,
   PlanHistoryAppendError,
+  type AppendJournalDeps,
   type PlanArtifact,
   type PlanSlice,
   type PlanSliceStatus,
@@ -24,6 +25,7 @@ import {
   deriveSystemEventKey,
   ensureOrderedBaseline,
   findOrderedEventByIdempotencyKey,
+  orderedSnapshotMatchesJournal,
   reconcileThreadJournal,
   readOrderedThreadEvents,
   type OrderedThreadEvent,
@@ -111,6 +113,8 @@ export interface UpdateClaimedSliceInput extends ThreadMutationTarget {
 export interface ThreadWorkerDeps {
   persistPlan?: typeof persistPlan;
   deleteClaimSecret?: typeof deleteClaimSecret;
+  /** Injectable journal append/fsync seam for tests (landed-then-throw, etc.). */
+  appendJournalDeps?: AppendJournalDeps;
 }
 
 function requireNonEmpty(value: string, label: string): string {
@@ -519,6 +523,7 @@ export async function prepareThreadMutation(
   input: ThreadPlanTarget & { actor: string },
   plan: PlanArtifact,
   now: Date,
+  appendJournalDeps: AppendJournalDeps = {},
 ): Promise<{
   journalPath: string;
   ordered: OrderedThreadEvent[];
@@ -526,23 +531,29 @@ export async function prepareThreadMutation(
   const journalPath = journalPathFor(input.notePath, input.planId);
   const summary = readySummary(plan, now);
   const ordered = await readOrderedThreadEvents(journalPath);
-  await reconcileThreadJournal({
-    journalPath,
-    notePath: input.notePath,
-    planId: input.planId,
-    rev: plan.rev,
-    actor: input.actor,
-    readySummary: summary,
-    orderedSnapshot: ordered,
-  });
-  await ensureOrderedBaseline({
-    journalPath,
-    planId: input.planId,
-    rev: plan.rev,
-    actor: input.actor,
-    readySummary: summary,
-    orderedSnapshot: ordered,
-  });
+  await reconcileThreadJournal(
+    {
+      journalPath,
+      notePath: input.notePath,
+      planId: input.planId,
+      rev: plan.rev,
+      actor: input.actor,
+      readySummary: summary,
+      orderedSnapshot: ordered,
+    },
+    appendJournalDeps,
+  );
+  await ensureOrderedBaseline(
+    {
+      journalPath,
+      planId: input.planId,
+      rev: plan.rev,
+      actor: input.actor,
+      readySummary: summary,
+      orderedSnapshot: ordered,
+    },
+    appendJournalDeps,
+  );
   return { journalPath, ordered };
 }
 
@@ -589,6 +600,7 @@ export async function recordThreadMutationEvents(input: {
   planBefore?: PlanArtifact;
   now: Date;
   orderedSnapshot?: OrderedThreadEvent[];
+  appendJournalDeps?: AppendJournalDeps;
   supplementalEvents?: Array<{
     idempotencyKey: string;
     kind: string;
@@ -634,18 +646,32 @@ export async function recordThreadMutationEvents(input: {
     });
   }
   try {
-    await appendOrderedEventBatch({
-      journalPath: input.journalPath,
-      planId: input.planId,
-      rev: input.rev,
-      actor: input.actor,
-      at,
-      events,
-      orderedSnapshot: input.orderedSnapshot,
-    });
+    await appendOrderedEventBatch(
+      {
+        journalPath: input.journalPath,
+        planId: input.planId,
+        rev: input.rev,
+        actor: input.actor,
+        at,
+        events,
+        orderedSnapshot: input.orderedSnapshot,
+      },
+      input.appendJournalDeps ?? {},
+    );
   } catch (error) {
     if (error instanceof ThreadEventIdempotencyConflictError) {
       throw error;
+    }
+    if (input.orderedSnapshot) {
+      const snapshotTruthful = await orderedSnapshotMatchesJournal(
+        input.orderedSnapshot,
+        input.journalPath,
+      );
+      if (!snapshotTruthful) {
+        throw error;
+      }
+      // Snapshot matches durable journal; safe to continue the locked mutation.
+      return;
     }
     // The note is already durable; the next locked mutation reconciles first.
   }
@@ -663,18 +689,22 @@ async function repairClaimSchedulerEvents(input: {
   plan: PlanArtifact;
   now: Date;
   orderedSnapshot?: OrderedThreadEvent[];
+  appendJournalDeps?: AppendJournalDeps;
 }): Promise<void> {
   const ordered =
     input.orderedSnapshot ?? await readOrderedThreadEvents(input.journalPath);
   const summary = readySummary(input.plan, input.now);
-  await ensureOrderedBaseline({
-    journalPath: input.journalPath,
-    planId: input.planId,
-    rev: input.rev,
-    actor: input.actor,
-    readySummary: summary,
-    orderedSnapshot: ordered,
-  });
+  await ensureOrderedBaseline(
+    {
+      journalPath: input.journalPath,
+      planId: input.planId,
+      rev: input.rev,
+      actor: input.actor,
+      readySummary: summary,
+      orderedSnapshot: ordered,
+    },
+    input.appendJournalDeps ?? {},
+  );
   const claimed = findOrderedEventByIdempotencyKey(ordered, input.operationKey);
   if (!claimed) {
     await recordThreadMutationEvents({
@@ -690,6 +720,7 @@ async function repairClaimSchedulerEvents(input: {
       plan: input.plan,
       now: input.now,
       orderedSnapshot: ordered,
+      appendJournalDeps: input.appendJournalDeps,
     });
     return;
   }
@@ -702,21 +733,24 @@ async function repairClaimSchedulerEvents(input: {
   if (!readyIdsEqual(input.readyBefore, input.readyAfter)) {
     const readyKey = deriveReadyChangedKey(input.operationKey);
     if (!findOrderedEventByIdempotencyKey(ordered, readyKey)) {
-      await appendOrderedEventBatch({
-        journalPath: input.journalPath,
-        planId: input.planId,
-        rev: input.rev,
-        actor: input.actor,
-        at: input.now.toISOString(),
-        events: [
-          {
-            idempotencyKey: readyKey,
-            kind: "ready.changed",
-            payload: { slices: summary.slices },
-          },
-        ],
-        orderedSnapshot: ordered,
-      });
+      await appendOrderedEventBatch(
+        {
+          journalPath: input.journalPath,
+          planId: input.planId,
+          rev: input.rev,
+          actor: input.actor,
+          at: input.now.toISOString(),
+          events: [
+            {
+              idempotencyKey: readyKey,
+              kind: "ready.changed",
+              payload: { slices: summary.slices },
+            },
+          ],
+          orderedSnapshot: ordered,
+        },
+        input.appendJournalDeps ?? {},
+      );
     }
   }
 }
@@ -733,6 +767,7 @@ async function expireStaleClaimForSlice(input: {
   persist: typeof persistPlan;
   deleteSecret: typeof deleteClaimSecret;
   orderedSnapshot?: OrderedThreadEvent[];
+  appendJournalDeps?: AppendJournalDeps;
 }): Promise<{ plan: PlanArtifact; expired: boolean; readyBefore: string[] }> {
   const slice = findSlice(input.plan, input.sliceId);
   if (!slice.claim || hasLiveClaim(slice, input.now)) {
@@ -792,6 +827,7 @@ async function expireStaleClaimForSlice(input: {
     // array (not a fresh re-parse) so the outer append computes seqs that
     // are strictly higher than these, never colliding with them.
     orderedSnapshot: input.orderedSnapshot,
+    appendJournalDeps: input.appendJournalDeps,
     supplementalEvents: [
       {
         idempotencyKey: deriveSystemEventKey(
@@ -821,6 +857,7 @@ async function synchronizeExpiredClaimsForPlan(input: {
   persist: typeof persistPlan;
   deleteSecret: typeof deleteClaimSecret;
   orderedSnapshot?: OrderedThreadEvent[];
+  appendJournalDeps?: AppendJournalDeps;
 }): Promise<PlanArtifact> {
   let plan = input.plan;
   for (const slice of plan.slices) {
@@ -847,6 +884,7 @@ export async function synchronizeExpiredClaimsAndReadReady(
   const actor = requireNonEmpty(input.actor, "actor");
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
+  const appendJournalDeps = deps.appendJournalDeps ?? {};
 
   return withThreadPlanLock(
     {
@@ -861,6 +899,7 @@ export async function synchronizeExpiredClaimsAndReadReady(
         { ...input, planId, actor },
         initialPlan,
         now,
+        appendJournalDeps,
       );
       const plan = await synchronizeExpiredClaimsForPlan({
         vaultPath: input.vaultPath,
@@ -873,6 +912,7 @@ export async function synchronizeExpiredClaimsAndReadReady(
         persist,
         deleteSecret,
         orderedSnapshot: ordered,
+        appendJournalDeps,
       });
       return { plan, ready: readySlices(plan, now) };
     },
@@ -935,6 +975,7 @@ export async function assignSlice(
   const profile = assignmentProfile(input.assignmentProfile);
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
+  const appendJournalDeps = deps.appendJournalDeps ?? {};
 
   return withThreadPlanLock(
     {
@@ -949,6 +990,7 @@ export async function assignSlice(
         { ...input, planId, actor: actorAgentId },
         plan,
         now,
+        appendJournalDeps,
       );
       const slice = findSlice(plan, sliceId);
       const readyBefore = readyIds(plan, now);
@@ -1052,6 +1094,7 @@ export async function assignSlice(
         plan: next,
         now,
         orderedSnapshot: ordered,
+        appendJournalDeps,
         supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
       });
       return result;
@@ -1097,6 +1140,7 @@ export async function claimSlice(
   }
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
+  const appendJournalDeps = deps.appendJournalDeps ?? {};
 
   return withThreadPlanLock(
     {
@@ -1111,6 +1155,7 @@ export async function claimSlice(
         { ...input, planId, actor: workerAgentId },
         initialPlan,
         now,
+        appendJournalDeps,
       );
       let plan = initialPlan;
       plan = await synchronizeExpiredClaimsForPlan({
@@ -1124,6 +1169,7 @@ export async function claimSlice(
         persist,
         deleteSecret,
         orderedSnapshot: ordered,
+        appendJournalDeps,
       });
       let slice = findSlice(plan, sliceId);
       if (!isNonTerminal(slice)) {
@@ -1197,6 +1243,7 @@ export async function claimSlice(
             plan,
             now,
             orderedSnapshot: ordered,
+            appendJournalDeps,
           });
           return publicClaimResponse(existing.response);
         }
@@ -1348,6 +1395,7 @@ export async function claimSlice(
         plan: next,
         now,
         orderedSnapshot: ordered,
+        appendJournalDeps,
       });
       return response;
     },
@@ -1606,6 +1654,7 @@ export async function updateClaimedSlice(
   );
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
+  const appendJournalDeps = deps.appendJournalDeps ?? {};
   const kind = workerEventKind(input.action);
 
   return withThreadPlanLock(
@@ -1648,6 +1697,7 @@ export async function updateClaimedSlice(
           { ...input, planId, actor: workerAgentId },
           initialPlan,
           now,
+          appendJournalDeps,
         );
         void journalPath;
         void ordered;
@@ -1661,6 +1711,7 @@ export async function updateClaimedSlice(
         { ...input, planId, actor: workerAgentId },
         initialPlan,
         now,
+        appendJournalDeps,
       );
       let plan = await synchronizeExpiredClaimsForPlan({
         vaultPath: input.vaultPath,
@@ -1673,6 +1724,7 @@ export async function updateClaimedSlice(
         persist,
         deleteSecret,
         orderedSnapshot: ordered,
+        appendJournalDeps,
       });
       const sliceBeforeExpiry = findSlice(initialPlan, sliceId);
       const sliceAfterExpiry = findSlice(plan, sliceId);
@@ -1873,6 +1925,7 @@ export async function updateClaimedSlice(
         planBefore,
         now,
         orderedSnapshot: ordered,
+        appendJournalDeps,
         supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
       });
       return result;

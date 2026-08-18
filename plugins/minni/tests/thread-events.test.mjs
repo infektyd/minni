@@ -23,6 +23,7 @@ import {
   reconcileThreadJournal,
 } from "../dist/thread-events.js";
 import { withThreadLock } from "../dist/thread-lock.js";
+import { appendFileWithFsync as realAppendFileWithFsync } from "../dist/vault.js";
 
 const execFileAsync = promisify(execFile);
 const THREAD_START = new Date("2026-08-18T12:00:00.000Z");
@@ -417,5 +418,67 @@ test("client claim idempotency keys are namespaced and cannot squat system recov
         event.kind === "slice.claimed" &&
         event.idempotency_key.startsWith("client:claim:"),
     ),
+  );
+});
+
+// --- final-fix-5 -------------------------------------------------------
+//
+// appendJournalLine's catch-all used to treat ANY append/fsync failure as
+// "journal missing" and overwrite it via writeFileAtomic — even when the
+// journal already existed and the line had already landed on disk before
+// fsync threw. That is real data loss, not recovery. The catch must be
+// ENOENT / missing-file only.
+
+test("final-fix-5: a post-write fsync throw does not get treated as a missing journal and overwrite existing events", async (t) => {
+  const fixture = await createThread(t);
+  await withThreadLock(fixture.vaultPath, fixture.planId, "seed", async () => {
+    await appendOrderedEventBatch({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      actor: "test",
+      events: [{ idempotencyKey: "seed-one", kind: "test.one" }],
+    });
+  });
+  const before = await readThreadEvents(fixture.journalPath, 0, 100);
+  assert.equal(before.events.length, 1);
+  assert.equal(before.events[0].idempotency_key, "seed-one");
+
+  const landedThenThrows = async (filePath, content) => {
+    // The write genuinely lands (like appendFileWithFsync's write() before
+    // its sync() call throws) before the rejection propagates.
+    await realAppendFileWithFsync(filePath, content);
+    throw new Error("simulated fsync failure after write landed");
+  };
+
+  await withThreadLock(
+    fixture.vaultPath,
+    fixture.planId,
+    "landed-then-throw",
+    async () => {
+      await assert.rejects(
+        appendOrderedEventBatch(
+          {
+            journalPath: fixture.journalPath,
+            planId: fixture.planId,
+            rev: fixture.rev,
+            actor: "test",
+            events: [{ idempotencyKey: "landed-two", kind: "test.two" }],
+          },
+          { appendFileWithFsync: landedThenThrows },
+        ),
+        /simulated fsync failure/,
+      );
+    },
+  );
+
+  const after = await readThreadEvents(fixture.journalPath, 0, 100);
+  assert.ok(
+    after.events.some((event) => event.idempotency_key === "seed-one"),
+    "the pre-existing event must survive a post-write fsync throw, not be clobbered by writeFileAtomic",
+  );
+  assert.ok(
+    after.events.some((event) => event.idempotency_key === "landed-two"),
+    "the line that landed on disk before the throw must remain readable",
   );
 });

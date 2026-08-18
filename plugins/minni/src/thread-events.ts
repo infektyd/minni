@@ -323,6 +323,66 @@ function nextSequence(ordered: OrderedThreadEvent[]): number {
   return ordered.reduce((highest, event) => Math.max(highest, event.seq), 0) + 1;
 }
 
+function isErrno(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: unknown }).code === code
+  );
+}
+
+/** Disk load for snapshot resync — does not increment orderedJournalParseCount. */
+async function loadOrderedThreadEventsWithoutParseCount(
+  journalPath: string,
+): Promise<OrderedThreadEvent[]> {
+  try {
+    const journalText = await readFile(journalPath, "utf8");
+    return parseOrderedThreadEvents(journalText);
+  } catch {
+    return [];
+  }
+}
+
+function replaceOrderedSnapshotContents(
+  snapshot: OrderedThreadEvent[],
+  diskEvents: OrderedThreadEvent[],
+): void {
+  snapshot.length = 0;
+  for (const event of diskEvents) {
+    snapshot.push(event);
+  }
+}
+
+function orderedSnapshotsEqual(
+  left: OrderedThreadEvent[],
+  right: OrderedThreadEvent[],
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    const leftEvent = left[index];
+    const rightEvent = right[index];
+    if (
+      leftEvent.seq !== rightEvent.seq ||
+      leftEvent.event_id !== rightEvent.event_id
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Whether a shared snapshot matches the durable ordered journal on disk. */
+export async function orderedSnapshotMatchesJournal(
+  snapshot: OrderedThreadEvent[],
+  journalPath: string,
+): Promise<boolean> {
+  const diskEvents = await loadOrderedThreadEventsWithoutParseCount(journalPath);
+  return orderedSnapshotsEqual(snapshot, diskEvents);
+}
+
 async function appendJournalLine(
   journalPath: string,
   payload: unknown,
@@ -332,15 +392,21 @@ async function appendJournalLine(
   const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
   const line = `${JSON.stringify(payload)}\n`;
 
+  let existing: string;
   try {
-    const existing = await readFile(journalPath, "utf8");
-    const prefix =
-      existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-    await doAppendWithFsync(journalPath, prefix + line);
-  } catch {
+    existing = await readFile(journalPath, "utf8");
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
     const header = `# Minni Plan Journal\n\n## events\n`;
     await doWriteAtomic(journalPath, header + line);
+    return;
   }
+
+  const prefix =
+    existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+  await doAppendWithFsync(journalPath, prefix + line);
 }
 
 function materializeBatchEvents(
@@ -423,13 +489,23 @@ export async function appendOrderedEventBatch(
   const batchLine: ThreadEventBatchLine = {
     thread_event_batch: fresh,
   };
-  await appendJournalLine(input.journalPath, batchLine, deps);
-  if (input.orderedSnapshot) {
-    for (const event of fresh) {
-      input.orderedSnapshot.push(event);
+  try {
+    await appendJournalLine(input.journalPath, batchLine, deps);
+    if (input.orderedSnapshot) {
+      for (const event of fresh) {
+        input.orderedSnapshot.push(event);
+      }
     }
+    return materialized;
+  } catch (error) {
+    if (input.orderedSnapshot) {
+      const diskEvents = await loadOrderedThreadEventsWithoutParseCount(
+        input.journalPath,
+      );
+      replaceOrderedSnapshotContents(input.orderedSnapshot, diskEvents);
+    }
+    throw error;
   }
-  return materialized;
 }
 
 /** @deprecated Prefer appendOrderedEventBatch; retained for low-level tests. */

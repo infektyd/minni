@@ -59,6 +59,7 @@ import {
 } from "../dist/thread-worker.js";
 import * as threadWorkerRuntime from "../dist/thread-worker.js";
 import { withThreadLock } from "../dist/thread-lock.js";
+import { appendFileWithFsync as realAppendFileWithFsync } from "../dist/vault.js";
 
 const BEFORE_EXPIRY = new Date("2026-08-18T14:59:00.000Z");
 const AT_EXPIRY = new Date("2026-08-18T15:00:00.000Z");
@@ -3697,5 +3698,110 @@ test("final-fix-4: parent swap during receipt-generation pruning deletes the rea
   await assert.rejects(
     readdir(originalGenerationPath),
     (error) => error?.code === "ENOENT",
+  );
+});
+
+// --- final-fix-5 ------------------------------------------------------------
+//
+// In-lock sibling expiry can land its journal batch on disk and then throw
+// (write succeeded, fsync/follow-up failed). If that error is swallowed while
+// the shared orderedSnapshot stays behind the landed write, the outer claim
+// batch reallocates those seqs and limit=1 pagination permanently hides the
+// colliding expiry event.
+
+test("final-fix-5: claimSlice sibling expiry that lands-then-throws must not let the outer claim reallocate those seqs", async (t) => {
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+    { id: "b", title: "Slice B" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  await assignWorker(fixture, "b", "worker-b");
+  await claimSlice({
+    ...fixture,
+    sliceId: "b",
+    workerAgentId: "worker-b",
+    idempotencyKey: "final-fix-5-claim-b-will-expire",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+
+  // First in-lock journal append during claim A is the sibling-expiry batch.
+  // Land the line on disk, then throw — matching appendFileWithFsync's
+  // write-then-sync failure mode. writeFileAtomic also rejects so the current
+  // catch-all cannot "recover" by overwriting and masking the hole.
+  let remainingForcedFailures = 1;
+  const landedThenThrows = async (filePath, content) => {
+    if (remainingForcedFailures > 0) {
+      remainingForcedFailures -= 1;
+      await realAppendFileWithFsync(filePath, content);
+      throw new Error("simulated fsync failure after write landed");
+    }
+    return realAppendFileWithFsync(filePath, content);
+  };
+
+  const laterNow = new Date(THREAD_START.getTime() + 10 * 60_000);
+  const claimA = await claimSlice(
+    {
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      idempotencyKey: "final-fix-5-claim-a-triggers-sibling-expiry",
+      ttlSeconds: 60,
+      now: laterNow,
+    },
+    {
+      appendJournalDeps: {
+        appendFileWithFsync: landedThenThrows,
+        writeFileAtomic: async () => {
+          throw new Error("simulated fsync failure after write landed");
+        },
+      },
+    },
+  );
+  assert.ok(claimA?.claim_id, "claim A itself must succeed (or idempotent retry path)");
+  assert.ok(claimA?.token, "claim A must return a token");
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events: allEvents } = await readThreadEvents(journalPath, 0, 1000);
+  assert.ok(allEvents.length > 0);
+
+  const seqs = allEvents.map((event) => event.seq);
+  assert.equal(
+    new Set(seqs).size,
+    seqs.length,
+    `expected every seq to be unique, got ${JSON.stringify(seqs)}`,
+  );
+  for (let index = 1; index < seqs.length; index += 1) {
+    assert.ok(
+      seqs[index] > seqs[index - 1],
+      `seq must strictly increase across the journal: ${seqs[index - 1]} -> ${seqs[index]}`,
+    );
+  }
+
+  const paged = [];
+  let sinceSeq = 0;
+  for (let guard = 0; guard < allEvents.length + 5; guard += 1) {
+    const { events, next_seq } = await readThreadEvents(journalPath, sinceSeq, 1);
+    if (events.length === 0) break;
+    paged.push(...events);
+    sinceSeq = next_seq;
+  }
+  assert.deepEqual(
+    paged.map((event) => event.event_id),
+    allEvents.map((event) => event.event_id),
+    "limit=1 pagination must surface every event exactly once, in order",
+  );
+
+  const leaseExpired = allEvents.find(
+    (event) => event.kind === "slice.lease_expired" && event.slice_id === "b",
+  );
+  assert.ok(leaseExpired, "expected slice B's lease_expired event to be recorded");
+  const claimed = allEvents.find(
+    (event) => event.kind === "slice.claimed" && event.slice_id === "a",
+  );
+  assert.ok(claimed, "expected slice A's claimed event to be recorded");
+  assert.ok(
+    leaseExpired.seq < claimed.seq,
+    "the in-lock sibling expiry must be ordered strictly before the triggering claim event",
   );
 });
