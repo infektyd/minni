@@ -1041,19 +1041,39 @@ adversarial review has no unresolved HIGH.
 
 Run after all implementation tasks:
 
+1. Focused privacy regressions in test suite:
 ```bash
-rg -n "claim_token|token_hash|thread-claims" \
-  plugins/minni/src \
+cd plugins/minni
+node --test --import ./tests/setup-env.mjs \
+  tests/thread-worker.test.mjs \
+  tests/thread-server.test.mjs \
+  tests/thread-events.test.mjs
+```
+Expected: all mode-0600 storage, non-disclosure, sentinel token/evidence, and response-isolation assertions pass.
+
+2. Model-facing envelope/render/docs scan:
+```bash
+rg -n "token_digest|token_hash|\bfilePath\b.*thread-claims|\.runtime/thread-claims" \
+  plugins/minni/src/agent_envelope.ts \
+  plugins/minni/src/hook-handlers.ts \
   plugins/minni/skills \
   plugins/minni/commands \
   docs \
   --glob '!docs/superpowers/**'
 ```
+Expected: empty output (no internal token digests, hashes, or private `.runtime/thread-claims` paths leak into agent envelopes, hook handlers, skills, commands, or documentation).
 
-Expected: only private-store implementation, typed input schema, and explicit
-non-disclosure documentation references. No renderer, envelope, audit payload,
-journal payload, or model-facing response contains a stored secret path or
-token except the one-time `minni_thread_claim` response.
+3. Model-facing tool schema boundary:
+```bash
+rg -n "token_digest|token_hash" \
+  plugins/minni/src/server.ts
+```
+Expected: empty output.
+
+4. Allowed token boundary documentation:
+- The secret lease token is exposed only in the `minni_thread_claim` response as property `token`.
+- The worker supplies this secret back as input argument `claim_token` to `minni_thread_worker_update`.
+- It is never stored in markdown note frontmatter, thread journals (`plan-*.log.md`), or audit logs.
 
 ## Phase 1 completion
 
