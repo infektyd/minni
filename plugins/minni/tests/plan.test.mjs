@@ -48,6 +48,17 @@ test("createPlan rejects duplicate explicit slice ids before writing", async () 
       /duplicate explicit slice id "same"/,
     );
     await assert.rejects(
+      createPlan({
+        goal: "Reject generated and explicit slice id collision",
+        slices: [
+          { title: "Generated Same" },
+          { id: "generated-same", title: "Explicit Same" },
+        ],
+        vaultPath: root,
+      }, { vaultPath: root }),
+      /duplicate slice id "generated-same"/,
+    );
+    await assert.rejects(
       readdir(path.join(root, "wiki", "artifacts")),
       /ENOENT/,
     );
