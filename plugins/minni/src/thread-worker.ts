@@ -23,16 +23,24 @@ import {
   findOrderedEventByIdempotencyKey,
   reconcileThreadJournal,
   readOrderedThreadEvents,
-  type OperationEventIdentity,
+  ThreadEventIdempotencyConflictError,
   type ReadySummaryPayload,
 } from "./thread-events.js";
 import {
+  commitWorkerUpdateReceipt,
   createClaimSecret,
   deleteClaimSecret,
+  hashWorkerUpdateToken,
   readClaimByIdempotency,
+  readWorkerUpdateReceipt,
   verifyClaimToken,
+  workerUpdateTokenMatches,
+  writePendingWorkerUpdateReceipt,
   type ThreadClaimResponse,
+  type WorkerUpdateReceiptEnvelope,
+  type WorkerUpdateReceiptResponse,
 } from "./thread-claims.js";
+import { stableStringify } from "./agent_envelope.js";
 import { withThreadLock } from "./thread-lock.js";
 
 const DEFAULT_CLAIM_TTL_SECONDS = 10 * 60;
@@ -336,6 +344,29 @@ function mutationResult(
   };
 }
 
+function structurallyEqual(left: unknown, right: unknown): boolean {
+  return stableStringify(left) === stableStringify(right);
+}
+
+/**
+ * Reconstructs the exact ThreadMutationResult shape from a worker-update
+ * receipt's stored PUBLIC response. `plan` here is only ever used by a
+ * caller for `.rev` — the receipt's recorded rev, not the (possibly
+ * further-advanced) rev of the freshly loaded `plan` passed in, so a
+ * replay's rev never appears to increase.
+ */
+function receiptMutationResult(
+  plan: PlanArtifact,
+  receipt: WorkerUpdateReceiptEnvelope,
+): ThreadMutationResult {
+  return {
+    plan: { ...plan, rev: receipt.response.rev },
+    slice: receipt.response.slice,
+    ready_before: receipt.response.ready_before,
+    ready_after: receipt.response.ready_after,
+  };
+}
+
 function readyIdsEqual(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false;
   const sortedLeft = [...left].sort();
@@ -509,19 +540,6 @@ async function repairClaimSchedulerEvents(input: {
       });
     }
   }
-}
-
-function findWorkerUpdateIdempotency(
-  ordered: Awaited<ReturnType<typeof readOrderedThreadEvents>>,
-  identity: OperationEventIdentity,
-): boolean {
-  const existing = findOrderedEventByIdempotencyKey(
-    ordered,
-    identity.idempotencyKey,
-  );
-  if (!existing) return false;
-  assertOperationIdentity(existing, identity);
-  return true;
 }
 
 function publicClaimResponse(
@@ -1063,6 +1081,42 @@ function applyWorkerAction(
   }
 }
 
+/**
+ * Root-cause fix for the claim-clearing idempotency hole: a successful
+ * "complete" (or any other action that clears the live claim) leaves an
+ * identical retry with no live claim to authenticate against, so the OLD
+ * claim-scope check threw before an idempotency check was ever consulted.
+ * The receipt below is checked first, before a live claim is required at
+ * all, and authenticates the retry itself (a timing-safe digest of the
+ * original claim token) — the ordered Thread journal alone was never
+ * sufficient because it holds no secret to authenticate against, by design.
+ */
+async function loadWorkerUpdateReceipt(
+  input: UpdateClaimedSliceInput,
+  planId: string,
+  sliceId: string,
+  workerAgentId: string,
+  idempotencyKey: string,
+  kind: string,
+  token: string,
+): Promise<WorkerUpdateReceiptEnvelope | undefined> {
+  const receipt = await readWorkerUpdateReceipt({
+    vaultPath: input.vaultPath,
+    planId,
+    sliceId,
+    workerAgentId,
+    idempotencyKey,
+  });
+  if (!receipt) return undefined;
+  if (receipt.kind !== kind) {
+    throw new ThreadEventIdempotencyConflictError(idempotencyKey);
+  }
+  if (!workerUpdateTokenMatches(token, receipt.token_digest)) {
+    throw new Error("claim token mismatch");
+  }
+  return receipt;
+}
+
 export async function updateClaimedSlice(
   input: UpdateClaimedSliceInput,
   deps: ThreadWorkerDeps = {},
@@ -1080,6 +1134,7 @@ export async function updateClaimedSlice(
   );
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
+  const kind = workerEventKind(input.action);
 
   return withThreadPlanLock(
     {
@@ -1090,7 +1145,56 @@ export async function updateClaimedSlice(
     },
     async (plan) => {
       const now = sampleNow(input.now);
-      const { journalPath, ordered } = await prepareThreadMutation(
+
+      const existingReceipt = await loadWorkerUpdateReceipt(
+        input,
+        planId,
+        sliceId,
+        workerAgentId,
+        idempotencyKey,
+        kind,
+        token,
+      );
+      if (existingReceipt?.status === "committed") {
+        return receiptMutationResult(plan, existingReceipt);
+      }
+      if (existingReceipt) {
+        // Pending: an earlier attempt wrote this receipt before calling
+        // persist, then crashed (or is still in flight in another process)
+        // before it could be promoted to committed. Trust it only if the
+        // Thread's own strict current state already shows the exact result
+        // it recorded — never take the receipt's word for it.
+        let looksCommitted = false;
+        try {
+          looksCommitted =
+            plan.rev >= existingReceipt.rev &&
+            structurallyEqual(
+              findSlice(plan, sliceId),
+              existingReceipt.response.slice,
+            );
+        } catch {
+          looksCommitted = false;
+        }
+        if (looksCommitted) {
+          const committed = await commitWorkerUpdateReceipt({
+            vaultPath: input.vaultPath,
+            planId,
+            sliceId,
+            workerAgentId,
+            idempotencyKey,
+            kind,
+            tokenDigest: existingReceipt.token_digest,
+            rev: existingReceipt.rev,
+            response: existingReceipt.response,
+          });
+          return receiptMutationResult(plan, committed);
+        }
+        // Otherwise the recorded attempt never actually landed. Fall through
+        // and reprocess from the live claim; the stale pending receipt is
+        // unconditionally overwritten by the fresh attempt below.
+      }
+
+      const { journalPath } = await prepareThreadMutation(
         { ...input, planId, actor: workerAgentId },
         plan,
         now,
@@ -1125,17 +1229,6 @@ export async function updateClaimedSlice(
         throw new Error(`slice "${sliceId}" is not worker-updatable`);
       }
 
-      const operationIdentity: OperationEventIdentity = {
-        idempotencyKey,
-        kind: workerEventKind(input.action),
-        actor: workerAgentId,
-        sliceId,
-      };
-      if (findWorkerUpdateIdempotency(ordered, operationIdentity)) {
-        const readyBefore = readyIds(plan, now);
-        return mutationResult(plan, sliceId, readyBefore, now);
-      }
-
       const readyBefore = readyIds(plan, now);
       const applied = applyWorkerAction(plan, sliceId, input.action);
       let next = applied.plan;
@@ -1146,10 +1239,75 @@ export async function updateClaimedSlice(
           claim: undefined,
         });
       }
-      await persist(next, {
+
+      // persistPlan bumps `next.rev` in place only once it is called below;
+      // predict the value it will land on so the receipt written BEFORE
+      // that call already carries the exact rev/response a replay must see.
+      const intendedRev = plan.rev + 1;
+      const tokenDigest = hashWorkerUpdateToken(token);
+      const publicResponse: WorkerUpdateReceiptResponse = {
+        slice: findSlice(next, sliceId),
+        ready_before: readyBefore,
+        ready_after: readyIds(next, now),
+        rev: intendedRev,
+      };
+
+      await writePendingWorkerUpdateReceipt({
         vaultPath: input.vaultPath,
-        notePath: input.notePath,
+        planId,
+        sliceId,
+        workerAgentId,
+        idempotencyKey,
+        kind,
+        tokenDigest,
+        rev: intendedRev,
+        response: publicResponse,
       });
+
+      try {
+        await persist(next, {
+          vaultPath: input.vaultPath,
+          notePath: input.notePath,
+        });
+      } catch (error) {
+        // Mirrors claimSlice's own committed-despite-error detection: the
+        // typed PlanHistoryAppendError proves the note itself already
+        // landed; anything else is judged by reconciling a fresh strict
+        // read while still holding the Thread lock. A pending receipt that
+        // is NOT promoted here is not lost — the next locked attempt
+        // performs the exact same reconciliation before trusting it.
+        let committed = error instanceof PlanHistoryAppendError;
+        if (!committed) {
+          try {
+            const canonical = await rehydrateAuthority(input);
+            committed =
+              canonical.rev === intendedRev &&
+              structurallyEqual(
+                findSlice(canonical, sliceId),
+                publicResponse.slice,
+              );
+          } catch {
+            committed = false;
+          }
+        }
+        if (committed) {
+          await commitWorkerUpdateReceipt({
+            vaultPath: input.vaultPath,
+            planId,
+            sliceId,
+            workerAgentId,
+            idempotencyKey,
+            kind,
+            tokenDigest,
+            rev: intendedRev,
+            response: publicResponse,
+          }).catch(() => {});
+        }
+        // Either way this is surfaced to the caller below — a post-commit
+        // failure must never be silently swallowed into a success return.
+        throw error;
+      }
+
       if (applied.completed) {
         await deleteClaimSecretsBestEffort(
           input.vaultPath,
@@ -1158,6 +1316,17 @@ export async function updateClaimedSlice(
           deleteSecret,
         );
       }
+      await commitWorkerUpdateReceipt({
+        vaultPath: input.vaultPath,
+        planId,
+        sliceId,
+        workerAgentId,
+        idempotencyKey,
+        kind,
+        tokenDigest,
+        rev: intendedRev,
+        response: publicResponse,
+      });
       const result = mutationResult(next, sliceId, readyBefore, now);
       await recordThreadMutationEvents({
         journalPath,
@@ -1165,7 +1334,7 @@ export async function updateClaimedSlice(
         rev: next.rev,
         actor: workerAgentId,
         operationKey: idempotencyKey,
-        kind: workerEventKind(input.action),
+        kind,
         sliceId,
         readyBefore: result.ready_before,
         readyAfter: result.ready_after,

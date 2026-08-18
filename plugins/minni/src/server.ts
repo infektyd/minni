@@ -2000,6 +2000,18 @@ server.registerTool(
   },
 );
 
+// Task 6 followup: a whitespace-only key satisfied z.string().min(1) — the
+// SDK layer accepted it and thread-worker.ts's own requireNonEmpty caught it
+// several layers deeper as a generic domain error. Reject it here instead,
+// at the same layer every other structural validation for these tools
+// happens, with a message that names the offending field.
+const nonBlankIdempotencyKey = z
+  .string()
+  .min(1)
+  .refine((value) => value.trim().length > 0, {
+    message: "idempotency_key must not be blank",
+  });
+
 server.registerTool(
   "minni_thread_claim",
   {
@@ -2010,7 +2022,7 @@ server.registerTool(
       plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1),
       worker_agent_id: z.string().min(1),
-      idempotency_key: z.string().min(1),
+      idempotency_key: nonBlankIdempotencyKey,
       ttl_seconds: z.number().int().positive().optional(),
     },
   },
@@ -2097,13 +2109,13 @@ server.registerTool(
   {
     title: "Minni Thread Worker Update",
     description:
-      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the one-time claim token from minni_thread_claim. idempotency_key is required and must be non-empty — retries with the same key replay the original result rather than re-applying. plan_id defaults to the active plan.",
+      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the one-time claim token from minni_thread_claim. idempotency_key is required and must be non-empty — retries with the same key, token, and action replay the original result rather than re-applying, even after an action (like complete) that clears the live claim. plan_id defaults to the active plan.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1),
       worker_agent_id: z.string().min(1),
       claim_token: z.string().min(1),
-      idempotency_key: z.string().min(1),
+      idempotency_key: nonBlankIdempotencyKey,
       action: z.enum([
         "start",
         "progress",

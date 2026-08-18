@@ -195,6 +195,86 @@ test("minni_thread_assign -> claim -> worker_update completes a slice end to end
       evidence: "Verified against docs/source-a.md and docs/source-b.md",
     });
     assert.equal(done.slice.status, "done");
+
+    // Task 6 followup regression: "complete" clears the live claim once it
+    // durably lands, so an identical retry has no live claim left to
+    // authenticate the same token against — the OLD code threw "claim scope
+    // mismatch" here instead of replaying. The private worker-update
+    // receipt (keyed by plan/slice/worker/idempotency, holding a token
+    // digest and the original public response) is what a retry
+    // authenticates against instead.
+    const eventsBeforeRetry = await call("minni_thread_events", {
+      plan_id,
+      since_seq: 0,
+      limit: 200,
+    });
+    const retried = await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "research",
+      worker_agent_id: "worker-a",
+      claim_token: claim.token,
+      idempotency_key: "done-research-1",
+      action: "complete",
+      evidence: "Verified against docs/source-a.md and docs/source-b.md",
+    });
+    assert.deepEqual(
+      retried,
+      done,
+      "an identical retry after completion must replay the exact original response",
+    );
+    const eventsAfterRetry = await call("minni_thread_events", {
+      plan_id,
+      since_seq: 0,
+      limit: 200,
+    });
+    assert.deepEqual(
+      eventsAfterRetry.events,
+      eventsBeforeRetry.events,
+      "a same-key retry must never append a new journal event",
+    );
+    assert.equal(eventsAfterRetry.next_seq, eventsBeforeRetry.next_seq);
+
+    // A wrong token against the same idempotency key must fail typed — the
+    // receipt authenticates the retry via a timing-safe token digest, not
+    // by trusting the idempotency key alone.
+    const wrongToken = await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "research",
+      worker_agent_id: "worker-a",
+      claim_token: "wrong-token-does-not-match-the-original",
+      idempotency_key: "done-research-1",
+      action: "complete",
+      evidence: "Verified against docs/source-a.md and docs/source-b.md",
+    });
+    assert.equal(wrongToken.status, "error");
+    assert.match(wrongToken.error, /claim token mismatch/);
+
+    // The same idempotency key reused for a DIFFERENT action is a genuine
+    // identity conflict, not a replay — it must also fail typed.
+    const conflictingAction = await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "research",
+      worker_agent_id: "worker-a",
+      claim_token: claim.token,
+      idempotency_key: "done-research-1",
+      action: "start",
+    });
+    assert.equal(conflictingAction.status, "error");
+    assert.match(
+      conflictingAction.error,
+      /idempotency key .* already bound to a different operation/,
+    );
+
+    const eventsAfterConflicts = await call("minni_thread_events", {
+      plan_id,
+      since_seq: 0,
+      limit: 200,
+    });
+    assert.deepEqual(
+      eventsAfterConflicts.events,
+      eventsBeforeRetry.events,
+      "a rejected wrong-token or conflicting-action call must never append a new journal event either",
+    );
   });
 });
 
@@ -322,6 +402,70 @@ test("minni_thread_worker_update rejects an empty idempotency_key before it reac
   });
 });
 
+test("minni_thread_worker_update and minni_thread_claim reject a whitespace-only idempotency_key at the SDK layer", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call, send, awaitResponse }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
+    await call("minni_thread_assign", {
+      plan_id,
+      slice_id: "alpha",
+      worker_agent_id: "worker-a",
+    });
+
+    const claimId = 9101;
+    send({
+      jsonrpc: "2.0",
+      id: claimId,
+      method: "tools/call",
+      params: {
+        name: "minni_thread_claim",
+        arguments: {
+          plan_id,
+          slice_id: "alpha",
+          worker_agent_id: "worker-a",
+          idempotency_key: "   ",
+        },
+      },
+    });
+    const claimReply = await awaitResponse(claimId);
+    assert.equal(
+      claimReply.result?.isError,
+      true,
+      `a whitespace-only idempotency_key must be rejected before reaching thread-worker: ${JSON.stringify(claimReply)}`,
+    );
+
+    const claim = await call("minni_thread_claim", {
+      plan_id,
+      slice_id: "alpha",
+      worker_agent_id: "worker-a",
+      idempotency_key: "claim-alpha-blank-check",
+    });
+
+    const updateId = 9102;
+    send({
+      jsonrpc: "2.0",
+      id: updateId,
+      method: "tools/call",
+      params: {
+        name: "minni_thread_worker_update",
+        arguments: {
+          plan_id,
+          slice_id: "alpha",
+          worker_agent_id: "worker-a",
+          claim_token: claim.token,
+          idempotency_key: "\t\n ",
+          action: "start",
+        },
+      },
+    });
+    const updateReply = await awaitResponse(updateId);
+    assert.equal(
+      updateReply.result?.isError,
+      true,
+      `a whitespace-only idempotency_key must be rejected before reaching thread-worker: ${JSON.stringify(updateReply)}`,
+    );
+  });
+});
+
 test("minni_thread_worker_update's discriminated union strips fields that do not belong to the given action, never applies them", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);
@@ -396,8 +540,13 @@ test("minni_thread_worker_update schema exposes no topology, assignment, or forc
   }
   assert.match(
     schema,
-    /idempotency_key:\s*z\.string\(\)\.min\(1\)/,
-    "idempotency_key must be a required, non-empty field",
+    /idempotency_key:\s*nonBlankIdempotencyKey/,
+    "idempotency_key must be the shared, whitespace-rejecting schema",
+  );
+  assert.match(
+    source,
+    /const nonBlankIdempotencyKey\s*=\s*z\s*\n?\s*\.string\(\)\s*\n?\s*\.min\(1\)\s*\n?\s*\.refine\(/,
+    "the shared idempotency_key schema must reject whitespace-only values, not just length 0",
   );
 });
 

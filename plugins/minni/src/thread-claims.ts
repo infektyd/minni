@@ -17,6 +17,7 @@ import {
 import path from "node:path";
 
 import { stableStringify } from "./agent_envelope.js";
+import type { PlanSlice } from "./plan.js";
 import { withThreadLock } from "./thread-lock.js";
 
 const CLAIM_SCHEMA = "minni.thread-claim.v1" as const;
@@ -44,6 +45,37 @@ const RESPONSE_KEYS = [
   "slice_id",
   "token",
   "worker_agent_id",
+] as const;
+
+// Worker-update receipts: a SEPARATE private record from the claim secret
+// above. A claim-clearing action (e.g. "complete") deletes the live claim
+// once it durably lands, so an identical retry has nothing left to
+// authenticate against via verifyClaimToken. This receipt is what a retry
+// authenticates against instead — keyed by plan/slice/worker/idempotency
+// (never by claim id or generation, both of which the clearing action just
+// invalidated), holding only a timing-safe digest of the claim token that
+// authorized the original call, never the token itself.
+const RECEIPT_SCHEMA = "minni.thread-worker-update-receipt.v1" as const;
+const RECEIPT_ID_PATTERN = /^[0-9a-f]{32}$/;
+const TOKEN_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+const MAX_RECEIPT_BYTES = 64 * 1024;
+const RECEIPT_ENVELOPE_KEYS = [
+  "idempotency_key",
+  "kind",
+  "plan_id",
+  "response",
+  "rev",
+  "schema",
+  "slice_id",
+  "status",
+  "token_digest",
+  "worker_agent_id",
+] as const;
+const RECEIPT_RESPONSE_KEYS = [
+  "ready_after",
+  "ready_before",
+  "rev",
+  "slice",
 ] as const;
 
 export interface ClaimSecretEnvelope {
@@ -106,6 +138,49 @@ export interface DeleteClaimSecretInput {
   vaultPath: string;
   planId: string;
   claimId: string;
+}
+
+/**
+ * The exact public shape a worker-update tool call returns. Safe to store
+ * verbatim — it is model-facing already — but it is not the same thing as a
+ * journal event: it lives only in this private receipt, never in the
+ * ordered Thread journal minni_thread_events reads.
+ */
+export interface WorkerUpdateReceiptResponse {
+  slice: PlanSlice;
+  ready_before: string[];
+  ready_after: string[];
+  rev: number;
+}
+
+export type WorkerUpdateReceiptStatus = "pending" | "committed";
+
+export interface WorkerUpdateReceiptEnvelope {
+  schema: "minni.thread-worker-update-receipt.v1";
+  plan_id: string;
+  slice_id: string;
+  worker_agent_id: string;
+  idempotency_key: string;
+  kind: string;
+  token_digest: string;
+  status: WorkerUpdateReceiptStatus;
+  rev: number;
+  response: WorkerUpdateReceiptResponse;
+}
+
+export interface WorkerUpdateReceiptIdentity {
+  vaultPath: string;
+  planId: string;
+  sliceId: string;
+  workerAgentId: string;
+  idempotencyKey: string;
+}
+
+export interface WriteWorkerUpdateReceiptInput extends WorkerUpdateReceiptIdentity {
+  kind: string;
+  tokenDigest: string;
+  rev: number;
+  response: WorkerUpdateReceiptResponse;
 }
 
 interface ClaimLocation {
@@ -191,6 +266,47 @@ function claimIdFor(
     }))
     .digest("hex")
     .slice(0, 32);
+}
+
+// Deliberately omits generation: a claim-clearing action invalidates the
+// slice's generation for future claims, but a retry of THAT SAME action
+// must still resolve to the SAME receipt regardless. plan/slice/worker/
+// idempotency_key alone is exactly what the request itself declares.
+function receiptIdFor(
+  planId: string,
+  sliceId: string,
+  workerAgentId: string,
+  idempotencyKey: string,
+): string {
+  return createHash("sha256")
+    .update(stableStringify({
+      plan_id: planId,
+      slice_id: sliceId,
+      worker_agent_id: workerAgentId,
+      idempotency_key: idempotencyKey,
+    }))
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function tokenDigestOf(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+/** Timing-safe: compares digests, never the raw token bytes. */
+export function hashWorkerUpdateToken(token: string): string {
+  requireNonEmpty(token, "claim token");
+  return tokenDigestOf(token);
+}
+
+export function workerUpdateTokenMatches(
+  suppliedToken: string,
+  storedDigestHex: string,
+): boolean {
+  if (!TOKEN_DIGEST_PATTERN.test(storedDigestHex)) return false;
+  const supplied = createHash("sha256").update(suppliedToken).digest();
+  const stored = Buffer.from(storedDigestHex, "hex");
+  return supplied.length === stored.length && timingSafeEqual(supplied, stored);
 }
 
 function directoryOpenFlags(): number {
@@ -370,6 +486,123 @@ async function withClaimLocation<T>(
   }
 }
 
+interface ReceiptLocation {
+  fdAliasRoot: string;
+  vaultHandle: FileHandle;
+  runtimeHandle: FileHandle;
+  claimsHandle: FileHandle;
+  planHandle: FileHandle;
+  updatesHandle: FileHandle;
+  vaultPath: string;
+  runtimePath: string;
+  claimsPath: string;
+  planPath: string;
+  updatesPath: string;
+  filePath: string;
+  fileName: string;
+}
+
+/**
+ * Same descriptor-anchored authority as withClaimLocation (vault ->
+ * .runtime -> thread-claims -> <planHash>), one level deeper into an
+ * "updates" child so a receipt file can never collide with, or be
+ * confused for, a claim secret's <claimId>.json in the same plan
+ * directory.
+ */
+async function withReceiptLocation<T>(
+  vaultPath: string,
+  planId: string,
+  receiptId: string,
+  create: boolean,
+  fn: (location: ReceiptLocation | undefined) => Promise<T>,
+): Promise<T> {
+  requireNonEmpty(vaultPath, "vault path");
+  requireNonEmpty(planId, "plan id");
+  if (!RECEIPT_ID_PATTERN.test(receiptId)) {
+    throw pathMismatch();
+  }
+
+  const logicalVaultPath = path.resolve(vaultPath);
+  const handles: FileHandle[] = [];
+  try {
+    let vaultHandle: FileHandle;
+    try {
+      vaultHandle = await open(logicalVaultPath, directoryOpenFlags());
+    } catch (error) {
+      if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
+        throw pathMismatch();
+      }
+      throw error;
+    }
+    handles.push(vaultHandle);
+    const vaultStat = await vaultHandle.stat();
+    if (!vaultStat.isDirectory()) throw pathMismatch();
+    const fdAliasRoot = await detectFdAliasRoot(vaultHandle);
+
+    const runtimeHandle = await openPrivateChildDirectory(
+      vaultHandle,
+      fdAliasRoot,
+      ".runtime",
+      create,
+    );
+    if (!runtimeHandle) return await fn(undefined);
+    handles.push(runtimeHandle);
+
+    const claimsHandle = await openPrivateChildDirectory(
+      runtimeHandle,
+      fdAliasRoot,
+      "thread-claims",
+      create,
+    );
+    if (!claimsHandle) return await fn(undefined);
+    handles.push(claimsHandle);
+
+    const planHash = hashSegment(planId);
+    const planHandle = await openPrivateChildDirectory(
+      claimsHandle,
+      fdAliasRoot,
+      planHash,
+      create,
+    );
+    if (!planHandle) return await fn(undefined);
+    handles.push(planHandle);
+
+    const updatesHandle = await openPrivateChildDirectory(
+      planHandle,
+      fdAliasRoot,
+      "updates",
+      create,
+    );
+    if (!updatesHandle) return await fn(undefined);
+    handles.push(updatesHandle);
+
+    const runtimePath = path.join(logicalVaultPath, ".runtime");
+    const claimsPath = path.join(runtimePath, "thread-claims");
+    const planPath = path.join(claimsPath, planHash);
+    const updatesPath = path.join(planPath, "updates");
+    const fileName = `${receiptId}.json`;
+    return await fn({
+      fdAliasRoot,
+      vaultHandle,
+      runtimeHandle,
+      claimsHandle,
+      planHandle,
+      updatesHandle,
+      vaultPath: logicalVaultPath,
+      runtimePath,
+      claimsPath,
+      planPath,
+      updatesPath,
+      filePath: path.join(updatesPath, fileName),
+      fileName,
+    });
+  } finally {
+    for (const handle of handles.reverse()) {
+      await handle.close().catch(() => {});
+    }
+  }
+}
+
 async function logicalPathMatchesHandle(
   logicalPath: string,
   expectedHandle: FileHandle,
@@ -409,6 +642,21 @@ async function assertLocationStillAttached(
     logicalPathMatchesHandle(location.runtimePath, location.runtimeHandle),
     logicalPathMatchesHandle(location.claimsPath, location.claimsHandle),
     logicalPathMatchesHandle(location.planPath, location.planHandle),
+  ]);
+  if (matches.some((match) => !match)) {
+    throw new ClaimStoreParentChangedError();
+  }
+}
+
+async function assertReceiptLocationStillAttached(
+  location: ReceiptLocation,
+): Promise<void> {
+  const matches = await Promise.all([
+    logicalPathMatchesHandle(location.vaultPath, location.vaultHandle),
+    logicalPathMatchesHandle(location.runtimePath, location.runtimeHandle),
+    logicalPathMatchesHandle(location.claimsPath, location.claimsHandle),
+    logicalPathMatchesHandle(location.planPath, location.planHandle),
+    logicalPathMatchesHandle(location.updatesPath, location.updatesHandle),
   ]);
   if (matches.some((match) => !match)) {
     throw new ClaimStoreParentChangedError();
@@ -622,6 +870,304 @@ async function unlinkEnvelope(location: ClaimLocation): Promise<void> {
     if (!isErrno(error, "ENOENT")) throw error;
   }
   await location.planHandle.sync();
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isPlanSliceLike(value: unknown): value is PlanSlice {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.title === "string" &&
+    typeof value.status === "string"
+  );
+}
+
+function parseReceiptEnvelope(
+  raw: string,
+  expected: WorkerUpdateReceiptIdentity & { receiptId: string },
+): WorkerUpdateReceiptEnvelope {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw metadataMismatch();
+  }
+  if (!isRecord(value) || !isRecord(value.response)) {
+    throw metadataMismatch();
+  }
+
+  const response = value.response;
+  if (
+    !hasExactKeys(value, RECEIPT_ENVELOPE_KEYS) ||
+    !hasExactKeys(response, RECEIPT_RESPONSE_KEYS) ||
+    value.schema !== RECEIPT_SCHEMA ||
+    typeof value.plan_id !== "string" ||
+    value.plan_id.trim().length === 0 ||
+    typeof value.slice_id !== "string" ||
+    value.slice_id.trim().length === 0 ||
+    typeof value.worker_agent_id !== "string" ||
+    value.worker_agent_id.trim().length === 0 ||
+    typeof value.idempotency_key !== "string" ||
+    value.idempotency_key.trim().length === 0 ||
+    typeof value.kind !== "string" ||
+    value.kind.trim().length === 0 ||
+    typeof value.token_digest !== "string" ||
+    !TOKEN_DIGEST_PATTERN.test(value.token_digest) ||
+    (value.status !== "pending" && value.status !== "committed") ||
+    !Number.isSafeInteger(value.rev) ||
+    (value.rev as number) < 0 ||
+    !isPlanSliceLike(response.slice) ||
+    !isStringArray(response.ready_before) ||
+    !isStringArray(response.ready_after) ||
+    !Number.isSafeInteger(response.rev) ||
+    (response.rev as number) < 0
+  ) {
+    throw metadataMismatch();
+  }
+
+  const envelope = value as unknown as WorkerUpdateReceiptEnvelope;
+  const derivedReceiptId = receiptIdFor(
+    envelope.plan_id,
+    envelope.slice_id,
+    envelope.worker_agent_id,
+    envelope.idempotency_key,
+  );
+  if (
+    derivedReceiptId !== expected.receiptId ||
+    envelope.plan_id !== expected.planId ||
+    envelope.slice_id !== expected.sliceId ||
+    envelope.worker_agent_id !== expected.workerAgentId ||
+    envelope.idempotency_key !== expected.idempotencyKey ||
+    envelope.response.rev !== envelope.rev
+  ) {
+    throw metadataMismatch();
+  }
+  return envelope;
+}
+
+async function readReceiptEnvelope(
+  location: ReceiptLocation | undefined,
+  expected: WorkerUpdateReceiptIdentity & { receiptId: string },
+): Promise<WorkerUpdateReceiptEnvelope | undefined> {
+  if (!location) return undefined;
+
+  let handle;
+  try {
+    handle = await open(
+      childOfHandle(
+        location.fdAliasRoot,
+        location.updatesHandle,
+        location.fileName,
+      ),
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    if (isErrno(error, "ELOOP")) throw pathMismatch();
+    throw error;
+  }
+
+  try {
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile() || fileStat.nlink !== 1) {
+      throw pathMismatch();
+    }
+    if ((fileStat.mode & 0o777) !== 0o600) {
+      throw new Error("worker update receipt permissions mismatch");
+    }
+    if (fileStat.size > MAX_RECEIPT_BYTES) {
+      throw metadataMismatch();
+    }
+    const raw = await handle.readFile("utf8");
+    const afterReadStat = await handle.stat();
+    if (
+      !afterReadStat.isFile() ||
+      afterReadStat.nlink !== 1 ||
+      (afterReadStat.mode & 0o777) !== 0o600
+    ) {
+      throw new Error("worker update receipt permissions mismatch");
+    }
+    return parseReceiptEnvelope(raw, expected);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Unlike writeEnvelopeAtomic (claim secrets are always create-once), this
+ * unconditionally replaces any existing file at the destination. Every
+ * caller has already decided, before reaching this write, that doing so is
+ * safe: either no receipt existed yet, or the existing one was a pending
+ * receipt already proven stale (its recorded result never actually landed).
+ */
+async function writeReceiptEnvelopeAtomic(
+  location: ReceiptLocation,
+  envelope: WorkerUpdateReceiptEnvelope,
+): Promise<void> {
+  const temporaryName = `.${location.fileName}.${randomBytes(16).toString("hex")}.tmp`;
+  const temporaryPath = childOfHandle(
+    location.fdAliasRoot,
+    location.updatesHandle,
+    temporaryName,
+  );
+  const finalPath = childOfHandle(
+    location.fdAliasRoot,
+    location.updatesHandle,
+    location.fileName,
+  );
+
+  let handle;
+  try {
+    handle = await open(
+      temporaryPath,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.chmod(0o600);
+    await handle.writeFile(`${JSON.stringify(envelope)}\n`, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+
+    await rename(temporaryPath, finalPath);
+    await location.updatesHandle.sync();
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await unlink(temporaryPath).catch((error) => {
+      if (!isErrno(error, "ENOENT")) throw error;
+    });
+  }
+}
+
+async function withReceiptLock<T>(
+  vaultPath: string,
+  planId: string,
+  receiptId: string,
+  fn: (location: ReceiptLocation) => Promise<T>,
+): Promise<T> {
+  let anchoredVaultPath = "";
+  await withReceiptLocation(vaultPath, planId, receiptId, true, async (location) => {
+    if (!location) throw pathMismatch();
+    anchoredVaultPath = location.vaultPath;
+  });
+  return withThreadLock(
+    anchoredVaultPath,
+    `update:${hashSegment(planId)}:${receiptId}`,
+    randomUUID(),
+    () =>
+      withReceiptLocation(
+        anchoredVaultPath,
+        planId,
+        receiptId,
+        true,
+        async (lockedLocation) => {
+          if (!lockedLocation) throw pathMismatch();
+          return fn(lockedLocation);
+        },
+      ),
+  );
+}
+
+export async function readWorkerUpdateReceipt(
+  input: WorkerUpdateReceiptIdentity,
+): Promise<WorkerUpdateReceiptEnvelope | undefined> {
+  requireNonEmpty(input.vaultPath, "vault path");
+  requireNonEmpty(input.planId, "plan id");
+  requireNonEmpty(input.sliceId, "slice id");
+  requireNonEmpty(input.workerAgentId, "worker agent id");
+  requireNonEmpty(input.idempotencyKey, "idempotency key");
+  const receiptId = receiptIdFor(
+    input.planId,
+    input.sliceId,
+    input.workerAgentId,
+    input.idempotencyKey,
+  );
+  return withReceiptLocation(
+    input.vaultPath,
+    input.planId,
+    receiptId,
+    false,
+    (location) => readReceiptEnvelope(location, { ...input, receiptId }),
+  );
+}
+
+function validateReceiptWriteInput(
+  input: WriteWorkerUpdateReceiptInput,
+): string {
+  requireNonEmpty(input.vaultPath, "vault path");
+  requireNonEmpty(input.planId, "plan id");
+  requireNonEmpty(input.sliceId, "slice id");
+  requireNonEmpty(input.workerAgentId, "worker agent id");
+  requireNonEmpty(input.idempotencyKey, "idempotency key");
+  requireNonEmpty(input.kind, "operation kind");
+  if (!TOKEN_DIGEST_PATTERN.test(input.tokenDigest)) {
+    throw new Error("worker update receipt requires a valid token digest");
+  }
+  requireNonNegativeInteger(input.rev, "revision");
+  if (input.response.rev !== input.rev) {
+    throw new Error("worker update receipt response rev must match rev");
+  }
+  return receiptIdFor(
+    input.planId,
+    input.sliceId,
+    input.workerAgentId,
+    input.idempotencyKey,
+  );
+}
+
+async function writeWorkerUpdateReceipt(
+  input: WriteWorkerUpdateReceiptInput,
+  status: WorkerUpdateReceiptStatus,
+): Promise<WorkerUpdateReceiptEnvelope> {
+  const receiptId = validateReceiptWriteInput(input);
+  return withReceiptLock(input.vaultPath, input.planId, receiptId, async (location) => {
+    const envelope: WorkerUpdateReceiptEnvelope = {
+      schema: RECEIPT_SCHEMA,
+      plan_id: input.planId,
+      slice_id: input.sliceId,
+      worker_agent_id: input.workerAgentId,
+      idempotency_key: input.idempotencyKey,
+      kind: input.kind,
+      token_digest: input.tokenDigest,
+      status,
+      rev: input.rev,
+      response: input.response,
+    };
+    await writeReceiptEnvelopeAtomic(location, envelope);
+    await assertReceiptLocationStillAttached(location);
+    return envelope;
+  });
+}
+
+/**
+ * Written BEFORE persistPlan is called, while still holding the Thread
+ * lock, so a crash between this write and the actual persist leaves a
+ * receipt whose recorded result never landed. readWorkerUpdateReceipt's
+ * caller is responsible for treating a "pending" status as untrusted
+ * unless the current strict Thread state matches — this function only
+ * writes the record, it never decides whether one is trustworthy.
+ */
+export async function writePendingWorkerUpdateReceipt(
+  input: WriteWorkerUpdateReceiptInput,
+): Promise<WorkerUpdateReceiptEnvelope> {
+  return writeWorkerUpdateReceipt(input, "pending");
+}
+
+/**
+ * Promotes a pending receipt (or writes a fresh committed one directly) once
+ * the caller has independently confirmed the note write actually landed.
+ */
+export async function commitWorkerUpdateReceipt(
+  input: WriteWorkerUpdateReceiptInput,
+): Promise<WorkerUpdateReceiptEnvelope> {
+  return writeWorkerUpdateReceipt(input, "committed");
 }
 
 async function withClaimLock<T>(

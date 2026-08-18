@@ -1933,6 +1933,87 @@ test("claimSlice surfaces a real persistPlan history-append failure, then an ide
   assert.equal(stored.envelope.claim_id, retry.claim_id);
 });
 
+test("workerUpdate surfaces a real persistPlan history-append failure on complete, then an identical retry replays the same committed result via its receipt", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-a-history",
+    now: new Date(THREAD_START),
+  });
+
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  const updateInput = {
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    idempotencyKey: "complete-a-history-eisdir",
+    action: {
+      action: "complete",
+      evidence: "Completed despite a broken history append",
+    },
+    now: () => new Date("2026-08-18T12:05:00.000Z"),
+  };
+
+  // The first call must NOT silently return a success response — the note
+  // committed (including clearing the live claim) but the history journal
+  // for this revision is missing, and that must be visible to the caller.
+  const failure = await workerUpdate(updateInput).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+  assert.equal(failure.ok, false, JSON.stringify(failure));
+  assert.ok(
+    failure.error instanceof PlanHistoryAppendError,
+    `expected PlanHistoryAppendError, got ${failure.error?.constructor?.name}: ${failure.error?.message}`,
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(
+    durable.slices[0].status,
+    "done",
+    "the note write itself is durable despite the thrown error",
+  );
+  assert.equal(
+    durable.slices[0].claim,
+    undefined,
+    "completion already cleared the live claim in the durable note",
+  );
+
+  // Same idempotency key + same token: a live-claim retry is now
+  // impossible (completion cleared it), so this can only succeed via the
+  // private worker-update receipt written before persist and promoted to
+  // committed in the catch block above — the exact crash window the
+  // adversarial review flagged.
+  const retried = await workerUpdate(updateInput);
+  assert.equal(retried.slice.status, "done");
+  assert.equal(
+    retried.slice.evidence,
+    "Completed despite a broken history append",
+  );
+  assert.equal(
+    retried.plan.rev,
+    durable.rev,
+    "a receipt replay must never appear to advance rev",
+  );
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    events.filter(
+      (event) => event.idempotency_key === "complete-a-history-eisdir",
+    ).length,
+    0,
+    "a history-append failure must never leave a false slice.completed event behind",
+  );
+});
+
 test("upgrade-eligible status reads hold the Thread lock through upgrade persistence", async (t) => {
   const fixture = await threadFixture(t, [
     { id: "a", title: "Slice A" },
