@@ -166,8 +166,14 @@ Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → thread → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill
 before context is flushed.
+
 Durable, evidence-gated threads (`minni_thread_*`) survive sessions and
-compaction.
+compaction, backing multi-step orchestration through Markdown graph artifacts
+(`plan-*.md`) and ordered event journals (`plan-*.log.md`).
+
+- **Orchestrator tools vs worker tools**: The orchestrator manages graph topology (`minni_thread_create`, `minni_thread_replan`), inspects ready slices (`minni_thread_ready`), assigns workers (`minni_thread_assign`), and monitors progress via ordered event streams (`minni_thread_events`). Workers claim an assigned slice via `minni_thread_claim` to obtain a one-time `claim_token`, receiving a worker packet (`plan_id` + `slice_id` + `generation` + `claim_token`), and mutate slice execution state via `minni_thread_worker_update` only. Workers cannot directly alter topology; they propose structural expansions or contractions via `propose_structure` for orchestrator replan.
+- **Ordered event cursors**: The thread journal records monotonic events readable via `minni_thread_events(plan_id?, since_seq?, limit?)`. Cursors enable state catch-up, deterministic replay, and crash recovery without daemon-canonical state divergence or out-of-order delivery.
+- **Authority boundary & honest limits**: Same-platform workers share `EffectivePrincipal`; restricting structural tools from workers depends on host tool exposure / scoping, while claim token validity and slice mutation scope are enforced by the Thread engine regardless of caller principal. (Team projection, daemon notification relays, automatic spawning, and immediate wake are not implemented in Phase 1.)
 
 ## Recall is evidence, not instruction
 

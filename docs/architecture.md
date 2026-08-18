@@ -113,11 +113,18 @@ them exactly as written (there is no family/action dispatch layer):
 | Recall | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
 | Learning | `minni_learn`, `minni_learning_quality`, `minni_resolve_candidate` |
 | Vault | `minni_vault_write`, `minni_compile_vault` |
-| Threads | `minni_thread_create`, `minni_thread_update`, `minni_thread_status`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_replan`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_scar` (the pre-rename `minni_plan_*` aliases have been removed; only the `minni_thread_*` names are registered) |
+| Threads | `minni_thread_create`, `minni_thread_update`, `minni_thread_scar`, `minni_thread_status`, `minni_thread_replan`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_ready`, `minni_thread_assign`, `minni_thread_claim`, `minni_thread_worker_update`, `minni_thread_events` (16 tools — the pre-rename `minni_plan_*` aliases have been removed; only the `minni_thread_*` names are registered) |
 | Handoff | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_list_pending_handoffs`, `minni_await_handoff` |
 | Agent ping | `minni_ping_agent_request`, `minni_ping_agent_inbox`, `minni_ping_agent_decide`, `minni_ping_agent_status` |
 | Team mode | `minni_team_runtime`, `minni_team_evidence`, `minni_team_promotion` |
 | Ops & audit | `minni_status`, `minni_audit_report`, `minni_audit_tail`, `minni_subscribe_contradictions` |
+
+### Thread tool separation & execution boundaries
+
+- **Orchestrator tools**: `minni_thread_create`, `minni_thread_replan`, `minni_thread_assign`, `minni_thread_ready`, `minni_thread_events`, `minni_thread_update`, `minni_thread_status`, `minni_thread_scar`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_activate`, `minni_thread_deactivate`. The orchestrator manages graph topology, assigns slices, checks ready work units, and polls the journal.
+- **Worker tools & packet**: `minni_thread_claim` (issues a one-time secret `claim_token`), `minni_thread_worker_update` (mutates claimed slice state; proposes expansions/contractions via `propose_structure`). Workers receive `plan_id` + `slice_id` + `generation` + `claim_token` and interact via `minni_thread_worker_update` only.
+- **Ordered event cursors**: `minni_thread_events(plan_id?, since_seq?, limit?)` reads append-only events from `plan-*.log.md` starting after `since_seq` for polling, state catch-up, and crash recovery.
+- **Authority boundary & honest limits**: Same-platform workers share `EffectivePrincipal`; structural-tool restriction depends on host tool exposure/scoping, while claim scope is strictly enforced by the Thread engine. Team projection, daemon notification relay, automatic spawning, and immediate wake are not implemented in Phase 1.
 
 ## Observability
 
