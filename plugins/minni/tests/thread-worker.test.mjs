@@ -378,6 +378,76 @@ test("parent swap before temporary open cannot redirect a claim write", async (t
   );
 });
 
+test("thread-claims and plan-directory swaps cannot redirect a claim write", async (t) => {
+  for (const swappedParent of ["thread-claims", "plan-directory"]) {
+    await t.test(swappedParent, async (st) => {
+      const input = await claimFixture(st);
+      const outside = await mkdtemp(
+        path.join(tmpdir(), "minni-claim-race-outside-"),
+      );
+      st.after(() => rm(outside, { recursive: true, force: true }));
+      const { planHash } = claimPathParts(input);
+      const claimsPath = path.join(
+        input.vaultPath,
+        ".runtime",
+        "thread-claims",
+      );
+      const parentPath =
+        swappedParent === "thread-claims"
+          ? claimsPath
+          : path.join(claimsPath, planHash);
+      const movedParentPath =
+        swappedParent === "thread-claims"
+          ? path.join(input.vaultPath, ".runtime", "thread-claims-original")
+          : path.join(claimsPath, `${planHash}-original`);
+      const outsidePlanDir =
+        swappedParent === "thread-claims"
+          ? path.join(outside, planHash)
+          : outside;
+      const originalPlanDir =
+        swappedParent === "thread-claims"
+          ? path.join(movedParentPath, planHash)
+          : movedParentPath;
+      await mkdir(outsidePlanDir, { recursive: true, mode: 0o700 });
+
+      const originalOpen = fs.promises.open;
+      let swapped = false;
+      fs.promises.open = async (target, flags, ...args) => {
+        if (
+          !swapped &&
+          String(target).endsWith(".tmp") &&
+          (Number(flags) & constants.O_CREAT) !== 0
+        ) {
+          swapped = true;
+          await rename(parentPath, movedParentPath);
+          await symlink(outside, parentPath, "dir");
+        }
+        return originalOpen(target, flags, ...args);
+      };
+      syncBuiltinESMExports();
+
+      try {
+        await assert.rejects(
+          createClaimSecret(input),
+          /claim store parent changed during operation/,
+        );
+      } finally {
+        fs.promises.open = originalOpen;
+        syncBuiltinESMExports();
+      }
+
+      assert.equal(swapped, true);
+      assert.deepEqual(await readdir(outsidePlanDir), []);
+      assert.deepEqual(
+        (await readdir(originalPlanDir)).filter(
+          (name) => name.endsWith(".json") || name.endsWith(".tmp"),
+        ),
+        [],
+      );
+    });
+  }
+});
+
 test("parent swap before atomic rename cannot redirect or orphan a claim write", async (t) => {
   const input = await claimFixture(t);
   const outside = await mkdtemp(path.join(tmpdir(), "minni-claim-race-outside-"));
@@ -473,7 +543,7 @@ test("parent swap before final read cannot redirect to an outside envelope", asy
 });
 
 test("claim store refuses symlink escapes from the vault runtime tree", async (t) => {
-  for (const escapedSegment of [".runtime", "thread-claims"]) {
+  for (const escapedSegment of [".runtime", "thread-claims", "plan-directory"]) {
     await t.test(escapedSegment, async (st) => {
       const vaultPath = await mkdtemp(path.join(tmpdir(), "minni-claim-vault-"));
       const outside = await mkdtemp(path.join(tmpdir(), "minni-claim-outside-"));
@@ -485,12 +555,24 @@ test("claim store refuses symlink escapes from the vault runtime tree", async (t
       if (escapedSegment === ".runtime") {
         await symlink(outside, path.join(vaultPath, ".runtime"), "dir");
       } else {
-        await mkdir(path.join(vaultPath, ".runtime"));
-        await symlink(
-          outside,
-          path.join(vaultPath, ".runtime", "thread-claims"),
-          "dir",
+        const claimsPath = path.join(vaultPath, ".runtime", "thread-claims");
+        await mkdir(
+          escapedSegment === "thread-claims"
+            ? path.dirname(claimsPath)
+            : claimsPath,
+          { recursive: true },
         );
+        const escapedPath =
+          escapedSegment === "thread-claims"
+            ? claimsPath
+            : path.join(
+                claimsPath,
+                createHash("sha256")
+                  .update("plan-escape")
+                  .digest("hex")
+                  .slice(0, 32),
+              );
+        await symlink(outside, escapedPath, "dir");
       }
 
       await assert.rejects(
