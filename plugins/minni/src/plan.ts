@@ -1286,6 +1286,29 @@ export function addScar(plan: PlanArtifact, entry: ScarTissueEntry): PlanArtifac
   return nextPlan;
 }
 
+function sameStringSet(
+  left: string[] | undefined,
+  right: string[] | undefined,
+): boolean {
+  const a = [...(left ?? [])].sort();
+  const b = [...(right ?? [])].sort();
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * A structural edit invalidates any work issued for the old slice meaning.
+ * Clearing the public claim ref removes it from every worker authority path;
+ * incrementing generation also prevents an orphaned private envelope from
+ * becoming authoritative again if the slice is later reassigned.
+ */
+function invalidateSliceGeneration(slice: PlanSlice): PlanSlice {
+  return {
+    ...slice,
+    generation: (slice.generation ?? 0) + 1,
+    claim: undefined,
+  };
+}
+
 /** Replan: preserve superset (never drop history). Mark no-longer-proposed non-final slices superseded; append unmatched new ones. Pure. */
 export function replan(
   plan: PlanArtifact,
@@ -1307,7 +1330,11 @@ export function replan(
         ((ns.title ?? "").trim().toLowerCase() === slice.title.trim().toLowerCase()),
     );
     if (!stillProposed && slice.status !== "done" && slice.status !== "superseded") {
-      return { ...slice, status: "superseded", superseded_by: supersededMarker };
+      return invalidateSliceGeneration({
+        ...slice,
+        status: "superseded",
+        superseded_by: supersededMarker,
+      });
     }
     return slice;
   });
@@ -1357,12 +1384,19 @@ export function replan(
       const idx = nextSlices.findIndex((s) => s.id === ns.id);
       if (idx >= 0) {
         const cur = nextSlices[idx];
-        nextSlices[idx] = {
+        const refreshed: PlanSlice = {
           ...cur,
           title: ns.title || cur.title,
           gate: ns.gate ?? cur.gate,
           depends_on: ns.depends_on ?? cur.depends_on,
         };
+        const meaningChanged =
+          refreshed.title !== cur.title ||
+          refreshed.gate !== cur.gate ||
+          !sameStringSet(refreshed.depends_on, cur.depends_on);
+        nextSlices[idx] = meaningChanged
+          ? invalidateSliceGeneration(refreshed)
+          : refreshed;
       }
     }
   }
@@ -1866,7 +1900,11 @@ export function applySliceDelta(
   const dropSet = new Set(delta.drop_slice_ids ?? []);
   let nextSlices: PlanSlice[] = plan.slices.map((slice) => {
     if (dropSet.has(slice.id) && slice.status !== "done" && slice.status !== "superseded") {
-      return { ...slice, status: "superseded", superseded_by: supersededMarker };
+      return invalidateSliceGeneration({
+        ...slice,
+        status: "superseded",
+        superseded_by: supersededMarker,
+      });
     }
     return slice;
   });
