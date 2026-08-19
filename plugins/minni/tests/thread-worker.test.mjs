@@ -1759,7 +1759,6 @@ test("every production Thread read-modify-write path enters the shared lock", as
   for (const name of [
     "minni_thread_update",
     "minni_thread_scar",
-    "minni_thread_status",
     "minni_thread_replan",
   ]) {
     assert.match(
@@ -1768,6 +1767,18 @@ test("every production Thread read-modify-write path enters the shared lock", as
       `${name} must use the strict lock-before-rehydrate helper`,
     );
   }
+  // status shares the locked expiry sweep with events/ready — that helper
+  // enters withThreadPlanLock internally; do not require a second direct lock.
+  assert.match(
+    handlerBlock("minni_thread_status"),
+    /synchronizeExpiredClaims/,
+    "minni_thread_status must run the shared expiry sweep (lock + rehydrate)",
+  );
+  assert.match(
+    handlerBlock("minni_thread_events"),
+    /synchronizeExpiredClaims/,
+    "minni_thread_events must run the shared expiry sweep before the cursor read",
+  );
   const restoreBlock = handlerBlock("minni_thread_restore");
   assert.match(restoreBlock, /withThreadLock/);
   assert.ok(
@@ -3241,6 +3252,143 @@ test("final-fix-2: lazy expiry on ready emits lease_expired and attention withou
     const payload = JSON.stringify(event.payload ?? {});
     assert.doesNotMatch(payload, /token|evidence|\.runtime/i);
   }
+});
+
+// Phase-1 residual (2026-08-19): an orchestrator that only polls the event
+// cursor / status must still observe dead claims. ready/claim/worker_update
+// already run the locked expiry sweep; events + status must share that same
+// helper — not invent a second expiry path, and not require a ready poll.
+test("shared expiry sweep: events/status path expires without ready/claim/worker_update", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "events-status-expiry-claim",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+
+  const before = await rehydratePlan(fixture.notePath);
+  assert.ok(before.slices[0].claim, "claim must still be durable before the sweep");
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const beforeCursor = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    beforeCursor.events.some((event) => event.kind === "slice.lease_expired"),
+    false,
+    "readThreadEvents alone must not invent expiry — the shared sweep owns that",
+  );
+
+  const { synchronizeExpiredClaims } = threadWorkerRuntime;
+  assert.equal(
+    typeof synchronizeExpiredClaims,
+    "function",
+    "events/status must share synchronizeExpiredClaims (same helper ready already uses)",
+  );
+
+  const laterNow = new Date("2026-08-18T12:02:00.000Z");
+  // events-path shape: sweep, then read the ordered cursor
+  const swept = await synchronizeExpiredClaims({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: laterNow,
+  });
+  assert.equal(
+    swept.plan.slices[0].claim,
+    undefined,
+    "status-path shape: returned plan must show a non-live (cleared) claim",
+  );
+
+  const afterCursor = await readThreadEvents(journalPath, beforeCursor.next_seq, 100);
+  assert.ok(
+    afterCursor.events.some((event) => event.kind === "slice.lease_expired"),
+    "ordered cursor must surface slice.lease_expired after the shared sweep",
+  );
+  assert.ok(
+    afterCursor.events.some((event) => event.kind === "thread.attention_required"),
+    "ordered cursor must surface thread.attention_required after the shared sweep",
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(durable.slices[0].claim, undefined);
+});
+
+test("shared expiry sweep skips journal I/O when no claim needs expiry", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "live-claim-no-journal-touch",
+    ttlSeconds: 3600,
+    now: new Date(THREAD_START),
+  });
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  await rm(journalPath, { force: true });
+  await mkdir(journalPath);
+
+  const { synchronizeExpiredClaims } = threadWorkerRuntime;
+  // Live claim + unreadable journal: sweep must still return the plan without
+  // attempting journal prep (status contract beside EISDIR journals).
+  const swept = await synchronizeExpiredClaims({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.ok(swept.plan.slices[0].claim, "live claim must remain");
+});
+
+test("ready expiry delegates to the same synchronizeExpiredClaims helper", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "ready-delegates-expiry-claim",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+
+  const { synchronizeExpiredClaims, synchronizeExpiredClaimsAndReadReady } =
+    threadWorkerRuntime;
+  const laterNow = new Date("2026-08-18T12:02:00.000Z");
+  const viaShared = await synchronizeExpiredClaims({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: laterNow,
+  });
+  assert.equal(viaShared.plan.slices[0].claim, undefined);
+
+  // Second call via ready must be a no-op re-entry of the same sweep (idempotent
+  // lease_expired keys), not a divergent expiry implementation.
+  const viaReady = await synchronizeExpiredClaimsAndReadReady({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: laterNow,
+  });
+  assert.equal(viaReady.plan.slices[0].claim, undefined);
+  assert.ok(viaReady.ready.some((slice) => slice.id === "a"));
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    events.filter((event) => event.kind === "slice.lease_expired").length,
+    1,
+    "ready must reuse the shared sweep's idempotent expiry, not double-emit",
+  );
 });
 
 test("final-fix-2: block and completion lifecycle events are single-shot on retry", async (t) => {

@@ -102,6 +102,7 @@ import {
   recordThreadMutationEvents,
   revokedClaimIds,
   synchronizeExpiredClaimsAndReadReady,
+  synchronizeExpiredClaims,
   threadWorkerErrorText,
   updateClaimedSlice,
   withThreadPlanLock,
@@ -1709,21 +1710,16 @@ server.registerTool(
       const target = await resolvePlanTarget(planIdInput);
       if (!target.ok) return target.result;
       const { plan_id, notePath } = target;
-      const { plan, active } = await withThreadPlanLock(
-        {
-          vaultPath: effectiveVaultPath,
-          notePath,
-          planId: plan_id,
-          operationId: `server-status-read:${randomUUID()}`,
-        },
-        async (lockedPlan) => {
-          const activePointer = await getActivePlan(effectiveVaultPath);
-          return {
-            plan: lockedPlan,
-            active: activePointer?.plan_id === plan_id,
-          };
-        },
-      );
+      // Same locked expiry sweep ready/claim already use — a status poll must
+      // not leave a dead claim looking live for an orchestrator that skips ready.
+      const { plan } = await synchronizeExpiredClaims({
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        actor: DEFAULT_AGENT_ID,
+      });
+      const activePointer = await getActivePlan(effectiveVaultPath);
+      const active = activePointer?.plan_id === plan_id;
       const view = compactPlanView(plan);
       const drift = live_shelf_content
         ? shelfDrift(plan, live_shelf_content)
@@ -2474,6 +2470,15 @@ server.registerTool(
       const target = await resolvePlanTarget(planIdInput);
       if (!target.ok) return target.result;
       const { plan_id, notePath } = target;
+      // Same locked expiry sweep ready/claim already use — land
+      // slice.lease_expired / thread.attention_required before the cursor read
+      // so an events-only orchestrator cannot miss a dead claim.
+      await synchronizeExpiredClaims({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        actor: DEFAULT_AGENT_ID,
+      });
       const journalPath = journalPathFor(notePath, plan_id);
       const result = await readThreadEvents(journalPath, since_seq, limit);
       return textResult(JSON.stringify({ plan_id, ...result }, null, 2));

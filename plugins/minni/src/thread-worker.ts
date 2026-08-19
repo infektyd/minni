@@ -949,13 +949,21 @@ async function synchronizeExpiredClaimsForPlan(input: {
 }
 
 /**
- * Lazily expire stale claims under the Thread lock, then return the ready set.
- * Used by minni_thread_ready and any path that must observe expiry durably.
+ * Lazily expire stale claims under the Thread lock and persist
+ * slice.lease_expired / thread.attention_required before returning.
+ *
+ * Single shared expiry sweep for every read path that must observe a dead
+ * claim without going through ready/claim/worker_update first
+ * (minni_thread_events, minni_thread_status, and ready via the wrapper below).
+ * Do not invent a second expiry implementation beside this helper.
+ *
+ * When no claim is past expires_at, this is a lock+rehydrate only — no journal
+ * write — so status can still resolve beside an unreadable journal.
  */
-export async function synchronizeExpiredClaimsAndReadReady(
+export async function synchronizeExpiredClaims(
   input: ThreadPlanTarget & { actor: string; now?: Date | (() => Date) },
   deps: ThreadWorkerDeps = {},
-): Promise<{ plan: PlanArtifact; ready: PlanSlice[] }> {
+): Promise<{ plan: PlanArtifact }> {
   const planId = requireNonEmpty(input.planId, "plan id");
   const actor = requireNonEmpty(input.actor, "actor");
   const persist = deps.persistPlan ?? persistPlan;
@@ -971,6 +979,12 @@ export async function synchronizeExpiredClaimsAndReadReady(
     },
     async (initialPlan) => {
       const now = sampleNow(input.now);
+      const needsExpiry = initialPlan.slices.some(
+        (slice) => slice.claim !== undefined && !hasLiveClaim(slice, now),
+      );
+      if (!needsExpiry) {
+        return { plan: initialPlan };
+      }
       const { journalPath, ordered } = await prepareThreadMutation(
         { ...input, planId, actor },
         initialPlan,
@@ -990,9 +1004,24 @@ export async function synchronizeExpiredClaimsAndReadReady(
         orderedSnapshot: ordered,
         appendJournalDeps,
       });
-      return { plan, ready: readySlices(plan, now) };
+      return { plan };
     },
   );
+}
+
+/**
+ * Lazily expire stale claims under the Thread lock, then return the ready set.
+ * Ready delegates to synchronizeExpiredClaims — the same sweep events/status use.
+ */
+export async function synchronizeExpiredClaimsAndReadReady(
+  input: ThreadPlanTarget & { actor: string; now?: Date | (() => Date) },
+  deps: ThreadWorkerDeps = {},
+): Promise<{ plan: PlanArtifact; ready: PlanSlice[] }> {
+  // Sample once so ready and expiry agree on the same injected clock, matching
+  // the pre-extract behavior of a single now inside the lock.
+  const now = sampleNow(input.now);
+  const { plan } = await synchronizeExpiredClaims({ ...input, now }, deps);
+  return { plan, ready: readySlices(plan, now) };
 }
 
 function claimRevokedEvent(
