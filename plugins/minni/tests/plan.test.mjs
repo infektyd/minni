@@ -2692,8 +2692,13 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       status: "done",
       evidence: "B is finished, verified via logs/b.log",
     });
-    assert.ok(blocked.result?.isError, `expected an error result, got: ${JSON.stringify(blocked)}`);
-    assert.match(blocked.result.content[0].text, /depends_on unmet: a/);
+    // Same contract as claim/assign: domain refusals are typed JSON via
+    // threadWorkerErrorResult, not MCP isError (which would trip thread-server call()).
+    assert.ok(blocked.result && !blocked.result.isError, `expected typed JSON error, got: ${JSON.stringify(blocked)}`);
+    const blockedBody = JSON.parse(blocked.result.content[0].text);
+    assert.equal(blockedBody.status, "error");
+    assert.equal(blockedBody.operation, "plan.update");
+    assert.match(blockedBody.error, /depends_on unmet: a/);
 
     // 2. force without a reason: still refused — force alone cannot bypass silently.
     const forceNoReason = await call("minni_thread_update", {
@@ -2702,7 +2707,10 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       evidence: "B is finished, verified via logs/b.log",
       force: true,
     });
-    assert.ok(forceNoReason.result?.isError, `expected an error result, got: ${JSON.stringify(forceNoReason)}`);
+    assert.ok(forceNoReason.result && !forceNoReason.result.isError, `expected typed JSON error, got: ${JSON.stringify(forceNoReason)}`);
+    const forceNoReasonBody = JSON.parse(forceNoReason.result.content[0].text);
+    assert.equal(forceNoReasonBody.status, "error");
+    assert.equal(forceNoReasonBody.operation, "plan.update");
     // #291 round-1 cassandra finding 8: the refusal message must name the
     // MCP-facing field (force_reason) a retrying model can actually pass,
     // not the internal TS option name (forceReason).
@@ -2711,7 +2719,7 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
     // reason/ regex here would pass even if this scenario's specific
     // "force without a reason" refusal were silently replaced by the wrong
     // error. Match the discriminating phrase instead.
-    assert.match(forceNoReason.result.content[0].text, /requires a non-empty force reason/);
+    assert.match(forceNoReasonBody.error, /requires a non-empty force reason/);
 
     // 2b. round-1 finding 7: a non-"done" transition with an unmet dep must
     // NOT emit an override record even if force is set — there's nothing
@@ -2938,8 +2946,11 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       drop_slice_ids: ["a"],
       add_slices: [{ id: "a", title: "A retry" }],
     });
-    assert.ok(dupIdAttempt.result?.isError, `expected an error result, got: ${JSON.stringify(dupIdAttempt)}`);
-    assert.match(dupIdAttempt.result.content[0].text, /cannot add slice with id "a"/);
+    assert.ok(dupIdAttempt.result && !dupIdAttempt.result.isError, `expected typed JSON error, got: ${JSON.stringify(dupIdAttempt)}`);
+    const dupIdBody = JSON.parse(dupIdAttempt.result.content[0].text);
+    assert.equal(dupIdBody.status, "error");
+    assert.equal(dupIdBody.operation, "plan.replan");
+    assert.match(dupIdBody.error, /cannot add slice with id "a"/);
     // And the plan itself must be unchanged on disk — the rejected replan
     // (thrown before persistPlan is ever called) must not have partially
     // applied (a is still live, pending, exactly one slice with that id).
