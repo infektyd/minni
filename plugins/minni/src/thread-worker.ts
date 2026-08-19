@@ -309,8 +309,9 @@ function nodeErrnoCode(error: unknown): string | undefined {
  * callers. Rebuild from rev + cause.code (history) or version (digest)
  * only — never interpolate notePath, historyPathFor(notePath),
  * cause.message, or cause.path (real EISDIR/EACCES embed wiki/artifacts).
- * Untyped Node errno / path-bearing messages are rebuilt the same way:
- * syscall code only, never Error.message.
+ * ThreadJournalAppendError is the same contract: syscall code or a generic
+ * phrase, never cause.message. Untyped Node errno / path-bearing messages
+ * are rebuilt the same way: syscall code only, never Error.message.
  */
 export function threadWorkerErrorText(error: unknown): string {
   if (error instanceof PlanHistoryAppendError) {
@@ -323,7 +324,9 @@ export function threadWorkerErrorText(error: unknown): string {
     return error.message;
   }
   if (error instanceof ThreadJournalAppendError) {
-    return error.message;
+    return error.causeCode
+      ? `thread journal append failed for ${error.kind}: ${error.causeCode}`
+      : `thread journal append failed for ${error.kind}: ordered append failed`;
   }
   if (error instanceof ThreadCursorGapError) {
     return error.message;
