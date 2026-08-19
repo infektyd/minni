@@ -1044,6 +1044,23 @@ test("UserPromptSubmit FS failure on the active pointer is degraded active_threa
   });
 });
 
+async function holdLivePlanLock(vault, planId) {
+  const key = createHash("sha256").update(planId).digest("hex").slice(0, 32);
+  const lockDir = path.join(vault, ".runtime", "thread-locks", `${key}.lock`);
+  await mkdir(lockDir, { recursive: true });
+  await writeFile(
+    path.join(lockDir, "owner.json"),
+    `${JSON.stringify({
+      pid: process.pid,
+      operationId: "ups-live-holder",
+      acquiredAt: "2026-01-01T00:00:00.000Z",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const old = new Date("2026-01-01T00:00:00.000Z");
+  await utimes(lockDir, old, old);
+}
+
 test("UserPromptSubmit held lock is degraded active_thread, not empty", { timeout: 20_000 }, async () => {
   await withRawSessionFixture(async ({ vault }) => {
     await ensureVault(vault);
@@ -1051,20 +1068,7 @@ test("UserPromptSubmit held lock is degraded active_thread, not empty", { timeou
       { goal: "UPS lock contention is degraded, not empty", vaultPath: vault },
       { vaultPath: vault },
     );
-    const key = createHash("sha256").update(plan.plan_id).digest("hex").slice(0, 32);
-    const lockDir = path.join(vault, ".runtime", "thread-locks", `${key}.lock`);
-    await mkdir(lockDir, { recursive: true });
-    await writeFile(
-      path.join(lockDir, "owner.json"),
-      `${JSON.stringify({
-        pid: process.pid,
-        operationId: "ups-live-holder",
-        acquiredAt: "2026-01-01T00:00:00.000Z",
-      })}\n`,
-      { mode: 0o600 },
-    );
-    const old = new Date("2026-01-01T00:00:00.000Z");
-    await utimes(lockDir, old, old);
+    await holdLivePlanLock(vault, plan.plan_id);
 
     const handlers = createHookHandlers(upsConfig(vault));
     const output = await handlers.handleUserPromptSubmit({
@@ -1075,6 +1079,45 @@ test("UserPromptSubmit held lock is degraded active_thread, not empty", { timeou
 
     const body = parseUpsEnvelope(output);
     assert.ok(body, "lock-busy plan read must still inject an envelope");
+    assert.ok(
+      Array.isArray(body.degraded?.sections) && body.degraded.sections.includes("active_thread"),
+      `degraded.sections must name active_thread, got ${JSON.stringify(body.degraded)}`,
+    );
+    assert.equal(body.active_thread, undefined);
+    assert.equal(body.active_thread_ref, undefined);
+  });
+});
+
+// Spent prompt budget must not wait out THREAD_BUSY. A raw await of
+// resolveActivePlanView sits on the 5s lock after recall; the host then
+// discards the envelope and the failed read looks empty again.
+test("UserPromptSubmit spent budget does not wait out a held lock", { timeout: 10_000 }, async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    await ensureVault(vault);
+    const { plan } = await createPlan(
+      { goal: "UPS budget cut is degraded, not a 5s lock wait", vaultPath: vault },
+      { vaultPath: vault },
+    );
+    await holdLivePlanLock(vault, plan.plan_id);
+
+    const handlers = createHookHandlers({
+      ...upsConfig(vault),
+      promptHookTimeoutMs: 2,
+    });
+    const started = Date.now();
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "an utterly novel question with zero prior memory budget-cut-zzz",
+      workspace_id: "workspace-fixture",
+    });
+    const elapsedMs = Date.now() - started;
+    assert.ok(
+      elapsedMs < 2000,
+      `spent budget must not wait the 5s lock; took ${elapsedMs}ms`,
+    );
+    assert.equal(output.continue, true);
+
+    const body = parseUpsEnvelope(output);
+    assert.ok(body, "budget-cut plan read must still inject an envelope");
     assert.ok(
       Array.isArray(body.degraded?.sections) && body.degraded.sections.includes("active_thread"),
       `degraded.sections must name active_thread, got ${JSON.stringify(body.degraded)}`,

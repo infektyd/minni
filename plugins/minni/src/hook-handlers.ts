@@ -1288,17 +1288,28 @@ export function createHookHandlers(
 
     let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>> = undefined;
     let activePlanReadOk = true;
-    try {
-      activePlan = await resolveActivePlanView(config.vaultPath);
-    } catch (error) {
-      // FS/lock throws are unknown, not empty. SessionStart already maps
-      // those onto degraded.sections=["active_thread"]; UPS used to audit
-      // and then look like "no active plan."
+    // Same contract as SessionStart: withBudget maps FS/lock throws AND a
+    // spent prompt budget onto ok=false so a failed/unread plan is degraded,
+    // not empty. A raw await here waits out THREAD_BUSY (default 5s lock)
+    // after the recall budget — the host then kills the hook and discards
+    // the envelope, which looks like "no active plan" again.
+    const planRead = await withBudget(
+      resolveActivePlanView(config.vaultPath)
+        .then((view) => ({ ok: true as const, view }))
+        .catch(async (error: unknown) => {
+          await recordAudit(config.vaultPath, {
+            tool: `${config.auditPrefix}_active_plan_error`,
+            summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
+          }).catch(() => {});
+          return { ok: false as const, view: undefined };
+        }),
+      remainingMs(),
+      { ok: false as const, view: undefined },
+    );
+    if (!planRead.ok) {
       activePlanReadOk = false;
-      await recordAudit(config.vaultPath, {
-        tool: `${config.auditPrefix}_active_plan_error`,
-        summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
-      }).catch(() => {});
+    } else {
+      activePlan = planRead.view;
     }
 
     const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
