@@ -1551,6 +1551,91 @@ test("resolveActivePlanView never crashes on a plan with no shelf_ref even when 
   }
 });
 
+// Wave 2 residual: self-heal wrote legacy appendJournal({ kind: "status_reconciled" })
+// which the ordered parser ignores. Heal must land on the ordered cursor.
+test("resolveActivePlanView self-heal writes status_reconciled onto the ordered cursor", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-heal-ordered-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      {
+        goal: "Finish the stuck plan",
+        slices: [
+          { id: "s1", title: "Slice one" },
+          { id: "s2", title: "Slice two" },
+        ],
+        vaultPath: root,
+      },
+      { vaultPath: root },
+    );
+    plan.slices[0] = {
+      ...plan.slices[0],
+      status: "done",
+      evidence: "tests/plan.test.mjs ordered self-heal pin",
+    };
+    plan.slices[1] = {
+      ...plan.slices[1],
+      status: "superseded",
+      superseded_by: "replan-test",
+    };
+    assert.equal(plan.status, "draft");
+    await persistPlan(plan, { vaultPath: root, notePath: write.notePath });
+
+    const view = await resolveActivePlanView(root);
+    assert.equal(view, undefined);
+
+    const healed = await rehydratePlan(write.notePath);
+    assert.equal(healed.status, "complete");
+
+    const { readThreadEvents } = await import("../dist/thread-events.js");
+    const journalPath = journalPathFor(write.notePath, plan.plan_id);
+    const { events } = await readThreadEvents(journalPath, 0, 100);
+    const reconciled = events.find((event) => event.kind === "status_reconciled");
+    assert.ok(
+      reconciled,
+      `expected ordered status_reconciled, got kinds: ${events.map((e) => e.kind)}`,
+    );
+    assert.equal(typeof reconciled.seq, "number");
+    assert.deepEqual(reconciled.payload, { from: "draft", to: "complete" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Wave 2 residual: FS/lock failures from getActivePlan / resolveActivePlanView
+// used to return undefined and look like "no active plan."
+test("resolveActivePlanView distinguishes FS errors from an empty active pointer", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-active-fs-"));
+  try {
+    await ensureVault(root);
+    const pointerPath = path.join(root, "wiki", "artifacts", "_active_plan.json");
+    await mkdir(path.dirname(pointerPath), { recursive: true });
+    await rm(pointerPath, { force: true });
+    await mkdir(pointerPath); // EISDIR on readFile
+
+    await assert.rejects(
+      resolveActivePlanView(root),
+      (error) =>
+        error?.code === "ACTIVE_PLAN_READ_FAILED" &&
+        typeof error.message === "string" &&
+        !error.message.includes(pointerPath),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("getActivePlan still returns undefined for a missing pointer (empty, not error)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-active-empty-"));
+  try {
+    await ensureVault(root);
+    assert.equal(await getActivePlan(root), undefined);
+    assert.equal(await resolveActivePlanView(root), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // ── PLUMB-T4 / #231: active pointer is written atomically ───────────────────
 //
 // A crash mid-write used to leave a truncated `_active_plan.json` because

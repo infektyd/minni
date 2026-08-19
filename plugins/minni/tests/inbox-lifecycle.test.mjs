@@ -447,6 +447,17 @@ test("resolveActivePlanView self-heals a stuck-draft plan whose slices are all t
     assert.match(journalRaw, /"from":"draft"/);
     assert.match(journalRaw, /"to":"complete"/);
 
+    const { readThreadEvents } = await import("../dist/thread-events.js");
+    const { events } = await readThreadEvents(
+      path.join(path.dirname(write.notePath), `${plan.plan_id}.log.md`),
+      0,
+      100,
+    );
+    assert.ok(
+      events.some((event) => event.kind === "status_reconciled"),
+      "self-heal must be visible on the ordered cursor, not only as a legacy journal line",
+    );
+
     // Idempotent: a second resolve still returns undefined and does not
     // re-journal another reconciliation.
     const view2 = await resolveActivePlanView(root);
