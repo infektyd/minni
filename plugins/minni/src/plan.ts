@@ -1177,11 +1177,19 @@ export async function findPlanNote(
     return undefined;
   }
   for (const name of names) {
-    if (!name.endsWith(".md")) continue;
+    // Journals are `<planId>.log.md`. They are not plan notes; reading them
+    // here used to abort discovery with a path-bearing Node EISDIR/EACCES
+    // before MCP handlers reached threadWorkerErrorResult.
+    if (!name.endsWith(".md") || name.endsWith(".log.md")) continue;
     const notePath = path.join(dir, name);
-    const raw = await readFile(notePath, "utf8");
-    const { frontmatter: fm } = parseFrontmatter(raw);
-    if (String(fm.plan_id ?? "") === plan_id) return notePath;
+    try {
+      const raw = await readFile(notePath, "utf8");
+      const { frontmatter: fm } = parseFrontmatter(raw);
+      if (String(fm.plan_id ?? "") === plan_id) return notePath;
+    } catch {
+      // Per-file: a sibling directory named *.md or an unreadable note must
+      // not abort the scan or leak a vault path as a raw throw.
+    }
   }
   return undefined;
 }

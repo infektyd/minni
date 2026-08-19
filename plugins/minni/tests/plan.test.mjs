@@ -19,6 +19,8 @@ import {
   createPlan,
   replan,
   persistPlan,
+  findPlanNote,
+  journalPathFor,
   setActivePlan,
   clearActivePlan,
   getActivePlan,
@@ -690,10 +692,21 @@ test("minni_thread_status/_update/_history accept an OPTIONAL plan_id (C5 schema
   // the five handlers keep the active-plan default through one code path.
   const helperStart = source.indexOf("async function resolvePlanTarget(");
   assert.ok(helperStart >= 0, "shared resolvePlanTarget helper must exist");
+  const helper = source.slice(helperStart, helperStart + 1800);
   assert.match(
-    source.slice(helperStart, helperStart + 1200),
+    helper,
     /resolvePlanIdOrActive\(/,
     "resolvePlanTarget must default to the active plan via resolvePlanIdOrActive",
+  );
+  assert.match(
+    helper,
+    /try \{/,
+    "resolvePlanTarget must catch remaining discovery I/O instead of leaking a raw JSON-RPC error",
+  );
+  assert.match(
+    helper,
+    /threadWorkerErrorText\(error\)/,
+    "resolvePlanTarget must sanitize discovery throws through threadWorkerErrorText",
   );
 });
 
@@ -1818,7 +1831,6 @@ test("freeze guard: createPlan still mints plan- prefixed ids after the threads 
     assert.match(write.wikilink, /\[\[.*plan-[0-9a-f]{16}\]\]/, "wikilink is frozen");
 
     // and lookup still resolves by the frozen frontmatter key, not the filename
-    const { findPlanNote } = await import("../dist/plan.js");
     assert.equal(await findPlanNote(root, plan.plan_id), write.notePath);
     const note = await readFile(write.notePath, "utf8");
     assert.match(note, /minni_plan:\s*true/, "legacy frontmatter marker is frozen");
@@ -1830,6 +1842,47 @@ test("freeze guard: createPlan still mints plan- prefixed ids after the threads 
     await setActivePlan(root, plan.plan_id, write.notePath);
     const pointer = await readFile(path.join(root, "wiki", "artifacts", "_active_plan.json"), "utf8");
     assert.equal(JSON.parse(pointer).plan_id, plan.plan_id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Cassandra PR #371 round 3: findPlanNote used to readFile every wiki/artifacts
+// *.md, including plan-*.log.md journals, with no per-file catch. An EISDIR
+// journal (or any sibling *.md directory) threw a path-bearing Node error
+// before MCP handlers reached threadWorkerErrorResult.
+test("findPlanNote skips an EISDIR journal and still locates the plan note", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-find-eisdir-journal-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "findPlanNote must survive a directory-at-journal-path", vaultPath: root },
+      { vaultPath: root },
+    );
+    const journalPath = journalPathFor(write.notePath, plan.plan_id);
+    await rm(journalPath, { force: true });
+    await mkdir(journalPath);
+
+    const found = await findPlanNote(root, plan.plan_id);
+    assert.equal(found, write.notePath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("findPlanNote skips an unreadable sibling *.md and still locates the plan note", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-find-eisdir-sibling-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "findPlanNote must catch per-file read failures", vaultPath: root },
+      { vaultPath: root },
+    );
+    const poison = path.join(root, "wiki", "artifacts", "poison.md");
+    await mkdir(poison);
+
+    const found = await findPlanNote(root, plan.plan_id);
+    assert.equal(found, write.notePath);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

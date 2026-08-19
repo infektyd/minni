@@ -1399,19 +1399,26 @@ async function resolvePlanTarget(
   | { ok: true; plan_id: string; notePath: string }
   | { ok: false; result: ReturnType<typeof textResult> }
 > {
-  const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput);
-  if ("error" in resolved) {
-    return { ok: false, result: textResult(JSON.stringify({ error: resolved.error }, null, 2)) };
+  try {
+    const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput);
+    if ("error" in resolved) {
+      return { ok: false, result: textResult(JSON.stringify({ error: resolved.error }, null, 2)) };
+    }
+    const plan_id = resolved.plan_id;
+    const notePath = await findPlanNote(DEFAULT_VAULT_PATH, plan_id);
+    if (!notePath) {
+      return {
+        ok: false,
+        result: textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2)),
+      };
+    }
+    return { ok: true, plan_id, notePath };
+  } catch (error) {
+    // findPlanNote is fail-closed per file, but any remaining throw (or a
+    // resolvePlanIdOrActive I/O error) must not escape as a path-bearing
+    // JSON-RPC / MCP transport error.
+    return { ok: false, result: textResult(JSON.stringify({ error: threadWorkerErrorText(error) }, null, 2)) };
   }
-  const plan_id = resolved.plan_id;
-  const notePath = await findPlanNote(DEFAULT_VAULT_PATH, plan_id);
-  if (!notePath) {
-    return {
-      ok: false,
-      result: textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2)),
-    };
-  }
-  return { ok: true, plan_id, notePath };
 }
 
 server.registerTool(
@@ -1688,31 +1695,35 @@ server.registerTool(
     const gated = await requireSharedGate("plan.status", { plan_id: planIdInput });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const target = await resolvePlanTarget(planIdInput);
-    if (!target.ok) return target.result;
-    const { plan_id, notePath } = target;
-    const { plan, active } = await withThreadPlanLock(
-      {
-        vaultPath: effectiveVaultPath,
-        notePath,
-        planId: plan_id,
-        operationId: `server-status-read:${randomUUID()}`,
-      },
-      async (lockedPlan) => {
-        const activePointer = await getActivePlan(effectiveVaultPath);
-        return {
-          plan: lockedPlan,
-          active: activePointer?.plan_id === plan_id,
-        };
-      },
-    );
-    const view = compactPlanView(plan);
-    const drift = live_shelf_content
-      ? shelfDrift(plan, live_shelf_content)
-      : undefined;
-    return textResult(
-      JSON.stringify({ view, drift, status: plan.status, rev: plan.rev, active }, null, 2),
-    );
+    try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
+      const { plan, active } = await withThreadPlanLock(
+        {
+          vaultPath: effectiveVaultPath,
+          notePath,
+          planId: plan_id,
+          operationId: `server-status-read:${randomUUID()}`,
+        },
+        async (lockedPlan) => {
+          const activePointer = await getActivePlan(effectiveVaultPath);
+          return {
+            plan: lockedPlan,
+            active: activePointer?.plan_id === plan_id,
+          };
+        },
+      );
+      const view = compactPlanView(plan);
+      const drift = live_shelf_content
+        ? shelfDrift(plan, live_shelf_content)
+        : undefined;
+      return textResult(
+        JSON.stringify({ view, drift, status: plan.status, rev: plan.rev, active }, null, 2),
+      );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.status", error);
+    }
   },
 );
 
@@ -2138,10 +2149,10 @@ server.registerTool(
   async ({ plan_id: planIdInput }) => {
     const gated = await requireSharedGate("plan.ready", { plan_id: planIdInput });
     if (gated) return gated;
-    const target = await resolvePlanTarget(planIdInput);
-    if (!target.ok) return target.result;
-    const { plan_id, notePath } = target;
     try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
       const { plan, ready } = await synchronizeExpiredClaimsAndReadReady({
         vaultPath: DEFAULT_VAULT_PATH,
         notePath,
@@ -2182,10 +2193,10 @@ server.registerTool(
       assignment_profile,
     });
     if (gated) return gated;
-    const target = await resolvePlanTarget(planIdInput);
-    if (!target.ok) return target.result;
-    const { plan_id, notePath } = target;
     try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
       const result = await assignSlice({
         vaultPath: DEFAULT_VAULT_PATH,
         notePath,
@@ -2250,10 +2261,10 @@ server.registerTool(
       idempotency_key,
     });
     if (gated) return gated;
-    const target = await resolvePlanTarget(planIdInput);
-    if (!target.ok) return target.result;
-    const { plan_id, notePath } = target;
     try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
       // claimSlice already returns thread-claims.ts's ThreadClaimResponse —
       // the one shape in this whole surface that is allowed to carry a
       // secret (the one-time token). It never carries the envelope's
@@ -2394,10 +2405,10 @@ server.registerTool(
         ),
       );
     }
-    const target = await resolvePlanTarget(planIdInput);
-    if (!target.ok) return target.result;
-    const { plan_id, notePath } = target;
     try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
       const result = await updateClaimedSlice({
         vaultPath: DEFAULT_VAULT_PATH,
         notePath,

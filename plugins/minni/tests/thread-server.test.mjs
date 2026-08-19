@@ -800,6 +800,64 @@ test("minni_thread_worker_update history-append error never leaks the vault note
   });
 });
 
+test("minni_thread_claim EISDIR journal is a typed MCP error, not a path-bearing transport crash", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath, "seeded plan must have a vault note");
+    const journalPath = journalPathFor(notePath, plan_id);
+    await rm(journalPath, { force: true });
+    await mkdir(journalPath);
+
+    const result = await call("minni_thread_claim", {
+      plan_id,
+      slice_id: "a",
+      worker_agent_id: "worker-a",
+      idempotency_key: "claim-eisdir-journal",
+    });
+    assert.equal(result.status, "error");
+    assert.equal(result.operation, "plan.claim");
+    assert.equal(result.code, "THREAD_JOURNAL_UNREADABLE");
+    assert.match(result.error, /EISDIR|unreadable/);
+    assert.equal(result.error.includes(journalPath), false);
+    assert.equal(result.error.includes(notePath), false);
+    assert.equal(result.journalPath, undefined);
+    assert.equal(result.notePath, undefined);
+    assert.equal(result.filePath, undefined);
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /wiki\/artifacts/,
+      "model-facing claim error must not embed a vault artifacts path",
+    );
+  });
+});
+
+test("minni_thread_status EISDIR journal does not leak a vault path as a transport crash", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath, "seeded plan must have a vault note");
+    const journalPath = journalPathFor(notePath, plan_id);
+    await rm(journalPath, { force: true });
+    await mkdir(journalPath);
+
+    const result = await call("minni_thread_status", { plan_id });
+    assert.equal(typeof result.error, "undefined", `status must not fail at plan-note discovery: ${JSON.stringify(result)}`);
+    assert.ok(result.view, "status must still resolve the plan note beside an unreadable journal");
+    assert.equal(result.rev !== undefined, true);
+    assert.equal(
+      JSON.stringify(result).includes(journalPath),
+      false,
+      "status payload must not embed the journal path",
+    );
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /wiki\/artifacts/,
+      "status payload must not embed a vault artifacts path",
+    );
+  });
+});
+
 test("minni_thread_events fails closed on an unreadable journal instead of an empty cursor", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
