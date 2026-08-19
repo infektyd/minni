@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm, writeFile, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, rm, utimes, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1631,6 +1632,41 @@ test("getActivePlan still returns undefined for a missing pointer (empty, not er
     await ensureVault(root);
     assert.equal(await getActivePlan(root), undefined);
     assert.equal(await resolveActivePlanView(root), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Wave 2 residual: a live held lock used to be indistinguishable from "no
+// active plan" if the view swallowed THREAD_BUSY. Domain rethrows; this pin
+// is the missing active-plan-view proof.
+test("resolveActivePlanView rethrows THREAD_BUSY when the plan lock is held", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-active-busy-"));
+  try {
+    await ensureVault(root);
+    const { plan } = await createPlan(
+      { goal: "held lock is busy, not empty", vaultPath: root },
+      { vaultPath: root },
+    );
+    const key = createHash("sha256").update(plan.plan_id).digest("hex").slice(0, 32);
+    const lockDir = path.join(root, ".runtime", "thread-locks", `${key}.lock`);
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(
+      path.join(lockDir, "owner.json"),
+      `${JSON.stringify({
+        pid: process.pid,
+        operationId: "live-holder",
+        acquiredAt: "2026-01-01T00:00:00.000Z",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const old = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockDir, old, old);
+
+    await assert.rejects(
+      resolveActivePlanView(root),
+      (error) => error?.code === "THREAD_BUSY",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

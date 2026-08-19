@@ -1286,10 +1286,15 @@ export function createHookHandlers(
       await clearRecallState(config.vaultPath).catch(() => {});
     }
 
-    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
+    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>> = undefined;
+    let activePlanReadOk = true;
     try {
       activePlan = await resolveActivePlanView(config.vaultPath);
     } catch (error) {
+      // FS/lock throws are unknown, not empty. SessionStart already maps
+      // those onto degraded.sections=["active_thread"]; UPS used to audit
+      // and then look like "no active plan."
+      activePlanReadOk = false;
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_active_plan_error`,
         summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
@@ -1299,8 +1304,9 @@ export function createHookHandlers(
     const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
 
     // Nothing salient to inject this turn: no strong recall, no stale fallback
-    // pointer AND no active plan.
-    if (!strong && stalePointer === undefined && planRef === undefined) {
+    // pointer AND no active plan. A failed plan read is salient — degraded,
+    // not the empty-pointer path.
+    if (!strong && stalePointer === undefined && planRef === undefined && activePlanReadOk) {
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_user_prompt_submit`,
         summary: prompt.slice(0, 120),
@@ -1359,6 +1365,29 @@ export function createHookHandlers(
     // the compiler narrows it for compactPlanPointer.)
     if (activePlan !== undefined) {
       envelopeBody.active_thread_ref = compactPlanPointer(activePlan);
+    }
+    if (!activePlanReadOk) {
+      const existing =
+        envelopeBody.degraded !== undefined &&
+        typeof envelopeBody.degraded === "object" &&
+        !Array.isArray(envelopeBody.degraded)
+          ? (envelopeBody.degraded as Record<string, unknown>)
+          : {};
+      const sections = Array.isArray(existing.sections)
+        ? existing.sections.filter((section): section is string => typeof section === "string")
+        : [];
+      if (!sections.includes("active_thread")) {
+        sections.push("active_thread");
+      }
+      envelopeBody.degraded = {
+        ...existing,
+        sections,
+        ...(typeof existing.note === "string"
+          ? {}
+          : {
+              note: "Active thread was not read (filesystem or lock). Treat it as unknown, not empty.",
+            }),
+      };
     }
 
     const envelope = wrapEnvelope({
