@@ -179,14 +179,16 @@ async function requireSharedGate(
 }
 
 // Task 6: every minni_thread_{ready,assign,claim,worker_update,events} handler
-// funnels its thread-worker/thread-events failures through here instead of
-// letting a thrown error become a raw JSON-RPC transport error. Only
-// `.message` and a typed `.code` (ThreadInconsistentError,
-// ThreadEventIdempotencyConflictError, PlanHistoryAppendError, ...) are ever
-// read off the error — never the whole object. PlanHistoryAppendError.notePath
-// and PlanDigestVersionError.notePath stay typed internal fields;
-// threadWorkerErrorText rebuilds those cases from rev + cause.code / version
-// only, never notePath / history file / cause.message.
+// and the orchestrator mutation tools (update/scar/replan) funnel journal
+// and thread-worker failures through here instead of letting a thrown error
+// become a raw JSON-RPC transport error. Only `.message` and a typed `.code`
+// (ThreadInconsistentError, ThreadEventIdempotencyConflictError,
+// PlanHistoryAppendError, ...) are ever read off the error — never the whole
+// object. PlanHistoryAppendError.notePath and PlanDigestVersionError.notePath
+// stay typed internal fields; threadWorkerErrorText rebuilds those cases
+// from rev + cause.code / version only, never notePath / history file /
+// cause.message. Raw Node EISDIR/EACCES from prepareThreadMutation /
+// appendJournal / appendJournalLine is rebuilt from the syscall code.
 async function persistPlanThenRevokeClaimSecrets(
   plan: PlanArtifact,
   opts: { vaultPath: string; notePath: string },
@@ -1444,6 +1446,7 @@ server.registerTool(
     // itself is made with the override visible.
     const gated = await requireSharedGate("plan.update", { plan_id: planIdInput, slice_id, status, force, force_reason });
     if (gated) return gated;
+    try {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
@@ -1605,6 +1608,9 @@ server.registerTool(
         2,
       ),
     );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.update", error);
+    }
   },
 );
 
@@ -1624,6 +1630,7 @@ server.registerTool(
   async ({ plan_id: planIdInput, kind, signal, resolution }) => {
     const gated = await requireSharedGate("plan.scar", { plan_id: planIdInput, kind });
     if (gated) return gated;
+    try {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
@@ -1677,6 +1684,9 @@ server.registerTool(
       },
     );
     return textResult(JSON.stringify(next, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.scar", error);
+    }
   },
 );
 
@@ -1758,6 +1768,7 @@ server.registerTool(
       drop_slice_ids,
     });
     if (gated) return gated;
+    try {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
@@ -1873,6 +1884,9 @@ server.registerTool(
       },
     );
     return textResult(JSON.stringify(next, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.replan", error);
+    }
   },
 );
 

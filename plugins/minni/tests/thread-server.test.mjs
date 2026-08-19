@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -655,18 +655,29 @@ test("journal-ahead-of-note blocks minni_thread_update, scar, replan, and restor
       "utf8",
     );
 
-    await assert.rejects(
-      call("minni_thread_update", { plan_id, slice_id: "a", status: "in_progress" }),
-      /thread_inconsistent/,
-    );
-    await assert.rejects(
-      call("minni_thread_scar", { plan_id, kind: "dead_end", signal: "must not commit" }),
-      /thread_inconsistent/,
-    );
-    await assert.rejects(
-      call("minni_thread_replan", { plan_id, add_slices: [{ title: "Slice C" }] }),
-      /thread_inconsistent/,
-    );
+    for (const tool of [
+      {
+        name: "minni_thread_update",
+        operation: "plan.update",
+        args: { slice_id: "a", status: "in_progress" },
+      },
+      {
+        name: "minni_thread_scar",
+        operation: "plan.scar",
+        args: { kind: "dead_end", signal: "must not commit" },
+      },
+      {
+        name: "minni_thread_replan",
+        operation: "plan.replan",
+        args: { add_slices: [{ title: "Slice C" }] },
+      },
+    ]) {
+      const result = await call(tool.name, { plan_id, ...tool.args });
+      assert.equal(result.status, "error", `${tool.name}: ${JSON.stringify(result)}`);
+      assert.equal(result.operation, tool.operation);
+      assert.equal(result.code, "THREAD_INCONSISTENT");
+      assert.match(result.error, /thread_inconsistent/);
+    }
     // minni_thread_restore pre-existing behavior (unrelated to this fix):
     // it wraps every thrown error from its withThreadLock body — including
     // "revision not found" — into a soft { error } result rather than an
@@ -914,6 +925,112 @@ test("minni_thread_restore catch never forwards a path-bearing Error.message", a
       "restore catch must not embed a vault artifacts path",
     );
   });
+});
+
+// Cassandra PR #371 round 4: update/scar/replan write the ordered journal via
+// prepareThreadMutation / appendJournal / appendJournalLine but were not
+// wrapped in threadWorkerErrorResult. A raw Node EISDIR/EACCES from those
+// writes becomes a transport-level isError whose .message embeds the vault
+// journal path. Sanitizer unit tests never ran on this MCP path.
+const ORCHESTRATOR_JOURNAL_MUTATIONS = [
+  {
+    name: "minni_thread_update",
+    operation: "plan.update",
+    args: { slice_id: "a", status: "in_progress" },
+  },
+  {
+    name: "minni_thread_scar",
+    operation: "plan.scar",
+    args: { kind: "dead_end", signal: "must not leak a journal path" },
+  },
+  {
+    name: "minni_thread_replan",
+    operation: "plan.replan",
+    args: { add_slices: [{ title: "Slice C" }] },
+  },
+];
+
+function assertPathFreeOrchestratorJournalError(result, { name, operation, journalPath, notePath }) {
+  assert.equal(
+    result.status,
+    "error",
+    `${name} must return a typed MCP error, not a transport-level isError: ${JSON.stringify(result)}`,
+  );
+  assert.equal(result.operation, operation);
+  assert.equal(typeof result.error, "string");
+  assert.equal(result.error.includes(journalPath), false, `${name} leaked journalPath`);
+  assert.equal(result.error.includes(notePath), false, `${name} leaked notePath`);
+  assert.equal(result.journalPath, undefined);
+  assert.equal(result.notePath, undefined);
+  assert.equal(result.filePath, undefined);
+  assert.doesNotMatch(
+    JSON.stringify(result),
+    /wiki\/artifacts/,
+    `${name} must not embed a vault artifacts path`,
+  );
+}
+
+test("minni_thread_update/scar/replan EISDIR journal is a typed MCP error, not a path-bearing transport crash", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    for (const tool of ORCHESTRATOR_JOURNAL_MUTATIONS) {
+      const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      assert.ok(notePath, "seeded plan must have a vault note");
+      const journalPath = journalPathFor(notePath, plan_id);
+      await rm(journalPath, { force: true });
+      await mkdir(journalPath);
+
+      const result = await call(tool.name, { plan_id, ...tool.args });
+      assertPathFreeOrchestratorJournalError(result, {
+        name: tool.name,
+        operation: tool.operation,
+        journalPath,
+        notePath,
+      });
+      assert.match(result.error, /EISDIR|unreadable/);
+    }
+  });
+});
+
+test("minni_thread_update/scar/replan EACCES journal append is a typed MCP error, not a path-bearing transport crash", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    for (const tool of ORCHESTRATOR_JOURNAL_MUTATIONS) {
+      const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      assert.ok(notePath, "seeded plan must have a vault note");
+      const journalPath = journalPathFor(notePath, plan_id);
+      await chmod(journalPath, 0o444);
+      try {
+        const result = await call(tool.name, { plan_id, ...tool.args });
+        assertPathFreeOrchestratorJournalError(result, {
+          name: tool.name,
+          operation: tool.operation,
+          journalPath,
+          notePath,
+        });
+        assert.match(result.error, /EACCES|unreadable|thread worker failed/);
+      } finally {
+        await chmod(journalPath, 0o644).catch(() => {});
+      }
+    }
+  });
+});
+
+test("minni_thread_update/scar/replan funnel journal I/O failures through threadWorkerErrorResult", async () => {
+  const source = await readFile(SRC_PATH, "utf8");
+  for (const { name, operation } of ORCHESTRATOR_JOURNAL_MUTATIONS) {
+    const block = toolBlock(source, name);
+    assert.match(
+      block,
+      /try \{/,
+      `${name} must catch journal I/O instead of leaking a raw JSON-RPC error`,
+    );
+    assert.match(
+      block,
+      new RegExp(`threadWorkerErrorResult\\(\\s*"${operation.replace(".", "\\.")}"`),
+      `${name} must sanitize throws through threadWorkerErrorResult("${operation}")`,
+    );
+  }
 });
 
 test("minni_thread_worker_update rejects an empty idempotency_key before it reaches thread-worker", async (t) => {
