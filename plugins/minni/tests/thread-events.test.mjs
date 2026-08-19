@@ -21,8 +21,10 @@ import {
   deriveSystemEventKey,
   orderedSnapshotMatchesJournal,
   readOrderedThreadEvents,
+  parseOrderedThreadEvents,
   readThreadEvents,
   reconcileThreadJournal,
+  ThreadCursorGapError,
   ThreadJournalReadError,
 } from "../dist/thread-events.js";
 import { withThreadLock } from "../dist/thread-lock.js";
@@ -635,4 +637,304 @@ test("failed append does not wipe the in-memory snapshot when resync cannot read
     "resync must not replace a live snapshot with [] when the journal is unreadable",
   );
   assert.equal(snapshot[0].idempotency_key, "seed-one");
+});
+
+// Ordered-journal bound protocol (stacked on #373): a since_seq poller must
+// see journal_truncated with last_dropped_seq + first_kept_seq after a drop.
+// Silent holes are a fail. Seq is never renumbered.
+
+test("parseOrderedThreadEvents keeps journal_truncated as a first-class event", () => {
+  const at = THREAD_START.toISOString();
+  const parsed = parseOrderedThreadEvents(
+    JSON.stringify({
+      seq: 3,
+      rev: 1,
+      event_id: "trunc-3",
+      idempotency_key: "system:journal_truncated:3:4",
+      actor: "minni",
+      kind: "journal_truncated",
+      at,
+      payload: { last_dropped_seq: 3, first_kept_seq: 4 },
+    }) + "\n",
+  );
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].kind, "journal_truncated");
+  assert.deepEqual(parsed[0].payload, {
+    last_dropped_seq: 3,
+    first_kept_seq: 4,
+  });
+});
+
+test("since_seq poller sees journal_truncated after a simulated prefix drop", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const base = {
+    rev: fixture.rev,
+    actor: "test",
+    at,
+  };
+  await seedOrderedEvents(fixture.journalPath, [
+    { ...base, seq: 1, event_id: "e1", idempotency_key: "one", kind: "test.one" },
+    { ...base, seq: 2, event_id: "e2", idempotency_key: "two", kind: "test.two" },
+    { ...base, seq: 3, event_id: "e3", idempotency_key: "three", kind: "test.three" },
+    { ...base, seq: 4, event_id: "e4", idempotency_key: "four", kind: "test.four" },
+    { ...base, seq: 5, event_id: "e5", idempotency_key: "five", kind: "test.five" },
+  ]);
+
+  // Simulate an honest prefix drop: keep seq 4–5 at their original numbers,
+  // and leave a durable journal_truncated occupying last_dropped_seq.
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const truncation = {
+    seq: 3,
+    rev: fixture.rev,
+    event_id: "trunc-3",
+    idempotency_key: "system:journal_truncated:3:4",
+    actor: "minni",
+    kind: "journal_truncated",
+    at,
+    payload: { last_dropped_seq: 3, first_kept_seq: 4 },
+  };
+  const kept = [
+    { ...base, seq: 4, event_id: "e4", idempotency_key: "four", kind: "test.four" },
+    { ...base, seq: 5, event_id: "e5", idempotency_key: "five", kind: "test.five" },
+  ];
+  await writeFile(
+    fixture.journalPath,
+    header
+      + `${JSON.stringify(truncation)}\n`
+      + kept.map((event) => `${JSON.stringify(event)}\n`).join(""),
+    "utf8",
+  );
+
+  const page = await readThreadEvents(fixture.journalPath, 1, 20);
+  assert.equal(page.events[0]?.kind, "journal_truncated");
+  assert.deepEqual(page.events[0]?.payload, {
+    last_dropped_seq: 3,
+    first_kept_seq: 4,
+  });
+  assert.deepEqual(
+    page.events.slice(1).map((event) => event.seq),
+    [4, 5],
+    "kept events must retain their original seq numbers",
+  );
+  assert.equal(page.next_seq, 5);
+
+  // Poller that already consumed through the truncation seq does not re-see it.
+  const after = await readThreadEvents(fixture.journalPath, 3, 20);
+  assert.equal(
+    after.events.some((event) => event.kind === "journal_truncated"),
+    false,
+  );
+  assert.deepEqual(after.events.map((event) => event.seq), [4, 5]);
+});
+
+test("cursor_gap kind is accepted as the same truncation protocol", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const gap = {
+    seq: 2,
+    rev: fixture.rev,
+    event_id: "gap-2",
+    idempotency_key: "system:cursor_gap:2:3",
+    actor: "minni",
+    kind: "cursor_gap",
+    at,
+    payload: { last_dropped_seq: 2, first_kept_seq: 3 },
+  };
+  const kept = {
+    seq: 3,
+    rev: fixture.rev,
+    event_id: "e3",
+    idempotency_key: "three",
+    actor: "test",
+    kind: "test.three",
+    at,
+  };
+  await writeFile(
+    fixture.journalPath,
+    `${header}${JSON.stringify(gap)}\n${JSON.stringify(kept)}\n`,
+    "utf8",
+  );
+
+  const page = await readThreadEvents(fixture.journalPath, 0, 20);
+  assert.equal(page.events[0]?.kind, "cursor_gap");
+  assert.deepEqual(page.events[0]?.payload, {
+    last_dropped_seq: 2,
+    first_kept_seq: 3,
+  });
+});
+
+test("unmarked seq hole fails closed instead of a silent cursor jump", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const base = { rev: fixture.rev, actor: "test", at };
+  // Dropped 1–3 with no journal_truncated / cursor_gap marker.
+  await seedOrderedEvents(fixture.journalPath, [
+    { ...base, seq: 4, event_id: "e4", idempotency_key: "four", kind: "test.four" },
+    { ...base, seq: 5, event_id: "e5", idempotency_key: "five", kind: "test.five" },
+  ]);
+
+  await assert.rejects(
+    () => readThreadEvents(fixture.journalPath, 1, 20),
+    (error) => {
+      assert.ok(error instanceof ThreadCursorGapError);
+      assert.equal(error.code, "THREAD_CURSOR_GAP");
+      assert.match(error.message, /cursor_gap|journal_truncated|unmarked/i);
+      return true;
+    },
+  );
+});
+
+test("since_seq inside a marked hole still surfaces journal_truncated", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  // Non-adjacent keep: dropped 1–5, kept 10+. Marker seq = last_dropped.
+  // A poller parked at since_seq=7 is inside the hole; naive seq>7 filtering
+  // would skip the marker at seq=5 and silently jump to 10.
+  const truncation = {
+    seq: 5,
+    rev: fixture.rev,
+    event_id: "trunc-5",
+    idempotency_key: "system:journal_truncated:5:10",
+    actor: "minni",
+    kind: "journal_truncated",
+    at,
+    payload: { last_dropped_seq: 5, first_kept_seq: 10 },
+  };
+  const kept = {
+    seq: 10,
+    rev: fixture.rev,
+    event_id: "e10",
+    idempotency_key: "ten",
+    actor: "test",
+    kind: "test.ten",
+    at,
+  };
+  await writeFile(
+    fixture.journalPath,
+    `${header}${JSON.stringify(truncation)}\n${JSON.stringify(kept)}\n`,
+    "utf8",
+  );
+
+  const page = await readThreadEvents(fixture.journalPath, 7, 20);
+  assert.equal(page.events[0]?.kind, "journal_truncated");
+  assert.deepEqual(page.events[0]?.payload, {
+    last_dropped_seq: 5,
+    first_kept_seq: 10,
+  });
+  assert.equal(page.events[1]?.seq, 10);
+});
+
+// Slice 2: read/parse tail bound (no delete-rotate). Cursor path must not
+// rescan an oversized journal; when the bound drops a prefix it emits
+// journal_truncated with last_dropped_seq + first_kept_seq and never renumbers.
+
+test("bounded cursor read emits journal_truncated instead of rescanning the whole journal", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const pad = "x".repeat(200);
+  const lines = [];
+  for (let seq = 1; seq <= 40; seq += 1) {
+    lines.push(JSON.stringify({
+      seq,
+      rev: fixture.rev,
+      event_id: `e${seq}`,
+      idempotency_key: `k${seq}`,
+      actor: "test",
+      kind: "test.bulk",
+      at,
+      payload: { pad },
+    }));
+  }
+  await writeFile(fixture.journalPath, `${header}${lines.join("\n")}\n`, "utf8");
+  const fileSize = (await readFile(fixture.journalPath)).length;
+  const maxReadBytes = Math.min(2_500, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize, "fixture must exceed the cursor read bound");
+
+  const page = await readThreadEvents(fixture.journalPath, 0, 100, { maxReadBytes });
+  assert.ok(
+    page.events[0]?.kind === "journal_truncated" || page.events[0]?.kind === "cursor_gap",
+    `expected cursor gap kind, got ${page.events[0]?.kind}`,
+  );
+  const payload = page.events[0]?.payload;
+  assert.equal(typeof payload?.last_dropped_seq, "number");
+  assert.equal(typeof payload?.first_kept_seq, "number");
+  assert.equal(payload.last_dropped_seq, payload.first_kept_seq - 1);
+  assert.ok(payload.first_kept_seq > 1, "bound must drop a real prefix of seqs");
+  assert.equal(page.events[1]?.seq, payload.first_kept_seq);
+  assert.equal(
+    page.events.some((event) => event.seq === 1 && event.kind === "test.bulk"),
+    false,
+    "seq 1 must not appear — the reader must not have rescanned the prefix",
+  );
+  assert.equal(
+    page.events.filter((event) => event.kind === "test.bulk").every(
+      (event) => event.seq >= payload.first_kept_seq,
+    ),
+    true,
+    "kept events must retain their original seq numbers",
+  );
+});
+
+test("cursor read under the byte bound does not invent journal_truncated", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  await seedOrderedEvents(fixture.journalPath, [
+    {
+      seq: 1,
+      rev: fixture.rev,
+      event_id: "e1",
+      idempotency_key: "one",
+      actor: "test",
+      kind: "test.one",
+      at,
+    },
+    {
+      seq: 2,
+      rev: fixture.rev,
+      event_id: "e2",
+      idempotency_key: "two",
+      actor: "test",
+      kind: "test.two",
+      at,
+    },
+  ]);
+  const page = await readThreadEvents(fixture.journalPath, 0, 20, { maxReadBytes: 1_000_000 });
+  assert.equal(
+    page.events.some((event) => event.kind === "journal_truncated" || event.kind === "cursor_gap"),
+    false,
+  );
+  assert.deepEqual(page.events.map((event) => event.seq), [1, 2]);
+});
+
+test("cursor bound with no complete tail event fails closed instead of inventing a gap", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const event = {
+    seq: 1,
+    rev: fixture.rev,
+    event_id: "e1",
+    idempotency_key: "one",
+    actor: "test",
+    kind: "test.one",
+    at,
+    payload: { pad: "z".repeat(400) },
+  };
+  await writeFile(
+    fixture.journalPath,
+    `${header}${JSON.stringify(event)}\n`,
+    "utf8",
+  );
+  const fileSize = (await readFile(fixture.journalPath)).length;
+  await assert.rejects(
+    () => readThreadEvents(fixture.journalPath, 0, 20, { maxReadBytes: Math.min(40, fileSize - 1) }),
+    (error) => {
+      assert.equal(error?.code, "THREAD_JOURNAL_BOUND");
+      return true;
+    },
+  );
 });

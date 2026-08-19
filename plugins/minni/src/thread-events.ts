@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 
 import { stableStringify } from "./agent_envelope.js";
 import { type AppendJournalDeps } from "./plan.js";
@@ -147,6 +147,83 @@ export class ThreadJournalAppendError extends Error {
   }
 }
 
+/** Wire kinds for an honest ordered-journal hole. Same payload shape. */
+export const JOURNAL_TRUNCATION_KIND = "journal_truncated";
+export const CURSOR_GAP_KIND = "cursor_gap";
+
+export interface JournalTruncationPayload {
+  last_dropped_seq: number;
+  first_kept_seq: number;
+}
+
+/**
+ * since_seq poller would jump over missing seqs with no journal_truncated /
+ * cursor_gap marker explaining last_dropped_seq + first_kept_seq. Fail closed
+ * — a silent hole is worse than an unbounded parse.
+ */
+export class ThreadCursorGapError extends Error {
+  readonly code = "THREAD_CURSOR_GAP" as const;
+  readonly sinceSeq: number;
+  readonly firstKeptSeq: number;
+
+  constructor(sinceSeq: number, firstKeptSeq: number) {
+    super(
+      `unmarked cursor_gap: since_seq ${sinceSeq} jumps to first_kept_seq ${firstKeptSeq} without journal_truncated`,
+    );
+    this.name = "ThreadCursorGapError";
+    this.sinceSeq = sinceSeq;
+    this.firstKeptSeq = firstKeptSeq;
+  }
+}
+
+/**
+ * Cursor read bound could not produce an honest first_kept_seq (empty/partial
+ * tail after skipping a prefix). Prefer this over inventing gap bounds.
+ */
+export class ThreadJournalBoundError extends Error {
+  readonly code = "THREAD_JOURNAL_BOUND" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ThreadJournalBoundError";
+  }
+}
+
+/** Default max bytes the cursor reader will load from the end of a journal. */
+export const ORDERED_JOURNAL_CURSOR_TAIL_BYTES = 1024 * 1024;
+
+export interface ReadThreadEventsOptions {
+  /** Override the cursor read/parse byte bound (tests + deliberate tuning). */
+  maxReadBytes?: number;
+}
+
+export function isJournalGapKind(kind: string): boolean {
+  return kind === JOURNAL_TRUNCATION_KIND || kind === CURSOR_GAP_KIND;
+}
+
+export function journalTruncationPayload(
+  event: OrderedThreadEvent,
+): JournalTruncationPayload | undefined {
+  if (!isJournalGapKind(event.kind)) return undefined;
+  const payload = event.payload;
+  if (payload === undefined || typeof payload !== "object" || payload === null) {
+    return undefined;
+  }
+  const lastDropped = (payload as Record<string, unknown>).last_dropped_seq;
+  const firstKept = (payload as Record<string, unknown>).first_kept_seq;
+  if (
+    typeof lastDropped !== "number" ||
+    !Number.isSafeInteger(lastDropped) ||
+    lastDropped < 1 ||
+    typeof firstKept !== "number" ||
+    !Number.isSafeInteger(firstKept) ||
+    firstKept <= lastDropped
+  ) {
+    return undefined;
+  }
+  return { last_dropped_seq: lastDropped, first_kept_seq: firstKept };
+}
+
 function isErrno(error: unknown, code: string): boolean {
   return (
     typeof error === "object" &&
@@ -168,6 +245,129 @@ async function readOrderedJournalText(
     }
     throw new ThreadJournalReadError(journalPath, error);
   }
+}
+
+/**
+ * Cursor-path read: load at most maxReadBytes from the file tail. When the
+ * prefix is skipped, the caller must emit a cursor_gap — never pretend the
+ * stream is contiguous from seq 1.
+ */
+async function readOrderedJournalTextBounded(
+  journalPath: string,
+  maxReadBytes: number,
+): Promise<{ text: string; prefixTruncated: boolean } | undefined> {
+  if (maxReadBytes < 1) {
+    throw new ThreadJournalBoundError(
+      "ordered journal cursor bound must be at least 1 byte",
+    );
+  }
+
+  let fileSize: number;
+  try {
+    fileSize = (await stat(journalPath)).size;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new ThreadJournalReadError(journalPath, error);
+  }
+
+  if (fileSize <= maxReadBytes) {
+    const text = await readOrderedJournalText(journalPath);
+    if (text === undefined) {
+      return undefined;
+    }
+    return { text, prefixTruncated: false };
+  }
+
+  try {
+    const handle = await open(journalPath, "r");
+    try {
+      const length = Math.min(maxReadBytes, fileSize);
+      const start = fileSize - length;
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, start);
+      let text = buffer.toString("utf8", 0, bytesRead);
+      const newline = text.indexOf("\n");
+      if (newline === -1) {
+        return { text: "", prefixTruncated: true };
+      }
+      // Discard the leading torn line so parse never invents a half-event.
+      text = text.slice(newline + 1);
+      return { text, prefixTruncated: true };
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new ThreadJournalReadError(journalPath, error);
+  }
+}
+
+function synthesizeCursorGapForReadBound(
+  firstKept: OrderedThreadEvent,
+): OrderedThreadEvent {
+  const lastDropped = firstKept.seq - 1;
+  const idempotencyKey = deriveSystemEventKey(
+    CURSOR_GAP_KIND,
+    String(lastDropped),
+    String(firstKept.seq),
+  );
+  return {
+    seq: lastDropped,
+    rev: firstKept.rev,
+    event_id: createHash("sha256")
+      .update(
+        stableStringify({
+          kind: CURSOR_GAP_KIND,
+          last_dropped_seq: lastDropped,
+          first_kept_seq: firstKept.seq,
+        }),
+      )
+      .digest("hex")
+      .slice(0, 32),
+    idempotency_key: idempotencyKey,
+    actor: "minni",
+    kind: CURSOR_GAP_KIND,
+    at: firstKept.at,
+    payload: {
+      last_dropped_seq: lastDropped,
+      first_kept_seq: firstKept.seq,
+    },
+  };
+}
+
+/**
+ * After a tail-only read, surface cursor_gap when event seqs were skipped.
+ * Uses contiguous-seq honesty: last_dropped = first_kept - 1. Does not rewrite
+ * the file (prefer read bound over delete-rotate).
+ */
+function applyCursorReadBound(
+  events: OrderedThreadEvent[],
+  prefixTruncated: boolean,
+): OrderedThreadEvent[] {
+  if (!prefixTruncated) {
+    return events;
+  }
+  const firstKept = events.find((event) => !isJournalGapKind(event.kind));
+  if (firstKept === undefined) {
+    throw new ThreadJournalBoundError(
+      "ordered journal cursor bound dropped the prefix and left no complete events",
+    );
+  }
+  if (firstKept.seq <= 1) {
+    return events;
+  }
+  const covering = events.find((event) => {
+    const payload = journalTruncationPayload(event);
+    return payload !== undefined && payload.first_kept_seq === firstKept.seq;
+  });
+  if (covering) {
+    return events;
+  }
+  return [synthesizeCursorGapForReadBound(firstKept), ...events];
 }
 
 /** Namespaced journal key for client-supplied idempotency (claim/worker). */
@@ -304,6 +504,11 @@ function isIncompleteJsonLine(
   return false;
 }
 
+/**
+ * Parse durable ordered events, including journal_truncated / cursor_gap wire
+ * kinds. Does not invent a gap marker — that belongs to readThreadEvents so a
+ * mutation full-parse cannot mint a synthetic cursor event.
+ */
 export function parseOrderedThreadEvents(
   journalText: string,
 ): OrderedThreadEvent[] {
@@ -359,18 +564,85 @@ export async function readOrderedThreadEvents(
   return parseOrderedThreadEvents(journalText);
 }
 
+function findCoveringGapMarker(
+  ordered: OrderedThreadEvent[],
+  sinceSeq: number,
+  firstKeptSeq: number,
+): OrderedThreadEvent | undefined {
+  for (const event of ordered) {
+    const payload = journalTruncationPayload(event);
+    if (!payload) continue;
+    if (payload.first_kept_seq !== firstKeptSeq) continue;
+    // Poller still sits before the kept window — surface the marker even when
+    // its own seq is <= since_seq (cursor parked inside the hole).
+    if (sinceSeq < payload.first_kept_seq) {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Cursor page after since_seq. Inserts journal_truncated / cursor_gap when the
+ * poller would otherwise jump a marked hole; throws THREAD_CURSOR_GAP on an
+ * unmarked jump. Never renumbers seq.
+ *
+ * Read/parse is byte-bounded (ORDERED_JOURNAL_CURSOR_TAIL_BYTES by default):
+ * an oversized journal loads only the tail and synthesizes cursor_gap for the
+ * skipped prefix. Mutation paths still full-parse via readOrderedThreadEvents.
+ */
 export async function readThreadEvents(
   journalPath: string,
   sinceSeq = 0,
   limit = 100,
+  options: ReadThreadEventsOptions = {},
 ): Promise<{ events: OrderedThreadEvent[]; next_seq: number }> {
-  // Phase 1 bound: one journal read + parse per minni_thread_events call.
-  const ordered = await readOrderedThreadEvents(journalPath);
+  const maxReadBytes =
+    options.maxReadBytes ?? ORDERED_JOURNAL_CURSOR_TAIL_BYTES;
+  orderedJournalParseCount += 1;
+  const loaded = await readOrderedJournalTextBounded(journalPath, maxReadBytes);
+  const ordered = applyCursorReadBound(
+    loaded === undefined ? [] : parseOrderedThreadEvents(loaded.text),
+    loaded?.prefixTruncated ?? false,
+  );
+  const firstKept = ordered.find(
+    (event) => event.seq > sinceSeq && !isJournalGapKind(event.kind),
+  );
+  const expectedNext = sinceSeq + 1;
+  let leadingGap: OrderedThreadEvent | undefined;
+
+  if (firstKept !== undefined && firstKept.seq > expectedNext) {
+    const marker = findCoveringGapMarker(ordered, sinceSeq, firstKept.seq);
+    if (!marker || !journalTruncationPayload(marker)) {
+      throw new ThreadCursorGapError(sinceSeq, firstKept.seq);
+    }
+    leadingGap = marker;
+  }
+
   const filtered = ordered.filter((event) => event.seq > sinceSeq);
-  const page = filtered.slice(0, limit);
+  const page: OrderedThreadEvent[] = [];
+  if (
+    leadingGap !== undefined &&
+    !filtered.some((event) => event.event_id === leadingGap.event_id)
+  ) {
+    page.push(leadingGap);
+  }
+  for (const event of filtered) {
+    if (page.length >= limit) break;
+    page.push(event);
+  }
+
+  let nextSeq = page.length > 0 ? page[page.length - 1].seq : sinceSeq;
+  const last = page.length > 0 ? page[page.length - 1] : undefined;
+  const lastPayload = last ? journalTruncationPayload(last) : undefined;
+  if (lastPayload) {
+    // limit=1 may return only the marker; advance past the hole so the next
+    // poll lands on first_kept_seq instead of re-entering a silent jump.
+    nextSeq = Math.max(nextSeq, lastPayload.first_kept_seq - 1);
+  }
   return {
     events: page,
-    next_seq: page.length > 0 ? page[page.length - 1].seq : sinceSeq,
+    next_seq: nextSeq,
   };
 }
 

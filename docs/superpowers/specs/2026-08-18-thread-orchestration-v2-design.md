@@ -314,6 +314,7 @@ Required event kinds:
 - `thread.attention_required`
 - `thread.completed`
 - `state.recovered`
+- `journal_truncated` / `cursor_gap` (same payload: `last_dropped_seq` + `first_kept_seq`; unmarked holes fail closed)
 
 Routine events are queryable. Attention events are the later notification
 input.

@@ -40,6 +40,8 @@ import {
   deriveReadyChangedKey,
   deriveSystemEventKey,
   readThreadEvents,
+  ThreadCursorGapError,
+  ThreadJournalBoundError,
   ThreadJournalReadError,
 } from "../dist/thread-events.js";
 import {
@@ -2038,6 +2040,16 @@ test("threadWorkerErrorText still forwards path-free operational errors", () => 
     threadWorkerErrorText(new Error("claim scope mismatch")),
     "claim scope mismatch",
   );
+});
+
+test("threadWorkerErrorText forwards THREAD_CURSOR_GAP and THREAD_JOURNAL_BOUND", () => {
+  const gap = new ThreadCursorGapError(1, 4);
+  assert.equal(threadWorkerErrorText(gap), gap.message);
+  assert.match(threadWorkerErrorText(gap), /unmarked cursor_gap/);
+  const bound = new ThreadJournalBoundError(
+    "ordered journal cursor bound dropped the prefix and left no complete events",
+  );
+  assert.equal(threadWorkerErrorText(bound), bound.message);
 });
 
 test("threadWorkerErrorText never serializes ThreadJournalReadError.journalPath", () => {
@@ -4458,5 +4470,151 @@ test("final-fix-5: claimSlice sibling expiry that lands-then-throws must not let
   assert.ok(
     leaseExpired.seq < claimed.seq,
     "the in-lock sibling expiry must be ordered strictly before the triggering claim event",
+  );
+});
+
+// Stacked on #373: worker/orchestrator poller must see journal_truncated after
+// a simulated ordered-journal prefix drop. Silent holes are a fail.
+test("worker-side since_seq poller sees journal_truncated after simulated drop", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+  const claimed = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-before-trunc",
+    ttlSeconds: 3600,
+    now: new Date(THREAD_START),
+  });
+  assert.ok(claimed.token);
+
+  const before = await readThreadEvents(journalPath, 0, 1000);
+  assert.ok(before.events.length >= 2, "assign/claim must leave ordered events");
+  const lastDropped = before.events[before.events.length - 2];
+  const firstKept = before.events[before.events.length - 1];
+  assert.ok(lastDropped.seq + 1 === firstKept.seq);
+
+  const at = THREAD_START.toISOString();
+  const truncation = {
+    seq: lastDropped.seq,
+    rev: lastDropped.rev,
+    event_id: `trunc-${lastDropped.seq}`,
+    idempotency_key: `system:journal_truncated:${lastDropped.seq}:${firstKept.seq}`,
+    actor: "minni",
+    kind: "journal_truncated",
+    at,
+    payload: {
+      last_dropped_seq: lastDropped.seq,
+      first_kept_seq: firstKept.seq,
+    },
+  };
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  await writeFile(
+    journalPath,
+    header
+      + `${JSON.stringify(truncation)}\n`
+      + `${JSON.stringify(firstKept)}\n`,
+    "utf8",
+  );
+
+  // Cursor parked before the drop must observe the hole, not jump silently.
+  const sinceSeq = Math.max(0, lastDropped.seq - 1);
+  const page = await readThreadEvents(journalPath, sinceSeq, 50);
+  assert.equal(page.events[0]?.kind, "journal_truncated");
+  assert.deepEqual(page.events[0]?.payload, {
+    last_dropped_seq: lastDropped.seq,
+    first_kept_seq: firstKept.seq,
+  });
+  assert.equal(page.events[1]?.seq, firstKept.seq);
+  assert.equal(page.events[1]?.event_id, firstKept.event_id);
+});
+
+test("worker poller bounded cursor read surfaces journal_truncated for an oversized journal", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-before-bound",
+    ttlSeconds: 3600,
+    now: new Date(THREAD_START),
+  });
+
+  const before = await readThreadEvents(journalPath, 0, 1000);
+  const at = THREAD_START.toISOString();
+  const rev = before.events.at(-1)?.rev ?? 1;
+  let seq = before.events.reduce((max, event) => Math.max(max, event.seq), 0);
+  const pad = "y".repeat(180);
+  const extras = [];
+  for (let i = 0; i < 35; i += 1) {
+    seq += 1;
+    extras.push(JSON.stringify({
+      seq,
+      rev,
+      event_id: `pad-${seq}`,
+      idempotency_key: `pad-${seq}`,
+      actor: "test",
+      kind: "test.pad",
+      at,
+      payload: { pad },
+    }));
+  }
+  const existing = await readFile(journalPath, "utf8");
+  await writeFile(journalPath, `${existing}${extras.join("\n")}\n`, "utf8");
+  const fileSize = Buffer.byteLength(existing) + Buffer.byteLength(`${extras.join("\n")}\n`);
+  const maxReadBytes = Math.min(2_800, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize);
+
+  const page = await readThreadEvents(journalPath, 0, 80, { maxReadBytes });
+  assert.ok(
+    page.events[0]?.kind === "journal_truncated" || page.events[0]?.kind === "cursor_gap",
+    `expected cursor gap kind, got ${page.events[0]?.kind}`,
+  );
+  assert.equal(
+    page.events[0]?.payload?.last_dropped_seq,
+    page.events[0]?.payload?.first_kept_seq - 1,
+  );
+  assert.ok(page.events[0].payload.first_kept_seq > 1);
+  assert.equal(page.events[1]?.seq, page.events[0].payload.first_kept_seq);
+});
+
+test("worker-side since_seq poller fails closed on an unmarked seq hole", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+  const before = await readThreadEvents(journalPath, 0, 1000);
+  const firstKept = before.events.at(-1);
+  assert.ok(firstKept);
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  await writeFile(journalPath, `${header}${JSON.stringify(firstKept)}\n`, "utf8");
+  // firstKept.seq > 1 after assign (baseline + assigned). Drop everything
+  // before it with no journal_truncated marker.
+  assert.ok(firstKept.seq > 1);
+  await assert.rejects(
+    () => readThreadEvents(journalPath, 0, 50),
+    (error) => {
+      assert.equal(error?.code, "THREAD_CURSOR_GAP");
+      return true;
+    },
   );
 });

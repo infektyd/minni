@@ -28,7 +28,7 @@ Use Minni Threads for: $ARGUMENTS
    - If you have live shelf markdown, pass `live_shelf_content` to surface `drift` only — **never auto-pull** shelf content; recommend a manual pull to the user when drifted
 8. When scope changes materially, call `minni_thread_replan` with either a full set of `new_slices` or differential updates (`add_slices` and/or `drop_slice_ids`) instead of editing the vault note by hand. History is preserved via `superseded` slices.
 9. Follow progress and synchronize state via ordered event cursors with `minni_thread_events`:
-   - Call `minni_thread_events(plan_id?, since_seq?, limit?)` to read append-only journal events recorded after `since_seq`.
+   - Call `minni_thread_events(plan_id?, since_seq?, limit?)` to read append-only journal events recorded after `since_seq`. Treat `journal_truncated` / `cursor_gap` as a hole (`last_dropped_seq` + `first_kept_seq`); do not assume seq is contiguous.
    - Lazy claim expiry shares the same locked sweep as `minni_thread_ready` / `minni_thread_status`: if a claim is past `expires_at`, the call lands `slice.lease_expired` / `thread.attention_required` before returning the cursor. Otherwise the journal is read once.
 10. To inspect and manage thread revision history:
    - Call `minni_thread_history` to list all saved revisions.
