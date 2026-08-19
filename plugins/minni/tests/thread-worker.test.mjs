@@ -2824,6 +2824,129 @@ test("duplicate worker start does not rev-bump or emit false recovery", async (t
   );
 });
 
+// --- Wave 2 residual: note-ahead journal swallow (MED) ------------------------
+//
+// recordThreadMutationEvents used to catch a failed ordered append and return
+// after the note was already durable, so the MCP tool reported OK while the
+// mutation's ordered kind was missing until a later mutation wrote
+// state.recovered. Pin: persist succeeds, ordered kind missing, tool still OK
+// is the hole — success and cursor-moved must be the same moment, or the
+// caller gets a typed error. Do not silently hide the gap.
+
+test("assignSlice must not return OK when the ordered slice.assigned append fails to land", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const before = await readThreadEvents(journalPath, 0, 100);
+
+  // Let prepareThreadMutation / baseline land, then fail only the post-persist
+  // mutation batch — the note-ahead swallow window.
+  const failAfterPrepare = async (filePath, content) => {
+    const text = typeof content === "string" ? content : String(content);
+    if (text.includes("slice.assigned")) {
+      throw new Error("simulated ordered append failure before write");
+    }
+    return realAppendFileWithFsync(filePath, content);
+  };
+
+  const outcome = await assignSlice(
+    {
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+      now: new Date(THREAD_START),
+    },
+    {
+      appendJournalDeps: {
+        appendFileWithFsync: failAfterPrepare,
+        writeFileAtomic: async () => {
+          throw new Error("simulated ordered append failure before write");
+        },
+      },
+    },
+  ).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(
+    durable.slices[0].assigned_to,
+    "worker-a",
+    "note persist still lands — the hole is lying about the cursor, not durability",
+  );
+
+  const after = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    after.events.some((event) => event.kind === "slice.assigned"),
+    false,
+    "ordered slice.assigned must be missing when the append never landed",
+  );
+
+  // Hole today: ok===true with missing ordered kind. Fix: typed error (or
+  // same-call repair that lands the kind before returning).
+  if (outcome.ok) {
+    assert.fail(
+      "assignSlice returned OK while slice.assigned is missing from the ordered cursor (note-ahead swallow)",
+    );
+  }
+  assert.equal(
+    outcome.error?.code,
+    "THREAD_JOURNAL_APPEND_FAILED",
+    `expected typed THREAD_JOURNAL_APPEND_FAILED, got ${outcome.error?.name}: ${outcome.error?.message}`,
+  );
+  // prepareThreadMutation may have advanced the cursor (baseline); the
+  // mutation's own kind must still be absent.
+  assert.equal(
+    after.events.some((event) => event.kind === "slice.assigned"),
+    false,
+  );
+});
+
+test("recordThreadMutationEvents continues when land-then-throw left the operation on disk", async (t) => {
+  // Sibling of final-fix-5: write lands, fsync throws, snapshot refreshes —
+  // the operation key is present, so the locked mutation may continue.
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  let forcedLandThenThrow = false;
+  const landedThenThrows = async (filePath, content) => {
+    const text = typeof content === "string" ? content : String(content);
+    // Only the post-persist mutation batch (not prepare/baseline).
+    if (!forcedLandThenThrow && text.includes("slice.assigned")) {
+      forcedLandThenThrow = true;
+      await realAppendFileWithFsync(filePath, content);
+      throw new Error("simulated fsync failure after write landed");
+    }
+    return realAppendFileWithFsync(filePath, content);
+  };
+
+  const result = await assignSlice(
+    {
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+      now: new Date(THREAD_START),
+    },
+    {
+      appendJournalDeps: {
+        appendFileWithFsync: landedThenThrows,
+        writeFileAtomic: async () => {
+          throw new Error("simulated fsync failure after write landed");
+        },
+      },
+    },
+  );
+  assert.equal(result.slice.assigned_to, "worker-a");
+  assert.equal(forcedLandThenThrow, true, "mutation append must have been forced");
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.ok(
+    events.some((event) => event.kind === "slice.assigned"),
+    "land-then-throw must still leave slice.assigned on the ordered cursor",
+  );
+});
+
 test("claim idempotent retry repairs missing slice.claimed and ready delta", async (t) => {
   const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
   await assignWorker(fixture, "a", "worker-a");

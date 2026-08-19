@@ -33,6 +33,7 @@ import {
   readOrderedThreadEvents,
   type OrderedThreadEvent,
   ThreadEventIdempotencyConflictError,
+  ThreadJournalAppendError,
   ThreadJournalReadError,
   type ReadySummaryPayload,
 } from "./thread-events.js";
@@ -318,6 +319,9 @@ export function threadWorkerErrorText(error: unknown): string {
     return planDigestVersionErrorMessage(error.version);
   }
   if (error instanceof ThreadJournalReadError) {
+    return error.message;
+  }
+  if (error instanceof ThreadJournalAppendError) {
     return error.message;
   }
   const errno = nodeErrnoCode(error);
@@ -649,11 +653,15 @@ function workerEventKind(action: WorkerUpdateAction): string {
 /**
  * Append one operation event plus, when the ready set actually changed, one
  * coalesced ready.changed event — the "after persistence" half of every
- * locked mutation's event lifecycle. A caught append failure is swallowed
- * here on purpose: the note is already durable, and the next locked
- * mutation's prepareThreadMutation reconciles the resulting note-ahead gap
- * via state.recovered rather than ever silently hiding it. Exported for
- * the same cross-call-site reuse reason as prepareThreadMutation above.
+ * locked mutation's event lifecycle.
+ *
+ * If the ordered append fails but the operation event actually landed
+ * (write-then-fsync: land-then-throw with a refreshed snapshot), continue —
+ * success and cursor-moved already agree. If the operation key is still
+ * missing, throw THREAD_JOURNAL_APPEND_FAILED rather than returning MCP OK
+ * while the cursor lags until a later state.recovered. Crash between note
+ * persist and this call remains a true note-ahead gap recovered on the next
+ * locked mutation per the v2 contract.
  */
 export async function recordThreadMutationEvents(input: {
   journalPath: string;
@@ -740,10 +748,18 @@ export async function recordThreadMutationEvents(input: {
       if (!snapshotTruthful) {
         throw error;
       }
-      // Snapshot matches durable journal; safe to continue the locked mutation.
+    }
+    // Snapshot matches the durable journal (or there is no live snapshot).
+    // Continue only when this mutation's operation event actually landed
+    // (land-then-throw refresh path). Otherwise the note is ahead and the
+    // caller must see a typed failure — not MCP OK with a silent gap.
+    const ordered =
+      input.orderedSnapshot ??
+      (await readOrderedThreadEvents(input.journalPath).catch(() => []));
+    if (findOrderedEventByIdempotencyKey(ordered, input.operationKey)) {
       return;
     }
-    // The note is already durable; the next locked mutation reconciles first.
+    throw new ThreadJournalAppendError(input.operationKey, input.kind, error);
   }
 }
 

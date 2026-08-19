@@ -122,6 +122,31 @@ export class ThreadJournalReadError extends Error {
   }
 }
 
+/**
+ * Ordered journal append failed after the note mutation was already durable,
+ * and the mutation's operation event is not on the cursor. Callers must not
+ * report MCP OK for this — success and cursor-moved are the same moment, or
+ * this typed error. Distinct from THREAD_JOURNAL_UNREADABLE (read path).
+ */
+export class ThreadJournalAppendError extends Error {
+  readonly code = "THREAD_JOURNAL_APPEND_FAILED" as const;
+  readonly operationKey: string;
+  readonly kind: string;
+
+  constructor(operationKey: string, kind: string, cause?: unknown) {
+    const detail =
+      cause instanceof Error && cause.message.trim().length > 0
+        ? cause.message
+        : "ordered append failed";
+    super(`thread journal append failed for ${kind}: ${detail}`, {
+      cause: cause instanceof Error ? cause : undefined,
+    });
+    this.name = "ThreadJournalAppendError";
+    this.operationKey = operationKey;
+    this.kind = kind;
+  }
+}
+
 function isErrno(error: unknown, code: string): boolean {
   return (
     typeof error === "object" &&
