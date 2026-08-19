@@ -5,7 +5,9 @@ import {
   addScar,
   journalPathFor,
   persistPlan,
+  planDigestVersionErrorMessage,
   planHistoryAppendErrorMessage,
+  PlanDigestVersionError,
   rehydratePlan,
   unmetDependencies,
   updateSlice,
@@ -265,14 +267,18 @@ export function revokedClaimIds(
 }
 
 /**
- * Model-facing text for thread MCP handlers. PlanHistoryAppendError keeps
- * notePath as a typed field for internal callers. Rebuild from rev +
- * cause.code only — never interpolate notePath, historyPathFor(notePath),
+ * Model-facing text for thread MCP handlers. PlanHistoryAppendError and
+ * PlanDigestVersionError keep notePath as a typed field for internal
+ * callers. Rebuild from rev + cause.code (history) or version (digest)
+ * only — never interpolate notePath, historyPathFor(notePath),
  * cause.message, or cause.path (real EISDIR/EACCES embed wiki/artifacts).
  */
 export function threadWorkerErrorText(error: unknown): string {
   if (error instanceof PlanHistoryAppendError) {
     return planHistoryAppendErrorMessage(error.rev, error.cause);
+  }
+  if (error instanceof PlanDigestVersionError) {
+    return planDigestVersionErrorMessage(error.version);
   }
   return error instanceof Error ? error.message : String(error);
 }

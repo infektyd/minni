@@ -482,3 +482,49 @@ test("final-fix-5: a post-write fsync throw does not get treated as a missing jo
     "the line that landed on disk before the throw must remain readable",
   );
 });
+
+// Cassandra PR #371 G1: the ordered Thread journal and the legacy plan
+// journal are the same file. appendJournalLine already refused catch-all
+// rewrite; appendJournal used to still do it — a failed fsync append of
+// a legacy line wiped the now-canonical ordered events.
+test("appendJournal fsync-fail does not wipe the now-canonical ordered event journal", async (t) => {
+  const fixture = await createThread(t);
+  await withThreadLock(fixture.vaultPath, fixture.planId, "seed", async () => {
+    await appendOrderedEventBatch({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      actor: "test",
+      events: [
+        { idempotencyKey: "seed-one", kind: "test.one" },
+        { idempotencyKey: "seed-two", kind: "test.two" },
+      ],
+    });
+  });
+  const before = await readThreadEvents(fixture.journalPath, 0, 100);
+  assert.equal(before.events.length, 2);
+
+  const landedThenThrows = async (filePath, content) => {
+    await realAppendFileWithFsync(filePath, content);
+    throw new Error("simulated fsync failure after write landed");
+  };
+
+  await assert.rejects(
+    () =>
+      appendJournal(
+        fixture.journalPath,
+        { kind: "status_changed", at: "2026-01-01T00:00:00.000Z" },
+        { appendFileWithFsync: landedThenThrows },
+      ),
+    /simulated fsync failure/,
+  );
+
+  const after = await readThreadEvents(fixture.journalPath, 0, 100);
+  assert.equal(
+    after.events.length,
+    2,
+    "ordered events must survive a failed legacy appendJournal fsync, not be clobbered",
+  );
+  assert.ok(after.events.some((event) => event.idempotency_key === "seed-one"));
+  assert.ok(after.events.some((event) => event.idempotency_key === "seed-two"));
+});

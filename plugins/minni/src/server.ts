@@ -184,8 +184,9 @@ async function requireSharedGate(
 // `.message` and a typed `.code` (ThreadInconsistentError,
 // ThreadEventIdempotencyConflictError, PlanHistoryAppendError, ...) are ever
 // read off the error — never the whole object. PlanHistoryAppendError.notePath
-// stays a typed internal field; threadWorkerErrorText rebuilds that case
-// from rev + cause.code only, never notePath / history file / cause.message.
+// and PlanDigestVersionError.notePath stay typed internal fields;
+// threadWorkerErrorText rebuilds those cases from rev + cause.code / version
+// only, never notePath / history file / cause.message.
 async function persistPlanThenRevokeClaimSecrets(
   plan: PlanArtifact,
   opts: { vaultPath: string; notePath: string },

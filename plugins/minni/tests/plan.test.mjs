@@ -32,7 +32,7 @@ import {
   historyPathFor,
   readHistory
 } from "../dist/plan.js";
-import { ensureVault, writeVaultPage } from "../dist/vault.js";
+import { appendFileWithFsync as realAppendFileWithFsync, ensureVault, writeFileAtomic, writeVaultPage } from "../dist/vault.js";
 
 test("createPlan rejects duplicate explicit slice ids before writing", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-plan-duplicate-create-"));
@@ -1382,6 +1382,13 @@ test("rehydratePlan still rejects a newer-than-current declared digest version",
         assert.ok(err instanceof PlanDigestVersionError, "must be the typed newer-version error");
         assert.equal(err.code, "PLAN_DIGEST_NEWER");
         assert.match(err.message, /newer than this plugin/);
+        assert.equal(err.notePath, write.notePath, "notePath stays a typed internal field");
+        assert.equal(
+          err.message.includes(write.notePath),
+          false,
+          "PlanDigestVersionError.message must not interpolate notePath",
+        );
+        assert.equal(err.message.includes("wiki/artifacts"), false);
         return true;
       },
     );
@@ -1663,6 +1670,62 @@ test("appendJournal round-trips real init + append with no leftover .tmp sibling
       events.map((e) => e.at),
       ["2026-01-01T00:00:00.000Z", "2026-01-01T00:01:00.000Z"],
       "both events must be present, in order, after init + append",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Cassandra PR #371 G1: appendJournal's catch-all used to treat ANY
+// append/fsync failure as "journal missing" and overwrite it via
+// writeFileAtomic. This file is also the ordered Thread event journal —
+// rewriting it after a failed fsync is real lost-events, not recovery.
+test("appendJournal does not rewrite an existing journal when append/fsync fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-journal-fsync-"));
+  try {
+    const journalPath = path.join(root, "test.log.md");
+    await appendJournal(journalPath, { kind: "rehydrated", at: "2026-01-01T00:00:00.000Z" });
+    await appendJournal(journalPath, { kind: "status_changed", at: "2026-01-01T00:01:00.000Z" });
+    const before = parseJournal(await readFile(journalPath, "utf8"));
+    assert.deepEqual(
+      before.map((e) => e.at),
+      ["2026-01-01T00:00:00.000Z", "2026-01-01T00:01:00.000Z"],
+    );
+
+    const atomicCalls = [];
+    const landedThenThrows = async (filePath, content) => {
+      await realAppendFileWithFsync(filePath, content);
+      throw Object.assign(new Error("simulated fsync failure after write landed"), {
+        code: "EIO",
+      });
+    };
+
+    await assert.rejects(
+      () =>
+        appendJournal(
+          journalPath,
+          { kind: "gate_passed", at: "2026-01-01T00:02:00.000Z" },
+          {
+            appendFileWithFsync: landedThenThrows,
+            writeFileAtomic: async (p, c) => {
+              atomicCalls.push([p, c]);
+              await writeFileAtomic(p, c);
+            },
+          },
+        ),
+      /simulated fsync failure/,
+    );
+
+    assert.equal(
+      atomicCalls.length,
+      0,
+      "fsync-fail on an existing journal must not rewrite via writeFileAtomic",
+    );
+    const after = parseJournal(await readFile(journalPath, "utf8"));
+    assert.deepEqual(
+      after.map((e) => e.at),
+      ["2026-01-01T00:00:00.000Z", "2026-01-01T00:01:00.000Z", "2026-01-01T00:02:00.000Z"],
+      "prior events must survive; the line that landed before the throw must remain",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

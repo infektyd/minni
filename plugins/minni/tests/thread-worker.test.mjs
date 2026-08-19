@@ -29,6 +29,7 @@ import {
   historyPathFor,
   journalPathFor,
   persistPlan,
+  PlanDigestVersionError,
   PlanHistoryAppendError,
   rehydratePlan,
   replan,
@@ -1909,6 +1910,48 @@ test("orchestrator slice transitions revoke a claim across terminal reopen", asy
   const block = serverSource.slice(start, end);
   assert.match(block, /applyOrchestratorSliceUpdate/);
   assert.match(block, /persistPlanThenRevokeClaimSecrets/);
+});
+
+test("threadWorkerErrorText never serializes PlanDigestVersionError.notePath", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const error = new PlanDigestVersionError(4, notePath);
+  const text = threadWorkerErrorText(error);
+  assert.match(text, /newer than this plugin/);
+  assert.match(text, /v4/);
+  assert.equal(error.notePath, notePath);
+  assert.equal(text.includes(notePath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText redacts notePath from a real rehydratePlan PlanDigestVersionError", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-worker-digest-redact-"));
+  try {
+    const { ensureVault } = await import("../dist/vault.js");
+    await ensureVault(root);
+    const created = await createPlan(
+      { goal: "Redact a real digest-version notePath", vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(created.write.notePath, "utf8");
+    await writeFile(
+      created.write.notePath,
+      raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"),
+      "utf8",
+    );
+    const failure = await rehydratePlan(created.write.notePath).then(
+      (value) => ({ ok: true, value }),
+      (error) => ({ ok: false, error }),
+    );
+    assert.equal(failure.ok, false);
+    assert.ok(failure.error instanceof PlanDigestVersionError);
+    const text = threadWorkerErrorText(failure.error);
+    assert.match(text, /newer than this plugin/);
+    assert.equal(text.includes(created.write.notePath), false);
+    assert.equal(text.includes("wiki/artifacts"), false);
+    assert.equal(failure.error.notePath, created.write.notePath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("threadWorkerErrorText never serializes PlanHistoryAppendError.notePath", () => {

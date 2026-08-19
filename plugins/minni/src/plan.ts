@@ -384,6 +384,15 @@ function parsePlanDigestTag(stored: string): { version: number; hex: string } | 
 }
 
 /**
+ * Model-facing / `.message` text for a newer-than-supported digest.
+ * Keep `notePath` as a typed field on PlanDigestVersionError — never
+ * interpolate it here. Worker MCP surfaces this via threadWorkerErrorText.
+ */
+export function planDigestVersionErrorMessage(version: number): string {
+  return `plan_digest version v${version} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`;
+}
+
+/**
  * A note whose declared digest version is newer than this plugin understands.
  * Typed (not a bare Error) so recovery paths can tell it apart from a tamper:
  * minni_thread_restore must refuse to "heal" such a note — writing it back with
@@ -391,11 +400,13 @@ function parsePlanDigestTag(stored: string): { version: number; hex: string } | 
  */
 export class PlanDigestVersionError extends Error {
   readonly code = "PLAN_DIGEST_NEWER" as const;
+  readonly version: number;
+  readonly notePath: string;
   constructor(version: number, notePath: string) {
-    super(
-      `plan_digest version v${version} on ${notePath} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`,
-    );
+    super(planDigestVersionErrorMessage(version));
     this.name = "PlanDigestVersionError";
+    this.version = version;
+    this.notePath = notePath;
   }
 }
 
@@ -772,6 +783,15 @@ export interface AppendJournalDeps {
   writeFileAtomic?: typeof writeFileAtomic;
 }
 
+function isJournalMissing(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: unknown }).code === "ENOENT"
+  );
+}
+
 /** Append a PlanEvent as a single JSON line. Creates header on first write. */
 export async function appendJournal(
   journalPath: string,
@@ -783,18 +803,28 @@ export async function appendJournal(
   // (plan.ts's historyFile write, below) — a crash could leave history
   // durable and the journal behind it or truncated. Same durability
   // guarantee as the sibling now: fsync'd append, atomic temp+rename init.
+  //
+  // Init (header + first line) is ENOENT-only. A catch-all rewrite after a
+  // failed fsync append wipes this file, which is also the ordered Thread
+  // event journal — real lost-events, not recovery.
   const doAppendWithFsync = deps.appendFileWithFsync ?? appendFileWithFsync;
   const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
   const line = JSON.stringify(event) + "\n";
+
+  let existing: string;
   try {
-    // exists -> append
-    await readFile(journalPath, "utf8");
-    await doAppendWithFsync(journalPath, line);
-  } catch {
-    // missing or unreadable -> init
+    existing = await readFile(journalPath, "utf8");
+  } catch (error) {
+    if (!isJournalMissing(error)) {
+      throw error;
+    }
     const header = `# Minni Plan Journal\n\n## events\n`;
     await doWriteAtomic(journalPath, header + line);
+    return;
   }
+
+  const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+  await doAppendWithFsync(journalPath, prefix + line);
 }
 
 /** Parse NDJSON-ish events from journal text (ignores header/markdown). */
