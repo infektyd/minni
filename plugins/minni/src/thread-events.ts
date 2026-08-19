@@ -132,18 +132,20 @@ export class ThreadJournalAppendError extends Error {
   readonly code = "THREAD_JOURNAL_APPEND_FAILED" as const;
   readonly operationKey: string;
   readonly kind: string;
+  readonly causeCode?: string;
 
   constructor(operationKey: string, kind: string, cause?: unknown) {
-    const detail =
-      cause instanceof Error && cause.message.trim().length > 0
-        ? cause.message
-        : "ordered append failed";
-    super(`thread journal append failed for ${kind}: ${detail}`, {
-      cause: cause instanceof Error ? cause : undefined,
-    });
+    const causeCode = nodeErrnoCode(cause);
+    super(
+      causeCode
+        ? `thread journal append failed for ${kind}: ${causeCode}`
+        : `thread journal append failed for ${kind}: ordered append failed`,
+      cause instanceof Error ? { cause } : undefined,
+    );
     this.name = "ThreadJournalAppendError";
     this.operationKey = operationKey;
     this.kind = kind;
+    this.causeCode = causeCode;
   }
 }
 

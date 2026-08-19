@@ -1286,21 +1286,38 @@ export function createHookHandlers(
       await clearRecallState(config.vaultPath).catch(() => {});
     }
 
-    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
-    try {
-      activePlan = await resolveActivePlanView(config.vaultPath);
-    } catch (error) {
-      await recordAudit(config.vaultPath, {
-        tool: `${config.auditPrefix}_active_plan_error`,
-        summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
-      }).catch(() => {});
+    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>> = undefined;
+    let activePlanReadOk = true;
+    // Same contract as SessionStart: withBudget maps FS/lock throws AND a
+    // spent prompt budget onto ok=false so a failed/unread plan is degraded,
+    // not empty. A raw await here waits out THREAD_BUSY (default 5s lock)
+    // after the recall budget — the host then kills the hook and discards
+    // the envelope, which looks like "no active plan" again.
+    const planRead = await withBudget(
+      resolveActivePlanView(config.vaultPath)
+        .then((view) => ({ ok: true as const, view }))
+        .catch(async (error: unknown) => {
+          await recordAudit(config.vaultPath, {
+            tool: `${config.auditPrefix}_active_plan_error`,
+            summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
+          }).catch(() => {});
+          return { ok: false as const, view: undefined };
+        }),
+      remainingMs(),
+      { ok: false as const, view: undefined },
+    );
+    if (!planRead.ok) {
+      activePlanReadOk = false;
+    } else {
+      activePlan = planRead.view;
     }
 
     const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
 
     // Nothing salient to inject this turn: no strong recall, no stale fallback
-    // pointer AND no active plan.
-    if (!strong && stalePointer === undefined && planRef === undefined) {
+    // pointer AND no active plan. A failed plan read is salient — degraded,
+    // not the empty-pointer path.
+    if (!strong && stalePointer === undefined && planRef === undefined && activePlanReadOk) {
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_user_prompt_submit`,
         summary: prompt.slice(0, 120),
@@ -1359,6 +1376,29 @@ export function createHookHandlers(
     // the compiler narrows it for compactPlanPointer.)
     if (activePlan !== undefined) {
       envelopeBody.active_thread_ref = compactPlanPointer(activePlan);
+    }
+    if (!activePlanReadOk) {
+      const existing =
+        envelopeBody.degraded !== undefined &&
+        typeof envelopeBody.degraded === "object" &&
+        !Array.isArray(envelopeBody.degraded)
+          ? (envelopeBody.degraded as Record<string, unknown>)
+          : {};
+      const sections = Array.isArray(existing.sections)
+        ? existing.sections.filter((section): section is string => typeof section === "string")
+        : [];
+      if (!sections.includes("active_thread")) {
+        sections.push("active_thread");
+      }
+      envelopeBody.degraded = {
+        ...existing,
+        sections,
+        ...(typeof existing.note === "string"
+          ? {}
+          : {
+              note: "Active thread was not read (filesystem or lock). Treat it as unknown, not empty.",
+            }),
+      };
     }
 
     const envelope = wrapEnvelope({

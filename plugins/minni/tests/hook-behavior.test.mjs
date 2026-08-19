@@ -10,7 +10,8 @@
 // refusal). The live ~/.minni is never read or written.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -18,8 +19,9 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
+import { createPlan } from "../dist/plan.js";
 import { writeRecallState } from "../dist/recall-state.js";
-import { auditTail } from "../dist/vault.js";
+import { auditTail, ensureVault } from "../dist/vault.js";
 
 const execFileAsync = promisify(execFile);
 const PLUGIN_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1007,5 +1009,120 @@ test("PreToolUse guard audit stamps session_id only when the payload carries one
     const detailsWithSession = await lastAuditDetails(vault, "hook_test_pretooluse_guard");
     assert.ok(detailsWithSession);
     assert.equal(detailsWithSession.session_id, "guard-session-9");
+  });
+});
+
+function parseUpsEnvelope(output) {
+  const ctx = output.hookSpecificOutput?.additionalContext ?? "";
+  const raw = ctx.match(/<minni:context [^>]*>\n([\s\S]*?)\n<\/minni:context>/)?.[1];
+  return raw ? JSON.parse(raw) : undefined;
+}
+
+// Wave 2 residual: domain throws on FS/lock, but UPS mapped that to audit +
+// empty plan (lifecycle-only / noIntent). Failed read must be degraded
+// active_thread, not "nothing salient."
+test("UserPromptSubmit FS failure on the active pointer is degraded active_thread, not empty", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const pointerPath = path.join(vault, "wiki", "artifacts", "_active_plan.json");
+    await mkdir(pointerPath, { recursive: true });
+
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "an utterly novel question with zero prior memory pointer-eisdir-zzz",
+      workspace_id: "workspace-fixture",
+    });
+    assert.equal(output.continue, true);
+
+    const body = parseUpsEnvelope(output);
+    assert.ok(body, "failed plan read must still inject an envelope");
+    assert.ok(
+      Array.isArray(body.degraded?.sections) && body.degraded.sections.includes("active_thread"),
+      `degraded.sections must name active_thread, got ${JSON.stringify(body.degraded)}`,
+    );
+    assert.equal(body.active_thread, undefined);
+    assert.equal(body.active_thread_ref, undefined);
+  });
+});
+
+async function holdLivePlanLock(vault, planId) {
+  const key = createHash("sha256").update(planId).digest("hex").slice(0, 32);
+  const lockDir = path.join(vault, ".runtime", "thread-locks", `${key}.lock`);
+  await mkdir(lockDir, { recursive: true });
+  await writeFile(
+    path.join(lockDir, "owner.json"),
+    `${JSON.stringify({
+      pid: process.pid,
+      operationId: "ups-live-holder",
+      acquiredAt: "2026-01-01T00:00:00.000Z",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const old = new Date("2026-01-01T00:00:00.000Z");
+  await utimes(lockDir, old, old);
+}
+
+test("UserPromptSubmit held lock is degraded active_thread, not empty", { timeout: 20_000 }, async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    await ensureVault(vault);
+    const { plan } = await createPlan(
+      { goal: "UPS lock contention is degraded, not empty", vaultPath: vault },
+      { vaultPath: vault },
+    );
+    await holdLivePlanLock(vault, plan.plan_id);
+
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "an utterly novel question with zero prior memory lock-busy-zzz",
+      workspace_id: "workspace-fixture",
+    });
+    assert.equal(output.continue, true);
+
+    const body = parseUpsEnvelope(output);
+    assert.ok(body, "lock-busy plan read must still inject an envelope");
+    assert.ok(
+      Array.isArray(body.degraded?.sections) && body.degraded.sections.includes("active_thread"),
+      `degraded.sections must name active_thread, got ${JSON.stringify(body.degraded)}`,
+    );
+    assert.equal(body.active_thread, undefined);
+    assert.equal(body.active_thread_ref, undefined);
+  });
+});
+
+// Spent prompt budget must not wait out THREAD_BUSY. A raw await of
+// resolveActivePlanView sits on the 5s lock after recall; the host then
+// discards the envelope and the failed read looks empty again.
+test("UserPromptSubmit spent budget does not wait out a held lock", { timeout: 10_000 }, async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    await ensureVault(vault);
+    const { plan } = await createPlan(
+      { goal: "UPS budget cut is degraded, not a 5s lock wait", vaultPath: vault },
+      { vaultPath: vault },
+    );
+    await holdLivePlanLock(vault, plan.plan_id);
+
+    const handlers = createHookHandlers({
+      ...upsConfig(vault),
+      promptHookTimeoutMs: 2,
+    });
+    const started = Date.now();
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "an utterly novel question with zero prior memory budget-cut-zzz",
+      workspace_id: "workspace-fixture",
+    });
+    const elapsedMs = Date.now() - started;
+    assert.ok(
+      elapsedMs < 2000,
+      `spent budget must not wait the 5s lock; took ${elapsedMs}ms`,
+    );
+    assert.equal(output.continue, true);
+
+    const body = parseUpsEnvelope(output);
+    assert.ok(body, "budget-cut plan read must still inject an envelope");
+    assert.ok(
+      Array.isArray(body.degraded?.sections) && body.degraded.sections.includes("active_thread"),
+      `degraded.sections must name active_thread, got ${JSON.stringify(body.degraded)}`,
+    );
+    assert.equal(body.active_thread, undefined);
+    assert.equal(body.active_thread_ref, undefined);
   });
 });

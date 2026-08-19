@@ -41,6 +41,7 @@ import {
   deriveSystemEventKey,
   readThreadEvents,
   ThreadCursorGapError,
+  ThreadJournalAppendError,
   ThreadJournalReadError,
 } from "../dist/thread-events.js";
 import {
@@ -2060,6 +2061,23 @@ test("threadWorkerErrorText never serializes ThreadJournalReadError.journalPath"
   assert.equal(error.journalPath, journalPath);
   assert.equal(text.includes(journalPath), false);
   assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText never serializes ThreadJournalAppendError cause paths", () => {
+  const journalPath = "/tmp/minni-vault/wiki/artifacts/plan-secret.log.md";
+  const cause = Object.assign(
+    new Error(`EISDIR: illegal operation on a directory, open '${journalPath}'`),
+    { code: "EISDIR", path: journalPath },
+  );
+  const error = new ThreadJournalAppendError("op-key", "slice.claimed", cause);
+  const text = threadWorkerErrorText(error);
+  assert.match(text, /append failed/);
+  assert.match(text, /EISDIR/);
+  assert.equal(error.operationKey, "op-key");
+  assert.equal(error.kind, "slice.claimed");
+  assert.equal(text.includes(journalPath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+  assert.equal(error.message.includes(journalPath), false);
 });
 
 test("prepareThreadMutation does not mint seq=1 onto an unreadable journal", async (t) => {

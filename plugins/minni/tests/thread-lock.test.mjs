@@ -135,7 +135,8 @@ test("withThreadLock recovers a stale lock when the PID was reused under a new s
   assert.equal(last?.previous_owner?.processStartMarker, "boot-generation-1");
 });
 
-// Wave 3: recovery must leave an audit trail distinguishable from theft.
+// Wave 3: when the audit write succeeds, recovery leaves a trail
+// distinguishable from theft. The write is best-effort, not required.
 test("withThreadLock records a recovery audit when it quarantines a stale lock", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "minni-thread-lock-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -165,6 +166,37 @@ test("withThreadLock records a recovery audit when it quarantines a stale lock",
   assert.equal(last.reason, "stale_dead");
   assert.equal(last.previous_owner?.operationId, "dead-op");
   assert.equal(typeof last.at, "string");
+});
+
+// Audit is best-effort. A failed recovery.jsonl write must not block
+// quarantine; do not claim every recovery appends a line.
+test("withThreadLock still recovers when the recovery audit write fails", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-thread-lock-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await seedOwner(root, "plan-audit-fail", {
+    pid: 999999,
+    operationId: "dead-op",
+    acquiredAt: "2026-01-01T00:00:00.000Z",
+    processStartMarker: "gone",
+  });
+  const auditPath = path.join(root, ".runtime", "thread-locks", "recovery.jsonl");
+  await mkdir(auditPath, { recursive: true });
+  let entered = false;
+
+  await withThreadLock(
+    root,
+    "plan-audit-fail",
+    "recovery-despite-audit-fail",
+    async () => {
+      entered = true;
+    },
+    {
+      staleMs: 1,
+      isProcessAlive: () => false,
+    },
+  );
+
+  assert.equal(entered, true);
 });
 
 test("withThreadLock recovers only a stale dead-owner directory", async (t) => {
@@ -235,6 +267,12 @@ test("withThreadLock atomically quarantines a stale lock with no owner file", as
     renames[0].to,
     new RegExp(`^${lockDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.stale-`),
   );
+
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const audit = await readThreadLockRecoveryAudit(root);
+  const last = audit.at(-1);
+  assert.equal(last?.reason, "stale_ownerless");
+  assert.equal(last?.plan_id, "plan-ownerless");
 });
 
 test("withThreadLock recovers a stale lock with invalid owner JSON", async (t) => {
@@ -261,4 +299,10 @@ test("withThreadLock recovers a stale lock with invalid owner JSON", async (t) =
   );
 
   assert.equal(entered, true);
+
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const audit = await readThreadLockRecoveryAudit(root);
+  const last = audit.at(-1);
+  assert.equal(last?.reason, "stale_invalid_owner");
+  assert.equal(last?.plan_id, "plan-invalid-owner");
 });
