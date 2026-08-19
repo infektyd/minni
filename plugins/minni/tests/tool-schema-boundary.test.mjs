@@ -53,7 +53,8 @@ test("model-facing MCP input schemas do not expose local path authority", async 
     await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
   );
   const schemas = extractInputSchemas(source);
-  assert.equal(schemas.length, 37, "expected one schema per registered MCP tool");
+  // Task 6 added 5 tools (minni_thread_ready/assign/claim/worker_update/events).
+  assert.equal(schemas.length, 42, "expected one schema per registered MCP tool");
 
   const forbiddenFields = [
     "vaultPath",

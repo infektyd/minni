@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -7,12 +7,41 @@ import { writeVaultPage, appendFileWithFsync, writeFileAtomic, type VaultWriteRe
 import type { PageStatus } from "./vault.js";
 import type { ScarTissueEntry } from "./task.js";
 import { stableStringify } from "./agent_envelope.js";
+import { withThreadLock } from "./thread-lock.js";
 
 // ---------------------------------------------------------------------------
 // Types (exported per spec)
 // ---------------------------------------------------------------------------
 
 export type PlanSliceStatus = "pending" | "in_progress" | "done" | "blocked" | "superseded";
+
+/**
+ * Thread Phase 1 (worker slice metadata, digest v3): the private claim a
+ * worker currently holds on a slice. NEVER carries the claim token itself —
+ * the token lives only in the private mode-0600 envelope under
+ * `.runtime/thread-claims/` (thread-claims.ts, a later task). This ref is
+ * durable metadata (who/when/expiry) so ready-set and scope checks can run
+ * from the plan note alone; it is intentionally silent on secret material.
+ */
+export interface ThreadClaimRef {
+  claim_id: string;
+  worker_agent_id: string;
+  claimed_at: string;
+  expires_at: string;
+}
+
+/**
+ * Thread Phase 1: attributed worker proposals for topology change. Only the
+ * orchestrator applies a proposal (through existing replan/supersession
+ * behavior, per the V2 design's "Expansion and contraction" section) — a
+ * proposal recorded on a slice is a durable request, never a mutation by
+ * itself. `slices` reuses CreatePlanInput's slice shape so a proposal can be
+ * fed straight into the existing replan() input without another mapping
+ * layer.
+ */
+export type StructuralProposal =
+  | { kind: "expand" | "split"; reason: string; slices: CreatePlanInput["slices"] }
+  | { kind: "contract"; reason: string; slice_ids: string[] };
 
 export interface PlanSlice {
   id: string;
@@ -22,6 +51,19 @@ export interface PlanSlice {
   depends_on?: string[];
   evidence?: string;
   superseded_by?: string;
+  // Thread Phase 1 (worker slice metadata, digest v3) — all optional so a
+  // note persisted before this task, or a slice literal built by an older
+  // test/caller, remains a valid PlanSlice with no backfill required on
+  // read. `generation`/`attempt` are conceptually "0 unless recorded"; pure
+  // helpers (e.g. computePlanDigestHexV3) default a missing value to 0
+  // in-memory rather than writing a materialized 0 back into the note.
+  requirements?: string[];
+  assigned_to?: string;
+  assignment_profile?: string;
+  generation?: number;
+  attempt?: number;
+  claim?: ThreadClaimRef;
+  proposals?: StructuralProposal[];
 }
 
 export interface ShelfRef {
@@ -156,8 +198,13 @@ export function computePlanDigestV1(plan: PlanArtifact): string {
  * The payload is versioned ("v2") so rehydratePlan can distinguish a genuine
  * tamper from a pre-H7 plan (which validates against computePlanDigestV1) and
  * upgrade the latter gracefully.
+ *
+ * Exported (like computePlanDigestV1) so tests can stamp a note as declared
+ * v2 — v2 is now itself a legacy algorithm superseded by v3 below, and the
+ * declared-v2-stays-readable-without-mutation contract needs a real v2 hex
+ * to fabricate a fixture with.
  */
-function computePlanDigestHexV2(plan: PlanArtifact): string {
+export function computePlanDigestHexV2(plan: PlanArtifact): string {
   const slices = plan.slices
     .map((sl) => ({
       id: sl.id,
@@ -198,33 +245,151 @@ function computePlanDigestHexV2(plan: PlanArtifact): string {
 }
 
 /**
+ * Thread Phase 1 (Task 2, worker slice metadata): widens the H7 v2 payload
+ * with every new PlanSlice field (requirements, assigned_to,
+ * assignment_profile, generation, attempt, claim, proposals) so a vault edit
+ * to any of them — an unauthorized reassignment, a forged claim, a silently
+ * dropped structural proposal — is caught by digest verification exactly
+ * like every pre-existing field is (Gate T2: every new durable field affects
+ * v3). `generation`/`attempt` default to 0 in this pure computation only;
+ * that default is never written back into the slice itself (see the
+ * rehydratePlan declared-version gate below, which returns a declared-older
+ * note unmodified rather than upgrading it on a mere read).
+ */
+function computePlanDigestHexV3(plan: PlanArtifact): string {
+  const slices = plan.slices
+    .map((sl) => ({
+      id: sl.id,
+      title: sl.title,
+      status: sl.status,
+      gate: sl.gate,
+      depends_on: sl.depends_on ? [...sl.depends_on].sort() : undefined,
+      evidence: sl.evidence,
+      superseded_by: sl.superseded_by,
+      requirements: sl.requirements ? [...sl.requirements].sort() : undefined,
+      assigned_to: sl.assigned_to,
+      assignment_profile: sl.assignment_profile,
+      generation: sl.generation ?? 0,
+      attempt: sl.attempt ?? 0,
+      claim: sl.claim
+        ? {
+            claim_id: sl.claim.claim_id,
+            worker_agent_id: sl.claim.worker_agent_id,
+            claimed_at: sl.claim.claimed_at,
+            expires_at: sl.claim.expires_at,
+          }
+        : undefined,
+      proposals: sl.proposals ?? undefined,
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const scar_tissue = (plan.scar_tissue ?? []).map((sc) => ({
+    kind: sc.kind,
+    signal: sc.signal,
+    resolution: sc.resolution,
+  }));
+  const shelf_ref = plan.shelf_ref
+    ? {
+        agent: plan.shelf_ref.agent,
+        wikilink: plan.shelf_ref.wikilink,
+        pull_hint: plan.shelf_ref.pull_hint,
+        approx_tokens: plan.shelf_ref.approx_tokens,
+        shelf_hash: plan.shelf_ref.shelf_hash,
+      }
+    : undefined;
+  const payload = {
+    v: 3,
+    goal: plan.goal,
+    next_action: plan.next_action,
+    constraints: plan.constraints ?? [],
+    open_questions: plan.open_questions ?? [],
+    scar_tissue,
+    shelf_ref,
+    slices,
+  };
+  const str = stableStringify(payload);
+  return createHash("sha256").update(str).digest("hex").slice(0, 16);
+}
+
+/**
  * #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130): the
  * persisted plan_digest VALUE stays a bare hex so pre-tagging readers on other
  * hosts keep validating it during a rolling update; the algorithm version
  * travels in the separate plan_digest_v frontmatter field (old readers ignore
  * unknown fields). Read-time recognition dispatches on the declared version
- * through a registry of every historical algorithm, so a future payload
- * widening (v3) cannot re-open the single-legacy-fn cliff that transiently
- * bricked plan tools during the v1->v2 rollout. Notes without plan_digest_v
- * are still recognized as bare v2-or-v1 exactly as before, and "vN:<hex>"
- * digest prefixes (written by interim builds of this PR) are accepted on read
- * and normalized to bare hex on the next write.
+ * through a registry of every historical algorithm, so payload widening
+ * (v2->v3, and any future version) cannot re-open the single-legacy-fn cliff
+ * that transiently bricked plan tools during the v1->v2 rollout. Notes
+ * without plan_digest_v are still recognized as bare v2-or-v1 exactly as
+ * before, and "vN:<hex>" digest prefixes (written by interim builds of a
+ * version bump) are accepted on read and normalized to bare hex on the next
+ * write — but ONLY when the declared version is the CURRENT one. A note that
+ * DECLARES an older version (v1 or v2) validates against that older
+ * algorithm and is returned as-is: rehydratePlan must never write-on-read a
+ * note a still-running older-plugin host declares itself the owner of during
+ * a rolling upgrade (Task 2 / Thread Phase 1). The next explicit mutation
+ * naturally advances such a note to v3 through the normal persistPlan path.
  */
-export const PLAN_DIGEST_VERSION = 2;
+export const PLAN_DIGEST_VERSION = 3;
 
 const PLAN_DIGEST_ALGORITHMS: Record<number, (plan: PlanArtifact) => string> = {
   1: computePlanDigestV1,
   2: computePlanDigestHexV2,
+  3: computePlanDigestHexV3,
 };
 
 /** Current digest (bare hex; the algorithm version is persisted separately as plan_digest_v). */
 export function computePlanDigest(plan: PlanArtifact): string {
-  return computePlanDigestHexV2(plan);
+  return computePlanDigestHexV3(plan);
+}
+
+/**
+ * Every PlanSlice key that ONLY v3 knows how to hash. Review finding
+ * (Task 2 follow-up): the v1/v2 algorithms pick specific known keys into
+ * their payload and silently ignore anything else — so a slice can carry
+ * one of these keys (an unauthorized reassignment, a forged claim, an
+ * injected structural proposal) while the note's DECLARED v1/v2 digest still
+ * validates, because that older algorithm never looked at the key in the
+ * first place. A genuine v1/v2 writer's PlanSlice type never had these
+ * fields, so JSON.stringify of a real one never emits them — their mere
+ * presence on a note that declares an older version is itself the tamper
+ * signal, independent of what the declared algorithm's hash covers.
+ */
+const V3_ONLY_SLICE_FIELDS = [
+  "requirements",
+  "assigned_to",
+  "assignment_profile",
+  "generation",
+  "attempt",
+  "claim",
+  "proposals",
+] as const;
+
+function findV3OnlySliceField(
+  slices: PlanSlice[],
+): { sliceId: string; field: string } | undefined {
+  for (const slice of slices) {
+    const record = slice as unknown as Record<string, unknown>;
+    for (const field of V3_ONLY_SLICE_FIELDS) {
+      if (record[field] !== undefined) {
+        return { sliceId: slice.id, field };
+      }
+    }
+  }
+  return undefined;
 }
 
 function parsePlanDigestTag(stored: string): { version: number; hex: string } | undefined {
   const m = stored.match(/^v(\d+):([0-9a-f]+)$/);
   return m ? { version: Number(m[1]), hex: m[2] } : undefined;
+}
+
+/**
+ * Model-facing / `.message` text for a newer-than-supported digest.
+ * Keep `notePath` as a typed field on PlanDigestVersionError — never
+ * interpolate it here. Worker MCP surfaces this via threadWorkerErrorText.
+ */
+export function planDigestVersionErrorMessage(version: number): string {
+  return `plan_digest version v${version} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`;
 }
 
 /**
@@ -235,11 +400,63 @@ function parsePlanDigestTag(stored: string): { version: number; hex: string } | 
  */
 export class PlanDigestVersionError extends Error {
   readonly code = "PLAN_DIGEST_NEWER" as const;
+  readonly version: number;
+  readonly notePath: string;
   constructor(version: number, notePath: string) {
-    super(
-      `plan_digest version v${version} on ${notePath} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`,
-    );
+    super(planDigestVersionErrorMessage(version));
     this.name = "PlanDigestVersionError";
+    this.version = version;
+    this.notePath = notePath;
+  }
+}
+
+/**
+ * persistPlan writes the canonical vault note, then appends a history
+ * snapshot as a second, separate durable step. If the note write succeeds
+ * but the history append throws (e.g. EISDIR/EACCES on the history file),
+ * the plan mutation is ALREADY durable — this is never a pre-commit
+ * failure. Typed (not a bare Error) so a caller holding a freshly staged
+ * secret (claimSlice) can tell "committed, journal degraded" apart from
+ * "nothing was written" without re-deriving that distinction from message
+ * text, and so it never mistakes this for a rollback signal that would
+ * license deleting the only token for a now-durable claim.
+ */
+const SYS_ERR_CODE = /^[A-Z][A-Z0-9_]{1,31}$/;
+
+/**
+ * Model-facing / .message cause fragment for a failed history append.
+ * Prefer a Node syscall `.code` (EISDIR, EACCES, …) so the operator still
+ * sees the failure class. Never interpolate cause.message or cause.path:
+ * real Node system errors embed the history file path
+ * (`wiki/artifacts/…history.jsonl`), which is adjacent to — but distinct
+ * from — the vault notePath. Without a syscall code, use a generic phrase.
+ */
+export function planHistoryAppendErrorCauseText(cause: unknown): string {
+  if (cause && typeof cause === "object") {
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === "string" && SYS_ERR_CODE.test(code)) {
+      return code;
+    }
+  }
+  return "history append failed";
+}
+
+export function planHistoryAppendErrorMessage(rev: number, cause: unknown): string {
+  return `persistPlan: note committed at rev ${rev}, but appending the history snapshot failed: ${planHistoryAppendErrorCauseText(cause)}`;
+}
+
+export class PlanHistoryAppendError extends Error {
+  readonly code = "PLAN_HISTORY_APPEND_FAILED" as const;
+  readonly notePath: string;
+  readonly rev: number;
+  constructor(notePath: string, rev: number, cause: unknown) {
+    super(
+      planHistoryAppendErrorMessage(rev, cause),
+      cause instanceof Error ? { cause } : undefined,
+    );
+    this.name = "PlanHistoryAppendError";
+    this.notePath = notePath;
+    this.rev = rev;
   }
 }
 
@@ -322,6 +539,33 @@ export function slugifySliceId(title: string, taken: Set<string>): string {
     const cand = `${slug}-${i}`;
     if (!taken.has(cand)) return cand;
     i += 1;
+  }
+}
+
+function assertUniqueSliceIds(
+  slices: Array<{ id: string }>,
+  context: string,
+): void {
+  const seen = new Set<string>();
+  for (const slice of slices) {
+    if (seen.has(slice.id)) {
+      throw new Error(`${context}: duplicate slice id "${slice.id}"`);
+    }
+    seen.add(slice.id);
+  }
+}
+
+function assertUniqueExplicitSliceIds(
+  slices: Array<{ id?: string }>,
+  context: string,
+): void {
+  const seen = new Set<string>();
+  for (const slice of slices) {
+    if (!slice.id) continue;
+    if (seen.has(slice.id)) {
+      throw new Error(`${context}: duplicate explicit slice id "${slice.id}"`);
+    }
+    seen.add(slice.id);
   }
 }
 
@@ -539,6 +783,15 @@ export interface AppendJournalDeps {
   writeFileAtomic?: typeof writeFileAtomic;
 }
 
+function isJournalMissing(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: unknown }).code === "ENOENT"
+  );
+}
+
 /** Append a PlanEvent as a single JSON line. Creates header on first write. */
 export async function appendJournal(
   journalPath: string,
@@ -550,18 +803,28 @@ export async function appendJournal(
   // (plan.ts's historyFile write, below) — a crash could leave history
   // durable and the journal behind it or truncated. Same durability
   // guarantee as the sibling now: fsync'd append, atomic temp+rename init.
+  //
+  // Init (header + first line) is ENOENT-only. A catch-all rewrite after a
+  // failed fsync append wipes this file, which is also the ordered Thread
+  // event journal — real lost-events, not recovery.
   const doAppendWithFsync = deps.appendFileWithFsync ?? appendFileWithFsync;
   const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
   const line = JSON.stringify(event) + "\n";
+
+  let existing: string;
   try {
-    // exists -> append
-    await readFile(journalPath, "utf8");
-    await doAppendWithFsync(journalPath, line);
-  } catch {
-    // missing or unreadable -> init
+    existing = await readFile(journalPath, "utf8");
+  } catch (error) {
+    if (!isJournalMissing(error)) {
+      throw error;
+    }
     const header = `# Minni Plan Journal\n\n## events\n`;
     await doWriteAtomic(journalPath, header + line);
+    return;
   }
+
+  const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+  await doAppendWithFsync(journalPath, prefix + line);
 }
 
 /** Parse NDJSON-ish events from journal text (ignores header/markdown). */
@@ -598,6 +861,7 @@ export async function createPlan(
   const nowFn = deps.now ?? (() => new Date());
   const vaultPath = deps.vaultPath ?? input.vaultPath ?? DEFAULT_VAULT_PATH;
 
+  assertUniqueExplicitSliceIds(input.slices ?? [], "createPlan");
   const used = new Set<string>();
   const initialSlices: PlanSlice[] = (input.slices ?? []).map((s) => {
     const id = s.id || slugifySliceId(s.title, used);
@@ -672,7 +936,7 @@ export async function createPlan(
 
   await setActivePlan(vaultPath, plan.plan_id, writeRes.notePath);
 
-  const journalPath = path.join(path.dirname(writeRes.notePath), `${plan.plan_id}.log.md`);
+  const journalPath = journalPathFor(writeRes.notePath, plan.plan_id);
   await appendJournal(journalPath, { kind: "rehydrated", at: plan.created });
 
   return { plan, write: writeRes, displaced_active };
@@ -855,6 +1119,7 @@ export async function persistPlan(
 ): Promise<VaultWriteResult> {
   const writeFn = opts.writeVaultPage ?? writeVaultPage;
   const updated = new Date().toISOString();
+  assertUniqueSliceIds(plan.slices, "persistPlan");
 
   // mutate in-place so caller gets updated rev, updated time and digest
   plan.rev = (plan.rev ?? 0) + 1;
@@ -872,8 +1137,10 @@ export async function persistPlan(
   });
 
   if (opts.notePath && writeRes.notePath !== opts.notePath) {
+    // The write already landed. Do not interpolate either vault path into
+    // `.message` — MCP surfaces persistPlan errors via threadWorkerErrorText.
     throw new Error(
-      `persistPlan: expected notePath ${opts.notePath}, got ${writeRes.notePath}`,
+      "persistPlan: durable write landed at a different notePath than the caller expected",
     );
   }
 
@@ -885,7 +1152,14 @@ export async function persistPlan(
     digest: plan.plan_digest,
     plan,
   };
-  await appendHistorySnapshot(historyFile, snapshot);
+  try {
+    await appendHistorySnapshot(historyFile, snapshot);
+  } catch (cause) {
+    // The note above is already durable — never swallow this into a bare
+    // Error a caller could mistake for "nothing was written". See
+    // PlanHistoryAppendError's doc comment.
+    throw new PlanHistoryAppendError(writeRes.notePath, plan.rev, cause);
+  }
 
   return writeRes;
 }
@@ -903,11 +1177,19 @@ export async function findPlanNote(
     return undefined;
   }
   for (const name of names) {
-    if (!name.endsWith(".md")) continue;
+    // Journals are `<planId>.log.md`. They are not plan notes; reading them
+    // here used to abort discovery with a path-bearing Node EISDIR/EACCES
+    // before MCP handlers reached threadWorkerErrorResult.
+    if (!name.endsWith(".md") || name.endsWith(".log.md")) continue;
     const notePath = path.join(dir, name);
-    const raw = await readFile(notePath, "utf8");
-    const { frontmatter: fm } = parseFrontmatter(raw);
-    if (String(fm.plan_id ?? "") === plan_id) return notePath;
+    try {
+      const raw = await readFile(notePath, "utf8");
+      const { frontmatter: fm } = parseFrontmatter(raw);
+      if (String(fm.plan_id ?? "") === plan_id) return notePath;
+    } catch {
+      // Per-file: a sibling directory named *.md or an unreadable note must
+      // not abort the scan or leak a vault path as a raw throw.
+    }
   }
   return undefined;
 }
@@ -1028,6 +1310,7 @@ export function updateSlice(
   evidence?: string,
   options?: UpdateSliceOptions,
 ): PlanArtifact {
+  assertUniqueSliceIds(plan.slices, "updateSlice");
   const idx = plan.slices.findIndex((s) => s.id === slice_id);
   if (idx < 0) {
     throw new Error(`updateSlice: no slice with id ${slice_id}`);
@@ -1131,6 +1414,29 @@ export function addScar(plan: PlanArtifact, entry: ScarTissueEntry): PlanArtifac
   return nextPlan;
 }
 
+function sameStringSet(
+  left: string[] | undefined,
+  right: string[] | undefined,
+): boolean {
+  const a = [...(left ?? [])].sort();
+  const b = [...(right ?? [])].sort();
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * A structural edit invalidates any work issued for the old slice meaning.
+ * Clearing the public claim ref removes it from every worker authority path;
+ * incrementing generation also prevents an orphaned private envelope from
+ * becoming authoritative again if the slice is later reassigned.
+ */
+function invalidateSliceGeneration(slice: PlanSlice): PlanSlice {
+  return {
+    ...slice,
+    generation: (slice.generation ?? 0) + 1,
+    claim: undefined,
+  };
+}
+
 /** Replan: preserve superset (never drop history). Mark no-longer-proposed non-final slices superseded; append unmatched new ones. Pure. */
 export function replan(
   plan: PlanArtifact,
@@ -1139,6 +1445,8 @@ export function replan(
   if (!Array.isArray(newSlices)) {
     return { ...plan, updated: new Date().toISOString() };
   }
+  assertUniqueSliceIds(plan.slices, "replan");
+  assertUniqueExplicitSliceIds(newSlices, "replan");
   const updated = new Date().toISOString();
   // Deterministic marker (no clock in id)
   const titlesKey = stableStringify(newSlices.map((s) => (s.title ?? s.id ?? "")).sort());
@@ -1152,7 +1460,11 @@ export function replan(
         ((ns.title ?? "").trim().toLowerCase() === slice.title.trim().toLowerCase()),
     );
     if (!stillProposed && slice.status !== "done" && slice.status !== "superseded") {
-      return { ...slice, status: "superseded", superseded_by: supersededMarker };
+      return invalidateSliceGeneration({
+        ...slice,
+        status: "superseded",
+        superseded_by: supersededMarker,
+      });
     }
     return slice;
   });
@@ -1202,12 +1514,19 @@ export function replan(
       const idx = nextSlices.findIndex((s) => s.id === ns.id);
       if (idx >= 0) {
         const cur = nextSlices[idx];
-        nextSlices[idx] = {
+        const refreshed: PlanSlice = {
           ...cur,
           title: ns.title || cur.title,
           gate: ns.gate ?? cur.gate,
           depends_on: ns.depends_on ?? cur.depends_on,
         };
+        const meaningChanged =
+          refreshed.title !== cur.title ||
+          refreshed.gate !== cur.gate ||
+          !sameStringSet(refreshed.depends_on, cur.depends_on);
+        nextSlices[idx] = meaningChanged
+          ? invalidateSliceGeneration(refreshed)
+          : refreshed;
       }
     }
   }
@@ -1311,8 +1630,16 @@ export function compactPlanView(plan: PlanArtifact): {
   };
 }
 
-/** Rehydrate snapshot from vault note (frontmatter + body). Appends a rehydrated journal event as side effect. */
-export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
+export interface RehydratePlanDeps {
+  persistPlan?: typeof persistPlan;
+  beforeUpgradePersist?: (plan: PlanArtifact) => Promise<void>;
+}
+
+/** Rehydrate snapshot from vault note (frontmatter + body). Read-only: does not append journal events. */
+export async function rehydratePlan(
+  notePath: string,
+  deps: RehydratePlanDeps = {},
+): Promise<PlanArtifact> {
   const raw = await readFile(notePath, "utf8");
   const { frontmatter: fm } = parseFrontmatter(raw);
 
@@ -1378,6 +1705,8 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     rev,
   };
 
+  assertUniqueSliceIds(plan.slices, "rehydratePlan");
+
   // Validate that any 'done' slice has non-empty evidence
   for (const s of plan.slices) {
     if (s.status === "done" && (!s.evidence || !s.evidence.trim())) {
@@ -1387,13 +1716,24 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
 
   // Check for digest mismatch instead of silent repair.
   //
-  // #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130):
-  // dispatch on the DECLARED algorithm version (resolved above, before any
-  // current-schema validation) through the algorithm registry. A KNOWN
-  // version verifies with that exact algorithm; a note with NO declared
-  // version validates against bare v2-or-v1 exactly as before. Anything but
-  // the current bare-hex form is upgraded/normalized in place on a successful
-  // read (re-persist stamps plan_digest_v and a bare-hex plan_digest).
+  // #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130,
+  // extended by Task 2 / digest v3): dispatch on the DECLARED algorithm
+  // version (resolved above, before any current-schema validation) through
+  // the algorithm registry. A KNOWN version verifies with that exact
+  // algorithm; a note with NO declared version validates against bare
+  // v2-or-v1 exactly as before.
+  //
+  // Task 2: a declared version OLDER than current (v1 or v2) that verifies
+  // is returned UNCHANGED — no persistPlan side effect on a mere read. A
+  // rolling upgrade can have an older-plugin host still reading/writing that
+  // note at its own declared version; silently rewriting it to the current
+  // schema here would race that host and, for v1/v2, would also strip the
+  // newer-only slice fields (assigned_to, generation, claim, ...) that
+  // reader has never written, corrupting data it doesn't yet know exists.
+  // The next EXPLICIT mutation (updateSlice/replan/persistPlan) is what
+  // naturally advances such a note to v3. Only an interim "vN:<hex>" TAG on
+  // an ALREADY-current declaration is normalized to bare hex here, mirroring
+  // the pre-existing v1->v2 interim-tag behavior.
   const storedHex = storedTag ? storedTag.hex : plan.plan_digest;
   const recomputed = computePlanDigest(plan);
   let needsUpgrade = false;
@@ -1402,10 +1742,68 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     if (algo(plan) !== storedHex) {
       throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
     }
-    needsUpgrade = storedTag !== undefined || storedHex !== recomputed;
+    // Review finding (Task 2 follow-up): a declared OLDER algorithm having
+    // validated proves only that the fields IT covers are intact — it says
+    // nothing about a v3-only slice key, which that algorithm never hashed
+    // and therefore could not have caught being added, changed, or removed.
+    // A genuine v1/v2 writer's slices can never contain one of these keys at
+    // all, so their mere presence on a declared-older note is tampering,
+    // not a legitimate value this build should trust or silently accept.
+    if (declaredVersion < PLAN_DIGEST_VERSION) {
+      const v3Field = findV3OnlySliceField(plan.slices);
+      if (v3Field) {
+        throw new Error(
+          `rehydratePlan: slice "${v3Field.sliceId}" carries v3-only field "${v3Field.field}" outside declared digest v${declaredVersion}'s coverage; note may be tampered`,
+        );
+      }
+    }
+    // Normalize the RETURNED in-memory digest to bare hex regardless of the
+    // write decision below — an interim "vN:<hex>" tag is an on-disk
+    // encoding detail, never something a caller of rehydratePlan should see
+    // in plan.plan_digest. This does not touch the note file; needsUpgrade
+    // (just below) is the only thing that decides whether persistPlan runs.
+    plan.plan_digest = storedHex;
+    needsUpgrade = declaredVersion === PLAN_DIGEST_VERSION && storedTag !== undefined;
   } else if (plan.plan_digest !== recomputed) {
-    // No declared version: legacy recognition (pre-H7 v1 upgrades in place).
-    if (plan.plan_digest === computePlanDigestV1(plan)) {
+    // No declared version: legacy recognition. This has ALWAYS meant "bare
+    // v2-or-v1" (see the doc comment on PLAN_DIGEST_VERSION above) — a note
+    // with no plan_digest_v field at all predates the tagging field itself,
+    // and could genuinely have been written by EITHER a pre-H7 v1 host or a
+    // v2-era host that predated plan_digest_v (the tagging field and v1->v2
+    // both landed together; a note written between the v2 payload widening
+    // and the tagging field's own rollout has a bare v2 hex and no version
+    // marker). Task 2's second follow-up regressed this to "v1 only",
+    // which made a genuine bare-v2 note fail closed as tampered. Fixed by
+    // trying every REGISTERED algorithm older than current, not just v1 —
+    // this also means any future intermediate version added to
+    // PLAN_DIGEST_ALGORITHMS is automatically covered here too.
+    const legacyVersions = Object.keys(PLAN_DIGEST_ALGORITHMS)
+      .map(Number)
+      .filter((v) => v < PLAN_DIGEST_VERSION)
+      .sort((a, b) => a - b);
+    let matchedLegacyVersion: number | undefined;
+    for (const v of legacyVersions) {
+      if (PLAN_DIGEST_ALGORITHMS[v](plan) === plan.plan_digest) {
+        matchedLegacyVersion = v;
+        break;
+      }
+    }
+    if (matchedLegacyVersion !== undefined) {
+      // Review finding (Task 2 second follow-up): this path used to skip the
+      // v3-only-field tamper check entirely, because that check originally
+      // lived only inside the `declaredVersion !== undefined` branch above.
+      // But an undeclared note validating against a legacy algorithm is
+      // exactly as blind to the seven v3-only slice keys as a DECLARED
+      // older note is — and, worse, it was about to be upgraded (persisted)
+      // below, which would silently BLESS an injected
+      // assigned_to/claim/proposals/etc. as legitimate v3 data. So the same
+      // guard applies here too, before needsUpgrade is set.
+      const v3Field = findV3OnlySliceField(plan.slices);
+      if (v3Field) {
+        throw new Error(
+          `rehydratePlan: slice "${v3Field.sliceId}" carries v3-only field "${v3Field.field}" outside undeclared-v${matchedLegacyVersion} digest coverage; note may be tampered`,
+        );
+      }
       needsUpgrade = true;
     } else {
       throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
@@ -1419,18 +1817,11 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     // read still succeeds.
     try {
       const vaultPath = path.resolve(path.dirname(notePath), "..", "..");
-      await persistPlan(plan, { vaultPath, notePath });
+      await deps.beforeUpgradePersist?.(plan);
+      await (deps.persistPlan ?? persistPlan)(plan, { vaultPath, notePath });
     } catch {
       // advisory: the in-memory upgraded digest is enough for this read to proceed
     }
-  }
-
-  // Record access (best-effort, append-only journal lives next to the note)
-  const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-  try {
-    await appendJournal(journalPath, { kind: "rehydrated", at: new Date().toISOString() });
-  } catch {
-    // journal is advisory; do not fail rehydrate
   }
 
   return plan;
@@ -1490,6 +1881,11 @@ export function historyPathFor(notePath: string): string {
   const dir = path.dirname(notePath);
   const base = path.basename(notePath, ext);
   return path.join(dir, `${base}.history.jsonl`);
+}
+
+/** Adjacent append-only journal for a plan artifact note. */
+export function journalPathFor(notePath: string, planId: string): string {
+  return path.join(path.dirname(notePath), `${planId}.log.md`);
 }
 
 export async function readHistory(
@@ -1603,11 +1999,33 @@ export function diffPlans(a: PlanArtifact, b: PlanArtifact): PlanDiff {
 }
 
 export function restorePlan(current: PlanArtifact, snapshot: PlanArtifact): PlanArtifact {
+  assertUniqueSliceIds(current.slices, "restorePlan current");
+  assertUniqueSliceIds(snapshot.slices, "restorePlan snapshot");
+  const generations = [...current.slices, ...snapshot.slices]
+    .map((slice) => slice.generation)
+    .filter(
+      (generation): generation is number =>
+        Number.isSafeInteger(generation) && (generation ?? -1) >= 0,
+    );
+  // A forward restore must never roll claim identity backward. current.rev is
+  // monotonic across durable mutations, while the global generation maximum
+  // carries the high-water mark even when the restored snapshot omitted a
+  // currently claimed slice. Every restored slice advances beyond both.
+  const generationFloor = Math.max(
+    Number.isSafeInteger(current.rev) && current.rev >= 0
+      ? current.rev + 1
+      : 1,
+    ...generations.map((generation) => generation + 1),
+  );
   return {
     ...current,
     goal: snapshot.goal,
     constraints: [...snapshot.constraints],
-    slices: snapshot.slices.map((s) => ({ ...s })),
+    slices: snapshot.slices.map((slice) => ({
+      ...slice,
+      generation: generationFloor,
+      claim: undefined,
+    })),
     open_questions: [...snapshot.open_questions],
     scar_tissue: snapshot.scar_tissue.map((s) => ({ ...s })),
     shelf_ref: snapshot.shelf_ref ? { ...snapshot.shelf_ref } : undefined,
@@ -1633,6 +2051,8 @@ export function applySliceDelta(
     drop_slice_ids?: string[];
   },
 ): PlanArtifact {
+  assertUniqueSliceIds(plan.slices, "applySliceDelta");
+  assertUniqueExplicitSliceIds(delta.add_slices ?? [], "applySliceDelta");
   const deltaKey = stableStringify({
     add: (delta.add_slices ?? []).map((s) => s.title ?? s.id ?? "").sort(),
     drop: (delta.drop_slice_ids ?? []).sort(),
@@ -1642,7 +2062,11 @@ export function applySliceDelta(
   const dropSet = new Set(delta.drop_slice_ids ?? []);
   let nextSlices: PlanSlice[] = plan.slices.map((slice) => {
     if (dropSet.has(slice.id) && slice.status !== "done" && slice.status !== "superseded") {
-      return { ...slice, status: "superseded", superseded_by: supersededMarker };
+      return invalidateSliceGeneration({
+        ...slice,
+        status: "superseded",
+        superseded_by: supersededMarker,
+      });
     }
     return slice;
   });
@@ -1869,52 +2293,62 @@ export async function resolveActivePlanView(
   try {
     const active = await getActivePlan(vaultPath);
     if (!active) return undefined;
-    const plan = await rehydratePlan(active.notePath);
-    if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
-      return undefined;
-    }
-    // Honest-health self-heal (audit C4): plans completed under a stale plugin
-    // deploy can be stuck with every slice terminal but status still
-    // 'draft'/'candidate' (live evidence: plan-3da1b00ca39d2500,
-    // plan-512ee7225dbb1c6f, plan-9fd20af5bc87bee2 — all 100% done, status
-    // draft). Re-derive the terminal status at load time, persist it through
-    // persistPlan (journaled; never a direct file write) and stop injecting
-    // the finished plan.
-    const allResolved = allSlicesResolved(plan.slices);
-    if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
-      const from = plan.status;
-      // H6: terminal, non-recallable completion (not the recallable "accepted").
-      plan.status = "complete";
-      await persistPlan(plan, { vaultPath, notePath: active.notePath });
-      const journalPath = path.join(
-        path.dirname(active.notePath),
-        `${plan.plan_id}.log.md`,
-      );
-      try {
-        await appendJournal(journalPath, {
-          kind: "status_reconciled",
-          from,
-          to: "complete",
-          at: new Date().toISOString(),
-        });
-      } catch {
-        // journal is advisory; the persisted status is the durable fix
-      }
-      return undefined;
-    }
-    return {
-      plan_id: active.plan_id,
-      rev: plan.rev,
-      view: compactPlanView(plan),
-      // #295: only computed (and only non-undefined) when the caller supplied
-      // live shelf content AND the plan actually has a shelf_ref configured —
-      // omitted entirely rather than a misleading "configured: false" when the
-      // caller didn't pass anything, so a degraded/budget-cut layer1Shelf read
-      // upstream reads as "not checked", not "checked and fine".
-      ...(liveShelfContent !== undefined && plan.shelf_ref
-        ? { shelf_drift: shelfDrift(plan, liveShelfContent) }
-        : {}),
-    };
+    return await withThreadLock(
+      vaultPath,
+      active.plan_id,
+      `active-plan-view:${randomUUID()}`,
+      async () => {
+        // The active pointer can change while this reader queues. Never use a
+        // stale pointer after acquiring the old plan's lock.
+        const lockedActive = await getActivePlan(vaultPath);
+        if (
+          !lockedActive ||
+          lockedActive.plan_id !== active.plan_id ||
+          lockedActive.notePath !== active.notePath
+        ) {
+          return undefined;
+        }
+        const plan = await rehydratePlan(active.notePath);
+        if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
+          return undefined;
+        }
+        // Honest-health self-heal (audit C4): plans completed under a stale
+        // plugin deploy can be stuck with every slice terminal but status
+        // still 'draft'/'candidate'. Lock before strict rehydrate so this
+        // repair cannot overwrite a concurrent worker mutation.
+        const allResolved = allSlicesResolved(plan.slices);
+        if (
+          allResolved &&
+          (plan.status === "draft" || plan.status === "candidate")
+        ) {
+          const from = plan.status;
+          // H6: terminal, non-recallable completion (not "accepted").
+          plan.status = "complete";
+          await persistPlan(plan, { vaultPath, notePath: active.notePath });
+          const journalPath = journalPathFor(active.notePath, plan.plan_id);
+          try {
+            await appendJournal(journalPath, {
+              kind: "status_reconciled",
+              from,
+              to: "complete",
+              at: new Date().toISOString(),
+            });
+          } catch {
+            // journal is advisory; the persisted status is the durable fix
+          }
+          return undefined;
+        }
+        return {
+          plan_id: active.plan_id,
+          rev: plan.rev,
+          view: compactPlanView(plan),
+          // #295: omitted when the caller did not provide live shelf content.
+          ...(liveShelfContent !== undefined && plan.shelf_ref
+            ? { shelf_drift: shelfDrift(plan, liveShelfContent) }
+            : {}),
+        };
+      },
+    );
   } catch {
     return undefined;
   }
