@@ -3391,6 +3391,49 @@ test("ready expiry delegates to the same synchronizeExpiredClaims helper", async
   );
 });
 
+// Phase-1 residual: claim ttl_seconds had no ceiling (Team already clamps at
+// MAX_TEAM_TTL_SECONDS). Thread rejects over-cap with a typed error — claim
+// validation already rejects non-positive TTL rather than clamping, and a
+// silent clamp would lie about the lease the worker thinks it holds.
+test("claimSlice rejects ttlSeconds above MAX_THREAD_CLAIM_TTL_SECONDS with a typed error", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const { MAX_THREAD_CLAIM_TTL_SECONDS, ThreadClaimTtlError } = threadWorkerRuntime;
+  assert.equal(
+    MAX_THREAD_CLAIM_TTL_SECONDS,
+    7 * 24 * 3600,
+    "Thread claim ceiling matches Team's MAX_TEAM_TTL_SECONDS bound",
+  );
+
+  await assert.rejects(
+    claimSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      idempotencyKey: "ttl-ceiling-claim",
+      ttlSeconds: MAX_THREAD_CLAIM_TTL_SECONDS + 1,
+      now: new Date(THREAD_START),
+    }),
+    (error) =>
+      error instanceof ThreadClaimTtlError &&
+      error.code === "THREAD_CLAIM_TTL_INVALID" &&
+      error.message.includes(String(MAX_THREAD_CLAIM_TTL_SECONDS)),
+  );
+
+  const atCap = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "ttl-at-cap-claim",
+    ttlSeconds: MAX_THREAD_CLAIM_TTL_SECONDS,
+    now: new Date(THREAD_START),
+  });
+  assert.equal(
+    Date.parse(atCap.expires_at),
+    THREAD_START.getTime() + MAX_THREAD_CLAIM_TTL_SECONDS * 1000,
+  );
+});
+
 test("final-fix-2: block and completion lifecycle events are single-shot on retry", async (t) => {
   const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
   await assignWorker(fixture, "a", "worker-a");

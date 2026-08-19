@@ -103,6 +103,7 @@ import {
   revokedClaimIds,
   synchronizeExpiredClaimsAndReadReady,
   synchronizeExpiredClaims,
+  MAX_THREAD_CLAIM_TTL_SECONDS,
   threadWorkerErrorText,
   updateClaimedSlice,
   withThreadPlanLock,
@@ -2260,7 +2261,12 @@ server.registerTool(
       slice_id: z.string().min(1),
       worker_agent_id: z.string().min(1),
       idempotency_key: nonBlankIdempotencyKey,
-      ttl_seconds: z.number().int().positive().optional(),
+      ttl_seconds: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_THREAD_CLAIM_TTL_SECONDS)
+        .optional(),
     },
   },
   async ({ plan_id: planIdInput, slice_id, worker_agent_id, idempotency_key, ttl_seconds }) => {

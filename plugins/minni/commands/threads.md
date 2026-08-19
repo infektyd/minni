@@ -29,7 +29,7 @@ Use Minni Threads for: $ARGUMENTS
 8. When scope changes materially, call `minni_thread_replan` with either a full set of `new_slices` or differential updates (`add_slices` and/or `drop_slice_ids`) instead of editing the vault note by hand. History is preserved via `superseded` slices.
 9. Follow progress and synchronize state via ordered event cursors with `minni_thread_events`:
    - Call `minni_thread_events(plan_id?, since_seq?, limit?)` to read append-only journal events recorded after `since_seq`.
-   - Phase 1 bound: each call loads and parses the ordered event journal once (no read-side journal writes).
+   - Lazy claim expiry shares the same locked sweep as `minni_thread_ready` / `minni_thread_status`: if a claim is past `expires_at`, the call lands `slice.lease_expired` / `thread.attention_required` before returning the cursor. Otherwise the journal is read once.
 10. To inspect and manage thread revision history:
    - Call `minni_thread_history` to list all saved revisions.
    - Call `minni_thread_revision` to view a specific revision snapshot.
@@ -37,7 +37,7 @@ Use Minni Threads for: $ARGUMENTS
    - Call `minni_thread_restore` to revert the thread forward to a previous revision.
 11. Active Thread Pointer:
    - Creating a thread auto-sets it as the active thread.
-   - The active thread view auto-injects into context at SessionStart and UserPromptSubmit, surviving memory compaction.
+   - The active thread view injects only where the platform wire allows it: SessionStart (full view) + UserPromptSubmit (compact ref) on Claude/Codex/Kilocode/Gemini; SessionStart only on Cursor (UserPromptSubmit cannot inject); Stop only on Grok. Hooks never read `minni_thread_events` — poll that tool for ordered attention.
    - Finished threads (accepted, complete, superseded, or rejected) are automatically filtered out and not injected.
    - Call `minni_thread_activate` to switch the active thread.
    - Call `minni_thread_deactivate` to clear the active pointer.
@@ -45,7 +45,7 @@ Use Minni Threads for: $ARGUMENTS
 ## Worker Slice Protocol
 
 1. Claim an assigned slice via `minni_thread_claim`:
-   - Pass `plan_id`, `slice_id`, `worker_agent_id`, non-blank `idempotency_key`, and optional `ttl_seconds`.
+   - Pass `plan_id`, `slice_id`, `worker_agent_id`, non-blank `idempotency_key`, and optional `ttl_seconds` (positive integer, capped at 7 days / `MAX_THREAD_CLAIM_TTL_SECONDS`; over-cap is rejected).
    - Returns a lease response containing `token` (valid for `ttl_seconds`), `generation`, `slice_id`, `claim_id`, and `expires_at`.
 2. Worker execution packet assembly:
    - Phase 1 has no automatic hydration packet builder; the orchestrator/adapter constructs the worker packet from ready/assign/claim outputs:

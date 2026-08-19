@@ -53,8 +53,28 @@ import {
 } from "./thread-claims.js";
 import { stableStringify } from "./agent_envelope.js";
 import { withThreadLock } from "./thread-lock.js";
+import { MAX_TEAM_TTL_SECONDS } from "./team.js";
 
 const DEFAULT_CLAIM_TTL_SECONDS = 10 * 60;
+
+/**
+ * Upper bound on a Thread claim lease. Same ceiling as Team packet TTL
+ * (MAX_TEAM_TTL_SECONDS) so the two surfaces share one max lease length;
+ * Thread rejects over-cap (typed) rather than clamping, matching existing
+ * claim TTL validation which already rejects non-positive values.
+ */
+export const MAX_THREAD_CLAIM_TTL_SECONDS = MAX_TEAM_TTL_SECONDS;
+
+export class ThreadClaimTtlError extends Error {
+  readonly code = "THREAD_CLAIM_TTL_INVALID" as const;
+
+  constructor(ttlSeconds: number, maxSeconds: number) {
+    super(
+      `claim ttlSeconds ${ttlSeconds} exceeds maximum of ${maxSeconds}`,
+    );
+    this.name = "ThreadClaimTtlError";
+  }
+}
 
 export type WorkerUpdateAction =
   | { action: "start" }
@@ -1253,6 +1273,9 @@ export async function claimSlice(
   const ttlSeconds = input.ttlSeconds ?? DEFAULT_CLAIM_TTL_SECONDS;
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0) {
     throw new Error("claim ttlSeconds must be a positive safe integer");
+  }
+  if (ttlSeconds > MAX_THREAD_CLAIM_TTL_SECONDS) {
+    throw new ThreadClaimTtlError(ttlSeconds, MAX_THREAD_CLAIM_TTL_SECONDS);
   }
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
