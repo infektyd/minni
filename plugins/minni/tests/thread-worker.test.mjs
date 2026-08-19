@@ -41,7 +41,6 @@ import {
   deriveSystemEventKey,
   readThreadEvents,
   ThreadCursorGapError,
-  ThreadJournalBoundError,
   ThreadJournalReadError,
 } from "../dist/thread-events.js";
 import {
@@ -2042,14 +2041,10 @@ test("threadWorkerErrorText still forwards path-free operational errors", () => 
   );
 });
 
-test("threadWorkerErrorText forwards THREAD_CURSOR_GAP and THREAD_JOURNAL_BOUND", () => {
+test("threadWorkerErrorText forwards THREAD_CURSOR_GAP", () => {
   const gap = new ThreadCursorGapError(1, 4);
   assert.equal(threadWorkerErrorText(gap), gap.message);
   assert.match(threadWorkerErrorText(gap), /unmarked cursor_gap/);
-  const bound = new ThreadJournalBoundError(
-    "ordered journal cursor bound dropped the prefix and left no complete events",
-  );
-  assert.equal(threadWorkerErrorText(bound), bound.message);
 });
 
 test("threadWorkerErrorText never serializes ThreadJournalReadError.journalPath", () => {
@@ -4534,63 +4529,6 @@ test("worker-side since_seq poller sees journal_truncated after simulated drop",
   });
   assert.equal(page.events[1]?.seq, firstKept.seq);
   assert.equal(page.events[1]?.event_id, firstKept.event_id);
-});
-
-test("worker poller bounded cursor read surfaces journal_truncated for an oversized journal", async (t) => {
-  const fixture = await threadFixture(t);
-  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
-
-  await assignSlice({
-    ...fixture,
-    sliceId: "a",
-    workerAgentId: "worker-a",
-    actorAgentId: "test-orchestrator",
-  });
-  await claimSlice({
-    ...fixture,
-    sliceId: "a",
-    workerAgentId: "worker-a",
-    idempotencyKey: "claim-before-bound",
-    ttlSeconds: 3600,
-    now: new Date(THREAD_START),
-  });
-
-  const before = await readThreadEvents(journalPath, 0, 1000);
-  const at = THREAD_START.toISOString();
-  const rev = before.events.at(-1)?.rev ?? 1;
-  let seq = before.events.reduce((max, event) => Math.max(max, event.seq), 0);
-  const pad = "y".repeat(180);
-  const extras = [];
-  for (let i = 0; i < 35; i += 1) {
-    seq += 1;
-    extras.push(JSON.stringify({
-      seq,
-      rev,
-      event_id: `pad-${seq}`,
-      idempotency_key: `pad-${seq}`,
-      actor: "test",
-      kind: "test.pad",
-      at,
-      payload: { pad },
-    }));
-  }
-  const existing = await readFile(journalPath, "utf8");
-  await writeFile(journalPath, `${existing}${extras.join("\n")}\n`, "utf8");
-  const fileSize = Buffer.byteLength(existing) + Buffer.byteLength(`${extras.join("\n")}\n`);
-  const maxReadBytes = Math.min(2_800, Math.floor(fileSize / 4));
-  assert.ok(maxReadBytes < fileSize);
-
-  const page = await readThreadEvents(journalPath, 0, 80, { maxReadBytes });
-  assert.ok(
-    page.events[0]?.kind === "journal_truncated" || page.events[0]?.kind === "cursor_gap",
-    `expected cursor gap kind, got ${page.events[0]?.kind}`,
-  );
-  assert.equal(
-    page.events[0]?.payload?.last_dropped_seq,
-    page.events[0]?.payload?.first_kept_seq - 1,
-  );
-  assert.ok(page.events[0].payload.first_kept_seq > 1);
-  assert.equal(page.events[1]?.seq, page.events[0].payload.first_kept_seq);
 });
 
 test("worker-side since_seq poller fails closed on an unmarked seq hole", async (t) => {

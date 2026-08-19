@@ -35,7 +35,6 @@ import {
   ThreadCursorGapError,
   ThreadEventIdempotencyConflictError,
   ThreadJournalAppendError,
-  ThreadJournalBoundError,
   ThreadJournalReadError,
   type ReadySummaryPayload,
 } from "./thread-events.js";
@@ -327,9 +326,6 @@ export function threadWorkerErrorText(error: unknown): string {
     return error.message;
   }
   if (error instanceof ThreadCursorGapError) {
-    return error.message;
-  }
-  if (error instanceof ThreadJournalBoundError) {
     return error.message;
   }
   const errno = nodeErrnoCode(error);
