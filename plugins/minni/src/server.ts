@@ -47,6 +47,7 @@ import {
   findPlanNote,
   persistPlan,
   PlanDigestVersionError,
+  PlanHistoryAppendError,
   rehydratePlan,
   rehydratePlanScalars,
   replan,
@@ -185,6 +186,30 @@ async function requireSharedGate(
 // read off the error — never the whole object. PlanHistoryAppendError.notePath
 // stays a typed internal field; threadWorkerErrorText rebuilds that case
 // from rev + cause.code only, never notePath / history file / cause.message.
+async function persistPlanThenRevokeClaimSecrets(
+  plan: PlanArtifact,
+  opts: { vaultPath: string; notePath: string },
+  planId: string,
+  claimIdsToDelete: Iterable<string>,
+): Promise<void> {
+  try {
+    await persistPlan(plan, opts);
+  } catch (error) {
+    // Same contract as assign/complete: a typed history-append failure
+    // means the note write already landed. Any revoked claim envelope is
+    // an orphan and must go even though this error is rethrown.
+    if (error instanceof PlanHistoryAppendError) {
+      await deleteClaimSecretsBestEffort(
+        opts.vaultPath,
+        planId,
+        claimIdsToDelete,
+      );
+    }
+    throw error;
+  }
+  await deleteClaimSecretsBestEffort(opts.vaultPath, planId, claimIdsToDelete);
+}
+
 function threadWorkerErrorResult(
   operation: string,
   error: unknown,
@@ -1445,16 +1470,25 @@ server.registerTool(
           { force, forceReason: force_reason },
         );
         const updated = applied.plan;
-        await persistPlan(updated, {
-          vaultPath: effectiveVaultPath,
-          notePath,
-        });
-        if (applied.revoked_claim_id) {
-          await deleteClaimSecretsBestEffort(
-            effectiveVaultPath,
+        try {
+          await persistPlanThenRevokeClaimSecrets(
+            updated,
+            { vaultPath: effectiveVaultPath, notePath },
             plan_id,
-            [applied.revoked_claim_id],
+            applied.revoked_claim_id ? [applied.revoked_claim_id] : [],
           );
+        } catch (error) {
+          if (error instanceof PlanHistoryAppendError && applied.revoked_claim_id) {
+            await pruneSliceReceiptsOnGenerationAdvance(
+              effectiveVaultPath,
+              plan_id,
+              slice_id,
+              applied.previous_slice.generation ?? 0,
+            );
+          }
+          throw error;
+        }
+        if (applied.revoked_claim_id) {
           await pruneSliceReceiptsOnGenerationAdvance(
             effectiveVaultPath,
             plan_id,
@@ -1760,13 +1794,10 @@ server.registerTool(
     // design decision outside this fix's brief (see diffSupersededDependencies'
     // docstring).
         const dependsOnSuperseded = diffSupersededDependencies(plan, updated);
-        await persistPlan(updated, {
-          vaultPath: effectiveVaultPath,
-          notePath,
-        });
         const revokedClaimIdList = revokedClaimIds(plan, updated);
-        await deleteClaimSecretsBestEffort(
-          effectiveVaultPath,
+        await persistPlanThenRevokeClaimSecrets(
+          updated,
+          { vaultPath: effectiveVaultPath, notePath },
           plan_id,
           revokedClaimIdList,
         );
@@ -1972,13 +2003,10 @@ server.registerTool(
           throw new Error(`revision ${rev} not found`);
         }
         const restored = restorePlan(current, snapshot);
-        await persistPlan(restored, {
-          vaultPath: effectiveVaultPath,
-          notePath,
-        });
         const restoreRevoked = [...claimIds(current), ...claimIds(snapshot)];
-        await deleteClaimSecretsBestEffort(
-          effectiveVaultPath,
+        await persistPlanThenRevokeClaimSecrets(
+          restored,
+          { vaultPath: effectiveVaultPath, notePath },
           plan_id,
           restoreRevoked,
         );

@@ -1908,11 +1908,7 @@ test("orchestrator slice transitions revoke a claim across terminal reopen", asy
   const end = serverSource.indexOf("server.registerTool", start + 1);
   const block = serverSource.slice(start, end);
   assert.match(block, /applyOrchestratorSliceUpdate/);
-  assert.match(block, /deleteClaimSecretsBestEffort/);
-  assert.ok(
-    block.indexOf("persistPlan") < block.indexOf("deleteClaimSecretsBestEffort"),
-    "server update must persist revoked metadata before best-effort cleanup",
-  );
+  assert.match(block, /persistPlanThenRevokeClaimSecrets/);
 });
 
 test("threadWorkerErrorText never serializes PlanHistoryAppendError.notePath", () => {
@@ -2187,6 +2183,130 @@ test("workerUpdate surfaces a real persistPlan history-append failure on complet
     100,
   );
   assert.deepEqual(eventsAfterSecondRetry, events);
+});
+
+async function persistPlantedClaim(fixture, sliceId, claim) {
+  const plan = await rehydratePlan(fixture.notePath);
+  const next = {
+    ...plan,
+    slices: plan.slices.map((slice) =>
+      slice.id === sliceId ? { ...slice, claim } : slice,
+    ),
+  };
+  await persistPlan(next, {
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+  });
+  return claim;
+}
+
+test("assignSlice deletes the orphan claim secret when history append fails after a durable reassignment", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const planted = await persistPlantedClaim(fixture, "a", {
+    claim_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    worker_agent_id: "worker-a",
+    claimed_at: THREAD_START.toISOString(),
+    expires_at: "2026-08-18T12:10:00.000Z",
+  });
+
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  const deleted = [];
+  const failure = await assignSlice(
+    {
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-b",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+      now: new Date("2026-08-18T12:05:00.000Z"),
+    },
+    {
+      deleteClaimSecret: async ({ claimId }) => {
+        deleted.push(claimId);
+      },
+    },
+  ).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+  assert.equal(failure.ok, false, JSON.stringify(failure));
+  assert.ok(
+    failure.error instanceof PlanHistoryAppendError,
+    `expected PlanHistoryAppendError, got ${failure.error?.constructor?.name}: ${failure.error?.message}`,
+  );
+  assert.match(failure.error.message, /history snapshot failed/);
+  assert.equal(failure.error.message.includes(historyPath), false);
+  assert.equal(failure.error.message.includes("wiki/artifacts"), false);
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(durable.slices[0].assigned_to, "worker-b");
+  assert.equal(
+    durable.slices[0].claim,
+    undefined,
+    "reassignment already cleared the live claim in the durable note",
+  );
+  assert.deepEqual(
+    deleted,
+    [planted.claim_id],
+    "durable reassignment must delete the orphan claim secret even when history append fails",
+  );
+});
+
+test("lazy expiry deletes the orphan claim secret when history append fails after a durable revoke", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const planted = await persistPlantedClaim(fixture, "a", {
+    claim_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    worker_agent_id: "worker-a",
+    claimed_at: THREAD_START.toISOString(),
+    expires_at: "2026-08-18T12:01:00.000Z",
+  });
+
+  const historyPath = historyPathFor(fixture.notePath);
+  await rm(historyPath, { force: true });
+  await mkdir(historyPath);
+
+  const deleted = [];
+  const { synchronizeExpiredClaimsAndReadReady } = threadWorkerRuntime;
+  const failure = await synchronizeExpiredClaimsAndReadReady(
+    {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      actor: TEST_ORCHESTRATOR_ACTOR,
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    },
+    {
+      deleteClaimSecret: async ({ claimId }) => {
+        deleted.push(claimId);
+      },
+    },
+  ).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+  assert.equal(failure.ok, false, JSON.stringify(failure));
+  assert.ok(
+    failure.error instanceof PlanHistoryAppendError,
+    `expected PlanHistoryAppendError, got ${failure.error?.constructor?.name}: ${failure.error?.message}`,
+  );
+  assert.match(failure.error.message, /history snapshot failed/);
+  assert.equal(failure.error.message.includes(historyPath), false);
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(
+    durable.slices[0].claim,
+    undefined,
+    "expiry already cleared the live claim in the durable note",
+  );
+  assert.deepEqual(
+    deleted,
+    [planted.claim_id],
+    "durable expiry must delete the orphan claim secret even when history append fails",
+  );
 });
 
 test("workerUpdate receipt replay on the clean happy path adds no recovery event", async (t) => {

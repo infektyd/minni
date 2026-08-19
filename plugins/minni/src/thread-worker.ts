@@ -801,10 +801,36 @@ async function expireStaleClaimForSlice(input: {
     claim: undefined,
   };
   const next = replaceSlice(input.plan, input.sliceId, nextSlice);
-  await input.persist(next, {
-    vaultPath: input.vaultPath,
-    notePath: input.notePath,
-  });
+  const intendedRev = input.plan.rev + 1;
+  try {
+    await input.persist(next, {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+    });
+  } catch (error) {
+    let committed = error instanceof PlanHistoryAppendError;
+    if (!committed) {
+      try {
+        const canonical = await rehydrateAuthority(input);
+        const durableSlice = findSlice(canonical, input.sliceId);
+        committed =
+          canonical.rev === intendedRev &&
+          requireGeneration(durableSlice) === generation &&
+          durableSlice.claim === undefined;
+      } catch {
+        committed = false;
+      }
+    }
+    if (committed) {
+      await deleteClaimSecretsBestEffort(
+        input.vaultPath,
+        input.planId,
+        [revokedClaimId],
+        input.deleteSecret,
+      );
+    }
+    throw error;
+  }
   await deleteClaimSecretsBestEffort(
     input.vaultPath,
     input.planId,
@@ -1057,6 +1083,17 @@ export async function assignSlice(
             planId,
             sliceId,
             [previousGeneration],
+          );
+        }
+        // Assign is claim-clearing: the durable note already has no live
+        // claim, so the mode-0600 envelope is an orphan and must go even
+        // when history append failed after the note write.
+        if (committed && slice.claim) {
+          await deleteClaimSecretsBestEffort(
+            input.vaultPath,
+            planId,
+            [slice.claim.claim_id],
+            deleteSecret,
           );
         }
         throw error;
