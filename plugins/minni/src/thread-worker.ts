@@ -32,7 +32,9 @@ import {
   reconcileThreadJournal,
   readOrderedThreadEvents,
   type OrderedThreadEvent,
+  ThreadCursorGapError,
   ThreadEventIdempotencyConflictError,
+  ThreadJournalAppendError,
   ThreadJournalReadError,
   type ReadySummaryPayload,
 } from "./thread-events.js";
@@ -53,8 +55,28 @@ import {
 } from "./thread-claims.js";
 import { stableStringify } from "./agent_envelope.js";
 import { withThreadLock } from "./thread-lock.js";
+import { MAX_TEAM_TTL_SECONDS } from "./team.js";
 
 const DEFAULT_CLAIM_TTL_SECONDS = 10 * 60;
+
+/**
+ * Upper bound on a Thread claim lease. Same ceiling as Team packet TTL
+ * (MAX_TEAM_TTL_SECONDS) so the two surfaces share one max lease length;
+ * Thread rejects over-cap (typed) rather than clamping, matching existing
+ * claim TTL validation which already rejects non-positive values.
+ */
+export const MAX_THREAD_CLAIM_TTL_SECONDS = MAX_TEAM_TTL_SECONDS;
+
+export class ThreadClaimTtlError extends Error {
+  readonly code = "THREAD_CLAIM_TTL_INVALID" as const;
+
+  constructor(ttlSeconds: number, maxSeconds: number) {
+    super(
+      `claim ttlSeconds ${ttlSeconds} exceeds maximum of ${maxSeconds}`,
+    );
+    this.name = "ThreadClaimTtlError";
+  }
+}
 
 export type WorkerUpdateAction =
   | { action: "start" }
@@ -298,6 +320,12 @@ export function threadWorkerErrorText(error: unknown): string {
     return planDigestVersionErrorMessage(error.version);
   }
   if (error instanceof ThreadJournalReadError) {
+    return error.message;
+  }
+  if (error instanceof ThreadJournalAppendError) {
+    return error.message;
+  }
+  if (error instanceof ThreadCursorGapError) {
     return error.message;
   }
   const errno = nodeErrnoCode(error);
@@ -629,11 +657,15 @@ function workerEventKind(action: WorkerUpdateAction): string {
 /**
  * Append one operation event plus, when the ready set actually changed, one
  * coalesced ready.changed event — the "after persistence" half of every
- * locked mutation's event lifecycle. A caught append failure is swallowed
- * here on purpose: the note is already durable, and the next locked
- * mutation's prepareThreadMutation reconciles the resulting note-ahead gap
- * via state.recovered rather than ever silently hiding it. Exported for
- * the same cross-call-site reuse reason as prepareThreadMutation above.
+ * locked mutation's event lifecycle.
+ *
+ * If the ordered append fails but the operation event actually landed
+ * (write-then-fsync: land-then-throw with a refreshed snapshot), continue —
+ * success and cursor-moved already agree. If the operation key is still
+ * missing, throw THREAD_JOURNAL_APPEND_FAILED rather than returning MCP OK
+ * while the cursor lags until a later state.recovered. Crash between note
+ * persist and this call remains a true note-ahead gap recovered on the next
+ * locked mutation per the v2 contract.
  */
 export async function recordThreadMutationEvents(input: {
   journalPath: string;
@@ -720,10 +752,18 @@ export async function recordThreadMutationEvents(input: {
       if (!snapshotTruthful) {
         throw error;
       }
-      // Snapshot matches durable journal; safe to continue the locked mutation.
+    }
+    // Snapshot matches the durable journal (or there is no live snapshot).
+    // Continue only when this mutation's operation event actually landed
+    // (land-then-throw refresh path). Otherwise the note is ahead and the
+    // caller must see a typed failure — not MCP OK with a silent gap.
+    const ordered =
+      input.orderedSnapshot ??
+      (await readOrderedThreadEvents(input.journalPath).catch(() => []));
+    if (findOrderedEventByIdempotencyKey(ordered, input.operationKey)) {
       return;
     }
-    // The note is already durable; the next locked mutation reconciles first.
+    throw new ThreadJournalAppendError(input.operationKey, input.kind, error);
   }
 }
 
@@ -949,13 +989,21 @@ async function synchronizeExpiredClaimsForPlan(input: {
 }
 
 /**
- * Lazily expire stale claims under the Thread lock, then return the ready set.
- * Used by minni_thread_ready and any path that must observe expiry durably.
+ * Lazily expire stale claims under the Thread lock and persist
+ * slice.lease_expired / thread.attention_required before returning.
+ *
+ * Single shared expiry sweep for every read path that must observe a dead
+ * claim without going through ready/claim/worker_update first
+ * (minni_thread_events, minni_thread_status, and ready via the wrapper below).
+ * Do not invent a second expiry implementation beside this helper.
+ *
+ * When no claim is past expires_at, this is a lock+rehydrate only — no journal
+ * write — so status can still resolve beside an unreadable journal.
  */
-export async function synchronizeExpiredClaimsAndReadReady(
+export async function synchronizeExpiredClaims(
   input: ThreadPlanTarget & { actor: string; now?: Date | (() => Date) },
   deps: ThreadWorkerDeps = {},
-): Promise<{ plan: PlanArtifact; ready: PlanSlice[] }> {
+): Promise<{ plan: PlanArtifact }> {
   const planId = requireNonEmpty(input.planId, "plan id");
   const actor = requireNonEmpty(input.actor, "actor");
   const persist = deps.persistPlan ?? persistPlan;
@@ -971,6 +1019,12 @@ export async function synchronizeExpiredClaimsAndReadReady(
     },
     async (initialPlan) => {
       const now = sampleNow(input.now);
+      const needsExpiry = initialPlan.slices.some(
+        (slice) => slice.claim !== undefined && !hasLiveClaim(slice, now),
+      );
+      if (!needsExpiry) {
+        return { plan: initialPlan };
+      }
       const { journalPath, ordered } = await prepareThreadMutation(
         { ...input, planId, actor },
         initialPlan,
@@ -990,9 +1044,24 @@ export async function synchronizeExpiredClaimsAndReadReady(
         orderedSnapshot: ordered,
         appendJournalDeps,
       });
-      return { plan, ready: readySlices(plan, now) };
+      return { plan };
     },
   );
+}
+
+/**
+ * Lazily expire stale claims under the Thread lock, then return the ready set.
+ * Ready delegates to synchronizeExpiredClaims — the same sweep events/status use.
+ */
+export async function synchronizeExpiredClaimsAndReadReady(
+  input: ThreadPlanTarget & { actor: string; now?: Date | (() => Date) },
+  deps: ThreadWorkerDeps = {},
+): Promise<{ plan: PlanArtifact; ready: PlanSlice[] }> {
+  // Sample once so ready and expiry agree on the same injected clock, matching
+  // the pre-extract behavior of a single now inside the lock.
+  const now = sampleNow(input.now);
+  const { plan } = await synchronizeExpiredClaims({ ...input, now }, deps);
+  return { plan, ready: readySlices(plan, now) };
 }
 
 function claimRevokedEvent(
@@ -1224,6 +1293,9 @@ export async function claimSlice(
   const ttlSeconds = input.ttlSeconds ?? DEFAULT_CLAIM_TTL_SECONDS;
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0) {
     throw new Error("claim ttlSeconds must be a positive safe integer");
+  }
+  if (ttlSeconds > MAX_THREAD_CLAIM_TTL_SECONDS) {
+    throw new ThreadClaimTtlError(ttlSeconds, MAX_THREAD_CLAIM_TTL_SECONDS);
   }
   const persist = deps.persistPlan ?? persistPlan;
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;

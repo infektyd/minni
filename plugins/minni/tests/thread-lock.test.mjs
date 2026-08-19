@@ -81,6 +81,7 @@ test("withThreadLock never steals a live owner's old lock", async (t) => {
     pid: process.pid,
     operationId: "live-op",
     acquiredAt: "2026-01-01T00:00:00.000Z",
+    processStartMarker: "live-start-marker",
   });
 
   await assert.rejects(
@@ -89,9 +90,81 @@ test("withThreadLock never steals a live owner's old lock", async (t) => {
       staleMs: 1,
       pollMs: 5,
       isProcessAlive: () => true,
+      // Same start marker as the seeded owner — still the live incarnation.
+      getProcessStartMarker: () => "live-start-marker",
     }),
     (error) => error?.code === "THREAD_BUSY",
   );
+});
+
+// Wave 3: PID reuse. Age is stale and kill(pid,0) succeeds, but the recorded
+// process-start marker no longer matches the live PID's incarnation — recover.
+test("withThreadLock recovers a stale lock when the PID was reused under a new start marker", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-thread-lock-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await seedOwner(root, "plan-reused-pid", {
+    pid: process.pid,
+    operationId: "old-incarnation",
+    acquiredAt: "2026-01-01T00:00:00.000Z",
+    processStartMarker: "boot-generation-1",
+  });
+  let entered = false;
+
+  await withThreadLock(
+    root,
+    "plan-reused-pid",
+    "after-reuse",
+    async () => {
+      entered = true;
+    },
+    {
+      waitMs: 40,
+      staleMs: 1,
+      pollMs: 5,
+      isProcessAlive: () => true,
+      getProcessStartMarker: () => "boot-generation-2",
+    },
+  );
+
+  assert.equal(entered, true);
+
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const audit = await readThreadLockRecoveryAudit(root);
+  const last = audit.at(-1);
+  assert.equal(last?.reason, "stale_pid_reuse");
+  assert.equal(last?.previous_owner?.processStartMarker, "boot-generation-1");
+});
+
+// Wave 3: recovery must leave an audit trail distinguishable from theft.
+test("withThreadLock records a recovery audit when it quarantines a stale lock", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-thread-lock-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await seedOwner(root, "plan-audit-recovery", {
+    pid: 999999,
+    operationId: "dead-op",
+    acquiredAt: "2026-01-01T00:00:00.000Z",
+    processStartMarker: "gone",
+  });
+
+  await withThreadLock(
+    root,
+    "plan-audit-recovery",
+    "recovery-with-audit",
+    async () => undefined,
+    {
+      staleMs: 1,
+      isProcessAlive: () => false,
+    },
+  );
+
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const audit = await readThreadLockRecoveryAudit(root);
+  assert.ok(Array.isArray(audit) && audit.length >= 1, "expected at least one recovery audit line");
+  const last = audit.at(-1);
+  assert.equal(last.plan_id, "plan-audit-recovery");
+  assert.equal(last.reason, "stale_dead");
+  assert.equal(last.previous_owner?.operationId, "dead-op");
+  assert.equal(typeof last.at, "string");
 });
 
 test("withThreadLock recovers only a stale dead-owner directory", async (t) => {

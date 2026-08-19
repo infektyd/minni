@@ -40,6 +40,7 @@ import {
   deriveReadyChangedKey,
   deriveSystemEventKey,
   readThreadEvents,
+  ThreadCursorGapError,
   ThreadJournalReadError,
 } from "../dist/thread-events.js";
 import {
@@ -1759,7 +1760,6 @@ test("every production Thread read-modify-write path enters the shared lock", as
   for (const name of [
     "minni_thread_update",
     "minni_thread_scar",
-    "minni_thread_status",
     "minni_thread_replan",
   ]) {
     assert.match(
@@ -1768,6 +1768,18 @@ test("every production Thread read-modify-write path enters the shared lock", as
       `${name} must use the strict lock-before-rehydrate helper`,
     );
   }
+  // status shares the locked expiry sweep with events/ready — that helper
+  // enters withThreadPlanLock internally; do not require a second direct lock.
+  assert.match(
+    handlerBlock("minni_thread_status"),
+    /synchronizeExpiredClaims/,
+    "minni_thread_status must run the shared expiry sweep (lock + rehydrate)",
+  );
+  assert.match(
+    handlerBlock("minni_thread_events"),
+    /synchronizeExpiredClaims/,
+    "minni_thread_events must run the shared expiry sweep before the cursor read",
+  );
   const restoreBlock = handlerBlock("minni_thread_restore");
   assert.match(restoreBlock, /withThreadLock/);
   assert.ok(
@@ -2027,6 +2039,12 @@ test("threadWorkerErrorText still forwards path-free operational errors", () => 
     threadWorkerErrorText(new Error("claim scope mismatch")),
     "claim scope mismatch",
   );
+});
+
+test("threadWorkerErrorText forwards THREAD_CURSOR_GAP", () => {
+  const gap = new ThreadCursorGapError(1, 4);
+  assert.equal(threadWorkerErrorText(gap), gap.message);
+  assert.match(threadWorkerErrorText(gap), /unmarked cursor_gap/);
 });
 
 test("threadWorkerErrorText never serializes ThreadJournalReadError.journalPath", () => {
@@ -2813,6 +2831,129 @@ test("duplicate worker start does not rev-bump or emit false recovery", async (t
   );
 });
 
+// --- Wave 2 residual: note-ahead journal swallow (MED) ------------------------
+//
+// recordThreadMutationEvents used to catch a failed ordered append and return
+// after the note was already durable, so the MCP tool reported OK while the
+// mutation's ordered kind was missing until a later mutation wrote
+// state.recovered. Pin: persist succeeds, ordered kind missing, tool still OK
+// is the hole — success and cursor-moved must be the same moment, or the
+// caller gets a typed error. Do not silently hide the gap.
+
+test("assignSlice must not return OK when the ordered slice.assigned append fails to land", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const before = await readThreadEvents(journalPath, 0, 100);
+
+  // Let prepareThreadMutation / baseline land, then fail only the post-persist
+  // mutation batch — the note-ahead swallow window.
+  const failAfterPrepare = async (filePath, content) => {
+    const text = typeof content === "string" ? content : String(content);
+    if (text.includes("slice.assigned")) {
+      throw new Error("simulated ordered append failure before write");
+    }
+    return realAppendFileWithFsync(filePath, content);
+  };
+
+  const outcome = await assignSlice(
+    {
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+      now: new Date(THREAD_START),
+    },
+    {
+      appendJournalDeps: {
+        appendFileWithFsync: failAfterPrepare,
+        writeFileAtomic: async () => {
+          throw new Error("simulated ordered append failure before write");
+        },
+      },
+    },
+  ).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error }),
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(
+    durable.slices[0].assigned_to,
+    "worker-a",
+    "note persist still lands — the hole is lying about the cursor, not durability",
+  );
+
+  const after = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    after.events.some((event) => event.kind === "slice.assigned"),
+    false,
+    "ordered slice.assigned must be missing when the append never landed",
+  );
+
+  // Hole today: ok===true with missing ordered kind. Fix: typed error (or
+  // same-call repair that lands the kind before returning).
+  if (outcome.ok) {
+    assert.fail(
+      "assignSlice returned OK while slice.assigned is missing from the ordered cursor (note-ahead swallow)",
+    );
+  }
+  assert.equal(
+    outcome.error?.code,
+    "THREAD_JOURNAL_APPEND_FAILED",
+    `expected typed THREAD_JOURNAL_APPEND_FAILED, got ${outcome.error?.name}: ${outcome.error?.message}`,
+  );
+  // prepareThreadMutation may have advanced the cursor (baseline); the
+  // mutation's own kind must still be absent.
+  assert.equal(
+    after.events.some((event) => event.kind === "slice.assigned"),
+    false,
+  );
+});
+
+test("recordThreadMutationEvents continues when land-then-throw left the operation on disk", async (t) => {
+  // Sibling of final-fix-5: write lands, fsync throws, snapshot refreshes —
+  // the operation key is present, so the locked mutation may continue.
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  let forcedLandThenThrow = false;
+  const landedThenThrows = async (filePath, content) => {
+    const text = typeof content === "string" ? content : String(content);
+    // Only the post-persist mutation batch (not prepare/baseline).
+    if (!forcedLandThenThrow && text.includes("slice.assigned")) {
+      forcedLandThenThrow = true;
+      await realAppendFileWithFsync(filePath, content);
+      throw new Error("simulated fsync failure after write landed");
+    }
+    return realAppendFileWithFsync(filePath, content);
+  };
+
+  const result = await assignSlice(
+    {
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      actorAgentId: TEST_ORCHESTRATOR_ACTOR,
+      now: new Date(THREAD_START),
+    },
+    {
+      appendJournalDeps: {
+        appendFileWithFsync: landedThenThrows,
+        writeFileAtomic: async () => {
+          throw new Error("simulated fsync failure after write landed");
+        },
+      },
+    },
+  );
+  assert.equal(result.slice.assigned_to, "worker-a");
+  assert.equal(forcedLandThenThrow, true, "mutation append must have been forced");
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.ok(
+    events.some((event) => event.kind === "slice.assigned"),
+    "land-then-throw must still leave slice.assigned on the ordered cursor",
+  );
+});
+
 test("claim idempotent retry repairs missing slice.claimed and ready delta", async (t) => {
   const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
   await assignWorker(fixture, "a", "worker-a");
@@ -3241,6 +3382,186 @@ test("final-fix-2: lazy expiry on ready emits lease_expired and attention withou
     const payload = JSON.stringify(event.payload ?? {});
     assert.doesNotMatch(payload, /token|evidence|\.runtime/i);
   }
+});
+
+// Phase-1 residual (2026-08-19): an orchestrator that only polls the event
+// cursor / status must still observe dead claims. ready/claim/worker_update
+// already run the locked expiry sweep; events + status must share that same
+// helper — not invent a second expiry path, and not require a ready poll.
+test("shared expiry sweep: events/status path expires without ready/claim/worker_update", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "events-status-expiry-claim",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+
+  const before = await rehydratePlan(fixture.notePath);
+  assert.ok(before.slices[0].claim, "claim must still be durable before the sweep");
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const beforeCursor = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    beforeCursor.events.some((event) => event.kind === "slice.lease_expired"),
+    false,
+    "readThreadEvents alone must not invent expiry — the shared sweep owns that",
+  );
+
+  const { synchronizeExpiredClaims } = threadWorkerRuntime;
+  assert.equal(
+    typeof synchronizeExpiredClaims,
+    "function",
+    "events/status must share synchronizeExpiredClaims (same helper ready already uses)",
+  );
+
+  const laterNow = new Date("2026-08-18T12:02:00.000Z");
+  // events-path shape: sweep, then read the ordered cursor
+  const swept = await synchronizeExpiredClaims({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: laterNow,
+  });
+  assert.equal(
+    swept.plan.slices[0].claim,
+    undefined,
+    "status-path shape: returned plan must show a non-live (cleared) claim",
+  );
+
+  const afterCursor = await readThreadEvents(journalPath, beforeCursor.next_seq, 100);
+  assert.ok(
+    afterCursor.events.some((event) => event.kind === "slice.lease_expired"),
+    "ordered cursor must surface slice.lease_expired after the shared sweep",
+  );
+  assert.ok(
+    afterCursor.events.some((event) => event.kind === "thread.attention_required"),
+    "ordered cursor must surface thread.attention_required after the shared sweep",
+  );
+
+  const durable = await rehydratePlan(fixture.notePath);
+  assert.equal(durable.slices[0].claim, undefined);
+});
+
+test("shared expiry sweep skips journal I/O when no claim needs expiry", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "live-claim-no-journal-touch",
+    ttlSeconds: 3600,
+    now: new Date(THREAD_START),
+  });
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  await rm(journalPath, { force: true });
+  await mkdir(journalPath);
+
+  const { synchronizeExpiredClaims } = threadWorkerRuntime;
+  // Live claim + unreadable journal: sweep must still return the plan without
+  // attempting journal prep (status contract beside EISDIR journals).
+  const swept = await synchronizeExpiredClaims({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.ok(swept.plan.slices[0].claim, "live claim must remain");
+});
+
+test("ready expiry delegates to the same synchronizeExpiredClaims helper", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "ready-delegates-expiry-claim",
+    ttlSeconds: 60,
+    now: new Date(THREAD_START),
+  });
+
+  const { synchronizeExpiredClaims, synchronizeExpiredClaimsAndReadReady } =
+    threadWorkerRuntime;
+  const laterNow = new Date("2026-08-18T12:02:00.000Z");
+  const viaShared = await synchronizeExpiredClaims({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: laterNow,
+  });
+  assert.equal(viaShared.plan.slices[0].claim, undefined);
+
+  // Second call via ready must be a no-op re-entry of the same sweep (idempotent
+  // lease_expired keys), not a divergent expiry implementation.
+  const viaReady = await synchronizeExpiredClaimsAndReadReady({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    actor: TEST_ORCHESTRATOR_ACTOR,
+    now: laterNow,
+  });
+  assert.equal(viaReady.plan.slices[0].claim, undefined);
+  assert.ok(viaReady.ready.some((slice) => slice.id === "a"));
+
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const { events } = await readThreadEvents(journalPath, 0, 100);
+  assert.equal(
+    events.filter((event) => event.kind === "slice.lease_expired").length,
+    1,
+    "ready must reuse the shared sweep's idempotent expiry, not double-emit",
+  );
+});
+
+// Phase-1 residual: claim ttl_seconds had no ceiling (Team already clamps at
+// MAX_TEAM_TTL_SECONDS). Thread rejects over-cap with a typed error — claim
+// validation already rejects non-positive TTL rather than clamping, and a
+// silent clamp would lie about the lease the worker thinks it holds.
+test("claimSlice rejects ttlSeconds above MAX_THREAD_CLAIM_TTL_SECONDS with a typed error", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  await assignWorker(fixture, "a", "worker-a");
+  const { MAX_THREAD_CLAIM_TTL_SECONDS, ThreadClaimTtlError } = threadWorkerRuntime;
+  assert.equal(
+    MAX_THREAD_CLAIM_TTL_SECONDS,
+    7 * 24 * 3600,
+    "Thread claim ceiling matches Team's MAX_TEAM_TTL_SECONDS bound",
+  );
+
+  await assert.rejects(
+    claimSlice({
+      ...fixture,
+      sliceId: "a",
+      workerAgentId: "worker-a",
+      idempotencyKey: "ttl-ceiling-claim",
+      ttlSeconds: MAX_THREAD_CLAIM_TTL_SECONDS + 1,
+      now: new Date(THREAD_START),
+    }),
+    (error) =>
+      error instanceof ThreadClaimTtlError &&
+      error.code === "THREAD_CLAIM_TTL_INVALID" &&
+      error.message.includes(String(MAX_THREAD_CLAIM_TTL_SECONDS)),
+  );
+
+  const atCap = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "ttl-at-cap-claim",
+    ttlSeconds: MAX_THREAD_CLAIM_TTL_SECONDS,
+    now: new Date(THREAD_START),
+  });
+  assert.equal(
+    Date.parse(atCap.expires_at),
+    THREAD_START.getTime() + MAX_THREAD_CLAIM_TTL_SECONDS * 1000,
+  );
 });
 
 test("final-fix-2: block and completion lifecycle events are single-shot on retry", async (t) => {
@@ -4144,5 +4465,201 @@ test("final-fix-5: claimSlice sibling expiry that lands-then-throws must not let
   assert.ok(
     leaseExpired.seq < claimed.seq,
     "the in-lock sibling expiry must be ordered strictly before the triggering claim event",
+  );
+});
+
+// Stacked on #373: worker/orchestrator poller must see journal_truncated after
+// a simulated ordered-journal prefix drop. Silent holes are a fail.
+test("worker-side since_seq poller sees journal_truncated after simulated drop", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+  const claimed = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-before-trunc",
+    ttlSeconds: 3600,
+    now: new Date(THREAD_START),
+  });
+  assert.ok(claimed.token);
+
+  const before = await readThreadEvents(journalPath, 0, 1000);
+  assert.ok(before.events.length >= 2, "assign/claim must leave ordered events");
+  const lastDropped = before.events[before.events.length - 2];
+  const firstKept = before.events[before.events.length - 1];
+  assert.ok(lastDropped.seq + 1 === firstKept.seq);
+
+  const at = THREAD_START.toISOString();
+  const truncation = {
+    seq: lastDropped.seq,
+    rev: lastDropped.rev,
+    event_id: `trunc-${lastDropped.seq}`,
+    idempotency_key: `system:journal_truncated:${lastDropped.seq}:${firstKept.seq}`,
+    actor: "minni",
+    kind: "journal_truncated",
+    at,
+    payload: {
+      last_dropped_seq: lastDropped.seq,
+      first_kept_seq: firstKept.seq,
+    },
+  };
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  await writeFile(
+    journalPath,
+    header
+      + `${JSON.stringify(truncation)}\n`
+      + `${JSON.stringify(firstKept)}\n`,
+    "utf8",
+  );
+
+  // Cursor parked before the drop must observe the hole, not jump silently.
+  const sinceSeq = Math.max(0, lastDropped.seq - 1);
+  const page = await readThreadEvents(journalPath, sinceSeq, 50);
+  assert.equal(page.events[0]?.kind, "journal_truncated");
+  assert.deepEqual(page.events[0]?.payload, {
+    last_dropped_seq: lastDropped.seq,
+    first_kept_seq: firstKept.seq,
+  });
+  assert.equal(page.events[1]?.seq, firstKept.seq);
+  assert.equal(page.events[1]?.event_id, firstKept.event_id);
+});
+
+test("worker poller bounded cursor read surfaces journal_truncated for an oversized journal", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+  await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "claim-before-bound",
+    ttlSeconds: 3600,
+    now: new Date(THREAD_START),
+  });
+
+  const before = await readThreadEvents(journalPath, 0, 1000);
+  const at = THREAD_START.toISOString();
+  const rev = before.events.at(-1)?.rev ?? 1;
+  let seq = before.events.reduce((max, event) => Math.max(max, event.seq), 0);
+  const pad = "y".repeat(180);
+  const extras = [];
+  for (let i = 0; i < 35; i += 1) {
+    seq += 1;
+    extras.push(JSON.stringify({
+      seq,
+      rev,
+      event_id: `pad-${seq}`,
+      idempotency_key: `pad-${seq}`,
+      actor: "test",
+      kind: "test.pad",
+      at,
+      payload: { pad },
+    }));
+  }
+  const existing = await readFile(journalPath, "utf8");
+  const appended = `${extras.join("\n")}\n`;
+  await writeFile(journalPath, `${existing}${appended}`, "utf8");
+  const fileSize = Buffer.byteLength(existing) + Buffer.byteLength(appended);
+  const maxReadBytes = Math.min(2_800, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize);
+
+  const page = await readThreadEvents(journalPath, 0, 80, { maxReadBytes });
+  assert.ok(
+    page.events[0]?.kind === "journal_truncated" || page.events[0]?.kind === "cursor_gap",
+    `expected cursor gap kind, got ${page.events[0]?.kind}`,
+  );
+  assert.equal(
+    page.events[0]?.payload?.last_dropped_seq,
+    page.events[0]?.payload?.first_kept_seq - 1,
+  );
+  assert.ok(page.events[0].payload.first_kept_seq > 1);
+  assert.equal(page.events[1]?.seq, page.events[0].payload.first_kept_seq);
+  assert.equal(
+    threadWorkerErrorText(new ThreadCursorGapError(0, page.events[0].payload.first_kept_seq)),
+    new ThreadCursorGapError(0, page.events[0].payload.first_kept_seq).message,
+  );
+});
+
+test("worker poller tail bound does not hide an unmarked leading hole", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const pad = "y".repeat(180);
+  const extras = [];
+  for (let seq = 10; seq <= 45; seq += 1) {
+    extras.push(JSON.stringify({
+      seq,
+      rev: 1,
+      event_id: `pad-${seq}`,
+      idempotency_key: `pad-${seq}`,
+      actor: "test",
+      kind: "test.pad",
+      at,
+      payload: { pad },
+    }));
+  }
+  const text = `${header}${extras.join("\n")}\n`;
+  await writeFile(journalPath, text, "utf8");
+  const fileSize = Buffer.byteLength(text);
+  const maxReadBytes = Math.min(2_800, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize);
+
+  await assert.rejects(
+    () => readThreadEvents(journalPath, 0, 80, { maxReadBytes }),
+    (error) => {
+      assert.equal(error?.code, "THREAD_CURSOR_GAP");
+      assert.equal(
+        threadWorkerErrorText(error),
+        error.message,
+      );
+      return true;
+    },
+  );
+});
+
+test("worker-side since_seq poller fails closed on an unmarked seq hole", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+  const before = await readThreadEvents(journalPath, 0, 1000);
+  const firstKept = before.events.at(-1);
+  assert.ok(firstKept);
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  await writeFile(journalPath, `${header}${JSON.stringify(firstKept)}\n`, "utf8");
+  // firstKept.seq > 1 after assign (baseline + assigned). Drop everything
+  // before it with no journal_truncated marker.
+  assert.ok(firstKept.seq > 1);
+  await assert.rejects(
+    () => readThreadEvents(journalPath, 0, 50),
+    (error) => {
+      assert.equal(error?.code, "THREAD_CURSOR_GAP");
+      return true;
+    },
   );
 });

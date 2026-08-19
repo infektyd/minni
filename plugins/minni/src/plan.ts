@@ -2,12 +2,19 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 
-import { DEFAULT_VAULT_PATH } from "./config.js";
+import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
 import { writeVaultPage, appendFileWithFsync, writeFileAtomic, type VaultWriteResult } from "./vault.js";
 import type { PageStatus } from "./vault.js";
 import type { ScarTissueEntry } from "./task.js";
 import { stableStringify } from "./agent_envelope.js";
-import { withThreadLock } from "./thread-lock.js";
+import { withThreadLock, ThreadBusyError } from "./thread-lock.js";
+import {
+  appendOrderedEventBatch,
+  deriveSystemEventKey,
+  ensureOrderedBaseline,
+  readOrderedThreadEvents,
+  reconcileThreadJournal,
+} from "./thread-events.js";
 
 // ---------------------------------------------------------------------------
 // Types (exported per spec)
@@ -408,6 +415,39 @@ export class PlanDigestVersionError extends Error {
     this.version = version;
     this.notePath = notePath;
   }
+}
+
+/**
+ * Active-plan pointer / view read failed for a filesystem or lock reason.
+ * Distinct from "no active plan" (undefined) so hooks do not treat a failed
+ * read as "nothing salient." Message is path-free — syscall code only.
+ */
+export class ActivePlanReadError extends Error {
+  readonly code = "ACTIVE_PLAN_READ_FAILED" as const;
+  readonly causeCode?: string;
+
+  constructor(causeCode?: string, cause?: unknown) {
+    super(
+      causeCode
+        ? `active plan read failed: ${causeCode}`
+        : "active plan read failed",
+      cause instanceof Error ? { cause } : undefined,
+    );
+    this.name = "ActivePlanReadError";
+    this.causeCode = causeCode;
+  }
+}
+
+const ACTIVE_PLAN_ERRNO = /^E[A-Z][A-Z0-9]{1,30}$/;
+
+function activePlanErrnoCode(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code: unknown }).code;
+    if (typeof code === "string" && ACTIVE_PLAN_ERRNO.test(code)) {
+      return code;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -2192,8 +2232,17 @@ export async function getActivePlan(
       }
       return parsed;
     }
-  } catch {
-    // undefined if absent/corrupt (never throw)
+  } catch (error) {
+    const errno = activePlanErrnoCode(error);
+    // Missing pointer is empty (no active plan). Other FS failures must not
+    // look like empty — hooks treat undefined as "nothing salient."
+    if (errno === "ENOENT") {
+      return undefined;
+    }
+    if (errno) {
+      throw new ActivePlanReadError(errno, error);
+    }
+    // Corrupt JSON / shape — no usable active plan.
   }
   return undefined;
 }
@@ -2327,11 +2376,64 @@ export async function resolveActivePlanView(
           await persistPlan(plan, { vaultPath, notePath: active.notePath });
           const journalPath = journalPathFor(active.notePath, plan.plan_id);
           try {
-            await appendJournal(journalPath, {
-              kind: "status_reconciled",
-              from,
-              to: "complete",
-              at: new Date().toISOString(),
+            // Ordered cursor (not legacy appendJournal): status_reconciled
+            // without seq was invisible to minni_thread_events. Same actor
+            // stamp as other server-side Thread mutations.
+            const now = new Date();
+            const readySummary = {
+              slices: plan.slices
+                .filter(
+                  (slice) =>
+                    slice.status === "pending" ||
+                    slice.status === "in_progress" ||
+                    slice.status === "blocked",
+                )
+                .map((slice) => ({ id: slice.id, title: slice.title })),
+            };
+            const ordered = await readOrderedThreadEvents(journalPath);
+            await reconcileThreadJournal(
+              {
+                journalPath,
+                notePath: active.notePath,
+                planId: plan.plan_id,
+                rev: plan.rev,
+                actor: DEFAULT_AGENT_ID,
+                at: now.toISOString(),
+                readySummary,
+                orderedSnapshot: ordered,
+              },
+            );
+            await ensureOrderedBaseline(
+              {
+                journalPath,
+                planId: plan.plan_id,
+                rev: plan.rev,
+                actor: DEFAULT_AGENT_ID,
+                at: now.toISOString(),
+                readySummary,
+                orderedSnapshot: ordered,
+              },
+            );
+            await appendOrderedEventBatch({
+              journalPath,
+              planId: plan.plan_id,
+              rev: plan.rev,
+              actor: DEFAULT_AGENT_ID,
+              at: now.toISOString(),
+              orderedSnapshot: ordered,
+              events: [
+                {
+                  idempotencyKey: deriveSystemEventKey(
+                    "status_reconciled",
+                    plan.plan_id,
+                    from,
+                    "complete",
+                    String(plan.rev),
+                  ),
+                  kind: "status_reconciled",
+                  payload: { from, to: "complete" },
+                },
+              ],
             });
           } catch {
             // journal is advisory; the persisted status is the durable fix
@@ -2349,7 +2451,18 @@ export async function resolveActivePlanView(
         };
       },
     );
-  } catch {
+  } catch (error) {
+    // FS failures and lock contention must not look like "no active plan."
+    if (error instanceof ActivePlanReadError) {
+      throw error;
+    }
+    if (error instanceof ThreadBusyError) {
+      throw error;
+    }
+    const errno = activePlanErrnoCode(error);
+    if (errno) {
+      throw new ActivePlanReadError(errno, error);
+    }
     return undefined;
   }
 }
