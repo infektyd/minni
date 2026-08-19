@@ -235,6 +235,12 @@ test("withThreadLock atomically quarantines a stale lock with no owner file", as
     renames[0].to,
     new RegExp(`^${lockDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.stale-`),
   );
+
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const audit = await readThreadLockRecoveryAudit(root);
+  const last = audit.at(-1);
+  assert.equal(last?.reason, "stale_ownerless");
+  assert.equal(last?.plan_id, "plan-ownerless");
 });
 
 test("withThreadLock recovers a stale lock with invalid owner JSON", async (t) => {
@@ -261,4 +267,10 @@ test("withThreadLock recovers a stale lock with invalid owner JSON", async (t) =
   );
 
   assert.equal(entered, true);
+
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const audit = await readThreadLockRecoveryAudit(root);
+  const last = audit.at(-1);
+  assert.equal(last?.reason, "stale_invalid_owner");
+  assert.equal(last?.plan_id, "plan-invalid-owner");
 });
