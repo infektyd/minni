@@ -184,7 +184,7 @@ async function requireSharedGate(
 // ThreadEventIdempotencyConflictError, PlanHistoryAppendError, ...) are ever
 // read off the error — never the whole object. PlanHistoryAppendError.notePath
 // stays a typed internal field; threadWorkerErrorText rebuilds that case
-// without the vault path so the model-facing string cannot leak it.
+// from rev + cause.code only, never notePath / history file / cause.message.
 function threadWorkerErrorResult(
   operation: string,
   error: unknown,

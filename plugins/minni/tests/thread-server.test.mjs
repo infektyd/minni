@@ -776,6 +776,7 @@ test("minni_thread_worker_update history-append error never leaks the vault note
     assert.equal(result.notePath, undefined);
     assert.equal(result.filePath, undefined);
     assert.match(result.error, /note committed at rev/);
+    assert.match(result.error, /EISDIR/);
     assert.equal(
       result.error.includes(notePath),
       false,
@@ -784,12 +785,17 @@ test("minni_thread_worker_update history-append error never leaks the vault note
     assert.equal(
       result.error.includes(historyFile),
       false,
-      "model-facing MCP error must not embed the history file path from cause.message",
+      "model-facing MCP error must not embed the history file path from a real Node EISDIR",
     );
     assert.doesNotMatch(
       JSON.stringify(result),
       /wiki\/artifacts/,
       "model-facing MCP error payload must not contain a vault artifacts path",
+    );
+    assert.equal(
+      JSON.stringify(result).includes(historyFile),
+      false,
+      "model-facing MCP JSON must not embed the history file path",
     );
   });
 });

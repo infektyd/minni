@@ -2090,9 +2090,10 @@ test("PlanHistoryAppendError keeps notePath typed and out of .message", () => {
   assert.equal(error.code, "PLAN_HISTORY_APPEND_FAILED");
   assert.equal(
     error.message,
-    "persistPlan: note committed at rev 4, but appending the history snapshot failed: EISDIR: illegal operation on a directory",
+    "persistPlan: note committed at rev 4, but appending the history snapshot failed: history append failed",
   );
   assert.equal(error.message.includes(notePath), false);
+  assert.equal(error.message.includes("wiki/artifacts"), false);
 });
 
 test("PlanHistoryAppendError drops a Node-style cause path (history file, not notePath)", () => {
@@ -2113,7 +2114,7 @@ test("PlanHistoryAppendError drops a Node-style cause path (history file, not no
   assert.equal(error.message.includes("wiki/artifacts"), false);
 });
 
-test("PlanHistoryAppendError redacts a path-bearing cause that has no syscall code", () => {
+test("PlanHistoryAppendError does not interpolate a path-bearing cause that has no syscall code", () => {
   const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
   const historyPath = historyPathFor(notePath);
   const error = new PlanHistoryAppendError(
@@ -2121,8 +2122,10 @@ test("PlanHistoryAppendError redacts a path-bearing cause that has no syscall co
     4,
     new Error(`append failed at ${historyPath}`),
   );
-  assert.match(error.message, /history snapshot failed/);
-  assert.match(error.message, /append failed at/);
+  assert.equal(
+    error.message,
+    "persistPlan: note committed at rev 4, but appending the history snapshot failed: history append failed",
+  );
   assert.equal(error.message.includes(historyPath), false);
   assert.equal(error.message.includes("wiki/artifacts"), false);
 });
@@ -2186,6 +2189,41 @@ test("persistPlan throws the typed PlanHistoryAppendError when the note commits 
     assert.equal(after.rev, before.rev + 1);
     assert.equal(after.rev, plan.rev);
     assert.equal(after.plan_digest, plan.plan_digest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("persistPlan notePath mismatch after durable write does not embed vault paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-notepath-mismatch-"));
+  try {
+    await ensureVault(root);
+    const created = await createPlan(
+      { goal: "Reproduce a post-commit notePath mismatch", vaultPath: root },
+      { vaultPath: root },
+    );
+    const { plan, write } = created;
+    const otherPath = path.join(root, "wiki", "artifacts", "plan-other.md");
+    await assert.rejects(
+      persistPlan(plan, {
+        vaultPath: root,
+        notePath: write.notePath,
+        writeVaultPage: async () => ({
+          notePath: otherPath,
+          relativePath: "wiki/artifacts/plan-other.md",
+          wikilink: "[[plan-other]]",
+        }),
+      }),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /different notePath than the caller expected/);
+        assert.equal(error.message.includes(write.notePath), false);
+        assert.equal(error.message.includes(otherPath), false);
+        assert.equal(error.message.includes("wiki/artifacts"), false);
+        assert.equal(error.message.includes(root), false);
+        return true;
+      },
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

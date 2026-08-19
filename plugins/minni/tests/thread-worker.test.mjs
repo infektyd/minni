@@ -1925,7 +1925,7 @@ test("threadWorkerErrorText never serializes PlanHistoryAppendError.notePath", (
   const text = threadWorkerErrorText(error);
   assert.equal(
     text,
-    "persistPlan: note committed at rev 9, but appending the history snapshot failed: EISDIR: illegal operation on a directory",
+    "persistPlan: note committed at rev 9, but appending the history snapshot failed: history append failed",
   );
   assert.equal(text.includes(notePath), false);
   assert.equal(text.includes("wiki/artifacts"), false);
@@ -2084,6 +2084,10 @@ test("workerUpdate surfaces a real persistPlan history-append failure on complet
     failure.error instanceof PlanHistoryAppendError,
     `expected PlanHistoryAppendError, got ${failure.error?.constructor?.name}: ${failure.error?.message}`,
   );
+  assert.match(failure.error.message, /history snapshot failed/);
+  assert.match(failure.error.message, /EISDIR/);
+  assert.equal(failure.error.message.includes(historyPath), false);
+  assert.equal(failure.error.message.includes("wiki/artifacts"), false);
 
   const durable = await rehydratePlan(fixture.notePath);
   assert.equal(

@@ -415,9 +415,10 @@ const SYS_ERR_CODE = /^[A-Z][A-Z0-9_]{1,31}$/;
 /**
  * Model-facing / .message cause fragment for a failed history append.
  * Prefer a Node syscall `.code` (EISDIR, EACCES, …) so the operator still
- * sees the failure class. Never interpolate cause.message: real Node
- * system errors embed the history file path (`wiki/artifacts/…history.jsonl`),
- * which is adjacent to — but distinct from — the vault notePath.
+ * sees the failure class. Never interpolate cause.message or cause.path:
+ * real Node system errors embed the history file path
+ * (`wiki/artifacts/…history.jsonl`), which is adjacent to — but distinct
+ * from — the vault notePath. Without a syscall code, use a generic phrase.
  */
 export function planHistoryAppendErrorCauseText(cause: unknown): string {
   if (cause && typeof cause === "object") {
@@ -426,13 +427,7 @@ export function planHistoryAppendErrorCauseText(cause: unknown): string {
       return code;
     }
   }
-  const raw =
-    cause instanceof Error
-      ? cause.message
-      : cause == null
-        ? "unknown"
-        : String(cause);
-  return redactFilesystemPathsFromErrorText(raw) || "unknown";
+  return "history append failed";
 }
 
 /** Strip quoted, absolute, and vault-relative filesystem paths from error text. */
@@ -1125,8 +1120,10 @@ export async function persistPlan(
   });
 
   if (opts.notePath && writeRes.notePath !== opts.notePath) {
+    // The write already landed. Do not interpolate either vault path into
+    // `.message` — MCP surfaces persistPlan errors via threadWorkerErrorText.
     throw new Error(
-      `persistPlan: expected notePath ${opts.notePath}, got ${writeRes.notePath}`,
+      "persistPlan: durable write landed at a different notePath than the caller expected",
     );
   }
 
