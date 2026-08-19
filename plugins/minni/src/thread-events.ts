@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 
 import { stableStringify } from "./agent_envelope.js";
 import { type AppendJournalDeps } from "./plan.js";
@@ -176,6 +176,14 @@ export class ThreadCursorGapError extends Error {
   }
 }
 
+/** Default max bytes the cursor reader will load from the end of a journal. */
+export const ORDERED_JOURNAL_CURSOR_TAIL_BYTES = 1024 * 1024;
+
+export interface ReadThreadEventsOptions {
+  /** Override the cursor read/parse byte bound (tests + deliberate tuning). */
+  maxReadBytes?: number;
+}
+
 export function isJournalGapKind(kind: string): boolean {
   return kind === JOURNAL_TRUNCATION_KIND || kind === CURSOR_GAP_KIND;
 }
@@ -224,6 +232,154 @@ async function readOrderedJournalText(
     }
     throw new ThreadJournalReadError(journalPath, error);
   }
+}
+
+/**
+ * Cursor-path read: load at most maxReadBytes from the file tail. When the
+ * prefix is skipped, the caller must emit journal_truncated / cursor_gap or
+ * fall back to a full parse — never pretend the stream is contiguous from seq 1.
+ */
+async function readOrderedJournalTextBounded(
+  journalPath: string,
+  maxReadBytes: number,
+): Promise<{ text: string; prefixTruncated: boolean } | undefined> {
+  let fileSize: number;
+  try {
+    fileSize = (await stat(journalPath)).size;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new ThreadJournalReadError(journalPath, error);
+  }
+
+  if (fileSize <= maxReadBytes) {
+    const text = await readOrderedJournalText(journalPath);
+    if (text === undefined) {
+      return undefined;
+    }
+    return { text, prefixTruncated: false };
+  }
+
+  try {
+    const handle = await open(journalPath, "r");
+    try {
+      const length = Math.min(maxReadBytes, fileSize);
+      const start = fileSize - length;
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, start);
+      let text = buffer.toString("utf8", 0, bytesRead);
+      const newline = text.indexOf("\n");
+      if (newline === -1) {
+        return { text: "", prefixTruncated: true };
+      }
+      // Discard the leading torn line so parse never invents a half-event.
+      text = text.slice(newline + 1);
+      return { text, prefixTruncated: true };
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new ThreadJournalReadError(journalPath, error);
+  }
+}
+
+function synthesizeCursorGapForReadBound(
+  firstKept: OrderedThreadEvent,
+): OrderedThreadEvent {
+  const lastDropped = firstKept.seq - 1;
+  const idempotencyKey = deriveSystemEventKey(
+    CURSOR_GAP_KIND,
+    String(lastDropped),
+    String(firstKept.seq),
+  );
+  return {
+    seq: lastDropped,
+    rev: firstKept.rev,
+    event_id: createHash("sha256")
+      .update(
+        stableStringify({
+          kind: CURSOR_GAP_KIND,
+          last_dropped_seq: lastDropped,
+          first_kept_seq: firstKept.seq,
+        }),
+      )
+      .digest("hex")
+      .slice(0, 32),
+    idempotency_key: idempotencyKey,
+    actor: "minni",
+    kind: CURSOR_GAP_KIND,
+    at: firstKept.at,
+    payload: {
+      last_dropped_seq: lastDropped,
+      first_kept_seq: firstKept.seq,
+    },
+  };
+}
+
+/**
+ * After a tail-only read, surface cursor_gap when event seqs were skipped.
+ * Uses contiguous-seq honesty: last_dropped = first_kept - 1. Does not rewrite
+ * the file. Returns undefined when the tail cannot name those bounds — caller
+ * must leave the parse unbounded instead of inventing a second protocol.
+ */
+function applyCursorReadBound(
+  events: OrderedThreadEvent[],
+  prefixTruncated: boolean,
+): OrderedThreadEvent[] | undefined {
+  if (!prefixTruncated) {
+    return events;
+  }
+  const firstKept = events.find((event) => !isJournalGapKind(event.kind));
+  if (firstKept === undefined) {
+    return undefined;
+  }
+  if (firstKept.seq <= 1) {
+    return events;
+  }
+  const covering = events.find((event) => {
+    const payload = journalTruncationPayload(event);
+    return payload !== undefined && payload.first_kept_seq === firstKept.seq;
+  });
+  if (covering) {
+    return events;
+  }
+  return [synthesizeCursorGapForReadBound(firstKept), ...events];
+}
+
+/**
+ * Cursor load. Bound the tail when that can emit an honest gap kind; otherwise
+ * full-parse. Mutation stays on readOrderedThreadEvents.
+ */
+async function loadOrderedEventsForCursor(
+  journalPath: string,
+  maxReadBytes: number,
+): Promise<OrderedThreadEvent[]> {
+  if (maxReadBytes < 1) {
+    return readOrderedThreadEvents(journalPath);
+  }
+  const loaded = await readOrderedJournalTextBounded(journalPath, maxReadBytes);
+  if (loaded === undefined) {
+    orderedJournalParseCount += 1;
+    return [];
+  }
+  if (!loaded.prefixTruncated) {
+    orderedJournalParseCount += 1;
+    return parseOrderedThreadEvents(loaded.text);
+  }
+  const bounded = applyCursorReadBound(
+    parseOrderedThreadEvents(loaded.text),
+    true,
+  );
+  if (bounded === undefined) {
+    // Tail has no complete first_kept_seq. Unbounded parse > lying cursor.
+    return readOrderedThreadEvents(journalPath);
+  }
+  orderedJournalParseCount += 1;
+  return bounded;
 }
 
 /** Namespaced journal key for client-supplied idempotency (claim/worker). */
@@ -438,18 +594,21 @@ function findCoveringGapMarker(
 }
 
 /**
- * Cursor page after since_seq. Full-file parse, then filter. Surfaces
+ * Cursor page after since_seq. Byte-bounded tail read by default. Surfaces
  * journal_truncated / cursor_gap when the poller would otherwise jump a
  * marked hole; throws THREAD_CURSOR_GAP on an unmarked jump. Never
- * renumbers seq. No tail bound yet. Unbounded parse until this pin is
- * the only cursor contract.
+ * renumbers seq. Does not delete or rotate the file. If the tail cannot
+ * name last_dropped_seq + first_kept_seq, falls back to unbounded parse.
  */
 export async function readThreadEvents(
   journalPath: string,
   sinceSeq = 0,
   limit = 100,
+  options: ReadThreadEventsOptions = {},
 ): Promise<{ events: OrderedThreadEvent[]; next_seq: number }> {
-  const ordered = await readOrderedThreadEvents(journalPath);
+  const maxReadBytes =
+    options.maxReadBytes ?? ORDERED_JOURNAL_CURSOR_TAIL_BYTES;
+  const ordered = await loadOrderedEventsForCursor(journalPath, maxReadBytes);
   const firstKept = ordered.find(
     (event) => event.seq > sinceSeq && !isJournalGapKind(event.kind),
   );

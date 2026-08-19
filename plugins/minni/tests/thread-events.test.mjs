@@ -826,3 +826,159 @@ test("since_seq inside a marked hole still surfaces journal_truncated", async (t
   });
   assert.equal(page.events[1]?.seq, 10);
 });
+
+// Slice 2: read/parse tail bound (no delete-rotate). Cursor path must not
+// rescan an oversized journal. When the bound drops bytes it emits the #374
+// kinds (last_dropped_seq + first_kept_seq) and never renumbers. If the tail
+// cannot name those bounds honestly, fall back to unbounded parse — do not
+// invent a second gap protocol.
+
+function isCursorGapKind(kind) {
+  return kind === "journal_truncated" || kind === "cursor_gap";
+}
+
+async function writeOversizedBulkJournal(journalPath, rev, eventCount, padLen) {
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const pad = "x".repeat(padLen);
+  const lines = [];
+  for (let seq = 1; seq <= eventCount; seq += 1) {
+    lines.push(JSON.stringify({
+      seq,
+      rev,
+      event_id: `e${seq}`,
+      idempotency_key: `k${seq}`,
+      actor: "test",
+      kind: "test.bulk",
+      at,
+      payload: { pad },
+    }));
+  }
+  const text = `${header}${lines.join("\n")}\n`;
+  await writeFile(journalPath, text, "utf8");
+  return Buffer.byteLength(text);
+}
+
+test("bounded cursor read emits journal_truncated instead of rescanning the whole journal", async (t) => {
+  const fixture = await createThread(t);
+  const fileSize = await writeOversizedBulkJournal(fixture.journalPath, fixture.rev, 40, 200);
+  const maxReadBytes = Math.min(2_500, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize, "fixture must exceed the cursor read bound");
+
+  const before = await readFile(fixture.journalPath);
+  const page = await readThreadEvents(fixture.journalPath, 0, 100, { maxReadBytes });
+  assert.ok(
+    isCursorGapKind(page.events[0]?.kind),
+    `expected cursor gap kind, got ${page.events[0]?.kind}`,
+  );
+  const payload = page.events[0]?.payload;
+  assert.equal(typeof payload?.last_dropped_seq, "number");
+  assert.equal(typeof payload?.first_kept_seq, "number");
+  assert.equal(payload.last_dropped_seq, payload.first_kept_seq - 1);
+  assert.ok(payload.first_kept_seq > 1, "bound must drop a real prefix of seqs");
+  assert.equal(page.events[1]?.seq, payload.first_kept_seq);
+  assert.equal(
+    page.events.some((event) => event.seq === 1 && event.kind === "test.bulk"),
+    false,
+    "seq 1 must not appear — the reader must not have rescanned the prefix",
+  );
+  assert.equal(
+    page.events.filter((event) => event.kind === "test.bulk").every(
+      (event) => event.seq >= payload.first_kept_seq,
+    ),
+    true,
+    "kept events must retain their original seq numbers",
+  );
+
+  const after = await readFile(fixture.journalPath);
+  assert.equal(after.length, before.length, "tail bound must not delete or rotate the journal");
+  assert.equal(after.equals(before), true, "tail bound must not rewrite the journal");
+});
+
+test("cursor read under the byte bound does not invent journal_truncated", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  await seedOrderedEvents(fixture.journalPath, [
+    {
+      seq: 1,
+      rev: fixture.rev,
+      event_id: "e1",
+      idempotency_key: "one",
+      actor: "test",
+      kind: "test.one",
+      at,
+    },
+    {
+      seq: 2,
+      rev: fixture.rev,
+      event_id: "e2",
+      idempotency_key: "two",
+      actor: "test",
+      kind: "test.two",
+      at,
+    },
+  ]);
+  const page = await readThreadEvents(fixture.journalPath, 0, 20, { maxReadBytes: 1_000_000 });
+  assert.equal(
+    page.events.some((event) => isCursorGapKind(event.kind)),
+    false,
+  );
+  assert.deepEqual(page.events.map((event) => event.seq), [1, 2]);
+});
+
+test("cursor bound with no complete tail event falls back to unbounded parse", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const event = {
+    seq: 1,
+    rev: fixture.rev,
+    event_id: "e1",
+    idempotency_key: "one",
+    actor: "test",
+    kind: "test.one",
+    at,
+    payload: { pad: "z".repeat(400) },
+  };
+  await writeFile(
+    fixture.journalPath,
+    `${header}${JSON.stringify(event)}\n`,
+    "utf8",
+  );
+  const fileSize = Buffer.byteLength(await readFile(fixture.journalPath));
+  const page = await readThreadEvents(
+    fixture.journalPath,
+    0,
+    20,
+    { maxReadBytes: Math.min(40, fileSize - 1) },
+  );
+  assert.equal(
+    page.events.some((event) => isCursorGapKind(event.kind)),
+    false,
+    "cannot invent a gap without an honest first_kept_seq",
+  );
+  assert.equal(page.events[0]?.seq, 1);
+  assert.equal(page.events[0]?.kind, "test.one");
+});
+
+test("mutation path still full-parses an oversized journal so seq is not renumbered", async (t) => {
+  const fixture = await createThread(t);
+  await writeOversizedBulkJournal(fixture.journalPath, fixture.rev, 40, 200);
+  const ordered = await readOrderedThreadEvents(fixture.journalPath);
+  assert.equal(ordered[0]?.seq, 1, "mutation load must still see the prefix");
+  assert.equal(ordered.length, 40);
+  assert.equal(ordered[39]?.seq, 40);
+
+  const [appended] = await appendOrderedEventBatch({
+    journalPath: fixture.journalPath,
+    planId: fixture.planId,
+    rev: fixture.rev,
+    actor: "test",
+    at: THREAD_START.toISOString(),
+    events: [{
+      idempotencyKey: "after-bound",
+      kind: "test.after",
+    }],
+  });
+  assert.equal(appended.seq, 41, "next seq comes from the full journal, not a tail");
+});
