@@ -86,6 +86,65 @@ export class ThreadEventIdempotencyConflictError extends Error {
   }
 }
 
+const NODE_ERRNO_CODE = /^E[A-Z][A-Z0-9]{1,30}$/;
+
+function nodeErrnoCode(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code: unknown }).code;
+    if (typeof code === "string" && NODE_ERRNO_CODE.test(code)) {
+      return code;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Ordered-journal load failed for a reason other than a missing file.
+ * `journalPath` stays a typed field — never interpolate it into `.message`.
+ * ENOENT is not this error: a missing journal is an empty cursor.
+ */
+export class ThreadJournalReadError extends Error {
+  readonly code = "THREAD_JOURNAL_UNREADABLE" as const;
+  readonly journalPath: string;
+  readonly causeCode?: string;
+
+  constructor(journalPath: string, cause: unknown) {
+    const causeCode = nodeErrnoCode(cause);
+    super(
+      causeCode
+        ? `thread journal is unreadable: ${causeCode}`
+        : "thread journal is unreadable",
+      cause instanceof Error ? { cause } : undefined,
+    );
+    this.name = "ThreadJournalReadError";
+    this.journalPath = journalPath;
+    this.causeCode = causeCode;
+  }
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: unknown }).code === code
+  );
+}
+
+/** Missing journal → undefined. Any other read failure → ThreadJournalReadError. */
+async function readOrderedJournalText(
+  journalPath: string,
+): Promise<string | undefined> {
+  try {
+    return await readFile(journalPath, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new ThreadJournalReadError(journalPath, error);
+  }
+}
+
 /** Namespaced journal key for client-supplied idempotency (claim/worker). */
 export function deriveClientEventKey(
   scope: string,
@@ -268,12 +327,11 @@ export async function readOrderedThreadEvents(
   journalPath: string,
 ): Promise<OrderedThreadEvent[]> {
   orderedJournalParseCount += 1;
-  try {
-    const journalText = await readFile(journalPath, "utf8");
-    return parseOrderedThreadEvents(journalText);
-  } catch {
+  const journalText = await readOrderedJournalText(journalPath);
+  if (journalText === undefined) {
     return [];
   }
+  return parseOrderedThreadEvents(journalText);
 }
 
 export async function readThreadEvents(
@@ -323,25 +381,15 @@ function nextSequence(ordered: OrderedThreadEvent[]): number {
   return ordered.reduce((highest, event) => Math.max(highest, event.seq), 0) + 1;
 }
 
-function isErrno(error: unknown, code: string): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code: unknown }).code === code
-  );
-}
-
 /** Disk load for snapshot resync — does not increment orderedJournalParseCount. */
 async function loadOrderedThreadEventsWithoutParseCount(
   journalPath: string,
 ): Promise<OrderedThreadEvent[]> {
-  try {
-    const journalText = await readFile(journalPath, "utf8");
-    return parseOrderedThreadEvents(journalText);
-  } catch {
+  const journalText = await readOrderedJournalText(journalPath);
+  if (journalText === undefined) {
     return [];
   }
+  return parseOrderedThreadEvents(journalText);
 }
 
 function replaceOrderedSnapshotContents(
@@ -499,10 +547,15 @@ export async function appendOrderedEventBatch(
     return materialized;
   } catch (error) {
     if (input.orderedSnapshot) {
-      const diskEvents = await loadOrderedThreadEventsWithoutParseCount(
-        input.journalPath,
-      );
-      replaceOrderedSnapshotContents(input.orderedSnapshot, diskEvents);
+      try {
+        const diskEvents = await loadOrderedThreadEventsWithoutParseCount(
+          input.journalPath,
+        );
+        replaceOrderedSnapshotContents(input.orderedSnapshot, diskEvents);
+      } catch {
+        // Unreadable journal is not empty. Leave the live snapshot alone
+        // and rethrow the original append failure.
+      }
     }
     throw error;
   }

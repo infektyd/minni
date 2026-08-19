@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,8 +19,11 @@ import {
   appendOrderedThreadEvent,
   deriveClientEventKey,
   deriveSystemEventKey,
+  orderedSnapshotMatchesJournal,
+  readOrderedThreadEvents,
   readThreadEvents,
   reconcileThreadJournal,
+  ThreadJournalReadError,
 } from "../dist/thread-events.js";
 import { withThreadLock } from "../dist/thread-lock.js";
 import { appendFileWithFsync as realAppendFileWithFsync } from "../dist/vault.js";
@@ -527,4 +530,109 @@ test("appendJournal fsync-fail does not wipe the now-canonical ordered event jou
   );
   assert.ok(after.events.some((event) => event.idempotency_key === "seed-one"));
   assert.ok(after.events.some((event) => event.idempotency_key === "seed-two"));
+});
+
+// Cassandra PR #371 round 2: journal load used to catch-all return [] on any
+// readFile failure. ENOENT is empty; EISDIR/EACCES must fail closed so
+// minni_thread_events cannot report an empty cursor and prepareThreadMutation
+// cannot mint seq=1 onto a journal the next successful read can see.
+
+test("readOrderedThreadEvents returns [] only when the journal is missing", async (t) => {
+  const fixture = await createThread(t);
+  const missing = path.join(
+    path.dirname(fixture.journalPath),
+    "no-such-journal.log.md",
+  );
+  assert.deepEqual(await readOrderedThreadEvents(missing), []);
+});
+
+test("readOrderedThreadEvents does not treat an EISDIR journal as empty", async (t) => {
+  const fixture = await createThread(t);
+  await rm(fixture.journalPath, { force: true });
+  await mkdir(fixture.journalPath);
+  await assert.rejects(
+    () => readOrderedThreadEvents(fixture.journalPath),
+    (error) => {
+      assert.ok(error instanceof ThreadJournalReadError);
+      assert.equal(error.code, "THREAD_JOURNAL_UNREADABLE");
+      assert.match(error.message, /EISDIR/);
+      assert.equal(error.message.includes(fixture.journalPath), false);
+      assert.equal(error.journalPath, fixture.journalPath);
+      return true;
+    },
+  );
+});
+
+test("readThreadEvents fails closed on an unreadable journal instead of an empty cursor", async (t) => {
+  const fixture = await createThread(t);
+  await withThreadLock(fixture.vaultPath, fixture.planId, "seed", async () => {
+    await appendOrderedEventBatch({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      actor: "test",
+      events: [{ idempotencyKey: "seed-one", kind: "test.one" }],
+    });
+  });
+  await rm(fixture.journalPath, { force: true });
+  await mkdir(fixture.journalPath);
+  await assert.rejects(
+    () => readThreadEvents(fixture.journalPath, 0, 100),
+    (error) => error instanceof ThreadJournalReadError,
+  );
+});
+
+test("snapshot resync does not treat an unreadable journal as empty", async (t) => {
+  const fixture = await createThread(t);
+  const snapshot = [
+    {
+      seq: 1,
+      rev: fixture.rev,
+      event_id: "evt-1",
+      idempotency_key: "seed-one",
+      actor: "test",
+      kind: "test.one",
+      at: THREAD_START.toISOString(),
+    },
+  ];
+  await rm(fixture.journalPath, { force: true });
+  await mkdir(fixture.journalPath);
+  await assert.rejects(
+    () => orderedSnapshotMatchesJournal(snapshot, fixture.journalPath),
+    (error) => error instanceof ThreadJournalReadError,
+  );
+});
+
+test("failed append does not wipe the in-memory snapshot when resync cannot read the journal", async (t) => {
+  const fixture = await createThread(t);
+  const snapshot = [];
+  await withThreadLock(fixture.vaultPath, fixture.planId, "seed", async () => {
+    await appendOrderedEventBatch({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      actor: "test",
+      orderedSnapshot: snapshot,
+      events: [{ idempotencyKey: "seed-one", kind: "test.one" }],
+    });
+  });
+  assert.equal(snapshot.length, 1);
+  await rm(fixture.journalPath, { force: true });
+  await mkdir(fixture.journalPath);
+  await assert.rejects(() =>
+    appendOrderedEventBatch({
+      journalPath: fixture.journalPath,
+      planId: fixture.planId,
+      rev: fixture.rev,
+      actor: "test",
+      orderedSnapshot: snapshot,
+      events: [{ idempotencyKey: "seed-two", kind: "test.two" }],
+    }),
+  );
+  assert.equal(
+    snapshot.length,
+    1,
+    "resync must not replace a live snapshot with [] when the journal is unreadable",
+  );
+  assert.equal(snapshot[0].idempotency_key, "seed-one");
 });

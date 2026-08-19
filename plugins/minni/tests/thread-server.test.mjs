@@ -800,6 +800,64 @@ test("minni_thread_worker_update history-append error never leaks the vault note
   });
 });
 
+test("minni_thread_events fails closed on an unreadable journal instead of an empty cursor", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath, "seeded plan must have a vault note");
+    const journalPath = journalPathFor(notePath, plan_id);
+    await rm(journalPath, { force: true });
+    await mkdir(journalPath);
+
+    const result = await call("minni_thread_events", {
+      plan_id,
+      since_seq: 0,
+      limit: 50,
+    });
+    assert.notEqual(
+      result.status,
+      undefined,
+      "unreadable journal must not look like a successful empty cursor",
+    );
+    assert.equal(result.status, "error");
+    assert.equal(result.operation, "plan.events");
+    assert.equal(Array.isArray(result.events), false);
+    assert.match(result.error, /EISDIR|unreadable/);
+    assert.equal(result.error.includes(journalPath), false);
+    assert.equal(result.error.includes(notePath), false);
+    assert.equal(result.journalPath, undefined);
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /wiki\/artifacts/,
+      "model-facing events error must not embed the journal path",
+    );
+  });
+});
+
+test("minni_thread_restore catch never forwards a path-bearing Error.message", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath, "seeded plan must have a vault note");
+    const journalPath = journalPathFor(notePath, plan_id);
+    await rm(journalPath, { force: true });
+    await mkdir(journalPath);
+
+    const result = await call("minni_thread_restore", {
+      plan_id,
+      rev: 1,
+    });
+    assert.equal(typeof result.error, "string");
+    assert.equal(result.error.includes(notePath), false);
+    assert.equal(result.error.includes(journalPath), false);
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /wiki\/artifacts/,
+      "restore catch must not embed a vault artifacts path",
+    );
+  });
+});
+
 test("minni_thread_worker_update rejects an empty idempotency_key before it reaches thread-worker", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call, send, awaitResponse }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "alpha", title: "Alpha slice" }]);

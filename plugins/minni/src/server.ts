@@ -1963,10 +1963,11 @@ server.registerTool(
     const gated = await requireSharedGate("plan.restore", { plan_id, rev });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    try {
+      const notePath = await findPlanNote(effectiveVaultPath, plan_id);
+      if (!notePath) {
+        return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
+      }
     const next = await withThreadLock(
       effectiveVaultPath,
       plan_id,
@@ -2057,12 +2058,13 @@ server.registerTool(
         });
         return restored;
       },
-    ).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      return textResult(JSON.stringify({ error: message }, null, 2));
-    });
-    if ("content" in next) return next;
+    );
     return textResult(JSON.stringify(next, null, 2));
+    } catch (error: unknown) {
+      return textResult(
+        JSON.stringify({ error: threadWorkerErrorText(error) }, null, 2),
+      );
+    }
   },
 );
 
@@ -2443,10 +2445,10 @@ server.registerTool(
       limit,
     });
     if (gated) return gated;
-    const target = await resolvePlanTarget(planIdInput);
-    if (!target.ok) return target.result;
-    const { plan_id, notePath } = target;
     try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
       const journalPath = journalPathFor(notePath, plan_id);
       const result = await readThreadEvents(journalPath, since_seq, limit);
       return textResult(JSON.stringify({ plan_id, ...result }, null, 2));

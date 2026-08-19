@@ -33,6 +33,7 @@ import {
   readOrderedThreadEvents,
   type OrderedThreadEvent,
   ThreadEventIdempotencyConflictError,
+  ThreadJournalReadError,
   type ReadySummaryPayload,
 } from "./thread-events.js";
 import {
@@ -266,12 +267,28 @@ export function revokedClaimIds(
   return claimIds(before).filter((claimId) => !afterClaimIds.has(claimId));
 }
 
+const NODE_ERRNO_CODE = /^E[A-Z][A-Z0-9]{1,30}$/;
+const PATH_BEARING_MESSAGE =
+  /wiki\/artifacts|(?:^|[\s'"`=(])(?:\/|\.\.?\/|[A-Za-z]:[\\/])/;
+
+function nodeErrnoCode(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code: unknown }).code;
+    if (typeof code === "string" && NODE_ERRNO_CODE.test(code)) {
+      return code;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Model-facing text for thread MCP handlers. PlanHistoryAppendError and
  * PlanDigestVersionError keep notePath as a typed field for internal
  * callers. Rebuild from rev + cause.code (history) or version (digest)
  * only — never interpolate notePath, historyPathFor(notePath),
  * cause.message, or cause.path (real EISDIR/EACCES embed wiki/artifacts).
+ * Untyped Node errno / path-bearing messages are rebuilt the same way:
+ * syscall code only, never Error.message.
  */
 export function threadWorkerErrorText(error: unknown): string {
   if (error instanceof PlanHistoryAppendError) {
@@ -280,7 +297,20 @@ export function threadWorkerErrorText(error: unknown): string {
   if (error instanceof PlanDigestVersionError) {
     return planDigestVersionErrorMessage(error.version);
   }
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof ThreadJournalReadError) {
+    return error.message;
+  }
+  const errno = nodeErrnoCode(error);
+  if (errno) {
+    return `thread worker failed: ${errno}`;
+  }
+  if (error instanceof Error) {
+    if (PATH_BEARING_MESSAGE.test(error.message)) {
+      return "thread worker failed";
+    }
+    return error.message;
+  }
+  return String(error);
 }
 
 export async function deleteClaimSecretsBestEffort(

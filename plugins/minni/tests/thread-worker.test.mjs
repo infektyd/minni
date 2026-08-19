@@ -40,6 +40,7 @@ import {
   deriveReadyChangedKey,
   deriveSystemEventKey,
   readThreadEvents,
+  ThreadJournalReadError,
 } from "../dist/thread-events.js";
 import {
   commitWorkerUpdateReceipt,
@@ -55,6 +56,7 @@ import {
 import {
   assignSlice,
   claimSlice,
+  prepareThreadMutation,
   readySlices,
   threadWorkerErrorText,
   updateClaimedSlice as updateClaimedSliceImpl,
@@ -1985,6 +1987,88 @@ test("threadWorkerErrorText drops a Node-style history-file path from cause.mess
   assert.equal(text.includes(historyPath), false);
   assert.equal(text.includes(notePath), false);
   assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText never forwards a Node EISDIR path from an untyped journal error", () => {
+  const journalPath = "/tmp/minni-vault/wiki/artifacts/plan-secret.log.md";
+  const error = Object.assign(
+    new Error(`EISDIR: illegal operation on a directory, open '${journalPath}'`),
+    { code: "EISDIR", path: journalPath },
+  );
+  const text = threadWorkerErrorText(error);
+  assert.match(text, /EISDIR/);
+  assert.equal(text.includes(journalPath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText never forwards a Node EACCES path from an untyped journal error", () => {
+  const journalPath = "/tmp/minni-vault/wiki/artifacts/plan-secret.log.md";
+  const error = Object.assign(
+    new Error(`EACCES: permission denied, open '${journalPath}'`),
+    { code: "EACCES", path: journalPath },
+  );
+  const text = threadWorkerErrorText(error);
+  assert.match(text, /EACCES/);
+  assert.equal(text.includes(journalPath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText drops notePath interpolated into a rehydratePlan Error.message", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const text = threadWorkerErrorText(
+    new Error(`rehydratePlan: note ${notePath} missing plan_id in frontmatter`),
+  );
+  assert.equal(text.includes(notePath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText still forwards path-free operational errors", () => {
+  assert.equal(
+    threadWorkerErrorText(new Error("claim scope mismatch")),
+    "claim scope mismatch",
+  );
+});
+
+test("threadWorkerErrorText never serializes ThreadJournalReadError.journalPath", () => {
+  const journalPath = "/tmp/minni-vault/wiki/artifacts/plan-secret.log.md";
+  const cause = Object.assign(
+    new Error(`EISDIR: illegal operation on a directory, open '${journalPath}'`),
+    { code: "EISDIR", path: journalPath },
+  );
+  const error = new ThreadJournalReadError(journalPath, cause);
+  const text = threadWorkerErrorText(error);
+  assert.match(text, /unreadable/);
+  assert.match(text, /EISDIR/);
+  assert.equal(error.journalPath, journalPath);
+  assert.equal(text.includes(journalPath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("prepareThreadMutation does not mint seq=1 onto an unreadable journal", async (t) => {
+  const fixture = await threadFixture(t, [{ id: "a", title: "Slice A" }]);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  const plan = await rehydratePlan(fixture.notePath);
+  await rm(journalPath, { force: true });
+  await mkdir(journalPath);
+  await assert.rejects(
+    () =>
+      prepareThreadMutation(
+        {
+          vaultPath: fixture.vaultPath,
+          notePath: fixture.notePath,
+          planId: fixture.planId,
+          actor: "test",
+        },
+        plan,
+        THREAD_START,
+      ),
+    (error) => error instanceof ThreadJournalReadError,
+  );
+  const st = await stat(journalPath);
+  assert.ok(
+    st.isDirectory(),
+    "unreadable journal path must not be replaced with a seq=1 file",
+  );
 });
 
 test("threadWorkerErrorText redacts the history path from a real persistPlan EISDIR", async () => {
