@@ -2095,6 +2095,38 @@ test("PlanHistoryAppendError keeps notePath typed and out of .message", () => {
   assert.equal(error.message.includes(notePath), false);
 });
 
+test("PlanHistoryAppendError drops a Node-style cause path (history file, not notePath)", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const historyPath = historyPathFor(notePath);
+  const cause = Object.assign(
+    new Error(`EISDIR: illegal operation on a directory, open '${historyPath}'`),
+    { code: "EISDIR", path: historyPath },
+  );
+  const error = new PlanHistoryAppendError(notePath, 4, cause);
+  assert.equal(error.notePath, notePath);
+  assert.equal(
+    error.message,
+    "persistPlan: note committed at rev 4, but appending the history snapshot failed: EISDIR",
+  );
+  assert.equal(error.message.includes(historyPath), false);
+  assert.equal(error.message.includes(notePath), false);
+  assert.equal(error.message.includes("wiki/artifacts"), false);
+});
+
+test("PlanHistoryAppendError redacts a path-bearing cause that has no syscall code", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const historyPath = historyPathFor(notePath);
+  const error = new PlanHistoryAppendError(
+    notePath,
+    4,
+    new Error(`append failed at ${historyPath}`),
+  );
+  assert.match(error.message, /history snapshot failed/);
+  assert.match(error.message, /append failed at/);
+  assert.equal(error.message.includes(historyPath), false);
+  assert.equal(error.message.includes("wiki/artifacts"), false);
+});
+
 // persistPlan performs two durable steps: it writes the canonical vault note,
 // then appends a history snapshot line. A real EISDIR on the history file
 // proves the note write itself already committed while the second step
@@ -2127,10 +2159,21 @@ test("persistPlan throws the typed PlanHistoryAppendError when the note commits 
         assert.equal(error.notePath, write.notePath);
         assert.match(error.message, /persistPlan: note committed at rev/);
         assert.match(error.message, /history snapshot failed/);
+        assert.match(error.message, /EISDIR/);
         assert.equal(
           error.message.includes(write.notePath),
           false,
           "PlanHistoryAppendError.message must keep notePath as a typed field only",
+        );
+        assert.equal(
+          error.message.includes(historyFile),
+          false,
+          "PlanHistoryAppendError.message must not embed the history file path from cause.message",
+        );
+        assert.equal(
+          error.message.includes("wiki/artifacts"),
+          false,
+          "PlanHistoryAppendError.message must not leak a vault artifacts path",
         );
         return true;
       },

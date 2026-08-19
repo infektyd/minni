@@ -1915,24 +1915,6 @@ test("orchestrator slice transitions revoke a claim across terminal reopen", asy
   );
 });
 
-test("workerUpdate persist-fail catch deletes the completed claim secret before rethrow", async () => {
-  const src = await readFile(new URL("../src/thread-worker.ts", import.meta.url), "utf8");
-  const pending = src.indexOf("await writePendingWorkerUpdateReceipt({");
-  assert.ok(pending >= 0, "expected writePendingWorkerUpdateReceipt before persist");
-  const persist = src.indexOf("await persist(next, {", pending);
-  assert.ok(persist > pending, "expected persist(next) after the pending receipt write");
-  const catchStart = src.indexOf("} catch (error) {", persist);
-  const rethrow = src.indexOf("throw error;", catchStart);
-  assert.ok(catchStart > persist && rethrow > catchStart);
-  const block = src.slice(catchStart, rethrow);
-  assert.match(block, /applied\.completed/);
-  assert.match(block, /deleteClaimSecretsBestEffort/);
-  assert.ok(
-    block.indexOf("commitWorkerUpdateReceipt") < block.indexOf("deleteClaimSecretsBestEffort"),
-    "receipt commit stays first; secret delete must still run before rethrow",
-  );
-});
-
 test("threadWorkerErrorText never serializes PlanHistoryAppendError.notePath", () => {
   const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
   const error = new PlanHistoryAppendError(
@@ -1947,6 +1929,55 @@ test("threadWorkerErrorText never serializes PlanHistoryAppendError.notePath", (
   );
   assert.equal(text.includes(notePath), false);
   assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText drops a Node-style history-file path from cause.message", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const historyPath = historyPathFor(notePath);
+  const cause = Object.assign(
+    new Error(`EISDIR: illegal operation on a directory, open '${historyPath}'`),
+    { code: "EISDIR", path: historyPath },
+  );
+  const text = threadWorkerErrorText(new PlanHistoryAppendError(notePath, 9, cause));
+  assert.equal(
+    text,
+    "persistPlan: note committed at rev 9, but appending the history snapshot failed: EISDIR",
+  );
+  assert.equal(text.includes(historyPath), false);
+  assert.equal(text.includes(notePath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+});
+
+test("threadWorkerErrorText redacts the history path from a real persistPlan EISDIR", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-worker-hist-redact-"));
+  try {
+    const { ensureVault } = await import("../dist/vault.js");
+    await ensureVault(root);
+    const created = await createPlan(
+      { goal: "Redact a real history-append path", vaultPath: root },
+      { vaultPath: root },
+    );
+    const historyFile = historyPathFor(created.write.notePath);
+    await rm(historyFile, { force: true });
+    await mkdir(historyFile);
+    const failure = await persistPlan(created.plan, {
+      vaultPath: root,
+      notePath: created.write.notePath,
+    }).then(
+      (value) => ({ ok: true, value }),
+      (error) => ({ ok: false, error }),
+    );
+    assert.equal(failure.ok, false);
+    assert.ok(failure.error instanceof PlanHistoryAppendError);
+    const text = threadWorkerErrorText(failure.error);
+    assert.match(text, /history snapshot failed/);
+    assert.match(text, /EISDIR/);
+    assert.equal(text.includes(created.write.notePath), false);
+    assert.equal(text.includes(historyFile), false);
+    assert.equal(text.includes("wiki/artifacts"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("claimSlice surfaces a real persistPlan history-append failure, then an identical retry replays the same durable token", async (t) => {

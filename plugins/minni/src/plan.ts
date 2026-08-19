@@ -410,9 +410,46 @@ export class PlanDigestVersionError extends Error {
  * text, and so it never mistakes this for a rollback signal that would
  * license deleting the only token for a now-durable claim.
  */
+const SYS_ERR_CODE = /^[A-Z][A-Z0-9_]{1,31}$/;
+
+/**
+ * Model-facing / .message cause fragment for a failed history append.
+ * Prefer a Node syscall `.code` (EISDIR, EACCES, …) so the operator still
+ * sees the failure class. Never interpolate cause.message: real Node
+ * system errors embed the history file path (`wiki/artifacts/…history.jsonl`),
+ * which is adjacent to — but distinct from — the vault notePath.
+ */
+export function planHistoryAppendErrorCauseText(cause: unknown): string {
+  if (cause && typeof cause === "object") {
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === "string" && SYS_ERR_CODE.test(code)) {
+      return code;
+    }
+  }
+  const raw =
+    cause instanceof Error
+      ? cause.message
+      : cause == null
+        ? "unknown"
+        : String(cause);
+  return redactFilesystemPathsFromErrorText(raw) || "unknown";
+}
+
+/** Strip quoted, absolute, and vault-relative filesystem paths from error text. */
+export function redactFilesystemPathsFromErrorText(text: string): string {
+  return text
+    .replace(/'[^']+'/g, "")
+    .replace(/"[^"]+"/g, "")
+    .replace(/\b(?:[A-Za-z]:\\|\/)[^\s,;)]+/g, "")
+    .replace(/\bwiki\/artifacts\/[^\s,;)]+/g, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\s+,/g, ",")
+    .replace(/[ ,:]+$/g, "")
+    .trim();
+}
+
 export function planHistoryAppendErrorMessage(rev: number, cause: unknown): string {
-  const causeText = cause instanceof Error ? cause.message : String(cause);
-  return `persistPlan: note committed at rev ${rev}, but appending the history snapshot failed: ${causeText}`;
+  return `persistPlan: note committed at rev ${rev}, but appending the history snapshot failed: ${planHistoryAppendErrorCauseText(cause)}`;
 }
 
 export class PlanHistoryAppendError extends Error {

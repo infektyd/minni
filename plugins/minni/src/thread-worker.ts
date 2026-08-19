@@ -3,9 +3,11 @@ import path from "node:path";
 
 import {
   addScar,
+  historyPathFor,
   journalPathFor,
   persistPlan,
   planHistoryAppendErrorMessage,
+  redactFilesystemPathsFromErrorText,
   rehydratePlan,
   unmetDependencies,
   updateSlice,
@@ -267,16 +269,17 @@ export function revokedClaimIds(
 /**
  * Model-facing text for thread MCP handlers. PlanHistoryAppendError keeps
  * notePath as a typed field for internal callers; this must never interpolate
- * that vault path (or any leftover copy of it in .message).
+ * that vault path, the adjacent history file path, or any leftover copy of
+ * either in cause.message.
  */
 export function threadWorkerErrorText(error: unknown): string {
   if (error instanceof PlanHistoryAppendError) {
-    const cause = error.cause;
-    const text = planHistoryAppendErrorMessage(error.rev, cause);
-    if (error.notePath && text.includes(error.notePath)) {
-      return text.split(error.notePath).join("");
+    let text = planHistoryAppendErrorMessage(error.rev, error.cause);
+    if (error.notePath) {
+      text = text.split(historyPathFor(error.notePath)).join("");
+      text = text.split(error.notePath).join("");
     }
-    return text;
+    return redactFilesystemPathsFromErrorText(text);
   }
   return error instanceof Error ? error.message : String(error);
 }

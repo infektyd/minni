@@ -781,6 +781,11 @@ test("minni_thread_worker_update history-append error never leaks the vault note
       false,
       "model-facing MCP error must not embed PlanHistoryAppendError.notePath",
     );
+    assert.equal(
+      result.error.includes(historyFile),
+      false,
+      "model-facing MCP error must not embed the history file path from cause.message",
+    );
     assert.doesNotMatch(
       JSON.stringify(result),
       /wiki\/artifacts/,
