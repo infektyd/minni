@@ -17,6 +17,7 @@ import test from "node:test";
 import {
   createPlan,
   findPlanNote,
+  historyPathFor,
   journalPathFor,
   persistPlan,
   rehydratePlan,
@@ -733,6 +734,58 @@ test("minni_thread_claim surfaces a typed domain error instead of a transport cr
     assert.match(result.error, /assigned/i);
     assert.equal(result.filePath, undefined);
     assert.equal(result.notePath, undefined);
+  });
+});
+
+test("minni_thread_worker_update history-append error never leaks the vault note path", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
+    await call("minni_thread_assign", {
+      plan_id,
+      slice_id: "a",
+      worker_agent_id: "worker-a",
+    });
+    const claim = await call("minni_thread_claim", {
+      plan_id,
+      slice_id: "a",
+      worker_agent_id: "worker-a",
+      idempotency_key: "claim-for-path-leak",
+    });
+    assert.ok(
+      claim.token,
+      `claim must return a token before the history-append probe, got ${JSON.stringify(claim)}`,
+    );
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath, "seeded plan must have a vault note");
+    const historyFile = historyPathFor(notePath);
+    await rm(historyFile, { force: true });
+    await mkdir(historyFile);
+
+    const result = await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "a",
+      worker_agent_id: "worker-a",
+      claim_token: claim.token,
+      idempotency_key: "complete-history-eisdir",
+      action: "complete",
+      evidence: "Completed despite a broken history append",
+    });
+    assert.equal(result.status, "error");
+    assert.equal(result.operation, "plan.worker_update");
+    assert.equal(result.code, "PLAN_HISTORY_APPEND_FAILED");
+    assert.equal(result.notePath, undefined);
+    assert.equal(result.filePath, undefined);
+    assert.match(result.error, /note committed at rev/);
+    assert.equal(
+      result.error.includes(notePath),
+      false,
+      "model-facing MCP error must not embed PlanHistoryAppendError.notePath",
+    );
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /wiki\/artifacts/,
+      "model-facing MCP error payload must not contain a vault artifacts path",
+    );
   });
 });
 

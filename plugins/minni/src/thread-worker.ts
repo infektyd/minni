@@ -5,6 +5,7 @@ import {
   addScar,
   journalPathFor,
   persistPlan,
+  planHistoryAppendErrorMessage,
   rehydratePlan,
   unmetDependencies,
   updateSlice,
@@ -261,6 +262,23 @@ export function revokedClaimIds(
 ): string[] {
   const afterClaimIds = new Set(claimIds(after));
   return claimIds(before).filter((claimId) => !afterClaimIds.has(claimId));
+}
+
+/**
+ * Model-facing text for thread MCP handlers. PlanHistoryAppendError keeps
+ * notePath as a typed field for internal callers; this must never interpolate
+ * that vault path (or any leftover copy of it in .message).
+ */
+export function threadWorkerErrorText(error: unknown): string {
+  if (error instanceof PlanHistoryAppendError) {
+    const cause = error.cause;
+    const text = planHistoryAppendErrorMessage(error.rev, cause);
+    if (error.notePath && text.includes(error.notePath)) {
+      return text.split(error.notePath).join("");
+    }
+    return text;
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 export async function deleteClaimSecretsBestEffort(
@@ -1865,6 +1883,17 @@ export async function updateClaimedSlice(
             rev: intendedRev,
             response: publicResponse,
           }).catch(() => {});
+          // Complete is the opposite of claim: the durable note already has
+          // no live claim, so the mode-0600 envelope is an orphan and must
+          // go even when history append failed after the note write.
+          if (applied.completed) {
+            await deleteClaimSecretsBestEffort(
+              input.vaultPath,
+              planId,
+              [claim.claim_id],
+              deleteSecret,
+            );
+          }
         }
         throw error;
       }

@@ -55,6 +55,7 @@ import {
   assignSlice,
   claimSlice,
   readySlices,
+  threadWorkerErrorText,
   updateClaimedSlice as updateClaimedSliceImpl,
 } from "../dist/thread-worker.js";
 import * as threadWorkerRuntime from "../dist/thread-worker.js";
@@ -1914,6 +1915,40 @@ test("orchestrator slice transitions revoke a claim across terminal reopen", asy
   );
 });
 
+test("workerUpdate persist-fail catch deletes the completed claim secret before rethrow", async () => {
+  const src = await readFile(new URL("../src/thread-worker.ts", import.meta.url), "utf8");
+  const pending = src.indexOf("await writePendingWorkerUpdateReceipt({");
+  assert.ok(pending >= 0, "expected writePendingWorkerUpdateReceipt before persist");
+  const persist = src.indexOf("await persist(next, {", pending);
+  assert.ok(persist > pending, "expected persist(next) after the pending receipt write");
+  const catchStart = src.indexOf("} catch (error) {", persist);
+  const rethrow = src.indexOf("throw error;", catchStart);
+  assert.ok(catchStart > persist && rethrow > catchStart);
+  const block = src.slice(catchStart, rethrow);
+  assert.match(block, /applied\.completed/);
+  assert.match(block, /deleteClaimSecretsBestEffort/);
+  assert.ok(
+    block.indexOf("commitWorkerUpdateReceipt") < block.indexOf("deleteClaimSecretsBestEffort"),
+    "receipt commit stays first; secret delete must still run before rethrow",
+  );
+});
+
+test("threadWorkerErrorText never serializes PlanHistoryAppendError.notePath", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const error = new PlanHistoryAppendError(
+    notePath,
+    9,
+    new Error("EISDIR: illegal operation on a directory"),
+  );
+  const text = threadWorkerErrorText(error);
+  assert.equal(
+    text,
+    "persistPlan: note committed at rev 9, but appending the history snapshot failed: EISDIR: illegal operation on a directory",
+  );
+  assert.equal(text.includes(notePath), false);
+  assert.equal(text.includes("wiki/artifacts"), false);
+});
+
 test("claimSlice surfaces a real persistPlan history-append failure, then an identical retry replays the same durable token", async (t) => {
   const fixture = await threadFixture(t, [
     { id: "a", title: "Slice A" },
@@ -2029,6 +2064,30 @@ test("workerUpdate surfaces a real persistPlan history-append failure on complet
     durable.slices[0].claim,
     undefined,
     "completion already cleared the live claim in the durable note",
+  );
+  assert.equal(
+    await readClaimByIdempotency(
+      fixture.vaultPath,
+      fixture.planId,
+      "a",
+      claim.generation,
+      "claim-a-history",
+    ),
+    undefined,
+    "durable complete must delete the orphan claim secret even when history append fails",
+  );
+  await assert.rejects(
+    verifyClaimToken({
+      vaultPath: fixture.vaultPath,
+      planId: fixture.planId,
+      sliceId: "a",
+      generation: claim.generation,
+      workerAgentId: "worker-a",
+      token: claim.token,
+      claimId: claim.claim_id,
+      now: new Date("2026-08-18T12:06:00.000Z"),
+    }),
+    /claim not found/,
   );
 
   // Same idempotency key + same token: a live-claim retry is now

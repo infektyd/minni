@@ -2078,6 +2078,23 @@ test("persistPlan wires real plan writes through the capped history append (#294
   }
 });
 
+test("PlanHistoryAppendError keeps notePath typed and out of .message", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const error = new PlanHistoryAppendError(
+    notePath,
+    4,
+    new Error("EISDIR: illegal operation on a directory"),
+  );
+  assert.equal(error.notePath, notePath);
+  assert.equal(error.rev, 4);
+  assert.equal(error.code, "PLAN_HISTORY_APPEND_FAILED");
+  assert.equal(
+    error.message,
+    "persistPlan: note committed at rev 4, but appending the history snapshot failed: EISDIR: illegal operation on a directory",
+  );
+  assert.equal(error.message.includes(notePath), false);
+});
+
 // persistPlan performs two durable steps: it writes the canonical vault note,
 // then appends a history snapshot line. A real EISDIR on the history file
 // proves the note write itself already committed while the second step
@@ -2108,7 +2125,13 @@ test("persistPlan throws the typed PlanHistoryAppendError when the note commits 
         );
         assert.equal(error.code, "PLAN_HISTORY_APPEND_FAILED");
         assert.equal(error.notePath, write.notePath);
-        assert.match(error.message, /committed at rev/);
+        assert.match(error.message, /persistPlan: note committed at rev/);
+        assert.match(error.message, /history snapshot failed/);
+        assert.equal(
+          error.message.includes(write.notePath),
+          false,
+          "PlanHistoryAppendError.message must keep notePath as a typed field only",
+        );
         return true;
       },
     );

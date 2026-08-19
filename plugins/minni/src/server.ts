@@ -101,6 +101,7 @@ import {
   recordThreadMutationEvents,
   revokedClaimIds,
   synchronizeExpiredClaimsAndReadReady,
+  threadWorkerErrorText,
   updateClaimedSlice,
   withThreadPlanLock,
   type WorkerUpdateAction,
@@ -181,14 +182,14 @@ async function requireSharedGate(
 // letting a thrown error become a raw JSON-RPC transport error. Only
 // `.message` and a typed `.code` (ThreadInconsistentError,
 // ThreadEventIdempotencyConflictError, PlanHistoryAppendError, ...) are ever
-// read off the error — never the whole object, so an error subclass that
-// happens to carry a local path (e.g. PlanHistoryAppendError.notePath) cannot
-// be serialized as a side effect of a generic catch.
+// read off the error — never the whole object. PlanHistoryAppendError.notePath
+// stays a typed internal field; threadWorkerErrorText rebuilds that case
+// without the vault path so the model-facing string cannot leak it.
 function threadWorkerErrorResult(
   operation: string,
   error: unknown,
 ): ReturnType<typeof textResult> {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = threadWorkerErrorText(error);
   const errorCode =
     error instanceof Error ? (error as unknown as { code?: unknown }).code : undefined;
   const code = typeof errorCode === "string" ? errorCode : undefined;

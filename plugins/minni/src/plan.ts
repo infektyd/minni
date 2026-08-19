@@ -410,13 +410,18 @@ export class PlanDigestVersionError extends Error {
  * text, and so it never mistakes this for a rollback signal that would
  * license deleting the only token for a now-durable claim.
  */
+export function planHistoryAppendErrorMessage(rev: number, cause: unknown): string {
+  const causeText = cause instanceof Error ? cause.message : String(cause);
+  return `persistPlan: note committed at rev ${rev}, but appending the history snapshot failed: ${causeText}`;
+}
+
 export class PlanHistoryAppendError extends Error {
   readonly code = "PLAN_HISTORY_APPEND_FAILED" as const;
   readonly notePath: string;
   readonly rev: number;
   constructor(notePath: string, rev: number, cause: unknown) {
     super(
-      `persistPlan: note ${notePath} committed at rev ${rev}, but appending the history snapshot failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      planHistoryAppendErrorMessage(rev, cause),
       cause instanceof Error ? { cause } : undefined,
     );
     this.name = "PlanHistoryAppendError";
