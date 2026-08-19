@@ -350,13 +350,99 @@ function applyCursorReadBound(
   return [synthesizeCursorGapForReadBound(firstKept), ...events];
 }
 
+const ORDERED_JOURNAL_HEAD_PEEK_BYTES = 8 * 1024;
+
 /**
- * Cursor load. Bound the tail when that can emit an honest gap kind; otherwise
- * full-parse. Mutation stays on readOrderedThreadEvents.
+ * Read the start of the journal just far enough to see whether the file
+ * itself begins with an unmarked hole. Not a full parse.
+ */
+async function peekOrderedJournalHead(
+  journalPath: string,
+): Promise<OrderedThreadEvent[] | undefined> {
+  let fileSize: number;
+  try {
+    fileSize = (await stat(journalPath)).size;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new ThreadJournalReadError(journalPath, error);
+  }
+  const length = Math.min(ORDERED_JOURNAL_HEAD_PEEK_BYTES, fileSize);
+  if (length < 1) {
+    return [];
+  }
+  try {
+    const handle = await open(journalPath, "r");
+    try {
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, 0);
+      let text = buffer.toString("utf8", 0, bytesRead);
+      if (fileSize > length) {
+        const lastNewline = text.lastIndexOf("\n");
+        if (lastNewline === -1) {
+          return [];
+        }
+        text = text.slice(0, lastNewline + 1);
+      }
+      return parseOrderedThreadEvents(text);
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return undefined;
+    }
+    throw new ThreadJournalReadError(journalPath, error);
+  }
+}
+
+/**
+ * A tail bound hides a hole when it would turn THREAD_CURSOR_GAP (or a
+ * durable marker the tail cannot see) into a successful synthesized skip.
+ * Unbounded parse > that lie.
+ */
+async function tailBoundWouldHideHole(
+  journalPath: string,
+  sinceSeq: number,
+  tailEvents: OrderedThreadEvent[],
+  tailFirstKept: OrderedThreadEvent,
+): Promise<boolean> {
+  if (
+    findCoveringGapMarker(tailEvents, sinceSeq, tailFirstKept.seq) !== undefined
+  ) {
+    return false;
+  }
+  if (tailFirstKept.seq <= sinceSeq + 1) {
+    return false;
+  }
+  // Unread seqs after a live cursor were not inspected. Synthesizing a
+  // cover would hide an unmarked hole parked behind since_seq.
+  if (sinceSeq > 0) {
+    return true;
+  }
+  const head = await peekOrderedJournalHead(journalPath);
+  if (head === undefined || head.length === 0) {
+    return true;
+  }
+  const headFirstKept = head.find((event) => !isJournalGapKind(event.kind));
+  if (headFirstKept === undefined) {
+    return true;
+  }
+  if (headFirstKept.seq > 1) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Cursor load. Bound the tail when that can emit an honest gap kind without
+ * hiding a hole; otherwise full-parse. Mutation stays on readOrderedThreadEvents.
  */
 async function loadOrderedEventsForCursor(
   journalPath: string,
   maxReadBytes: number,
+  sinceSeq: number,
 ): Promise<OrderedThreadEvent[]> {
   if (maxReadBytes < 1) {
     return readOrderedThreadEvents(journalPath);
@@ -370,12 +456,16 @@ async function loadOrderedEventsForCursor(
     orderedJournalParseCount += 1;
     return parseOrderedThreadEvents(loaded.text);
   }
-  const bounded = applyCursorReadBound(
-    parseOrderedThreadEvents(loaded.text),
-    true,
-  );
+  const tailEvents = parseOrderedThreadEvents(loaded.text);
+  const tailFirstKept = tailEvents.find((event) => !isJournalGapKind(event.kind));
+  if (tailFirstKept === undefined) {
+    return readOrderedThreadEvents(journalPath);
+  }
+  if (await tailBoundWouldHideHole(journalPath, sinceSeq, tailEvents, tailFirstKept)) {
+    return readOrderedThreadEvents(journalPath);
+  }
+  const bounded = applyCursorReadBound(tailEvents, true);
   if (bounded === undefined) {
-    // Tail has no complete first_kept_seq. Unbounded parse > lying cursor.
     return readOrderedThreadEvents(journalPath);
   }
   orderedJournalParseCount += 1;
@@ -598,7 +688,8 @@ function findCoveringGapMarker(
  * journal_truncated / cursor_gap when the poller would otherwise jump a
  * marked hole; throws THREAD_CURSOR_GAP on an unmarked jump. Never
  * renumbers seq. Does not delete or rotate the file. If the tail cannot
- * name last_dropped_seq + first_kept_seq, falls back to unbounded parse.
+ * name last_dropped_seq + first_kept_seq, or if bounding would hide a
+ * hole, falls back to unbounded parse.
  */
 export async function readThreadEvents(
   journalPath: string,
@@ -608,7 +699,11 @@ export async function readThreadEvents(
 ): Promise<{ events: OrderedThreadEvent[]; next_seq: number }> {
   const maxReadBytes =
     options.maxReadBytes ?? ORDERED_JOURNAL_CURSOR_TAIL_BYTES;
-  const ordered = await loadOrderedEventsForCursor(journalPath, maxReadBytes);
+  const ordered = await loadOrderedEventsForCursor(
+    journalPath,
+    maxReadBytes,
+    sinceSeq,
+  );
   const firstKept = ordered.find(
     (event) => event.seq > sinceSeq && !isJournalGapKind(event.kind),
   );

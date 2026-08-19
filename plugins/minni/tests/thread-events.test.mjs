@@ -837,12 +837,19 @@ function isCursorGapKind(kind) {
   return kind === "journal_truncated" || kind === "cursor_gap";
 }
 
-async function writeOversizedBulkJournal(journalPath, rev, eventCount, padLen) {
+async function writeOversizedBulkJournal(
+  journalPath,
+  rev,
+  eventCount,
+  padLen,
+  startSeq = 1,
+) {
   const at = THREAD_START.toISOString();
   const header = `# Minni Plan Journal\n\n## events\n`;
   const pad = "x".repeat(padLen);
   const lines = [];
-  for (let seq = 1; seq <= eventCount; seq += 1) {
+  for (let offset = 0; offset < eventCount; offset += 1) {
+    const seq = startSeq + offset;
     lines.push(JSON.stringify({
       seq,
       rev,
@@ -981,4 +988,77 @@ test("mutation path still full-parses an oversized journal so seq is not renumbe
     }],
   });
   assert.equal(appended.seq, 41, "next seq comes from the full journal, not a tail");
+});
+
+test("tail bound that would hide an unmarked leading hole falls back to full-parse", async (t) => {
+  const fixture = await createThread(t);
+  // On-disk hole: seq starts at 10 with no journal_truncated / cursor_gap.
+  // A tail-only read that synthesizes last_dropped=first_kept-1 would hide
+  // THREAD_CURSOR_GAP behind a lying cursor.
+  const fileSize = await writeOversizedBulkJournal(
+    fixture.journalPath,
+    fixture.rev,
+    40,
+    200,
+    10,
+  );
+  const maxReadBytes = Math.min(2_500, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize);
+
+  await assert.rejects(
+    () => readThreadEvents(fixture.journalPath, 0, 100, { maxReadBytes }),
+    (error) => {
+      assert.ok(error instanceof ThreadCursorGapError);
+      assert.equal(error.code, "THREAD_CURSOR_GAP");
+      return true;
+    },
+  );
+});
+
+test("tail bound that would hide an unmarked hole after since_seq falls back to full-parse", async (t) => {
+  const fixture = await createThread(t);
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const pad = "x".repeat(200);
+  const lines = [];
+  for (const seq of [1, 2, 3, 4, 5, 10, 11, 12]) {
+    lines.push(JSON.stringify({
+      seq,
+      rev: fixture.rev,
+      event_id: `e${seq}`,
+      idempotency_key: `k${seq}`,
+      actor: "test",
+      kind: "test.bulk",
+      at,
+      payload: { pad },
+    }));
+  }
+  // Pad the file so a tail read starts after the unmarked 5→10 hole.
+  for (let seq = 13; seq <= 50; seq += 1) {
+    lines.push(JSON.stringify({
+      seq,
+      rev: fixture.rev,
+      event_id: `e${seq}`,
+      idempotency_key: `k${seq}`,
+      actor: "test",
+      kind: "test.bulk",
+      at,
+      payload: { pad },
+    }));
+  }
+  const text = `${header}${lines.join("\n")}\n`;
+  await writeFile(fixture.journalPath, text, "utf8");
+  const fileSize = Buffer.byteLength(text);
+  const maxReadBytes = Math.min(2_500, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize);
+
+  await assert.rejects(
+    () => readThreadEvents(fixture.journalPath, 5, 100, { maxReadBytes }),
+    (error) => {
+      assert.ok(error instanceof ThreadCursorGapError);
+      assert.equal(error.code, "THREAD_CURSOR_GAP");
+      assert.equal(error.firstKeptSeq, 10);
+      return true;
+    },
+  );
 });

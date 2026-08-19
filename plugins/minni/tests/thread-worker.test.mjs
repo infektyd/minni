@@ -4593,6 +4593,51 @@ test("worker poller bounded cursor read surfaces journal_truncated for an oversi
   );
 });
 
+test("worker poller tail bound does not hide an unmarked leading hole", async (t) => {
+  const fixture = await threadFixture(t);
+  const journalPath = journalPathFor(fixture.notePath, fixture.planId);
+  await assignSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    actorAgentId: "test-orchestrator",
+  });
+
+  const at = THREAD_START.toISOString();
+  const header = `# Minni Plan Journal\n\n## events\n`;
+  const pad = "y".repeat(180);
+  const extras = [];
+  for (let seq = 10; seq <= 45; seq += 1) {
+    extras.push(JSON.stringify({
+      seq,
+      rev: 1,
+      event_id: `pad-${seq}`,
+      idempotency_key: `pad-${seq}`,
+      actor: "test",
+      kind: "test.pad",
+      at,
+      payload: { pad },
+    }));
+  }
+  const text = `${header}${extras.join("\n")}\n`;
+  await writeFile(journalPath, text, "utf8");
+  const fileSize = Buffer.byteLength(text);
+  const maxReadBytes = Math.min(2_800, Math.floor(fileSize / 4));
+  assert.ok(maxReadBytes < fileSize);
+
+  await assert.rejects(
+    () => readThreadEvents(journalPath, 0, 80, { maxReadBytes }),
+    (error) => {
+      assert.equal(error?.code, "THREAD_CURSOR_GAP");
+      assert.equal(
+        threadWorkerErrorText(error),
+        error.message,
+      );
+      return true;
+    },
+  );
+});
+
 test("worker-side since_seq poller fails closed on an unmarked seq hole", async (t) => {
   const fixture = await threadFixture(t);
   const journalPath = journalPathFor(fixture.notePath, fixture.planId);
