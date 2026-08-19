@@ -430,19 +430,6 @@ export function planHistoryAppendErrorCauseText(cause: unknown): string {
   return "history append failed";
 }
 
-/** Strip quoted, absolute, and vault-relative filesystem paths from error text. */
-export function redactFilesystemPathsFromErrorText(text: string): string {
-  return text
-    .replace(/'[^']+'/g, "")
-    .replace(/"[^"]+"/g, "")
-    .replace(/\b(?:[A-Za-z]:\\|\/)[^\s,;)]+/g, "")
-    .replace(/\bwiki\/artifacts\/[^\s,;)]+/g, "")
-    .replace(/\s{2,}/g, " ")
-    .replace(/\s+,/g, ",")
-    .replace(/[ ,:]+$/g, "")
-    .trim();
-}
-
 export function planHistoryAppendErrorMessage(rev: number, cause: unknown): string {
   return `persistPlan: note committed at rev ${rev}, but appending the history snapshot failed: ${planHistoryAppendErrorCauseText(cause)}`;
 }

@@ -3,11 +3,9 @@ import path from "node:path";
 
 import {
   addScar,
-  historyPathFor,
   journalPathFor,
   persistPlan,
   planHistoryAppendErrorMessage,
-  redactFilesystemPathsFromErrorText,
   rehydratePlan,
   unmetDependencies,
   updateSlice,
@@ -268,18 +266,13 @@ export function revokedClaimIds(
 
 /**
  * Model-facing text for thread MCP handlers. PlanHistoryAppendError keeps
- * notePath as a typed field for internal callers; this must never interpolate
- * that vault path, the adjacent history file path, or any leftover copy of
- * either in cause.message.
+ * notePath as a typed field for internal callers. Rebuild from rev +
+ * cause.code only — never interpolate notePath, historyPathFor(notePath),
+ * cause.message, or cause.path (real EISDIR/EACCES embed wiki/artifacts).
  */
 export function threadWorkerErrorText(error: unknown): string {
   if (error instanceof PlanHistoryAppendError) {
-    let text = planHistoryAppendErrorMessage(error.rev, error.cause);
-    if (error.notePath) {
-      text = text.split(historyPathFor(error.notePath)).join("");
-      text = text.split(error.notePath).join("");
-    }
-    return redactFilesystemPathsFromErrorText(text);
+    return planHistoryAppendErrorMessage(error.rev, error.cause);
   }
   return error instanceof Error ? error.message : String(error);
 }
