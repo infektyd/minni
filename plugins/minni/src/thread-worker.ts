@@ -56,7 +56,11 @@ import {
   type WorkerUpdateReceiptResponse,
 } from "./thread-claims.js";
 import { stableStringify } from "./agent_envelope.js";
-import { ThreadBusyError, withThreadLock } from "./thread-lock.js";
+import {
+  ThreadBusyError,
+  exclusiveReplanReservationIsLive,
+  withThreadLock,
+} from "./thread-lock.js";
 import {
   enqueueWorkerWrite,
   findQueuedWorkerWrite,
@@ -2084,6 +2088,16 @@ export async function updateClaimedSlice(
     }
   }
 
+  // Exclusive replan reserved: dump-and-return. Do not apply start on a
+  // parent that replan is about to supersede. Kick yields until reservation
+  // clears. Not THREAD_BUSY as the default — only while exclusive replan
+  // is in flight.
+  if (await exclusiveReplanReservationIsLive(input.vaultPath, planId)) {
+    await enqueueAcceptedWorkerWrite(lockedInput);
+    kickWorkerWriteDrain(lockedInput, deps);
+    return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
+  }
+
   try {
     const applied = await withThreadLock(
       input.vaultPath,
@@ -2127,6 +2141,10 @@ export async function drainWorkerWrites(
   while (Date.now() < deadline) {
     const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
     if (remaining.length === 0) return;
+    if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      continue;
+    }
     try {
       await withThreadLock(
         input.vaultPath,
@@ -2149,6 +2167,10 @@ export async function drainWorkerWrites(
  * In-process kick. It dies with the accepting process. Do not treat this as
  * the durable drain — a later process must call drainWorkerWrites /
  * drainPendingWorkerWritesForVault.
+ *
+ * Yields (does not apply) while exclusive replan is reserved so a live
+ * acceptor cannot journal slice.started on a parent that replan then
+ * supersedes. Kick still drains when no exclusive replan is in flight.
  */
 export function kickWorkerWriteDrain(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
@@ -2245,6 +2267,11 @@ async function drainOneQueuedWorkerWrite(
   const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const item = pickNextQueuedWorkerWrite(items);
   if (item === undefined) return;
+  if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
+    // Yield: keep the ticket. Exclusive replan owns persist. Do not
+    // journal slice.started on a parent that replan then supersedes.
+    return;
+  }
   if (!(await queuedWriteIsLiveWork(input.notePath, item))) {
     // Leftover Q after generation advance / supersede is not live work.
     // Drop it so drain is not stuck. Do not persist in_progress or journal
@@ -2327,6 +2354,9 @@ async function applyClaimedSliceOnLockedPlan(
     notePath: input.notePath,
     planId,
   });
+  if (await exclusiveReplanReservationIsLive(input.vaultPath, planId)) {
+    throw new ThreadBusyError();
+  }
       const now = sampleNow(input.now);
       const workerOperationKey = deriveWorkerEventKey(
         planId,

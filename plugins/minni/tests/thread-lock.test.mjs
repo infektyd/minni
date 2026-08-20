@@ -17,7 +17,11 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { withThreadLock } from "../dist/thread-lock.js";
+import {
+  exclusiveReplanReservationIsLive,
+  withExclusiveReplanReservation,
+  withThreadLock,
+} from "../dist/thread-lock.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -314,4 +318,38 @@ test("withThreadLock keeps DEFAULT_WAIT_MS at 5s; silent bump is fake close", as
   assert.doesNotMatch(src, /const DEFAULT_WAIT_MS = (?:[6-9]\d{3}|[1-9]\d{4,})/);
   assert.doesNotMatch(src, /FIFO waiter queue/);
   assert.doesNotMatch(src, /stallDeadline/);
+});
+
+test("exclusive replan reservation is live only for a live owner", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+  let sawLive = false;
+  await withExclusiveReplanReservation(root, "plan-x", "replan-1", async () => {
+    sawLive = await exclusiveReplanReservationIsLive(root, "plan-x");
+  });
+  assert.equal(sawLive, true);
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(
+    reservationPath,
+    `${JSON.stringify({
+      pid: 2_147_483_647,
+      operationId: "dead-replan",
+      acquiredAt: "2026-01-01T00:00:00.000Z",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  assert.equal(
+    await exclusiveReplanReservationIsLive(root, "plan-x", { isProcessAlive: () => false }),
+    false,
+    "dead exclusive-replan owner must not block kick",
+  );
 });

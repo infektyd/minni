@@ -12,7 +12,11 @@ import test from "node:test";
 
 import { applySliceDelta, createPlan, journalPathFor, persistPlan, rehydratePlan } from "../dist/plan.js";
 import { readThreadEvents } from "../dist/thread-events.js";
-import { withThreadLock } from "../dist/thread-lock.js";
+import {
+  exclusiveReplanReservationIsLive,
+  withExclusiveReplanReservation,
+  withThreadLock,
+} from "../dist/thread-lock.js";
 import {
   assignSlice,
   claimSlice,
@@ -1263,4 +1267,200 @@ test("generation-N leftover start does not authorize or block N+1", { timeout: 3
   assert.equal(live.slices[0].status, "in_progress");
   const journalLive = await journalState(fixture);
   assert.deepEqual(journalLive.started, ["s0"]);
+});
+
+test("kick yields to exclusive replan with accepting process still up", { timeout: 30_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const acceptGeneration = claim.generation;
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "accept-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  assert.equal(start.applied, false);
+  const queuedAtAccept = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.ok(
+    queuedAtAccept.some((item) => item.idempotencyKey === "start-0" && item.action?.action === "start"),
+    `start must be queued while hold is live: ${JSON.stringify(queuedAtAccept)}`,
+  );
+  const stamp = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stamp?.kind, START_ACCEPTED_RECEIPT_KIND);
+  assert.equal(stamp?.status, "pending");
+  assert.notEqual(stamp?.response.slice.status, "in_progress");
+  const journalAtAccept = await journalState(fixture);
+  assert.equal(journalAtAccept.started.includes("s0"), false, "stamp is not slice.started");
+
+  let reservedBeforeLock = false;
+  const split = withExclusiveReplanReservation(
+    fixture.vaultPath,
+    fixture.planId,
+    "orch-split-s0",
+    async () => {
+      reservedBeforeLock = await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId);
+      return withThreadPlanLock(
+        {
+          vaultPath: fixture.vaultPath,
+          notePath: fixture.notePath,
+          planId: fixture.planId,
+          operationId: "orch-split-s0",
+        },
+        async (plan) => {
+          const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+          assert.ok(
+            queued.some((item) => item.idempotencyKey === "start-0"),
+            `start must still be queued when exclusive replan acquires: ${JSON.stringify(queued)}`,
+          );
+          const mid = await journalState(fixture);
+          assert.equal(
+            mid.started.includes("s0"),
+            false,
+            `kick must not land slice.started before exclusive split: ${JSON.stringify(mid.started)}`,
+          );
+          const updated = applySliceDelta(plan, {
+            drop_slice_ids: ["s0"],
+            add_slices: [
+              { id: "child-a", title: "Child A" },
+              { id: "child-b", title: "Child B" },
+            ],
+          });
+          assert.equal(updated.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+          assert.deepEqual(
+            updated.slices.filter((slice) => slice.status !== "superseded").map((slice) => slice.id).sort(),
+            ["child-a", "child-b"],
+          );
+          await persistPlan(updated, {
+            vaultPath: fixture.vaultPath,
+            notePath: fixture.notePath,
+          });
+          await pruneSliceReceiptsAfterPlanMutation(
+            fixture.vaultPath,
+            fixture.planId,
+            plan,
+            updated,
+          );
+          await deleteClaimSecretsBestEffort(
+            fixture.vaultPath,
+            fixture.planId,
+            revokedClaimIds(plan, updated),
+          );
+          return updated;
+        },
+      );
+    },
+  );
+
+  const waitReserved = Date.now();
+  while (Date.now() - waitReserved < 2_000) {
+    if (await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(
+    await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId),
+    true,
+    "exclusive replan must reserve before the persist lock is free",
+  );
+
+  releaseHold();
+  await holder;
+  await split;
+  assert.equal(reservedBeforeLock, true, "reservation must be live before exclusive replan takes the persist lock");
+
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0, `leftover start must drop after supersede: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(fixture.notePath);
+  const parent = plan.slices.find((slice) => slice.id === "s0");
+  assert.ok(parent, "split never deletes the parent");
+  assert.equal(parent.status, "superseded");
+  assert.notEqual(parent.status, "in_progress");
+  assert.notEqual(parent.status, "done");
+  assert.equal(parent.claim, undefined);
+  assert.ok(parent.generation === undefined || parent.generation > acceptGeneration);
+  assert.deepEqual(
+    plan.slices.filter((slice) => slice.status !== "superseded").map((slice) => slice.id).sort(),
+    ["child-a", "child-b"],
+  );
+  const journal = await journalState(fixture);
+  assert.equal(
+    journal.started.includes("s0"),
+    false,
+    `process-stays-up GO: journal must not have slice.started on superseded s0: ${JSON.stringify(journal.started)}`,
+  );
+  assert.equal(journal.completed.includes("s0"), false);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-s0-after-yield-split",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-yield-split",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /claim scope mismatch|not worker-updatable|cannot persist done|claim token mismatch|claim expired/,
+  );
+  const afterComplete = await rehydratePlan(fixture.notePath);
+  assert.equal(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+  assert.notEqual(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "done");
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+});
+
+test("kick still applies start when no exclusive replan is in flight", { timeout: 20_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "no-replan-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+  releaseHold();
+  await holder;
+  await waitForJournal(fixture, { started: 1 });
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "in_progress");
+  const journal = await journalState(fixture);
+  assert.deepEqual(journal.started, ["s0"]);
 });
