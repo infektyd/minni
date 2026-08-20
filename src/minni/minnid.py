@@ -2017,6 +2017,19 @@ def _warn_if_sync_root(label: str, path: Path) -> None:
             return
 
 
+def _worker_write_drain_enabled() -> bool:
+    from minni.worker_write_drain import worker_write_drain_enabled
+
+    return worker_write_drain_enabled()
+
+
+async def _worker_write_drain_runner():
+    """Named standing drain: minnid tick. Kick only. Not Thread SoT."""
+    from minni.worker_write_drain import minnid_tick_runner
+
+    await minnid_tick_runner()
+
+
 # ── Entry point ──────────────────────────────────────────────────────────
 
 def main():
@@ -2170,6 +2183,12 @@ def main():
     if _backfill_enabled():
         backfill_task = loop.create_task(_backfill_runner())
 
+    # Standing drain: minnid tick kicks leftover Q when nobody boots MCP
+    # on that vault. Same apply entry. Not Thread SoT. Not G3.
+    worker_write_drain_task = None
+    if _worker_write_drain_enabled():
+        worker_write_drain_task = loop.create_task(_worker_write_drain_runner())
+
     # Model warmup. Scheduled AFTER the socket is being served, so the daemon is
     # answerable during the load: an early caller still gets the lazy path, it
     # just no longer has to be the one that pays for it.
@@ -2182,7 +2201,8 @@ def main():
     footprint_task = None
     background_tasks = lambda: [
         main_task, http_task, afm_task, vault_watch_task,
-        decay_task, backfill_task, warmup_task, footprint_task,
+        decay_task, backfill_task, worker_write_drain_task,
+        warmup_task, footprint_task,
     ]
     if _footprint_watchdog_enabled():
         footprint_task = loop.create_task(

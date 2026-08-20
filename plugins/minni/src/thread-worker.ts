@@ -2127,6 +2127,7 @@ export function kickWorkerWriteDrain(
  * Later-process entry: scan this vault's pending Q dirs and apply each plan
  * through drainWorkerWrites. Same persist authority. findPlanNote is the
  * existing note locator — not a second graph, not minnid-canonical.
+ * minnid tick may kick this when nobody boots MCP. minnid is not SoT.
  */
 export async function drainPendingWorkerWritesForVault(
   vaultPath: string,
