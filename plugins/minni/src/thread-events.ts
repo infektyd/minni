@@ -7,6 +7,7 @@ import { appendFileWithFsync, writeFileAtomic } from "./vault.js";
 import {
   ingestJournalIntoVault,
   loadRelayStore,
+  seedRelaySubscribers,
   vaultPathFromJournalPath,
   type JournalEvent,
 } from "./thread-notification-relay.js";
@@ -912,10 +913,6 @@ async function ingestRelayAfterJournalAppend(input: {
   if (!vaultPath) return;
   try {
     const store = await loadRelayStore(vaultPath);
-    const subscriberIds = new Set<string>([input.actor]);
-    for (const cursor of store.cursors) {
-      if (cursor.plan_id === input.planId) subscriberIds.add(cursor.subscriber_id);
-    }
     const events: JournalEvent[] = input.events.map((event) => {
       const item: JournalEvent = {
         seq: event.seq,
@@ -926,7 +923,13 @@ async function ingestRelayAfterJournalAppend(input: {
       if (event.slice_id) item.slice_id = event.slice_id;
       return item;
     });
-    await ingestJournalIntoVault(vaultPath, input.planId, events, [...subscriberIds]);
+    const subscriberIds = seedRelaySubscribers({
+      actor: input.actor,
+      planId: input.planId,
+      cursors: store.cursors,
+      events,
+    });
+    await ingestJournalIntoVault(vaultPath, input.planId, events, subscriberIds);
   } catch {
     // Relay is not SoT. The journal line already landed.
   }

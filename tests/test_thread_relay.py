@@ -12,6 +12,7 @@ from minni.thread_relay import (
     HOOKS_POLL_MINNI_THREAD_EVENTS,
     HOST_INJECTION_TABLE,
     RELAY_IS_GRAPH_STATE,
+    SQLITE_020_LIVE,
     SPAWNED,
     advance_cursor,
     attempt_immediate_wake,
@@ -26,6 +27,7 @@ from minni.thread_relay import (
     read_pending_attention,
     rebuild_queue_from_journal,
     relay_store_path,
+    seed_relay_subscribers,
     store_holds_graph_state,
 )
 
@@ -60,6 +62,7 @@ def test_store_is_not_graph_state_and_does_not_spawn():
     assert SPAWNED is False
     assert GROK_WORKER_START is None
     assert HOOKS_POLL_MINNI_THREAD_EVENTS is False
+    assert SQLITE_020_LIVE is False
     assert store_holds_graph_state({"graph": False}) is False
     assert store_holds_graph_state({"graph": False, "slices": []}) is True
     source = inspect.getsource(thread_relay)
@@ -196,3 +199,58 @@ def test_production_ingest_writes_cursors_json(tmp_path: Path):
     source = inspect.getsource(thread_relay)
     assert "def ingest_journal_into_vault" in source
     assert "def ingest_plan_journal_from_disk" in source
+
+
+def test_old_writer_only_seed_misses_orchestrator_new_seed_notifies():
+    worker = "worker-g3"
+    landed = (
+        {
+            "seq": 1,
+            "kind": "slice.assigned",
+            "actor": "orchestrator-g3",
+            "at": "2026-08-20T12:00:00.000Z",
+            "slice_id": "alpha",
+        },
+        {
+            "seq": 2,
+            "kind": "slice.completed",
+            "actor": worker,
+            "at": "2026-08-20T12:01:00.000Z",
+            "slice_id": "alpha",
+        },
+    )
+    old_ids = [worker]  # old seed: {append actor} ∪ existing cursors (none)
+    assert old_ids == [worker]
+    old_store = ingest_journal_events(empty_relay_store(), "plan-g3-relay", landed, old_ids)
+    orch_old = [
+        item for item in old_store["pending"] if item["subscriber_id"] == "orchestrator-g3"
+    ]
+    assert orch_old == [], "old seed: worker append, orchestrator reads empty"
+    worker_old = [item for item in old_store["pending"] if item["subscriber_id"] == worker]
+    assert worker_old, "old seed notifies the writer only"
+
+    new_ids = seed_relay_subscribers(
+        actor=worker,
+        plan_id="plan-g3-relay",
+        cursors=[],
+        events=landed,
+        extra_ids=["orchestrator-g3"],
+    )
+    assert "orchestrator-g3" in new_ids
+    new_store = ingest_journal_events(empty_relay_store(), "plan-g3-relay", landed, new_ids)
+    orch_new = [
+        item for item in new_store["pending"] if item["subscriber_id"] == "orchestrator-g3"
+    ]
+    assert orch_new, "new seed: worker append, orchestrator has pending"
+    assert any(item["actor"] == worker for item in orch_new)
+
+
+def test_sqlite_020_is_not_a_production_writer():
+    assert SQLITE_020_LIVE is False
+    minnid = Path(__file__).resolve().parents[1] / "src/minni/minnid.py"
+    source = minnid.read_text(encoding="utf-8")
+    assert "thread_relay" not in source
+    assert "thread_delivery_cursors" not in source
+    assert "ingest_journal_into_vault" not in source
+    relay = inspect.getsource(thread_relay)
+    assert "SQLITE_020_LIVE = False" in relay

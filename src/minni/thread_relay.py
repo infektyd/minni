@@ -25,6 +25,10 @@ GROK_WORKER_START = None
 HOOKS_POLL_MINNI_THREAD_EVENTS = False
 RELAY_IS_GRAPH_STATE = False
 SPAWNED = False
+# SQLite 020 thread_delivery_cursors is unused in production.
+# Live store is plugin .runtime/thread-relay/cursors.json on journal append.
+# minnid does not call ingest_journal_into_vault.
+SQLITE_020_LIVE = False
 
 GRAPH_KEYS = frozenset(
     {
@@ -280,6 +284,37 @@ def _cursor_for(store: Mapping[str, Any], subscriber_id: str, plan_id: str) -> d
     return {"subscriber_id": subscriber_id, "plan_id": plan_id, "last_delivered_seq": 0}
 
 
+def seed_relay_subscribers(
+    *,
+    actor: str | None = None,
+    plan_id: str,
+    cursors: Sequence[Mapping[str, Any]] | None = None,
+    events: Sequence[Mapping[str, Any]] | None = None,
+    extra_ids: Sequence[str] | None = None,
+) -> list[str]:
+    """Seed subscribers from landed journal actors, not only the writer.
+
+    Old seed was ``{current append actor} ∪ existing cursors for that plan``.
+    That notifies the writer on a cursor-less store and leaves the
+    already-working orchestrator empty.
+    """
+    ids: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            ids.add(value.strip())
+
+    add(actor)
+    for cursor in cursors or ():
+        if cursor.get("plan_id") == plan_id:
+            add(cursor.get("subscriber_id"))
+    for event in events or ():
+        add(event.get("actor"))
+    for extra in extra_ids or ():
+        add(extra)
+    return list(ids)
+
+
 def ingest_journal_events(
     store: Mapping[str, Any],
     plan_id: str,
@@ -393,10 +428,11 @@ def ingest_journal_into_vault(
     conn: Any = None,
     updated_at: str = "",
 ) -> dict[str, Any]:
-    """Production daemon ingest: rebuild pending from journal seq into cursors.json.
+    """Library ingest into cursors.json. Production writer is plugin journal append.
 
-    Hooks read that file. They do not poll minni_thread_events. Optional SQLite
-    conn gets cursor rows created at 0 without advancing.
+    minnid does not call this. SQLite 020 is unused (SQLITE_020_LIVE is False).
+    Optional conn is a leftover helper, not a live daemon path.
+    Hooks read cursors.json. They do not poll minni_thread_events.
     """
     store = ingest_journal_events(
         load_relay_store(vault_path), plan_id, events, subscriber_ids

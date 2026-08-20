@@ -1,6 +1,7 @@
--- G3: daemon delivery cursors only. Not graph state.
--- Journal seq rebuilds the pending notification queue. This table stores
--- last_delivered_seq per subscriber/plan. No slices, deps, claims, or evidence.
+-- G3: unused in production. Honesty: minnid does not write this table.
+-- Live delivery cursors live in plugin .runtime/thread-relay/cursors.json
+-- written on journal append. This schema is leftover, not a live store.
+-- No slices, deps, claims, or evidence.
 
 CREATE TABLE IF NOT EXISTS thread_delivery_cursors (
     subscriber_id TEXT NOT NULL,

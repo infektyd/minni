@@ -29,6 +29,9 @@ export const HOOKS_POLL_MINNI_THREAD_EVENTS = false as const;
 /** This store is delivery state, never slices/deps/claims/evidence. */
 export const RELAY_IS_GRAPH_STATE = false as const;
 
+/** SQLite 020 thread_delivery_cursors is unused in production. Live store is cursors.json. */
+export const SQLITE_020_LIVE = false as const;
+
 /** G2 in-session complete is not a spawn. Landing G3 does not spawn. */
 export const SPAWNED = false as const;
 
@@ -243,6 +246,39 @@ export function advanceCursor(
   if (!deliverySucceeded) return { ...cursor };
   if (deliveredThroughSeq <= cursor.last_delivered_seq) return { ...cursor };
   return { ...cursor, last_delivered_seq: deliveredThroughSeq };
+}
+
+/**
+ * Who gets pending after a journal append.
+ *
+ * Old seed was `{current append actor} ∪ existing cursors for that plan`.
+ * That notifies the writer on a cursor-less store and leaves the
+ * already-working orchestrator empty. Landed journal actors and any
+ * plan orchestrator / coordinator identity must be seeded too.
+ */
+export function seedRelaySubscribers(input: {
+  actor?: string;
+  planId: string;
+  cursors?: readonly DeliveryCursor[];
+  events?: readonly { actor?: string }[];
+  extraIds?: readonly string[];
+}): string[] {
+  const ids = new Set<string>();
+  const add = (value: string | undefined) => {
+    const id = typeof value === "string" ? value.trim() : "";
+    if (id) ids.add(id);
+  };
+  add(input.actor);
+  for (const cursor of input.cursors ?? []) {
+    if (cursor.plan_id === input.planId) add(cursor.subscriber_id);
+  }
+  for (const event of input.events ?? []) {
+    add(event.actor);
+  }
+  for (const extra of input.extraIds ?? []) {
+    add(extra);
+  }
+  return [...ids];
 }
 
 export function cursorFor(

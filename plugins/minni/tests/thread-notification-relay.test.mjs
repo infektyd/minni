@@ -2,7 +2,7 @@
 // Immediate wake is unsupported (not wet). Hooks do not poll minni_thread_events.
 // G2 in-session complete is not a spawn. GROK_WORKER_START stays null.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import {
   HOOKS_POLL_MINNI_THREAD_EVENTS,
   HOST_INJECTION_TABLE,
   RELAY_IS_GRAPH_STATE,
+  SQLITE_020_LIVE,
   SPAWNED,
   advanceCursor,
   attemptImmediateWake,
@@ -29,6 +30,7 @@ import {
   readPendingAttention,
   rebuildQueueFromJournal,
   saveRelayStore,
+  seedRelaySubscribers,
   storeHoldsGraphState,
 } from "../dist/thread-notification-relay.js";
 import { createHookHandlers } from "../dist/hook-handlers.js";
@@ -64,6 +66,7 @@ test("store is not graph state and does not spawn", () => {
   assert.equal(SPAWNED, false);
   assert.equal(GROK_WORKER_START, null);
   assert.equal(HOOKS_POLL_MINNI_THREAD_EVENTS, false);
+  assert.equal(SQLITE_020_LIVE, false);
   const forged = { ...store, slices: [{ id: "alpha" }] };
   assert.equal(storeHoldsGraphState(forged), true);
 });
@@ -185,6 +188,9 @@ test("hooks read pending attention and do not poll minni_thread_events", async (
   );
   assert.match(eventsSrc, /ingestJournalIntoVault/);
   assert.match(eventsSrc, /ingestRelayAfterJournalAppend/);
+  assert.match(eventsSrc, /seedRelaySubscribers/);
+  assert.match(relaySrc, /seedRelaySubscribers/);
+  assert.match(relaySrc, /SQLITE_020_LIVE\s*=\s*false/);
   assert.doesNotMatch(eventsSrc, /minni_thread_events/);
   assert.match(dispatchSrc, /GROK_WORKER_START:\s*null\s*=\s*null/);
   assert.match(dispatchSrc, /outcome:\s*"CANNOT"/);
@@ -269,6 +275,90 @@ test("production ingest writes cursors.json from journal seq so hooks can read i
   const fromDisk = await ingestPlanJournalFromDisk(vaultPath, PLAN, [ORCH]);
   assert.equal(fromDisk.graph, false);
   assert.ok(fromDisk.pending.some((item) => item.subscriber_id === ORCH));
+});
+
+test("old writer-only seed misses orchestrator; landed-actor seed notifies orch", () => {
+  const WORKER = "worker-g3";
+  const landed = [
+    { seq: 1, kind: "slice.assigned", actor: ORCH, at: "2026-08-20T12:00:00.000Z", slice_id: "alpha" },
+    { seq: 2, kind: "slice.completed", actor: WORKER, at: "2026-08-20T12:01:00.000Z", slice_id: "alpha" },
+  ];
+  const oldIds = [WORKER]; // old seed: {append actor} ∪ existing cursors (none)
+  assert.deepEqual(oldIds, [WORKER]);
+  const oldStore = ingestJournalEvents(emptyRelayStore(), PLAN, landed, oldIds);
+  assert.equal(
+    readPendingAttention(oldStore, ORCH, PLAN).notifications.length,
+    0,
+    "old seed: worker append, orchestrator reads empty",
+  );
+  assert.ok(
+    readPendingAttention(oldStore, WORKER, PLAN).notifications.length > 0,
+    "old seed notifies the writer only",
+  );
+
+  const newIds = seedRelaySubscribers({
+    actor: WORKER,
+    planId: PLAN,
+    cursors: [],
+    events: landed,
+    extraIds: [ORCH],
+  });
+  assert.ok(newIds.includes(ORCH), "new seed includes orchestrator from landed actors / coordinator");
+  assert.ok(newIds.includes(WORKER));
+  const newStore = ingestJournalEvents(emptyRelayStore(), PLAN, landed, newIds);
+  const orchPending = readPendingAttention(newStore, ORCH, PLAN);
+  assert.ok(orchPending.notifications.length > 0, "new seed: worker append, orchestrator has pending");
+  assert.ok(orchPending.notifications.some((item) => item.actor === WORKER));
+});
+
+test("first worker_update on a cursor-less store notifies the orchestrator", async (t) => {
+  const WORKER = "worker-g3";
+  const vaultPath = await mkdtemp(path.join(tmpdir(), "minni-g3-orch-seed-"));
+  t.after(() => rm(vaultPath, { recursive: true, force: true }));
+  const journalPath = path.join(vaultPath, "wiki", "artifacts", `${PLAN}.log.md`);
+  await mkdir(path.dirname(journalPath), { recursive: true });
+
+  // In-flight Thread: orchestrator events already on disk, no cursors.json.
+  const preexisting = {
+    thread_event_batch: [
+      {
+        seq: 1,
+        rev: 1,
+        event_id: "g3-inflight-assign",
+        idempotency_key: "g3-inflight-assign",
+        actor: ORCH,
+        kind: "slice.assigned",
+        at: "2026-08-20T12:00:00.000Z",
+        slice_id: "alpha",
+      },
+    ],
+  };
+  await writeFile(
+    journalPath,
+    `# Minni Plan Journal\n\n## events\n${JSON.stringify(preexisting)}\n`,
+    "utf8",
+  );
+
+  await appendOrderedEventBatch({
+    journalPath,
+    planId: PLAN,
+    rev: 1,
+    actor: WORKER,
+    at: "2026-08-20T12:01:00.000Z",
+    events: [
+      { idempotencyKey: "g3-worker-complete", kind: "slice.completed", sliceId: "alpha" },
+    ],
+  });
+
+  const pending = await pendingAttentionForHook({
+    vaultPath,
+    subscriberId: ORCH,
+    planId: PLAN,
+  });
+  assert.ok(pending, "orchestrator must see pending after worker append on a cursor-less store");
+  assert.equal(pending.hooksPollThreadEvents, false);
+  assert.ok(pending.notifications.some((item) => item.actor === WORKER && item.kind === "slice.completed"));
+  assert.ok(pending.notifications.every((item) => item.subscriber_id === ORCH));
 });
 
 async function withHookEnv(t, run) {
