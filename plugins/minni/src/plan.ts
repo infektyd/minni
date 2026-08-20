@@ -1344,8 +1344,9 @@ export function diffSupersededDependencies(
  * ids; journaling landed state keeps the ordered journal SoT.
  *
  * add_slices: newly appended slices (id + proposal fields only; no claim
- * token, status, or proposals). drop_slice_ids: ids that newly became
- * superseded. Empty sides are omitted.
+ * token, status, proposals, or evidence). Ordered mirrors elsewhere omit
+ * evidence (status_changed is status enums only). drop_slice_ids: ids that
+ * newly became superseded. Empty sides are omitted.
  */
 export function landedReplanTopology(
   before: PlanArtifact,
@@ -1363,11 +1364,9 @@ export function landedReplanTopology(
         title: string;
         gate?: string;
         depends_on?: string[];
-        evidence?: string;
       } = { id: s.id, title: s.title };
       if (s.gate !== undefined) landed.gate = s.gate;
       if (s.depends_on !== undefined) landed.depends_on = [...s.depends_on];
-      if (s.evidence !== undefined) landed.evidence = s.evidence;
       return landed;
     });
   const drop_slice_ids = after.slices

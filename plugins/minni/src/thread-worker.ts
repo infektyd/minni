@@ -2286,13 +2286,7 @@ async function drainOneQueuedWorkerWrite(
       (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
       input.now,
   };
-  try {
-    await applyClaimedSliceOnLockedPlan(mapped, deps);
-  } catch (error) {
-    // Fail-closed: an accepted write that failed apply is still accepted.
-    // Dropping it lets a later complete persist done with no start.
-    throw error;
-  }
+  await applyClaimedSliceOnLockedPlan(mapped, deps);
   await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
   const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const next = leftover[0];

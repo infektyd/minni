@@ -2701,6 +2701,38 @@ test("landedReplanTopology: new_slices-shaped apply reports landed add ids and s
   );
 });
 
+test("landedReplanTopology omits evidence from ordered add_slices", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+  };
+  const after = replan(before, [
+    { id: "keep", title: "Keep" },
+    {
+      id: "child",
+      title: "Child",
+      evidence: "vault/secret/path.log passed",
+    },
+  ]);
+  assert.equal(
+    after.slices.find((s) => s.id === "child")?.evidence,
+    "vault/secret/path.log passed",
+    "plan note still stores evidence; only the ordered payload omits it",
+  );
+  const landed = landedReplanTopology(before, after);
+  assert.deepEqual(landed.add_slices, [{ id: "child", title: "Child" }]);
+  assert.equal(
+    JSON.stringify(landed).includes("evidence"),
+    false,
+    "ordered replan payload must not copy freeform evidence",
+  );
+  assert.equal(
+    JSON.stringify(landed).includes("vault/secret"),
+    false,
+    "path-bearing evidence must not reach the ordered journal",
+  );
+});
+
 test("landedReplanTopology: depends_on-only remount (no add/supersede) omits add/drop", () => {
   const before = {
     ...dependsOnPlan(),
