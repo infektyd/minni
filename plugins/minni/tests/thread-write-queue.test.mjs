@@ -1269,7 +1269,9 @@ test("generation-N leftover start does not authorize or block N+1", { timeout: 3
   assert.deepEqual(journalLive.started, ["s0"]);
 });
 
-test("kick yields to exclusive replan with accepting process still up", { timeout: 30_000 }, async (t) => {
+test("kick one-shot yield: lock free before orch reserve, process stays up", { timeout: 30_000 }, async (t) => {
+  // Not lock-until-reserved: release persist lock while reservation is NOT live,
+  // so kick is free to apply before orch announces. That is the IRL TOCTOU.
   const fixture = await burstFixture(t, 1);
   const [claim] = await assignAndClaimAll(fixture);
   const acceptGeneration = claim.generation;
@@ -1295,6 +1297,11 @@ test("kick yields to exclusive replan with accepting process still up", { timeou
   });
   assert.equal(isAcceptedWorkerWrite(start), true);
   assert.equal(start.applied, false);
+  assert.equal(
+    await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId),
+    false,
+    "reservation must not be live at accept return",
+  );
   const queuedAtAccept = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
   assert.ok(
     queuedAtAccept.some((item) => item.idempotencyKey === "start-0" && item.action?.action === "start"),
@@ -1307,8 +1314,20 @@ test("kick yields to exclusive replan with accepting process still up", { timeou
   const journalAtAccept = await journalState(fixture);
   assert.equal(journalAtAccept.started.includes("s0"), false, "stamp is not slice.started");
 
+  // Persist lock is NOT held across accept→replan. Kick is free; reservation still absent.
+  releaseHold();
+  await holder;
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const journalAfterFreeLock = await journalState(fixture);
+  assert.equal(
+    journalAfterFreeLock.started.includes("s0"),
+    false,
+    `kick must not apply start after accept while orch has not reserved: ${JSON.stringify(journalAfterFreeLock.started)}`,
+  );
+
   let reservedBeforeLock = false;
-  const split = withExclusiveReplanReservation(
+  await withExclusiveReplanReservation(
     fixture.vaultPath,
     fixture.planId,
     "orch-split-s0",
@@ -1322,11 +1341,6 @@ test("kick yields to exclusive replan with accepting process still up", { timeou
           operationId: "orch-split-s0",
         },
         async (plan) => {
-          const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
-          assert.ok(
-            queued.some((item) => item.idempotencyKey === "start-0"),
-            `start must still be queued when exclusive replan acquires: ${JSON.stringify(queued)}`,
-          );
           const mid = await journalState(fixture);
           assert.equal(
             mid.started.includes("s0"),
@@ -1365,21 +1379,6 @@ test("kick yields to exclusive replan with accepting process still up", { timeou
       );
     },
   );
-
-  const waitReserved = Date.now();
-  while (Date.now() - waitReserved < 2_000) {
-    if (await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId)) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(
-    await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId),
-    true,
-    "exclusive replan must reserve before the persist lock is free",
-  );
-
-  releaseHold();
-  await holder;
-  await split;
   assert.equal(reservedBeforeLock, true, "reservation must be live before exclusive replan takes the persist lock");
 
   await drainWorkerWrites({
@@ -1458,9 +1457,260 @@ test("kick still applies start when no exclusive replan is in flight", { timeout
   assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
   releaseHold();
   await holder;
+  // Accept kick one-shot yields; later same-process drain still applies when no replan.
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
   await waitForJournal(fixture, { started: 1 });
   const plan = await rehydratePlan(fixture.notePath);
   assert.equal(plan.slices[0].status, "in_progress");
   const journal = await journalState(fixture);
   assert.deepEqual(journal.started, ["s0"]);
+});
+
+// Pin GO: live MCP, process stays up, reservation not live at accept return,
+// persist lock not held across accept→replan. Not lock-until-reserved library GO.
+test("live MCP: accept kick yields before orch reserve (process stays up)", { timeout: 60_000 }, async (t) => {
+  const net = await import("node:net");
+  const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
+  const root = await mkdtemp(path.join(tmpdir(), "minni-kick-live-mcp-"));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  });
+  const home = path.join(root, "home");
+  const vaultPath = path.join(root, "vault");
+  await mkdir(home, { recursive: true });
+  await mkdir(vaultPath, { recursive: true });
+  const socketPath = path.join(home, "minnid.sock");
+  const daemon = net.createServer((socket) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        const request = JSON.parse(line);
+        socket.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { ok: true } })}\n`,
+        );
+      }
+    });
+  });
+  await new Promise((resolve) => daemon.listen(socketPath, resolve));
+  t.after(() => daemon.close());
+
+  const created = await createPlan(
+    {
+      goal: "Live MCP kick vs exclusive replan",
+      slices: [{ id: "s0", title: "Parent" }],
+      vaultPath,
+    },
+    { vaultPath, now: () => THREAD_START },
+  );
+  const planId = created.plan.plan_id;
+  const notePath = created.write.notePath;
+
+  function attachMcp(child) {
+    const responses = new Map();
+    const waiters = new Map();
+    let buffered = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      let nl;
+      while ((nl = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, nl).trim();
+        buffered = buffered.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id !== undefined) {
+            responses.set(msg.id, msg);
+            waiters.get(msg.id)?.(msg);
+          }
+        } catch {
+          // protocol noise
+        }
+      }
+    });
+    let nextId = 1;
+    const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+    const awaitResponse = (id, ms = 20000) =>
+      responses.get(id) ??
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`timeout waiting for response ${id}`)),
+          ms,
+        );
+        waiters.set(id, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
+      });
+    const allocId = () => nextId++;
+    const call = async (name, args) => {
+      const id = allocId();
+      send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+      const reply = await awaitResponse(id);
+      if (reply.error) throw new Error(`${name}: ${JSON.stringify(reply.error)}`);
+      if (reply.result?.isError) {
+        throw new Error(`${name}: ${reply.result.content?.[0]?.text}`);
+      }
+      return JSON.parse(reply.result.content[0].text);
+    };
+    return { send, awaitResponse, call, allocId };
+  }
+
+  async function bootMcp() {
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      env: {
+        ...process.env,
+        MINNI_HOME: home,
+        MINNI_SOCKET_PATH: socketPath,
+        MINNI_VAULT_PATH: vaultPath,
+        MINNI_CLAUDECODE_VAULT_PATH: vaultPath,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const client = attachMcp(child);
+    const initId = client.allocId();
+    client.send({
+      jsonrpc: "2.0",
+      id: initId,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "kick-live-mcp-go", version: "0.0.0" },
+      },
+    });
+    await client.awaitResponse(initId);
+    client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    return { child, ...client };
+  }
+
+  const orch = await bootMcp();
+  t.after(() => {
+    if (orch.child.exitCode === null && orch.child.signalCode === null) {
+      orch.child.kill("SIGTERM");
+    }
+  });
+  await orch.call("minni_thread_assign", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+  });
+  const claim = await orch.call("minni_thread_claim", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+    idempotency_key: "claim-0",
+  });
+  assert.ok(claim.token);
+
+  let releaseHold;
+  const held = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(vaultPath, planId, "live-mcp-accept-hold", async () => {
+    await held;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const worker = await bootMcp();
+  t.after(() => {
+    if (worker.child.exitCode === null && worker.child.signalCode === null) {
+      worker.child.kill("SIGTERM");
+    }
+  });
+  const started = await worker.call("minni_thread_worker_update", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+    claim_token: claim.token,
+    idempotency_key: "start-0",
+    action: "start",
+  });
+  assert.equal(started.status, "accepted");
+  assert.equal(started.applied, false);
+  assert.equal(
+    await exclusiveReplanReservationIsLive(vaultPath, planId),
+    false,
+    "reservation must not be live at accept return",
+  );
+  assert.equal(worker.child.exitCode, null, "accepting MCP must stay up");
+  assert.equal(worker.child.signalCode, null, "accepting MCP must stay up (no SIGKILL)");
+
+  const queued = await listQueuedWorkerWrites(vaultPath, planId);
+  assert.ok(
+    queued.some((item) => item.idempotencyKey === "start-0"),
+    `start must be queued: ${JSON.stringify(queued)}`,
+  );
+
+  // Lock NOT held across accept→replan. Kick free; reservation still absent.
+  releaseHold();
+  await holder;
+  assert.equal(await exclusiveReplanReservationIsLive(vaultPath, planId), false);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  const midJournal = await journalState({ notePath, planId });
+  assert.equal(
+    midJournal.started.includes("s0"),
+    false,
+    `kick must not apply before orch reserves: ${JSON.stringify(midJournal.started)}`,
+  );
+  assert.equal(worker.child.exitCode, null, "process stays up after lock free");
+
+  const replan = await orch.call("minni_thread_replan", {
+    plan_id: planId,
+    drop_slice_ids: ["s0"],
+    add_slices: [
+      { id: "child-a", title: "Child A" },
+      { id: "child-b", title: "Child B" },
+    ],
+  });
+  assert.ok(replan.plan_id === planId || replan.plan?.plan_id === planId || replan.slices);
+
+  await drainWorkerWrites({ vaultPath, notePath, planId });
+  const leftover = await listQueuedWorkerWrites(vaultPath, planId);
+  assert.equal(leftover.length, 0, `leftover must drop: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(notePath);
+  const parent = plan.slices.find((slice) => slice.id === "s0");
+  assert.ok(parent, "split never deletes parent");
+  assert.equal(parent.status, "superseded");
+  assert.notEqual(parent.status, "in_progress");
+  assert.notEqual(parent.status, "done");
+  const journal = await journalState({ notePath, planId });
+  assert.equal(
+    journal.started.includes("s0"),
+    false,
+    `live MCP GO: no slice.started on superseded s0: ${JSON.stringify(journal.started)}`,
+  );
+  assert.equal(worker.child.exitCode, null, "accepting MCP still up at end (no SIGKILL)");
+
+  const complete = await worker.call("minni_thread_worker_update", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+    claim_token: claim.token,
+    idempotency_key: "complete-s0-after-live-split",
+    action: "complete",
+    evidence: "Verification: slice s0 done via live MCP after split",
+  }).catch((error) => ({ status: "error", error: String(error) }));
+  assert.equal(
+    complete.status,
+    "error",
+    `complete on superseded s0 must error (MCP returns status:error, not transport isError): ${JSON.stringify(complete)}`,
+  );
+  const after = await rehydratePlan(notePath);
+  assert.equal(after.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+  assert.notEqual(after.slices.find((slice) => slice.id === "s0")?.status, "done");
 });
