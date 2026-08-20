@@ -2147,6 +2147,56 @@ export function applySliceDelta(
   return nextPlan;
 }
 
+/**
+ * Map a worker StructuralProposal onto minni_thread_replan's existing
+ * add_slices / drop_slice_ids surface. Not a second apply tool and not a
+ * replan kind enum — orch still calls replan with add/drop.
+ *
+ *   expand   = add only; proposer stays
+ *   split    = supersede claimed parent + add children; no parent-id reuse
+ *   contract = drop named ids only (supersede, never delete)
+ */
+export function structuralProposalDelta(
+  proposal: StructuralProposal,
+  proposerSliceId: string,
+): {
+  add_slices?: NonNullable<CreatePlanInput["slices"]>;
+  drop_slice_ids?: string[];
+} {
+  const parentId = proposerSliceId.trim();
+  if (!parentId) {
+    throw new Error("structuralProposalDelta: proposer slice id is required");
+  }
+  if (proposal.kind === "expand" || proposal.kind === "split") {
+    const slices = proposal.slices;
+    if (!slices || slices.length === 0) {
+      throw new Error(
+        `structuralProposalDelta: ${proposal.kind} requires slices`,
+      );
+    }
+    if (proposal.kind === "expand") {
+      return {
+        add_slices: slices.map((slice) => ({ ...slice })),
+      };
+    }
+    if (slices.some((slice) => slice.id === parentId)) {
+      throw new Error(
+        `structuralProposalDelta: split cannot reuse parent id "${parentId}"`,
+      );
+    }
+    return {
+      add_slices: slices.map((slice) => ({ ...slice })),
+      drop_slice_ids: [parentId],
+    };
+  }
+  if (proposal.kind === "contract") {
+    return {
+      drop_slice_ids: [...proposal.slice_ids],
+    };
+  }
+  throw new Error("structuralProposalDelta: unknown proposal kind");
+}
+
 export function activePointerPath(vaultPath: string): string {
   return path.join(vaultPath, "wiki", "artifacts", "_active_plan.json");
 }

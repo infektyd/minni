@@ -55,17 +55,19 @@ import {
 } from "./thread-claims.js";
 import { stableStringify } from "./agent_envelope.js";
 import { withThreadLock } from "./thread-lock.js";
-import { MAX_TEAM_TTL_SECONDS } from "./team.js";
 
 const DEFAULT_CLAIM_TTL_SECONDS = 10 * 60;
 
 /**
  * Upper bound on a Thread claim lease. Same ceiling as Team packet TTL
- * (MAX_TEAM_TTL_SECONDS) so the two surfaces share one max lease length;
- * Thread rejects over-cap (typed) rather than clamping, matching existing
- * claim TTL validation which already rejects non-positive values.
+ * (`7 * 24 * 3600` in team.ts) so the two surfaces share one max lease
+ * length. The numeric ceiling is local on purpose: team.ts imports this
+ * module, so reading team.js at init hits TDZ on MAX_TEAM_TTL_SECONDS and
+ * the MCP server cannot boot. Thread rejects over-cap (typed) rather than
+ * clamping, matching existing claim TTL validation which already rejects
+ * non-positive values.
  */
-export const MAX_THREAD_CLAIM_TTL_SECONDS = MAX_TEAM_TTL_SECONDS;
+export const MAX_THREAD_CLAIM_TTL_SECONDS = 7 * 24 * 3600;
 
 export class ThreadClaimTtlError extends Error {
   readonly code = "THREAD_CLAIM_TTL_INVALID" as const;

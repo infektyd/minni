@@ -11,6 +11,7 @@ import {
   diffDependsOn,
   diffSupersededDependencies,
   applySliceDelta,
+  structuralProposalDelta,
   computePlanDigest,
   computePlanDigestV1,
   computePlanDigestHexV2,
@@ -3082,4 +3083,129 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
     child.kill("SIGKILL");
     await rm(root, { recursive: true, force: true });
   }
+});
+
+
+test("structuralProposalDelta: expand is add-only; proposer stays", () => {
+  const delta = structuralProposalDelta(
+    {
+      kind: "expand",
+      reason: "Need a sibling branch",
+      slices: [{ id: "extra", title: "Extra branch" }],
+    },
+    "parent",
+  );
+  assert.deepEqual(delta, {
+    add_slices: [{ id: "extra", title: "Extra branch" }],
+  });
+  assert.equal("drop_slice_ids" in delta, false);
+});
+
+test("structuralProposalDelta: split supersedes parent and rejects parent-id reuse", () => {
+  const delta = structuralProposalDelta(
+    {
+      kind: "split",
+      reason: "Two independent outputs",
+      slices: [
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+      ],
+    },
+    "parent",
+  );
+  assert.deepEqual(delta, {
+    add_slices: [
+      { id: "child-a", title: "Child A" },
+      { id: "child-b", title: "Child B" },
+    ],
+    drop_slice_ids: ["parent"],
+  });
+  assert.throws(
+    () => structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "Reuse is not a split",
+        slices: [{ id: "parent", title: "Same id" }],
+      },
+      "parent",
+    ),
+    /split cannot reuse parent id "parent"/,
+  );
+});
+
+test("structuralProposalDelta: contract is drop-only", () => {
+  const delta = structuralProposalDelta(
+    {
+      kind: "contract",
+      reason: "These slices are no longer needed",
+      slice_ids: ["gone", "also-gone"],
+    },
+    "proposer",
+  );
+  assert.deepEqual(delta, { drop_slice_ids: ["gone", "also-gone"] });
+  assert.equal("add_slices" in delta, false);
+});
+
+test("applySliceDelta via structuralProposalDelta: expand keeps proposer; split supersedes; contract never deletes", () => {
+  const plan = {
+    plan_id: "p",
+    goal: "evolution helper",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "parent", title: "Parent", status: "in_progress", assigned_to: "worker-a" },
+      { id: "keep", title: "Keep", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "parent",
+    plan_digest: "x",
+    created: "2026-08-18T12:00:00.000Z",
+    updated: "2026-08-18T12:00:00.000Z",
+    rev: 1,
+  };
+
+  const expanded = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      { kind: "expand", reason: "branch", slices: [{ id: "extra", title: "Extra" }] },
+      "parent",
+    ),
+  );
+  assert.deepEqual(expanded.slices.map((s) => s.id), ["parent", "keep", "extra"]);
+  assert.equal(expanded.slices.find((s) => s.id === "parent").status, "in_progress");
+  assert.equal(expanded.slices.find((s) => s.id === "parent").assigned_to, "worker-a");
+  assert.equal(expanded.slices.find((s) => s.id === "extra").status, "pending");
+
+  const split = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "split",
+        slices: [{ id: "child-a", title: "Child A" }, { id: "child-b", title: "Child B" }],
+      },
+      "parent",
+    ),
+  );
+  const splitParent = split.slices.find((s) => s.id === "parent");
+  assert.equal(splitParent.status, "superseded");
+  assert.ok(splitParent.superseded_by);
+  assert.deepEqual(
+    split.slices.filter((s) => s.status !== "superseded").map((s) => s.id).sort(),
+    ["child-a", "child-b", "keep"],
+  );
+  assert.equal(split.slices.filter((s) => s.id === "parent").length, 1, "split never deletes the parent");
+
+  const contracted = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      { kind: "contract", reason: "drop keep", slice_ids: ["keep"] },
+      "parent",
+    ),
+  );
+  const dropped = contracted.slices.find((s) => s.id === "keep");
+  assert.ok(dropped, "contract never deletes");
+  assert.equal(dropped.status, "superseded");
+  assert.equal(contracted.slices.find((s) => s.id === "parent").status, "in_progress");
 });
