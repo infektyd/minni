@@ -379,6 +379,7 @@ const V3_ONLY_SLICE_FIELDS = [
   "attempt",
   "claim",
   "proposals",
+  "replaced_by",
 ] as const;
 
 function findV3OnlySliceField(
@@ -1871,10 +1872,10 @@ export async function rehydratePlan(
       // v3-only-field tamper check entirely, because that check originally
       // lived only inside the `declaredVersion !== undefined` branch above.
       // But an undeclared note validating against a legacy algorithm is
-      // exactly as blind to the seven v3-only slice keys as a DECLARED
+      // exactly as blind to the v3-only slice keys as a DECLARED
       // older note is — and, worse, it was about to be upgraded (persisted)
       // below, which would silently BLESS an injected
-      // assigned_to/claim/proposals/etc. as legitimate v3 data. So the same
+      // assigned_to/claim/proposals/replaced_by/etc. as legitimate v3 data. So the same
       // guard applies here too, before needsUpgrade is set.
       const v3Field = findV3OnlySliceField(plan.slices);
       if (v3Field) {
