@@ -216,16 +216,24 @@ test("wet: propose expand leaves topology unchanged; orch add-only apply changes
     assert.ok(proposedEvent, `expected structure.proposed, got ${eventsAfterPropose.events.map((e) => e.kind)}`);
     assert.equal(proposedEvent.actor, "worker-a");
     assert.equal(proposedEvent.slice_id, "parent");
+    assert.deepEqual(proposedEvent.payload, {
+      kind: "expand",
+      reason: "Need an independent verification branch",
+      slices: [{ id: "extra", title: "Extra branch" }],
+    });
+    assert.equal(
+      JSON.stringify(proposedEvent).includes(claim.token),
+      false,
+      "claim token must stay off the journal",
+    );
     assert.equal(
       eventsAfterPropose.events.some((e) => e.kind === "replan"),
       false,
       "propose must not apply",
     );
 
-    const delta = structuralProposalDelta(
-      afterPropose.slices.find((s) => s.id === "parent").proposals.at(-1),
-      "parent",
-    );
+    // Orch reconstructs add/drop from the journal event, not the plan note.
+    const delta = structuralProposalDelta(proposedEvent.payload, proposedEvent.slice_id);
     assert.equal("drop_slice_ids" in delta, false);
     const applied = await call("minni_thread_replan", { plan_id, ...delta });
     assert.notEqual(applied.status, "error", JSON.stringify(applied));
@@ -252,6 +260,10 @@ test("wet: propose expand leaves topology unchanged; orch add-only apply changes
       eventsAfterApply.events.some((e) => e.kind === "structure.proposed"),
       "attribution remains in the journal",
     );
+    const replanEvent = eventsAfterApply.events.find((e) => e.kind === "replan");
+    assert.ok(replanEvent?.payload, "replan event must carry landed add/drop");
+    assert.deepEqual(replanEvent.payload.add_slices, [{ id: "extra", title: "Extra branch" }]);
+    assert.equal("drop_slice_ids" in (replanEvent.payload ?? {}), false);
     assert.deepEqual(parent.proposals.at(-1).kind, "expand");
   });
 });
@@ -301,10 +313,30 @@ test("wet: propose split leaves topology unchanged; orch drop+add supersedes cla
     assert.deepEqual(sliceIds(afterRejected), sliceIds(beforePropose));
     assert.equal(afterRejected.slices.find((s) => s.id === "parent").status, "pending");
 
-    const delta = structuralProposalDelta(
-      afterPropose.slices.find((s) => s.id === "parent").proposals.at(-1),
-      "parent",
+    const eventsAfterPropose = await call("minni_thread_events", {
+      plan_id,
+      since_seq: 0,
+      limit: 200,
+    });
+    const proposedEvent = eventsAfterPropose.events.find((e) => e.kind === "structure.proposed");
+    assert.ok(proposedEvent, `expected structure.proposed, got ${eventsAfterPropose.events.map((e) => e.kind)}`);
+    assert.equal(proposedEvent.actor, "worker-b");
+    assert.equal(proposedEvent.slice_id, "parent");
+    assert.deepEqual(proposedEvent.payload, {
+      kind: "split",
+      reason: "Two independently verifiable outputs",
+      slices: [
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+      ],
+    });
+    assert.equal(
+      JSON.stringify(proposedEvent).includes(claim.token),
+      false,
+      "claim token must stay off the journal",
     );
+
+    const delta = structuralProposalDelta(proposedEvent.payload, proposedEvent.slice_id);
     assert.deepEqual(delta.drop_slice_ids, ["parent"]);
     const applied = await call("minni_thread_replan", { plan_id, ...delta });
     assert.notEqual(applied.status, "error", JSON.stringify(applied));
@@ -328,9 +360,12 @@ test("wet: propose split leaves topology unchanged; orch drop+add supersedes cla
     assert.ok(kinds.includes("replan"));
     assert.ok(kinds.includes("ready.changed"));
     assert.ok(kinds.includes("slice.claim_revoked"));
-    const proposedEvent = events.events.find((e) => e.kind === "structure.proposed");
-    assert.equal(proposedEvent.actor, "worker-b");
-    assert.equal(proposedEvent.slice_id, "parent");
+    const replanEvent = events.events.find((e) => e.kind === "replan");
+    assert.deepEqual(replanEvent.payload.add_slices, [
+      { id: "child-a", title: "Child A" },
+      { id: "child-b", title: "Child B" },
+    ]);
+    assert.deepEqual(replanEvent.payload.drop_slice_ids, ["parent"]);
   });
 });
 
@@ -367,10 +402,27 @@ test("wet: propose contract leaves topology unchanged; orch drop supersedes name
     const readyAfterPropose = await call("minni_thread_ready", { plan_id });
     assert.deepEqual(readyAfterPropose.ready.map((s) => s.id), ["drop-me"]);
 
-    const delta = structuralProposalDelta(
-      afterPropose.slices.find((s) => s.id === "keep").proposals.at(-1),
-      "keep",
+    const eventsAfterPropose = await call("minni_thread_events", {
+      plan_id,
+      since_seq: 0,
+      limit: 200,
+    });
+    const proposedEvent = eventsAfterPropose.events.find((e) => e.kind === "structure.proposed");
+    assert.ok(proposedEvent, `expected structure.proposed, got ${eventsAfterPropose.events.map((e) => e.kind)}`);
+    assert.equal(proposedEvent.actor, "worker-c");
+    assert.equal(proposedEvent.slice_id, "keep");
+    assert.deepEqual(proposedEvent.payload, {
+      kind: "contract",
+      reason: "drop-me is no longer in scope",
+      slice_ids: ["drop-me"],
+    });
+    assert.equal(
+      JSON.stringify(proposedEvent).includes(claim.token),
+      false,
+      "claim token must stay off the journal",
     );
+
+    const delta = structuralProposalDelta(proposedEvent.payload, proposedEvent.slice_id);
     assert.deepEqual(delta, { drop_slice_ids: ["drop-me"] });
     const applied = await call("minni_thread_replan", { plan_id, ...delta });
     assert.notEqual(applied.status, "error", JSON.stringify(applied));
@@ -390,8 +442,9 @@ test("wet: propose contract leaves topology unchanged; orch drop supersedes name
     assert.ok(kinds.includes("structure.proposed"));
     assert.ok(kinds.includes("replan"));
     assert.ok(kinds.includes("ready.changed"));
-    const proposedEvent = events.events.find((e) => e.kind === "structure.proposed");
-    assert.equal(proposedEvent.actor, "worker-c");
+    const replanEvent = events.events.find((e) => e.kind === "replan");
+    assert.deepEqual(replanEvent.payload.drop_slice_ids, ["drop-me"]);
+    assert.equal("add_slices" in (replanEvent.payload ?? {}), false);
     assert.deepEqual(
       afterApply.slices.find((s) => s.id === "keep").proposals.at(-1),
       {

@@ -143,6 +143,11 @@ export type PlanEvent =
       // slice that depends on it just as much as depends_on being edited
       // directly — must be equally non-silent.
       depends_on_superseded?: Array<{ slice_id: string; depended_on_by: string[] }>;
+      // Landed add/drop from orch apply (minni_thread_replan). Journal is
+      // SoT for what topology change actually applied; propose_structure
+      // never writes these.
+      add_slices?: CreatePlanInput["slices"];
+      drop_slice_ids?: string[];
     }
   | { kind: "gate_passed"; slice_id: string; evidence: string; at: string }
   | { kind: "rehydrated"; at: string }
@@ -1296,8 +1301,10 @@ export function diffDependsOn(
  * superseded, and unmetDependencies already treats superseded as
  * resolved). That path is cheaper than editing depends_on directly and,
  * before this function, produced NO journal trail at all — the plain
- * "replan" event carries no payload. Pure diff used by the
- * minni_thread_replan handler to make that supersession visible: for every
+ * "replan" event previously carried only depends_on diffs. Orch apply now
+ * also journals landed add_slices / drop_slice_ids on that same event.
+ * Pure diff used by the minni_thread_replan handler to make that
+ * supersession visible: for every
  * slice that newly became superseded in this operation, list which
  * still-open (not done/superseded) slices depend on it.
  */

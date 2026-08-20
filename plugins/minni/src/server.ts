@@ -1837,7 +1837,8 @@ server.registerTool(
           plan,
           updated,
         );
-        // Legacy appendJournal line unchanged.
+        // Legacy appendJournal: include landed add/drop so both journals
+        // agree that replan apply carried the topology delta that landed.
         await appendJournal(journalPath, {
           kind: "replan",
           at: now.toISOString(),
@@ -1847,13 +1848,23 @@ server.registerTool(
           ...(dependsOnSuperseded.length > 0
             ? { depends_on_superseded: dependsOnSuperseded }
             : {}),
+          ...(add_slices && add_slices.length > 0
+            ? { add_slices }
+            : {}),
+          ...(drop_slice_ids && drop_slice_ids.length > 0
+            ? { drop_slice_ids }
+            : {}),
         });
-        // Ordered mirror: ids only (never evidence/scar text). Coalesces
-        // ready.changed automatically when supersession or a depends_on
-        // edit frees or blocks a dependent.
+        // Ordered mirror: carry the add/drop that landed (never claim
+        // tokens). Coalesces ready.changed when supersession or a
+        // depends_on edit frees or blocks a dependent.
         const replanPayload: Record<string, unknown> = {};
         if (dependsOnChanged.length > 0) replanPayload.depends_on_changed = dependsOnChanged;
         if (dependsOnSuperseded.length > 0) replanPayload.depends_on_superseded = dependsOnSuperseded;
+        if (add_slices && add_slices.length > 0) replanPayload.add_slices = add_slices;
+        if (drop_slice_ids && drop_slice_ids.length > 0) {
+          replanPayload.drop_slice_ids = drop_slice_ids;
+        }
         const replanSupplemental = plan.slices
           .filter(
             (slice) =>
