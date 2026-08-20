@@ -4,6 +4,13 @@ import { open, readFile, stat } from "node:fs/promises";
 import { stableStringify } from "./agent_envelope.js";
 import { type AppendJournalDeps } from "./plan.js";
 import { appendFileWithFsync, writeFileAtomic } from "./vault.js";
+import {
+  ingestJournalIntoVault,
+  loadRelayStore,
+  seedRelaySubscribers,
+  vaultPathFromJournalPath,
+  type JournalEvent,
+} from "./thread-notification-relay.js";
 
 export interface OrderedThreadEvent {
   seq: number;
@@ -895,6 +902,39 @@ function materializeBatchEvents(
   return materialized;
 }
 
+
+async function ingestRelayAfterJournalAppend(input: {
+  journalPath: string;
+  planId: string;
+  actor: string;
+  events: OrderedThreadEvent[];
+}): Promise<void> {
+  const vaultPath = vaultPathFromJournalPath(input.journalPath);
+  if (!vaultPath) return;
+  try {
+    const store = await loadRelayStore(vaultPath);
+    const events: JournalEvent[] = input.events.map((event) => {
+      const item: JournalEvent = {
+        seq: event.seq,
+        kind: event.kind,
+        actor: event.actor,
+        at: event.at,
+      };
+      if (event.slice_id) item.slice_id = event.slice_id;
+      return item;
+    });
+    const subscriberIds = seedRelaySubscribers({
+      actor: input.actor,
+      planId: input.planId,
+      cursors: store.cursors,
+      events,
+    });
+    await ingestJournalIntoVault(vaultPath, input.planId, events, subscriberIds);
+  } catch {
+    // Relay is not SoT. The journal line already landed.
+  }
+}
+
 export async function appendOrderedEventBatch(
   input: AppendOrderedEventBatchInput,
   deps: AppendJournalDeps = {},
@@ -942,6 +982,13 @@ export async function appendOrderedEventBatch(
         input.orderedSnapshot.push(event);
       }
     }
+    const landed = input.orderedSnapshot ?? [...ordered, ...fresh];
+    await ingestRelayAfterJournalAppend({
+      journalPath: input.journalPath,
+      planId: input.planId,
+      actor: input.actor,
+      events: landed,
+    });
     return materialized;
   } catch (error) {
     if (input.orderedSnapshot) {
