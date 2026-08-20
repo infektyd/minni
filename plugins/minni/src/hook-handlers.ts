@@ -56,6 +56,13 @@ import type { HookIntent } from "./hook-intent.js";
 import { canInject, renderIntent, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
+import {
+  activePlanIdFromVault,
+  confirmDeliveryInVault,
+  pendingAttentionForHook,
+} from "./thread-notification-relay.js";
+
+
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildRecallPointer,
@@ -120,6 +127,38 @@ import {
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
+
+/** G3 hook fallback: read pending attention. Not minni_thread_events. */
+async function attachPendingAttention(args: {
+  vaultPath: string;
+  subscriberId: string;
+  planId?: string;
+  envelopeBody: Record<string, unknown>;
+}): Promise<void> {
+  try {
+    const pending = await pendingAttentionForHook({
+      vaultPath: args.vaultPath,
+      subscriberId: args.subscriberId,
+      planId: args.planId,
+    });
+    if (!pending || !args.planId) return;
+    args.envelopeBody.pending_attention = pending.notifications.map((item) => ({
+      seq: item.seq,
+      actor: item.actor,
+      kind: item.kind,
+      ...(item.slice_id ? { slice_id: item.slice_id } : {}),
+      delta: item.delta,
+    }));
+    const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
+    if (lastSeq === undefined) return;
+    const planId = args.planId;
+    deferUntilDelivered(async () => {
+      await confirmDeliveryInVault(args.vaultPath, args.subscriberId, planId, lastSeq, true);
+    });
+  } catch {
+    // Relay is not SoT. A missed attach leaves the cursor behind.
+  }
+}
 
 export interface AgentHookConfig {
   /** Stamped agent identity (e.g. "codex", "grok-build"). */
@@ -1060,6 +1099,12 @@ export function createHookHandlers(
     if (activePlan !== undefined) {
       envelopeBody.active_thread = activePlan;
     }
+    await attachPendingAttention({
+      vaultPath: config.vaultPath,
+      subscriberId: config.agentId,
+      planId: activePlan?.plan_id,
+      envelopeBody,
+    });
 
     const budget = envelopeBudgetFor(config.contextWindow);
     if (identityRead.ok && identityRead.data?.context) {
@@ -1377,6 +1422,12 @@ export function createHookHandlers(
     if (activePlan !== undefined) {
       envelopeBody.active_thread_ref = compactPlanPointer(activePlan);
     }
+    await attachPendingAttention({
+      vaultPath: config.vaultPath,
+      subscriberId: config.agentId,
+      planId: activePlan?.plan_id,
+      envelopeBody,
+    });
     if (!activePlanReadOk) {
       const existing =
         envelopeBody.degraded !== undefined &&
@@ -1705,12 +1756,33 @@ export function createHookHandlers(
       }
     }
 
-    if (correctionsEnvelope) {
+    let pendingStopText = "";
+    try {
+      const planId = await activePlanIdFromVault(config.vaultPath);
+      const pending = await pendingAttentionForHook({
+        vaultPath: config.vaultPath,
+        subscriberId: config.agentId,
+        planId,
+      });
+      if (pending && planId) {
+        pendingStopText = pending.text;
+        const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
+        if (lastSeq !== undefined) {
+          deferUntilDelivered(async () => {
+            await confirmDeliveryInVault(config.vaultPath, config.agentId, planId, lastSeq, true);
+          });
+        }
+      }
+    } catch {
+      // Relay is not SoT.
+    }
+
+    if (correctionsEnvelope || pendingStopText) {
       // Inject is the model-facing channel; append any stop note (receipt /
       // candidates CTA) so both land in one Stop output. Prefer inject over
       // note alone — on Grok both channels work at Stop, but inject is what
-      // carries structured memory.
-      const text = [correctionsEnvelope, result.systemMessage]
+      // carries structured memory. Pending attention rides the same inject.
+      const text = [correctionsEnvelope, pendingStopText, result.systemMessage]
         .filter((part): part is string => Boolean(part && part.trim()))
         .join("\n\n");
       return render(injectIntent("Stop", text));
