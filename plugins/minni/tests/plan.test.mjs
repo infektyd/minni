@@ -948,13 +948,15 @@ test("digest v3 changes for assignment, generation, claim metadata, and proposal
 });
 
 // Gate T2 requires EVERY new durable slice field to affect v3, not just the
-// five exercised above — `requirements` and `assignment_profile` are the
-// remaining two named in the interface (plan.ts PlanSlice).
-test("digest v3 also changes for requirements and assignment_profile", () => {
+// five exercised above — `requirements`, `assignment_profile`, and
+// `replaced_by` (exclusive-split remount honesty) are the remaining named
+// optional fields on PlanSlice.
+test("digest v3 also changes for requirements, assignment_profile, and replaced_by", () => {
   const base = makePlan();
   const variants = [
     { requirements: ["needs-shell-access"] },
     { assignment_profile: "profile-research" },
+    { replaced_by: ["child-a", "child-b"] },
   ];
   for (const extra of variants) {
     const changed = withSliceZeroField(base, extra);
@@ -2532,6 +2534,91 @@ test("updateSlice: superseded (not just done) also satisfies a dependency", () =
   const aSuperseded = updateSlice(plan, "a", "superseded", "replaced by a different approach, see replan");
   const bDone = updateSlice(aSuperseded, "b", "done", "B is finished, verified via logs/b.log");
   assert.equal(bDone.slices.find((s) => s.id === "b").status, "done");
+});
+
+// Exclusive split is replacement, not drop-without-replacement: superseding the
+// parent while adding children must NOT treat depends_on as resolved. Plain
+// contract drop (drop-only) still unblocks — that residual stays disclosed.
+test("unmetDependencies: exclusive split keeps dependents blocked; contract drop still resolves", () => {
+  const plan = {
+    plan_id: "split-dep",
+    goal: "split remount",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-20T12:00:00.000Z",
+    updated: "2026-08-20T12:00:00.000Z",
+    rev: 1,
+  };
+
+  const contracted = applySliceDelta(plan, { drop_slice_ids: ["s0"] });
+  assert.equal(contracted.slices.find((s) => s.id === "s0").status, "superseded");
+  assert.deepEqual(
+    unmetDependencies(contracted, "b"),
+    [],
+    "plain contract drop-without-replacement still resolves depends_on",
+  );
+  assert.equal(
+    contracted.slices.find((s) => s.id === "s0").replaced_by,
+    undefined,
+    "drop-only must not mark replacement",
+  );
+
+  const split = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "two independently verifiable outputs",
+        slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+        ],
+      },
+      "s0",
+    ),
+  );
+  const parent = split.slices.find((s) => s.id === "s0");
+  assert.equal(parent.status, "superseded");
+  assert.deepEqual(
+    [...(parent.replaced_by ?? [])].sort(),
+    ["child-a", "child-b"],
+    "split marks the superseded parent as replaced by the children",
+  );
+  assert.deepEqual(
+    unmetDependencies(split, "b"),
+    ["s0"],
+    "dependents of a replaced parent stay blocked until orch remounts depends_on",
+  );
+  assert.deepEqual(unmetDependencies(split, "child-a"), [], "children do not inherit parent deps");
+  assert.deepEqual(unmetDependencies(split, "child-b"), []);
+  assert.deepEqual(unmetDependencies(split, "indie"), []);
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "structuralProposalDelta / applySliceDelta must not auto-remount depends_on",
+  );
+
+  const remounted = replan(split, [
+    { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+    { id: "child-a", title: "Child A" },
+    { id: "child-b", title: "Child B" },
+    { id: "indie", title: "Independent" },
+  ]);
+  assert.deepEqual(remounted.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+  assert.deepEqual(
+    unmetDependencies(remounted, "b").sort(),
+    ["child-a", "child-b"],
+    "after orch remount on the existing replan surface, b waits on the children",
+  );
 });
 
 test("updateSlice: succeeds once the dependency actually resolves, no force needed", () => {
