@@ -353,3 +353,32 @@ test("exclusive replan reservation is live only for a live owner", async (t) => 
     "dead exclusive-replan owner must not block kick",
   );
 });
+
+test("corrupt exclusive-replan reservation is not live and acquire reaps it", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-corrupt-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(reservationPath, "{not a reservation owner\n", { mode: 0o600 });
+
+  assert.equal(
+    await exclusiveReplanReservationIsLive(root, "plan-x"),
+    false,
+    "unparseable reservation must not look live (kick must still drain)",
+  );
+
+  let entered = false;
+  await withExclusiveReplanReservation(root, "plan-x", "replan-after-corrupt", async () => {
+    entered = true;
+    assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), true);
+  });
+  assert.equal(entered, true, "acquire must reap corrupt reservation instead of THREAD_BUSY");
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+  await assert.rejects(readFile(reservationPath, "utf8"), { code: "ENOENT" });
+});

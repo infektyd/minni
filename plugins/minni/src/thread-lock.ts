@@ -357,8 +357,9 @@ export async function exclusiveReplanReservationIsLive(
   }
   const owner = parseOwner(raw);
   if (owner === undefined) {
-    // File exists but is unreadable as an owner: yield (do not apply).
-    return true;
+    // Unparseable is not a live exclusive replan. Kick must not park
+    // forever; acquire reaps (same as a dead owner).
+    return false;
   }
   const isProcessAlive = options.isProcessAlive ?? processAlive;
   const getProcessStartMarker =
@@ -417,10 +418,17 @@ export async function withExclusiveReplanReservation<T>(
       throw readError;
     }
     const observed = parseOwner(raw ?? "");
-    const live =
-      observed === undefined
-        ? true
-        : ownerLooksLive(observed, isProcessAlive, getProcessStartMarker).live;
+    if (observed === undefined) {
+      // Corrupt reservation: reap and retry. Same as a dead owner —
+      // do not wait out DEFAULT_WAIT_MS then throw THREAD_BUSY.
+      await rm(reservationPath, { force: true }).catch(() => {});
+      continue;
+    }
+    const live = ownerLooksLive(
+      observed,
+      isProcessAlive,
+      getProcessStartMarker,
+    ).live;
     if (!live) {
       await rm(reservationPath, { force: true }).catch(() => {});
       continue;

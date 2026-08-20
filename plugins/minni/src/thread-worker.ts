@@ -2171,7 +2171,12 @@ export async function updateClaimedSlice(
   }
 }
 
-const drainKicks = new Map<string, Promise<void>>();
+type DrainKickEntry = {
+  oneShot: boolean;
+  followUpFull: boolean;
+};
+
+const drainKicks = new Map<string, DrainKickEntry>();
 
 function drainKickKey(vaultPath: string, planId: string): string {
   return `${path.resolve(vaultPath)}\0${planId}`;
@@ -2266,6 +2271,10 @@ export interface KickWorkerWriteDrainOptions {
  * reservation is not yet live (closes apply-before-orch-reserve TOCTOU).
  * Kick still drains when no exclusive replan is in flight (later drain /
  * post-replan kick / kick without oneShotYield).
+ *
+ * A one-shot in-flight run can exit without applying. A later full-drain
+ * kick (complete-behind-start, post-replan) must not be coalesced away —
+ * mark follow-up so this process reasserts after the one-shot returns.
  */
 export function kickWorkerWriteDrain(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
@@ -2273,8 +2282,19 @@ export function kickWorkerWriteDrain(
   options: KickWorkerWriteDrainOptions = {},
 ): void {
   const key = drainKickKey(input.vaultPath, input.planId);
-  if (drainKicks.has(key)) return;
-  const run = drainWorkerWrites(input, deps, {
+  const existing = drainKicks.get(key);
+  if (existing) {
+    if (existing.oneShot && options.oneShotYield !== true) {
+      existing.followUpFull = true;
+    }
+    return;
+  }
+  const entry: DrainKickEntry = {
+    oneShot: options.oneShotYield === true,
+    followUpFull: false,
+  };
+  drainKicks.set(key, entry);
+  void drainWorkerWrites(input, deps, {
     oneShotYield: options.oneShotYield === true,
   })
     .catch(() => {
@@ -2283,8 +2303,10 @@ export function kickWorkerWriteDrain(
     })
     .finally(() => {
       drainKicks.delete(key);
+      if (entry.followUpFull) {
+        kickWorkerWriteDrain(input, deps);
+      }
     });
-  drainKicks.set(key, run);
 }
 
 /**
@@ -2411,13 +2433,9 @@ async function drainOneQueuedWorkerWrite(
       (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
       input.now,
   };
-  try {
-    await applyClaimedSliceOnLockedPlan(mapped, deps);
-  } catch (error) {
-    // Fail-closed: an accepted write that failed apply is still accepted.
-    // Dropping it lets a later complete persist done with no start.
-    throw error;
-  }
+  // Fail-closed: apply throw must not reach removeQueuedWorkerWrite.
+  // Dropping the ticket lets a later complete persist done with no start.
+  await applyClaimedSliceOnLockedPlan(mapped, deps);
   await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
   const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const next = leftover[0];

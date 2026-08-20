@@ -1431,6 +1431,116 @@ test("kick one-shot yield: lock free before orch reserve, process stays up", { t
   assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
 });
 
+test("full-drain kick after one-shot yield still applies (no coalesce drop)", { timeout: 20_000 }, async (t) => {
+  // Accept start arms a one-shot kick. Complete-behind-start arms a full
+  // drain. If the one-shot is still in flight, the full kick must not be
+  // coalesced away — this process has to reassert after the one-shot yields.
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "coalesce-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+
+  const complete = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "complete-0",
+    action: {
+      action: "complete",
+      evidence: "Verification: slice s0 done via test ID T-coalesce",
+    },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(complete), true, "complete-behind-start must enqueue");
+
+  releaseHold();
+  await holder;
+
+  // In-process reassert only — do not kick again. A coalesced-away full
+  // drain would leave tickets parked until standing drain / later MCP.
+  const begin = Date.now();
+  let last;
+  while (Date.now() - begin < 8_000) {
+    last = await journalState(fixture);
+    if (last.started.includes("s0") && last.completed.includes("s0")) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(
+    last?.started.includes("s0"),
+    `one-shot then full-drain kick must apply start in-process: ${JSON.stringify(last?.started)}`,
+  );
+  assert.ok(
+    last?.completed.includes("s0"),
+    `follow-up full drain must apply complete after start: ${JSON.stringify(last?.completed)}`,
+  );
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0, `Q must drain in-process: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "done");
+});
+
+test("corrupt exclusive-replan file does not park an accepted start", { timeout: 15_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const key = createHash("sha256").update(fixture.planId).digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    fixture.vaultPath,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(reservationPath, "{not a reservation owner\n", { mode: 0o600 });
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  if (isAcceptedWorkerWrite(start)) {
+    await drainWorkerWrites({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+    });
+  }
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "in_progress");
+  const journal = await journalState(fixture);
+  assert.deepEqual(journal.started, ["s0"]);
+});
+
 test("kick still applies start when no exclusive replan is in flight", { timeout: 20_000 }, async (t) => {
   const fixture = await burstFixture(t, 1);
   const [claim] = await assignAndClaimAll(fixture);
