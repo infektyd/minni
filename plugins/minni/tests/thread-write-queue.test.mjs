@@ -15,9 +15,13 @@ import { withThreadLock } from "../dist/thread-lock.js";
 import {
   assignSlice,
   claimSlice,
+  deleteClaimSecretsBestEffort,
   drainPendingWorkerWritesForVault,
+  drainWorkerWrites,
   isAcceptedWorkerWrite,
   kickWorkerWriteDrain,
+  pruneSliceReceiptsAfterPlanMutation,
+  revokedClaimIds,
   START_ACCEPTED_RECEIPT_KIND,
   startAcceptedReceiptKey,
   updateClaimedSlice,
@@ -897,4 +901,265 @@ test("MCP queued payload is not the applied slice/ready/rev shape", async (t) =>
   release();
   await holder;
   await waitForJournal(fixture, { started: 1 });
+});
+
+test("leftover accepted start does not apply live after orch split supersedes s0", { timeout: 30_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const acceptGeneration = claim.generation;
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const split = withThreadPlanLock(
+    {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      operationId: "orch-split-s0",
+    },
+    async (plan) => {
+      await hold;
+      const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+      assert.ok(
+        queued.some((item) => item.idempotencyKey === "start-0" && item.action?.action === "start"),
+        `start must be queued before split: ${JSON.stringify(queued)}`,
+      );
+      assert.equal(queued.find((item) => item.idempotencyKey === "start-0")?.generation, acceptGeneration);
+      const stamp = await readStartAcceptedStamp(fixture, claim);
+      assert.equal(stamp?.kind, START_ACCEPTED_RECEIPT_KIND);
+      assert.equal(stamp?.status, "pending");
+      assert.notEqual(stamp?.response.slice.status, "in_progress");
+      const updated = applySliceDelta(plan, {
+        drop_slice_ids: ["s0"],
+        add_slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+        ],
+      });
+      assert.equal(updated.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+      assert.equal(
+        updated.slices.some((slice) => slice.id === "s0" && slice.status !== "superseded"),
+        false,
+      );
+      assert.deepEqual(
+        updated.slices.filter((slice) => slice.status !== "superseded").map((slice) => slice.id).sort(),
+        ["child-a", "child-b"],
+      );
+      await persistPlan(updated, {
+        vaultPath: fixture.vaultPath,
+        notePath: fixture.notePath,
+      });
+      await pruneSliceReceiptsAfterPlanMutation(
+        fixture.vaultPath,
+        fixture.planId,
+        plan,
+        updated,
+      );
+      await deleteClaimSecretsBestEffort(
+        fixture.vaultPath,
+        fixture.planId,
+        revokedClaimIds(plan, updated),
+      );
+      return updated;
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  assert.equal(start.applied, false);
+  releaseHold();
+  await split;
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0, `stale leftover start must not stay as live Q: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(fixture.notePath);
+  const parent = plan.slices.find((slice) => slice.id === "s0");
+  assert.ok(parent, "split never deletes the parent");
+  assert.equal(parent.status, "superseded");
+  assert.notEqual(parent.status, "in_progress");
+  assert.notEqual(parent.status, "done");
+  assert.equal(parent.claim, undefined);
+  assert.ok(parent.generation === undefined || parent.generation > acceptGeneration);
+  assert.equal(plan.slices.filter((slice) => slice.id === "s0").length, 1);
+  assert.deepEqual(
+    plan.slices.filter((slice) => slice.status !== "superseded").map((slice) => slice.id).sort(),
+    ["child-a", "child-b"],
+  );
+  const journal = await journalState(fixture);
+  assert.equal(
+    journal.started.includes("s0"),
+    false,
+    `journal must not show leftover start as live work on the dead parent: ${JSON.stringify(journal.started)}`,
+  );
+  assert.equal(journal.completed.includes("s0"), false);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-s0-after-split",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-split",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /claim scope mismatch|not worker-updatable|cannot persist done|claim token mismatch|claim expired/,
+  );
+  const afterComplete = await rehydratePlan(fixture.notePath);
+  assert.equal(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+  assert.notEqual(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "done");
+  const journalAfter = await journalState(fixture);
+  assert.equal(journalAfter.completed.includes("s0"), false);
+});
+
+test("generation-N leftover start does not authorize or block N+1", { timeout: 30_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claimN] = await assignAndClaimAll(fixture);
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const advance = withThreadPlanLock(
+    {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      operationId: "reassign-s0-n1",
+    },
+    async (plan) => {
+      await hold;
+      const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+      assert.equal(queued[0]?.idempotencyKey, "start-0");
+      assert.equal(queued[0]?.generation, claimN.generation);
+      const stampN = await readStartAcceptedStamp(fixture, claimN);
+      assert.equal(stampN?.kind, START_ACCEPTED_RECEIPT_KIND);
+      const slice = plan.slices[0];
+      const nextGeneration = (slice.generation ?? 0) + 1;
+      const updated = {
+        ...plan,
+        slices: [
+          {
+            ...slice,
+            assigned_to: "worker-1",
+            generation: nextGeneration,
+            claim: undefined,
+          },
+        ],
+      };
+      await persistPlan(updated, {
+        vaultPath: fixture.vaultPath,
+        notePath: fixture.notePath,
+      });
+      await pruneSliceReceiptsAfterPlanMutation(
+        fixture.vaultPath,
+        fixture.planId,
+        plan,
+        updated,
+      );
+      await deleteClaimSecretsBestEffort(
+        fixture.vaultPath,
+        fixture.planId,
+        revokedClaimIds(plan, updated),
+      );
+      return updated;
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const accepted = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claimN.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(accepted), true);
+  releaseHold();
+  await advance;
+  const claimN1 = await claimSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-1",
+    idempotencyKey: "claim-n1",
+    now: THREAD_START,
+  });
+  assert.ok(claimN1.generation > claimN.generation);
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0, `N leftover start must not remain live at N+1: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "pending");
+  assert.notEqual(plan.slices[0].status, "in_progress");
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 0, "old-generation start must not journal as live work");
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-1",
+      token: claimN1.token,
+      idempotencyKey: "complete-n1-no-start",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-n1",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /complete cannot persist done without start/,
+  );
+  const after = await rehydratePlan(fixture.notePath);
+  assert.equal(after.slices[0].status, "pending");
+  const startN1 = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-1",
+    token: claimN1.token,
+    idempotencyKey: "start-n1",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:03:00.000Z"),
+  });
+  if (isAcceptedWorkerWrite(startN1)) {
+    await drainWorkerWrites({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+    });
+  }
+  const live = await rehydratePlan(fixture.notePath);
+  assert.equal(live.slices[0].status, "in_progress");
+  const journalLive = await journalState(fixture);
+  assert.deepEqual(journalLive.started, ["s0"]);
 });
