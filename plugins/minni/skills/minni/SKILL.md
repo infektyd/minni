@@ -207,17 +207,19 @@ Core rule: Minni owns the team substrate; Codex CLI, Codex Desktop, Claude Code,
    - Call `minni_status`.
    - Recall narrowly for the task, including relevant Layer 1 / foundational context and Layer 2 project/session context.
 
-2. Build the team packet.
-   - Call `minni_team_runtime` before spawning or delegating.
+2. Project the team packet from one Thread.
+   - Call `minni_team_runtime` with `plan_id` when a Thread already exists. Absent `plan_id` creates one Thread from the task.
+   - Ready is the expiry sweep plus `readySlices`. Leftover `taskLedger` is a view of `ready`, not a second graph.
    - Prefer 3 default lanes when the user does not specify: explorer, worker, reviewer.
    - Use up to 5 lanes only when workstreams are genuinely independent.
    - Assign explicit focus, ownership, and permissions for each temporary agent.
+   - Do not pass `coordinatorAgentId`. The server stamps it (G11).
 
-3. Spawn or delegate through the current host adapter.
-   - After assign → claim, call `dispatchWorkerPacket` with one Wave 2 worker packet. That packet is the worker contract, not Team `hydrationPackets`.
+3. Dispatch through the current host adapter.
+   - After assign → claim, call library `buildWorkerPacketAfterClaim`, then `dispatchWorkerPacket` with that one packet. Neither is an MCP tool. That packet is the worker contract, not Team `hydrationPackets`.
    - grok: worker-start is MISSING. Do not invent SubagentStop, injectSteps, Stop hooks, or `/minni:handoff grok -p`.
    - agy: default allowlist cannot run `minni_thread_worker_update`. injectSteps is not start. No worker allowlist exists yet.
-   - Codex: map one Wave 2 packet onto one Codex subagent (replaces `temporaryProfile` + `hydrationPacket`). Dispatch is UNPROVEN. Do not claim a spawn Minni cannot verify.
+   - Codex: map one Wave 2 packet onto one Codex subagent (replaces `temporaryProfile` + `hydrationPacket`). Dispatch is UNPROVEN. `spawned` is false. Do not claim a spawn Minni cannot verify.
    - Cursor is out of this first wet set.
    - Temporary agents may recall and report. They must not learn, write vault notes, persist identity, or promote themselves — this is a host-side instruction the coordinator must enforce (e.g. by scoping tool permissions), not a boundary the daemon enforces (see `docs/concepts.md`).
 
@@ -255,14 +257,15 @@ Use Sovereign Team Mode for this. Hydrate from Layer 1 and Layer 2, create tempo
 - `minni_audit_report`: Summarize recent memory tool activity.
 - `minni_audit_tail`: Show recent memory audit entries.
 - `minni_negotiate_handoff`: Build an agent-to-agent handoff envelope (identity, top recalls with provenance, scar tissue, open questions, inbox pointer) optimized for another LLM to consume — use before delegating to a subagent or another session.
-- `minni_team_runtime`: Build a temporary team packet with agent profiles, task ledger, hydration packets, gates, and non-goals. It does not spawn agents, write durable memory, or promote profiles.
+- `minni_team_runtime`: Project one vault Thread as a Team packet (`plan_id`, `rev`, `readySlices` after the expiry sweep). Absent `plan_id` creates one Thread. Leftover `taskLedger` is a view of `ready`. It does not spawn, claim, assign, or write durable memory.
 - `minni_team_evidence`: Summarize temporary agent evidence reports and promotion candidates. Promotion and durable learning remain explicit human decisions.
 - `minni_team_promotion`: Draft a permanent agent profile from a temporary team profile only after explicit approval. This is still dry-run and does not write durable memory.
 - `minni_thread_*` (16 tools — create/update/status/activate/deactivate/replan/diff/history/revision/restore/scar/ready/assign/claim/worker_update/events): Durable, evidence-gated work threads that survive sessions and compaction. Slices cannot be marked done without substantive evidence; scope changes go through replan (history preserved); dead-ends are recorded as scars. The active thread auto-injects into hooks on all platforms.
+  - **Team projection**: `minni_team_runtime` projects one vault Thread (`plan_id` + `readySlices` after the expiry sweep). `ledgerFor` and the compat invented-ready chain are gone. Leftover `taskLedger` is a view of `ready`.
   - **Orchestrator tools**: `minni_thread_create`, `minni_thread_replan`, `minni_thread_assign`, `minni_thread_ready`, `minni_thread_events` (plus `minni_thread_update`, `minni_thread_status`, `minni_thread_scar`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_activate`, `minni_thread_deactivate`). The orchestrator creates threads, discovers ready slices with `minni_thread_ready`, assigns workers with `minni_thread_assign` (passes `worker_agent_id`, setting durable slice field `assigned_to`), modifies graph topology with `minni_thread_replan`, and polls ordered journal events with `minni_thread_events`.
   - **Worker tools & packet**: Workers claim an assigned slice via `minni_thread_claim` to obtain a lease `token` (valid for `ttl_seconds`). After assign → claim, `buildWorkerPacketAfterClaim` copies `ThreadClaimResponse` (`plan_id`, `slice_id`, `generation`, `token` as `claim_token`) plus that slice, thread goal/constraints, completed-dep evidence refs, bounded `prepare_task` recall (G11: `DEFAULT_AGENT_ID`), and allowed mutations (`start` / `progress` / `block` / `scar` / `propose_structure` / `complete`). This is not built inside `minni_team_runtime`, not before claim, and not a new MCP tool. Workers mutate slice execution state via `minni_thread_worker_update` only (non-blank `idempotency_key` and substantive `evidence` where required). Action `start` transitions any claimed non-terminal worker-updatable slice (`pending`, `in_progress`, or `blocked`) to `in_progress`. (Slice statuses are `pending`, `in_progress`, `done`, `blocked`, `superseded`; there is no `assigned` status). Workers cannot mutate graph topology directly; they propose structural expansions or contractions via `propose_structure` for orchestrator review.
   - **Ordered event cursors**: `minni_thread_events(plan_id?, since_seq?, limit?)` reads durable, monotonic journal events starting after a sequence cursor (`since_seq`) for coordinator tracking, event replay, and crash recovery.
-  - **Honest limits**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction depends on host tool exposure/scoping. Claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is enforced by the Thread engine regardless of caller principal. Wave 3 host dispatch (`dispatchWorkerPacket`) is honesty-only for the first wet set: grok MISSING, agy default CANNOT, Codex UNPROVEN. It does not spawn or wake. Daemon notification relay, automatic spawning, and immediate wake stay later waves.
+  - **Honest limits**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction depends on host tool exposure/scoping. Claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is enforced by the Thread engine regardless of caller principal. Wave 3 host dispatch (`dispatchWorkerPacket`) is honesty-only for the first wet set: grok worker-start MISSING, agy default CANNOT, Codex UNPROVEN, `spawned` false. Completion is `minni_thread_worker_update`. G3 daemon notification relay, automatic spawning, immediate wake, grok worker-start, and an agy worker allowlist are not implemented.
   - On-disk artifact naming (`plan_id`, the `plan-<hex>` id prefix, `plan_*` frontmatter, `_active_plan.json`) is deliberately FROZEN at the old names. The pre-rename `minni_plan_*` aliases were removed in v0.5.0 — only the `minni_thread_*` names resolve.
 
 ## Slash Commands (Claude Code)
@@ -274,7 +277,7 @@ Use Sovereign Team Mode for this. Hydrate from Layer 1 and Layer 2, create tempo
 - `/minni:prepare-task <task>` — ranked task packet before complex work.
 - `/minni:prepare-outcome` — dry-run outcome packet, no writes.
 - `/minni:team-mode <task>` — full temporary-agent workflow reminder for Sovereign Team Mode.
-- `/minni:team-runtime <task>` — temporary helper-agent coordination packet.
+- `/minni:team-runtime <task>` — project one vault Thread as a Team packet (`plan_id` + `readySlices`).
 - `/minni:team-evidence` — dry-run evidence and promotion review.
 - `/minni:team-promotion` — approved promotion draft, still no durable write.
 - `/minni:threads` — proposal-first durable work threads: create, gate slices with evidence, replan without losing history. (Renamed from `/minni:plan`.)

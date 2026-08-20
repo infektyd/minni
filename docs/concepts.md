@@ -45,12 +45,15 @@ serialized into the team packet for host adapters to honor, not a boundary
 the daemon enforces — a spawned helper handed the same host-level
 `minni_learn` tool access can still call it, so scope tool permissions at
 the runtime level if that matters for your setup. A note
-on maturity while we're here: the temporary-team surface itself hasn't been
-exercised beyond its unit tests yet. What *is* battle-tested daily is the
-core multi-agent loop — several approved principals (e.g. `claude-code` and
-`codex`) sharing one daemon, staging and resolving each other's candidates —
-because Minni is developed using Minni. At that scale it holds up; the team
-harness is the untested frontier.
+on maturity while we're here: Team projection, the post-claim worker packet,
+and the honesty dispatch are in the tree and covered by unit tests. Host
+start is still the untested frontier. grok has no worker-start, default agy
+cannot run `minni_thread_worker_update`, and Codex dispatch stays UNPROVEN.
+What *is* battle-tested daily is the core multi-agent loop — several approved
+principals (e.g. `claude-code` and `codex`) sharing one daemon, staging and
+resolving each other's candidates — because Minni is developed using Minni.
+At that scale it holds up. Automatic spawning and immediate wake are not
+the untested frontier; they are not implemented.
 
 **Approval.** Who gets to resolve candidates is decided per principal, and the
 operator can delegate it. Four resolution paths exist, all landing in the
@@ -171,9 +174,10 @@ Durable, evidence-gated threads (`minni_thread_*`) survive sessions and
 compaction, backing multi-step orchestration through Markdown graph artifacts
 (`plan-*.md`) and ordered event journals (`plan-*.log.md`).
 
-- **Orchestrator tools vs worker tools**: The orchestrator manages graph topology (`minni_thread_create`, `minni_thread_replan`), inspects ready slices (`minni_thread_ready`), assigns workers (`minni_thread_assign`, which accepts `worker_agent_id` and sets durable slice field `assigned_to`), and monitors progress via ordered event streams (`minni_thread_events`). Workers claim an assigned slice via `minni_thread_claim` to obtain a lease `token`. After assign → claim, the Team adapter (`buildWorkerPacketAfterClaim`) builds one worker packet from that `ThreadClaimResponse` (`token` is labeled `claim_token`) plus the claimed slice, thread goal/constraints, completed-dep evidence refs, and bounded `prepare_task` recall. It is not built inside `minni_team_runtime` and is not a new MCP tool. Workers mutate slice execution state via `minni_thread_worker_update` only. Action `start` transitions any claimed non-terminal worker-updatable slice (`pending`, `in_progress`, or `blocked`) to `in_progress` (slice statuses are `pending`, `in_progress`, `done`, `blocked`, `superseded`; there is no `assigned` status). Workers cannot directly alter topology; they propose structural expansions or contractions via `propose_structure` for orchestrator replan.
+- **Team projection**: `minni_team_runtime` projects one vault Thread. `plan_id` present reads that Thread and fails if it is missing. `plan_id` absent creates one Thread (`goal = task.trim()`, independent pending slices). Ready is the expiry sweep plus `readySlices`. `ledgerFor` and the compat invented-ready chain are gone. A leftover `taskLedger` name is a view of `ready`, not a second graph. The coordinator id is stamped server-side (G11); the model-facing schema does not take `coordinatorAgentId`.
+- **Orchestrator tools vs worker tools**: The orchestrator manages graph topology (`minni_thread_create`, `minni_thread_replan`), inspects ready slices (`minni_thread_ready`), assigns workers (`minni_thread_assign`, which accepts `worker_agent_id` and sets durable slice field `assigned_to`), and monitors progress via ordered event streams (`minni_thread_events`). Workers claim an assigned slice via `minni_thread_claim` to obtain a lease `token`. After assign → claim, the library adapter `buildWorkerPacketAfterClaim` builds one worker packet from that `ThreadClaimResponse` (`token` is labeled `claim_token`) plus the claimed slice, thread goal/constraints, completed-dep evidence refs, and bounded `prepare_task` recall. It is not built inside `minni_team_runtime` and is not a new MCP tool. Workers mutate slice execution state via `minni_thread_worker_update` only. Action `start` transitions any claimed non-terminal worker-updatable slice (`pending`, `in_progress`, or `blocked`) to `in_progress` (slice statuses are `pending`, `in_progress`, `done`, `blocked`, `superseded`; there is no `assigned` status). Workers cannot directly alter topology; they propose structural expansions or contractions via `propose_structure` for orchestrator replan.
 - **Ordered event cursors**: The thread journal records monotonic events readable via `minni_thread_events(plan_id?, since_seq?, limit?)`. Cursors enable state catch-up, deterministic replay, and crash recovery without daemon-canonical state divergence or out-of-order delivery.
-- **Authority boundary & honest limits**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction depends on host tool exposure / scoping, while claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is strictly enforced by the Thread engine regardless of caller principal. Wave 3 `dispatchWorkerPacket` is the host-dispatch honesty adapter (grok MISSING, agy default CANNOT, Codex UNPROVEN). It does not spawn. Daemon notification relays, automatic spawning, and immediate wake are not implemented.
+- **Authority boundary & honest limits**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction depends on host tool exposure / scoping, while claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is strictly enforced by the Thread engine regardless of caller principal. Wave 3 `dispatchWorkerPacket` is the host-dispatch honesty adapter (library, not MCP): grok worker-start is MISSING, default agy allowlist is CANNOT (`minni_thread_worker_update` is not granted), Codex is UNPROVEN, and `spawned` is always false. Completion is `minni_thread_worker_update`. G3 daemon notification relay, automatic spawning, immediate wake, grok worker-start, and an agy worker allowlist are not implemented. Do not invent a grok or agy start API. Default agy cannot write `minni_thread_worker_update`.
 
 ## Recall is evidence, not instruction
 
