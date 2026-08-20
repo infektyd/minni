@@ -11,6 +11,7 @@ from minni.worker_write_drain import (
     STANDING_DRAIN_TRIGGER,
     kick_pending_worker_write_drain_for_vault,
     minnid_tick_once,
+    standing_drain_tick_js,
     vaults_needing_worker_write_drain,
     worker_write_drain_enabled,
 )
@@ -32,6 +33,8 @@ def test_python_kick_does_not_write_the_journal():
     assert "write_text" not in source
     assert "drainPendingWorkerWritesForVault" in source
     assert "STANDING_DRAIN_TRIGGER" in source
+    assert "plugin_payload" in source
+    assert "_package_data_tick_js" in source
 
 
 def test_tick_js_calls_existing_apply_entry():
@@ -149,9 +152,69 @@ def test_minnid_tick_not_scheduled_when_disabled(monkeypatch, tmp_path):
     assert loop.task_for(minnid._worker_write_drain_runner) is None
 
 
+def test_tick_js_resolves_from_installed_package_data(tmp_path, monkeypatch):
+    import os
+
+    import minni.worker_write_drain as drain
+
+    tick = tmp_path / "plugin_payload" / "dist" / "standing-drain-tick.js"
+    tick.parent.mkdir(parents=True)
+    tick.write_text("/* installed package_data */\n", encoding="utf-8")
+    monkeypatch.setattr(drain, "_package_dir", lambda: tmp_path)
+    monkeypatch.setattr(drain, "_source_checkout", lambda: None)
+    monkeypatch.setattr(drain, "_deployed_plugin_tick_js", lambda: None)
+    monkeypatch.delenv("MINNI_STANDING_DRAIN_TICK_JS", raising=False)
+    monkeypatch.delenv("GROK_PLUGIN_ROOT", raising=False)
+    monkeypatch.delenv("MINNI_PLUGIN_ROOT", raising=False)
+    assert "MINNI_STANDING_DRAIN_TICK_JS" not in os.environ
+    assert drain._source_checkout() is None
+    found = drain.standing_drain_tick_js()
+    assert found == tick
+    assert found is not None
+    assert "plugin_payload" in found.parts
+    assert found.name == "standing-drain-tick.js"
+
+
+def test_tick_js_missing_on_installed_layout_without_payload(tmp_path, monkeypatch):
+    import os
+
+    import minni.worker_write_drain as drain
+
+    empty = tmp_path / "site-packages" / "minni"
+    empty.mkdir(parents=True)
+    monkeypatch.setattr(drain, "_package_dir", lambda: empty)
+    monkeypatch.setattr(drain, "_source_checkout", lambda: None)
+    monkeypatch.setattr(drain, "_deployed_plugin_tick_js", lambda: None)
+    monkeypatch.delenv("MINNI_STANDING_DRAIN_TICK_JS", raising=False)
+    assert "MINNI_STANDING_DRAIN_TICK_JS" not in os.environ
+    assert standing_drain_tick_js() is None
+
+
+def test_tick_js_prefers_package_data_over_checkout(tmp_path, monkeypatch):
+    import minni.worker_write_drain as drain
+
+    packaged = tmp_path / "pkg" / "plugin_payload" / "dist" / "standing-drain-tick.js"
+    packaged.parent.mkdir(parents=True)
+    packaged.write_text("/* packaged */\n", encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    other = checkout / "plugins" / "minni" / "dist" / "standing-drain-tick.js"
+    other.parent.mkdir(parents=True)
+    other.write_text("/* checkout */\n", encoding="utf-8")
+    monkeypatch.setattr(drain, "_package_dir", lambda: tmp_path / "pkg")
+    monkeypatch.setattr(drain, "_source_checkout", lambda: checkout)
+    monkeypatch.setattr(drain, "_deployed_plugin_tick_js", lambda: None)
+    monkeypatch.delenv("MINNI_STANDING_DRAIN_TICK_JS", raising=False)
+    assert drain.standing_drain_tick_js() == packaged
+
+
 def test_runner_source_is_kick_not_journal():
     import minni.minnid as minnid
 
     src = inspect.getsource(minnid._worker_write_drain_runner)
     assert "minnid_tick_runner" in src
     assert "ingest_journal_into_vault" not in src
+
+
+def test_package_data_ships_standing_drain_tick():
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"plugin_payload/dist/*"' in pyproject

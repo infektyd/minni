@@ -40,8 +40,13 @@ def worker_write_drain_interval() -> float:
     return value
 
 
+def _package_dir() -> Path:
+    """Installed minni package dir (site-packages or src/minni)."""
+    return Path(__file__).resolve().parent
+
+
 def _source_checkout() -> Path | None:
-    pkg = Path(__file__).resolve().parent
+    pkg = _package_dir()
     if pkg.name != "minni" or pkg.parent.name != "src":
         return None
     repo = pkg.parent.parent
@@ -50,11 +55,56 @@ def _source_checkout() -> Path | None:
     return repo
 
 
+def _package_data_tick_js() -> Path | None:
+    """Wheel / site-packages: plugin_payload dist shipped via package_data."""
+    path = _package_dir() / "plugin_payload" / "dist" / "standing-drain-tick.js"
+    return path if path.is_file() else None
+
+
+def _deployed_plugin_tick_js() -> Path | None:
+    """Live plugin install (propagate / GROK_PLUGIN_ROOT). Not Thread SoT."""
+    roots: list[Path] = []
+    for key in ("GROK_PLUGIN_ROOT", "MINNI_PLUGIN_ROOT"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            roots.append(Path(raw).expanduser())
+    plugin_home = Path.home() / ".minni" / "plugin"
+    current = plugin_home / "current"
+    if current.exists():
+        roots.append(current)
+    try:
+        children = list(plugin_home.iterdir()) if plugin_home.is_dir() else []
+    except OSError:
+        children = []
+    for child in children:
+        if child.is_dir() and child.name not in {"current", "cache"}:
+            roots.append(child)
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            key = str(root.resolve()) if root.exists() else str(root)
+        except OSError:
+            key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        path = root / "dist" / "standing-drain-tick.js"
+        if path.is_file():
+            return path
+    return None
+
+
 def standing_drain_tick_js() -> Path | None:
     override = (os.environ.get("MINNI_STANDING_DRAIN_TICK_JS") or "").strip()
     if override:
         path = Path(override).expanduser()
         return path if path.is_file() else None
+    packaged = _package_data_tick_js()
+    if packaged is not None:
+        return packaged
+    deployed = _deployed_plugin_tick_js()
+    if deployed is not None:
+        return deployed
     checkout = _source_checkout()
     if checkout is None:
         return None

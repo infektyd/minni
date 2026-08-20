@@ -1,9 +1,10 @@
 // Standing drain: minnid tick. Accept start, kill that MCP, no later MCP
 // on that vault. Named tick journals slice.started. Stamp is not applied.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import net from "node:net";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { cp, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -24,13 +25,43 @@ import {
 } from "../dist/thread-write-queue.js";
 
 const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
-const TICK_JS = new URL("../dist/standing-drain-tick.js", import.meta.url).pathname;
+const DIST_DIR = new URL("../dist/", import.meta.url).pathname;
 const REPO_ROOT = path.resolve(new URL("../../../", import.meta.url).pathname);
-const PYTHONPATH = path.join(REPO_ROOT, "src");
+const SRC_MINNI = path.join(REPO_ROOT, "src", "minni");
 
 function pythonBin() {
   return process.env.PYTHON ?? process.env.PYTHON3 ?? "python3";
 }
+
+
+async function stageInstalledDaemon(root) {
+  const site = path.join(root, "site-packages");
+  const pkg = path.join(site, "minni");
+  await mkdir(pkg, { recursive: true });
+  await cp(path.join(SRC_MINNI, "worker_write_drain.py"), path.join(pkg, "worker_write_drain.py"));
+  await cp(path.join(SRC_MINNI, "__init__.py"), path.join(pkg, "__init__.py"));
+  const payloadDist = path.join(pkg, "plugin_payload", "dist");
+  await cp(DIST_DIR, payloadDist, { recursive: true });
+  return {
+    site,
+    tickJs: path.join(payloadDist, "standing-drain-tick.js"),
+  };
+}
+
+function installedTickEnv(base, { site, home, vaultPath }) {
+  const env = { ...base };
+  delete env.MINNI_STANDING_DRAIN_TICK_JS;
+  delete env.GROK_PLUGIN_ROOT;
+  delete env.MINNI_PLUGIN_ROOT;
+  env.PYTHONPATH = site;
+  env.PYTHONNOUSERSITE = "1";
+  env.HOME = home;
+  env.MINNI_HOME = home;
+  env.MINNI_VAULT_PATH = vaultPath;
+  env.MINNI_WORKER_WRITE_DRAIN_INTERVAL = "0.15";
+  return env;
+}
+
 
 async function startFakeGateDaemon(socketPath) {
   const daemon = net.createServer((socket) => {
@@ -206,6 +237,9 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
   const holder = withThreadLock(vaultPath, planId, "standing-drain-hold", async () => {
     await held;
   });
+  t.after(() => {
+    release();
+  });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   const started = await call("minni_thread_worker_update", {
@@ -275,20 +309,43 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
   const queuedAfterKill = await listQueuedWorkerWrites(vaultPath, planId);
   assert.equal(pickNextQueuedWorkerWrite(queuedAfterKill)?.idempotencyKey, "start-0");
 
+  const installed = await stageInstalledDaemon(root);
+  const tickEnv = installedTickEnv(process.env, { site: installed.site, home, vaultPath });
+  assert.equal(tickEnv.MINNI_STANDING_DRAIN_TICK_JS, undefined);
+  assert.equal("MINNI_STANDING_DRAIN_TICK_JS" in tickEnv, false);
+  const probe = spawnSync(
+    pythonBin(),
+    [
+      "-c",
+      [
+        "import json, os",
+        "from minni.worker_write_drain import standing_drain_tick_js, _source_checkout",
+        "js = standing_drain_tick_js()",
+        "print(json.dumps({",
+        "  'env_set': 'MINNI_STANDING_DRAIN_TICK_JS' in os.environ,",
+        "  'checkout': None if _source_checkout() is None else str(_source_checkout()),",
+        "  'js': None if js is None else str(js),",
+        "  'parent': None if js is None else str(js.parent),",
+        "  'file': None if js is None else js.name,",
+        "}))",
+      ].join("\n"),
+    ],
+    { env: tickEnv, encoding: "utf8" },
+  );
+  assert.equal(probe.status, 0, `installed-daemon probe failed: ${probe.stderr || probe.stdout}`);
+  const resolved = JSON.parse(probe.stdout.trim().split("\n").at(-1));
+  assert.equal(resolved.env_set, false, "MINNI_STANDING_DRAIN_TICK_JS must be unset");
+  assert.equal(resolved.checkout, null, "installed daemon must not use checkout layout");
+  assert.equal(resolved.file, "standing-drain-tick.js");
+  assert.match(resolved.parent, /plugin_payload[/\\]dist$/);
+  assert.equal(realpathSync(resolved.js), realpathSync(installed.tickJs));
+
   const tick = spawn(
     pythonBin(),
     ["-m", "minni.worker_write_drain"],
     {
-      cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        PYTHONPATH,
-        PYTHONNOUSERSITE: "1",
-        MINNI_HOME: home,
-        MINNI_VAULT_PATH: vaultPath,
-        MINNI_WORKER_WRITE_DRAIN_INTERVAL: "0.15",
-        MINNI_STANDING_DRAIN_TICK_JS: TICK_JS,
-      },
+      cwd: root,
+      env: tickEnv,
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
