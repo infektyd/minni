@@ -124,6 +124,18 @@ function workerUpdate(input, deps) {
   );
 }
 
+function startClaimedSlice(fixture, claim, sliceId, now = new Date("2026-08-18T12:01:00.000Z")) {
+  return workerUpdate({
+    ...fixture,
+    sliceId,
+    workerAgentId: claim.worker_agent_id,
+    token: claim.token,
+    idempotencyKey: `test-start-${sliceId}-${claim.claim_id}`,
+    action: { action: "start" },
+    now,
+  });
+}
+
 async function claimFixture(t, overrides = {}) {
   const vaultPath = await mkdtemp(path.join(tmpdir(), "minni-thread-claim-"));
   t.after(() => rm(vaultPath, { recursive: true, force: true }));
@@ -963,6 +975,8 @@ test("two real processes completing independent slices preserve both results", a
       now: new Date(THREAD_START),
     }),
   ]);
+  await startClaimedSlice(fixture, claimA, "a");
+  await startClaimedSlice(fixture, claimB, "b");
   const workers = [
     startBarrierWorker("updateClaimedSlice", {
       ...fixture,
@@ -1110,7 +1124,7 @@ test("barrier expiry-versus-complete race commits exactly one outcome", async (t
       assert.equal(final.slices[0].claim.claim_id, results[1].value.claim_id);
     }
     if (!results[0].ok) {
-      assert.match(results[0].error, /claim token mismatch|claim scope mismatch|claim expired/);
+      assert.match(results[0].error, /claim token mismatch|claim scope mismatch|claim expired|complete cannot persist done without start/);
     } else {
       assert.equal(results[0].accepted, true);
     }
@@ -1575,6 +1589,7 @@ test("cleanup failures cannot undo reassignment or completion", async (t) => {
       idempotencyKey: "cleanup-failure-complete",
       now: new Date(THREAD_START),
     });
+    await startClaimedSlice(fixture, claim, "a");
     const completed = await workerUpdate({
       ...fixture,
       sliceId: "a",
@@ -1687,6 +1702,7 @@ test("locked orchestrator scar and replan cannot clobber a worker completion", a
         idempotencyKey: `worker-a-${operation}`,
         now: new Date(THREAD_START),
       });
+      await startClaimedSlice(fixture, claim, "a");
 
       let resolveRead;
       const read = new Promise((resolve) => {
@@ -1747,8 +1763,13 @@ test("locked orchestrator scar and replan cannot clobber a worker completion", a
       const mid = await rehydratePlan(fixture.notePath);
       assert.equal(
         mid.slices.find((slice) => slice.id === "a").status,
-        "pending",
-        "accepted is not applied mid-replan",
+        "in_progress",
+        "accepted complete is not applied mid-replan; start already applied",
+      );
+      assert.notEqual(
+        mid.slices.find((slice) => slice.id === "a").status,
+        "done",
+        "accepted complete is not applied mid-replan",
       );
 
       releaseMutation();
@@ -2244,6 +2265,7 @@ test("workerUpdate surfaces a real persistPlan history-append failure on complet
     idempotencyKey: "claim-a-history",
     now: new Date(THREAD_START),
   });
+  await startClaimedSlice(fixture, claim, "a");
 
   const historyPath = historyPathFor(fixture.notePath);
   await rm(historyPath, { force: true });
@@ -2513,6 +2535,7 @@ test("workerUpdate receipt replay on the clean happy path adds no recovery event
     idempotencyKey: "claim-a-happy",
     now: new Date(THREAD_START),
   });
+  await startClaimedSlice(fixture, claim, "a");
 
   const updateInput = {
     ...fixture,
@@ -2558,6 +2581,7 @@ test("a committed worker-update receipt still fails thread_inconsistent when the
     idempotencyKey: "claim-a-ahead",
     now: new Date(THREAD_START),
   });
+  await startClaimedSlice(fixture, claim, "a");
 
   const updateInput = {
     ...fixture,
@@ -2684,6 +2708,7 @@ test("worker mutations append ordered operation and ready.changed events", async
     idempotencyKey: "claim-a",
     now: new Date(THREAD_START),
   });
+  await startClaimedSlice(fixture, claim, "a");
   await workerUpdate({
     ...fixture,
     sliceId: "a",
@@ -3202,6 +3227,7 @@ test("final-fix-2: wrong-token receipt retry does not append state.recovered", a
     idempotencyKey: "claim-wrong-token",
     now: new Date(THREAD_START),
   });
+  await startClaimedSlice(fixture, claim, "a");
   await workerUpdate({
     ...fixture,
     sliceId: "a",
@@ -3259,6 +3285,7 @@ test("final-fix-2: generation-bound receipts replay same-generation complete", a
     idempotencyKey: "gen-receipt-claim",
     now: new Date(THREAD_START),
   });
+  await startClaimedSlice(fixture, claim, "a");
   const done = await workerUpdate({
     ...fixture,
     sliceId: "a",

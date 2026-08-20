@@ -21,7 +21,9 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   worker-update receipt (`slice.start_accepted`, digest only — not
   `slice.started`, not ready, not in_progress). Apply throw keeps that
   stamp. Complete cannot persist `done` while that stamp or start ticket
-  exists; start still applies first. Claim tokens stay off the journal. In-process `kickWorkerWriteDrain` dies with the accepting MCP process; a later drain (`drainWorkerWrites` / `drainPendingWorkerWritesForVault`) still applies one-at-a-time under `withThreadLock`. Stamp is not applied until that later apply. Not minnid-canonical, not a second graph, no new MCP tool.
+  exists; start still applies first. A claimed pending slice with no start,
+  no stamp, and no start ticket also cannot persist `done` (old apply path).
+  That path journals no `slice.completed` without `slice.started`. Claim tokens stay off the journal. In-process `kickWorkerWriteDrain` dies with the accepting MCP process; a later drain (`drainWorkerWrites` / `drainPendingWorkerWritesForVault`) still applies one-at-a-time under `withThreadLock`. Stamp is not applied until that later apply. Not minnid-canonical, not a second graph, no new MCP tool.
 
 - `docs-accuracy-converge.rhai` now binds `risk_acceptance`/`re_check_issue`
   into both loom gap arrays and emits a `Re-checks required` report section
