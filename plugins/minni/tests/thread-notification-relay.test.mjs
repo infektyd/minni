@@ -32,6 +32,7 @@ import {
   saveRelayStore,
   seedRelaySubscribers,
   storeHoldsGraphState,
+  vaultPrincipalSubscriberId,
 } from "../dist/thread-notification-relay.js";
 import { createHookHandlers } from "../dist/hook-handlers.js";
 import { geminiWire, grokBuildWire } from "../dist/hook-platform.js";
@@ -189,7 +190,11 @@ test("hooks read pending attention and do not poll minni_thread_events", async (
   assert.match(eventsSrc, /ingestJournalIntoVault/);
   assert.match(eventsSrc, /ingestRelayAfterJournalAppend/);
   assert.match(eventsSrc, /seedRelaySubscribers/);
+  assert.match(eventsSrc, /vaultPrincipalSubscriberId/);
+  assert.match(eventsSrc, /extraIds/);
   assert.match(relaySrc, /seedRelaySubscribers/);
+  assert.match(relaySrc, /vaultPrincipalSubscriberId/);
+  assert.match(relaySrc, /inboxPrincipalForVaultPath/);
   assert.match(relaySrc, /SQLITE_020_LIVE\s*=\s*false/);
   assert.doesNotMatch(eventsSrc, /minni_thread_events/);
   assert.match(dispatchSrc, /GROK_WORKER_START:\s*null\s*=\s*null/);
@@ -359,6 +364,78 @@ test("first worker_update on a cursor-less store notifies the orchestrator", asy
   assert.equal(pending.hooksPollThreadEvents, false);
   assert.ok(pending.notifications.some((item) => item.actor === WORKER && item.kind === "slice.completed"));
   assert.ok(pending.notifications.every((item) => item.subscriber_id === ORCH));
+});
+
+test("vault principal is fail-closed: no -vault suffix is not a subscriber", () => {
+  assert.equal(vaultPrincipalSubscriberId("/tmp/gemini-vault"), "gemini");
+  assert.equal(vaultPrincipalSubscriberId("/tmp/grok-build-vault"), "grok-build");
+  assert.equal(vaultPrincipalSubscriberId(`/tmp/${ORCH}-vault`), ORCH);
+  assert.equal(vaultPrincipalSubscriberId("/tmp/plain-dir"), undefined);
+  assert.equal(vaultPrincipalSubscriberId("/tmp/vault"), undefined);
+});
+
+test("worker-only journal seeds vault principal; no principal stays empty", async (t) => {
+  const WORKER = "worker-g3";
+  const workerOnly = [
+    {
+      idempotencyKey: "g3-worker-only-complete",
+      kind: "slice.completed",
+      sliceId: "alpha",
+    },
+  ];
+
+  const honestRoot = await mkdtemp(path.join(tmpdir(), "minni-g3-honest-"));
+  const honestVault = path.join(honestRoot, `${ORCH}-vault`);
+  t.after(() => rm(honestRoot, { recursive: true, force: true }));
+  const honestJournal = path.join(honestVault, "wiki", "artifacts", `${PLAN}.log.md`);
+  await mkdir(path.dirname(honestJournal), { recursive: true });
+  assert.equal(vaultPrincipalSubscriberId(honestVault), ORCH);
+
+  await appendOrderedEventBatch({
+    journalPath: honestJournal,
+    planId: PLAN,
+    rev: 1,
+    actor: WORKER,
+    at: "2026-08-20T12:01:00.000Z",
+    events: workerOnly,
+  });
+  const pending = await pendingAttentionForHook({
+    vaultPath: honestVault,
+    subscriberId: ORCH,
+    planId: PLAN,
+  });
+  assert.ok(pending, "worker-only journal: vault principal must still see pending");
+  assert.equal(pending.hooksPollThreadEvents, false);
+  assert.equal(pending.spawned, false);
+  assert.ok(pending.notifications.some((item) => item.actor === WORKER));
+  assert.ok(pending.notifications.every((item) => item.subscriber_id === ORCH));
+
+  const closedVault = await mkdtemp(path.join(tmpdir(), "minni-g3-closed-"));
+  t.after(() => rm(closedVault, { recursive: true, force: true }));
+  const closedJournal = path.join(closedVault, "wiki", "artifacts", `${PLAN}.log.md`);
+  await mkdir(path.dirname(closedJournal), { recursive: true });
+  assert.equal(vaultPrincipalSubscriberId(closedVault), undefined, "no -vault suffix: empty is honest");
+
+  await appendOrderedEventBatch({
+    journalPath: closedJournal,
+    planId: PLAN,
+    rev: 1,
+    actor: WORKER,
+    at: "2026-08-20T12:02:00.000Z",
+    events: [{ idempotencyKey: "g3-worker-only-closed", kind: "slice.completed", sliceId: "alpha" }],
+  });
+  const empty = await pendingAttentionForHook({
+    vaultPath: closedVault,
+    subscriberId: ORCH,
+    planId: PLAN,
+  });
+  assert.equal(empty, null, "no honest vault principal: orchestrator pending stays empty");
+  const workerPending = await pendingAttentionForHook({
+    vaultPath: closedVault,
+    subscriberId: WORKER,
+    planId: PLAN,
+  });
+  assert.ok(workerPending, "writer is still seeded as the append actor");
 });
 
 async function withHookEnv(t, run) {

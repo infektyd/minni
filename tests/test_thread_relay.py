@@ -29,6 +29,7 @@ from minni.thread_relay import (
     relay_store_path,
     seed_relay_subscribers,
     store_holds_graph_state,
+    vault_principal_subscriber_id,
 )
 
 
@@ -254,3 +255,59 @@ def test_sqlite_020_is_not_a_production_writer():
     assert "ingest_journal_into_vault" not in source
     relay = inspect.getsource(thread_relay)
     assert "SQLITE_020_LIVE = False" in relay
+
+def test_vault_principal_is_fail_closed():
+    assert vault_principal_subscriber_id("/tmp/gemini-vault") == "gemini"
+    assert vault_principal_subscriber_id("/tmp/grok-build-vault") == "grok-build"
+    assert vault_principal_subscriber_id("/tmp/orchestrator-g3-vault") == "orchestrator-g3"
+    assert vault_principal_subscriber_id("/tmp/plain-dir") is None
+    assert vault_principal_subscriber_id("/tmp/vault") is None
+
+
+def test_worker_only_journal_seeds_vault_principal_or_stays_empty(tmp_path):
+    worker = "worker-g3"
+    landed = (
+        {
+            "seq": 1,
+            "kind": "slice.completed",
+            "actor": worker,
+            "at": "2026-08-20T12:01:00.000Z",
+            "slice_id": "alpha",
+        },
+    )
+    honest = tmp_path / "orchestrator-g3-vault"
+    honest.mkdir()
+    assert vault_principal_subscriber_id(honest) == "orchestrator-g3"
+    extra = [vault_principal_subscriber_id(honest)]
+    ids = seed_relay_subscribers(
+        actor=worker,
+        plan_id="plan-g3-relay",
+        cursors=[],
+        events=landed,
+        extra_ids=extra,
+    )
+    assert "orchestrator-g3" in ids
+    store = ingest_journal_events(empty_relay_store(), "plan-g3-relay", landed, ids)
+    orch = [item for item in store["pending"] if item["subscriber_id"] == "orchestrator-g3"]
+    assert orch, "worker-only journal: vault principal must still see pending"
+    assert any(item["actor"] == worker for item in orch)
+
+    closed = tmp_path / "plain-dir"
+    closed.mkdir()
+    assert vault_principal_subscriber_id(closed) is None
+    closed_ids = seed_relay_subscribers(
+        actor=worker,
+        plan_id="plan-g3-relay",
+        cursors=[],
+        events=landed,
+        extra_ids=[vid for vid in [vault_principal_subscriber_id(closed)] if vid],
+    )
+    assert "orchestrator-g3" not in closed_ids
+    closed_store = ingest_journal_events(empty_relay_store(), "plan-g3-relay", landed, closed_ids)
+    orch_closed = [
+        item for item in closed_store["pending"] if item["subscriber_id"] == "orchestrator-g3"
+    ]
+    assert orch_closed == [], "no honest vault principal: empty is correct"
+    worker_pending = [item for item in closed_store["pending"] if item["subscriber_id"] == worker]
+    assert worker_pending, "writer is still seeded as the append actor"
+
