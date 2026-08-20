@@ -50,7 +50,11 @@ Use Minni Threads for: $ARGUMENTS
 2. Worker execution packet assembly (after claim only):
    - Call `buildWorkerPacketAfterClaim` with the `ThreadClaimResponse` plus the rehydrated Thread. Do not build this inside `minni_team_runtime` and do not invent a new MCP tool.
    - Packet carries `plan_id` + `slice_id` + `generation` + `claim_token` (where `claim_token` is the `token` received from `minni_thread_claim`), that slice only (`title`, `status`, `gate?`, `depends_on`, `assigned_to`), thread goal + hard constraints, completed-dep evidence refs (ids/paths), bounded `prepare_task` recall, and allowed mutations.
-3. Worker mutations execute via `minni_thread_worker_update` only:
+3. Host dispatch (Wave 3, first wet set):
+   - Call `dispatchWorkerPacket` with that packet and host `grok` | `agy` | `codex`. One packet is one host worker session.
+   - grok returns typed MISSING (`worker-start` does not exist). agy default allowlist returns typed CANNOT (no `minni_thread_*`). Codex returns an UNPROVEN one-packet-to-one-subagent map. `spawned` is always false.
+   - Do not invent a grok or agy start API. Do not copy the Codex map onto grok/agy. Cursor is out of this set.
+4. Worker mutations execute via `minni_thread_worker_update` only:
    - Pass `plan_id`, `slice_id`, `worker_agent_id`, `claim_token`, non-blank `idempotency_key`, and `action`.
    - Supported actions:
      - `start`: transitions any claimed non-terminal worker-updatable slice (`pending`, `in_progress`, or `blocked`) to `in_progress`.
@@ -68,7 +72,7 @@ Use Minni Threads for: $ARGUMENTS
 - **Worker tools**: `minni_thread_claim` (returns lease `token`), `minni_thread_worker_update` (accepts `claim_token`).
 - **Security & authority boundary**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction (`minni_thread_create`, `minni_thread_replan`, `minni_thread_assign`) depends on host tool exposure / scoping. Claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is strictly enforced by Minni regardless of caller principal.
 - **Ordered event cursors**: `minni_thread_events` reads durable, monotonic events from `plan-*.log.md` starting after `since_seq` for crash recovery and polling without out-of-order delivery.
-- **Unimplemented capabilities**: Host dispatch, daemon notification relay, automatic spawning, and immediate wake are later waves.
+- **Host dispatch (Wave 3, first wet set)**: After claim, `dispatchWorkerPacket` takes one WorkerPacket. grok worker-start is MISSING. agy default allowlist is a typed CANNOT (`minni_thread_worker_update` is not granted). Codex maps that packet onto one subagent and marks dispatch UNPROVEN. Cursor is out of this set. The adapter does not spawn or wake. Daemon notification relay, automatic spawning, and immediate wake stay later waves.
 
 ## Hard Rules
 
