@@ -143,6 +143,12 @@ export type PlanEvent =
       // slice that depends on it just as much as depends_on being edited
       // directly — must be equally non-silent.
       depends_on_superseded?: Array<{ slice_id: string; depended_on_by: string[] }>;
+      // Landed topology from orch apply (add/drop MCP args OR new_slices
+      // full-set replan). Journal is SoT for what actually applied —
+      // derived from before→after, never claim tokens. propose_structure
+      // never writes these.
+      add_slices?: CreatePlanInput["slices"];
+      drop_slice_ids?: string[];
     }
   | { kind: "gate_passed"; slice_id: string; evidence: string; at: string }
   | { kind: "rehydrated"; at: string }
@@ -1296,7 +1302,9 @@ export function diffDependsOn(
  * superseded, and unmetDependencies already treats superseded as
  * resolved). That path is cheaper than editing depends_on directly and,
  * before this function, produced NO journal trail at all — the plain
- * "replan" event carries no payload. Pure diff used by the
+ * "replan" event previously carried only depends_on diffs. Orch apply
+ * also journals landed add_slices / drop_slice_ids on that same event
+ * (see landedReplanTopology). Pure diff used by the
  * minni_thread_replan handler to make that supersession visible: for every
  * slice that newly became superseded in this operation, list which
  * still-open (not done/superseded) slices depend on it.
@@ -1325,6 +1333,58 @@ export function diffSupersededDependencies(
     }
   }
   return result;
+}
+
+/**
+ * Landed add/drop for a replan apply, derived from before→after — not from
+ * which MCP args the orch used. Closes the hole where new_slices (full-set
+ * replan; remount uses this) can land adds and supersessions while the
+ * ordered replan event still omits add_slices / drop_slice_ids because
+ * those MCP fields were absent. Echoing request args would miss generated
+ * ids; journaling landed state keeps the ordered journal SoT.
+ *
+ * add_slices: newly appended slices (id + proposal fields only; no claim
+ * token, status, or proposals). drop_slice_ids: ids that newly became
+ * superseded. Empty sides are omitted.
+ */
+export function landedReplanTopology(
+  before: PlanArtifact,
+  after: PlanArtifact,
+): {
+  add_slices?: NonNullable<CreatePlanInput["slices"]>;
+  drop_slice_ids?: string[];
+} {
+  const beforeIds = new Set(before.slices.map((s) => s.id));
+  const add_slices = after.slices
+    .filter((s) => !beforeIds.has(s.id))
+    .map((s) => {
+      const landed: {
+        id: string;
+        title: string;
+        gate?: string;
+        depends_on?: string[];
+        evidence?: string;
+      } = { id: s.id, title: s.title };
+      if (s.gate !== undefined) landed.gate = s.gate;
+      if (s.depends_on !== undefined) landed.depends_on = [...s.depends_on];
+      if (s.evidence !== undefined) landed.evidence = s.evidence;
+      return landed;
+    });
+  const drop_slice_ids = after.slices
+    .filter((s) => s.status === "superseded")
+    .map((s) => s.id)
+    .filter((id) => {
+      const was = before.slices.find((b) => b.id === id);
+      return !!was && was.status !== "superseded";
+    })
+    .sort();
+  const out: {
+    add_slices?: NonNullable<CreatePlanInput["slices"]>;
+    drop_slice_ids?: string[];
+  } = {};
+  if (add_slices.length > 0) out.add_slices = add_slices;
+  if (drop_slice_ids.length > 0) out.drop_slice_ids = drop_slice_ids;
+  return out;
 }
 
 export interface UpdateSliceOptions {
