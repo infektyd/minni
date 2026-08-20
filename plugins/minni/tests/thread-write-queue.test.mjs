@@ -15,10 +15,13 @@ import {
   claimSlice,
   isAcceptedWorkerWrite,
   kickWorkerWriteDrain,
+  START_ACCEPTED_RECEIPT_KIND,
+  startAcceptedReceiptKey,
   updateClaimedSlice,
   workerUpdateMcpPayload,
   withThreadPlanLock,
 } from "../dist/thread-worker.js";
+import { readWorkerUpdateReceipt } from "../dist/thread-claims.js";
 import {
   DEFAULT_QUEUE_MAX,
   enqueueWorkerWrite,
@@ -154,6 +157,23 @@ function completeBurst(fixture, claims) {
       ),
     ),
   );
+}
+
+async function readStartAcceptedStamp(fixture, claim) {
+  return readWorkerUpdateReceipt({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: claim.slice_id,
+    workerAgentId: claim.worker_agent_id,
+    generation: claim.generation,
+    idempotencyKey: startAcceptedReceiptKey(
+      fixture.planId,
+      claim.slice_id,
+      claim.generation,
+      claim.claim_id,
+    ),
+    claimId: claim.claim_id,
+  });
 }
 
 async function journalState(fixture) {
@@ -423,7 +443,12 @@ test("replan during an N=40 start burst stays exclusive and is not a Q item", { 
   );
   await new Promise((resolve) => setTimeout(resolve, 20));
   const startsP = startBurst(fixture, claims);
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  const waitDump = Date.now();
+  while (Date.now() - waitDump < 2_000) {
+    const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+    if (queued.length > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
   releaseHold();
   const [startResults, replanResult] = await Promise.all([
     startsP,
@@ -458,6 +483,158 @@ test("replan during an N=40 start burst stays exclusive and is not a Q item", { 
     if (leftover.length === 0) break;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+});
+
+
+test("fail-closed drain keeps accepted start when apply throws; complete cannot persist done with no start", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let persistCalls = 0;
+  const throwingPersist = async (plan, opts) => {
+    persistCalls += 1;
+    const slice = plan.slices.find((item) => item.id === "s0");
+    // Fail only the start persist. A dropped start ticket would let
+    // complete persist done with no start; that must still fail.
+    if (slice?.status === "in_progress") {
+      throw new Error("injected start apply failure");
+    }
+    return persistPlan(plan, opts);
+  };
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "apply-throw-hold", async () => {
+    await held;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const start = await updateClaimedSlice(
+    {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "start-0",
+      action: { action: "start" },
+      now: new Date("2026-08-18T12:01:00.000Z"),
+    },
+    { persistPlan: throwingPersist },
+  );
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  const queuedBefore = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(queuedBefore.length, 1);
+  assert.equal(queuedBefore[0].idempotencyKey, "start-0");
+  assert.equal(queuedBefore[0].action.action, "start");
+  const stampAtAccept = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stampAtAccept?.kind, START_ACCEPTED_RECEIPT_KIND);
+  assert.equal(stampAtAccept?.status, "pending");
+  assert.notEqual(stampAtAccept?.response.slice.status, "in_progress");
+  assert.notEqual(stampAtAccept?.response.slice.status, "done");
+  assert.deepEqual(stampAtAccept?.response.ready_before, stampAtAccept?.response.ready_after);
+  release();
+  await holder;
+  const begin = Date.now();
+  while (persistCalls === 0 && Date.now() - begin < 5_000) {
+    kickWorkerWriteDrain(
+      {
+        vaultPath: fixture.vaultPath,
+        notePath: fixture.notePath,
+        planId: fixture.planId,
+      },
+      { persistPlan: throwingPersist },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(persistCalls >= 1, `drain must attempt apply; persistCalls=${persistCalls}`);
+  const queuedAfterThrow = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.ok(
+    queuedAfterThrow.some((item) => item.idempotencyKey === "start-0"),
+    `accepted start must stay after apply throw: ${JSON.stringify(queuedAfterThrow)}`,
+  );
+  const stampAfterThrow = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stampAfterThrow?.kind, START_ACCEPTED_RECEIPT_KIND, "apply throw must keep the start-accepted receipt");
+  assert.equal(stampAfterThrow?.status, "pending");
+  assert.notEqual(stampAfterThrow?.response.slice.status, "in_progress");
+  const complete = await updateClaimedSlice(
+    {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-0",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-0",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    },
+    { persistPlan: throwingPersist },
+  );
+  assert.equal(isAcceptedWorkerWrite(complete), true, "complete-while-start-queued must enqueue, not apply");
+  const afterComplete = persistCalls;
+  const waitComplete = Date.now();
+  while (Date.now() - waitComplete < 1_000) {
+    kickWorkerWriteDrain(
+      {
+        vaultPath: fixture.vaultPath,
+        notePath: fixture.notePath,
+        planId: fixture.planId,
+      },
+      { persistPlan: throwingPersist },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.ok(
+    leftover.some((item) => item.idempotencyKey === "start-0"),
+    `start ticket must still be present after complete: ${JSON.stringify(leftover)}`,
+  );
+  assert.equal(pickNextQueuedWorkerWrite(leftover)?.idempotencyKey, "start-0", "drain order still start-before-complete");
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 0, "failed start apply must not journal slice.started");
+  assert.equal(journal.completed.length, 0, "complete must not persist done with no start");
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.notEqual(plan.slices[0].status, "done");
+  assert.notEqual(plan.slices[0].status, "in_progress");
+  assert.ok(persistCalls >= afterComplete, `persistCalls=${persistCalls}`);
+  const stampFinal = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stampFinal?.kind, START_ACCEPTED_RECEIPT_KIND);
+  assert.equal(stampFinal?.status, "pending");
+
+  // Stamp alone still blocks done if the Q ticket is gone (the old drop).
+  const { removeQueuedWorkerWrite } = await import("../dist/thread-write-queue.js");
+  await removeQueuedWorkerWrite(fixture.vaultPath, fixture.planId, "start-0");
+  await removeQueuedWorkerWrite(fixture.vaultPath, fixture.planId, "complete-0");
+  await assert.rejects(
+    updateClaimedSlice(
+      {
+        vaultPath: fixture.vaultPath,
+        notePath: fixture.notePath,
+        planId: fixture.planId,
+        sliceId: "s0",
+        workerAgentId: "worker-0",
+        token: claim.token,
+        idempotencyKey: "complete-stamp-only",
+        action: {
+          action: "complete",
+          evidence: "Verification: slice s0 done via test ID T-stamp",
+        },
+        now: new Date("2026-08-18T12:03:00.000Z"),
+      },
+      { persistPlan: throwingPersist },
+    ),
+    /start must apply before complete/,
+  );
+  const planAfterStampOnly = await rehydratePlan(fixture.notePath);
+  assert.notEqual(planAfterStampOnly.slices[0].status, "done");
+  const journalAfter = await journalState(fixture);
+  assert.equal(journalAfter.completed.length, 0);
+  assert.deepEqual(journalAfter.completesWithoutStarts, []);
 });
 
 test("DEFAULT_WAIT_MS stays 5000 — silent bump is fake close", async () => {

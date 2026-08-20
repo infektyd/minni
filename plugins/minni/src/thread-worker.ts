@@ -177,6 +177,112 @@ function acceptedWorkerWrite(
   };
 }
 
+/**
+ * Worker-update receipt kind for a start that was accepted onto the Q.
+ * Status is pending. Response is the current unapplied slice (ready unchanged,
+ * not in_progress). This is the learn analog: keep a candidate receipt if the
+ * write hiccups. It is NOT slice.started and is not journaled.
+ */
+export const START_ACCEPTED_RECEIPT_KIND = "slice.start_accepted";
+
+export function startAcceptedReceiptKey(
+  planId: string,
+  sliceId: string,
+  generation: number,
+  claimId: string,
+): string {
+  return `minni.start_accepted:${planId}:${sliceId}:g${generation}:${claimId}`;
+}
+
+async function stampAcceptedStart(input: UpdateClaimedSliceInput): Promise<void> {
+  const plan = await rehydrateAuthority({
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
+    planId: input.planId,
+  });
+  const slice = findSlice(plan, input.sliceId);
+  const claim = slice.claim;
+  if (!claim || claim.worker_agent_id !== input.workerAgentId) {
+    throw new Error("claim scope mismatch");
+  }
+  const generation = requireGeneration(slice);
+  const ready = readyIds(plan, new Date());
+  await writePendingWorkerUpdateReceipt({
+    vaultPath: input.vaultPath,
+    planId: input.planId,
+    sliceId: input.sliceId,
+    workerAgentId: input.workerAgentId,
+    claimId: claim.claim_id,
+    generation,
+    idempotencyKey: startAcceptedReceiptKey(
+      input.planId,
+      input.sliceId,
+      generation,
+      claim.claim_id,
+    ),
+    kind: START_ACCEPTED_RECEIPT_KIND,
+    tokenDigest: hashWorkerUpdateToken(input.token),
+    rev: plan.rev,
+    response: {
+      slice,
+      ready_before: ready,
+      ready_after: ready,
+      rev: plan.rev,
+    },
+  });
+}
+
+async function hasAcceptedStartStamp(
+  vaultPath: string,
+  planId: string,
+  sliceId: string,
+  workerAgentId: string,
+  slice: PlanSlice,
+): Promise<boolean> {
+  const claimId = slice.claim?.claim_id;
+  if (!claimId) return false;
+  const generation = requireGeneration(slice);
+  const receipt = await readWorkerUpdateReceipt({
+    vaultPath,
+    planId,
+    sliceId,
+    workerAgentId,
+    generation,
+    idempotencyKey: startAcceptedReceiptKey(
+      planId,
+      sliceId,
+      generation,
+      claimId,
+    ),
+    claimId,
+  });
+  return (
+    receipt?.kind === START_ACCEPTED_RECEIPT_KIND &&
+    receipt.status === "pending" &&
+    receipt.response.slice.status !== "in_progress" &&
+    receipt.response.slice.status !== "done"
+  );
+}
+
+async function enqueueAcceptedWorkerWrite(
+  input: UpdateClaimedSliceInput,
+): Promise<void> {
+  if (input.action.action === "start") {
+    await stampAcceptedStart(input);
+  }
+  await enqueueWorkerWrite({
+    vaultPath: input.vaultPath,
+    planId: input.planId,
+    sliceId: input.sliceId,
+    workerAgentId: input.workerAgentId,
+    token: input.token,
+    idempotencyKey: input.idempotencyKey,
+    action: input.action,
+    now: new Date(),
+    applyNow: input.now instanceof Date ? input.now : undefined,
+  });
+}
+
 interface ThreadPlanTarget {
   vaultPath: string;
   notePath: string;
@@ -1914,6 +2020,9 @@ export async function updateClaimedSlice(
     idempotencyKey,
   );
   if (already !== undefined) {
+    if (input.action.action === "start") {
+      await stampAcceptedStart(lockedInput);
+    }
     kickWorkerWriteDrain(lockedInput, deps);
     return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
   }
@@ -1924,17 +2033,7 @@ export async function updateClaimedSlice(
       item.sliceId === sliceId && queuedWriteActionName(item) === "start",
   );
   if (input.action.action === "complete" && startQueued) {
-    await enqueueWorkerWrite({
-      vaultPath: input.vaultPath,
-      planId,
-      sliceId,
-      workerAgentId,
-      token,
-      idempotencyKey,
-      action: input.action,
-      now: new Date(),
-      applyNow: input.now instanceof Date ? input.now : undefined,
-    });
+    await enqueueAcceptedWorkerWrite(lockedInput);
     kickWorkerWriteDrain(lockedInput, deps);
     return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
   }
@@ -1951,17 +2050,7 @@ export async function updateClaimedSlice(
     return applied;
   } catch (error) {
     if (error instanceof ThreadBusyError) {
-      await enqueueWorkerWrite({
-        vaultPath: input.vaultPath,
-        planId,
-        sliceId,
-        workerAgentId,
-        token,
-        idempotencyKey,
-        action: input.action,
-        now: new Date(),
-        applyNow: input.now instanceof Date ? input.now : undefined,
-      });
+      await enqueueAcceptedWorkerWrite(lockedInput);
       kickWorkerWriteDrain(lockedInput, deps);
       return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
     }
@@ -2007,7 +2096,10 @@ export function kickWorkerWriteDrain(
       }
     }
   })()
-    .catch(() => {})
+    .catch(() => {
+      // Apply throw is parked, not dropped: drainOne keeps the ticket and
+      // the start-accepted receipt. Swallow only the unhandled rejection.
+    })
     .finally(() => {
       drainKicks.delete(key);
     });
@@ -2036,16 +2128,19 @@ async function drainOneQueuedWorkerWrite(
   };
   try {
     await applyClaimedSliceOnLockedPlan(mapped, deps);
-  } finally {
-    await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
-    const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
-    const next = leftover[0];
-    await recordWorkerWriteDrainProgress(input.vaultPath, input.planId, {
-      headTicketId: next?.ticketId ?? item.ticketId,
-      remaining: leftover.length,
-      at: new Date().toISOString(),
-    });
+  } catch (error) {
+    // Fail-closed: an accepted write that failed apply is still accepted.
+    // Dropping it lets a later complete persist done with no start.
+    throw error;
   }
+  await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
+  const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+  const next = leftover[0];
+  await recordWorkerWriteDrainProgress(input.vaultPath, input.planId, {
+    headTicketId: next?.ticketId ?? item.ticketId,
+    remaining: leftover.length,
+    at: new Date().toISOString(),
+  });
 }
 
 async function applyClaimedSliceOnLockedPlan(
@@ -2201,6 +2296,24 @@ async function applyClaimedSliceOnLockedPlan(
       }
       if (!isNonTerminal(slice)) {
         throw new Error(`slice "${sliceId}" is not worker-updatable`);
+      }
+
+      if (input.action.action === "complete" && slice.status !== "in_progress") {
+        const queuedNow = await listQueuedWorkerWrites(input.vaultPath, planId);
+        const startTicket = queuedNow.some(
+          (item) =>
+            item.sliceId === sliceId && queuedWriteActionName(item) === "start",
+        );
+        const startStamp = await hasAcceptedStartStamp(
+          input.vaultPath,
+          planId,
+          sliceId,
+          workerAgentId,
+          slice,
+        );
+        if (startTicket || startStamp) {
+          throw new Error("start must apply before complete");
+        }
       }
 
       const planBefore = plan;
