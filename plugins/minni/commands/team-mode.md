@@ -13,7 +13,7 @@ Protocol:
    - `profile`: `standard` unless the task is architecture-heavy, then `deep`
    - `includeVault`: `true`
    - `agents`: 3-5 temporary lanes only when the work can be split safely
-4. Delegate through the current host adapter. For Codex, map each `temporaryProfile` and `hydrationPacket` onto a Codex subagent.
+4. Delegate through the current host adapter (`dispatchWorkerPacket`). One Wave 2 worker packet is one host worker session. grok worker-start is MISSING. agy default allowlist cannot run `minni_thread_worker_update`. For Codex, map that packet onto one Codex subagent (replaces `temporaryProfile` + `hydrationPacket`). Codex dispatch is UNPROVEN. Cursor is out of this first wet set. Do not treat `minni_team_evidence` as the worker SoT.
 5. Require each temporary agent to return evidence: inspected files/APIs/docs, changed files or findings, verification, and blockers.
 6. Call `minni_team_evidence` before claiming completion.
 7. Integrate, run final verification, and report the result.
