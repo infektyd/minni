@@ -10,6 +10,19 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Changed
 
+- Thread lock Q is dump-and-return, not sit-and-wait: when the plan lock is
+  held, a worker write is accepted onto a per-Thread queue and the caller
+  returns immediately. Accepted is not applied. The daemon drains one item
+  at a time under the existing `withThreadLock` persist authority. Replan
+  stays exclusive (not a queue item). `THREAD_BUSY` is overflow (queue full
+  or drain stuck), not the N=40 default. `DEFAULT_WAIT_MS` remains 5s.
+  Drain is fail-closed: an accepted ticket stays (is not dropped) when
+  apply throws, and a start accepted onto the Q writes a pending
+  worker-update receipt (`slice.start_accepted`, digest only — not
+  `slice.started`, not ready, not in_progress). Apply throw keeps that
+  stamp. Complete cannot persist `done` while that stamp or start ticket
+  exists; start still applies first. Claim tokens stay off the journal.
+
 - `docs-accuracy-converge.rhai` now binds `risk_acceptance`/`re_check_issue`
   into both loom gap arrays and emits a `Re-checks required` report section
   (filed refs marked apart from PROPOSED titles) (#354) — superseding the

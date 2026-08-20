@@ -10,6 +10,12 @@ const DEFAULT_STALE_MS = 120_000;
 const DEFAULT_POLL_MS = 25;
 
 /**
+ * DEFAULT_WAIT_MS is overflow/stuck for exclusive holders (replan, drain
+ * retry). Worker writes dump-and-return instead of sitting this budget.
+ * Do not silently enlarge it. Do not steal a live owner.
+ */
+
+/**
  * Cross-process Thread lock owner. `processStartMarker` is the local OS
  * process-start identity for `pid` (Linux: /proc/<pid>/stat starttime). A
  * reused PID with a different marker is not the live owner — stale recovery

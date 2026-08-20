@@ -306,3 +306,12 @@ test("withThreadLock recovers a stale lock with invalid owner JSON", async (t) =
   assert.equal(last?.reason, "stale_invalid_owner");
   assert.equal(last?.plan_id, "plan-invalid-owner");
 });
+
+test("withThreadLock keeps DEFAULT_WAIT_MS at 5s; silent bump is fake close", async () => {
+  const src = await readFile(new URL("../src/thread-lock.ts", import.meta.url), "utf8");
+  assert.match(src, /const DEFAULT_WAIT_MS = 5_000;/);
+  assert.match(src, /const DEFAULT_STALE_MS = 120_000;/);
+  assert.doesNotMatch(src, /const DEFAULT_WAIT_MS = (?:[6-9]\d{3}|[1-9]\d{4,})/);
+  assert.doesNotMatch(src, /FIFO waiter queue/);
+  assert.doesNotMatch(src, /stallDeadline/);
+});

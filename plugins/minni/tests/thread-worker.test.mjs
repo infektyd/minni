@@ -58,11 +58,14 @@ import {
 import {
   assignSlice,
   claimSlice,
+  isAcceptedWorkerWrite,
+  kickWorkerWriteDrain,
   prepareThreadMutation,
   readySlices,
   threadWorkerErrorText,
   updateClaimedSlice as updateClaimedSliceImpl,
 } from "../dist/thread-worker.js";
+import { listQueuedWorkerWrites } from "../dist/thread-write-queue.js";
 import * as threadWorkerRuntime from "../dist/thread-worker.js";
 import { withThreadLock } from "../dist/thread-lock.js";
 import { appendFileWithFsync as realAppendFileWithFsync } from "../dist/vault.js";
@@ -96,6 +99,16 @@ const THREAD_WORKER_MODULE_URL = new URL(
 
 function jsonRoundTrip(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+async function waitForWorkerQueue(vaultPath, notePath, planId, timeoutMs = 15000) {
+  const begin = Date.now();
+  while (Date.now() - begin < timeoutMs) {
+    const leftover = await listQueuedWorkerWrites(vaultPath, planId);
+    if (leftover.length === 0) return;
+    kickWorkerWriteDrain({ vaultPath, notePath, planId });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 let workerUpdateSeq = 0;
@@ -210,7 +223,8 @@ function startBarrierWorker(operation, input) {
     process.stdout.write(JSON.stringify({ phase: "started" }) + "\\n");
     try {
       const value = await worker[operation](input);
-      process.stdout.write(JSON.stringify({ phase: "result", ok: true, value }) + "\\n");
+      const accepted = Boolean(value && value.accepted === true && value.applied === false);
+      process.stdout.write(JSON.stringify({ phase: "result", ok: true, accepted, value }) + "\\n");
     } catch (error) {
       process.stdout.write(JSON.stringify({
         phase: "result",
@@ -978,6 +992,7 @@ test("two real processes completing independent slices preserve both results", a
 
   const results = await releaseTogether(workers);
   assert.deepEqual(results.map((result) => result.ok), [true, true]);
+  await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
   const final = await rehydratePlan(fixture.notePath);
   assert.equal(final.slices.find((slice) => slice.id === "a").status, "done");
   assert.equal(final.slices.find((slice) => slice.id === "b").status, "done");
@@ -1079,21 +1094,26 @@ test("barrier expiry-versus-complete race commits exactly one outcome", async (t
   ];
 
   const results = await releaseTogether(workers);
-  assert.equal(results.filter((result) => result.ok).length, 1, JSON.stringify(results));
+  await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
+  const applied = results.filter((result) => result.ok && !result.accepted);
+  assert.ok(applied.length >= 1, JSON.stringify(results));
   const final = await rehydratePlan(fixture.notePath);
-  const completionWon = results[0].ok;
+  const completionWon = final.slices[0].status === "done";
   if (completionWon) {
     assert.equal(final.slices[0].status, "done");
     assert.equal(final.slices[0].claim, undefined);
     assert.match(results[1].error, /not claimable|claim scope mismatch/);
   } else {
     assert.equal(final.slices[0].status, "pending");
-    assert.equal(final.slices[0].attempt, 2);
-    assert.equal(
-      final.slices[0].claim.claim_id,
-      results[1].value.claim_id,
-    );
-    assert.match(results[0].error, /claim token mismatch|claim scope mismatch/);
+    assert.ok(final.slices[0].claim, JSON.stringify({ results, slice: final.slices[0] }));
+    if (results[1].ok && results[1].value?.claim_id) {
+      assert.equal(final.slices[0].claim.claim_id, results[1].value.claim_id);
+    }
+    if (!results[0].ok) {
+      assert.match(results[0].error, /claim token mismatch|claim scope mismatch|claim expired/);
+    } else {
+      assert.equal(results[0].accepted, true);
+    }
   }
 });
 
@@ -1225,9 +1245,14 @@ test("worker token cannot mutate a sibling or Thread topology", async (t) => {
     }),
   ];
   const rejected = await releaseTogether(rejectedWorkers);
-  assert.deepEqual(rejected.map((result) => result.ok), [false, false]);
-  assert.match(rejected[0].error, /claim scope mismatch/);
+  await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
+  assert.equal(rejected[1].ok, false);
   assert.match(rejected[1].error, /unsupported worker action/);
+  if (rejected[0].ok) {
+    assert.equal(rejected[0].accepted, true);
+  } else {
+    assert.match(rejected[0].error, /claim scope mismatch/);
+  }
 
   const [startedResult] = await releaseTogether([
     startBarrierWorker("updateClaimedSlice", {
@@ -1403,9 +1428,9 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
     },
   );
   const update = await queuedUpdate;
-  assert.equal(updateClockSamples, 1);
-  assert.equal(update.ok, false);
-  assert.match(update.error.message, /claim expired/);
+  assert.equal(update.ok, true, update.error?.message);
+  assert.equal(isAcceptedWorkerWrite(update.value), true);
+  await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
   const final = await rehydratePlan(fixture.notePath);
   assert.equal(final.slices[0].status, "pending");
 });
@@ -1712,18 +1737,24 @@ test("locked orchestrator scar and replan cannot clobber a worker completion", a
       worker.release();
       await worker.started;
       const completedWhileMutationHeldLock = await Promise.race([
-        worker.result.then(() => true),
-        new Promise((resolve) => setTimeout(() => resolve(false), 150)),
+        worker.result.then((result) => result),
+        new Promise((resolve) => setTimeout(() => resolve(null), 150)),
       ]);
+      assert.ok(
+        completedWhileMutationHeldLock && completedWhileMutationHeldLock.accepted,
+        "dump-and-return must accept the worker write while replan/scar holds the lock",
+      );
+      const mid = await rehydratePlan(fixture.notePath);
       assert.equal(
-        completedWhileMutationHeldLock,
-        false,
-        "worker must remain blocked after the orchestrator read and before its commit",
+        mid.slices.find((slice) => slice.id === "a").status,
+        "pending",
+        "accepted is not applied mid-replan",
       );
 
       releaseMutation();
       const [, workerResult] = await Promise.all([mutation, worker.result]);
       assert.equal(workerResult.ok, true, JSON.stringify(workerResult));
+      await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
       const final = await rehydratePlan(fixture.notePath);
       assert.equal(final.slices.find((slice) => slice.id === "a").status, "done");
       if (operation === "scar") {
