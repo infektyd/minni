@@ -10,9 +10,12 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Changed
 
-- Thread lock wait is a FIFO stall budget, not a total-wait cap: overlapping
-  starts on one plan acquire while the lock keeps moving; `THREAD_BUSY` stays
-  fail-closed overflow for a stuck live owner. `DEFAULT_WAIT_MS` remains 5s.
+- Thread lock Q is dump-and-return, not sit-and-wait: when the plan lock is
+  held, a worker write is accepted onto a per-Thread queue and the caller
+  returns immediately. Accepted is not applied. The daemon drains one item
+  at a time under the existing `withThreadLock` persist authority. Replan
+  stays exclusive (not a queue item). `THREAD_BUSY` is overflow (queue full
+  or drain stuck), not the N=40 default. `DEFAULT_WAIT_MS` remains 5s.
 
 - `docs-accuracy-converge.rhai` now binds `risk_acceptance`/`re_check_issue`
   into both loom gap arrays and emits a `Re-checks required` report section

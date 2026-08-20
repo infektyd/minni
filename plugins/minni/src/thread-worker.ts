@@ -54,7 +54,16 @@ import {
   type WorkerUpdateReceiptResponse,
 } from "./thread-claims.js";
 import { stableStringify } from "./agent_envelope.js";
-import { withThreadLock } from "./thread-lock.js";
+import { ThreadBusyError, withThreadLock } from "./thread-lock.js";
+import {
+  enqueueWorkerWrite,
+  findQueuedWorkerWrite,
+  listQueuedWorkerWrites,
+  pickNextQueuedWorkerWrite,
+  queuedWriteActionName,
+  recordWorkerWriteDrainProgress,
+  removeQueuedWorkerWrite,
+} from "./thread-write-queue.js";
 
 const DEFAULT_CLAIM_TTL_SECONDS = 10 * 60;
 
@@ -98,6 +107,74 @@ export interface ThreadMutationResult {
   slice: PlanSlice;
   ready_before: string[];
   ready_after: string[];
+}
+
+/**
+ * Dump-and-return acceptance. The write is on the per-Thread queue.
+ * It is not applied: no journal seq / ready / slice mutation yet.
+ */
+export interface AcceptedWorkerWrite {
+  accepted: true;
+  applied: false;
+  queued: true;
+  plan_id: string;
+  slice_id: string;
+  action: WorkerUpdateAction["action"];
+  idempotency_key: string;
+}
+
+export type WorkerUpdateOutcome = ThreadMutationResult | AcceptedWorkerWrite;
+
+export function isAcceptedWorkerWrite(
+  value: WorkerUpdateOutcome,
+): value is AcceptedWorkerWrite {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "accepted" in value &&
+    (value as AcceptedWorkerWrite).accepted === true &&
+    "applied" in value &&
+    (value as AcceptedWorkerWrite).applied === false
+  );
+}
+
+export function workerUpdateMcpPayload(
+  result: WorkerUpdateOutcome,
+): Record<string, unknown> {
+  if (isAcceptedWorkerWrite(result)) {
+    return {
+      status: "accepted",
+      applied: false,
+      queued: true,
+      plan_id: result.plan_id,
+      slice_id: result.slice_id,
+      action: result.action,
+      idempotency_key: result.idempotency_key,
+    };
+  }
+  return {
+    slice: result.slice,
+    ready_before: result.ready_before,
+    ready_after: result.ready_after,
+    rev: result.plan.rev,
+  };
+}
+
+function acceptedWorkerWrite(
+  planId: string,
+  sliceId: string,
+  action: WorkerUpdateAction["action"],
+  idempotencyKey: string,
+): AcceptedWorkerWrite {
+  return {
+    accepted: true,
+    applied: false,
+    queued: true,
+    plan_id: planId,
+    slice_id: sliceId,
+    action,
+    idempotency_key: idempotencyKey,
+  };
 }
 
 interface ThreadPlanTarget {
@@ -264,13 +341,17 @@ export async function withThreadPlanLock<T>(
   fn: (plan: PlanArtifact) => Promise<T>,
   deps: ThreadPlanLockDeps = {},
 ): Promise<T> {
-  return withThreadLock(
+  const result = await withThreadLock(
     input.vaultPath,
     requireNonEmpty(input.planId, "plan id"),
     requireNonEmpty(input.operationId, "operation id"),
     async () =>
       fn(await rehydrateAuthority(input, deps.rehydratePlan ?? rehydratePlan)),
   );
+  // After exclusive persist releases, daemon-drain queued worker writes.
+  // Not mid-replan: the lock is free. Not a second graph.
+  kickWorkerWriteDrain(input);
+  return result;
 }
 
 export function claimIds(plan: PlanArtifact): string[] {
@@ -1804,6 +1885,172 @@ async function loadWorkerUpdateReceipt(
 export async function updateClaimedSlice(
   input: UpdateClaimedSliceInput,
   deps: ThreadWorkerDeps = {},
+): Promise<WorkerUpdateOutcome> {
+  const planId = requireNonEmpty(input.planId, "plan id");
+  const sliceId = requireNonEmpty(input.sliceId, "slice id");
+  const workerAgentId = requireNonEmpty(
+    input.workerAgentId,
+    "worker agent id",
+  );
+  const token = requireNonEmpty(input.token, "claim token");
+  const idempotencyKey = requireNonEmpty(
+    input.idempotencyKey,
+    "idempotency key",
+  );
+  // Reject illegal actions before enqueue. Do not sample input.now here —
+  // verification/lease clocks are taken under the lock at drain/apply.
+  workerEventKind(input.action);
+  const lockedInput: UpdateClaimedSliceInput = {
+    ...input,
+    planId,
+    sliceId,
+    workerAgentId,
+    token,
+    idempotencyKey,
+  };
+  const already = await findQueuedWorkerWrite(
+    input.vaultPath,
+    planId,
+    idempotencyKey,
+  );
+  if (already !== undefined) {
+    kickWorkerWriteDrain(lockedInput, deps);
+    return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
+  }
+
+  const queued = await listQueuedWorkerWrites(input.vaultPath, planId);
+  const startQueued = queued.some(
+    (item) =>
+      item.sliceId === sliceId && queuedWriteActionName(item) === "start",
+  );
+  if (input.action.action === "complete" && startQueued) {
+    await enqueueWorkerWrite({
+      vaultPath: input.vaultPath,
+      planId,
+      sliceId,
+      workerAgentId,
+      token,
+      idempotencyKey,
+      action: input.action,
+      now: new Date(),
+      applyNow: input.now instanceof Date ? input.now : undefined,
+    });
+    kickWorkerWriteDrain(lockedInput, deps);
+    return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
+  }
+
+  try {
+    const applied = await withThreadLock(
+      input.vaultPath,
+      planId,
+      `worker-update:${randomUUID()}`,
+      () => applyClaimedSliceOnLockedPlan(lockedInput, deps),
+      { waitMs: 0 },
+    );
+    kickWorkerWriteDrain(lockedInput, deps);
+    return applied;
+  } catch (error) {
+    if (error instanceof ThreadBusyError) {
+      await enqueueWorkerWrite({
+        vaultPath: input.vaultPath,
+        planId,
+        sliceId,
+        workerAgentId,
+        token,
+        idempotencyKey,
+        action: input.action,
+        now: new Date(),
+        applyNow: input.now instanceof Date ? input.now : undefined,
+      });
+      kickWorkerWriteDrain(lockedInput, deps);
+      return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
+    }
+    throw error;
+  }
+}
+
+const drainKicks = new Map<string, Promise<void>>();
+
+function drainKickKey(vaultPath: string, planId: string): string {
+  return `${path.resolve(vaultPath)}\0${planId}`;
+}
+
+/**
+ * Daemon drain: apply queued worker writes one-at-a-time under the existing
+ * one persist authority. Not a second graph. Not G3. Replan is never queued.
+ */
+export function kickWorkerWriteDrain(
+  input: ThreadPlanTarget & { now?: Date | (() => Date) },
+  deps: ThreadWorkerDeps = {},
+): void {
+  const key = drainKickKey(input.vaultPath, input.planId);
+  if (drainKicks.has(key)) return;
+  const run = (async () => {
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+      if (remaining.length === 0) return;
+      try {
+        await withThreadLock(
+          input.vaultPath,
+          input.planId,
+          `worker-queue-drain:${randomUUID()}`,
+          () => drainOneQueuedWorkerWrite(input, deps),
+          { waitMs: 0 },
+        );
+      } catch (error) {
+        if (error instanceof ThreadBusyError) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          continue;
+        }
+        throw error;
+      }
+    }
+  })()
+    .catch(() => {})
+    .finally(() => {
+      drainKicks.delete(key);
+    });
+  drainKicks.set(key, run);
+}
+
+async function drainOneQueuedWorkerWrite(
+  input: ThreadPlanTarget & { now?: Date | (() => Date) },
+  deps: ThreadWorkerDeps,
+): Promise<void> {
+  const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+  const item = pickNextQueuedWorkerWrite(items);
+  if (item === undefined) return;
+  const mapped: UpdateClaimedSliceInput = {
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
+    planId: item.planId,
+    sliceId: item.sliceId,
+    workerAgentId: item.workerAgentId,
+    token: item.token,
+    idempotencyKey: item.idempotencyKey,
+    action: item.action as WorkerUpdateAction,
+    now:
+      (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
+      input.now,
+  };
+  try {
+    await applyClaimedSliceOnLockedPlan(mapped, deps);
+  } finally {
+    await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
+    const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+    const next = leftover[0];
+    await recordWorkerWriteDrainProgress(input.vaultPath, input.planId, {
+      headTicketId: next?.ticketId ?? item.ticketId,
+      remaining: leftover.length,
+      at: new Date().toISOString(),
+    });
+  }
+}
+
+async function applyClaimedSliceOnLockedPlan(
+  input: UpdateClaimedSliceInput,
+  deps: ThreadWorkerDeps = {},
 ): Promise<ThreadMutationResult> {
   const planId = requireNonEmpty(input.planId, "plan id");
   const sliceId = requireNonEmpty(input.sliceId, "slice id");
@@ -1820,15 +2067,11 @@ export async function updateClaimedSlice(
   const deleteSecret = deps.deleteClaimSecret ?? deleteClaimSecret;
   const appendJournalDeps = deps.appendJournalDeps ?? {};
   const kind = workerEventKind(input.action);
-
-  return withThreadPlanLock(
-    {
-      vaultPath: input.vaultPath,
-      notePath: input.notePath,
-      planId,
-      operationId: `worker-update:${randomUUID()}`,
-    },
-    async (initialPlan) => {
+  const initialPlan = await rehydrateAuthority({
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
+    planId,
+  });
       const now = sampleNow(input.now);
       const workerOperationKey = deriveWorkerEventKey(
         planId,
@@ -2104,6 +2347,5 @@ export async function updateClaimedSlice(
         supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
       });
       return result;
-    },
-  );
 }
+

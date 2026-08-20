@@ -106,6 +106,7 @@ import {
   MAX_THREAD_CLAIM_TTL_SECONDS,
   threadWorkerErrorText,
   updateClaimedSlice,
+  workerUpdateMcpPayload,
   withThreadPlanLock,
   type WorkerUpdateAction,
 } from "./thread-worker.js";
@@ -2360,7 +2361,7 @@ server.registerTool(
   {
     title: "Minni Thread Worker Update",
     description:
-      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the one-time claim token from minni_thread_claim. idempotency_key is required and must be non-empty — retries with the same key, token, and action replay the original result rather than re-applying, even after an action (like complete) that clears the live claim. plan_id defaults to the active plan.",
+      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the one-time claim token from minni_thread_claim. idempotency_key is required and must be non-empty — retries with the same key, token, and action replay the original result rather than re-applying, even after an action (like complete) that clears the live claim. When the Thread lock is held the write is accepted onto the per-Thread queue and this call returns immediately; accepted is not applied (no journal/ready/slice change until drain). Same idempotency_key while queued does not double-enqueue. plan_id defaults to the active plan.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1),
@@ -2443,18 +2444,7 @@ server.registerTool(
         idempotencyKey: idempotency_key,
         action: parsedAction.data as WorkerUpdateAction,
       });
-      return textResult(
-        JSON.stringify(
-          {
-            slice: result.slice,
-            ready_before: result.ready_before,
-            ready_after: result.ready_after,
-            rev: result.plan.rev,
-          },
-          null,
-          2,
-        ),
-      );
+      return textResult(JSON.stringify(workerUpdateMcpPayload(result), null, 2));
     } catch (error) {
       return threadWorkerErrorResult("plan.worker_update", error);
     }
