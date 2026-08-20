@@ -16,6 +16,9 @@ stays None. Default agy install stays CANNOT. Codex stays UNPROVEN.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from typing import Any, Iterable, Mapping, Sequence
 
 GROK_WORKER_START = None
@@ -84,6 +87,14 @@ HOST_INJECTION_TABLE: dict[str, dict[str, Any]] = {
     },
 }
 
+def host_hook_injects(host: str, hook: str) -> bool:
+    """Confirm delivery=true only when this host's wire for this hook injects."""
+    row = HOST_INJECTION_TABLE.get(host)
+    if row is None:
+        return False
+    return row.get(hook) == "injects"
+
+
 CURSOR_SELECT = (
     "SELECT last_delivered_seq FROM thread_delivery_cursors "
     "WHERE subscriber_id = ? AND plan_id = ?"
@@ -117,6 +128,7 @@ def rebuild_queue_from_journal(
     plan_id: str,
     events: Sequence[Mapping[str, Any]],
     last_delivered_seq: int,
+    subscriber_id: str | None = None,
 ) -> list[dict[str, Any]]:
     pending: list[dict[str, Any]] = []
     for event in sorted(events, key=lambda item: int(item["seq"])):
@@ -131,6 +143,8 @@ def rebuild_queue_from_journal(
             "delta": format_state_delta(event, plan_id),
             "at": event["at"],
         }
+        if subscriber_id is not None:
+            item["subscriber_id"] = subscriber_id
         if event.get("slice_id"):
             item["slice_id"] = event["slice_id"]
         pending.append(item)
@@ -207,3 +221,208 @@ def confirm_delivery(
     advanced = advance_cursor(current, delivered_through_seq, delivery_succeeded)
     persist_cursor(conn, subscriber_id, plan_id, advanced, updated_at)
     return advanced
+
+
+RELAY_STORE_VERSION = 1
+
+
+def empty_relay_store() -> dict[str, Any]:
+    return {"version": RELAY_STORE_VERSION, "graph": False, "cursors": [], "pending": []}
+
+
+def relay_store_path(vault_path: str | Path) -> Path:
+    return Path(vault_path) / ".runtime" / "thread-relay" / "cursors.json"
+
+
+def plan_journal_path(vault_path: str | Path, plan_id: str) -> Path:
+    return Path(vault_path) / "wiki" / "artifacts" / f"{plan_id}.log.md"
+
+
+def parse_journal_events_from_log(raw: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        trimmed = line.strip()
+        if not trimmed.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(trimmed)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        items = parsed.get("thread_event_batch")
+        if not isinstance(items, list):
+            items = []
+        if isinstance(parsed.get("seq"), int) and isinstance(parsed.get("kind"), str):
+            items = [*items, parsed]
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            if not isinstance(row.get("seq"), int) or not isinstance(row.get("kind"), str):
+                continue
+            event = {
+                "seq": row["seq"],
+                "kind": row["kind"],
+                "actor": row.get("actor") if isinstance(row.get("actor"), str) else "",
+                "at": row.get("at") if isinstance(row.get("at"), str) else "",
+            }
+            if isinstance(row.get("slice_id"), str) and row["slice_id"]:
+                event["slice_id"] = row["slice_id"]
+            events.append(event)
+    events.sort(key=lambda item: int(item["seq"]))
+    return events
+
+
+def _cursor_for(store: Mapping[str, Any], subscriber_id: str, plan_id: str) -> dict[str, Any]:
+    for cursor in store.get("cursors") or []:
+        if cursor.get("subscriber_id") == subscriber_id and cursor.get("plan_id") == plan_id:
+            return dict(cursor)
+    return {"subscriber_id": subscriber_id, "plan_id": plan_id, "last_delivered_seq": 0}
+
+
+def ingest_journal_events(
+    store: Mapping[str, Any],
+    plan_id: str,
+    events: Sequence[Mapping[str, Any]],
+    subscriber_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Rebuild per-subscriber pending from journal seq. Not graph state."""
+    next_store = empty_relay_store()
+    next_store["cursors"] = [dict(cursor) for cursor in store.get("cursors") or []]
+    next_store["pending"] = [
+        dict(item) for item in store.get("pending") or [] if item.get("plan_id") != plan_id
+    ]
+    seen: set[str] = set()
+    for subscriber_id in subscriber_ids:
+        seen.add(subscriber_id)
+        cursor = _cursor_for(next_store, subscriber_id, plan_id)
+        if not any(
+            row.get("subscriber_id") == subscriber_id and row.get("plan_id") == plan_id
+            for row in next_store["cursors"]
+        ):
+            next_store["cursors"].append(cursor)
+        next_store["pending"].extend(
+            rebuild_queue_from_journal(
+                plan_id, events, int(cursor["last_delivered_seq"]), subscriber_id
+            )
+        )
+    for cursor in next_store["cursors"]:
+        if cursor.get("plan_id") == plan_id and cursor.get("subscriber_id") not in seen:
+            next_store["pending"].extend(
+                rebuild_queue_from_journal(
+                    plan_id,
+                    events,
+                    int(cursor["last_delivered_seq"]),
+                    str(cursor["subscriber_id"]),
+                )
+            )
+    next_store["pending"].sort(
+        key=lambda item: (
+            int(item["seq"]),
+            str(item.get("subscriber_id") or ""),
+            str(item.get("plan_id") or ""),
+        )
+    )
+    return next_store
+
+
+def confirm_delivery_store(
+    store: Mapping[str, Any],
+    subscriber_id: str,
+    plan_id: str,
+    delivered_through_seq: int,
+    delivery_succeeded: bool,
+) -> dict[str, Any]:
+    """Advance one subscriber's cursor. Prune only that subscriber's pending."""
+    current = _cursor_for(store, subscriber_id, plan_id)
+    advanced_seq = advance_cursor(
+        int(current["last_delivered_seq"]), delivered_through_seq, delivery_succeeded
+    )
+    advanced = {**current, "last_delivered_seq": advanced_seq}
+    next_store = empty_relay_store()
+    next_store["cursors"] = [
+        dict(cursor)
+        for cursor in store.get("cursors") or []
+        if not (cursor.get("subscriber_id") == subscriber_id and cursor.get("plan_id") == plan_id)
+    ]
+    next_store["cursors"].append(advanced)
+    next_store["pending"] = []
+    for item in store.get("pending") or []:
+        if item.get("subscriber_id") != subscriber_id:
+            next_store["pending"].append(dict(item))
+            continue
+        if item.get("plan_id") != plan_id:
+            next_store["pending"].append(dict(item))
+            continue
+        if int(item["seq"]) > advanced_seq:
+            next_store["pending"].append(dict(item))
+    return next_store
+
+
+def load_relay_store(vault_path: str | Path) -> dict[str, Any]:
+    path = relay_store_path(vault_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty_relay_store()
+    if not isinstance(raw, dict) or raw.get("version") != RELAY_STORE_VERSION or raw.get("graph") is not False:
+        return empty_relay_store()
+    return {
+        "version": RELAY_STORE_VERSION,
+        "graph": False,
+        "cursors": list(raw["cursors"]) if isinstance(raw.get("cursors"), list) else [],
+        "pending": list(raw["pending"]) if isinstance(raw.get("pending"), list) else [],
+    }
+
+
+def save_relay_store(vault_path: str | Path, store: Mapping[str, Any]) -> None:
+    if store_holds_graph_state(store):
+        raise ValueError("thread relay refuses graph state")
+    path = relay_store_path(vault_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(store)
+    payload["graph"] = False
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def ingest_journal_into_vault(
+    vault_path: str | Path,
+    plan_id: str,
+    events: Sequence[Mapping[str, Any]],
+    subscriber_ids: Sequence[str],
+    conn: Any = None,
+    updated_at: str = "",
+) -> dict[str, Any]:
+    """Production daemon ingest: rebuild pending from journal seq into cursors.json.
+
+    Hooks read that file. They do not poll minni_thread_events. Optional SQLite
+    conn gets cursor rows created at 0 without advancing.
+    """
+    store = ingest_journal_events(
+        load_relay_store(vault_path), plan_id, events, subscriber_ids
+    )
+    save_relay_store(vault_path, store)
+    if conn is not None:
+        stamp = updated_at or "1970-01-01T00:00:00.000Z"
+        for subscriber_id in subscriber_ids:
+            if load_cursor(conn, subscriber_id, plan_id) == 0:
+                persist_cursor(conn, subscriber_id, plan_id, 0, stamp)
+    return store
+
+
+def ingest_plan_journal_from_disk(
+    vault_path: str | Path,
+    plan_id: str,
+    subscriber_ids: Sequence[str],
+    conn: Any = None,
+    updated_at: str = "",
+) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    path = plan_journal_path(vault_path, plan_id)
+    try:
+        events = parse_journal_events_from_log(path.read_text(encoding="utf-8"))
+    except OSError:
+        events = []
+    return ingest_journal_into_vault(
+        vault_path, plan_id, events, subscriber_ids, conn=conn, updated_at=updated_at
+    )

@@ -35,8 +35,40 @@ export const SPAWNED = false as const;
 export const RELAY_STORE_VERSION = 1 as const;
 
 export type RelayHost = "agy" | "grok" | "codex" | "cursor";
+export type RelayHook = "sessionStart" | "promptSubmit" | "stop";
 export type WakeMode = "immediate" | "deferred" | "unsupported";
 export type InjectionCapability = "injects" | "ignored" | "rejects" | "cannot" | "out";
+
+/** Wire / agent ids that map onto a G3 relay host. Unknown ids fail closed. */
+const RELAY_HOST_ALIASES: Record<string, RelayHost> = {
+  agy: "agy",
+  gemini: "agy",
+  antigravity: "agy",
+  grok: "grok",
+  "grok-build": "grok",
+  codex: "codex",
+  cursor: "cursor",
+};
+
+export function relayHostFor(id: string): RelayHost | undefined {
+  const key = id.trim().toLowerCase();
+  return RELAY_HOST_ALIASES[key];
+}
+
+/**
+ * Confirm delivery=true ONLY when this host's wire for this hook actually
+ * injects. ignored / rejects / cannot / out leave the cursor behind.
+ * Unknown hosts fail closed (do not confirm true).
+ */
+export function hostHookInjects(host: RelayHost, hook: RelayHook): boolean {
+  return HOST_INJECTION_TABLE[host][hook] === "injects";
+}
+
+export function deliverySucceededForHostHook(hostId: string, hook: RelayHook): boolean {
+  const host = relayHostFor(hostId);
+  if (host === undefined) return false;
+  return hostHookInjects(host, hook);
+}
 
 export interface HostInjectionRow {
   host: RelayHost;
@@ -120,6 +152,7 @@ export interface DeliveryCursor {
 export interface RelayNotification {
   seq: number;
   plan_id: string;
+  subscriber_id: string;
   actor: string;
   kind: string;
   slice_id?: string;
@@ -187,6 +220,7 @@ export function rebuildQueueFromJournal(
       const notification: RelayNotification = {
         seq: event.seq,
         plan_id: planId,
+        subscriber_id: cursor.subscriber_id,
         actor: event.actor,
         kind: event.kind,
         delta: formatStateDelta(event, planId),
@@ -246,7 +280,12 @@ export function ingestJournalEvents(
       next.pending.push(...rebuildQueueFromJournal(planId, events, cursor));
     }
   }
-  next.pending.sort((a, b) => a.seq - b.seq || a.plan_id.localeCompare(b.plan_id));
+  next.pending.sort(
+    (a, b) =>
+      a.seq - b.seq ||
+      a.subscriber_id.localeCompare(b.subscriber_id) ||
+      a.plan_id.localeCompare(b.plan_id),
+  );
   return next;
 }
 
@@ -264,7 +303,10 @@ export function confirmDelivery(
     (cursor) => !(cursor.subscriber_id === subscriberId && cursor.plan_id === planId),
   );
   next.cursors.push(advanced);
+  // Prune ONLY this subscriber's queue. A shared plan+seq filter would drop
+  // subscriber B's 2–5 when A confirms seq 5.
   next.pending = store.pending.filter((item) => {
+    if (item.subscriber_id !== subscriberId) return true;
     if (item.plan_id !== planId) return true;
     return item.seq > advanced.last_delivered_seq;
   });
@@ -307,7 +349,10 @@ export function readPendingAttention(
 ): PendingAttention {
   const cursor = cursorFor(store, subscriberId, planId);
   const notifications = store.pending.filter(
-    (item) => item.plan_id === planId && item.seq > cursor.last_delivered_seq,
+    (item) =>
+      item.subscriber_id === subscriberId &&
+      item.plan_id === planId &&
+      item.seq > cursor.last_delivered_seq,
   );
   return {
     notifications,
@@ -392,4 +437,86 @@ export async function activePlanIdFromVault(vaultPath: string): Promise<string |
   } catch {
     return undefined;
   }
+}
+
+export function planJournalPath(vaultPath: string, planId: string): string {
+  return path.join(vaultPath, "wiki", "artifacts", `${planId}.log.md`);
+}
+
+/** Journal lives at <vault>/wiki/artifacts/<planId>.log.md. */
+export function vaultPathFromJournalPath(journalPath: string): string | undefined {
+  const artifactsDir = path.dirname(journalPath);
+  const wikiDir = path.dirname(artifactsDir);
+  if (path.basename(artifactsDir) !== "artifacts" || path.basename(wikiDir) !== "wiki") {
+    return undefined;
+  }
+  return path.dirname(wikiDir);
+}
+
+export function parseJournalEventsFromLog(raw: string): JournalEvent[] {
+  const events: JournalEvent[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") continue;
+    const record = parsed as Record<string, unknown>;
+    const batch = record.thread_event_batch;
+    const items: unknown[] = Array.isArray(batch) ? [...batch] : [];
+    if (typeof record.seq === "number" && typeof record.kind === "string") {
+      items.push(record);
+    }
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const row = item as Record<string, unknown>;
+      if (typeof row.seq !== "number" || typeof row.kind !== "string") continue;
+      const event: JournalEvent = {
+        seq: row.seq,
+        kind: row.kind,
+        actor: typeof row.actor === "string" ? row.actor : "",
+        at: typeof row.at === "string" ? row.at : "",
+      };
+      if (typeof row.slice_id === "string" && row.slice_id) event.slice_id = row.slice_id;
+      events.push(event);
+    }
+  }
+  events.sort((a, b) => a.seq - b.seq);
+  return events;
+}
+
+/**
+ * Production ingest: persist rebuilt per-subscriber pending from journal seq
+ * into cursors.json. Not a second graph. Not an MCP tool. Hooks remain
+ * readers of that store and do not poll minni_thread_events.
+ */
+export async function ingestJournalIntoVault(
+  vaultPath: string,
+  planId: string,
+  events: readonly JournalEvent[],
+  subscriberIds: readonly string[],
+): Promise<RelayStore> {
+  const store = await loadRelayStore(vaultPath);
+  const next = ingestJournalEvents(store, planId, events, subscriberIds);
+  await saveRelayStore(vaultPath, next);
+  return next;
+}
+
+export async function ingestPlanJournalFromDisk(
+  vaultPath: string,
+  planId: string,
+  subscriberIds: readonly string[],
+): Promise<RelayStore> {
+  let events: JournalEvent[] = [];
+  try {
+    const raw = await readFile(planJournalPath(vaultPath, planId), "utf8");
+    events = parseJournalEventsFromLog(raw);
+  } catch {
+    events = [];
+  }
+  return ingestJournalIntoVault(vaultPath, planId, events, subscriberIds);
 }

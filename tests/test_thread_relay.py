@@ -16,9 +16,16 @@ from minni.thread_relay import (
     advance_cursor,
     attempt_immediate_wake,
     confirm_delivery,
+    confirm_delivery_store,
+    empty_relay_store,
+    host_hook_injects,
+    ingest_journal_events,
+    ingest_journal_into_vault,
+    ingest_plan_journal_from_disk,
     persist_cursor,
     read_pending_attention,
     rebuild_queue_from_journal,
+    relay_store_path,
     store_holds_graph_state,
 )
 
@@ -114,3 +121,78 @@ def test_host_table_and_immediate_wake_are_fail_closed():
         assert result["wetImmediate"] is False
         assert result["grokWorkerStart"] is None
         assert result["mode"] != "immediate"
+
+
+def test_confirm_true_only_when_host_hook_injects():
+    assert host_hook_injects("grok", "sessionStart") is False
+    assert host_hook_injects("grok", "promptSubmit") is False
+    assert host_hook_injects("grok", "stop") is True
+    assert host_hook_injects("agy", "sessionStart") is True
+    assert host_hook_injects("agy", "stop") is False
+    assert host_hook_injects("codex", "stop") is False
+    assert host_hook_injects("cursor", "sessionStart") is False
+    assert host_hook_injects("unknown", "sessionStart") is False
+
+
+def test_a_confirming_seq_5_does_not_drop_b_pending_2_to_5():
+    plan_id = "plan-g3-relay"
+    seqs = [
+        {
+            "seq": seq,
+            "kind": "slice.completed",
+            "actor": "orchestrator-g3",
+            "at": f"2026-08-20T12:0{seq}:00.000Z",
+            "slice_id": "alpha",
+        }
+        for seq in range(1, 6)
+    ]
+    store = empty_relay_store()
+    store["cursors"] = [
+        {"subscriber_id": "subscriber-a", "plan_id": plan_id, "last_delivered_seq": 0},
+        {"subscriber_id": "subscriber-b", "plan_id": plan_id, "last_delivered_seq": 1},
+    ]
+    store = ingest_journal_events(store, plan_id, seqs, ["subscriber-a", "subscriber-b"])
+    b_before = [item["seq"] for item in store["pending"] if item["subscriber_id"] == "subscriber-b"]
+    assert b_before == [2, 3, 4, 5]
+    after = confirm_delivery_store(store, "subscriber-a", plan_id, 5, True)
+    a_cursor = next(c for c in after["cursors"] if c["subscriber_id"] == "subscriber-a")
+    b_cursor = next(c for c in after["cursors"] if c["subscriber_id"] == "subscriber-b")
+    assert a_cursor["last_delivered_seq"] == 5
+    assert b_cursor["last_delivered_seq"] == 1
+    b_after = [item["seq"] for item in after["pending"] if item["subscriber_id"] == "subscriber-b"]
+    assert b_after == [2, 3, 4, 5]
+
+
+def test_production_ingest_writes_cursors_json(tmp_path: Path):
+    plan_id = "plan-g3-relay"
+    journal = tmp_path / "wiki" / "artifacts" / f"{plan_id}.log.md"
+    journal.parent.mkdir(parents=True)
+    payload = {
+        "thread_event_batch": [
+            {
+                "seq": 1,
+                "kind": "slice.assigned",
+                "actor": "orchestrator-g3",
+                "at": "2026-08-20T12:00:00.000Z",
+                "slice_id": "alpha",
+            },
+            {
+                "seq": 2,
+                "kind": "slice.completed",
+                "actor": "worker-a",
+                "at": "2026-08-20T12:01:00.000Z",
+                "slice_id": "alpha",
+            },
+        ]
+    }
+    journal.write_text("# Minni Plan Journal\n\n## events\n" + __import__("json").dumps(payload) + "\n", encoding="utf-8")
+    store = ingest_plan_journal_from_disk(tmp_path, plan_id, ["orchestrator-g3"])
+    assert store["graph"] is False
+    assert relay_store_path(tmp_path).is_file()
+    seqs = [item["seq"] for item in store["pending"] if item["subscriber_id"] == "orchestrator-g3"]
+    assert seqs == [1, 2]
+    again = ingest_journal_into_vault(tmp_path, plan_id, EVENTS, ["orchestrator-g3"])
+    assert [item["seq"] for item in again["pending"]] == [1, 2, 3]
+    source = inspect.getsource(thread_relay)
+    assert "def ingest_journal_into_vault" in source
+    assert "def ingest_plan_journal_from_disk" in source

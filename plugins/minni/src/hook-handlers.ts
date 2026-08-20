@@ -59,8 +59,10 @@ import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import {
   activePlanIdFromVault,
   confirmDeliveryInVault,
+  deliverySucceededForHostHook,
   pendingAttentionForHook,
 } from "./thread-notification-relay.js";
+import type { RelayHook } from "./thread-notification-relay.js";
 
 
 import { routeMemoryIntent } from "./policy.js";
@@ -128,12 +130,33 @@ import {
   writeInbox,
 } from "./vault.js";
 
+/**
+ * Confirm delivery=true only when HOST_INJECTION_TABLE says this host+hook
+ * actually injects. ignored / rejects / cannot / out leave the cursor behind.
+ */
+function confirmPendingIfInjects(args: {
+  vaultPath: string;
+  subscriberId: string;
+  planId: string;
+  lastSeq: number;
+  hostId: string;
+  hook: RelayHook;
+}): void {
+  if (!deliverySucceededForHostHook(args.hostId, args.hook)) return;
+  const { vaultPath, subscriberId, planId, lastSeq } = args;
+  deferUntilDelivered(async () => {
+    await confirmDeliveryInVault(vaultPath, subscriberId, planId, lastSeq, true);
+  });
+}
+
 /** G3 hook fallback: read pending attention. Not minni_thread_events. */
 async function attachPendingAttention(args: {
   vaultPath: string;
   subscriberId: string;
   planId?: string;
   envelopeBody: Record<string, unknown>;
+  hostId: string;
+  hook: RelayHook;
 }): Promise<void> {
   try {
     const pending = await pendingAttentionForHook({
@@ -151,9 +174,13 @@ async function attachPendingAttention(args: {
     }));
     const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
     if (lastSeq === undefined) return;
-    const planId = args.planId;
-    deferUntilDelivered(async () => {
-      await confirmDeliveryInVault(args.vaultPath, args.subscriberId, planId, lastSeq, true);
+    confirmPendingIfInjects({
+      vaultPath: args.vaultPath,
+      subscriberId: args.subscriberId,
+      planId: args.planId,
+      lastSeq,
+      hostId: args.hostId,
+      hook: args.hook,
     });
   } catch {
     // Relay is not SoT. A missed attach leaves the cursor behind.
@@ -1104,6 +1131,8 @@ export function createHookHandlers(
       subscriberId: config.agentId,
       planId: activePlan?.plan_id,
       envelopeBody,
+      hostId: wire.id,
+      hook: "sessionStart",
     });
 
     const budget = envelopeBudgetFor(config.contextWindow);
@@ -1427,6 +1456,8 @@ export function createHookHandlers(
       subscriberId: config.agentId,
       planId: activePlan?.plan_id,
       envelopeBody,
+      hostId: wire.id,
+      hook: "promptSubmit",
     });
     if (!activePlanReadOk) {
       const existing =
@@ -1768,8 +1799,13 @@ export function createHookHandlers(
         pendingStopText = pending.text;
         const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
         if (lastSeq !== undefined) {
-          deferUntilDelivered(async () => {
-            await confirmDeliveryInVault(config.vaultPath, config.agentId, planId, lastSeq, true);
+          confirmPendingIfInjects({
+            vaultPath: config.vaultPath,
+            subscriberId: config.agentId,
+            planId,
+            lastSeq,
+            hostId: wire.id,
+            hook: "stop",
           });
         }
       }
