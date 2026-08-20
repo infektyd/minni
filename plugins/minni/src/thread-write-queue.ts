@@ -31,6 +31,8 @@ export interface QueuedWorkerWrite {
   idempotencyKey: string;
   action: unknown;
   applyNow?: string;
+  /** Slice generation at accept. Leftover tickets must not apply after this advances. */
+  generation?: number;
 }
 
 export interface WorkerWriteDrainProgress {
@@ -193,6 +195,12 @@ function parseQueuedWrite(value: string): QueuedWorkerWrite | undefined {
     };
     if (typeof item.applyNow === "string" && Number.isFinite(Date.parse(item.applyNow))) {
       parsed.applyNow = item.applyNow;
+    }
+    if (item.generation !== undefined) {
+      if (!Number.isSafeInteger(item.generation) || (item.generation ?? -1) < 0) {
+        return undefined;
+      }
+      parsed.generation = item.generation;
     }
     return parsed;
   } catch {
@@ -389,6 +397,7 @@ export interface EnqueueWorkerWriteInput {
   applyNow?: Date;
   queueMax?: number;
   stuckMs?: number;
+  generation?: number;
 }
 
 export async function enqueueWorkerWrite(
@@ -424,6 +433,12 @@ export async function enqueueWorkerWrite(
     throw new ThreadBusyError(owner);
   }
 
+  if (
+    input.generation !== undefined &&
+    (!Number.isSafeInteger(input.generation) || input.generation < 0)
+  ) {
+    throw new Error("queued worker write generation is invalid");
+  }
   const item: QueuedWorkerWrite = {
     ticketId: randomUUID(),
     enqueuedAt: now.toISOString(),
@@ -434,6 +449,7 @@ export async function enqueueWorkerWrite(
     idempotencyKey: input.idempotencyKey,
     action: input.action,
     ...(input.applyNow instanceof Date ? { applyNow: input.applyNow.toISOString() } : {}),
+    ...(input.generation !== undefined ? { generation: input.generation } : {}),
   };
   try {
     await writeFile(filePath, `${JSON.stringify(item)}\n`, {

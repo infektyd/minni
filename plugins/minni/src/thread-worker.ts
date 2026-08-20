@@ -203,6 +203,10 @@ async function stampAcceptedStart(input: UpdateClaimedSliceInput): Promise<void>
     planId: input.planId,
   });
   const slice = findSlice(plan, input.sliceId);
+  if (!isNonTerminal(slice)) {
+    // Leftover accept after supersede/done is not a live start stamp.
+    return;
+  }
   const claim = slice.claim;
   if (!claim || claim.worker_agent_id !== input.workerAgentId) {
     throw new Error("claim scope mismatch");
@@ -261,6 +265,7 @@ async function hasAcceptedStartStamp(
   return (
     receipt?.kind === START_ACCEPTED_RECEIPT_KIND &&
     receipt.status === "pending" &&
+    receipt.generation === generation &&
     receipt.response.slice.status !== "in_progress" &&
     receipt.response.slice.status !== "done"
   );
@@ -269,6 +274,13 @@ async function hasAcceptedStartStamp(
 async function enqueueAcceptedWorkerWrite(
   input: UpdateClaimedSliceInput,
 ): Promise<void> {
+  const plan = await rehydrateAuthority({
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
+    planId: input.planId,
+  });
+  const slice = findSlice(plan, input.sliceId);
+  const generation = requireGeneration(slice);
   if (input.action.action === "start") {
     await stampAcceptedStart(input);
   }
@@ -282,6 +294,7 @@ async function enqueueAcceptedWorkerWrite(
     action: input.action,
     now: new Date(),
     applyNow: input.now instanceof Date ? input.now : undefined,
+    generation,
   });
 }
 
@@ -377,6 +390,14 @@ function hasLiveClaim(slice: PlanSlice, now: Date): boolean {
 
 function isNonTerminal(slice: PlanSlice): boolean {
   return slice.status !== "done" && slice.status !== "superseded";
+}
+
+function queuedWriteMatchesLiveGeneration(
+  item: { generation?: number },
+  slice: PlanSlice,
+): boolean {
+  if (typeof item.generation !== "number") return true;
+  return item.generation === requireGeneration(slice);
 }
 
 /**
@@ -2023,21 +2044,42 @@ export async function updateClaimedSlice(
   );
   if (already !== undefined) {
     if (input.action.action === "start") {
-      await stampAcceptedStart(lockedInput);
+      const plan = await rehydrateAuthority({
+        vaultPath: input.vaultPath,
+        notePath: input.notePath,
+        planId,
+      });
+      const slice = findSlice(plan, sliceId);
+      if (
+        isNonTerminal(slice) &&
+        queuedWriteMatchesLiveGeneration(already, slice)
+      ) {
+        await stampAcceptedStart(lockedInput);
+      }
     }
     kickWorkerWriteDrain(lockedInput, deps);
     return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
   }
 
   const queued = await listQueuedWorkerWrites(input.vaultPath, planId);
-  const startQueued = queued.some(
-    (item) =>
-      item.sliceId === sliceId && queuedWriteActionName(item) === "start",
-  );
-  if (input.action.action === "complete" && startQueued) {
-    await enqueueAcceptedWorkerWrite(lockedInput);
-    kickWorkerWriteDrain(lockedInput, deps);
-    return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
+  if (input.action.action === "complete") {
+    const planForQueue = await rehydrateAuthority({
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId,
+    });
+    const sliceForQueue = findSlice(planForQueue, sliceId);
+    const startQueued = queued.some(
+      (item) =>
+        item.sliceId === sliceId &&
+        queuedWriteActionName(item) === "start" &&
+        queuedWriteMatchesLiveGeneration(item, sliceForQueue),
+    );
+    if (startQueued) {
+      await enqueueAcceptedWorkerWrite(lockedInput);
+      kickWorkerWriteDrain(lockedInput, deps);
+      return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
+    }
   }
 
   try {
@@ -2148,6 +2190,19 @@ export async function drainPendingWorkerWritesForVault(
   return { planIds: drained };
 }
 
+async function queuedWriteIsLiveWork(
+  notePath: string,
+  item: { sliceId: string; generation?: number },
+): Promise<boolean> {
+  try {
+    const plan = await rehydratePlan(notePath);
+    const slice = findSlice(plan, item.sliceId);
+    return isNonTerminal(slice) && queuedWriteMatchesLiveGeneration(item, slice);
+  } catch {
+    return false;
+  }
+}
+
 async function drainOneQueuedWorkerWrite(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps,
@@ -2168,6 +2223,29 @@ async function drainOneQueuedWorkerWrite(
       (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
       input.now,
   };
+  if (!(await queuedWriteIsLiveWork(input.notePath, item))) {
+    // Leftover Q after generation advance / supersede is not live work.
+    // Drop it so drain is not stuck. Do not persist in_progress or journal
+    // slice.started on a dead parent. Same persist authority: we are already
+    // under withThreadLock. Live same-generation apply throws still keep the ticket.
+    await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
+    if (typeof item.generation === "number") {
+      await pruneSliceReceiptsOnGenerationAdvance(
+        input.vaultPath,
+        input.planId,
+        item.sliceId,
+        item.generation,
+      );
+    }
+    const leftoverStale = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+    const nextStale = leftoverStale[0];
+    await recordWorkerWriteDrainProgress(input.vaultPath, input.planId, {
+      headTicketId: nextStale?.ticketId ?? item.ticketId,
+      remaining: leftoverStale.length,
+      at: new Date().toISOString(),
+    });
+    return;
+  }
   try {
     await applyClaimedSliceOnLockedPlan(mapped, deps);
   } catch (error) {
@@ -2344,7 +2422,9 @@ async function applyClaimedSliceOnLockedPlan(
         const queuedNow = await listQueuedWorkerWrites(input.vaultPath, planId);
         const startTicket = queuedNow.some(
           (item) =>
-            item.sliceId === sliceId && queuedWriteActionName(item) === "start",
+            item.sliceId === sliceId &&
+            queuedWriteActionName(item) === "start" &&
+            queuedWriteMatchesLiveGeneration(item, slice),
         );
         const startStamp = await hasAcceptedStartStamp(
           input.vaultPath,

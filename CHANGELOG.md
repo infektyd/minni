@@ -24,6 +24,7 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   exists; start still applies first. A claimed pending slice with no start,
   no stamp, and no start ticket also cannot persist `done` (old apply path).
   That path journals no `slice.completed` without `slice.started`. Claim tokens stay off the journal. In-process `kickWorkerWriteDrain` dies with the accepting MCP process; a later drain (`drainWorkerWrites` / `drainPendingWorkerWritesForVault`) still applies one-at-a-time under `withThreadLock`. Stamp is not applied until that later apply. Not minnid-canonical, not a second graph, no new MCP tool.
+  Leftover Q + `slice.start_accepted` are bound to the slice generation they were accepted at. After exclusive replan/split advances generation or supersedes the parent, drain does not apply that start as live `in_progress` and does not journal it as live work on the dead parent. A generation-N stamp does not block or authorize N+1. Complete on a superseded parent still cannot persist `done`. Start still applies first when the slice is still live.
 
 - `docs-accuracy-converge.rhai` now binds `risk_acceptance`/`re_check_issue`
   into both loom gap arrays and emits a `Re-checks required` report section
