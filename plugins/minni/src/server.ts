@@ -399,9 +399,10 @@ server.registerTool(
   {
     title: "Minni Team Runtime",
     description:
-      "Build a deterministic temporary team runtime: agent profiles, task ledger, hydration packets, gates, and non-goals. Does not spawn agents or write durable learnings.",
+      "Project a vault Thread as a Team packet: plan_id, rev, and ready slices after the expiry sweep. Absent plan_id creates one Thread. Does not spawn, claim, assign, or write durable learnings.",
     inputSchema: {
       task: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       agents: z.array(teamAgentSchema).optional(),
       // G11: coordinatorAgentId removed from the model-facing schema (model no
       // longer supplies the coordinator identity). A caller-supplied name would
@@ -418,6 +419,7 @@ server.registerTool(
   },
   async ({
     task,
+    plan_id,
     agents,
     workspaceId,
     profile,
@@ -428,10 +430,13 @@ server.registerTool(
     const gated = await requireSharedGate("team.runtime", {
       agents: agents?.length ?? 0,
       coordinatorAgentId: DEFAULT_AGENT_ID,
+      plan_id,
     });
     if (gated) return gated;
-    const packet = await buildTeamRuntime({
+    try {
+      const packet = await buildTeamRuntime({
       task,
+      plan_id,
       agents,
       coordinatorAgentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies coordinator identity)
       workspaceId,
@@ -441,7 +446,10 @@ server.registerTool(
       includeVault,
       useAfm,
     });
-    return textResult(JSON.stringify(packet, null, 2));
+      return textResult(JSON.stringify(packet, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("team.runtime", error);
+    }
   },
 );
 

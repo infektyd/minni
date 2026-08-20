@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
+import { DEFAULT_AGENT_ID } from "../dist/config.js";
 import {
   DEFAULT_TEAM_TTL_SECONDS,
   MAX_TEAM_TTL_SECONDS,
@@ -10,7 +14,12 @@ import {
   buildTeamPromotionPacket,
   buildTeamRuntime,
 } from "../dist/team.js";
-import { DEFAULT_AGENT_ID } from "../dist/config.js";
+
+async function withVault(t) {
+  const vaultPath = await mkdtemp(path.join(tmpdir(), "minni-team-runtime-"));
+  t.after(() => rm(vaultPath, { recursive: true, force: true }));
+  return vaultPath;
+}
 
 function fakePreparedTask(input) {
   return {
@@ -32,7 +41,8 @@ function fakePreparedTask(input) {
   };
 }
 
-test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydration packets", async () => {
+test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydration packets", async (t) => {
+  const vaultPath = await withVault(t);
   const prepareCalls = [];
   const audits = [];
   const packet = await buildTeamRuntime(
@@ -40,7 +50,7 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
       task: "Implement Sovereign Team Runtime",
       coordinatorAgentId: "codex",
       workspaceId: "/repo",
-      vaultPath: "/tmp/vault",
+      vaultPath,
       agents: [
         { agentId: "researcher", role: "explorer", focus: "Map prior decisions." },
         { agentId: "implementer", role: "worker", focus: "Implement runtime.", ownership: ["src/team.ts"] },
@@ -65,10 +75,16 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.equal(packet.temporaryProfiles[0].memoryPolicy.learn, "manual-only");
   assert.deepEqual(packet.temporaryProfiles[0].permissions, ["read", "memory-recall"]);
   assert.ok(packet.temporaryProfiles[1].permissions.includes("write"));
+  assert.equal(packet.ready.length, 3);
+  assert.match(packet.plan_id, /^plan-[0-9a-f]{16}$/);
   assert.equal(packet.taskLedger.length, 3);
-  assert.equal(packet.taskLedger[0].status, "queued");
-  assert.deepEqual(packet.taskLedger[1].dependencies, ["researcher"]);
-  assert.deepEqual(packet.taskLedger[1].ownership, ["src/team.ts"]);
+  assert.equal(packet.taskLedger[0].status, "pending");
+  assert.deepEqual(packet.taskLedger.map((entry) => entry.id), packet.ready.map((slice) => slice.id));
+  for (const entry of packet.taskLedger) {
+    assert.deepEqual(entry.dependencies, []);
+    assert.ok(!entry.id.startsWith("task-"));
+  }
+  assert.deepEqual(packet.temporaryProfiles[1].ownership, ["src/team.ts"]);
   assert.equal(packet.hydrationPackets.length, 3);
   assert.equal(packet.hydrationPackets[0].agentId, "researcher");
   assert.equal(packet.hydrationPackets[0].context.task.includes("Assigned role: explorer"), true);
@@ -85,7 +101,8 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.deepEqual(packet.repeatedAgentSuggestions, []);
 });
 
-test("buildTeamRuntime pins the daemon recall leg to the server principal, never the caller-supplied coordinatorAgentId, while keeping hydration packets labeled by the temp agent's own id", async () => {
+test("buildTeamRuntime pins the daemon recall leg to the server principal, never the caller-supplied coordinatorAgentId, while keeping hydration packets labeled by the temp agent's own id", async (t) => {
+  const vaultPath = await withVault(t);
   const prepareCalls = [];
   const packet = await buildTeamRuntime(
     {
@@ -95,7 +112,7 @@ test("buildTeamRuntime pins the daemon recall leg to the server principal, never
       // that platform's vault-scoped content (cross-agent read-boundary bypass).
       coordinatorAgentId: "codex",
       workspaceId: "/repo",
-      vaultPath: "/tmp/vault",
+      vaultPath,
       agents: [
         { agentId: "keystone-praxis", role: "explorer", focus: "Map the blackout." },
       ],
@@ -127,7 +144,7 @@ test("buildTeamRuntime pins the daemon recall leg to the server principal, never
   );
 });
 
-test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and renders them", async () => {
+test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and renders them", async (t) => {
   const stubSuggestions = [
     {
       signature: "worker::audit swift concurrency",
@@ -149,7 +166,7 @@ test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and r
   const packet = await buildTeamRuntime(
     {
       task: "Repetition wiring",
-      vaultPath: "/tmp/vault",
+      vaultPath: await withVault(t),
     },
     {
       prepare: async (input) => fakePreparedTask(input),
@@ -169,11 +186,11 @@ test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and r
   assert.match(packet.contextMarkdown, /promotion candidate: yes/);
 });
 
-test("buildTeamRuntime omits Repeated Agent Patterns section when no suggestions", async () => {
+test("buildTeamRuntime omits Repeated Agent Patterns section when no suggestions", async (t) => {
   const packet = await buildTeamRuntime(
     {
       task: "No repetitions",
-      vaultPath: "/tmp/vault",
+      vaultPath: await withVault(t),
     },
     {
       prepare: async (input) => fakePreparedTask(input),
@@ -185,11 +202,11 @@ test("buildTeamRuntime omits Repeated Agent Patterns section when no suggestions
   assert.equal(packet.contextMarkdown.includes("## Repeated Agent Patterns"), false);
 });
 
-test("buildTeamRuntime never breaks when findRepeated throws", async () => {
+test("buildTeamRuntime never breaks when findRepeated throws", async (t) => {
   const packet = await buildTeamRuntime(
     {
       task: "Resilient against repetition failure",
-      vaultPath: "/tmp/vault",
+      vaultPath: await withVault(t),
     },
     {
       prepare: async (input) => fakePreparedTask(input),
@@ -204,14 +221,15 @@ test("buildTeamRuntime never breaks when findRepeated throws", async () => {
   assert.ok(packet.runtimeId.startsWith("team-"));
 });
 
-test("buildTeamRuntime defaults to a complete explorer, worker, reviewer team", async () => {
+test("buildTeamRuntime defaults to a complete explorer, worker, reviewer team", async (t) => {
   const packet = await buildTeamRuntime(
-    { task: "Ship runtime", vaultPath: "/tmp/vault" },
+    { task: "Ship runtime", vaultPath: await withVault(t) },
     { prepare: async (input) => fakePreparedTask(input), audit: async () => undefined },
   );
 
   assert.deepEqual(packet.temporaryProfiles.map((profile) => profile.role), ["explorer", "worker", "reviewer"]);
-  assert.equal(packet.taskLedger.length, 3);
+  assert.equal(packet.ready.length, 1, "no agents => one Thread slice from the task, not DEFAULT_TEAM");
+  assert.equal(packet.taskLedger.length, 1);
   assert.match(packet.gates.join("\n"), /Durable learning requires an explicit user request/);
   assert.match(packet.nonGoals.join("\n"), /No automatic spawning/);
 });
@@ -459,11 +477,11 @@ function fixedClock(iso = FIXED_NOW_ISO) {
   return () => new Date(iso);
 }
 
-async function buildRuntimeAt(iso, overrides = {}) {
+async function buildRuntimeAt(t, iso, overrides = {}) {
   return buildTeamRuntime(
     {
       task: "Lifecycle test",
-      vaultPath: "/tmp/vault",
+      vaultPath: await withVault(t),
       ...overrides,
     },
     {
@@ -474,8 +492,8 @@ async function buildRuntimeAt(iso, overrides = {}) {
   );
 }
 
-test("buildTeamRuntime defaults TTL to 24h and stamps createdAt + expiresAt", async () => {
-  const packet = await buildRuntimeAt(FIXED_NOW_ISO);
+test("buildTeamRuntime defaults TTL to 24h and stamps createdAt + expiresAt", async (t) => {
+  const packet = await buildRuntimeAt(t, FIXED_NOW_ISO);
 
   assert.equal(packet.createdAt, FIXED_NOW_ISO);
   assert.equal(packet.ttlSeconds, DEFAULT_TEAM_TTL_SECONDS);
@@ -484,20 +502,20 @@ test("buildTeamRuntime defaults TTL to 24h and stamps createdAt + expiresAt", as
   assert.match(packet.contextMarkdown, new RegExp(`Expires: ${packet.expiresAt}`));
 });
 
-test("buildTeamRuntime accepts a custom ttlSeconds", async () => {
-  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+test("buildTeamRuntime accepts a custom ttlSeconds", async (t) => {
+  const packet = await buildRuntimeAt(t, FIXED_NOW_ISO, { ttlSeconds: 3600 });
   assert.equal(packet.ttlSeconds, 3600);
   assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 3600 * 1000).toISOString());
 });
 
-test("buildTeamRuntime clamps ttlSeconds below the floor up to MIN_TEAM_TTL_SECONDS", async () => {
-  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: MIN_TEAM_TTL_SECONDS - 30 });
+test("buildTeamRuntime clamps ttlSeconds below the floor up to MIN_TEAM_TTL_SECONDS", async (t) => {
+  const packet = await buildRuntimeAt(t, FIXED_NOW_ISO, { ttlSeconds: MIN_TEAM_TTL_SECONDS - 30 });
   assert.equal(packet.ttlSeconds, MIN_TEAM_TTL_SECONDS);
   assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + MIN_TEAM_TTL_SECONDS * 1000).toISOString());
 });
 
-test("buildTeamRuntime clamps ttlSeconds above the ceiling down to MAX_TEAM_TTL_SECONDS", async () => {
-  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 999_999_999 });
+test("buildTeamRuntime clamps ttlSeconds above the ceiling down to MAX_TEAM_TTL_SECONDS", async (t) => {
+  const packet = await buildRuntimeAt(t, FIXED_NOW_ISO, { ttlSeconds: 999_999_999 });
   assert.equal(packet.ttlSeconds, MAX_TEAM_TTL_SECONDS);
   assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + MAX_TEAM_TTL_SECONDS * 1000).toISOString());
 });
@@ -525,8 +543,8 @@ test("buildTeamEvidencePacket without a runtime emits promotion candidates and n
   assert.ok(!packet.contextMarkdown.includes("## Expiration"));
 });
 
-test("buildTeamEvidencePacket with a fresh runtime marks runtimeExpired === false", async () => {
-  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+test("buildTeamEvidencePacket with a fresh runtime marks runtimeExpired === false", async (t) => {
+  const runtime = await buildRuntimeAt(t, FIXED_NOW_ISO, { ttlSeconds: 3600 });
   const packet = buildTeamEvidencePacket({
     task: "Implement runtime",
     runtime,
@@ -551,8 +569,8 @@ test("buildTeamEvidencePacket with a fresh runtime marks runtimeExpired === fals
   assert.ok(!packet.contextMarkdown.includes("## Expiration"));
 });
 
-test("buildTeamEvidencePacket with an expired runtime suppresses promotion and adds a blocker", async () => {
-  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+test("buildTeamEvidencePacket with an expired runtime suppresses promotion and adds a blocker", async (t) => {
+  const runtime = await buildRuntimeAt(t, FIXED_NOW_ISO, { ttlSeconds: 3600 });
   const oneSecondPastExpiry = new Date(Date.parse(runtime.expiresAt) + 1000).toISOString();
   const packet = buildTeamEvidencePacket({
     task: "Implement runtime",
@@ -584,8 +602,8 @@ test("buildTeamEvidencePacket with an expired runtime suppresses promotion and a
   assert.ok(packet.contextMarkdown.includes(runtime.runtimeId));
 });
 
-test("buildTeamEvidencePacketWithHarvest refuses to harvest when runtime expired", async () => {
-  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+test("buildTeamEvidencePacketWithHarvest refuses to harvest when runtime expired", async (t) => {
+  const runtime = await buildRuntimeAt(t, FIXED_NOW_ISO, { ttlSeconds: 3600 });
   const oneSecondPastExpiry = new Date(Date.parse(runtime.expiresAt) + 1000).toISOString();
   let harvestCalled = false;
   const callAfm = async () => {
