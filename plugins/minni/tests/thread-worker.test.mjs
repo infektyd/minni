@@ -1442,8 +1442,11 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
     },
   );
   const update = await queuedUpdate;
-  assert.equal(update.ok, true, update.error?.message);
-  assert.equal(isAcceptedWorkerWrite(update.value), true);
+  assert.equal(update.ok, false, "complete without start must refuse, not dump-and-return");
+  assert.match(
+    String(update.error?.message ?? ""),
+    /cannot persist done without start/,
+  );
   await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
   const final = await rehydratePlan(fixture.notePath);
   assert.equal(final.slices[0].status, "pending");
