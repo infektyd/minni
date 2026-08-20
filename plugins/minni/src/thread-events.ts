@@ -9,6 +9,7 @@ import {
   loadRelayStore,
   seedRelaySubscribers,
   vaultPathFromJournalPath,
+  vaultPrincipalSubscriberId,
   type JournalEvent,
 } from "./thread-notification-relay.js";
 
@@ -923,11 +924,14 @@ async function ingestRelayAfterJournalAppend(input: {
       if (event.slice_id) item.slice_id = event.slice_id;
       return item;
     });
+    const principal = vaultPrincipalSubscriberId(vaultPath);
+    const extraIds = principal ? [principal] : [];
     const subscriberIds = seedRelaySubscribers({
       actor: input.actor,
       planId: input.planId,
       cursors: store.cursors,
       events,
+      extraIds,
     });
     await ingestJournalIntoVault(vaultPath, input.planId, events, subscriberIds);
   } catch {

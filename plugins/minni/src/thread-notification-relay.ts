@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { inboxPrincipalForVaultPath } from "./hook-utils.js";
 import { GROK_WORKER_START } from "./thread-host-dispatch.js";
 
 /**
@@ -249,12 +250,26 @@ export function advanceCursor(
 }
 
 /**
+ * Honest orchestrator subscriber for this vault, if one exists.
+ *
+ * PlanArtifact has no owner. DEFAULT_AGENT_ID on a worker append is the
+ * writer. Hook config.agentId is not on the journal path. The product
+ * already derives a fail-closed vault principal from the `<slug>-vault`
+ * directory name (`inboxPrincipalForVaultPath`). No `-vault` suffix →
+ * undefined. Do not invent a subscriber.
+ */
+export function vaultPrincipalSubscriberId(vaultPath: string): string | undefined {
+  return inboxPrincipalForVaultPath(vaultPath);
+}
+
+/**
  * Who gets pending after a journal append.
  *
  * Old seed was `{current append actor} ∪ existing cursors for that plan`.
  * That notifies the writer on a cursor-less store and leaves the
- * already-working orchestrator empty. Landed journal actors and any
- * plan orchestrator / coordinator identity must be seeded too.
+ * already-working orchestrator empty. Landed journal actors and the
+ * fail-closed vault principal (when the vault dir names one) must be
+ * seeded too. extraIds is how production passes that principal.
  */
 export function seedRelaySubscribers(input: {
   actor?: string;

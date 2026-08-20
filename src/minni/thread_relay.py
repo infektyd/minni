@@ -284,6 +284,26 @@ def _cursor_for(store: Mapping[str, Any], subscriber_id: str, plan_id: str) -> d
     return {"subscriber_id": subscriber_id, "plan_id": plan_id, "last_delivered_seq": 0}
 
 
+def vault_principal_subscriber_id(vault_path: str | Path) -> str | None:
+    """Fail-closed vault principal. Same rule as inboxPrincipalForVaultPath.
+
+    PlanArtifact has no owner. A worker process DEFAULT_AGENT_ID is the
+    writer. Hook config.agentId is not on the journal path. The product
+    already derives a principal from the ``<slug>-vault`` directory name.
+    No ``-vault`` suffix → None. Do not invent a subscriber.
+    Slug aliases come from the existing inbox map, not a new field.
+    """
+    base = Path(vault_path).resolve().name
+    if not base.endswith("-vault"):
+        return None
+    slug = base[: -len("-vault")]
+    if not slug:
+        return None
+    from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+
+    return _VAULT_SLUG_TO_AGENT_ID.get(slug, slug)
+
+
 def seed_relay_subscribers(
     *,
     actor: str | None = None,
@@ -296,7 +316,8 @@ def seed_relay_subscribers(
 
     Old seed was ``{current append actor} ∪ existing cursors for that plan``.
     That notifies the writer on a cursor-less store and leaves the
-    already-working orchestrator empty.
+    already-working orchestrator empty. extra_ids is how a fail-closed
+    vault principal is passed when the vault dir names one.
     """
     ids: set[str] = set()
 
