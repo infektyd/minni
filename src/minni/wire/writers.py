@@ -29,6 +29,13 @@ MINNI_READONLY_TOOLS = (
 )
 MINNI_READONLY_GRANTS = tuple(f"mcp(minni/{tool})" for tool in MINNI_READONLY_TOOLS)
 MINNI_WILDCARD_GRANT = "mcp(minni/*)"
+# Worker allowlist is post-claim only. One tool: minni_thread_worker_update
+# (actions already include start/progress/block/scar/propose_structure/complete).
+# Do not merge these into MINNI_READONLY_GRANTS. Claim stays orchestrator-side.
+MINNI_WORKER_TOOLS = (
+    "minni_thread_worker_update",
+)
+MINNI_WORKER_GRANTS = tuple(f"mcp(minni/{tool})" for tool in MINNI_WORKER_TOOLS)
 AGY_PLUGIN_NAME = "minni"
 AGY_PLUGINS_DIR = "~/.gemini/config/plugins"
 AGY_DIST_TOKEN = "__MINNI_GEMINI_DIST__"
@@ -415,6 +422,26 @@ def ensure_permission_grant(
     owner[leaf] = filtered
     write_json(path, data)
     return True
+
+
+def ensure_worker_permission_grant(
+    path: Path,
+    key_path: list[str],
+    grants: tuple[str, ...] = MINNI_WORKER_GRANTS,
+    legacy_markers: tuple[str, ...] = GEMINI_LEGACY_GRANT_MARKERS,
+) -> bool:
+    """Write worker grants onto a worker allowlist only.
+
+    Still strips ``mcp(minni/*)``. That wildcard would grant structural
+    thread tools. The named worker grant is not a wildcard, so the strip
+    must leave ``mcp(minni/minni_thread_worker_update)`` in place.
+
+    Not called from ``update_antigravity_config``. Default install stays
+    the readonly nine.
+    """
+    return ensure_permission_grant(
+        path, key_path, grants=grants, legacy_markers=legacy_markers,
+    )
 
 
 def update_antigravity_config(

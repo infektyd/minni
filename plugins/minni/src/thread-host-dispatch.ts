@@ -10,9 +10,11 @@ import type { WorkerPacket } from "./thread-worker-packet.js";
  * `minni_team_evidence` is a promotion summary, not the worker SoT.
  *
  * Host start is not invented here. grok has no worker-start. agy's default
- * readonly allowlist cannot call the completion tool. Codex keeps its
- * documented coordinator map (one packet → one subagent) and marks wet
- * dispatch UNPROVEN. Cursor is out of this first wet set.
+ * readonly allowlist cannot call the completion tool. A named worker
+ * allowlist exists (`minni_thread_worker_update` only) and is still not
+ * wet. Codex keeps its documented coordinator map (one packet → one
+ * subagent) and marks wet dispatch UNPROVEN. Cursor is out of this first
+ * wet set.
  */
 export const FIRST_WET_SET = ["grok", "agy", "codex"] as const;
 export type FirstWetSetHost = (typeof FIRST_WET_SET)[number];
@@ -40,8 +42,33 @@ export const AGY_DEFAULT_ALLOWLIST = [
   "minni_ping_agent_status",
 ] as const;
 
-/** A worker allowlist that includes `minni_thread_worker_update` is missing. */
-export const AGY_WORKER_ALLOWLIST: null = null;
+/**
+ * Named agy worker allowlist. Copied from `MINNI_WORKER_TOOLS` in
+ * `src/minni/wire/writers.py`. One tool; scar is a worker_update action.
+ * Default dispatch still uses `AGY_DEFAULT_ALLOWLIST` and stays CANNOT.
+ */
+export const AGY_WORKER_ALLOWLIST = [
+  "minni_thread_worker_update",
+] as const;
+
+export interface AgyWorkerAllowlistReport {
+  host: "agy";
+  exists: true;
+  allowlist: typeof AGY_WORKER_ALLOWLIST;
+  injectStepsIsStart: false;
+  spawned: false;
+}
+
+/** Named list exists. Still not wet. injectSteps is not start. */
+export function reportAgyWorkerAllowlist(): AgyWorkerAllowlistReport {
+  return {
+    host: "agy",
+    exists: true,
+    allowlist: AGY_WORKER_ALLOWLIST,
+    injectStepsIsStart: false,
+    spawned: false,
+  };
+}
 
 export interface WorkerCompletion {
   tool: typeof WORKER_COMPLETION_TOOL;
