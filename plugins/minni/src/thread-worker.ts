@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   addScar,
   journalPathFor,
+  findPlanNote,
   persistPlan,
   planDigestVersionErrorMessage,
   planHistoryAppendErrorMessage,
@@ -58,6 +59,7 @@ import { ThreadBusyError, withThreadLock } from "./thread-lock.js";
 import {
   enqueueWorkerWrite,
   findQueuedWorkerWrite,
+  listPendingWorkerWritePlanIds,
   listQueuedWorkerWrites,
   pickNextQueuedWorkerWrite,
   queuedWriteActionName,
@@ -2065,8 +2067,44 @@ function drainKickKey(vaultPath: string, planId: string): string {
 }
 
 /**
- * Daemon drain: apply queued worker writes one-at-a-time under the existing
- * one persist authority. Not a second graph. Not G3. Replan is never queued.
+ * Apply queued worker writes one-at-a-time under the existing one persist
+ * authority. Not a second graph. Not G3. Replan is never queued.
+ *
+ * This is the durable drain: any later process can call it. Q + start-accepted
+ * stamp live on disk, so the accepting MCP process does not have to stay
+ * alive. Stamp is not applied until this apply. Start still applies before
+ * that slice complete.
+ */
+export async function drainWorkerWrites(
+  input: ThreadPlanTarget & { now?: Date | (() => Date) },
+  deps: ThreadWorkerDeps = {},
+): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+    if (remaining.length === 0) return;
+    try {
+      await withThreadLock(
+        input.vaultPath,
+        input.planId,
+        `worker-queue-drain:${randomUUID()}`,
+        () => drainOneQueuedWorkerWrite(input, deps),
+        { waitMs: 0 },
+      );
+    } catch (error) {
+      if (error instanceof ThreadBusyError) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * In-process kick. It dies with the accepting process. Do not treat this as
+ * the durable drain — a later process must call drainWorkerWrites /
+ * drainPendingWorkerWritesForVault.
  */
 export function kickWorkerWriteDrain(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
@@ -2074,28 +2112,7 @@ export function kickWorkerWriteDrain(
 ): void {
   const key = drainKickKey(input.vaultPath, input.planId);
   if (drainKicks.has(key)) return;
-  const run = (async () => {
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
-      const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
-      if (remaining.length === 0) return;
-      try {
-        await withThreadLock(
-          input.vaultPath,
-          input.planId,
-          `worker-queue-drain:${randomUUID()}`,
-          () => drainOneQueuedWorkerWrite(input, deps),
-          { waitMs: 0 },
-        );
-      } catch (error) {
-        if (error instanceof ThreadBusyError) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-          continue;
-        }
-        throw error;
-      }
-    }
-  })()
+  const run = drainWorkerWrites(input, deps)
     .catch(() => {
       // Apply throw is parked, not dropped: drainOne keeps the ticket and
       // the start-accepted receipt. Swallow only the unhandled rejection.
@@ -2104,6 +2121,30 @@ export function kickWorkerWriteDrain(
       drainKicks.delete(key);
     });
   drainKicks.set(key, run);
+}
+
+/**
+ * Later-process entry: scan this vault's pending Q dirs and apply each plan
+ * through drainWorkerWrites. Same persist authority. findPlanNote is the
+ * existing note locator — not a second graph, not minnid-canonical.
+ */
+export async function drainPendingWorkerWritesForVault(
+  vaultPath: string,
+  deps: ThreadWorkerDeps = {},
+): Promise<{ planIds: string[] }> {
+  const planIds = await listPendingWorkerWritePlanIds(vaultPath);
+  const drained: string[] = [];
+  for (const planId of planIds) {
+    const notePath = await findPlanNote(vaultPath, planId);
+    if (notePath === undefined) continue;
+    try {
+      await drainWorkerWrites({ vaultPath, notePath, planId }, deps);
+      drained.push(planId);
+    } catch {
+      // Apply throw is parked. Ticket + stamp stay for the next later drain.
+    }
+  }
+  return { planIds: drained };
 }
 
 async function drainOneQueuedWorkerWrite(
