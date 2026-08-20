@@ -1747,7 +1747,7 @@ server.registerTool(
   {
     title: "Minni Thread Replan",
     description:
-      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan.",
+      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse); contract = drop_slice_ids only. Drop supersedes; it never deletes.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       new_slices: z.array(planSliceInputSchema).optional(),
