@@ -306,3 +306,83 @@ test("withThreadLock recovers a stale lock with invalid owner JSON", async (t) =
   assert.equal(last?.reason, "stale_invalid_owner");
   assert.equal(last?.plan_id, "plan-invalid-owner");
 });
+
+
+test("withThreadLock keeps DEFAULT_WAIT_MS at 5s; waitMs is stall not a silent bump", async () => {
+  const src = await readFile(new URL("../src/thread-lock.ts", import.meta.url), "utf8");
+  assert.match(src, /const DEFAULT_WAIT_MS = 5_000;/);
+  assert.match(src, /const DEFAULT_STALE_MS = 120_000;/);
+  assert.doesNotMatch(src, /const DEFAULT_WAIT_MS = (?:[6-9]\d{3}|[1-9]\d{4,})/);
+  assert.match(src, /\.wait/);
+  assert.match(src, /stallDeadline/);
+});
+
+test("withThreadLock FIFO wait lets N=40 overlapping holders acquire after >5s serialized work", { timeout: 30_000 }, async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-thread-lock-fifo40-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const N = 40;
+  const holdMs = 175;
+  const intervals = [];
+  const results = await Promise.all(
+    Array.from({ length: N }, (_, index) =>
+      withThreadLock(
+        root,
+        "plan-fifo-40",
+        `op-${index}`,
+        async () => {
+          const entered = Date.now();
+          await new Promise((resolve) => setTimeout(resolve, holdMs));
+          const left = Date.now();
+          intervals.push({ index, entered, left });
+        },
+      )
+        .then(() => ({ index, ok: true }))
+        .catch((error) => ({
+          index,
+          ok: false,
+          code: error?.code,
+          message: error instanceof Error ? error.message : String(error),
+        })),
+    ),
+  );
+
+  const busy = results.filter((result) => result.code === "THREAD_BUSY");
+  assert.equal(busy.length, 0, `THREAD_BUSY must be overflow not N=40 default: ${JSON.stringify(busy)}`);
+  assert.equal(results.filter((result) => result.ok).length, N);
+  intervals.sort((a, b) => a.entered - b.entered);
+  assert.equal(intervals.length, N);
+  for (let i = 1; i < intervals.length; i += 1) {
+    assert.ok(
+      intervals[i - 1].left <= intervals[i].entered,
+      `lock sections overlapped: ${JSON.stringify(intervals.slice(i - 1, i + 1))}`,
+    );
+  }
+  const span = intervals[intervals.length - 1].left - intervals[0].entered;
+  assert.ok(span > 5_000, `serialized N=40 must exceed the 5s stall budget (got ${span}ms)`);
+});
+
+test("withThreadLock FIFO grants waiters in enqueue order and never overlaps", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-thread-lock-fifo-order-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let releaseHolder;
+  const held = new Promise((resolve) => {
+    releaseHolder = resolve;
+  });
+  const holder = withThreadLock(root, "plan-fifo-order", "holder", async () => {
+    await held;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  const order = [];
+  const first = withThreadLock(root, "plan-fifo-order", "first", async () => {
+    order.push("first");
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const second = withThreadLock(root, "plan-fifo-order", "second", async () => {
+    order.push("second");
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  releaseHolder();
+  await Promise.all([holder, first, second]);
+  assert.deepEqual(order, ["first", "second"]);
+});

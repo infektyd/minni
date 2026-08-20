@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { appendFileWithFsync } from "./vault.js";
@@ -8,6 +8,15 @@ import { appendFileWithFsync } from "./vault.js";
 const DEFAULT_WAIT_MS = 5_000;
 const DEFAULT_STALE_MS = 120_000;
 const DEFAULT_POLL_MS = 25;
+
+/**
+ * `waitMs` is the stall budget: max time without lock progress (owner
+ * change, release, or stale recovery). It is not a total-wait cap.
+ * A FIFO waiter queue lets a Thread-C burst of overlapping starts acquire
+ * the same plan lock while the lock keeps moving. THREAD_BUSY is
+ * fail-closed overflow for a stuck live owner — not the N=40 default.
+ * Do not steal a live owner. Do not silently enlarge DEFAULT_WAIT_MS.
+ */
 
 /**
  * Cross-process Thread lock owner. `processStartMarker` is the local OS
@@ -20,6 +29,14 @@ export interface ThreadLockOwner {
   pid: number;
   operationId: string;
   acquiredAt: string;
+  processStartMarker?: string;
+}
+
+interface ThreadLockWaiter {
+  ticketId: string;
+  operationId: string;
+  pid: number;
+  enqueuedAt: string;
   processStartMarker?: string;
 }
 
@@ -161,6 +178,107 @@ async function readOwner(ownerPath: string): Promise<ThreadLockOwner | undefined
   }
 }
 
+
+function waitDirFor(locksRoot: string, planId: string): string {
+  return path.join(locksRoot, `${lockKey(planId)}.wait`);
+}
+
+function parseWaiter(value: string): ThreadLockWaiter | undefined {
+  try {
+    const waiter = JSON.parse(value) as Partial<ThreadLockWaiter>;
+    if (
+      typeof waiter.ticketId !== "string" ||
+      waiter.ticketId.length === 0 ||
+      typeof waiter.operationId !== "string" ||
+      waiter.operationId.length === 0 ||
+      !Number.isInteger(waiter.pid) ||
+      (waiter.pid ?? 0) <= 0 ||
+      typeof waiter.enqueuedAt !== "string" ||
+      !Number.isFinite(Date.parse(waiter.enqueuedAt))
+    ) {
+      return undefined;
+    }
+    const parsed: ThreadLockWaiter = {
+      ticketId: waiter.ticketId,
+      operationId: waiter.operationId,
+      pid: waiter.pid as number,
+      enqueuedAt: waiter.enqueuedAt,
+    };
+    if (
+      typeof waiter.processStartMarker === "string" &&
+      waiter.processStartMarker.length > 0
+    ) {
+      parsed.processStartMarker = waiter.processStartMarker;
+    }
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+function waiterLooksLive(
+  waiter: ThreadLockWaiter,
+  isProcessAlive: (pid: number) => boolean,
+  getProcessStartMarker: (pid: number) => string | undefined,
+): boolean {
+  return ownerLooksLive(
+    {
+      pid: waiter.pid,
+      operationId: waiter.operationId,
+      acquiredAt: waiter.enqueuedAt,
+      ...(waiter.processStartMarker !== undefined
+        ? { processStartMarker: waiter.processStartMarker }
+        : {}),
+    },
+    isProcessAlive,
+    getProcessStartMarker,
+  ).live;
+}
+
+function progressKey(
+  lockExists: boolean,
+  owner: ThreadLockOwner | undefined,
+): string {
+  if (!lockExists) return "free";
+  if (owner === undefined) return "held-unknown";
+  return `owner:${owner.pid}:${owner.operationId}:${owner.acquiredAt}`;
+}
+
+async function listLivingWaiters(
+  waitDir: string,
+  isProcessAlive: (pid: number) => boolean,
+  getProcessStartMarker: (pid: number) => string | undefined,
+): Promise<ThreadLockWaiter[]> {
+  let names: string[];
+  try {
+    names = await readdir(waitDir);
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return [];
+    throw error;
+  }
+  const waiters: ThreadLockWaiter[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const ticketPath = path.join(waitDir, name);
+    let waiter: ThreadLockWaiter | undefined;
+    try {
+      waiter = parseWaiter(await readFile(ticketPath, "utf8"));
+    } catch {
+      waiter = undefined;
+    }
+    if (waiter === undefined || !waiterLooksLive(waiter, isProcessAlive, getProcessStartMarker)) {
+      await rm(ticketPath, { force: true }).catch(() => {});
+      continue;
+    }
+    waiters.push(waiter);
+  }
+  waiters.sort((a, b) => {
+    const byTime = a.enqueuedAt.localeCompare(b.enqueuedAt);
+    return byTime !== 0 ? byTime : a.ticketId.localeCompare(b.ticketId);
+  });
+  return waiters;
+}
+
 function recoveryAuditPath(vaultPath: string): string {
   return path.join(vaultPath, ".runtime", "thread-locks", "recovery.jsonl");
 }
@@ -213,7 +331,7 @@ export async function withThreadLock<T>(
   const locksRoot = path.join(vaultPath, ".runtime", "thread-locks");
   const lockDir = path.join(locksRoot, `${lockKey(planId)}.lock`);
   const ownerPath = path.join(lockDir, "owner.json");
-  const deadline = Date.now() + waitMs;
+  const waitDir = waitDirFor(locksRoot, planId);
   const selfMarker = getProcessStartMarker(process.pid);
   const owner: ThreadLockOwner = {
     pid: process.pid,
@@ -222,100 +340,163 @@ export async function withThreadLock<T>(
     ...(selfMarker !== undefined ? { processStartMarker: selfMarker } : {}),
   };
   let observedOwner: ThreadLockOwner | undefined;
+  let ticketPath: string | undefined;
+  let lastProgressKey: string | undefined;
+  let stallDeadline = Date.now() + waitMs;
 
   await mkdir(locksRoot, { recursive: true });
 
-  while (true) {
-    try {
-      await mkdir(lockDir);
-      try {
-        await writeFile(ownerPath, `${JSON.stringify(owner)}\n`, {
-          encoding: "utf8",
-          flag: "wx",
-          mode: 0o600,
-        });
-      } catch (error) {
-        await rm(lockDir, { recursive: true, force: true }).catch(() => {});
-        throw error;
-      }
-      break;
-    } catch (error) {
-      if (!isErrno(error, "EEXIST")) {
-        throw error;
-      }
-    }
+  const enqueueWaiter = async (): Promise<void> => {
+    if (ticketPath !== undefined) return;
+    const ticketId = randomUUID();
+    const waiter: ThreadLockWaiter = {
+      ticketId,
+      operationId,
+      pid: process.pid,
+      enqueuedAt: now().toISOString(),
+      ...(selfMarker !== undefined ? { processStartMarker: selfMarker } : {}),
+    };
+    await mkdir(waitDir, { recursive: true });
+    const nextPath = path.join(waitDir, `${ticketId}.json`);
+    await writeFile(nextPath, `${JSON.stringify(waiter)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    ticketPath = nextPath;
+  };
 
-    observedOwner = await readOwner(ownerPath);
-    let ageMs: number | undefined;
-    try {
-      const lockStat = await stat(lockDir);
-      ageMs = Math.max(0, now().getTime() - lockStat.mtimeMs);
-    } catch (error) {
-      if (!isErrno(error, "ENOENT")) {
-        throw error;
-      }
+  const noteProgress = (lockExists: boolean, current: ThreadLockOwner | undefined) => {
+    const key = progressKey(lockExists, current);
+    if (lastProgressKey === undefined) {
+      lastProgressKey = key;
+      return;
     }
+    if (key !== lastProgressKey) {
+      lastProgressKey = key;
+      stallDeadline = Date.now() + waitMs;
+    }
+  };
 
-    let recoveryReason: ThreadLockRecoveryReason | undefined;
-    if (ageMs !== undefined && ageMs > staleMs) {
-      if (observedOwner === undefined) {
-        // Distinguish missing owner file from unparseable JSON for the audit.
+  try {
+    while (true) {
+      // Waiter liveness is the OS process that queued, not the lock-owner
+      // injectors (those exist to recover/refuse the current owner).
+      const living = ticketPath
+        ? await listLivingWaiters(waitDir, processAlive, readProcessStartMarker)
+        : [];
+      const myTicket =
+        ticketPath === undefined
+          ? undefined
+          : path.basename(ticketPath, ".json");
+      const isHead =
+        myTicket === undefined ||
+        living.length === 0 ||
+        living[0]?.ticketId === myTicket;
+
+      if (isHead) {
         try {
-          await readFile(ownerPath, "utf8");
-          recoveryReason = "stale_invalid_owner";
+          await mkdir(lockDir);
+          try {
+            await writeFile(ownerPath, `${JSON.stringify(owner)}\n`, {
+              encoding: "utf8",
+              flag: "wx",
+              mode: 0o600,
+            });
+          } catch (error) {
+            await rm(lockDir, { recursive: true, force: true }).catch(() => {});
+            throw error;
+          }
+          break;
         } catch (error) {
-          if (isErrno(error, "ENOENT")) {
-            recoveryReason = "stale_ownerless";
-          } else {
-            recoveryReason = "stale_invalid_owner";
+          if (!isErrno(error, "EEXIST")) {
+            throw error;
           }
         }
-      } else {
-        const liveness = ownerLooksLive(
-          observedOwner,
-          isProcessAlive,
-          getProcessStartMarker,
-        );
-        if (!liveness.live) {
-          recoveryReason = liveness.reasonIfStale;
-        }
       }
-    }
 
-    if (recoveryReason !== undefined) {
-      const quarantineDir = `${lockDir}.stale-${randomUUID()}`;
+      await enqueueWaiter();
+
+      observedOwner = await readOwner(ownerPath);
+      let lockExists = false;
+      let ageMs: number | undefined;
       try {
-        await rename(lockDir, quarantineDir);
+        const lockStat = await stat(lockDir);
+        lockExists = true;
+        ageMs = Math.max(0, now().getTime() - lockStat.mtimeMs);
       } catch (error) {
         if (!isErrno(error, "ENOENT")) {
           throw error;
         }
       }
-      await rm(quarantineDir, { recursive: true, force: true }).catch(() => {});
-      // Best-effort audit: recovery must still succeed if the audit write
-      // fails (lock progress > audit completeness).
-      await appendRecoveryAudit(vaultPath, {
-        at: now().toISOString(),
-        plan_id: planId,
-        reason: recoveryReason,
-        ...(observedOwner ? { previous_owner: observedOwner } : {}),
-      }).catch(() => {});
-      continue;
+
+      let recoveryReason: ThreadLockRecoveryReason | undefined;
+      if (ageMs !== undefined && ageMs > staleMs) {
+        if (observedOwner === undefined) {
+          // Distinguish missing owner file from unparseable JSON for the audit.
+          try {
+            await readFile(ownerPath, "utf8");
+            recoveryReason = "stale_invalid_owner";
+          } catch (error) {
+            if (isErrno(error, "ENOENT")) {
+              recoveryReason = "stale_ownerless";
+            } else {
+              recoveryReason = "stale_invalid_owner";
+            }
+          }
+        } else {
+          const liveness = ownerLooksLive(
+            observedOwner,
+            isProcessAlive,
+            getProcessStartMarker,
+          );
+          if (!liveness.live) {
+            recoveryReason = liveness.reasonIfStale;
+          }
+        }
+      }
+
+      if (recoveryReason !== undefined) {
+        const quarantineDir = `${lockDir}.stale-${randomUUID()}`;
+        try {
+          await rename(lockDir, quarantineDir);
+        } catch (error) {
+          if (!isErrno(error, "ENOENT")) {
+            throw error;
+          }
+        }
+        await rm(quarantineDir, { recursive: true, force: true }).catch(() => {});
+        // Best-effort audit: recovery must still succeed if the audit write
+        // fails (lock progress > audit completeness).
+        await appendRecoveryAudit(vaultPath, {
+          at: now().toISOString(),
+          plan_id: planId,
+          reason: recoveryReason,
+          ...(observedOwner ? { previous_owner: observedOwner } : {}),
+        }).catch(() => {});
+        noteProgress(false, undefined);
+        continue;
+      }
+
+      noteProgress(lockExists, observedOwner);
+      const remainingMs = stallDeadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new ThreadBusyError(observedOwner);
+      }
+      await sleep(Math.min(pollMs, remainingMs));
     }
 
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      throw new ThreadBusyError(observedOwner);
+    try {
+      return await fn();
+    } finally {
+      const currentOwner = await readOwner(ownerPath);
+      if (currentOwner?.operationId === operationId) {
+        await rm(lockDir, { recursive: true, force: true });
+      }
     }
-    await sleep(Math.min(pollMs, remainingMs));
-  }
-
-  try {
-    return await fn();
   } finally {
-    const currentOwner = await readOwner(ownerPath);
-    if (currentOwner?.operationId === operationId) {
-      await rm(lockDir, { recursive: true, force: true });
+    if (ticketPath !== undefined) {
+      await rm(ticketPath, { force: true }).catch(() => {});
     }
   }
 }
