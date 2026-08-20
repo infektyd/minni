@@ -94,6 +94,7 @@ import {
   claimIds,
   claimSlice,
   deleteClaimSecretsBestEffort,
+  drainPendingWorkerWritesForVault,
   pruneSliceReceiptsAfterPlanMutation,
   pruneSliceReceiptsOnGenerationAdvance,
   prepareThreadMutation,
@@ -2495,6 +2496,9 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Later process (not the accepting kick): pick pending Q + stamp and
+  // apply under the same withThreadLock persist authority.
+  void drainPendingWorkerWritesForVault(DEFAULT_VAULT_PATH).catch(() => {});
 }
 
 main().catch((error) => {

@@ -9,8 +9,10 @@ import { ThreadBusyError, readProcessStartMarker, type ThreadLockOwner } from ".
  *
  * When the plan lock is held, a worker write is ACCEPTED onto this queue and
  * the caller returns immediately. Accepted is not applied: journal seq, ready
- * set, and slice state change only when the daemon drains one item at a time
- * under `withThreadLock` (the existing one persist authority).
+ * set, and slice state change only when a drain applies one item at a time
+ * under `withThreadLock` (the existing one persist authority). That drain
+ * must outlive the accepting process: Q + stamp stay on disk, and a later
+ * process (not that in-process kick) can apply. Not a second graph.
  *
  * Replan is exclusive and is never a queue item.
  * THREAD_BUSY is fail-closed overflow: queue full, or drain stuck.
@@ -196,6 +198,44 @@ function parseQueuedWrite(value: string): QueuedWorkerWrite | undefined {
   } catch {
     return undefined;
   }
+}
+
+export async function listPendingWorkerWritePlanIds(
+  vaultPath: string,
+): Promise<string[]> {
+  const root = path.join(path.resolve(vaultPath), ".runtime", "thread-locks");
+  let names: string[];
+  try {
+    names = await readdir(root);
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return [];
+    throw error;
+  }
+  const planIds = new Set<string>();
+  for (const name of names) {
+    if (!name.endsWith(".q")) continue;
+    const dir = path.join(root, name);
+    let files: string[];
+    try {
+      files = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.endsWith(".json") || file === "progress.json") continue;
+      let item: QueuedWorkerWrite | undefined;
+      try {
+        item = parseQueuedWrite(await readFile(path.join(dir, file), "utf8"));
+      } catch {
+        item = undefined;
+      }
+      if (item !== undefined) {
+        planIds.add(item.planId);
+        break;
+      }
+    }
+  }
+  return [...planIds].sort();
 }
 
 export async function listQueuedWorkerWrites(

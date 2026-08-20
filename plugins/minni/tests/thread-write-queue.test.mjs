@@ -1,7 +1,9 @@
 // Dump-and-return Thread lock Q. Accepted is not applied.
 // Drain is one persist authority. Replan is exclusive, not a Q item.
 // THREAD_BUSY is overflow (Q full or drain stuck), not N=40.
+// Durable drain outlives the accepting process; in-process kick does not.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,6 +15,7 @@ import { withThreadLock } from "../dist/thread-lock.js";
 import {
   assignSlice,
   claimSlice,
+  drainPendingWorkerWritesForVault,
   isAcceptedWorkerWrite,
   kickWorkerWriteDrain,
   START_ACCEPTED_RECEIPT_KIND,
@@ -25,6 +28,7 @@ import { readWorkerUpdateReceipt } from "../dist/thread-claims.js";
 import {
   DEFAULT_QUEUE_MAX,
   enqueueWorkerWrite,
+  listPendingWorkerWritePlanIds,
   listQueuedWorkerWrites,
   pickNextQueuedWorkerWrite,
 } from "../dist/thread-write-queue.js";
@@ -635,6 +639,144 @@ test("fail-closed drain keeps accepted start when apply throws; complete cannot 
   const journalAfter = await journalState(fixture);
   assert.equal(journalAfter.completed.length, 0);
   assert.deepEqual(journalAfter.completesWithoutStarts, []);
+});
+
+test("accept start, kill that process, later drain (not that kick) journals slice.started", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "kill-accept-hold", async () => {
+    await held;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const workerModule = new URL("../dist/thread-worker.js", import.meta.url).href;
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+      import { updateClaimedSlice } from ${JSON.stringify(workerModule)};
+      const input = JSON.parse(process.env.MINNI_DRAIN_INPUT);
+      if (typeof input.now === "string") input.now = new Date(input.now);
+      const result = await updateClaimedSlice(input);
+      process.stdout.write(JSON.stringify(result) + "\\n");
+      await new Promise(() => {});
+      `,
+    ],
+    {
+      env: {
+        ...process.env,
+        MINNI_DRAIN_INPUT: JSON.stringify({
+          vaultPath: fixture.vaultPath,
+          notePath: fixture.notePath,
+          planId: fixture.planId,
+          sliceId: "s0",
+          workerAgentId: "worker-0",
+          token: claim.token,
+          idempotencyKey: "start-0",
+          action: { action: "start" },
+          now: "2026-08-18T12:01:00.000Z",
+        }),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+  });
+  let childOut = "";
+  child.stdout.on("data", (chunk) => {
+    childOut += chunk.toString();
+  });
+  const waitAccept = Date.now();
+  let queued = [];
+  while (Date.now() - waitAccept < 5_000) {
+    queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+    if (queued.some((item) => item.idempotencyKey === "start-0") && childOut.includes('"accepted":true')) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(
+    queued.some((item) => item.idempotencyKey === "start-0"),
+    `accepting process must enqueue start: ${JSON.stringify(queued)} out=${childOut}`,
+  );
+  const pendingPlans = await listPendingWorkerWritePlanIds(fixture.vaultPath);
+  assert.deepEqual(pendingPlans, [fixture.planId]);
+  const stampAtAccept = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stampAtAccept?.kind, START_ACCEPTED_RECEIPT_KIND);
+  assert.equal(stampAtAccept?.status, "pending");
+  assert.notEqual(stampAtAccept?.response.slice.status, "in_progress");
+  assert.notEqual(stampAtAccept?.response.slice.status, "done");
+
+  child.kill("SIGKILL");
+  await new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    child.once("exit", resolve);
+  });
+
+  // Enqueue complete without kicking. A later updateClaimedSlice complete
+  // would kick in THIS process and hide the dead accepting kick.
+  await enqueueWorkerWrite({
+    vaultPath: fixture.vaultPath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "complete-0",
+    action: {
+      action: "complete",
+      evidence: "Verification: slice s0 done via test ID T-kill",
+    },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+    applyNow: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  const afterKill = await journalState(fixture);
+  assert.equal(afterKill.started.length, 0, "killed kick must not journal slice.started");
+  assert.equal(afterKill.completed.length, 0, "complete must not persist done first");
+  const planAfterKill = await rehydratePlan(fixture.notePath);
+  assert.notEqual(planAfterKill.slices[0].status, "done");
+  assert.notEqual(planAfterKill.slices[0].status, "in_progress");
+  const queuedAfterKill = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(pickNextQueuedWorkerWrite(queuedAfterKill)?.idempotencyKey, "start-0");
+
+  release();
+  await holder;
+
+  const waitDeadKick = Date.now();
+  let mid;
+  while (Date.now() - waitDeadKick < 250) {
+    mid = await journalState(fixture);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(mid.started.length, 0, "accepting-process kick must stay dead after lock release");
+  assert.equal(mid.completed.length, 0);
+
+  const later = await drainPendingWorkerWritesForVault(fixture.vaultPath);
+  assert.ok(later.planIds.includes(fixture.planId), JSON.stringify(later));
+  const journal = await journalState(fixture);
+  assert.deepEqual(journal.started, ["s0"]);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  assert.ok(journal.started.length >= 1, "later drain (not that kick) must journal slice.started");
+  if (journal.completed.length > 0) {
+    const startIdx = journal.events.findIndex((event) => event.kind === "slice.started");
+    const completeIdx = journal.events.findIndex((event) => event.kind === "slice.completed");
+    assert.ok(startIdx >= 0 && completeIdx > startIdx, "start must apply before complete");
+  }
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0);
+  const planAfter = await rehydratePlan(fixture.notePath);
+  assert.ok(["in_progress", "done"].includes(planAfter.slices[0].status));
 });
 
 test("DEFAULT_WAIT_MS stays 5000 — silent bump is fake close", async () => {
