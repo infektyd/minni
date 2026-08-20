@@ -113,7 +113,7 @@ rejected outright and disables the cloud provider.
 - `minni_list_pending_handoffs`
 - `minni_await_handoff`
 - `minni_thread_create` / `minni_thread_update` / `minni_thread_status` / `minni_thread_activate` / `minni_thread_deactivate` / `minni_thread_replan` / `minni_thread_history` / `minni_thread_revision` / `minni_thread_diff` / `minni_thread_restore` / `minni_thread_scar` (11 tools; the pre-rename `minni_plan_*` aliases were removed in v0.5.0 — canonical names only)
-- `minni_team_runtime` — temporary team packet with agent profiles, task ledger, hydration packets, gates, and non-goals
+- `minni_team_runtime` — project one vault Thread as a Team packet (`plan_id`, `rev`, `readySlices`); leftover `taskLedger` is a view of ready, not a second graph
 - `minni_team_evidence` — dry-run evidence report plus promotion candidates; never promotes or learns automatically
 - `minni_team_promotion` — dry-run permanent-profile draft gated by explicit approval; never writes durable memory
 - `minni_ping_agent_request` / `minni_ping_agent_inbox` / `minni_ping_agent_decide` / `minni_ping_agent_status`
@@ -124,12 +124,14 @@ these tools, but new integrations should use the `minni_*` names above.
 
 ## Minni Team Runtime
 
-`minni_team_runtime` is a coordinator-side planning surface for short-lived helper agents. It creates:
+`minni_team_runtime` projects one vault Thread for short-lived helper agents. `plan_id` present reads that Thread and fails if it is missing. `plan_id` absent creates one Thread from the task. Ready is the expiry sweep plus `readySlices`. It also returns:
 
 - temporary profiles with role, focus, ownership, permissions, and recall-only memory policy
-- a task ledger with evidence requirements and dependencies
-- one hydration packet per temporary agent, built with `minni_prepare_task`
+- leftover `taskLedger`, a view of `ready` keyed by `PlanSlice.id` (not a second graph; `ledgerFor` is gone)
+- one coordinator-side hydration packet per temporary agent, built with `prepare_task` (not the worker contract)
 - gates and non-goals that keep promotion, learning, and vault writes explicit
+
+The worker contract is library `buildWorkerPacketAfterClaim` after assign → claim, then honesty-only `dispatchWorkerPacket`. Neither is an MCP tool. grok worker-start is missing. Default agy cannot run `minni_thread_worker_update`. Codex dispatch is UNPROVEN and `spawned` is false. G3 daemon relay, automatic spawning, and immediate wake are not implemented.
 
 `minni_team_evidence` is the matching close-out surface. It grades each temporary agent report as `missing`, `partial`, or `complete`, collects blockers, and marks promotion candidates for human review only.
 
