@@ -193,6 +193,16 @@ test("minni_thread_assign -> claim -> worker_update completes a slice end to end
       "claim response must be exactly ThreadClaimResponse, nothing more",
     );
 
+    const started = await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "research",
+      worker_agent_id: "worker-a",
+      claim_token: claim.token,
+      idempotency_key: "start-research-1",
+      action: "start",
+    });
+    assert.equal(started.slice.status, "in_progress");
+
     const done = await call("minni_thread_worker_update", {
       plan_id,
       slice_id: "research",
@@ -766,6 +776,15 @@ test("minni_thread_worker_update history-append error never leaks the vault note
       claim.token,
       `claim must return a token before the history-append probe, got ${JSON.stringify(claim)}`,
     );
+    const started = await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "a",
+      worker_agent_id: "worker-a",
+      claim_token: claim.token,
+      idempotency_key: "start-history-eisdir",
+      action: "start",
+    });
+    assert.equal(started.slice.status, "in_progress");
     const notePath = await findPlanNote(vaultPath, plan_id);
     assert.ok(notePath, "seeded plan must have a vault note");
     const historyFile = historyPathFor(notePath);

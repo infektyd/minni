@@ -367,9 +367,11 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
 
   const waitTick = Date.now();
   let journal;
+  let leftover = [];
   while (Date.now() - waitTick < 8_000) {
     journal = await journalState(notePath, planId);
-    if (journal.started.includes("s0")) break;
+    leftover = await listQueuedWorkerWrites(vaultPath, planId);
+    if (journal.started.includes("s0") && leftover.length === 0) break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.ok(journal.started.includes("s0"), `minnid tick must journal slice.started: ${JSON.stringify(journal)} stderr=${tickErr}`);
@@ -381,7 +383,7 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
   }
   assert.equal(tick.exitCode, null, "daemon/watcher that ticks stays up");
   assert.equal(tick.signalCode, null);
-  const leftover = await listQueuedWorkerWrites(vaultPath, planId);
+  leftover = await listQueuedWorkerWrites(vaultPath, planId);
   assert.equal(leftover.length, 0);
   const planAfter = await rehydratePlan(notePath);
   assert.ok(["in_progress", "done"].includes(planAfter.slices[0].status));

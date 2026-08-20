@@ -2356,6 +2356,11 @@ async function applyClaimedSliceOnLockedPlan(
         if (startTicket || startStamp) {
           throw new Error("start must apply before complete");
         }
+        // Claimed pending, no slice.started, no stamp, no start ticket:
+        // the old apply path persisted done. Complete cannot.
+        if (slice.status === "pending") {
+          throw new Error("complete cannot persist done without start");
+        }
       }
 
       const planBefore = plan;
