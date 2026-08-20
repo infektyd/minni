@@ -47,9 +47,9 @@ Use Minni Threads for: $ARGUMENTS
 1. Claim an assigned slice via `minni_thread_claim`:
    - Pass `plan_id`, `slice_id`, `worker_agent_id`, non-blank `idempotency_key`, and optional `ttl_seconds` (positive integer, capped at 7 days / `MAX_THREAD_CLAIM_TTL_SECONDS`; over-cap is rejected).
    - Returns a lease response containing `token` (valid for `ttl_seconds`), `generation`, `slice_id`, `claim_id`, and `expires_at`.
-2. Worker execution packet assembly:
-   - Phase 1 has no automatic hydration packet builder; the orchestrator/adapter constructs the worker packet from ready/assign/claim outputs:
-   - Worker packet carries `plan_id` + `slice_id` + `generation` + `claim_token` (where `claim_token` is the `token` received from `minni_thread_claim`).
+2. Worker execution packet assembly (after claim only):
+   - The Team adapter library `buildWorkerPacketAfterClaim` builds the packet from the `ThreadClaimResponse` plus the rehydrated Thread. Do not build this inside `minni_team_runtime` and do not invent a new MCP tool.
+   - Packet carries `plan_id` + `slice_id` + `generation` + `claim_token` (where `claim_token` is the `token` received from `minni_thread_claim`), that slice only (`title`, `status`, `gate?`, `depends_on`, `assigned_to`), thread goal + hard constraints, completed-dep evidence refs (ids/paths), bounded `prepare_task` recall, and allowed mutations.
 3. Worker mutations execute via `minni_thread_worker_update` only:
    - Pass `plan_id`, `slice_id`, `worker_agent_id`, `claim_token`, non-blank `idempotency_key`, and `action`.
    - Supported actions:
@@ -68,7 +68,7 @@ Use Minni Threads for: $ARGUMENTS
 - **Worker tools**: `minni_thread_claim` (returns lease `token`), `minni_thread_worker_update` (accepts `claim_token`).
 - **Security & authority boundary**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction (`minni_thread_create`, `minni_thread_replan`, `minni_thread_assign`) depends on host tool exposure / scoping. Claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is strictly enforced by Minni regardless of caller principal.
 - **Ordered event cursors**: `minni_thread_events` reads durable, monotonic events from `plan-*.log.md` starting after `since_seq` for crash recovery and polling without out-of-order delivery.
-- **Unimplemented capabilities**: Team projection, daemon notification relay, automatic spawning, and immediate wake are not implemented in Phase 1.
+- **Unimplemented capabilities**: Host dispatch, daemon notification relay, automatic spawning, and immediate wake are later waves.
 
 ## Hard Rules
 
