@@ -18,6 +18,7 @@ import {
   GROK_WORKER_START,
   WORKER_COMPLETION_TOOL,
   dispatchWorkerPacket,
+  reportAgyWorkerAllowlist,
 } from "../dist/thread-host-dispatch.js";
 
 const TEAM_SRC = new URL("../src/team.ts", import.meta.url);
@@ -171,7 +172,6 @@ test("agy default allowlist is honest CANNOT for minni_thread_worker_update", as
   assert.equal(result.reason, "default-allowlist");
   assert.equal(result.spawned, false);
   assert.equal(result.injectStepsIsStart, false);
-  assert.equal(AGY_WORKER_ALLOWLIST, null, "a worker allowlist that includes thread tools is MISSING");
   assert.deepEqual([...AGY_DEFAULT_ALLOWLIST], [
     "minni_recall",
     "minni_drill",
@@ -201,8 +201,44 @@ test("agy default allowlist is honest CANNOT for minni_thread_worker_update", as
     assert.match(writers, new RegExp(`"${tool}"`));
     assert.match(propagate, new RegExp(`"${tool}"`));
   }
-  assert.doesNotMatch(writers, /minni_thread_worker_update/);
+  assert.match(writers, /MINNI_READONLY_TOOLS = \([\s\S]*?\)/);
+  const readonlyBlock = writers.match(/MINNI_READONLY_TOOLS = \(([\s\S]*?)\)/)[1];
+  assert.doesNotMatch(readonlyBlock, /minni_thread_worker_update/);
   assert.doesNotMatch(propagate, /minni_thread_worker_update/);
+});
+
+test("agy worker allowlist exists as worker_update only and is still not wet", async (t) => {
+  const fixture = await seedClaimedPacket(t);
+  const defaultResult = dispatchWorkerPacket({ host: "agy", packet: fixture.packet });
+  const named = reportAgyWorkerAllowlist();
+
+  assert.notEqual(AGY_WORKER_ALLOWLIST, null);
+  assert.deepEqual([...AGY_WORKER_ALLOWLIST], [WORKER_COMPLETION_TOOL]);
+  assert.equal(AGY_WORKER_ALLOWLIST.includes("minni_thread_claim"), false);
+  assert.equal(GROK_WORKER_START, null, "do not invent a grok start API");
+  assert.equal(defaultResult.outcome, "CANNOT");
+  assert.equal(defaultResult.spawned, false);
+  assert.equal(named.host, "agy");
+  assert.equal(named.exists, true);
+  assert.deepEqual([...named.allowlist], [...AGY_WORKER_ALLOWLIST]);
+  assert.equal(named.spawned, false);
+  assert.equal(named.injectStepsIsStart, false);
+
+  const [writers, dispatchSrc, serverSrc] = await Promise.all([
+    readFile(WRITERS_PY, "utf8"),
+    readFile(DISPATCH_SRC, "utf8"),
+    readFile(SERVER_SRC, "utf8"),
+  ]);
+  assert.match(writers, /MINNI_WORKER_TOOLS = \(\s*"minni_thread_worker_update",?\s*\)/);
+  assert.match(writers, /MINNI_WORKER_GRANTS = tuple\(f"mcp\(minni\/\{tool\}\)" for tool in MINNI_WORKER_TOOLS\)/);
+  assert.match(writers, /def ensure_worker_permission_grant\(/);
+  assert.doesNotMatch(writers, /minni_thread_claim/);
+  assert.match(dispatchSrc, /GROK_WORKER_START:\s*null\s*=\s*null/);
+  assert.doesNotMatch(dispatchSrc, /SubagentStop|SessionStart|UserPromptSubmit/);
+  assert.doesNotMatch(
+    serverSrc,
+    /registerTool\(\s*"dispatch"|registerTool\(\s*"agy_worker"|registerTool\(\s*"host_dispatch"/,
+  );
 });
 
 test("Codex maps one Wave 2 packet onto one subagent and stays UNPROVEN", async (t) => {
