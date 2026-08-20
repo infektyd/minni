@@ -11,6 +11,7 @@ import {
   diffDependsOn,
   diffSupersededDependencies,
   applySliceDelta,
+  landedAddSlices,
   structuralProposalDelta,
   computePlanDigest,
   computePlanDigestV1,
@@ -3208,4 +3209,39 @@ test("applySliceDelta via structuralProposalDelta: expand keeps proposer; split 
   assert.ok(dropped, "contract never deletes");
   assert.equal(dropped.status, "superseded");
   assert.equal(contracted.slices.find((s) => s.id === "parent").status, "in_progress");
+});
+
+test("landedAddSlices reports generated ids after applySliceDelta omits them", () => {
+  const before = {
+    plan_id: "p",
+    goal: "generated-id journal",
+    status: "active",
+    constraints: [],
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-18T12:00:00.000Z",
+    updated: "2026-08-18T12:00:00.000Z",
+    rev: 1,
+  };
+  const requestAdds = [
+    { title: "Generated Child", gate: "review", depends_on: ["keep"] },
+  ];
+  const after = applySliceDelta(before, { add_slices: requestAdds });
+  const landed = landedAddSlices(before, after);
+  assert.equal(landed.length, 1);
+  assert.equal(landed[0].title, "Generated Child");
+  assert.equal(landed[0].gate, "review");
+  assert.deepEqual(landed[0].depends_on, ["keep"]);
+  assert.ok(landed[0].id, "generated id must be present on the landed payload");
+  assert.notEqual(landed[0].id, undefined);
+  assert.equal(
+    after.slices.some((s) => s.id === landed[0].id && s.title === "Generated Child"),
+    true,
+    "journaled id must be the one that landed on the plan",
+  );
+  assert.equal("id" in requestAdds[0], false, "request omitted id; journal must not echo that");
+  assert.equal("evidence" in landed[0], false, "ordered journal omits evidence");
 });

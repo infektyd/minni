@@ -56,6 +56,7 @@ import {
   diffDependsOn,
   diffSupersededDependencies,
   applySliceDelta,
+  landedAddSlices,
   readHistory,
   getRevision,
   diffPlans,
@@ -1839,6 +1840,9 @@ server.registerTool(
         );
         // Legacy appendJournal: include landed add/drop so both journals
         // agree that replan apply carried the topology delta that landed.
+        // Landed ids, not request add_slices — applySliceDelta may generate
+        // ids when callers omit them.
+        const landedAdds = landedAddSlices(plan, updated);
         await appendJournal(journalPath, {
           kind: "replan",
           at: now.toISOString(),
@@ -1848,8 +1852,8 @@ server.registerTool(
           ...(dependsOnSuperseded.length > 0
             ? { depends_on_superseded: dependsOnSuperseded }
             : {}),
-          ...(add_slices && add_slices.length > 0
-            ? { add_slices }
+          ...(landedAdds.length > 0
+            ? { add_slices: landedAdds }
             : {}),
           ...(drop_slice_ids && drop_slice_ids.length > 0
             ? { drop_slice_ids }
@@ -1861,7 +1865,7 @@ server.registerTool(
         const replanPayload: Record<string, unknown> = {};
         if (dependsOnChanged.length > 0) replanPayload.depends_on_changed = dependsOnChanged;
         if (dependsOnSuperseded.length > 0) replanPayload.depends_on_superseded = dependsOnSuperseded;
-        if (add_slices && add_slices.length > 0) replanPayload.add_slices = add_slices;
+        if (landedAdds.length > 0) replanPayload.add_slices = landedAdds;
         if (drop_slice_ids && drop_slice_ids.length > 0) {
           replanPayload.drop_slice_ids = drop_slice_ids;
         }

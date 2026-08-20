@@ -519,3 +519,33 @@ test("wet: worker cannot replan; live worker tool stays worker_update only", asy
     "no new worker MCP tool",
   );
 });
+
+test("wet: replan journals generated add ids when request add_slices omit id", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [{ id: "keep", title: "Keep working" }]);
+    const applied = await call("minni_thread_replan", {
+      plan_id,
+      add_slices: [{ title: "Generated Child", depends_on: ["keep"] }],
+    });
+    assert.notEqual(applied.status, "error", JSON.stringify(applied));
+
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    const after = await rehydratePlan(notePath);
+    const generated = after.slices.find((s) => s.id !== "keep");
+    assert.ok(generated, "applySliceDelta must land a generated-id slice");
+    assert.equal(generated.title, "Generated Child");
+    assert.notEqual(generated.id, "Generated Child");
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const replanEvent = events.events.find((e) => e.kind === "replan");
+    assert.ok(replanEvent?.payload?.add_slices, "replan journal must carry landed add_slices");
+    assert.deepEqual(replanEvent.payload.add_slices, [
+      { id: generated.id, title: "Generated Child", depends_on: ["keep"] },
+    ]);
+    assert.equal(
+      JSON.stringify(replanEvent.payload).includes('"title":"Generated Child"') &&
+        !JSON.stringify(replanEvent.payload.add_slices[0]).includes('"id":undefined'),
+      true,
+    );
+  });
+});
