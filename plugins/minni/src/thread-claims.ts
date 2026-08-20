@@ -1608,6 +1608,32 @@ export async function readClaimByIdempotency(
   );
 }
 
+/**
+ * Existing claim-secret store, by claim id. Drain uses this so a Q ticket
+ * does not need a leaked raw token copy.
+ */
+export async function readClaimById(
+  vaultPath: string,
+  planId: string,
+  claimId: string,
+): Promise<ClaimSecretEnvelope | undefined> {
+  requireNonEmpty(planId, "plan id");
+  if (!CLAIM_ID_PATTERN.test(claimId)) {
+    throw pathMismatch();
+  }
+  return withClaimLocation(
+    vaultPath,
+    planId,
+    claimId,
+    false,
+    (location) =>
+      readEnvelope(location, {
+        planId,
+        claimId,
+      }),
+  );
+}
+
 export async function createClaimSecret(
   input: CreateClaimSecretInput,
 ): Promise<StoredClaimSecret> {

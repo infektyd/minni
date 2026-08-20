@@ -17,6 +17,10 @@ import { ThreadBusyError, readProcessStartMarker, type ThreadLockOwner } from ".
  * Replan is exclusive and is never a queue item.
  * THREAD_BUSY is fail-closed overflow: queue full, or drain stuck.
  * Do not silently enlarge the lock DEFAULT_WAIT_MS. Do not steal a live owner.
+ *
+ * Q JSON stores a token digest only (like the start-accepted stamp). The raw
+ * claim token stays in the existing claim-secret store
+ * (`.runtime/thread-claims/`). Do not write it onto the journal or stamp.
  */
 export const DEFAULT_QUEUE_MAX = 256;
 export const DEFAULT_DRAIN_STUCK_MS = 5_000;
@@ -27,7 +31,8 @@ export interface QueuedWorkerWrite {
   planId: string;
   sliceId: string;
   workerAgentId: string;
-  token: string;
+  /** SHA-256 hex of the presented claim token. Never the raw token. */
+  tokenDigest: string;
   idempotencyKey: string;
   action: unknown;
   applyNow?: string;
@@ -41,8 +46,25 @@ export interface WorkerWriteDrainProgress {
   at: string;
 }
 
+const TOKEN_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
 function lockKey(planId: string): string {
   return createHash("sha256").update(planId).digest("hex").slice(0, 32);
+}
+
+function tokenDigestOf(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function queuedTokenDigest(item: Partial<QueuedWorkerWrite> & { token?: unknown }): string | undefined {
+  if (typeof item.tokenDigest === "string" && TOKEN_DIGEST_PATTERN.test(item.tokenDigest)) {
+    return item.tokenDigest;
+  }
+  // Legacy Q files stored the raw token. Hash in memory; do not keep it.
+  if (typeof item.token === "string" && item.token.length > 0) {
+    return tokenDigestOf(item.token);
+  }
+  return undefined;
 }
 
 function idempotencyFileName(idempotencyKey: string): string {
@@ -175,12 +197,14 @@ function parseQueuedWrite(value: string): QueuedWorkerWrite | undefined {
       item.sliceId.length === 0 ||
       typeof item.workerAgentId !== "string" ||
       item.workerAgentId.length === 0 ||
-      typeof item.token !== "string" ||
-      item.token.length === 0 ||
       typeof item.idempotencyKey !== "string" ||
       item.idempotencyKey.length === 0 ||
       item.action === undefined
     ) {
+      return undefined;
+    }
+    const tokenDigest = queuedTokenDigest(item);
+    if (tokenDigest === undefined) {
       return undefined;
     }
     const parsed: QueuedWorkerWrite = {
@@ -189,7 +213,7 @@ function parseQueuedWrite(value: string): QueuedWorkerWrite | undefined {
       planId: item.planId,
       sliceId: item.sliceId,
       workerAgentId: item.workerAgentId,
-      token: item.token,
+      tokenDigest,
       idempotencyKey: item.idempotencyKey,
       action: item.action,
     };
@@ -390,6 +414,7 @@ export interface EnqueueWorkerWriteInput {
   planId: string;
   sliceId: string;
   workerAgentId: string;
+  /** Presented by the worker. Persisted as tokenDigest only — never raw on Q. */
   token: string;
   idempotencyKey: string;
   action: unknown;
@@ -445,7 +470,7 @@ export async function enqueueWorkerWrite(
     planId: input.planId,
     sliceId: input.sliceId,
     workerAgentId: input.workerAgentId,
-    token: input.token,
+    tokenDigest: tokenDigestOf(input.token),
     idempotencyKey: input.idempotencyKey,
     action: input.action,
     ...(input.applyNow instanceof Date ? { applyNow: input.applyNow.toISOString() } : {}),

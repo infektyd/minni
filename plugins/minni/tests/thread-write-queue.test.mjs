@@ -4,7 +4,8 @@
 // Durable drain outlives the accepting process; in-process kick does not.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -35,10 +36,39 @@ import {
   listPendingWorkerWritePlanIds,
   listQueuedWorkerWrites,
   pickNextQueuedWorkerWrite,
+  workerWriteQueueDir,
 } from "../dist/thread-write-queue.js";
 
 const THREAD_START = new Date("2026-08-18T12:00:00.000Z");
 const TEST_ORCHESTRATOR_ACTOR = "orchestrator-caller";
+
+async function readRawQTickets(vaultPath, planId) {
+  const dir = workerWriteQueueDir(vaultPath, planId);
+  const names = await readdir(dir);
+  const tickets = [];
+  for (const name of names) {
+    if (!name.endsWith(".json") || name === "progress.json") continue;
+    tickets.push(JSON.parse(await readFile(path.join(dir, name), "utf8")));
+  }
+  return tickets;
+}
+
+function assertQTicketHasNoRawToken(ticket, rawToken) {
+  assert.equal("token" in ticket, false, "Q JSON must omit raw claim token");
+  assert.equal(typeof ticket.tokenDigest, "string");
+  assert.match(ticket.tokenDigest, /^[0-9a-f]{64}$/);
+  assert.notEqual(ticket.tokenDigest, rawToken);
+  assert.equal(
+    JSON.stringify(ticket).includes(rawToken),
+    false,
+    "Q JSON must not contain the raw claim token",
+  );
+  assert.equal(
+    ticket.tokenDigest,
+    createHash("sha256").update(rawToken).digest("hex"),
+  );
+}
+
 
 async function burstFixture(t, n) {
   const vaultPath = await mkdtemp(path.join(tmpdir(), `minni-thread-lock-q-${n}-`));
@@ -287,6 +317,15 @@ test("accepted-into-Q is not applied until drain", async (t) => {
   const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
   assert.equal(queued.length, 1);
   assert.equal(queued[0].idempotencyKey, "start-0");
+  assert.equal("token" in queued[0], false);
+  const rawTickets = await readRawQTickets(fixture.vaultPath, fixture.planId);
+  assert.equal(rawTickets.length, 1);
+  assertQTicketHasNoRawToken(rawTickets[0], claim.token);
+  const stampAtAccept = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stampAtAccept?.kind, START_ACCEPTED_RECEIPT_KIND);
+  assert.equal(stampAtAccept?.status, "pending");
+  assert.equal("token" in (stampAtAccept ?? {}), false);
+  assert.equal(JSON.stringify(stampAtAccept).includes(claim.token), false);
   const again = await updateClaimedSlice({
     vaultPath: fixture.vaultPath,
     notePath: fixture.notePath,
@@ -307,6 +346,58 @@ test("accepted-into-Q is not applied until drain", async (t) => {
   assert.equal(journal.started.length, 1);
   const planAfter = await rehydratePlan(fixture.notePath);
   assert.equal(planAfter.slices[0].status, "in_progress");
+  const journalText = await readFile(journalPathFor(fixture.notePath, fixture.planId), "utf8");
+  assert.equal(journalText.includes(claim.token), false, "raw claim token must stay off the journal");
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0);
+});
+
+
+test("drain apply authenticates against claim-secret store, not a Q token copy", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "store-auth-hold", async () => {
+    await held;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  const raw = await readRawQTickets(fixture.vaultPath, fixture.planId);
+  assert.equal(raw.length, 1);
+  assertQTicketHasNoRawToken(raw[0], claim.token);
+  await deleteClaimSecretsBestEffort(fixture.vaultPath, fixture.planId, [claim.claim_id]);
+  release();
+  await holder;
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  }).catch(() => {});
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 0, "without the claim-secret store, drain must not apply");
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.ok(
+    leftover.some((item) => item.idempotencyKey === "start-0"),
+    "ticket stays when store auth fails",
+  );
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "pending");
+  const journalText = await readFile(journalPathFor(fixture.notePath, fixture.planId), "utf8");
+  assert.equal(journalText.includes(claim.token), false);
 });
 
 test("THREAD_BUSY is Q-full overflow, not N=40", async (t) => {
@@ -348,6 +439,12 @@ test("THREAD_BUSY is Q-full overflow, not N=40", async (t) => {
     now: new Date("2026-08-18T12:01:00.000Z"),
   });
   assert.equal(again.alreadyQueued, true);
+  const rawFull = await readRawQTickets(root, "plan-full");
+  assert.equal(rawFull.length, DEFAULT_QUEUE_MAX);
+  for (const ticket of rawFull) {
+    assert.equal("token" in ticket, false, "Q-full tickets must omit raw token");
+    assert.match(ticket.tokenDigest, /^[0-9a-f]{64}$/);
+  }
 });
 
 test("THREAD_BUSY is drain-stuck overflow when the live owner is not draining", async (t) => {
@@ -752,6 +849,10 @@ test("accept start, kill that process, later drain (not that kick) journals slic
     queued.some((item) => item.idempotencyKey === "start-0"),
     `accepting process must enqueue start: ${JSON.stringify(queued)} out=${childOut}`,
   );
+  const rawAtAccept = await readRawQTickets(fixture.vaultPath, fixture.planId);
+  const startTicket = rawAtAccept.find((item) => item.idempotencyKey === "start-0");
+  assert.ok(startTicket, "start Q file must exist");
+  assertQTicketHasNoRawToken(startTicket, claim.token);
   const pendingPlans = await listPendingWorkerWritePlanIds(fixture.vaultPath);
   assert.deepEqual(pendingPlans, [fixture.planId]);
   const stampAtAccept = await readStartAcceptedStamp(fixture, claim);
@@ -836,7 +937,7 @@ test("drain pick applies start before that slice's complete", () => {
     planId: "p",
     sliceId: "s0",
     workerAgentId: "w",
-    token: "t",
+    tokenDigest: "a".repeat(64),
     idempotencyKey: "complete-0",
     action: { action: "complete" },
   };
@@ -846,7 +947,7 @@ test("drain pick applies start before that slice's complete", () => {
     planId: "p",
     sliceId: "s0",
     workerAgentId: "w",
-    token: "t",
+    tokenDigest: "a".repeat(64),
     idempotencyKey: "start-0",
     action: { action: "start" },
   };
@@ -856,7 +957,7 @@ test("drain pick applies start before that slice's complete", () => {
     planId: "p",
     sliceId: "s1",
     workerAgentId: "w",
-    token: "t",
+    tokenDigest: "a".repeat(64),
     idempotencyKey: "start-1",
     action: { action: "start" },
   };

@@ -45,6 +45,7 @@ import {
   deleteClaimSecret,
   hashWorkerUpdateToken,
   pruneWorkerUpdateReceiptsForGeneration,
+  readClaimById,
   readClaimByIdempotency,
   readWorkerUpdateReceipt,
   verifyClaimToken,
@@ -65,6 +66,7 @@ import {
   queuedWriteActionName,
   recordWorkerWriteDrainProgress,
   removeQueuedWorkerWrite,
+  type QueuedWorkerWrite,
 } from "./thread-write-queue.js";
 
 const DEFAULT_CLAIM_TTL_SECONDS = 10 * 60;
@@ -2203,6 +2205,39 @@ async function queuedWriteIsLiveWork(
   }
 }
 
+/**
+ * Apply authenticates against the existing claim-secret store, not a leaked
+ * raw token on the Q ticket. Digest on the ticket must match the store.
+ */
+async function claimTokenFromExistingStore(
+  vaultPath: string,
+  notePath: string,
+  item: QueuedWorkerWrite,
+): Promise<string> {
+  const plan = await rehydratePlan(notePath);
+  const slice = findSlice(plan, item.sliceId);
+  const claimId = slice.claim?.claim_id;
+  if (!claimId) {
+    throw new Error("claim not found");
+  }
+  const envelope = await readClaimById(vaultPath, item.planId, claimId);
+  if (!envelope) {
+    throw new Error("claim not found");
+  }
+  if (
+    envelope.plan_id !== item.planId ||
+    envelope.slice_id !== item.sliceId ||
+    envelope.worker_agent_id !== item.workerAgentId ||
+    (item.generation !== undefined && envelope.generation !== item.generation)
+  ) {
+    throw new Error("claim scope mismatch");
+  }
+  if (!workerUpdateTokenMatches(envelope.token, item.tokenDigest)) {
+    throw new Error("claim token mismatch");
+  }
+  return envelope.token;
+}
+
 async function drainOneQueuedWorkerWrite(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps,
@@ -2210,19 +2245,6 @@ async function drainOneQueuedWorkerWrite(
   const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const item = pickNextQueuedWorkerWrite(items);
   if (item === undefined) return;
-  const mapped: UpdateClaimedSliceInput = {
-    vaultPath: input.vaultPath,
-    notePath: input.notePath,
-    planId: item.planId,
-    sliceId: item.sliceId,
-    workerAgentId: item.workerAgentId,
-    token: item.token,
-    idempotencyKey: item.idempotencyKey,
-    action: item.action as WorkerUpdateAction,
-    now:
-      (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
-      input.now,
-  };
   if (!(await queuedWriteIsLiveWork(input.notePath, item))) {
     // Leftover Q after generation advance / supersede is not live work.
     // Drop it so drain is not stuck. Do not persist in_progress or journal
@@ -2246,6 +2268,24 @@ async function drainOneQueuedWorkerWrite(
     });
     return;
   }
+  const token = await claimTokenFromExistingStore(
+    input.vaultPath,
+    input.notePath,
+    item,
+  );
+  const mapped: UpdateClaimedSliceInput = {
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
+    planId: item.planId,
+    sliceId: item.sliceId,
+    workerAgentId: item.workerAgentId,
+    token,
+    idempotencyKey: item.idempotencyKey,
+    action: item.action as WorkerUpdateAction,
+    now:
+      (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
+      input.now,
+  };
   try {
     await applyClaimedSliceOnLockedPlan(mapped, deps);
   } catch (error) {
