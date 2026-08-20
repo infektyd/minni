@@ -76,6 +76,8 @@ export interface TeamRuntimePacket {
   plan_id: string;
   rev: number;
   ready: PlanSlice[];
+  /** Incumbent plan_id when createPlan displaced a non-terminal active Thread. Absent on present plan_id path and when createPlan is silent. */
+  displaced_active?: string;
   task: string;
   coordinatorAgentId: string;
   workspaceId: string;
@@ -336,7 +338,7 @@ async function loadTeamThread(
     now: Date;
   },
   deps: TeamRuntimeDeps,
-): Promise<{ plan: PlanArtifact; ready: PlanSlice[] }> {
+): Promise<{ plan: PlanArtifact; ready: PlanSlice[]; displaced_active?: string }> {
   const create = deps.createPlan ?? createPlan;
   const findNote = deps.findPlanNote ?? findPlanNote;
   const readReady = deps.synchronizeExpiredClaimsAndReadReady ?? synchronizeExpiredClaimsAndReadReady;
@@ -358,6 +360,7 @@ async function loadTeamThread(
       actor: DEFAULT_AGENT_ID,
       now,
     });
+    // Present plan_id reads only; do not invent displaced_active.
     return { plan: swept.plan, ready: readySlices(swept.plan, now) };
   }
 
@@ -376,7 +379,11 @@ async function loadTeamThread(
     actor: DEFAULT_AGENT_ID,
     now,
   });
-  return { plan: swept.plan, ready: readySlices(swept.plan, now) };
+  return {
+    plan: swept.plan,
+    ready: readySlices(swept.plan, now),
+    ...(created.displaced_active ? { displaced_active: created.displaced_active } : {}),
+  };
 }
 
 function instructionsFor(profile: TemporaryAgentProfile, recallPrincipal: string): string[] {
@@ -478,7 +485,7 @@ async function buildPreparedTeamRuntime(
   const sliceHints = input.plan_id === undefined && input.agents?.length
     ? input.agents.map((agent) => ({ title: agent.focus.trim() }))
     : undefined;
-  const { plan, ready } = await loadTeamThread(
+  const { plan, ready, displaced_active } = await loadTeamThread(
     {
       plan_id: input.plan_id,
       task: input.task,
@@ -560,6 +567,7 @@ async function buildPreparedTeamRuntime(
     plan_id: plan.plan_id,
     rev: plan.rev,
     ready,
+    ...(displaced_active ? { displaced_active } : {}),
     task: input.task,
     coordinatorAgentId,
     workspaceId,
@@ -681,6 +689,8 @@ export interface CompatTeamRuntimePacket {
   plan_id: string;
   rev: number;
   ready: PlanSlice[];
+  /** Incumbent plan_id when createPlan displaced a non-terminal active Thread. Absent on present plan_id path and when createPlan is silent. */
+  displaced_active?: string;
   task: string;
   ownerAgentId: string;
   workspaceId: string;
@@ -847,7 +857,7 @@ async function buildCompatRuntime(
   const sliceHints = input.plan_id === undefined && input.agents?.length
     ? input.agents.map((agent) => ({ title: (agent.role || agent.id).trim() }))
     : undefined;
-  const { plan, ready } = await loadTeamThread(
+  const { plan, ready, displaced_active } = await loadTeamThread(
     {
       plan_id: input.plan_id,
       task: input.task,
@@ -878,6 +888,7 @@ async function buildCompatRuntime(
     plan_id: plan.plan_id,
     rev: plan.rev,
     ready,
+    ...(displaced_active ? { displaced_active } : {}),
     task: input.task,
     ownerAgentId: input.ownerAgentId,
     workspaceId: input.workspaceId,

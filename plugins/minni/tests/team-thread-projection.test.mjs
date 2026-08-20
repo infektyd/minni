@@ -309,3 +309,59 @@ test("MCP team runtime accepts plan_id and keeps G11/G12 shut", async () => {
   assert.match(block, /vaultPath:\s*DEFAULT_VAULT_PATH/);
   assert.match(block, /coordinatorAgentId:\s*DEFAULT_AGENT_ID/);
 });
+
+test("create while a non-terminal active Thread exists surfaces displaced_active; no incumbent leaves the field absent", async (t) => {
+  const emptyVault = await withVault(t);
+  const noIncumbent = await runtime({ task: "First Thread has no incumbent", vaultPath: emptyVault });
+  assert.equal(noIncumbent.displaced_active, undefined, "no incumbent must not mint a fake displaced_active");
+  assert.equal("displaced_active" in noIncumbent, false, "field must be absent, not a dummy");
+
+  const vaultPath = await withVault(t);
+  const incumbent = await createPlan(
+    {
+      goal: "Non-terminal active Thread",
+      slices: [{ title: "Still open" }],
+      vaultPath,
+    },
+    { vaultPath },
+  );
+  assert.equal(incumbent.displaced_active, undefined, "first createPlan auto-activates silently");
+
+  const live = await runtime({ task: "Displace the in-flight Thread", vaultPath });
+  assert.equal(live.displaced_active, incumbent.plan.plan_id, "live packet must name the displaced incumbent");
+  assert.notEqual(live.plan_id, incumbent.plan.plan_id);
+
+  const present = await runtime({ plan_id: live.plan_id, task: "read path must not create", vaultPath });
+  assert.equal(present.plan_id, live.plan_id);
+  assert.equal(present.displaced_active, undefined, "present plan_id path does not create and must not invent displaced_active");
+  assert.equal("displaced_active" in present, false);
+
+  const compatVault = await withVault(t);
+  const compatIncumbent = await createPlan(
+    {
+      goal: "Compat incumbent",
+      slices: [{ title: "Open" }],
+      vaultPath: compatVault,
+    },
+    { vaultPath: compatVault },
+  );
+  const compat = await runtime({
+    task: "Compat must also surface displacement",
+    ownerAgentId: DEFAULT_AGENT_ID,
+    workspaceId: "workspace-test",
+    vaultPath: compatVault,
+    agents: [{ id: "hosted-a", role: "explorer" }],
+  });
+  assert.equal(compat.displaced_active, compatIncumbent.plan.plan_id, "compat packet uses the same displaced_active field");
+
+  const compatNoneVault = await withVault(t);
+  const compatNone = await runtime({
+    task: "Compat with no incumbent",
+    ownerAgentId: DEFAULT_AGENT_ID,
+    workspaceId: "workspace-test",
+    vaultPath: compatNoneVault,
+    agents: [{ id: "hosted-a", role: "explorer" }],
+  });
+  assert.equal(compatNone.displaced_active, undefined, "compat no-incumbent must not mint a fake displaced_active");
+  assert.equal("displaced_active" in compatNone, false);
+});
