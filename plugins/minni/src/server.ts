@@ -113,7 +113,7 @@ import {
   type WorkerUpdateAction,
 } from "./thread-worker.js";
 import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
-import { withThreadLock } from "./thread-lock.js";
+import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
 // vault's wiki tree regardless of `limit` — the limit is a post-scoring
@@ -1786,12 +1786,17 @@ server.registerTool(
         error: "Either new_slices or add_slices/drop_slice_ids must be provided",
       }, null, 2));
     }
-    const next = await withThreadPlanLock(
+    const replanOperationId = `server-replan:${randomUUID()}`;
+    const next = await withExclusiveReplanReservation(
+      effectiveVaultPath,
+      plan_id,
+      replanOperationId,
+      () => withThreadPlanLock(
       {
         vaultPath: effectiveVaultPath,
         notePath,
         planId: plan_id,
-        operationId: `server-replan:${randomUUID()}`,
+        operationId: replanOperationId,
       },
       async (plan) => {
         const now = new Date();
@@ -1908,6 +1913,7 @@ server.registerTool(
         });
         return updated;
       },
+    ),
     );
     return textResult(JSON.stringify(next, null, 2));
     } catch (error) {

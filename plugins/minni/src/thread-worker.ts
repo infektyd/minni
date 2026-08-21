@@ -56,7 +56,11 @@ import {
   type WorkerUpdateReceiptResponse,
 } from "./thread-claims.js";
 import { stableStringify } from "./agent_envelope.js";
-import { ThreadBusyError, withThreadLock } from "./thread-lock.js";
+import {
+  ThreadBusyError,
+  exclusiveReplanReservationIsLive,
+  withThreadLock,
+} from "./thread-lock.js";
 import {
   enqueueWorkerWrite,
   findQueuedWorkerWrite,
@@ -271,6 +275,48 @@ async function hasAcceptedStartStamp(
     receipt.response.slice.status !== "in_progress" &&
     receipt.response.slice.status !== "done"
   );
+}
+
+/**
+ * Complete must not dump-and-return past a pending start stamp/ticket when
+ * the persist lock is busy or exclusive replan is reserved. Same refuse as
+ * under-lock apply — otherwise ThreadBusy enqueue hides "Missing expected
+ * rejection" and can park a complete ahead of a failed start.
+ */
+async function refuseCompleteUntilStartApplied(
+  input: UpdateClaimedSliceInput,
+  planId: string,
+  sliceId: string,
+  workerAgentId: string,
+): Promise<void> {
+  if (input.action.action !== "complete") return;
+  const plan = await rehydrateAuthority({
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
+    planId,
+  });
+  const slice = findSlice(plan, sliceId);
+  if (slice.status === "in_progress") return;
+  const queuedNow = await listQueuedWorkerWrites(input.vaultPath, planId);
+  const startTicket = queuedNow.some(
+    (item) =>
+      item.sliceId === sliceId &&
+      queuedWriteActionName(item) === "start" &&
+      queuedWriteMatchesLiveGeneration(item, slice),
+  );
+  const startStamp = await hasAcceptedStartStamp(
+    input.vaultPath,
+    planId,
+    sliceId,
+    workerAgentId,
+    slice,
+  );
+  if (startTicket || startStamp) {
+    throw new Error("start must apply before complete");
+  }
+  if (slice.status === "pending") {
+    throw new Error("complete cannot persist done without start");
+  }
 }
 
 async function enqueueAcceptedWorkerWrite(
@@ -2059,7 +2105,10 @@ export async function updateClaimedSlice(
         await stampAcceptedStart(lockedInput);
       }
     }
-    kickWorkerWriteDrain(lockedInput, deps);
+    // One-shot only for start accepts — complete dump-and-return must keep draining.
+    kickWorkerWriteDrain(lockedInput, deps, {
+      oneShotYield: input.action.action === "start",
+    });
     return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
   }
 
@@ -2079,9 +2128,25 @@ export async function updateClaimedSlice(
     );
     if (startQueued) {
       await enqueueAcceptedWorkerWrite(lockedInput);
-      kickWorkerWriteDrain(lockedInput, deps);
+      // Start is still unapplied. One-shot yield so this kick cannot journal
+      // slice.started in the accept→reserve window. Later drain / post-replan
+      // kick still apply start first when the slice stays live.
+      kickWorkerWriteDrain(lockedInput, deps, { oneShotYield: true });
       return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
     }
+  }
+
+  // Exclusive replan reserved: dump-and-return. Do not apply start on a
+  // parent that replan is about to supersede. Kick yields until reservation
+  // clears. Not THREAD_BUSY as the default — only while exclusive replan
+  // is in flight.
+  if (await exclusiveReplanReservationIsLive(input.vaultPath, planId)) {
+    await refuseCompleteUntilStartApplied(lockedInput, planId, sliceId, workerAgentId);
+    await enqueueAcceptedWorkerWrite(lockedInput);
+    kickWorkerWriteDrain(lockedInput, deps, {
+      oneShotYield: input.action.action === "start",
+    });
+    return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
   }
 
   try {
@@ -2092,19 +2157,28 @@ export async function updateClaimedSlice(
       () => applyClaimedSliceOnLockedPlan(lockedInput, deps),
       { waitMs: 0 },
     );
+    // Applied under lock: kick drains remaining Q without one-shot deferral.
     kickWorkerWriteDrain(lockedInput, deps);
     return applied;
   } catch (error) {
     if (error instanceof ThreadBusyError) {
+      await refuseCompleteUntilStartApplied(lockedInput, planId, sliceId, workerAgentId);
       await enqueueAcceptedWorkerWrite(lockedInput);
-      kickWorkerWriteDrain(lockedInput, deps);
+      kickWorkerWriteDrain(lockedInput, deps, {
+        oneShotYield: input.action.action === "start",
+      });
       return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
     }
     throw error;
   }
 }
 
-const drainKicks = new Map<string, Promise<void>>();
+type DrainKickEntry = {
+  oneShot: boolean;
+  followUpFull: boolean;
+};
+
+const drainKicks = new Map<string, DrainKickEntry>();
 
 function drainKickKey(vaultPath: string, planId: string): string {
   return `${path.resolve(vaultPath)}\0${planId}`;
@@ -2118,23 +2192,57 @@ function drainKickKey(vaultPath: string, planId: string): string {
  * stamp live on disk, so the accepting MCP process does not have to stay
  * alive. Stamp is not applied until this apply. Start still applies before
  * that slice complete.
+ *
+ * Accept-path kick may arm a one-shot yield on this run: the first under-lock
+ * pass does not apply live work (still drops dead leftover). That closes the
+ * TOCTOU where kick would apply after accept returns and before orch reserves,
+ * without holding the persist lock across accept→replan. Returns true when
+ * that live yield happened so in-process follow-up will not apply the start.
+ * Later drainWorkerWrites / standing drain / post-replan kick still apply or drop.
  */
 export async function drainWorkerWrites(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps = {},
-): Promise<void> {
+  runOptions: { oneShotYield?: boolean } = {},
+): Promise<boolean> {
+  let oneShotPending = runOptions.oneShotYield === true;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
-    if (remaining.length === 0) return;
+    if (remaining.length === 0) return false;
+    if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      continue;
+    }
     try {
+      let oneShotYieldedLive = false;
       await withThreadLock(
         input.vaultPath,
         input.planId,
         `worker-queue-drain:${randomUUID()}`,
-        () => drainOneQueuedWorkerWrite(input, deps),
+        async () => {
+          if (oneShotPending) {
+            oneShotPending = false;
+            const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+            const head = pickNextQueuedWorkerWrite(items);
+            if (
+              head !== undefined &&
+              !(await queuedWriteIsLiveWork(input.notePath, head))
+            ) {
+              // Dead leftover after supersede: drop now. Not a live apply.
+              await drainOneQueuedWorkerWrite(input, deps);
+              return;
+            }
+            // Live accepted start: yield once. Do not journal slice.started
+            // before orch may reserve. Keep the ticket for later drain.
+            oneShotYieldedLive = true;
+            return;
+          }
+          await drainOneQueuedWorkerWrite(input, deps);
+        },
         { waitMs: 0 },
       );
+      if (oneShotYieldedLive) return true;
     } catch (error) {
       if (error instanceof ThreadBusyError) {
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -2143,28 +2251,72 @@ export async function drainWorkerWrites(
       throw error;
     }
   }
+  return false;
+}
+
+export interface KickWorkerWriteDrainOptions {
+  /**
+   * Accept dump-and-return: first under-lock pass yields without applying
+   * live work so kick cannot race orch exclusive-replan reservation.
+   * Not a sit-and-wait. Later drain still applies when no replan, or drops
+   * leftover after supersede. Scoped to this kick run (not a global flag).
+   */
+  oneShotYield?: boolean;
 }
 
 /**
  * In-process kick. It dies with the accepting process. Do not treat this as
  * the durable drain — a later process must call drainWorkerWrites /
  * drainPendingWorkerWritesForVault.
+ *
+ * Yields (does not apply) while exclusive replan is reserved so a live
+ * acceptor cannot journal slice.started on a parent that replan then
+ * supersedes. Accept-path kicks also one-shot yield once under lock when
+ * reservation is not yet live (closes apply-before-orch-reserve TOCTOU).
+ * Kick still drains when no exclusive replan is in flight (later drain /
+ * post-replan kick / kick without oneShotYield).
+ *
+ * A one-shot in-flight run can exit without applying. A later full-drain
+ * kick (post-replan) must not be coalesced away — mark follow-up so this
+ * process reasserts after the one-shot returns. Do not reassert if the
+ * one-shot yielded live work: that apply would reopen the accept→reserve
+ * window. Later drain / standing drain / post-replan kick still apply
+ * start first when the slice stays live.
  */
 export function kickWorkerWriteDrain(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps = {},
+  options: KickWorkerWriteDrainOptions = {},
 ): void {
   const key = drainKickKey(input.vaultPath, input.planId);
-  if (drainKicks.has(key)) return;
-  const run = drainWorkerWrites(input, deps)
+  const existing = drainKicks.get(key);
+  if (existing) {
+    if (existing.oneShot && options.oneShotYield !== true) {
+      existing.followUpFull = true;
+    }
+    return;
+  }
+  const entry: DrainKickEntry = {
+    oneShot: options.oneShotYield === true,
+    followUpFull: false,
+  };
+  drainKicks.set(key, entry);
+  void drainWorkerWrites(input, deps, {
+    oneShotYield: options.oneShotYield === true,
+  })
     .catch(() => {
       // Apply throw is parked, not dropped: drainOne keeps the ticket and
       // the start-accepted receipt. Swallow only the unhandled rejection.
+      return false;
     })
-    .finally(() => {
+    .then((yieldedLive) => {
       drainKicks.delete(key);
+      // One-shot yielded a live start: do not apply it here. Orch may still
+      // reserve. Later drain / post-replan kick still apply or drop.
+      if (entry.followUpFull && yieldedLive !== true) {
+        kickWorkerWriteDrain(input, deps);
+      }
     });
-  drainKicks.set(key, run);
 }
 
 /**
@@ -2245,6 +2397,11 @@ async function drainOneQueuedWorkerWrite(
   const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const item = pickNextQueuedWorkerWrite(items);
   if (item === undefined) return;
+  if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
+    // Yield: keep the ticket. Exclusive replan owns persist. Do not
+    // journal slice.started on a parent that replan then supersedes.
+    return;
+  }
   if (!(await queuedWriteIsLiveWork(input.notePath, item))) {
     // Leftover Q after generation advance / supersede is not live work.
     // Drop it so drain is not stuck. Do not persist in_progress or journal
@@ -2286,6 +2443,8 @@ async function drainOneQueuedWorkerWrite(
       (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
       input.now,
   };
+  // Fail-closed: apply throw must not reach removeQueuedWorkerWrite.
+  // Dropping the ticket lets a later complete persist done with no start.
   await applyClaimedSliceOnLockedPlan(mapped, deps);
   await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
   const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
@@ -2321,6 +2480,9 @@ async function applyClaimedSliceOnLockedPlan(
     notePath: input.notePath,
     planId,
   });
+  if (await exclusiveReplanReservationIsLive(input.vaultPath, planId)) {
+    throw new ThreadBusyError();
+  }
       const now = sampleNow(input.now);
       const workerOperationKey = deriveWorkerEventKey(
         planId,

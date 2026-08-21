@@ -17,7 +17,11 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { withThreadLock } from "../dist/thread-lock.js";
+import {
+  exclusiveReplanReservationIsLive,
+  withExclusiveReplanReservation,
+  withThreadLock,
+} from "../dist/thread-lock.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -314,4 +318,186 @@ test("withThreadLock keeps DEFAULT_WAIT_MS at 5s; silent bump is fake close", as
   assert.doesNotMatch(src, /const DEFAULT_WAIT_MS = (?:[6-9]\d{3}|[1-9]\d{4,})/);
   assert.doesNotMatch(src, /FIFO waiter queue/);
   assert.doesNotMatch(src, /stallDeadline/);
+});
+
+test("exclusive replan reservation is live only for a live owner", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+  let sawLive = false;
+  await withExclusiveReplanReservation(root, "plan-x", "replan-1", async () => {
+    sawLive = await exclusiveReplanReservationIsLive(root, "plan-x");
+  });
+  assert.equal(sawLive, true);
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(
+    reservationPath,
+    `${JSON.stringify({
+      pid: 2_147_483_647,
+      operationId: "dead-replan",
+      acquiredAt: "2026-01-01T00:00:00.000Z",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  assert.equal(
+    await exclusiveReplanReservationIsLive(root, "plan-x", { isProcessAlive: () => false }),
+    false,
+    "dead exclusive-replan owner must not block kick",
+  );
+});
+
+test("corrupt exclusive-replan reservation is not live and acquire reaps it", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-corrupt-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(reservationPath, "{not a reservation owner\n", { mode: 0o600 });
+  const aged = new Date(Date.now() - 200_000);
+  await utimes(reservationPath, aged, aged);
+
+  assert.equal(
+    await exclusiveReplanReservationIsLive(root, "plan-x"),
+    false,
+    "aged unparseable reservation must not look live (kick must still drain)",
+  );
+
+  let entered = false;
+  await withExclusiveReplanReservation(root, "plan-x", "replan-after-corrupt", async () => {
+    entered = true;
+    assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), true);
+  });
+  assert.equal(entered, true, "acquire must reap aged corrupt reservation instead of THREAD_BUSY");
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+  await assert.rejects(readFile(reservationPath, "utf8"), { code: "ENOENT" });
+});
+
+test("young empty exclusive-replan file is live and acquire does not reap it", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-empty-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(reservationPath, "", { mode: 0o600 });
+
+  assert.equal(
+    await exclusiveReplanReservationIsLive(root, "plan-x"),
+    true,
+    "empty file inside stale grace is the publish window — kick must yield",
+  );
+
+  await assert.rejects(
+    () => withExclusiveReplanReservation(
+      root,
+      "plan-x",
+      "replan-during-empty",
+      async () => {
+        throw new Error("must not enter while young empty reservation exists");
+      },
+      { waitMs: 50, pollMs: 10 },
+    ),
+    (err) => {
+      assert.equal(err.name, "ThreadBusyError");
+      return true;
+    },
+  );
+  const leftover = await readFile(reservationPath, "utf8");
+  assert.equal(leftover, "", "acquire must not unlink a young empty reservation");
+});
+
+test("exclusive replan publish falls back to wx when link is unsupported", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-nolink-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const originalLink = fs.promises.link;
+  fs.promises.link = async () => {
+    const error = new Error("operation not supported");
+    error.code = "ENOTSUP";
+    throw error;
+  };
+  syncBuiltinESMExports();
+  let sawLive = false;
+  try {
+    await withExclusiveReplanReservation(root, "plan-x", "replan-nolink", async () => {
+      sawLive = await exclusiveReplanReservationIsLive(root, "plan-x");
+    });
+  } finally {
+    fs.promises.link = originalLink;
+    syncBuiltinESMExports();
+  }
+  assert.equal(sawLive, true, "wx fallback must still publish a live reservation");
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+});
+
+test("exclusive replan wx fallback reaps dest when write fails after create", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-wxfail-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  const originalLink = fs.promises.link;
+  const originalWriteFile = fs.promises.writeFile;
+  fs.promises.link = async () => {
+    const error = new Error("operation not supported");
+    error.code = "ENOTSUP";
+    throw error;
+  };
+  fs.promises.writeFile = async (filePath, data, options) => {
+    if (options?.flag === "wx" && String(filePath) === reservationPath) {
+      await originalWriteFile(filePath, "", { encoding: "utf8", mode: 0o600 });
+      const error = new Error("no space left on device");
+      error.code = "ENOSPC";
+      throw error;
+    }
+    return originalWriteFile(filePath, data, options);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      () => withExclusiveReplanReservation(root, "plan-x", "replan-wxfail", async () => {
+        throw new Error("must not enter after wx write failure");
+      }),
+      (err) => {
+        assert.equal(err.code, "ENOSPC");
+        return true;
+      },
+    );
+    await assert.rejects(readFile(reservationPath, "utf8"), { code: "ENOENT" });
+    assert.equal(
+      await exclusiveReplanReservationIsLive(root, "plan-x"),
+      false,
+      "failed wx publish must not leave a young empty reservation that blocks kick",
+    );
+  } finally {
+    fs.promises.link = originalLink;
+    fs.promises.writeFile = originalWriteFile;
+    syncBuiltinESMExports();
+  }
+
+  let entered = false;
+  await withExclusiveReplanReservation(root, "plan-x", "replan-after-wxfail", async () => {
+    entered = true;
+  });
+  assert.equal(entered, true, "next exclusive replan must acquire immediately after failed wx publish");
 });
