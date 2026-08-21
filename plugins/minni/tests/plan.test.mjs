@@ -2732,6 +2732,33 @@ test("applySliceDelta: remounts named depends_on without superseding omitted liv
     "any missing target rejects the whole remount",
   );
 
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["b"] }] }),
+    /applySliceDelta: cannot remount onto "b" — target is the remounted slice/,
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "self remount must not persist; b still depends_on s0",
+  );
+  assert.equal(
+    split.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "self remount must not touch indie",
+  );
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["b", "child-a"] }] }),
+    /applySliceDelta: cannot remount onto "b" — target is the remounted slice/,
+    "mixed self+valid rejects the whole remount",
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "mixed self remount must not persist; b still depends_on s0",
+  );
+  assert.equal(split.slices.find((s) => s.id === "indie").status, "pending");
+
   const remounted = applySliceDelta(split, {
     set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],
   });

@@ -501,6 +501,35 @@ test("wet GO: exclusive split keeps depends_on blocked until orch remounts; prop
       "MCP still up after rejected remounts; b still not ready",
     );
 
+    const selfRemount = await call("minni_thread_replan", {
+      plan_id,
+      set_depends_on: [{ slice_id: "b", depends_on: ["b"] }],
+    });
+    assert.equal(selfRemount.status, "error", JSON.stringify(selfRemount));
+    assert.match(
+      selfRemount.error ?? "",
+      /cannot remount onto "b" — target is the remounted slice/,
+    );
+    const afterSelf = await rehydratePlan(notePath);
+    assert.deepEqual(
+      afterSelf.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+      "self remount must not persist; b still depends_on s0",
+    );
+    assert.equal(afterSelf.slices.find((s) => s.id === "indie").status, "pending");
+    const eventsAfterSelf = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterSelf.events.some((e) => e.payload?.depends_on_changed),
+      false,
+      "no depends_on_changed to self",
+    );
+    const readyAfterSelf = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterSelf.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "MCP still up after rejected self remount; b still not ready",
+    );
+
     const remountArgs = {
       plan_id,
       set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],
