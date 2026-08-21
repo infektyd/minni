@@ -604,6 +604,121 @@ test("wet GO: exclusive split keeps depends_on blocked until orch remounts; prop
       "MCP still up after rejected add_slices self-edge; b still not ready",
     );
 
+    const ghostNewSlices = await call("minni_thread_replan", {
+      plan_id,
+      new_slices: [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["ghost"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent slice" },
+      ],
+    });
+    assert.equal(ghostNewSlices.status, "error", JSON.stringify(ghostNewSlices));
+    assert.equal("isError" in ghostNewSlices, false, "MCP status:error, not transport isError");
+    assert.match(
+      ghostNewSlices.error ?? "",
+      /cannot depend on "ghost" — missing or superseded/,
+    );
+    const afterGhostNew = await rehydratePlan(notePath);
+    assert.deepEqual(
+      afterGhostNew.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+      "new_slices ghost must not persist; b still depends_on s0",
+    );
+    assert.equal(
+      afterGhostNew.slices.find((s) => s.id === "indie").status,
+      "pending",
+      "indie must not be superseded by rejected new_slices ghost",
+    );
+    const eventsAfterGhostNew = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterGhostNew.events
+        .filter((e) => e.kind === "replan")
+        .some((e) => JSON.stringify(e.payload?.depends_on_changed ?? []).includes("ghost")),
+      false,
+      "no persist / no depends_on_changed to ghost via new_slices",
+    );
+    const readyAfterGhostNew = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterGhostNew.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "MCP still up after rejected new_slices ghost; Ready still child-a, child-b, indie",
+    );
+
+    const deadNewSlices = await call("minni_thread_replan", {
+      plan_id,
+      new_slices: [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["s0"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent slice" },
+      ],
+    });
+    assert.equal(deadNewSlices.status, "error", JSON.stringify(deadNewSlices));
+    assert.equal("isError" in deadNewSlices, false, "MCP status:error, not transport isError");
+    assert.match(
+      deadNewSlices.error ?? "",
+      /cannot depend on "s0" — missing or superseded/,
+    );
+    const afterDeadNew = await rehydratePlan(notePath);
+    assert.deepEqual(
+      afterDeadNew.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+      "new_slices superseded target must not persist; b still depends_on s0",
+    );
+    assert.equal(
+      afterDeadNew.slices.find((s) => s.id === "indie").status,
+      "pending",
+      "indie must not be superseded by rejected new_slices [s0]",
+    );
+    const eventsAfterDeadNew = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterDeadNew.events.some((e) => e.payload?.depends_on_changed),
+      false,
+      "no depends_on_changed after superseded-target new_slices",
+    );
+    const readyAfterDeadNew = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterDeadNew.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "MCP still up after rejected new_slices [s0]; Ready unchanged",
+    );
+
+    const ghostAdd = await call("minni_thread_replan", {
+      plan_id,
+      add_slices: [{ id: "x", title: "Ghost waiter", depends_on: ["ghost"] }],
+    });
+    assert.equal(ghostAdd.status, "error", JSON.stringify(ghostAdd));
+    assert.equal("isError" in ghostAdd, false, "MCP status:error, not transport isError");
+    assert.match(
+      ghostAdd.error ?? "",
+      /cannot depend on "ghost" — missing or superseded/,
+    );
+    const afterGhostAdd = await rehydratePlan(notePath);
+    assert.equal(
+      afterGhostAdd.slices.find((s) => s.id === "x"),
+      undefined,
+      "add_slices ghost must not persist x",
+    );
+    assert.deepEqual(
+      afterGhostAdd.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+    );
+    const eventsAfterGhostAdd = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterGhostAdd.events
+        .filter((e) => e.kind === "replan")
+        .some((e) => JSON.stringify(e.payload?.add_slices ?? []).includes('"id":"x"')),
+      false,
+      "no journal add of x",
+    );
+    const readyAfterGhostAdd = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterGhostAdd.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "MCP still up after rejected add_slices ghost; b still not ready",
+    );
+
     const remountArgs = {
       plan_id,
       set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],

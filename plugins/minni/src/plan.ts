@@ -638,6 +638,36 @@ function assertNoSelfEdge(
   }
 }
 
+/** Only the depends_on this new_slices/add_slices write is applying. */
+function assertWrittenDependsOnTargetsLive(
+  context: string,
+  previousSlices: PlanSlice[],
+  nextSlices: PlanSlice[],
+  writtenIds: Set<string>,
+): void {
+  const prevById = new Map(previousSlices.map((s) => [s.id, s]));
+  for (const slice of nextSlices) {
+    if (!writtenIds.has(slice.id) || !slice.depends_on) continue;
+    for (const depId of slice.depends_on) {
+      const dep = nextSlices.find((s) => s.id === depId);
+      if (!dep) {
+        throw new Error(`${context}: cannot depend on "${depId}" — missing or superseded`);
+      }
+      if (dep.status !== "superseded") continue;
+      const prev = prevById.get(dep.id);
+      const newlyPlainDrop =
+        prev !== undefined &&
+        prev.status !== "superseded" &&
+        !(Array.isArray(dep.replaced_by) && dep.replaced_by.length > 0);
+      // Same-call omit/drop-without-replacement still resolves dependents
+      // (unmetDependencies treats plain superseded as met). Exclusive split
+      // stamps replaced_by and stays unmet — that write is the dangling edge.
+      if (newlyPlainDrop) continue;
+      throw new Error(`${context}: cannot depend on "${depId}" — missing or superseded`);
+    }
+  }
+}
+
 function computeNextAction(slices: PlanSlice[]): string {
   const active = slices.find(
     (s) => s.status === "pending" || s.status === "in_progress" || s.status === "blocked",
@@ -1607,6 +1637,7 @@ export function replan(
 
   const usedIds = new Set(nextSlices.map((s) => s.id));
   const addedIds: string[] = [];
+  const writtenDependsOnIds = new Set<string>();
 
   // Append truly new (no id or title match among current non-superseded)
   for (const ns of newSlices) {
@@ -1635,6 +1666,7 @@ export function replan(
       }
       const id = ns.id || slugifySliceId(ns.title, usedIds);
       assertNoSelfEdge("replan", id, ns.depends_on);
+      if (ns.depends_on) writtenDependsOnIds.add(id);
       usedIds.add(id);
       addedIds.push(id);
       nextSlices = [
@@ -1651,6 +1683,7 @@ export function replan(
     } else if (ns.id) {
       // Refresh fields on the matched entry (title/gate/deps may evolve)
       assertNoSelfEdge("replan", ns.id, ns.depends_on);
+      if (ns.depends_on) writtenDependsOnIds.add(ns.id);
       const idx = nextSlices.findIndex((s) => s.id === ns.id);
       if (idx >= 0) {
         const cur = nextSlices[idx];
@@ -1685,6 +1718,11 @@ export function replan(
       return slice;
     });
   }
+
+  // After add/refresh in this call so same-call added ids are valid
+  // targets. Parked leftover depends_on on slices this write did not
+  // restate is honest until orch remounts — do not reject it here.
+  assertWrittenDependsOnTargetsLive("replan", plan.slices, nextSlices, writtenDependsOnIds);
 
   const nextAction = computeNextAction(nextSlices);
   const nextPlan: PlanArtifact = {
@@ -2233,6 +2271,7 @@ export function applySliceDelta(
 
   const usedIds = new Set(nextSlices.map((s) => s.id));
   const addedIds: string[] = [];
+  const writtenDependsOnIds = new Set<string>();
 
   for (const ns of addList) {
     // #291 (round-2 cassandra finding HIGH-2): same collision as replan()'s
@@ -2247,6 +2286,7 @@ export function applySliceDelta(
     }
     const id = ns.id || slugifySliceId(ns.title, usedIds);
     assertNoSelfEdge("applySliceDelta", id, ns.depends_on);
+    if (ns.depends_on) writtenDependsOnIds.add(id);
     usedIds.add(id);
     addedIds.push(id);
     nextSlices.push({
@@ -2258,6 +2298,11 @@ export function applySliceDelta(
       evidence: ns.evidence,
     });
   }
+
+  // After add in this call so same-call added ids are valid targets.
+  // Existing leftover depends_on (e.g. b → superseded s0 after exclusive
+  // split) is not this write — leave it parked.
+  assertWrittenDependsOnTargetsLive("applySliceDelta", plan.slices, nextSlices, writtenDependsOnIds);
 
   if (isReplacement && addedIds.length > 0) {
     nextSlices = nextSlices.map((slice) => {

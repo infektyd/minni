@@ -2934,6 +2934,212 @@ test("applySliceDelta: remount onto slices added in the same call lands", () => 
   assert.equal(remounted.slices.find((s) => s.id === "child-a").status, "pending");
 });
 
+function exclusiveSplitLivePlan(planId = "split-live-dep-targets") {
+  return {
+    plan_id: planId,
+    goal: "new_slices/add_slices must not write a dangling depends_on",
+    status: "active",
+    constraints: [],
+    slices: [
+      {
+        id: "s0",
+        title: "Parent",
+        status: "superseded",
+        superseded_by: "replan-split",
+        replaced_by: ["child-a", "child-b"],
+      },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "child-a", title: "Child A", status: "pending" },
+      { id: "child-b", title: "Child B", status: "pending" },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "child-a",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+}
+
+test("replan: new_slices restating live with b.depends_on=[ghost] throws; topology unchanged", () => {
+  const plan = exclusiveSplitLivePlan("newslices-ghost-dep");
+  assert.throws(
+    () =>
+      replan(plan, [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["ghost"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent" },
+      ]),
+    /replan: cannot depend on "ghost" — missing or superseded/,
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "ghost new_slices must not land; b still depends_on s0",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "rejected new_slices ghost must not supersede indie",
+  );
+});
+
+test("replan: new_slices restating live with b.depends_on=[s0] throws; topology unchanged", () => {
+  const plan = exclusiveSplitLivePlan("newslices-superseded-dep");
+  assert.throws(
+    () =>
+      replan(plan, [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["s0"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent" },
+      ]),
+    /replan: cannot depend on "s0" — missing or superseded/,
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "superseded-target new_slices must not land; b still depends_on s0",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "rejected new_slices superseded target must not supersede indie",
+  );
+});
+
+test("applySliceDelta: add_slices {id:x, depends_on:[ghost]} throws; x does not land", () => {
+  const plan = exclusiveSplitLivePlan("addslices-ghost-dep");
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        add_slices: [{ id: "x", title: "Ghost waiter", depends_on: ["ghost"] }],
+      }),
+    /applySliceDelta: cannot depend on "ghost" — missing or superseded/,
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "x"),
+    undefined,
+    "add_slices ghost must not land x",
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "rejected add_slices ghost must not change leftover b.depends_on",
+  );
+});
+
+test("applySliceDelta: add_slices {id:x, depends_on:[s0]} throws; x does not land", () => {
+  const plan = exclusiveSplitLivePlan("addslices-superseded-dep");
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        add_slices: [{ id: "x", title: "Dead waiter", depends_on: ["s0"] }],
+      }),
+    /applySliceDelta: cannot depend on "s0" — missing or superseded/,
+  );
+  assert.equal(plan.slices.find((s) => s.id === "x"), undefined);
+  assert.deepEqual(plan.slices.find((s) => s.id === "b").depends_on, ["s0"]);
+});
+
+test("applySliceDelta: unrelated add_slices still lands while leftover b.depends_on stays [s0]", () => {
+  const plan = exclusiveSplitLivePlan("addslices-parked-leftover");
+  const added = applySliceDelta(plan, {
+    add_slices: [{ id: "x", title: "Unrelated" }],
+  });
+  assert.equal(added.slices.find((s) => s.id === "x").status, "pending");
+  assert.deepEqual(
+    added.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "parked leftover b.depends_on [s0] is honest until orch remounts",
+  );
+  assert.equal(added.slices.find((s) => s.id === "indie").status, "pending");
+
+  const liveDep = applySliceDelta(plan, {
+    add_slices: [{ id: "y", title: "Waits on child-a", depends_on: ["child-a"] }],
+  });
+  assert.deepEqual(liveDep.slices.find((s) => s.id === "y").depends_on, ["child-a"]);
+  assert.deepEqual(liveDep.slices.find((s) => s.id === "b").depends_on, ["s0"]);
+});
+
+test("replan: new_slices remount onto children still lands; indie stays", () => {
+  const plan = exclusiveSplitLivePlan("newslices-honest-remount");
+  const remounted = replan(plan, [
+    { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+    { id: "child-a", title: "Child A" },
+    { id: "child-b", title: "Child B" },
+    { id: "indie", title: "Independent" },
+  ]);
+  assert.deepEqual(remounted.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+  assert.equal(
+    remounted.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "honest new_slices remount restates indie; it stays live",
+  );
+});
+
+test("applySliceDelta: add_slices depending on a sibling added in the same call lands", () => {
+  const plan = {
+    plan_id: "addslices-same-call-dep",
+    goal: "same-call added ids stay valid targets",
+    status: "active",
+    constraints: [],
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  const added = applySliceDelta(plan, {
+    add_slices: [
+      { id: "sib-b", title: "Sib B", depends_on: ["sib-a"] },
+      { id: "sib-a", title: "Sib A" },
+    ],
+  });
+  assert.deepEqual(
+    added.slices.find((s) => s.id === "sib-b").depends_on,
+    ["sib-a"],
+    "same-call added ids are valid depends_on targets after add in this call",
+  );
+  assert.equal(added.slices.find((s) => s.id === "sib-a").status, "pending");
+  assert.equal(added.slices.find((s) => s.id === "keep").status, "pending");
+});
+
+test("replan: new_slices that adds a slice depending on another id added in this same call lands", () => {
+  const plan = {
+    plan_id: "newslices-same-call-dep",
+    goal: "same-call added ids stay valid targets",
+    status: "active",
+    constraints: [],
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  const next = replan(plan, [
+    { id: "keep", title: "Keep" },
+    { id: "sib-b", title: "Sib B", depends_on: ["sib-a"] },
+    { id: "sib-a", title: "Sib A" },
+  ]);
+  assert.deepEqual(
+    next.slices.find((s) => s.id === "sib-b").depends_on,
+    ["sib-a"],
+    "same-call added ids are valid depends_on targets after refresh/add in this call",
+  );
+  assert.equal(next.slices.find((s) => s.id === "sib-a").status, "pending");
+  assert.equal(next.slices.find((s) => s.id === "keep").status, "pending");
+});
+
 test("updateSlice: succeeds once the dependency actually resolves, no force needed", () => {
   const plan = dependsOnPlan();
   const aDone = updateSlice(plan, "a", "done", "verified via test output, exit 0");
