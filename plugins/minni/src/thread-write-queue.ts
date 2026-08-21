@@ -38,6 +38,14 @@ export interface QueuedWorkerWrite {
   applyNow?: string;
   /** Slice generation at accept. Leftover tickets must not apply after this advances. */
   generation?: number;
+  /**
+   * Accepting process pid at enqueue. Standing drain uses this to yield a
+   * live start while that process is still up in the accept→reserve window.
+   * Legacy tickets omit it and apply as today (no defer).
+   */
+  acceptorPid?: number;
+  /** Optional OS start marker for acceptorPid. Mismatch means stale/reused pid. */
+  processStartMarker?: string;
 }
 
 export interface WorkerWriteDrainProgress {
@@ -161,6 +169,31 @@ function ownerLooksLive(owner: ThreadLockOwner): boolean {
   return true;
 }
 
+/** True when the ticket recorded an acceptor pid (not a legacy Q file). */
+export function queuedWriteHasAcceptor(item: QueuedWorkerWrite): boolean {
+  return Number.isInteger(item.acceptorPid) && (item.acceptorPid ?? 0) > 0;
+}
+
+/**
+ * Reuses ownerLooksLive: pid dead or processStartMarker mismatch is stale.
+ * Legacy tickets without acceptor pid are not live acceptors.
+ */
+export function queuedWriteAcceptorLooksLive(item: QueuedWorkerWrite): boolean {
+  if (!queuedWriteHasAcceptor(item) || item.acceptorPid === undefined) return false;
+  const owner: ThreadLockOwner = {
+    pid: item.acceptorPid,
+    operationId: "queued-write-acceptor",
+    acquiredAt: item.enqueuedAt,
+  };
+  if (
+    typeof item.processStartMarker === "string" &&
+    item.processStartMarker.length > 0
+  ) {
+    owner.processStartMarker = item.processStartMarker;
+  }
+  return ownerLooksLive(owner);
+}
+
 export function workerWriteQueueDir(vaultPath: string, planId: string): string {
   return path.join(
     vaultPath,
@@ -225,6 +258,15 @@ function parseQueuedWrite(value: string): QueuedWorkerWrite | undefined {
         return undefined;
       }
       parsed.generation = item.generation;
+    }
+    if (Number.isInteger(item.acceptorPid) && (item.acceptorPid ?? 0) > 0) {
+      parsed.acceptorPid = item.acceptorPid as number;
+    }
+    if (
+      typeof item.processStartMarker === "string" &&
+      item.processStartMarker.length > 0
+    ) {
+      parsed.processStartMarker = item.processStartMarker;
     }
     return parsed;
   } catch {
@@ -464,6 +506,8 @@ export async function enqueueWorkerWrite(
   ) {
     throw new Error("queued worker write generation is invalid");
   }
+  const acceptorPid = process.pid;
+  const processStartMarker = readProcessStartMarker(acceptorPid);
   const item: QueuedWorkerWrite = {
     ticketId: randomUUID(),
     enqueuedAt: now.toISOString(),
@@ -473,6 +517,10 @@ export async function enqueueWorkerWrite(
     tokenDigest: tokenDigestOf(input.token),
     idempotencyKey: input.idempotencyKey,
     action: input.action,
+    acceptorPid,
+    ...(typeof processStartMarker === "string" && processStartMarker.length > 0
+      ? { processStartMarker }
+      : {}),
     ...(input.applyNow instanceof Date ? { applyNow: input.applyNow.toISOString() } : {}),
     ...(input.generation !== undefined ? { generation: input.generation } : {}),
   };

@@ -4,6 +4,8 @@
  * Not an MCP stdio process. Not a second graph. Not G3. Not Thread SoT.
  * drainPendingWorkerWritesForVault stays the apply entry. This file only
  * lets minnid kick that apply when nobody boots MCP on the vault.
+ * Standing drain must not apply a live start in the accept→reserve window
+ * while the acceptor is live — that yield lives on the apply entry.
  */
 import { drainPendingWorkerWritesForVault } from "./thread-worker.js";
 

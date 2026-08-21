@@ -1440,6 +1440,196 @@ test("kick one-shot yield: lock free before orch reserve, process stays up", { t
   assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
 });
 
+test("standing tick yields live start before orch reserve (process stays up)", { timeout: 30_000 }, async (t) => {
+  // Standing drain is a different process from the accepting MCP. #29
+  // in-process one-shot yield does not cover it. Arm standing tick (not
+  // kick / drainWorkerWrites) while the acceptor stays up.
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const acceptGeneration = claim.generation;
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "standing-tick-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  assert.equal(start.applied, false);
+  assert.equal(
+    await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId),
+    false,
+    "reservation must not be live at accept return",
+  );
+  const queuedAtAccept = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  const startTicket = queuedAtAccept.find(
+    (item) => item.idempotencyKey === "start-0" && item.action?.action === "start",
+  );
+  assert.ok(startTicket, `start must be queued while hold is live: ${JSON.stringify(queuedAtAccept)}`);
+  const rawAtAccept = await readRawQTickets(fixture.vaultPath, fixture.planId);
+  const rawStart = rawAtAccept.find((item) => item.idempotencyKey === "start-0");
+  assert.ok(rawStart, "start Q file must exist");
+  assertQTicketHasNoRawToken(rawStart, claim.token);
+  assert.equal(rawStart.acceptorPid, process.pid);
+  assert.equal("token" in rawStart, false);
+
+  const stamp = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stamp?.kind, START_ACCEPTED_RECEIPT_KIND);
+  assert.equal(stamp?.status, "pending");
+  assert.notEqual(stamp?.response.slice.status, "in_progress");
+  const journalAtAccept = await journalState(fixture);
+  assert.equal(journalAtAccept.started.includes("s0"), false, "stamp is not slice.started");
+
+  releaseHold();
+  await holder;
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const journalAfterFreeLock = await journalState(fixture);
+  assert.equal(
+    journalAfterFreeLock.started.includes("s0"),
+    false,
+    `accept-path kick one-shot must not journal slice.started: ${JSON.stringify(journalAfterFreeLock.started)}`,
+  );
+
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+  const standingBegan = Date.now();
+  const standing = await drainPendingWorkerWritesForVault(fixture.vaultPath);
+  const standingMs = Date.now() - standingBegan;
+  assert.ok(
+    standingMs < 2_000,
+    `standing tick must yield this tick without sitting the 60s drain loop: ${standingMs}ms ${JSON.stringify(standing)}`,
+  );
+  const journalAfterStanding = await journalState(fixture);
+  assert.equal(
+    journalAfterStanding.started.includes("s0"),
+    false,
+    `standing tick must not apply start while acceptor is live in the accept→reserve window: ${JSON.stringify(journalAfterStanding.started)}`,
+  );
+  const queuedAfterStanding = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.ok(
+    queuedAfterStanding.some((item) => item.idempotencyKey === "start-0"),
+    `live start ticket must stay for later drain: ${JSON.stringify(queuedAfterStanding)}`,
+  );
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+
+  let reservedBeforeLock = false;
+  await withExclusiveReplanReservation(
+    fixture.vaultPath,
+    fixture.planId,
+    "orch-split-standing-tick",
+    async () => {
+      reservedBeforeLock = await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId);
+      return withThreadPlanLock(
+        {
+          vaultPath: fixture.vaultPath,
+          notePath: fixture.notePath,
+          planId: fixture.planId,
+          operationId: "orch-split-standing-tick",
+        },
+        async (plan) => {
+          const mid = await journalState(fixture);
+          assert.equal(
+            mid.started.includes("s0"),
+            false,
+            `standing tick must not land slice.started before exclusive split: ${JSON.stringify(mid.started)}`,
+          );
+          const updated = applySliceDelta(plan, {
+            drop_slice_ids: ["s0"],
+            add_slices: [
+              { id: "child-a", title: "Child A" },
+              { id: "child-b", title: "Child B" },
+            ],
+          });
+          assert.equal(updated.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+          assert.deepEqual(
+            updated.slices.filter((slice) => slice.status !== "superseded").map((slice) => slice.id).sort(),
+            ["child-a", "child-b"],
+          );
+          await persistPlan(updated, {
+            vaultPath: fixture.vaultPath,
+            notePath: fixture.notePath,
+          });
+          await pruneSliceReceiptsAfterPlanMutation(
+            fixture.vaultPath,
+            fixture.planId,
+            plan,
+            updated,
+          );
+          await deleteClaimSecretsBestEffort(
+            fixture.vaultPath,
+            fixture.planId,
+            revokedClaimIds(plan, updated),
+          );
+          return updated;
+        },
+      );
+    },
+  );
+  assert.equal(reservedBeforeLock, true, "reservation must be live before exclusive replan takes the persist lock");
+
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0, `leftover start must drop after supersede: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(fixture.notePath);
+  const parent = plan.slices.find((slice) => slice.id === "s0");
+  assert.ok(parent, "split never deletes the parent");
+  assert.equal(parent.status, "superseded");
+  assert.notEqual(parent.status, "in_progress");
+  assert.notEqual(parent.status, "done");
+  assert.equal(parent.claim, undefined);
+  assert.ok(parent.generation === undefined || parent.generation > acceptGeneration);
+  assert.deepEqual(
+    plan.slices.filter((slice) => slice.status !== "superseded").map((slice) => slice.id).sort(),
+    ["child-a", "child-b"],
+  );
+  const journal = await journalState(fixture);
+  assert.equal(
+    journal.started.includes("s0"),
+    false,
+    `standing-tick GO: journal must not have slice.started on superseded s0: ${JSON.stringify(journal.started)}`,
+  );
+  assert.equal(journal.completed.includes("s0"), false);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-s0-after-standing-split",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-standing-split",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /claim scope mismatch|not worker-updatable|cannot persist done|claim token mismatch|claim expired/,
+  );
+  const afterComplete = await rehydratePlan(fixture.notePath);
+  assert.equal(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+  assert.notEqual(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "done");
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
+});
+
 test("complete-behind-start follow-up must not apply start before orch reserve", { timeout: 30_000 }, async (t) => {
   // Accept start arms a one-shot kick. Complete-behind-start while that
   // run is in flight must not reassert a full drain that journals
@@ -2106,3 +2296,381 @@ test("live MCP: accept kick yields before orch reserve (process stays up)", { ti
   assert.equal(after.slices.find((slice) => slice.id === "s0")?.status, "superseded");
   assert.notEqual(after.slices.find((slice) => slice.id === "s0")?.status, "done");
 });
+
+// Pin GO: live MCP, standing tick is a separate Node child (not worker
+// in-process kick). Process stays up. Exclusive split supersedes s0.
+test("live MCP: standing tick yields before orch reserve (process stays up)", { timeout: 60_000 }, async (t) => {
+  const net = await import("node:net");
+  const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
+  const STANDING_TICK_JS = new URL("../dist/standing-drain-tick.js", import.meta.url).pathname;
+  const root = await mkdtemp(path.join(tmpdir(), "minni-standing-live-mcp-"));
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  });
+  const home = path.join(root, "home");
+  const vaultPath = path.join(root, "vault");
+  await mkdir(home, { recursive: true });
+  await mkdir(vaultPath, { recursive: true });
+  const socketPath = path.join(home, "minnid.sock");
+  const daemon = net.createServer((socket) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        const request = JSON.parse(line);
+        socket.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { ok: true } })}\n`,
+        );
+      }
+    });
+  });
+  await new Promise((resolve) => daemon.listen(socketPath, resolve));
+  t.after(() => daemon.close());
+
+  const created = await createPlan(
+    {
+      goal: "Live MCP standing tick vs exclusive replan",
+      slices: [{ id: "s0", title: "Parent" }],
+      vaultPath,
+    },
+    { vaultPath, now: () => THREAD_START },
+  );
+  const planId = created.plan.plan_id;
+  const notePath = created.write.notePath;
+
+  function attachMcp(child) {
+    const responses = new Map();
+    const waiters = new Map();
+    let buffered = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      let nl;
+      while ((nl = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, nl).trim();
+        buffered = buffered.slice(nl + 1);
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id !== undefined) {
+            responses.set(msg.id, msg);
+            waiters.get(msg.id)?.(msg);
+          }
+        } catch {
+          // protocol noise
+        }
+      }
+    });
+    let nextId = 1;
+    const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+    const awaitResponse = (id, ms = 20000) =>
+      responses.get(id) ??
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`timeout waiting for response ${id}`)),
+          ms,
+        );
+        waiters.set(id, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
+      });
+    const allocId = () => nextId++;
+    const call = async (name, args) => {
+      const id = allocId();
+      send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+      const reply = await awaitResponse(id);
+      if (reply.error) throw new Error(`${name}: ${JSON.stringify(reply.error)}`);
+      if (reply.result?.isError) {
+        throw new Error(`${name}: ${reply.result.content?.[0]?.text}`);
+      }
+      return JSON.parse(reply.result.content[0].text);
+    };
+    return { send, awaitResponse, call, allocId };
+  }
+
+  async function bootMcp() {
+    const child = spawn(process.execPath, [SERVER_PATH], {
+      env: {
+        ...process.env,
+        MINNI_HOME: home,
+        MINNI_SOCKET_PATH: socketPath,
+        MINNI_VAULT_PATH: vaultPath,
+        MINNI_CLAUDECODE_VAULT_PATH: vaultPath,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const client = attachMcp(child);
+    const initId = client.allocId();
+    client.send({
+      jsonrpc: "2.0",
+      id: initId,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "standing-live-mcp-go", version: "0.0.0" },
+      },
+    });
+    await client.awaitResponse(initId);
+    client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    return { child, ...client };
+  }
+
+  const orch = await bootMcp();
+  t.after(() => {
+    if (orch.child.exitCode === null && orch.child.signalCode === null) {
+      orch.child.kill("SIGTERM");
+    }
+  });
+  await orch.call("minni_thread_assign", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+  });
+  const claim = await orch.call("minni_thread_claim", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+    idempotency_key: "claim-0",
+  });
+  assert.ok(claim.token);
+
+  let releaseHold;
+  const held = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(vaultPath, planId, "live-mcp-standing-hold", async () => {
+    await held;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const worker = await bootMcp();
+  t.after(() => {
+    if (worker.child.exitCode === null && worker.child.signalCode === null) {
+      worker.child.kill("SIGTERM");
+    }
+  });
+  const started = await worker.call("minni_thread_worker_update", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+    claim_token: claim.token,
+    idempotency_key: "start-0",
+    action: "start",
+  });
+  assert.equal(started.status, "accepted");
+  assert.equal(started.applied, false);
+  assert.equal(
+    await exclusiveReplanReservationIsLive(vaultPath, planId),
+    false,
+    "reservation must not be live at accept return",
+  );
+  assert.equal(worker.child.exitCode, null, "accepting MCP must stay up");
+  assert.equal(worker.child.signalCode, null, "accepting MCP must stay up (no SIGKILL)");
+
+  const queued = await listQueuedWorkerWrites(vaultPath, planId);
+  assert.ok(
+    queued.some((item) => item.idempotencyKey === "start-0"),
+    `start must be queued: ${JSON.stringify(queued)}`,
+  );
+  const rawQueued = await readRawQTickets(vaultPath, planId);
+  const rawStart = rawQueued.find((item) => item.idempotencyKey === "start-0");
+  assert.ok(rawStart);
+  assertQTicketHasNoRawToken(rawStart, claim.token);
+  assert.equal(rawStart.acceptorPid, worker.child.pid);
+
+  releaseHold();
+  await holder;
+  assert.equal(await exclusiveReplanReservationIsLive(vaultPath, planId), false);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  const midJournal = await journalState({ notePath, planId });
+  assert.equal(
+    midJournal.started.includes("s0"),
+    false,
+    `kick must not apply before orch reserves: ${JSON.stringify(midJournal.started)}`,
+  );
+  assert.equal(worker.child.exitCode, null, "process stays up after lock free");
+
+  const standingBegan = Date.now();
+  const tick = spawn(process.execPath, [STANDING_TICK_JS, vaultPath], {
+    env: { ...process.env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let tickErr = "";
+  tick.stderr.on("data", (chunk) => {
+    tickErr += chunk.toString();
+  });
+  const tickExit = await new Promise((resolve, reject) => {
+    tick.once("error", reject);
+    tick.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  const standingMs = Date.now() - standingBegan;
+  assert.equal(tickExit.signal, null, `standing tick child must exit cleanly: ${tickErr}`);
+  assert.equal(tickExit.code, 0, `standing tick child must exit 0: ${tickErr}`);
+  assert.ok(
+    standingMs < 2_000,
+    `standing tick child must not sit the 60s drain loop: ${standingMs}ms`,
+  );
+  assert.equal(worker.child.exitCode, null, "worker still up after standing tick");
+  assert.equal(worker.child.signalCode, null, "worker still up after standing tick (no SIGKILL)");
+  const afterTick = await journalState({ notePath, planId });
+  assert.equal(
+    afterTick.started.includes("s0"),
+    false,
+    `standing tick child must not apply start while worker is live: ${JSON.stringify(afterTick.started)}`,
+  );
+
+  const replan = await orch.call("minni_thread_replan", {
+    plan_id: planId,
+    drop_slice_ids: ["s0"],
+    add_slices: [
+      { id: "child-a", title: "Child A" },
+      { id: "child-b", title: "Child B" },
+    ],
+  });
+  assert.ok(replan.plan_id === planId || replan.plan?.plan_id === planId || replan.slices);
+
+  await drainWorkerWrites({ vaultPath, notePath, planId });
+  const leftover = await listQueuedWorkerWrites(vaultPath, planId);
+  assert.equal(leftover.length, 0, `leftover must drop: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(notePath);
+  const parent = plan.slices.find((slice) => slice.id === "s0");
+  assert.ok(parent, "split never deletes parent");
+  assert.equal(parent.status, "superseded");
+  assert.notEqual(parent.status, "in_progress");
+  assert.notEqual(parent.status, "done");
+  const journal = await journalState({ notePath, planId });
+  assert.equal(
+    journal.started.includes("s0"),
+    false,
+    `live MCP standing GO: no slice.started on superseded s0: ${JSON.stringify(journal.started)}`,
+  );
+  assert.equal(worker.child.exitCode, null, "accepting MCP still up at end (no SIGKILL)");
+
+  const complete = await worker.call("minni_thread_worker_update", {
+    plan_id: planId,
+    slice_id: "s0",
+    worker_agent_id: "worker-0",
+    claim_token: claim.token,
+    idempotency_key: "complete-s0-after-standing-live-split",
+    action: "complete",
+    evidence: "Verification: slice s0 done via live MCP standing tick after split",
+  }).catch((error) => ({ status: "error", error: String(error) }));
+  assert.equal(
+    complete.status,
+    "error",
+    `complete on superseded s0 must error (MCP returns status:error, not transport isError): ${JSON.stringify(complete)}`,
+  );
+  const after = await rehydratePlan(notePath);
+  assert.equal(after.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+  assert.notEqual(after.slices.find((slice) => slice.id === "s0")?.status, "done");
+});
+
+test("standing drain applies live start after DEFAULT_WAIT_MS while acceptor stays up", { timeout: 20_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "aged-standing-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  releaseHold();
+  await holder;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal((await journalState(fixture)).started.includes("s0"), false);
+
+  const dir = workerWriteQueueDir(fixture.vaultPath, fixture.planId);
+  const names = await readdir(dir);
+  let aged = false;
+  for (const name of names) {
+    if (!name.endsWith(".json") || name === "progress.json") continue;
+    const filePath = path.join(dir, name);
+    const ticket = JSON.parse(await readFile(filePath, "utf8"));
+    if (ticket.idempotencyKey !== "start-0") continue;
+    ticket.enqueuedAt = new Date(Date.now() - 6_000).toISOString();
+    await writeFile(filePath, `${JSON.stringify(ticket)}\n`, { mode: 0o600 });
+    aged = true;
+  }
+  assert.equal(aged, true, "start ticket must exist to age past DEFAULT_WAIT_MS");
+
+  const later = await drainPendingWorkerWritesForVault(fixture.vaultPath);
+  assert.ok(later.planIds.includes(fixture.planId), JSON.stringify(later));
+  const journal = await journalState(fixture);
+  assert.deepEqual(journal.started, ["s0"]);
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "in_progress");
+});
+
+test("legacy queued start without acceptor pid still applies on standing drain", { timeout: 20_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "legacy-standing-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  releaseHold();
+  await holder;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const dir = workerWriteQueueDir(fixture.vaultPath, fixture.planId);
+  const names = await readdir(dir);
+  let stripped = false;
+  for (const name of names) {
+    if (!name.endsWith(".json") || name === "progress.json") continue;
+    const filePath = path.join(dir, name);
+    const ticket = JSON.parse(await readFile(filePath, "utf8"));
+    if (ticket.idempotencyKey !== "start-0") continue;
+    delete ticket.acceptorPid;
+    delete ticket.processStartMarker;
+    await writeFile(filePath, `${JSON.stringify(ticket)}\n`, { mode: 0o600 });
+    stripped = true;
+  }
+  assert.equal(stripped, true, "start ticket must exist to strip acceptor pid");
+
+  const later = await drainPendingWorkerWritesForVault(fixture.vaultPath);
+  assert.ok(later.planIds.includes(fixture.planId), JSON.stringify(later));
+  const journal = await journalState(fixture);
+  assert.deepEqual(journal.started, ["s0"]);
+});
+
