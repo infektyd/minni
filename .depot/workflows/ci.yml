@@ -1,0 +1,95 @@
+# Depot CI copy of .github/workflows/ci.yml.
+# Origin's required check is Public CI (pull_request:ci.yml). Depot registers
+# pull_request / push triggers from .depot/workflows/ on the default branch,
+# not from .github/ (that tree stays the GitHub Actions source).
+# Keep the workflow `name:` stable — protection matches it.
+#
+# Depot CI Migration
+# Source: .github/workflows/ci.yml
+# Changes: ubuntu-latest → depot-ubuntu-latest (Depot sandbox label).
+
+name: Public CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cloud-smoke:
+    name: Free public cloud smoke
+    runs-on: depot-ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # This job executes PR-authored code (make setup / pytest); a credential in
+          # .git/config would be readable by it.
+          # Default checkout persists the token into .git/config as an http
+          # extraheader; nothing downstream needs it (the repo is public, so
+          # any git fetch here is anonymous).
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+
+      - name: Install project deps
+        run: |
+          make setup
+          .venv/bin/python -m pip install pyyaml
+
+      - name: Public boundary guard
+        run: |
+          bash scripts/check-public-boundary.sh
+          bash scripts/check-migrations.sh
+
+      - name: Engine tests
+        run: |
+          .venv/bin/python -m pytest -q --tb=short
+
+      - name: Plugin tests
+        working-directory: plugins/minni
+        run: |
+          npm test
+          npm audit --audit-level=moderate
+
+      - name: Hermetic smoke (status + recall + isolation)
+        run: |
+          bash scripts/repro-smoke.sh
+
+      # The newcomer-facing health check must stay truthful: stand up a daemon
+      # in an isolated $HOME (same pattern as repro-smoke.sh) and require
+      # `minni doctor` to pass against it.
+      - name: minni doctor (newcomer health check)
+        run: |
+          TD="$(mktemp -d /tmp/minnid-doctor-XXXXXX)"
+          mkdir -p "$TD/home"
+          export HOME="$TD/home" MINNI_HOME="$TD"
+          SOCK="$TD/run/minnid.sock"
+          .venv/bin/python -u -m minni.minnid --socket "$SOCK" > "$TD/daemon.log" 2>&1 &
+          DPID=$!
+          trap 'kill "$DPID" 2>/dev/null || true; rm -rf "$TD"' EXIT
+          sleep 3
+          .venv/bin/minni --socket "$SOCK" doctor || { cat "$TD/daemon.log"; exit 1; }
