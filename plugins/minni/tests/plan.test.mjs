@@ -10,6 +10,7 @@ import {
   unmetDependencies,
   diffDependsOn,
   diffSupersededDependencies,
+  landedReplanTopology,
   applySliceDelta,
   landedAddSlices,
   structuralProposalDelta,
@@ -949,13 +950,15 @@ test("digest v3 changes for assignment, generation, claim metadata, and proposal
 });
 
 // Gate T2 requires EVERY new durable slice field to affect v3, not just the
-// five exercised above — `requirements` and `assignment_profile` are the
-// remaining two named in the interface (plan.ts PlanSlice).
-test("digest v3 also changes for requirements and assignment_profile", () => {
+// five exercised above — `requirements`, `assignment_profile`, and
+// `replaced_by` (exclusive-split remount honesty) are the remaining named
+// optional fields on PlanSlice.
+test("digest v3 also changes for requirements, assignment_profile, and replaced_by", () => {
   const base = makePlan();
   const variants = [
     { requirements: ["needs-shell-access"] },
     { assignment_profile: "profile-research" },
+    { replaced_by: ["child-a", "child-b"] },
   ];
   for (const extra of variants) {
     const changed = withSliceZeroField(base, extra);
@@ -1043,6 +1046,7 @@ const V3_ONLY_FIELD_SAMPLES = {
     expires_at: "2026-08-18T00:10:00.000Z",
   },
   proposals: [{ kind: "contract", reason: "enough evidence", slice_ids: ["s1"] }],
+  replaced_by: ["child-a", "child-b"],
 };
 
 /**
@@ -1127,7 +1131,7 @@ test("rehydratePlan rejects a declared v1 note whose slice carries a v3-only fie
  * shape) whose plan_digest genuinely equals computePlanDigestV1 — but one
  * slice ALSO carries a v3-only field the v1 algorithm never looks at. This
  * is the re-review's scenario: an UNDECLARED note is just as blind to the
- * seven v3-only keys as a declared-v1 note is, and — unlike the declared
+ * v3-only keys as a declared-v1 note is, and — unlike the declared
  * case — it was about to be silently upgraded (persisted) as a genuine v3
  * note, which would bless the injected field permanently.
  */
@@ -1160,7 +1164,7 @@ async function writeUndeclaredV1PlanWithV3Field(field) {
 }
 
 test("rehydratePlan rejects an undeclared legacy (no plan_digest_v) valid-v1 note whose slice carries a v3-only field", async (t) => {
-  for (const field of ["assigned_to", "claim"]) {
+  for (const field of ["assigned_to", "claim", "replaced_by"]) {
     await t.test(field, async () => {
       const fixture = await writeUndeclaredV1PlanWithV3Field(field);
       try {
@@ -1185,7 +1189,7 @@ test("rehydratePlan rejects an undeclared legacy (no plan_digest_v) valid-v1 not
 
 test("rehydratePlan still upgrades a CLEAN undeclared legacy (no plan_digest_v) valid-v1 note on read", async () => {
   // The new legacy-path guard above must not be a false positive: a genuine
-  // pre-H7 note with none of the seven v3-only keys must keep upgrading in
+  // pre-H7 note with none of the v3-only keys must keep upgrading in
   // place exactly as the pre-existing H7 test already proves — this test
   // re-confirms that specifically alongside the new tamper guard, using the
   // same note shape (single slice, no plan_digest_v) as the rejection test
@@ -1257,7 +1261,7 @@ async function writeUndeclaredV2PlanWithV3Field(field) {
 }
 
 test("rehydratePlan rejects an undeclared legacy (no plan_digest_v) valid-v2 note whose slice carries a v3-only field", async (t) => {
-  for (const field of ["assigned_to", "claim"]) {
+  for (const field of ["assigned_to", "claim", "replaced_by"]) {
     await t.test(field, async () => {
       const fixture = await writeUndeclaredV2PlanWithV3Field(field);
       try {
@@ -2535,6 +2539,91 @@ test("updateSlice: superseded (not just done) also satisfies a dependency", () =
   assert.equal(bDone.slices.find((s) => s.id === "b").status, "done");
 });
 
+// Exclusive split is replacement, not drop-without-replacement: superseding the
+// parent while adding children must NOT treat depends_on as resolved. Plain
+// contract drop (drop-only) still unblocks — that residual stays disclosed.
+test("unmetDependencies: exclusive split keeps dependents blocked; contract drop still resolves", () => {
+  const plan = {
+    plan_id: "split-dep",
+    goal: "split remount",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-20T12:00:00.000Z",
+    updated: "2026-08-20T12:00:00.000Z",
+    rev: 1,
+  };
+
+  const contracted = applySliceDelta(plan, { drop_slice_ids: ["s0"] });
+  assert.equal(contracted.slices.find((s) => s.id === "s0").status, "superseded");
+  assert.deepEqual(
+    unmetDependencies(contracted, "b"),
+    [],
+    "plain contract drop-without-replacement still resolves depends_on",
+  );
+  assert.equal(
+    contracted.slices.find((s) => s.id === "s0").replaced_by,
+    undefined,
+    "drop-only must not mark replacement",
+  );
+
+  const split = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "two independently verifiable outputs",
+        slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+        ],
+      },
+      "s0",
+    ),
+  );
+  const parent = split.slices.find((s) => s.id === "s0");
+  assert.equal(parent.status, "superseded");
+  assert.deepEqual(
+    [...(parent.replaced_by ?? [])].sort(),
+    ["child-a", "child-b"],
+    "split marks the superseded parent as replaced by the children",
+  );
+  assert.deepEqual(
+    unmetDependencies(split, "b"),
+    ["s0"],
+    "dependents of a replaced parent stay blocked until orch remounts depends_on",
+  );
+  assert.deepEqual(unmetDependencies(split, "child-a"), [], "children do not inherit parent deps");
+  assert.deepEqual(unmetDependencies(split, "child-b"), []);
+  assert.deepEqual(unmetDependencies(split, "indie"), []);
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "structuralProposalDelta / applySliceDelta must not auto-remount depends_on",
+  );
+
+  const remounted = replan(split, [
+    { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+    { id: "child-a", title: "Child A" },
+    { id: "child-b", title: "Child B" },
+    { id: "indie", title: "Independent" },
+  ]);
+  assert.deepEqual(remounted.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+  assert.deepEqual(
+    unmetDependencies(remounted, "b").sort(),
+    ["child-a", "child-b"],
+    "after orch remount on the existing replan surface, b waits on the children",
+  );
+});
+
 test("updateSlice: succeeds once the dependency actually resolves, no force needed", () => {
   const plan = dependsOnPlan();
   const aDone = updateSlice(plan, "a", "done", "verified via test output, exit 0");
@@ -2675,6 +2764,80 @@ test("diffSupersededDependencies: a superseded dependency with no surviving depe
     ],
   };
   assert.deepEqual(diffSupersededDependencies(before, after), [], "b is done — no longer a live dependent to report");
+});
+
+test("landedReplanTopology: new_slices-shaped apply reports landed add ids and superseded ids", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "keep", title: "Keep", status: "pending" },
+      { id: "drop-me", title: "Drop", status: "pending" },
+    ],
+  };
+  const after = replan(before, [
+    { id: "keep", title: "Keep" },
+    { id: "child-a", title: "Child A", depends_on: ["keep"] },
+  ]);
+  const landed = landedReplanTopology(before, after);
+  assert.deepEqual(landed.drop_slice_ids, ["drop-me"]);
+  assert.deepEqual(landed.add_slices, [
+    { id: "child-a", title: "Child A", depends_on: ["keep"] },
+  ]);
+  assert.equal(
+    JSON.stringify(landed).includes("claim"),
+    false,
+    "claim tokens stay off the landed topology payload",
+  );
+});
+
+test("landedReplanTopology omits evidence from ordered add_slices", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+  };
+  const after = replan(before, [
+    { id: "keep", title: "Keep" },
+    {
+      id: "child",
+      title: "Child",
+      evidence: "vault/secret/path.log passed",
+    },
+  ]);
+  assert.equal(
+    after.slices.find((s) => s.id === "child")?.evidence,
+    "vault/secret/path.log passed",
+    "plan note still stores evidence; only the ordered payload omits it",
+  );
+  const landed = landedReplanTopology(before, after);
+  assert.deepEqual(landed.add_slices, [{ id: "child", title: "Child" }]);
+  assert.equal(
+    JSON.stringify(landed).includes("evidence"),
+    false,
+    "ordered replan payload must not copy freeform evidence",
+  );
+  assert.equal(
+    JSON.stringify(landed).includes("vault/secret"),
+    false,
+    "path-bearing evidence must not reach the ordered journal",
+  );
+});
+
+test("landedReplanTopology: depends_on-only remount (no add/supersede) omits add/drop", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "b", title: "B", status: "pending", depends_on: ["s0"] },
+      { id: "child-a", title: "Child A", status: "pending" },
+    ],
+  };
+  const after = replan(before, [
+    { id: "b", title: "B", depends_on: ["child-a"] },
+    { id: "child-a", title: "Child A" },
+  ]);
+  assert.deepEqual(landedReplanTopology(before, after), {});
+  assert.deepEqual(diffDependsOn(before, after), [
+    { slice_id: "b", from: ["s0"], to: ["child-a"] },
+  ]);
 });
 
 // #291 round-2 cassandra finding HIGH-2 (confirmed by independent

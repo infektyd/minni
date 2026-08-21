@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { appendFileWithFsync } from "./vault.js";
@@ -325,3 +325,206 @@ export async function withThreadLock<T>(
     }
   }
 }
+
+function exclusiveReplanReservationPath(vaultPath: string, planId: string): string {
+  return path.join(
+    vaultPath,
+    ".runtime",
+    "thread-locks",
+    `${lockKey(planId)}.exclusive-replan.json`,
+  );
+}
+
+/**
+ * Exclusive replan announces itself before the persist lock. Kick/drain
+ * must yield while this is live so an accepting process that stays up
+ * cannot journal slice.started on a parent that replan then supersedes.
+ * Dead reservation owners are not live — kick still drains when no
+ * exclusive replan is in flight. THREAD_BUSY stays overflow, not the default.
+ */
+export async function exclusiveReplanReservationIsLive(
+  vaultPath: string,
+  planId: string,
+  options: Pick<
+    ThreadLockOptions,
+    "isProcessAlive" | "getProcessStartMarker" | "staleMs" | "now"
+  > = {},
+): Promise<boolean> {
+  const reservationPath = exclusiveReplanReservationPath(vaultPath, planId);
+  let raw: string;
+  try {
+    raw = await readFile(reservationPath, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return false;
+    throw error;
+  }
+  const owner = parseOwner(raw);
+  if (owner === undefined) {
+    // Empty/unparseable is the publish window (tmp+link or wx create
+    // before JSON lands). Same as withThreadLock: invalid owners are
+    // live until stale grace, then kick may drain and acquire may reap.
+    return !(await reservationOlderThanStale(reservationPath, options));
+  }
+  const isProcessAlive = options.isProcessAlive ?? processAlive;
+  const getProcessStartMarker =
+    options.getProcessStartMarker ?? readProcessStartMarker;
+  return ownerLooksLive(owner, isProcessAlive, getProcessStartMarker).live;
+}
+
+async function reservationOlderThanStale(
+  reservationPath: string,
+  options: Pick<ThreadLockOptions, "staleMs" | "now">,
+): Promise<boolean> {
+  const staleMs = Math.max(0, options.staleMs ?? DEFAULT_STALE_MS);
+  const now = options.now ?? (() => new Date());
+  try {
+    const st = await stat(reservationPath);
+    return now().getTime() - st.mtimeMs > staleMs;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return false;
+    throw error;
+  }
+}
+
+/**
+ * Publish a complete owner JSON onto the reservation path. Prefer
+ * tmp+link so dest never appears empty. Filesystems that reject hard
+ * links (NFS/SMB/virtiofs) fall back to exclusive wx write — the
+ * young-unparseable stale grace covers that create-before-write window.
+ * link/wx EEXIST means another owner already holds the name.
+ * wx can create dest then fail the write (ENOSPC/EIO); reap that dest
+ * unless EEXIST, same as withThreadLock's owner publish, so kick does
+ * not yield on our leftover empty file.
+ */
+async function publishExclusiveReservation(
+  reservationPath: string,
+  owner: ThreadLockOwner,
+): Promise<void> {
+  const payload = `${JSON.stringify(owner)}\n`;
+  const tmpPath = `${reservationPath}.${randomUUID()}.tmp`;
+  await writeFile(tmpPath, payload, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  try {
+    try {
+      await link(tmpPath, reservationPath);
+    } catch (error) {
+      if (
+        !isErrno(error, "ENOTSUP") &&
+        !isErrno(error, "EOPNOTSUPP") &&
+        !isErrno(error, "EPERM") &&
+        !isErrno(error, "EXDEV")
+      ) {
+        throw error;
+      }
+      try {
+        await writeFile(reservationPath, payload, {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+      } catch (writeError) {
+        if (!isErrno(writeError, "EEXIST")) {
+          await rm(reservationPath, { force: true }).catch(() => {});
+        }
+        throw writeError;
+      }
+    }
+  } finally {
+    await rm(tmpPath, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Reserve exclusive replan before withThreadLock so kick sees it and yields.
+ * Same persist authority. Replan is never a Q item.
+ */
+export async function withExclusiveReplanReservation<T>(
+  vaultPath: string,
+  planId: string,
+  operationId: string,
+  fn: () => Promise<T>,
+  options: ThreadLockOptions = {},
+): Promise<T> {
+  const waitMs = Math.max(0, options.waitMs ?? DEFAULT_WAIT_MS);
+  const staleMs = Math.max(0, options.staleMs ?? DEFAULT_STALE_MS);
+  const pollMs = Math.max(0, options.pollMs ?? DEFAULT_POLL_MS);
+  const now = options.now ?? (() => new Date());
+  const isProcessAlive = options.isProcessAlive ?? processAlive;
+  const getProcessStartMarker =
+    options.getProcessStartMarker ?? readProcessStartMarker;
+  const reservationPath = exclusiveReplanReservationPath(vaultPath, planId);
+  const deadline = Date.now() + waitMs;
+  const selfMarker = getProcessStartMarker(process.pid);
+  const owner: ThreadLockOwner = {
+    pid: process.pid,
+    operationId,
+    acquiredAt: now().toISOString(),
+    ...(selfMarker !== undefined ? { processStartMarker: selfMarker } : {}),
+  };
+
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+
+  while (true) {
+    try {
+      await publishExclusiveReservation(reservationPath, owner);
+      break;
+    } catch (error) {
+      if (!isErrno(error, "EEXIST")) {
+        throw error;
+      }
+    }
+
+    let raw: string | undefined;
+    try {
+      raw = await readFile(reservationPath, "utf8");
+    } catch (readError) {
+      if (isErrno(readError, "ENOENT")) continue;
+      throw readError;
+    }
+    const observed = parseOwner(raw ?? "");
+    if (observed === undefined) {
+      // Young unparseable: publish window, not a dead owner. Wait.
+      // Aged unparseable: reap like withThreadLock stale_invalid_owner.
+      if (await reservationOlderThanStale(reservationPath, { staleMs, now })) {
+        await rm(reservationPath, { force: true }).catch(() => {});
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new ThreadBusyError();
+      }
+      await sleep(Math.min(pollMs, remainingMs));
+      continue;
+    }
+    const live = ownerLooksLive(
+      observed,
+      isProcessAlive,
+      getProcessStartMarker,
+    ).live;
+    if (!live) {
+      await rm(reservationPath, { force: true }).catch(() => {});
+      continue;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new ThreadBusyError(observed);
+    }
+    await sleep(Math.min(pollMs, remainingMs));
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try {
+      const current = parseOwner(await readFile(reservationPath, "utf8"));
+      if (current?.operationId === operationId) {
+        await rm(reservationPath, { force: true });
+      }
+    } catch {
+      // Reservation already gone.
+    }
+  }
+}
+

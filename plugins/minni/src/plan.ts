@@ -58,6 +58,15 @@ export interface PlanSlice {
   depends_on?: string[];
   evidence?: string;
   superseded_by?: string;
+  /**
+   * Exclusive split (drop + add in one replan) is replacement, not
+   * drop-without-replacement. When set, unmetDependencies treats this
+   * superseded slice as still unmet for anyone who still depends_on it —
+   * orch must remount depends_on onto the replacement ids on the existing
+   * replan surface. Plain contract drop leaves this unset so superseded
+   * continues to resolve dependents (disclosed residual).
+   */
+  replaced_by?: string[];
   // Thread Phase 1 (worker slice metadata, digest v3) — all optional so a
   // note persisted before this task, or a slice literal built by an older
   // test/caller, remains a valid PlanSlice with no backfill required on
@@ -143,8 +152,9 @@ export type PlanEvent =
       // slice that depends on it just as much as depends_on being edited
       // directly — must be equally non-silent.
       depends_on_superseded?: Array<{ slice_id: string; depended_on_by: string[] }>;
-      // Landed add/drop from orch apply (minni_thread_replan). Journal is
-      // SoT for what topology change actually applied; propose_structure
+      // Landed topology from orch apply (add/drop MCP args OR new_slices
+      // full-set replan). Journal is SoT for what actually applied —
+      // derived from before→after, never claim tokens. propose_structure
       // never writes these.
       add_slices?: CreatePlanInput["slices"];
       drop_slice_ids?: string[];
@@ -278,6 +288,7 @@ function computePlanDigestHexV3(plan: PlanArtifact): string {
       depends_on: sl.depends_on ? [...sl.depends_on].sort() : undefined,
       evidence: sl.evidence,
       superseded_by: sl.superseded_by,
+      replaced_by: sl.replaced_by ? [...sl.replaced_by].sort() : undefined,
       requirements: sl.requirements ? [...sl.requirements].sort() : undefined,
       assigned_to: sl.assigned_to,
       assignment_profile: sl.assignment_profile,
@@ -374,6 +385,7 @@ const V3_ONLY_SLICE_FIELDS = [
   "attempt",
   "claim",
   "proposals",
+  "replaced_by",
 ] as const;
 
 function findV3OnlySliceField(
@@ -1254,13 +1266,22 @@ function isTrivialEvidence(ev: string): boolean {
  * that doesn't match any slice in the plan (typo, or a slice removed by
  * replan) is also unmet — it can never be resolved, so it must not be
  * silently ignored either.
+ *
+ * Exclusive split exception: a superseded slice with replaced_by is a
+ * replacement, not drop-without-replacement. Dependents that still point at
+ * it stay blocked until orch remounts depends_on onto the children.
  */
 export function unmetDependencies(plan: PlanArtifact, slice_id: string): string[] {
   const slice = plan.slices.find((s) => s.id === slice_id);
   const depends_on = slice?.depends_on ?? [];
   return depends_on.filter((depId) => {
     const dep = plan.slices.find((s) => s.id === depId);
-    return !dep || (dep.status !== "done" && dep.status !== "superseded");
+    if (!dep) return true;
+    if (dep.status === "done") return false;
+    if (dep.status === "superseded") {
+      return Array.isArray(dep.replaced_by) && dep.replaced_by.length > 0;
+    }
+    return true;
   });
 }
 
@@ -1301,10 +1322,10 @@ export function diffDependsOn(
  * superseded, and unmetDependencies already treats superseded as
  * resolved). That path is cheaper than editing depends_on directly and,
  * before this function, produced NO journal trail at all — the plain
- * "replan" event previously carried only depends_on diffs. Orch apply now
- * also journals landed add_slices / drop_slice_ids on that same event.
- * Pure diff used by the minni_thread_replan handler to make that
- * supersession visible: for every
+ * "replan" event previously carried only depends_on diffs. Orch apply
+ * also journals landed add_slices / drop_slice_ids on that same event
+ * (see landedReplanTopology). Pure diff used by the
+ * minni_thread_replan handler to make that supersession visible: for every
  * slice that newly became superseded in this operation, list which
  * still-open (not done/superseded) slices depend on it.
  */
@@ -1332,6 +1353,57 @@ export function diffSupersededDependencies(
     }
   }
   return result;
+}
+
+/**
+ * Landed add/drop for a replan apply, derived from before→after — not from
+ * which MCP args the orch used. Closes the hole where new_slices (full-set
+ * replan; remount uses this) can land adds and supersessions while the
+ * ordered replan event still omits add_slices / drop_slice_ids because
+ * those MCP fields were absent. Echoing request args would miss generated
+ * ids; journaling landed state keeps the ordered journal SoT.
+ *
+ * add_slices: newly appended slices (id + proposal fields only; no claim
+ * token, status, proposals, or evidence). Ordered mirrors elsewhere omit
+ * evidence (status_changed is status enums only). drop_slice_ids: ids that
+ * newly became superseded. Empty sides are omitted.
+ */
+export function landedReplanTopology(
+  before: PlanArtifact,
+  after: PlanArtifact,
+): {
+  add_slices?: NonNullable<CreatePlanInput["slices"]>;
+  drop_slice_ids?: string[];
+} {
+  const beforeIds = new Set(before.slices.map((s) => s.id));
+  const add_slices = after.slices
+    .filter((s) => !beforeIds.has(s.id))
+    .map((s) => {
+      const landed: {
+        id: string;
+        title: string;
+        gate?: string;
+        depends_on?: string[];
+      } = { id: s.id, title: s.title };
+      if (s.gate !== undefined) landed.gate = s.gate;
+      if (s.depends_on !== undefined) landed.depends_on = [...s.depends_on];
+      return landed;
+    });
+  const drop_slice_ids = after.slices
+    .filter((s) => s.status === "superseded")
+    .map((s) => s.id)
+    .filter((id) => {
+      const was = before.slices.find((b) => b.id === id);
+      return !!was && was.status !== "superseded";
+    })
+    .sort();
+  const out: {
+    add_slices?: NonNullable<CreatePlanInput["slices"]>;
+    drop_slice_ids?: string[];
+  } = {};
+  if (add_slices.length > 0) out.add_slices = add_slices;
+  if (drop_slice_ids.length > 0) out.drop_slice_ids = drop_slice_ids;
+  return out;
 }
 
 export interface UpdateSliceOptions {
@@ -1377,7 +1449,7 @@ export function updateSlice(
           // an MCP-calling model sees on refusal — name the MCP-facing field
           // (force_reason on minni_thread_update), not the internal TS option
           // name, so a model retrying doesn't pass a parameter that doesn't exist.
-          `updateSlice: cannot mark "${slice_id}" done — depends_on unmet: ${unmet.join(", ")} (must be "done" or "superseded" first). Pass force + a non-empty force reason to override.`
+          `updateSlice: cannot mark "${slice_id}" done — depends_on unmet: ${unmet.join(", ")} (must be "done", or "superseded" without replacement, first). Pass force + a non-empty force reason to override.`
         );
       }
       if (!options.forceReason || !options.forceReason.trim()) {
@@ -1500,6 +1572,7 @@ export function replan(
   const supersededMarker = `replan-${createHash("sha256").update(titlesKey).digest("hex").slice(0, 10)}`;
 
   // Supersede old non-final that are absent from the proposed set (match by id or title)
+  const newlySupersededIds = new Set<string>();
   let nextSlices: PlanSlice[] = plan.slices.map((slice) => {
     const stillProposed = newSlices.some(
       (ns) =>
@@ -1507,6 +1580,7 @@ export function replan(
         ((ns.title ?? "").trim().toLowerCase() === slice.title.trim().toLowerCase()),
     );
     if (!stillProposed && slice.status !== "done" && slice.status !== "superseded") {
+      newlySupersededIds.add(slice.id);
       return invalidateSliceGeneration({
         ...slice,
         status: "superseded",
@@ -1517,6 +1591,7 @@ export function replan(
   });
 
   const usedIds = new Set(nextSlices.map((s) => s.id));
+  const addedIds: string[] = [];
 
   // Append truly new (no id or title match among current non-superseded)
   for (const ns of newSlices) {
@@ -1545,6 +1620,7 @@ export function replan(
       }
       const id = ns.id || slugifySliceId(ns.title, usedIds);
       usedIds.add(id);
+      addedIds.push(id);
       nextSlices = [
         ...nextSlices,
         {
@@ -1576,6 +1652,21 @@ export function replan(
           : refreshed;
       }
     }
+  }
+
+  // Same exclusive-split honesty as applySliceDelta: supersede + add in one
+  // call is replacement. Omit-only (no adds) stays drop-without-replacement.
+  if (newlySupersededIds.size > 0 && addedIds.length > 0) {
+    nextSlices = nextSlices.map((slice) => {
+      if (
+        newlySupersededIds.has(slice.id) &&
+        slice.status === "superseded" &&
+        slice.superseded_by === supersededMarker
+      ) {
+        return { ...slice, replaced_by: [...addedIds] };
+      }
+      return slice;
+    });
   }
 
   const nextAction = computeNextAction(nextSlices);
@@ -1840,10 +1931,10 @@ export async function rehydratePlan(
       // v3-only-field tamper check entirely, because that check originally
       // lived only inside the `declaredVersion !== undefined` branch above.
       // But an undeclared note validating against a legacy algorithm is
-      // exactly as blind to the seven v3-only slice keys as a DECLARED
+      // exactly as blind to the v3-only slice keys as a DECLARED
       // older note is — and, worse, it was about to be upgraded (persisted)
       // below, which would silently BLESS an injected
-      // assigned_to/claim/proposals/etc. as legitimate v3 data. So the same
+      // assigned_to/claim/proposals/replaced_by/etc. as legitimate v3 data. So the same
       // guard applies here too, before needsUpgrade is set.
       const v3Field = findV3OnlySliceField(plan.slices);
       if (v3Field) {
@@ -2107,6 +2198,10 @@ export function applySliceDelta(
   const supersededMarker = `replan-${createHash("sha256").update(deltaKey).digest("hex").slice(0, 10)}`;
 
   const dropSet = new Set(delta.drop_slice_ids ?? []);
+  const addList = delta.add_slices ?? [];
+  // drop+add is exclusive-split shape: replacement, not drop-without-replacement.
+  const isReplacement = dropSet.size > 0 && addList.length > 0;
+
   let nextSlices: PlanSlice[] = plan.slices.map((slice) => {
     if (dropSet.has(slice.id) && slice.status !== "done" && slice.status !== "superseded") {
       return invalidateSliceGeneration({
@@ -2119,8 +2214,9 @@ export function applySliceDelta(
   });
 
   const usedIds = new Set(nextSlices.map((s) => s.id));
+  const addedIds: string[] = [];
 
-  for (const ns of delta.add_slices ?? []) {
+  for (const ns of addList) {
     // #291 (round-2 cassandra finding HIGH-2): same collision as replan()'s
     // sibling loop, reached here via drop_slice_ids + add_slices in a
     // single call — e.g. dropping "a" and re-adding a slice explicitly
@@ -2133,6 +2229,7 @@ export function applySliceDelta(
     }
     const id = ns.id || slugifySliceId(ns.title, usedIds);
     usedIds.add(id);
+    addedIds.push(id);
     nextSlices.push({
       id,
       title: ns.title,
@@ -2140,6 +2237,19 @@ export function applySliceDelta(
       gate: ns.gate,
       depends_on: ns.depends_on ? [...ns.depends_on] : undefined,
       evidence: ns.evidence,
+    });
+  }
+
+  if (isReplacement && addedIds.length > 0) {
+    nextSlices = nextSlices.map((slice) => {
+      if (
+        dropSet.has(slice.id) &&
+        slice.status === "superseded" &&
+        slice.superseded_by === supersededMarker
+      ) {
+        return { ...slice, replaced_by: [...addedIds] };
+      }
+      return slice;
     });
   }
 
@@ -2189,7 +2299,11 @@ export function landedAddSlices(
  * replan kind enum — orch still calls replan with add/drop.
  *
  *   expand   = add only; proposer stays
- *   split    = supersede claimed parent + add children; no parent-id reuse
+ *   split    = supersede claimed parent + add children; no parent-id reuse.
+ *              Does not remount dependents' depends_on — orch remounts on
+ *              the existing replan surface (same call via new_slices, or
+ *              follow-up). Split is replacement; contract is drop-without-
+ *              replacement.
  *   contract = drop named ids only (supersede, never delete)
  */
 export function structuralProposalDelta(

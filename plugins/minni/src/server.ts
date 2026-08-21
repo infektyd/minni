@@ -55,8 +55,8 @@ import {
   unmetDependencies,
   diffDependsOn,
   diffSupersededDependencies,
+  landedReplanTopology,
   applySliceDelta,
-  landedAddSlices,
   readHistory,
   getRevision,
   diffPlans,
@@ -113,7 +113,7 @@ import {
   type WorkerUpdateAction,
 } from "./thread-worker.js";
 import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
-import { withThreadLock } from "./thread-lock.js";
+import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
 // vault's wiki tree regardless of `limit` — the limit is a post-scoring
@@ -1750,7 +1750,7 @@ server.registerTool(
   {
     title: "Minni Thread Replan",
     description:
-      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse); contract = drop_slice_ids only. Drop supersedes; it never deletes.",
+      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse; dependents of the replaced parent stay blocked until orch remounts depends_on onto the children via this same surface); contract = drop_slice_ids only (drop-without-replacement still unblocks dependents). Drop supersedes; it never deletes.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       new_slices: z.array(planSliceInputSchema).optional(),
@@ -1786,12 +1786,17 @@ server.registerTool(
         error: "Either new_slices or add_slices/drop_slice_ids must be provided",
       }, null, 2));
     }
-    const next = await withThreadPlanLock(
+    const replanOperationId = `server-replan:${randomUUID()}`;
+    const next = await withExclusiveReplanReservation(
+      effectiveVaultPath,
+      plan_id,
+      replanOperationId,
+      () => withThreadPlanLock(
       {
         vaultPath: effectiveVaultPath,
         notePath,
         planId: plan_id,
-        operationId: `server-replan:${randomUUID()}`,
+        operationId: replanOperationId,
       },
       async (plan) => {
         const now = new Date();
@@ -1818,13 +1823,20 @@ server.registerTool(
     // reproduction before trusting the review): diffDependsOn alone missed
     // the ordinary, cheaper way to satisfy a dependency for free — omitting
     // the dependency slice from new_slices (or listing it in
-    // drop_slice_ids) supersedes it, and unmetDependencies already treats
-    // superseded as resolved. That path produced zero journal trail before
+    // drop_slice_ids) supersedes it, and unmetDependencies treats plain
+    // superseded (drop-without-replacement) as resolved. Exclusive split
+    // (drop+add) stamps replaced_by so dependents stay blocked until orch
+    // remounts depends_on. That path produced zero journal trail before
     // this. Journaled here, not blocked: replan's purpose is restructuring
     // the plan, and hard-gating supersession itself is a separate, larger
     // design decision outside this fix's brief (see diffSupersededDependencies'
     // docstring).
         const dependsOnSuperseded = diffSupersededDependencies(plan, updated);
+        // Landed add/drop from before→after so new_slices full-set replan
+        // (and add/drop MCP args) both put topology on the journal. Echoing
+        // only MCP add_slices/drop_slice_ids would omit the new_slices path
+        // that remount / full-set apply uses. Never claim tokens.
+        const landedTopology = landedReplanTopology(plan, updated);
         const revokedClaimIdList = revokedClaimIds(plan, updated);
         await persistPlanThenRevokeClaimSecrets(
           updated,
@@ -1840,9 +1852,9 @@ server.registerTool(
         );
         // Legacy appendJournal: include landed add/drop so both journals
         // agree that replan apply carried the topology delta that landed.
-        // Landed ids, not request add_slices — applySliceDelta may generate
-        // ids when callers omit them.
-        const landedAdds = landedAddSlices(plan, updated);
+        // Landed ids from before→after — applySliceDelta may generate ids
+        // when callers omit them; new_slices full-set replan has no MCP
+        // add/drop args to echo.
         await appendJournal(journalPath, {
           kind: "replan",
           at: now.toISOString(),
@@ -1852,11 +1864,11 @@ server.registerTool(
           ...(dependsOnSuperseded.length > 0
             ? { depends_on_superseded: dependsOnSuperseded }
             : {}),
-          ...(landedAdds.length > 0
-            ? { add_slices: landedAdds }
+          ...(landedTopology.add_slices
+            ? { add_slices: landedTopology.add_slices }
             : {}),
-          ...(drop_slice_ids && drop_slice_ids.length > 0
-            ? { drop_slice_ids }
+          ...(landedTopology.drop_slice_ids
+            ? { drop_slice_ids: landedTopology.drop_slice_ids }
             : {}),
         });
         // Ordered mirror: carry the add/drop that landed (never claim
@@ -1865,9 +1877,9 @@ server.registerTool(
         const replanPayload: Record<string, unknown> = {};
         if (dependsOnChanged.length > 0) replanPayload.depends_on_changed = dependsOnChanged;
         if (dependsOnSuperseded.length > 0) replanPayload.depends_on_superseded = dependsOnSuperseded;
-        if (landedAdds.length > 0) replanPayload.add_slices = landedAdds;
-        if (drop_slice_ids && drop_slice_ids.length > 0) {
-          replanPayload.drop_slice_ids = drop_slice_ids;
+        if (landedTopology.add_slices) replanPayload.add_slices = landedTopology.add_slices;
+        if (landedTopology.drop_slice_ids) {
+          replanPayload.drop_slice_ids = landedTopology.drop_slice_ids;
         }
         const replanSupplemental = plan.slices
           .filter(
@@ -1904,6 +1916,7 @@ server.registerTool(
         });
         return updated;
       },
+    ),
     );
     return textResult(JSON.stringify(next, null, 2));
     } catch (error) {
