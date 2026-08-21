@@ -62,9 +62,10 @@ export interface PlanSlice {
    * Exclusive split (drop + add in one replan) is replacement, not
    * drop-without-replacement. When set, unmetDependencies treats this
    * superseded slice as still unmet for anyone who still depends_on it —
-   * orch must remount depends_on onto the replacement ids on the existing
-   * replan surface. Plain contract drop leaves this unset so superseded
-   * continues to resolve dependents (disclosed residual).
+   * orch remounts named depends_on onto the replacement ids (set_depends_on
+   * on the existing replan surface) without restating every other slice.
+   * Plain contract drop leaves this unset so superseded continues to
+   * resolve dependents (disclosed residual).
    */
   replaced_by?: string[];
   // Thread Phase 1 (worker slice metadata, digest v3) — all optional so a
@@ -1358,10 +1359,12 @@ export function diffSupersededDependencies(
 /**
  * Landed add/drop for a replan apply, derived from before→after — not from
  * which MCP args the orch used. Closes the hole where new_slices (full-set
- * replan; remount uses this) can land adds and supersessions while the
- * ordered replan event still omits add_slices / drop_slice_ids because
- * those MCP fields were absent. Echoing request args would miss generated
- * ids; journaling landed state keeps the ordered journal SoT.
+ * replan) can land adds and supersessions while the ordered replan event
+ * still omits add_slices / drop_slice_ids because those MCP fields were
+ * absent. Named remount is set_depends_on (edge edit; omitted live ids
+ * stay); it journals depends_on_changed, not add/drop. Echoing request
+ * args would miss generated ids; journaling landed state keeps the
+ * ordered journal SoT.
  *
  * add_slices: newly appended slices (id + proposal fields only; no claim
  * token, status, proposals, or evidence). Ordered mirrors elsewhere omit
@@ -2187,6 +2190,7 @@ export function applySliceDelta(
       evidence?: string;
     }>;
     drop_slice_ids?: string[];
+    set_depends_on?: Array<{ slice_id: string; depends_on: string[] }>;
   },
 ): PlanArtifact {
   assertUniqueSliceIds(plan.slices, "applySliceDelta");
@@ -2253,6 +2257,34 @@ export function applySliceDelta(
     });
   }
 
+  const remounts = delta.set_depends_on ?? [];
+  if (remounts.length > 0) {
+    const seen = new Set<string>();
+    for (const entry of remounts) {
+      const id = entry.slice_id;
+      if (seen.has(id)) {
+        throw new Error(`applySliceDelta: duplicate set_depends_on slice_id "${id}"`);
+      }
+      seen.add(id);
+      const target = nextSlices.find((s) => s.id === id);
+      if (!target || target.status === "superseded") {
+        throw new Error(
+          `applySliceDelta: cannot remount depends_on on "${id}" — missing or not live`,
+        );
+      }
+    }
+    nextSlices = nextSlices.map((slice) => {
+      const entry = remounts.find((r) => r.slice_id === slice.id);
+      if (!entry) return slice;
+      const nextDepends = [...entry.depends_on];
+      if (sameStringSet(slice.depends_on, nextDepends)) return slice;
+      return invalidateSliceGeneration({
+        ...slice,
+        depends_on: nextDepends,
+      });
+    });
+  }
+
   const nextAction = computeNextAction(nextSlices);
   const nextPlan: PlanArtifact = {
     ...plan,
@@ -2300,10 +2332,10 @@ export function landedAddSlices(
  *
  *   expand   = add only; proposer stays
  *   split    = supersede claimed parent + add children; no parent-id reuse.
- *              Does not remount dependents' depends_on — orch remounts on
- *              the existing replan surface (same call via new_slices, or
- *              follow-up). Split is replacement; contract is drop-without-
- *              replacement.
+ *              Does not remount dependents' depends_on — orch remounts
+ *              named live slices via set_depends_on on the existing replan
+ *              surface (edge edit; unnamed live slices stay). Split is
+ *              replacement; contract is drop-without-replacement.
  *   contract = drop named ids only (supersede, never delete)
  */
 export function structuralProposalDelta(

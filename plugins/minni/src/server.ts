@@ -1750,15 +1750,24 @@ server.registerTool(
   {
     title: "Minni Thread Replan",
     description:
-      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse; dependents of the replaced parent stay blocked until orch remounts depends_on onto the children via this same surface); contract = drop_slice_ids only (drop-without-replacement still unblocks dependents). Drop supersedes; it never deletes.",
+      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse; dependents of the replaced parent stay blocked until orch remounts named depends_on onto the children via set_depends_on — unnamed live slices stay); contract = drop_slice_ids only (drop-without-replacement still unblocks dependents). Remount-only set_depends_on is valid without new_slices. Drop supersedes; it never deletes.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       new_slices: z.array(planSliceInputSchema).optional(),
       add_slices: z.array(planSliceInputSchema).optional(),
       drop_slice_ids: z.array(z.string()).optional(),
+      set_depends_on: z
+        .array(
+          z.object({
+            slice_id: z.string().min(1),
+            depends_on: z.array(z.string()),
+          }),
+        )
+        .min(1)
+        .optional(),
     },
   },
-  async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids }) => {
+  async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids, set_depends_on }) => {
     // #291 round-2 cassandra finding LOW-8: replan is now capable of
     // silently satisfying a dependency via supersession (see
     // diffSupersededDependencies below) — the shared-gate approval decision
@@ -1781,9 +1790,14 @@ server.registerTool(
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    if (!new_slices && !add_slices && !drop_slice_ids) {
+    if (new_slices && set_depends_on) {
       return textResult(JSON.stringify({
-        error: "Either new_slices or add_slices/drop_slice_ids must be provided",
+        error: "Cannot mix new_slices with set_depends_on; remount named depends_on as an edge edit, or send a full-set new_slices rewrite",
+      }, null, 2));
+    }
+    if (!new_slices && !add_slices && !drop_slice_ids && !set_depends_on) {
+      return textResult(JSON.stringify({
+        error: "Either new_slices, add_slices/drop_slice_ids, or set_depends_on must be provided",
       }, null, 2));
     }
     const replanOperationId = `server-replan:${randomUUID()}`;
@@ -1806,8 +1820,8 @@ server.registerTool(
           plan,
           now,
         );
-        const updated = add_slices || drop_slice_ids
-          ? applySliceDelta(plan, { add_slices, drop_slice_ids })
+        const updated = add_slices || drop_slice_ids || set_depends_on
+          ? applySliceDelta(plan, { add_slices, drop_slice_ids, set_depends_on })
           : replan(plan, new_slices!);
     // #291 round-1 cassandra finding 1 (HIGH, confirmed by independent
     // reproduction against the real compiled server): replan()'s `??` on
@@ -1826,16 +1840,16 @@ server.registerTool(
     // drop_slice_ids) supersedes it, and unmetDependencies treats plain
     // superseded (drop-without-replacement) as resolved. Exclusive split
     // (drop+add) stamps replaced_by so dependents stay blocked until orch
-    // remounts depends_on. That path produced zero journal trail before
+    // remounts named depends_on. That path produced zero journal trail before
     // this. Journaled here, not blocked: replan's purpose is restructuring
     // the plan, and hard-gating supersession itself is a separate, larger
     // design decision outside this fix's brief (see diffSupersededDependencies'
     // docstring).
         const dependsOnSuperseded = diffSupersededDependencies(plan, updated);
         // Landed add/drop from before→after so new_slices full-set replan
-        // (and add/drop MCP args) both put topology on the journal. Echoing
-        // only MCP add_slices/drop_slice_ids would omit the new_slices path
-        // that remount / full-set apply uses. Never claim tokens.
+        // (and add/drop MCP args) both put topology on the journal. Named
+        // remount is set_depends_on (edge edit); omitted live ids stay and
+        // journal via depends_on_changed, not add/drop. Never claim tokens.
         const landedTopology = landedReplanTopology(plan, updated);
         const revokedClaimIdList = revokedClaimIds(plan, updated);
         await persistPlanThenRevokeClaimSecrets(

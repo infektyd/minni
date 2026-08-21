@@ -2610,6 +2610,8 @@ test("unmetDependencies: exclusive split keeps dependents blocked; contract drop
     "structuralProposalDelta / applySliceDelta must not auto-remount depends_on",
   );
 
+  // Leftover rewrite pin: new_slices remount still restates the live set.
+  // Omit a live id and it is superseded — that is a rewrite, not an edge edit.
   const remounted = replan(split, [
     { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
     { id: "child-a", title: "Child A" },
@@ -2621,6 +2623,110 @@ test("unmetDependencies: exclusive split keeps dependents blocked; contract drop
     unmetDependencies(remounted, "b").sort(),
     ["child-a", "child-b"],
     "after orch remount on the existing replan surface, b waits on the children",
+  );
+  assert.equal(remounted.slices.find((s) => s.id === "indie").status, "pending");
+});
+
+test("replan new_slices: omitting a live id still supersedes it", () => {
+  const plan = {
+    plan_id: "omit-indie-rewrite",
+    goal: "omit indie",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "superseded", superseded_by: "replan-x", replaced_by: ["child-a", "child-b"] },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+      { id: "child-a", title: "Child A", status: "pending" },
+      { id: "child-b", title: "Child B", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "child-a",
+    plan_digest: "x",
+    created: "2026-08-20T12:00:00.000Z",
+    updated: "2026-08-20T12:00:00.000Z",
+    rev: 1,
+  };
+  const rewritten = replan(plan, [
+    { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+    { id: "child-a", title: "Child A" },
+    { id: "child-b", title: "Child B" },
+  ]);
+  assert.equal(
+    rewritten.slices.find((s) => s.id === "indie").status,
+    "superseded",
+    "omitting indie from new_slices is still a rewrite",
+  );
+  assert.deepEqual(rewritten.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+});
+
+test("applySliceDelta: remounts named depends_on without superseding omitted live slices", () => {
+  const plan = {
+    plan_id: "split-dep-edge",
+    goal: "split remount edge",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-20T12:00:00.000Z",
+    updated: "2026-08-20T12:00:00.000Z",
+    rev: 1,
+  };
+  const split = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "two independently verifiable outputs",
+        slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+        ],
+      },
+      "s0",
+    ),
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "applySliceDelta add/drop-only still does not remount dependents",
+  );
+
+  const remounted = applySliceDelta(split, {
+    set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],
+  });
+  assert.deepEqual(remounted.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+  assert.equal(
+    remounted.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "unnamed live slices stay; remount must not supersede indie",
+  );
+  assert.equal(remounted.slices.find((s) => s.id === "s0").status, "superseded");
+  assert.deepEqual(
+    unmetDependencies(remounted, "b").sort(),
+    ["child-a", "child-b"],
+    "after named remount, b waits on the children",
+  );
+  assert.deepEqual(diffDependsOn(split, remounted), [
+    { slice_id: "b", from: ["s0"], to: ["child-a", "child-b"] },
+  ]);
+  assert.deepEqual(landedReplanTopology(split, remounted), {});
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "ghost", depends_on: ["child-a"] }] }),
+    /applySliceDelta: cannot remount depends_on on "ghost"/,
+  );
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "s0", depends_on: ["child-a"] }] }),
+    /applySliceDelta: cannot remount depends_on on "s0"/,
   );
 });
 
