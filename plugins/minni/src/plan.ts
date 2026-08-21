@@ -2299,11 +2299,6 @@ export function applySliceDelta(
     });
   }
 
-  // After add in this call so same-call added ids are valid targets.
-  // Existing leftover depends_on (e.g. b → superseded s0 after exclusive
-  // split) is not this write — leave it parked.
-  assertWrittenDependsOnTargetsLive("applySliceDelta", plan.slices, nextSlices, writtenDependsOnIds);
-
   if (isReplacement && addedIds.length > 0) {
     nextSlices = nextSlices.map((slice) => {
       if (
@@ -2316,6 +2311,11 @@ export function applySliceDelta(
       return slice;
     });
   }
+
+  // After exclusive-split replaced_by is stamped so a same-call waiter on
+  // the dead parent is not newlyPlainDrop. Same-call added ids stay valid
+  // targets. Parked leftover depends_on is not this write — leave it.
+  assertWrittenDependsOnTargetsLive("applySliceDelta", plan.slices, nextSlices, writtenDependsOnIds);
 
   const remounts = delta.set_depends_on ?? [];
   if (remounts.length > 0) {
