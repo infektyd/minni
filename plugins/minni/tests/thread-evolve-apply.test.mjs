@@ -530,6 +530,80 @@ test("wet GO: exclusive split keeps depends_on blocked until orch remounts; prop
       "MCP still up after rejected self remount; b still not ready",
     );
 
+    const selfNewSlices = await call("minni_thread_replan", {
+      plan_id,
+      new_slices: [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["b"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent slice" },
+      ],
+    });
+    assert.equal(selfNewSlices.status, "error", JSON.stringify(selfNewSlices));
+    assert.equal("isError" in selfNewSlices, false, "MCP status:error, not transport isError");
+    assert.match(
+      selfNewSlices.error ?? "",
+      /refused self-edge on slice "b"/,
+    );
+    const afterSelfNew = await rehydratePlan(notePath);
+    assert.deepEqual(
+      afterSelfNew.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+      "new_slices self-edge must not persist; b still depends_on s0",
+    );
+    assert.equal(
+      afterSelfNew.slices.find((s) => s.id === "indie").status,
+      "pending",
+      "indie must not be superseded by rejected new_slices self-edge",
+    );
+    const eventsAfterSelfNew = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterSelfNew.events.some((e) => e.payload?.depends_on_changed),
+      false,
+      "no depends_on_changed to self via new_slices",
+    );
+    const readyAfterSelfNew = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterSelfNew.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "MCP still up after rejected new_slices self-edge; b still not ready",
+    );
+
+    const selfAdd = await call("minni_thread_replan", {
+      plan_id,
+      add_slices: [{ id: "x", title: "Self loop", depends_on: ["x"] }],
+    });
+    assert.equal(selfAdd.status, "error", JSON.stringify(selfAdd));
+    assert.equal("isError" in selfAdd, false, "MCP status:error, not transport isError");
+    assert.match(
+      selfAdd.error ?? "",
+      /refused self-edge on slice "x"/,
+    );
+    const afterSelfAdd = await rehydratePlan(notePath);
+    assert.equal(
+      afterSelfAdd.slices.find((s) => s.id === "x"),
+      undefined,
+      "add_slices self-edge must not persist x",
+    );
+    assert.deepEqual(
+      afterSelfAdd.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+    );
+    const eventsAfterSelfAdd = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterSelfAdd.events
+        .filter((e) => e.kind === "replan")
+        .some((e) => JSON.stringify(e.payload?.add_slices ?? []).includes('"id":"x"')),
+      false,
+      "no persist/journal of x",
+    );
+    const readyAfterSelfAdd = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterSelfAdd.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "MCP still up after rejected add_slices self-edge; b still not ready",
+    );
+
     const remountArgs = {
       plan_id,
       set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],

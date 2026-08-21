@@ -2789,6 +2789,91 @@ test("applySliceDelta: remounts named depends_on without superseding omitted liv
   );
 });
 
+test("replan: new_slices self-edge throws; topology unchanged", () => {
+  const plan = {
+    plan_id: "newslices-self-edge",
+    goal: "new_slices must not write a self-edge",
+    status: "active",
+    constraints: [],
+    slices: [
+      {
+        id: "s0",
+        title: "Parent",
+        status: "superseded",
+        superseded_by: "replan-split",
+        replaced_by: ["child-a", "child-b"],
+      },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "child-a", title: "Child A", status: "pending" },
+      { id: "child-b", title: "Child B", status: "pending" },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "child-a",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  assert.throws(
+    () =>
+      replan(plan, [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["b"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent" },
+      ]),
+    /replan: refused self-edge on slice "b"/,
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "new_slices self-edge must not land; b still depends_on s0",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "rejected new_slices self-edge must not supersede indie",
+  );
+});
+
+test("applySliceDelta: add_slices self-edge throws; x does not land", () => {
+  const plan = {
+    plan_id: "addslices-self-edge",
+    goal: "add_slices must not write a self-edge",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "keep", title: "Keep", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        add_slices: [{ id: "x", title: "Self loop", depends_on: ["x"] }],
+      }),
+    /applySliceDelta: refused self-edge on slice "x"/,
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "x"),
+    undefined,
+    "add_slices self-edge must not land x",
+  );
+  assert.deepEqual(
+    plan.slices.map((s) => s.id),
+    ["keep"],
+    "rejected add_slices self-edge must not change topology",
+  );
+});
+
 test("applySliceDelta: remount onto pending/in_progress/done/blocked targets lands", () => {
   for (const status of ["pending", "in_progress", "done", "blocked"]) {
     const plan = {

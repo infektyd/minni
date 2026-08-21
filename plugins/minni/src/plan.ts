@@ -628,6 +628,16 @@ function assertUniqueExplicitSliceIds(
   }
 }
 
+function assertNoSelfEdge(
+  context: string,
+  sliceId: string,
+  dependsOn: string[] | undefined,
+): void {
+  if (dependsOn?.includes(sliceId)) {
+    throw new Error(`${context}: refused self-edge on slice "${sliceId}"`);
+  }
+}
+
 function computeNextAction(slices: PlanSlice[]): string {
   const active = slices.find(
     (s) => s.status === "pending" || s.status === "in_progress" || s.status === "blocked",
@@ -1624,6 +1634,7 @@ export function replan(
         );
       }
       const id = ns.id || slugifySliceId(ns.title, usedIds);
+      assertNoSelfEdge("replan", id, ns.depends_on);
       usedIds.add(id);
       addedIds.push(id);
       nextSlices = [
@@ -1639,6 +1650,7 @@ export function replan(
       ];
     } else if (ns.id) {
       // Refresh fields on the matched entry (title/gate/deps may evolve)
+      assertNoSelfEdge("replan", ns.id, ns.depends_on);
       const idx = nextSlices.findIndex((s) => s.id === ns.id);
       if (idx >= 0) {
         const cur = nextSlices[idx];
@@ -2234,6 +2246,7 @@ export function applySliceDelta(
       );
     }
     const id = ns.id || slugifySliceId(ns.title, usedIds);
+    assertNoSelfEdge("applySliceDelta", id, ns.depends_on);
     usedIds.add(id);
     addedIds.push(id);
     nextSlices.push({
