@@ -2963,6 +2963,27 @@ function exclusiveSplitLivePlan(planId = "split-live-dep-targets") {
   };
 }
 
+function liveExclusiveSplitPlan(planId = "split-same-call-waiter") {
+  return {
+    plan_id: planId,
+    goal: "same-call exclusive split must not persist a waiter on the dead parent",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+}
+
 test("replan: new_slices restating live with b.depends_on=[ghost] throws; topology unchanged", () => {
   const plan = exclusiveSplitLivePlan("newslices-ghost-dep");
   assert.throws(
@@ -3063,6 +3084,61 @@ test("applySliceDelta: unrelated add_slices still lands while leftover b.depends
   });
   assert.deepEqual(liveDep.slices.find((s) => s.id === "y").depends_on, ["child-a"]);
   assert.deepEqual(liveDep.slices.find((s) => s.id === "b").depends_on, ["s0"]);
+});
+
+test("applySliceDelta: same-call exclusive split with waiter on s0 throws; x does not land", () => {
+  const plan = liveExclusiveSplitPlan("addslices-same-call-dead-parent");
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        drop_slice_ids: ["s0"],
+        add_slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+          { id: "x", title: "Waiter on dead parent", depends_on: ["s0"] },
+        ],
+      }),
+    /applySliceDelta: cannot depend on "s0" — missing or superseded/,
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "x"),
+    undefined,
+    "same-call waiter must not land x on the input",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "s0").status,
+    "pending",
+    "rejected same-call waiter must not mutate s0 on the input",
+  );
+  assert.equal(plan.slices.find((s) => s.id === "s0").replaced_by, undefined);
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "parked leftover b.depends_on stays [s0] on the input",
+  );
+  assert.equal(plan.slices.find((s) => s.id === "indie").status, "pending");
+});
+
+test("applySliceDelta: honest exclusive split without waiter lands; leftover b stays parked", () => {
+  const plan = liveExclusiveSplitPlan("addslices-honest-exclusive-split");
+  const split = applySliceDelta(plan, {
+    drop_slice_ids: ["s0"],
+    add_slices: [
+      { id: "child-a", title: "Child A" },
+      { id: "child-b", title: "Child B" },
+    ],
+  });
+  const parent = split.slices.find((s) => s.id === "s0");
+  assert.equal(parent.status, "superseded");
+  assert.ok(parent.replaced_by?.length, "exclusive split stamps replaced_by");
+  assert.deepEqual([...parent.replaced_by].sort(), ["child-a", "child-b"]);
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "honest exclusive split must not auto-remount leftover b",
+  );
+  assert.equal(split.slices.find((s) => s.id === "indie").status, "pending");
+  assert.equal(split.slices.find((s) => s.id === "x"), undefined);
 });
 
 test("replan: new_slices remount onto children still lands; indie stays", () => {

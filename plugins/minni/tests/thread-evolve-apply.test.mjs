@@ -405,6 +405,53 @@ test("wet GO: exclusive split keeps depends_on blocked until orch remounts; prop
     assert.equal(afterPropose.slices.find((s) => s.id === "s0").status, "pending");
     assert.deepEqual(afterPropose.slices.find((s) => s.id === "b").depends_on, ["s0"]);
 
+    const sameCallWaiter = await call("minni_thread_replan", {
+      plan_id,
+      drop_slice_ids: ["s0"],
+      add_slices: [
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "x", title: "Waiter on dead parent", depends_on: ["s0"] },
+      ],
+    });
+    assert.equal(sameCallWaiter.status, "error", JSON.stringify(sameCallWaiter));
+    assert.equal("isError" in sameCallWaiter, false, "MCP status:error, not transport isError");
+    assert.match(
+      sameCallWaiter.error ?? "",
+      /cannot depend on "s0" — missing or superseded/,
+    );
+    const afterSameCallWaiter = await rehydratePlan(notePath);
+    assert.equal(
+      afterSameCallWaiter.slices.find((s) => s.id === "x"),
+      undefined,
+      "same-call waiter on exclusive-split parent must not persist x",
+    );
+    assert.equal(
+      afterSameCallWaiter.slices.find((s) => s.id === "s0").status,
+      "pending",
+      "rejected same-call waiter must not supersede s0",
+    );
+    assert.equal(afterSameCallWaiter.slices.find((s) => s.id === "s0").replaced_by, undefined);
+    assert.deepEqual(
+      afterSameCallWaiter.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+    );
+    assert.equal(afterSameCallWaiter.slices.find((s) => s.id === "indie").status, "pending");
+    const eventsAfterSameCallWaiter = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterSameCallWaiter.events
+        .filter((e) => e.kind === "replan")
+        .some((e) => JSON.stringify(e.payload?.add_slices ?? []).includes('"id":"x"')),
+      false,
+      "no persist/journal of x",
+    );
+    const readyAfterSameCallWaiter = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterSameCallWaiter.ready.map((s) => s.id).sort(),
+      ["indie"],
+      "MCP still up after rejected same-call waiter; s0 still claimed, b still blocked",
+    );
+
     const delta = structuralProposalDelta(
       afterPropose.slices.find((s) => s.id === "s0").proposals.at(-1),
       "s0",
