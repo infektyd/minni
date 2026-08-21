@@ -450,6 +450,57 @@ test("wet GO: exclusive split keeps depends_on blocked until orch remounts; prop
     );
     assert.equal(team.ready.some((s) => s.id === "b"), false);
 
+    const ghostRemount = await call("minni_thread_replan", {
+      plan_id,
+      set_depends_on: [{ slice_id: "b", depends_on: ["ghost"] }],
+    });
+    assert.equal(ghostRemount.status, "error", JSON.stringify(ghostRemount));
+    const afterGhost = await rehydratePlan(notePath);
+    assert.deepEqual(
+      afterGhost.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+      "ghost remount must not persist; b still depends_on s0",
+    );
+    assert.equal(
+      afterGhost.slices.find((s) => s.id === "indie").status,
+      "pending",
+      "indie unchanged after rejected ghost remount",
+    );
+    const eventsAfterGhost = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterGhost.events
+        .filter((e) => e.kind === "replan")
+        .some((e) => JSON.stringify(e.payload?.depends_on_changed ?? []).includes("ghost")),
+      false,
+      "no depends_on_changed to ghost",
+    );
+
+    const deadRemount = await call("minni_thread_replan", {
+      plan_id,
+      set_depends_on: [{ slice_id: "b", depends_on: ["s0"] }],
+    });
+    assert.equal(deadRemount.status, "error", JSON.stringify(deadRemount));
+    const afterDead = await rehydratePlan(notePath);
+    assert.deepEqual(
+      afterDead.slices.find((s) => s.id === "b").depends_on,
+      ["s0"],
+      "superseded-target remount must not persist",
+    );
+    assert.equal(afterDead.slices.find((s) => s.id === "indie").status, "pending");
+    assert.equal(afterDead.slices.find((s) => s.id === "s0").status, "superseded");
+    const eventsAfterDead = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.equal(
+      eventsAfterDead.events.some((e) => e.payload?.depends_on_changed),
+      false,
+      "still no depends_on_changed after superseded-target remount",
+    );
+    const readyAfterRejects = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterRejects.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "MCP still up after rejected remounts; b still not ready",
+    );
+
     const remountArgs = {
       plan_id,
       set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],
