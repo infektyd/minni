@@ -422,3 +422,26 @@ test("young empty exclusive-replan file is live and acquire does not reap it", a
   const leftover = await readFile(reservationPath, "utf8");
   assert.equal(leftover, "", "acquire must not unlink a young empty reservation");
 });
+
+test("exclusive replan publish falls back to wx when link is unsupported", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-nolink-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const originalLink = fs.promises.link;
+  fs.promises.link = async () => {
+    const error = new Error("operation not supported");
+    error.code = "ENOTSUP";
+    throw error;
+  };
+  syncBuiltinESMExports();
+  let sawLive = false;
+  try {
+    await withExclusiveReplanReservation(root, "plan-x", "replan-nolink", async () => {
+      sawLive = await exclusiveReplanReservationIsLive(root, "plan-x");
+    });
+  } finally {
+    fs.promises.link = originalLink;
+    syncBuiltinESMExports();
+  }
+  assert.equal(sawLive, true, "wx fallback must still publish a live reservation");
+  assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
+});

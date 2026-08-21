@@ -387,21 +387,40 @@ async function reservationOlderThanStale(
 }
 
 /**
- * Publish a complete owner JSON onto the reservation path. Write the
- * payload to a tmp file first, then link — dest never appears empty.
- * link fails with EEXIST when another owner already holds the name.
+ * Publish a complete owner JSON onto the reservation path. Prefer
+ * tmp+link so dest never appears empty. Filesystems that reject hard
+ * links (NFS/SMB/virtiofs) fall back to exclusive wx write — the
+ * young-unparseable stale grace covers that create-before-write window.
+ * link/wx EEXIST means another owner already holds the name.
  */
 async function publishExclusiveReservation(
   reservationPath: string,
   owner: ThreadLockOwner,
 ): Promise<void> {
+  const payload = `${JSON.stringify(owner)}\n`;
   const tmpPath = `${reservationPath}.${randomUUID()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(owner)}\n`, {
+  await writeFile(tmpPath, payload, {
     encoding: "utf8",
     mode: 0o600,
   });
   try {
-    await link(tmpPath, reservationPath);
+    try {
+      await link(tmpPath, reservationPath);
+    } catch (error) {
+      if (
+        !isErrno(error, "ENOTSUP") &&
+        !isErrno(error, "EOPNOTSUPP") &&
+        !isErrno(error, "EPERM") &&
+        !isErrno(error, "EXDEV")
+      ) {
+        throw error;
+      }
+      await writeFile(reservationPath, payload, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+    }
   } finally {
     await rm(tmpPath, { force: true }).catch(() => {});
   }
