@@ -57,6 +57,7 @@ import {
 } from "./thread-claims.js";
 import { stableStringify } from "./agent_envelope.js";
 import {
+  DEFAULT_WAIT_MS,
   ThreadBusyError,
   exclusiveReplanReservationIsLive,
   withThreadLock,
@@ -67,7 +68,9 @@ import {
   listPendingWorkerWritePlanIds,
   listQueuedWorkerWrites,
   pickNextQueuedWorkerWrite,
+  queuedWriteAcceptorLooksLive,
   queuedWriteActionName,
+  queuedWriteHasAcceptor,
   recordWorkerWriteDrainProgress,
   removeQueuedWorkerWrite,
   type QueuedWorkerWrite,
@@ -2160,8 +2163,10 @@ export async function updateClaimedSlice(
     if (startQueued) {
       await enqueueAcceptedWorkerWrite(lockedInput);
       // Start is still unapplied. One-shot yield so this kick cannot journal
-      // slice.started in the accept→reserve window. Later drain / post-replan
-      // kick still apply start first when the slice stays live.
+      // slice.started in the accept→reserve window. Standing drain must not
+      // apply a live start in that window while the acceptor is live.
+      // Kick / drainWorkerWrites without standing-defer still apply start
+      // first when the slice stays live and no exclusive replan is in flight.
       kickWorkerWriteDrain(lockedInput, deps, { oneShotYield: true });
       return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
     }
@@ -2229,12 +2234,19 @@ function drainKickKey(vaultPath: string, planId: string): string {
  * TOCTOU where kick would apply after accept returns and before orch reserves,
  * without holding the persist lock across accept→replan. Returns true when
  * that live yield happened so in-process follow-up will not apply the start.
- * Later drainWorkerWrites / standing drain / post-replan kick still apply or drop.
+ * Standing drain (drainPendingWorkerWritesForVault / minnid tick / later
+ * MCP main()) arms standingDefer: do not apply a live queued start while
+ * the accepting process is still alive and the ticket is younger than
+ * DEFAULT_WAIT_MS. That leftover is a different drain actor than in-process
+ * kick. Dead leftover after supersede still drops. Dead/stale acceptor
+ * still applies. Kick / drainWorkerWrites without standingDefer still
+ * apply when no exclusive replan is in flight. Later drainWorkerWrites /
+ * post-replan kick still apply or drop.
  */
 export async function drainWorkerWrites(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps = {},
-  runOptions: { oneShotYield?: boolean } = {},
+  runOptions: { oneShotYield?: boolean; standingDefer?: boolean } = {},
 ): Promise<boolean> {
   let oneShotPending = runOptions.oneShotYield === true;
   const deadline = Date.now() + 60_000;
@@ -2244,6 +2256,14 @@ export async function drainWorkerWrites(
     if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
       await new Promise((resolve) => setTimeout(resolve, 25));
       continue;
+    }
+    if (runOptions.standingDefer === true) {
+      const head = pickNextQueuedWorkerWrite(remaining);
+      if (await standingDrainShouldYieldLiveStart(input.notePath, head)) {
+        // Yield this tick. Do not journal slice.started. Do not sit the
+        // 60s drain loop — minnid must not block. Next interval retries.
+        return false;
+      }
     }
     try {
       let oneShotYieldedLive = false;
@@ -2289,8 +2309,11 @@ export interface KickWorkerWriteDrainOptions {
   /**
    * Accept dump-and-return: first under-lock pass yields without applying
    * live work so kick cannot race orch exclusive-replan reservation.
-   * Not a sit-and-wait. Later drain still applies when no replan, or drops
-   * leftover after supersede. Scoped to this kick run (not a global flag).
+   * Not a sit-and-wait. Kick / drainWorkerWrites without standing-defer
+   * still applies when no exclusive replan is in flight, or drops leftover
+   * after supersede. Standing drain must not apply a live start in the
+   * accept→reserve window while the acceptor is live. Scoped to this kick
+   * run (not a global flag).
    */
   oneShotYield?: boolean;
 }
@@ -2304,15 +2327,15 @@ export interface KickWorkerWriteDrainOptions {
  * acceptor cannot journal slice.started on a parent that replan then
  * supersedes. Accept-path kicks also one-shot yield once under lock when
  * reservation is not yet live (closes apply-before-orch-reserve TOCTOU).
- * Kick still drains when no exclusive replan is in flight (later drain /
- * post-replan kick / kick without oneShotYield).
+ * Kick still drains when no exclusive replan is in flight (drainWorkerWrites
+ * without standing-defer / post-replan kick / kick without oneShotYield).
  *
  * A one-shot in-flight run can exit without applying. A later full-drain
  * kick (post-replan) must not be coalesced away — mark follow-up so this
  * process reasserts after the one-shot returns. Do not reassert if the
  * one-shot yielded live work: that apply would reopen the accept→reserve
- * window. Later drain / standing drain / post-replan kick still apply
- * start first when the slice stays live.
+ * window. Standing drain must not apply a live start in that window while
+ * the acceptor is live.
  */
 export function kickWorkerWriteDrain(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
@@ -2343,7 +2366,9 @@ export function kickWorkerWriteDrain(
     .then((yieldedLive) => {
       drainKicks.delete(key);
       // One-shot yielded a live start: do not apply it here. Orch may still
-      // reserve. Later drain / post-replan kick still apply or drop.
+      // reserve. Standing drain must not apply a live start in that window
+      // while the acceptor is live. Later drainWorkerWrites / post-replan
+      // kick still apply or drop.
       if (entry.followUpFull && yieldedLive !== true) {
         kickWorkerWriteDrain(input, deps);
       }
@@ -2352,9 +2377,16 @@ export function kickWorkerWriteDrain(
 
 /**
  * Later-process entry: scan this vault's pending Q dirs and apply each plan
- * through drainWorkerWrites. Same persist authority. findPlanNote is the
- * existing note locator — not a second graph, not minnid-canonical.
- * minnid tick may kick this when nobody boots MCP. minnid is not SoT.
+ * through drainWorkerWrites with standingDefer. Same persist authority.
+ * findPlanNote is the existing note locator — not a second graph, not
+ * minnid-canonical. minnid tick AND later MCP main() use this entry.
+ *
+ * Standing defer refuses to apply a LIVE queued START while the accepting
+ * process is still alive and the ticket is younger than DEFAULT_WAIT_MS.
+ * Yield this tick (no 60s sit). Dead/stale acceptor still applies. Dead
+ * leftover after supersede still drops. Kick / drainWorkerWrites without
+ * this flag still applies when no exclusive replan is in flight. minnid
+ * is not SoT.
  */
 export async function drainPendingWorkerWritesForVault(
   vaultPath: string,
@@ -2366,7 +2398,9 @@ export async function drainPendingWorkerWritesForVault(
     const notePath = await findPlanNote(vaultPath, planId);
     if (notePath === undefined) continue;
     try {
-      await drainWorkerWrites({ vaultPath, notePath, planId }, deps);
+      await drainWorkerWrites({ vaultPath, notePath, planId }, deps, {
+        standingDefer: true,
+      });
       drained.push(planId);
     } catch {
       // Apply throw is parked. Ticket + stamp stay for the next later drain.
@@ -2386,6 +2420,28 @@ async function queuedWriteIsLiveWork(
   } catch {
     return false;
   }
+}
+
+/**
+ * Standing tick / later MCP main() must not apply a live queued START
+ * while the accepting process is still alive in the DEFAULT_WAIT_MS
+ * accept→reserve window. Complete tickets are not deferred. Dead leftover
+ * after supersede is not deferred (drop immediately). Legacy tickets
+ * without acceptor pid apply as today. Dead/stale acceptor applies (#25).
+ */
+async function standingDrainShouldYieldLiveStart(
+  notePath: string,
+  item: QueuedWorkerWrite | undefined,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  if (item === undefined) return false;
+  if (queuedWriteActionName(item) !== "start") return false;
+  if (!(await queuedWriteIsLiveWork(notePath, item))) return false;
+  if (!queuedWriteHasAcceptor(item)) return false;
+  if (!queuedWriteAcceptorLooksLive(item)) return false;
+  const enqueuedMs = Date.parse(item.enqueuedAt);
+  if (!Number.isFinite(enqueuedMs)) return false;
+  return nowMs - enqueuedMs < DEFAULT_WAIT_MS;
 }
 
 /**

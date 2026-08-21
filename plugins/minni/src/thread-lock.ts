@@ -5,7 +5,7 @@ import path from "node:path";
 
 import { appendFileWithFsync } from "./vault.js";
 
-const DEFAULT_WAIT_MS = 5_000;
+export const DEFAULT_WAIT_MS = 5_000;
 const DEFAULT_STALE_MS = 120_000;
 const DEFAULT_POLL_MS = 25;
 
