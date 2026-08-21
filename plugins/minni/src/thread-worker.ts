@@ -2128,8 +2128,10 @@ export async function updateClaimedSlice(
     );
     if (startQueued) {
       await enqueueAcceptedWorkerWrite(lockedInput);
-      // Complete behind a start ticket: drain must apply start first — no one-shot.
-      kickWorkerWriteDrain(lockedInput, deps);
+      // Start is still unapplied. One-shot yield so this kick cannot journal
+      // slice.started in the accept→reserve window. Later drain / post-replan
+      // kick still apply start first when the slice stays live.
+      kickWorkerWriteDrain(lockedInput, deps, { oneShotYield: true });
       return acceptedWorkerWrite(planId, sliceId, input.action.action, idempotencyKey);
     }
   }
@@ -2194,19 +2196,20 @@ function drainKickKey(vaultPath: string, planId: string): string {
  * Accept-path kick may arm a one-shot yield on this run: the first under-lock
  * pass does not apply live work (still drops dead leftover). That closes the
  * TOCTOU where kick would apply after accept returns and before orch reserves,
- * without holding the persist lock across accept→replan. Later
- * drainWorkerWrites / standing drain / post-replan kick still apply or drop.
+ * without holding the persist lock across accept→replan. Returns true when
+ * that live yield happened so in-process follow-up will not apply the start.
+ * Later drainWorkerWrites / standing drain / post-replan kick still apply or drop.
  */
 export async function drainWorkerWrites(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps = {},
   runOptions: { oneShotYield?: boolean } = {},
-): Promise<void> {
+): Promise<boolean> {
   let oneShotPending = runOptions.oneShotYield === true;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
-    if (remaining.length === 0) return;
+    if (remaining.length === 0) return false;
     if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
       await new Promise((resolve) => setTimeout(resolve, 25));
       continue;
@@ -2239,7 +2242,7 @@ export async function drainWorkerWrites(
         },
         { waitMs: 0 },
       );
-      if (oneShotYieldedLive) return;
+      if (oneShotYieldedLive) return true;
     } catch (error) {
       if (error instanceof ThreadBusyError) {
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -2248,6 +2251,7 @@ export async function drainWorkerWrites(
       throw error;
     }
   }
+  return false;
 }
 
 export interface KickWorkerWriteDrainOptions {
@@ -2273,8 +2277,11 @@ export interface KickWorkerWriteDrainOptions {
  * post-replan kick / kick without oneShotYield).
  *
  * A one-shot in-flight run can exit without applying. A later full-drain
- * kick (complete-behind-start, post-replan) must not be coalesced away —
- * mark follow-up so this process reasserts after the one-shot returns.
+ * kick (post-replan) must not be coalesced away — mark follow-up so this
+ * process reasserts after the one-shot returns. Do not reassert if the
+ * one-shot yielded live work: that apply would reopen the accept→reserve
+ * window. Later drain / standing drain / post-replan kick still apply
+ * start first when the slice stays live.
  */
 export function kickWorkerWriteDrain(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
@@ -2300,10 +2307,13 @@ export function kickWorkerWriteDrain(
     .catch(() => {
       // Apply throw is parked, not dropped: drainOne keeps the ticket and
       // the start-accepted receipt. Swallow only the unhandled rejection.
+      return false;
     })
-    .finally(() => {
+    .then((yieldedLive) => {
       drainKicks.delete(key);
-      if (entry.followUpFull) {
+      // One-shot yielded a live start: do not apply it here. Orch may still
+      // reserve. Later drain / post-replan kick still apply or drop.
+      if (entry.followUpFull && yieldedLive !== true) {
         kickWorkerWriteDrain(input, deps);
       }
     });

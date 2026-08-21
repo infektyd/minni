@@ -1431,10 +1431,169 @@ test("kick one-shot yield: lock free before orch reserve, process stays up", { t
   assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
 });
 
-test("full-drain kick after one-shot yield still applies (no coalesce drop)", { timeout: 20_000 }, async (t) => {
-  // Accept start arms a one-shot kick. Complete-behind-start arms a full
-  // drain. If the one-shot is still in flight, the full kick must not be
-  // coalesced away — this process has to reassert after the one-shot yields.
+test("complete-behind-start follow-up must not apply start before orch reserve", { timeout: 30_000 }, async (t) => {
+  // Accept start arms a one-shot kick. Complete-behind-start while that
+  // run is in flight must not reassert a full drain that journals
+  // slice.started in the accept→reserve window. Process stays up.
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const acceptGeneration = claim.generation;
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "follow-up-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+
+  const complete = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "complete-0",
+    action: {
+      action: "complete",
+      evidence: "Verification: slice s0 done via test ID T-follow-up-yield",
+    },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(complete), true, "complete-behind-start must enqueue");
+  assert.equal(
+    await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId),
+    false,
+    "reservation must not be live at complete accept",
+  );
+
+  releaseHold();
+  await holder;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const journalAfterFollowUp = await journalState(fixture);
+  assert.equal(
+    journalAfterFollowUp.started.includes("s0"),
+    false,
+    `follow-up full drain must not apply start before orch reserve: ${JSON.stringify(journalAfterFollowUp.started)}`,
+  );
+  const queuedAfterFollowUp = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.ok(
+    queuedAfterFollowUp.some((item) => item.idempotencyKey === "start-0"),
+    `start ticket must stay for later drain: ${JSON.stringify(queuedAfterFollowUp)}`,
+  );
+
+  let reservedBeforeLock = false;
+  await withExclusiveReplanReservation(
+    fixture.vaultPath,
+    fixture.planId,
+    "orch-split-follow-up",
+    async () => {
+      reservedBeforeLock = await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId);
+      return withThreadPlanLock(
+        {
+          vaultPath: fixture.vaultPath,
+          notePath: fixture.notePath,
+          planId: fixture.planId,
+          operationId: "orch-split-follow-up",
+        },
+        async (plan) => {
+          const mid = await journalState(fixture);
+          assert.equal(
+            mid.started.includes("s0"),
+            false,
+            `kick must not land slice.started before exclusive split: ${JSON.stringify(mid.started)}`,
+          );
+          const updated = applySliceDelta(plan, {
+            drop_slice_ids: ["s0"],
+            add_slices: [
+              { id: "child-a", title: "Child A" },
+              { id: "child-b", title: "Child B" },
+            ],
+          });
+          await persistPlan(updated, {
+            vaultPath: fixture.vaultPath,
+            notePath: fixture.notePath,
+          });
+          await pruneSliceReceiptsAfterPlanMutation(
+            fixture.vaultPath,
+            fixture.planId,
+            plan,
+            updated,
+          );
+          await deleteClaimSecretsBestEffort(
+            fixture.vaultPath,
+            fixture.planId,
+            revokedClaimIds(plan, updated),
+          );
+          return updated;
+        },
+      );
+    },
+  );
+  assert.equal(reservedBeforeLock, true);
+
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0, `leftover Q must drop after supersede: ${JSON.stringify(leftover)}`);
+  const plan = await rehydratePlan(fixture.notePath);
+  const parent = plan.slices.find((slice) => slice.id === "s0");
+  assert.ok(parent, "split never deletes the parent");
+  assert.equal(parent.status, "superseded");
+  assert.notEqual(parent.status, "in_progress");
+  assert.notEqual(parent.status, "done");
+  assert.ok(parent.generation === undefined || parent.generation > acceptGeneration);
+  const journal = await journalState(fixture);
+  assert.equal(
+    journal.started.includes("s0"),
+    false,
+    `process-stays-up GO: follow-up must not journal slice.started on superseded s0: ${JSON.stringify(journal.started)}`,
+  );
+  assert.equal(journal.completed.includes("s0"), false);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-s0-after-follow-up-split",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-follow-up-split",
+      },
+      now: new Date("2026-08-18T12:03:00.000Z"),
+    }),
+    /claim scope mismatch|not worker-updatable|cannot persist done|claim token mismatch|claim expired/,
+  );
+  const afterComplete = await rehydratePlan(fixture.notePath);
+  assert.equal(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "superseded");
+  assert.notEqual(afterComplete.slices.find((slice) => slice.id === "s0")?.status, "done");
+});
+
+test("complete-behind-start tickets stay for later drain after one-shot yield", { timeout: 20_000 }, async (t) => {
+  // Accept start + complete-behind-start while one-shot is in flight.
+  // Follow-up must not apply in the yield window. Tickets stay; later
+  // drain still applies start first when no exclusive replan is in flight.
   const fixture = await burstFixture(t, 1);
   const [claim] = await assignAndClaimAll(fixture);
   let releaseHold;
@@ -1477,28 +1636,100 @@ test("full-drain kick after one-shot yield still applies (no coalesce drop)", { 
 
   releaseHold();
   await holder;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const journalAfterYield = await journalState(fixture);
+  assert.equal(
+    journalAfterYield.started.includes("s0"),
+    false,
+    `one-shot / complete-behind-start must not apply start in the yield window: ${JSON.stringify(journalAfterYield.started)}`,
+  );
+  const queuedAfterYield = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.ok(
+    queuedAfterYield.some((item) => item.idempotencyKey === "start-0"),
+    `start ticket must stay: ${JSON.stringify(queuedAfterYield)}`,
+  );
+  assert.ok(
+    queuedAfterYield.some((item) => item.idempotencyKey === "complete-0"),
+    `complete ticket must stay: ${JSON.stringify(queuedAfterYield)}`,
+  );
 
-  // In-process reassert only — do not kick again. A coalesced-away full
-  // drain would leave tickets parked until standing drain / later MCP.
-  const begin = Date.now();
-  let last;
-  while (Date.now() - begin < 8_000) {
-    last = await journalState(fixture);
-    if (last.started.includes("s0") && last.completed.includes("s0")) {
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  assert.ok(
-    last?.started.includes("s0"),
-    `one-shot then full-drain kick must apply start in-process: ${JSON.stringify(last?.started)}`,
-  );
-  assert.ok(
-    last?.completed.includes("s0"),
-    `follow-up full drain must apply complete after start: ${JSON.stringify(last?.completed)}`,
-  );
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
   const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
-  assert.equal(leftover.length, 0, `Q must drain in-process: ${JSON.stringify(leftover)}`);
+  assert.equal(leftover.length, 0, `later drain must apply start then complete: ${JSON.stringify(leftover)}`);
+  const journal = await journalState(fixture);
+  assert.ok(journal.started.includes("s0"), `later drain must apply start: ${JSON.stringify(journal.started)}`);
+  assert.ok(journal.completed.includes("s0"), `later drain must apply complete after start: ${JSON.stringify(journal.completed)}`);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "done");
+});
+
+test("complete-behind-start after one-shot returned still yields", { timeout: 20_000 }, async (t) => {
+  // One-shot already exited. Complete-behind-start must not start a full
+  // drain that journals slice.started before orch can reserve.
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  let releaseHold;
+  const hold = new Promise((resolve) => {
+    releaseHold = resolve;
+  });
+  const holder = withThreadLock(fixture.vaultPath, fixture.planId, "after-yield-hold", async () => {
+    await hold;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  releaseHold();
+  await holder;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal((await journalState(fixture)).started.includes("s0"), false);
+
+  const complete = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "complete-0",
+    action: {
+      action: "complete",
+      evidence: "Verification: slice s0 done via test ID T-after-yield",
+    },
+    now: new Date("2026-08-18T12:02:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(complete), true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const journalAfterComplete = await journalState(fixture);
+  assert.equal(
+    journalAfterComplete.started.includes("s0"),
+    false,
+    `complete-behind-start after one-shot must not apply start: ${JSON.stringify(journalAfterComplete.started)}`,
+  );
+
+  await drainWorkerWrites({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+  });
+  const journal = await journalState(fixture);
+  assert.ok(journal.started.includes("s0"));
+  assert.ok(journal.completed.includes("s0"));
   const plan = await rehydratePlan(fixture.notePath);
   assert.equal(plan.slices[0].status, "done");
 });
