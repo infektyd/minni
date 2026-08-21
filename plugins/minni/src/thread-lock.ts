@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { appendFileWithFsync } from "./vault.js";
@@ -345,7 +345,10 @@ function exclusiveReplanReservationPath(vaultPath: string, planId: string): stri
 export async function exclusiveReplanReservationIsLive(
   vaultPath: string,
   planId: string,
-  options: Pick<ThreadLockOptions, "isProcessAlive" | "getProcessStartMarker"> = {},
+  options: Pick<
+    ThreadLockOptions,
+    "isProcessAlive" | "getProcessStartMarker" | "staleMs" | "now"
+  > = {},
 ): Promise<boolean> {
   const reservationPath = exclusiveReplanReservationPath(vaultPath, planId);
   let raw: string;
@@ -357,14 +360,51 @@ export async function exclusiveReplanReservationIsLive(
   }
   const owner = parseOwner(raw);
   if (owner === undefined) {
-    // Unparseable is not a live exclusive replan. Kick must not park
-    // forever; acquire reaps (same as a dead owner).
-    return false;
+    // Empty/unparseable is the publish window (tmp+link or wx create
+    // before JSON lands). Same as withThreadLock: invalid owners are
+    // live until stale grace, then kick may drain and acquire may reap.
+    return !(await reservationOlderThanStale(reservationPath, options));
   }
   const isProcessAlive = options.isProcessAlive ?? processAlive;
   const getProcessStartMarker =
     options.getProcessStartMarker ?? readProcessStartMarker;
   return ownerLooksLive(owner, isProcessAlive, getProcessStartMarker).live;
+}
+
+async function reservationOlderThanStale(
+  reservationPath: string,
+  options: Pick<ThreadLockOptions, "staleMs" | "now">,
+): Promise<boolean> {
+  const staleMs = Math.max(0, options.staleMs ?? DEFAULT_STALE_MS);
+  const now = options.now ?? (() => new Date());
+  try {
+    const st = await stat(reservationPath);
+    return now().getTime() - st.mtimeMs > staleMs;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return false;
+    throw error;
+  }
+}
+
+/**
+ * Publish a complete owner JSON onto the reservation path. Write the
+ * payload to a tmp file first, then link — dest never appears empty.
+ * link fails with EEXIST when another owner already holds the name.
+ */
+async function publishExclusiveReservation(
+  reservationPath: string,
+  owner: ThreadLockOwner,
+): Promise<void> {
+  const tmpPath = `${reservationPath}.${randomUUID()}.tmp`;
+  await writeFile(tmpPath, `${JSON.stringify(owner)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  try {
+    await link(tmpPath, reservationPath);
+  } finally {
+    await rm(tmpPath, { force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -379,6 +419,7 @@ export async function withExclusiveReplanReservation<T>(
   options: ThreadLockOptions = {},
 ): Promise<T> {
   const waitMs = Math.max(0, options.waitMs ?? DEFAULT_WAIT_MS);
+  const staleMs = Math.max(0, options.staleMs ?? DEFAULT_STALE_MS);
   const pollMs = Math.max(0, options.pollMs ?? DEFAULT_POLL_MS);
   const now = options.now ?? (() => new Date());
   const isProcessAlive = options.isProcessAlive ?? processAlive;
@@ -398,11 +439,7 @@ export async function withExclusiveReplanReservation<T>(
 
   while (true) {
     try {
-      await writeFile(reservationPath, `${JSON.stringify(owner)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
+      await publishExclusiveReservation(reservationPath, owner);
       break;
     } catch (error) {
       if (!isErrno(error, "EEXIST")) {
@@ -419,9 +456,17 @@ export async function withExclusiveReplanReservation<T>(
     }
     const observed = parseOwner(raw ?? "");
     if (observed === undefined) {
-      // Corrupt reservation: reap and retry. Same as a dead owner —
-      // do not wait out DEFAULT_WAIT_MS then throw THREAD_BUSY.
-      await rm(reservationPath, { force: true }).catch(() => {});
+      // Young unparseable: publish window, not a dead owner. Wait.
+      // Aged unparseable: reap like withThreadLock stale_invalid_owner.
+      if (await reservationOlderThanStale(reservationPath, { staleMs, now })) {
+        await rm(reservationPath, { force: true }).catch(() => {});
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new ThreadBusyError();
+      }
+      await sleep(Math.min(pollMs, remainingMs));
       continue;
     }
     const live = ownerLooksLive(

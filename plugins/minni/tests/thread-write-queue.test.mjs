@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1515,6 +1515,8 @@ test("corrupt exclusive-replan file does not park an accepted start", { timeout:
   );
   await mkdir(path.dirname(reservationPath), { recursive: true });
   await writeFile(reservationPath, "{not a reservation owner\n", { mode: 0o600 });
+  const aged = new Date(Date.now() - 200_000);
+  await utimes(reservationPath, aged, aged);
   assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), false);
 
   const start = await updateClaimedSlice({
@@ -1539,6 +1541,46 @@ test("corrupt exclusive-replan file does not park an accepted start", { timeout:
   assert.equal(plan.slices[0].status, "in_progress");
   const journal = await journalState(fixture);
   assert.deepEqual(journal.started, ["s0"]);
+});
+
+test("young empty exclusive-replan file parks kick (publish window)", { timeout: 15_000 }, async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const key = createHash("sha256").update(fixture.planId).digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    fixture.vaultPath,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(reservationPath, "", { mode: 0o600 });
+  assert.equal(await exclusiveReplanReservationIsLive(fixture.vaultPath, fixture.planId), true);
+
+  const start = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(start), true);
+  await kickWorkerWriteDrain(
+    {
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+    },
+    { oneShotYield: true },
+  );
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "pending", "kick must yield during young empty publish window");
+  const journal = await journalState(fixture);
+  assert.deepEqual(journal.started, []);
 });
 
 test("kick still applies start when no exclusive replan is in flight", { timeout: 20_000 }, async (t) => {

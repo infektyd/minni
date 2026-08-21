@@ -366,11 +366,13 @@ test("corrupt exclusive-replan reservation is not live and acquire reaps it", as
   );
   await mkdir(path.dirname(reservationPath), { recursive: true });
   await writeFile(reservationPath, "{not a reservation owner\n", { mode: 0o600 });
+  const aged = new Date(Date.now() - 200_000);
+  await utimes(reservationPath, aged, aged);
 
   assert.equal(
     await exclusiveReplanReservationIsLive(root, "plan-x"),
     false,
-    "unparseable reservation must not look live (kick must still drain)",
+    "aged unparseable reservation must not look live (kick must still drain)",
   );
 
   let entered = false;
@@ -378,7 +380,45 @@ test("corrupt exclusive-replan reservation is not live and acquire reaps it", as
     entered = true;
     assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), true);
   });
-  assert.equal(entered, true, "acquire must reap corrupt reservation instead of THREAD_BUSY");
+  assert.equal(entered, true, "acquire must reap aged corrupt reservation instead of THREAD_BUSY");
   assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
   await assert.rejects(readFile(reservationPath, "utf8"), { code: "ENOENT" });
+});
+
+test("young empty exclusive-replan file is live and acquire does not reap it", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-empty-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  await mkdir(path.dirname(reservationPath), { recursive: true });
+  await writeFile(reservationPath, "", { mode: 0o600 });
+
+  assert.equal(
+    await exclusiveReplanReservationIsLive(root, "plan-x"),
+    true,
+    "empty file inside stale grace is the publish window — kick must yield",
+  );
+
+  await assert.rejects(
+    () => withExclusiveReplanReservation(
+      root,
+      "plan-x",
+      "replan-during-empty",
+      async () => {
+        throw new Error("must not enter while young empty reservation exists");
+      },
+      { waitMs: 50, pollMs: 10 },
+    ),
+    (err) => {
+      assert.equal(err.name, "ThreadBusyError");
+      return true;
+    },
+  );
+  const leftover = await readFile(reservationPath, "utf8");
+  assert.equal(leftover, "", "acquire must not unlink a young empty reservation");
 });
