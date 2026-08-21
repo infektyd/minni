@@ -450,21 +450,29 @@ test("wet GO: exclusive split keeps depends_on blocked until orch remounts; prop
     );
     assert.equal(team.ready.some((s) => s.id === "b"), false);
 
-    const remount = await call("minni_thread_replan", {
+    const remountArgs = {
       plan_id,
-      new_slices: [
-        { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
-        { id: "child-a", title: "Child A" },
-        { id: "child-b", title: "Child B" },
-        { id: "indie", title: "Independent slice" },
-      ],
-    });
+      set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],
+    };
+    assert.equal("new_slices" in remountArgs, false, "remount must not restate the live set");
+    assert.equal(
+      JSON.stringify(remountArgs).includes("indie"),
+      false,
+      "remount-only must not include indie in the request",
+    );
+    const remount = await call("minni_thread_replan", remountArgs);
     assert.notEqual(remount.status, "error", JSON.stringify(remount));
     const afterRemount = await rehydratePlan(notePath);
     assert.deepEqual(
       afterRemount.slices.find((s) => s.id === "b").depends_on,
       ["child-a", "child-b"],
     );
+    assert.equal(
+      afterRemount.slices.find((s) => s.id === "indie").status,
+      "pending",
+      "indie must stay live; remount is an edge edit, not a rewrite",
+    );
+    assert.equal(afterRemount.slices.find((s) => s.id === "s0").status, "superseded");
     const readyAfterRemount = await call("minni_thread_ready", { plan_id });
     assert.deepEqual(
       readyAfterRemount.ready.map((s) => s.id).sort(),
@@ -480,6 +488,43 @@ test("wet GO: exclusive split keeps depends_on blocked until orch remounts; prop
       .filter((e) => e.kind === "replan")
       .find((e) => e.payload?.depends_on_changed);
     assert.ok(remountEvent, "orch remount must journal depends_on_changed on existing replan surface");
+    assert.deepEqual(remountEvent.payload.depends_on_changed, [
+      { slice_id: "b", from: ["s0"], to: ["child-a", "child-b"] },
+    ]);
+    assert.equal("add_slices" in (remountEvent.payload ?? {}), false);
+    assert.equal("drop_slice_ids" in (remountEvent.payload ?? {}), false);
+    assert.equal(
+      JSON.stringify(remountEvent).includes(claim.token),
+      false,
+      "claim token must stay off the remount journal event",
+    );
+    assert.equal(
+      JSON.stringify(remountEvent).includes("claim_token"),
+      false,
+      "claim_token key must stay off the remount payload",
+    );
+  });
+});
+
+test("wet pin: new_slices that omits indie still supersedes indie", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "keep", title: "Keep" },
+      { id: "indie", title: "Independent slice" },
+    ]);
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    const omitted = await call("minni_thread_replan", {
+      plan_id,
+      new_slices: [{ id: "keep", title: "Keep" }],
+    });
+    assert.notEqual(omitted.status, "error", JSON.stringify(omitted));
+    const after = await rehydratePlan(notePath);
+    assert.equal(after.slices.find((s) => s.id === "keep").status, "pending");
+    assert.equal(
+      after.slices.find((s) => s.id === "indie").status,
+      "superseded",
+      "omitting a live id from new_slices is still a rewrite",
+    );
   });
 });
 
