@@ -2700,6 +2700,38 @@ test("applySliceDelta: remounts named depends_on without superseding omitted liv
     "applySliceDelta add/drop-only still does not remount dependents",
   );
 
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["ghost"] }] }),
+    /applySliceDelta: cannot remount onto "ghost"/,
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "ghost remount must not persist; b still depends_on s0",
+  );
+  assert.equal(
+    split.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "ghost remount must not touch indie",
+  );
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["s0"] }] }),
+    /applySliceDelta: cannot remount onto "s0"/,
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "superseded-target remount must not persist; b still depends_on s0",
+  );
+  assert.equal(split.slices.find((s) => s.id === "indie").status, "pending");
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "ghost"] }] }),
+    /applySliceDelta: cannot remount onto "ghost"/,
+    "any missing target rejects the whole remount",
+  );
+
   const remounted = applySliceDelta(split, {
     set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],
   });
@@ -2728,6 +2760,66 @@ test("applySliceDelta: remounts named depends_on without superseding omitted liv
     () => applySliceDelta(split, { set_depends_on: [{ slice_id: "s0", depends_on: ["child-a"] }] }),
     /applySliceDelta: cannot remount depends_on on "s0"/,
   );
+});
+
+test("applySliceDelta: remount onto pending/in_progress/done/blocked targets lands", () => {
+  for (const status of ["pending", "in_progress", "done", "blocked"]) {
+    const plan = {
+      plan_id: `remount-${status}-target`,
+      goal: "live remount targets",
+      status: "active",
+      constraints: [],
+      slices: [
+        { id: "target", title: "Live target", status },
+        { id: "b", title: "Waiter", status: "pending", depends_on: ["old"] },
+      ],
+      open_questions: [],
+      scar_tissue: [],
+      next_action: "b",
+      plan_digest: "x",
+      created: "2026-08-21T12:00:00.000Z",
+      updated: "2026-08-21T12:00:00.000Z",
+      rev: 1,
+    };
+    const remounted = applySliceDelta(plan, {
+      set_depends_on: [{ slice_id: "b", depends_on: ["target"] }],
+    });
+    assert.deepEqual(
+      remounted.slices.find((s) => s.id === "b").depends_on,
+      ["target"],
+      `remount onto ${status} target must land`,
+    );
+  }
+});
+
+test("applySliceDelta: remount onto slices added in the same call lands", () => {
+  const plan = {
+    plan_id: "remount-same-call-add",
+    goal: "nextSlices remount targets",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Waiter", status: "pending", depends_on: ["s0"] },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  const remounted = applySliceDelta(plan, {
+    add_slices: [{ id: "child-a", title: "Child A" }],
+    set_depends_on: [{ slice_id: "b", depends_on: ["child-a"] }],
+  });
+  assert.deepEqual(
+    remounted.slices.find((s) => s.id === "b").depends_on,
+    ["child-a"],
+    "remount targets are nextSlices after add in this same call",
+  );
+  assert.equal(remounted.slices.find((s) => s.id === "child-a").status, "pending");
 });
 
 test("updateSlice: succeeds once the dependency actually resolves, no force needed", () => {

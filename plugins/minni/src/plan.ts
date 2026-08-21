@@ -64,6 +64,7 @@ export interface PlanSlice {
    * superseded slice as still unmet for anyone who still depends_on it —
    * orch remounts named depends_on onto the replacement ids (set_depends_on
    * on the existing replan surface) without restating every other slice.
+   * Remount targets must exist and not be superseded.
    * Plain contract drop leaves this unset so superseded continues to
    * resolve dependents (disclosed residual).
    */
@@ -1271,6 +1272,7 @@ function isTrivialEvidence(ev: string): boolean {
  * Exclusive split exception: a superseded slice with replaced_by is a
  * replacement, not drop-without-replacement. Dependents that still point at
  * it stay blocked until orch remounts depends_on onto the children.
+ * Remount targets must exist and not be superseded.
  */
 export function unmetDependencies(plan: PlanArtifact, slice_id: string): string[] {
   const slice = plan.slices.find((s) => s.id === slice_id);
@@ -2272,6 +2274,17 @@ export function applySliceDelta(
           `applySliceDelta: cannot remount depends_on on "${id}" — missing or not live`,
         );
       }
+      // Targets are nextSlices after add/drop in this same call. Missing or
+      // superseded is a dangling edge, not a remount — throw so MCP does
+      // not persist or journal depends_on_changed.
+      for (const depId of entry.depends_on) {
+        const dep = nextSlices.find((s) => s.id === depId);
+        if (!dep || dep.status === "superseded") {
+          throw new Error(
+            `applySliceDelta: cannot remount onto "${depId}" — missing or superseded`,
+          );
+        }
+      }
     }
     nextSlices = nextSlices.map((slice) => {
       const entry = remounts.find((r) => r.slice_id === slice.id);
@@ -2334,7 +2347,8 @@ export function landedAddSlices(
  *   split    = supersede claimed parent + add children; no parent-id reuse.
  *              Does not remount dependents' depends_on — orch remounts
  *              named live slices via set_depends_on on the existing replan
- *              surface (edge edit; unnamed live slices stay). Split is
+ *              surface (edge edit; unnamed live slices stay). Remount
+ *              targets must exist and not be superseded. Split is
  *              replacement; contract is drop-without-replacement.
  *   contract = drop named ids only (supersede, never delete)
  */
