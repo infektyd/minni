@@ -1750,7 +1750,7 @@ server.registerTool(
   {
     title: "Minni Thread Replan",
     description:
-      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse); contract = drop_slice_ids only. Drop supersedes; it never deletes.",
+      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse; dependents of the replaced parent stay blocked until orch remounts depends_on onto the children via this same surface); contract = drop_slice_ids only (drop-without-replacement still unblocks dependents). Drop supersedes; it never deletes.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       new_slices: z.array(planSliceInputSchema).optional(),
@@ -1818,8 +1818,10 @@ server.registerTool(
     // reproduction before trusting the review): diffDependsOn alone missed
     // the ordinary, cheaper way to satisfy a dependency for free — omitting
     // the dependency slice from new_slices (or listing it in
-    // drop_slice_ids) supersedes it, and unmetDependencies already treats
-    // superseded as resolved. That path produced zero journal trail before
+    // drop_slice_ids) supersedes it, and unmetDependencies treats plain
+    // superseded (drop-without-replacement) as resolved. Exclusive split
+    // (drop+add) stamps replaced_by so dependents stay blocked until orch
+    // remounts depends_on. That path produced zero journal trail before
     // this. Journaled here, not blocked: replan's purpose is restructuring
     // the plan, and hard-gating supersession itself is a separate, larger
     // design decision outside this fix's brief (see diffSupersededDependencies'

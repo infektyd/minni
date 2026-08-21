@@ -334,6 +334,120 @@ test("wet: propose split leaves topology unchanged; orch drop+add supersedes cla
   });
 });
 
+test("wet GO: exclusive split keeps depends_on blocked until orch remounts; propose does not apply", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "s0", title: "Claimed parent" },
+      { id: "b", title: "Sibling depends on s0", depends_on: ["s0"] },
+      { id: "indie", title: "Independent slice" },
+    ]);
+    const claim = await claimWorker(call, plan_id, "s0", "worker-split", "claim-s0-split");
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath, "seeded plan note");
+
+    const readyBefore = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(readyBefore.ready.map((s) => s.id).sort(), ["indie"]);
+
+    const proposed = await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "s0",
+      worker_agent_id: "worker-split",
+      claim_token: claim.token,
+      idempotency_key: "propose-exclusive-split",
+      action: "propose_structure",
+      proposal: {
+        kind: "split",
+        reason: "Exclusive split into independently verifiable children",
+        slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+        ],
+      },
+    });
+    assert.deepEqual(proposed.ready_before, proposed.ready_after);
+    const afterPropose = await rehydratePlan(notePath);
+    assert.equal(afterPropose.slices.some((s) => s.id === "child-a"), false);
+    assert.equal(afterPropose.slices.find((s) => s.id === "s0").status, "pending");
+    assert.deepEqual(afterPropose.slices.find((s) => s.id === "b").depends_on, ["s0"]);
+
+    const delta = structuralProposalDelta(
+      afterPropose.slices.find((s) => s.id === "s0").proposals.at(-1),
+      "s0",
+    );
+    assert.deepEqual(delta.drop_slice_ids, ["s0"]);
+    assert.equal("depends_on" in delta, false, "delta does not remount dependents");
+    const applied = await call("minni_thread_replan", { plan_id, ...delta });
+    assert.notEqual(applied.status, "error", JSON.stringify(applied));
+
+    const afterSplit = await rehydratePlan(notePath);
+    const parent = afterSplit.slices.find((s) => s.id === "s0");
+    assert.equal(parent.status, "superseded");
+    assert.ok(parent.superseded_by);
+    assert.ok(parent.replaced_by?.length, "split marks replacement");
+    assert.equal(parent.claim, undefined);
+    assert.deepEqual(afterSplit.slices.find((s) => s.id === "b").depends_on, ["s0"]);
+    assert.equal(afterSplit.slices.find((s) => s.id === "child-a").assigned_to, undefined);
+    assert.equal(afterSplit.slices.find((s) => s.id === "child-b").assigned_to, undefined);
+
+    const readyAfterSplit = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterSplit.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "b must not become ready when s0 is replaced",
+    );
+    assert.equal(
+      readyAfterSplit.ready.some((s) => s.id === "b"),
+      false,
+    );
+    assert.equal(
+      readyAfterSplit.ready.some((s) => s.id === "s0"),
+      false,
+    );
+
+    const team = await call("minni_team_runtime", {
+      task: "exclusive-split remount honesty",
+      plan_id,
+    });
+    assert.deepEqual(
+      team.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "team_runtime ready must match thread ready after split",
+    );
+    assert.equal(team.ready.some((s) => s.id === "b"), false);
+
+    const remount = await call("minni_thread_replan", {
+      plan_id,
+      new_slices: [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent slice" },
+      ],
+    });
+    assert.notEqual(remount.status, "error", JSON.stringify(remount));
+    const afterRemount = await rehydratePlan(notePath);
+    assert.deepEqual(
+      afterRemount.slices.find((s) => s.id === "b").depends_on,
+      ["child-a", "child-b"],
+    );
+    const readyAfterRemount = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(
+      readyAfterRemount.ready.map((s) => s.id).sort(),
+      ["child-a", "child-b", "indie"],
+      "after remount, b still waits on the live children",
+    );
+    assert.equal(readyAfterRemount.ready.some((s) => s.id === "b"), false);
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    assert.ok(events.events.some((e) => e.kind === "structure.proposed"));
+    assert.ok(events.events.some((e) => e.kind === "replan"));
+    const remountEvent = events.events
+      .filter((e) => e.kind === "replan")
+      .find((e) => e.payload?.depends_on_changed);
+    assert.ok(remountEvent, "orch remount must journal depends_on_changed on existing replan surface");
+  });
+});
+
 test("wet: propose contract leaves topology unchanged; orch drop supersedes named ids and never deletes", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [
