@@ -55,6 +55,7 @@ import {
   unmetDependencies,
   diffDependsOn,
   diffSupersededDependencies,
+  landedReplanTopology,
   applySliceDelta,
   readHistory,
   getRevision,
@@ -1824,6 +1825,11 @@ server.registerTool(
     // design decision outside this fix's brief (see diffSupersededDependencies'
     // docstring).
         const dependsOnSuperseded = diffSupersededDependencies(plan, updated);
+        // Landed add/drop from before→after so new_slices full-set replan
+        // (and add/drop MCP args) both put topology on the journal. Echoing
+        // only MCP add_slices/drop_slice_ids would omit the new_slices path
+        // that remount / full-set apply uses. Never claim tokens.
+        const landedTopology = landedReplanTopology(plan, updated);
         const revokedClaimIdList = revokedClaimIds(plan, updated);
         await persistPlanThenRevokeClaimSecrets(
           updated,
@@ -1837,7 +1843,8 @@ server.registerTool(
           plan,
           updated,
         );
-        // Legacy appendJournal line unchanged.
+        // Legacy appendJournal: include landed add/drop so both journals
+        // agree that replan apply carried the topology delta that landed.
         await appendJournal(journalPath, {
           kind: "replan",
           at: now.toISOString(),
@@ -1847,13 +1854,23 @@ server.registerTool(
           ...(dependsOnSuperseded.length > 0
             ? { depends_on_superseded: dependsOnSuperseded }
             : {}),
+          ...(landedTopology.add_slices
+            ? { add_slices: landedTopology.add_slices }
+            : {}),
+          ...(landedTopology.drop_slice_ids
+            ? { drop_slice_ids: landedTopology.drop_slice_ids }
+            : {}),
         });
-        // Ordered mirror: ids only (never evidence/scar text). Coalesces
-        // ready.changed automatically when supersession or a depends_on
-        // edit frees or blocks a dependent.
+        // Ordered mirror: carry the add/drop that landed (never claim
+        // tokens). Coalesces ready.changed when supersession or a
+        // depends_on edit frees or blocks a dependent.
         const replanPayload: Record<string, unknown> = {};
         if (dependsOnChanged.length > 0) replanPayload.depends_on_changed = dependsOnChanged;
         if (dependsOnSuperseded.length > 0) replanPayload.depends_on_superseded = dependsOnSuperseded;
+        if (landedTopology.add_slices) replanPayload.add_slices = landedTopology.add_slices;
+        if (landedTopology.drop_slice_ids) {
+          replanPayload.drop_slice_ids = landedTopology.drop_slice_ids;
+        }
         const replanSupplemental = plan.slices
           .filter(
             (slice) =>

@@ -10,6 +10,7 @@ import {
   unmetDependencies,
   diffDependsOn,
   diffSupersededDependencies,
+  landedReplanTopology,
   applySliceDelta,
   structuralProposalDelta,
   computePlanDigest,
@@ -2674,6 +2675,80 @@ test("diffSupersededDependencies: a superseded dependency with no surviving depe
     ],
   };
   assert.deepEqual(diffSupersededDependencies(before, after), [], "b is done — no longer a live dependent to report");
+});
+
+test("landedReplanTopology: new_slices-shaped apply reports landed add ids and superseded ids", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "keep", title: "Keep", status: "pending" },
+      { id: "drop-me", title: "Drop", status: "pending" },
+    ],
+  };
+  const after = replan(before, [
+    { id: "keep", title: "Keep" },
+    { id: "child-a", title: "Child A", depends_on: ["keep"] },
+  ]);
+  const landed = landedReplanTopology(before, after);
+  assert.deepEqual(landed.drop_slice_ids, ["drop-me"]);
+  assert.deepEqual(landed.add_slices, [
+    { id: "child-a", title: "Child A", depends_on: ["keep"] },
+  ]);
+  assert.equal(
+    JSON.stringify(landed).includes("claim"),
+    false,
+    "claim tokens stay off the landed topology payload",
+  );
+});
+
+test("landedReplanTopology omits evidence from ordered add_slices", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+  };
+  const after = replan(before, [
+    { id: "keep", title: "Keep" },
+    {
+      id: "child",
+      title: "Child",
+      evidence: "vault/secret/path.log passed",
+    },
+  ]);
+  assert.equal(
+    after.slices.find((s) => s.id === "child")?.evidence,
+    "vault/secret/path.log passed",
+    "plan note still stores evidence; only the ordered payload omits it",
+  );
+  const landed = landedReplanTopology(before, after);
+  assert.deepEqual(landed.add_slices, [{ id: "child", title: "Child" }]);
+  assert.equal(
+    JSON.stringify(landed).includes("evidence"),
+    false,
+    "ordered replan payload must not copy freeform evidence",
+  );
+  assert.equal(
+    JSON.stringify(landed).includes("vault/secret"),
+    false,
+    "path-bearing evidence must not reach the ordered journal",
+  );
+});
+
+test("landedReplanTopology: depends_on-only remount (no add/supersede) omits add/drop", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "b", title: "B", status: "pending", depends_on: ["s0"] },
+      { id: "child-a", title: "Child A", status: "pending" },
+    ],
+  };
+  const after = replan(before, [
+    { id: "b", title: "B", depends_on: ["child-a"] },
+    { id: "child-a", title: "Child A" },
+  ]);
+  assert.deepEqual(landedReplanTopology(before, after), {});
+  assert.deepEqual(diffDependsOn(before, after), [
+    { slice_id: "b", from: ["s0"], to: ["child-a"] },
+  ]);
 });
 
 // #291 round-2 cassandra finding HIGH-2 (confirmed by independent

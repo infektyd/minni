@@ -403,6 +403,78 @@ test("wet: propose contract leaves topology unchanged; orch drop supersedes name
   });
 });
 
+test("wet GO: new_slices replan that adds and supersedes journals landed add/drop; propose still does not apply", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const plan_id = await seedPlan(vaultPath, [
+      { id: "keep", title: "Keep" },
+      { id: "old", title: "Supersede me" },
+    ]);
+    const claim = await claimWorker(call, plan_id, "keep", "worker-ns", "claim-newslices");
+    const notePath = await findPlanNote(vaultPath, plan_id);
+    assert.ok(notePath, "seeded plan note");
+    const beforePropose = await rehydratePlan(notePath);
+
+    await call("minni_thread_worker_update", {
+      plan_id,
+      slice_id: "keep",
+      worker_agent_id: "worker-ns",
+      claim_token: claim.token,
+      idempotency_key: "propose-newslices",
+      action: "propose_structure",
+      proposal: {
+        kind: "expand",
+        reason: "need a replacement branch via full-set replan",
+        slices: [{ id: "new-a", title: "New A" }],
+      },
+    });
+
+    const afterPropose = await rehydratePlan(notePath);
+    assert.deepEqual(sliceIds(afterPropose), sliceIds(beforePropose));
+    assert.equal(afterPropose.slices.some((s) => s.id === "new-a"), false);
+    const eventsAfterPropose = await call("minni_thread_events", {
+      plan_id,
+      since_seq: 0,
+      limit: 200,
+    });
+    assert.equal(
+      eventsAfterPropose.events.some((e) => e.kind === "replan"),
+      false,
+      "propose must not apply",
+    );
+
+    // Full-set replan surface (#30 remount path): MCP args are new_slices
+    // only — no add_slices / drop_slice_ids. Journal must still carry what
+    // landed.
+    const applied = await call("minni_thread_replan", {
+      plan_id,
+      new_slices: [
+        { id: "keep", title: "Keep" },
+        { id: "new-a", title: "New A" },
+      ],
+    });
+    assert.notEqual(applied.status, "error", JSON.stringify(applied));
+
+    const afterApply = await rehydratePlan(notePath);
+    assert.equal(afterApply.slices.find((s) => s.id === "old").status, "superseded");
+    assert.equal(afterApply.slices.find((s) => s.id === "new-a").status, "pending");
+    assert.equal(afterApply.slices.find((s) => s.id === "keep").status, "pending");
+    assert.ok(afterApply.slices.find((s) => s.id === "keep").claim, "proposer claim stays");
+
+    const events = await call("minni_thread_events", { plan_id, since_seq: 0, limit: 200 });
+    const replanEvent = events.events.find((e) => e.kind === "replan");
+    assert.ok(replanEvent?.payload, "replan event must carry landed add/drop");
+    assert.deepEqual(replanEvent.payload.add_slices, [{ id: "new-a", title: "New A" }]);
+    assert.deepEqual(replanEvent.payload.drop_slice_ids, ["old"]);
+    assert.equal(
+      JSON.stringify(replanEvent).includes(claim.token),
+      false,
+      "claim token must stay off the journal",
+    );
+    const readyAfter = await call("minni_thread_ready", { plan_id });
+    assert.deepEqual(readyAfter.ready.map((s) => s.id), ["new-a"]);
+  });
+});
+
 test("wet: worker cannot replan; live worker tool stays worker_update only", async (t) => {
   await withMcpSession(t, async ({ vaultPath, call }) => {
     const plan_id = await seedPlan(vaultPath, [{ id: "a", title: "Slice A" }]);
