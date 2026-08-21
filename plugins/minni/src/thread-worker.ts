@@ -1915,6 +1915,37 @@ function copyProposal(value: unknown): StructuralProposal {
   };
 }
 
+/**
+ * Ordered-journal payload for structure.proposed. Journal is SoT for the
+ * proposed topology (kind/reason/slices-or-slice_ids) so orch can reconstruct
+ * add/drop without reading slice.proposals[]. Never includes claim tokens.
+ */
+function structureProposedPayload(
+  proposal: StructuralProposal,
+): Record<string, unknown> {
+  if (proposal.kind === "contract") {
+    return {
+      kind: "contract",
+      reason: proposal.reason,
+      slice_ids: [...proposal.slice_ids],
+    };
+  }
+  return {
+    kind: proposal.kind,
+    reason: proposal.reason,
+    slices: (proposal.slices ?? []).map((slice) => {
+      const copy: Record<string, unknown> = { title: slice.title };
+      if (slice.id !== undefined) copy.id = slice.id;
+      if (slice.gate !== undefined) copy.gate = slice.gate;
+      if (slice.depends_on !== undefined) {
+        copy.depends_on = [...slice.depends_on];
+      }
+      if (slice.evidence !== undefined) copy.evidence = slice.evidence;
+      return copy;
+    }),
+  };
+}
+
 function applyWorkerAction(
   plan: PlanArtifact,
   sliceId: string,
@@ -2765,6 +2796,17 @@ async function applyClaimedSliceOnLockedPlan(
           payload: attentionPayload(sliceId, "block"),
         });
       }
+      // structure.proposed carries the proposed topology so the ordered
+      // journal is SoT; orch reconstructs add/drop from this event. Propose
+      // still does not apply — topology is unchanged until minni_thread_replan.
+      const structurePayload =
+        input.action.action === "propose_structure"
+          ? structureProposedPayload(
+              copyProposal(
+                (input.action as { proposal?: unknown }).proposal,
+              ),
+            )
+          : undefined;
       await recordThreadMutationEvents({
         journalPath,
         planId,
@@ -2773,6 +2815,7 @@ async function applyClaimedSliceOnLockedPlan(
         operationKey: workerOperationKey,
         kind,
         sliceId,
+        payload: structurePayload,
         readyBefore: result.ready_before,
         readyAfter: result.ready_after,
         plan: next,

@@ -1852,6 +1852,9 @@ server.registerTool(
         );
         // Legacy appendJournal: include landed add/drop so both journals
         // agree that replan apply carried the topology delta that landed.
+        // Landed ids from before→after — applySliceDelta may generate ids
+        // when callers omit them; new_slices full-set replan has no MCP
+        // add/drop args to echo.
         await appendJournal(journalPath, {
           kind: "replan",
           at: now.toISOString(),

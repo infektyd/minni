@@ -2265,6 +2265,35 @@ export function applySliceDelta(
 }
 
 /**
+ * Landed add_slices for a replan apply, derived from before→after — not
+ * from the request list. applySliceDelta generates ids when callers omit
+ * them; journaling the request would miss those ids and leave the ordered
+ * journal no longer SoT for what applied.
+ *
+ * Proposal fields only (id, title, gate, depends_on). No claim token,
+ * status, proposals, or evidence — same as other ordered mirrors.
+ */
+export function landedAddSlices(
+  before: PlanArtifact,
+  after: PlanArtifact,
+): NonNullable<CreatePlanInput["slices"]> {
+  const beforeIds = new Set(before.slices.map((s) => s.id));
+  return after.slices
+    .filter((s) => !beforeIds.has(s.id))
+    .map((s) => {
+      const landed: {
+        id: string;
+        title: string;
+        gate?: string;
+        depends_on?: string[];
+      } = { id: s.id, title: s.title };
+      if (s.gate !== undefined) landed.gate = s.gate;
+      if (s.depends_on !== undefined) landed.depends_on = [...s.depends_on];
+      return landed;
+    });
+}
+
+/**
  * Map a worker StructuralProposal onto minni_thread_replan's existing
  * add_slices / drop_slice_ids surface. Not a second apply tool and not a
  * replan kind enum — orch still calls replan with add/drop.
