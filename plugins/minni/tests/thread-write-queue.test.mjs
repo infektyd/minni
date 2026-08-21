@@ -239,12 +239,20 @@ async function journalState(fixture) {
   };
 }
 
-async function waitForJournal(fixture, { started = 0, completed = 0 }, timeoutMs = 20_000) {
+async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false }, timeoutMs = 20_000) {
   const begin = Date.now();
   let last;
+  let leftover;
   while (Date.now() - begin < timeoutMs) {
     last = await journalState(fixture);
-    if (last.started.length >= started && last.completed.length >= completed) {
+    leftover = queueEmpty
+      ? await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)
+      : undefined;
+    if (
+      last.started.length >= started &&
+      last.completed.length >= completed &&
+      (!queueEmpty || leftover.length === 0)
+    ) {
       return last;
     }
     kickWorkerWriteDrain({
@@ -259,6 +267,7 @@ async function waitForJournal(fixture, { started = 0, completed = 0 }, timeoutMs
       started: last?.started?.length,
       completed: last?.completed?.length,
       completesWithoutStarts: last?.completesWithoutStarts,
+      leftover: leftover?.length,
     })}`,
   );
 }
@@ -346,7 +355,7 @@ test("accepted-into-Q is not applied until drain", async (t) => {
   assert.equal(queuedAgain.length, 1, "same idempotency_key while queued must not double-enqueue");
   release();
   await holder;
-  const journal = await waitForJournal(fixture, { started: 1 });
+  const journal = await waitForJournal(fixture, { started: 1, queueEmpty: true });
   assert.equal(journal.started.length, 1);
   const planAfter = await rehydratePlan(fixture.notePath);
   assert.equal(planAfter.slices[0].status, "in_progress");
