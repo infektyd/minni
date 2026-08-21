@@ -445,3 +445,59 @@ test("exclusive replan publish falls back to wx when link is unsupported", async
   assert.equal(sawLive, true, "wx fallback must still publish a live reservation");
   assert.equal(await exclusiveReplanReservationIsLive(root, "plan-x"), false);
 });
+
+test("exclusive replan wx fallback reaps dest when write fails after create", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-exclusive-replan-wxfail-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const key = createHash("sha256").update("plan-x").digest("hex").slice(0, 32);
+  const reservationPath = path.join(
+    root,
+    ".runtime",
+    "thread-locks",
+    `${key}.exclusive-replan.json`,
+  );
+  const originalLink = fs.promises.link;
+  const originalWriteFile = fs.promises.writeFile;
+  fs.promises.link = async () => {
+    const error = new Error("operation not supported");
+    error.code = "ENOTSUP";
+    throw error;
+  };
+  fs.promises.writeFile = async (filePath, data, options) => {
+    if (options?.flag === "wx" && String(filePath) === reservationPath) {
+      await originalWriteFile(filePath, "", { encoding: "utf8", mode: 0o600 });
+      const error = new Error("no space left on device");
+      error.code = "ENOSPC";
+      throw error;
+    }
+    return originalWriteFile(filePath, data, options);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      () => withExclusiveReplanReservation(root, "plan-x", "replan-wxfail", async () => {
+        throw new Error("must not enter after wx write failure");
+      }),
+      (err) => {
+        assert.equal(err.code, "ENOSPC");
+        return true;
+      },
+    );
+    await assert.rejects(readFile(reservationPath, "utf8"), { code: "ENOENT" });
+    assert.equal(
+      await exclusiveReplanReservationIsLive(root, "plan-x"),
+      false,
+      "failed wx publish must not leave a young empty reservation that blocks kick",
+    );
+  } finally {
+    fs.promises.link = originalLink;
+    fs.promises.writeFile = originalWriteFile;
+    syncBuiltinESMExports();
+  }
+
+  let entered = false;
+  await withExclusiveReplanReservation(root, "plan-x", "replan-after-wxfail", async () => {
+    entered = true;
+  });
+  assert.equal(entered, true, "next exclusive replan must acquire immediately after failed wx publish");
+});

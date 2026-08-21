@@ -392,6 +392,9 @@ async function reservationOlderThanStale(
  * links (NFS/SMB/virtiofs) fall back to exclusive wx write — the
  * young-unparseable stale grace covers that create-before-write window.
  * link/wx EEXIST means another owner already holds the name.
+ * wx can create dest then fail the write (ENOSPC/EIO); reap that dest
+ * unless EEXIST, same as withThreadLock's owner publish, so kick does
+ * not yield on our leftover empty file.
  */
 async function publishExclusiveReservation(
   reservationPath: string,
@@ -415,11 +418,18 @@ async function publishExclusiveReservation(
       ) {
         throw error;
       }
-      await writeFile(reservationPath, payload, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
+      try {
+        await writeFile(reservationPath, payload, {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+      } catch (writeError) {
+        if (!isErrno(writeError, "EEXIST")) {
+          await rm(reservationPath, { force: true }).catch(() => {});
+        }
+        throw writeError;
+      }
     }
   } finally {
     await rm(tmpPath, { force: true }).catch(() => {});
