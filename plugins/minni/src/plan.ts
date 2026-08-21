@@ -2276,7 +2276,8 @@ export function applySliceDelta(
       }
       // Targets are nextSlices after add/drop in this same call. Missing or
       // superseded is a dangling edge, not a remount — throw so MCP does
-      // not persist or journal depends_on_changed.
+      // not persist or journal depends_on_changed. Self (or mixed self+valid)
+      // is a loop, not a remount — same fail-closed.
       for (const depId of entry.depends_on) {
         const dep = nextSlices.find((s) => s.id === depId);
         if (!dep || dep.status === "superseded") {
@@ -2284,6 +2285,11 @@ export function applySliceDelta(
             `applySliceDelta: cannot remount onto "${depId}" — missing or superseded`,
           );
         }
+      }
+      if (entry.depends_on.includes(id)) {
+        throw new Error(
+          `applySliceDelta: cannot remount onto "${id}" — target is the remounted slice`,
+        );
       }
     }
     nextSlices = nextSlices.map((slice) => {
