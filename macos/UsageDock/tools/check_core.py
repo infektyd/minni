@@ -117,6 +117,26 @@ def windows_from_payload(payload: dict) -> list[dict]:
     return result
 
 
+def apply_refresh(
+    root: dict,
+    access_token: str,
+    refresh_token: str | None,
+    expires_in: int,
+    now: float,
+) -> dict:
+    oauth = dict(root["claudeAiOauth"])
+    previous = oauth.get("expiresAt", 0)
+    milliseconds = previous >= 1e11
+    oauth["accessToken"] = access_token
+    if refresh_token:
+        oauth["refreshToken"] = refresh_token
+    expiry = now + expires_in
+    oauth["expiresAt"] = expiry * 1000 if milliseconds else expiry
+    next_root = dict(root)
+    next_root["claudeAiOauth"] = oauth
+    return next_root
+
+
 def epoch_date(raw: float) -> tuple[float, bool]:
     if raw >= 1e11:
         return raw / 1000, True
@@ -182,6 +202,19 @@ def main() -> int:
     creds = json.loads((FIXTURES / "claude-credentials.sample.json").read_text())
     assert "claudeAiOauth" in creds
     assert creds["claudeAiOauth"]["accessToken"].startswith("sk-ant-oat01-")
+
+    merged = apply_refresh(
+        creds,
+        access_token="new",
+        refresh_token="rotated",
+        expires_in=3600,
+        now=1_800_000_000,
+    )
+    oauth = merged["claudeAiOauth"]
+    assert_eq(oauth["accessToken"], "new", "refresh access")
+    assert_eq(oauth["refreshToken"], "rotated", "refresh rotate")
+    assert_eq(oauth["subscriptionType"], "max", "round-trip extra key")
+    assert_eq(oauth["expiresAt"], 1_800_003_600_000, "ms expiry write-back")
 
     print("UsageDock core checks passed.")
     print(f"  fixtures: {FIXTURES}")
