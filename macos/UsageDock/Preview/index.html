@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UsageDock layout preview</title>
+  <style>
+    :root {
+      --persimmon: #d2603a;
+      --verdigris: #2f7d68;
+      --mustard: #c9a961;
+      --blue: #3d6f95;
+      --bone: #f4f1ea;
+      --secondary: rgba(255,255,255,0.55);
+      --track: rgba(255,255,255,0.12);
+      --rail: 72px;
+      --ring: 44px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      background: #d8d8d4;
+      color: var(--bone);
+    }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px 24px 48px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 22px;
+      font-weight: 650;
+      color: #181613;
+    }
+    .lede {
+      margin: 0 0 22px;
+      color: #4e4a42;
+      font-size: 14px;
+      line-height: 1.45;
+      max-width: 68ch;
+    }
+    .stages {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    .stage {
+      background: #ececea;
+      border-radius: 16px;
+      padding: 14px;
+    }
+    .stage h2 {
+      margin: 0 0 10px;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #4e4a42;
+    }
+    .desktop {
+      position: relative;
+      height: 420px;
+      border-radius: 10px;
+      overflow: hidden;
+      background: radial-gradient(120% 80% at 20% 10%, #f4e4df 0%, transparent 42%),
+                  radial-gradient(90% 70% at 80% 0%, #dceaf2 0%, transparent 40%),
+                  linear-gradient(160deg, #e8edf2, #f3e6e2 55%, #d9e4ee);
+    }
+    .menubar {
+      height: 22px;
+      background: rgba(40,40,40,0.18);
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      padding: 0 10px;
+      font-size: 11px;
+      color: #222;
+    }
+    .scene {
+      position: absolute;
+      inset: 22px 8px 8px auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .scene.leading {
+      inset: 22px auto 8px 8px;
+      flex-direction: row-reverse;
+    }
+    .rail {
+      width: var(--rail);
+      padding: 14px 14px 12px;
+      border-radius: 999px;
+      background: rgba(18,16,14,0.72);
+      backdrop-filter: blur(18px);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .provider { text-align: center; }
+    .ring {
+      width: var(--ring);
+      height: var(--ring);
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: conic-gradient(var(--accent) calc(var(--p) * 1%), rgba(255,255,255,0.12) 0);
+      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3.5px), #000 calc(100% - 3.4px));
+              mask: radial-gradient(farthest-side, transparent calc(100% - 3.5px), #000 calc(100% - 3.4px));
+    }
+    .mark-wrap {
+      width: var(--ring);
+      height: var(--ring);
+      margin-top: calc(var(--ring) * -1);
+      display: grid;
+      place-items: center;
+    }
+    .pct {
+      margin-top: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .demo-tag {
+      font-size: 8px;
+      font-weight: 700;
+      letter-spacing: 0.6px;
+      color: var(--mustard);
+    }
+    .card {
+      width: 268px;
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(18,16,14,0.78);
+      backdrop-filter: blur(18px);
+      box-shadow: 0 10px 28px rgba(0,0,0,0.32);
+      position: relative;
+    }
+    .card:after {
+      content: "";
+      position: absolute;
+      right: -8px;
+      top: 38px;
+      border-top: 5px solid transparent;
+      border-bottom: 5px solid transparent;
+      border-left: 8px solid rgba(18,16,14,0.78);
+    }
+    .card.live:after { top: 38px; }
+    .head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .head strong { font-size: 15px; font-weight: 600; }
+    .head span { margin-left: auto; font-size: 11px; color: var(--secondary); }
+    .row { margin-bottom: 12px; }
+    .row-top {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+    .row-top .muted { color: var(--secondary); }
+    .bar {
+      height: 6px;
+      border-radius: 99px;
+      background: var(--track);
+      overflow: hidden;
+    }
+    .bar > i {
+      display: block;
+      height: 100%;
+      border-radius: 99px;
+      background: var(--fill);
+    }
+    .used { margin-top: 6px; font-size: 11px; }
+    .foot { font-size: 10px; color: var(--secondary); }
+    .note {
+      margin-top: 18px;
+      color: #242320;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .note code { font-size: 12px; }
+    svg.mark { width: 20px; height: 20px; }
+    svg.mark-sm { width: 16px; height: 16px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>UsageDock layout preview</h1>
+    <p class="lede">
+      Visual twin of the SwiftUI rail. Left is demo mode with the hivinz_ numbers (73 / 21 / 52).
+      Right is live honesty: Claude filled, ChatGPT and Perplexity empty because those vendors
+      do not publish a session utilization API.
+    </p>
+    <div class="stages">
+      <div class="stage">
+        <h2>Demo · tweet numbers</h2>
+        <div class="desktop">
+          <div class="menubar">Thu 29 Aug 11:22</div>
+          <div class="scene">
+            <div class="card">
+              <div class="head">
+                <svg class="mark-sm" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round">
+                  <path d="M12 4v16M4 12h16M6.3 6.3l11.4 11.4M17.7 6.3L6.3 17.7"/>
+                </svg>
+                <strong>Claude Usage</strong>
+                <span>Resets in 51 min</span>
+              </div>
+              <div class="row">
+                <div class="row-top"><span>Current session</span></div>
+                <div class="bar" style="--fill: var(--persimmon)"><i style="width:73%"></i></div>
+                <div class="used">73% Used</div>
+              </div>
+              <div class="row">
+                <div class="row-top"><span>All models</span><span class="muted">Resets Thu 12:00 AM</span></div>
+                <div class="bar" style="--fill: var(--verdigris)"><i style="width:7%"></i></div>
+                <div class="used">7% Used</div>
+              </div>
+              <div class="foot">Just now</div>
+            </div>
+            <div class="rail">
+              <div class="provider">
+                <div class="ring" style="--accent: var(--persimmon); --p: 73"></div>
+                <div class="mark-wrap">
+                  <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round">
+                    <path d="M12 4v16M4 12h16M6.3 6.3l11.4 11.4M17.7 6.3L6.3 17.7"/>
+                  </svg>
+                </div>
+                <div class="pct">73%</div>
+              </div>
+              <div class="provider">
+                <div class="ring" style="--accent: var(--verdigris); --p: 21"></div>
+                <div class="mark-wrap">
+                  <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8">
+                    <path d="M12 4l7 4v8l-7 4-7-4V8z"/>
+                    <circle cx="12" cy="12" r="3.2"/>
+                  </svg>
+                </div>
+                <div class="pct">21%</div>
+              </div>
+              <div class="provider">
+                <div class="ring" style="--accent: var(--mustard); --p: 52"></div>
+                <div class="mark-wrap">
+                  <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.6">
+                    <path d="M12 4l4 8-4 8-4-8z"/>
+                    <path d="M5 9.5h14M5 14.5h14"/>
+                  </svg>
+                </div>
+                <div class="pct">52%</div>
+              </div>
+              <div class="demo-tag">DEMO</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="stage">
+        <h2>Live · honest adapters</h2>
+        <div class="desktop">
+          <div class="menubar">Usage C 73%</div>
+          <div class="scene">
+            <div class="card live">
+              <div class="head">
+                <svg class="mark-sm" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round">
+                  <path d="M12 4v16M4 12h16M6.3 6.3l11.4 11.4M17.7 6.3L6.3 17.7"/>
+                </svg>
+                <strong>ChatGPT Usage</strong>
+              </div>
+              <p class="foot" style="line-height:1.45;color:var(--secondary);margin:0">
+                ChatGPT does not publish a session utilization API
+              </p>
+            </div>
+            <div class="rail">
+              <div class="provider">
+                <div class="ring" style="--accent: var(--persimmon); --p: 73"></div>
+                <div class="mark-wrap">
+                  <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round">
+                    <path d="M12 4v16M4 12h16M6.3 6.3l11.4 11.4M17.7 6.3L6.3 17.7"/>
+                  </svg>
+                </div>
+                <div class="pct">73%</div>
+              </div>
+              <div class="provider">
+                <div class="ring" style="--accent: var(--verdigris); --p: 0"></div>
+                <div class="mark-wrap" style="opacity:0.35">
+                  <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8">
+                    <path d="M12 4l7 4v8l-7 4-7-4V8z"/>
+                    <circle cx="12" cy="12" r="3.2"/>
+                  </svg>
+                </div>
+                <div class="pct" style="opacity:0.55">—</div>
+              </div>
+              <div class="provider">
+                <div class="ring" style="--accent: var(--mustard); --p: 0"></div>
+                <div class="mark-wrap" style="opacity:0.35">
+                  <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.6">
+                    <path d="M12 4l4 8-4 8-4-8z"/>
+                    <path d="M5 9.5h14M5 14.5h14"/>
+                  </svg>
+                </div>
+                <div class="pct" style="opacity:0.55">—</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note">
+      Geometry is the contract in <code>DESIGN.md</code>: rail 72pt, ring 44pt, popover 268pt, 8pt inset.
+      Open <code>UsageDock.xcodeproj</code> on a Mac to run the real AppKit panel.
+    </p>
+  </div>
+</body>
+</html>
