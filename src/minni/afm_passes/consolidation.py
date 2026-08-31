@@ -10,9 +10,12 @@ Design notes:
 - The pass NEVER performs the durable write itself. It returns decisions; the
   daemon applies promote/dedup/review via `_apply_consolidation_result` so the
   privileged write + embedding stay in one audited place (`minnid.py`).
-- Conservative: only `privacy: safe`, non-instruction, non-duplicate,
-  quality-passing candidates are proposed for auto-promotion. Everything spicier
-  is routed to review (status → `needs_review`) and surfaced as a draft.
+- Conservative: `privacy: safe` **and** learn-only `privacy: review` (the
+  stage_candidate clamp) are AFM-examinable. Unset/NULL privacy is still
+  parked (I1/I2). Instruction-like / duplicate / quality failures still
+  route to review + fence. A review fence on a `privacy=review` row must
+  not hide it from the next drain — that is how examined=0 / deferred=N
+  happened on a full proposed queue.
 - Swarm-scale:
     * Dedup is an INDEXED hash lookup (`content_hash`), not an O(N) in-memory
       scan of all learnings. Duplicate volume costs ~O(log N), so a swarm
@@ -40,6 +43,10 @@ logger = logging.getLogger("sovereign.afm.consolidation")
 # privacy is NOT the same as "known safe" and must never auto-promote to durable
 # learnings without a review pass (I1/I2 security fix).
 _SAFE_PRIVACY = {"safe", "public", "low"}
+# Learn-only stage_candidate clamps non-operator rows to privacy=review.
+# That label means "AFM must filter", not "park forever behind afm_review".
+# Unset/NULL stays out of this set (I1/I2).
+_EXAMINABLE_PRIVACY = _SAFE_PRIVACY | {"review"}
 _MIN_CONTENT_LEN = 12
 _DEFAULT_MAX_PER_RUN = 50
 
@@ -121,11 +128,17 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
                    content, instruction_like, proposed_at
             FROM candidate_packets cp
             WHERE cp.status = 'proposed'
-              AND NOT EXISTS (
-                  SELECT 1 FROM consolidation_actions ca
-                  WHERE ca.action_type = 'afm_review'
-                    AND ca.claim = CAST(cp.candidate_id AS TEXT)
-                    AND COALESCE(ca.status, '') != 'superseded'
+              AND (
+                  NOT EXISTS (
+                      SELECT 1 FROM consolidation_actions ca
+                      WHERE ca.action_type = 'afm_review'
+                        AND ca.claim = CAST(cp.candidate_id AS TEXT)
+                        AND COALESCE(ca.status, '') != 'superseded'
+                  )
+                  OR (
+                      lower(COALESCE(cp.privacy_level, '')) = 'review'
+                      AND COALESCE(cp.instruction_like, 0) = 0
+                  )
               )
             ORDER BY cp.proposed_at ASC
             LIMIT ?
@@ -224,7 +237,7 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     if promote_candidate_ids and chosen.get("candidate_id") not in promote_set:
         return None
     privacy = str(chosen.get("privacy_level") or "safe").strip().lower()
-    if privacy not in {"safe", ""}:
+    if privacy not in _EXAMINABLE_PRIVACY and privacy != "":
         return None
     if int(chosen.get("instruction_like") or 0) == 1:
         return None
@@ -295,7 +308,7 @@ def run(db, config, vault_path: Optional[str] = None,
             continue
 
         privacy = (cand.get("privacy_level") or "").strip().lower()
-        if privacy not in _SAFE_PRIVACY:
+        if privacy not in _EXAMINABLE_PRIVACY:
             _review(cand, f"privacy={privacy or 'unset'}")
             continue
 

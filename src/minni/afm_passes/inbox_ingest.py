@@ -356,12 +356,15 @@ _VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
     "codex": "codex",
     "cursor": "cursor",
     "gemini": "gemini",
+    "agy": "gemini",
+    "antigravity": "gemini",
     "hermes": "hermes",
     "kilocode": "kilocode",
     "openclaw": "openclaw",
     "grok-build": "grok-build",
     "grok-beta": "grok-build",
     "grok": "grok-build",
+    "xai": "grok-build",
 }
 
 
