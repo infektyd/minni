@@ -27,12 +27,28 @@ test("wireFor resolves each platform by agent id", () => {
   assert.equal(wireFor("codex").id, "codex");
   assert.equal(wireFor("grok-build").id, "grok-build");
   assert.equal(wireFor("kilocode").id, "kilocode");
+  assert.equal(wireFor("hermes").id, "hermes");
 });
 
-test("wireFor falls back to the Claude shape for an unknown platform", () => {
-  // Narrow but deliberate: Codex and Grok Build are both Claude-contract
-  // clones, so it is the least-bad guess. Add a profile rather than lean on it.
-  assert.equal(wireFor("some-future-agent").id, "claude-code");
+test("wireFor does not pretend an unknown platform is Claude Code", () => {
+  // Historical failure: unknown ids (hermes, muse, future hosts) rendered
+  // Claude's envelope and looked like a healthy inject. Cursor already had
+  // this scar. An unprofiled host must keep its own id and refuse inject.
+  const wire = wireFor("some-future-agent");
+  assert.equal(wire.id, "some-future-agent");
+  assert.equal(wire.inject("SessionStart", "memory"), null);
+  assert.equal(wire.inject("UserPromptSubmit", "memory"), null);
+  assert.equal(wire.inject("Stop", "memory"), null);
+  const rendered = renderIntent(wire, injectIntent("SessionStart", "memory"));
+  assert.match(rendered.dropped?.reason ?? "", /no hook-platform profile|cannot inject/);
+});
+
+test("hermes is an explicit unprofiled wire, not a Claude clone", () => {
+  const wire = wireFor("hermes");
+  assert.equal(wire.id, "hermes");
+  assert.equal(wire.inject("SessionStart", "memory"), null);
+  const rendered = renderIntent(wire, injectIntent("UserPromptSubmit", "memory"));
+  assert.ok(rendered.dropped);
 });
 
 test("Claude Code injects at SessionStart/UserPromptSubmit/Stop but NOT PreCompact", () => {

@@ -325,6 +325,28 @@ export function renderIntent(wire: PlatformWire, intent: HookIntent): RenderedIn
   };
 }
 
+/**
+ * Hosts without a vendor hook contract (Hermes/OpenClaw, Muse, future ids).
+ *
+ * Historical failure: unknown ids fell through to claudeCodeWire, so inject
+ * "succeeded" in our audit log while the host discarded Claude's envelope
+ * (same scar as cursor before it had a profile). Hermes wrote 1075 daemon
+ * learnings with an empty vault and no WIRES entry. Refuse inject; keep the
+ * requested id so the drop reason is attributable.
+ */
+export function unprofiledWire(id: string): PlatformWire {
+  return {
+    id,
+    noop: () => ({ continue: true }),
+    inject: () => null,
+    note: () => null,
+    lastTaskText: () => "",
+  };
+}
+
+/** Documented in docs/contracts/VAULT.md; no vendor hook profile. */
+export const hermesWire: PlatformWire = unprofiledWire("hermes");
+
 const WIRES: ReadonlyArray<PlatformWire> = [
   claudeCodeWire,
   codexWire,
@@ -332,15 +354,16 @@ const WIRES: ReadonlyArray<PlatformWire> = [
   kilocodeWire,
   geminiWire,
   cursorWire,
+  hermesWire,
 ];
 
 /**
- * Resolve a wire by platform id, falling back to the Claude Code shape.
+ * Resolve a wire by platform id.
  *
- * The fallback is deliberate but narrow: an unknown platform is far more likely
- * to be a Claude-contract clone (Codex and Grok Build both are) than anything
- * else. It is still a guess -- add a profile rather than relying on it.
+ * Unknown ids get {@link unprofiledWire}, not Claude. Claude-shaped fallback
+ * made unwired hosts look healthy. Add a real profile when the vendor
+ * contract is known.
  */
 export function wireFor(id: string): PlatformWire {
-  return WIRES.find((wire) => wire.id === id) ?? claudeCodeWire;
+  return WIRES.find((wire) => wire.id === id) ?? unprofiledWire(id);
 }

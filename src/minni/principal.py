@@ -254,6 +254,18 @@ def _principal_from_raw(
             norm_roots.append(str(rp))
         except Exception:
             norm_roots.append(p)
+    for root in norm_roots:
+        try:
+            from minni.vault_layout import ensure_agent_vault
+
+            ensure_agent_vault(root)
+        except Exception:
+            logger.warning(
+                "principal %s: failed to seed vault contract under %s",
+                aid,
+                root,
+                exc_info=True,
+            )
     return EffectivePrincipal(
         agent_id=aid,
         workspace_id=str(raw.get("workspace_id", "default")),
