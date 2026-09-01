@@ -10,12 +10,14 @@ Design notes:
 - The pass NEVER performs the durable write itself. It returns decisions; the
   daemon applies promote/dedup/review via `_apply_consolidation_result` so the
   privileged write + embedding stay in one audited place (`minnid.py`).
-- Conservative: `privacy: safe` **and** learn-only `privacy: review` (the
-  stage_candidate clamp) are AFM-examinable. Unset/NULL privacy is still
-  parked (I1/I2). Instruction-like / duplicate / quality failures still
-  route to review + fence. An active fence hides the row from the next
-  drain so the loop makes progress. A one-shot unpark lifts fences only
-  on quality-pass, non-IL ``privacy=review`` rows.
+- Conservative: `privacy: safe` auto-promotes. Learn-only `privacy: review`
+  (the stage_candidate clamp) is AFM-examinable — quality / IL / dedup
+  still drain — but quality-pass review stays parked for
+  ``resolve_candidate``. Unset/NULL privacy is still parked (I1/I2).
+  Instruction-like / duplicate / quality failures still route to review +
+  fence. An active fence hides the row from the next drain so the loop
+  makes progress. A one-shot unpark lifts fences only on quality-pass,
+  non-IL ``privacy=review`` rows.
 - Swarm-scale:
     * Dedup is an INDEXED hash lookup (`content_hash`), not an O(N) in-memory
       scan of all learnings. Duplicate volume costs ~O(log N), so a swarm
@@ -44,8 +46,9 @@ logger = logging.getLogger("sovereign.afm.consolidation")
 # learnings without a review pass (I1/I2 security fix).
 _SAFE_PRIVACY = {"safe", "public", "low"}
 # Learn-only stage_candidate clamps non-operator rows to privacy=review.
-# That label means "AFM must filter", not "park forever behind afm_review".
-# Unset/NULL stays out of this set (I1/I2).
+# That label means "AFM must filter", not "park forever behind afm_review"
+# and not "auto-promote into learnings/writeback as safe". Unset/NULL
+# stays out of this set (I1/I2). Auto-promote still requires _SAFE_PRIVACY.
 _EXAMINABLE_PRIVACY = _SAFE_PRIVACY | {"review"}
 _MIN_CONTENT_LEN = 12
 _DEFAULT_MAX_PER_RUN = 50
@@ -309,6 +312,13 @@ def run(db, config, vault_path: Optional[str] = None,
         blockers = _quality_blockers(content)
         if blockers:
             _review(cand, "low quality: " + "; ".join(blockers))
+            continue
+
+        # Examinable ≠ auto-promotable. Learn-only review packets must
+        # stay parked for resolve_candidate; promote_candidate_durable
+        # has no privacy column and writeback/indexer default to safe.
+        if privacy not in _SAFE_PRIVACY:
+            _review(cand, f"privacy={privacy or 'unset'}")
             continue
 
         promote_candidate_ids.append(cand["candidate_id"])

@@ -11,6 +11,8 @@ drafts.
 The drain contract:
 
 * NEW unfenced ``privacy=review`` rows are examinable (Python gate).
+* Quality-pass review is routed to operator ``resolve_candidate``, not
+  auto-promoted into learnings/writeback (no privacy column; defaults safe).
 * An active fence hides the row from the next drain (SQL exclusion).
 * One-shot unpark lifts fences only on quality-pass, non-IL review rows.
 * Unset/NULL privacy stays parked (I1/I2).
@@ -147,7 +149,9 @@ FLEET_PRINCIPALS = (
 )
 
 
-def test_review_privacy_quality_pass_is_promoted_not_parked(tmp_path, monkeypatch):
+def test_review_privacy_quality_pass_is_examinable_not_auto_promoted(
+    tmp_path, monkeypatch
+):
     from minni.afm_passes.consolidation import run as consolidate
 
     monkeypatch.setenv("MINNI_AFM_MODE", "off")
@@ -156,8 +160,8 @@ def test_review_privacy_quality_pass_is_promoted_not_parked(tmp_path, monkeypatc
 
     result = consolidate(db, cfg, dry_run=True, trace_id="review-promote")
     assert result["summary"]["examined"] == 1
-    assert result["promote_candidate_ids"] == [cid]
-    assert result["review_candidate_ids"] == []
+    assert result["promote_candidate_ids"] == []
+    assert result["review_candidate_ids"] == [cid]
 
 
 def test_fenced_review_filler_second_tick_is_not_reexamined(tmp_path, monkeypatch):
@@ -314,12 +318,12 @@ def test_wet_quality_fail_review_does_not_livelock_or_remint_drafts(
     assert learnings == 1
 
 
-def test_unfenced_review_good_promotes_shared_writeback_not_agent_vault(
+def test_unfenced_review_good_writes_shared_review_draft_not_safe_learning(
     tmp_path, monkeypatch
 ):
-    """(c) Unfenced review + GOOD → learnings row, writeback under
-    cfg.writeback_path, wiki draft agent=afm-loop under cfg.vault_path,
-    never a sibling ``*-vault``.
+    """(c) Unfenced review + GOOD → operator review draft (agent=afm-loop
+    under cfg.vault_path), never a durable learning / writeback md (those
+    default privacy to safe) and never a sibling ``*-vault``.
     """
     from minni.afm_passes.consolidation import run as consolidate
     from minni.afm_writer import _write_one
@@ -343,7 +347,8 @@ def test_unfenced_review_good_promotes_shared_writeback_not_agent_vault(
     filler_id = _insert(db, content=FILLER, privacy_level="review")
 
     result = consolidate(db, cfg, dry_run=False, trace_id="review-shared")
-    assert result["promote_candidate_ids"] == [good_id]
+    assert result["promote_candidate_ids"] == []
+    assert good_id in result["review_candidate_ids"]
     assert filler_id in result["review_candidate_ids"]
     assert result["drafts"]
     assert all(draft.get("agent") == "afm-loop" for draft in result["drafts"])
@@ -359,14 +364,9 @@ def test_unfenced_review_good_promotes_shared_writeback_not_agent_vault(
             "SELECT status FROM candidate_packets WHERE candidate_id=?",
             (good_id,),
         ).fetchone()["status"]
-    assert learning is not None
-    assert learning["status"] == "active"
-    assert GOOD in learning["content"]
-    assert good_status == "accepted"
-
-    written = list(writeback_dir.glob("*.md"))
-    assert written, "promote must write under cfg.writeback_path"
-    assert all(p.is_relative_to(writeback_dir) for p in written)
+    assert learning is None
+    assert good_status == "proposed"
+    assert list(writeback_dir.glob("*.md")) == []
     assert not list(agent_vault.rglob("*")), "must not write a per-agent *-vault"
 
     written_draft = _write_one(Path(cfg.vault_path), result["drafts"][0])
@@ -435,7 +435,7 @@ def test_review_route_stamps_instruction_like_column(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("principal", FLEET_PRINCIPALS)
-def test_review_promote_is_the_same_for_every_fleet_host(
+def test_review_examine_is_the_same_for_every_fleet_host(
     principal, tmp_path, monkeypatch
 ):
     from minni.afm_passes.consolidation import run as consolidate
@@ -446,7 +446,8 @@ def test_review_promote_is_the_same_for_every_fleet_host(
 
     result = consolidate(db, cfg, dry_run=True, trace_id=f"fleet-{principal}")
     assert result["summary"]["examined"] == 1, principal
-    assert result["promote_candidate_ids"] == [cid], principal
+    assert result["promote_candidate_ids"] == [], principal
+    assert result["review_candidate_ids"] == [cid], principal
 
 
 def test_unset_privacy_still_goes_to_review(tmp_path, monkeypatch):
@@ -508,7 +509,8 @@ def test_unpark_review_privacy_lifts_only_quality_pass_rows(tmp_path, monkeypatc
     assert by_id[il_id]["status"] != "superseded"
 
     result = consolidate(db, cfg, dry_run=True, trace_id="post-review-unpark")
-    assert result["promote_candidate_ids"] == [good_id]
+    assert result["promote_candidate_ids"] == []
+    assert result["review_candidate_ids"] == [good_id]
     assert filler_id not in result["promote_candidate_ids"]
     assert il_id not in result["promote_candidate_ids"]
     assert result["summary"]["examined"] == 1
@@ -539,3 +541,121 @@ def test_unpark_review_privacy_does_not_touch_null_privacy(tmp_path, monkeypatch
         ).fetchone()
     assert row["privacy_level"] is None
     assert fence["status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "alias,canonical",
+    (("agy", "gemini"), ("antigravity", "gemini"), ("xai", "grok-build")),
+)
+def test_leftover_alias_principal_promotes_under_canonical_agent(
+    alias, canonical, tmp_path, monkeypatch
+):
+    """Leftover inbox packets keep principal='agy'/'xai' (ingest/repair do
+    not rewrite that column). Gemini/grok-build templates declare no aliases,
+    so copying cand['principal'] into learnings.agent_id fills a phantom
+    agent. Canonicalize on promote; leave the leftover packet column alone.
+    """
+    from minni.afm_passes.consolidation import run as consolidate
+    from minni.minnid_runtime.afm import apply_consolidation_result
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "off")
+    writeback_dir = tmp_path / "learnings"
+    writeback_dir.mkdir()
+    db, cfg = _make_db(
+        tmp_path, writeback_enabled=True, writeback_path=writeback_dir
+    )
+    cid = _insert(db, content=GOOD, privacy_level="safe", principal=alias)
+
+    result = consolidate(db, cfg, dry_run=False, trace_id=f"alias-{alias}")
+    assert result["promote_candidate_ids"] == [cid]
+
+    apply_consolidation_result(
+        result, _afm_context(db, cfg, _writeback_stub(db, cfg))
+    )
+
+    with db.cursor() as cursor:
+        learning = cursor.execute(
+            "SELECT agent_id, content FROM learnings"
+        ).fetchone()
+        packet = cursor.execute(
+            "SELECT principal FROM candidate_packets WHERE candidate_id=?",
+            (cid,),
+        ).fetchone()
+    assert learning is not None
+    assert learning["agent_id"] == canonical, learning["agent_id"]
+    assert GOOD in learning["content"]
+    assert packet["principal"] == alias
+
+    written = list(writeback_dir.glob("*.md"))
+    assert written, "promote must still write under cfg.writeback_path"
+    assert all(canonical in p.name for p in written)
+    assert all(alias not in p.name for p in written)
+
+
+def test_learn_only_review_quality_pass_does_not_auto_promote_safe_memory(
+    tmp_path, monkeypatch
+):
+    """Learn-only stage_candidate clamps privacy to review so the writer
+    cannot self-mark auto-promotable rows. Examinable is the drain/filter
+    label, not a license to INSERT learnings (no privacy column) or
+    writeback markdown whose documents.privacy_level is hardcoded 'safe'.
+    Quality-pass review stays proposed for resolve_candidate.
+    """
+    from minni.afm_passes.consolidation import run as consolidate
+    from minni.minnid_runtime.afm import (
+        apply_consolidation_result,
+        promote_candidate_durable,
+    )
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "off")
+    writeback_dir = tmp_path / "learnings"
+    writeback_dir.mkdir()
+    db, cfg = _make_db(
+        tmp_path, writeback_enabled=True, writeback_path=writeback_dir
+    )
+    secret = (
+        "Production API token rotation lives in the vault under ops/secrets.md."
+    )
+    cid = _insert(db, content=secret, privacy_level="review")
+
+    result = consolidate(db, cfg, dry_run=False, trace_id="review-no-promote")
+    assert result["summary"]["examined"] == 1
+    assert result["promote_candidate_ids"] == []
+    assert result["review_candidate_ids"] == [cid]
+
+    ctx = _afm_context(db, cfg, _writeback_stub(db, cfg))
+    apply_consolidation_result(result, ctx)
+
+    with db.cursor() as cursor:
+        row = cursor.execute(
+            "SELECT status, privacy_level FROM candidate_packets "
+            "WHERE candidate_id=?",
+            (cid,),
+        ).fetchone()
+        learnings = cursor.execute(
+            "SELECT COUNT(*) AS n FROM learnings"
+        ).fetchone()["n"]
+        fence = cursor.execute(
+            """
+            SELECT 1 FROM consolidation_actions
+            WHERE action_type='afm_review' AND claim=?
+              AND COALESCE(status, '') != 'superseded'
+            """,
+            (str(cid),),
+        ).fetchone()
+    assert row["status"] == "proposed"
+    assert row["privacy_level"] == "review"
+    assert learnings == 0
+    assert fence is not None
+    assert list(writeback_dir.glob("*.md")) == []
+
+    # Direct promote (the apply path) must also refuse a review packet.
+    assert promote_candidate_durable(cid, "afm-consolidation", ctx) is None
+    with db.cursor() as cursor:
+        assert cursor.execute(
+            "SELECT COUNT(*) AS n FROM learnings"
+        ).fetchone()["n"] == 0
+        assert cursor.execute(
+            "SELECT status FROM candidate_packets WHERE candidate_id=?",
+            (cid,),
+        ).fetchone()["status"] == "proposed"

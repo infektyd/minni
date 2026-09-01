@@ -251,7 +251,39 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
             candidate_id,
         )
         return None
-    agent_id = cand.get("principal") or "afm-loop"
+    from minni.afm_passes.consolidation import _SAFE_PRIVACY, content_hash as _content_hash
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
+    privacy = (cand.get("privacy_level") or "").strip().lower()
+    if privacy not in _SAFE_PRIVACY:
+        now = time.time()
+        with wb.db.transaction() as c:
+            c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+            chk = c.fetchone()
+            if not chk or chk["status"] != "proposed":
+                return None
+            c.execute(
+                """SELECT 1 FROM consolidation_actions
+                   WHERE action_type='afm_review' AND claim=?
+                     AND COALESCE(status, '') != 'superseded' LIMIT 1""",
+                (str(candidate_id),),
+            )
+            if not c.fetchone():
+                c.execute(
+                    """
+                    INSERT INTO consolidation_actions
+                    (action_type, claim, category, status, detail, created_at)
+                    VALUES ('afm_review', ?, 'general', 'pending', ?, ?)
+                    """,
+                    (str(candidate_id), f"{reason[:450]}: privacy={privacy or 'unset'}", now),
+                )
+        context.logger.warning(
+            "AFM consolidation refused auto-promote of candidate #%d privacy=%s",
+            candidate_id,
+            privacy or "unset",
+        )
+        return None
+    agent_id = _canonical_principal(cand.get("principal") or "afm-loop")
     try:
         validate_agent_id(agent_id)
     except ValueError as exc:
@@ -261,7 +293,6 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
             exc,
         )
         return None
-    from minni.afm_passes.consolidation import content_hash as _content_hash
 
     chash = _content_hash(content)
 

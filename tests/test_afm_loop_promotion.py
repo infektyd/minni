@@ -383,11 +383,14 @@ def test_main_learn_only_stage_candidate_clamps_safe_privacy(monkeypatch, tmp_pa
     assert resp["result"]["privacy_level"] == "review"
 
 
-def test_afm_loop_promotes_learn_only_clamped_quality_pass(tmp_path, monkeypatch):
+def test_afm_loop_does_not_promote_learn_only_clamped_quality_pass(
+    tmp_path, monkeypatch
+):
     """Learn-only stage clamps privacy=safe → review; AFM then filters.
 
-    Quality-pass review rows promote. The clamp is the AFM-filter label, not
-    a permanent park. (I1/I2 NULL privacy still holds elsewhere.)
+    Quality-pass review rows stay proposed for resolve_candidate. The clamp
+    is the AFM-filter label, not a license to write durable/safe memory.
+    (I1/I2 NULL privacy still holds elsewhere.)
     """
     import types
 
@@ -428,6 +431,11 @@ def test_afm_loop_promotes_learn_only_clamped_quality_pass(tmp_path, monkeypatch
         c.execute("SELECT status, privacy_level FROM candidate_packets WHERE candidate_id=?", (cid,))
         row = dict(c.fetchone())
         assert row["privacy_level"] == "review"
-        assert row["status"] == "accepted"
+        assert row["status"] == "proposed"
         c.execute("SELECT COUNT(*) AS n FROM learnings")
-        assert c.fetchone()["n"] == 1
+        assert c.fetchone()["n"] == 0
+        c.execute(
+            "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=?",
+            (str(cid),),
+        )
+        assert c.fetchone() is not None
