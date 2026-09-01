@@ -38,6 +38,7 @@ from minni.afm_passes.inbox_ingest import (
     _canonical_principal,
     _content_sha1,
     _is_stop_candidate_shape,
+    _principal_family,
     _principal_for_inbox,
     discover_inboxes,
     is_audit_echo,
@@ -129,15 +130,22 @@ def _rows_for_inbox_file(
     ``derived_from``. When ``principal`` is set, only that agent's rows
     count — principal-scoped ingest can create same-basename peers in other
     vaults; archive must not treat those as open siblings of this inbox.
+
+    Alias family is expanded so leftover ``agy``/``xai`` rows still count as
+    siblings of remapped ``gemini``/``grok-build`` fills (and vice versa).
+    Exact ``principal = owner`` hid those twins after alias collapse.
     """
     like = f'%"inbox_file": "{inbox_file}"%'
     with db.cursor() as c:
         if principal is not None:
+            family = _principal_family(principal)
+            placeholders = ",".join("?" for _ in family)
             c.execute(
                 "SELECT principal, status, content, derived_from "
                 "FROM candidate_packets "
-                "WHERE COALESCE(principal, '') = ? AND derived_from LIKE ?",
-                (str(principal), like),
+                f"WHERE COALESCE(principal, '') IN ({placeholders}) "
+                "AND derived_from LIKE ?",
+                (*family, like),
             )
         else:
             c.execute(
@@ -251,7 +259,9 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
         return None
     # Scope siblings to the resolved candidate's principal so multi-vault
     # same-basename peers (allowed by principal-scoped ingest) do not block
-    # archive of a fully-terminal agent vault copy.
+    # archive of a fully-terminal agent vault copy. Compare the alias family
+    # (agy↔gemini, xai↔grok-build): leftover rows keep the raw principal while
+    # ``_principal_for_inbox`` returns the canonical vault owner.
     owner_principal = str(row["principal"] or "")
     rows = _rows_for_inbox_file(db, inbox_file, principal=owner_principal)
     if not rows:
@@ -260,11 +270,11 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     # Content-matching alone is insufficient: byte-identical candidates under
     # the same basename in another vault would otherwise archive the wrong
     # agent's still-live file when discover order visits them first.
-    from minni.afm_passes.inbox_ingest import _principal_for_inbox
+    owner_canon = _canonical_principal(owner_principal)
 
     for inbox in discover_inboxes(config):
         inbox_owner = _principal_for_inbox(inbox, fallback_principal="unknown")
-        if str(inbox_owner or "") != owner_principal:
+        if _canonical_principal(inbox_owner or "") != owner_canon:
             continue
         source = inbox / inbox_file
         try:

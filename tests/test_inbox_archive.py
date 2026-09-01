@@ -11,7 +11,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from test_inbox_ingest import _make_db, _stop_doc, _write_inbox_file
+from test_inbox_ingest import (  # noqa: E402
+    _cc_stop_doc,
+    _make_db,
+    _seed_inbox_packet,
+    _stop_doc,
+    _write_inbox_file,
+)
 
 
 def _set_status(db_obj, status, principal="codex"):
@@ -572,3 +578,96 @@ def test_identical_cross_vault_archives_only_owner(tmp_path, monkeypatch):
     assert archived == str(inbox_b / ".archive" / "same.json")
     assert not (inbox_b / "same.json").exists()
     assert (inbox_a / "same.json").is_file(), "peer vault must stay live while proposed"
+
+
+_ALIAS_VAULT_CASES = (
+    ("agy-vault", "agy", "gemini"),
+    ("xai-vault", "xai", "grok-build"),
+)
+
+
+def test_leftover_alias_principal_archives_vault_file(tmp_path, monkeypatch):
+    """After alias collapse, agy-vault/xai-vault owners are gemini/grok-build
+    while leftover rows stay agy/xai. Archive must still close the source file
+    when that leftover is accepted — exact principal == inbox_owner misses it.
+    """
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    for vault_dir, leftover, _canonical in _ALIAS_VAULT_CASES:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"durable leftover fill from {leftover}"
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=content,
+        )
+        inbox = home / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([content]))
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' WHERE principal=?",
+                (leftover,),
+            )
+            c.execute(
+                "SELECT candidate_id FROM candidate_packets WHERE principal=?",
+                (leftover,),
+            )
+            cid = dict(c.fetchone())["candidate_id"]
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        assert archived is not None, vault_dir
+        assert not (inbox / "session.json").exists(), vault_dir
+        assert (inbox / ".archive" / "session.json").is_file(), vault_dir
+
+
+def test_canonical_resolution_sees_leftover_alias_proposed_twin(
+    tmp_path, monkeypatch
+):
+    """Exact-match sibling load hides leftover proposed twins when a
+    canonical-principal row resolves, so the file archives while leftover
+    qty is still proposed (second fill on the next consolidation tick).
+    """
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    for vault_dir, leftover, canonical in _ALIAS_VAULT_CASES:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"shared fill {leftover} and {canonical}"
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=content,
+        )
+        _seed_inbox_packet(
+            db_obj,
+            principal=canonical,
+            inbox_file="session.json",
+            content=content,
+        )
+        inbox = home / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([content]))
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' WHERE principal=?",
+                (canonical,),
+            )
+            c.execute(
+                "SELECT candidate_id FROM candidate_packets WHERE principal=?",
+                (canonical,),
+            )
+            cid = dict(c.fetchone())["candidate_id"]
+        assert maybe_archive_for_candidate(db_obj, cfg, cid) is None, vault_dir
+        assert (inbox / "session.json").is_file(), vault_dir
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' WHERE principal=?",
+                (leftover,),
+            )
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        assert archived is not None, vault_dir
+        assert not (inbox / "session.json").exists(), vault_dir
+        assert (inbox / ".archive" / "session.json").is_file(), vault_dir
