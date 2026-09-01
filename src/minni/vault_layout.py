@@ -12,8 +12,12 @@ path. Do not route learnings into hermes-vault.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Union
+
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
 
 CONTRACT_DIRS = (
     "wiki",
@@ -51,35 +55,73 @@ def ensure_agent_vault(vault: Union[str, Path]) -> List[str]:
         )
     if not root.is_dir():
         return []
+    try:
+        root_real = root.resolve()
+    except OSError as exc:
+        raise OSError(f"vault root is not resolvable: {root}") from exc
     created: List[str] = []
     for rel in CONTRACT_DIRS:
         dest = root / rel
+        _reject_symlink_or_escape(dest, root_real, rel)
         if dest.exists():
             if not dest.is_dir():
                 raise NotADirectoryError(
                     f"vault contract {rel!r} exists and is not a directory: {dest}"
                 )
             continue
-        dest.mkdir(parents=True, exist_ok=True)
+        dest.mkdir(parents=True, exist_ok=True, mode=_DIR_MODE)
+        os.chmod(dest, _DIR_MODE)
         created.append(rel)
     for rel, header in (("log.md", _LOG_HEADER), ("index.md", _INDEX_HEADER)):
         dest = root / rel
+        _reject_symlink_or_escape(dest, root_real, rel)
         if dest.exists():
             _require_regular_contract_file(dest, rel)
             continue
-        try:
-            # Exclusive create: exists()+write_text races plugin ensureVault/
-            # recordAudit and can truncate append-only log.md / index.md.
-            with dest.open("x", encoding="utf-8") as fh:
-                fh.write(header)
-        except FileExistsError:
+        if _seed_exclusive_file(dest, header):
+            created.append(rel)
+        else:
             _require_regular_contract_file(dest, rel)
-            continue
-        created.append(rel)
     return created
 
 
+def _reject_symlink_or_escape(dest: Path, root_real: Path, rel: str) -> None:
+    if dest.is_symlink():
+        raise OSError(
+            f"vault contract {rel!r} is a symlink; refusing to seed through it: {dest}"
+        )
+    try:
+        dest_real = dest.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise OSError(f"vault contract {rel!r} is not resolvable: {dest}") from exc
+    if not dest_real.is_relative_to(root_real):
+        raise OSError(
+            f"vault contract {rel!r} resolves outside vault root: {dest}"
+        )
+
+
+def _seed_exclusive_file(dest: Path, header: str) -> bool:
+    """O_EXCL create at 0600. Do not write at offset 0 if another writer appended."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
+    try:
+        fd = os.open(dest, flags, _FILE_MODE)
+    except FileExistsError:
+        return False
+    try:
+        os.fchmod(fd, _FILE_MODE)
+        if os.fstat(fd).st_size > 0:
+            return False
+        os.write(fd, header.encode("utf-8"))
+        return True
+    finally:
+        os.close(fd)
+
+
 def _require_regular_contract_file(dest: Path, rel: str) -> None:
+    if dest.is_symlink():
+        raise OSError(
+            f"vault contract {rel!r} is a symlink; refusing to seed through it: {dest}"
+        )
     if dest.is_dir():
         raise IsADirectoryError(
             f"vault contract {rel!r} exists and is a directory: {dest}"

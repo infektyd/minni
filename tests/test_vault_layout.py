@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
+
+import pytest
 
 from minni.vault_layout import ensure_agent_vault
 
@@ -51,3 +55,104 @@ def test_ensure_agent_vault_exclusive_create_does_not_clobber_raced_append(
     assert (vault / "index.md").read_text(encoding="utf-8") == _PLUGIN_INDEX
     assert "log.md" not in created
     assert "index.md" not in created
+
+
+_RACE_AUDIT = (
+    "## [2026-09-01T00:00:00Z] plugin | audit | unique-payload-do-not-clobber\n\n"
+)
+_RACE_INDEX = "- [[wiki/entities/peer]] unique-index-do-not-clobber\n"
+
+
+def test_ensure_agent_vault_does_not_clobber_append_after_exclusive_create(
+    tmp_path, monkeypatch
+):
+    """open('x') only excludes a pre-existing path; the fd is then written at 0.
+
+    Plugin recordAudit can append after O_EXCL create and before the stub
+    header write. Writing the header at offset 0 would overwrite the start of
+    the audit entry. Treat a non-empty exclusive fd as already owned.
+    """
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    orig_os_open = os.open
+    orig_path_open = Path.open
+
+    def append_after_create(path) -> None:
+        try:
+            name = Path(os.fsdecode(path)).name
+        except (TypeError, ValueError, OSError):
+            return
+        if name not in {"log.md", "index.md"}:
+            return
+        payload = _RACE_AUDIT if name == "log.md" else _RACE_INDEX
+        extra = orig_os_open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(extra, payload.encode("utf-8"))
+        finally:
+            os.close(extra)
+
+    def racing_os_open(path, flags, *args, **kwargs):
+        fd = orig_os_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL:
+            append_after_create(path)
+        return fd
+
+    def racing_path_open(self, *args, **kwargs):
+        fh = orig_path_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if "x" in str(mode):
+            append_after_create(self)
+        return fh
+
+    monkeypatch.setattr(os, "open", racing_os_open)
+    monkeypatch.setattr(Path, "open", racing_path_open)
+    created = ensure_agent_vault(vault)
+    log_text = (vault / "log.md").read_text(encoding="utf-8")
+    index_text = (vault / "index.md").read_text(encoding="utf-8")
+    assert _RACE_AUDIT in log_text
+    assert _RACE_INDEX in index_text
+    assert "log.md" not in created
+    assert "index.md" not in created
+
+
+def test_ensure_agent_vault_created_paths_are_owner_only(tmp_path):
+    """Seeded wiki/inbox/log.md must be 0700/0600; umask is not the boundary."""
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    old_umask = os.umask(0)
+    try:
+        ensure_agent_vault(vault)
+    finally:
+        os.umask(old_umask)
+    for rel in ("wiki", "wiki/sessions", "inbox", "outbox", "logs"):
+        mode = stat.S_IMODE((vault / rel).stat().st_mode)
+        assert mode == 0o700, f"{rel} mode {oct(mode)}"
+    for rel in ("log.md", "index.md"):
+        mode = stat.S_IMODE((vault / rel).stat().st_mode)
+        assert mode == 0o600, f"{rel} mode {oct(mode)}"
+
+
+def test_ensure_agent_vault_refuses_symlink_wiki_into_shop_restore(tmp_path):
+    """Contract-dir mkdir must not follow wiki → shop/backup/peer trees."""
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "wiki").symlink_to(shop)
+    with pytest.raises(OSError):
+        ensure_agent_vault(vault)
+    assert not (shop / "entities").exists()
+    assert not (shop / "sessions").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_ensure_agent_vault_refuses_symlink_inbox_into_peer_vault(tmp_path):
+    vault = tmp_path / "hermes-vault"
+    peer = tmp_path / "codex-vault"
+    vault.mkdir()
+    peer.mkdir()
+    (vault / "inbox").symlink_to(peer)
+    with pytest.raises(OSError):
+        ensure_agent_vault(vault)
+    assert list(peer.iterdir()) == []
