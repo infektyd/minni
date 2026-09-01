@@ -69,6 +69,26 @@ test("ensureVault does not wipe a raced log.md seed", async () => {
   }
 });
 
+test("ensureVault refuses hermes-vault dir symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await writeFile(path.join(shop, "keep.md"), "restore\n", "utf8");
+    await symlink(shop, vault);
+    await assert.rejects(
+      () => ensureVault(vault),
+      /refusing symlinked vault root/,
+    );
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+    assert.equal(await readFile(path.join(shop, "keep.md"), "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-prime-"));
   try {

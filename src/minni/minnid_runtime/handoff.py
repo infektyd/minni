@@ -72,6 +72,8 @@ def agent_vault(agent_id: str) -> tuple[Path, bool]:
 def ensure_handoff_vault(vault_path: Path) -> None:
     from minni.vault_layout import _INDEX_HEADER, _LOG_HEADER, _seed_exclusive_file
 
+    if vault_path.is_symlink():
+        raise OSError(f"refusing symlinked vault root: {vault_path}")
     for rel in (
         "raw",
         "wiki",

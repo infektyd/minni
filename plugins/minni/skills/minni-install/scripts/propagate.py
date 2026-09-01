@@ -1811,6 +1811,23 @@ def seed_distill(vault: Path, agent: str) -> dict[str, object]:
     return result
 
 
+def _seed_exclusive_file(dest: Path, header: str) -> bool:
+    """O_EXCL create at 0600. Do not write at offset 0 if another writer appended."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
+    try:
+        fd = os.open(dest, flags, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        os.fchmod(fd, 0o600)
+        if os.fstat(fd).st_size > 0:
+            return False
+        os.write(fd, header.encode("utf-8"))
+        return True
+    finally:
+        os.close(fd)
+
+
 def bootstrap_vault(args: argparse.Namespace) -> int:
     agent = args.agent
     vault = vault_for(agent)
@@ -1830,12 +1847,8 @@ def bootstrap_vault(args: argparse.Namespace) -> int:
             "another agent's logs, inbox, or wiki wholesale.\n",
             encoding="utf-8",
         )
-    index = vault / "index.md"
-    if not index.exists():
-        index.write_text(f"# {agent} Vault Index\n\n", encoding="utf-8")
-    log = vault / "log.md"
-    if not log.exists():
-        log.write_text(f"# {agent} Vault Log\n\n", encoding="utf-8")
+    _seed_exclusive_file(vault / "index.md", f"# {agent} Vault Index\n\n")
+    _seed_exclusive_file(vault / "log.md", f"# {agent} Vault Log\n\n")
     # Layer 1 first: seed_distill reports whether layer1/core.md exists, and the
     # gauges must read "present" on a freshly bootstrapped vault.
     layer1 = seed_layer1(vault, agent, getattr(args, "workspace", None))

@@ -694,12 +694,10 @@ def bootstrap_vault(agent: str) -> Path:
             "This is an actual per-agent vault directory.\n",
             encoding="utf-8",
         )
-    index = vault / "index.md"
-    if not index.exists():
-        index.write_text(f"# {agent} Vault Index\n\n", encoding="utf-8")
-    log = vault / "log.md"
-    if not log.exists():
-        log.write_text(f"# {agent} Vault Log\n\n", encoding="utf-8")
+    from minni.vault_layout import _seed_exclusive_file
+
+    _seed_exclusive_file(vault / "index.md", f"# {agent} Vault Index\n\n")
+    _seed_exclusive_file(vault / "log.md", f"# {agent} Vault Log\n\n")
     return vault
 
 

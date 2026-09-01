@@ -247,3 +247,122 @@ def test_afm_ensure_vault_does_not_clobber_append_after_exclusive_create(
     index_text = (vault / "index.md").read_text(encoding="utf-8")
     assert _RACE_AUDIT in log_text
     assert _RACE_INDEX in index_text
+
+
+def _shop_restore_symlink_root(tmp_path: Path) -> tuple[Path, Path]:
+    shop = tmp_path / "shop-restore"
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    vault = tmp_path / "hermes-vault"
+    vault.symlink_to(shop)
+    return vault, shop
+
+
+def _assert_shop_unplanted(shop: Path) -> None:
+    assert not (shop / "wiki").exists()
+    assert not (shop / "inbox").exists()
+    assert not (shop / "log.md").exists()
+    assert not (shop / "index.md").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_afm_ensure_vault_refuses_symlink_root_into_shop_restore(tmp_path):
+    """Peer AFM mkdir must not follow hermes-vault → shop-restore."""
+    from minni.afm_writer import _ensure_vault
+
+    vault, shop = _shop_restore_symlink_root(tmp_path)
+    with pytest.raises(OSError, match="symlinked vault root"):
+        _ensure_vault(vault)
+    _assert_shop_unplanted(shop)
+
+
+def test_handoff_ensure_vault_refuses_symlink_root_into_shop_restore(tmp_path):
+    """Peer handoff mkdir must not follow hermes-vault → shop-restore."""
+    from minni.minnid_runtime.handoff import ensure_handoff_vault
+
+    vault, shop = _shop_restore_symlink_root(tmp_path)
+    with pytest.raises(OSError, match="symlinked vault root"):
+        ensure_handoff_vault(vault)
+    _assert_shop_unplanted(shop)
+
+
+def test_afm_append_audit_refuses_symlink_root_into_shop_restore(tmp_path):
+    from minni.afm_writer import _append_audit
+
+    vault, shop = _shop_restore_symlink_root(tmp_path)
+    with pytest.raises(OSError, match="symlinked vault root"):
+        _append_audit(vault, "afm_loop", "wrote draft", {"k": "v"})
+    _assert_shop_unplanted(shop)
+
+
+def test_afm_append_audit_does_not_truncate_when_exists_lies(tmp_path, monkeypatch):
+    """Leftover exists()+write_text after exclusive ensure must not wipe log.md."""
+    from minni.afm_writer import _append_audit
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
+    orig_exists = Path.exists
+
+    def lying_exists(self: Path) -> bool:
+        if self == vault / "log.md":
+            return False
+        return orig_exists(self)
+
+    monkeypatch.setattr(Path, "exists", lying_exists)
+    _append_audit(vault, "afm_loop", "wrote draft", {"k": "v"})
+    text = (vault / "log.md").read_text(encoding="utf-8")
+    assert _PLUGIN_LOG in text
+    assert "wrote draft" in text
+
+
+def test_wire_bootstrap_vault_preserves_existing_log_and_index(tmp_path, monkeypatch):
+    from minni.wire.writers import bootstrap_vault
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault = tmp_path / ".minni" / "hermes-vault"
+    vault.mkdir(parents=True)
+    (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
+    (vault / "index.md").write_text(_PLUGIN_INDEX, encoding="utf-8")
+    bootstrap_vault("hermes")
+    assert (vault / "log.md").read_text(encoding="utf-8") == _PLUGIN_LOG
+    assert (vault / "index.md").read_text(encoding="utf-8") == _PLUGIN_INDEX
+
+
+def test_wire_bootstrap_vault_does_not_clobber_append_after_exclusive_create(
+    tmp_path, monkeypatch
+):
+    from minni.wire.writers import bootstrap_vault
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault = tmp_path / ".minni" / "hermes-vault"
+    vault.mkdir(parents=True)
+    orig_os_open = os.open
+
+    def append_after_create(path) -> None:
+        try:
+            name = Path(os.fsdecode(path)).name
+        except (TypeError, ValueError, OSError):
+            return
+        if name not in {"log.md", "index.md"}:
+            return
+        payload = _RACE_AUDIT if name == "log.md" else _RACE_INDEX
+        extra = orig_os_open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(extra, payload.encode("utf-8"))
+        finally:
+            os.close(extra)
+
+    def racing_os_open(path, flags, *args, **kwargs):
+        fd = orig_os_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL:
+            append_after_create(path)
+        return fd
+
+    monkeypatch.setattr(os, "open", racing_os_open)
+    bootstrap_vault("hermes")
+    log_text = (vault / "log.md").read_text(encoding="utf-8")
+    index_text = (vault / "index.md").read_text(encoding="utf-8")
+    assert _RACE_AUDIT in log_text
+    assert _RACE_INDEX in index_text

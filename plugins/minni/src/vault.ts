@@ -1,6 +1,7 @@
 import {
   access,
   appendFile,
+  lstat,
   mkdir,
   readFile,
   readdir,
@@ -862,6 +863,16 @@ export async function ensureVault(
   vaultPath: string,
 ): Promise<EnsureVaultResult> {
   const created: string[] = [];
+  try {
+    const st = await lstat(vaultPath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`refusing symlinked vault root: ${vaultPath}`);
+    }
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
+  }
   await mkdir(vaultPath, { recursive: true });
   for (const dir of VAULT_DIRS) {
     const full = path.join(vaultPath, dir);
