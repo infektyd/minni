@@ -98,16 +98,20 @@ Load-bearing details:
 |---|---|---|---|
 | Claude Code | `allow` `deny` `ask` `defer` | all tools | Yes — native Claude protocol + shared guard |
 | Codex | `allow` `deny` `ask` (**no `defer`**) | ⚠️ **Bash only** | No for Grep/Read/Glob — registration ≠ cold-file deny |
-| Grok Build | `allow` `deny` | broad (matcher aliases `Read`→`read_file` etc.) | Yes — `grok-adapter.ts` maps camelCase + natives; `{decision,reason}` out |
-| Cursor | `allow` `deny` `ask` (`ask` unenforced on `preToolUse`) | broad | Yes — Cursor adapters |
+| Grok Build | `allow` `deny` | broad (matcher aliases `Read`→`read_file` etc.) | **PARTIAL** — host deny-capable. `grok-adapter.ts` maps camelCase + natives and `{decision,reason}` out (capability, not liveness). Host deny ≠ Minni s6 liveness. UPS/SS stdout ignored (`GROK_INJECTABLE={Stop}`), so dropped UPS does not plant `consumed=false`; leftover false is cleared even on daemon timeout. PreToolUse allows immediately when UPS cannot inject, so a leftover file cannot deny. |
+| Cursor | `allow` `deny` `ask` (`ask` unenforced on `preToolUse`) | broad | **PARTIAL** — host deny-capable (Cursor adapters). Host deny ≠ Minni s6 liveness. UPS inject dropped (`CURSOR_INJECTABLE={SessionStart}`; `beforeSubmitPrompt` has no inject channel); leftover false is cleared; PreToolUse allows immediately so a leftover file cannot deny. |
 | agy | `allow` `deny` `ask` `force_ask` — **rejects `approve`/`block`** | broad | Yes — `gemini-adapter.ts` |
 | Kilocode | throw from `tool.execute.before`, or `permission.ask` → `ask\|deny\|allow` | broad | Yes — bridge plugin |
 
 **Recall-guard consequence:** the guard gates `Read`/`Grep`/`Glob` (and Grok
-natives / shell under strict). Host **deny capability** is necessary but not
-sufficient: Codex's PreToolUse intercepts Bash only, so the guard **cannot**
-gate cold-file tools there even though deny exists. Minni-adapter-complete
-hosts for live s6 cold-tool guard: Claude Code, Cursor, agy, Kilo, Grok Build.
+natives / shell under strict) only when UPS actually delivered the envelope.
+Host **deny capability** is necessary but not sufficient: Codex's PreToolUse
+intercepts Bash only, so the guard **cannot** gate cold-file tools there even
+though deny exists. Grok Build and Cursor are the other side of the same split
+— adapters map tools, but dropped UPS inject means leftover `consumed=false`
+cannot deny (do not expand `GROK_INJECTABLE` to fake liveness). Live s6
+cold-tool guard: Claude Code, agy, Kilo. Grok/Cursor remain PARTIAL until UPS
+(or equivalent) delivers the envelope.
 
 ## Stop payload — the field that exists nowhere
 
