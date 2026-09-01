@@ -703,6 +703,45 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
         assert dict(c.fetchone())["n"] == 1
 
 
+def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
+    """agy/gemini (and xai/grok-build) are one agent: same file+index is a dual.
+
+    Slug aliases remap the vault-derived principal, so leftover agy/xai rows
+    plus a remapped gemini/grok-build insert share one fill and must collapse.
+    """
+    from minni.repair_dual_candidates import (
+        find_app_key_collisions,
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    content = "alias dual lesson about inbox uniqueness"
+    agy_id = _insert_candidate(
+        db, content=content, status="proposed", principal="agy"
+    )
+    gemini_id = _insert_candidate(
+        db, content=content, status="proposed", principal="gemini"
+    )
+
+    collisions = find_app_key_collisions(db)
+    assert len(collisions) == 1, collisions
+    assert collisions[0]["row_count"] == 2
+    assert set(collisions[0]["candidate_ids"]) == {agy_id, gemini_id}
+    assert collisions[0]["key"]["principal"] == "gemini"
+
+    groups = find_duplicate_candidate_groups(db)
+    assert len(groups) == 1
+    assert groups[0]["row_count"] == 2
+    applied = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert applied["deleted"] == 1
+    with db.cursor() as c:
+        c.execute("SELECT candidate_id, principal FROM candidate_packets")
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["candidate_id"] == min(agy_id, gemini_id)
+
+
 def test_ingest_allows_same_basename_under_other_principal(tmp_path):
     """Principal-scoped key: multi-vault same basename is legitimate.
 

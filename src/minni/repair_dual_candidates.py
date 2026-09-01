@@ -139,12 +139,16 @@ def _inbox_key(
 
     Matches ``inbox_ingest`` / ``compact_distillation`` principal-scoped
     idempotency. Same basename in two agent vaults is not a dual.
+    Vault-slug aliases (``agy``→``gemini``, ``xai``→``grok-build``) collapse
+    to the canonical id so a remap is the same fill, not a new key.
     ``content_sha1`` is not part of the app key.
     """
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
     fi = _file_index_key(derived)
     if fi is None:
         return None
-    return (str(principal or ""), fi[0], fi[1])
+    return (_canonical_principal(principal), fi[0], fi[1])
 
 
 def _content_sha1_of(derived: Dict[str, Any]) -> Optional[str]:
@@ -590,28 +594,34 @@ def _load_collapse_group_on_cursor(
 ) -> List[Dict[str, Any]]:
     """Re-read byte-identical twins for one collapse key under an open txn.
 
-    Always scopes by principal (including empty-string principal) so a
-    same-basename peer under another agent cannot be hard-deleted.
+    Always scopes by principal family (canonical id plus vault-slug aliases)
+    so a leftover ``agy``/``xai`` twin of a remapped ``gemini``/``grok-build``
+    row is the same fill. A same-basename peer under another agent still
+    cannot be hard-deleted.
     """
+    from minni.afm_passes.inbox_ingest import _principal_family
+
     principal = str(key.get("principal") or "")
     inbox_file = key.get("inbox_file")
     candidate_index = key.get("candidate_index")
     content_sha1 = key.get("content_sha1")
     if not isinstance(inbox_file, str) or candidate_index is None:
         return []
+    family = _principal_family(principal)
+    placeholders = ",".join("?" for _ in family)
     # COALESCE so empty-string principal matches rows with '' or NULL.
     c.execute(
-        """
+        f"""
         SELECT candidate_id, principal, status, content, derived_from,
                proposed_at, resolved_at, resolved_by, resolution_reason
         FROM candidate_packets
-        WHERE COALESCE(principal, '') = ?
+        WHERE COALESCE(principal, '') IN ({placeholders})
           AND derived_from IS NOT NULL
           AND json_extract(derived_from, '$.source') = 'inbox'
           AND json_extract(derived_from, '$.inbox_file') = ?
           AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
         """,
-        (principal, inbox_file, int(candidate_index)),
+        (*family, inbox_file, int(candidate_index)),
     )
     want_sha = (
         content_sha1.strip().lower()

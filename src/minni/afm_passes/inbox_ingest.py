@@ -237,8 +237,12 @@ def _make_inbox_key(
     by ``principal`` (derived from ``<agent>-vault/inbox``) prevents those
     twins without blocking legitimate same-basename files in other vaults
     (see ``test_cross_vault_live_sibling_does_not_block_other_vaults_copy``).
+
+    Vault-slug aliases (``agy``/``antigravity`` → ``gemini``, ``xai`` →
+    ``grok-build``) collapse to the canonical id so a remap is a merge of
+    the old row, not a new UNIQUE key.
     """
-    return (str(principal or ""), inbox_file, int(candidate_index))
+    return (_canonical_principal(principal), inbox_file, int(candidate_index))
 
 
 def _parse_inbox_key(
@@ -258,15 +262,20 @@ def _existing_keys(db, principals: set | None = None) -> set:
     Status-agnostic so re-runs are no-ops after resolution.
 
     ``principals`` optionally restricts the scan (compact_distillation per-inbox).
+    Alias family is expanded so leftover ``agy``/``xai`` rows still block a
+    remapped ``gemini``/``grok-build`` insert of the same inbox fill.
     """
     keys: set = set()
     with db.cursor() as c:
         if principals:
-            placeholders = ",".join("?" for _ in principals)
+            expanded: set[str] = set()
+            for p in principals:
+                expanded.update(_principal_family(p))
+            placeholders = ",".join("?" for _ in expanded)
             c.execute(
                 f"SELECT principal, derived_from FROM candidate_packets "
                 f"WHERE principal IN ({placeholders})",
-                tuple(principals),
+                tuple(expanded),
             )
         else:
             c.execute("SELECT principal, derived_from FROM candidate_packets")
@@ -297,15 +306,17 @@ def _existing_keys_for_on_cursor(c, wanted: set) -> set:
         by_scope.setdefault((principal, inbox_file), set()).add(idx)
     found: set = set()
     for (principal, inbox_file), indices in by_scope.items():
+        family = _principal_family(principal)
+        placeholders = ",".join("?" for _ in family)
         c.execute(
-            """
+            f"""
             SELECT principal, derived_from FROM candidate_packets
-            WHERE principal = ?
+            WHERE principal IN ({placeholders})
               AND derived_from IS NOT NULL
               AND json_extract(derived_from, '$.source') = 'inbox'
               AND json_extract(derived_from, '$.inbox_file') = ?
             """,
-            (principal, inbox_file),
+            (*family, inbox_file),
         )
         for row in c.fetchall():
             if isinstance(row, dict) or hasattr(row, "keys"):
@@ -366,6 +377,33 @@ _VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
     "grok": "grok-build",
     "xai": "grok-build",
 }
+
+
+def _canonical_principal(principal: Any) -> str:
+    """Map a vault slug / leftover packet principal onto its canonical id.
+
+    ``agy``/``antigravity`` → ``gemini``; ``xai``/``grok``/``grok-beta`` →
+    ``grok-build``. Unknown values pass through so a genuine other-agent
+    row stays a distinct UNIQUE key.
+    """
+    raw = str(principal or "")
+    return _VAULT_SLUG_TO_AGENT_ID.get(raw, raw)
+
+
+def _principal_family(principal: Any) -> tuple[str, ...]:
+    """All principals that share identity with ``principal`` (including itself).
+
+    Inbox UNIQUE is (principal, inbox_file, candidate_index). Remapping a
+    vault slug without this family turns leftover ``agy``/``xai`` rows into
+    a *new* key beside ``gemini``/``grok-build`` and dual-inserts #239.
+    """
+    raw = str(principal or "")
+    canon = _canonical_principal(raw)
+    family = {raw, canon}
+    for slug, agent_id in _VAULT_SLUG_TO_AGENT_ID.items():
+        if agent_id == canon:
+            family.add(slug)
+    return tuple(sorted(family))
 
 
 def _principal_for_inbox(inbox: Path, fallback_principal: str) -> str:
@@ -442,7 +480,7 @@ def _scan_inbox(
         else:
             privacy_level = str(raw_privacy).strip()
         file_agent = str(doc.get("agent_id") or "").strip()
-        if file_agent and file_agent != inbox_principal:
+        if file_agent and _canonical_principal(file_agent) != inbox_principal:
             skipped_by_kind["_agent_mismatch"] = skipped_by_kind.get("_agent_mismatch", 0) + 1
             continue
         principal = inbox_principal

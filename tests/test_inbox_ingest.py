@@ -119,6 +119,86 @@ def test_ingest_is_idempotent(tmp_path):
     assert _count_proposed(db_obj) == 1
 
 
+def _seed_inbox_packet(db_obj, *, principal, inbox_file, content, candidate_index=0):
+    import hashlib
+    import time
+
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "inbox_file": inbox_file,
+            "candidate_index": candidate_index,
+            "kind": None,
+            "content_sha1": hashlib.sha1(content.encode("utf-8")).hexdigest(),
+        }
+    )
+    now = time.time()
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES (?, 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (principal, content, derived, now),
+        )
+
+
+def test_slug_alias_kindless_file_does_not_dual_insert(tmp_path):
+    """agy/xai vault slugs remap principal; that must not mint a second UNIQUE key.
+
+    Inbox idempotency is (principal, inbox_file, candidate_index). Kind-less
+    stop files skip the agent_id mismatch gate, so a remap used to INSERT
+    gemini/grok-build beside leftover agy/xai packets for the same source file.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        content = f"durable lesson from {legacy_principal} vault"
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=content,
+        )
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([content]))
+
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 0, (vault_dir, res)
+        assert res["already_present"] == 1, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute("SELECT principal FROM candidate_packets ORDER BY candidate_id")
+            principals = [dict(r)["principal"] for r in c.fetchall()]
+        assert principals == [legacy_principal], (vault_dir, principals)
+        assert _count_proposed(db_obj, principal=canonical) == 0
+
+
+def test_slug_alias_stamped_agent_id_is_not_mismatch(tmp_path):
+    """Files that still stamp the pre-alias agent_id must ingest, not wipe."""
+    from minni.afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "stamped.json",
+        _stop_doc(["agy-stamped durable lesson"], agent_id="agy"),
+    )
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["skipped_by_kind"].get("_agent_mismatch", 0) == 0, res
+    assert res["inserted"] == 1, res
+    assert _count_proposed(db_obj, principal="gemini") == 1
+    assert _count_proposed(db_obj, principal="agy") == 0
+
+
 def test_ingest_idempotent_after_status_change(tmp_path):
     """Re-run must be a no-op even after the loop resolves the row."""
     from minni.afm_passes.inbox_ingest import ingest
