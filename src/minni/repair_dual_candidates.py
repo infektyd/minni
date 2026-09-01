@@ -68,6 +68,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -389,7 +390,11 @@ def _active_afm_review_ids_on_cursor(c) -> set:
               AND COALESCE(status, '') != 'superseded'
             """
         )
-    except Exception:
+    except sqlite3.Error as exc:
+        # Only a missing table is excused (pre-014). Empty set on lock/schema
+        # looks like nobody is fenced and collapse deletes the unfenced twin.
+        if "no such table" not in str(exc).lower():
+            raise
         return set()
     out: set = set()
     for row in c.fetchall():

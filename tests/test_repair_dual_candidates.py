@@ -1827,6 +1827,110 @@ def test_all_proposed_superseded_fence_does_not_prefer(tmp_path):
     assert groups[0]["loser_ids"] == [high]
 
 
+def test_fence_query_lock_is_not_laundered_into_empty_set():
+    """High: a broken fence SELECT must raise, not look like nobody is fenced."""
+    import sqlite3
+
+    from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
+
+    class BoomCursor:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        _active_afm_review_ids_on_cursor(BoomCursor())
+
+
+def test_fence_query_unexpected_schema_is_not_laundered_into_empty_set():
+    """Only 'no such table' is excused; missing claim column must surface."""
+    import sqlite3
+
+    from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
+
+    class BoomCursor:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("no such column: claim")
+
+    with pytest.raises(sqlite3.OperationalError, match="no such column"):
+        _active_afm_review_ids_on_cursor(BoomCursor())
+
+
+def test_fence_query_missing_table_returns_empty_set():
+    """Pre-014 installs lack consolidation_actions — that is not a fault."""
+    import sqlite3
+
+    from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
+
+    class MissingTableCursor:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("no such table: consolidation_actions")
+
+    assert _active_afm_review_ids_on_cursor(MissingTableCursor()) == set()
+
+
+class _FenceSelectLockCursor:
+    """Proxy that fails only the apply-path fence SELECT (table still exists)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def execute(self, sql, *args, **kwargs):
+        import sqlite3
+
+        text = " ".join(str(sql).split())
+        if "SELECT claim FROM consolidation_actions" in text:
+            raise sqlite3.OperationalError("database is locked")
+        return self._inner.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_apply_fence_select_error_does_not_delete_unfenced_twin(tmp_path):
+    """High: lock/schema error on apply fence SELECT must not DELETE the fill.
+
+    Two proposed alias twins (agy fenced, gemini unfenced). Swallowing the
+    SELECT into fenced={} keeps lowest id and deletes the unfenced gemini
+    row; the leftover agy packet stays behind afm_review and examinable
+    fills go 1→0. The error must raise and both rows must survive.
+    """
+    import sqlite3
+
+    from minni import repair_dual_candidates as mod
+
+    db, _cfg = _make_db(tmp_path)
+    content = "alias twins one fenced by afm_review"
+    agy = _insert_candidate(
+        db, content=content, status="proposed", principal="agy"
+    )
+    gemini = _insert_candidate(
+        db, content=content, status="proposed", principal="gemini"
+    )
+    assert agy < gemini
+    _insert_afm_review_fence(db, agy, status="pending")
+
+    real_txn = db.transaction
+
+    @contextlib.contextmanager
+    def txn_fence_select_locked():
+        with real_txn() as c:
+            yield _FenceSelectLockCursor(c)
+
+    db.transaction = txn_fence_select_locked
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        mod.repair_duplicate_candidate_pairs(db, dry_run=False)
+
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT candidate_id FROM candidate_packets ORDER BY candidate_id"
+        )
+        remaining = [r["candidate_id"] for r in cur.fetchall()]
+    assert remaining == [agy, gemini], (
+        "unfenced gemini twin must survive a broken fence SELECT"
+    )
+
+
 def test_cli_warns_on_dual_accepted_groups(tmp_path, capsys):
     """Medium #2: dual accepted surfaces needs_operator + CLI WARNING."""
     import importlib.util
