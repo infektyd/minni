@@ -251,6 +251,78 @@ def test_slug_alias_stamped_agent_id_is_not_compact_mismatch(tmp_path, monkeypat
     assert res["inserted"] > 0, res
 
 
+def test_distill_in_txn_canonicalizes_alias_wanted_against_leftover_gemini(
+    tmp_path, monkeypatch
+):
+    """In-txn compact keys must use _make_inbox_key like inbox_ingest.
+
+    Leftover candidate_packets.principal='gemini' for session.json index 0;
+    distill(..., fallback_principal='agy') on a non-*-vault inbox so
+    _principal_for_inbox leaves principal='agy'; kind-less agent_id skips
+    the mismatch gate; monkeypatch-empty _existing_keys forces the in-txn
+    path. Family scan finds the gemini row, but wanted (agy, file, 0) misses
+    because _parse_inbox_key always returns canonical key[0]. Without the
+    operator CASE UNIQUE that INSERT would mint an agy twin.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    monkeypatch.setattr(mod, "default_provider_chain", lambda: None)
+    monkeypatch.setattr(mod, "_existing_keys", lambda db, principals=None: set())
+
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = (
+        "Key technical concepts: race on bootout after launchctl error 5"
+    )
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('gemini', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    inbox = tmp_path / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(
+            agent_id="",
+            summary_text=(
+                "1. Key technical concepts:\n"
+                "race on bootout after launchctl error 5\n\n"
+                "2. All user messages:\n"
+                "please fix it\n"
+            ),
+        ),
+    )
+
+    res = distill(
+        db_obj, cfg, inboxes=[inbox], fallback_principal="agy", dry_run=False
+    )
+    assert res["inserted"] == 0, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT principal FROM candidate_packets ORDER BY candidate_id"
+        )
+        principals = [dict(r)["principal"] for r in c.fetchall()]
+    assert principals == ["gemini"], principals
+
+
 FLAT_SUMMARY = "One paragraph of genuinely useful session findings about the migration."
 
 

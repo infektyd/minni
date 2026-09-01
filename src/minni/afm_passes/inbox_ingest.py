@@ -296,14 +296,17 @@ def _existing_keys_for_on_cursor(c, wanted: set) -> set:
     """Return which of ``wanted`` keys already exist — narrow scan under txn.
 
     ``wanted`` entries are ``(principal, inbox_file, candidate_index)``.
+    Principals are canonicalized (``agy`` → ``gemini``) so the
+    ``key[0] == principal`` check matches leftover alias-family rows.
     Avoids full-table scan under ``BEGIN IMMEDIATE``.
     """
     if not wanted:
         return set()
-    # Group by (principal, inbox_file) → indices
+    # Group by (canonical principal, inbox_file) → indices
     by_scope: Dict[Tuple[str, str], set] = {}
     for principal, inbox_file, idx in wanted:
-        by_scope.setdefault((principal, inbox_file), set()).add(idx)
+        canon, inbox_file, idx = _make_inbox_key(principal, inbox_file, idx)
+        by_scope.setdefault((canon, inbox_file), set()).add(idx)
     found: set = set()
     for (principal, inbox_file), indices in by_scope.items():
         family = _principal_family(principal)

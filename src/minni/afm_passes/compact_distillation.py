@@ -83,6 +83,7 @@ from minni.afm_passes.inbox_ingest import (
     _existing_keys,
     _existing_keys_for_on_cursor,
     _is_unique_integrity_error,
+    _make_inbox_key,
     _principal_for_inbox,
     discover_inboxes,
 )
@@ -475,7 +476,9 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             # file, so its presence marks the whole file as done. This also
             # holds the AFM/fallback split stable per file — a re-run with a
             # different AFM availability must not append a second variant set.
-            file_key0 = (principal, path.name, 0)
+            # Canonicalize so leftover gemini/grok-build rows match agy/xai
+            # fallback principals (same app key as inbox_ingest).
+            file_key0 = _make_inbox_key(principal, path.name, 0)
             if file_key0 in existing:
                 already += 1
                 # Legacy sweep: a file processed by a pre-fix daemon build has
@@ -518,7 +521,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
             for idx, (content, afm_used) in enumerate(candidates):
-                existing.add((principal, path.name, idx))
+                existing.add(_make_inbox_key(principal, path.name, idx))
                 to_insert.append({
                     "principal": principal,
                     "workspace_id": workspace,
@@ -538,14 +541,18 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             # Issue #239: re-load only to_insert keys under BEGIN IMMEDIATE
             # (not full-table scan). Mirror inbox_ingest: narrow in-txn check
             # + UNIQUE swallow. Principal-scoped keys allow multi-vault peers.
+            # _make_inbox_key canonicalizes agy/xai so leftover gemini/
+            # grok-build rows are the same fill, not a new UNIQUE key.
             wanted = {
-                (r["principal"], r["inbox_file"], r["candidate_index"])
+                _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
                 for r in to_insert
             }
             txn_existing = _existing_keys_for_on_cursor(c, wanted)
 
             for r in to_insert:
-                key = (r["principal"], r["inbox_file"], r["candidate_index"])
+                key = _make_inbox_key(
+                    r["principal"], r["inbox_file"], r["candidate_index"]
+                )
                 if key in txn_existing:
                     already += 1
                     continue
