@@ -132,6 +132,41 @@ def _file_index_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     return (inbox_file, idx_i)
 
 
+def _sql_quote_str(value: str) -> str:
+    """Single-quote a SQL string literal (map keys, not user input)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _canonical_principal_sql_expr(column: str = "principal") -> str:
+    """SQLite expression matching ``inbox_ingest._canonical_principal``.
+
+    Operator UNIQUE must key the canonical fill so leftover ``agy``/``xai``
+    rows collide with remapped ``gemini``/``grok-build`` inserts. Raw
+    ``principal`` is a different tuple and cannot backstop #239 duals.
+    """
+    from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+
+    remaps = [
+        (slug, agent)
+        for slug, agent in sorted(_VAULT_SLUG_TO_AGENT_ID.items())
+        if slug != agent
+    ]
+    if not remaps:
+        return column
+    whens = " ".join(
+        f"WHEN {_sql_quote_str(slug)} THEN {_sql_quote_str(agent)}"
+        for slug, agent in remaps
+    )
+    return f"CASE {column} {whens} ELSE {column} END"
+
+
+def _inbox_dedup_index_sql_is_current(sql: Any) -> bool:
+    """True when sqlite_master SQL keys canonical fill, not raw principal."""
+    sql_s = " ".join(str(sql or "").split()).lower()
+    expr = " ".join(_canonical_principal_sql_expr("principal").split()).lower()
+    return expr in sql_s
+
+
 def _inbox_key(
     principal: Any, derived: Dict[str, Any]
 ) -> Optional[Tuple[str, str, int]]:
@@ -929,14 +964,17 @@ def repair_duplicate_candidate_pairs(
 def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
     """Create a partial unique index matching app-level inbox idempotency.
 
-    Key is ``(principal, inbox_file, candidate_index)`` for ``source='inbox'``
-    — the same key ``inbox_ingest`` / ``compact_distillation`` use.
-    ``content_sha1`` is not part of the constraint.
+    Key is ``(canonical principal, inbox_file, candidate_index)`` for
+    ``source='inbox'`` — the same key ``inbox_ingest`` /
+    ``compact_distillation`` use. Vault-slug aliases (``agy``→``gemini``,
+    ``xai``→``grok-build``) are folded in SQL so leftover alias rows collide
+    with remapped inserts. ``content_sha1`` is not part of the constraint.
 
     Requires principal-scoped (file, index) duplicates to already be collapsed
     (call repair first). Migrates off the legacy weaker
-    ``…_inbox_sha1_unique`` and any pre-principal ``…_inbox_key_unique``
-    (file, index only) index if present.
+    ``…_inbox_sha1_unique``, any pre-principal ``…_inbox_key_unique``
+    (file, index only) index, and any raw-``principal`` ``…_inbox_key_unique``
+    that would still admit alias twins.
 
     **Operator-only, not a migration.** Schema rebuilds of
     ``candidate_packets`` drop this index; re-run
@@ -951,12 +989,12 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
         row = c.fetchone()
         if row:
             sql = row["sql"] if hasattr(row, "keys") else row[0]
-            sql_s = str(sql or "")
-            if "principal" in sql_s.lower():
+            if _inbox_dedup_index_sql_is_current(sql):
                 c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
                 return {"status": "exists", "index": index_name}
-            # Stale global (file, index) index exists — do NOT drop until we
-            # know principal-scoped CREATE can succeed (collision preflight).
+            # Stale global (file, index) or raw-principal index exists — do
+            # NOT drop until we know canonical-fill CREATE can succeed
+            # (collision preflight).
 
     collisions = find_app_key_collisions(db)
     if collisions:
@@ -983,13 +1021,15 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
             ],
             "note": (
                 "Existing UNIQUE index left in place until collisions clear; "
-                "stale global (file,index) indexes are only replaced on CREATE."
+                "stale global (file,index) or raw-principal indexes are only "
+                "replaced on CREATE."
             ),
         }
 
     try:
+        canon_principal = _canonical_principal_sql_expr("principal")
         with db.transaction() as c:
-            # Drop legacy + any stale global index inside the same txn as CREATE
+            # Drop legacy + any stale index inside the same txn as CREATE
             # so we never leave zero uniqueness backstop on a failed upgrade.
             c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
             c.execute(f"DROP INDEX IF EXISTS {index_name}")
@@ -997,7 +1037,7 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
                 f"""
                 CREATE UNIQUE INDEX {index_name}
                 ON candidate_packets (
-                    principal,
+                    {canon_principal},
                     json_extract(derived_from, '$.inbox_file'),
                     CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER)
                 )

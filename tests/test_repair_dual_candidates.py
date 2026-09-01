@@ -742,6 +742,88 @@ def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
     assert rows[0]["candidate_id"] == min(agy_id, gemini_id)
 
 
+def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(
+    tmp_path, monkeypatch
+):
+    """SQL UNIQUE must key the canonical fill, not the raw leftover principal.
+
+    Failing input: leftover candidate_packets principal='agy' (or 'xai') for
+    session.json index 0; repair keeps that row (no twin to collapse, and
+    collapse keeps min(candidate_id) without rewriting principal); operator
+    index is created. A later INSERT principal='gemini' (or 'grok-build') for
+    the same inbox_file+index must collide so inbox_ingest's IntegrityError
+    swallow is a #239 backstop, not a silent dual PK.
+    """
+    import sqlite3
+
+    from minni.afm_passes import inbox_ingest as ii
+    from minni.repair_dual_candidates import (
+        ensure_inbox_dedup_index,
+        repair_duplicate_candidate_pairs,
+    )
+
+    cases = (
+        ("agy", "gemini", "agy-vault"),
+        ("xai", "grok-build", "xai-vault"),
+    )
+    for leftover, canonical, vault_dir in cases:
+        db, cfg = _make_db(tmp_path / leftover)
+        content = f"leftover {leftover} session fill"
+        leftover_id = _insert_candidate(
+            db,
+            content=content,
+            status="proposed",
+            inbox_file="session.json",
+            candidate_index=0,
+            principal=leftover,
+        )
+
+        repair = repair_duplicate_candidate_pairs(db, dry_run=False)
+        assert repair["deleted"] == 0
+        created = ensure_inbox_dedup_index(db)
+        assert created["status"] == "created"
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_candidate(
+                db,
+                content=f"canonical {canonical} twin of leftover",
+                status="proposed",
+                inbox_file="session.json",
+                candidate_index=0,
+                principal=canonical,
+            )
+
+        monkeypatch.setattr(ii, "_existing_keys", lambda db, principals=None: set())
+        inbox = tmp_path / leftover / vault_dir / "inbox"
+        inbox.mkdir(parents=True)
+        (inbox / "session.json").write_text(
+            json.dumps(
+                {
+                    "slug": "s",
+                    "createdAt": "2026-06-06T12:00:00.000Z",
+                    "kind": "stop_candidates",
+                    "agent_id": leftover,
+                    "workspace_id": "default",
+                    "candidates": [content],
+                    "log_only": [],
+                    "expires": [],
+                    "do_not_store": [],
+                    "last_task": "t",
+                }
+            ),
+            encoding="utf-8",
+        )
+        res = ii.ingest(db, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 0, (leftover, res)
+        assert res["already_present"] >= 1, (leftover, res)
+        with db.cursor() as c:
+            c.execute("SELECT candidate_id, principal FROM candidate_packets")
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, (leftover, rows)
+        assert rows[0]["candidate_id"] == leftover_id
+        assert rows[0]["principal"] == leftover
+
+
 def test_ingest_allows_same_basename_under_other_principal(tmp_path):
     """Principal-scoped key: multi-vault same basename is legitimate.
 
