@@ -240,23 +240,33 @@ def _canonical_vault_dirname(agent_id: str) -> str:
     return vault_dirname_for(agent_id)
 
 
+def _minni_home() -> Path:
+    return Path(os.environ.get("MINNI_HOME") or (Path.home() / ".minni")).expanduser()
+
+
+def _canonical_live_vault_root(agent_id: str) -> Path:
+    """Product vault path: MINNI_HOME / AGENT_VAULT_DIRS slug, not an ACL basename."""
+    return _minni_home() / _canonical_vault_dirname(agent_id)
+
+
 def _seed_own_vault(principal: EffectivePrincipal) -> None:
     """Seed this principal's canonical vault after identity is resolved.
 
     Must not run inside ``_principal_from_raw``: ``from_local_transport``
     loads the operator stamp on every RPC before the caller is known.
     Search-only and default-deny stamps must not write layout.
+
+    ``allowed_vault_roots`` is a read ACL. Seed the live path
+    ``MINNI_HOME / vault_dirname_for(agent_id)``, never the first ACL
+    entry whose basename matches (a backup also named hermes-vault, or a
+    missing first hit that would skip a later live dir).
+    ``ensure_agent_vault`` already no-ops when that live path is missing.
     """
     if not (principal.can("learn") or principal.can("write")):
         return
-    own_name = _canonical_vault_dirname(principal.agent_id)
     from minni.vault_layout import ensure_agent_vault
 
-    for root in principal.allowed_vault_roots:
-        if Path(root).name != own_name:
-            continue
-        ensure_agent_vault(root)
-        return
+    ensure_agent_vault(_canonical_live_vault_root(principal.agent_id))
 
 
 def _principal_from_raw(
@@ -628,17 +638,13 @@ def _stamp_effective_principal(
             # A MISSING entry is not a lockout: existing installs using only
             # platform_agent_ids + platform_agent_capabilities predate the roots map,
             # and their platform principals must keep pathed access to their own
-            # ~/.minni/<agent>-vault (both the literal id and the dashless alias the
-            # installer uses, e.g. claude-code → claudecode-vault). Never the
-            # operator's roots.
+            # ~/.minni/<vault_dirname_for(id)> (claude-code → claudecode-vault
+            # from AGENT_VAULT_DIRS, never a synthesized hyphen-stripped alias
+            # such as grokbuild-vault). Never the operator's roots.
             _PLATFORM_NO_ROOTS = [PLATFORM_NO_ROOTS_SENTINEL]
 
             def _default_platform_roots(agent_id: str) -> list[str]:
-                minni_home = Path(
-                    os.environ.get("MINNI_HOME") or (Path.home() / ".minni")
-                ).expanduser()
-                names = {f"{agent_id}-vault", f"{agent_id.replace('-', '')}-vault"}
-                roots = [str((minni_home / n).resolve()) for n in sorted(names)]
+                roots = [str(_canonical_live_vault_root(agent_id).resolve())]
                 if agent_id == "gemini":
                     # The installer's vault_for("gemini") deliberately falls
                     # back to the legacy ~/.gemini/minni-vault when it has data

@@ -40,6 +40,13 @@ def _write_principal(principals: Path, name: str, raw: dict) -> Path:
     return path
 
 
+def _isolate_minni_home(tmp_path, monkeypatch) -> Path:
+    minni_home = tmp_path / "minni-home"
+    minni_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+    return minni_home
+
+
 def test_ensure_agent_vault_seeds_empty_index_only_dir(tmp_path):
     vault = tmp_path / "hermes-vault"
     vault.mkdir()
@@ -59,8 +66,9 @@ def test_ensure_agent_vault_does_not_create_missing_root(tmp_path):
     assert not missing.exists()
 
 
-def test_principal_load_seeds_existing_vault_root(tmp_path):
-    vault = tmp_path / "hermes-vault"
+def test_principal_load_seeds_existing_vault_root(tmp_path, monkeypatch):
+    minni_home = _isolate_minni_home(tmp_path, monkeypatch)
+    vault = minni_home / "hermes-vault"
     vault.mkdir()
     principals = tmp_path / "principals"
     _write_principal(
@@ -92,9 +100,12 @@ def _acl_principal(agent_id, roots, capabilities=("search", "learn")):
     }
 
 
-def test_principal_load_does_not_seed_shared_or_foreign_acl_roots(tmp_path):
-    """allowed_vault_roots is a read ACL. Seed only the canonical vault slug."""
-    own = tmp_path / "claudecode-vault"
+def test_principal_load_does_not_seed_shared_or_foreign_acl_roots(
+    tmp_path, monkeypatch
+):
+    """allowed_vault_roots is a read ACL. Seed only the canonical live vault."""
+    minni_home = _isolate_minni_home(tmp_path, monkeypatch)
+    own = minni_home / "claudecode-vault"
     shared = tmp_path / "shared"
     foreign = tmp_path / "codex-vault"
     own.mkdir()
@@ -125,7 +136,8 @@ def test_principal_load_does_not_seed_shared_or_foreign_acl_roots(tmp_path):
     assert not (foreign / "inbox").exists()
 
 
-def test_principal_load_does_not_seed_broad_home_acl_root(tmp_path):
+def test_principal_load_does_not_seed_broad_home_acl_root(tmp_path, monkeypatch):
+    _isolate_minni_home(tmp_path, monkeypatch)
     home = tmp_path / "home"
     home.mkdir()
     principals = tmp_path / "principals"
@@ -160,8 +172,9 @@ def test_ensure_agent_vault_raises_on_wiki_file(tmp_path):
         ensure_agent_vault(vault)
 
 
-def test_principal_load_does_not_swallow_vault_seed_failure(tmp_path):
-    vault = tmp_path / "hermes-vault"
+def test_principal_load_does_not_swallow_vault_seed_failure(tmp_path, monkeypatch):
+    minni_home = _isolate_minni_home(tmp_path, monkeypatch)
+    vault = minni_home / "hermes-vault"
     vault.mkdir()
     (vault / "wiki").write_text("not a directory\n", encoding="utf-8")
     principals = tmp_path / "principals"
@@ -185,9 +198,12 @@ def test_vault_dirname_for_uses_canonical_agent_vault_dirs():
         assert vault_dirname_for(agent_id) == vault_dir
 
 
-def test_principal_resolve_seeds_canonical_grok_build_vault_not_dashless_alias(tmp_path):
-    canonical = tmp_path / "grok-build-vault"
-    dashless = tmp_path / "grokbuild-vault"
+def test_principal_resolve_seeds_canonical_grok_build_vault_not_dashless_alias(
+    tmp_path, monkeypatch
+):
+    minni_home = _isolate_minni_home(tmp_path, monkeypatch)
+    canonical = minni_home / "grok-build-vault"
+    dashless = minni_home / "grokbuild-vault"
     shared = tmp_path / "shared"
     canonical.mkdir()
     dashless.mkdir()
@@ -403,8 +419,9 @@ def test_ensure_agent_vault_raises_on_symlink_to_file_at_root(tmp_path):
         ensure_agent_vault(vault)
 
 
-def test_principal_resolve_fail_closed_on_file_at_vault_root(tmp_path):
-    vault = tmp_path / "hermes-vault"
+def test_principal_resolve_fail_closed_on_file_at_vault_root(tmp_path, monkeypatch):
+    minni_home = _isolate_minni_home(tmp_path, monkeypatch)
+    vault = minni_home / "hermes-vault"
     vault.write_text("not a directory\n", encoding="utf-8")
     principals = tmp_path / "principals"
     _write_principal(principals, "hermes", _acl_principal("hermes", [vault]))
@@ -421,6 +438,7 @@ def test_principal_resolve_expands_user_vault_root_and_seeds(tmp_path, monkeypat
     vault = fake_home / ".minni" / "hermes-vault"
     vault.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("MINNI_HOME", str(fake_home / ".minni"))
     principals = tmp_path / "principals"
     _write_principal(
         principals,
@@ -435,3 +453,104 @@ def test_principal_resolve_expands_user_vault_root_and_seeds(tmp_path, monkeypat
     assert Path(p.allowed_vault_roots[0]) == vault.resolve()
     assert (vault / "log.md").is_file()
     assert (vault / "wiki").is_dir()
+
+
+def test_seed_canonical_live_path_not_first_acl_basename(tmp_path, monkeypatch):
+    """allowed_vault_roots is a read ACL. Seed MINNI_HOME / authored vault.
+
+    A backup (or extra ACL entry) also named hermes-vault must not receive
+    inbox/wiki/log.md even when it is the first basename match.
+    """
+    minni_home = tmp_path / "minni-home"
+    live = minni_home / "hermes-vault"
+    backup = tmp_path / "backup" / "hermes-vault"
+    live.mkdir(parents=True)
+    backup.mkdir(parents=True)
+    (live / ".index").mkdir()
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+    principals = tmp_path / "principals"
+    _write_principal(principals, "hermes", _acl_principal("hermes", [backup]))
+    p = resolve_effective_principal(
+        supplied_agent_id="hermes",
+        transport="uds",
+        principals_dir=principals,
+    )
+    assert p.agent_id == "hermes"
+    assert (live / "log.md").is_file()
+    assert (live / "wiki" / "sessions").is_dir()
+    assert (live / "inbox").is_dir()
+    assert not (backup / "log.md").exists()
+    assert not (backup / "wiki").exists()
+    assert not (backup / "inbox").exists()
+
+
+def test_seed_skips_missing_first_acl_basename_and_seeds_live_path(
+    tmp_path, monkeypatch
+):
+    """A missing first basename match must not skip a later live vault."""
+    minni_home = tmp_path / "minni-home"
+    live = minni_home / "hermes-vault"
+    missing = tmp_path / "stale" / "hermes-vault"
+    live.mkdir(parents=True)
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+    principals = tmp_path / "principals"
+    _write_principal(
+        principals, "hermes", _acl_principal("hermes", [missing, live])
+    )
+    assert not missing.exists()
+    resolve_effective_principal(
+        supplied_agent_id="hermes",
+        transport="uds",
+        principals_dir=principals,
+    )
+    assert not missing.exists()
+    assert (live / "log.md").is_file()
+    assert (live / "wiki").is_dir()
+
+
+def test_platform_default_roots_use_vault_dirname_for_not_synthesized_alias(
+    tmp_path, monkeypatch
+):
+    """Platform ACL must match the seed key: AGENT_VAULT_DIRS, not hyphen-strip.
+
+    grok-build → grok-build-vault only (grokbuild-vault would ingest as grokbuild).
+    claude-code → claudecode-vault from the map, not a synthesized claude-code-vault.
+    """
+    minni_home = tmp_path / "minni-home"
+    minni_home.mkdir()
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+    principals = tmp_path / "principals"
+    _write_principal(
+        principals,
+        "local",
+        {
+            "agent_id": "main",
+            "capabilities": ["*"],
+            "allowed_vault_roots": [str(tmp_path / "operator-vault")],
+            "platform_agent_ids": ["grok-build", "claude-code"],
+            "platform_agent_capabilities": {
+                "grok-build": ["search", "learn"],
+                "claude-code": ["search", "learn"],
+            },
+        },
+    )
+    grok = resolve_effective_principal(
+        supplied_agent_id="grok-build",
+        transport="uds",
+        principals_dir=principals,
+    )
+    claude = resolve_effective_principal(
+        supplied_agent_id="claude-code",
+        transport="uds",
+        principals_dir=principals,
+    )
+    grok_canonical = (minni_home / "grok-build-vault").resolve()
+    grok_dashless = (minni_home / "grokbuild-vault").resolve()
+    claude_map = (minni_home / "claudecode-vault").resolve()
+    claude_hyphen = (minni_home / "claude-code-vault").resolve()
+    assert grok.allowed_vault_roots == [str(grok_canonical)]
+    assert grok.allows_vault_root(grok_canonical)
+    assert not grok.allows_vault_root(grok_dashless)
+    assert claude.allowed_vault_roots == [str(claude_map)]
+    assert claude.allows_vault_root(claude_map)
+    assert not claude.allows_vault_root(claude_hyphen)
