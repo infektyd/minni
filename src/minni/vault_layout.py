@@ -60,15 +60,26 @@ def ensure_agent_vault(vault: Union[str, Path]) -> List[str]:
     for rel, header in (("log.md", _LOG_HEADER), ("index.md", _INDEX_HEADER)):
         dest = root / rel
         if dest.exists():
-            if dest.is_dir():
-                raise IsADirectoryError(
-                    f"vault contract {rel!r} exists and is a directory: {dest}"
-                )
-            if not dest.is_file():
-                raise OSError(
-                    f"vault contract {rel!r} exists and is not a regular file: {dest}"
-                )
+            _require_regular_contract_file(dest, rel)
             continue
-        dest.write_text(header, encoding="utf-8")
+        try:
+            # Exclusive create: exists()+write_text races plugin ensureVault/
+            # recordAudit and can truncate append-only log.md / index.md.
+            with dest.open("x", encoding="utf-8") as fh:
+                fh.write(header)
+        except FileExistsError:
+            _require_regular_contract_file(dest, rel)
+            continue
         created.append(rel)
     return created
+
+
+def _require_regular_contract_file(dest: Path, rel: str) -> None:
+    if dest.is_dir():
+        raise IsADirectoryError(
+            f"vault contract {rel!r} exists and is a directory: {dest}"
+        )
+    if not dest.is_file():
+        raise OSError(
+            f"vault contract {rel!r} exists and is not a regular file: {dest}"
+        )
