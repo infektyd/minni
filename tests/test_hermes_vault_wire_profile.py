@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from minni.principal import (
+    PLATFORM_NO_ROOTS_SENTINEL,
     IdentityMismatchError,
     _principal_from_raw,
     resolve_effective_principal,
@@ -415,8 +416,45 @@ def test_ensure_agent_vault_raises_on_symlink_to_file_at_root(tmp_path):
     target.write_text("not a directory\n", encoding="utf-8")
     vault = tmp_path / "hermes-vault"
     vault.symlink_to(target)
-    with pytest.raises(NotADirectoryError):
+    with pytest.raises(OSError):
         ensure_agent_vault(vault)
+
+
+def test_ensure_agent_vault_refuses_dir_symlink_root_into_shop_restore(tmp_path):
+    shop = tmp_path / "shop-restore"
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    vault = tmp_path / "hermes-vault"
+    vault.symlink_to(shop)
+    with pytest.raises(OSError):
+        ensure_agent_vault(vault)
+    assert not (shop / "wiki").exists()
+    assert not (shop / "inbox").exists()
+    assert not (shop / "log.md").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_principal_resolve_refuses_vault_root_dir_symlink_into_shop(
+    tmp_path, monkeypatch
+):
+    minni_home = _isolate_minni_home(tmp_path, monkeypatch)
+    shop = tmp_path / "shop-restore"
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    vault = minni_home / "hermes-vault"
+    vault.symlink_to(shop)
+    principals = tmp_path / "principals"
+    _write_principal(principals, "hermes", _acl_principal("hermes", [vault]))
+    with pytest.raises(OSError):
+        resolve_effective_principal(
+            supplied_agent_id="hermes",
+            transport="uds",
+            principals_dir=principals,
+        )
+    assert not (shop / "wiki").exists()
+    assert not (shop / "inbox").exists()
+    assert not (shop / "log.md").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
 
 
 def test_principal_resolve_fail_closed_on_file_at_vault_root(tmp_path, monkeypatch):
@@ -554,3 +592,71 @@ def test_platform_default_roots_use_vault_dirname_for_not_synthesized_alias(
     assert claude.allowed_vault_roots == [str(claude_map)]
     assert claude.allows_vault_root(claude_map)
     assert not claude.allows_vault_root(claude_hyphen)
+
+
+def test_locked_out_platform_stamp_does_not_seed_live_vault(tmp_path, monkeypatch):
+    """Empty/sentinel platform_agent_vault_roots must not plant inbox/wiki/log.md."""
+    minni_home = tmp_path / "minni-home"
+    live = minni_home / "codex-vault"
+    live.mkdir(parents=True)
+    (live / ".index").mkdir()
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+    principals = tmp_path / "principals"
+    _write_principal(
+        principals,
+        "local",
+        {
+            "agent_id": "main",
+            "capabilities": ["*"],
+            "platform_agent_ids": ["codex"],
+            "platform_agent_capabilities": {"codex": ["search", "learn", "write"]},
+            "platform_agent_vault_roots": {"codex": []},
+        },
+    )
+    p = resolve_effective_principal(
+        supplied_agent_id="codex",
+        transport="uds",
+        principals_dir=principals,
+    )
+    assert p.agent_id == "codex"
+    assert p.can("learn")
+    assert p.can("write")
+    assert PLATFORM_NO_ROOTS_SENTINEL in p.allowed_vault_roots
+    assert not p.allows_vault_root(live)
+    assert not (live / "log.md").exists()
+    assert not (live / "index.md").exists()
+    assert not (live / "wiki").exists()
+    assert not (live / "inbox").exists()
+    assert (live / ".index").is_dir()
+
+
+def test_locked_out_platform_malformed_roots_do_not_seed_live_vault(
+    tmp_path, monkeypatch
+):
+    minni_home = tmp_path / "minni-home"
+    live = minni_home / "hermes-vault"
+    live.mkdir(parents=True)
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+    principals = tmp_path / "principals"
+    _write_principal(
+        principals,
+        "local",
+        {
+            "agent_id": "main",
+            "capabilities": ["*"],
+            "platform_agent_ids": ["hermes"],
+            "platform_agent_capabilities": {"hermes": ["search", "learn"]},
+            "platform_agent_vault_roots": {"hermes": ""},
+        },
+    )
+    p = resolve_effective_principal(
+        supplied_agent_id="hermes",
+        transport="uds",
+        principals_dir=principals,
+    )
+    assert p.agent_id == "hermes"
+    assert p.can("learn")
+    assert not p.allows_vault_root(live)
+    assert not (live / "log.md").exists()
+    assert not (live / "wiki").exists()
+    assert not (live / "inbox").exists()

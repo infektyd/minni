@@ -156,3 +156,94 @@ def test_ensure_agent_vault_refuses_symlink_inbox_into_peer_vault(tmp_path):
     with pytest.raises(OSError):
         ensure_agent_vault(vault)
     assert list(peer.iterdir()) == []
+
+
+def test_ensure_agent_vault_refuses_symlink_root_into_shop_restore(tmp_path):
+    """hermes-vault → shop-restore must not plant wiki/inbox in the target."""
+    shop = tmp_path / "shop-restore"
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    vault = tmp_path / "hermes-vault"
+    vault.symlink_to(shop)
+    with pytest.raises(OSError):
+        ensure_agent_vault(vault)
+    assert not (shop / "wiki").exists()
+    assert not (shop / "inbox").exists()
+    assert not (shop / "log.md").exists()
+    assert not (shop / "index.md").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def _plant_stamp_then_claim_missing(orig_exists, vault: Path):
+    def racing_exists(self: Path) -> bool:
+        if self == vault / "log.md" or self == vault / "index.md":
+            if not orig_exists(self):
+                body = _PLUGIN_LOG if self.name == "log.md" else _PLUGIN_INDEX
+                self.write_text(body, encoding="utf-8")
+            return False
+        return orig_exists(self)
+
+    return racing_exists
+
+
+def test_afm_ensure_vault_does_not_wipe_raced_log_md(tmp_path, monkeypatch):
+    """Peer AFM seeder must not exists()+write_text over a raced stamp."""
+    from minni.afm_writer import _ensure_vault
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    monkeypatch.setattr(Path, "exists", _plant_stamp_then_claim_missing(Path.exists, vault))
+    _ensure_vault(vault)
+    assert (vault / "log.md").read_text(encoding="utf-8") == _PLUGIN_LOG
+    assert (vault / "index.md").read_text(encoding="utf-8") == _PLUGIN_INDEX
+
+
+def test_handoff_ensure_vault_does_not_wipe_raced_log_md(tmp_path, monkeypatch):
+    """Peer handoff seeder must not exists()+write_text over a raced stamp."""
+    from minni.minnid_runtime.handoff import ensure_handoff_vault
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    monkeypatch.setattr(Path, "exists", _plant_stamp_then_claim_missing(Path.exists, vault))
+    ensure_handoff_vault(vault)
+    assert (vault / "log.md").read_text(encoding="utf-8") == _PLUGIN_LOG
+    assert (vault / "index.md").read_text(encoding="utf-8") == _PLUGIN_INDEX
+
+
+def test_afm_ensure_vault_does_not_clobber_append_after_exclusive_create(
+    tmp_path, monkeypatch
+):
+    """Peer AFM seeder must skip a non-empty exclusive fd, not write at 0."""
+    from minni.afm_writer import _ensure_vault
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    orig_os_open = os.open
+
+    def append_after_create(path) -> None:
+        try:
+            name = Path(os.fsdecode(path)).name
+        except (TypeError, ValueError, OSError):
+            return
+        if name not in {"log.md", "index.md"}:
+            return
+        payload = _RACE_AUDIT if name == "log.md" else _RACE_INDEX
+        extra = orig_os_open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(extra, payload.encode("utf-8"))
+        finally:
+            os.close(extra)
+
+    def racing_os_open(path, flags, *args, **kwargs):
+        fd = orig_os_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL:
+            append_after_create(path)
+        return fd
+
+    monkeypatch.setattr(os, "open", racing_os_open)
+    _ensure_vault(vault)
+    log_text = (vault / "log.md").read_text(encoding="utf-8")
+    index_text = (vault / "index.md").read_text(encoding="utf-8")
+    assert _RACE_AUDIT in log_text
+    assert _RACE_INDEX in index_text

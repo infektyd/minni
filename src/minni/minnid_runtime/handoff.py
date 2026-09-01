@@ -70,6 +70,8 @@ def agent_vault(agent_id: str) -> tuple[Path, bool]:
 
 
 def ensure_handoff_vault(vault_path: Path) -> None:
+    from minni.vault_layout import _INDEX_HEADER, _LOG_HEADER, _seed_exclusive_file
+
     for rel in (
         "raw",
         "wiki",
@@ -80,12 +82,11 @@ def ensure_handoff_vault(vault_path: Path) -> None:
         "outbox",
     ):
         (vault_path / rel).mkdir(parents=True, exist_ok=True)
-    log_path = vault_path / "log.md"
-    if not log_path.exists():
-        log_path.write_text("# Minni Log\n\n", encoding="utf-8")
-    index_path = vault_path / "index.md"
-    if not index_path.exists():
-        index_path.write_text("# Minni Index\n\n", encoding="utf-8")
+    for rel, header in (("log.md", _LOG_HEADER), ("index.md", _INDEX_HEADER)):
+        dest = vault_path / rel
+        if dest.exists():
+            continue
+        _seed_exclusive_file(dest, header)
 
 
 def slugify(text: str) -> str:

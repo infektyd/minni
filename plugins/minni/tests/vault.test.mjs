@@ -52,6 +52,23 @@ test("ensureVault creates the Codex LLM wiki structure and schema", async () => 
   }
 });
 
+test("ensureVault does not wipe a raced log.md seed", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-vault-race-"));
+  try {
+    const payload =
+      "## [2026-09-01T00:00:00Z] plugin | audit | unique-payload-do-not-clobber\n\n";
+    const logPath = path.join(root, "log.md");
+    const indexPath = path.join(root, "index.md");
+    await writeFile(logPath, payload, "utf8");
+    await writeFile(indexPath, payload, "utf8");
+    await ensureVault(root);
+    assert.equal(await readFile(logPath, "utf8"), payload);
+    assert.equal(await readFile(indexPath, "utf8"), payload);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-prime-"));
   try {

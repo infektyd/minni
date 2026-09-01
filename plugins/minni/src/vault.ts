@@ -829,6 +829,35 @@ Append-only audit of Codex memory operations.
 `;
 }
 
+function isErrno(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException).code === code;
+}
+
+async function seedExclusiveFile(
+  filePath: string,
+  content: string,
+): Promise<boolean> {
+  let fh;
+  try {
+    fh = await open(filePath, "ax", 0o600);
+  } catch (error) {
+    if (isErrno(error, "EEXIST")) {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    const st = await fh.stat();
+    if (st.size > 0) {
+      return false;
+    }
+    await fh.write(Buffer.from(content, "utf8"));
+    return true;
+  } finally {
+    await fh.close();
+  }
+}
+
 export async function ensureVault(
   vaultPath: string,
 ): Promise<EnsureVaultResult> {
@@ -840,20 +869,12 @@ export async function ensureVault(
     created.push(full);
   }
 
-  const schemaPath = path.join(vaultPath, "schema", "AGENTS.md");
-  if (!(await exists(schemaPath))) {
-    await writeFile(schemaPath, schemaContent(), "utf8");
-  }
-
-  const indexPath = path.join(vaultPath, "index.md");
-  if (!(await exists(indexPath))) {
-    await writeFile(indexPath, indexContent(), "utf8");
-  }
-
-  const logPath = path.join(vaultPath, "log.md");
-  if (!(await exists(logPath))) {
-    await writeFile(logPath, logContent(), "utf8");
-  }
+  await seedExclusiveFile(
+    path.join(vaultPath, "schema", "AGENTS.md"),
+    schemaContent(),
+  );
+  await seedExclusiveFile(path.join(vaultPath, "index.md"), indexContent());
+  await seedExclusiveFile(path.join(vaultPath, "log.md"), logContent());
 
   return { vaultPath, created };
 }

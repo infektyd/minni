@@ -249,6 +249,21 @@ def _canonical_live_vault_root(agent_id: str) -> Path:
     return _minni_home() / _canonical_vault_dirname(agent_id)
 
 
+def _acl_forbids_live_store(principal: EffectivePrincipal, live: Path) -> bool:
+    """True when the stamp's vault-root ACL uniquely forbade the live store.
+
+    ``PLATFORM_NO_ROOTS_SENTINEL`` / empty+no-caps is the fail-closed
+    lockout. A read ACL that lists a backup still seeds the product live
+    path (basename matching must not retarget the seed).
+    """
+    if principal.allows_vault_root(live):
+        return False
+    roots = principal.allowed_vault_roots
+    if not roots:
+        return True
+    return all(r == PLATFORM_NO_ROOTS_SENTINEL for r in roots)
+
+
 def _seed_own_vault(principal: EffectivePrincipal) -> None:
     """Seed this principal's canonical vault after identity is resolved.
 
@@ -260,13 +275,18 @@ def _seed_own_vault(principal: EffectivePrincipal) -> None:
     ``MINNI_HOME / vault_dirname_for(agent_id)``, never the first ACL
     entry whose basename matches (a backup also named hermes-vault, or a
     missing first hit that would skip a later live dir).
-    ``ensure_agent_vault`` already no-ops when that live path is missing.
+    Do not seed when the ACL uniquely forbade the store (sentinel /
+    empty platform_agent_vault_roots). ``ensure_agent_vault`` already
+    no-ops when that live path is missing.
     """
     if not (principal.can("learn") or principal.can("write")):
         return
+    live = _canonical_live_vault_root(principal.agent_id)
+    if _acl_forbids_live_store(principal, live):
+        return
     from minni.vault_layout import ensure_agent_vault
 
-    ensure_agent_vault(_canonical_live_vault_root(principal.agent_id))
+    ensure_agent_vault(live)
 
 
 def _principal_from_raw(

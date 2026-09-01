@@ -714,12 +714,15 @@ def _utc() -> str:
 
 
 def _ensure_vault(vault: Path) -> None:
+    from minni.vault_layout import _INDEX_HEADER, _LOG_HEADER, _seed_exclusive_file
+
     for rel in ("wiki/sessions", "wiki/entities", "wiki/concepts", "inbox", "logs"):
         (vault / rel).mkdir(parents=True, exist_ok=True)
-    for rel, header in (("log.md", "# Minni Log\n\n"), ("index.md", "# Minni Index\n\n")):
+    for rel, header in (("log.md", _LOG_HEADER), ("index.md", _INDEX_HEADER)):
         path = vault / rel
-        if not path.exists():
-            path.write_text(header, encoding="utf-8")
+        if path.exists():
+            continue
+        _seed_exclusive_file(path, header)
 
 
 def _append_audit(vault: Path, tool: str, summary: str, details: dict) -> None:

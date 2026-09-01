@@ -46,9 +46,14 @@ def ensure_agent_vault(vault: Union[str, Path]) -> List[str]:
     not exist, or if everything was already present. Raises
     ``NotADirectoryError`` / ``IsADirectoryError`` / ``OSError`` when the
     root or a contract path exists as the wrong type. A file (or
-    symlink-to-file) at the vault root is a conflict, not a missing vault.
+    symlink) at the vault root is a conflict, not a missing vault.
+    A directory symlink is refused so wiki/inbox/log.md are not planted
+    in a shop/peer tree (``is_dir()`` follows; ``resolve()`` would then
+    become the containment base).
     """
     root = Path(vault).expanduser()
+    if root.is_symlink():
+        raise OSError(f"refusing symlinked vault root: {root}")
     if root.exists() and not root.is_dir():
         raise NotADirectoryError(
             f"vault root exists and is not a directory: {root}"
@@ -56,6 +61,8 @@ def ensure_agent_vault(vault: Union[str, Path]) -> List[str]:
     if not root.is_dir():
         return []
     try:
+        # Unresolved vault path is the containment base. After refusing a
+        # last-component symlink, resolve() does not retarget into shop/peer.
         root_real = root.resolve()
     except OSError as exc:
         raise OSError(f"vault root is not resolvable: {root}") from exc
