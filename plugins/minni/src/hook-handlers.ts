@@ -1339,15 +1339,27 @@ export function createHookHandlers(
     let recallStateFile: string | undefined;
     let stalePointer: string | undefined;
     if (strong) {
-      try {
-        recallStateFile = await writeRecallState(config.vaultPath, {
-          task_signature: signature,
-          intent: intent.action,
-          top_hits: strong.topHits,
-          top_score: strong.topScore,
-        });
-      } catch {
-        // best-effort: a state-write failure must not break the hook
+      // s6 UNCONSULTED deny is a backstop for an envelope the model actually
+      // received. Grok UPS/SS and Cursor UPS structurally drop inject
+      // (GROK_INJECTABLE={Stop}, CURSOR_INJECTABLE={SessionStart}); planting
+      // consumed=false here would deny cold tools against memory the model
+      // never saw. Do not expand those injectable sets — this gate follows them.
+      if (canInject(wire, "UserPromptSubmit")) {
+        try {
+          recallStateFile = await writeRecallState(config.vaultPath, {
+            task_signature: signature,
+            intent: intent.action,
+            top_hits: strong.topHits,
+            top_score: strong.topScore,
+          });
+        } catch {
+          // best-effort: a state-write failure must not break the hook
+        }
+      } else {
+        // Prior dropped-UPS plants left consumed=false on disk; this turn
+        // would have overwritten them with another false plant. Clear instead
+        // of leaving the guard armed against an undelivered envelope.
+        await clearRecallState(config.vaultPath).catch(() => {});
       }
     } else if (daemonTimedOut) {
       // DEGRADED, not weak. Keep the existing state file — clearing it would
