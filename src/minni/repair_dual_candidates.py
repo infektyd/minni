@@ -1508,10 +1508,11 @@ def _dry_run_inbox_dedup_index_status(
         )
         row = c.fetchone()
         if row:
-            sql = str((row["sql"] if hasattr(row, "keys") else row[0]) or "")
-            if "principal" in sql.lower():
+            sql = row["sql"] if hasattr(row, "keys") else row[0]
+            if _inbox_dedup_index_sql_is_current(sql):
                 return {"status": "exists", "index": index_name, "dry_run": True}
-            # Stale global index — would be replaced on apply.
+            # Stale global (file, index) or raw-principal index — would be
+            # replaced on apply. Fall through to collision preflight.
     loser_ids: set = set()
     if dual_plan:
         # repair_duplicate_candidate_pairs dry-run exposes plan in ``sample``

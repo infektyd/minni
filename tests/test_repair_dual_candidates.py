@@ -824,6 +824,99 @@ def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(
         assert rows[0]["principal"] == leftover
 
 
+def test_dry_run_stale_raw_principal_unique_is_not_exists(tmp_path):
+    """Stale UNIQUE on raw principal must not report dry-run status=exists.
+
+    ``"principal" in sql.lower()`` is true for both the leftover raw-column
+    index and the CASE canonical fill. Dry-run has to reuse
+    ``_inbox_dedup_index_sql_is_current`` so a named-but-stale index falls
+    through to collision preflight (would_create / would_block), then
+    ``ensure_inbox_dedup_index`` recreates the CASE index and leftover
+    ``agy``/``xai`` rows collide with ``gemini``/``grok-build`` inserts.
+    """
+    import sqlite3
+
+    from minni.repair_dual_candidates import (
+        INBOX_DEDUP_INDEX,
+        _inbox_dedup_index_sql_is_current,
+        ensure_inbox_dedup_index,
+        run_full_repair,
+    )
+
+    cases = (
+        ("agy", "gemini"),
+        ("xai", "grok-build"),
+    )
+    for leftover, canonical in cases:
+        db, _cfg = _make_db(tmp_path / leftover)
+        _insert_candidate(
+            db,
+            content=f"leftover {leftover} session fill",
+            status="proposed",
+            inbox_file="session.json",
+            candidate_index=0,
+            principal=leftover,
+        )
+        with db.transaction() as c:
+            c.execute(
+                f"""
+                CREATE UNIQUE INDEX {INBOX_DEDUP_INDEX}
+                ON candidate_packets (
+                    principal,
+                    json_extract(derived_from, '$.inbox_file'),
+                    CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER)
+                )
+                WHERE json_extract(derived_from, '$.source') = 'inbox'
+                  AND json_extract(derived_from, '$.inbox_file') IS NOT NULL
+                  AND json_extract(derived_from, '$.candidate_index') IS NOT NULL
+                """
+            )
+        with db.cursor() as c:
+            c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (INBOX_DEDUP_INDEX,),
+            )
+            stale_sql = (c.fetchone() or [None])[0]
+        assert stale_sql
+        assert "principal" in str(stale_sql).lower()
+        assert not _inbox_dedup_index_sql_is_current(stale_sql)
+
+        dry = run_full_repair(db, dry_run=True, create_index=True)
+        idx = dry["inbox_dedup_index"]
+        assert idx["status"] != "exists", (leftover, idx)
+        assert idx["status"] in {"would_create", "would_block"}, (leftover, idx)
+        assert idx.get("dry_run") is True
+        with db.cursor() as c:
+            c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (INBOX_DEDUP_INDEX,),
+            )
+            after_dry = (c.fetchone() or [None])[0]
+        assert after_dry == stale_sql
+
+        created = ensure_inbox_dedup_index(db)
+        assert created["status"] == "created", (leftover, created)
+        with db.cursor() as c:
+            c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (INBOX_DEDUP_INDEX,),
+            )
+            new_sql = (c.fetchone() or [None])[0]
+        assert _inbox_dedup_index_sql_is_current(new_sql)
+        dry_after = run_full_repair(db, dry_run=True, create_index=True)
+        assert dry_after["inbox_dedup_index"]["status"] == "exists"
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_candidate(
+                db,
+                content=f"canonical {canonical} twin of leftover",
+                status="proposed",
+                inbox_file="session.json",
+                candidate_index=0,
+                principal=canonical,
+            )
+
+
 def test_ingest_allows_same_basename_under_other_principal(tmp_path):
     """Principal-scoped key: multi-vault same basename is legitimate.
 
