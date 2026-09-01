@@ -254,18 +254,15 @@ def _principal_from_raw(
             norm_roots.append(str(rp))
         except Exception:
             norm_roots.append(p)
-    for root in norm_roots:
-        try:
-            from minni.vault_layout import ensure_agent_vault
+    # allowed_vault_roots is a read ACL (own vault + shared + maybe siblings).
+    # Seed only this agent's vault directory — never shared or a foreign *-vault.
+    own_names = {f"{aid}-vault", f"{aid.replace('-', '')}-vault"}
+    from minni.vault_layout import ensure_agent_vault
 
-            ensure_agent_vault(root)
-        except Exception:
-            logger.warning(
-                "principal %s: failed to seed vault contract under %s",
-                aid,
-                root,
-                exc_info=True,
-            )
+    for root in norm_roots:
+        if Path(root).name not in own_names:
+            continue
+        ensure_agent_vault(root)
     return EffectivePrincipal(
         agent_id=aid,
         workspace_id=str(raw.get("workspace_id", "default")),

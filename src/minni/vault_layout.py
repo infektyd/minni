@@ -39,7 +39,9 @@ def ensure_agent_vault(vault: Union[str, Path]) -> List[str]:
     """Create missing contract dirs/files under an existing vault directory.
 
     Returns relative paths that were created. Empty list if ``vault`` is not
-    already a directory, or if everything was already present.
+    already a directory, or if everything was already present. Raises
+    ``NotADirectoryError`` / ``IsADirectoryError`` / ``OSError`` when a
+    contract path exists as the wrong type.
     """
     root = Path(vault)
     if not root.is_dir():
@@ -47,12 +49,26 @@ def ensure_agent_vault(vault: Union[str, Path]) -> List[str]:
     created: List[str] = []
     for rel in CONTRACT_DIRS:
         dest = root / rel
-        if not dest.exists():
-            dest.mkdir(parents=True, exist_ok=True)
-            created.append(rel)
+        if dest.exists():
+            if not dest.is_dir():
+                raise NotADirectoryError(
+                    f"vault contract {rel!r} exists and is not a directory: {dest}"
+                )
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        created.append(rel)
     for rel, header in (("log.md", _LOG_HEADER), ("index.md", _INDEX_HEADER)):
         dest = root / rel
-        if not dest.exists():
-            dest.write_text(header, encoding="utf-8")
-            created.append(rel)
+        if dest.exists():
+            if dest.is_dir():
+                raise IsADirectoryError(
+                    f"vault contract {rel!r} exists and is a directory: {dest}"
+                )
+            if not dest.is_file():
+                raise OSError(
+                    f"vault contract {rel!r} exists and is not a regular file: {dest}"
+                )
+            continue
+        dest.write_text(header, encoding="utf-8")
+        created.append(rel)
     return created
