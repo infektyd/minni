@@ -24,6 +24,7 @@ from minni.tools.author_principals import render_principal
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_TS = REPO_ROOT / "plugins" / "minni" / "src" / "server.ts"
+LIST_MODEL_TS = REPO_ROOT / "plugins" / "minni" / "src" / "list-candidates-model.ts"
 
 # Authored platform template caps — cursor.json, grok-build.json, and the
 # claude-code template (the live claude-code.json resolve_candidate grant is
@@ -192,3 +193,101 @@ def test_explicit_resolve_candidate_cap_still_resolves_foreign(monkeypatch, tmp_
         {"candidate_id": cursor_cid, "decision": "reject"}, 6
     )
     assert resp.get("result", {}).get("new_status") == "rejected", resp
+
+
+SECRET_MARKER = "hunter2-not-a-path"
+LOCAL_PATH_MARKER = "/Users/example/Projects/secret-notes.md"
+REDACT_THEN_LIST_MARKER = "HIDDEN_REDACT_MARKER_xyz"
+
+
+def test_list_candidates_redacts_secrets_and_paths(monkeypatch, tmp_path):
+    """POLICY §2: list_candidates is a JSON-RPC envelope that crosses a
+    process boundary. SELECT * used to ship raw content, evidence_refs,
+    and inbox paths to MCP (and therefore to cloud models)."""
+    _patch_db(monkeypatch, tmp_path)
+    _stage(
+        monkeypatch,
+        "cursor",
+        f"Remember api_key={SECRET_MARKER} lives at {LOCAL_PATH_MARKER}",
+    )
+    _stamp(monkeypatch, "cursor")
+    listed = minnid._list_candidates({"status": "proposed"}, 8)
+    blob = str(listed)
+    assert SECRET_MARKER not in blob, listed
+    assert "/Users/example" not in blob, listed
+    rows = listed.get("result", {}).get("candidates", [])
+    assert len(rows) == 1, listed
+    content = rows[0].get("content", "")
+    assert "api_key=[REDACTED]" in content, content
+    assert "[REDACTED_PATH]" in content, content
+
+
+def test_list_defaults_to_proposed_and_hides_redacted_content(monkeypatch, tmp_path):
+    """Omitting status used to SELECT every status. redact/reject only
+    flips status — content stays — so a naive drain re-leaked hidden
+    packets. Default the drain queue to proposed."""
+    _patch_db(monkeypatch, tmp_path)
+    visible_cid = _stage(monkeypatch, "cursor", "cursor proposed drain item")
+    hidden_cid = _stage(monkeypatch, "cursor", REDACT_THEN_LIST_MARKER)
+    _stamp(monkeypatch, "cursor")
+    redacted = minnid._resolve_candidate(
+        {"candidate_id": hidden_cid, "decision": "redact", "reason": "scrub"},
+        9,
+    )
+    assert redacted.get("result", {}).get("new_status") == "redacted", redacted
+
+    listed = minnid._list_candidates({}, 10)
+    result = listed.get("result", {})
+    rows = result.get("candidates", [])
+    ids = {row["candidate_id"] for row in rows}
+    assert visible_cid in ids, listed
+    assert hidden_cid not in ids, listed
+    assert all(row.get("status") == "proposed" for row in rows), listed
+    assert REDACT_THEN_LIST_MARKER not in str(listed), listed
+    assert result.get("status") == "proposed", listed
+
+    explicit = minnid._list_candidates({"status": "redacted"}, 11)
+    explicit_rows = explicit.get("result", {}).get("candidates", [])
+    assert any(row.get("candidate_id") == hidden_cid for row in explicit_rows), explicit
+
+
+def test_list_truncation_is_not_silent(monkeypatch, tmp_path):
+    """count was len(page) with default min(limit or 100, 500) and no
+    has_more/total. Hundreds of proposed packets then looked complete.
+    Tests must fail if truncation is silent."""
+    _patch_db(monkeypatch, tmp_path)
+    for i in range(3):
+        _stage(monkeypatch, "cursor", f"cursor drain item {i} unique")
+    _stamp(monkeypatch, "cursor")
+
+    page = minnid._list_candidates({"status": "proposed", "limit": 2}, 12)
+    result = page.get("result", {})
+    assert result.get("count") == 2, page
+    assert result.get("total") == 3, page
+    assert result.get("has_more") is True, page
+    assert result.get("limit") == 2, page
+    assert len(result.get("candidates", [])) == 2, page
+
+    full = minnid._list_candidates({"status": "proposed", "limit": 10}, 13)
+    full_result = full.get("result", {})
+    assert full_result.get("count") == 3, full
+    assert full_result.get("total") == 3, full
+    assert full_result.get("has_more") is False, full
+
+
+def test_mcp_list_does_not_stringify_raw_daemon_packet():
+    """Cursor MCP sends tool output to cloud models. The handler must
+    redact + project before returning, default the drain queue to
+    proposed, and refuse redacted/rejected content."""
+    source = SERVER_TS.read_text(encoding="utf8")
+    start = source.find('"minni_list_candidates"')
+    assert start != -1
+    next_tool = source.find("server.registerTool(", start + 1)
+    block = source[start : next_tool if next_tool != -1 else None]
+    assert "modelListCandidatesPayload" in block
+    assert "drainStatusForModel" in block
+    assert "JSON.stringify(rpc," not in block
+    helper = LIST_MODEL_TS.read_text(encoding="utf8")
+    assert "redacted" in helper
+    assert "rejected" in helper
+    assert "proposed" in helper

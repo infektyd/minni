@@ -114,6 +114,11 @@ import {
 } from "./thread-worker.js";
 import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
 import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
+import {
+  drainStatusForModel,
+  modelListCandidatesPayload,
+  MODEL_HIDDEN_CANDIDATE_STATUSES,
+} from "./list-candidates-model.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
 // vault's wiki tree regardless of `limit` — the limit is a post-scoring
@@ -856,7 +861,7 @@ server.registerTool(
   {
     title: "Minni List Candidates",
     description:
-      "List staged learning candidates for this runtime principal (own rows only). Pass status=proposed to see the drain queue.",
+      "List staged learning candidates for this runtime principal (own rows only). Defaults to status=proposed (the drain queue). Redacted/rejected packet content is not returned.",
     inputSchema: {
       status: z.string().min(1).optional(),
       limit: z.number().int().min(1).max(500).optional(),
@@ -866,13 +871,19 @@ server.registerTool(
   async ({ status, limit }) => {
     const gated = await requireSharedGate("candidates.list", { status, limit });
     if (gated) return gated;
+    const drainStatus = drainStatusForModel(status);
+    if (MODEL_HIDDEN_CANDIDATE_STATUSES.has(drainStatus)) {
+      return textResult(
+        JSON.stringify(modelListCandidatesPayload({ ok: true, data: { candidates: [] } }, drainStatus), null, 2),
+      );
+    }
     const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
     const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
-      ...(status ? { status } : {}),
+      status: drainStatus,
       ...(limit != null ? { limit } : {}),
       agent_id: DEFAULT_AGENT_ID,
     });
-    return textResult(JSON.stringify(rpc, null, 2));
+    return textResult(JSON.stringify(modelListCandidatesPayload(rpc, drainStatus), null, 2));
   },
 );
 

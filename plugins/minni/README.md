@@ -103,7 +103,8 @@ rejected outright and disables the cloud provider.
 - `minni_learning_quality`
 - `minni_learn`
 - `minni_list_candidates` — list this runtime principal's staged candidates
-  (own rows only; pass `status=proposed` for the drain queue)
+  (own rows only; defaults to `status=proposed`; redacted/rejected content
+  is not returned to the model)
 - `minni_resolve_candidate` — owner-or-explicit-operator candidate resolution
   for staged learning candidates. Accept into durable memory still requires
   operator/govern; a platform host may reject/redact its own rows without that

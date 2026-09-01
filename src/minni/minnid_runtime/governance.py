@@ -13,6 +13,8 @@ from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
 from minni.safety import is_instruction_like
 
+from .redaction import redact_value
+
 # Migration-015 probe. db.py treats a failed migrations run as non-fatal
 # (warns and keeps serving), so a live daemon can run against a DB whose
 # candidate_packets CHECK still predates 015 and rejects the do_not_store /
@@ -1107,27 +1109,46 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
 
 
 def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -> dict:
-    """List candidates for the stamped principal."""
+    """List candidates for the stamped principal.
+
+    Default status is ``proposed`` (the drain queue). Omitting status used
+    to SELECT every status, so a later list after redact/reject returned
+    hidden packet content. Explicit status still works for console zones.
+    Envelopes that cross the process boundary are POLICY §2 redacted, and
+    ``total`` / ``has_more`` make a truncated page visible.
+    """
     principal, err = context.handler_principal(params, request_id)
     if err:
         return err
 
-    status_f = params.get("status")
-    limit = min(int(params.get("limit", 100)), 500)
+    raw_status = params.get("status")
+    if isinstance(raw_status, str):
+        status_f = raw_status.strip() or "proposed"
+    elif raw_status in (None, ""):
+        status_f = "proposed"
+    else:
+        status_f = str(raw_status).strip() or "proposed"
+
+    try:
+        limit = int(params.get("limit", 100))
+    except (TypeError, ValueError):
+        return context.make_error(-32602, "limit must be an integer", request_id)
+    limit = min(max(limit, 1), 500)
+
     db = None
     try:
         db = context.sovereign_db()
         with db.cursor() as c:
-            if status_f:
-                c.execute(
-                    "SELECT * FROM candidate_packets WHERE principal=? AND status=? ORDER BY proposed_at DESC LIMIT ?",
-                    (principal.agent_id, status_f, limit),
-                )
-            else:
-                c.execute(
-                    "SELECT * FROM candidate_packets WHERE principal=? ORDER BY proposed_at DESC LIMIT ?",
-                    (principal.agent_id, limit),
-                )
+            c.execute(
+                "SELECT COUNT(*) AS n FROM candidate_packets WHERE principal=? AND status=?",
+                (principal.agent_id, status_f),
+            )
+            total = int(c.fetchone()["n"])
+            c.execute(
+                "SELECT * FROM candidate_packets WHERE principal=? AND status=? "
+                "ORDER BY proposed_at DESC LIMIT ?",
+                (principal.agent_id, status_f, limit),
+            )
             rows = []
             for row in c.fetchall():
                 item = dict(row)
@@ -1137,9 +1158,18 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
                             item[key] = json.loads(item[key])
                         except Exception:
                             pass
-                rows.append(item)
+                redacted, _ = redact_value(item)
+                rows.append(redacted)
         return context.make_response(
-            {"candidates": rows, "principal": principal.agent_id, "count": len(rows)},
+            {
+                "candidates": rows,
+                "principal": principal.agent_id,
+                "status": status_f,
+                "count": len(rows),
+                "total": total,
+                "limit": limit,
+                "has_more": total > len(rows),
+            },
             request_id,
         )
     except Exception as exc:
