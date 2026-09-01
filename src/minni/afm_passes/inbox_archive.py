@@ -35,6 +35,7 @@ from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
     STOP_KINDS,
     _as_str_set,
+    _canonical_principal,
     _content_sha1,
     _is_stop_candidate_shape,
     _principal_for_inbox,
@@ -329,7 +330,7 @@ def _inert_reason(doc: Any, inbox_principal: str) -> Optional[Dict[str, Any]]:
     if doc.get("log_only") is True or doc.get("do_not_store") is True:
         return {"reason": "log_only_or_do_not_store_flag"}
     file_agent = str(doc.get("agent_id") or "").strip()
-    if file_agent and file_agent != inbox_principal:
+    if file_agent and _canonical_principal(file_agent) != inbox_principal:
         return None  # _agent_mismatch: inbox_quarantine's cohort
     cands = doc.get("candidates") or []
     if not isinstance(cands, list):

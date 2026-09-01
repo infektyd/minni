@@ -77,6 +77,7 @@ from minni.safety import is_instruction_like
 from minni.afm_passes.inbox_archive import archive_inbox_file
 from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
+    _canonical_principal,
     _coerce_candidate_index,
     _content_sha1,
     _existing_keys,
@@ -368,7 +369,7 @@ def classify_unusable_compact_file(path: Path, principal: str) -> Optional[str]:
     if doc.get("kind") != COMPACT_SUMMARY_KIND:
         return None  # routing: another kind's pass owns this file
     file_agent = str(doc.get("agent_id") or "").strip()
-    if file_agent and file_agent != principal:
+    if file_agent and _canonical_principal(file_agent) != principal:
         return COMPACT_AGENT_MISMATCH
     if not str(doc.get("summary_text") or "").strip():
         return COMPACT_EMPTY_SUMMARY
@@ -464,7 +465,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 continue
             scanned_files += 1
             file_agent = str(doc.get("agent_id") or "").strip()
-            if file_agent and file_agent != principal:
+            if file_agent and _canonical_principal(file_agent) != principal:
                 skipped["_agent_mismatch"] = skipped.get("_agent_mismatch", 0) + 1
                 continue
             if not str(doc.get("summary_text") or "").strip():

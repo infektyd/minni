@@ -173,6 +173,17 @@ def _principal_for_inbox_dir(
     return fallback_principal
 
 
+def _canonical_principal(principal: Any) -> str:
+    """Map a leftover packet agent_id onto its canonical id.
+
+    Mirrors ``inbox_ingest._canonical_principal`` so ``agy`` in
+    ``agy-vault`` (principal ``gemini``) is a match, not
+    ``agent_mismatch_quarantine``.
+    """
+    raw = str(principal or "")
+    return _VAULT_SLUG_TO_AGENT_ID.get(raw, raw)
+
+
 # Both inbox filename formats:
 #   2026-06-09-<base36 ms>-slug.json   (plugin writeInbox)
 #   20260426T184233Z-slug.json         (daemon handoff channel)
@@ -393,7 +404,7 @@ def classify_file(
             # simply fresh, not broken, and stays 'keep'.
             file_agent = str(doc.get("agent_id") or "").strip()
             vault_principal = _principal_for_inbox_dir(path.parent.parent.name)
-            if file_agent and file_agent != vault_principal:
+            if file_agent and _canonical_principal(file_agent) != vault_principal:
                 age = _file_age_seconds(path, now)
                 if age is not None and age > residue_ttl_days * 86400:
                     return "agent_mismatch_quarantine"

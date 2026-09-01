@@ -133,6 +133,22 @@ def test_agent_mismatch_file_is_left_for_quarantine(tmp_path):
     assert (inbox / "mm.json").exists()
 
 
+def test_slug_alias_stamped_echo_is_archived_not_left_as_mismatch(tmp_path):
+    """Parity with test_slug_alias_stamped_agent_id_is_not_mismatch:
+    leftover agent_id=agy in agy-vault (canonical gemini) is not
+    _agent_mismatch, so an echo-only file is inert (this sweep's cohort),
+    not left for quarantine."""
+    from minni.afm_passes.inbox_archive import archive_inert_files
+
+    _, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(inbox, "echo.json", _echo_doc(agent_id="agy"))
+
+    res = archive_inert_files(cfg, inboxes=[inbox])
+    assert res["archived"] == 1, res
+    assert not (inbox / "echo.json").exists()
+
+
 def test_non_stop_kind_is_untouched(tmp_path):
     from minni.afm_passes.inbox_archive import archive_inert_files
 

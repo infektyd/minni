@@ -63,6 +63,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from minni.afm_passes.inbox_ingest import (
     STOP_KINDS,
+    _canonical_principal,
     _file_createdat_epoch,
     _is_stop_candidate_shape,
     _principal_for_inbox,
@@ -146,10 +147,11 @@ def _stale_agent_mismatch_files(
 ) -> List[Tuple[Path, Dict[str, Any]]]:
     """``(path, reason_payload)`` for every file in ``inbox`` that
     ``inbox_ingest._scan_inbox`` would bucket under
-    ``skipped_by_kind["_agent_mismatch"]`` (the SAME ``file_agent !=
-    inbox_principal`` test, inbox_ingest.py:256-259) and that is older than
-    ``ttl_seconds``. Scoped to that cohort only — a malformed/missing kind or
-    an unrecognized kind is a different bug and is left untouched here."""
+    ``skipped_by_kind["_agent_mismatch"]`` (the SAME
+    ``_canonical_principal(file_agent) != inbox_principal`` test) and that
+    is older than ``ttl_seconds``. Scoped to that cohort only — a
+    malformed/missing kind or an unrecognized kind is a different bug and
+    is left untouched here."""
     out: List[Tuple[Path, Dict[str, Any]]] = []
     inbox_principal = _principal_for_inbox(inbox, fallback_principal)
     for path in sorted(inbox.glob("*.json")):
@@ -165,7 +167,7 @@ def _stale_agent_mismatch_files(
         if kind not in STOP_KINDS and not (kind is None and _is_stop_candidate_shape(doc)):
             continue  # _unrecognized / explicit other kind: different bug
         file_agent = str(doc.get("agent_id") or "").strip()
-        if not file_agent or file_agent == inbox_principal:
+        if not file_agent or _canonical_principal(file_agent) == inbox_principal:
             continue  # not an _agent_mismatch file at all
         created = _file_createdat_epoch(doc)
         if created is None:

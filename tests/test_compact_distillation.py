@@ -228,6 +228,29 @@ def test_skips_agent_mismatch_and_empty_and_foreign_kinds(tmp_path, monkeypatch)
     assert res["files_scanned"] == 2  # foreign kinds are not compact files at all
 
 
+def test_slug_alias_stamped_agent_id_is_not_compact_mismatch(tmp_path, monkeypatch):
+    """Parity with test_slug_alias_stamped_agent_id_is_not_mismatch:
+    leftover agent_id=agy in agy-vault (canonical gemini) is usable.
+    Both classify_unusable_compact_file and distill must agree — a raw
+    file_agent != principal compare would skip/quarantine the leftover."""
+    from minni.afm_passes.compact_distillation import (
+        classify_unusable_compact_file,
+        distill,
+    )
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(inbox, "stamped.json", _summary_doc(agent_id="agy"))
+
+    assert classify_unusable_compact_file(inbox / "stamped.json", "gemini") is None
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["skipped"].get("_agent_mismatch", 0) == 0, res
+    assert res["inserted"] > 0, res
+
+
 FLAT_SUMMARY = "One paragraph of genuinely useful session findings about the migration."
 
 

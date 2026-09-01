@@ -506,6 +506,21 @@ def test_classify_agent_matching_zero_rows_stays_keep(tmp_path):
     assert reason == "keep", reason
 
 
+def test_classify_slug_alias_stamped_agent_id_stays_keep(tmp_path):
+    """Parity with test_slug_alias_stamped_agent_id_is_not_mismatch:
+    leftover agent_id=agy in agy-vault (canonical gemini) is ingestible.
+    classify_file must keep it, never sweep it to agent_mismatch_quarantine
+    even once stale — --apply would otherwise quarantine the exact leftover
+    ingest now requires."""
+    inbox = tmp_path / "agy-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    doc = {**_stop_doc(["agy-stamped durable lesson"]), "agent_id": "agy"}
+    path = inbox / "2026-04-01-agy-stamped.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    reason = inbox_cleanup.classify_file(path, {}, handoff_ttl_days=7.0, now=NOW)
+    assert reason == "keep", reason
+
+
 def test_classify_agentless_zero_rows_stays_keep(tmp_path):
     """Scope guard: no agent_id at all (kind-less Claude Code shape) is never
     treated as an agent mismatch, regardless of age."""
