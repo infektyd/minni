@@ -38,12 +38,17 @@ _INDEX_HEADER = "# Minni Index\n\n"
 def ensure_agent_vault(vault: Union[str, Path]) -> List[str]:
     """Create missing contract dirs/files under an existing vault directory.
 
-    Returns relative paths that were created. Empty list if ``vault`` is not
-    already a directory, or if everything was already present. Raises
-    ``NotADirectoryError`` / ``IsADirectoryError`` / ``OSError`` when a
-    contract path exists as the wrong type.
+    Returns relative paths that were created. Empty list if ``vault`` does
+    not exist, or if everything was already present. Raises
+    ``NotADirectoryError`` / ``IsADirectoryError`` / ``OSError`` when the
+    root or a contract path exists as the wrong type. A file (or
+    symlink-to-file) at the vault root is a conflict, not a missing vault.
     """
-    root = Path(vault)
+    root = Path(vault).expanduser()
+    if root.exists() and not root.is_dir():
+        raise NotADirectoryError(
+            f"vault root exists and is not a directory: {root}"
+        )
     if not root.is_dir():
         return []
     created: List[str] = []

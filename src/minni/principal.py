@@ -234,6 +234,31 @@ def _auto_accept_flag(raw_value: Any, *, where: str) -> bool:
     return False
 
 
+def _canonical_vault_dirname(agent_id: str) -> str:
+    from minni.tools.author_principals import vault_dirname_for
+
+    return vault_dirname_for(agent_id)
+
+
+def _seed_own_vault(principal: EffectivePrincipal) -> None:
+    """Seed this principal's canonical vault after identity is resolved.
+
+    Must not run inside ``_principal_from_raw``: ``from_local_transport``
+    loads the operator stamp on every RPC before the caller is known.
+    Search-only and default-deny stamps must not write layout.
+    """
+    if not (principal.can("learn") or principal.can("write")):
+        return
+    own_name = _canonical_vault_dirname(principal.agent_id)
+    from minni.vault_layout import ensure_agent_vault
+
+    for root in principal.allowed_vault_roots:
+        if Path(root).name != own_name:
+            continue
+        ensure_agent_vault(root)
+        return
+
+
 def _principal_from_raw(
     raw: dict, *, transport: str, principals_dir: Path
 ) -> EffectivePrincipal:
@@ -244,8 +269,9 @@ def _principal_from_raw(
     for x in raw_roots:
         p = str(x)
         try:
-            rp = Path(p).resolve()
-            if not Path(p).is_absolute():
+            expanded = Path(p).expanduser()
+            rp = expanded.resolve()
+            if not expanded.is_absolute():
                 logger.warning(
                     "principal %s allowed_vault_root %r was relative; resolved against cwd to %s. "
                     "Operator configs should use absolute paths.",
@@ -254,15 +280,6 @@ def _principal_from_raw(
             norm_roots.append(str(rp))
         except Exception:
             norm_roots.append(p)
-    # allowed_vault_roots is a read ACL (own vault + shared + maybe siblings).
-    # Seed only this agent's vault directory — never shared or a foreign *-vault.
-    own_names = {f"{aid}-vault", f"{aid.replace('-', '')}-vault"}
-    from minni.vault_layout import ensure_agent_vault
-
-    for root in norm_roots:
-        if Path(root).name not in own_names:
-            continue
-        ensure_agent_vault(root)
     return EffectivePrincipal(
         agent_id=aid,
         workspace_id=str(raw.get("workspace_id", "default")),
@@ -463,6 +480,38 @@ def resolve_effective_principal(
     operator_context: bool = False,
 ) -> EffectivePrincipal:
     """Resolve the single authoritative EffectivePrincipal for this request.
+
+    Rules:
+    - No supplied id means explicit local/operator context and resolves through
+      the canonical operator principal order.
+    - A supplied non-operator agent id first resolves principals/<agent_id>.json.
+    - Unknown/fileless valid agent ids resolve to a default-deny principal.
+    - Reserved operator ids ("main", "operator") require operator_context=True.
+    - Per-agent file id mismatches still raise IdentityMismatchError.
+
+    The returned principal (or the raised error) is the ONLY identity that
+    downstream code is allowed to use. Vault layout is seeded only for this
+    resolved principal's canonical vault, never as a side effect of loading
+    the operator stamp.
+    """
+    principal = _stamp_effective_principal(
+        supplied_agent_id=supplied_agent_id,
+        transport=transport,
+        principals_dir=principals_dir,
+        operator_context=operator_context,
+    )
+    _seed_own_vault(principal)
+    return principal
+
+
+def _stamp_effective_principal(
+    *,
+    supplied_agent_id: Optional[str] = None,
+    transport: str = "uds",
+    principals_dir: Optional[Path] = None,
+    operator_context: bool = False,
+) -> EffectivePrincipal:
+    """Stamp identity without mutating vault layout.
 
     Rules:
     - No supplied id means explicit local/operator context and resolves through
