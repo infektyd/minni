@@ -43,10 +43,11 @@ Contract (mirrors afm_passes.inbox_ingest):
   candidate rows are durably inserted (or, for the zero-shared case, once its
   session note is written) — idempotency lives entirely on the candidate
   rows' ``derived_from`` keys, so the file itself is never read again
-  regardless of outcome. A file whose candidates were already inserted by a
-  prior run (the file-level idempotency short-circuit below) but never got
-  archived — e.g. one processed before this archive-on-insert behavior
-  shipped — is swept the same way on its next scan.
+  regardless of outcome. A file whose *every distilled index* was already
+  inserted by a prior run but never got archived — e.g. one processed
+  before this archive-on-insert behavior shipped — is swept the same way
+  on its next scan. Index 0 alone is not "the whole file": leftover alias
+  fills occupy 0 while later compact_summary sections still need merging.
   Without this, files that DO yield shared candidates would sit in the inbox
   forever: their idempotency key already prevents reprocessing, so they are
   rescanned-and-skipped on every tick and inflate pending-inbox counts (see
@@ -433,7 +434,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     notes_written = 0
     archived_zero_shared = 0
     archived_with_shared = 0
-    to_archive_with_shared: List[Path] = []
+    to_archive_with_shared: List[Tuple[Path, set]] = []
 
     for inbox in inboxes:
         principal = _principal_for_inbox(inbox, fallback_principal)
@@ -472,37 +473,19 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             if not str(doc.get("summary_text") or "").strip():
                 skipped["_empty_summary"] = skipped.get("_empty_summary", 0) + 1
                 continue
-            # File-level idempotency: index 0 always exists for a processed
-            # file, so its presence marks the whole file as done. This also
-            # holds the AFM/fallback split stable per file — a re-run with a
-            # different AFM availability must not append a second variant set.
-            # Canonicalize so leftover gemini/grok-build rows match agy/xai
-            # fallback principals (same app key as inbox_ingest).
-            file_key0 = _make_inbox_key(principal, path.name, 0)
-            if file_key0 in existing:
-                already += 1
-                # Legacy sweep: a file processed by a pre-fix daemon build has
-                # its candidate rows sitting in the DB already but was never
-                # archived (this pass's own historical bug). Its content is
-                # fully captured by those rows regardless of their resolution
-                # status, so it is safe — and necessary — to archive it here
-                # too, or it would keep being rescanned-and-skipped forever.
-                if not dry_run and archive_inbox_file(path):
-                    archived_with_shared += 1
-                continue
             candidates, personal, file_dropped = _distill_file(doc, afm_chain)
             afm_sections += sum(1 for _, used in candidates if used)
             personal_sections += personal
             for reason, count in file_dropped.items():
                 dropped_sections[reason] = dropped_sections.get(reason, 0) + count
-            if not dry_run:
-                # Personal leg runs for EVERY processed file, whatever the
-                # audience mix — the vault note is the only place the full
-                # session context is kept.
-                if _write_session_note(inbox.parent, doc, path.name, principal):
-                    notes_written += 1
             if not candidates:
                 skipped["_no_candidates"] = skipped.get("_no_candidates", 0) + 1
+                if not dry_run:
+                    # Personal leg runs for EVERY processed file, whatever the
+                    # audience mix — the vault note is the only place the full
+                    # session context is kept.
+                    if _write_session_note(inbox.parent, doc, path.name, principal):
+                        notes_written += 1
                 # No candidate rows means no idempotency key, so this file would
                 # be rescanned on every tick forever. Its content is now in the
                 # vault note, so retire it through the archive lifecycle (moved,
@@ -510,17 +493,37 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 if not dry_run and archive_inbox_file(path):
                     archived_zero_shared += 1
                 continue
-            # This file's content now lives entirely in inserted candidate rows
-            # (plus the session note above) — idempotency is keyed on those
-            # rows' derived_from, not on the file, so it can be archived as
-            # soon as they are durably inserted. Deferred until after the
-            # insert transaction below succeeds (never archive-before-insert).
+            expected_keys = {
+                _make_inbox_key(principal, path.name, idx)
+                for idx in range(len(candidates))
+            }
+            missing = [
+                idx
+                for idx in range(len(candidates))
+                if _make_inbox_key(principal, path.name, idx) not in existing
+            ]
+            if not missing:
+                already += 1
+                # Legacy sweep: every distilled index is already in the DB
+                # (not merely index 0 — leftover alias fills occupy 0 while
+                # later compact_summary sections still need 1..n) but the
+                # file was never archived. Safe to retire now.
+                if not dry_run and archive_inbox_file(path):
+                    archived_with_shared += 1
+                continue
             if not dry_run:
-                to_archive_with_shared.append(path)
+                if _write_session_note(inbox.parent, doc, path.name, principal):
+                    notes_written += 1
+            # Archive only after the insert transaction below succeeds for
+            # every missing index (never archive-before-insert, never archive
+            # on a UNIQUE/family skip that left extra fills unmerged).
+            if not dry_run:
+                to_archive_with_shared.append((path, expected_keys))
             raw_privacy = doc.get("privacy_level", "safe")
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
-            for idx, (content, afm_used) in enumerate(candidates):
+            for idx in missing:
+                content, afm_used = candidates[idx]
                 existing.add(_make_inbox_key(principal, path.name, idx))
                 to_insert.append({
                     "principal": principal,
@@ -601,12 +604,20 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 txn_existing.add(key)
                 inserted += 1
 
-    # Archive only after the insert transaction above has committed — the
-    # rows are the durable record now, so a crash between insert and archive
-    # just leaves the file to be (harmlessly, idempotently) re-skipped next
-    # tick, never lost.
-    for path in to_archive_with_shared:
-        if archive_inbox_file(path):
+    # Archive only after the insert transaction above has committed AND
+    # every distilled index for the file is actually in the DB. UNIQUE/
+    # family skip of index 0 must not retire a file whose extra fills
+    # never landed. A crash between insert and archive just leaves the
+    # file to be (harmlessly) merged/archived next tick, never lost.
+    durable_keys: set = set()
+    if not dry_run and to_archive_with_shared:
+        wanted = set()
+        for _path, expected in to_archive_with_shared:
+            wanted |= expected
+        with db.cursor() as c:
+            durable_keys = _existing_keys_for_on_cursor(c, wanted)
+    for path, expected in to_archive_with_shared:
+        if expected and expected <= durable_keys and archive_inbox_file(path):
             archived_with_shared += 1
 
     return {

@@ -48,6 +48,14 @@ logger = logging.getLogger("minnid")
 
 ARCHIVE_DIRNAME = ".archive"
 
+
+def _inbox_vault_slug(inbox: Path) -> str:
+    """Raw ``<slug>`` from ``<slug>-vault/inbox``; empty for the daemon vault."""
+    parent = Path(inbox).parent.name
+    if parent.endswith("-vault"):
+        return parent[: -len("-vault")]
+    return ""
+
 # Every candidate_packets status except 'proposed' (the schema CHECK set,
 # including the do_not_store/log_only statuses added by migration 015).
 TERMINAL_STATUSES = frozenset(
@@ -271,10 +279,16 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     # the same basename in another vault would otherwise archive the wrong
     # agent's still-live file when discover order visits them first.
     owner_canon = _canonical_principal(owner_principal)
+    # Leftover alias packets (agy/xai) share a canonical owner with the
+    # remapped vault (gemini/grok-build). Do not archive that remapped
+    # vault's live file — it was never the leftover's source.
+    owner_is_alias = bool(owner_principal) and owner_principal != owner_canon
 
     for inbox in discover_inboxes(config):
         inbox_owner = _principal_for_inbox(inbox, fallback_principal="unknown")
         if _canonical_principal(inbox_owner or "") != owner_canon:
+            continue
+        if owner_is_alias and _inbox_vault_slug(inbox) != owner_principal:
             continue
         source = inbox / inbox_file
         try:

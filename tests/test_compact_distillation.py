@@ -323,6 +323,138 @@ def test_distill_in_txn_canonicalizes_alias_wanted_against_leftover_gemini(
     assert principals == ["gemini"], principals
 
 
+THREE_SHARED_BODY = (
+    "1. Key Technical Concepts:\n"
+    "   SovereignDB caches one sqlite connection per thread so the RPC pool\n"
+    "   multiplies open fds past the launchd soft limit.\n"
+    "2. Errors and fixes:\n"
+    "   launchctl bootstrap error 5 right after bootout is a teardown race;\n"
+    "   sleeping two seconds and retrying succeeds.\n"
+    "3. Decisions:\n"
+    "   Keep the unique inbox key canonical so leftover agy rows merge.\n"
+)
+
+
+def test_leftover_alias_index0_does_not_archive_compact_without_extra_fills(
+    tmp_path, monkeypatch
+):
+    """Leftover agy index 0 must not treat a later 3-section compact_summary
+    as fully received. File-key0 UNIQUE/family skip used to archive the live
+    file before indices 1–2 were inserted.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = (
+        "Key technical concepts: leftover alias fill occupying index 0 only"
+    )
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "channel": "compact_distillation",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=THREE_SHARED_BODY),
+    )
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 2, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT principal, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    indices = sorted(
+        json.loads(r["derived_from"]).get("candidate_index") for r in rows
+    )
+    assert indices == [0, 1, 2], (indices, rows)
+    assert rows[0]["principal"] == "agy"
+    assert {r["principal"] for r in rows[1:]} == {"gemini"}
+    assert not (inbox / "session.json").exists()
+    assert (inbox / ".archive" / "session.json").is_file()
+
+
+def test_unique_skip_does_not_archive_compact_file_before_insert(
+    tmp_path, monkeypatch
+):
+    """to_archive_with_shared used to append before the INSERT txn. A UNIQUE
+    family skip of index 0 then archived a 3-section file without merging
+    extra fills. Archive only after the missing indices land.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    monkeypatch.setattr(mod, "_existing_keys", lambda db, principals=None: set())
+
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = "Key technical concepts: in-txn unique skip of leftover index 0"
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=THREE_SHARED_BODY),
+    )
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 2, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT derived_from FROM candidate_packets ORDER BY candidate_id"
+        )
+        indices = sorted(
+            json.loads(dict(r)["derived_from"]).get("candidate_index")
+            for r in c.fetchall()
+        )
+    assert indices == [0, 1, 2], indices
+    assert (inbox / ".archive" / "session.json").is_file()
+    assert not (inbox / "session.json").exists()
+
+
 FLAT_SUMMARY = "One paragraph of genuinely useful session findings about the migration."
 
 

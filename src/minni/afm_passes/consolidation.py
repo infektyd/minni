@@ -222,6 +222,8 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
         return None
     # Prefer a candidate the deterministic gate already chose to promote, so the
     # advisory is comparable to a real decision; else fall back to the first one.
+    # Review / NULL never reach the native call — gated below — so the fallback
+    # cannot exfiltrate learn-only text the way an unguarded candidates[0] did.
     chosen = None
     if promote_candidate_ids:
         promote_set = set(promote_candidate_ids)
@@ -233,8 +235,15 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     promote_set = set(promote_candidate_ids)
     if promote_candidate_ids and chosen.get("candidate_id") not in promote_set:
         return None
-    privacy = str(chosen.get("privacy_level") or "safe").strip().lower()
-    if privacy not in _EXAMINABLE_PRIVACY and privacy != "":
+    # Native triage is a model-path. Learn-only review (and I1/I2 NULL/unset)
+    # stay on the deterministic drain; do not fail-open as "safe".
+    raw_privacy = chosen.get("privacy_level")
+    if raw_privacy is None or (
+        isinstance(raw_privacy, str) and not raw_privacy.strip()
+    ):
+        return None
+    privacy = str(raw_privacy).strip().lower()
+    if privacy not in _SAFE_PRIVACY:
         return None
     if int(chosen.get("instruction_like") or 0) == 1:
         return None

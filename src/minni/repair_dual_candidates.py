@@ -837,6 +837,7 @@ def repair_duplicate_candidate_pairs(
 
     if not dry_run and plan:
         now = time.time()
+        from minni.afm_passes.inbox_ingest import _canonical_principal
         # Probe once outside the write loop so we never open db.cursor()
         # (which commits) while BEGIN IMMEDIATE is held.
         has_audit = _table_exists(db, "consolidation_actions")
@@ -898,6 +899,17 @@ def repair_duplicate_candidate_pairs(
                     group_deleted += 1
                 if group_deleted:
                     groups_applied += 1
+                    # Leftover agy/xai winners keep the raw principal; list/
+                    # resolve match that column, so rewrite to the canonical
+                    # id after losers are gone (UNIQUE CASE already agrees).
+                    winner_principal = str(live_winner.get("principal") or "")
+                    canon = _canonical_principal(winner_principal)
+                    if canon and canon != winner_principal:
+                        c.execute(
+                            "UPDATE candidate_packets SET principal=? "
+                            "WHERE candidate_id=?",
+                            (canon, live_keep),
+                        )
                 elif live_losers:
                     # All losers were accepted-guarded — group unresolved.
                     groups_skipped_stale += 1

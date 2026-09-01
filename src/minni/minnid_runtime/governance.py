@@ -1117,16 +1117,24 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
     db = None
     try:
         db = context.sovereign_db()
+        from minni.afm_passes.inbox_ingest import _principal_family
+
+        family = _principal_family(principal.agent_id)
+        placeholders = ",".join("?" for _ in family)
         with db.cursor() as c:
             if status_f:
                 c.execute(
-                    "SELECT * FROM candidate_packets WHERE principal=? AND status=? ORDER BY proposed_at DESC LIMIT ?",
-                    (principal.agent_id, status_f, limit),
+                    "SELECT * FROM candidate_packets "
+                    f"WHERE principal IN ({placeholders}) AND status=? "
+                    "ORDER BY proposed_at DESC LIMIT ?",
+                    (*family, status_f, limit),
                 )
             else:
                 c.execute(
-                    "SELECT * FROM candidate_packets WHERE principal=? ORDER BY proposed_at DESC LIMIT ?",
-                    (principal.agent_id, limit),
+                    "SELECT * FROM candidate_packets "
+                    f"WHERE principal IN ({placeholders}) "
+                    "ORDER BY proposed_at DESC LIMIT ?",
+                    (*family, limit),
                 )
             rows = []
             for row in c.fetchall():
@@ -1276,7 +1284,13 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 )
             rowd = dict(row)
             owner = str(rowd.get("principal") or "")
-            if owner != principal.agent_id and not explicitly_allowed_operator(principal):
+            from minni.afm_passes.inbox_ingest import _canonical_principal
+
+            if (
+                _canonical_principal(owner)
+                != _canonical_principal(principal.agent_id)
+                and not explicitly_allowed_operator(principal)
+            ):
                 raise ResolveRejected(context.make_error(
                     -32004,
                     f"principal_mismatch: candidate #{cid} is owned by '{owner}'; "

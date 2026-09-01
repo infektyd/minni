@@ -671,3 +671,50 @@ def test_canonical_resolution_sees_leftover_alias_proposed_twin(
         assert archived is not None, vault_dir
         assert not (inbox / "session.json").exists(), vault_dir
         assert (inbox / ".archive" / "session.json").is_file(), vault_dir
+
+
+def test_leftover_alias_accept_does_not_archive_remapped_vault_live_file(
+    tmp_path, monkeypatch
+):
+    """Leftover accepted principal='agy' must archive agy-vault, never the
+    remapped gemini-vault copy that was never ingested. Canonical-owner
+    matching treated both vaults as one agent; discover order then archived
+    whichever live file matched first.
+    """
+    import minni.afm_passes.inbox_archive as archive_mod
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    home = tmp_path
+    db_obj, cfg = _make_db(home)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+    content = "byte-identical leftover fill shared across alias vaults"
+    _seed_inbox_packet(
+        db_obj,
+        principal="agy",
+        inbox_file="same.json",
+        content=content,
+    )
+    agy_inbox = home / "agy-vault" / "inbox"
+    gemini_inbox = home / "gemini-vault" / "inbox"
+    _write_inbox_file(agy_inbox, "same.json", _cc_stop_doc([content]))
+    _write_inbox_file(gemini_inbox, "same.json", _cc_stop_doc([content]))
+    with db_obj.cursor() as c:
+        c.execute(
+            "UPDATE candidate_packets SET status='accepted' WHERE principal='agy'"
+        )
+        c.execute(
+            "SELECT candidate_id FROM candidate_packets WHERE principal='agy'"
+        )
+        cid = dict(c.fetchone())["candidate_id"]
+    monkeypatch.setattr(
+        archive_mod,
+        "discover_inboxes",
+        lambda _cfg: [gemini_inbox, agy_inbox],
+    )
+    archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+    assert archived == str(agy_inbox / ".archive" / "same.json")
+    assert not (agy_inbox / "same.json").exists()
+    assert (agy_inbox / ".archive" / "same.json").is_file()
+    assert (gemini_inbox / "same.json").is_file(), (
+        "remapped vault live file was never ingested and must stay"
+    )

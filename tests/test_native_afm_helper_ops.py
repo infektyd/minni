@@ -409,6 +409,72 @@ def test_consolidation_triage_advisory_none_when_afm_off(tmp_path, monkeypatch):
     assert result["triage_advisory"] is None
 
 
+def test_learn_only_review_is_not_sent_to_native_afm_triage(tmp_path, monkeypatch):
+    """Learn-only privacy=review is deterministically examinable, but must
+    not be shipped to native AFM triage (model-path exfil). Empty promote
+    set used to fall back to candidates[0].
+    """
+    from minni.afm_passes import consolidation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _ensure_candidate_tables(db_obj)
+    cid = _seed_candidate(
+        db_obj,
+        "Always validate the migration plan against a fresh fixture database.",
+        privacy="review",
+    )
+    calls = []
+
+    def capture(operation, payload, timeout=2.0):
+        calls.append(operation)
+        return _AFMResult(
+            ok=True,
+            data={"decision": "accept", "reason": "model would leak this", "tool_used": True},
+        )
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("minni.afm_provider.invoke_native_afm", capture)
+
+    result = consolidation.run(
+        db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="review-triage"
+    )
+    assert result["promote_candidate_ids"] == []
+    assert result["review_candidate_ids"] == [cid]
+    assert result["triage_advisory"] is None
+    assert "triage" not in calls
+
+
+def test_null_privacy_is_not_sent_to_native_afm_triage(tmp_path, monkeypatch):
+    """I1/I2: NULL/unset privacy stays parked and must not fail-open as safe
+    into the native triage helper.
+    """
+    from minni.afm_passes import consolidation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _ensure_candidate_tables(db_obj)
+    cid = _seed_candidate(
+        db_obj,
+        "Always validate the migration plan against a fresh fixture database.",
+        privacy=None,
+    )
+    calls = []
+
+    def capture(operation, payload, timeout=2.0):
+        calls.append(operation)
+        return _AFMResult(ok=True, data={"decision": "accept", "reason": "x"})
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("minni.afm_provider.invoke_native_afm", capture)
+
+    result = consolidation.run(
+        db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="null-triage"
+    )
+    assert result["promote_candidate_ids"] == []
+    assert cid in result["review_candidate_ids"]
+    assert result["triage_advisory"] is None
+    assert "triage" not in calls
+
+
 # --- Task 4: session_distill chunks oversized text --------------------------
 
 

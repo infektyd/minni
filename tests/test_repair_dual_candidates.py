@@ -740,6 +740,7 @@ def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
         rows = [dict(r) for r in c.fetchall()]
     assert len(rows) == 1
     assert rows[0]["candidate_id"] == min(agy_id, gemini_id)
+    assert rows[0]["principal"] == "gemini"
 
 
 def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(
