@@ -13,9 +13,9 @@ Design notes:
 - Conservative: `privacy: safe` **and** learn-only `privacy: review` (the
   stage_candidate clamp) are AFM-examinable. Unset/NULL privacy is still
   parked (I1/I2). Instruction-like / duplicate / quality failures still
-  route to review + fence. A review fence on a `privacy=review` row must
-  not hide it from the next drain — that is how examined=0 / deferred=N
-  happened on a full proposed queue.
+  route to review + fence. An active fence hides the row from the next
+  drain so the loop makes progress. A one-shot unpark lifts fences only
+  on quality-pass, non-IL ``privacy=review`` rows.
 - Swarm-scale:
     * Dedup is an INDEXED hash lookup (`content_hash`), not an O(N) in-memory
       scan of all learnings. Duplicate volume costs ~O(log N), so a swarm
@@ -128,17 +128,11 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
                    content, instruction_like, proposed_at
             FROM candidate_packets cp
             WHERE cp.status = 'proposed'
-              AND (
-                  NOT EXISTS (
-                      SELECT 1 FROM consolidation_actions ca
-                      WHERE ca.action_type = 'afm_review'
-                        AND ca.claim = CAST(cp.candidate_id AS TEXT)
-                        AND COALESCE(ca.status, '') != 'superseded'
-                  )
-                  OR (
-                      lower(COALESCE(cp.privacy_level, '')) = 'review'
-                      AND COALESCE(cp.instruction_like, 0) = 0
-                  )
+              AND NOT EXISTS (
+                  SELECT 1 FROM consolidation_actions ca
+                  WHERE ca.action_type = 'afm_review'
+                    AND ca.claim = CAST(cp.candidate_id AS TEXT)
+                    AND COALESCE(ca.status, '') != 'superseded'
               )
             ORDER BY cp.proposed_at ASC
             LIMIT ?

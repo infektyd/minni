@@ -362,14 +362,30 @@ def reject_candidate_dedup(candidate_id: int, context: AFMContext) -> bool:
 
 
 def mark_candidate_review(candidate_id: int, reason: str, context: AFMContext) -> bool:
-    """Flag a proposed candidate for operator review without changing status."""
+    """Flag a proposed candidate for operator review without changing status.
+
+    Content that trips ``is_instruction_like`` is stamped ``instruction_like=1``
+    even when a fence already exists — otherwise a later SQL window can
+    re-select the row after a privacy-review unpark. The stamp is the same
+    one ``promote_candidate_durable`` already writes on the accept path.
+    """
     wb = context.lazy_writeback()
     now = time.time()
     with wb.db.transaction() as c:
-        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+        c.execute(
+            "SELECT status, content, instruction_like FROM candidate_packets "
+            "WHERE candidate_id=?",
+            (candidate_id,),
+        )
         row = c.fetchone()
         if not row or row["status"] != "proposed":
             return False
+        content = row["content"] or ""
+        if int(row["instruction_like"] or 0) == 1 or is_instruction_like(content):
+            c.execute(
+                "UPDATE candidate_packets SET instruction_like=1 WHERE candidate_id=?",
+                (candidate_id,),
+            )
         c.execute(
             """SELECT 1 FROM consolidation_actions
                WHERE action_type='afm_review' AND claim=?
