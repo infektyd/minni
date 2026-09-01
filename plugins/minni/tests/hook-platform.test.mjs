@@ -39,14 +39,18 @@ test("wireFor does not pretend an unknown platform is Claude Code", () => {
   assert.equal(wire.inject("SessionStart", "memory"), null);
   assert.equal(wire.inject("UserPromptSubmit", "memory"), null);
   assert.equal(wire.inject("Stop", "memory"), null);
+  assert.equal(wire.note("SessionStart", "2 candidates"), null);
+  assert.equal(wire.note("Stop", "2 candidates"), null);
   const rendered = renderIntent(wire, injectIntent("SessionStart", "memory"));
-  assert.match(rendered.dropped?.reason ?? "", /no hook-platform profile|cannot inject/);
+  assert.match(rendered.dropped?.reason ?? "", /cannot inject/);
 });
 
 test("hermes is an explicit unprofiled wire, not a Claude clone", () => {
   const wire = wireFor("hermes");
   assert.equal(wire.id, "hermes");
   assert.equal(wire.inject("SessionStart", "memory"), null);
+  assert.equal(wire.note("SessionStart", "2 candidates"), null);
+  assert.equal(wire.note("Stop", "2 candidates"), null);
   const rendered = renderIntent(wire, injectIntent("UserPromptSubmit", "memory"));
   assert.ok(rendered.dropped);
 });
@@ -209,7 +213,7 @@ test("Cursor: a Stop note is dropped, never sent as followup_message", () => {
 test("Cursor resolves to its OWN wire, not the Claude fallback", () => {
   // Regression: cursor previously fell through wireFor() to claudeCodeWire, so
   // handlers emitted Claude envelopes that the adapter then discarded with no
-  // record. The fallback must stay a safety net, never load-bearing.
+  // record. Unknown ids now resolve to unprofiledWire; Claude is not a fallback.
   assert.equal(wireFor("cursor").id, "cursor");
 });
 

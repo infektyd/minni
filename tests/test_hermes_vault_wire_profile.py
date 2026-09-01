@@ -1,14 +1,18 @@
 """Hermes vault/wire slice (usage-audit R2).
 
-Live machine: 1075 learnings with agent_id=hermes (2026-04-13..2026-05-17),
-zero documents, hermes-vault contains only `.index`. Principal JSON names
-the vault; docs/contracts/VAULT.md documents it; hook-platform.wireFor has
-no hermes profile and used to silently render the Claude Code shape.
+Live machine: 1075 learnings with agent_id=hermes (2026-04-13..2026-05-17)
+live in shared ``~/.minni/learnings`` and AFM wiki ``~/.minni/vault``, not
+hermes-vault wiki. hermes-vault being `.index`-only is a missing
+inbox/identity layout (wiki dirs, log.md, index.md). Principal JSON names
+the vault; docs/contracts/VAULT.md documents it. hook-platform.wireFor
+used to silently render the Claude Code shape for hermes; it now keeps
+the id and refuses inject/note.
 
 This slice:
-- seeds contract files (wiki/, log.md, index.md) when a principal's vault
-  root already exists as a directory
+- seeds inbox/identity contract files when a principal's vault root
+  already exists as a directory
 - does not invent a vault from nothing
+- does not route learnings into hermes-vault
 """
 
 from __future__ import annotations

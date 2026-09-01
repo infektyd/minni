@@ -240,15 +240,17 @@ after the manifest was loaded.
 
 ## Every platform must own a wire
 
-`wireFor()` falls back to the Claude Code shape for an unknown id. That is a
-narrow safety net for a not-yet-profiled platform — it must never become
-load-bearing for a shipped one.
+`wireFor()` never falls back to Claude. Unknown ids resolve to
+`unprofiledWire`: keep the requested id, `inject`/`note` return null, and
+`renderIntent` records the drop. Claude is not a safety net for a
+not-yet-profiled host.
 
-It did, once: Cursor had no profile, so it resolved to `claudeCodeWire`, the
-handlers emitted Claude envelopes, and `adaptCursorOutput` translated them after
-the fact. Anything Cursor could not carry — the prompt-submit envelope — was
-dropped by the adapter **with no record**, which is precisely the silence the
-wire layer exists to eliminate. A test now pins `wireFor("cursor").id === "cursor"`.
+It used to be. Cursor had no profile, so it resolved to `claudeCodeWire`,
+the handlers emitted Claude envelopes, and `adaptCursorOutput` translated
+them after the fact. Anything Cursor could not carry — the prompt-submit
+envelope — was dropped by the adapter **with no record**, which is precisely
+the silence the wire layer exists to eliminate. A test now pins
+`wireFor("cursor").id === "cursor"`.
 
 If you add a platform: give it a profile, set `wire:` on its config, and let the
 adapter handle only what genuinely bypasses the wire (the `PreToolUse` guard

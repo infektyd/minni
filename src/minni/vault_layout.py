@@ -1,10 +1,13 @@
 """Seed the human vault contract under an existing agent vault root.
 
-Learnings can land in SQLite with no wiki/log.md (live: hermes-vault is
-``.index`` only, 1075 daemon learnings, zero documents). The plugin's
-``ensureVault`` already creates this layout on first hook; CLI/socket
-principals never took that path. Seed only when the root already exists —
-do not invent a vault from a missing path.
+Per-agent vaults hold inbox/identity (wiki dirs, log.md, index.md), not
+the learning corpus. Live: 1075 hermes-stamped daemon learnings sit in
+shared ``~/.minni/learnings`` and AFM wiki ``~/.minni/vault``; hermes-vault
+being ``.index``-only is a missing inbox/identity layout, not a hole those
+learnings should fill. The plugin's ``ensureVault`` already creates this
+layout on first hook; CLI/socket principals never took that path. Seed
+only when the root already exists — do not invent a vault from a missing
+path. Do not route learnings into hermes-vault.
 """
 
 from __future__ import annotations
