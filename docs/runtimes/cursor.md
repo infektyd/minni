@@ -61,8 +61,11 @@ the weak point on this platform**:
   see [docs/contracts/AGENT.md §8](../contracts/AGENT.md).
 
 Practical upshot: on Cursor, plan on the agent reaching memory through MCP
-tool calls (`minni_recall`, `minni_status`, …) rather than boot-time hook
-injection.
+tool calls (`minni_recall`, `minni_status`, `minni_list_candidates`,
+`minni_resolve_candidate`, …) rather than boot-time hook injection. Cursor's
+principal template does not include the cross-principal `resolve_candidate`
+grant; it can list and reject/redact its own proposed rows, but accepting
+into durable memory still needs operator/govern.
 
 ## Vault path
 

@@ -849,12 +849,39 @@ server.registerTool(
 
 // G15 / RCM-009 "THREE places" literal match: (1) this TS handler surface (no agentId in schema), (2) sovrd._resolve_candidate (does resolve_effective_principal + is_operator_principal check + -32004), (3) principal resolver + is_operator_principal itself.
 // Enforcement delegated to daemon RPC (correct per design); explicit comment here documents the surface for plan fidelity. Model cannot spoof operator.
+// List is the missing half of the drain pair: hosts (Cursor included) stage via
+// minni_learn but could not see their own candidate_id without this tool.
+server.registerTool(
+  "minni_list_candidates",
+  {
+    title: "Minni List Candidates",
+    description:
+      "List staged learning candidates for this runtime principal (own rows only). Pass status=proposed to see the drain queue.",
+    inputSchema: {
+      status: z.string().min(1).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+      // G11: no caller-controlled identity. Server stamps DEFAULT_AGENT_ID; daemon list_candidates filters WHERE principal=stamped.
+    },
+  },
+  async ({ status, limit }) => {
+    const gated = await requireSharedGate("candidates.list", { status, limit });
+    if (gated) return gated;
+    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
+      ...(status ? { status } : {}),
+      ...(limit != null ? { limit } : {}),
+      agent_id: DEFAULT_AGENT_ID,
+    });
+    return textResult(JSON.stringify(rpc, null, 2));
+  },
+);
+
 server.registerTool(
   "minni_resolve_candidate",
   {
     title: "Minni Resolve Candidate",
     description:
-      "Resolve a staged candidate (accept→durable learn, reject, redact, merge, etc.). Operator-only via principal gating. Privacy/expiry/scope marking decisions are not yet implemented and were removed from this surface — see issue #123.",
+      "Resolve a staged candidate (accept→durable learn, reject, redact, merge, etc.). Owner may resolve own rows; accept into durable memory still requires operator/govern. Cross-principal resolve requires an explicit resolve_candidate/govern grant. Privacy/expiry/scope marking decisions are not yet implemented and were removed from this surface — see issue #123.",
     inputSchema: {
       candidate_id: z.number().int(),
       decision: z.enum([
@@ -874,7 +901,7 @@ server.registerTool(
   async ({ candidate_id, decision, reason }) => {
     const gated = await requireSharedGate("candidates.resolve", { candidate_id, decision });
     if (gated) return gated;
-    // Delegate to daemon RPC (will enforce operator principal on server)
+    // Delegate to daemon RPC (owner-or-explicit-operator inside the transaction)
     const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
     const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
       candidate_id,
