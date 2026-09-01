@@ -219,7 +219,7 @@ def test_fenced_quality_fail_review_does_not_starve_newer_unfenced(
     for i in range(n):
         cid = _insert(
             db,
-            content=f"{FILLER} {'a' * (i % 8)}",
+            content="y" * (16 + i),
             privacy_level="review",
             proposed_at=1000.0 + i,
         )
@@ -255,7 +255,7 @@ def test_wet_quality_fail_review_does_not_livelock_or_remint_drafts(
     filler_ids = [
         _insert(
             db,
-            content=f"{FILLER} {'a' * (i % 8)}",
+            content="y" * (16 + i),
             privacy_level="review",
             proposed_at=2000.0 + i,
         )
