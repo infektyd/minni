@@ -176,6 +176,8 @@ def escape_audit_details_block(raw: str) -> str:
 
 
 def append_handoff_audit(vault_path: Path, tool: str, summary: str, details: dict) -> None:
+    from minni.vault_layout import _LOG_HEADER, _seed_exclusive_file
+
     ensure_handoff_vault(vault_path)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     safe_tool = escape_audit_field(tool, mode="inline", max_len=200)
@@ -183,9 +185,11 @@ def append_handoff_audit(vault_path: Path, tool: str, summary: str, details: dic
     raw_details = json.dumps(details, indent=2, sort_keys=True)
     safe_details = escape_audit_details_block(raw_details)
     line = f"## [{ts}] {safe_tool} | {safe_summary}\n\n```json\n{safe_details}\n```\n\n"
-    for path in (vault_path / "log.md", vault_path / "logs" / f"{ts[:10]}.md"):
-        if not path.exists():
-            path.write_text(f"# {ts[:10]} Minni Audit\n\n", encoding="utf-8")
+    daily = vault_path / "logs" / f"{ts[:10]}.md"
+    # Exclusive header seed, then append — never exists()+write_text (truncate).
+    _seed_exclusive_file(vault_path / "log.md", _LOG_HEADER)
+    _seed_exclusive_file(daily, f"# {ts[:10]} Minni Audit\n\n")
+    for path in (vault_path / "log.md", daily):
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line)
 

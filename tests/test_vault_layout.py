@@ -317,6 +317,27 @@ def test_afm_append_audit_does_not_truncate_when_exists_lies(tmp_path, monkeypat
     assert "wrote draft" in text
 
 
+def test_handoff_append_audit_does_not_truncate_when_exists_lies(tmp_path, monkeypatch):
+    """Leftover exists()+write_text after exclusive ensure must not wipe log.md."""
+    from minni.minnid_runtime.handoff import append_handoff_audit
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
+    orig_exists = Path.exists
+
+    def lying_exists(self: Path) -> bool:
+        if self == vault / "log.md":
+            return False
+        return orig_exists(self)
+
+    monkeypatch.setattr(Path, "exists", lying_exists)
+    append_handoff_audit(vault, "handoff_sent", "wrote draft", {"k": "v"})
+    text = (vault / "log.md").read_text(encoding="utf-8")
+    assert _PLUGIN_LOG in text
+    assert "wrote draft" in text
+
+
 def test_wire_bootstrap_vault_preserves_existing_log_and_index(tmp_path, monkeypatch):
     from minni.wire.writers import bootstrap_vault
 
