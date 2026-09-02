@@ -382,14 +382,17 @@ def _clear_persisted_pending_lifecycle(
         )
 
 
-def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> None:
+def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> bool:
     """Load durable sticky lifecycle into process memory after a cold start.
 
     Caller must hold ``_IN_FLIGHT_LOCK``. Only fills passes that are not already
     held in memory (in-process sticky wins over a stale file race).
+
+    Returns False when the sidecar exists but cannot be parsed so callers can
+    refuse a wet enqueue instead of minting a second draft set.
     """
     if not vault_path:
-        return
+        return True
     try:
         loaded = _read_pending_lifecycle_file(vault_path)
     except Exception:
@@ -397,7 +400,7 @@ def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> None:
             "AFM writer: could not hydrate pending lifecycle from %s",
             vault_path,
         )
-        return
+        return False
     for name, life in loaded.items():
         if name not in _PENDING_LIFECYCLE:
             _PENDING_LIFECYCLE[name] = life
@@ -406,6 +409,7 @@ def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> None:
                 "from vault (post-restart recovery)",
                 name,
             )
+    return True
 
 
 def _vault_path_from_pending(pending: dict) -> Optional[str]:
@@ -1073,6 +1077,48 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
     return expired
 
 
+def _load_inbox_runs(inbox_path: Path, *, kind: str) -> list:
+    """Fail-closed parse of an AFM inbox ledger. Torn JSON is not empty."""
+    try:
+        parsed = json.loads(inbox_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise OSError(
+            f"unreadable {kind}; refusing to replace: {inbox_path}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise OSError(
+            f"{kind} is not a JSON object; refusing to replace: {inbox_path}"
+        )
+    existing = parsed.get("runs")
+    if not isinstance(existing, list):
+        raise OSError(
+            f"{kind} runs is not a list; refusing to replace: {inbox_path}"
+        )
+    return existing
+
+
+def _prepare_inbox_ledger(
+    vault: Path, inbox_rel: str, *, kind: str
+) -> tuple[Path, list]:
+    """Reject plants, exclusive-seed, and fail-closed load ``runs``."""
+    from minni.vault_layout import (
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
+
+    inbox_path = vault / inbox_rel
+    root_real = _resolved_vault_root(vault)
+    _reject_symlink_or_escape(inbox_path.parent, root_real, "inbox")
+    inbox_path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_or_escape(inbox_path, root_real, inbox_rel)
+    _seed_exclusive_file(
+        inbox_path,
+        json.dumps({"runs": []}, indent=2, sort_keys=True) + "\n",
+    )
+    return inbox_path, _load_inbox_runs(inbox_path, kind=kind)
+
+
 def _write_batch(job: dict) -> dict:
     started = time.perf_counter()
     vault = Path(job["vault_path"]).expanduser()
@@ -1080,43 +1126,19 @@ def _write_batch(job: dict) -> dict:
     expired = _expire_stale_drafts(vault)
     drafts = job.get("drafts") or []
     writeback = job.get("writeback")
-    written = [_write_one(vault, draft, writeback=writeback) for draft in drafts]
+    # Fail-closed ledger load BEFORE wiki pages: a torn inbox must not leave
+    # durable drafts that the next compile re-mints under new page_ids.
     inbox_rel = f"inbox/afm-drafts-{_utc()[:10]}.json"
-    inbox_path = vault / inbox_rel
+    inbox_path, existing = _prepare_inbox_ledger(
+        vault, inbox_rel, kind="AFM inbox ledger"
+    )
+    written = [_write_one(vault, draft, writeback=writeback) for draft in drafts]
     payload = {
         "trace_id": job.get("trace_id"),
         "pass_name": job.get("pass_name"),
         "created_at": _utc(),
         "drafts": written,
     }
-    from minni.vault_layout import (
-        _reject_symlink_or_escape,
-        _resolved_vault_root,
-        _seed_exclusive_file,
-    )
-
-    root_real = _resolved_vault_root(vault)
-    _reject_symlink_or_escape(inbox_path.parent, root_real, "inbox")
-    _reject_symlink_or_escape(inbox_path, root_real, inbox_rel)
-    _seed_exclusive_file(
-        inbox_path,
-        json.dumps({"runs": []}, indent=2, sort_keys=True) + "\n",
-    )
-    try:
-        parsed = json.loads(inbox_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise OSError(
-            f"unreadable AFM inbox ledger; refusing to replace: {inbox_path}"
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise OSError(
-            f"AFM inbox ledger is not a JSON object; refusing to replace: {inbox_path}"
-        )
-    existing = parsed.get("runs")
-    if not isinstance(existing, list):
-        raise OSError(
-            f"AFM inbox ledger runs is not a list; refusing to replace: {inbox_path}"
-        )
     _atomic_write_text(
         inbox_path,
         json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n",
@@ -1415,7 +1437,21 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         # Round 18: after a daemon restart process memory is empty but the
         # vault sidecar still names the deferred decision set. Hydrate before
         # the pending check so we re-apply instead of minting a second draft.
-        _hydrate_pending_lifecycle_from_vault(job.get("vault_path"))
+        # A torn sidecar is not empty: refuse wet enqueue so original
+        # candidates stay the only proposed set.
+        if not _hydrate_pending_lifecycle_from_vault(job.get("vault_path")):
+            logger.warning(
+                "AFM writer: pending-lifecycle sidecar for pass %r is "
+                "unreadable; REFUSED %d draft(s) — not minting over torn sticky",
+                pass_name, drafts_deferred,
+            )
+            return {
+                "status": "write_in_flight",
+                "queue_depth": _WORK_QUEUE.qsize(),
+                "drafts_written": [],
+                "drafts_deferred": drafts_deferred,
+                "lifecycle_pending": True,
+            }
         # Round 13/14: pending lifecycle after a failed deferred apply.
         # Re-apply the stored decision set (no new drafts) before refusing
         # forever / restarting into a second draft generation.

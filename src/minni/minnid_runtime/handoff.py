@@ -266,7 +266,8 @@ def compile_handoff_page(sender_vault: Path, packet: dict, stamp: str) -> Option
         return None
     title = packet["task"].strip()
     slug = slugify(f"{packet['from_agent']}-to-{packet['to_agent']}-{title}")
-    page_path = sender_vault / "wiki" / "handoffs" / f"{stamp[:8]}-{slug}.md"
+    unique = slugify(str(packet.get("lease_id") or packet.get("trace_id") or stamp))
+    page_path = sender_vault / "wiki" / "handoffs" / f"{stamp[:8]}-{slug}-{unique}.md"
     refs = "\n".join(f"- [[{ref.removesuffix('.md')}]]" for ref in packet.get("wikilink_refs", []))
     page = (
         "---\n"

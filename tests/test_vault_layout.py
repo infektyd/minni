@@ -840,9 +840,49 @@ def test_hydrate_pending_lifecycle_from_torn_sidecar_is_noop(tmp_path):
     vault = tmp_path / "hermes-vault"
     vault.mkdir()
     path = _torn_pending_sidecar(vault)
-    _hydrate_pending_lifecycle_from_vault(str(vault))
+    assert _hydrate_pending_lifecycle_from_vault(str(vault)) is False
     assert "probe" not in _PENDING_LIFECYCLE
     assert path.read_text(encoding="utf-8") == _TORN_PENDING_SIDECAR
+
+
+def test_submit_drafts_refuses_wet_enqueue_on_torn_pending_sidecar(
+    tmp_path, monkeypatch
+):
+    """Torn sticky sidecar must not hydrate-empty into a second wet mint."""
+    import queue as queue_mod
+
+    import minni.afm_writer as afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    path = _torn_pending_sidecar(vault)
+    put_calls = []
+
+    def _spy_put(item):
+        put_calls.append(item)
+        raise AssertionError("torn pending-lifecycle must not enqueue a wet batch")
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
+    result = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "vault_path": str(vault),
+            "drafts": [
+                {"title": "dup", "page_id": "consolidation-review-1-t2"},
+            ],
+        },
+        timeout=0.05,
+    )
+    assert result.get("status") == "write_in_flight", result
+    assert result.get("lifecycle_pending") is True
+    assert result.get("drafts_written") == []
+    assert put_calls == []
+    assert path.read_text(encoding="utf-8") == _TORN_PENDING_SIDECAR
+    afm_writer.reset_pass_counters()
 
 
 def test_afm_write_batch_does_not_wipe_runs_on_truncated_inbox(tmp_path):
@@ -883,6 +923,46 @@ def test_afm_write_batch_does_not_wipe_runs_on_non_object_inbox(tmp_path):
     assert inbox.read_text(encoding="utf-8") == "[1, 2]\n"
 
 
+def test_afm_write_batch_does_not_mint_wiki_when_inbox_torn(tmp_path):
+    """Inbox fail-close must happen before wiki writes, or retry dual-mints."""
+    import json
+
+    from minni.afm_writer import _write_batch
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    first_draft = _afm_draft(section="concepts")
+    first = _write_batch(
+        {"vault_path": str(vault), "pass_name": "probe", "drafts": [first_draft]}
+    )
+    inbox = Path(first["inbox_path"])
+    wiki_before = {p.relative_to(vault) for p in (vault / "wiki").rglob("*.md")}
+    assert wiki_before
+    original = inbox.read_text(encoding="utf-8")
+    torn = original[: max(12, original.find("runs") + 6)]
+    assert torn != original
+    inbox.write_text(torn, encoding="utf-8")
+    second_draft = {
+        **_afm_draft(section="concepts"),
+        "page_id": "page-zzz999",
+        "title": "Second mint",
+    }
+    with pytest.raises(OSError, match="unreadable AFM inbox ledger"):
+        _write_batch(
+            {
+                "vault_path": str(vault),
+                "pass_name": "probe-2",
+                "drafts": [second_draft],
+            }
+        )
+    wiki_after = {p.relative_to(vault) for p in (vault / "wiki").rglob("*.md")}
+    assert wiki_after == wiki_before
+    assert inbox.read_text(encoding="utf-8") == torn
+    assert "page-zzz999" not in json.dumps(
+        [p.read_text(encoding="utf-8") for p in (vault / "wiki").rglob("*.md")]
+    )
+
+
 def test_handoff_write_json_refuses_dest_symlink_into_shop(tmp_path):
     """Path.write_text follows inbox/packet.json → shop/keep.md."""
     from minni.minnid_runtime.handoff import write_json
@@ -912,17 +992,108 @@ def test_compile_handoff_page_refuses_dest_symlink_into_shop(tmp_path):
         "from_agent": "hermes",
         "to_agent": "grok",
         "trace_id": "trace-1",
+        "lease_id": "handoff-lease1",
         "created_at": "2026-09-01T00:00:00Z",
         "wikilink_refs": [],
         "envelope": "<e/>",
     }
-    dest = dest_dir / f"{stamp[:8]}-{slugify('hermes-to-grok-task')}.md"
+    dest = dest_dir / (
+        f"{stamp[:8]}-{slugify('hermes-to-grok-task')}-"
+        f"{slugify(packet['lease_id'])}.md"
+    )
     dest.symlink_to(shop / "keep.md")
     with pytest.raises(OSError):
         compile_handoff_page(vault, packet, stamp)
     assert dest.is_symlink()
     assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
     assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_compile_handoff_page_keeps_same_day_packets(tmp_path):
+    """Date+slug alone would atomically replace the first same-day handoff."""
+    from minni.minnid_runtime.handoff import compile_handoff_page
+
+    vault = tmp_path / "hermes-vault"
+    (vault / "wiki" / "handoffs").mkdir(parents=True)
+    stamp = "20260901T000000Z"
+    first = {
+        "kind": "handoff",
+        "task": "task",
+        "from_agent": "hermes",
+        "to_agent": "grok",
+        "trace_id": "trace-aaa",
+        "lease_id": "handoff-lease-aaa",
+        "created_at": "2026-09-01T00:00:00Z",
+        "wikilink_refs": [],
+        "envelope": "<e>first</e>",
+    }
+    second = {
+        **first,
+        "trace_id": "trace-bbb",
+        "lease_id": "handoff-lease-bbb",
+        "envelope": "<e>second</e>",
+    }
+    path1 = compile_handoff_page(vault, first, stamp)
+    path2 = compile_handoff_page(vault, second, stamp)
+    assert path1 is not None and path2 is not None
+    assert path1 != path2
+    assert path1.is_file() and path2.is_file()
+    assert "handoff-lease-aaa" in path1.name
+    assert "handoff-lease-bbb" in path2.name
+    assert "<e>first</e>" in path1.read_text(encoding="utf-8")
+    assert "<e>second</e>" in path2.read_text(encoding="utf-8")
+
+
+def _pruning_proposal(trace_id: str = "trace-prune") -> dict:
+    return {
+        "proposal_id": "afm-pruning-transition-probe",
+        "proposal_type": "status_transition",
+        "status": "draft",
+        "agent": "afm-loop",
+        "trace_id": trace_id,
+        "path": "wiki/concepts/expired.md",
+        "from_status": "accepted",
+        "to_status": "expired",
+        "reason": "probe",
+        "lifecycle": "requires_endorsement; original_page_unchanged",
+    }
+
+
+def test_pruning_write_inbox_does_not_wipe_runs_on_truncated_inbox(tmp_path):
+    """Torn pruning ledger must not be treated as empty then Path.write_text."""
+    import json
+    import time
+
+    from minni.afm_passes.pruning import _write_inbox
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    first = _write_inbox(str(vault), "trace-prune-1", [_pruning_proposal("trace-prune-1")])
+    inbox = vault / first["path"]
+    original = inbox.read_text(encoding="utf-8")
+    assert len(json.loads(original)["runs"]) == 1
+    torn = original[: max(12, original.find("runs") + 6)]
+    assert torn != original
+    inbox.write_text(torn, encoding="utf-8")
+    with pytest.raises(OSError, match="unreadable AFM pruning inbox"):
+        _write_inbox(str(vault), "trace-prune-2", [_pruning_proposal("trace-prune-2")])
+    assert inbox.read_text(encoding="utf-8") == torn
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    assert inbox == vault / f"inbox/afm-pruning-{day}.json"
+
+
+def test_pruning_write_inbox_refuses_dest_symlink_into_shop(tmp_path):
+    import time
+
+    from minni.afm_passes.pruning import _write_inbox
+
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    vault, shop = _file_symlink_to_shop(tmp_path, f"inbox/afm-pruning-{day}.json")
+    with pytest.raises(OSError):
+        _write_inbox(str(vault), "trace-prune", [_pruning_proposal()])
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+    assert (vault / "inbox" / f"afm-pruning-{day}.json").is_symlink()
 
 
 def test_atomic_write_text_preserves_dest_0600(tmp_path):

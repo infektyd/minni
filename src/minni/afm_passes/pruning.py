@@ -151,22 +151,23 @@ def _append_audit(vault: Path, trace_id: str, proposal_count: int, inbox_rel: Op
 
 
 def _write_inbox(vault_path: str, trace_id: str, proposals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    from minni.afm_writer import _atomic_write_text, _prepare_inbox_ledger
+
     vault = Path(vault_path).expanduser()
-    inbox = vault / "inbox" / f"afm-pruning-{_utc()[:10]}.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox_rel = f"inbox/afm-pruning-{_utc()[:10]}.json"
     payload = {
         "trace_id": trace_id,
         "pass_name": "pruning",
         "created_at": _utc(),
         "proposals": proposals,
     }
-    existing: List[dict] = []
-    if inbox.exists():
-        try:
-            existing = json.loads(inbox.read_text(encoding="utf-8")).get("runs", [])
-        except Exception:
-            existing = []
-    inbox.write_text(json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    inbox, existing = _prepare_inbox_ledger(
+        vault, inbox_rel, kind="AFM pruning inbox ledger"
+    )
+    _atomic_write_text(
+        inbox,
+        json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n",
+    )
     rel = str(inbox.relative_to(vault))
     _append_audit(vault, trace_id, len(proposals), rel)
     return {"path": rel, "proposal_count": len(proposals)}
