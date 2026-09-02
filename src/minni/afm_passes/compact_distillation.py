@@ -48,6 +48,11 @@ Contract (mirrors afm_passes.inbox_ingest):
   before this archive-on-insert behavior shipped — is swept the same way
   on its next scan. Index 0 alone is not "the whole file": leftover alias
   fills occupy 0 while later compact_summary sections still need merging.
+  Occupied leftover 0 with a divergent body extras-at-next-idx even when
+  missing=[1..N-1]; unmerged occupied keys are not put in expected_keys.
+  Alias vaults that share a canonical principal (agy-vault + gemini-vault)
+  share one occupancy map over the whole scan so the second file's body is
+  extras-at-next-idx rather than UNIQUE-swallowed and archived unmerged.
   Without this, files that DO yield shared candidates would sit in the inbox
   forever: their idempotency key already prevents reprocessing, so they are
   rescanned-and-skipped on every tick and inflate pending-inbox counts (see
@@ -78,15 +83,14 @@ from minni.safety import is_instruction_like
 from minni.afm_passes.inbox_archive import archive_inbox_file
 from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
+    _assign_fill_indices,
     _canonical_principal,
-    _coerce_candidate_index,
     _content_sha1,
-    _existing_keys,
+    _existing_keys,  # tests monkeypatch the pre-scan hook
     _existing_keys_for_on_cursor,
+    _fills_for_file,
     _is_unique_integrity_error,
     _make_inbox_key,
-    _parse_inbox_key,
-    _principal_family,
     _principal_for_inbox,
     discover_inboxes,
 )
@@ -346,50 +350,6 @@ COMPACT_AGENT_MISMATCH = "_compact_agent_mismatch"
 COMPACT_EMPTY_SUMMARY = "_compact_empty_summary"
 
 
-def _fills_for_file(db, principal: str, inbox_file: str) -> List[Tuple[int, str]]:
-    """``(candidate_index, content_sha1)`` already stored for this inbox file.
-
-    Alias-family leftover rows occupy the canonical (file, index) slot.
-    Index 0 alone is not the whole fill when the stored body diverges from
-    a later compact_summary section.
-    """
-    family = _principal_family(principal)
-    placeholders = ",".join("?" for _ in family)
-    with db.cursor() as c:
-        c.execute(
-            f"""
-            SELECT principal, content, derived_from FROM candidate_packets
-            WHERE principal IN ({placeholders})
-              AND derived_from IS NOT NULL
-            """,
-            tuple(family),
-        )
-        rows = c.fetchall()
-    out: List[Tuple[int, str]] = []
-    for row in rows:
-        if isinstance(row, dict) or hasattr(row, "keys"):
-            p, content, df = row["principal"], row["content"], row["derived_from"]
-        else:
-            p, content, df = row[0], row[1], row[2]
-        key = _parse_inbox_key(p, df)
-        if key is None or key[1] != inbox_file:
-            continue
-        sha = None
-        if isinstance(df, str) and df:
-            try:
-                obj = json.loads(df)
-            except Exception:
-                obj = None
-            if isinstance(obj, dict):
-                raw_sha = obj.get("content_sha1")
-                if isinstance(raw_sha, str) and raw_sha:
-                    sha = raw_sha
-        if not sha:
-            sha = _content_sha1(content or "")
-        out.append((key[2], sha))
-    return out
-
-
 def classify_unusable_compact_file(path: Path, principal: str) -> Optional[str]:
     """Why this inbox file is unusable to the distillation pass, or None.
 
@@ -481,10 +441,22 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     archived_zero_shared = 0
     archived_with_shared = 0
     to_archive_with_shared: List[Tuple[Path, set]] = []
+    # One occupancy map over the whole scan (like inbox_ingest). Reloading
+    # _existing_keys per inbox queued the same canonical key twice for
+    # agy-vault + gemini-vault, UNIQUE-swallowed the second body, and
+    # archived the unmerged file.
+    occupancy: Dict[Tuple[str, str], Dict[int, str]] = {}
+
+    def _slot(principal: str, inbox_file: str) -> Dict[int, str]:
+        key = (_canonical_principal(principal), inbox_file)
+        if key not in occupancy:
+            occupancy[key] = {
+                idx: sha for idx, sha in _fills_for_file(db, principal, inbox_file)
+            }
+        return occupancy[key]
 
     for inbox in inboxes:
         principal = _principal_for_inbox(inbox, fallback_principal)
-        existing = _existing_keys(db, {principal})
         for path in sorted(inbox.glob("*.json")):
             try:
                 doc = json.loads(path.read_text(encoding="utf-8"))
@@ -539,57 +511,40 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 if not dry_run and archive_inbox_file(path):
                     archived_zero_shared += 1
                 continue
+            fills = _slot(principal, path.name)
+            requested = [
+                (idx, _content_sha1(content))
+                for idx, (content, _used) in enumerate(candidates)
+            ]
+            assigned = _assign_fill_indices(fills, requested)
+            insert_slots = [
+                (new_idx, candidates[i][0], candidates[i][1])
+                for i, new_idx in enumerate(assigned)
+                if new_idx is not None
+            ]
+            if not insert_slots:
+                already += 1
+                if not dry_run and archive_inbox_file(path):
+                    archived_with_shared += 1
+                continue
+            # Only newly assigned keys — leftover occupied 0 with a
+            # divergent body is not "the fill" and must not gate archive.
             expected_keys = {
                 _make_inbox_key(principal, path.name, idx)
-                for idx in range(len(candidates))
+                for idx, _content, _used in insert_slots
             }
-            missing = [
-                idx
-                for idx in range(len(candidates))
-                if _make_inbox_key(principal, path.name, idx) not in existing
-            ]
-            insert_slots: List[Tuple[int, str, bool]] = []
-            if missing:
-                for idx in missing:
-                    content, afm_used = candidates[idx]
-                    insert_slots.append((idx, content, afm_used))
-            else:
-                # Every distilled index is occupied. That is "already done"
-                # only when stored bodies cover this file. Leftover alias
-                # index 0 with a different body is not a 1-section fill.
-                fills = _fills_for_file(db, principal, path.name)
-                existing_shas = {sha for _idx, sha in fills}
-                occupied = {idx for idx, _sha in fills}
-                extras = [
-                    (content, afm_used)
-                    for content, afm_used in candidates
-                    if _content_sha1(content) not in existing_shas
-                ]
-                if not extras:
-                    already += 1
-                    if not dry_run and archive_inbox_file(path):
-                        archived_with_shared += 1
-                    continue
-                next_idx = (max(occupied) if occupied else -1) + 1
-                for offset, (content, afm_used) in enumerate(extras):
-                    insert_slots.append((next_idx + offset, content, afm_used))
-                expected_keys = {
-                    _make_inbox_key(principal, path.name, idx)
-                    for idx, _content, _used in insert_slots
-                }
             if not dry_run:
                 if _write_session_note(inbox.parent, doc, path.name, principal):
                     notes_written += 1
             # Archive only after the insert transaction below succeeds for
-            # every missing index (never archive-before-insert, never archive
-            # on a UNIQUE/family skip that left extra fills unmerged).
+            # every missing/extra index (never archive-before-insert, never
+            # archive on a UNIQUE/family skip that left extra fills unmerged).
             if not dry_run:
                 to_archive_with_shared.append((path, expected_keys))
             raw_privacy = doc.get("privacy_level", "safe")
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
             for idx, content, afm_used in insert_slots:
-                existing.add(_make_inbox_key(principal, path.name, idx))
                 to_insert.append({
                     "principal": principal,
                     "workspace_id": workspace,

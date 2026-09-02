@@ -180,6 +180,52 @@ def test_slug_alias_kindless_file_does_not_dual_insert(tmp_path):
         assert _count_proposed(db_obj, principal=canonical) == 0
 
 
+def test_ingest_divergent_leftover_body_extras_at_next_index(tmp_path):
+    """Remapped stop-candidate with a different body at leftover index 0
+    must extras-at-next-idx, not already_present. Compact 1-section got
+    that merge; ingest still treated key-in-existing as done with no
+    content_sha1 compare.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    leftover_body = "leftover remapped stop body occupying index 0"
+    live_body = "divergent remapped stop body that leftover UNIQUE must not swallow"
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=leftover_body,
+        )
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, principal, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, (vault_dir, contents)
+        assert live_body in contents, (vault_dir, contents)
+        by_idx = {
+            json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
+        }
+        assert 0 in by_idx and leftover_body in by_idx[0]["content"]
+        extra = [r for r in rows if live_body in r["content"]]
+        extra_idx = json.loads(extra[0]["derived_from"]).get("candidate_index")
+        assert extra_idx not in {0}, (vault_dir, extra_idx)
+        assert {r["principal"] for r in extra} == {canonical}
+
+
 def test_slug_alias_stamped_agent_id_is_not_mismatch(tmp_path):
     """Files that still stamp the pre-alias agent_id must ingest, not wipe."""
     from minni.afm_passes.inbox_ingest import ingest

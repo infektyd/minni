@@ -49,8 +49,11 @@ Safety / contract
   here as defense in depth. Echoes are tallied as ``_audit_echo`` in
   ``skipped_by_kind`` so the drop is observable rather than silent.
 * IDEMPOTENT: each row carries ``derived_from`` with the source inbox file +
-  candidate index; existing rows (ANY status) are detected and never
-  re-inserted. Re-running is a no-op even after the loop resolves a row.
+  candidate index; existing rows (ANY status) whose body matches (content
+  sha1) are detected and never re-inserted. A leftover occupying the same
+  (canonical principal, inbox_file, candidate_index) with a *divergent*
+  body extras-at-next-idx so the remapped stop-candidate still lands.
+  Re-running is a no-op even after the loop resolves a row.
 * ``derived_from.kind`` records what the source file actually declared
   (``null`` for the kind-less Claude Code shape) — Minni logic never stamps
   one agent's label onto another agent's rows.
@@ -290,6 +293,108 @@ def _existing_keys(db, principals: set | None = None) -> set:
         if key is not None:
             keys.add(key)
     return keys
+
+
+def _packet_content_sha1(content: Any, df: Any) -> str:
+    """Prefer derived_from.content_sha1; hash the body when the stamp is missing."""
+    if isinstance(df, str) and df:
+        try:
+            obj = json.loads(df)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            raw_sha = obj.get("content_sha1")
+            if isinstance(raw_sha, str) and raw_sha:
+                return raw_sha
+    return _content_sha1(content or "")
+
+
+def _existing_fills(
+    db, principals: set | None = None
+) -> Dict[Tuple[str, str], Dict[int, str]]:
+    """``(canonical principal, inbox_file) -> {candidate_index: content_sha1}``.
+
+    Alias-family leftover rows occupy the canonical (file, index) slot so a
+    remapped vault can extras-at-next-idx when the occupying body diverges.
+    """
+    fills: Dict[Tuple[str, str], Dict[int, str]] = {}
+    with db.cursor() as c:
+        if principals:
+            expanded: set[str] = set()
+            for p in principals:
+                expanded.update(_principal_family(p))
+            placeholders = ",".join("?" for _ in expanded)
+            c.execute(
+                f"SELECT principal, content, derived_from FROM candidate_packets "
+                f"WHERE principal IN ({placeholders})",
+                tuple(expanded),
+            )
+        else:
+            c.execute(
+                "SELECT principal, content, derived_from FROM candidate_packets"
+            )
+        rows = c.fetchall()
+    for row in rows:
+        if isinstance(row, dict) or hasattr(row, "keys"):
+            p, content, df = row["principal"], row["content"], row["derived_from"]
+        else:
+            p, content, df = row[0], row[1], row[2]
+        key = _parse_inbox_key(p, df)
+        if key is None:
+            continue
+        canon, inbox_file, idx = key
+        fills.setdefault((canon, inbox_file), {})[idx] = _packet_content_sha1(
+            content, df
+        )
+    return fills
+
+
+def _fills_for_file(db, principal: str, inbox_file: str) -> List[Tuple[int, str]]:
+    """``(candidate_index, content_sha1)`` already stored for this inbox file.
+
+    Alias-family leftover rows occupy the canonical (file, index) slot.
+    Index 0 alone is not the whole fill when the stored body diverges from
+    a later compact_summary section or remapped stop-candidate.
+    """
+    slot = _existing_fills(db, {principal}).get(
+        (_canonical_principal(principal), inbox_file), {}
+    )
+    return sorted(slot.items())
+
+
+def _assign_fill_indices(
+    occupied: Dict[int, str],
+    requested: List[Tuple[int, str]],
+) -> List[Optional[int]]:
+    """Map each ``(requested_idx, sha)`` to an insert index, or None if present.
+
+    Missing indices keep ``requested_idx``. Occupied indices whose body
+    already exists (same sha at this index or any index) are skipped.
+    Occupied divergent bodies go at the next free index after every
+    reserved missing slot, so extras never steal a still-free distilled
+    index. Mutates ``occupied``.
+    """
+    existing_shas = set(occupied.values())
+    assigned: List[Optional[int]] = [None] * len(requested)
+    extras: List[int] = []
+    for i, (idx, sha) in enumerate(requested):
+        if sha in existing_shas:
+            continue
+        if idx not in occupied:
+            occupied[idx] = sha
+            existing_shas.add(sha)
+            assigned[i] = idx
+        else:
+            extras.append(i)
+    if extras:
+        next_idx = (max(occupied) if occupied else -1) + 1
+        for i in extras:
+            _idx, sha = requested[i]
+            occupied[next_idx] = sha
+            existing_shas.add(sha)
+            assigned[i] = next_idx
+            next_idx += 1
+    return assigned
 
 
 def _existing_keys_for_on_cursor(c, wanted: set) -> set:
@@ -564,17 +669,29 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
         for label, count in skipped.items():
             skipped_by_kind[label] = skipped_by_kind.get(label, 0) + count
 
-    existing = _existing_keys(db)
+    occupancy = _existing_fills(db)
+
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in scanned:
+        file_key = (_canonical_principal(r["principal"]), r["inbox_file"])
+        grouped.setdefault(file_key, []).append(r)
 
     to_insert: List[Dict[str, Any]] = []
     already = 0
-    for r in scanned:
-        key = _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
-        if key in existing:
-            already += 1
-            continue
-        existing.add(key)  # guard within-run dup
-        to_insert.append(r)
+    for file_key, rows in grouped.items():
+        slot = occupancy.setdefault(file_key, {})
+        requested = [
+            (int(r["candidate_index"]), _content_sha1(r["content"])) for r in rows
+        ]
+        assigned = _assign_fill_indices(slot, requested)
+        for r, new_idx in zip(rows, assigned):
+            if new_idx is None:
+                already += 1
+                continue
+            if new_idx != r["candidate_index"]:
+                r = dict(r)
+                r["candidate_index"] = new_idx
+            to_insert.append(r)
 
     inserted = 0
     if not dry_run and to_insert:

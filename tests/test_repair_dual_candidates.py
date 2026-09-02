@@ -689,12 +689,13 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
     monkeypatch.setattr(cd, "resolve_afm_mode", lambda: "off")
     monkeypatch.setattr(cd, "default_provider_chain", lambda: None)
 
-    # Bypass file-level short-circuit by clearing pre-scan existing keys for
-    # this file? The pre-scan uses _existing_keys which will see our seed and
-    # skip the whole file. That is correct prevention for the common path.
-    # Exercise the in-txn UNIQUE path by monkeypatching _existing_keys to
-    # return empty so the insert path runs, then UNIQUE/recheck must hold.
+    # Bypass file-level short-circuit by clearing pre-scan occupancy for
+    # this file. The pre-scan uses _fills_for_file which will see our seed
+    # and extras-at-next-idx (or skip on matching sha). Exercise the in-txn
+    # UNIQUE path by emptying occupancy so the insert path runs, then
+    # UNIQUE/recheck must hold.
     monkeypatch.setattr(cd, "_existing_keys", lambda db, principals=None: set())
+    monkeypatch.setattr(cd, "_fills_for_file", lambda db, principal, inbox_file: [])
 
     res = cd.distill(db, cfg, inboxes=[inbox], dry_run=False)
     assert res["inserted"] == 0
