@@ -187,11 +187,48 @@ def _inbox_key(
     return (_canonical_principal(principal), fi[0], fi[1])
 
 
+def _alias_source_principal(row: Dict[str, Any]) -> Optional[str]:
+    """Leftover vault slug from raw principal or stamped ``derived_from``.
+
+    Prefer-unfenced collapse deletes a fenced leftover ``agy``/``xai`` row
+    and keeps an already-canonical winner. Archive still needs the leftover
+    slug so the remapped vault's live file is not the only drain.
+    """
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
+    def _if_alias(raw: str) -> Optional[str]:
+        if not raw:
+            return None
+        canon = _canonical_principal(raw)
+        if canon and canon != raw:
+            return raw
+        return None
+
+    from_principal = _if_alias(str(row.get("principal") or ""))
+    if from_principal:
+        return from_principal
+    raw_df = row.get("derived_from")
+    if not isinstance(raw_df, str) or not raw_df:
+        return None
+    try:
+        df = json.loads(raw_df)
+    except Exception:
+        return None
+    if not isinstance(df, dict):
+        return None
+    stamped = df.get("source_principal")
+    if isinstance(stamped, str):
+        return _if_alias(stamped)
+    return None
+
+
 def _stamp_source_principal(derived_from: Any, leftover_principal: str) -> Optional[str]:
     """Return derived_from JSON with leftover slug preserved, or None.
 
-    Collapse rewrites ``principal`` to the canonical host; archive uses
-    ``source_principal`` to refuse the remapped vault's live file.
+    Collapse rewrites ``principal`` to the canonical host, or keeps an
+    already-canonical unfenced twin after deleting a leftover alias.
+    Archive uses ``source_principal`` to refuse the remapped vault's live
+    file in both cases.
     """
     if not leftover_principal:
         return None
@@ -892,6 +929,7 @@ def repair_duplicate_candidate_pairs(
                     winner_replanned += 1
                 live_losers = list(decision["losers"])
                 group_deleted = 0
+                deleted_losers: List[Dict[str, Any]] = []
                 for loser in live_losers:
                     loser_id = int(loser["candidate_id"])
                     loser_status = _norm_status(loser.get("status"))
@@ -917,20 +955,31 @@ def repair_duplicate_candidate_pairs(
                     )
                     deleted += 1
                     group_deleted += 1
+                    deleted_losers.append(loser)
                 if group_deleted:
                     groups_applied += 1
                     # Leftover agy/xai winners keep the raw principal; list/
                     # resolve match that column, so rewrite to the canonical
                     # id after losers are gone (UNIQUE CASE already agrees).
-                    # Stamp the leftover slug into derived_from so archive
-                    # can still refuse the remapped vault after this UPDATE
-                    # makes owner_is_alias false.
+                    # Prefer-unfenced keeps an already-canonical twin and
+                    # deletes the leftover alias — still stamp that leftover
+                    # slug so archive refuses the remapped vault.
                     winner_principal = str(live_winner.get("principal") or "")
                     canon = _canonical_principal(winner_principal)
-                    if canon and canon != winner_principal:
-                        new_derived = _stamp_source_principal(
-                            live_winner.get("derived_from"), winner_principal
+                    leftover_source = _alias_source_principal(live_winner)
+                    if leftover_source is None:
+                        for loser in deleted_losers:
+                            leftover_source = _alias_source_principal(loser)
+                            if leftover_source:
+                                break
+                    new_derived = (
+                        _stamp_source_principal(
+                            live_winner.get("derived_from"), leftover_source
                         )
+                        if leftover_source is not None
+                        else None
+                    )
+                    if canon and canon != winner_principal:
                         if new_derived is not None:
                             c.execute(
                                 "UPDATE candidate_packets SET principal=?, "
@@ -943,6 +992,12 @@ def repair_duplicate_candidate_pairs(
                                 "WHERE candidate_id=?",
                                 (canon, live_keep),
                             )
+                    elif new_derived is not None:
+                        c.execute(
+                            "UPDATE candidate_packets SET derived_from=? "
+                            "WHERE candidate_id=?",
+                            (new_derived, live_keep),
+                        )
                 elif live_losers:
                     # All losers were accepted-guarded — group unresolved.
                     groups_skipped_stale += 1

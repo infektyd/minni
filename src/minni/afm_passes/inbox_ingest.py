@@ -421,6 +421,25 @@ def _principal_for_inbox(inbox: Path, fallback_principal: str) -> str:
     return fallback_principal
 
 
+def _alias_source_principal_for_inbox(
+    inbox: Path, canonical_principal: str
+) -> Optional[str]:
+    """Raw vault slug when ingest remaps an alias vault to a canonical id.
+
+    ``agy-vault`` stores principal=gemini; without ``source_principal``
+    archive treats the row as a gemini-vault fill and gemini-first discover
+    archives never-ingested ``gemini-vault/inbox``. Canonical vaults
+    (slug == principal) return None.
+    """
+    parent = Path(inbox).parent.name
+    if not parent.endswith("-vault"):
+        return None
+    slug = parent[: -len("-vault")]
+    if slug and slug != canonical_principal:
+        return slug
+    return None
+
+
 def _scan_inbox(
     inbox: Path, fallback_principal: str,
 ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -434,6 +453,7 @@ def _scan_inbox(
     out: List[Dict[str, Any]] = []
     skipped_by_kind: Dict[str, int] = {}
     inbox_principal = _principal_for_inbox(inbox, fallback_principal)
+    source_principal = _alias_source_principal_for_inbox(inbox, inbox_principal)
     for path in sorted(inbox.glob("*.json")):
         # An unreadable or non-object payload used to be dropped with a bare
         # `continue`, incrementing nothing — so it was invisible to every
@@ -507,21 +527,22 @@ def _scan_inbox(
                 skipped_by_kind["_audit_echo"] = skipped_by_kind.get("_audit_echo", 0) + 1
                 continue
             content = cand.strip()[:CONTENT_CAP]
-            out.append(
-                {
-                    "principal": principal,
-                    "workspace_id": ws,
-                    "privacy_level": privacy_level,
-                    "content": content,
-                    "inbox_file": path.name,
-                    "candidate_index": idx,
-                    "proposed_at": proposed_at,
-                    # Record what the file actually declared; null for the
-                    # kind-less Claude Code shape. Never stamp an agent-specific
-                    # label onto another agent's rows.
-                    "kind": kind,
-                }
-            )
+            row = {
+                "principal": principal,
+                "workspace_id": ws,
+                "privacy_level": privacy_level,
+                "content": content,
+                "inbox_file": path.name,
+                "candidate_index": idx,
+                "proposed_at": proposed_at,
+                # Record what the file actually declared; null for the
+                # kind-less Claude Code shape. Never stamp an agent-specific
+                # label onto another agent's rows.
+                "kind": kind,
+            }
+            if source_principal:
+                row["source_principal"] = source_principal
+            out.append(row)
     return out, skipped_by_kind
 
 
@@ -576,15 +597,17 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                 if key in txn_existing:
                     already += 1
                     continue
-                derived_from = json.dumps(
-                    {
-                        "source": "inbox",
-                        "inbox_file": r["inbox_file"],
-                        "candidate_index": r["candidate_index"],
-                        "kind": r.get("kind"),
-                        "content_sha1": _content_sha1(r["content"]),
-                    }
-                )
+                derived_obj: Dict[str, Any] = {
+                    "source": "inbox",
+                    "inbox_file": r["inbox_file"],
+                    "candidate_index": r["candidate_index"],
+                    "kind": r.get("kind"),
+                    "content_sha1": _content_sha1(r["content"]),
+                }
+                source_principal = r.get("source_principal")
+                if source_principal:
+                    derived_obj["source_principal"] = source_principal
+                derived_from = json.dumps(derived_obj)
                 try:
                     c.execute(
                         """

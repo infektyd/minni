@@ -747,6 +747,47 @@ def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
     assert df.get("source_principal") == "agy"
 
 
+def test_prefer_unfenced_collapse_stamps_deleted_leftover_source_principal(
+    tmp_path,
+):
+    """all_proposed_prefer_unfenced keeps the canonical twin; leftover alias
+    is deleted. Stamp source_principal from that deleted leftover even when
+    the winner is already gemini/grok-build, or accept archives the leftover
+    vault as the only drain of the remapped fill.
+    """
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    cases = (
+        ("agy", "gemini"),
+        ("xai", "grok-build"),
+    )
+    for leftover, canonical in cases:
+        db, _cfg = _make_db(tmp_path / leftover)
+        content = f"prefer-unfenced leftover fill {leftover} {canonical}"
+        leftover_id = _insert_candidate(
+            db, content=content, status="proposed", principal=leftover
+        )
+        canonical_id = _insert_candidate(
+            db, content=content, status="proposed", principal=canonical
+        )
+        assert leftover_id < canonical_id
+        _insert_afm_review_fence(db, leftover_id, status="pending")
+
+        applied = repair_duplicate_candidate_pairs(db, dry_run=False)
+        assert applied["deleted"] == 1, leftover
+        with db.cursor() as c:
+            c.execute(
+                "SELECT candidate_id, principal, derived_from "
+                "FROM candidate_packets"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, leftover
+        assert rows[0]["candidate_id"] == canonical_id, leftover
+        assert rows[0]["principal"] == canonical, leftover
+        df = json.loads(rows[0]["derived_from"])
+        assert df.get("source_principal") == leftover, leftover
+
+
 def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(
     tmp_path, monkeypatch
 ):

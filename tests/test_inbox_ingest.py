@@ -197,6 +197,38 @@ def test_slug_alias_stamped_agent_id_is_not_mismatch(tmp_path):
     assert res["inserted"] == 1, res
     assert _count_proposed(db_obj, principal="gemini") == 1
     assert _count_proposed(db_obj, principal="agy") == 0
+    with db_obj.cursor() as c:
+        c.execute("SELECT derived_from FROM candidate_packets WHERE principal='gemini'")
+        df = json.loads(dict(c.fetchone())["derived_from"])
+    assert df.get("source_principal") == "agy"
+
+
+def test_alias_vault_ingest_stamps_source_principal(tmp_path):
+    """agy/xai vault ingest stores canonical principal; archive still needs
+    the leftover slug. Stamp source_principal at ingest, not only at collapse.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    for vault_dir, leftover, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / leftover)
+        inbox = tmp_path / leftover / vault_dir / "inbox"
+        _write_inbox_file(
+            inbox, "session.json", _cc_stop_doc([f"alias ingest {leftover}"])
+        )
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, vault_dir
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT principal, derived_from FROM candidate_packets"
+            )
+            row = dict(c.fetchone())
+        assert row["principal"] == canonical, vault_dir
+        df = json.loads(row["derived_from"])
+        assert df.get("source_principal") == leftover, vault_dir
 
 
 def test_ingest_idempotent_after_status_change(tmp_path):
