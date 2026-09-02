@@ -244,20 +244,11 @@ def _serializable_lifecycle(lifecycle: dict) -> dict:
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(str(tmp), str(path))
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
+    """Serialize ``payload`` through the unique O_EXCL|O_NOFOLLOW tmp path."""
+    _atomic_write_text(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _read_pending_lifecycle_file(vault_path: str | Path) -> dict[str, dict]:
@@ -304,6 +295,13 @@ def _persist_pending_lifecycle(
         return
     path = _pending_lifecycle_path(vault_path)
     try:
+        from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+        vault = Path(vault_path).expanduser()
+        root_real = _resolved_vault_root(vault)
+        _reject_symlink_or_escape(path.parent, root_real, "inbox")
+        _reject_symlink_or_escape(path, root_real, str(_PENDING_LIFECYCLE_REL))
+        path.parent.mkdir(parents=True, exist_ok=True)
         existing = _read_pending_lifecycle_file(vault_path)
         # File payload must not include runtime-only keys.
         file_passes = {
@@ -341,6 +339,13 @@ def _clear_persisted_pending_lifecycle(
         return
     path = _pending_lifecycle_path(vault_path)
     try:
+        from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+        vault = Path(vault_path).expanduser()
+        root_real = _resolved_vault_root(vault)
+        _reject_symlink_or_escape(path.parent, root_real, "inbox")
+        _reject_symlink_or_escape(path, root_real, str(_PENDING_LIFECYCLE_REL))
+        path.parent.mkdir(parents=True, exist_ok=True)
         existing = _read_pending_lifecycle_file(vault_path)
         if str(pass_name) not in existing and not path.exists():
             return

@@ -709,6 +709,78 @@ def test_atomic_write_text_refuses_unique_tmp_symlink_into_shop(tmp_path, monkey
     assert list(shop.iterdir()) == [shop / "keep.md"]
 
 
+def _pending_lifecycle() -> dict:
+    return {
+        "promote_candidate_ids": [3],
+        "dedup_candidate_ids": [],
+        "review_candidate_ids": [7, 8],
+    }
+
+
+def test_persist_pending_lifecycle_does_not_plant_pid_sidecar_symlink(
+    tmp_path, monkeypatch
+):
+    """Pid-only .afm-pending-lifecycle.json.{pid}.tmp must not follow into shop."""
+    from minni.afm_writer import _persist_pending_lifecycle
+
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    inbox = vault / "inbox"
+    inbox.mkdir()
+    sidecar = inbox / ".afm-pending-lifecycle.json.4242.tmp"
+    sidecar.symlink_to(shop / "keep.md")
+    _persist_pending_lifecycle("consolidation", _pending_lifecycle(), str(vault))
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+    assert sidecar.is_symlink()
+
+
+def test_persist_pending_lifecycle_refuses_inbox_dir_symlink_into_shop(tmp_path):
+    """mkdir + write of afm-pending-lifecycle.json must not follow inbox → shop."""
+    from minni.afm_writer import _persist_pending_lifecycle
+
+    vault, shop = _inbox_symlink_to_shop(tmp_path)
+    _persist_pending_lifecycle("consolidation", _pending_lifecycle(), str(vault))
+    assert (vault / "inbox").is_symlink()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_clear_persisted_pending_lifecycle_refuses_inbox_dir_symlink_into_shop(
+    tmp_path,
+):
+    """Clear rewrite of leftover passes must not mkdir-through inbox → shop."""
+    import json
+
+    from minni.afm_writer import _clear_persisted_pending_lifecycle
+
+    vault, shop = _inbox_symlink_to_shop(tmp_path)
+    bait = shop / "afm-pending-lifecycle.json"
+    bait_body = (
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-09-01T00:00:00Z",
+                "passes": {
+                    "consolidation": _pending_lifecycle(),
+                    "probe": {"promote_candidate_ids": [1]},
+                },
+            }
+        )
+        + "\n"
+    )
+    bait.write_text(bait_body, encoding="utf-8")
+    _clear_persisted_pending_lifecycle("consolidation", str(vault))
+    assert (vault / "inbox").is_symlink()
+    assert bait.read_text(encoding="utf-8") == bait_body
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert set(shop.iterdir()) == {shop / "keep.md", bait}
+
+
 def test_wire_bootstrap_vault_refuses_schema_agents_symlink_into_shop(
     tmp_path, monkeypatch
 ):
