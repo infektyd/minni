@@ -679,23 +679,30 @@ def update_toml_mcp_config(
 
 
 def bootstrap_vault(agent: str) -> Path:
+    from minni.vault_layout import (
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
+
     vault = vault_for(agent)
     if vault.is_symlink():
         raise ValueError(f"refusing symlinked vault root: {vault}")
     if vault.exists() and not vault.is_dir():
         raise ValueError(f"vault path exists but is not a directory: {vault}")
     vault.mkdir(parents=True, exist_ok=True)
+    root_real = _resolved_vault_root(vault)
     for child in ("raw", "wiki", "logs", "schema", "inbox", "outbox"):
-        (vault / child).mkdir(exist_ok=True)
+        dest = vault / child
+        _reject_symlink_or_escape(dest, root_real, child)
+        dest.mkdir(exist_ok=True)
     schema = vault / "schema" / "AGENTS.md"
-    if not schema.exists():
-        schema.write_text(
-            f"# {agent} Minni Vault\n\n"
-            "This is an actual per-agent vault directory.\n",
-            encoding="utf-8",
-        )
-    from minni.vault_layout import _seed_exclusive_file
-
+    _reject_symlink_or_escape(schema, root_real, "schema/AGENTS.md")
+    _seed_exclusive_file(
+        schema,
+        f"# {agent} Minni Vault\n\n"
+        "This is an actual per-agent vault directory.\n",
+    )
     _seed_exclusive_file(vault / "index.md", f"# {agent} Vault Index\n\n")
     _seed_exclusive_file(vault / "log.md", f"# {agent} Vault Log\n\n")
     return vault

@@ -1811,9 +1811,29 @@ def seed_distill(vault: Path, agent: str) -> dict[str, object]:
     return result
 
 
+def _reject_symlink_or_escape(dest: Path, root_real: Path, rel: str) -> None:
+    if dest.is_symlink():
+        raise OSError(
+            f"vault contract {rel!r} is a symlink; refusing to seed through it: {dest}"
+        )
+    try:
+        dest_real = dest.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise OSError(f"vault contract {rel!r} is not resolvable: {dest}") from exc
+    if not dest_real.is_relative_to(root_real):
+        raise OSError(
+            f"vault contract {rel!r} resolves outside vault root: {dest}"
+        )
+
+
 def _seed_exclusive_file(dest: Path, header: str) -> bool:
     """O_EXCL create at 0600. Do not write at offset 0 if another writer appended."""
+    if dest.is_symlink():
+        raise OSError(f"refusing to seed through symlink: {dest}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
     try:
         fd = os.open(dest, flags, 0o600)
     except FileExistsError:
@@ -1836,17 +1856,23 @@ def bootstrap_vault(args: argparse.Namespace) -> int:
     if vault.exists() and not vault.is_dir():
         raise SystemExit(f"Vault path exists but is not a directory: {vault}")
     vault.mkdir(parents=True, exist_ok=True)
+    try:
+        root_real = vault.resolve()
+    except OSError as exc:
+        raise SystemExit(f"vault root is not resolvable: {vault}") from exc
     for child in ("raw", "wiki", "logs", "schema", "inbox", "outbox"):
-        (vault / child).mkdir(exist_ok=True)
+        dest = vault / child
+        _reject_symlink_or_escape(dest, root_real, child)
+        dest.mkdir(exist_ok=True)
     schema = vault / "schema" / "AGENTS.md"
-    if not schema.exists():
-        schema.write_text(
-            f"# {agent} Minni Vault\n\n"
-            "This is an actual per-agent vault directory. Do not symlink this "
-            "vault to another agent's vault and do not bootstrap it by copying "
-            "another agent's logs, inbox, or wiki wholesale.\n",
-            encoding="utf-8",
-        )
+    _reject_symlink_or_escape(schema, root_real, "schema/AGENTS.md")
+    _seed_exclusive_file(
+        schema,
+        f"# {agent} Minni Vault\n\n"
+        "This is an actual per-agent vault directory. Do not symlink this "
+        "vault to another agent's vault and do not bootstrap it by copying "
+        "another agent's logs, inbox, or wiki wholesale.\n",
+    )
     _seed_exclusive_file(vault / "index.md", f"# {agent} Vault Index\n\n")
     _seed_exclusive_file(vault / "log.md", f"# {agent} Vault Log\n\n")
     # Layer 1 first: seed_distill reports whether layer1/core.md exists, and the

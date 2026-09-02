@@ -887,6 +887,11 @@ def _write_one(
     section = draft.get("section") or f"{draft.get('kind', 'concept')}s"
     rel = Path("wiki") / section / f"{created[:10].replace('-', '')}-{_slugify(draft['title'])}-{draft['page_id'][-6:]}.md"
     path = vault / rel
+    from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+    root_real = _resolved_vault_root(vault)
+    _reject_symlink_or_escape(path.parent, root_real, str(rel.parent))
+    _reject_symlink_or_escape(path, root_real, str(rel))
     path.parent.mkdir(parents=True, exist_ok=True)
     expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp + DRAFT_TTL_SECONDS))
     with _page_lock(draft["page_id"]):
@@ -1012,20 +1017,36 @@ def _write_batch(job: dict) -> dict:
     drafts = job.get("drafts") or []
     writeback = job.get("writeback")
     written = [_write_one(vault, draft, writeback=writeback) for draft in drafts]
-    inbox_path = vault / "inbox" / f"afm-drafts-{_utc()[:10]}.json"
+    inbox_rel = f"inbox/afm-drafts-{_utc()[:10]}.json"
+    inbox_path = vault / inbox_rel
     payload = {
         "trace_id": job.get("trace_id"),
         "pass_name": job.get("pass_name"),
         "created_at": _utc(),
         "drafts": written,
     }
+    from minni.vault_layout import (
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
+
+    root_real = _resolved_vault_root(vault)
+    _reject_symlink_or_escape(inbox_path.parent, root_real, "inbox")
+    _reject_symlink_or_escape(inbox_path, root_real, inbox_rel)
+    _seed_exclusive_file(
+        inbox_path,
+        json.dumps({"runs": []}, indent=2, sort_keys=True) + "\n",
+    )
     existing: List[dict] = []
-    if inbox_path.exists():
-        try:
-            existing = json.loads(inbox_path.read_text(encoding="utf-8")).get("runs", [])
-        except Exception:
-            existing = []
-    inbox_path.write_text(json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        existing = json.loads(inbox_path.read_text(encoding="utf-8")).get("runs", [])
+    except Exception:
+        existing = []
+    _atomic_write_text(
+        inbox_path,
+        json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n",
+    )
     elapsed = time.perf_counter() - started
     _LATENCIES.append(elapsed)
     del _LATENCIES[:-100]

@@ -1197,7 +1197,9 @@ export async function recordAudit(
       await rename(logPath, path1);
     }
 
-    await writeFileAtomic(logPath, logContent());
+    // Exclusive seed, then the append below. writeFileAtomic replace would
+    // wipe a second tap that O_EXCL-created+appended the new log.md.
+    await seedExclusiveFile(logPath, logContent());
   }
 
   // --- 3. Format and Append Audit Line ---

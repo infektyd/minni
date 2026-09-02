@@ -534,3 +534,158 @@ def test_afm_append_audit_refuses_daily_log_symlink_into_shop(tmp_path):
     with pytest.raises(OSError):
         _append_audit(vault, "afm_loop", "wrote draft", {"k": "v"})
     assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def _afm_draft(*, section: str, kind: str = "concept") -> dict:
+    return {
+        "title": "Shop plant probe",
+        "body": "A body long enough to chunk. " * 20,
+        "page_id": "page-abc123",
+        "trace_id": "trace-shop",
+        "kind": kind,
+        "section": section,
+        "sources": ["`probe`"],
+    }
+
+
+def _wiki_section_symlink_to_shop(tmp_path: Path, section: str) -> tuple[Path, Path]:
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "wiki").mkdir()
+    (vault / "wiki" / section).symlink_to(shop)
+    return vault, shop
+
+
+@pytest.mark.parametrize(
+    "section",
+    ("decisions", "syntheses", "procedures", "artifacts"),
+)
+def test_afm_write_one_refuses_wiki_section_symlink_into_shop_restore(tmp_path, section):
+    """mkdir(parents=True) on wiki/<section> must not plant through a dir symlink."""
+    from minni.afm_writer import _write_one
+
+    vault, shop = _wiki_section_symlink_to_shop(tmp_path, section)
+    with pytest.raises(OSError):
+        _write_one(vault, _afm_draft(section=section))
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_afm_write_one_refuses_wiki_dir_symlink_into_shop_restore(tmp_path):
+    from minni.afm_writer import _write_one
+
+    vault, shop = _wiki_symlink_to_shop(tmp_path)
+    with pytest.raises(OSError):
+        _write_one(vault, _afm_draft(section="decisions"))
+    _assert_shop_identity_unplanted(shop)
+    assert not (shop / "decisions").exists()
+
+
+def test_afm_write_batch_refuses_inbox_drafts_symlink_into_shop(tmp_path):
+    """exists()+write_text follows inbox/afm-drafts-*.json into shop-restore."""
+    import time
+
+    from minni.afm_writer import _write_batch
+
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    vault, shop = _file_symlink_to_shop(tmp_path, f"inbox/afm-drafts-{day}.json")
+    with pytest.raises(OSError):
+        _write_batch(
+            {
+                "vault_path": str(vault),
+                "pass_name": "probe",
+                "drafts": [],
+            }
+        )
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_afm_write_batch_merges_inbox_runs_after_exclusive_seed(tmp_path):
+    import json
+
+    from minni.afm_writer import _write_batch
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    job = {"vault_path": str(vault), "pass_name": "probe", "drafts": []}
+    first = _write_batch(job)
+    second = _write_batch(job)
+    inbox = Path(first["inbox_path"])
+    assert inbox == Path(second["inbox_path"])
+    payload = json.loads(inbox.read_text(encoding="utf-8"))
+    assert len(payload["runs"]) == 2
+    assert not inbox.is_symlink()
+
+
+def test_wire_bootstrap_vault_refuses_schema_agents_symlink_into_shop(
+    tmp_path, monkeypatch
+):
+    from minni.wire.writers import bootstrap_vault
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault = tmp_path / ".minni" / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir(parents=True)
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "schema").mkdir()
+    (vault / "schema" / "AGENTS.md").symlink_to(shop / "keep.md")
+    with pytest.raises(OSError):
+        bootstrap_vault("hermes")
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_wire_bootstrap_vault_refuses_schema_dir_symlink_into_shop(
+    tmp_path, monkeypatch
+):
+    from minni.wire.writers import bootstrap_vault
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault = tmp_path / ".minni" / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir(parents=True)
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "schema").symlink_to(shop)
+    with pytest.raises(OSError):
+        bootstrap_vault("hermes")
+    assert not (shop / "AGENTS.md").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_wire_bootstrap_vault_refuses_symlink_wiki_into_shop_restore(
+    tmp_path, monkeypatch
+):
+    from minni.wire.writers import bootstrap_vault
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault = tmp_path / ".minni" / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir(parents=True)
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "wiki").symlink_to(shop)
+    with pytest.raises(OSError):
+        bootstrap_vault("hermes")
+    _assert_shop_identity_unplanted(shop)
+
+
+def test_wire_bootstrap_vault_refuses_symlink_inbox_into_shop_restore(
+    tmp_path, monkeypatch
+):
+    from minni.wire.writers import bootstrap_vault
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault = tmp_path / ".minni" / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir(parents=True)
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "inbox").symlink_to(shop)
+    with pytest.raises(OSError):
+        bootstrap_vault("hermes")
+    assert list(shop.iterdir()) == [shop / "keep.md"]

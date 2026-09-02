@@ -156,6 +156,58 @@ test("recordAudit exclusive-seeds daily log.md, never exists()+writeFileAtomic",
   assert.doesNotMatch(body, /writeFileAtomic\(\s*dailyPath/);
 });
 
+test("recordAudit rotation exclusive-seeds log.md, never writeFileAtomic replace", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function recordAudit");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /seedExclusiveFile\(\s*logPath/);
+  assert.doesNotMatch(body, /writeFileAtomic\(\s*logPath/);
+});
+
+test("recordAudit rotation does not wipe a second-tap exclusive seed", async () => {
+  const { closeSync, existsSync, openSync, writeSync } = await import("node:fs");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-rotate-race-"));
+  try {
+    await ensureVault(root);
+    const logPath = path.join(root, "log.md");
+    const rotated = path.join(root, "log.1.md");
+    await writeFile(logPath, "a".repeat(5 * 1024 * 1024), "utf8");
+    const raced =
+      "## [2026-09-01T00:00:00Z] plugin | second-tap-do-not-clobber\n\n";
+    let planted = false;
+    const racer = (async () => {
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline && !planted) {
+        if (existsSync(rotated)) {
+          try {
+            const fd = openSync(logPath, "wx", 0o600);
+            writeSync(fd, `# Minni Codex Log\n\n${raced}`);
+            closeSync(fd);
+            planted = true;
+            return;
+          } catch (error) {
+            if (error && error.code !== "EEXIST") throw error;
+          }
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+    await recordAudit(root, {
+      tool: "test_tool",
+      summary: "rotate-tap",
+    });
+    await racer;
+    assert.equal(planted, true, "second tap must win the post-rename hole");
+    const text = await readFile(logPath, "utf8");
+    assert.match(text, /second-tap-do-not-clobber/);
+    assert.match(text, /rotate-tap/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("recordAudit refuses log.md symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-audit-log-shop-"));
   const shop = path.join(tmp, "shop-restore");
