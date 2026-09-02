@@ -915,6 +915,8 @@ def _write_one(
     draft: dict,
     writeback: Any = None,
     now: Optional[float] = None,
+    *,
+    persist: bool = True,
 ) -> dict:
     """Write one AFM draft (or refuse for forged). Return shape:
     - normal/quality-blocked: path/wikilink/status present, written implied by file
@@ -985,7 +987,9 @@ def _write_one(
         # Only write if not forged (forged bodies are blocked but note is still produced in return).
         # Same atomic path as expiry/endorse: vault-watch indexes concurrently, so a
         # truncate-in-place crash mid-write must not leave a torn page for the next sweep.
-        if not forged:
+        # persist=False renders the inbox record without landing the wiki page so
+        # _write_batch can commit the ledger first.
+        if not forged and persist:
             _atomic_write_text(path, body)
     # RCM-010: forged cases return null path/wikilink + written:false (callers see refusal shape; no fabricated draft loc)
     if forged:
@@ -1119,6 +1123,29 @@ def _prepare_inbox_ledger(
     return inbox_path, _load_inbox_runs(inbox_path, kind=kind)
 
 
+def _landed_wiki_records(vault: Path, existing: list) -> dict[str, dict]:
+    """page_id → inbox record for wiki pages that already landed."""
+    landed: dict[str, dict] = {}
+    for run in existing:
+        if not isinstance(run, dict):
+            continue
+        for rec in run.get("drafts") or []:
+            if not isinstance(rec, dict):
+                continue
+            page_id = rec.get("page_id")
+            rel = rec.get("path")
+            if not page_id or not rel:
+                continue
+            dest = vault / rel
+            try:
+                if dest.is_symlink() or not dest.is_file():
+                    continue
+            except OSError:
+                continue
+            landed[str(page_id)] = rec
+    return landed
+
+
 def _write_batch(job: dict) -> dict:
     started = time.perf_counter()
     vault = Path(job["vault_path"]).expanduser()
@@ -1126,23 +1153,52 @@ def _write_batch(job: dict) -> dict:
     expired = _expire_stale_drafts(vault)
     drafts = job.get("drafts") or []
     writeback = job.get("writeback")
-    # Fail-closed ledger load BEFORE wiki pages: a torn inbox must not leave
-    # durable drafts that the next compile re-mints under new page_ids.
+    # Fail-closed ledger load AND commit BEFORE wiki pages: a torn inbox must
+    # not leave durable drafts, and a wiki-then-inbox crash must not let the
+    # next compile remint under new page_ids. Skip _write_one when those
+    # page_ids already landed.
     inbox_rel = f"inbox/afm-drafts-{_utc()[:10]}.json"
     inbox_path, existing = _prepare_inbox_ledger(
         vault, inbox_rel, kind="AFM inbox ledger"
     )
-    written = [_write_one(vault, draft, writeback=writeback) for draft in drafts]
+    landed = _landed_wiki_records(vault, existing)
+    stamp = time.time()
+    planned = []
+    for draft in drafts:
+        page_id = str(draft.get("page_id") or "")
+        if page_id and page_id in landed:
+            planned.append(landed[page_id])
+            continue
+        planned.append(
+            _write_one(vault, draft, writeback=writeback, now=stamp, persist=False)
+        )
     payload = {
         "trace_id": job.get("trace_id"),
         "pass_name": job.get("pass_name"),
         "created_at": _utc(),
-        "drafts": written,
+        "drafts": planned,
     }
     _atomic_write_text(
         inbox_path,
         json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n",
     )
+    written = []
+    for draft, rec in zip(drafts, planned):
+        page_id = str(draft.get("page_id") or rec.get("page_id") or "")
+        rel = rec.get("path")
+        dest = vault / rel if rel else None
+        already = bool(page_id and page_id in landed)
+        if not already and dest is not None:
+            try:
+                already = dest.is_file() and not dest.is_symlink()
+            except OSError:
+                already = False
+        if already or rec.get("written") is False or not rel:
+            written.append(rec)
+            continue
+        written.append(
+            _write_one(vault, draft, writeback=writeback, now=stamp, persist=True)
+        )
     elapsed = time.perf_counter() - started
     _LATENCIES.append(elapsed)
     del _LATENCIES[:-100]

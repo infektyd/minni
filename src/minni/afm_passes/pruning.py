@@ -138,16 +138,32 @@ def _build_proposals(db, vault_path: str, trace_id: str) -> tuple[List[Dict[str,
 
 
 def _append_audit(vault: Path, trace_id: str, proposal_count: int, inbox_rel: Optional[str]) -> None:
+    from minni.vault_layout import (
+        _LOG_HEADER,
+        _append_regular_file,
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
+
     ts = _utc()
-    for rel, header in (("log.md", "# Minni Log\n\n"), (f"logs/{ts[:10]}.md", f"# {ts[:10]} Minni Audit\n\n")):
-        path = vault / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            path.write_text(header, encoding="utf-8")
-        details = {"trace_id": trace_id, "proposal_count": proposal_count, "inbox_path": inbox_rel}
-        line = f"## [{ts}] afm_loop | pruning proposed {proposal_count} transition(s)\n\n```json\n{json.dumps(details, indent=2, sort_keys=True)}\n```\n\n"
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+    details = {"trace_id": trace_id, "proposal_count": proposal_count, "inbox_path": inbox_rel}
+    line = (
+        f"## [{ts}] afm_loop | pruning proposed {proposal_count} transition(s)\n\n"
+        f"```json\n{json.dumps(details, indent=2, sort_keys=True)}\n```\n\n"
+    )
+    daily = vault / "logs" / f"{ts[:10]}.md"
+    root_real = _resolved_vault_root(vault)
+    # Exclusive header seed, then append — never exists()+write_text (truncate).
+    # lstat before skip-or-append so log.md/daily cannot follow into shop.
+    for dest, header in (
+        (vault / "log.md", _LOG_HEADER),
+        (daily, f"# {ts[:10]} Minni Audit\n\n"),
+    ):
+        _reject_symlink_or_escape(dest, root_real, dest.name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _seed_exclusive_file(dest, header)
+        _append_regular_file(dest, line)
 
 
 def _write_inbox(vault_path: str, trace_id: str, proposals: List[Dict[str, Any]]) -> Dict[str, Any]:

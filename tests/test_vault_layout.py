@@ -963,6 +963,57 @@ def test_afm_write_batch_does_not_mint_wiki_when_inbox_torn(tmp_path):
     )
 
 
+def test_afm_write_batch_inbox_commit_fail_does_not_dual_mint_wiki(
+    tmp_path, monkeypatch
+):
+    """Wiki-before-inbox left durable pages when ledger commit raised.
+
+    Next compile mints new page_ids. Commit the inbox first; retry must not
+    land a second wiki set.
+    """
+    from minni import afm_writer
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    orig = afm_writer._atomic_write_text
+
+    def fail_inbox(path, data):
+        if path.name.startswith("afm-drafts-") and path.suffix == ".json":
+            raise OSError("inbox commit failed")
+        return orig(path, data)
+
+    monkeypatch.setattr(afm_writer, "_atomic_write_text", fail_inbox)
+    first_draft = {**_afm_draft(section="concepts"), "page_id": "page-aaa111"}
+    with pytest.raises(OSError, match="inbox commit failed"):
+        afm_writer._write_batch(
+            {
+                "vault_path": str(vault),
+                "pass_name": "probe",
+                "drafts": [first_draft],
+            }
+        )
+    wiki_after_fail = list((vault / "wiki").rglob("*.md")) if (vault / "wiki").exists() else []
+    assert wiki_after_fail == []
+
+    monkeypatch.setattr(afm_writer, "_atomic_write_text", orig)
+    second_draft = {
+        **_afm_draft(section="concepts"),
+        "page_id": "page-bbb222",
+        "title": "Second mint",
+    }
+    result = afm_writer._write_batch(
+        {
+            "vault_path": str(vault),
+            "pass_name": "probe-2",
+            "drafts": [second_draft],
+        }
+    )
+    assert result["drafts_written"]
+    texts = [p.read_text(encoding="utf-8") for p in (vault / "wiki").rglob("*.md")]
+    assert any("page-bbb222" in text for text in texts)
+    assert all("page-aaa111" not in text for text in texts)
+
+
 def test_handoff_write_json_refuses_dest_symlink_into_shop(tmp_path):
     """Path.write_text follows inbox/packet.json → shop/keep.md."""
     from minni.minnid_runtime.handoff import write_json
@@ -976,7 +1027,10 @@ def test_handoff_write_json_refuses_dest_symlink_into_shop(tmp_path):
 
 
 def test_compile_handoff_page_refuses_dest_symlink_into_shop(tmp_path):
-    from minni.minnid_runtime.handoff import compile_handoff_page, slugify
+    from minni.minnid_runtime.handoff import (
+        _handoff_wiki_filename,
+        compile_handoff_page,
+    )
 
     vault = tmp_path / "hermes-vault"
     shop = tmp_path / "shop-restore"
@@ -997,10 +1051,7 @@ def test_compile_handoff_page_refuses_dest_symlink_into_shop(tmp_path):
         "wikilink_refs": [],
         "envelope": "<e/>",
     }
-    dest = dest_dir / (
-        f"{stamp[:8]}-{slugify('hermes-to-grok-task')}-"
-        f"{slugify(packet['lease_id'])}.md"
-    )
+    dest = dest_dir / _handoff_wiki_filename(packet, stamp)
     dest.symlink_to(shop / "keep.md")
     with pytest.raises(OSError):
         compile_handoff_page(vault, packet, stamp)
@@ -1042,6 +1093,39 @@ def test_compile_handoff_page_keeps_same_day_packets(tmp_path):
     assert "handoff-lease-bbb" in path2.name
     assert "<e>first</e>" in path1.read_text(encoding="utf-8")
     assert "<e>second</e>" in path2.read_text(encoding="utf-8")
+
+
+def test_compile_handoff_page_lease_id_case_collision(tmp_path):
+    """slugify lowercases; handoff-AAA and handoff-aaa must not share a page."""
+    from minni.minnid_runtime.handoff import compile_handoff_page
+
+    vault = tmp_path / "hermes-vault"
+    (vault / "wiki" / "handoffs").mkdir(parents=True)
+    stamp = "20260901T000000Z"
+    upper = {
+        "kind": "handoff",
+        "task": "task",
+        "from_agent": "hermes",
+        "to_agent": "grok",
+        "trace_id": "trace-upper",
+        "lease_id": "handoff-AAA",
+        "created_at": "2026-09-01T00:00:00Z",
+        "wikilink_refs": [],
+        "envelope": "<e>upper</e>",
+    }
+    lower = {
+        **upper,
+        "trace_id": "trace-lower",
+        "lease_id": "handoff-aaa",
+        "envelope": "<e>lower</e>",
+    }
+    path1 = compile_handoff_page(vault, upper, stamp)
+    path2 = compile_handoff_page(vault, lower, stamp)
+    assert path1 is not None and path2 is not None
+    assert path1 != path2
+    assert path1.is_file() and path2.is_file()
+    assert "<e>upper</e>" in path1.read_text(encoding="utf-8")
+    assert "<e>lower</e>" in path2.read_text(encoding="utf-8")
 
 
 def _pruning_proposal(trace_id: str = "trace-prune") -> dict:
@@ -1094,6 +1178,88 @@ def test_pruning_write_inbox_refuses_dest_symlink_into_shop(tmp_path):
     assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
     assert list(shop.iterdir()) == [shop / "keep.md"]
     assert (vault / "inbox" / f"afm-pruning-{day}.json").is_symlink()
+
+
+def test_pruning_append_audit_does_not_truncate_when_exists_lies(
+    tmp_path, monkeypatch
+):
+    """exists()+write_text after a peer stamp must not wipe log.md."""
+    from minni.afm_passes.pruning import _append_audit
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
+    orig_exists = Path.exists
+
+    def lying_exists(self: Path) -> bool:
+        if self == vault / "log.md":
+            return False
+        return orig_exists(self)
+
+    monkeypatch.setattr(Path, "exists", lying_exists)
+    _append_audit(vault, "trace-prune", 1, "inbox/afm-pruning-probe.json")
+    text = (vault / "log.md").read_text(encoding="utf-8")
+    assert _PLUGIN_LOG in text
+    assert "pruning proposed" in text
+
+
+def test_pruning_append_audit_does_not_clobber_append_after_exclusive_create(
+    tmp_path, monkeypatch
+):
+    """O_EXCL seed must not write the header at offset 0 after a raced stamp."""
+    from minni.afm_passes.pruning import _append_audit
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    orig_os_open = os.open
+
+    def append_after_create(path) -> None:
+        try:
+            name = Path(os.fsdecode(path)).name
+        except (TypeError, ValueError, OSError):
+            return
+        if name != "log.md":
+            return
+        extra = orig_os_open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(extra, _RACE_AUDIT.encode("utf-8"))
+        finally:
+            os.close(extra)
+
+    def racing_os_open(path, flags, *args, **kwargs):
+        fd = orig_os_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL:
+            append_after_create(path)
+        return fd
+
+    monkeypatch.setattr(os, "open", racing_os_open)
+    _append_audit(vault, "trace-prune", 1, "inbox/afm-pruning-probe.json")
+    text = (vault / "log.md").read_text(encoding="utf-8")
+    assert _RACE_AUDIT in text
+    assert "pruning proposed" in text
+
+
+def test_pruning_append_audit_refuses_log_md_symlink_into_shop(tmp_path):
+    from minni.afm_passes.pruning import _append_audit
+
+    vault, shop = _file_symlink_to_shop(tmp_path, "log.md")
+    with pytest.raises(OSError):
+        _append_audit(vault, "trace-prune", 1, "inbox/afm-pruning-probe.json")
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_pruning_append_audit_refuses_daily_log_symlink_into_shop(tmp_path):
+    import time
+
+    from minni.afm_passes.pruning import _append_audit
+
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    vault, shop = _file_symlink_to_shop(tmp_path, f"logs/{day}.md")
+    with pytest.raises(OSError):
+        _append_audit(vault, "trace-prune", 1, "inbox/afm-pruning-probe.json")
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
 
 
 def test_atomic_write_text_preserves_dest_0600(tmp_path):

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -102,6 +103,15 @@ def ensure_handoff_vault(vault_path: Path) -> None:
 def slugify(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug[:80] or "handoff"
+
+
+def _handoff_wiki_filename(packet: dict, stamp: str) -> str:
+    """Date+slug+lease slug still collides when slugify lowercases the PK."""
+    title = packet["task"].strip()
+    slug = slugify(f"{packet['from_agent']}-to-{packet['to_agent']}-{title}")
+    raw = str(packet.get("lease_id") or packet.get("trace_id") or stamp)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{stamp[:8]}-{slug}-{slugify(raw)}-{digest}.md"
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -265,9 +275,7 @@ def compile_handoff_page(sender_vault: Path, packet: dict, stamp: str) -> Option
     if packet.get("kind") != "handoff":
         return None
     title = packet["task"].strip()
-    slug = slugify(f"{packet['from_agent']}-to-{packet['to_agent']}-{title}")
-    unique = slugify(str(packet.get("lease_id") or packet.get("trace_id") or stamp))
-    page_path = sender_vault / "wiki" / "handoffs" / f"{stamp[:8]}-{slug}-{unique}.md"
+    page_path = sender_vault / "wiki" / "handoffs" / _handoff_wiki_filename(packet, stamp)
     refs = "\n".join(f"- [[{ref.removesuffix('.md')}]]" for ref in packet.get("wikilink_refs", []))
     page = (
         "---\n"
