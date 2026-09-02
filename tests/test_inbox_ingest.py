@@ -226,6 +226,82 @@ def test_ingest_divergent_leftover_body_extras_at_next_index(tmp_path):
         assert {r["principal"] for r in extra} == {canonical}
 
 
+def test_assign_fill_indices_skips_duplicate_extra_sha():
+    """Occupied leftover 0 + two identical D extras must share one next_idx.
+
+    The extras loop used to be sha-blind: both D bodies queued, then D at 1
+    and D at 2. UNIQUE is (canon, file, idx) so both insert — a new dual.
+    """
+    from minni.afm_passes.inbox_ingest import _assign_fill_indices
+
+    occupied = {0: "shaL"}
+    assigned = _assign_fill_indices(occupied, [(0, "shaD"), (0, "shaD")])
+    assert assigned == [1, None], assigned
+    assert occupied == {0: "shaL", 1: "shaD"}
+
+    occupied_divergent = {0: "shaL"}
+    two_bodies = _assign_fill_indices(
+        occupied_divergent, [(0, "shaD"), (0, "shaE")]
+    )
+    assert two_bodies == [1, 2], two_bodies
+    assert occupied_divergent == {0: "shaL", 1: "shaD", 2: "shaE"}
+
+
+def test_ingest_identical_alias_vault_bodies_do_not_mint_twin_extras(tmp_path):
+    """Leftover occupies 0; agy-vault + gemini-vault both session.json with
+    the SAME new body D. ingest groups alias vaults by (canonical, basename)
+    into one requested list, so sha-blind extras assigned D at 1 and D at 2.
+
+    Pin: leftover 0 + two alias session.json with identical D → inserted==1,
+    indices {0,1}, no twin at 2.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    leftover_body = "leftover occupying index 0"
+    live_body = "identical D body from both alias vaults"
+    cases = (
+        ("agy-vault", "agy", "gemini-vault"),
+        ("xai-vault", "xai", "grok-build-vault"),
+    )
+    for leftover_dir, leftover, remapped_dir in cases:
+        db_obj, cfg = _make_db(tmp_path / leftover)
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=leftover_body,
+        )
+        leftover_inbox = tmp_path / leftover / leftover_dir / "inbox"
+        remapped_inbox = tmp_path / leftover / remapped_dir / "inbox"
+        _write_inbox_file(
+            leftover_inbox, "session.json", _cc_stop_doc([live_body])
+        )
+        _write_inbox_file(
+            remapped_inbox, "session.json", _cc_stop_doc([live_body])
+        )
+
+        res = ingest(
+            db_obj,
+            cfg,
+            inboxes=[leftover_inbox, remapped_inbox],
+            dry_run=False,
+        )
+        assert res["inserted"] == 1, (leftover, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        indices = {
+            json.loads(r["derived_from"]).get("candidate_index") for r in rows
+        }
+        assert indices == {0, 1}, (leftover, indices)
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, leftover
+        assert contents.count(live_body) == 1, (leftover, contents)
+
+
 def test_slug_alias_stamped_agent_id_is_not_mismatch(tmp_path):
     """Files that still stamp the pre-alias agent_id must ingest, not wipe."""
     from minni.afm_passes.inbox_ingest import ingest

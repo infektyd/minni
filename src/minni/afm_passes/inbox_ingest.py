@@ -372,7 +372,9 @@ def _assign_fill_indices(
     already exists (same sha at this index or any index) are skipped.
     Occupied divergent bodies go at the next free index after every
     reserved missing slot, so extras never steal a still-free distilled
-    index. Mutates ``occupied``.
+    index. Identical extra shas share one extra index (agy-vault +
+    gemini-vault grouped into one requested list must not mint a twin).
+    Mutates ``occupied``.
     """
     existing_shas = set(occupied.values())
     assigned: List[Optional[int]] = [None] * len(requested)
@@ -386,10 +388,16 @@ def _assign_fill_indices(
             assigned[i] = idx
         else:
             extras.append(i)
+            # Claim the sha now so a later identical extra (agy-vault +
+            # gemini-vault grouped into one requested list) does not mint
+            # a twin at next_idx+1. UNIQUE is (canon, file, idx).
+            existing_shas.add(sha)
     if extras:
         next_idx = (max(occupied) if occupied else -1) + 1
         for i in extras:
             _idx, sha = requested[i]
+            if sha in occupied.values():
+                continue
             occupied[next_idx] = sha
             existing_shas.add(sha)
             assigned[i] = next_idx

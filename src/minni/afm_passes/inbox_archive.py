@@ -241,9 +241,10 @@ def _matching_rows_for_file(doc: Any, rows: List[dict]) -> Optional[List[dict]]:
     filename — without this check a single forged terminal row could archive
     ANY agent's live, never-ingested inbox file (cross-vault name match). So a
     row only counts when it carries ingest-written provenance for THIS file's
-    content: its ``candidate_index`` addresses a real eligible candidate and
-    its ``content_sha1`` (or, for legacy rows without one, the row's stored
-    content) matches that candidate's text. The file is archivable only when
+    content: its ``content_sha1`` (or, for legacy rows without one, the row's
+    stored content) matches an eligible candidate's text. extras-at-next-idx
+    remaps ``derived_from.candidate_index`` off the file slot, so coverage is
+    by sibling content, not by enumerate key. The file is archivable only when
     every eligible candidate is covered by a matching row — i.e. the DB
     provably carries all of the file's content. Non-stop-candidate files
     (handoffs, *_precompact_handoff, ...) are never archived here; they drain
@@ -253,19 +254,24 @@ def _matching_rows_for_file(doc: Any, rows: List[dict]) -> Optional[List[dict]]:
         return None  # not a stop-candidate file, or nothing ingestible in it
     matched: List[dict] = []
     covered: set = set()
-    for row in rows:
-        idx = row.get("candidate_index")
-        if not isinstance(idx, int) or idx not in eligible:
-            continue
-        content = eligible[idx]
-        sha = row.get("content_sha1")
-        if isinstance(sha, str) and sha:
-            if sha != _content_sha1(content):
+    seen: set = set()
+    for idx, content in eligible.items():
+        want_sha = _content_sha1(content)
+        for i, row in enumerate(rows):
+            sha = row.get("content_sha1")
+            if isinstance(sha, str) and sha:
+                if sha != want_sha:
+                    continue
+            elif row.get("content") != content:
                 continue
-        elif row.get("content") != content:
-            continue
-        matched.append(row)
-        covered.add(idx)
+            # Sibling matches this file's eligible bytes (index may have
+            # remapped via extras-at-next-idx). Forged rows with a different
+            # body still fail the sha/body guard above.
+            covered.add(idx)
+            if i not in seen:
+                matched.append(row)
+                seen.add(i)
+            break
     if covered != set(eligible):
         return None  # some eligible candidate has no genuine DB row -> keep
     return matched
