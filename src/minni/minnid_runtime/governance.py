@@ -1115,10 +1115,11 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
     to SELECT every status, so a later list after redact/reject returned
     hidden packet content. Explicit status still works for console zones.
     Envelopes that cross the process boundary are POLICY §2 redacted, and
-    ``total`` / ``has_more`` make a truncated page visible. ``has_more``
-    comes from a single ``LIMIT n+1`` read — sqlite3 does not start a
-    transaction on SELECT, so a COUNT(*) then LIMIT pair can hide a live
-    proposed row when WAL commits between the two.
+    ``total`` / ``has_more`` make a truncated page visible. Both come from
+    a single ``LIMIT n+1`` read — sqlite3 does not start a transaction on
+    SELECT, so a COUNT(*) after the page is a second WAL snapshot. When
+    has_more, total is len(page)+1 (the n+1 lower bound), not a later
+    COUNT(*).
     """
     principal, err = context.handler_principal(params, request_id)
     if err:
@@ -1163,14 +1164,7 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
                 rows.append(redacted)
             has_more = len(rows) > limit
             rows = rows[:limit]
-            if has_more:
-                c.execute(
-                    "SELECT COUNT(*) AS n FROM candidate_packets WHERE principal=? AND status=?",
-                    (principal.agent_id, status_f),
-                )
-                total = max(int(c.fetchone()["n"]), len(rows) + 1)
-            else:
-                total = len(rows)
+            total = len(rows) + 1 if has_more else len(rows)
         return context.make_response(
             {
                 "candidates": rows,
@@ -1450,7 +1444,11 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         return exc.response
     except Exception as exc:
         context.logger.exception("resolve_candidate failed")
-        return context.make_error(-32000, f"resolve_candidate error: {exc}", request_id)
+        envelope = context.make_error(
+            -32000, f"resolve_candidate error: {exc}", request_id
+        )
+        redacted, _ = redact_value(envelope)
+        return redacted
     finally:
         if db is not None and hasattr(db, "close"):
             try:

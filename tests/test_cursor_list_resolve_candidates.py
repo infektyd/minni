@@ -287,43 +287,58 @@ def _wal_connect(db_path):
 class _HookCursor:
     """sqlite3.Cursor.execute is read-only; proxy so tests can inject WAL writers."""
 
-    def __init__(self, real, hook):
+    def __init__(self, real, hook, when="before"):
         self._real = real
         self._hook = hook
+        self._when = when
+        self.executed = []
 
     def execute(self, sql, parameters=()):
         sql_s = sql if isinstance(sql, str) else str(sql)
+        self.executed.append(sql_s)
         compact = sql_s.replace(" ", "")
         page_select = (
             "FROM candidate_packets" in sql_s
             and "LIMIT" in sql_s
             and "COUNT(" not in compact
         )
-        if page_select:
+        if page_select and self._when == "before":
             self._hook()
-        return self._real.execute(sql, parameters)
+        result = self._real.execute(sql, parameters)
+        if page_select and self._when == "after":
+            self._hook()
+        return result
 
     def __getattr__(self, name):
         return getattr(self._real, name)
 
 
-def _before_page_select(monkeypatch, hook):
-    """Run ``hook`` immediately before the candidate page SELECT.
+def _around_page_select(monkeypatch, hook, when="before"):
+    """Run ``hook`` immediately before or after the candidate page SELECT.
 
     sqlite3 does not start a transaction on SELECT, so a COUNT(*) then
     LIMIT page can observe two WAL snapshots. The hook is the injected
-    writer in that window.
+    writer in that window. ``when='after'`` is the COUNT follow-up
+    window: extras that land after LIMIT n+1 must not change total.
     """
     import minni.db as db_mod
 
     orig = db_mod.SovereignDB.cursor
+    hooked = []
 
     @contextmanager
     def wrapped(self):
         with orig(self) as c:
-            yield _HookCursor(c, hook)
+            proxy = _HookCursor(c, hook, when=when)
+            hooked.append(proxy)
+            yield proxy
 
     monkeypatch.setattr(db_mod.SovereignDB, "cursor", wrapped)
+    return hooked
+
+
+def _before_page_select(monkeypatch, hook):
+    _around_page_select(monkeypatch, hook, when="before")
 
 
 def _count_proposed(db_path, principal):
@@ -413,6 +428,68 @@ def test_list_has_more_delete_window_cannot_claim_a_short_page(monkeypatch, tmp_
     assert result.get("total") == len(returned), listed
 
 
+def test_list_total_pins_to_n_plus_one_read(monkeypatch, tmp_path):
+    """When has_more is true, a later COUNT(*) is a second WAL snapshot.
+
+    Pin total to the n+1 read: has_more ? len(page)+1 : len(page).
+    Five live rows with limit 2 used to report total=5 via COUNT(*).
+    """
+    _patch_db(monkeypatch, tmp_path)
+    for i in range(5):
+        _stage(monkeypatch, "cursor", f"cursor drain item {i} unique")
+    _stamp(monkeypatch, "cursor")
+    page = minnid._list_candidates({"status": "proposed", "limit": 2}, 22)
+    result = page.get("result", {})
+    assert result.get("count") == 2, page
+    assert result.get("has_more") is True, page
+    assert result.get("total") == 3, page
+    assert len(result.get("candidates", [])) == 2, page
+
+    source = (REPO_ROOT / "src" / "minni" / "minnid_runtime" / "governance.py").read_text(
+        encoding="utf8"
+    )
+    start = source.find("def list_candidates")
+    end = source.find("\ndef explicitly_allowed_operator", start)
+    block = source[start:end]
+    assert "SELECT COUNT(*)" not in block, block
+    assert "limit + 1" in block, block
+
+
+def test_list_total_count_window_cannot_disagree_with_page(monkeypatch, tmp_path):
+    """LIMIT n+1 then COUNT(*) without BEGIN used to let WAL inserts
+    between the two statements inflate total past the page snapshot.
+    """
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    for i in range(3):
+        _stage(monkeypatch, "cursor", f"cursor drain item {i} unique")
+    _stamp(monkeypatch, "cursor")
+    db_path = db_obj.config.db_path
+
+    def inject_after_page():
+        conn = _wal_connect(db_path)
+        try:
+            now = time.time()
+            for i in range(5):
+                conn.execute(
+                    "INSERT INTO candidate_packets "
+                    "(principal, workspace_id, content, status, proposed_at) "
+                    "VALUES (?, 'default', ?, 'proposed', ?)",
+                    ("cursor", f"cursor drain item after-page {i} unique", now + i + 10),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    hooked = _around_page_select(monkeypatch, inject_after_page, when="after")
+    listed = minnid._list_candidates({"status": "proposed", "limit": 2}, 23)
+    result = listed.get("result", {})
+    assert result.get("has_more") is True, listed
+    assert result.get("count") == 2, listed
+    assert result.get("total") == 3, listed
+    executed = [sql for proxy in hooked for sql in proxy.executed]
+    assert not any("COUNT(" in sql.replace(" ", "") for sql in executed), executed
+
+
 def test_mcp_list_does_not_stringify_raw_daemon_packet():
     """Cursor MCP sends tool output to cloud models. The handler must
     redact + project before returning, default the drain queue to
@@ -462,6 +539,11 @@ def test_mcp_resolve_redacts_jsonresult_errors_like_list():
     assert "redactLocalValue" in block
     assert "JSON.stringify(rpc," not in block
     assert "agent_id: DEFAULT_AGENT_ID" in block
+    helper = LIST_MODEL_TS.read_text(encoding="utf8")
+    redact_start = helper.find("export function redactLocalValue")
+    redact_end = helper.find("\nexport function", redact_start + 1)
+    redact_block = helper[redact_start:redact_end if redact_end != -1 else None]
+    assert "/private" in redact_block, redact_block
 
 
 def _require_shared_gate_source(source: str) -> str:
@@ -529,3 +611,36 @@ def test_list_candidates_rpc_error_redacts_db_paths(monkeypatch, tmp_path):
     message = err.get("message", "")
     assert "list_candidates error" in message, listed
     assert "[REDACTED_PATH]" in message, listed
+
+
+def test_resolve_candidate_rpc_error_redacts_private_paths(monkeypatch, tmp_path):
+    """JSON-RPC `resolve_candidate error: {exc}` used to embed sqlite/IO
+    paths, including macOS `/private/var/folders/.../minni.db`. MCP
+    redactLocalValue missed /private; console /api/resolve-candidate and
+    UDS never redacted. Redact the daemon envelope with redact_value.
+    """
+    _patch_db(monkeypatch, tmp_path)
+    cid = _stage(monkeypatch, "cursor", "cursor resolve drain item")
+    _stamp(monkeypatch, "cursor")
+    leak = "/private/var/folders/zz/minni.db"
+
+    import minni.db as db_mod
+
+    @contextmanager
+    def boom(_self):
+        raise sqlite3.OperationalError(f"unable to open database file: {leak}")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(db_mod.SovereignDB, "transaction", boom)
+    resolved = minnid._resolve_candidate(
+        {"candidate_id": cid, "decision": "reject", "reason": "drain"},
+        31,
+    )
+    blob = str(resolved)
+    assert leak not in blob, resolved
+    assert "/private/" not in blob, resolved
+    err = resolved.get("error", {})
+    assert err.get("code") == -32000, resolved
+    message = err.get("message", "")
+    assert "resolve_candidate error" in message, resolved
+    assert "[REDACTED_PATH]" in message, resolved

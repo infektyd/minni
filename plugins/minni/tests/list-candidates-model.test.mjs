@@ -11,6 +11,7 @@ import {
 
 const SECRET = "hunter2-not-a-path";
 const LOCAL_PATH = "/Users/example/Projects/secret-notes.md";
+const PRIVATE_PATH = "/private/var/folders/zz/minni.db";
 
 test("drainStatusForModel defaults omitted status to proposed", () => {
   assert.equal(drainStatusForModel(undefined), "proposed");
@@ -188,6 +189,16 @@ test("minni_resolve_candidate redacts JsonResult errors the same as list", async
   assert.equal(blob.includes("/Users/example"), false, blob);
   assert.equal(blob.includes("minnid.sock"), false, blob);
   assert.equal(payload.ok, false);
+
+  const privateRpc = {
+    ok: false,
+    error: `resolve_candidate error: unable to open database file: ${PRIVATE_PATH}`,
+  };
+  const privatePayload = redactLocalValue(privateRpc);
+  const privateBlob = JSON.stringify(privatePayload);
+  assert.equal(privateBlob.includes("/private/"), false, privateBlob);
+  assert.equal(privateBlob.includes(PRIVATE_PATH), false, privateBlob);
+  assert.match(String(privatePayload.error), /\[local-path\]/);
 });
 
 test("shared-gate unavailable errors redact socket paths before MCP return", async () => {
@@ -215,6 +226,7 @@ test("shared-gate unavailable errors redact socket paths before MCP return", asy
   for (const [operation, error] of [
     ["candidates.list", "Socket not found: /Users/example/.minni/run/minnid.sock"],
     ["candidates.resolve", "connect ECONNREFUSED /Users/example/.minni/run/minnid.sock"],
+    ["candidates.resolve", `unable to open database file: ${PRIVATE_PATH}`],
   ]) {
     const payload = modelSharedGatePayload({
       status: "gate-unavailable",
@@ -223,6 +235,7 @@ test("shared-gate unavailable errors redact socket paths before MCP return", asy
     });
     const blob = JSON.stringify(payload);
     assert.equal(blob.includes("/Users/example"), false, blob);
+    assert.equal(blob.includes("/private/"), false, blob);
     assert.equal(blob.includes("minnid.sock"), false, blob);
     assert.equal(blob.includes(".minni/run"), false, blob);
     assert.equal(payload.status, "gate-unavailable");

@@ -44,6 +44,7 @@ export function redactLocalValue(value: unknown): unknown {
       .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
       .replace(/\/home\/[^\s"',)]+/g, "[local-path]")
       .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
+      .replace(/\/private\/[^\s"',)]+/g, "[local-path]")
       .replace(new RegExp(home + "[^\\s\"',)]*", "g"), "[local-path]")
       .replace(/\/tmp\/sov(?:ereign|rd)\.sock\b/g, "[local-path]")
       .replace(/[^\s"',)]+\.fmadapter\b/g, "[local-path]")
