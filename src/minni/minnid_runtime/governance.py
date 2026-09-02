@@ -1185,7 +1185,11 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
         )
     except Exception as exc:
         context.logger.exception("list_candidates failed")
-        return context.make_error(-32000, f"list_candidates error: {exc}", request_id)
+        envelope = context.make_error(
+            -32000, f"list_candidates error: {exc}", request_id
+        )
+        redacted, _ = redact_value(envelope)
+        return redacted
     finally:
         if db is not None and hasattr(db, "close"):
             try:

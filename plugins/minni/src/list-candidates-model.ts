@@ -61,6 +61,14 @@ export function redactLocalValue(value: unknown): unknown {
   return value;
 }
 
+/** Shared-gate failures return from MCP before jsonRpc. Redact the same
+ *  as daemon JsonResult so socket/db paths never reach the model. */
+export function modelSharedGatePayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  return redactLocalValue(payload) as Record<string, unknown>;
+}
+
 function projectModelCandidate(row: unknown): Record<string, unknown> {
   const obj = row && typeof row === "object" ? (row as Record<string, unknown>) : {};
   const projected: Record<string, unknown> = {};

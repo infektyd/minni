@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import {
   drainStatusForModel,
   modelListCandidatesPayload,
+  modelSharedGatePayload,
   MODEL_HIDDEN_CANDIDATE_STATUSES,
   redactLocalValue,
 } from "../dist/list-candidates-model.js";
@@ -187,4 +188,46 @@ test("minni_resolve_candidate redacts JsonResult errors the same as list", async
   assert.equal(blob.includes("/Users/example"), false, blob);
   assert.equal(blob.includes("minnid.sock"), false, blob);
   assert.equal(payload.ok, false);
+});
+
+test("shared-gate unavailable errors redact socket paths before MCP return", async () => {
+  // The earlier requireSharedGate return used to stringify
+  // `Socket not found: /Users/<name>/.minni/run/minnid.sock` unchanged.
+  // This must fail if that earlier payload is unredacted — grepping the
+  // later jsonRpc redactLocalValue(rpc) return is not enough.
+  const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
+  const fnStart = source.indexOf("async function requireSharedGate");
+  assert.notEqual(fnStart, -1);
+  const fnEnd = source.indexOf("\n// Task 6:", fnStart);
+  const gateFn = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd);
+  assert.match(gateFn, /modelSharedGatePayload/);
+  assert.equal((gateFn.match(/modelSharedGatePayload/g) || []).length >= 3, true, gateFn);
+  assert.doesNotMatch(gateFn, /JSON\.stringify\(\s*\{/);
+
+  for (const tool of ['"minni_list_candidates"', '"minni_resolve_candidate"']) {
+    const start = source.indexOf(tool);
+    assert.notEqual(start, -1, tool);
+    const nextTool = source.indexOf("server.registerTool(", start + 1);
+    const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+    assert.match(block, /if \(gated\) return gated;/);
+  }
+
+  for (const [operation, error] of [
+    ["candidates.list", "Socket not found: /Users/example/.minni/run/minnid.sock"],
+    ["candidates.resolve", "connect ECONNREFUSED /Users/example/.minni/run/minnid.sock"],
+  ]) {
+    const payload = modelSharedGatePayload({
+      status: "gate-unavailable",
+      operation,
+      error,
+    });
+    const blob = JSON.stringify(payload);
+    assert.equal(blob.includes("/Users/example"), false, blob);
+    assert.equal(blob.includes("minnid.sock"), false, blob);
+    assert.equal(blob.includes(".minni/run"), false, blob);
+    assert.equal(payload.status, "gate-unavailable");
+    assert.equal(payload.operation, operation);
+    assert.equal(typeof payload.error, "string");
+    assert.match(String(payload.error), /\[local-path\]/);
+  }
 });

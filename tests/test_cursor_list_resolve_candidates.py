@@ -462,3 +462,70 @@ def test_mcp_resolve_redacts_jsonresult_errors_like_list():
     assert "redactLocalValue" in block
     assert "JSON.stringify(rpc," not in block
     assert "agent_id: DEFAULT_AGENT_ID" in block
+
+
+def _require_shared_gate_source(source: str) -> str:
+    start = source.find("async function requireSharedGate")
+    assert start != -1, "requireSharedGate is missing from server.ts"
+    end = source.find("\n// Task 6:", start)
+    assert end != -1, "requireSharedGate block boundary not found"
+    return source[start:end]
+
+
+def test_mcp_shared_gate_failures_redact_before_tool_return():
+    """Drain MCP tools used to stringify requireSharedGate() unchanged.
+
+    When minnid is down, gateSharedOperation fails with
+    `Socket not found: /Users/<name>/.minni/run/minnid.sock` (or
+    ECONNREFUSED) and that text reached the model. redactLocalValue
+    only ran on the later jsonRpc result. Pin the earlier return.
+    """
+    source = SERVER_TS.read_text(encoding="utf8")
+    gate_fn = _require_shared_gate_source(source)
+    assert "modelSharedGatePayload" in gate_fn
+    assert gate_fn.count("modelSharedGatePayload") >= 3
+    assert "JSON.stringify(\n        {" not in gate_fn
+    assert "JSON.stringify({" not in gate_fn.replace(" ", "")
+
+    helper = LIST_MODEL_TS.read_text(encoding="utf8")
+    helper_start = helper.find("export function modelSharedGatePayload")
+    assert helper_start != -1, helper
+    helper_end = helper.find("\nexport function", helper_start + 1)
+    helper_block = helper[helper_start:helper_end if helper_end != -1 else None]
+    assert "redactLocalValue" in helper_block
+
+    for tool in ('"minni_list_candidates"', '"minni_resolve_candidate"'):
+        start = source.find(tool)
+        assert start != -1, tool
+        next_tool = source.find("server.registerTool(", start + 1)
+        block = source[start : next_tool if next_tool != -1 else None]
+        assert "requireSharedGate(" in block, tool
+        assert "if (gated) return gated;" in block, tool
+
+
+def test_list_candidates_rpc_error_redacts_db_paths(monkeypatch, tmp_path):
+    """JSON-RPC `list_candidates error: {exc}` used to embed sqlite/IO
+    paths. MCP list redacts rpc.error after the fact; other consumers
+    saw the raw envelope. Redact before the error leaves the process.
+    """
+    _patch_db(monkeypatch, tmp_path)
+    _stamp(monkeypatch, "cursor")
+    leak = "/Users/example/.minni/minni.db"
+
+    import minni.db as db_mod
+
+    @contextmanager
+    def boom(_self):
+        raise sqlite3.OperationalError(f"unable to open database file: {leak}")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(db_mod.SovereignDB, "cursor", boom)
+    listed = minnid._list_candidates({"status": "proposed"}, 30)
+    blob = str(listed)
+    assert leak not in blob, listed
+    assert "/Users/example" not in blob, listed
+    err = listed.get("error", {})
+    assert err.get("code") == -32000, listed
+    message = err.get("message", "")
+    assert "list_candidates error" in message, listed
+    assert "[REDACTED_PATH]" in message, listed

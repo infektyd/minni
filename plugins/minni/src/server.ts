@@ -118,6 +118,7 @@ import {
   drainStatusForModel,
   isModelHiddenCandidateStatus,
   modelListCandidatesPayload,
+  modelSharedGatePayload,
   redactLocalValue,
 } from "./list-candidates-model.js";
 
@@ -150,12 +151,12 @@ async function requireSharedGate(
   if (data?.status === "recovery_required") {
     return textResult(
       JSON.stringify(
-        {
+        modelSharedGatePayload({
           status: "gate-rejected",
           operation,
           reason: data.reason ?? "recovery_required",
           gate: data,
-        },
+        }),
         null,
         2,
       ),
@@ -166,11 +167,11 @@ async function requireSharedGate(
   if (isSharedGateUnavailable(error)) {
     return textResult(
       JSON.stringify(
-        {
+        modelSharedGatePayload({
           status: "gate-unavailable",
           operation,
           error,
-        },
+        }),
         null,
         2,
       ),
@@ -178,11 +179,11 @@ async function requireSharedGate(
   }
   return textResult(
     JSON.stringify(
-      {
+      modelSharedGatePayload({
         status: "gate-rejected",
         operation,
         gate,
-      },
+      }),
       null,
       2,
     ),
