@@ -291,3 +291,21 @@ def test_mcp_list_does_not_stringify_raw_daemon_packet():
     assert "redacted" in helper
     assert "rejected" in helper
     assert "proposed" in helper
+
+    schema_start = block.find("inputSchema:")
+    handler_start = block.find("async")
+    schema = block[schema_start:handler_start]
+    assert 'z.enum(["proposed"])' in schema, schema
+    assert "z.string()" not in schema, schema
+
+    fail_start = helper.find("ok === false")
+    assert fail_start != -1, helper
+    fail_return = helper.find("return redactLocalValue", fail_start)
+    assert fail_return != -1, helper[fail_start : fail_start + 200]
+    fail_end = helper.find(") as Record", fail_return)
+    fail_block = helper[fail_return:fail_end]
+    assert "ok: false" in fail_block, fail_block
+    assert "total: 0" not in fail_block, fail_block
+    assert "has_more: false" not in fail_block, fail_block
+    assert "count: 0" not in fail_block, fail_block
+    assert "candidates: []" not in fail_block, fail_block

@@ -3,8 +3,22 @@ import os from "node:os";
 /** Drain-queue default. Omitting status used to SELECT every status. */
 export const LIST_CANDIDATES_DEFAULT_STATUS = "proposed";
 
-/** redact/reject only flips status; content is not cleared. */
-export const MODEL_HIDDEN_CANDIDATE_STATUSES = new Set(["redacted", "rejected"]);
+/** Terminal statuses whose content is not cleared on resolve. The hide rule
+ *  is any non-proposed status — this set is the documented subset. */
+export const MODEL_HIDDEN_CANDIDATE_STATUSES = new Set([
+  "redacted",
+  "rejected",
+  "log_only",
+  "do_not_store",
+  "accepted",
+  "merged",
+  "superseded",
+  "expired",
+]);
+
+export function isModelHiddenCandidateStatus(status: string | undefined): boolean {
+  return typeof status === "string" && status !== LIST_CANDIDATES_DEFAULT_STATUS;
+}
 
 const MODEL_CANDIDATE_KEYS = [
   "candidate_id",
@@ -66,11 +80,19 @@ function candidatesFromRpc(rpc: unknown): { envelope: Record<string, unknown>; c
 
 /**
  * Model-facing list_candidates view: redact, drop SELECT * internals
- * (evidence_refs / derived_from / paths), and never return redacted/rejected
+ * (evidence_refs / derived_from / paths), and never return non-proposed
  * packet content even if the caller asked for those statuses.
  */
 export function modelListCandidatesPayload(rpc: unknown, requestedStatus: string): Record<string, unknown> {
-  if (MODEL_HIDDEN_CANDIDATE_STATUSES.has(requestedStatus)) {
+  const root = rpc && typeof rpc === "object" ? (rpc as Record<string, unknown>) : {};
+  if (root.ok === false) {
+    return redactLocalValue({
+      ok: false,
+      error: root.error,
+    }) as Record<string, unknown>;
+  }
+
+  if (isModelHiddenCandidateStatus(requestedStatus)) {
     return {
       ok: true,
       hidden: true,
@@ -79,20 +101,8 @@ export function modelListCandidatesPayload(rpc: unknown, requestedStatus: string
       count: 0,
       total: 0,
       has_more: false,
-      reason: "redacted/rejected candidate content is not returned to the model",
+      reason: "only proposed candidate content is returned to the model",
     };
-  }
-
-  const root = rpc && typeof rpc === "object" ? (rpc as Record<string, unknown>) : {};
-  if (root.ok === false) {
-    return redactLocalValue({
-      ok: false,
-      error: root.error,
-      candidates: [],
-      count: 0,
-      total: 0,
-      has_more: false,
-    }) as Record<string, unknown>;
   }
 
   const { envelope, candidates: raw } = candidatesFromRpc(rpc);
@@ -100,7 +110,7 @@ export function modelListCandidatesPayload(rpc: unknown, requestedStatus: string
     .filter((row) => {
       const status =
         row && typeof row === "object" ? (row as Record<string, unknown>).status : undefined;
-      return typeof status !== "string" || !MODEL_HIDDEN_CANDIDATE_STATUSES.has(status);
+      return status === LIST_CANDIDATES_DEFAULT_STATUS;
     })
     .map(projectModelCandidate);
 

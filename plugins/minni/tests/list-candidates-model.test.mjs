@@ -96,4 +96,74 @@ test("minni_list_candidates handler projects through modelListCandidatesPayload"
   assert.match(block, /modelListCandidatesPayload/);
   assert.match(block, /drainStatusForModel/);
   assert.doesNotMatch(block, /JSON\.stringify\(rpc,/);
+  const schemaStart = block.indexOf("inputSchema:");
+  const handlerStart = block.indexOf("async");
+  const schema = block.slice(schemaStart, handlerStart);
+  assert.match(schema, /status:\s*z\.enum\(\["proposed"\]\)\.optional\(\)/);
+  assert.doesNotMatch(schema, /status:\s*z\.string\(\)/);
+});
+
+test("failed candidate list does not report an empty complete drain", () => {
+  const payload = modelListCandidatesPayload(
+    { ok: false, error: "socket refused /Users/example/minnid.sock" },
+    "proposed",
+  );
+  assert.equal(payload.ok, false);
+  assert.equal(typeof payload.error, "string");
+  assert.equal(String(payload.error).includes("/Users/example"), false);
+  assert.equal("candidates" in payload, false, JSON.stringify(payload));
+  assert.equal("count" in payload, false, JSON.stringify(payload));
+  assert.equal("total" in payload, false, JSON.stringify(payload));
+  assert.equal("has_more" in payload, false, JSON.stringify(payload));
+  assert.notEqual(payload.total, 0);
+  assert.notEqual(payload.has_more, false);
+  assert.notDeepEqual(payload.candidates, []);
+});
+
+test("model list never returns do_not_store/log_only/accepted/merged/superseded content", () => {
+  const leakStatuses = ["do_not_store", "log_only", "accepted", "merged", "superseded", "expired"];
+  for (const status of leakStatuses) {
+    const marker = `LEAK_${status}_MARKER`;
+    const payload = modelListCandidatesPayload(
+      {
+        ok: true,
+        data: {
+          status,
+          candidates: [
+            {
+              candidate_id: 11,
+              status,
+              content: `${marker} remember this packet forever`,
+            },
+          ],
+        },
+      },
+      status,
+    );
+    const blob = JSON.stringify(payload);
+    assert.equal(blob.includes(marker), false, blob);
+    assert.deepEqual(payload.candidates, []);
+  }
+
+  const mixed = modelListCandidatesPayload(
+    {
+      ok: true,
+      data: {
+        status: "proposed",
+        candidates: [
+          { candidate_id: 1, status: "proposed", content: "ok-to-see" },
+          { candidate_id: 2, status: "do_not_store", content: "DNS_MARKER" },
+          { candidate_id: 3, status: "log_only", content: "LOG_ONLY_MARKER" },
+          { candidate_id: 4, status: "accepted", content: "ACCEPTED_MARKER" },
+        ],
+      },
+    },
+    "proposed",
+  );
+  const mixedBlob = JSON.stringify(mixed);
+  assert.equal(mixedBlob.includes("DNS_MARKER"), false, mixedBlob);
+  assert.equal(mixedBlob.includes("LOG_ONLY_MARKER"), false, mixedBlob);
+  assert.equal(mixedBlob.includes("ACCEPTED_MARKER"), false, mixedBlob);
+  assert.equal(mixed.candidates.length, 1);
+  assert.equal(mixed.candidates[0].candidate_id, 1);
 });
