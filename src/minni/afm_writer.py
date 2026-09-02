@@ -252,22 +252,28 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def _read_pending_lifecycle_file(vault_path: str | Path) -> dict[str, dict]:
-    """Return pass_name → lifecycle from the vault sidecar (or empty)."""
+    """Return pass_name → lifecycle from the vault sidecar (or empty).
+
+    Missing file is empty. Torn/unreadable sidecar raises so persist/clear
+    cannot treat it as “no other passes” and wipe sibling state.
+    """
     path = _pending_lifecycle_path(vault_path)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw_text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
+    try:
+        raw = json.loads(raw_text)
     except Exception as exc:
         logger.warning(
             "AFM writer: could not read pending-lifecycle file %s: %s", path, exc
         )
-        return {}
+        raise OSError(f"unreadable pending-lifecycle sidecar: {path}") from exc
     if not isinstance(raw, dict):
-        return {}
+        raise OSError(f"pending-lifecycle sidecar is not a JSON object: {path}")
     passes = raw.get("passes")
     if not isinstance(passes, dict):
-        return {}
+        raise OSError(f"pending-lifecycle sidecar has no passes object: {path}")
     out: dict[str, dict] = {}
     for name, life in passes.items():
         if isinstance(life, dict):
@@ -384,7 +390,14 @@ def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> None:
     """
     if not vault_path:
         return
-    loaded = _read_pending_lifecycle_file(vault_path)
+    try:
+        loaded = _read_pending_lifecycle_file(vault_path)
+    except Exception:
+        logger.exception(
+            "AFM writer: could not hydrate pending lifecycle from %s",
+            vault_path,
+        )
+        return
     for name, life in loaded.items():
         if name not in _PENDING_LIFECYCLE:
             _PENDING_LIFECYCLE[name] = life
@@ -452,29 +465,43 @@ def _atomic_write_text(path: Path, data: str) -> None:
     A fixed ``<name>.tmp`` sidecar is a plant vector: write_text follows
     ``inbox/afm-drafts-DATE.json.tmp -> shop/keep.md``. Exclusive-create a
     unique tmp with O_NOFOLLOW so a planted sidecar cannot be the write target.
+    lstat-refuse dest so a planted dest symlink is not followed or replaced.
+    Preserve dest mode across os.replace (plugin writeFileAtomic already does).
     """
+    if path.is_symlink():
+        raise OSError(f"refusing to write through symlink: {path}")
+    existing_mode: Optional[int] = None
+    try:
+        existing_mode = path.lstat().st_mode & 0o777
+    except FileNotFoundError:
+        pass
     payload = data.encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow:
         flags |= nofollow
     last_exc: Optional[OSError] = None
+    open_mode = existing_mode if existing_mode is not None else 0o666
     for _ in range(8):
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp")
         if tmp.is_symlink():
             raise OSError(f"refusing to write through symlink: {tmp}")
         try:
-            fd = os.open(tmp, flags, 0o666)
+            fd = os.open(tmp, flags, open_mode)
         except FileExistsError as exc:
             last_exc = exc
             continue
         try:
             try:
+                if existing_mode is not None:
+                    os.fchmod(fd, existing_mode)
                 written = 0
                 while written < len(payload):
                     written += os.write(fd, payload[written:])
             finally:
                 os.close(fd)
+            if path.is_symlink():
+                raise OSError(f"refusing to write through symlink: {path}")
             os.replace(tmp, path)
             return
         except Exception:
@@ -1075,11 +1102,21 @@ def _write_batch(job: dict) -> dict:
         inbox_path,
         json.dumps({"runs": []}, indent=2, sort_keys=True) + "\n",
     )
-    existing: List[dict] = []
     try:
-        existing = json.loads(inbox_path.read_text(encoding="utf-8")).get("runs", [])
-    except Exception:
-        existing = []
+        parsed = json.loads(inbox_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise OSError(
+            f"unreadable AFM inbox ledger; refusing to replace: {inbox_path}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise OSError(
+            f"AFM inbox ledger is not a JSON object; refusing to replace: {inbox_path}"
+        )
+    existing = parsed.get("runs")
+    if not isinstance(existing, list):
+        raise OSError(
+            f"AFM inbox ledger runs is not a list; refusing to replace: {inbox_path}"
+        )
     _atomic_write_text(
         inbox_path,
         json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n",

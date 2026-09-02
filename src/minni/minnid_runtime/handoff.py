@@ -105,7 +105,11 @@ def slugify(text: str) -> str:
 
 
 def write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    from minni.afm_writer import _atomic_write_text
+
+    _atomic_write_text(
+        path, json.dumps(data, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def parse_iso_ts(value: Optional[str]) -> Optional[float]:
@@ -283,7 +287,9 @@ def compile_handoff_page(sender_vault: Path, packet: dict, stamp: str) -> Option
         "## Wikilink References\n\n"
         f"{refs or '- None'}\n"
     )
-    page_path.write_text(page, encoding="utf-8")
+    from minni.afm_writer import _atomic_write_text
+
+    _atomic_write_text(page_path, page)
     return page_path
 
 
