@@ -714,32 +714,50 @@ def _utc() -> str:
 
 
 def _ensure_vault(vault: Path) -> None:
-    from minni.vault_layout import _INDEX_HEADER, _LOG_HEADER, _seed_exclusive_file
+    from minni.vault_layout import (
+        _INDEX_HEADER,
+        _LOG_HEADER,
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
 
-    if vault.is_symlink():
-        raise OSError(f"refusing symlinked vault root: {vault}")
+    root_real = _resolved_vault_root(vault)
     for rel in ("wiki/sessions", "wiki/entities", "wiki/concepts", "inbox", "logs"):
-        (vault / rel).mkdir(parents=True, exist_ok=True)
+        dest = vault / rel
+        _reject_symlink_or_escape(dest, root_real, rel)
+        dest.mkdir(parents=True, exist_ok=True)
     for rel, header in (("log.md", _LOG_HEADER), ("index.md", _INDEX_HEADER)):
-        path = vault / rel
-        if path.exists():
+        dest = vault / rel
+        _reject_symlink_or_escape(dest, root_real, rel)
+        if dest.exists():
             continue
-        _seed_exclusive_file(path, header)
+        _seed_exclusive_file(dest, header)
 
 
 def _append_audit(vault: Path, tool: str, summary: str, details: dict) -> None:
-    from minni.vault_layout import _LOG_HEADER, _seed_exclusive_file
+    from minni.vault_layout import (
+        _LOG_HEADER,
+        _append_regular_file,
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
 
     _ensure_vault(vault)
     ts = _utc()
     line = f"## [{ts}] {tool} | {summary}\n\n```json\n{json.dumps(details, indent=2, sort_keys=True)}\n```\n\n"
     daily = vault / "logs" / f"{ts[:10]}.md"
+    root_real = _resolved_vault_root(vault)
     # Exclusive header seed, then append — never exists()+write_text (truncate).
-    _seed_exclusive_file(vault / "log.md", _LOG_HEADER)
-    _seed_exclusive_file(daily, f"# {ts[:10]} Minni Audit\n\n")
-    for path in (vault / "log.md", daily):
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+    # lstat before skip-or-append so log.md/index.md/daily cannot follow into shop.
+    for dest, header in (
+        (vault / "log.md", _LOG_HEADER),
+        (daily, f"# {ts[:10]} Minni Audit\n\n"),
+    ):
+        _reject_symlink_or_escape(dest, root_real, dest.name)
+        _seed_exclusive_file(dest, header)
+        _append_regular_file(dest, line)
 
 
 def _page_lock(page_id: str) -> threading.Lock:

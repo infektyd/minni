@@ -89,6 +89,115 @@ test("ensureVault refuses hermes-vault dir symlink into shop-restore", async () 
   }
 });
 
+test("ensureVault refuses wiki symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-wiki-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    await writeFile(path.join(shop, "keep.md"), "restore\n", "utf8");
+    await symlink(shop, path.join(vault, "wiki"));
+    await assert.rejects(() => ensureVault(vault), /symlink/);
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+    assert.equal(await readFile(path.join(shop, "keep.md"), "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault refuses inbox symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-inbox-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    await writeFile(path.join(shop, "keep.md"), "restore\n", "utf8");
+    await symlink(shop, path.join(vault, "inbox"));
+    await assert.rejects(() => ensureVault(vault), /symlink/);
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit does not wipe a raced daily log.md header+line", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-vault-daily-race-"));
+  try {
+    await mkdir(path.join(root, "logs"), { recursive: true });
+    const date = new Date().toISOString().slice(0, 10);
+    const dailyPath = path.join(root, "logs", `${date}.md`);
+    const raced = `# ${date} Minni Audit\n\n## [2026-09-01T00:00:00Z] plugin | raced-header-line\n\n`;
+    await writeFile(dailyPath, raced, "utf8");
+    await recordAudit(root, {
+      tool: "test_tool",
+      summary: "second tap",
+      timestamp: new Date(),
+    });
+    const text = await readFile(dailyPath, "utf8");
+    assert.match(text, /raced-header-line/);
+    assert.match(text, /second tap/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit exclusive-seeds daily log.md, never exists()+writeFileAtomic", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function recordAudit");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /seedExclusiveFile\(\s*dailyPath/);
+  assert.doesNotMatch(body, /exists\(dailyPath\)/);
+  assert.doesNotMatch(body, /writeFileAtomic\(\s*dailyPath/);
+});
+
+test("recordAudit refuses log.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-audit-log-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await symlink(keep, path.join(vault, "log.md"));
+    await assert.rejects(
+      () => recordAudit(vault, { tool: "test_tool", summary: "tap" }),
+      /symlink/,
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit refuses daily log.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-audit-daily-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await mkdir(path.join(vault, "logs"));
+    const date = new Date().toISOString().slice(0, 10);
+    await symlink(keep, path.join(vault, "logs", `${date}.md`));
+    await assert.rejects(
+      () => recordAudit(vault, { tool: "test_tool", summary: "tap" }),
+      /symlink/,
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-prime-"));
   try {

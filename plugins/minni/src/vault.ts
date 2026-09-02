@@ -834,10 +834,44 @@ function isErrno(error: unknown, code: string): boolean {
   return (error as NodeJS.ErrnoException).code === code;
 }
 
+async function refuseSymlink(filePath: string, kind: "seed" | "append"): Promise<void> {
+  try {
+    const st = await lstat(filePath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`refusing to ${kind} through symlink: ${filePath}`);
+    }
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
+
+async function rejectSymlinkOrEscape(
+  destPath: string,
+  vaultPath: string,
+  rel: string,
+): Promise<void> {
+  try {
+    const st = await lstat(destPath);
+    if (st.isSymbolicLink()) {
+      throw new Error(
+        `vault contract ${rel} is a symlink; refusing to seed through it: ${destPath}`,
+      );
+    }
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
+  }
+  assertWriteTargetUnder(destPath, vaultPath);
+}
+
 async function seedExclusiveFile(
   filePath: string,
   content: string,
 ): Promise<boolean> {
+  await refuseSymlink(filePath, "seed");
   let fh;
   try {
     fh = await open(filePath, "ax", 0o600);
@@ -876,6 +910,7 @@ export async function ensureVault(
   await mkdir(vaultPath, { recursive: true });
   for (const dir of VAULT_DIRS) {
     const full = path.join(vaultPath, dir);
+    await rejectSymlinkOrEscape(full, vaultPath, dir);
     await mkdir(full, { recursive: true });
     created.push(full);
   }
@@ -1182,11 +1217,11 @@ export async function recordAudit(
   }
   const line = `## [${timestamp.toISOString()}] ${safeTool} | ${safeSummary}\n\n${detailBlock}`;
 
+  await refuseSymlink(logPath, "append");
   await appendFileWithFsync(logPath, line);
 
-  if (!(await exists(dailyPath))) {
-    await writeFileAtomic(dailyPath, `# ${date} Minni Audit\n\n`);
-  }
+  await seedExclusiveFile(dailyPath, `# ${date} Minni Audit\n\n`);
+  await refuseSymlink(dailyPath, "append");
   await appendFileWithFsync(dailyPath, line);
 
   // --- 4. Daily-log prune (older than 30 days) ---

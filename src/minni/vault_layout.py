@@ -109,7 +109,12 @@ def _reject_symlink_or_escape(dest: Path, root_real: Path, rel: str) -> None:
 
 def _seed_exclusive_file(dest: Path, header: str) -> bool:
     """O_EXCL create at 0600. Do not write at offset 0 if another writer appended."""
+    if dest.is_symlink():
+        raise OSError(f"refusing to seed through symlink: {dest}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
     try:
         fd = os.open(dest, flags, _FILE_MODE)
     except FileExistsError:
@@ -122,6 +127,22 @@ def _seed_exclusive_file(dest: Path, header: str) -> bool:
         return True
     finally:
         os.close(fd)
+
+
+def _append_regular_file(dest: Path, text: str) -> None:
+    if dest.is_symlink():
+        raise OSError(f"refusing to append through symlink: {dest}")
+    with dest.open("a", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def _resolved_vault_root(root: Path) -> Path:
+    if root.is_symlink():
+        raise OSError(f"refusing symlinked vault root: {root}")
+    try:
+        return root.resolve()
+    except OSError as exc:
+        raise OSError(f"vault root is not resolvable: {root}") from exc
 
 
 def _require_regular_contract_file(dest: Path, rel: str) -> None:

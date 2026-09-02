@@ -387,3 +387,150 @@ def test_wire_bootstrap_vault_does_not_clobber_append_after_exclusive_create(
     index_text = (vault / "index.md").read_text(encoding="utf-8")
     assert _RACE_AUDIT in log_text
     assert _RACE_INDEX in index_text
+
+
+def _wiki_symlink_to_shop(tmp_path: Path) -> tuple[Path, Path]:
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "wiki").symlink_to(shop)
+    return vault, shop
+
+
+def _inbox_symlink_to_shop(tmp_path: Path) -> tuple[Path, Path]:
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "inbox").symlink_to(shop)
+    return vault, shop
+
+
+def _file_symlink_to_shop(tmp_path: Path, rel: str) -> tuple[Path, Path]:
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    dest = vault / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.symlink_to(shop / "keep.md")
+    return vault, shop
+
+
+def _assert_shop_identity_unplanted(shop: Path) -> None:
+    assert not (shop / "sessions").exists()
+    assert not (shop / "entities").exists()
+    assert not (shop / "concepts").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_afm_ensure_vault_refuses_symlink_wiki_into_shop_restore(tmp_path):
+    """Peer AFM mkdir must not plant wiki/sessions through wiki → shop-restore."""
+    from minni.afm_writer import _ensure_vault
+
+    vault, shop = _wiki_symlink_to_shop(tmp_path)
+    with pytest.raises(OSError):
+        _ensure_vault(vault)
+    _assert_shop_identity_unplanted(shop)
+
+
+def test_handoff_ensure_vault_refuses_symlink_wiki_into_shop_restore(tmp_path):
+    """Peer handoff mkdir must not plant wiki/handoffs through wiki → shop-restore."""
+    from minni.minnid_runtime.handoff import ensure_handoff_vault
+
+    vault, shop = _wiki_symlink_to_shop(tmp_path)
+    with pytest.raises(OSError):
+        ensure_handoff_vault(vault)
+    _assert_shop_identity_unplanted(shop)
+    assert not (shop / "handoffs").exists()
+
+
+def test_afm_ensure_vault_refuses_symlink_inbox_into_shop_restore(tmp_path):
+    from minni.afm_writer import _ensure_vault
+
+    vault, shop = _inbox_symlink_to_shop(tmp_path)
+    with pytest.raises(OSError):
+        _ensure_vault(vault)
+    _assert_shop_identity_unplanted(shop)
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_handoff_ensure_vault_refuses_symlink_inbox_into_shop_restore(tmp_path):
+    from minni.minnid_runtime.handoff import ensure_handoff_vault
+
+    vault, shop = _inbox_symlink_to_shop(tmp_path)
+    with pytest.raises(OSError):
+        ensure_handoff_vault(vault)
+    _assert_shop_identity_unplanted(shop)
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_afm_ensure_vault_refuses_log_md_symlink_into_shop(tmp_path):
+    """dest.exists() follows log.md → shop; skip-or-append must lstat first."""
+    from minni.afm_writer import _ensure_vault
+
+    vault, shop = _file_symlink_to_shop(tmp_path, "log.md")
+    with pytest.raises(OSError):
+        _ensure_vault(vault)
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_afm_ensure_vault_refuses_index_md_symlink_into_shop(tmp_path):
+    from minni.afm_writer import _ensure_vault
+
+    vault, shop = _file_symlink_to_shop(tmp_path, "index.md")
+    with pytest.raises(OSError):
+        _ensure_vault(vault)
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_handoff_ensure_vault_refuses_log_md_symlink_into_shop(tmp_path):
+    from minni.minnid_runtime.handoff import ensure_handoff_vault
+
+    vault, shop = _file_symlink_to_shop(tmp_path, "log.md")
+    with pytest.raises(OSError):
+        ensure_handoff_vault(vault)
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_handoff_ensure_vault_refuses_index_md_symlink_into_shop(tmp_path):
+    from minni.minnid_runtime.handoff import ensure_handoff_vault
+
+    vault, shop = _file_symlink_to_shop(tmp_path, "index.md")
+    with pytest.raises(OSError):
+        ensure_handoff_vault(vault)
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_afm_append_audit_refuses_log_md_symlink_into_shop(tmp_path):
+    from minni.afm_writer import _append_audit
+
+    vault, shop = _file_symlink_to_shop(tmp_path, "log.md")
+    with pytest.raises(OSError):
+        _append_audit(vault, "afm_loop", "wrote draft", {"k": "v"})
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_handoff_append_audit_refuses_log_md_symlink_into_shop(tmp_path):
+    from minni.minnid_runtime.handoff import append_handoff_audit
+
+    vault, shop = _file_symlink_to_shop(tmp_path, "log.md")
+    with pytest.raises(OSError):
+        append_handoff_audit(vault, "handoff_sent", "wrote draft", {"k": "v"})
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_afm_append_audit_refuses_daily_log_symlink_into_shop(tmp_path):
+    import time
+
+    from minni.afm_writer import _append_audit
+
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    vault, shop = _file_symlink_to_shop(tmp_path, f"logs/{day}.md")
+    with pytest.raises(OSError):
+        _append_audit(vault, "afm_loop", "wrote draft", {"k": "v"})
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
