@@ -9,7 +9,7 @@
 // Isolation: missing daemon socket + a vault note whose body is the prompt
 // (direct substring match is strong). No live minni.db. No 30s harness raise.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -22,6 +22,7 @@ import {
   grokBuildWire,
 } from "../dist/hook-platform.js";
 import { RECALL_STATE_RELPATH, readRecallState } from "../dist/recall-state.js";
+import { auditTail } from "../dist/vault.js";
 
 const PLUGIN_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
 
@@ -122,6 +123,27 @@ async function strongUpsThenRead(handlers, vault, prompt) {
   return { ups, state, pre, statePath: path.join(vault, RECALL_STATE_RELPATH) };
 }
 
+/** Finds the last audit entry for `tool` and returns its parsed details JSON. */
+async function lastAuditDetails(vaultPath, tool) {
+  const tail = await auditTail(vaultPath, 20);
+  for (let i = tail.entries.length - 1; i >= 0; i -= 1) {
+    const entry = tail.entries[i];
+    if (!entry.includes(`] ${tool} |`)) continue;
+    const match = entry.match(/```json\n([\s\S]*?)\n```/);
+    return match ? JSON.parse(match[1]) : undefined;
+  }
+  return undefined;
+}
+
+const LEFTOVER_FALSE = {
+  task_signature: "leftover-from-dropped-ups",
+  intent: "recall",
+  top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],
+  top_score: 0.91,
+  consumed: false,
+  ts: "2026-08-30T00:00:00.000Z",
+};
+
 test("GROK_INJECTABLE stays Stop-only — do not 'fix' dropped UPS by expanding inject", async () => {
   const src = await readFile(path.join(PLUGIN_SRC, "hook-platform.ts"), "utf8");
   const match = src.match(
@@ -142,6 +164,9 @@ test("Grok UPS strong recall does not plant consumed=false; PreToolUse allows", 
     );
     const prompt = "resume the dropped-inject grok cobalt wal decision from prior context";
     const { state, pre, statePath } = await strongUpsThenRead(handlers, vault, prompt);
+    const details = await lastAuditDetails(vault, "hook_grok_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path this PR gates");
 
     assert.equal(await fileExists(statePath), false, "dropped Grok UPS must not write recall-state.json");
     assert.equal(state, null);
@@ -158,6 +183,9 @@ test("Cursor UPS (non-sessionStart) strong recall does not plant consumed=false;
     );
     const prompt = "resume the dropped-inject cursor cobalt wal decision from prior context";
     const { state, pre, statePath } = await strongUpsThenRead(handlers, vault, prompt);
+    const details = await lastAuditDetails(vault, "hook_cursor_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path this PR gates");
 
     assert.equal(cursorWire.inject("UserPromptSubmit", "memory"), null);
     assert.notEqual(cursorWire.inject("SessionStart", "memory"), null);
@@ -174,6 +202,9 @@ test("unprofiled wire strong UPS does not plant consumed=false; PreToolUse allow
     );
     const prompt = "resume the dropped-inject unprofiled cobalt wal decision from prior context";
     const { state, pre, statePath } = await strongUpsThenRead(handlers, vault, prompt);
+    const details = await lastAuditDetails(vault, "hook_unprofiled_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path this PR gates");
 
     assert.equal(await fileExists(statePath), false, "unprofiled drop must not write recall-state.json");
     assert.equal(state, null);
@@ -185,23 +216,15 @@ test("Grok UPS clears a leftover consumed=false plant so UNCONSULTED cannot fire
   await withFixture(async ({ vault }) => {
     const statePath = path.join(vault, RECALL_STATE_RELPATH);
     await mkdir(path.dirname(statePath), { recursive: true });
-    await writeFile(
-      statePath,
-      JSON.stringify({
-        task_signature: "leftover-from-dropped-ups",
-        intent: "recall",
-        top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],
-        top_score: 0.91,
-        consumed: false,
-        ts: "2026-08-30T00:00:00.000Z",
-      }),
-      "utf8",
-    );
+    await writeFile(statePath, JSON.stringify(LEFTOVER_FALSE), "utf8");
     const handlers = createHookHandlers(
       turnConfig(vault, { agentId: "grok-build", auditPrefix: "hook_grok", wire: grokBuildWire }),
     );
     const prompt = "resume the leftover dropped-inject grok cobalt wal decision from prior context";
     const { state, pre } = await strongUpsThenRead(handlers, vault, prompt);
+    const details = await lastAuditDetails(vault, "hook_grok_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(details.recall_strong, true, "precondition: leftover clear must run on the strong-recall path");
     assert.equal(await fileExists(statePath), false, "leftover consumed=false must not survive a dropped UPS");
     assert.equal(state, null);
     assert.equal(isDeny(pre), false, "leftover plant must not deny after the envelope was dropped");
@@ -213,10 +236,41 @@ test("Claude UPS still plants consumed=false and PreToolUse denies UNCONSULTED",
     const handlers = createHookHandlers(turnConfig(vault, { wire: claudeCodeWire }));
     const prompt = "resume the delivered-inject claude cobalt wal decision from prior context";
     const { state, pre, statePath } = await strongUpsThenRead(handlers, vault, prompt);
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path this PR gates");
 
     assert.ok(await fileExists(statePath), "injectable UPS must still write recall-state.json");
     assert.equal(state.consumed, false, "delivered envelope arms the s6 guard");
     assert.ok(isDeny(pre), "Claude PreToolUse must still deny UNCONSULTED after a delivered pointer");
     assert.match(pre.hookSpecificOutput.permissionDecisionReason, /UNCONSULTED/);
+  });
+});
+
+test("H2: dropped-inject strong UPS does not unlink recall-state.json through a .runtime dir symlink", async () => {
+  await withFixture(async ({ vault, root }) => {
+    await mkdir(vault, { recursive: true });
+    const outside = await mkdtemp(path.join(root, "outside-"));
+    const escapedStatePath = path.join(outside, "recall-state.json");
+    await writeFile(escapedStatePath, JSON.stringify(LEFTOVER_FALSE), "utf8");
+    await symlink(outside, path.join(vault, ".runtime"), "dir");
+
+    const handlers = createHookHandlers(
+      turnConfig(vault, { agentId: "grok-build", auditPrefix: "hook_grok", wire: grokBuildWire }),
+    );
+    const prompt = "resume the escaped-runtime dropped-inject grok cobalt wal decision from prior context";
+    const { pre } = await strongUpsThenRead(handlers, vault, prompt);
+    const details = await lastAuditDetails(vault, "hook_grok_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path this PR gates");
+    assert.equal(
+      await fileExists(escapedStatePath),
+      true,
+      "clearRecallState must not follow <vault>/.runtime dir symlink and wipe the escape target",
+    );
+    const escaped = JSON.parse(await readFile(escapedStatePath, "utf8"));
+    assert.equal(escaped.consumed, false);
+    assert.equal(escaped.task_signature, LEFTOVER_FALSE.task_signature);
+    assert.equal(isDeny(pre), false, "escaped leftover must not deny on a dropped-inject wire");
   });
 });
