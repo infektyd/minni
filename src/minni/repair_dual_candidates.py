@@ -187,6 +187,26 @@ def _inbox_key(
     return (_canonical_principal(principal), fi[0], fi[1])
 
 
+def _stamp_source_principal(derived_from: Any, leftover_principal: str) -> Optional[str]:
+    """Return derived_from JSON with leftover slug preserved, or None.
+
+    Collapse rewrites ``principal`` to the canonical host; archive uses
+    ``source_principal`` to refuse the remapped vault's live file.
+    """
+    if not leftover_principal:
+        return None
+    if not isinstance(derived_from, str) or not derived_from:
+        return None
+    try:
+        df = json.loads(derived_from)
+    except Exception:
+        return None
+    if not isinstance(df, dict):
+        return None
+    df.setdefault("source_principal", leftover_principal)
+    return json.dumps(df)
+
+
 def _content_sha1_of(derived: Dict[str, Any]) -> Optional[str]:
     """Normalize content_sha1 from derived_from (None if missing/empty)."""
     sha = derived.get("content_sha1")
@@ -902,14 +922,27 @@ def repair_duplicate_candidate_pairs(
                     # Leftover agy/xai winners keep the raw principal; list/
                     # resolve match that column, so rewrite to the canonical
                     # id after losers are gone (UNIQUE CASE already agrees).
+                    # Stamp the leftover slug into derived_from so archive
+                    # can still refuse the remapped vault after this UPDATE
+                    # makes owner_is_alias false.
                     winner_principal = str(live_winner.get("principal") or "")
                     canon = _canonical_principal(winner_principal)
                     if canon and canon != winner_principal:
-                        c.execute(
-                            "UPDATE candidate_packets SET principal=? "
-                            "WHERE candidate_id=?",
-                            (canon, live_keep),
+                        new_derived = _stamp_source_principal(
+                            live_winner.get("derived_from"), winner_principal
                         )
+                        if new_derived is not None:
+                            c.execute(
+                                "UPDATE candidate_packets SET principal=?, "
+                                "derived_from=? WHERE candidate_id=?",
+                                (canon, new_derived, live_keep),
+                            )
+                        else:
+                            c.execute(
+                                "UPDATE candidate_packets SET principal=? "
+                                "WHERE candidate_id=?",
+                                (canon, live_keep),
+                            )
                 elif live_losers:
                     # All losers were accepted-guarded — group unresolved.
                     groups_skipped_stale += 1

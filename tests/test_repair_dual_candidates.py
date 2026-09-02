@@ -736,11 +736,15 @@ def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
     applied = repair_duplicate_candidate_pairs(db, dry_run=False)
     assert applied["deleted"] == 1
     with db.cursor() as c:
-        c.execute("SELECT candidate_id, principal FROM candidate_packets")
+        c.execute(
+            "SELECT candidate_id, principal, derived_from FROM candidate_packets"
+        )
         rows = [dict(r) for r in c.fetchall()]
     assert len(rows) == 1
     assert rows[0]["candidate_id"] == min(agy_id, gemini_id)
     assert rows[0]["principal"] == "gemini"
+    df = json.loads(rows[0]["derived_from"])
+    assert df.get("source_principal") == "agy"
 
 
 def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(

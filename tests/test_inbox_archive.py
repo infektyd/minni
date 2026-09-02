@@ -680,6 +680,10 @@ def test_leftover_alias_accept_does_not_archive_remapped_vault_live_file(
     remapped gemini-vault copy that was never ingested. Canonical-owner
     matching treated both vaults as one agent; discover order then archived
     whichever live file matched first.
+
+    This case keeps principal='agy' (no collapse rewrite). The collapse
+    rewrite hole is pinned by
+    test_leftover_alias_collapse_rewrite_does_not_archive_remapped_vault.
     """
     import minni.afm_passes.inbox_archive as archive_mod
     from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
@@ -718,3 +722,77 @@ def test_leftover_alias_accept_does_not_archive_remapped_vault_live_file(
     assert (gemini_inbox / "same.json").is_file(), (
         "remapped vault live file was never ingested and must stay"
     )
+
+
+def test_leftover_alias_collapse_rewrite_does_not_archive_remapped_vault(
+    tmp_path, monkeypatch
+):
+    """Collapse deletes the gemini/grok-build twin then UPDATE leftover
+    winner principal agy/xai → gemini/grok-build. Archive must still
+    refuse the remapped vault: owner_is_alias is false after the rewrite,
+    so discover order used to archive never-ingested gemini-vault.
+
+    Pin: leftover principal='agy' + gemini twins on session.json index 0;
+    repair_duplicate_candidate_pairs(dry_run=False); then accept;
+    remapped-vault live file stays.
+    """
+    import minni.afm_passes.inbox_archive as archive_mod
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    cases = (
+        ("agy-vault", "agy", "gemini-vault", "gemini"),
+        ("xai-vault", "xai", "grok-build-vault", "grok-build"),
+    )
+    for leftover_dir, leftover, remapped_dir, canonical in cases:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"collapse-rewrite leftover fill {leftover} {canonical}"
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=content,
+            candidate_index=0,
+        )
+        _seed_inbox_packet(
+            db_obj,
+            principal=canonical,
+            inbox_file="session.json",
+            content=content,
+            candidate_index=0,
+        )
+        leftover_inbox = home / leftover_dir / "inbox"
+        remapped_inbox = home / remapped_dir / "inbox"
+        _write_inbox_file(leftover_inbox, "session.json", _cc_stop_doc([content]))
+        _write_inbox_file(remapped_inbox, "session.json", _cc_stop_doc([content]))
+
+        applied = repair_duplicate_candidate_pairs(db_obj, dry_run=False)
+        assert applied["deleted"] == 1, leftover
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT candidate_id, principal, status FROM candidate_packets"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, leftover
+        assert rows[0]["principal"] == canonical, leftover
+        cid = rows[0]["candidate_id"]
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' "
+                "WHERE candidate_id=?",
+                (cid,),
+            )
+        monkeypatch.setattr(
+            archive_mod,
+            "discover_inboxes",
+            lambda _cfg, _ri=remapped_inbox, _li=leftover_inbox: [_ri, _li],
+        )
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        assert archived == str(leftover_inbox / ".archive" / "session.json"), leftover
+        assert not (leftover_inbox / "session.json").exists(), leftover
+        assert (leftover_inbox / ".archive" / "session.json").is_file(), leftover
+        assert (remapped_inbox / "session.json").is_file(), (
+            f"{remapped_dir} live file was never ingested and must stay"
+        )

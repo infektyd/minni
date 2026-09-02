@@ -56,6 +56,30 @@ def _inbox_vault_slug(inbox: Path) -> str:
         return parent[: -len("-vault")]
     return ""
 
+
+def _source_principal_for_archive(row) -> str:
+    """Leftover vault slug if collapse rewrote ``principal`` to canonical.
+
+    ``repair_duplicate_candidate_pairs`` stamps ``source_principal`` into
+    ``derived_from`` before UPDATE agy/xai → gemini/grok-build. Without
+    that, ``owner_is_alias`` is false and discover order can archive the
+    remapped vault's never-ingested live file.
+    """
+    owner = str(row["principal"] or "")
+    raw = row["derived_from"] if "derived_from" in row.keys() else None
+    if not isinstance(raw, str) or not raw:
+        return owner
+    try:
+        df = json.loads(raw)
+    except Exception:
+        return owner
+    if not isinstance(df, dict):
+        return owner
+    stamped = df.get("source_principal")
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    return owner
+
 # Every candidate_packets status except 'proposed' (the schema CHECK set,
 # including the do_not_store/log_only statuses added by migration 015).
 TERMINAL_STATUSES = frozenset(
@@ -281,14 +305,19 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     owner_canon = _canonical_principal(owner_principal)
     # Leftover alias packets (agy/xai) share a canonical owner with the
     # remapped vault (gemini/grok-build). Do not archive that remapped
-    # vault's live file — it was never the leftover's source.
-    owner_is_alias = bool(owner_principal) and owner_principal != owner_canon
+    # vault's live file — it was never the leftover's source. Collapse
+    # rewrite sets principal to canonical, so owner_is_alias on the
+    # rewritten column is false; consult source_principal instead.
+    source_principal = _source_principal_for_archive(row)
+    source_is_alias = bool(source_principal) and source_principal != _canonical_principal(
+        source_principal
+    )
 
     for inbox in discover_inboxes(config):
         inbox_owner = _principal_for_inbox(inbox, fallback_principal="unknown")
         if _canonical_principal(inbox_owner or "") != owner_canon:
             continue
-        if owner_is_alias and _inbox_vault_slug(inbox) != owner_principal:
+        if source_is_alias and _inbox_vault_slug(inbox) != source_principal:
             continue
         source = inbox / inbox_file
         try:
