@@ -438,15 +438,47 @@ def _extract_frontmatter_block(text: str) -> Optional[str]:
 
 
 def _atomic_write_text(path: Path, data: str) -> None:
-    """Replace ``path`` with ``data`` atomically (same-directory temp + rename).
+    """Replace ``path`` with ``data`` atomically (unique same-dir temp + rename).
 
     Path.write_text opens 'w' — truncate, then write — so a crash, a full
     disk, or a concurrent reader mid-write leaves a torn page. The first live
     expiry sweep rewrites ~900 pages in one pass; each must be all-or-nothing.
+
+    A fixed ``<name>.tmp`` sidecar is a plant vector: write_text follows
+    ``inbox/afm-drafts-DATE.json.tmp -> shop/keep.md``. Exclusive-create a
+    unique tmp with O_NOFOLLOW so a planted sidecar cannot be the write target.
     """
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.replace(tmp, path)
+    payload = data.encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    last_exc: Optional[OSError] = None
+    for _ in range(8):
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp")
+        if tmp.is_symlink():
+            raise OSError(f"refusing to write through symlink: {tmp}")
+        try:
+            fd = os.open(tmp, flags, 0o666)
+        except FileExistsError as exc:
+            last_exc = exc
+            continue
+        try:
+            try:
+                written = 0
+                while written < len(payload):
+                    written += os.write(fd, payload[written:])
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+            return
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    raise OSError(f"could not exclusive-create unique tmp for {path}") from last_exc
 
 
 def derive_loop_status(

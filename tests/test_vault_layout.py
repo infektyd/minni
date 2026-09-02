@@ -620,6 +620,95 @@ def test_afm_write_batch_merges_inbox_runs_after_exclusive_seed(tmp_path):
     assert not inbox.is_symlink()
 
 
+def test_afm_write_batch_does_not_plant_inbox_drafts_tmp_sidecar_symlink(tmp_path):
+    """Predictable afm-drafts-DATE.json.tmp must not follow into shop-restore."""
+    import json
+    import time
+
+    from minni.afm_writer import _write_batch
+
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    inbox = vault / "inbox"
+    inbox.mkdir()
+    sidecar = inbox / f"afm-drafts-{day}.json.tmp"
+    sidecar.symlink_to(shop / "keep.md")
+    result = _write_batch(
+        {
+            "vault_path": str(vault),
+            "pass_name": "probe",
+            "drafts": [],
+        }
+    )
+    dest = Path(result["inbox_path"])
+    assert dest == inbox / f"afm-drafts-{day}.json"
+    assert dest.is_file()
+    assert not dest.is_symlink()
+    payload = json.loads(dest.read_text(encoding="utf-8"))
+    assert len(payload["runs"]) == 1
+    assert sidecar.is_symlink()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_afm_write_one_does_not_plant_wiki_page_tmp_sidecar_symlink(tmp_path):
+    """Predictable wiki/<section>/<page>.md.tmp must not follow into shop-restore."""
+    import time
+
+    from minni.afm_writer import _slugify, _write_one
+
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    draft = _afm_draft(section="decisions")
+    now = 1_777_000_000.0
+    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    name = (
+        f"{created[:10].replace('-', '')}-"
+        f"{_slugify(draft['title'])}-{draft['page_id'][-6:]}.md"
+    )
+    page_dir = vault / "wiki" / "decisions"
+    page_dir.mkdir(parents=True)
+    sidecar = page_dir / f"{name}.tmp"
+    sidecar.symlink_to(shop / "keep.md")
+    written = _write_one(vault, draft, now=now)
+    dest = vault / written["path"]
+    assert dest == page_dir / name
+    assert dest.is_file()
+    assert not dest.is_symlink()
+    assert sidecar.is_symlink()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_atomic_write_text_refuses_unique_tmp_symlink_into_shop(tmp_path, monkeypatch):
+    """O_EXCL unique tmp must lstat-refuse a planted sidecar, not follow it."""
+    from minni.afm_writer import _atomic_write_text
+
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+    monkeypatch.setattr(os, "urandom", lambda n: b"\xab" * n)
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    dest = vault / "page.md"
+    tmp = vault / f"page.md.4242.{(b'\xab' * 8).hex()}.tmp"
+    tmp.symlink_to(shop / "keep.md")
+    with pytest.raises(OSError):
+        _atomic_write_text(dest, "new\n")
+    assert not dest.exists()
+    assert tmp.is_symlink()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
 def test_wire_bootstrap_vault_refuses_schema_agents_symlink_into_shop(
     tmp_path, monkeypatch
 ):
