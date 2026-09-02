@@ -118,6 +118,7 @@ import {
   drainStatusForModel,
   isModelHiddenCandidateStatus,
   modelListCandidatesPayload,
+  redactLocalValue,
 } from "./list-candidates-model.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
@@ -920,7 +921,7 @@ server.registerTool(
       reason: reason || "",
       agent_id: DEFAULT_AGENT_ID,
     });
-    return textResult(JSON.stringify(rpc, null, 2));
+    return textResult(JSON.stringify(redactLocalValue(rpc), null, 2));
   },
 );
 

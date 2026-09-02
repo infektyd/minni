@@ -11,8 +11,11 @@ Fixtures/tmpdirs only — live ~/.minni/minni.db is never opened.
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
+import time
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -275,6 +278,141 @@ def test_list_truncation_is_not_silent(monkeypatch, tmp_path):
     assert full_result.get("has_more") is False, full
 
 
+def _wal_connect(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+class _HookCursor:
+    """sqlite3.Cursor.execute is read-only; proxy so tests can inject WAL writers."""
+
+    def __init__(self, real, hook):
+        self._real = real
+        self._hook = hook
+
+    def execute(self, sql, parameters=()):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        compact = sql_s.replace(" ", "")
+        page_select = (
+            "FROM candidate_packets" in sql_s
+            and "LIMIT" in sql_s
+            and "COUNT(" not in compact
+        )
+        if page_select:
+            self._hook()
+        return self._real.execute(sql, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _before_page_select(monkeypatch, hook):
+    """Run ``hook`` immediately before the candidate page SELECT.
+
+    sqlite3 does not start a transaction on SELECT, so a COUNT(*) then
+    LIMIT page can observe two WAL snapshots. The hook is the injected
+    writer in that window.
+    """
+    import minni.db as db_mod
+
+    orig = db_mod.SovereignDB.cursor
+
+    @contextmanager
+    def wrapped(self):
+        with orig(self) as c:
+            yield _HookCursor(c, hook)
+
+    monkeypatch.setattr(db_mod.SovereignDB, "cursor", wrapped)
+
+
+def _count_proposed(db_path, principal):
+    conn = _wal_connect(db_path)
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM candidate_packets WHERE principal=? AND status=?",
+            (principal, "proposed"),
+        ).fetchone()[0]
+        return int(n)
+    finally:
+        conn.close()
+
+
+def test_list_has_more_insert_window_cannot_hide_live_rows(monkeypatch, tmp_path):
+    """COUNT=1 then extra WAL stages used to fill LIMIT with has_more false.
+
+    Pin the page so extras that exist when the LIMIT SELECT runs cannot
+    be hidden. If live proposed rows exceed the returned page, has_more
+    must be true.
+    """
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    _stage(monkeypatch, "cursor", "cursor drain item keep unique")
+    _stamp(monkeypatch, "cursor")
+    db_path = db_obj.config.db_path
+
+    def inject_extras():
+        conn = _wal_connect(db_path)
+        try:
+            now = time.time()
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO candidate_packets "
+                    "(principal, workspace_id, content, status, proposed_at) "
+                    "VALUES (?, 'default', ?, 'proposed', ?)",
+                    ("cursor", f"cursor drain item injected {i} unique", now + i + 1),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _before_page_select(monkeypatch, inject_extras)
+    listed = minnid._list_candidates({"status": "proposed", "limit": 2}, 20)
+    result = listed.get("result", {})
+    returned = result.get("candidates", [])
+    live = _count_proposed(db_path, "cursor")
+    assert live > len(returned), (live, listed)
+    assert result.get("has_more") is True, listed
+    assert result.get("count") == 2, listed
+    assert result.get("total") >= live or result.get("total") > len(returned), listed
+    assert len(returned) <= 2, listed
+
+
+def test_list_has_more_delete_window_cannot_claim_a_short_page(monkeypatch, tmp_path):
+    """COUNT=N then WAL deletes used to leave has_more true on a short page.
+
+    The other direction of the window: if the LIMIT SELECT returns fewer
+    rows than limit, has_more must be false.
+    """
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    keep = "cursor drain item keep unique"
+    _stage(monkeypatch, "cursor", keep)
+    for i in range(3):
+        _stage(monkeypatch, "cursor", f"cursor drain item drop {i} unique")
+    _stamp(monkeypatch, "cursor")
+    db_path = db_obj.config.db_path
+
+    def drop_extras():
+        conn = _wal_connect(db_path)
+        try:
+            conn.execute(
+                "DELETE FROM candidate_packets WHERE principal=? AND status=? "
+                "AND content NOT LIKE ?",
+                ("cursor", "proposed", f"%{keep}%"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _before_page_select(monkeypatch, drop_extras)
+    listed = minnid._list_candidates({"status": "proposed", "limit": 2}, 21)
+    result = listed.get("result", {})
+    returned = result.get("candidates", [])
+    assert len(returned) < 2, listed
+    assert result.get("has_more") is False, listed
+    assert result.get("count") == len(returned), listed
+    assert result.get("total") == len(returned), listed
+
+
 def test_mcp_list_does_not_stringify_raw_daemon_packet():
     """Cursor MCP sends tool output to cloud models. The handler must
     redact + project before returning, default the drain queue to
@@ -309,3 +447,18 @@ def test_mcp_list_does_not_stringify_raw_daemon_packet():
     assert "has_more: false" not in fail_block, fail_block
     assert "count: 0" not in fail_block, fail_block
     assert "candidates: []" not in fail_block, fail_block
+
+
+def test_mcp_resolve_redacts_jsonresult_errors_like_list():
+    """List redacts daemon errors (socket paths). Resolve used to
+    JSON.stringify(rpc) unchanged, so JsonResult errors leaked local
+    paths to the model. Redact before returning. Still no identity spoof.
+    """
+    source = SERVER_TS.read_text(encoding="utf8")
+    start = source.find('"minni_resolve_candidate"')
+    assert start != -1
+    next_tool = source.find("server.registerTool(", start + 1)
+    block = source[start : next_tool if next_tool != -1 else None]
+    assert "redactLocalValue" in block
+    assert "JSON.stringify(rpc," not in block
+    assert "agent_id: DEFAULT_AGENT_ID" in block

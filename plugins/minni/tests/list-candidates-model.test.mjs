@@ -5,6 +5,7 @@ import {
   drainStatusForModel,
   modelListCandidatesPayload,
   MODEL_HIDDEN_CANDIDATE_STATUSES,
+  redactLocalValue,
 } from "../dist/list-candidates-model.js";
 
 const SECRET = "hunter2-not-a-path";
@@ -166,4 +167,24 @@ test("model list never returns do_not_store/log_only/accepted/merged/superseded 
   assert.equal(mixedBlob.includes("ACCEPTED_MARKER"), false, mixedBlob);
   assert.equal(mixed.candidates.length, 1);
   assert.equal(mixed.candidates[0].candidate_id, 1);
+});
+
+test("minni_resolve_candidate redacts JsonResult errors the same as list", async () => {
+  const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
+  const start = source.indexOf('"minni_resolve_candidate"');
+  assert.notEqual(start, -1);
+  const nextTool = source.indexOf("server.registerTool(", start + 1);
+  const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+  assert.match(block, /redactLocalValue/);
+  assert.doesNotMatch(block, /JSON\.stringify\(rpc,/);
+
+  const rpc = {
+    ok: false,
+    error: "connect ECONNREFUSED /Users/example/.minni/run/minnid.sock",
+  };
+  const payload = redactLocalValue(rpc);
+  const blob = JSON.stringify(payload);
+  assert.equal(blob.includes("/Users/example"), false, blob);
+  assert.equal(blob.includes("minnid.sock"), false, blob);
+  assert.equal(payload.ok, false);
 });

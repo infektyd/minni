@@ -1115,7 +1115,10 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
     to SELECT every status, so a later list after redact/reject returned
     hidden packet content. Explicit status still works for console zones.
     Envelopes that cross the process boundary are POLICY §2 redacted, and
-    ``total`` / ``has_more`` make a truncated page visible.
+    ``total`` / ``has_more`` make a truncated page visible. ``has_more``
+    comes from a single ``LIMIT n+1`` read — sqlite3 does not start a
+    transaction on SELECT, so a COUNT(*) then LIMIT pair can hide a live
+    proposed row when WAL commits between the two.
     """
     principal, err = context.handler_principal(params, request_id)
     if err:
@@ -1139,15 +1142,13 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
     try:
         db = context.sovereign_db()
         with db.cursor() as c:
-            c.execute(
-                "SELECT COUNT(*) AS n FROM candidate_packets WHERE principal=? AND status=?",
-                (principal.agent_id, status_f),
-            )
-            total = int(c.fetchone()["n"])
+            # One statement for the page + has_more probe. A prior COUNT(*)
+            # is a different WAL snapshot; extras that land between the two
+            # would fill LIMIT and still report has_more false.
             c.execute(
                 "SELECT * FROM candidate_packets WHERE principal=? AND status=? "
                 "ORDER BY proposed_at DESC LIMIT ?",
-                (principal.agent_id, status_f, limit),
+                (principal.agent_id, status_f, limit + 1),
             )
             rows = []
             for row in c.fetchall():
@@ -1160,6 +1161,16 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
                             pass
                 redacted, _ = redact_value(item)
                 rows.append(redacted)
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            if has_more:
+                c.execute(
+                    "SELECT COUNT(*) AS n FROM candidate_packets WHERE principal=? AND status=?",
+                    (principal.agent_id, status_f),
+                )
+                total = max(int(c.fetchone()["n"]), len(rows) + 1)
+            else:
+                total = len(rows)
         return context.make_response(
             {
                 "candidates": rows,
@@ -1168,7 +1179,7 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
                 "count": len(rows),
                 "total": total,
                 "limit": limit,
-                "has_more": total > len(rows),
+                "has_more": has_more,
             },
             request_id,
         )
