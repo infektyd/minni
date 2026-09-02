@@ -237,14 +237,33 @@ def test_assign_fill_indices_skips_duplicate_extra_sha():
     occupied = {0: "shaL"}
     assigned = _assign_fill_indices(occupied, [(0, "shaD"), (0, "shaD")])
     assert assigned == [1, None], assigned
-    assert occupied == {0: "shaL", 1: "shaD"}
+    assert occupied == {0: {"shaL"}, 1: {"shaD"}}
 
     occupied_divergent = {0: "shaL"}
     two_bodies = _assign_fill_indices(
         occupied_divergent, [(0, "shaD"), (0, "shaE")]
     )
     assert two_bodies == [1, 2], two_bodies
-    assert occupied_divergent == {0: "shaL", 1: "shaD", 2: "shaE"}
+    assert occupied_divergent == {0: {"shaL"}, 1: {"shaD"}, 2: {"shaE"}}
+
+
+def test_assign_fill_indices_skips_hidden_same_slot_twin():
+    """Occupancy last-write hid a same-slot twin so extras minted a duplicate.
+
+    Two shas can share one slot when CASE UNIQUE is not installed. extras
+    skip if sha is already present at any slot, not just last-write.
+    """
+    from minni.afm_passes.inbox_ingest import _assign_fill_indices
+
+    occupied = {0: {"shaA", "shaB"}}
+    assigned = _assign_fill_indices(occupied, [(0, "shaA")])
+    assert assigned == [None], assigned
+    assert occupied == {0: {"shaA", "shaB"}}
+
+    occupied_b = {0: {"shaA", "shaB"}}
+    assigned_b = _assign_fill_indices(occupied_b, [(0, "shaC")])
+    assert assigned_b == [1], assigned_b
+    assert occupied_b == {0: {"shaA", "shaB"}, 1: {"shaC"}}
 
 
 def test_ingest_identical_alias_vault_bodies_do_not_mint_twin_extras(tmp_path):
@@ -300,6 +319,86 @@ def test_ingest_identical_alias_vault_bodies_do_not_mint_twin_extras(tmp_path):
         contents = [r["content"] for r in rows]
         assert leftover_body in contents, leftover
         assert contents.count(live_body) == 1, (leftover, contents)
+
+
+def test_existing_fills_keeps_every_sha_at_a_slot(tmp_path):
+    """_existing_fills overwrote dict[idx]=sha with no ORDER BY. Two shas
+    sharing one slot (CASE UNIQUE not installed) must both occupy occupancy.
+    """
+    from minni.afm_passes.inbox_ingest import _content_sha1, _existing_fills
+
+    db_obj, _cfg = _make_db(tmp_path)
+    body_a = "twin A occupying index 0"
+    body_b = "twin B occupying index 0"
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_a,
+    )
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_b,
+    )
+    fills = _existing_fills(db_obj)
+    held = fills[("gemini", "session.json")][0]
+    shas = set(held) if isinstance(held, (set, frozenset)) else {held}
+    assert shas == {_content_sha1(body_a), _content_sha1(body_b)}, held
+
+
+def test_ingest_same_slot_twin_does_not_mint_duplicate_extra(tmp_path):
+    """Same-slot twins without CASE UNIQUE: ingesting the hidden twin must
+    skip, not extras-at-next-idx a third packet.
+    """
+    from minni.afm_passes.inbox_ingest import (
+        _content_sha1,
+        _existing_fills,
+        ingest,
+    )
+
+    body_a = "twin A occupying index 0"
+    body_b = "twin B occupying index 0"
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_a,
+    )
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_b,
+    )
+    fills = _existing_fills(db_obj)
+    held = fills[("gemini", "session.json")][0]
+    sha_a = _content_sha1(body_a)
+    sha_b = _content_sha1(body_b)
+    if isinstance(held, str):
+        hidden_body = body_a if held == sha_b else body_b
+    else:
+        hidden_body = body_a
+
+    inbox = tmp_path / "gemini-vault" / "inbox"
+    _write_inbox_file(inbox, "session.json", _cc_stop_doc([hidden_body]))
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 0, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 2, [r["content"] for r in rows]
+    indices = {
+        json.loads(r["derived_from"]).get("candidate_index") for r in rows
+    }
+    assert indices == {0}, indices
+    contents = [r["content"] for r in rows]
+    assert body_a in contents and body_b in contents, contents
 
 
 def test_slug_alias_stamped_agent_id_is_not_mismatch(tmp_path):

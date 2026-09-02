@@ -53,6 +53,9 @@ Contract (mirrors afm_passes.inbox_ingest):
   Alias vaults that share a canonical principal (agy-vault + gemini-vault)
   share one occupancy map over the whole scan so the second file's body is
   extras-at-next-idx rather than UNIQUE-swallowed and archived unmerged.
+  insert_slots=[] (second identical body already claimed in-memory) must
+  not archive until the INSERT txn commits and durable_keys confirm those
+  occupancy shas — occupancy is not a durable write.
   Without this, files that DO yield shared candidates would sit in the inbox
   forever: their idempotency key already prevents reprocessing, so they are
   rescanned-and-skipped on every tick and inflate pending-inbox counts (see
@@ -92,6 +95,7 @@ from minni.afm_passes.inbox_ingest import (
     _is_unique_integrity_error,
     _make_inbox_key,
     _principal_for_inbox,
+    _sha_set,
     discover_inboxes,
 )
 
@@ -445,14 +449,15 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     # _existing_keys per inbox queued the same canonical key twice for
     # agy-vault + gemini-vault, UNIQUE-swallowed the second body, and
     # archived the unmerged file.
-    occupancy: Dict[Tuple[str, str], Dict[int, str]] = {}
+    occupancy: Dict[Tuple[str, str], Dict[int, set]] = {}
 
-    def _slot(principal: str, inbox_file: str) -> Dict[int, str]:
+    def _slot(principal: str, inbox_file: str) -> Dict[int, set]:
         key = (_canonical_principal(principal), inbox_file)
         if key not in occupancy:
-            occupancy[key] = {
-                idx: sha for idx, sha in _fills_for_file(db, principal, inbox_file)
-            }
+            slot: Dict[int, set] = {}
+            for idx, sha in _fills_for_file(db, principal, inbox_file):
+                slot.setdefault(idx, set()).update(_sha_set(sha))
+            occupancy[key] = slot
         return occupancy[key]
 
     for inbox in inboxes:
@@ -524,8 +529,18 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             ]
             if not insert_slots:
                 already += 1
-                if not dry_run and archive_inbox_file(path):
-                    archived_with_shared += 1
+                # Occupancy is the in-memory map (first alias vault in this
+                # scan may have queued D into to_insert without committing).
+                # Archive only after the INSERT txn via durable_keys.
+                if not dry_run:
+                    requested_shas = {s for _idx, s in requested}
+                    expected_keys = {
+                        _make_inbox_key(principal, path.name, idx)
+                        for idx, held in fills.items()
+                        if _sha_set(held) & requested_shas
+                    }
+                    if expected_keys:
+                        to_archive_with_shared.append((path, expected_keys))
                 continue
             # Only newly assigned keys — leftover occupied 0 with a
             # divergent body is not "the fill" and must not gate archive.

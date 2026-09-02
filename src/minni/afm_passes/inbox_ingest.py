@@ -309,15 +309,35 @@ def _packet_content_sha1(content: Any, df: Any) -> str:
     return _content_sha1(content or "")
 
 
+def _sha_set(value: Any) -> set:
+    """Normalize occupancy at one slot to a set of content_sha1s."""
+    if isinstance(value, (set, frozenset)):
+        return set(value)
+    if isinstance(value, (list, tuple)):
+        return {v for v in value if isinstance(v, str) and v}
+    if isinstance(value, str) and value:
+        return {value}
+    return set()
+
+
+def _all_occupied_shas(occupied: Dict[int, Any]) -> set:
+    out: set = set()
+    for v in occupied.values():
+        out |= _sha_set(v)
+    return out
+
+
 def _existing_fills(
     db, principals: set | None = None
-) -> Dict[Tuple[str, str], Dict[int, str]]:
-    """``(canonical principal, inbox_file) -> {candidate_index: content_sha1}``.
+) -> Dict[Tuple[str, str], Dict[int, set]]:
+    """``(canonical principal, inbox_file) -> {candidate_index: set(sha)}``.
 
     Alias-family leftover rows occupy the canonical (file, index) slot so a
     remapped vault can extras-at-next-idx when the occupying body diverges.
+    Keep every sha at a slot (CASE UNIQUE may be absent) so a same-slot
+    twin cannot hide from extras skip.
     """
-    fills: Dict[Tuple[str, str], Dict[int, str]] = {}
+    fills: Dict[Tuple[str, str], Dict[int, set]] = {}
     with db.cursor() as c:
         if principals:
             expanded: set[str] = set()
@@ -343,8 +363,8 @@ def _existing_fills(
         if key is None:
             continue
         canon, inbox_file, idx = key
-        fills.setdefault((canon, inbox_file), {})[idx] = _packet_content_sha1(
-            content, df
+        fills.setdefault((canon, inbox_file), {}).setdefault(idx, set()).add(
+            _packet_content_sha1(content, df)
         )
     return fills
 
@@ -354,16 +374,21 @@ def _fills_for_file(db, principal: str, inbox_file: str) -> List[Tuple[int, str]
 
     Alias-family leftover rows occupy the canonical (file, index) slot.
     Index 0 alone is not the whole fill when the stored body diverges from
-    a later compact_summary section or remapped stop-candidate.
+    a later compact_summary section or remapped stop-candidate. Same-slot
+    twins (CASE UNIQUE not installed) yield one tuple per sha.
     """
     slot = _existing_fills(db, {principal}).get(
         (_canonical_principal(principal), inbox_file), {}
     )
-    return sorted(slot.items())
+    out: List[Tuple[int, str]] = []
+    for idx in sorted(slot):
+        for sha in sorted(_sha_set(slot[idx])):
+            out.append((idx, sha))
+    return out
 
 
 def _assign_fill_indices(
-    occupied: Dict[int, str],
+    occupied: Dict[int, Any],
     requested: List[Tuple[int, str]],
 ) -> List[Optional[int]]:
     """Map each ``(requested_idx, sha)`` to an insert index, or None if present.
@@ -374,16 +399,19 @@ def _assign_fill_indices(
     reserved missing slot, so extras never steal a still-free distilled
     index. Identical extra shas share one extra index (agy-vault +
     gemini-vault grouped into one requested list must not mint a twin).
-    Mutates ``occupied``.
+    Occupancy values are a set of shas per slot so a same-slot twin is
+    not last-write hidden. Mutates ``occupied``.
     """
-    existing_shas = set(occupied.values())
+    for idx in list(occupied):
+        occupied[idx] = _sha_set(occupied[idx])
+    existing_shas = _all_occupied_shas(occupied)
     assigned: List[Optional[int]] = [None] * len(requested)
     extras: List[int] = []
     for i, (idx, sha) in enumerate(requested):
         if sha in existing_shas:
             continue
         if idx not in occupied:
-            occupied[idx] = sha
+            occupied[idx] = {sha}
             existing_shas.add(sha)
             assigned[i] = idx
         else:
@@ -396,9 +424,9 @@ def _assign_fill_indices(
         next_idx = (max(occupied) if occupied else -1) + 1
         for i in extras:
             _idx, sha = requested[i]
-            if sha in occupied.values():
+            if sha in _all_occupied_shas(occupied):
                 continue
-            occupied[next_idx] = sha
+            occupied[next_idx] = {sha}
             existing_shas.add(sha)
             assigned[i] = next_idx
             next_idx += 1
