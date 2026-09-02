@@ -780,16 +780,35 @@ def _contains_forged_frontmatter(content: str) -> bool:
     return False
 
 
+_ALLOWED_DRAFT_PRIVACY = {
+    "safe",
+    "public",
+    "low",
+    "review",
+    "private",
+    "local-only",
+    "blocked",
+}
+
+
 def _frontmatter(draft: dict, created: str, expires_at: str, gate_status: str, instruction_like: bool = False) -> str:
     # RCM-011: build via dict + yaml.safe_dump (handles multiline title/tags safely, prevents injection)
     prompt_version = draft.get("prompt_version")
     tags = [str(tag) for tag in draft.get("tags", []) if str(tag).strip()]
+    raw_privacy = draft.get("privacy")
+    privacy = (
+        raw_privacy.strip().lower()
+        if isinstance(raw_privacy, str) and raw_privacy.strip()
+        else "safe"
+    )
+    if privacy not in _ALLOWED_DRAFT_PRIVACY:
+        privacy = "safe"
     fm: dict = {
         "title": draft["title"],
         "type": draft.get("kind", "concept"),
         "status": "draft",
         "agent": "afm-loop",
-        "privacy": "safe",
+        "privacy": privacy,
         "trace_id": draft["trace_id"],
         "page_id": draft["page_id"],
         "created": created,

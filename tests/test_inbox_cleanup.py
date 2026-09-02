@@ -22,7 +22,7 @@ NOW = time.mktime((2026, 6, 10, 12, 0, 0, 0, 0, 0))
 
 
 def _make_fixture_db(tmp_path, rows):
-    """rows: list of (status, inbox_file, candidate_index, content).
+    """rows: (status, inbox_file, candidate_index, content[, principal[, source_principal]]).
     Mirrors what inbox_ingest writes: the row carries the candidate content
     and derived_from carries its content_sha1 fingerprint."""
     db_path = tmp_path / "fixture.db"
@@ -30,21 +30,25 @@ def _make_fixture_db(tmp_path, rows):
     conn.execute(
         "CREATE TABLE candidate_packets ("
         " candidate_id INTEGER PRIMARY KEY, status TEXT, content TEXT,"
-        " derived_from TEXT)"
+        " derived_from TEXT, principal TEXT)"
     )
-    for status, inbox_file, idx, content in rows:
-        derived = json.dumps(
-            {
-                "source": "inbox",
-                "inbox_file": inbox_file,
-                "candidate_index": idx,
-                "content_sha1": inbox_cleanup._content_sha1(content),
-            }
-        )
+    for row in rows:
+        status, inbox_file, idx, content = row[:4]
+        principal = row[4] if len(row) > 4 else None
+        source_principal = row[5] if len(row) > 5 else None
+        derived = {
+            "source": "inbox",
+            "inbox_file": inbox_file,
+            "candidate_index": idx,
+            "content_sha1": inbox_cleanup._content_sha1(content),
+        }
+        if source_principal:
+            derived["source_principal"] = source_principal
         conn.execute(
-            "INSERT INTO candidate_packets (status, content, derived_from)"
-            " VALUES (?, ?, ?)",
-            (status, content, derived),
+            "INSERT INTO candidate_packets"
+            " (status, content, derived_from, principal)"
+            " VALUES (?, ?, ?, ?)",
+            (status, content, json.dumps(derived), principal),
         )
     conn.commit()
     conn.close()
@@ -639,6 +643,38 @@ def test_scripts_inbox_cleanup_classifies_and_quarantines_agent_mismatch_residue
     # Idempotent: a second --apply finds nothing left to quarantine.
     again = inbox_cleanup.run_cleanup(home=tmp_path, db_path=db_path, apply=True, now=NOW)
     assert again["vaults"]["unknown-vault"]["archived"] == []
+
+
+def test_leftover_alias_fill_does_not_archive_remapped_vault_live_inbox(tmp_path):
+    """Operator --apply must not archive gemini-vault/inbox/same.json for an
+    leftover agy-vault fill of the same basename. load_inbox_rows keyed by
+    bare inbox_file, then classified ingested on content fingerprint, so
+    the remapped vault's never-ingested live copy was swept with the alias
+    leftover. Scope rows by vault slug / source_principal like daemon archive.
+    """
+    content = "byte-identical leftover fill shared across alias vaults"
+    db_path = _make_fixture_db(
+        tmp_path,
+        [("accepted", "same.json", 0, content, "agy", "agy")],
+    )
+    agy_inbox = tmp_path / "agy-vault" / "inbox"
+    gemini_inbox = tmp_path / "gemini-vault" / "inbox"
+    agy_inbox.mkdir(parents=True)
+    gemini_inbox.mkdir(parents=True)
+    doc = _stop_doc([content])
+    (agy_inbox / "same.json").write_text(json.dumps(doc), encoding="utf-8")
+    (gemini_inbox / "same.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    applied = inbox_cleanup.run_cleanup(
+        home=tmp_path, db_path=db_path, apply=True, now=NOW
+    )
+    assert (gemini_inbox / "same.json").is_file(), (
+        "remapped vault live file was never ingested and must stay; "
+        f"report={applied}"
+    )
+    assert not (gemini_inbox / ".archive" / "same.json").exists()
+    assert not (agy_inbox / "same.json").exists()
+    assert (agy_inbox / ".archive" / "same.json").is_file()
 
 
 def test_parse_iso_epoch():

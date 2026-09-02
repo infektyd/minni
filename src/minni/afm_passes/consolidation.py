@@ -151,9 +151,28 @@ def _total_proposed(db) -> int:
         return int(c.fetchone()["n"])
 
 
+_DRAFT_PRIVACY = {"safe", "public", "low", "review", "private", "local-only", "blocked"}
+
+
+def _draft_privacy(candidate: Dict[str, Any]) -> str:
+    """Wiki-page privacy for a review draft. Learn-only review / NULL / unknown
+    must not compile as fleet-readable ``privacy: safe``."""
+    raw = candidate.get("privacy_level")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "review"
+    privacy = str(raw).strip().lower()
+    if privacy in _SAFE_PRIVACY:
+        return "safe"
+    return privacy if privacy in _DRAFT_PRIVACY else "review"
+
+
 def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict[str, Any]:
     cid = candidate["candidate_id"]
-    content = (candidate.get("content") or "")[:400]
+    privacy = _draft_privacy(candidate)
+    if privacy in _SAFE_PRIVACY:
+        content_line = f"- Content: {(candidate.get('content') or '')[:400]}"
+    else:
+        content_line = "- Content: [withheld; learn-only / non-safe privacy]"
     return {
         "page_id": f"consolidation-review-{cid}-{trace_id}",
         "kind": "concept",
@@ -161,6 +180,7 @@ def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict
         "title": f"Candidate #{cid} needs review ({reason})",
         "status": "draft",
         "agent": "afm-loop",
+        "privacy": privacy,
         "trace_id": trace_id,
         "sources": [f"candidate_packets:{cid}"],
         "body": (
@@ -169,7 +189,7 @@ def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict
             f"- Principal: {candidate.get('principal')}; "
             f"privacy: {candidate.get('privacy_level')}; "
             f"instruction_like: {bool(candidate.get('instruction_like'))}.\n"
-            f"- Content: {content}"
+            f"{content_line}"
         ),
     }
 

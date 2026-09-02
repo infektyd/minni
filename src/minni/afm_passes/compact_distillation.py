@@ -85,6 +85,8 @@ from minni.afm_passes.inbox_ingest import (
     _existing_keys_for_on_cursor,
     _is_unique_integrity_error,
     _make_inbox_key,
+    _parse_inbox_key,
+    _principal_family,
     _principal_for_inbox,
     discover_inboxes,
 )
@@ -344,6 +346,50 @@ COMPACT_AGENT_MISMATCH = "_compact_agent_mismatch"
 COMPACT_EMPTY_SUMMARY = "_compact_empty_summary"
 
 
+def _fills_for_file(db, principal: str, inbox_file: str) -> List[Tuple[int, str]]:
+    """``(candidate_index, content_sha1)`` already stored for this inbox file.
+
+    Alias-family leftover rows occupy the canonical (file, index) slot.
+    Index 0 alone is not the whole fill when the stored body diverges from
+    a later compact_summary section.
+    """
+    family = _principal_family(principal)
+    placeholders = ",".join("?" for _ in family)
+    with db.cursor() as c:
+        c.execute(
+            f"""
+            SELECT principal, content, derived_from FROM candidate_packets
+            WHERE principal IN ({placeholders})
+              AND derived_from IS NOT NULL
+            """,
+            tuple(family),
+        )
+        rows = c.fetchall()
+    out: List[Tuple[int, str]] = []
+    for row in rows:
+        if isinstance(row, dict) or hasattr(row, "keys"):
+            p, content, df = row["principal"], row["content"], row["derived_from"]
+        else:
+            p, content, df = row[0], row[1], row[2]
+        key = _parse_inbox_key(p, df)
+        if key is None or key[1] != inbox_file:
+            continue
+        sha = None
+        if isinstance(df, str) and df:
+            try:
+                obj = json.loads(df)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                raw_sha = obj.get("content_sha1")
+                if isinstance(raw_sha, str) and raw_sha:
+                    sha = raw_sha
+        if not sha:
+            sha = _content_sha1(content or "")
+        out.append((key[2], sha))
+    return out
+
+
 def classify_unusable_compact_file(path: Path, principal: str) -> Optional[str]:
     """Why this inbox file is unusable to the distillation pass, or None.
 
@@ -502,15 +548,35 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 for idx in range(len(candidates))
                 if _make_inbox_key(principal, path.name, idx) not in existing
             ]
-            if not missing:
-                already += 1
-                # Legacy sweep: every distilled index is already in the DB
-                # (not merely index 0 — leftover alias fills occupy 0 while
-                # later compact_summary sections still need 1..n) but the
-                # file was never archived. Safe to retire now.
-                if not dry_run and archive_inbox_file(path):
-                    archived_with_shared += 1
-                continue
+            insert_slots: List[Tuple[int, str, bool]] = []
+            if missing:
+                for idx in missing:
+                    content, afm_used = candidates[idx]
+                    insert_slots.append((idx, content, afm_used))
+            else:
+                # Every distilled index is occupied. That is "already done"
+                # only when stored bodies cover this file. Leftover alias
+                # index 0 with a different body is not a 1-section fill.
+                fills = _fills_for_file(db, principal, path.name)
+                existing_shas = {sha for _idx, sha in fills}
+                occupied = {idx for idx, _sha in fills}
+                extras = [
+                    (content, afm_used)
+                    for content, afm_used in candidates
+                    if _content_sha1(content) not in existing_shas
+                ]
+                if not extras:
+                    already += 1
+                    if not dry_run and archive_inbox_file(path):
+                        archived_with_shared += 1
+                    continue
+                next_idx = (max(occupied) if occupied else -1) + 1
+                for offset, (content, afm_used) in enumerate(extras):
+                    insert_slots.append((next_idx + offset, content, afm_used))
+                expected_keys = {
+                    _make_inbox_key(principal, path.name, idx)
+                    for idx, _content, _used in insert_slots
+                }
             if not dry_run:
                 if _write_session_note(inbox.parent, doc, path.name, principal):
                     notes_written += 1
@@ -522,8 +588,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             raw_privacy = doc.get("privacy_level", "safe")
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
-            for idx in missing:
-                content, afm_used = candidates[idx]
+            for idx, content, afm_used in insert_slots:
                 existing.add(_make_inbox_key(principal, path.name, idx))
                 to_insert.append({
                     "principal": principal,

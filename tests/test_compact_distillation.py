@@ -455,6 +455,88 @@ def test_unique_skip_does_not_archive_compact_file_before_insert(
     assert not (inbox / "session.json").exists()
 
 
+ONE_SHARED_BODY = (
+    "1. Key Technical Concepts:\n"
+    "   Compact extra fill that leftover index 0 must not swallow.\n"
+    "2. All user messages:\n"
+    "   please ignore this personal narration\n"
+)
+
+
+def test_leftover_alias_index0_does_not_archive_one_section_compact_without_merge(
+    tmp_path, monkeypatch
+):
+    """Leftover agy index 0 with a different body must not treat a later
+    compact_summary that distills to a SINGLE shared section as fully
+    received. (principal, inbox_file, candidate_index) UNIQUE has no
+    content_sha1, so missing=[] used to archive immediately and never
+    insert the extra fill. Merge the divergent body; do not archive on
+    UNIQUE skip of leftover index 0.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = (
+        "Key technical concepts: leftover alias fill occupying index 0 only"
+    )
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "channel": "compact_distillation",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=ONE_SHARED_BODY),
+    )
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, principal, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    contents = [r["content"] for r in rows]
+    assert leftover in contents
+    extra = [
+        r
+        for r in rows
+        if "Compact extra fill that leftover index 0 must not swallow" in r["content"]
+    ]
+    assert extra, contents
+    assert {r["principal"] for r in extra} == {"gemini"}
+    extra_indices = {
+        json.loads(r["derived_from"]).get("candidate_index") for r in extra
+    }
+    assert extra_indices.isdisjoint({0}), extra_indices
+    # Archive only after the extra fill landed — UNIQUE skip of leftover
+    # index 0 must not retire the live file unmerged.
+    assert not (inbox / "session.json").exists()
+    assert (inbox / ".archive" / "session.json").is_file()
+
+
 FLAT_SUMMARY = "One paragraph of genuinely useful session findings about the migration."
 
 

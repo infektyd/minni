@@ -463,6 +463,66 @@ def test_unset_privacy_still_goes_to_review(tmp_path, monkeypatch):
     assert result["review_candidate_ids"] == [cid]
 
 
+def test_learn_only_review_draft_does_not_copy_secret_into_safe_wiki(
+    tmp_path, monkeypatch
+):
+    """Learn-only privacy=review (and I1/I2 NULL) still drain to operator
+    review, but the first 400 chars must not land in a consolidation-review
+    wiki page stamped privacy: safe under cfg.vault_path.
+    """
+    from minni.afm_passes.consolidation import run as consolidate
+    from minni.afm_writer import _write_one
+    from minni.minnid_runtime.afm import apply_consolidation_result
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "off")
+    db, cfg = _make_db(tmp_path)
+    secret = "operator-only secret token sk-review-body-do-not-exfil"
+    review_id = _insert(
+        db,
+        content=f"{GOOD} {secret}",
+        privacy_level="review",
+    )
+    null_id = _insert(db, content=f"{GOOD} null-{secret}", privacy_level=None)
+
+    result = consolidate(db, cfg, dry_run=False, trace_id="review-no-exfil")
+    assert result["promote_candidate_ids"] == []
+    assert review_id in result["review_candidate_ids"]
+    assert null_id in result["review_candidate_ids"]
+    assert result["drafts"]
+    for draft in result["drafts"]:
+        body = draft.get("body") or ""
+        assert secret not in body, draft
+        assert GOOD not in body, draft
+        assert (draft.get("privacy") or "").strip().lower() != "safe"
+
+    written = _write_one(Path(cfg.vault_path), result["drafts"][0])
+    assert written.get("written") is not False
+    page = Path(cfg.vault_path) / written["path"]
+    text = page.read_text(encoding="utf-8")
+    assert secret not in text
+    assert GOOD not in text
+    assert "privacy: safe" not in text
+
+    apply_consolidation_result(result, _afm_context(db, cfg, _writeback_stub(db, cfg)))
+    with db.cursor() as cursor:
+        rows = cursor.execute(
+            "SELECT candidate_id, status FROM candidate_packets"
+        ).fetchall()
+        fences = cursor.execute(
+            """
+            SELECT COUNT(*) AS n FROM consolidation_actions
+            WHERE action_type = 'afm_review'
+              AND COALESCE(status, '') != 'superseded'
+            """
+        ).fetchone()["n"]
+        learnings = cursor.execute("SELECT COUNT(*) AS n FROM learnings").fetchone()["n"]
+    by_id = {row["candidate_id"]: row["status"] for row in rows}
+    assert by_id[review_id] == "proposed"
+    assert by_id[null_id] == "proposed"
+    assert fences == 2
+    assert learnings == 0
+
+
 def test_unpark_review_privacy_lifts_only_quality_pass_rows(tmp_path, monkeypatch):
     from minni.afm_passes.consolidation import run as consolidate
     from minni.afm_passes.unpark_review_privacy_backlog import run as unpark
