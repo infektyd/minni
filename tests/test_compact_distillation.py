@@ -276,7 +276,8 @@ def test_distill_in_txn_canonicalizes_alias_wanted_against_leftover_gemini(
 
     db_obj, cfg = _make_db(tmp_path)
     leftover = (
-        "Key technical concepts: race on bootout after launchctl error 5"
+        "Compaction summary — Key technical concepts: "
+        "race on bootout after launchctl error 5"
     )
     derived = json.dumps(
         {
@@ -409,9 +410,16 @@ def test_leftover_alias_index0_does_not_archive_compact_without_extra_fills(
 def test_unique_skip_does_not_archive_compact_file_before_insert(
     tmp_path, monkeypatch
 ):
-    """to_archive_with_shared used to append before the INSERT txn. A UNIQUE
-    family skip of index 0 then archived a 3-section file without merging
-    extra fills. Archive only after the missing indices land.
+    """In-txn UNIQUE/key skip of leftover index 0 used to treat the hit as
+    already_present without comparing content_sha1, then archive because
+    expected_keys ⊆ durable_keys as index tuples (leftover 0 covers slot 0
+    even when distilled section-0 qty never inserted).
+
+    Emptying _fills_for_file disables the pre-scan occupancy extras path so
+    this pin is the INSERT txn itself: compare sha, extras-at-next-idx when
+    divergent, and archive only once this file's distilled shas are in
+    candidate_packets. Leftover 0 + THREE_SHARED_BODY section 0 body must
+    land at a new index before the live file is renamed into .archive.
     """
     import time
 
@@ -453,16 +461,22 @@ def test_unique_skip_does_not_archive_compact_file_before_insert(
     )
 
     res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
-    assert res["inserted"] == 2, res
+    assert res["inserted"] == 3, res
     with db_obj.cursor() as c:
         c.execute(
-            "SELECT derived_from FROM candidate_packets ORDER BY candidate_id"
+            "SELECT content, principal, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
         )
-        indices = sorted(
-            json.loads(dict(r)["derived_from"]).get("candidate_index")
-            for r in c.fetchall()
-        )
-    assert indices == [0, 1, 2], indices
+        rows = [dict(r) for r in c.fetchall()]
+    by_idx = {
+        json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
+    }
+    assert sorted(by_idx) == [0, 1, 2, 3], by_idx
+    assert leftover in by_idx[0]["content"]
+    qty = [r for r in rows if "SovereignDB caches" in r["content"]]
+    assert qty, [r["content"] for r in rows]
+    qty_idx = json.loads(qty[0]["derived_from"]).get("candidate_index")
+    assert qty_idx not in {0}, qty_idx
     assert (inbox / ".archive" / "session.json").is_file()
     assert not (inbox / "session.json").exists()
 

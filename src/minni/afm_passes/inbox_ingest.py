@@ -327,33 +327,9 @@ def _all_occupied_shas(occupied: Dict[int, Any]) -> set:
     return out
 
 
-def _existing_fills(
-    db, principals: set | None = None
-) -> Dict[Tuple[str, str], Dict[int, set]]:
-    """``(canonical principal, inbox_file) -> {candidate_index: set(sha)}``.
-
-    Alias-family leftover rows occupy the canonical (file, index) slot so a
-    remapped vault can extras-at-next-idx when the occupying body diverges.
-    Keep every sha at a slot (CASE UNIQUE may be absent) so a same-slot
-    twin cannot hide from extras skip.
-    """
+def _fills_from_packet_rows(rows) -> Dict[Tuple[str, str], Dict[int, set]]:
+    """Build occupancy from ``(principal, content, derived_from)`` rows."""
     fills: Dict[Tuple[str, str], Dict[int, set]] = {}
-    with db.cursor() as c:
-        if principals:
-            expanded: set[str] = set()
-            for p in principals:
-                expanded.update(_principal_family(p))
-            placeholders = ",".join("?" for _ in expanded)
-            c.execute(
-                f"SELECT principal, content, derived_from FROM candidate_packets "
-                f"WHERE principal IN ({placeholders})",
-                tuple(expanded),
-            )
-        else:
-            c.execute(
-                "SELECT principal, content, derived_from FROM candidate_packets"
-            )
-        rows = c.fetchall()
     for row in rows:
         if isinstance(row, dict) or hasattr(row, "keys"):
             p, content, df = row["principal"], row["content"], row["derived_from"]
@@ -367,6 +343,41 @@ def _existing_fills(
             _packet_content_sha1(content, df)
         )
     return fills
+
+
+def _existing_fills_on_cursor(
+    c, principals: set | None = None
+) -> Dict[Tuple[str, str], Dict[int, set]]:
+    """Occupancy map loaded on ``c`` (in-txn; not the pre-scan ``_fills_for_file``)."""
+    if principals:
+        expanded: set[str] = set()
+        for p in principals:
+            expanded.update(_principal_family(p))
+        placeholders = ",".join("?" for _ in expanded)
+        c.execute(
+            f"SELECT principal, content, derived_from FROM candidate_packets "
+            f"WHERE principal IN ({placeholders})",
+            tuple(expanded),
+        )
+    else:
+        c.execute(
+            "SELECT principal, content, derived_from FROM candidate_packets"
+        )
+    return _fills_from_packet_rows(c.fetchall())
+
+
+def _existing_fills(
+    db, principals: set | None = None
+) -> Dict[Tuple[str, str], Dict[int, set]]:
+    """``(canonical principal, inbox_file) -> {candidate_index: set(sha)}``.
+
+    Alias-family leftover rows occupy the canonical (file, index) slot so a
+    remapped vault can extras-at-next-idx when the occupying body diverges.
+    Keep every sha at a slot (CASE UNIQUE may be absent) so a same-slot
+    twin cannot hide from extras skip.
+    """
+    with db.cursor() as c:
+        return _existing_fills_on_cursor(c, principals)
 
 
 def _fills_for_file(db, principal: str, inbox_file: str) -> List[Tuple[int, str]]:

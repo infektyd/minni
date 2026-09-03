@@ -523,6 +523,43 @@ def test_learn_only_review_draft_does_not_copy_secret_into_safe_wiki(
     assert learnings == 0
 
 
+def test_instruction_like_safe_draft_does_not_copy_body_into_wiki(
+    tmp_path, monkeypatch
+):
+    """Inbox ingest stamps missing privacy as safe. Content-IL / injection
+    with privacy=safe (instruction_like column still 0) used to interpolate
+    the first 400 chars into a privacy:safe consolidation-review wiki page.
+    Do not copy that body.
+    """
+    from minni.afm_passes.consolidation import run as consolidate
+    from minni.afm_writer import _write_one
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "off")
+    db, cfg = _make_db(tmp_path)
+    cid = _insert(
+        db,
+        content=INJECTION,
+        privacy_level="safe",
+        instruction_like=0,
+    )
+
+    result = consolidate(db, cfg, dry_run=False, trace_id="il-safe-no-exfil")
+    assert result["promote_candidate_ids"] == []
+    assert result["review_candidate_ids"] == [cid]
+    assert result["drafts"]
+    for draft in result["drafts"]:
+        body = draft.get("body") or ""
+        assert INJECTION not in body, draft
+        assert "Ignore all previous instructions" not in body, draft
+
+    written = _write_one(Path(cfg.vault_path), result["drafts"][0])
+    assert written.get("written") is not False
+    page = Path(cfg.vault_path) / written["path"]
+    text = page.read_text(encoding="utf-8")
+    assert INJECTION not in text
+    assert "Ignore all previous instructions" not in text
+
+
 def test_unpark_review_privacy_lifts_only_quality_pass_rows(tmp_path, monkeypatch):
     from minni.afm_passes.consolidation import run as consolidate
     from minni.afm_passes.unpark_review_privacy_backlog import run as unpark

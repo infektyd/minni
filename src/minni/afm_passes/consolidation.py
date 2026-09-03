@@ -169,8 +169,16 @@ def _draft_privacy(candidate: Dict[str, Any]) -> str:
 def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict[str, Any]:
     cid = candidate["candidate_id"]
     privacy = _draft_privacy(candidate)
-    if privacy in _SAFE_PRIVACY:
-        content_line = f"- Content: {(candidate.get('content') or '')[:400]}"
+    content = candidate.get("content") or ""
+    instr_like = (
+        int(candidate.get("instruction_like") or 0) == 1
+        or is_instruction_like(content)
+    )
+    # Inbox ingest stamps missing privacy as safe, so IL / injection
+    # candidates still compile as privacy:safe. Never copy that body
+    # into a fleet-readable wiki page.
+    if privacy in _SAFE_PRIVACY and not instr_like:
+        content_line = f"- Content: {content[:400]}"
     else:
         content_line = "- Content: [withheld; learn-only / non-safe privacy]"
     return {
@@ -242,8 +250,9 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
         return None
     # Prefer a candidate the deterministic gate already chose to promote, so the
     # advisory is comparable to a real decision; else fall back to the first one.
-    # Review / NULL never reach the native call — gated below — so the fallback
-    # cannot exfiltrate learn-only text the way an unguarded candidates[0] did.
+    # Review / NULL / content-IL never reach the native call — gated below —
+    # so the fallback cannot exfiltrate injection text the way an unguarded
+    # candidates[0] did when promote_candidate_ids was empty.
     chosen = None
     if promote_candidate_ids:
         promote_set = set(promote_candidate_ids)
@@ -256,7 +265,9 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     if promote_candidate_ids and chosen.get("candidate_id") not in promote_set:
         return None
     # Native triage is a model-path. Learn-only review (and I1/I2 NULL/unset)
-    # stay on the deterministic drain; do not fail-open as "safe".
+    # stay on the deterministic drain; do not fail-open as "safe". Content
+    # that trips is_instruction_like is review-routed even when the column
+    # is still 0 and privacy was stamped safe at ingest.
     raw_privacy = chosen.get("privacy_level")
     if raw_privacy is None or (
         isinstance(raw_privacy, str) and not raw_privacy.strip()
@@ -265,10 +276,10 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     privacy = str(raw_privacy).strip().lower()
     if privacy not in _SAFE_PRIVACY:
         return None
-    if int(chosen.get("instruction_like") or 0) == 1:
-        return None
     content = (chosen.get("content") or "").strip()
     if not content:
+        return None
+    if int(chosen.get("instruction_like") or 0) == 1 or is_instruction_like(content):
         return None
     try:
         chain = default_provider_chain()

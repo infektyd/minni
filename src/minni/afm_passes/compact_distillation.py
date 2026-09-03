@@ -54,8 +54,11 @@ Contract (mirrors afm_passes.inbox_ingest):
   share one occupancy map over the whole scan so the second file's body is
   extras-at-next-idx rather than UNIQUE-swallowed and archived unmerged.
   insert_slots=[] (second identical body already claimed in-memory) must
-  not archive until the INSERT txn commits and durable_keys confirm those
-  occupancy shas — occupancy is not a durable write.
+  not archive until the INSERT txn commits and this file's distilled
+  content_sha1s are actually in candidate_packets — occupancy is not a
+  durable write. In-txn UNIQUE/key hits compare sha and extras-at-next-idx
+  when the occupying leftover diverges; leftover index 0 must not satisfy
+  archive just because expected_keys ⊆ durable_keys as index tuples.
   Without this, files that DO yield shared candidates would sit in the inbox
   forever: their idempotency key already prevents reprocessing, so they are
   rescanned-and-skipped on every tick and inflate pending-inbox counts (see
@@ -86,20 +89,60 @@ from minni.safety import is_instruction_like
 from minni.afm_passes.inbox_archive import archive_inbox_file
 from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
+    _all_occupied_shas,
     _assign_fill_indices,
     _canonical_principal,
     _content_sha1,
+    _existing_fills,
+    _existing_fills_on_cursor,
     _existing_keys,  # tests monkeypatch the pre-scan hook
-    _existing_keys_for_on_cursor,
     _fills_for_file,
     _is_unique_integrity_error,
-    _make_inbox_key,
     _principal_for_inbox,
     _sha_set,
     discover_inboxes,
 )
 
 logger = logging.getLogger("sovereign.afm.compact_distillation")
+
+
+def _remap_rows_against_occupancy(
+    rows: List[Dict[str, Any]],
+    occupancy: Dict[Tuple[str, str], Dict[int, set]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Re-run extras-at-next-idx against in-txn occupancy.
+
+    Pre-scan occupancy can miss leftover fills (``_fills_for_file`` empty or
+    a race). UNIQUE is (canon, file, idx) with no content_sha1, so a key hit
+    without this remap unique-skips a divergent section-0 body.
+    """
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    order: List[Tuple[str, str]] = []
+    for r in rows:
+        key = (_canonical_principal(r["principal"]), r["inbox_file"])
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        grouped[key].append(r)
+    out: List[Dict[str, Any]] = []
+    skipped = 0
+    for key in order:
+        file_rows = grouped[key]
+        slot = occupancy.setdefault(key, {})
+        requested = [
+            (int(r["candidate_index"]), _content_sha1(r["content"]))
+            for r in file_rows
+        ]
+        assigned = _assign_fill_indices(slot, requested)
+        for r, new_idx in zip(file_rows, assigned):
+            if new_idx is None:
+                skipped += 1
+                continue
+            if new_idx != r["candidate_index"]:
+                r = dict(r)
+                r["candidate_index"] = new_idx
+            out.append(r)
+    return out, skipped
 
 #: File-format tag written by the hook-side harvest.
 COMPACT_SUMMARY_KIND = "compact_summary"
@@ -444,7 +487,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     notes_written = 0
     archived_zero_shared = 0
     archived_with_shared = 0
-    to_archive_with_shared: List[Tuple[Path, set]] = []
+    to_archive_with_shared: List[Tuple[Path, str, set]] = []
     # One occupancy map over the whole scan (like inbox_ingest). Reloading
     # _existing_keys per inbox queued the same canonical key twice for
     # agy-vault + gemini-vault, UNIQUE-swallowed the second body, and
@@ -527,35 +570,28 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 for i, new_idx in enumerate(assigned)
                 if new_idx is not None
             ]
+            requested_shas = {s for _idx, s in requested}
             if not insert_slots:
                 already += 1
                 # Occupancy is the in-memory map (first alias vault in this
                 # scan may have queued D into to_insert without committing).
-                # Archive only after the INSERT txn via durable_keys.
-                if not dry_run:
-                    requested_shas = {s for _idx, s in requested}
-                    expected_keys = {
-                        _make_inbox_key(principal, path.name, idx)
-                        for idx, held in fills.items()
-                        if _sha_set(held) & requested_shas
-                    }
-                    if expected_keys:
-                        to_archive_with_shared.append((path, expected_keys))
+                # Archive only after the INSERT txn via durable shas.
+                if not dry_run and requested_shas:
+                    to_archive_with_shared.append(
+                        (path, principal, requested_shas)
+                    )
                 continue
-            # Only newly assigned keys — leftover occupied 0 with a
-            # divergent body is not "the fill" and must not gate archive.
-            expected_keys = {
-                _make_inbox_key(principal, path.name, idx)
-                for idx, _content, _used in insert_slots
-            }
             if not dry_run:
                 if _write_session_note(inbox.parent, doc, path.name, principal):
                     notes_written += 1
-            # Archive only after the insert transaction below succeeds for
-            # every missing/extra index (never archive-before-insert, never
-            # archive on a UNIQUE/family skip that left extra fills unmerged).
-            if not dry_run:
-                to_archive_with_shared.append((path, expected_keys))
+            # Archive only after this file's distilled shas are in
+            # candidate_packets (never leftover's index tuple). UNIQUE
+            # skip of leftover 0 must extras-at-next-idx the divergent
+            # section-0 body before the live file is renamed.
+            if not dry_run and requested_shas:
+                to_archive_with_shared.append(
+                    (path, principal, requested_shas)
+                )
             raw_privacy = doc.get("privacy_level", "safe")
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
@@ -576,83 +612,106 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     if not dry_run and to_insert:
         now = time.time()
         with db.transaction() as c:
-            # Issue #239: re-load only to_insert keys under BEGIN IMMEDIATE
-            # (not full-table scan). Mirror inbox_ingest: narrow in-txn check
-            # + UNIQUE swallow. Principal-scoped keys allow multi-vault peers.
-            # _make_inbox_key canonicalizes agy/xai so leftover gemini/
-            # grok-build rows are the same fill, not a new UNIQUE key.
-            wanted = {
-                _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
-                for r in to_insert
+            # In-txn occupancy, not the pre-scan _fills_for_file map: leftover
+            # 0 with a divergent body extras-at-next-idx even when occupancy
+            # extras were skipped. UNIQUE is (canon, file, idx) with no
+            # content_sha1; a key hit without sha compare unique-skips qty.
+            durable_occupancy = _existing_fills_on_cursor(
+                c, {r["principal"] for r in to_insert}
+            )
+            occupancy: Dict[Tuple[str, str], Dict[int, set]] = {
+                k: {idx: set(shas) for idx, shas in slot.items()}
+                for k, slot in durable_occupancy.items()
             }
-            txn_existing = _existing_keys_for_on_cursor(c, wanted)
+            remapped, remap_skipped = _remap_rows_against_occupancy(
+                to_insert, occupancy
+            )
+            already += remap_skipped
 
-            for r in to_insert:
-                key = _make_inbox_key(
-                    r["principal"], r["inbox_file"], r["candidate_index"]
+            for r in remapped:
+                sha = _content_sha1(r["content"])
+                file_key = (
+                    _canonical_principal(r["principal"]), r["inbox_file"]
                 )
-                if key in txn_existing:
-                    already += 1
-                    continue
-                derived_from = json.dumps({
-                    # 'inbox' + inbox_file is the inbox_archive lifecycle key —
-                    # keep it EXACTLY this shape (see module docstring).
-                    "source": "inbox",
-                    "channel": "compact_distillation",
-                    "inbox_file": r["inbox_file"],
-                    "candidate_index": r["candidate_index"],
-                    "kind": COMPACT_SUMMARY_KIND,
-                    "audience": "shared",
-                    "summary_id": r["summary_id"],
-                    "platform": r["platform"],
-                    "afm_distilled": r["afm_distilled"],
-                    "content_sha1": _content_sha1(r["content"]),
-                })
-                try:
-                    c.execute(
-                        """
-                        INSERT INTO candidate_packets
-                        (principal, workspace_id, layer, privacy_level, content,
-                         evidence_refs, derived_from, instruction_like, status, proposed_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                        """,
-                        (
-                            r["principal"],
-                            r["workspace_id"],
-                            None,
-                            r["privacy_level"],
-                            r["content"],
-                            json.dumps([]),
-                            derived_from,
-                            1 if is_instruction_like(r["content"]) else 0,
-                            now,
-                        ),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    # Unique-index collision (post-#239 repair) or rare race:
-                    # treat as already_present rather than aborting the batch.
-                    # Re-raise CHECK/NOT NULL/FK integrity failures.
-                    if not _is_unique_integrity_error(exc):
-                        raise
-                    already += 1
-                    continue
-                txn_existing.add(key)
-                inserted += 1
+                attempts = 0
+                while True:
+                    derived_from = json.dumps({
+                        # 'inbox' + inbox_file is the inbox_archive lifecycle key —
+                        # keep it EXACTLY this shape (see module docstring).
+                        "source": "inbox",
+                        "channel": "compact_distillation",
+                        "inbox_file": r["inbox_file"],
+                        "candidate_index": r["candidate_index"],
+                        "kind": COMPACT_SUMMARY_KIND,
+                        "audience": "shared",
+                        "summary_id": r["summary_id"],
+                        "platform": r["platform"],
+                        "afm_distilled": r["afm_distilled"],
+                        "content_sha1": sha,
+                    })
+                    try:
+                        c.execute(
+                            """
+                            INSERT INTO candidate_packets
+                            (principal, workspace_id, layer, privacy_level, content,
+                             evidence_refs, derived_from, instruction_like, status, proposed_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                            """,
+                            (
+                                r["principal"],
+                                r["workspace_id"],
+                                None,
+                                r["privacy_level"],
+                                r["content"],
+                                json.dumps([]),
+                                derived_from,
+                                1 if is_instruction_like(r["content"]) else 0,
+                                now,
+                            ),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        # Unique-index collision: compare sha against the
+                        # durable leftover and extras-at-next-idx when
+                        # divergent rather than treating leftover 0 as
+                        # already_present.
+                        if not _is_unique_integrity_error(exc):
+                            raise
+                        held = _all_occupied_shas(
+                            durable_occupancy.get(file_key, {})
+                        )
+                        if sha in held:
+                            already += 1
+                            break
+                        slot = occupancy.setdefault(file_key, {})
+                        next_idx = (max(slot) if slot else -1) + 1
+                        r = dict(r)
+                        r["candidate_index"] = next_idx
+                        slot[next_idx] = {sha}
+                        attempts += 1
+                        if attempts > 8:
+                            already += 1
+                            break
+                        continue
+                    occupancy.setdefault(file_key, {}).setdefault(
+                        r["candidate_index"], set()
+                    ).add(sha)
+                    inserted += 1
+                    break
 
     # Archive only after the insert transaction above has committed AND
-    # every distilled index for the file is actually in the DB. UNIQUE/
-    # family skip of index 0 must not retire a file whose extra fills
-    # never landed. A crash between insert and archive just leaves the
-    # file to be (harmlessly) merged/archived next tick, never lost.
-    durable_keys: set = set()
+    # this file's distilled shas are actually in candidate_packets.
+    # Leftover index 0 must not satisfy archive via index tuples.
+    # A crash between insert and archive just leaves the file to be
+    # (harmlessly) merged/archived next tick, never lost.
+    durable_fills: Dict[Tuple[str, str], Dict[int, set]] = {}
     if not dry_run and to_archive_with_shared:
-        wanted = set()
-        for _path, expected in to_archive_with_shared:
-            wanted |= expected
-        with db.cursor() as c:
-            durable_keys = _existing_keys_for_on_cursor(c, wanted)
-    for path, expected in to_archive_with_shared:
-        if expected and expected <= durable_keys and archive_inbox_file(path):
+        durable_fills = _existing_fills(db)
+    for path, principal, expected_shas in to_archive_with_shared:
+        slot = durable_fills.get(
+            (_canonical_principal(principal), path.name), {}
+        )
+        durable_shas = _all_occupied_shas(slot)
+        if expected_shas and expected_shas <= durable_shas and archive_inbox_file(path):
             archived_with_shared += 1
 
     return {
