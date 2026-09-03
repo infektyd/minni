@@ -119,17 +119,31 @@ def test_ingest_is_idempotent(tmp_path):
     assert _count_proposed(db_obj) == 1
 
 
-def _seed_inbox_packet(db_obj, *, principal, inbox_file, content, candidate_index=0):
+def _seed_inbox_packet(
+    db_obj,
+    *,
+    principal,
+    inbox_file,
+    content,
+    candidate_index=0,
+    content_sha1=None,
+    status="proposed",
+):
     import hashlib
     import time
 
+    sha = (
+        content_sha1
+        if isinstance(content_sha1, str) and content_sha1
+        else hashlib.sha1(content.encode("utf-8")).hexdigest()
+    )
     derived = json.dumps(
         {
             "source": "inbox",
             "inbox_file": inbox_file,
             "candidate_index": candidate_index,
             "kind": None,
-            "content_sha1": hashlib.sha1(content.encode("utf-8")).hexdigest(),
+            "content_sha1": sha,
         }
     )
     now = time.time()
@@ -139,9 +153,9 @@ def _seed_inbox_packet(db_obj, *, principal, inbox_file, content, candidate_inde
             INSERT INTO candidate_packets
             (principal, workspace_id, layer, privacy_level, content,
              evidence_refs, derived_from, instruction_like, status, proposed_at)
-            VALUES (?, 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            VALUES (?, 'default', NULL, 'safe', ?, '[]', ?, 0, ?, ?)
             """,
-            (principal, content, derived, now),
+            (principal, content, derived, status, now),
         )
 
 
@@ -229,13 +243,14 @@ def test_ingest_divergent_leftover_body_extras_at_next_index(tmp_path):
 def test_ingest_in_txn_leftover_unique_extras_divergent_body(tmp_path, monkeypatch):
     """Leftover 0 body L + remapped D at the same app key must extras-at-next-idx.
 
-    Pre-scan occupancy already extras. Emptying _existing_fills assigns D the
-    leftover key (stale occupancy / TOCTOU). ingest() used to skip that key
-    in-txn with no content_sha1 compare, and UNIQUE IntegrityError was
-    already_present with no extras remap. Do not monkeypatch _existing_keys —
-    ingest no longer consults it, so that patch stays green on the miss.
+    True TOCTOU: INSERT reloads occupancy via _existing_fills_on_cursor, not
+    the pre-scan _existing_fills / _existing_keys / _fills_for_file hooks.
+    Emptying that in-txn loader assigns D the leftover key; CASE UNIQUE then
+    fires. IntegrityError used to count already_present with no extras remap.
+    Do not monkeypatch unused pre-scan names — those stay green on UNIQUE skip.
     """
     from minni.afm_passes import inbox_ingest as ii
+    from minni.repair_dual_candidates import ensure_inbox_dedup_index
 
     leftover_body = "leftover L occupying session.json index 0"
     live_body = "divergent remapped D that leftover UNIQUE must not swallow"
@@ -243,7 +258,9 @@ def test_ingest_in_txn_leftover_unique_extras_divergent_body(tmp_path, monkeypat
         ("agy-vault", "agy", "gemini"),
         ("xai-vault", "xai", "grok-build"),
     )
-    monkeypatch.setattr(ii, "_existing_fills", lambda db, principals=None: {})
+    monkeypatch.setattr(
+        ii, "_existing_fills_on_cursor", lambda c, principals=None: {}
+    )
     for vault_dir, legacy_principal, canonical in cases:
         db_obj, cfg = _make_db(tmp_path / canonical)
         _seed_inbox_packet(
@@ -252,6 +269,8 @@ def test_ingest_in_txn_leftover_unique_extras_divergent_body(tmp_path, monkeypat
             inbox_file="session.json",
             content=leftover_body,
         )
+        created = ensure_inbox_dedup_index(db_obj)
+        assert created["status"] in {"created", "exists"}, (vault_dir, created)
         inbox = tmp_path / canonical / vault_dir / "inbox"
         _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
 
@@ -271,6 +290,65 @@ def test_ingest_in_txn_leftover_unique_extras_divergent_body(tmp_path, monkeypat
             json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
         }
         assert 0 in by_idx and leftover_body in by_idx[0]["content"]
+        extra = [r for r in rows if live_body in r["content"]]
+        extra_idx = json.loads(extra[0]["derived_from"]).get("candidate_index")
+        assert extra_idx not in {0}, (vault_dir, extra_idx)
+        assert {r["principal"] for r in extra} == {canonical}
+
+
+def test_packet_content_sha1_ignores_stamp_when_body_present():
+    """Occupancy must hash candidate_packets.content, not derived_from stamp.
+
+    stage_candidate dumps caller derived_from verbatim, so a leftover alias
+    row can stamp sha(D) on body L. Preferring the stamp skips extras of D.
+    """
+    from minni.afm_passes.inbox_ingest import _content_sha1, _packet_content_sha1
+
+    leftover_body = "leftover L occupying index 0"
+    live_body = "divergent D that stamp must not occupy"
+    df = json.dumps({"content_sha1": _content_sha1(live_body)})
+    assert _packet_content_sha1(leftover_body, df) == _content_sha1(leftover_body)
+
+
+def test_ingest_stamp_lie_leftover_extras_divergent_body(tmp_path):
+    """Leftover 0 content L + stamp(sha(D)) must extras live [D] at next_idx.
+
+    Occupancy used derived_from.content_sha1 as the slot fingerprint, so a
+    same-family leftover whose stamp equals the stop-candidate sha skipped D
+    as already_present. Stamp is audit metadata; extras key on sha1(content).
+    """
+    from minni.afm_passes.inbox_ingest import _content_sha1, ingest
+
+    leftover_body = "leftover L occupying session.json index 0"
+    live_body = "divergent D that leftover stamp sha must not swallow"
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=leftover_body,
+            content_sha1=_content_sha1(live_body),
+        )
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, (vault_dir, res)
+        assert res["already_present"] == 0, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, principal, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, (vault_dir, contents)
+        assert live_body in contents, (vault_dir, contents)
         extra = [r for r in rows if live_body in r["content"]]
         extra_idx = json.loads(extra[0]["derived_from"]).get("candidate_index")
         assert extra_idx not in {0}, (vault_dir, extra_idx)

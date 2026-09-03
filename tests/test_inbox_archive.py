@@ -1023,3 +1023,75 @@ def test_extras_at_next_idx_accept_archives_live_file(tmp_path, monkeypatch):
         leftover_after = dict(c.fetchone())
     assert leftover_after["status"] == "proposed"
     assert leftover_body in leftover_after["content"]
+
+
+def test_stamp_lie_does_not_archive_unmerged_one_candidate_file(tmp_path, monkeypatch):
+    """One-candidate same-vault stamp lie must not retire unmerged qty.
+
+    Leftover 0 content L + stamp(sha(D)) + live [D]: occupancy used the stamp
+    as already_present, and _matching_rows_for_file treated the stamp as
+    coverage without hashing candidate_packets.content. Tests only pinned a
+    forged sha on a two-candidate file; a terminal leftover still archived.
+    D must extras at next_idx; the file stays live until sha1(content) matches.
+    """
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.afm_passes.inbox_ingest import _content_sha1, ingest
+
+    leftover_body = "L leftover occupying index 0"
+    live_body = "D live stop-candidate that stamp must not cover"
+    home = tmp_path / "agy"
+    db_obj, cfg = _make_db(home)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+    _seed_inbox_packet(
+        db_obj,
+        principal="agy",
+        inbox_file="session.json",
+        content=leftover_body,
+        content_sha1=_content_sha1(live_body),
+        status="accepted",
+    )
+    inbox = home / "agy-vault" / "inbox"
+    _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+    with db_obj.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets")
+        leftover_id = dict(c.fetchone())["candidate_id"]
+    assert maybe_archive_for_candidate(db_obj, cfg, leftover_id) is None
+    assert (inbox / "session.json").is_file(), "stamp must not cover unmerged D"
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    assert res["already_present"] == 0, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, content, derived_from, status "
+            "FROM candidate_packets ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    leftover_row = next(r for r in rows if leftover_body in r["content"])
+    extra_row = next(r for r in rows if live_body in r["content"])
+    extra_idx = json.loads(extra_row["derived_from"]).get("candidate_index")
+    assert extra_idx not in {0}, extra_idx
+    assert leftover_row["status"] == "accepted"
+    assert extra_row["status"] == "proposed"
+    assert maybe_archive_for_candidate(db_obj, cfg, leftover_id) is None
+    assert (inbox / "session.json").is_file()
+
+    extra_id = extra_row["candidate_id"]
+    with db_obj.cursor() as c:
+        c.execute(
+            "UPDATE candidate_packets SET status='accepted' WHERE candidate_id=?",
+            (extra_id,),
+        )
+    archived = maybe_archive_for_candidate(db_obj, cfg, extra_id)
+    assert archived == str(inbox / ".archive" / "session.json")
+    assert not (inbox / "session.json").exists()
+    assert (inbox / ".archive" / "session.json").is_file()
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT status, content FROM candidate_packets WHERE candidate_id=?",
+            (leftover_id,),
+        )
+        leftover_after = dict(c.fetchone())
+    assert leftover_after["status"] == "accepted"
+    assert leftover_body in leftover_after["content"]

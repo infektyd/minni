@@ -415,22 +415,34 @@ def test_unique_skip_does_not_archive_compact_file_before_insert(
     expected_keys ⊆ durable_keys as index tuples (leftover 0 covers slot 0
     even when distilled section-0 qty never inserted).
 
-    Emptying _fills_for_file disables the pre-scan occupancy extras path so
-    this pin is the INSERT txn itself: compare sha, extras-at-next-idx when
-    divergent, and archive only once this file's distilled shas are in
-    candidate_packets. Leftover 0 + THREE_SHARED_BODY section 0 body must
-    land at a new index before the live file is renamed into .archive.
+    True TOCTOU: INSERT reloads occupancy via _existing_fills_on_cursor, not
+    the pre-scan _existing_keys / _fills_for_file hooks. Emptying that loader
+    assigns section-0 the leftover key; CASE UNIQUE then fires. Do not
+    monkeypatch unused pre-scan names — those stay green on UNIQUE skip.
+    Archive occupancy after commit must still see durable distilled shas.
     """
     import time
 
+    from minni.afm_passes import inbox_ingest as ii
     from minni.afm_passes.compact_distillation import distill
     import minni.afm_passes.compact_distillation as mod
+    from minni.repair_dual_candidates import ensure_inbox_dedup_index
 
     monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
-    monkeypatch.setattr(mod, "_existing_keys", lambda db, principals=None: set())
-    # Force the in-txn UNIQUE skip of leftover index 0 rather than the
-    # pre-scan extras path (which consults _fills_for_file occupancy).
-    monkeypatch.setattr(mod, "_fills_for_file", lambda db, principal, inbox_file: [])
+    real_fills = ii._existing_fills_on_cursor
+    state = {"insert_seen": False}
+
+    def _pre_scan_empty_until_insert(c, principals=None):
+        if state["insert_seen"]:
+            return real_fills(c, principals)
+        return {}
+
+    def _in_txn_empty(c, principals=None):
+        state["insert_seen"] = True
+        return {}
+
+    monkeypatch.setattr(ii, "_existing_fills_on_cursor", _pre_scan_empty_until_insert)
+    monkeypatch.setattr(mod, "_existing_fills_on_cursor", _in_txn_empty)
 
     db_obj, cfg = _make_db(tmp_path)
     leftover = "Key technical concepts: in-txn unique skip of leftover index 0"
@@ -452,6 +464,8 @@ def test_unique_skip_does_not_archive_compact_file_before_insert(
             """,
             (leftover, derived, time.time()),
         )
+    created = ensure_inbox_dedup_index(db_obj)
+    assert created["status"] in {"created", "exists"}, created
 
     inbox = tmp_path / "agy-vault" / "inbox"
     _write_inbox_file(

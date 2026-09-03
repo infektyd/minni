@@ -296,7 +296,16 @@ def _existing_keys(db, principals: set | None = None) -> set:
 
 
 def _packet_content_sha1(content: Any, df: Any) -> str:
-    """Prefer derived_from.content_sha1; hash the body when the stamp is missing."""
+    """Hash the content column; derived_from.content_sha1 is audit metadata.
+
+    Same rule as repair ``_collapse_digest``: a leftover alias row can stamp
+    the live candidate's sha on a different body (``stage_candidate`` dumps
+    caller ``derived_from`` verbatim). Occupancy extras must not treat that
+    stamp as already_present.
+    """
+    if content is not None:
+        text = content if isinstance(content, str) else str(content)
+        return _content_sha1(text)
     if isinstance(df, str) and df:
         try:
             obj = json.loads(df)
@@ -306,7 +315,7 @@ def _packet_content_sha1(content: Any, df: Any) -> str:
             raw_sha = obj.get("content_sha1")
             if isinstance(raw_sha, str) and raw_sha:
                 return raw_sha
-    return _content_sha1(content or "")
+    return _content_sha1("")
 
 
 def _sha_set(value: Any) -> set:

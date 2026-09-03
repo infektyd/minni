@@ -194,13 +194,18 @@ def _rows_for_inbox_file(
             df = json.loads(row["derived_from"])
         except Exception:
             df = {}
+        body = row["content"]
+        if isinstance(body, str) and body:
+            fingerprint = _content_sha1(body)
+        else:
+            fingerprint = df.get("content_sha1")
         out.append(
             {
                 "principal": row["principal"] if "principal" in row.keys() else None,
                 "status": row["status"],
                 "candidate_index": df.get("candidate_index"),
-                "content_sha1": df.get("content_sha1"),
-                "content": row["content"],
+                "content_sha1": fingerprint,
+                "content": body,
             }
         )
     return out
@@ -241,14 +246,16 @@ def _matching_rows_for_file(doc: Any, rows: List[dict]) -> Optional[List[dict]]:
     filename — without this check a single forged terminal row could archive
     ANY agent's live, never-ingested inbox file (cross-vault name match). So a
     row only counts when it carries ingest-written provenance for THIS file's
-    content: its ``content_sha1`` (or, for legacy rows without one, the row's
-    stored content) matches an eligible candidate's text. extras-at-next-idx
-    remaps ``derived_from.candidate_index`` off the file slot, so coverage is
-    by sibling content, not by enumerate key. The file is archivable only when
-    every eligible candidate is covered by a matching row — i.e. the DB
-    provably carries all of the file's content. Non-stop-candidate files
-    (handoffs, *_precompact_handoff, ...) are never archived here; they drain
-    through their own TTL/ack channels."""
+    content: ``sha1(candidate_packets.content)`` (same as repair
+    ``_collapse_digest``). ``derived_from.content_sha1`` is audit metadata —
+    ``stage_candidate`` dumps caller ``derived_from`` verbatim, so a
+    same-family terminal row can stamp the live candidate's sha on a
+    different body. extras-at-next-idx remaps ``derived_from.candidate_index``
+    off the file slot, so coverage is by sibling content, not by enumerate
+    key. The file is archivable only when every eligible candidate is covered
+    by a matching row — i.e. the DB provably carries all of the file's
+    content. Non-stop-candidate files (handoffs, *_precompact_handoff, ...)
+    are never archived here; they drain through their own TTL/ack channels."""
     eligible = _eligible_candidates(doc)
     if not eligible:
         return None  # not a stop-candidate file, or nothing ingestible in it
@@ -258,15 +265,18 @@ def _matching_rows_for_file(doc: Any, rows: List[dict]) -> Optional[List[dict]]:
     for idx, content in eligible.items():
         want_sha = _content_sha1(content)
         for i, row in enumerate(rows):
-            sha = row.get("content_sha1")
-            if isinstance(sha, str) and sha:
-                if sha != want_sha:
+            row_content = row.get("content")
+            if isinstance(row_content, str) and row_content:
+                if _content_sha1(row_content) != want_sha:
                     continue
-            elif row.get("content") != content:
-                continue
+            else:
+                sha = row.get("content_sha1")
+                if not (isinstance(sha, str) and sha == want_sha):
+                    continue
             # Sibling matches this file's eligible bytes (index may have
-            # remapped via extras-at-next-idx). Forged rows with a different
-            # body still fail the sha/body guard above.
+            # remapped via extras-at-next-idx). Stamp is ignored when the
+            # content column is present; forged rows with a different body
+            # fail the content-hash guard above.
             covered.add(idx)
             if i not in seen:
                 matched.append(row)
