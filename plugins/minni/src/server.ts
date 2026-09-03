@@ -116,7 +116,6 @@ import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
 import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
 import {
   drainStatusForModel,
-  isModelHiddenCandidateStatus,
   modelListCandidatesPayload,
   modelSharedGatePayload,
   redactLocalValue,
@@ -874,11 +873,9 @@ server.registerTool(
     const gated = await requireSharedGate("candidates.list", { status, limit });
     if (gated) return gated;
     const drainStatus = drainStatusForModel(status);
-    if (isModelHiddenCandidateStatus(drainStatus)) {
-      return textResult(
-        JSON.stringify(modelListCandidatesPayload({ ok: true, data: { candidates: [] } }, drainStatus), null, 2),
-      );
-    }
+    // Schema pins status to z.enum(["proposed"]), so drainStatus is always
+    // "proposed" here — no hidden-status branch (it could never fire).
+    // Non-proposed rows are still filtered inside modelListCandidatesPayload.
     const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
     const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
       status: drainStatus,

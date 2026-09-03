@@ -17,7 +17,11 @@ export const MODEL_HIDDEN_CANDIDATE_STATUSES = new Set([
 ]);
 
 export function isModelHiddenCandidateStatus(status: string | undefined): boolean {
-  return typeof status === "string" && status !== LIST_CANDIDATES_DEFAULT_STATUS;
+  return (
+    typeof status === "string" &&
+    (MODEL_HIDDEN_CANDIDATE_STATUSES.has(status) ||
+      status !== LIST_CANDIDATES_DEFAULT_STATUS)
+  );
 }
 
 const MODEL_CANDIDATE_KEYS = [
@@ -36,7 +40,12 @@ export function drainStatusForModel(status: string | undefined): string {
   return trimmed || LIST_CANDIDATES_DEFAULT_STATUS;
 }
 
-/** Mirrors console `redactLocalValue` — MCP output goes to cloud models. */
+/** Model-surface redaction. Ports the daemon `redact_value` secret classes
+ *  (JSON-quoted credentials, bare provider tokens, PEM blocks) so MCP output
+ *  to cloud models is covered the same way. Naming split is deliberate and
+ *  covered by tests: this surface emits `[local-path]` / `key=[REDACTED]` /
+ *  `[REDACTED]` where the daemon emits `[REDACTED_PATH]` / `key=[REDACTED]` /
+ *  `[REDACTED]` — same redaction, different path token. */
 export function redactLocalValue(value: unknown): unknown {
   if (typeof value === "string") {
     const home = os.homedir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -51,6 +60,23 @@ export function redactLocalValue(value: unknown): unknown {
       .replace(
         /\b(api[_-]?key|password|secret|credential|private[_ -]?key|bearer|access[_-]?token|refresh[_-]?token|token)\b\s*[:=]\s*[^\s,;<>"']+/gi,
         (_match, key: string) => `${key}=[REDACTED]`,
+      )
+      .replace(
+        /("?)(api[_-]?key|password|secret|credential|private[_ -]?key)\1\s*:\s*"[^"]+"/gi,
+        (_match, _quote: string, key: string) => `${key}=[REDACTED]`,
+      )
+      .replace(
+        /("?)(bearer|access[_-]?token|refresh[_-]?token|token)\1\s*:\s*"[^"]+"/gi,
+        (_match, _quote: string, key: string) => `${key}=[REDACTED]`,
+      )
+      .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED]")
+      .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[REDACTED]")
+      .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED]")
+      .replace(/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]")
+      .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED]")
+      .replace(
+        /-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----/gs,
+        "[REDACTED]",
       );
   }
   if (Array.isArray(value)) return value.map(redactLocalValue);

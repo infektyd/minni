@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
   drainStatusForModel,
+  isModelHiddenCandidateStatus,
   modelListCandidatesPayload,
   modelSharedGatePayload,
   MODEL_HIDDEN_CANDIDATE_STATUSES,
@@ -18,6 +19,36 @@ test("drainStatusForModel defaults omitted status to proposed", () => {
   assert.equal(drainStatusForModel(""), "proposed");
   assert.equal(drainStatusForModel("  "), "proposed");
   assert.equal(drainStatusForModel("log_only"), "log_only");
+});
+
+test("isModelHiddenCandidateStatus is driven by the hidden set with superset fallback", () => {
+  for (const status of MODEL_HIDDEN_CANDIDATE_STATUSES) {
+    assert.equal(isModelHiddenCandidateStatus(status), true, status);
+  }
+  assert.equal(isModelHiddenCandidateStatus("proposed"), false);
+  assert.equal(isModelHiddenCandidateStatus(undefined), false);
+  // Superset behavior: an unknown future non-proposed status stays hidden.
+  assert.equal(isModelHiddenCandidateStatus("quarantined"), true);
+});
+
+test("redactLocalValue ports daemon classes: JSON-quoted secrets, bare tokens, PEM", () => {
+  const cases = [
+    [`{"password": "hunter2-secret"}`, "hunter2-secret"],
+    [`{"api_key": "abc123-value"}`, "abc123-value"],
+    ["token sk-ant-abcdefghijklmnopqrst leaked", "sk-ant-abcdefghijklmnopqrst"],
+    ["key ghp_abcdefghijklmnopqrstuvwx here", "ghp_abcdefghijklmnopqrstuvwx"],
+    ["aws AKIAIOSFODNN7EXAMPLE here", "AKIAIOSFODNN7EXAMPLE"],
+    ["slack xoxb-1234567890-abcdef here", "xoxb-1234567890-abcdef"],
+    [
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIBsecretbytes\n-----END RSA PRIVATE KEY-----",
+      "MIIBsecretbytes",
+    ],
+  ];
+  for (const [input, secret] of cases) {
+    const out = String(redactLocalValue(input));
+    assert.equal(out.includes(secret), false, out);
+    assert.match(out, /\[REDACTED\]/, out);
+  }
 });
 
 test("model list redacts secrets/paths and drops full packet fields", () => {
@@ -104,6 +135,18 @@ test("minni_list_candidates handler projects through modelListCandidatesPayload"
   const schema = block.slice(schemaStart, handlerStart);
   assert.match(schema, /status:\s*z\.enum\(\["proposed"\]\)\.optional\(\)/);
   assert.doesNotMatch(schema, /status:\s*z\.string\(\)/);
+});
+
+test("minni_list_candidates handler has no unreachable hidden-status branch", async () => {
+  // Schema pins status to proposed-only, so a handler-level hidden-status
+  // short-circuit could never fire. Row filtering lives in
+  // modelListCandidatesPayload (tested above), not in the handler.
+  const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
+  const start = source.indexOf('"minni_list_candidates"');
+  assert.notEqual(start, -1);
+  const nextTool = source.indexOf("server.registerTool(", start + 1);
+  const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+  assert.doesNotMatch(block, /isModelHiddenCandidateStatus/);
 });
 
 test("failed candidate list does not report an empty complete drain", () => {
