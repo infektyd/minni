@@ -10,6 +10,17 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Changed
 
+- Default platform-agent vault roots no longer include the dashless alias:
+  a platform principal without an explicit `platform_agent_vault_roots`
+  entry is now scoped to its canonical vault only
+  (`MINNI_HOME/<vault_dirname_for(id)>`, e.g. `grok-build` →
+  `grok-build-vault`), not the hyphen-stripped variant as well
+  (e.g. `~/.minni/grokbuild-vault`). Installs with live data in a dashless
+  directory lose pathed access on upgrade. Remedy, either: add an explicit
+  per-agent entry (`"platform_agent_vault_roots": {"<id>": ["~/.minni/<dir>"]}`
+  in the operator principal file), or move the directory to the canonical
+  name (`mv ~/.minni/grokbuild-vault ~/.minni/grok-build-vault`). The
+  `gemini` legacy fallback (`~/.gemini/minni-vault`) is unchanged.
 - Thread lock Q is dump-and-return, not sit-and-wait: when the plan lock is
   held, a worker write is accepted onto a per-Thread queue and the caller
   returns immediately. Accepted is not applied. The daemon drains one item

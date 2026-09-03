@@ -620,6 +620,77 @@ def test_afm_write_batch_merges_inbox_runs_after_exclusive_seed(tmp_path):
     assert not inbox.is_symlink()
 
 
+def test_afm_write_batch_crash_between_ledger_commit_and_landing_leaves_no_phantom_written(
+    tmp_path, monkeypatch
+):
+    """Ledger rows stay pending until their wiki page actually lands.
+
+    A crash between the ledger commit and the landing loop must not leave
+    written rows whose page file was never created.
+    """
+    import json
+
+    import minni.afm_writer as afm_writer
+    from minni.afm_writer import _write_batch
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    real_write_one = afm_writer._write_one
+
+    def crash_on_landing(vault_arg, draft, writeback=None, now=None, *, persist=True):
+        if persist:
+            raise RuntimeError("simulated crash between ledger commit and landing")
+        return real_write_one(
+            vault_arg, draft, writeback=writeback, now=now, persist=persist
+        )
+
+    monkeypatch.setattr(afm_writer, "_write_one", crash_on_landing)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _write_batch(
+            {
+                "vault_path": str(vault),
+                "pass_name": "probe",
+                "trace_id": "trace-crash-probe",
+                "drafts": [_afm_draft(section="decisions")],
+            }
+        )
+    inbox_files = list((vault / "inbox").glob("afm-drafts-*.json"))
+    assert len(inbox_files) == 1
+    payload = json.loads(inbox_files[0].read_text(encoding="utf-8"))
+    rows = [d for run in payload["runs"] for d in run.get("drafts", [])]
+    assert rows, "ledger commit must precede the landing loop"
+    phantoms = [
+        d
+        for d in rows
+        if d.get("written") and not (vault / d["path"]).is_file()
+    ]
+    assert phantoms == []
+
+
+def test_afm_write_batch_ledger_flips_pending_to_landed_after_landing(tmp_path):
+    """A successful batch commits exactly one run whose rows read written."""
+    import json
+
+    from minni.afm_writer import _write_batch
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    result = _write_batch(
+        {
+            "vault_path": str(vault),
+            "pass_name": "probe",
+            "trace_id": "trace-flip-probe",
+            "drafts": [_afm_draft(section="decisions")],
+        }
+    )
+    payload = json.loads(Path(result["inbox_path"]).read_text(encoding="utf-8"))
+    assert len(payload["runs"]) == 1
+    rows = payload["runs"][0]["drafts"]
+    assert len(rows) == 1
+    assert rows[0]["written"] is True
+    assert (vault / rows[0]["path"]).is_file()
+
+
 def test_afm_write_batch_does_not_plant_inbox_drafts_tmp_sidecar_symlink(tmp_path):
     """Predictable afm-drafts-DATE.json.tmp must not follow into shop-restore."""
     import json

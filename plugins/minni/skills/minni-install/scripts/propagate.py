@@ -1842,7 +1842,10 @@ def _seed_exclusive_file(dest: Path, header: str) -> bool:
         os.fchmod(fd, 0o600)
         if os.fstat(fd).st_size > 0:
             return False
-        os.write(fd, header.encode("utf-8"))
+        payload = header.encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
         return True
     finally:
         os.close(fd)

@@ -1373,19 +1373,26 @@ def _write_batch(job: dict) -> dict:
     landed = _landed_wiki_records(vault, existing)
     stamp = time.time()
     planned = []
+    pending = []
     for draft in drafts:
         page_id = str(draft.get("page_id") or "")
         if page_id and page_id in landed:
             planned.append(landed[page_id])
+            pending.append(landed[page_id])
             continue
-        planned.append(
-            _write_one(vault, draft, writeback=writeback, now=stamp, persist=False)
-        )
+        rec = _write_one(vault, draft, writeback=writeback, now=stamp, persist=False)
+        planned.append(rec)
+        # Two-phase ledger: this row has not landed yet, so commit it as
+        # pending even though _write_one reports written True for the
+        # rendered record. A crash between the commit below and the landing
+        # loop must not leave phantom written rows. Forged rows (path None)
+        # already report written False and pass through unchanged.
+        pending.append({**rec, "written": False} if rec.get("path") is not None else rec)
     payload = {
         "trace_id": job.get("trace_id"),
         "pass_name": job.get("pass_name"),
         "created_at": _utc(),
-        "drafts": planned,
+        "drafts": pending,
     }
     _atomic_write_text(
         inbox_path,
@@ -1408,6 +1415,38 @@ def _write_batch(job: dict) -> dict:
         written.append(
             _write_one(vault, draft, writeback=writeback, now=stamp, persist=True)
         )
+    # Flip pending rows to their landed state now that pages are durable.
+    # Reload fail-closed and replace our own run in place so a concurrent
+    # batch appended between commit and landing is not clobbered; a run we
+    # no longer find (torn ledger) is re-appended as a superseding record,
+    # never merged over someone else's rows.
+    final_payload = {**payload, "drafts": written}
+    try:
+        current = _load_inbox_runs(inbox_path, kind="AFM inbox ledger")
+    except OSError:
+        current = None
+    if current is None:
+        _atomic_write_text(
+            inbox_path,
+            json.dumps({"runs": existing + [final_payload]}, indent=2, sort_keys=True) + "\n",
+        )
+    else:
+        ours = [str(d.get("page_id")) for d in pending if isinstance(d, dict)]
+        for i, run in enumerate(current):
+            if (
+                isinstance(run, dict)
+                and run.get("trace_id") == payload.get("trace_id")
+                and run.get("created_at") == payload.get("created_at")
+                and [str(d.get("page_id")) for d in (run.get("drafts") or []) if isinstance(d, dict)] == ours
+            ):
+                current[i] = final_payload
+                break
+        else:
+            current.append(final_payload)
+        _atomic_write_text(
+            inbox_path,
+            json.dumps({"runs": current}, indent=2, sort_keys=True) + "\n",
+        )
     elapsed = time.perf_counter() - started
     _LATENCIES.append(elapsed)
     del _LATENCIES[:-100]
@@ -1418,7 +1457,7 @@ def _write_batch(job: dict) -> dict:
         "expired_drafts": expired,
         "latency_ms": round(elapsed * 1000, 3),
     }
-    _append_audit(vault, "afm_loop", f"{job.get('pass_name')} wrote {len(written)} draft(s)", {**payload, **result})
+    _append_audit(vault, "afm_loop", f"{job.get('pass_name')} wrote {len(written)} draft(s)", {**final_payload, **result})
     return result
 
 
