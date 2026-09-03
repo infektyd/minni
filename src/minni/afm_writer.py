@@ -255,9 +255,17 @@ def _read_pending_lifecycle_file(vault_path: str | Path) -> dict[str, dict]:
     """Return pass_name → lifecycle from the vault sidecar (or empty).
 
     Missing file is empty. Torn/unreadable sidecar raises so persist/clear
-    cannot treat it as “no other passes” and wipe sibling state.
+    cannot treat it as “no other passes” and wipe sibling state. Inbox or
+    sidecar symlink is not empty either — hydrate must refuse wet enqueue
+    rather than FileNotFound-as-empty after a swallowed persist.
     """
     path = _pending_lifecycle_path(vault_path)
+    from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+    vault = Path(vault_path).expanduser()
+    root_real = _resolved_vault_root(vault)
+    _reject_symlink_or_escape(path.parent, root_real, "inbox")
+    _reject_symlink_or_escape(path, root_real, str(_PENDING_LIFECYCLE_REL))
     try:
         raw_text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -328,6 +336,65 @@ def _persist_pending_lifecycle(
         logger.exception(
             "AFM writer: failed to persist pending lifecycle for pass %r to %s",
             pass_name,
+            path,
+        )
+        _leave_fail_closed_pending_sticky(path, pass_name, lifecycle, vault_path)
+
+
+def _leave_fail_closed_pending_sticky(
+    path: Path,
+    pass_name: str,
+    lifecycle: dict,
+    vault_path: str | Path,
+) -> None:
+    """Best-effort sidecar so restart hydrate cannot treat persist failure as empty.
+
+    If inbox/dest is a plant, refuse and leave nothing (hydrate rejects the
+    plant). If dest already exists (torn or otherwise), keep it. Otherwise
+    exclusive-create a readable sticky the next cold start can hydrate.
+    """
+    try:
+        from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+        vault = Path(vault_path).expanduser()
+        root_real = _resolved_vault_root(vault)
+        _reject_symlink_or_escape(path.parent, root_real, "inbox")
+        _reject_symlink_or_escape(path, root_real, str(_PENDING_LIFECYCLE_REL))
+        try:
+            path.lstat()
+            return
+        except FileNotFoundError:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (
+            json.dumps(
+                {
+                    "version": _PENDING_LIFECYCLE_FILE_VERSION,
+                    "updated_at": time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                    ),
+                    "passes": {str(pass_name): _serializable_lifecycle(lifecycle)},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+        fd = os.open(path, flags, 0o600)
+        try:
+            data = payload.encode("utf-8")
+            written = 0
+            while written < len(data):
+                written += os.write(fd, data[written:])
+        finally:
+            os.close(fd)
+    except Exception:
+        logger.exception(
+            "AFM writer: could not leave fail-closed pending-lifecycle sticky at %s",
             path,
         )
 

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   access,
   appendFile,
@@ -1024,7 +1025,11 @@ export function getAgentIdFromVaultPath(vaultPath: string): string {
 }
 
 export async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
-  const fh = await open(filePath, "a");
+  const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+  const fh = await open(
+    filePath,
+    fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow,
+  );
   try {
     await fh.writeFile(content, "utf8");
     await fh.sync();
@@ -1038,9 +1043,9 @@ export async function writeFileAtomic(filePath: string, content: string): Promis
   // pointer, this fix's journal init + plan/vault note) that assumed this
   // helper's guarantee was complete:
   //
-  // 1. Preserve the destination's existing mode. `open(tempPath, "w")` with no
-  //    explicit mode creates the temp file at the umask default; renaming it
-  //    onto an existing, differently-permissioned file (e.g. operator-tightened
+  // 1. Preserve the destination's existing mode. Exclusive-creating the unique
+  //    tmp without an explicit mode uses the umask default; renaming it onto
+  //    an existing, differently-permissioned file (e.g. operator-tightened
   //    to 0600) would silently widen it back to the default on every write —
   //    a permanent, silent permission downgrade nobody asked for.
   let mode: number | undefined;
@@ -1050,15 +1055,47 @@ export async function writeFileAtomic(filePath: string, content: string): Promis
     // Destination does not exist yet — first write, default mode is correct.
   }
 
-  const tempPath = `${filePath}.${Math.random().toString(36).substring(2)}.tmp`;
-  const fh = await open(tempPath, "w", mode);
-  try {
-    await fh.writeFile(content, "utf8");
-    await fh.sync();
-  } finally {
-    await fh.close();
+  const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+  const flags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | nofollow;
+  let lastErr: unknown;
+  let wrote = false;
+  for (let i = 0; i < 8; i++) {
+    const tempPath = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    let created = false;
+    try {
+      const fh = await open(tempPath, flags, mode ?? 0o666);
+      created = true;
+      try {
+        await fh.writeFile(content, "utf8");
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      await rename(tempPath, filePath);
+      wrote = true;
+      lastErr = undefined;
+      break;
+    } catch (error) {
+      lastErr = error;
+      if (created) {
+        try {
+          await unlink(tempPath);
+        } catch {
+          // Best-effort; rename may already have consumed the tmp.
+        }
+      }
+      if (isErrno(error, "EEXIST")) {
+        continue;
+      }
+      throw error;
+    }
   }
-  await rename(tempPath, filePath);
+  if (!wrote) {
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(`could not exclusive-create unique tmp for ${filePath}`);
+  }
 
   // 2. fsync the parent directory. fsync'ing the temp file's data (above)
   //    makes the CONTENT durable, but on POSIX the rename's directory-entry

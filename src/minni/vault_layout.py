@@ -12,6 +12,7 @@ path. Do not route learnings into hermes-vault.
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from typing import List, Union
@@ -130,10 +131,24 @@ def _seed_exclusive_file(dest: Path, header: str) -> bool:
 
 
 def _append_regular_file(dest: Path, text: str) -> None:
-    if dest.is_symlink():
-        raise OSError(f"refusing to append through symlink: {dest}")
-    with dest.open("a", encoding="utf-8") as fh:
-        fh.write(text)
+    """Append with O_APPEND|O_NOFOLLOW so a raced dest symlink is not followed."""
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        fd = os.open(dest, flags, _FILE_MODE)
+    except OSError as exc:
+        if dest.is_symlink() or getattr(exc, "errno", None) == errno.ELOOP:
+            raise OSError(f"refusing to append through symlink: {dest}") from exc
+        raise
+    try:
+        payload = text.encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
+    finally:
+        os.close(fd)
 
 
 def _resolved_vault_root(root: Path) -> Path:

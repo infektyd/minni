@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  appendFileWithFsync,
   auditTail,
   auditReport,
   ensureVault,
@@ -205,6 +206,41 @@ test("recordAudit rotation does not wipe a second-tap exclusive seed", async () 
     assert.match(text, /rotate-tap/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("appendFileWithFsync uses O_APPEND|O_NOFOLLOW, never open(path, \"a\")", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function appendFileWithFsync");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /O_APPEND/);
+  assert.match(body, /O_NOFOLLOW/);
+  assert.doesNotMatch(body, /open\(\s*filePath,\s*"a"\s*\)/);
+});
+
+test("appendFileWithFsync does not follow raced log.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-append-race-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    const logPath = path.join(vault, "log.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await writeFile(logPath, "# Minni Log\n\n", "utf8");
+    await rm(logPath);
+    await symlink(keep, logPath);
+    await assert.rejects(
+      () => appendFileWithFsync(logPath, "## [2026-09-01T00:00:00Z] plugin | raced\n\n"),
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
@@ -696,6 +732,37 @@ test("writeFileAtomic preserves the destination's existing file mode across a re
     assert.equal(await readFile(target, "utf8"), "second version");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("writeFileAtomic exclusive-creates unique tmp with O_EXCL|O_NOFOLLOW", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function writeFileAtomic");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /O_EXCL/);
+  assert.match(body, /O_NOFOLLOW/);
+  assert.doesNotMatch(body, /open\(\s*tempPath,\s*"w"/);
+});
+
+test("writeFileAtomic unique tmp does not follow planted sidecar into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-atomic-tmp-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  try {
+    await mkdir(shop);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    const dest = path.join(tmp, "note.md");
+    const planted = path.join(tmp, `note.md.${process.pid}.tmp`);
+    await symlink(keep, planted);
+    await writeFileAtomic(dest, "atomic-body\n");
+    assert.equal(await readFile(dest, "utf8"), "atomic-body\n");
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 

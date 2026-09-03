@@ -739,6 +739,35 @@ def test_persist_pending_lifecycle_does_not_plant_pid_sidecar_symlink(
     assert sidecar.is_symlink()
 
 
+def _submit_drafts_wet_enqueue_spy(monkeypatch, vault: Path):
+    """Cold-start submit_drafts: return (result, put_calls)."""
+    import queue as queue_mod
+
+    import minni.afm_writer as afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+    put_calls = []
+
+    def _spy_put(item):
+        put_calls.append(item)
+        raise AssertionError("must not enqueue a wet batch")
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
+    result = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "vault_path": str(vault),
+            "drafts": [
+                {"title": "dup", "page_id": "consolidation-review-1-t2"},
+            ],
+        },
+        timeout=0.05,
+    )
+    return result, put_calls
+
+
 def test_persist_pending_lifecycle_refuses_inbox_dir_symlink_into_shop(tmp_path):
     """mkdir + write of afm-pending-lifecycle.json must not follow inbox → shop."""
     from minni.afm_writer import _persist_pending_lifecycle
@@ -748,6 +777,47 @@ def test_persist_pending_lifecycle_refuses_inbox_dir_symlink_into_shop(tmp_path)
     assert (vault / "inbox").is_symlink()
     assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
     assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_persist_inbox_symlink_restart_hydrate_refuses_wet_enqueue(
+    tmp_path, monkeypatch
+):
+    """Swallowed persist through planted inbox must not remint after restart."""
+    from minni.afm_writer import _persist_pending_lifecycle
+
+    vault, shop = _inbox_symlink_to_shop(tmp_path)
+    _persist_pending_lifecycle("consolidation", _pending_lifecycle(), str(vault))
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+    result, put_calls = _submit_drafts_wet_enqueue_spy(monkeypatch, vault)
+    assert result.get("status") == "write_in_flight", result
+    assert result.get("lifecycle_pending") is True
+    assert result.get("drafts_written") == []
+    assert put_calls == []
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_persist_exception_restart_hydrate_refuses_wet_enqueue(
+    tmp_path, monkeypatch
+):
+    """Persist Exception with a missing sidecar must not hydrate-empty into a remint."""
+    import minni.afm_writer as afm_writer
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    (vault / "inbox").mkdir()
+
+    def boom(*_args, **_kwargs):
+        raise OSError("injected persist failure")
+
+    monkeypatch.setattr(afm_writer, "_atomic_write_json", boom)
+    afm_writer._persist_pending_lifecycle(
+        "consolidation", _pending_lifecycle(), str(vault)
+    )
+    result, put_calls = _submit_drafts_wet_enqueue_spy(monkeypatch, vault)
+    assert result.get("status") == "write_in_flight", result
+    assert result.get("lifecycle_pending") is True
+    assert result.get("drafts_written") == []
+    assert put_calls == []
 
 
 def test_clear_persisted_pending_lifecycle_refuses_inbox_dir_symlink_into_shop(
@@ -1239,6 +1309,67 @@ def test_pruning_append_audit_does_not_clobber_append_after_exclusive_create(
     assert "pruning proposed" in text
 
 
+def _plant_log_md_symlink_before_append(vault: Path, keep: Path, monkeypatch):
+    """Swap log.md for a shop symlink between exclusive seed and append open."""
+    orig_os_open = os.open
+
+    def racing_os_open(path, flags, *args, **kwargs):
+        try:
+            dest = Path(os.fsdecode(path))
+        except (TypeError, ValueError, OSError):
+            return orig_os_open(path, flags, *args, **kwargs)
+        if (
+            dest.name == "log.md"
+            and flags & os.O_APPEND
+            and not flags & os.O_EXCL
+        ):
+            if not dest.is_symlink():
+                try:
+                    dest.unlink()
+                except FileNotFoundError:
+                    pass
+                dest.symlink_to(keep)
+        return orig_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racing_os_open)
+
+
+def test_afm_append_audit_does_not_follow_raced_log_md_symlink_into_shop(
+    tmp_path, monkeypatch
+):
+    from minni.afm_writer import _append_audit
+
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    keep = shop / "keep.md"
+    keep.write_text("restore\n", encoding="utf-8")
+    _plant_log_md_symlink_before_append(vault, keep, monkeypatch)
+    with pytest.raises(OSError):
+        _append_audit(vault, "afm_loop", "wrote draft", {"k": "v"})
+    assert keep.read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [keep]
+
+
+def test_handoff_append_audit_does_not_follow_raced_log_md_symlink_into_shop(
+    tmp_path, monkeypatch
+):
+    from minni.minnid_runtime.handoff import append_handoff_audit
+
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    keep = shop / "keep.md"
+    keep.write_text("restore\n", encoding="utf-8")
+    _plant_log_md_symlink_before_append(vault, keep, monkeypatch)
+    with pytest.raises(OSError):
+        append_handoff_audit(vault, "handoff_sent", "wrote draft", {"k": "v"})
+    assert keep.read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [keep]
+
+
 def test_pruning_append_audit_refuses_log_md_symlink_into_shop(tmp_path):
     from minni.afm_passes.pruning import _append_audit
 
@@ -1247,6 +1378,24 @@ def test_pruning_append_audit_refuses_log_md_symlink_into_shop(tmp_path):
         _append_audit(vault, "trace-prune", 1, "inbox/afm-pruning-probe.json")
     assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
     assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_pruning_append_audit_does_not_follow_raced_log_md_symlink_into_shop(
+    tmp_path, monkeypatch
+):
+    from minni.afm_passes.pruning import _append_audit
+
+    vault = tmp_path / "hermes-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir()
+    shop.mkdir()
+    keep = shop / "keep.md"
+    keep.write_text("restore\n", encoding="utf-8")
+    _plant_log_md_symlink_before_append(vault, keep, monkeypatch)
+    with pytest.raises(OSError):
+        _append_audit(vault, "trace-prune", 1, "inbox/afm-pruning-probe.json")
+    assert keep.read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [keep]
 
 
 def test_pruning_append_audit_refuses_daily_log_symlink_into_shop(tmp_path):
