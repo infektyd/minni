@@ -19,6 +19,7 @@ PR-1b adds progressive disclosure depth tiers to retrieve():
 
 import time
 import math
+import concurrent.futures
 import logging
 import hashlib
 import importlib.util
@@ -26,6 +27,7 @@ import re
 import sqlite3
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
 
@@ -78,6 +80,123 @@ _TYPE_TO_AUTHORITY = {
 _FTS_RETRY_ATTEMPTS = 3
 _FTS_RETRY_BACKOFFS = (0.05, 0.1, 0.2)
 _FTS_TRANSIENT_MARKERS = ("vtable constructor failed", "schema has changed")
+
+# perf/parallel-fanout (issue #388): bounded width + kill-switch for the
+# per-variant fan-out in RetrievalEngine.retrieve. Each fan-out site creates
+# its own pool on demand and drains it on gather, rather than sharing one
+# global pool: corpus-leg workers in minnid_runtime/recall.py run variant
+# fan-outs of their own, so a single shared pool would deadlock the moment leg
+# tasks occupy every worker while their variant subtasks queue behind them.
+# Per-site pools are also lifecycle-free (no atexit joins, no cross-test
+# pollution). Thread creation per search is single-digit milliseconds against
+# a multi-second search body.
+# Cassandra YELLOW-3b: per-site cap is 4, not 8 — the fan-outs COMPOUND
+# (2 both-scope legs x up to 9 combined legs x variant workers each), so
+# 8-wide sites fielded 60+ threads per search. At 4/4 the worst case is
+# ~2 + 4 + (4 x 4) + 4 ≈ 30 threads, still wider than the corpora that
+# need it (≤8 vaults, ≤4 variants by query_expand._MAX_VARIANTS) with
+# queueing absorbing
+# the remainder. A shared semaphore was rejected: leg workers block in
+# gather while holding it, so permits held by waiters could starve the
+# variant subtasks they wait on (deadlock); smaller per-site caps cannot.
+_MAX_VARIANT_WORKERS = 4
+RETRIEVAL_VARIANT_PARALLEL = True
+
+
+# Thread-local degradation slot name -> RetrievalCallState attribute, for the
+# routed legacy properties below.
+_DEGRADATION_STATE_ATTRS = {
+    "rerank": "rerank_degraded",
+    "query_expand": "query_expand_degraded",
+    "vector": "vector_degraded",
+    "hyde": "hyde_degraded",
+}
+
+
+@dataclass
+class RetrievalCallState:
+    """Per-call mutable verdicts for one retrieve() invocation.
+
+    Hoisted off the engine (perf/parallel-fanout, #388): these five fields
+    used to live only in thread-local properties on the engine
+    (last_auth_suppression, last_*_degraded), which keeps concurrent REQUESTS
+    on distinct threads apart but is invisible across the variant/corpus
+    fan-out — a pool worker's writes land in ITS thread-local slot, unreadable
+    from the gathering thread. One state object per call, threaded through
+    retrieve() (explicit ``_state`` parameter) and reached from helpers via
+    the per-thread push/pop stack (``_current_state``), means concurrent
+    same-engine calls can never observe or clobber each other's verdicts,
+    while every aggregation semantic stays identical. The thread-local
+    properties remain as the read surface: a top-level retrieve() publishes
+    its state there on return, so existing readers (recall._degradation_for,
+    handlers, tests) are untouched.
+    """
+
+    auth_suppression: Optional[Dict] = None
+    rerank_degraded: Optional[str] = None
+    query_expand_degraded: Optional[str] = None
+    vector_degraded: Optional[str] = None
+    hyde_degraded: Optional[str] = None
+    # Cassandra RED-1 (#388): the trace id stamped onto this call's rows.
+    # last_trace_id used to be a plain shared instance attribute, so two
+    # both-scope legs running concurrently on the same engine overwrote and
+    # re-read each other's id. Carried here so each call owns its id; the
+    # legacy last_trace_id property routes into it mid-call (see below).
+    trace_id: Optional[str] = None
+
+
+class _ThreadLocalStateProxy:
+    """RetrievalCallState-shaped view of the legacy thread-local properties.
+
+    Fallback for helper calls made OUTSIDE retrieve() (unit tests, operator
+    tools calling _rerank/_encode_query directly): attribute reads/writes hit
+    exactly the properties they always did, so no helper signature changes and
+    no test-double breakage. Inside retrieve() helpers always see the pushed
+    per-call state instead — this proxy is never on the stack.
+    """
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    @property
+    def auth_suppression(self) -> Optional[Dict]:
+        return self._engine.last_auth_suppression
+
+    @auth_suppression.setter
+    def auth_suppression(self, value: Optional[Dict]) -> None:
+        self._engine.last_auth_suppression = value
+
+    @property
+    def rerank_degraded(self) -> Optional[str]:
+        return self._engine.last_rerank_degraded
+
+    @rerank_degraded.setter
+    def rerank_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_rerank_degraded = value
+
+    @property
+    def query_expand_degraded(self) -> Optional[str]:
+        return self._engine.last_query_expand_degraded
+
+    @query_expand_degraded.setter
+    def query_expand_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_query_expand_degraded = value
+
+    @property
+    def vector_degraded(self) -> Optional[str]:
+        return self._engine.last_vector_degraded
+
+    @vector_degraded.setter
+    def vector_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_vector_degraded = value
+
+    @property
+    def hyde_degraded(self) -> Optional[str]:
+        return self._engine.last_hyde_degraded
+
+    @hyde_degraded.setter
+    def hyde_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_hyde_degraded = value
 
 # Prefer a real embedded chunk over the raw vault_fts row. Unendorsed pages are
 # deliberately unembedded, so FTS is their only body path — but vault_fts stores
@@ -371,7 +490,14 @@ class RetrievalEngine:
         self._tokenizer = None
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
-        self.last_trace_id: Optional[str] = None
+        # Cassandra RED-1 (#388): was a plain shared instance attribute, so
+        # concurrent same-engine legs overwrote each other's trace id between
+        # the write and the recall.py re-read. Now a per-thread slot behind
+        # the last_trace_id property below, which routes into the running
+        # call's RetrievalCallState.trace_id mid-call (same routing as the
+        # verdict flags). Published there by retrieve() on return, exactly
+        # like the other per-call verdicts.
+        self._trace_id_local = threading.local()
         # P0-B (2026-07-19 blackout): the semantic leg must never die silently.
         # Set when _semantic_search finds no embedding model; cleared when the
         # model comes back. Surfaced by status/recall so an FTS-only session is
@@ -403,6 +529,11 @@ class RetrievalEngine:
         # handler pair runs on a single thread, so each request sees only its own
         # suppression regardless of what concurrent requests do on other threads.
         self._auth_suppression_local = threading.local()
+        # perf/parallel-fanout (#388): per-thread stack of RetrievalCallState.
+        # retrieve() pushes one state per call; helpers reach the innermost via
+        # _current_state() instead of touching the legacy thread-locals, so
+        # pool workers running concurrent same-engine calls stay isolated.
+        self._call_state_local = threading.local()
         # Serializes _ensure_faiss_loaded. invalidate() turned "rare cold
         # start" into "every worker after every vault change", and the ensure
         # path is a multi-step read-build-save that must not run twice
@@ -412,17 +543,43 @@ class RetrievalEngine:
         # it once here instead of once per scored doc in _score_merged_doc.
         self._correction_types = _correction_class_page_types(config)
 
+    def _stack_top(self) -> Optional["RetrievalCallState"]:
+        """Innermost pushed per-call state on THIS thread, or None.
+
+        Raw peek (no proxy fallback): the legacy properties use this to route
+        mid-call reads/writes into the running call's state, so pipeline hooks
+        that set engine.last_* (tests, tools) keep working with per-call
+        isolation under the variant fan-out.
+        """
+        local = getattr(self, "_call_state_local", None)
+        stack = getattr(local, "stack", None) if local is not None else None
+        return stack[-1] if stack else None
+
     @property
     def last_auth_suppression(self) -> Optional[Dict]:
         """Per-thread P0-A read-gate suppression from the last retrieve() on
         THIS thread. Thread-local so concurrent `search` RPCs sharing this
         process-wide engine never read each other's (or a cleared) diagnostic.
-        Defaults to None on a thread that has not run a gated retrieve() yet."""
+        Defaults to None on a thread that has not run a gated retrieve() yet.
+
+        perf/parallel-fanout (#388): routes into the running call's pushed
+        state when read inside retrieve() on this thread, else the legacy
+        thread-local. Serially observable behavior is unchanged (the state is
+        published to the thread-local at return); under the fan-out each
+        variant worker's writes land in its own variant state.
+        """
+        top = self._stack_top()
+        if top is not None:
+            return top.auth_suppression
         local = getattr(self, "_auth_suppression_local", None)
         return getattr(local, "value", None) if local is not None else None
 
     @last_auth_suppression.setter
     def last_auth_suppression(self, value: Optional[Dict]) -> None:
+        top = self._stack_top()
+        if top is not None:
+            top.auth_suppression = value
+            return
         # Lazy-init the backing store so instances built via object.__new__
         # (test fakes that bypass __init__) still get a working thread-local.
         local = getattr(self, "_auth_suppression_local", None)
@@ -431,11 +588,49 @@ class RetrievalEngine:
             self._auth_suppression_local = local
         local.value = value
 
+    @property
+    def last_trace_id(self) -> Optional[str]:
+        """Trace id stamped onto THIS thread's last retrieve() rows.
+
+        Cassandra RED-1 (#388): was a plain shared instance attribute, so
+        both-scope legs running concurrently on the same engine raced it.
+        Routes into the running call's pushed RetrievalCallState.trace_id
+        when read inside retrieve() on this thread, else the per-thread
+        slot published at return. Serially observable behavior is unchanged;
+        under the fan-out each leg observes only its own call's id.
+        """
+        top = self._stack_top()
+        if top is not None:
+            return top.trace_id
+        local = getattr(self, "_trace_id_local", None)
+        return getattr(local, "value", None) if local is not None else None
+
+    @last_trace_id.setter
+    def last_trace_id(self, value: Optional[str]) -> None:
+        top = self._stack_top()
+        if top is not None:
+            top.trace_id = value
+            return
+        # Lazy-init like the auth-suppression setter, so instances built via
+        # object.__new__ (test fakes bypassing __init__) still work.
+        local = getattr(self, "_trace_id_local", None)
+        if local is None:
+            local = threading.local()
+            self._trace_id_local = local
+        local.value = value
+
     def _degradation_flag(self, name: str) -> Optional[str]:
+        top = self._stack_top()
+        if top is not None:
+            return getattr(top, _DEGRADATION_STATE_ATTRS[name])
         local = getattr(self, "_degradation_local", None)
         return getattr(local, name, None) if local is not None else None
 
     def _set_degradation_flag(self, name: str, value: Optional[str]) -> None:
+        top = self._stack_top()
+        if top is not None:
+            setattr(top, _DEGRADATION_STATE_ATTRS[name], value)
+            return
         # Lazy-init like the auth-suppression setter, so instances built via
         # object.__new__ (test fakes bypassing __init__) still work.
         local = getattr(self, "_degradation_local", None)
@@ -495,6 +690,55 @@ class RetrievalEngine:
     @last_hyde_degraded.setter
     def last_hyde_degraded(self, value: Optional[str]) -> None:
         self._set_degradation_flag("hyde", value)
+
+    def _current_state(self) -> Any:
+        """Innermost per-call state on THIS thread (never None).
+
+        Inside retrieve() this is the pushed RetrievalCallState for the
+        running call — variant pool workers each pushed their own, so
+        concurrent same-engine calls stay isolated. Outside retrieve()
+        (direct helper calls in tests/tools) it is a _ThreadLocalStateProxy
+        over the legacy thread-local properties, preserving their exact
+        behavior with no helper signature changes.
+        """
+        top = self._stack_top()
+        if top is not None:
+            return top
+        return _ThreadLocalStateProxy(self)
+
+    def _push_call_state(self, state: RetrievalCallState) -> None:
+        local = getattr(self, "_call_state_local", None)
+        if local is None:
+            local = threading.local()
+            self._call_state_local = local
+        stack = getattr(local, "stack", None)
+        if stack is None:
+            stack = []
+            local.stack = stack
+        stack.append(state)
+
+    def _pop_call_state(self) -> None:
+        stack = self._call_state_local.stack
+        stack.pop()
+
+    def _publish_call_state(self, state: RetrievalCallState) -> None:
+        """Publish a top-level call's verdicts to the legacy read surface.
+
+        Runs on the calling thread at retrieve() return, so post-retrieve
+        readers (recall._degradation_for, handlers, tests) observe exactly
+        what the serial code left in the thread-locals — including on the
+        exception path, where the partial state matches the incremental
+        thread-local writes the serial code had made before throwing.
+        """
+        self.last_auth_suppression = state.auth_suppression
+        self.last_rerank_degraded = state.rerank_degraded
+        self.last_query_expand_degraded = state.query_expand_degraded
+        self.last_vector_degraded = state.vector_degraded
+        self.last_hyde_degraded = state.hyde_degraded
+        # RED-1: the call's own trace id (None when the merge never ran, e.g.
+        # a raising variant — see the documented exception-path delta below).
+        # Publish runs after the pop, so this lands in the thread-local slot.
+        self.last_trace_id = state.trace_id
 
     @property
     def model(self):
@@ -1425,11 +1669,28 @@ class RetrievalEngine:
                 passage = f"[{heading}] {passage}"
             pairs.append([query, passage])
 
-        try:
-            from minni.models import get_cross_encoder_lock
+        # perf/parallel-fanout (#388) + Cassandra RED-2: the global lock is
+        # skipped ONLY when the pinned-CPU precondition holds (CPU device +
+        # fired torch-thread pin, see models.cross_encoder_unlocked_predict_safe).
+        # A stress probe (8 threads x 3 rounds vs serial, committed as
+        # tests/test_parallel_fanout_red.py::test_cross_encoder_concurrent_predict_matches_serial)
+        # verified CrossEncoder.predict byte-identical under concurrency on
+        # that path (torch.set_num_threads(1) + OMP/MKL pins in minnid.main /
+        # models._pin_torch_threads_for_cpu_once — untouched). WITHOUT the
+        # pin the same probe segfaults (OpenMP oversubscription, #299 class),
+        # so every other device — and an unfired pin — takes the lock. The
+        # proof therefore covers all paths, not just the pinned-CPU daemon.
+        from minni.models import (
+            cross_encoder_unlocked_predict_safe,
+            get_cross_encoder_lock,
+        )
 
-            with get_cross_encoder_lock():
+        try:
+            if cross_encoder_unlocked_predict_safe():
                 scores = reranker.predict(pairs, show_progress_bar=False)
+            else:
+                with get_cross_encoder_lock():
+                    scores = reranker.predict(pairs, show_progress_bar=False)
 
             for score_index, c, score_value in zip(missing_indexes, missing, scores):
                 score = float(score_value)
@@ -1451,7 +1712,7 @@ class RetrievalEngine:
             # raw RRF magnitude against reranked corpora and is silently evicted.
             # Record it; the caller reports it rather than presenting the merge
             # as a clean cross-corpus ordering.
-            self.last_rerank_degraded = str(e)
+            self._current_state().rerank_degraded = str(e)
 
         return candidates
 
@@ -1928,7 +2189,10 @@ class RetrievalEngine:
             )
         self.vector_model_down = True
         # Per-request verdict for the response envelope (round 2, PR #260).
-        self.last_vector_degraded = (
+        # Per-call state (#388), not the thread-local: concurrent same-engine
+        # calls must not share it. The process-wide bool above stays as the
+        # health-surface outage signal and log-once guard.
+        self._current_state().vector_degraded = (
             "embedding model unavailable; lexical (FTS) only"
         )
 
@@ -1963,7 +2227,7 @@ class RetrievalEngine:
                     exc,
                 )
             self.vector_model_down = True
-            self.last_vector_degraded = (
+            self._current_state().vector_degraded = (
                 f"embedding encode failed: {exc}"[:200]
             )
             return np.array([], dtype=np.float32)
@@ -2435,13 +2699,13 @@ class RetrievalEngine:
                 query, mode=str(mode).lower()
             )
             if degraded:
-                self.last_query_expand_degraded = degraded
+                self._current_state().query_expand_degraded = degraded
         except Exception as exc:  # noqa: BLE001 - recall must not raise here
             logger.warning("Query expansion failed: %s — using original query", exc)
             # AFM-6 (#230): the log line alone is not reachable from the call
             # site. Recorded so the response can say the search ran on the bare
             # query rather than presenting it as an expanded one.
-            self.last_query_expand_degraded = str(exc)
+            self._current_state().query_expand_degraded = str(exc)
             variants = [query]
         return variants or [query]
 
@@ -2644,6 +2908,84 @@ class RetrievalEngine:
         # G19/G20/G22: principal for can_read_document gate + evidence envelope (default None = back-compat)
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
+        # perf/parallel-fanout (#388, YELLOW-3a): private per-call state for
+        # variant pool workers. Public callers never pass it. The signature
+        # is explicit — NOT *args — because G20 introspects it; it mirrors
+        # _retrieve_body plus this one private _state kwarg (it is not
+        # literally identical to _retrieve_body, which takes no _state).
+        _state: Optional[RetrievalCallState] = None,
+    ) -> List[Dict]:
+        """Hybrid retrieval (public entry; signature-compatible wrapper).
+
+        All parameters are forwarded to :meth:`_retrieve_body` unchanged —
+        existing positional/keyword callers (including the ``search()`` alias)
+        are unaffected. ``_state`` is private: variant pool workers pass their
+        own RetrievalCallState so concurrent same-engine calls stay isolated
+        (perf/parallel-fanout, #388). A top-level call creates one state,
+        pushes it for the duration, and publishes it to the legacy
+        thread-local read surface on return (including the exception path,
+        where the partial state matches the serial incremental writes).
+        """
+        outer = _state is None
+        state = _state if _state is not None else RetrievalCallState()
+        self._push_call_state(state)
+        try:
+            return self._retrieve_body(
+                query=query,
+                limit=limit,
+                agent_id=agent_id,
+                update_access=update_access,
+                budget_tokens=budget_tokens,
+                depth=depth,
+                include_superseded=include_superseded,
+                include_rejected=include_rejected,
+                include_drafts=include_drafts,
+                include_expired=include_expired,
+                backend=backend,
+                layers=layers,
+                sort=sort,
+                start_date=start_date,
+                end_date=end_date,
+                expand=expand,
+                summarize_neighborhood=summarize_neighborhood,
+                use_hyde=use_hyde,
+                cross_agent=cross_agent,
+                claim=claim,
+                document_agent_filter=document_agent_filter,
+                principal=principal,
+                workspace=workspace,
+            )
+        finally:
+            self._pop_call_state()
+            if outer:
+                self._publish_call_state(state)
+
+    def _retrieve_body(
+        self,
+        query: str,
+        limit: int = 5,
+        agent_id: Optional[str] = None,
+        update_access: bool = True,
+        budget_tokens: bool = True,
+        depth: str = "snippet",
+        include_superseded: bool = False,
+        include_rejected: bool = False,
+        include_drafts: bool = False,
+        include_expired: bool = False,
+        backend=None,
+        layers: Optional[Sequence[str]] = None,
+        sort: Literal["semantic", "chronological"] = "semantic",
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        expand=True,
+        summarize_neighborhood: bool = False,
+        use_hyde: Optional[bool] = None,
+        cross_agent: bool = False,
+        claim: Optional[str] = None,
+        document_agent_filter: Optional[Sequence[str]] = None,
+        # G19/G20/G22: principal for can_read_document gate + evidence envelope (default None = back-compat)
+        principal: Optional[EffectivePrincipal] = None,
+        workspace: str = "default",
     ) -> List[Dict]:
         """
         Hybrid retrieval: FTS5 + FAISS semantic, RRF fusion, cross-encoder re-rank,
@@ -2695,22 +3037,25 @@ class RetrievalEngine:
         # healthy one. Aggregated explicitly after the merge, exactly as
         # variant_suppressions already does. (Review round 1 on PR #260: an
         # earlier comment here claimed no re-clearing happened. It did.)
-        self.last_rerank_degraded = None
-        self.last_query_expand_degraded = None
-        self.last_vector_degraded = None
-        self.last_hyde_degraded = None
+        # Per-call state (#388): this body always runs under a pushed state
+        # (retrieve() pushed it), so `state` below is that call's own verdict
+        # object — never a sibling call's, however the legs interleave.
+        state = self._current_state()
+        state.rerank_degraded = None
+        state.query_expand_degraded = None
+        state.vector_degraded = None
+        state.hyde_degraded = None
         query_variants = self._resolve_query_variants(query, expand)
         # Round 25: expand soft-fail (mode=afm → afm_unavailable) is set on the
         # parent by _resolve_query_variants *before* multi-variant recursion.
         # Children run with expand=False and clear flags on entry, so the
         # parent signal must be captured here or the merge wipes AFM-6 honesty
         # exactly when rule fallback yields ≥2 variants (the common case).
-        parent_expand_degraded = self.last_query_expand_degraded
+        parent_expand_degraded = state.query_expand_degraded
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
-            per_variant = []
             # Review r1 (P2): each recursive single-variant call below rewrites
-            # self.last_auth_suppression, so without accumulation the P0-A
+            # the per-call suppression, so without accumulation the P0-A
             # diagnostic only survives when the SUPPRESSING variant happens to
             # run last. Collect per-variant suppressions and re-aggregate after
             # the merge.
@@ -2720,9 +3065,17 @@ class RetrievalEngine:
             variant_expand_degraded: List[str] = []
             variant_vector_degraded: List[str] = []
             variant_hyde_degraded: List[str] = []
-            for variant in query_variants:
-                per_variant.append(self.retrieve(
-                    query=variant,
+            # perf/parallel-fanout (#388): one isolated state per variant,
+            # gathered in submission order (pool.map preserves it), so the
+            # merge and every aggregation string below are deterministic and
+            # identical to the serial loop. A variant that raises propagates
+            # exactly as the serial append did (merge/access-bump/trace all
+            # skipped, error surfaces to the caller).
+            variant_states = [RetrievalCallState() for _ in query_variants]
+
+            def _run_variant(index: int) -> List[Dict]:
+                return self.retrieve(
+                    query=query_variants[index],
                     limit=limit,
                     agent_id=agent_id,
                     update_access=False,
@@ -2745,47 +3098,96 @@ class RetrievalEngine:
                     document_agent_filter=document_agent_filter,
                     principal=principal,
                     workspace=workspace,
-                ))
-                if self.last_auth_suppression:
+                    _state=variant_states[index],
+                )
+
+            if RETRIEVAL_VARIANT_PARALLEL:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(_MAX_VARIANT_WORKERS, len(query_variants)),
+                    thread_name_prefix="minni-variant",
+                ) as _variant_pool:
+                    # YELLOW-1/YELLOW-2 (documented, deliberate): a raising
+                    # variant's partial verdicts die with its
+                    # RetrievalCallState — the parent publishes its own
+                    # entry-cleared state plus the pre-recursion
+                    # parent_expand_degraded (the merge that would aggregate
+                    # the children never runs). Serially the raising
+                    # variant's incremental thread-local writes stayed
+                    # visible. The delta is confined to the failure path
+                    # (success-path aggregates are identical — see the parity
+                    # tests). pool.map submits ALL variants eagerly, but the
+                    # fate of a not-yet-started sibling when the gather
+                    # aborts is a scheduling RACE, not a guarantee either
+                    # way: abandoning the map iterator (as list() does on the
+                    # first raise) cancels pending futures via the iterator's
+                    # finally clause, while a worker that wins the race
+                    # starts the sibling first and it then runs to completion
+                    # (cancel only stops futures that never started). Probed
+                    # on 3.14 both ways — immediate-raise cancels ~always, a
+                    # GIL yield in the body lets the worker win — and pinned
+                    # by test_variant_abort_envelope_equal_despite_race. The
+                    # residue is observable below the RPC envelope whenever a
+                    # sibling actually ran: variant bodies are read-only on
+                    # documents (update_access=False) but DO leave trace-ring
+                    # entries the serial run never wrote. The deterministic
+                    # contract is RPC-envelope equality: pool.map yields in
+                    # submission order, so the FIRST variant's exception is
+                    # the one that propagates — exactly the serial raise, in
+                    # every trial under either race outcome. as_completed +
+                    # explicit cancel was rejected: it could surface a LATER
+                    # variant's error first, breaking the serial-raise
+                    # identity for zero gain (variant bodies are not
+                    # cancellable work).
+                    per_variant = list(
+                        _variant_pool.map(
+                            _run_variant, range(len(query_variants))
+                        )
+                    )
+            else:
+                per_variant = [
+                    _run_variant(index) for index in range(len(query_variants))
+                ]
+            for variant, child in zip(query_variants, variant_states):
+                if child.auth_suppression:
                     variant_suppressions.append(
-                        {**self.last_auth_suppression, "variant": variant}
+                        {**child.auth_suppression, "variant": variant}
                     )
-                if self.last_rerank_degraded:
+                if child.rerank_degraded:
                     variant_rerank_degraded.append(
-                        f"{variant}: {self.last_rerank_degraded}"
+                        f"{variant}: {child.rerank_degraded}"
                     )
-                if self.last_query_expand_degraded:
+                if child.query_expand_degraded:
                     variant_expand_degraded.append(
-                        f"{variant}: {self.last_query_expand_degraded}"
+                        f"{variant}: {child.query_expand_degraded}"
                     )
-                if self.last_vector_degraded:
+                if child.vector_degraded:
                     variant_vector_degraded.append(
-                        f"{variant}: {self.last_vector_degraded}"
+                        f"{variant}: {child.vector_degraded}"
                     )
-                if self.last_hyde_degraded:
+                if child.hyde_degraded:
                     variant_hyde_degraded.append(
-                        f"{variant}: {self.last_hyde_degraded}"
+                        f"{variant}: {child.hyde_degraded}"
                     )
             results = self._merge_expanded_results(per_variant, query_variants, limit)
             # A degrade in ANY variant degrades the merge — the merged ordering
             # mixed a leg that was not reranked. Set AFTER the loop, because the
             # last variant's clear would otherwise decide the whole verdict.
-            self.last_rerank_degraded = (
+            state.rerank_degraded = (
                 "; ".join(variant_rerank_degraded) if variant_rerank_degraded else None
             )
             child_expand = (
                 "; ".join(variant_expand_degraded) if variant_expand_degraded else None
             )
             if parent_expand_degraded and child_expand:
-                self.last_query_expand_degraded = (
+                state.query_expand_degraded = (
                     f"{parent_expand_degraded}; {child_expand}"
                 )
             else:
-                self.last_query_expand_degraded = parent_expand_degraded or child_expand
-            self.last_vector_degraded = (
+                state.query_expand_degraded = parent_expand_degraded or child_expand
+            state.vector_degraded = (
                 "; ".join(variant_vector_degraded) if variant_vector_degraded else None
             )
-            self.last_hyde_degraded = (
+            state.hyde_degraded = (
                 "; ".join(variant_hyde_degraded) if variant_hyde_degraded else None
             )
             # Aggregate: any variant whose non-empty candidate set was gated to
@@ -2793,7 +3195,7 @@ class RetrievalEngine:
             # (recall.py only surfaces it when the merged result is empty.)
             if variant_suppressions:
                 total_pre = sum(s.get("pre_gate", 0) for s in variant_suppressions)
-                self.last_auth_suppression = {
+                state.auth_suppression = {
                     "pre_gate": total_pre,
                     "suppressed": total_pre,
                     "reason": "; ".join(
@@ -2802,7 +3204,7 @@ class RetrievalEngine:
                     "variants": [s.get("variant") for s in variant_suppressions],
                 }
             else:
-                self.last_auth_suppression = None
+                state.auth_suppression = None
             if summarize_neighborhood:
                 results = self._add_neighborhood_summaries(
                     results, principal=principal, workspace=workspace
@@ -2848,11 +3250,16 @@ class RetrievalEngine:
                         for r in results
                         if r.get("attribution_score") is not None
                     ]
-                self.last_trace_id = _trace_ring().add(
+                # RED-1: stamped from the local into this call's own state
+                # (the last_trace_id write below routes into the pushed
+                # state, never a sibling call's) and onto these rows. Same
+                # value serially; race-free in parallel.
+                expanded_trace_id = _trace_ring().add(
                     expanded_trace, owner=getattr(principal, "agent_id", None)
                 )
+                self.last_trace_id = expanded_trace_id
                 for result in results:
-                    result["trace_id"] = self.last_trace_id
+                    result["trace_id"] = expanded_trace_id
             except Exception as exc:
                 logger.debug("expanded trace capture failed: %s", exc)
                 self.last_trace_id = None
@@ -3154,7 +3561,7 @@ class RetrievalEngine:
                             # bad result that the enrichment ran when it had not.
                             trace["hyde"]["completed"] = False
                             trace["hyde"]["skipped"] = "afm_unavailable"
-                            self.last_hyde_degraded = "afm_unavailable"
+                            self._current_state().hyde_degraded = "afm_unavailable"
                             logger.warning(
                                 "HyDE leg degraded: AFM produced no hypothetical "
                                 "answer — results are the un-enriched first pass"
@@ -3167,7 +3574,7 @@ class RetrievalEngine:
                     trace["hyde"]["completed"] = False
                     trace["hyde"]["skipped"] = "error"
                     trace["hyde"]["error"] = str(exc)
-                    self.last_hyde_degraded = str(exc)[:400]
+                    self._current_state().hyde_degraded = str(exc)[:400]
 
         # G19 gate (below, after status filter) is the single source of truth for visibility.
         # The prior ad-hoc "agent_id or unknown" filter is removed; legacy principal=None
@@ -3200,10 +3607,10 @@ class RetrievalEngine:
         # G19/G20: ws always defined (hoisted) so G22 envelope loop and legacy principal=None
         # paths never hit UnboundLocalError. Gate only when principal supplied.
         ws = workspace or getattr(principal, "workspace_id", "default") if principal is not None else (workspace or "default")
-        self.last_auth_suppression = None
+        self._current_state().auth_suppression = None
         if principal is not None:
             merged, suppression = self.apply_read_gate(principal, ws, merged)
-            self.last_auth_suppression = suppression
+            self._current_state().auth_suppression = suppression
 
         # G22: attach evidence-only envelope + instruction_like + provenance/reasoning to every result
         # Model-facing content is always wrapped; raw executable instructions never treated as policy.
@@ -3567,11 +3974,14 @@ class RetrievalEngine:
             ]
         timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
         try:
-            self.last_trace_id = _trace_ring().add(
+            # RED-1: see the expanded-trace branch above — routes into this
+            # call's own state, never a sibling's.
+            single_trace_id = _trace_ring().add(
                 trace, owner=getattr(principal, "agent_id", None)
             )
+            self.last_trace_id = single_trace_id
             for result in results:
-                result["trace_id"] = self.last_trace_id
+                result["trace_id"] = single_trace_id
         except Exception as exc:
             logger.debug("trace capture failed: %s", exc)
             self.last_trace_id = None
