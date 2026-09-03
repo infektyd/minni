@@ -1,7 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
   access,
-  appendFile,
   lstat,
   mkdir,
   readFile,
@@ -1341,7 +1340,7 @@ async function appendIndex(
   const link = wikilinkFor(relativePath);
   if (existing.includes(link)) return;
   const line = `- ${link} - ${summary.replace(/\s+/g, " ").slice(0, 160)}\n`;
-  await appendFile(indexPath, line, "utf8");
+  await appendFileWithFsync(indexPath, line);
 }
 
 // Bugbot on #309 (campaign scar #3): the durability of this write must be

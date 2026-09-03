@@ -114,6 +114,14 @@ def _handoff_wiki_filename(packet: dict, stamp: str) -> str:
     return f"{stamp[:8]}-{slug}-{slugify(raw)}-{digest}.md"
 
 
+def _handoff_packet_filename(packet: dict, stamp: str) -> str:
+    """stamp+task-slug+trace[:8] collides; include lease_id (or full trace)."""
+    slug = slugify(str(packet.get("task") or "handoff"))
+    raw = str(packet.get("lease_id") or packet.get("trace_id") or stamp)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{stamp}-{slug}-{slugify(raw)}-{digest}.json"
+
+
 def write_json(path: Path, data: dict) -> None:
     from minni.afm_writer import _atomic_write_text
 
@@ -413,7 +421,7 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
         context.ensure_handoff_vault(sender_vault)
         context.ensure_handoff_vault(recipient_vault)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        suffix = f"{stamp}-{context.slugify(redacted_packet['task'])}-{redacted_packet['trace_id'][:8]}.json"
+        suffix = _handoff_packet_filename(redacted_packet, stamp)
         outbox_path = sender_vault / "outbox" / suffix
         inbox_path = recipient_vault / "inbox" / suffix
         context.write_json(outbox_path, redacted_packet)

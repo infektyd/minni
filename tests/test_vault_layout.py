@@ -820,6 +820,59 @@ def test_persist_exception_restart_hydrate_refuses_wet_enqueue(
     assert put_calls == []
 
 
+def test_persist_fail_sibling_sidecar_restart_refuses_wet_enqueue(
+    tmp_path, monkeypatch
+):
+    """Persist fail must not skip a healthy sibling sidecar; restart must not remint.
+
+    _leave_fail_closed_pending_sticky used to lstat() and return if dest
+    already existed — including a readable JSON object that only listed
+    sibling passes. After os.replace/disk-full, in-memory sticky held this
+    pass, but a cold start hydrated only what was on disk and submit_drafts
+    wet-enqueued a second draft set.
+    """
+    import json
+
+    import minni.afm_writer as afm_writer
+
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    inbox = vault / "inbox"
+    inbox.mkdir()
+    sidecar = inbox / "afm-pending-lifecycle.json"
+    sibling_body = (
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-09-01T00:00:00Z",
+                "passes": {"probe": {"promote_candidate_ids": [9]}},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    sidecar.write_text(sibling_body, encoding="utf-8")
+
+    def boom(*_args, **_kwargs):
+        raise OSError("injected persist failure")
+
+    monkeypatch.setattr(afm_writer, "_atomic_write_json", boom)
+    afm_writer.reset_pass_counters()
+    afm_writer._persist_pending_lifecycle(
+        "consolidation", _pending_lifecycle(), str(vault)
+    )
+    on_disk = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert "probe" in (on_disk.get("passes") or {}), on_disk
+    result, put_calls = _submit_drafts_wet_enqueue_spy(monkeypatch, vault)
+    assert result.get("status") == "write_in_flight", result
+    assert result.get("lifecycle_pending") is True
+    assert result.get("drafts_written") == []
+    assert put_calls == []
+    still = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert "probe" in (still.get("passes") or {}), still
+
+
 def test_clear_persisted_pending_lifecycle_refuses_inbox_dir_symlink_into_shop(
     tmp_path,
 ):
@@ -951,6 +1004,27 @@ def test_submit_drafts_refuses_wet_enqueue_on_torn_pending_sidecar(
     assert result.get("lifecycle_pending") is True
     assert result.get("drafts_written") == []
     assert put_calls == []
+    assert path.read_text(encoding="utf-8") == _TORN_PENDING_SIDECAR
+    afm_writer.reset_pass_counters()
+
+
+def test_writer_status_torn_sticky_is_not_ok(tmp_path, monkeypatch):
+    """Hydrate False on a torn sidecar must not let writer_status read ok."""
+    import minni.afm_writer as afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    vault = tmp_path / "hermes-vault"
+    vault.mkdir()
+    path = _torn_pending_sidecar(vault)
+    state = afm_writer.writer_status(
+        vault_path=str(vault),
+        schedule={"passes": {}},
+        now=1_000_000.0,
+    )
+    assert state.get("status") != "ok", state
+    assert state.get("pending_lifecycle_unreadable") is True, state
+    assert state.get("pending_lifecycle_passes", 0) == 0, state
     assert path.read_text(encoding="utf-8") == _TORN_PENDING_SIDECAR
     afm_writer.reset_pass_counters()
 
@@ -1198,6 +1272,30 @@ def test_compile_handoff_page_lease_id_case_collision(tmp_path):
     assert "<e>lower</e>" in path2.read_text(encoding="utf-8")
 
 
+def test_handoff_packet_filename_keeps_same_stamp_task_trace_prefix():
+    """stamp+task-slug+trace_id[:8] collided; lease_id must disambiguate."""
+    from minni.minnid_runtime.handoff import _handoff_packet_filename
+
+    stamp = "20260901T000000Z"
+    first = {
+        "task": "task",
+        "trace_id": "trace-aaa-extra",
+        "lease_id": "handoff-lease-aaa",
+    }
+    second = {
+        "task": "task",
+        "trace_id": "trace-aaa-other",
+        "lease_id": "handoff-lease-bbb",
+    }
+    assert first["trace_id"][:8] == second["trace_id"][:8]
+    n1 = _handoff_packet_filename(first, stamp)
+    n2 = _handoff_packet_filename(second, stamp)
+    assert n1 != n2
+    assert n1.endswith(".json") and n2.endswith(".json")
+    assert "handoff-lease-aaa" in n1
+    assert "handoff-lease-bbb" in n2
+
+
 def _pruning_proposal(trace_id: str = "trace-prune") -> dict:
     return {
         "proposal_id": "afm-pruning-transition-probe",
@@ -1418,6 +1516,16 @@ def test_atomic_write_text_preserves_dest_0600(tmp_path):
     dest.write_text("{}\n", encoding="utf-8")
     dest.chmod(0o600)
     _atomic_write_text(dest, '{"ok": true}\n')
+    assert dest.stat().st_mode & 0o777 == 0o600
+    assert dest.read_text(encoding="utf-8") == '{"ok": true}\n'
+
+
+def test_atomic_write_text_new_file_is_0600(tmp_path):
+    from minni.afm_writer import _atomic_write_text
+
+    dest = tmp_path / "fresh.json"
+    _atomic_write_text(dest, '{"ok": true}\n')
+    assert dest.is_file()
     assert dest.stat().st_mode & 0o777 == 0o600
     assert dest.read_text(encoding="utf-8") == '{"ok": true}\n'
 

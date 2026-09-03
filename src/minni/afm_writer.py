@@ -231,6 +231,58 @@ def _pending_lifecycle_path(vault_path: str | Path) -> Path:
     return Path(vault_path).expanduser() / _PENDING_LIFECYCLE_REL
 
 
+def _pending_lifecycle_fragment_path(vault_path: str | Path, pass_name: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(pass_name)).strip("._-") or "pass"
+    return Path(vault_path).expanduser() / "inbox" / f".afm-pending-lifecycle.{safe}.json"
+
+
+def _pending_lifecycle_file_payload(passes: dict[str, dict]) -> dict:
+    return {
+        "version": _PENDING_LIFECYCLE_FILE_VERSION,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "passes": {
+            name: _serializable_lifecycle(life) for name, life in passes.items()
+        },
+    }
+
+
+def _exclusive_create_text(path: Path, data: str) -> None:
+    """O_EXCL|O_NOFOLLOW create at 0o600. Caller already rejected plants."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        payload = data.encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
+    finally:
+        os.close(fd)
+
+
+def _unlink_pending_lifecycle_fragment(
+    vault_path: str | Path, pass_name: str
+) -> None:
+    path = _pending_lifecycle_fragment_path(vault_path, pass_name)
+    try:
+        from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+        vault = Path(vault_path).expanduser()
+        root_real = _resolved_vault_root(vault)
+        _reject_symlink_or_escape(path.parent, root_real, "inbox")
+        _reject_symlink_or_escape(path, root_real, path.name)
+        path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.warning(
+            "AFM writer: could not drop pending-lifecycle fragment %s", path
+        )
+
+
 def _serializable_lifecycle(lifecycle: dict) -> dict:
     """JSON-safe lifecycle payload (drop callables / private bookkeeping keys)."""
     out: dict = {}
@@ -322,16 +374,8 @@ def _persist_pending_lifecycle(
             name: _serializable_lifecycle(life) for name, life in existing.items()
         }
         file_passes[str(pass_name)] = _serializable_lifecycle(lifecycle)
-        _atomic_write_json(
-            path,
-            {
-                "version": _PENDING_LIFECYCLE_FILE_VERSION,
-                "updated_at": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                ),
-                "passes": file_passes,
-            },
-        )
+        _atomic_write_json(path, _pending_lifecycle_file_payload(file_passes))
+        _unlink_pending_lifecycle_fragment(vault_path, pass_name)
     except Exception:
         logger.exception(
             "AFM writer: failed to persist pending lifecycle for pass %r to %s",
@@ -350,8 +394,10 @@ def _leave_fail_closed_pending_sticky(
     """Best-effort sidecar so restart hydrate cannot treat persist failure as empty.
 
     If inbox/dest is a plant, refuse and leave nothing (hydrate rejects the
-    plant). If dest already exists (torn or otherwise), keep it. Otherwise
-    exclusive-create a readable sticky the next cold start can hydrate.
+    plant). If dest is torn/unreadable, keep it (hydrate already refuses wet).
+    If dest is a healthy sibling-only object, retry the merged payload; if
+    that write also fails, exclusive-create a per-pass fragment hydrate merges.
+    If dest is missing, exclusive-create a readable sticky.
     """
     try:
         from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
@@ -360,43 +406,92 @@ def _leave_fail_closed_pending_sticky(
         root_real = _resolved_vault_root(vault)
         _reject_symlink_or_escape(path.parent, root_real, "inbox")
         _reject_symlink_or_escape(path, root_real, str(_PENDING_LIFECYCLE_REL))
+        dest_exists = False
         try:
             path.lstat()
-            return
+            dest_exists = True
         except FileNotFoundError:
             pass
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = (
             json.dumps(
-                {
-                    "version": _PENDING_LIFECYCLE_FILE_VERSION,
-                    "updated_at": time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                    ),
-                    "passes": {str(pass_name): _serializable_lifecycle(lifecycle)},
-                },
+                _pending_lifecycle_file_payload(
+                    {str(pass_name): _serializable_lifecycle(lifecycle)}
+                ),
                 indent=2,
                 sort_keys=True,
             )
             + "\n"
         )
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if nofollow:
-            flags |= nofollow
-        fd = os.open(path, flags, 0o600)
-        try:
-            data = payload.encode("utf-8")
-            written = 0
-            while written < len(data):
-                written += os.write(fd, data[written:])
-        finally:
-            os.close(fd)
+        if dest_exists:
+            try:
+                existing = _read_pending_lifecycle_file(vault_path)
+            except Exception:
+                return
+            if str(pass_name) in existing:
+                return
+            file_passes = {
+                name: _serializable_lifecycle(life)
+                for name, life in existing.items()
+            }
+            file_passes[str(pass_name)] = _serializable_lifecycle(lifecycle)
+            try:
+                _atomic_write_json(
+                    path, _pending_lifecycle_file_payload(file_passes)
+                )
+                _unlink_pending_lifecycle_fragment(vault_path, pass_name)
+                return
+            except Exception:
+                _exclusive_create_pending_fragment(
+                    vault_path, pass_name, lifecycle
+                )
+                return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _exclusive_create_text(path, payload)
     except Exception:
         logger.exception(
             "AFM writer: could not leave fail-closed pending-lifecycle sticky at %s",
             path,
         )
+        try:
+            _exclusive_create_pending_fragment(vault_path, pass_name, lifecycle)
+        except Exception:
+            logger.exception(
+                "AFM writer: could not leave pending-lifecycle fragment for pass %r",
+                pass_name,
+            )
+
+
+def _exclusive_create_pending_fragment(
+    vault_path: str | Path, pass_name: str, lifecycle: dict
+) -> None:
+    """Pass-local sticky when the merged sidecar write cannot land."""
+    path = _pending_lifecycle_fragment_path(vault_path, pass_name)
+    from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+    vault = Path(vault_path).expanduser()
+    root_real = _resolved_vault_root(vault)
+    _reject_symlink_or_escape(path.parent, root_real, "inbox")
+    _reject_symlink_or_escape(path, root_real, path.name)
+    try:
+        path.lstat()
+        return
+    except FileNotFoundError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(
+            _pending_lifecycle_file_payload(
+                {str(pass_name): _serializable_lifecycle(lifecycle)}
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    try:
+        _exclusive_create_text(path, payload)
+    except FileExistsError:
+        return
 
 
 def _clear_persisted_pending_lifecycle(
@@ -421,6 +516,7 @@ def _clear_persisted_pending_lifecycle(
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = _read_pending_lifecycle_file(vault_path)
         if str(pass_name) not in existing and not path.exists():
+            _unlink_pending_lifecycle_fragment(vault_path, pass_name)
             return
         file_passes = {
             name: _serializable_lifecycle(life)
@@ -432,15 +528,10 @@ def _clear_persisted_pending_lifecycle(
                 path.unlink(missing_ok=True)
             except Exception:
                 pass
+            _unlink_pending_lifecycle_fragment(vault_path, pass_name)
             return
-        _atomic_write_json(
-            path,
-            {
-                "version": _PENDING_LIFECYCLE_FILE_VERSION,
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "passes": file_passes,
-            },
-        )
+        _atomic_write_json(path, _pending_lifecycle_file_payload(file_passes))
+        _unlink_pending_lifecycle_fragment(vault_path, pass_name)
     except Exception:
         logger.exception(
             "AFM writer: failed to clear pending lifecycle for pass %r at %s",
@@ -462,12 +553,15 @@ def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> bool:
         return True
     try:
         loaded = _read_pending_lifecycle_file(vault_path)
+        fragments = _read_pending_lifecycle_fragments(vault_path)
     except Exception:
         logger.exception(
             "AFM writer: could not hydrate pending lifecycle from %s",
             vault_path,
         )
         return False
+    for name, life in fragments.items():
+        loaded.setdefault(name, life)
     for name, life in loaded.items():
         if name not in _PENDING_LIFECYCLE:
             _PENDING_LIFECYCLE[name] = life
@@ -477,6 +571,48 @@ def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> bool:
                 name,
             )
     return True
+
+
+def _read_pending_lifecycle_fragments(vault_path: str | Path) -> dict[str, dict]:
+    """Merge per-pass fail-closed fragments left when sidecar RMW could not land."""
+    from minni.vault_layout import _reject_symlink_or_escape, _resolved_vault_root
+
+    vault = Path(vault_path).expanduser()
+    inbox = vault / "inbox"
+    root_real = _resolved_vault_root(vault)
+    _reject_symlink_or_escape(inbox, root_real, "inbox")
+    out: dict[str, dict] = {}
+    try:
+        names = list(inbox.iterdir())
+    except FileNotFoundError:
+        return out
+    prefix = ".afm-pending-lifecycle."
+    suffix = ".json"
+    for path in names:
+        if not path.name.startswith(prefix) or not path.name.endswith(suffix):
+            continue
+        if path.name == _PENDING_LIFECYCLE_REL.name:
+            continue
+        _reject_symlink_or_escape(path, root_real, path.name)
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        try:
+            raw = json.loads(raw_text)
+        except Exception as exc:
+            raise OSError(f"unreadable pending-lifecycle fragment: {path}") from exc
+        if not isinstance(raw, dict):
+            raise OSError(f"pending-lifecycle fragment is not a JSON object: {path}")
+        passes = raw.get("passes")
+        if not isinstance(passes, dict):
+            raise OSError(f"pending-lifecycle fragment has no passes object: {path}")
+        for name, life in passes.items():
+            if isinstance(life, dict) and str(name) not in out:
+                stored = _serializable_lifecycle(life)
+                stored["_vault_path"] = str(vault)
+                out[str(name)] = stored
+    return out
 
 
 def _vault_path_from_pending(pending: dict) -> Optional[str]:
@@ -552,7 +688,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
     if nofollow:
         flags |= nofollow
     last_exc: Optional[OSError] = None
-    open_mode = existing_mode if existing_mode is not None else 0o666
+    open_mode = existing_mode if existing_mode is not None else 0o600
     for _ in range(8):
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp")
         if tmp.is_symlink():
@@ -564,8 +700,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
             continue
         try:
             try:
-                if existing_mode is not None:
-                    os.fchmod(fd, existing_mode)
+                os.fchmod(fd, open_mode)
                 written = 0
                 while written < len(payload):
                     written += os.write(fd, payload[written:])
@@ -751,11 +886,17 @@ def derive_loop_status(
     # Lifetime lifecycle_apply_failures is data only (not a status latch).
     pending_lc = int(state.get("pending_lifecycle_passes", 0) or 0)
     lc_fails = int(state.get("lifecycle_apply_failures", 0) or 0)
+    unreadable_lc = bool(state.get("pending_lifecycle_unreadable"))
     if pending_lc:
         reasons.append(
             f"deferred lifecycle apply incomplete "
             f"({pending_lc} pass(es) pending; {lc_fails} failure(s) lifetime) "
             "— resubmit refused until apply succeeds or counters are reset"
+        )
+    if unreadable_lc:
+        reasons.append(
+            "pending-lifecycle sidecar exists but is unreadable — "
+            "wet mint refused until the sidecar is repaired"
         )
     # Round 24/25: lifecycle_recovered discards the current wet LLM batch.
     # Counter alone is an orphaned metric (GA2-1 class) — consult recency so
@@ -829,6 +970,7 @@ def derive_loop_status(
         or write_failed_recently
         or unrecovered
         or pending_lc
+        or unreadable_lc
         or recovered_recently
         or jobs_in_flight
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
@@ -1907,9 +2049,10 @@ def writer_status(
     # health sample does not report pending_lifecycle_passes=0 / status ok
     # while the sidecar still names an incomplete apply. Read-only hydrate —
     # never re-apply from status.
+    hydrated_ok = True
     with _IN_FLIGHT_LOCK:
         if vault_path:
-            _hydrate_pending_lifecycle_from_vault(vault_path)
+            hydrated_ok = _hydrate_pending_lifecycle_from_vault(vault_path)
         in_flight_passes = sorted(
             name for name, event in _IN_FLIGHT_PER_PASS.items() if not event.is_set()
         )
@@ -1936,6 +2079,7 @@ def writer_status(
         "unrecovered_write_failures": _UNRECOVERED_WRITE_FAILURES,
         "pending_lifecycle_passes": pending_lifecycle_passes,
         "pending_lifecycle_pass_names": pending_lifecycle_pass_names,
+        "pending_lifecycle_unreadable": not hydrated_ok,
         "lifecycle_apply_failures": _LIFECYCLE_APPLY_FAILURES,
         "last_lifecycle_apply_failure_at": _LAST_LIFECYCLE_APPLY_FAILURE_AT,
         "lifecycle_recovered_drafts_dropped": _LIFECYCLE_RECOVERED_DRAFTS_DROPPED,

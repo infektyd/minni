@@ -107,6 +107,7 @@ def test_daemon_handoff_validates_redacts_and_writes_inbox_outbox(monkeypatch, t
     inbox_packet = json.loads(inbox_files[0].read_text())
     outbox_packet = json.loads(outbox_files[0].read_text())
     assert inbox_packet["lease_id"].startswith("handoff-")
+    assert inbox_packet["lease_id"] in inbox_files[0].name
     assert inbox_packet["requires_ack"] is True
     assert "expires_at" in inbox_packet
     assert inbox_packet["envelope"].count("[REDACTED]") >= 1
@@ -160,6 +161,78 @@ def test_daemon_handoff_reports_degraded_when_lease_persistence_fails(monkeypatc
     assert "SQLite lease persistence failed" in result["reason"]
     assert Path(result["inbox_path"]).exists()
     assert Path(result["outbox_path"]).exists()
+
+
+def test_daemon_handoff_keeps_same_stamp_task_trace_prefix_packets(
+    monkeypatch, tmp_path
+):
+    """write_json replace used stamp+task-slug+trace[:8]; two packets clobbered."""
+    import time as time_mod
+
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    real_strftime = time_mod.strftime
+
+    def _frozen_strftime(fmt, t=None):
+        if fmt == "%Y%m%dT%H%M%SZ":
+            return "20260901T000000Z"
+        if t is None:
+            return real_strftime(fmt)
+        return real_strftime(fmt, t)
+
+    monkeypatch.setattr(time_mod, "strftime", _frozen_strftime)
+
+    first = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "daemon.handoff",
+            "params": {
+                "from_agent": "codex",
+                "to_agent": "claude-code",
+                "packet": _packet(
+                    task="task",
+                    trace_id="trace-aaa-extra",
+                    lease_id="handoff-lease-aaa",
+                    envelope="<e>first</e>",
+                ),
+            },
+        }
+    )
+    second = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 44,
+            "method": "daemon.handoff",
+            "params": {
+                "from_agent": "codex",
+                "to_agent": "claude-code",
+                "packet": _packet(
+                    task="task",
+                    trace_id="trace-aaa-other",
+                    lease_id="handoff-lease-bbb",
+                    envelope="<e>second</e>",
+                ),
+            },
+        }
+    )
+    assert "error" not in first, first
+    assert "error" not in second, second
+    inbox_a = Path(first["result"]["inbox_path"])
+    inbox_b = Path(second["result"]["inbox_path"])
+    assert inbox_a != inbox_b
+    assert inbox_a.is_file() and inbox_b.is_file()
+    body_a = json.loads(inbox_a.read_text(encoding="utf-8"))
+    body_b = json.loads(inbox_b.read_text(encoding="utf-8"))
+    assert body_a["lease_id"] == "handoff-lease-aaa"
+    assert body_b["lease_id"] == "handoff-lease-bbb"
+    assert body_a["envelope"] == "<e>first</e>"
+    assert body_b["envelope"] == "<e>second</e>"
 
 
 def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):

@@ -209,6 +209,47 @@ test("recordAudit rotation does not wipe a second-tap exclusive seed", async () 
   }
 });
 
+test("appendIndex uses appendFileWithFsync (O_APPEND|O_NOFOLLOW), never appendFile(indexPath)", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("async function appendIndex");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /appendFileWithFsync\(\s*indexPath/);
+  assert.doesNotMatch(body, /appendFile\(\s*indexPath/);
+});
+
+test("writeVaultPage does not follow raced index.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-index-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await ensureVault(vault);
+    const indexPath = path.join(vault, "index.md");
+    await rm(indexPath, { force: true });
+    await symlink(keep, indexPath);
+    await assert.rejects(
+      () =>
+        writeVaultPage({
+          vaultPath: vault,
+          title: "Index plant",
+          content: "must not follow index.md into shop",
+          section: "decisions",
+          source: "unit-test",
+        }),
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("appendFileWithFsync uses O_APPEND|O_NOFOLLOW, never open(path, \"a\")", async () => {
   const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
   const start = src.indexOf("export async function appendFileWithFsync");
