@@ -46,5 +46,9 @@ minni sync              # or minni sync --full on an editable dogfood checkout
 ```
 
 Verify: from a Grok session, call `minni_status` and check `socket.ok` and the
-vault path. For PreToolUse, a pending strong-recall state must deny a native
-`read_file` (see `plugins/minni/tests/grok-hook.test.mjs`).
+vault path. PreToolUse is **allow**, not deny: native `read_file` with leftover
+`consumed=false` must `{decision: "allow"}` — UPS inject is dropped, so leftover
+cannot deny (host deny ≠ s6 liveness). See
+`plugins/minni/tests/grok-hook.test.mjs` and
+[platform-hook-contracts.md](../ops/platform-hook-contracts.md). A wet session
+that expects deny on pending strong recall is not the bar.

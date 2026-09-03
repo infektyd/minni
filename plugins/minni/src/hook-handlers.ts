@@ -1339,23 +1339,40 @@ export function createHookHandlers(
     let recallStateFile: string | undefined;
     let stalePointer: string | undefined;
     if (strong) {
-      try {
-        recallStateFile = await writeRecallState(config.vaultPath, {
-          task_signature: signature,
-          intent: intent.action,
-          top_hits: strong.topHits,
-          top_score: strong.topScore,
-        });
-      } catch {
-        // best-effort: a state-write failure must not break the hook
+      // s6 UNCONSULTED deny is a backstop for an envelope the model actually
+      // received. Grok UPS/SS and Cursor UPS structurally drop inject
+      // (GROK_INJECTABLE={Stop}, CURSOR_INJECTABLE={SessionStart}); planting
+      // consumed=false here would deny cold tools against memory the model
+      // never saw. Do not expand those injectable sets — this gate follows them.
+      if (canInject(wire, "UserPromptSubmit")) {
+        try {
+          recallStateFile = await writeRecallState(config.vaultPath, {
+            task_signature: signature,
+            intent: intent.action,
+            top_hits: strong.topHits,
+            top_score: strong.topScore,
+          });
+        } catch {
+          // best-effort: a state-write failure must not break the hook
+        }
+      } else {
+        // Prior dropped-UPS plants left consumed=false on disk; this turn
+        // would have overwritten them with another false plant. Clear instead
+        // of leaving the guard armed against an undelivered envelope.
+        await clearRecallState(config.vaultPath).catch(() => {});
       }
     } else if (daemonTimedOut) {
-      // DEGRADED, not weak. Keep the existing state file — clearing it would
-      // destroy the s6 guard's only pointer on exactly the turns the daemon
-      // cannot rebuild it — and surface it clearly flagged.
-      stalePointer = buildStaleRecallPointer(
-        await readRecallState(config.vaultPath).catch(() => null),
-      );
+      // DEGRADED, not weak — but only keep the pointer if this wire could
+      // have delivered it. Grok UPS/SS and Cursor UPS drop inject, so a
+      // leftover consumed=false would arm UNCONSULTED against an envelope
+      // the model never saw. Same gate as the plant: canInject(UPS) or clear.
+      if (canInject(wire, "UserPromptSubmit")) {
+        stalePointer = buildStaleRecallPointer(
+          await readRecallState(config.vaultPath).catch(() => null),
+        );
+      } else {
+        await clearRecallState(config.vaultPath).catch(() => {});
+      }
     } else {
       await clearRecallState(config.vaultPath).catch(() => {});
     }
@@ -1518,6 +1535,10 @@ export function createHookHandlers(
   ): Promise<PreToolUseDecisionOutput> {
     const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
     if (mode === "off") return preToolUseAllow();
+    // s6 deny is a backstop for an envelope the model actually received.
+    // Dropped UPS (Grok, Cursor, unprofiled) never delivers that envelope;
+    // leftover consumed=false must not deny cold tools.
+    if (!canInject(wire, "UserPromptSubmit")) return preToolUseAllow();
 
     const toolName = asString(payload.tool_name);
     if (!toolName) return preToolUseAllow();

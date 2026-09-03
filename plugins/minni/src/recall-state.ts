@@ -272,7 +272,12 @@ export async function readRecallState(vaultPath: string): Promise<RecallState | 
 
 /** Remove the recall-state file (used on weak turns to clear a stale strong pointer). */
 export async function clearRecallState(vaultPath: string): Promise<void> {
-  await rm(recallStatePath(vaultPath), { force: true });
+  const filePath = recallStatePath(vaultPath);
+  // H2: a bare rm follows a parent dir symlink — <vault>/.runtime → outside
+  // would unlink the real file in the escape target. Write/markConsumed already
+  // refuse that; clear must too. Callers treat a throw as best-effort no-op.
+  assertWriteTargetUnder(filePath, vaultPath);
+  await rm(filePath, { force: true });
 }
 
 /**
