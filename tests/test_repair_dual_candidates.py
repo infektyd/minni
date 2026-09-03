@@ -648,11 +648,19 @@ def test_repair_dual_does_not_commit_via_cursor_mid_txn(tmp_path, monkeypatch):
 
 
 def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
-    """Medium #4: compact_distillation mirrors ingest UNIQUE / in-txn recheck."""
+    """Medium #4: compact_distillation mirrors ingest UNIQUE / in-txn recheck.
+
+    Keys are sha-scoped: only a same-sha key hit skips. The seed must carry
+    the ACTUAL distilled body (a divergent body extras-at-next-idx instead —
+    see the next test).
+    """
     from minni.afm_passes import compact_distillation as cd
 
     db, cfg = _make_db(tmp_path)
-    content = "Compaction summary — Key technical concepts: race on bootout"
+    content = (
+        "Compaction summary — Key technical concepts: "
+        "race on bootout after launchctl error 5"
+    )
 
     # Pre-seed a twin key as if another process already inserted.
     _insert_candidate(
@@ -690,10 +698,8 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
     monkeypatch.setattr(cd, "default_provider_chain", lambda: None)
 
     # Bypass file-level short-circuit by clearing pre-scan occupancy for
-    # this file. The pre-scan uses _fills_for_file which will see our seed
-    # and extras-at-next-idx (or skip on matching sha). Exercise the in-txn
-    # UNIQUE path by emptying occupancy so the insert path runs, then
-    # UNIQUE/recheck must hold.
+    # this file. Exercise the in-txn recheck path by emptying occupancy so
+    # the insert path runs, then the sha-compare recheck must skip.
     monkeypatch.setattr(cd, "_existing_keys", lambda db, principals=None: set())
     monkeypatch.setattr(cd, "_fills_for_file", lambda db, principal, inbox_file: [])
 
@@ -702,6 +708,80 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
     with db.cursor() as c:
         c.execute("SELECT COUNT(*) AS n FROM candidate_packets")
         assert dict(c.fetchone())["n"] == 1
+    # The distilled sha is durably present, so the file retires.
+    assert res["archived_with_shared"] == 1
+    assert not (inbox / "compact-1.json").exists()
+    assert (inbox / ".archive" / "compact-1.json").is_file()
+
+
+def test_distill_in_txn_recheck_extras_divergent_body_at_next_idx(
+    tmp_path, monkeypatch
+):
+    """Sha-scoped keys: a leftover (file, index) key with a DIVERGENT body
+    must not swallow the distilled section — it extras-at-next-idx."""
+    from minni.afm_passes import compact_distillation as cd
+
+    db, cfg = _make_db(tmp_path)
+    # Leftover occupies (compact-1.json, 0) with a different body.
+    _insert_candidate(
+        db,
+        content="Compaction summary — Key technical concepts: race on bootout",
+        status="proposed",
+        inbox_file="compact-1.json",
+        candidate_index=0,
+        principal="codex",
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "compact-1.json").write_text(
+        json.dumps(
+            {
+                "kind": "compact_summary",
+                "agent_id": "codex",
+                "workspace_id": "default",
+                "summary_id": "s1",
+                "platform": "codex",
+                "summary_text": (
+                    "1. Key technical concepts:\n"
+                    "race on bootout after launchctl error 5\n\n"
+                    "2. All user messages:\n"
+                    "please fix it\n"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Force no AFM so deterministic fallback is used.
+    monkeypatch.setattr(cd, "resolve_afm_mode", lambda: "off")
+    monkeypatch.setattr(cd, "default_provider_chain", lambda: None)
+
+    # Same empty pre-scan as the skip test so the in-txn recheck path runs.
+    monkeypatch.setattr(cd, "_existing_keys", lambda db, principals=None: set())
+    monkeypatch.setattr(cd, "_fills_for_file", lambda db, principal, inbox_file: [])
+
+    res = cd.distill(db, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1
+    with db.cursor() as c:
+        c.execute(
+            "SELECT content, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 2
+    extra = [
+        r
+        for r in rows
+        if "race on bootout after launchctl error 5" in r["content"]
+    ]
+    assert len(extra) == 1
+    assert json.loads(extra[0]["derived_from"]).get("candidate_index") == 1
+    # Once the extra fill lands, the file retires — same lifecycle as the
+    # leftover-alias merge case in test_compact_distillation.py.
+    assert res["archived_with_shared"] == 1
+    assert not (inbox / "compact-1.json").exists()
+    assert (inbox / ".archive" / "compact-1.json").is_file()
 
 
 def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
