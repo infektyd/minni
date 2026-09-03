@@ -849,6 +849,48 @@ def test_unsectioned_summary_upgraded_to_shared_when_afm_distills(tmp_path, monk
     assert (inbox / ".archive" / "flat.json").is_file()
 
 
+def test_session_distill_receives_redacted_shared_section():
+    """Native session_distill must not see raw local paths / keys.
+
+    compact_distillation used to hand shared-section bodies to AFM unredacted
+    and only _redact the stored candidate afterward.
+    """
+    import minni.afm_passes.compact_distillation as mod
+
+    secret = "sk-testhook"
+    local = "/Users/someone/secret/token.log"
+    calls = []
+
+    class FakeResult:
+        ok = True
+        data = {
+            "title": "Path leak",
+            "assertion": "Never send local paths to AFM",
+        }
+
+    class FakeChain:
+        def native_op(self, operation, payload, timeout=2.0):
+            calls.append(payload.get("text") or "")
+            return FakeResult()
+
+    doc = {
+        "summary_text": (
+            "1. Key technical concepts:\n"
+            f"   Durable fd leak fix documented at {local} key {secret}\n"
+            "2. All user messages:\n"
+            "   ignore this personal narration\n"
+        )
+    }
+    candidates, _personal, _dropped = mod._distill_file(doc, FakeChain())
+    assert calls, "session_distill must be invoked for the shared section"
+    payload = calls[0]
+    assert secret not in payload, payload
+    assert local not in payload, payload
+    assert "[local-path]" in payload
+    assert "[redacted-key]" in payload
+    assert candidates, "redacted shared section must still yield a candidate"
+
+
 def test_afm_path_uses_session_distill_with_fallback(tmp_path, monkeypatch):
     from minni.afm_passes.compact_distillation import distill
     import minni.afm_passes.compact_distillation as mod

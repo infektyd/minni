@@ -99,50 +99,12 @@ from minni.afm_passes.inbox_ingest import (
     _fills_for_file,
     _is_unique_integrity_error,
     _principal_for_inbox,
+    _remap_rows_against_occupancy,
     _sha_set,
     discover_inboxes,
 )
 
 logger = logging.getLogger("sovereign.afm.compact_distillation")
-
-
-def _remap_rows_against_occupancy(
-    rows: List[Dict[str, Any]],
-    occupancy: Dict[Tuple[str, str], Dict[int, set]],
-) -> Tuple[List[Dict[str, Any]], int]:
-    """Re-run extras-at-next-idx against in-txn occupancy.
-
-    Pre-scan occupancy can miss leftover fills (``_fills_for_file`` empty or
-    a race). UNIQUE is (canon, file, idx) with no content_sha1, so a key hit
-    without this remap unique-skips a divergent section-0 body.
-    """
-    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    order: List[Tuple[str, str]] = []
-    for r in rows:
-        key = (_canonical_principal(r["principal"]), r["inbox_file"])
-        if key not in grouped:
-            order.append(key)
-            grouped[key] = []
-        grouped[key].append(r)
-    out: List[Dict[str, Any]] = []
-    skipped = 0
-    for key in order:
-        file_rows = grouped[key]
-        slot = occupancy.setdefault(key, {})
-        requested = [
-            (int(r["candidate_index"]), _content_sha1(r["content"]))
-            for r in file_rows
-        ]
-        assigned = _assign_fill_indices(slot, requested)
-        for r, new_idx in zip(file_rows, assigned):
-            if new_idx is None:
-                skipped += 1
-                continue
-            if new_idx != r["candidate_index"]:
-                r = dict(r)
-                r["candidate_index"] = new_idx
-            out.append(r)
-    return out, skipped
 
 #: File-format tag written by the hook-side harvest.
 COMPACT_SUMMARY_KIND = "compact_summary"
@@ -213,7 +175,7 @@ def _split_sections(body: str) -> List[Tuple[str, str]]:
 def _afm_distill_section(chain, title: str, content: str) -> Optional[str]:
     """One guided session_distill call; None on any miss (caller falls back)."""
     try:
-        payload_text = f"{title}:\n{content}"[:SECTION_AFM_MAX_CHARS]
+        payload_text = f"{title}:\n{_redact(content)}"[:SECTION_AFM_MAX_CHARS]
         result = chain.native_op("session_distill", {"text": payload_text}, timeout=4.0)
     except Exception:
         logger.exception("compact distill: session_distill raised for %r", title)

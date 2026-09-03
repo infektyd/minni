@@ -226,6 +226,57 @@ def test_ingest_divergent_leftover_body_extras_at_next_index(tmp_path):
         assert {r["principal"] for r in extra} == {canonical}
 
 
+def test_ingest_in_txn_leftover_unique_extras_divergent_body(tmp_path, monkeypatch):
+    """Leftover 0 body L + remapped D at the same app key must extras-at-next-idx.
+
+    Pre-scan occupancy already extras. Emptying _existing_fills assigns D the
+    leftover key (stale occupancy / TOCTOU). ingest() used to skip that key
+    in-txn with no content_sha1 compare, and UNIQUE IntegrityError was
+    already_present with no extras remap. Do not monkeypatch _existing_keys —
+    ingest no longer consults it, so that patch stays green on the miss.
+    """
+    from minni.afm_passes import inbox_ingest as ii
+
+    leftover_body = "leftover L occupying session.json index 0"
+    live_body = "divergent remapped D that leftover UNIQUE must not swallow"
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    monkeypatch.setattr(ii, "_existing_fills", lambda db, principals=None: {})
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=leftover_body,
+        )
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+        res = ii.ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, (vault_dir, res)
+        assert res["already_present"] == 0, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, principal, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, (vault_dir, contents)
+        assert live_body in contents, (vault_dir, contents)
+        by_idx = {
+            json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
+        }
+        assert 0 in by_idx and leftover_body in by_idx[0]["content"]
+        extra = [r for r in rows if live_body in r["content"]]
+        extra_idx = json.loads(extra[0]["derived_from"]).get("candidate_index")
+        assert extra_idx not in {0}, (vault_dir, extra_idx)
+        assert {r["principal"] for r in extra} == {canonical}
+
+
 def test_assign_fill_indices_skips_duplicate_extra_sha():
     """Occupied leftover 0 + two identical D extras must share one next_idx.
 

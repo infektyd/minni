@@ -444,6 +444,45 @@ def _assign_fill_indices(
     return assigned
 
 
+def _remap_rows_against_occupancy(
+    rows: List[Dict[str, Any]],
+    occupancy: Dict[Tuple[str, str], Dict[int, set]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Re-run extras-at-next-idx against in-txn occupancy.
+
+    Pre-scan occupancy can miss leftover fills (``_existing_fills`` emptied or
+    a race). UNIQUE is (canon, file, idx) with no content_sha1, so a key hit
+    without this remap unique-skips a divergent index-0 body.
+    """
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    order: List[Tuple[str, str]] = []
+    for r in rows:
+        key = (_canonical_principal(r["principal"]), r["inbox_file"])
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        grouped[key].append(r)
+    out: List[Dict[str, Any]] = []
+    skipped = 0
+    for key in order:
+        file_rows = grouped[key]
+        slot = occupancy.setdefault(key, {})
+        requested = [
+            (int(r["candidate_index"]), _content_sha1(r["content"]))
+            for r in file_rows
+        ]
+        assigned = _assign_fill_indices(slot, requested)
+        for r, new_idx in zip(file_rows, assigned):
+            if new_idx is None:
+                skipped += 1
+                continue
+            if new_idx != r["candidate_index"]:
+                r = dict(r)
+                r["candidate_index"] = new_idx
+            out.append(r)
+    return out, skipped
+
+
 def _existing_keys_for_on_cursor(c, wanted: set) -> set:
     """Return which of ``wanted`` keys already exist — narrow scan under txn.
 
@@ -743,65 +782,91 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
     inserted = 0
     if not dry_run and to_insert:
         with db.transaction() as c:
-            # Issue #239: re-load only the keys we intend to insert (not the
-            # full table) under BEGIN IMMEDIATE so concurrent ingest cannot
-            # both pass the pre-txn check and create twins. UNIQUE swallow
-            # remains the last backstop if the operator applied the index.
-            # Key is principal-scoped so multi-vault same basenames coexist.
-            wanted = {
-                _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
-                for r in to_insert
+            # In-txn occupancy, not the pre-scan _existing_fills map: leftover
+            # 0 with a divergent body extras-at-next-idx even when occupancy
+            # extras were skipped (stale pre-scan / TOCTOU). UNIQUE is
+            # (canon, file, idx) with no content_sha1; a key-only skip
+            # unique-swallows remapped qty.
+            durable_occupancy = _existing_fills_on_cursor(
+                c, {r["principal"] for r in to_insert}
+            )
+            occupancy: Dict[Tuple[str, str], Dict[int, set]] = {
+                k: {idx: set(shas) for idx, shas in slot.items()}
+                for k, slot in durable_occupancy.items()
             }
-            txn_existing = _existing_keys_for_on_cursor(c, wanted)
+            remapped, remap_skipped = _remap_rows_against_occupancy(
+                to_insert, occupancy
+            )
+            already += remap_skipped
 
-            for r in to_insert:
-                key = _make_inbox_key(
-                    r["principal"], r["inbox_file"], r["candidate_index"]
+            for r in remapped:
+                sha = _content_sha1(r["content"])
+                file_key = (
+                    _canonical_principal(r["principal"]), r["inbox_file"]
                 )
-                if key in txn_existing:
-                    already += 1
-                    continue
-                derived_obj: Dict[str, Any] = {
-                    "source": "inbox",
-                    "inbox_file": r["inbox_file"],
-                    "candidate_index": r["candidate_index"],
-                    "kind": r.get("kind"),
-                    "content_sha1": _content_sha1(r["content"]),
-                }
-                source_principal = r.get("source_principal")
-                if source_principal:
-                    derived_obj["source_principal"] = source_principal
-                derived_from = json.dumps(derived_obj)
-                try:
-                    c.execute(
-                        """
-                        INSERT INTO candidate_packets
-                        (principal, workspace_id, layer, privacy_level, content,
-                         evidence_refs, derived_from, instruction_like, status, proposed_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                        """,
-                        (
-                            r["principal"],
-                            r["workspace_id"],
-                            None,
-                            r["privacy_level"],
-                            r["content"],
-                            json.dumps([]),
-                            derived_from,
-                            1 if is_instruction_like(r["content"]) else 0,
-                            r["proposed_at"],
-                        ),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    # Unique-index collision (post-#239 repair) or rare race:
-                    # treat as already_present rather than aborting the batch.
-                    # Re-raise CHECK/NOT NULL/FK integrity failures.
-                    if not _is_unique_integrity_error(exc):
-                        raise
-                    already += 1
-                    continue
-                txn_existing.add(key)
-                inserted += 1
+                attempts = 0
+                while True:
+                    derived_obj: Dict[str, Any] = {
+                        "source": "inbox",
+                        "inbox_file": r["inbox_file"],
+                        "candidate_index": r["candidate_index"],
+                        "kind": r.get("kind"),
+                        "content_sha1": sha,
+                    }
+                    source_principal = r.get("source_principal")
+                    if source_principal:
+                        derived_obj["source_principal"] = source_principal
+                    derived_from = json.dumps(derived_obj)
+                    try:
+                        c.execute(
+                            """
+                            INSERT INTO candidate_packets
+                            (principal, workspace_id, layer, privacy_level, content,
+                             evidence_refs, derived_from, instruction_like, status, proposed_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                            """,
+                            (
+                                r["principal"],
+                                r["workspace_id"],
+                                None,
+                                r["privacy_level"],
+                                r["content"],
+                                json.dumps([]),
+                                derived_from,
+                                1 if is_instruction_like(r["content"]) else 0,
+                                r["proposed_at"],
+                            ),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        # Unique-index collision: compare sha against the
+                        # durable leftover and extras-at-next-idx when
+                        # divergent rather than treating leftover 0 as
+                        # already_present.
+                        if not _is_unique_integrity_error(exc):
+                            raise
+                        held = _all_occupied_shas(
+                            durable_occupancy.get(file_key, {})
+                        )
+                        if sha in held:
+                            already += 1
+                            break
+                        slot = occupancy.setdefault(file_key, {})
+                        next_idx = (max(slot) if slot else -1) + 1
+                        if next_idx <= int(r["candidate_index"]):
+                            next_idx = int(r["candidate_index"]) + 1
+                        r = dict(r)
+                        r["candidate_index"] = next_idx
+                        slot[next_idx] = {sha}
+                        attempts += 1
+                        if attempts > 8:
+                            already += 1
+                            break
+                        continue
+                    occupancy.setdefault(file_key, {}).setdefault(
+                        r["candidate_index"], set()
+                    ).add(sha)
+                    inserted += 1
+                    break
 
     return {
         "inboxes": [str(p) for p in inboxes],
