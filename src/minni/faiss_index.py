@@ -367,8 +367,17 @@ class FAISSIndex:
         before the whole batch (nothing lands) or after it (everything is
         cleared together) — never between two adds, which is the interleave
         that leaves a partial residual index. Returns False when cold or
-        invalidated: the caller's rows are already in the DB, and the next
-        ensure-load rebuilds fully.
+        invalidated: the caller's rows are already in the DB.
+
+        SKIP FLOOR: a False return does NOT mean "the next ensure-load
+        rebuilds fully". Under the search-deadline floor
+        (SEARCH_FAISS_REBUILD_MIN_REMAINING_S = 27s) an in-request ensure
+        after a disk miss SKIPS the rebuild — default leftover (22.5s / 27s)
+        is at or below the floor — so a cold index stays cold for every
+        default-budget search. Any path that leaves the index cold (this
+        return, invalidate()) MUST unbounded-ensure off the RPC
+        (deadline None, e.g. _warmup_models / _ensure_vault_engines_unbounded)
+        or the new rows are FTS-only until a large-budget search arrives.
         """
         with self._lock:
             if not self._ready:
