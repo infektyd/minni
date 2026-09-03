@@ -158,13 +158,14 @@ test("PreToolUse never emits Claude permissionDecision shape (hooks disabled / a
   }
 });
 
-test("native Grok read_file is denied once when strong recall is pending", async () => {
+test("native Grok read_file allows leftover consumed=false — UPS inject is dropped", async () => {
   const fixture = await makeFixture();
   try {
     const runtime = path.join(fixture.vault, ".runtime");
     await mkdir(runtime, { recursive: true });
+    const statePath = path.join(runtime, "recall-state.json");
     await writeFile(
-      path.join(runtime, "recall-state.json"),
+      statePath,
       JSON.stringify({
         task_signature: "grok-task",
         intent: "status",
@@ -178,13 +179,11 @@ test("native Grok read_file is denied once when strong recall is pending", async
       toolName: "read_file",
       toolInput: { target_file: "/tmp/work/src/main.ts" },
     });
-    const denied = await runGrokHook("PreToolUse", fixture, payload);
-    assert.equal(denied.decision, "deny");
-    assert.match(denied.reason, /prior-fix/);
-    // Idempotent re-issue: consumed=true ⇒ allow.
     assert.deepEqual(await runGrokHook("PreToolUse", fixture, payload), {
       decision: "allow",
     });
+    const leftover = JSON.parse(await readFile(statePath, "utf8"));
+    assert.equal(leftover.consumed, false, "defense in depth must not consume; leftover file cannot deny");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

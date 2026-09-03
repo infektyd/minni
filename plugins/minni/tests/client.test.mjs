@@ -170,5 +170,6 @@ test("new memory RPC helpers send expected JSON-RPC methods", async () => {
   assert.deepEqual(calls[0].params.result_ids, [1]);
   assert.deepEqual(calls[0].params.references, [{ doc_id: 2, src: "p", wikilink: "[[wiki/codex]]" }]);
   assert.equal(calls[1].params.cache_key, "k");
+  assert.equal(calls[1].params.timeout_ms, 30000);
   assert.equal(calls[2].params.lease_id, "lease");
 });

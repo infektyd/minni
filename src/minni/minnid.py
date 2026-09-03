@@ -232,10 +232,20 @@ def _handler_principal(params, request_id, **kwargs):
 
 
 def _reload_runtime_config(signum=None, frame=None) -> None:
-    """Clear identity and per-vault caches after operator config changes."""
+    """Clear identity and per-vault caches after operator config changes.
+
+    The vault-cache clear strands the replacement engines cold: default
+    leftover never rebuilds a cold FAISSIndex in-request, so the next
+    personal search would degrade to FTS-only. Unbounded-ensure the
+    replacements here, mirroring _vault_watch_runner. This BLOCKS the
+    signal handler on a full SELECT + FAISS build — accepted: a SIGHUP is
+    operator-rare, and the alternative is silent semantic blindness.
+    """
     agent_scope_for.cache_clear()
     _vault_retrieval_cache.clear()
     logger.info("SIGHUP received — cleared identity/runtime caches")
+    _ensure_vault_engines_unbounded()
+    logger.info("SIGHUP: per-vault FAISS rewarmed (blocked handler on ensure)")
 
 
 def _lazy_retrieval():
@@ -1007,11 +1017,22 @@ def _warmup_models() -> None:
         get_embedder()
         if DEFAULT_CONFIG.reranker_enabled:
             get_cross_encoder()
-        _lazy_retrieval()
+        # Constructing the engine is not enough: default leftover (22.5s /
+        # 27s) never starts an in-request FAISS rebuild. Load it here with
+        # no deadline so the first 25s/30s search finds the index ready.
+        # Per-vault engines are a separate cold FAISSIndex; warmup must
+        # unbounded-ensure those too or personal/combined hybrid stays FTS-only.
+        engine = _lazy_retrieval()
+        engine._set_current_deadline(None)
+        engine._ensure_faiss_loaded()
+        _ensure_vault_engines_unbounded()
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("warmup failed after %.1fs: %s", time.monotonic() - start, exc)
         return
-    logger.info("warmup complete in %.1fs (embedder, reranker, retrieval engine)", time.monotonic() - start)
+    logger.info(
+        "warmup complete in %.1fs (embedder, reranker, retrieval engine, FAISS)",
+        time.monotonic() - start,
+    )
 
 
 async def _warmup_runner() -> None:
@@ -1048,15 +1069,40 @@ def _expire_shared_vault_drafts() -> int:
     return _expire_stale_drafts(Path(DEFAULT_CONFIG.vault_path).expanduser())
 
 
+def _ensure_vault_engines_unbounded() -> None:
+    """Load per-vault FAISS off the RPC.
+
+    `_lazy_vault_retrieval` constructs a cold FAISSIndex. Default leftover
+    (22.5s / 27s) never starts an in-request rebuild after a disk miss, and
+    vault-watch cache clear drops the memoized engine so the next search
+    builds another cold one. Warmup and vault-watch must unbounded-ensure
+    these engines the same way `_invalidate_shared_faiss` does for shared.
+    """
+    try:
+        cached_list = _all_vault_retrievals()
+    except Exception:
+        logger.exception("per-vault FAISS unbounded ensure: listing failed")
+        return
+    for cached in cached_list:
+        if not cached:
+            continue
+        engine = cached[0]
+        try:
+            engine._set_current_deadline(None)
+            engine._ensure_faiss_loaded()
+        except Exception:
+            logger.exception("per-vault FAISS unbounded ensure failed")
+
+
 def _invalidate_shared_faiss() -> None:
     """Make chunks the sweep just wrote visible to the live engine's semantic leg.
 
     index_shared_vault writes through its OWN short-lived SovereignDB and
     VaultIndexer, so its FAISS rebuild lands on a throwaway instance. The
     daemon's process-wide RetrievalEngine keeps the in-memory index it built at
-    startup, and _ensure_faiss_loaded returns early while count > 0 — so new
-    chunks stayed invisible to semantic recall until restart even though FTS
-    could see them. Invalidating forces the next search to rebuild from the DB.
+    startup. Invalidating drops that snapshot; reload it here on the vault-watch
+    thread (no deadline) because default leftover (22.5s / 27s) will not start
+    an in-request rebuild.
 
     Deliberately does NOT call _lazy_retrieval(): if the engine has not been
     constructed yet there is nothing stale to fix, and constructing one here
@@ -1066,7 +1112,11 @@ def _invalidate_shared_faiss() -> None:
         return
     try:
         _retrieval.faiss_index.invalidate()
-        logger.info("Vault watch: invalidated live FAISS; next search rebuilds from DB")
+        # Reused to_thread workers can still hold a leftover search deadline
+        # on this engine's thread-local; clear it so ensure is unbounded.
+        _retrieval._set_current_deadline(None)
+        _retrieval._ensure_faiss_loaded()
+        logger.info("Vault watch: invalidated live FAISS and reloaded from DB")
     except Exception:
         logger.exception("Vault watch: FAISS invalidation failed")
 
@@ -1171,6 +1221,10 @@ async def _vault_watch_runner():
                 # daemon restart, with no change to the index itself.
                 _vault_retrieval_cache.clear()
                 logger.info("Vault watch: cleared per-vault retrieval cache")
+                # Cache clear constructs a new cold FAISSIndex on the next
+                # `_lazy_vault_retrieval`. Default leftover never rebuilds
+                # that in-request; unbounded-ensure the replacements here.
+                _ensure_vault_engines_unbounded()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1290,8 +1344,10 @@ def _backfill_sweep_once() -> dict:
     # index (count > 0 → _ensure_faiss_loaded early-returns), so backfilled
     # vault rows would stay invisible to semantic recall until restart — the
     # same blindness the shared-index refresh above exists to prevent. Drop the
-    # cache when any vault made progress, exactly as the vault watch does; the
-    # next search rebuilds the engine and loads the new rows.
+    # cache when any vault made progress, exactly as the vault watch does.
+    # Cache clear constructs a new cold FAISSIndex on the next
+    # `_lazy_vault_retrieval`. Default leftover never rebuilds that in-request;
+    # unbounded-ensure the replacements here, mirroring _vault_watch_runner.
     for name, s in results.items():
         if name == "shared" or not isinstance(s, dict):
             continue
@@ -1302,6 +1358,7 @@ def _backfill_sweep_once() -> dict:
                 "Backfill: vault %s gained vectors — cleared per-vault "
                 "retrieval cache", name,
             )
+            _ensure_vault_engines_unbounded()
             break
 
     # R7: reconcile episodic_fts on every sweep, not only in migration 018.

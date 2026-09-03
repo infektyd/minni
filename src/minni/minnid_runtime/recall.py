@@ -21,6 +21,40 @@ from .redaction import redact_text, redact_value
 
 logger = logging.getLogger("minnid")
 
+# Plugin DEFAULT_JSON_RPC_TIMEOUT_MS is 30_000. Search runs in to_thread and
+# cannot be cancelled; finish inside the client kill or the worker keeps
+# burning after the socket is gone. Callers may pass timeout_ms (ms).
+DEFAULT_SEARCH_BUDGET_MS = 25_000
+SEARCH_BUDGET_CLIENT_FRACTION = 0.9
+_SEARCH_BUDGET_MS_MAX = 300_000
+
+
+def _search_deadline_monotonic(params: dict) -> float:
+    raw = params.get("timeout_ms")
+    try:
+        if raw is None or raw == "":
+            budget_ms = DEFAULT_SEARCH_BUDGET_MS
+        else:
+            budget_ms = int(raw)
+    except (TypeError, ValueError):
+        budget_ms = DEFAULT_SEARCH_BUDGET_MS
+    budget_ms = max(1, min(budget_ms, _SEARCH_BUDGET_MS_MAX))
+    work_ms = max(1, int(budget_ms * SEARCH_BUDGET_CLIENT_FRACTION))
+    now = time.monotonic()
+    start = now
+    # Dispatch stamps this at request accept, before asyncio.to_thread
+    # queues the handler. A 10s dequeue wait on a 30s plugin kill must
+    # shrink leftover, not grant a fresh 27s work budget.
+    accepted = params.get("_accepted_monotonic")
+    try:
+        if accepted is not None and accepted != "":
+            accepted_f = float(accepted)
+            if accepted_f <= now:
+                start = accepted_f
+    except (TypeError, ValueError):
+        pass
+    return start + (work_ms / 1000.0)
+
 
 @dataclass(frozen=True)
 class RecallContext:
@@ -65,16 +99,106 @@ def result_identity(row: dict) -> tuple:
     )
 
 
+_QTY_ENGINE_KEY = "_qty_engine"
+_DEADLINE_POISONED_KEY = "_deadline_poisoned"
+
+
+def _ranking_deadline_poisoned(retrieval_engine: Any) -> bool:
+    """True when this leg's returned ranking is FTS-only or CE-skipped.
+
+    A skipped HyDE enrichment is not ranking poison — first-pass hybrid still
+    counts as a fill.
+    """
+    for attr in ("last_vector_degraded", "last_rerank_degraded"):
+        flag = getattr(retrieval_engine, attr, None)
+        if isinstance(flag, str) and "search deadline" in flag.lower():
+            return True
+    return False
+
+
+def _caller_visible_deadline_poisoned(results: list) -> bool:
+    """True when the merged ranking is non-empty and every dict row is poisoned.
+
+    An empty personal vault miss is not a healthy fill. Learnings qty follows
+    the caller-visible set, not a sticky per-leg ranking flag.
+    """
+    if not results:
+        return False
+    dict_rows = [r for r in results if isinstance(r, dict)]
+    return bool(dict_rows) and all(r.get(_DEADLINE_POISONED_KEY) for r in dict_rows)
+
+
+def _bump_merged_document_access(results: list) -> None:
+    """Qty-delta unique returned docs once per search cycle, per engine db."""
+    seen: set[tuple[int, Any]] = set()
+    now = time.time()
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        if row.get(_DEADLINE_POISONED_KEY):
+            continue
+        engine = row.get(_QTY_ENGINE_KEY)
+        doc_id = row.get("doc_id")
+        db = getattr(engine, "db", None)
+        if db is None or doc_id is None:
+            continue
+        key = (id(engine), doc_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        with db.cursor() as c:
+            c.execute(
+                """UPDATE documents
+                   SET access_count = access_count + 1, last_accessed = ?
+                   WHERE doc_id = ?""",
+                (now, doc_id),
+            )
+
+
+def _strip_private_search_keys(results: list) -> None:
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        row.pop(_QTY_ENGINE_KEY, None)
+        row.pop(_DEADLINE_POISONED_KEY, None)
+
+
 def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
+    has_healthy = any(
+        isinstance(row, dict) and not row.get(_DEADLINE_POISONED_KEY)
+        for rows in result_sets
+        for row in rows
+    )
     merged = []
     for rows in result_sets:
-        merged.extend(rows)
+        if has_healthy:
+            # Drop poisoned later-scope FTS before sort/slice. Unmatched
+            # deadline RRF>0 otherwise evicts a completed hybrid (negative CE
+            # logit) from [:limit] — combined too, not only prefer_personal.
+            merged.extend(
+                row
+                for row in rows
+                if not (isinstance(row, dict) and row.get(_DEADLINE_POISONED_KEY))
+            )
+        else:
+            merged.extend(rows)
     if prefer_personal:
         deduped = {}
         for row in merged:
             key = result_identity(row)
             existing = deduped.get(key)
             if existing is None:
+                deduped[key] = row
+                continue
+            row_poisoned = bool(row.get(_DEADLINE_POISONED_KEY))
+            existing_poisoned = bool(existing.get(_DEADLINE_POISONED_KEY))
+            # A later deadline retrieve can score FTS-only RRF>0 against a
+            # completed hybrid with a negative CE logit. Do not replace the
+            # healthy twin; prefer a later healthy row over an earlier
+            # poisoned one.
+            if row_poisoned and not existing_poisoned:
+                continue
+            if existing_poisoned and not row_poisoned:
                 deduped[key] = row
                 continue
             row_score = float(row.get("score") or 0.0)
@@ -298,6 +422,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()
+    deadline_monotonic = _search_deadline_monotonic(params)
 
     query = params.get("query", "")
     if not query:
@@ -380,6 +505,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # shared reports are one report; a second shared report that differs is
         # news and lands. Per-vault entries never enter this path.
         _shared_seen: dict[str, set] = {"degradation": set(), "auth": set()}
+        # Empty-abort skip must follow whichever retrieve_from ran, not the
+        # shared lazy_retrieval() engine. scope=personal with a vault returns
+        # from the vault leg on a deadline miss and never touches shared.
+        cycle_deadline_poisoned = False
 
         def record_shared(entry: dict, *, bucket: str, sink: list) -> None:
             key = json.dumps(entry, sort_keys=True, default=str)
@@ -396,6 +525,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             shared: bool = False,
             source_agent: Optional[str] = None,
         ) -> list:
+            nonlocal cycle_deadline_poisoned
             rows = retrieval_engine.retrieve(
                 query=query,
                 agent_id=agent_id,
@@ -416,7 +546,12 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     if principal_for_documents is not None
                     else "default"
                 ),
+                deadline_monotonic=deadline_monotonic,
+                update_access=False,
             )
+            poisoned = _ranking_deadline_poisoned(retrieval_engine)
+            if poisoned:
+                cycle_deadline_poisoned = True
             suppression = getattr(retrieval_engine, "last_auth_suppression", None)
             if suppression:
                 # Review round 2: the suppression channel had the same
@@ -433,7 +568,14 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 record_shared(degradation, bucket="degradation", sink=degradations)
             else:
                 degradations.append(degradation)
-            return tag_document_results(rows, src=src)
+            tagged = tag_document_results(rows, src=src)
+            for row in tagged:
+                if not isinstance(row, dict):
+                    continue
+                row[_QTY_ENGINE_KEY] = retrieval_engine
+                if poisoned:
+                    row[_DEADLINE_POISONED_KEY] = True
+            return tagged
 
         def retrieve_shared() -> list:
             return retrieve_from(
@@ -639,6 +781,25 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # is now raw-only (db=None); this loop records every final row's raw
         # into the SHARED window and rewrites its confidence onto that one
         # basis, then pops the carrier so the transport surface is unchanged.
+        # Deadline FTS-only RRF (no semantic weight, no CE logit) and
+        # deadline-skipped CE (hybrid RRF, still no CE logit) are a
+        # different numeric population than hybrid+CE scores. Encoder-down
+        # FTS still records — that path is the historical calibration
+        # feeder. Gate qty/calibration on the ranking that was actually
+        # returned: a skipped HyDE enrichment is not poison, and a later
+        # deadline leg must not wipe a completed hybrid fill in the same RPC.
+        # Learnings qty is not per-row — skip it when the merged
+        # caller-visible set is non-empty and every dict row is poisoned,
+        # or when the document ranking is empty AND this cycle aborted on
+        # a search deadline (FTS miss after vector/CE skip). Key empty-abort
+        # off retrieve_from cycle poison, not the shared engine: a personal
+        # vault miss never sets shared flags. An empty personal miss must
+        # not fail-open that gate, and an empty deadline cycle must not
+        # qty-delta learnings.
+        skip_score_record = _caller_visible_deadline_poisoned(results) or (
+            not results and cycle_deadline_poisoned
+        )
+        _bump_merged_document_access(results)
         try:
             from minni.rationale import explain
             from minni.retrieval import _recommended_action
@@ -654,8 +815,11 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             for r in results:
                 if not isinstance(r, dict):
                     continue
+                poisoned_row = bool(r.get(_DEADLINE_POISONED_KEY))
                 raw_score = r.pop("confidence_raw", None)
                 if raw_score is None:
+                    continue
+                if skip_score_record or poisoned_row:
                     continue
                 try:
                     record_score(float(raw_score), "combined", engine.db)
@@ -697,6 +861,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         )
         except Exception as exc:
             context.logger.warning("search: score recording failed: %s", exc)
+        _strip_private_search_keys(results)
 
         learnings: list = []
         try:
@@ -706,6 +871,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 cross_agent=learnings_cross_agent,
                 limit=limit,
                 source="minnid.search",
+                update_access=not skip_score_record,
             )
         except Exception as exc:
             context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
@@ -1354,6 +1520,7 @@ def handle_sm_export_pack(params: dict, request_id: Any, context: RecallContext)
     budget_tokens = int(params.get("budget_tokens", 4096))
     cache_key = str(params.get("cache_key", "default"))
     limit = min(int(params.get("limit", 12)), 50)
+    deadline_monotonic = _search_deadline_monotonic(params)
 
     try:
         engine = context.lazy_retrieval()
@@ -1365,6 +1532,7 @@ def handle_sm_export_pack(params: dict, request_id: Any, context: RecallContext)
             update_access=False,
             principal=principal,
             workspace=principal.workspace_id if principal is not None else (workspace_id or "default"),
+            deadline_monotonic=deadline_monotonic,
         )
         prefix_anchors = []
         for result in sorted(

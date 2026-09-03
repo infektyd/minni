@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import logging
+import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -56,6 +57,9 @@ async def dispatch_request(request: dict, context: DispatchContext) -> dict:
     params["_recovery"] = provenance.recovery is not None
     if provenance.principal is not None:
         params.setdefault("_principal", provenance.principal)
+    # Overwrite any caller-supplied value. Search budgets are from this
+    # accept instant, not after asyncio.to_thread dequeue.
+    params["_accepted_monotonic"] = time.monotonic()
 
     cap_err = context.enforce_method_capability(
         method_name,

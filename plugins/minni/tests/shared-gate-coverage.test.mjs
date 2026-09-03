@@ -20,6 +20,7 @@ test("shared model-facing tools gate before local shared work", async () => {
     ["minni_team_promotion", "team.promotion"],
     ["minni_status", "audit.status"],
     ["minni_route", "audit.route"],
+    ["minni_list_candidates", "candidates.list"],
     ["minni_resolve_candidate", "candidates.resolve"],
     ["minni_learning_quality", "audit.learning_quality"],
     ["minni_audit_report", "audit.report"],

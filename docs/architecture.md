@@ -111,7 +111,7 @@ them exactly as written (there is no family/action dispatch layer):
 |---|---|
 | Session lifecycle | `minni_prepare_task`, `minni_prepare_outcome` |
 | Recall | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
-| Learning | `minni_learn`, `minni_learning_quality`, `minni_resolve_candidate` |
+| Learning | `minni_learn`, `minni_learning_quality`, `minni_list_candidates`, `minni_resolve_candidate` |
 | Vault | `minni_vault_write`, `minni_compile_vault` |
 | Threads | `minni_thread_create`, `minni_thread_update`, `minni_thread_scar`, `minni_thread_status`, `minni_thread_replan`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_ready`, `minni_thread_assign`, `minni_thread_claim`, `minni_thread_worker_update`, `minni_thread_events` (16 tools — the pre-rename `minni_plan_*` aliases have been removed; only the `minni_thread_*` names are registered) |
 | Handoff | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_list_pending_handoffs`, `minni_await_handoff` |
@@ -147,9 +147,12 @@ by a deny-capable `PreToolUse` recall-guard backstop. Several hosts expose
 pre-tool **deny capability** (Claude, Kilo, Cursor, Grok, Antigravity/agy;
 Codex is Bash-only). **Live Minni s6 cold-tool guard** (file-backed
 recall-state + adapter/tool map that actually denies Grep/Read/Glob-class
-calls) is complete on Claude Code, Cursor, agy, Kilo, and Grok Build (Grok
-via `grok-adapter.ts`). Registration or host deny alone is not enough — Codex
-registers PreToolUse but cannot gate cold-file tools. Full matrix:
+calls) is complete on Claude Code, agy, and Kilo. Grok Build and Cursor are
+**PARTIAL**: host deny and adapters exist (`grok-adapter.ts` maps camelCase +
+natives — capability, not liveness), but UPS inject is dropped so leftover
+`consumed=false` cannot deny — host deny ≠ Minni s6 liveness. Registration or
+host deny alone is not enough — Codex registers PreToolUse but cannot gate
+cold-file tools. Full matrix:
 [docs/contracts/hook-platforms.md](contracts/hook-platforms.md). Operator
 knobs: `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables) and
 `MINNI_RECALL_GUARD_MODE` (`off` / `soft` / `strict`); the guard fails open —
