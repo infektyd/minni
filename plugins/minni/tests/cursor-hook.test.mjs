@@ -54,12 +54,13 @@ test("Cursor event and payload adapter maps native schema", () => {
   assert.equal(adapted.tool_name, "Bash");
 });
 
-test("native Cursor Shell read is denied once when strong recall is pending", async () => {
+test("native Cursor Shell read allows leftover consumed=false — UPS inject is dropped", async () => {
   const f = await fixture();
   try {
     const runtime = path.join(f.vault, ".runtime");
     await mkdir(runtime, { recursive: true });
-    await writeFile(path.join(runtime, "recall-state.json"), JSON.stringify({
+    const statePath = path.join(runtime, "recall-state.json");
+    await writeFile(statePath, JSON.stringify({
       task_signature: "cursor-task",
       intent: "status",
       top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],
@@ -73,10 +74,9 @@ test("native Cursor Shell read is denied once when strong recall is pending", as
       tool_input: { command: "rg needle ." },
       workspace_roots: ["/work/repo"],
     };
-    const denied = await run("preToolUse", f, payload);
-    assert.equal(denied.permission, "deny");
-    assert.match(denied.user_message, /prior-fix/);
     assert.deepEqual(await run("preToolUse", f, payload), { permission: "allow" });
+    const leftover = JSON.parse(await readFile(statePath, "utf8"));
+    assert.equal(leftover.consumed, false, "defense in depth must not consume; leftover file cannot deny");
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }

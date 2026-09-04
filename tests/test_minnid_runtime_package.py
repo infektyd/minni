@@ -82,7 +82,12 @@ def test_dispatch_runtime_rejects_non_object_params_before_handler():
     )
 
     assert response == make_response({"called": True}, "empty-list")
-    assert calls == [({"_recovery": False}, "empty-list")]
+    assert len(calls) == 1
+    got_params, got_id = calls[0]
+    assert got_id == "empty-list"
+    assert got_params["_recovery"] is False
+    assert isinstance(got_params["_accepted_monotonic"], float)
+    assert set(got_params) == {"_recovery", "_accepted_monotonic"}
 
     calls.clear()
     response = asyncio.run(

@@ -8,6 +8,17 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- MCP `minni_list_candidates` — hosts (Cursor included) can list their own
+  staged `candidate_packets` and pair that with existing
+  `minni_resolve_candidate`. List is this-principal only. Owner reject/redact
+  stays; accept into durable memory still requires operator/govern; a platform
+  template does not gain the cross-principal `resolve_candidate` grant.
+  Drain-queue list defaults to `status=proposed`, redacts POLICY §2 secrets
+  and local paths, exposes `total`/`has_more` so truncation is not silent,
+  and does not return redacted/rejected packet content to the model.
+
 ### Changed
 
 - Default platform-agent vault roots no longer include the dashless alias:

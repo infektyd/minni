@@ -126,12 +126,15 @@ _VAULT_SLUG_TO_AGENT_ID: Dict[str, str] = {
     "codex": "codex",
     "cursor": "cursor",
     "gemini": "gemini",
+    "agy": "gemini",
+    "antigravity": "gemini",
     "hermes": "hermes",
     "kilocode": "kilocode",
     "openclaw": "openclaw",
     "grok-build": "grok-build",
     "grok-beta": "grok-build",
     "grok": "grok-build",
+    "xai": "grok-build",
 }
 
 
@@ -168,6 +171,17 @@ def _principal_for_inbox_dir(
         slug = vault_dir_name[: -len("-vault")]
         return _VAULT_SLUG_TO_AGENT_ID.get(slug, slug) or fallback_principal
     return fallback_principal
+
+
+def _canonical_principal(principal: Any) -> str:
+    """Map a leftover packet agent_id onto its canonical id.
+
+    Mirrors ``inbox_ingest._canonical_principal`` so ``agy`` in
+    ``agy-vault`` (principal ``gemini``) is a match, not
+    ``agent_mismatch_quarantine``.
+    """
+    raw = str(principal or "")
+    return _VAULT_SLUG_TO_AGENT_ID.get(raw, raw)
 
 
 # Both inbox filename formats:
@@ -229,19 +243,47 @@ def _file_age_seconds(path: Path, now: float) -> Optional[float]:
     return now - created
 
 
+def _inbox_vault_slug(path: Path) -> str:
+    """Raw ``<slug>`` from ``<slug>-vault/inbox/<file>``; empty for bare vault."""
+    parent = path.parent.parent.name
+    if parent.endswith("-vault"):
+        return parent[: -len("-vault")]
+    return ""
+
+
+def _row_belongs_to_vault(
+    row: Dict[str, Any], vault_slug: str, vault_principal: str
+) -> bool:
+    """True when this DB row is this vault's fill, not a remapped sibling.
+
+    Mirrors ``inbox_archive.maybe_archive_for_candidate``: leftover alias
+    packets (``agy``/``xai``, or collapse-rewritten rows stamped
+    ``source_principal``) must not drain the remapped vault's live file.
+    Rows with no principal keep the legacy content-correspondence path.
+    """
+    source = row.get("source_principal") or row.get("principal")
+    if not isinstance(source, str) or not source.strip():
+        return True
+    source = source.strip()
+    if source != _canonical_principal(source):
+        return vault_slug == source
+    return _canonical_principal(source) == vault_principal
+
+
 def load_inbox_rows(db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
     """Map inbox filename -> [{candidate_index, status, content_sha1,
-    content}, ...] from candidate_packets.derived_from. DB is opened
-    read-only. NOTE: derived_from records only a bare filename, so the same
-    name in two vaults shares one row list — classify_file resolves the
-    ambiguity per file via content correspondence."""
+    content, principal, source_principal}, ...] from candidate_packets.
+    DB is opened read-only. Same basename in two vaults shares one list;
+    classify_file scopes rows by vault slug / source_principal (daemon
+    archive parity) then content correspondence."""
     rows_by_file: Dict[str, List[Dict[str, Any]]] = {}
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT status, content, derived_from FROM candidate_packets "
+            "SELECT status, content, derived_from, principal "
+            "FROM candidate_packets "
             "WHERE derived_from LIKE '%\"source\": \"inbox\"%'"
         ).fetchall()
     finally:
@@ -257,12 +299,17 @@ def load_inbox_rows(db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
         idx = obj.get("candidate_index")
         if not isinstance(name, str) or not name:
             continue
+        stamped = obj.get("source_principal")
         rows_by_file.setdefault(name, []).append(
             {
                 "candidate_index": idx,
                 "status": row["status"],
                 "content_sha1": obj.get("content_sha1"),
                 "content": row["content"],
+                "principal": row["principal"],
+                "source_principal": (
+                    stamped if isinstance(stamped, str) and stamped else None
+                ),
             }
         )
     return rows_by_file
@@ -351,15 +398,22 @@ def classify_file(
     if not isinstance(doc, dict):
         return "keep"
 
-    rows = rows_by_file.get(path.name, [])
+    vault_dir_name = path.parent.parent.name
+    vault_principal = _principal_for_inbox_dir(vault_dir_name)
+    vault_slug = _inbox_vault_slug(path)
+    rows = [
+        r
+        for r in rows_by_file.get(path.name, [])
+        if _row_belongs_to_vault(r, vault_slug, vault_principal)
+    ]
     eligible = eligible_candidates(doc)
     if eligible is not None:
         # Stop-candidate file: archive only when every eligible candidate has a
         # MATCHING DB row (the rows carry the content from here on). Rows are
-        # keyed by bare filename across all vaults, so a same-named file in
-        # another vault (different content) must NOT inherit this file's rows —
-        # _row_matches_candidate pins each row to the candidate text it was
-        # ingested from.
+        # first scoped to this vault (slug / source_principal) so a leftover
+        # alias fill cannot drain the remapped vault's never-ingested copy;
+        # _row_matches_candidate then pins each remaining row to the candidate
+        # text it was ingested from.
         matched = [
             r
             for r in rows
@@ -390,7 +444,7 @@ def classify_file(
             # simply fresh, not broken, and stays 'keep'.
             file_agent = str(doc.get("agent_id") or "").strip()
             vault_principal = _principal_for_inbox_dir(path.parent.parent.name)
-            if file_agent and file_agent != vault_principal:
+            if file_agent and _canonical_principal(file_agent) != vault_principal:
                 age = _file_age_seconds(path, now)
                 if age is not None and age > residue_ttl_days * 86400:
                     return "agent_mismatch_quarantine"

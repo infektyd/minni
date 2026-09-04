@@ -13,6 +13,8 @@ from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
 from minni.safety import is_instruction_like
 
+from .redaction import redact_value
+
 # Migration-015 probe. db.py treats a failed migrations run as non-fatal
 # (warns and keeps serving), so a live daemon can run against a DB whose
 # candidate_packets CHECK still predates 015 and rejects the do_not_store /
@@ -1107,27 +1109,57 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
 
 
 def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -> dict:
-    """List candidates for the stamped principal."""
+    """List candidates for the stamped principal.
+
+    Default status is ``proposed`` (the drain queue). Omitting status used
+    to SELECT every status, so a later list after redact/reject returned
+    hidden packet content. Explicit status still works for console zones.
+    Envelopes that cross the process boundary are POLICY §2 redacted, and
+    ``total`` / ``has_more`` make a truncated page visible. Both come from
+    a single ``LIMIT n+1`` read — sqlite3 does not start a transaction on
+    SELECT, so a COUNT(*) after the page is a second WAL snapshot. When
+    has_more, total is len(page)+1 (the n+1 lower bound), not a later
+    COUNT(*).
+    """
     principal, err = context.handler_principal(params, request_id)
     if err:
         return err
 
-    status_f = params.get("status")
-    limit = min(int(params.get("limit", 100)), 500)
+    raw_status = params.get("status")
+    if isinstance(raw_status, str):
+        status_f = raw_status.strip() or "proposed"
+    elif raw_status in (None, ""):
+        status_f = "proposed"
+    else:
+        status_f = str(raw_status).strip() or "proposed"
+
+    try:
+        limit = int(params.get("limit", 100))
+    except (TypeError, ValueError):
+        return context.make_error(-32602, "limit must be an integer", request_id)
+    limit = min(max(limit, 1), 500)
+
     db = None
     try:
         db = context.sovereign_db()
+        from minni.afm_passes.inbox_ingest import _principal_family
+
+        family = _principal_family(principal.agent_id)
+        placeholders = ",".join("?" for _ in family)
         with db.cursor() as c:
-            if status_f:
-                c.execute(
-                    "SELECT * FROM candidate_packets WHERE principal=? AND status=? ORDER BY proposed_at DESC LIMIT ?",
-                    (principal.agent_id, status_f, limit),
-                )
-            else:
-                c.execute(
-                    "SELECT * FROM candidate_packets WHERE principal=? ORDER BY proposed_at DESC LIMIT ?",
-                    (principal.agent_id, limit),
-                )
+            # One statement for the page + has_more probe. A prior COUNT(*)
+            # is a different WAL snapshot; extras that land between the two
+            # would fill LIMIT and still report has_more false.
+            # Family-scoped (#44): co-located sessions share a principal
+            # family, so scope by family, not the single stamped agent_id.
+            # status_f is always truthy here (defaults to "proposed"), so no
+            # unfiltered branch: omitting status must not SELECT every status.
+            c.execute(
+                "SELECT * FROM candidate_packets "
+                f"WHERE principal IN ({placeholders}) AND status=? "
+                "ORDER BY proposed_at DESC LIMIT ?",
+                (*family, status_f, limit + 1),
+            )
             rows = []
             for row in c.fetchall():
                 item = dict(row)
@@ -1137,14 +1169,30 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
                             item[key] = json.loads(item[key])
                         except Exception:
                             pass
-                rows.append(item)
+                redacted, _ = redact_value(item)
+                rows.append(redacted)
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            total = len(rows) + 1 if has_more else len(rows)
         return context.make_response(
-            {"candidates": rows, "principal": principal.agent_id, "count": len(rows)},
+            {
+                "candidates": rows,
+                "principal": principal.agent_id,
+                "status": status_f,
+                "count": len(rows),
+                "total": total,
+                "limit": limit,
+                "has_more": has_more,
+            },
             request_id,
         )
     except Exception as exc:
         context.logger.exception("list_candidates failed")
-        return context.make_error(-32000, f"list_candidates error: {exc}", request_id)
+        envelope = context.make_error(
+            -32000, f"list_candidates error: {exc}", request_id
+        )
+        redacted, _ = redact_value(envelope)
+        return redacted
     finally:
         if db is not None and hasattr(db, "close"):
             try:
@@ -1276,7 +1324,13 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 )
             rowd = dict(row)
             owner = str(rowd.get("principal") or "")
-            if owner != principal.agent_id and not explicitly_allowed_operator(principal):
+            from minni.afm_passes.inbox_ingest import _canonical_principal
+
+            if (
+                _canonical_principal(owner)
+                != _canonical_principal(principal.agent_id)
+                and not explicitly_allowed_operator(principal)
+            ):
                 raise ResolveRejected(context.make_error(
                     -32004,
                     f"principal_mismatch: candidate #{cid} is owned by '{owner}'; "
@@ -1405,7 +1459,11 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         return exc.response
     except Exception as exc:
         context.logger.exception("resolve_candidate failed")
-        return context.make_error(-32000, f"resolve_candidate error: {exc}", request_id)
+        envelope = context.make_error(
+            -32000, f"resolve_candidate error: {exc}", request_id
+        )
+        redacted, _ = redact_value(envelope)
+        return redacted
     finally:
         if db is not None and hasattr(db, "close"):
             try:

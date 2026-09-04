@@ -102,8 +102,13 @@ rejected outright and disables the cloud provider.
 - `minni_export_pack`
 - `minni_learning_quality`
 - `minni_learn`
+- `minni_list_candidates` — list this runtime principal's staged candidates
+  (own rows only; defaults to `status=proposed`; redacted/rejected content
+  is not returned to the model)
 - `minni_resolve_candidate` — owner-or-explicit-operator candidate resolution
-  for staged learning candidates
+  for staged learning candidates. Accept into durable memory still requires
+  operator/govern; a platform host may reject/redact its own rows without that
+  grant, and must not resolve another principal's rows unless explicitly allowed.
 - `minni_vault_write`
 - `minni_audit_report`
 - `minni_audit_tail`
@@ -142,9 +147,10 @@ The team runtime does not spawn agents, execute background work, write durable m
 ## Candidate Learning
 
 Durable learning is proposal-first. Ordinary learn calls stage candidate packets
-through the daemon instead of silently mutating long-term memory. Operators can
-list and resolve candidates through the local console API (`/api/candidates`,
-`/api/resolve-candidate`) or the explicit `minni_resolve_candidate` tool.
+through the daemon instead of silently mutating long-term memory. Hosts can
+list their own staged rows with `minni_list_candidates` and resolve them with
+`minni_resolve_candidate`. Operators can also list and resolve through the
+local console API (`/api/candidates`, `/api/resolve-candidate`).
 
 Candidate acceptance writes a durable learning. Rejection, redaction, log-only,
 and sensitivity decisions remain auditable without promoting the content into

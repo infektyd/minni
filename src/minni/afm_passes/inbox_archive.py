@@ -35,8 +35,10 @@ from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
     STOP_KINDS,
     _as_str_set,
+    _canonical_principal,
     _content_sha1,
     _is_stop_candidate_shape,
+    _principal_family,
     _principal_for_inbox,
     discover_inboxes,
     is_audit_echo,
@@ -45,6 +47,38 @@ from minni.afm_passes.inbox_ingest import (
 logger = logging.getLogger("minnid")
 
 ARCHIVE_DIRNAME = ".archive"
+
+
+def _inbox_vault_slug(inbox: Path) -> str:
+    """Raw ``<slug>`` from ``<slug>-vault/inbox``; empty for the daemon vault."""
+    parent = Path(inbox).parent.name
+    if parent.endswith("-vault"):
+        return parent[: -len("-vault")]
+    return ""
+
+
+def _source_principal_for_archive(row) -> str:
+    """Leftover vault slug if collapse rewrote ``principal`` to canonical.
+
+    ``repair_duplicate_candidate_pairs`` stamps ``source_principal`` into
+    ``derived_from`` before UPDATE agy/xai → gemini/grok-build. Without
+    that, ``owner_is_alias`` is false and discover order can archive the
+    remapped vault's never-ingested live file.
+    """
+    owner = str(row["principal"] or "")
+    raw = row["derived_from"] if "derived_from" in row.keys() else None
+    if not isinstance(raw, str) or not raw:
+        return owner
+    try:
+        df = json.loads(raw)
+    except Exception:
+        return owner
+    if not isinstance(df, dict):
+        return owner
+    stamped = df.get("source_principal")
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    return owner
 
 # Every candidate_packets status except 'proposed' (the schema CHECK set,
 # including the do_not_store/log_only statuses added by migration 015).
@@ -128,15 +162,22 @@ def _rows_for_inbox_file(
     ``derived_from``. When ``principal`` is set, only that agent's rows
     count — principal-scoped ingest can create same-basename peers in other
     vaults; archive must not treat those as open siblings of this inbox.
+
+    Alias family is expanded so leftover ``agy``/``xai`` rows still count as
+    siblings of remapped ``gemini``/``grok-build`` fills (and vice versa).
+    Exact ``principal = owner`` hid those twins after alias collapse.
     """
     like = f'%"inbox_file": "{inbox_file}"%'
     with db.cursor() as c:
         if principal is not None:
+            family = _principal_family(principal)
+            placeholders = ",".join("?" for _ in family)
             c.execute(
                 "SELECT principal, status, content, derived_from "
                 "FROM candidate_packets "
-                "WHERE COALESCE(principal, '') = ? AND derived_from LIKE ?",
-                (str(principal), like),
+                f"WHERE COALESCE(principal, '') IN ({placeholders}) "
+                "AND derived_from LIKE ?",
+                (*family, like),
             )
         else:
             c.execute(
@@ -153,13 +194,18 @@ def _rows_for_inbox_file(
             df = json.loads(row["derived_from"])
         except Exception:
             df = {}
+        body = row["content"]
+        if isinstance(body, str) and body:
+            fingerprint = _content_sha1(body)
+        else:
+            fingerprint = df.get("content_sha1")
         out.append(
             {
                 "principal": row["principal"] if "principal" in row.keys() else None,
                 "status": row["status"],
                 "candidate_index": df.get("candidate_index"),
-                "content_sha1": df.get("content_sha1"),
-                "content": row["content"],
+                "content_sha1": fingerprint,
+                "content": body,
             }
         )
     return out
@@ -200,31 +246,42 @@ def _matching_rows_for_file(doc: Any, rows: List[dict]) -> Optional[List[dict]]:
     filename — without this check a single forged terminal row could archive
     ANY agent's live, never-ingested inbox file (cross-vault name match). So a
     row only counts when it carries ingest-written provenance for THIS file's
-    content: its ``candidate_index`` addresses a real eligible candidate and
-    its ``content_sha1`` (or, for legacy rows without one, the row's stored
-    content) matches that candidate's text. The file is archivable only when
-    every eligible candidate is covered by a matching row — i.e. the DB
-    provably carries all of the file's content. Non-stop-candidate files
-    (handoffs, *_precompact_handoff, ...) are never archived here; they drain
-    through their own TTL/ack channels."""
+    content: ``sha1(candidate_packets.content)`` (same as repair
+    ``_collapse_digest``). ``derived_from.content_sha1`` is audit metadata —
+    ``stage_candidate`` dumps caller ``derived_from`` verbatim, so a
+    same-family terminal row can stamp the live candidate's sha on a
+    different body. extras-at-next-idx remaps ``derived_from.candidate_index``
+    off the file slot, so coverage is by sibling content, not by enumerate
+    key. The file is archivable only when every eligible candidate is covered
+    by a matching row — i.e. the DB provably carries all of the file's
+    content. Non-stop-candidate files (handoffs, *_precompact_handoff, ...)
+    are never archived here; they drain through their own TTL/ack channels."""
     eligible = _eligible_candidates(doc)
     if not eligible:
         return None  # not a stop-candidate file, or nothing ingestible in it
     matched: List[dict] = []
     covered: set = set()
-    for row in rows:
-        idx = row.get("candidate_index")
-        if not isinstance(idx, int) or idx not in eligible:
-            continue
-        content = eligible[idx]
-        sha = row.get("content_sha1")
-        if isinstance(sha, str) and sha:
-            if sha != _content_sha1(content):
-                continue
-        elif row.get("content") != content:
-            continue
-        matched.append(row)
-        covered.add(idx)
+    seen: set = set()
+    for idx, content in eligible.items():
+        want_sha = _content_sha1(content)
+        for i, row in enumerate(rows):
+            row_content = row.get("content")
+            if isinstance(row_content, str) and row_content:
+                if _content_sha1(row_content) != want_sha:
+                    continue
+            else:
+                sha = row.get("content_sha1")
+                if not (isinstance(sha, str) and sha == want_sha):
+                    continue
+            # Sibling matches this file's eligible bytes (index may have
+            # remapped via extras-at-next-idx). Stamp is ignored when the
+            # content column is present; forged rows with a different body
+            # fail the content-hash guard above.
+            covered.add(idx)
+            if i not in seen:
+                matched.append(row)
+                seen.add(i)
+            break
     if covered != set(eligible):
         return None  # some eligible candidate has no genuine DB row -> keep
     return matched
@@ -250,7 +307,9 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
         return None
     # Scope siblings to the resolved candidate's principal so multi-vault
     # same-basename peers (allowed by principal-scoped ingest) do not block
-    # archive of a fully-terminal agent vault copy.
+    # archive of a fully-terminal agent vault copy. Compare the alias family
+    # (agy↔gemini, xai↔grok-build): leftover rows keep the raw principal while
+    # ``_principal_for_inbox`` returns the canonical vault owner.
     owner_principal = str(row["principal"] or "")
     rows = _rows_for_inbox_file(db, inbox_file, principal=owner_principal)
     if not rows:
@@ -259,11 +318,22 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     # Content-matching alone is insufficient: byte-identical candidates under
     # the same basename in another vault would otherwise archive the wrong
     # agent's still-live file when discover order visits them first.
-    from minni.afm_passes.inbox_ingest import _principal_for_inbox
+    owner_canon = _canonical_principal(owner_principal)
+    # Leftover alias packets (agy/xai) share a canonical owner with the
+    # remapped vault (gemini/grok-build). Do not archive that remapped
+    # vault's live file — it was never the leftover's source. Collapse
+    # rewrite sets principal to canonical, so owner_is_alias on the
+    # rewritten column is false; consult source_principal instead.
+    source_principal = _source_principal_for_archive(row)
+    source_is_alias = bool(source_principal) and source_principal != _canonical_principal(
+        source_principal
+    )
 
     for inbox in discover_inboxes(config):
         inbox_owner = _principal_for_inbox(inbox, fallback_principal="unknown")
-        if str(inbox_owner or "") != owner_principal:
+        if _canonical_principal(inbox_owner or "") != owner_canon:
+            continue
+        if source_is_alias and _inbox_vault_slug(inbox) != source_principal:
             continue
         source = inbox / inbox_file
         try:
@@ -329,7 +399,7 @@ def _inert_reason(doc: Any, inbox_principal: str) -> Optional[Dict[str, Any]]:
     if doc.get("log_only") is True or doc.get("do_not_store") is True:
         return {"reason": "log_only_or_do_not_store_flag"}
     file_agent = str(doc.get("agent_id") or "").strip()
-    if file_agent and file_agent != inbox_principal:
+    if file_agent and _canonical_principal(file_agent) != inbox_principal:
         return None  # _agent_mismatch: inbox_quarantine's cohort
     cands = doc.get("candidates") or []
     if not isinstance(cands, list):

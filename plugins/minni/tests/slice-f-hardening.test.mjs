@@ -20,6 +20,7 @@ import test from "node:test";
 import {
   RECALL_STATE_RELPATH,
   buildRecallPointer,
+  clearRecallState,
   markRecallConsumed,
   recallStatePath,
   writeRecallState,
@@ -84,6 +85,38 @@ test("H2: markRecallConsumed does not follow a symlinked state file out of the v
   const after = JSON.parse(await readFile(decoy, "utf8"));
   assert.equal(after.consumed, false, "must not have mutated the symlink target");
   assert.equal(ok, false, "symlinked target must be treated as a failed consume");
+});
+
+test("H2: clearRecallState does not follow a .runtime dir symlink out of the vault", async (t) => {
+  const vault = await mkVault();
+  const outside = await mkdtemp(path.join(tmpdir(), "slice-f-outside-clear-"));
+  t.after(async () => {
+    await rm(vault, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
+  const decoy = path.join(outside, "recall-state.json");
+  await writeFile(
+    decoy,
+    JSON.stringify({
+      task_signature: "escaped",
+      intent: "recall",
+      top_hits: [],
+      top_score: 0,
+      consumed: false,
+      ts: "2026-08-30T00:00:00.000Z",
+    }),
+  );
+  // Attacker points <vault>/.runtime at a dir outside the vault. A bare
+  // rm(recall-state.json) would unlink the real file in `outside`.
+  await symlink(outside, path.join(vault, ".runtime"), "dir");
+
+  await assert.rejects(
+    () => clearRecallState(vault),
+    /escape|symlink|contain/i,
+    "expected symlink escape to be rejected",
+  );
+  const after = JSON.parse(await readFile(decoy, "utf8"));
+  assert.equal(after.task_signature, "escaped", "must not have unlinked the escape target");
 });
 
 // ---- H3: recall-guard / pointer sanitization --------------------------------

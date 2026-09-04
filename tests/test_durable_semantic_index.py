@@ -78,6 +78,19 @@ def temp_engine(tmp_path, monkeypatch):
     monkeypatch.setattr(minnid, "_writeback", None, raising=False)
     monkeypatch.setattr(minnid, "_episodic", None, raising=False)
 
+    # Warm-off-RPC doctrine, mirroring minnid._warmup_models: the default
+    # leftover (22.5s / 27s) never starts an in-request FAISS rebuild, so a
+    # cold engine stays cold for every search in this process. Construct the
+    # shared engine here with NO deadline (unbounded) so the first _search
+    # finds the index ready — the same guarantee warmup gives the first
+    # production search. This also clears any stale leftover deadline a prior
+    # test stamped on this thread's thread-local. (On the empty seed DB this
+    # ensure is a cold no-op; the per-search ensure in _search below warms
+    # once rows exist.)
+    _engine = minnid._lazy_retrieval()
+    _engine._set_current_deadline(None)
+    _engine._ensure_faiss_loaded()
+
     # Base schema first (_init_schema), THEN migrations ALTER it (the PR-6
     # learnings columns like `assertion`/`status` are ADDed by migration 005 on
     # top of the baseline table — same setup order the force-learn tests use).
@@ -102,6 +115,15 @@ def _semantic_doc_ids(resp):
 
 
 def _search(query, principal, depth="chunk"):
+    # Off-RPC warmer stand-in for minnid._warmup_models: the store paths leave
+    # a cold index cold (add_batch refuses while cold) and the default leftover
+    # never rebuilds in-request, so without this no search in this process
+    # would ever warm the live FAISS. Unbounded-ensure first so each search
+    # runs against the DB state the stores committed — exactly the "first
+    # search finds the index ready" guarantee warmup provides in production.
+    _engine = minnid._lazy_retrieval()
+    _engine._set_current_deadline(None)
+    _engine._ensure_faiss_loaded()
     return minnid._handle_search(
         {"query": query, "limit": 5, "depth": depth, "_principal": principal},
         request_id=99,
