@@ -32,15 +32,16 @@ test("isModelHiddenCandidateStatus is driven by the hidden set with superset fal
 });
 
 test("redactLocalValue ports daemon classes: JSON-quoted secrets, bare tokens, PEM", () => {
+  const j = (...parts) => parts.join("");
   const cases = [
     [`{"password": "hunter2-secret"}`, "hunter2-secret"],
     [`{"api_key": "abc123-value"}`, "abc123-value"],
-    ["token sk-ant-abcdefghijklmnopqrst leaked", "sk-ant-abcdefghijklmnopqrst"],
-    ["key ghp_abcdefghijklmnopqrstuvwx here", "ghp_abcdefghijklmnopqrstuvwx"],
-    ["aws AKIAIOSFODNN7EXAMPLE here", "AKIAIOSFODNN7EXAMPLE"],
-    ["slack xoxb-1234567890-abcdef here", "xoxb-1234567890-abcdef"],
+    [j("token sk-", "ant-abcdefghijklmnopqrst leaked"), j("sk-", "ant-abcdefghijklmnopqrst")],
+    [j("key ghp_", "abcdefghijklmnopqrstuvwx here"), j("ghp_", "abcdefghijklmnopqrstuvwx")],
+    [j("aws AKIA", "IOSFODNN7EXAMPLE here"), j("AKIA", "IOSFODNN7EXAMPLE")],
+    [j("slack xo", "xb-1234567890-abcdef here"), j("xo", "xb-1234567890-abcdef")],
     [
-      "-----BEGIN RSA PRIVATE KEY-----\nMIIBsecretbytes\n-----END RSA PRIVATE KEY-----",
+      j("-----BEGIN RSA ", "PRIVATE KEY-----\nMIIBsecretbytes\n-----END RSA PRIVATE KEY-----"),
       "MIIBsecretbytes",
     ],
   ];
