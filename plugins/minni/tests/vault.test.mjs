@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  appendFileWithFsync,
   auditTail,
   auditReport,
   ensureVault,
@@ -49,6 +50,280 @@ test("ensureVault creates the Codex LLM wiki structure and schema", async () => 
     assert.match(schema, /raw sources/i);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault does not wipe a raced log.md seed", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-vault-race-"));
+  try {
+    const payload =
+      "## [2026-09-01T00:00:00Z] plugin | audit | unique-payload-do-not-clobber\n\n";
+    const logPath = path.join(root, "log.md");
+    const indexPath = path.join(root, "index.md");
+    await writeFile(logPath, payload, "utf8");
+    await writeFile(indexPath, payload, "utf8");
+    await ensureVault(root);
+    assert.equal(await readFile(logPath, "utf8"), payload);
+    assert.equal(await readFile(indexPath, "utf8"), payload);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault refuses hermes-vault dir symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await writeFile(path.join(shop, "keep.md"), "restore\n", "utf8");
+    await symlink(shop, vault);
+    await assert.rejects(
+      () => ensureVault(vault),
+      /refusing symlinked vault root/,
+    );
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+    assert.equal(await readFile(path.join(shop, "keep.md"), "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault refuses wiki symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-wiki-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    await writeFile(path.join(shop, "keep.md"), "restore\n", "utf8");
+    await symlink(shop, path.join(vault, "wiki"));
+    await assert.rejects(() => ensureVault(vault), /symlink/);
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+    assert.equal(await readFile(path.join(shop, "keep.md"), "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault refuses inbox symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-inbox-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    await writeFile(path.join(shop, "keep.md"), "restore\n", "utf8");
+    await symlink(shop, path.join(vault, "inbox"));
+    await assert.rejects(() => ensureVault(vault), /symlink/);
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit does not wipe a raced daily log.md header+line", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-vault-daily-race-"));
+  try {
+    await mkdir(path.join(root, "logs"), { recursive: true });
+    const date = new Date().toISOString().slice(0, 10);
+    const dailyPath = path.join(root, "logs", `${date}.md`);
+    const raced = `# ${date} Minni Audit\n\n## [2026-09-01T00:00:00Z] plugin | raced-header-line\n\n`;
+    await writeFile(dailyPath, raced, "utf8");
+    await recordAudit(root, {
+      tool: "test_tool",
+      summary: "second tap",
+      timestamp: new Date(),
+    });
+    const text = await readFile(dailyPath, "utf8");
+    assert.match(text, /raced-header-line/);
+    assert.match(text, /second tap/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit exclusive-seeds daily log.md, never exists()+writeFileAtomic", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function recordAudit");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /seedExclusiveFile\(\s*dailyPath/);
+  assert.doesNotMatch(body, /exists\(dailyPath\)/);
+  assert.doesNotMatch(body, /writeFileAtomic\(\s*dailyPath/);
+});
+
+test("recordAudit rotation exclusive-seeds log.md, never writeFileAtomic replace", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function recordAudit");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /seedExclusiveFile\(\s*logPath/);
+  assert.doesNotMatch(body, /writeFileAtomic\(\s*logPath/);
+});
+
+test("recordAudit rotation does not wipe a second-tap exclusive seed", async () => {
+  const { closeSync, existsSync, openSync, writeSync } = await import("node:fs");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-rotate-race-"));
+  try {
+    await ensureVault(root);
+    const logPath = path.join(root, "log.md");
+    const rotated = path.join(root, "log.1.md");
+    await writeFile(logPath, "a".repeat(5 * 1024 * 1024), "utf8");
+    const raced =
+      "## [2026-09-01T00:00:00Z] plugin | second-tap-do-not-clobber\n\n";
+    let planted = false;
+    const racer = (async () => {
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline && !planted) {
+        if (existsSync(rotated)) {
+          try {
+            const fd = openSync(logPath, "wx", 0o600);
+            writeSync(fd, `# Minni Codex Log\n\n${raced}`);
+            closeSync(fd);
+            planted = true;
+            return;
+          } catch (error) {
+            if (error && error.code !== "EEXIST") throw error;
+          }
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+    await recordAudit(root, {
+      tool: "test_tool",
+      summary: "rotate-tap",
+    });
+    await racer;
+    assert.equal(planted, true, "second tap must win the post-rename hole");
+    const text = await readFile(logPath, "utf8");
+    assert.match(text, /second-tap-do-not-clobber/);
+    assert.match(text, /rotate-tap/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("appendIndex uses appendFileWithFsync (O_APPEND|O_NOFOLLOW), never appendFile(indexPath)", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("async function appendIndex");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /appendFileWithFsync\(\s*indexPath/);
+  assert.doesNotMatch(body, /appendFile\(\s*indexPath/);
+});
+
+test("writeVaultPage does not follow raced index.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-index-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await ensureVault(vault);
+    const indexPath = path.join(vault, "index.md");
+    await rm(indexPath, { force: true });
+    await symlink(keep, indexPath);
+    await assert.rejects(
+      () =>
+        writeVaultPage({
+          vaultPath: vault,
+          title: "Index plant",
+          content: "must not follow index.md into shop",
+          section: "decisions",
+          source: "unit-test",
+        }),
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("appendFileWithFsync uses O_APPEND|O_NOFOLLOW, never open(path, \"a\")", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function appendFileWithFsync");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /O_APPEND/);
+  assert.match(body, /O_NOFOLLOW/);
+  assert.doesNotMatch(body, /open\(\s*filePath,\s*"a"\s*\)/);
+});
+
+test("appendFileWithFsync does not follow raced log.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-append-race-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    const logPath = path.join(vault, "log.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await writeFile(logPath, "# Minni Log\n\n", "utf8");
+    await rm(logPath);
+    await symlink(keep, logPath);
+    await assert.rejects(
+      () => appendFileWithFsync(logPath, "## [2026-09-01T00:00:00Z] plugin | raced\n\n"),
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit refuses log.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-audit-log-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await symlink(keep, path.join(vault, "log.md"));
+    await assert.rejects(
+      () => recordAudit(vault, { tool: "test_tool", summary: "tap" }),
+      /symlink/,
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit refuses daily log.md symlink into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-audit-daily-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  const vault = path.join(tmp, "hermes-vault");
+  try {
+    await mkdir(shop);
+    await mkdir(vault);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    await mkdir(path.join(vault, "logs"));
+    const date = new Date().toISOString().slice(0, 10);
+    await symlink(keep, path.join(vault, "logs", `${date}.md`));
+    await assert.rejects(
+      () => recordAudit(vault, { tool: "test_tool", summary: "tap" }),
+      /symlink/,
+    );
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
@@ -498,6 +773,37 @@ test("writeFileAtomic preserves the destination's existing file mode across a re
     assert.equal(await readFile(target, "utf8"), "second version");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("writeFileAtomic exclusive-creates unique tmp with O_EXCL|O_NOFOLLOW", async () => {
+  const src = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+  const start = src.indexOf("export async function writeFileAtomic");
+  assert.notEqual(start, -1);
+  const next = src.indexOf("\nexport async function", start + 1);
+  const body = src.slice(start, next === -1 ? undefined : next);
+  assert.match(body, /O_EXCL/);
+  assert.match(body, /O_NOFOLLOW/);
+  assert.doesNotMatch(body, /open\(\s*tempPath,\s*"w"/);
+});
+
+test("writeFileAtomic unique tmp does not follow planted sidecar into shop-restore", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-atomic-tmp-shop-"));
+  const shop = path.join(tmp, "shop-restore");
+  try {
+    await mkdir(shop);
+    const keep = path.join(shop, "keep.md");
+    await writeFile(keep, "restore\n", "utf8");
+    const dest = path.join(tmp, "note.md");
+    const planted = path.join(tmp, `note.md.${process.pid}.tmp`);
+    await symlink(keep, planted);
+    await writeFileAtomic(dest, "atomic-body\n");
+    assert.equal(await readFile(dest, "utf8"), "atomic-body\n");
+    assert.equal(await readFile(keep, "utf8"), "restore\n");
+    const names = await readdir(shop);
+    assert.deepEqual(names.sort(), ["keep.md"]);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 

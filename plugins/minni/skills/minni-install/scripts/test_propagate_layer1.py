@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -151,3 +152,112 @@ def test_missing_templates_do_not_break_bootstrap(tmp_path, monkeypatch, capsys)
     assert report["status"] == "ok"
     assert report["layer1"]["status"] == "skipped"
     assert "template dir missing" in report["layer1"]["reason"]
+
+
+_PLUGIN_LOG = "# Minni Log\n\n## [2026-09-01T00:00:00Z] plugin | audit\n\n"
+_PLUGIN_INDEX = "# Minni Index\n\n- [[wiki/entities/peer]]\n"
+_RACE_AUDIT = (
+    "## [2026-09-01T00:00:00Z] plugin | audit | unique-payload-do-not-clobber\n\n"
+)
+_RACE_INDEX = "- [[wiki/entities/peer]] unique-index-do-not-clobber\n"
+
+
+def test_bootstrap_preserves_existing_log_and_index(tmp_path, monkeypatch, capsys):
+    """Exclusive create must not wipe a plugin stamp already at log.md/index.md."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MINNI_VAULT_PATH", raising=False)
+    monkeypatch.delenv("MINNI_WORKSPACE_ID", raising=False)
+    vault = tmp_path / ".minni" / "test-agent-vault"
+    vault.mkdir(parents=True)
+    (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
+    (vault / "index.md").write_text(_PLUGIN_INDEX, encoding="utf-8")
+    assert propagate.bootstrap_vault(argparse.Namespace(agent="test-agent", workspace=None)) == 0
+    capsys.readouterr()
+    assert (vault / "log.md").read_text(encoding="utf-8") == _PLUGIN_LOG
+    assert (vault / "index.md").read_text(encoding="utf-8") == _PLUGIN_INDEX
+
+
+def test_bootstrap_does_not_clobber_append_after_exclusive_create(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MINNI_VAULT_PATH", raising=False)
+    monkeypatch.delenv("MINNI_WORKSPACE_ID", raising=False)
+    vault = tmp_path / ".minni" / "test-agent-vault"
+    vault.mkdir(parents=True)
+    orig_os_open = os.open
+
+    def append_after_create(path) -> None:
+        try:
+            name = Path(os.fsdecode(path)).name
+        except (TypeError, ValueError, OSError):
+            return
+        if name not in {"log.md", "index.md"}:
+            return
+        payload = _RACE_AUDIT if name == "log.md" else _RACE_INDEX
+        extra = orig_os_open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(extra, payload.encode("utf-8"))
+        finally:
+            os.close(extra)
+
+    def racing_os_open(path, flags, *args, **kwargs):
+        fd = orig_os_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL:
+            append_after_create(path)
+        return fd
+
+    monkeypatch.setattr(os, "open", racing_os_open)
+    assert propagate.bootstrap_vault(argparse.Namespace(agent="test-agent", workspace=None)) == 0
+    capsys.readouterr()
+    assert _RACE_AUDIT in (vault / "log.md").read_text(encoding="utf-8")
+    assert _RACE_INDEX in (vault / "index.md").read_text(encoding="utf-8")
+
+
+def test_bootstrap_refuses_schema_agents_symlink_into_shop(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MINNI_VAULT_PATH", raising=False)
+    monkeypatch.delenv("MINNI_WORKSPACE_ID", raising=False)
+    vault = tmp_path / ".minni" / "test-agent-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir(parents=True)
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "schema").mkdir()
+    (vault / "schema" / "AGENTS.md").symlink_to(shop / "keep.md")
+    with pytest.raises((OSError, SystemExit)):
+        propagate.bootstrap_vault(argparse.Namespace(agent="test-agent", workspace=None))
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+    assert list(shop.iterdir()) == [shop / "keep.md"]
+
+
+def test_bootstrap_refuses_schema_dir_symlink_into_shop(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MINNI_VAULT_PATH", raising=False)
+    monkeypatch.delenv("MINNI_WORKSPACE_ID", raising=False)
+    vault = tmp_path / ".minni" / "test-agent-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir(parents=True)
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "schema").symlink_to(shop)
+    with pytest.raises((OSError, SystemExit)):
+        propagate.bootstrap_vault(argparse.Namespace(agent="test-agent", workspace=None))
+    assert not (shop / "AGENTS.md").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
+
+
+def test_bootstrap_refuses_wiki_dir_symlink_into_shop(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MINNI_VAULT_PATH", raising=False)
+    monkeypatch.delenv("MINNI_WORKSPACE_ID", raising=False)
+    vault = tmp_path / ".minni" / "test-agent-vault"
+    shop = tmp_path / "shop-restore"
+    vault.mkdir(parents=True)
+    shop.mkdir()
+    (shop / "keep.md").write_text("restore\n", encoding="utf-8")
+    (vault / "wiki").symlink_to(shop)
+    with pytest.raises((OSError, SystemExit)):
+        propagate.bootstrap_vault(argparse.Namespace(agent="test-agent", workspace=None))
+    assert not (shop / "sessions").exists()
+    assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"

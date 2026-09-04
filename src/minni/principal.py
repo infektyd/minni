@@ -234,6 +234,61 @@ def _auto_accept_flag(raw_value: Any, *, where: str) -> bool:
     return False
 
 
+def _canonical_vault_dirname(agent_id: str) -> str:
+    from minni.tools.author_principals import vault_dirname_for
+
+    return vault_dirname_for(agent_id)
+
+
+def _minni_home() -> Path:
+    return Path(os.environ.get("MINNI_HOME") or (Path.home() / ".minni")).expanduser()
+
+
+def _canonical_live_vault_root(agent_id: str) -> Path:
+    """Product vault path: MINNI_HOME / AGENT_VAULT_DIRS slug, not an ACL basename."""
+    return _minni_home() / _canonical_vault_dirname(agent_id)
+
+
+def _acl_forbids_live_store(principal: EffectivePrincipal, live: Path) -> bool:
+    """True when the stamp's vault-root ACL uniquely forbade the live store.
+
+    ``PLATFORM_NO_ROOTS_SENTINEL`` / empty+no-caps is the fail-closed
+    lockout. A read ACL that lists a backup still seeds the product live
+    path (basename matching must not retarget the seed).
+    """
+    if principal.allows_vault_root(live):
+        return False
+    roots = principal.allowed_vault_roots
+    if not roots:
+        return True
+    return all(r == PLATFORM_NO_ROOTS_SENTINEL for r in roots)
+
+
+def _seed_own_vault(principal: EffectivePrincipal) -> None:
+    """Seed this principal's canonical vault after identity is resolved.
+
+    Must not run inside ``_principal_from_raw``: ``from_local_transport``
+    loads the operator stamp on every RPC before the caller is known.
+    Search-only and default-deny stamps must not write layout.
+
+    ``allowed_vault_roots`` is a read ACL. Seed the live path
+    ``MINNI_HOME / vault_dirname_for(agent_id)``, never the first ACL
+    entry whose basename matches (a backup also named hermes-vault, or a
+    missing first hit that would skip a later live dir).
+    Do not seed when the ACL uniquely forbade the store (sentinel /
+    empty platform_agent_vault_roots). ``ensure_agent_vault`` already
+    no-ops when that live path is missing.
+    """
+    if not (principal.can("learn") or principal.can("write")):
+        return
+    live = _canonical_live_vault_root(principal.agent_id)
+    if _acl_forbids_live_store(principal, live):
+        return
+    from minni.vault_layout import ensure_agent_vault
+
+    ensure_agent_vault(live)
+
+
 def _principal_from_raw(
     raw: dict, *, transport: str, principals_dir: Path
 ) -> EffectivePrincipal:
@@ -244,8 +299,9 @@ def _principal_from_raw(
     for x in raw_roots:
         p = str(x)
         try:
-            rp = Path(p).resolve()
-            if not Path(p).is_absolute():
+            expanded = Path(p).expanduser()
+            rp = expanded.resolve()
+            if not expanded.is_absolute():
                 logger.warning(
                     "principal %s allowed_vault_root %r was relative; resolved against cwd to %s. "
                     "Operator configs should use absolute paths.",
@@ -464,6 +520,38 @@ def resolve_effective_principal(
     - Per-agent file id mismatches still raise IdentityMismatchError.
 
     The returned principal (or the raised error) is the ONLY identity that
+    downstream code is allowed to use. Vault layout is seeded only for this
+    resolved principal's canonical vault, never as a side effect of loading
+    the operator stamp.
+    """
+    principal = _stamp_effective_principal(
+        supplied_agent_id=supplied_agent_id,
+        transport=transport,
+        principals_dir=principals_dir,
+        operator_context=operator_context,
+    )
+    _seed_own_vault(principal)
+    return principal
+
+
+def _stamp_effective_principal(
+    *,
+    supplied_agent_id: Optional[str] = None,
+    transport: str = "uds",
+    principals_dir: Optional[Path] = None,
+    operator_context: bool = False,
+) -> EffectivePrincipal:
+    """Stamp identity without mutating vault layout.
+
+    Rules:
+    - No supplied id means explicit local/operator context and resolves through
+      the canonical operator principal order.
+    - A supplied non-operator agent id first resolves principals/<agent_id>.json.
+    - Unknown/fileless valid agent ids resolve to a default-deny principal.
+    - Reserved operator ids ("main", "operator") require operator_context=True.
+    - Per-agent file id mismatches still raise IdentityMismatchError.
+
+    The returned principal (or the raised error) is the ONLY identity that
     downstream code is allowed to use.
     """
     d = principals_dir or PRINCIPALS_DIR
@@ -570,17 +658,13 @@ def resolve_effective_principal(
             # A MISSING entry is not a lockout: existing installs using only
             # platform_agent_ids + platform_agent_capabilities predate the roots map,
             # and their platform principals must keep pathed access to their own
-            # ~/.minni/<agent>-vault (both the literal id and the dashless alias the
-            # installer uses, e.g. claude-code → claudecode-vault). Never the
-            # operator's roots.
+            # ~/.minni/<vault_dirname_for(id)> (claude-code → claudecode-vault
+            # from AGENT_VAULT_DIRS, never a synthesized hyphen-stripped alias
+            # such as grokbuild-vault). Never the operator's roots.
             _PLATFORM_NO_ROOTS = [PLATFORM_NO_ROOTS_SENTINEL]
 
             def _default_platform_roots(agent_id: str) -> list[str]:
-                minni_home = Path(
-                    os.environ.get("MINNI_HOME") or (Path.home() / ".minni")
-                ).expanduser()
-                names = {f"{agent_id}-vault", f"{agent_id.replace('-', '')}-vault"}
-                roots = [str((minni_home / n).resolve()) for n in sorted(names)]
+                roots = [str(_canonical_live_vault_root(agent_id).resolve())]
                 if agent_id == "gemini":
                     # The installer's vault_for("gemini") deliberately falls
                     # back to the legacy ~/.gemini/minni-vault when it has data

@@ -27,12 +27,32 @@ test("wireFor resolves each platform by agent id", () => {
   assert.equal(wireFor("codex").id, "codex");
   assert.equal(wireFor("grok-build").id, "grok-build");
   assert.equal(wireFor("kilocode").id, "kilocode");
+  assert.equal(wireFor("hermes").id, "hermes");
 });
 
-test("wireFor falls back to the Claude shape for an unknown platform", () => {
-  // Narrow but deliberate: Codex and Grok Build are both Claude-contract
-  // clones, so it is the least-bad guess. Add a profile rather than lean on it.
-  assert.equal(wireFor("some-future-agent").id, "claude-code");
+test("wireFor does not pretend an unknown platform is Claude Code", () => {
+  // Historical failure: unknown ids (hermes, muse, future hosts) rendered
+  // Claude's envelope and looked like a healthy inject. Cursor already had
+  // this scar. An unprofiled host must keep its own id and refuse inject.
+  const wire = wireFor("some-future-agent");
+  assert.equal(wire.id, "some-future-agent");
+  assert.equal(wire.inject("SessionStart", "memory"), null);
+  assert.equal(wire.inject("UserPromptSubmit", "memory"), null);
+  assert.equal(wire.inject("Stop", "memory"), null);
+  assert.equal(wire.note("SessionStart", "2 candidates"), null);
+  assert.equal(wire.note("Stop", "2 candidates"), null);
+  const rendered = renderIntent(wire, injectIntent("SessionStart", "memory"));
+  assert.match(rendered.dropped?.reason ?? "", /cannot inject/);
+});
+
+test("hermes is an explicit unprofiled wire, not a Claude clone", () => {
+  const wire = wireFor("hermes");
+  assert.equal(wire.id, "hermes");
+  assert.equal(wire.inject("SessionStart", "memory"), null);
+  assert.equal(wire.note("SessionStart", "2 candidates"), null);
+  assert.equal(wire.note("Stop", "2 candidates"), null);
+  const rendered = renderIntent(wire, injectIntent("UserPromptSubmit", "memory"));
+  assert.ok(rendered.dropped);
 });
 
 test("Claude Code injects at SessionStart/UserPromptSubmit/Stop but NOT PreCompact", () => {
@@ -193,7 +213,7 @@ test("Cursor: a Stop note is dropped, never sent as followup_message", () => {
 test("Cursor resolves to its OWN wire, not the Claude fallback", () => {
   // Regression: cursor previously fell through wireFor() to claudeCodeWire, so
   // handlers emitted Claude envelopes that the adapter then discarded with no
-  // record. The fallback must stay a safety net, never load-bearing.
+  // record. Unknown ids now resolve to unprofiledWire; Claude is not a fallback.
   assert.equal(wireFor("cursor").id, "cursor");
 });
 
