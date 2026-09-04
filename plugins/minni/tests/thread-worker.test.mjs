@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import fs, { constants } from "node:fs";
+import { constants } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -14,7 +14,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { syncBuiltinESMExports } from "node:module";
+import { claimFs } from "../dist/claim-fs.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -590,10 +590,10 @@ test("parent swap before temporary open cannot redirect a claim write", async (t
   t.after(() => rm(outside, { recursive: true, force: true }));
   const paths = await prepareRuntimeSwap(input, outside);
   const { planHash } = claimPathParts(input);
-  const originalOpen = fs.promises.open;
+  const originalOpen = claimFs.open;
   let swapped = false;
 
-  fs.promises.open = async (target, flags, ...args) => {
+  claimFs.open = async (target, flags, ...args) => {
     if (
       !swapped &&
       String(target).endsWith(".tmp") &&
@@ -605,7 +605,7 @@ test("parent swap before temporary open cannot redirect a claim write", async (t
     }
     return originalOpen(target, flags, ...args);
   };
-  syncBuiltinESMExports();
+
 
   try {
     await assert.rejects(
@@ -613,8 +613,8 @@ test("parent swap before temporary open cannot redirect a claim write", async (t
       /claim store parent changed during operation/,
     );
   } finally {
-    fs.promises.open = originalOpen;
-    syncBuiltinESMExports();
+    claimFs.open = originalOpen;
+
   }
 
   assert.equal(swapped, true);
@@ -664,9 +664,9 @@ test("thread-claims and plan-directory swaps cannot redirect a claim write", asy
           : movedParentPath;
       await mkdir(outsidePlanDir, { recursive: true, mode: 0o700 });
 
-      const originalOpen = fs.promises.open;
+      const originalOpen = claimFs.open;
       let swapped = false;
-      fs.promises.open = async (target, flags, ...args) => {
+      claimFs.open = async (target, flags, ...args) => {
         if (
           !swapped &&
           String(target).endsWith(".tmp") &&
@@ -678,7 +678,7 @@ test("thread-claims and plan-directory swaps cannot redirect a claim write", asy
         }
         return originalOpen(target, flags, ...args);
       };
-      syncBuiltinESMExports();
+
 
       try {
         await assert.rejects(
@@ -686,8 +686,8 @@ test("thread-claims and plan-directory swaps cannot redirect a claim write", asy
           /claim store parent changed during operation/,
         );
       } finally {
-        fs.promises.open = originalOpen;
-        syncBuiltinESMExports();
+        claimFs.open = originalOpen;
+
       }
 
       assert.equal(swapped, true);
@@ -708,10 +708,10 @@ test("parent swap before atomic rename cannot redirect or orphan a claim write",
   t.after(() => rm(outside, { recursive: true, force: true }));
   const paths = await prepareRuntimeSwap(input, outside);
   const { planHash } = claimPathParts(input);
-  const originalRename = fs.promises.rename;
+  const originalRename = claimFs.rename;
   let swapped = false;
 
-  fs.promises.rename = async (from, to) => {
+  claimFs.rename = async (from, to) => {
     if (
       !swapped &&
       String(from).endsWith(".tmp") &&
@@ -723,7 +723,7 @@ test("parent swap before atomic rename cannot redirect or orphan a claim write",
     }
     return originalRename(from, to);
   };
-  syncBuiltinESMExports();
+
 
   try {
     await assert.rejects(
@@ -731,8 +731,8 @@ test("parent swap before atomic rename cannot redirect or orphan a claim write",
       /claim store parent changed during operation/,
     );
   } finally {
-    fs.promises.rename = originalRename;
-    syncBuiltinESMExports();
+    claimFs.rename = originalRename;
+
   }
 
   assert.equal(swapped, true);
@@ -761,10 +761,10 @@ test("parent swap before final read cannot redirect to an outside envelope", asy
     '{"outside":"decoy"}\n',
     { mode: 0o600 },
   );
-  const originalOpen = fs.promises.open;
+  const originalOpen = claimFs.open;
   let swapped = false;
 
-  fs.promises.open = async (target, flags, ...args) => {
+  claimFs.open = async (target, flags, ...args) => {
     if (
       !swapped &&
       path.basename(String(target)) === `${claim.envelope.claim_id}.json` &&
@@ -776,7 +776,7 @@ test("parent swap before final read cannot redirect to an outside envelope", asy
     }
     return originalOpen(target, flags, ...args);
   };
-  syncBuiltinESMExports();
+
 
   let replay;
   try {
@@ -788,8 +788,8 @@ test("parent swap before final read cannot redirect to an outside envelope", asy
       input.idempotencyKey,
     );
   } finally {
-    fs.promises.open = originalOpen;
-    syncBuiltinESMExports();
+    claimFs.open = originalOpen;
+
   }
 
   assert.equal(swapped, true);
@@ -4400,9 +4400,9 @@ test("final-fix-4: parent swap during receipt-generation pruning deletes the rea
   const before = await readdir(generationPath);
   assert.equal(before.length, 1);
 
-  const originalOpen = fs.promises.open;
+  const originalOpen = claimFs.open;
   let swapped = false;
-  fs.promises.open = async (target, flags, ...args) => {
+  claimFs.open = async (target, flags, ...args) => {
     if (
       !swapped &&
       String(target).endsWith(`g${generation}`) &&
@@ -4414,7 +4414,7 @@ test("final-fix-4: parent swap during receipt-generation pruning deletes the rea
     }
     return originalOpen(target, flags, ...args);
   };
-  syncBuiltinESMExports();
+
 
   try {
     await assert.rejects(
@@ -4422,8 +4422,8 @@ test("final-fix-4: parent swap during receipt-generation pruning deletes the rea
       /claim store parent changed during operation/,
     );
   } finally {
-    fs.promises.open = originalOpen;
-    syncBuiltinESMExports();
+    claimFs.open = originalOpen;
+
   }
 
   assert.equal(swapped, true);

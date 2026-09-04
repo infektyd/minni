@@ -5,17 +5,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { constants } from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  readdir,
-  rename,
-  rmdir,
-  stat,
-  unlink,
-  type FileHandle,
-} from "node:fs/promises";
+import { claimFs, type FileHandle, startClaimFs, closeClaimFs, claimHandleId } from "./claim-fs.js";
 import path from "node:path";
 
 import { stableStringify } from "./agent_envelope.js";
@@ -338,7 +328,7 @@ function directoryOpenFlags(): number {
 }
 
 function fdAliasPath(fdAliasRoot: string, handle: FileHandle): string {
-  return path.join(fdAliasRoot, String(handle.fd));
+  return path.join(fdAliasRoot, String(claimHandleId(handle)));
 }
 
 function childOfHandle(
@@ -359,10 +349,11 @@ function childOfHandle(
 }
 
 async function detectFdAliasRoot(handle: FileHandle): Promise<string> {
+  if (process.platform === "darwin") return startClaimFs(handle);
   const expected = await handle.stat();
   for (const root of ["/proc/self/fd", "/dev/fd"]) {
     try {
-      const aliasStat = await stat(path.join(root, String(handle.fd)));
+      const aliasStat = await claimFs.stat(path.join(root, String(claimHandleId(handle))));
       if (
         aliasStat.isDirectory() &&
         aliasStat.dev === expected.dev &&
@@ -388,7 +379,7 @@ async function openPrivateChildDirectory(
   const anchoredPath = childOfHandle(fdAliasRoot, parent, childName);
   if (create) {
     try {
-      await mkdir(anchoredPath, { mode: 0o700 });
+      await claimFs.mkdir(anchoredPath, { mode: 0o700 });
     } catch (error) {
       if (!isErrno(error, "EEXIST")) throw error;
     }
@@ -396,7 +387,7 @@ async function openPrivateChildDirectory(
 
   let handle: FileHandle;
   try {
-    handle = await open(anchoredPath, directoryOpenFlags());
+    handle = await claimFs.open(anchoredPath, directoryOpenFlags());
   } catch (error) {
     if (!create && isErrno(error, "ENOENT")) return undefined;
     if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
@@ -438,7 +429,7 @@ async function withClaimLocation<T>(
   try {
     let vaultHandle: FileHandle;
     try {
-      vaultHandle = await open(logicalVaultPath, directoryOpenFlags());
+      vaultHandle = await claimFs.open(logicalVaultPath, directoryOpenFlags());
     } catch (error) {
       if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
         throw pathMismatch();
@@ -497,6 +488,7 @@ async function withClaimLocation<T>(
     });
   } finally {
     for (const handle of handles.reverse()) {
+      await closeClaimFs(handle);
       await handle.close().catch(() => {});
     }
   }
@@ -556,7 +548,7 @@ async function withReceiptSliceLocation<T>(
   try {
     let vaultHandle: FileHandle;
     try {
-      vaultHandle = await open(logicalVaultPath, directoryOpenFlags());
+      vaultHandle = await claimFs.open(logicalVaultPath, directoryOpenFlags());
     } catch (error) {
       if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
         throw pathMismatch();
@@ -634,6 +626,7 @@ async function withReceiptSliceLocation<T>(
     });
   } finally {
     for (const handle of handles.reverse()) {
+      await closeClaimFs(handle);
       await handle.close().catch(() => {});
     }
   }
@@ -667,7 +660,7 @@ async function withReceiptLocation<T>(
   try {
     let vaultHandle: FileHandle;
     try {
-      vaultHandle = await open(logicalVaultPath, directoryOpenFlags());
+      vaultHandle = await claimFs.open(logicalVaultPath, directoryOpenFlags());
     } catch (error) {
       if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) {
         throw pathMismatch();
@@ -761,6 +754,7 @@ async function withReceiptLocation<T>(
     });
   } finally {
     for (const handle of handles.reverse()) {
+      await closeClaimFs(handle);
       await handle.close().catch(() => {});
     }
   }
@@ -772,7 +766,7 @@ async function logicalPathMatchesHandle(
 ): Promise<boolean> {
   let currentHandle: FileHandle;
   try {
-    currentHandle = await open(logicalPath, directoryOpenFlags());
+    currentHandle = await claimFs.open(logicalPath, directoryOpenFlags());
   } catch {
     return false;
   }
@@ -946,7 +940,7 @@ async function readEnvelope(
 
   let handle;
   try {
-    handle = await open(
+    handle = await claimFs.open(
       childOfHandle(
         location.fdAliasRoot,
         location.planHandle,
@@ -1005,7 +999,7 @@ async function writeEnvelopeAtomic(
 
   let handle;
   try {
-    handle = await open(
+    handle = await claimFs.open(
       temporaryPath,
       constants.O_WRONLY |
         constants.O_CREAT |
@@ -1020,17 +1014,17 @@ async function writeEnvelopeAtomic(
     handle = undefined;
 
     try {
-      await lstat(finalPath);
+      await claimFs.lstat(finalPath);
       throw metadataMismatch();
     } catch (error) {
       if (!isErrno(error, "ENOENT")) throw error;
     }
 
-    await rename(temporaryPath, finalPath);
+    await claimFs.rename(temporaryPath, finalPath);
     await location.planHandle.sync();
   } finally {
     if (handle) await handle.close().catch(() => {});
-    await unlink(temporaryPath).catch((error) => {
+    await claimFs.unlink(temporaryPath).catch((error) => {
       if (!isErrno(error, "ENOENT")) throw error;
     });
   }
@@ -1038,7 +1032,7 @@ async function writeEnvelopeAtomic(
 
 async function unlinkEnvelope(location: ClaimLocation): Promise<void> {
   try {
-    await unlink(
+    await claimFs.unlink(
       childOfHandle(
         location.fdAliasRoot,
         location.planHandle,
@@ -1146,7 +1140,7 @@ async function readReceiptEnvelopeRaw(
 ): Promise<WorkerUpdateReceiptEnvelope | undefined> {
   let handle;
   try {
-    handle = await open(
+    handle = await claimFs.open(
       childOfHandle(
         location.fdAliasRoot,
         location.generationHandle,
@@ -1240,7 +1234,7 @@ async function writeReceiptEnvelopeAtomic(
 
   let handle;
   try {
-    handle = await open(
+    handle = await claimFs.open(
       temporaryPath,
       constants.O_WRONLY |
         constants.O_CREAT |
@@ -1254,11 +1248,11 @@ async function writeReceiptEnvelopeAtomic(
     await handle.close();
     handle = undefined;
 
-    await rename(temporaryPath, finalPath);
+    await claimFs.rename(temporaryPath, finalPath);
     await location.generationHandle.sync();
   } finally {
     if (handle) await handle.close().catch(() => {});
-    await unlink(temporaryPath).catch((error) => {
+    await claimFs.unlink(temporaryPath).catch((error) => {
       if (!isErrno(error, "ENOENT")) throw error;
     });
   }
@@ -1331,7 +1325,7 @@ async function removeAnchoredGenerationDirectory(
   const childPath = childOfHandle(fdAliasRoot, parentHandle, childName);
   let handle: FileHandle | undefined;
   try {
-    handle = await open(childPath, directoryOpenFlags());
+    handle = await claimFs.open(childPath, directoryOpenFlags());
   } catch (error) {
     if (isErrno(error, "ENOENT")) return;
     if (isErrno(error, "ELOOP") || isErrno(error, "ENOTDIR")) return;
@@ -1340,12 +1334,12 @@ async function removeAnchoredGenerationDirectory(
   try {
     const openedStat = await handle.stat();
     if (!openedStat.isDirectory()) return;
-    const entries = await readdir(childPath, { withFileTypes: true });
+    const entries = await claimFs.readdir(childPath, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.isDirectory()) {
         throw pathMismatch();
       }
-      await unlink(childOfHandle(fdAliasRoot, handle, entry.name)).catch(
+      await claimFs.unlink(childOfHandle(fdAliasRoot, handle, entry.name)).catch(
         (error) => {
           if (!isErrno(error, "ENOENT")) throw error;
         },
@@ -1354,7 +1348,7 @@ async function removeAnchoredGenerationDirectory(
   } finally {
     await handle.close().catch(() => {});
   }
-  await rmdir(childPath).catch((error) => {
+  await claimFs.rmdir(childPath).catch((error) => {
     if (!isErrno(error, "ENOENT")) throw error;
   });
 }

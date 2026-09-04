@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import fs, { constants } from "node:fs";
+import { constants } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -9,7 +9,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { syncBuiltinESMExports } from "node:module";
+import { claimFs } from "../dist/claim-fs.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -133,9 +133,9 @@ test("final-fix-3: readWorkerUpdateReceipt opens only the direct receipt file am
     },
   });
 
-  const originalOpen = fs.promises.open;
+  const originalOpen = claimFs.open;
   let receiptJsonOpens = 0;
-  fs.promises.open = async (target, flags, ...args) => {
+  claimFs.open = async (target, flags, ...args) => {
     const flagsNum = Number(flags);
     const accmode =
       typeof constants.O_ACCMODE === "number"
@@ -150,7 +150,7 @@ test("final-fix-3: readWorkerUpdateReceipt opens only the direct receipt file am
     }
     return originalOpen(target, flags, ...args);
   };
-  syncBuiltinESMExports();
+
 
   let receipt;
   try {
@@ -164,8 +164,8 @@ test("final-fix-3: readWorkerUpdateReceipt opens only the direct receipt file am
       claimId: hashSegment("claim-perf"),
     });
   } finally {
-    fs.promises.open = originalOpen;
-    syncBuiltinESMExports();
+    claimFs.open = originalOpen;
+
   }
 
   assert.ok(receipt);

@@ -2674,3 +2674,27 @@ test("legacy queued start without acceptor pid still applies on standing drain",
   assert.deepEqual(journal.started, ["s0"]);
 });
 
+
+test('busy completion rejects a superseded parent instead of accepting an undrainable ticket', async t => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const plan = await rehydratePlan(fixture.notePath);
+  const split = applySliceDelta(plan, {
+    drop_slice_ids: ['s0'],
+    add_slices: [{ id: 'replacement', title: 'Replacement slice' }],
+  });
+  await persistPlan(split, { vaultPath: fixture.vaultPath, notePath: fixture.notePath });
+  await withThreadLock(fixture.vaultPath, fixture.planId, 'hold-after-split', async () => {
+    await assert.rejects(updateClaimedSlice({
+      ...fixture,
+      sliceId: 's0',
+      workerAgentId: 'worker-0',
+      token: claim.token,
+      idempotencyKey: 'complete-after-split-while-busy',
+      action: { action: 'complete', evidence: 'Stale parent cannot be completed' },
+      now: new Date('2026-08-18T12:03:00.000Z'),
+    }), /not worker-updatable/);
+    assert.deepEqual(await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId), []);
+  });
+  assert.equal((await rehydratePlan(fixture.notePath)).slices.find(s => s.id === 's0').status, 'superseded');
+});

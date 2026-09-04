@@ -25,6 +25,23 @@ The frontend is a Vite + React + TypeScript app under [frontend-src/](frontend-s
 
 Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris accents) and **Phosphor** (CRT operator board with telemetry rail and live activity stream). Toggle from the gear button bottom-right. Layout sizes and theme persist to `localStorage`.
 
+## macOS Thread claim storage
+
+Thread claims and worker receipts on macOS use a bundled, standard-library Python
+helper for descriptor-relative filesystem operations. The helper inherits an
+already-open vault descriptor; it does not follow `/dev/fd` child paths or fall
+back to mutable logical paths. Python is required only when this storage backend
+runs. Interpreter selection is `MINNI_CLAIM_PYTHON`, then `PYTHON`, then `PYTHON3`,
+then `python3` on PATH. Set `MINNI_CLAIM_PYTHON` to an absolute interpreter path
+when the plugin host has a minimal PATH. No extra Python packages are needed.
+
+The helper runs in isolated Python mode, ships inside the compiled JavaScript
+payload, and is reused only within one awaited Thread mutation before being
+closed. Each location still closes its child descriptors; separate mutations
+never share an idle helper. Missing or failed helpers
+fail the claim operation explicitly; a stuck helper is killed after a 10-second
+request deadline. Linux continues using its native descriptor-path backend.
+
 ## Runtime Defaults
 
 All paths and env var names below are read in `src/config.ts` (and `src/afm.ts`

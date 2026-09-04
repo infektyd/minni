@@ -1,3 +1,4 @@
+import { withClaimFsScope } from "./claim-fs.js";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -206,6 +207,10 @@ export function startAcceptedReceiptKey(
 }
 
 async function stampAcceptedStart(input: UpdateClaimedSliceInput): Promise<void> {
+  return withClaimFsScope(() => stampAcceptedStartWithClaimFs(input));
+}
+
+async function stampAcceptedStartWithClaimFs(input: UpdateClaimedSliceInput): Promise<void> {
   const plan = await rehydrateAuthority({
     vaultPath: input.vaultPath,
     notePath: input.notePath,
@@ -299,6 +304,12 @@ async function refuseCompleteUntilStartApplied(
     planId,
   });
   const slice = findSlice(plan, sliceId);
+  // A competing drain can hold the persist lock after an orchestrator split.
+  // Busy fallback must not report acceptance for a superseded parent: no
+  // later drain can apply this completion. Keep done-receipt retries intact.
+  if (slice.status === "superseded") {
+    throw new Error(`slice "${sliceId}" is not worker-updatable`);
+  }
   if (slice.status === "in_progress") return;
   const queuedNow = await listQueuedWorkerWrites(input.vaultPath, planId);
   const startTicket = queuedNow.some(
@@ -525,8 +536,8 @@ export async function withThreadPlanLock<T>(
     input.vaultPath,
     requireNonEmpty(input.planId, "plan id"),
     requireNonEmpty(input.operationId, "operation id"),
-    async () =>
-      fn(await rehydrateAuthority(input, deps.rehydratePlan ?? rehydratePlan)),
+    () => withClaimFsScope(async () =>
+      fn(await rehydrateAuthority(input, deps.rehydratePlan ?? rehydratePlan))),
   );
   // After exclusive persist releases, daemon-drain queued worker writes.
   // Not mid-replan: the lock is free. Not a second graph.
@@ -2544,6 +2555,13 @@ async function drainOneQueuedWorkerWrite(
 }
 
 async function applyClaimedSliceOnLockedPlan(
+  input: UpdateClaimedSliceInput,
+  deps: ThreadWorkerDeps = {},
+): Promise<ThreadMutationResult> {
+  return withClaimFsScope(() => applyClaimedSliceWithClaimFs(input, deps));
+}
+
+async function applyClaimedSliceWithClaimFs(
   input: UpdateClaimedSliceInput,
   deps: ThreadWorkerDeps = {},
 ): Promise<ThreadMutationResult> {
