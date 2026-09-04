@@ -373,8 +373,8 @@ def _db_with_fenced_candidate(tmp_path, cid: int = 1):
             c.execute("ALTER TABLE learnings ADD COLUMN content_hash TEXT")
         c.execute(
             """INSERT INTO candidate_packets
-               (candidate_id, principal, content, status, proposed_at)
-               VALUES (?, 'test', 'a durable lesson worth keeping', 'proposed', ?)""",
+               (candidate_id, principal, privacy_level, content, status, proposed_at)
+               VALUES (?, 'test', 'safe', 'a durable lesson worth keeping', 'proposed', ?)""",
             (cid, time.time()),
         )
         c.execute(

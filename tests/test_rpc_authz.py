@@ -466,6 +466,101 @@ def test_resolve_candidate_owner_resolution_drains_inbox_exactly_once(monkeypatc
     assert archived == ["authz-drain.json"], archived
 
 
+def _insert_inbox_twin(db_obj, *, principal, content, inbox_file="session.json"):
+    import hashlib
+    import time
+
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "inbox_file": inbox_file,
+            "candidate_index": 0,
+            "kind": None,
+            "content_sha1": hashlib.sha1(content.encode("utf-8")).hexdigest(),
+        }
+    )
+    now = time.time()
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES (?, 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (principal, content, derived, now),
+        )
+        return c.lastrowid
+
+
+def test_gemini_host_lists_and_resolves_leftover_agy_session_twin(
+    monkeypatch, tmp_path
+):
+    """Leftover agy + gemini same session.json index 0: after collapse the
+    gemini host must list and resolve the remaining packet.
+
+    collapse_decision keeps min(candidate_id) and used to DELETE the gemini
+    twin without rewriting winner.principal, so list WHERE principal=gemini
+    and resolve owner==agent_id missed the leftover agy row.
+    """
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    content = "alias twin fill from the same session.json index 0"
+    agy_id = _insert_inbox_twin(db_obj, principal="agy", content=content)
+    gemini_id = _insert_inbox_twin(db_obj, principal="gemini", content=content)
+    assert agy_id < gemini_id
+
+    applied = repair_duplicate_candidate_pairs(db_obj, dry_run=False)
+    assert applied["deleted"] == 1
+
+    _stamp_principal(monkeypatch, "gemini", capabilities=["learn", "govern"])
+    listed = minnid._list_candidates({"status": "proposed"}, 20)
+    rows = listed.get("result", {}).get("candidates", [])
+    assert any(c.get("candidate_id") == agy_id for c in rows), listed
+    assert all(c.get("principal") in {"gemini", "agy"} for c in rows)
+
+    resp = minnid._resolve_candidate(
+        {"candidate_id": agy_id, "decision": "reject"}, 21
+    )
+    assert "error" not in resp, resp
+    assert resp["result"]["new_status"] == "rejected"
+
+    _stamp_principal(monkeypatch, "codex", capabilities=["learn"])
+    peer = minnid._list_candidates({"status": "rejected"}, 22)
+    assert peer.get("result", {}).get("candidates", []) == []
+    denied = minnid._resolve_candidate(
+        {"candidate_id": agy_id, "decision": "reject"}, 23
+    )
+    assert denied.get("error", {}).get("code") == -32004, denied
+    assert "principal_mismatch" in denied.get("error", {}).get("message", "")
+
+
+def test_gemini_host_lists_and_resolves_leftover_only_agy_packet(
+    monkeypatch, tmp_path
+):
+    """No gemini twin to collapse: leftover principal='agy' must still be
+    visible to the canonical gemini host (UNIQUE leftover-only shape)."""
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    cid = _insert_inbox_twin(
+        db_obj,
+        principal="agy",
+        content="leftover-only agy fill with no gemini twin",
+    )
+
+    _stamp_principal(monkeypatch, "gemini", capabilities=["learn", "govern"])
+    listed = minnid._list_candidates({"status": "proposed"}, 24)
+    ids = [c.get("candidate_id") for c in listed.get("result", {}).get("candidates", [])]
+    assert cid in ids, listed
+    resp = minnid._resolve_candidate(
+        {"candidate_id": cid, "decision": "reject"}, 25
+    )
+    assert "error" not in resp, resp
+    assert resp["result"]["new_status"] == "rejected"
+
+
 # ── resolve_contradiction: owner or explicitly allowed operator ──────────────
 # (Review panel: same cross-principal mutation class as resolve_candidate —
 # any agent could supersede another principal's learnings by integer id.)

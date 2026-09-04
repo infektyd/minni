@@ -197,6 +197,33 @@ def test_quarantine_scoped_to_agent_mismatch_only(tmp_path):
         assert (inbox / name).exists(), name
 
 
+def test_slug_alias_stamped_agent_id_is_not_quarantined(tmp_path):
+    """Parity with test_slug_alias_stamped_agent_id_is_not_mismatch:
+    leftover agent_id=agy in agy-vault (canonical gemini) is ingestible,
+    so this drain must not treat it as _agent_mismatch even past TTL.
+    A raw file_agent == inbox_principal compare would quarantine the
+    exact stamped leftover ingest now requires."""
+    from minni.afm_passes.inbox_quarantine import quarantine_stale_agent_mismatch
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "stamped.json",
+        _stop_doc(
+            ["agy-stamped durable lesson"],
+            agent_id="agy",
+            createdAt=OLD_CREATED,
+        ),
+    )
+
+    res = quarantine_stale_agent_mismatch(
+        None, inboxes=[inbox], ttl_days=14.0, now=NOW_LATE,
+    )
+    assert res["quarantined"] == 0, res
+    assert (inbox / "stamped.json").exists()
+    assert not (inbox / "quarantine").exists()
+
+
 def test_quarantine_dry_run_does_not_move(tmp_path):
     from minni.afm_passes.inbox_quarantine import quarantine_stale_agent_mismatch
 

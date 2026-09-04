@@ -10,9 +10,14 @@ Design notes:
 - The pass NEVER performs the durable write itself. It returns decisions; the
   daemon applies promote/dedup/review via `_apply_consolidation_result` so the
   privileged write + embedding stay in one audited place (`minnid.py`).
-- Conservative: only `privacy: safe`, non-instruction, non-duplicate,
-  quality-passing candidates are proposed for auto-promotion. Everything spicier
-  is routed to review (status → `needs_review`) and surfaced as a draft.
+- Conservative: `privacy: safe` auto-promotes. Learn-only `privacy: review`
+  (the stage_candidate clamp) is AFM-examinable — quality / IL / dedup
+  still drain — but quality-pass review stays parked for
+  ``resolve_candidate``. Unset/NULL privacy is still parked (I1/I2).
+  Instruction-like / duplicate / quality failures still route to review +
+  fence. An active fence hides the row from the next drain so the loop
+  makes progress. A one-shot unpark lifts fences only on quality-pass,
+  non-IL ``privacy=review`` rows.
 - Swarm-scale:
     * Dedup is an INDEXED hash lookup (`content_hash`), not an O(N) in-memory
       scan of all learnings. Duplicate volume costs ~O(log N), so a swarm
@@ -40,6 +45,11 @@ logger = logging.getLogger("sovereign.afm.consolidation")
 # privacy is NOT the same as "known safe" and must never auto-promote to durable
 # learnings without a review pass (I1/I2 security fix).
 _SAFE_PRIVACY = {"safe", "public", "low"}
+# Learn-only stage_candidate clamps non-operator rows to privacy=review.
+# That label means "AFM must filter", not "park forever behind afm_review"
+# and not "auto-promote into learnings/writeback as safe". Unset/NULL
+# stays out of this set (I1/I2). Auto-promote still requires _SAFE_PRIVACY.
+_EXAMINABLE_PRIVACY = _SAFE_PRIVACY | {"review"}
 _MIN_CONTENT_LEN = 12
 _DEFAULT_MAX_PER_RUN = 50
 
@@ -141,9 +151,36 @@ def _total_proposed(db) -> int:
         return int(c.fetchone()["n"])
 
 
+_DRAFT_PRIVACY = {"safe", "public", "low", "review", "private", "local-only", "blocked"}
+
+
+def _draft_privacy(candidate: Dict[str, Any]) -> str:
+    """Wiki-page privacy for a review draft. Learn-only review / NULL / unknown
+    must not compile as fleet-readable ``privacy: safe``."""
+    raw = candidate.get("privacy_level")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "review"
+    privacy = str(raw).strip().lower()
+    if privacy in _SAFE_PRIVACY:
+        return "safe"
+    return privacy if privacy in _DRAFT_PRIVACY else "review"
+
+
 def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict[str, Any]:
     cid = candidate["candidate_id"]
-    content = (candidate.get("content") or "")[:400]
+    privacy = _draft_privacy(candidate)
+    content = candidate.get("content") or ""
+    instr_like = (
+        int(candidate.get("instruction_like") or 0) == 1
+        or is_instruction_like(content)
+    )
+    # Inbox ingest stamps missing privacy as safe, so IL / injection
+    # candidates still compile as privacy:safe. Never copy that body
+    # into a fleet-readable wiki page.
+    if privacy in _SAFE_PRIVACY and not instr_like:
+        content_line = f"- Content: {content[:400]}"
+    else:
+        content_line = "- Content: [withheld; learn-only / non-safe privacy]"
     return {
         "page_id": f"consolidation-review-{cid}-{trace_id}",
         "kind": "concept",
@@ -151,6 +188,7 @@ def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict
         "title": f"Candidate #{cid} needs review ({reason})",
         "status": "draft",
         "agent": "afm-loop",
+        "privacy": privacy,
         "trace_id": trace_id,
         "sources": [f"candidate_packets:{cid}"],
         "body": (
@@ -159,7 +197,7 @@ def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict
             f"- Principal: {candidate.get('principal')}; "
             f"privacy: {candidate.get('privacy_level')}; "
             f"instruction_like: {bool(candidate.get('instruction_like'))}.\n"
-            f"- Content: {content}"
+            f"{content_line}"
         ),
     }
 
@@ -212,6 +250,9 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
         return None
     # Prefer a candidate the deterministic gate already chose to promote, so the
     # advisory is comparable to a real decision; else fall back to the first one.
+    # Review / NULL / content-IL never reach the native call — gated below —
+    # so the fallback cannot exfiltrate injection text the way an unguarded
+    # candidates[0] did when promote_candidate_ids was empty.
     chosen = None
     if promote_candidate_ids:
         promote_set = set(promote_candidate_ids)
@@ -223,13 +264,22 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     promote_set = set(promote_candidate_ids)
     if promote_candidate_ids and chosen.get("candidate_id") not in promote_set:
         return None
-    privacy = str(chosen.get("privacy_level") or "safe").strip().lower()
-    if privacy not in {"safe", ""}:
+    # Native triage is a model-path. Learn-only review (and I1/I2 NULL/unset)
+    # stay on the deterministic drain; do not fail-open as "safe". Content
+    # that trips is_instruction_like is review-routed even when the column
+    # is still 0 and privacy was stamped safe at ingest.
+    raw_privacy = chosen.get("privacy_level")
+    if raw_privacy is None or (
+        isinstance(raw_privacy, str) and not raw_privacy.strip()
+    ):
         return None
-    if int(chosen.get("instruction_like") or 0) == 1:
+    privacy = str(raw_privacy).strip().lower()
+    if privacy not in _SAFE_PRIVACY:
         return None
     content = (chosen.get("content") or "").strip()
     if not content:
+        return None
+    if int(chosen.get("instruction_like") or 0) == 1 or is_instruction_like(content):
         return None
     try:
         chain = default_provider_chain()
@@ -295,13 +345,20 @@ def run(db, config, vault_path: Optional[str] = None,
             continue
 
         privacy = (cand.get("privacy_level") or "").strip().lower()
-        if privacy not in _SAFE_PRIVACY:
+        if privacy not in _EXAMINABLE_PRIVACY:
             _review(cand, f"privacy={privacy or 'unset'}")
             continue
 
         blockers = _quality_blockers(content)
         if blockers:
             _review(cand, "low quality: " + "; ".join(blockers))
+            continue
+
+        # Examinable ≠ auto-promotable. Learn-only review packets must
+        # stay parked for resolve_candidate; promote_candidate_durable
+        # has no privacy column and writeback/indexer default to safe.
+        if privacy not in _SAFE_PRIVACY:
+            _review(cand, f"privacy={privacy or 'unset'}")
             continue
 
         promote_candidate_ids.append(cand["candidate_id"])

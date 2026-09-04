@@ -383,8 +383,15 @@ def test_main_learn_only_stage_candidate_clamps_safe_privacy(monkeypatch, tmp_pa
     assert resp["result"]["privacy_level"] == "review"
 
 
-def test_afm_loop_does_not_promote_learn_only_clamped_candidate(tmp_path, monkeypatch):
-    """End-to-end: learn-only stage with privacy=safe → review clamp → loop holds."""
+def test_afm_loop_does_not_promote_learn_only_clamped_quality_pass(
+    tmp_path, monkeypatch
+):
+    """Learn-only stage clamps privacy=safe → review; AFM then filters.
+
+    Quality-pass review rows stay proposed for resolve_candidate. The clamp
+    is the AFM-filter label, not a license to write durable/safe memory.
+    (I1/I2 NULL privacy still holds elsewhere.)
+    """
     import types
 
     import minni.minnid as minnid
@@ -397,7 +404,7 @@ def test_afm_loop_does_not_promote_learn_only_clamped_candidate(tmp_path, monkey
     monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
 
     db_obj, cfg = _make_db(tmp_path)
-    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
+    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj, model=None, config=cfg))
     monkeypatch.setattr(
         provenance,
         "resolve_effective_principal",
@@ -410,12 +417,13 @@ def test_afm_loop_does_not_promote_learn_only_clamped_candidate(tmp_path, monkey
             "method": "stage_candidate",
             "params": {
                 "agent_id": "codex",
-                "content": "Should stay in review despite caller privacy=safe.",
+                "content": "Always validate the migration plan against a fresh fixture database.",
                 "privacy_level": "safe",
             },
         }
     )
     cid = resp["result"]["candidate_id"]
+    assert resp["result"]["privacy_level"] == "review"
     ctx, _ = _loop_context(db_obj, cfg, ticks=1)
     asyncio.run(afm_loop_runner(ctx))
 
@@ -426,3 +434,8 @@ def test_afm_loop_does_not_promote_learn_only_clamped_candidate(tmp_path, monkey
         assert row["status"] == "proposed"
         c.execute("SELECT COUNT(*) AS n FROM learnings")
         assert c.fetchone()["n"] == 0
+        c.execute(
+            "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=?",
+            (str(cid),),
+        )
+        assert c.fetchone() is not None

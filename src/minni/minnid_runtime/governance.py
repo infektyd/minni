@@ -1142,14 +1142,23 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
     db = None
     try:
         db = context.sovereign_db()
+        from minni.afm_passes.inbox_ingest import _principal_family
+
+        family = _principal_family(principal.agent_id)
+        placeholders = ",".join("?" for _ in family)
         with db.cursor() as c:
             # One statement for the page + has_more probe. A prior COUNT(*)
             # is a different WAL snapshot; extras that land between the two
             # would fill LIMIT and still report has_more false.
+            # Family-scoped (#44): co-located sessions share a principal
+            # family, so scope by family, not the single stamped agent_id.
+            # status_f is always truthy here (defaults to "proposed"), so no
+            # unfiltered branch: omitting status must not SELECT every status.
             c.execute(
-                "SELECT * FROM candidate_packets WHERE principal=? AND status=? "
+                "SELECT * FROM candidate_packets "
+                f"WHERE principal IN ({placeholders}) AND status=? "
                 "ORDER BY proposed_at DESC LIMIT ?",
-                (principal.agent_id, status_f, limit + 1),
+                (*family, status_f, limit + 1),
             )
             rows = []
             for row in c.fetchall():
@@ -1315,7 +1324,13 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 )
             rowd = dict(row)
             owner = str(rowd.get("principal") or "")
-            if owner != principal.agent_id and not explicitly_allowed_operator(principal):
+            from minni.afm_passes.inbox_ingest import _canonical_principal
+
+            if (
+                _canonical_principal(owner)
+                != _canonical_principal(principal.agent_id)
+                and not explicitly_allowed_operator(principal)
+            ):
                 raise ResolveRejected(context.make_error(
                     -32004,
                     f"principal_mismatch: candidate #{cid} is owned by '{owner}'; "

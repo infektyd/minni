@@ -49,8 +49,11 @@ Safety / contract
   here as defense in depth. Echoes are tallied as ``_audit_echo`` in
   ``skipped_by_kind`` so the drop is observable rather than silent.
 * IDEMPOTENT: each row carries ``derived_from`` with the source inbox file +
-  candidate index; existing rows (ANY status) are detected and never
-  re-inserted. Re-running is a no-op even after the loop resolves a row.
+  candidate index; existing rows (ANY status) whose body matches (content
+  sha1) are detected and never re-inserted. A leftover occupying the same
+  (canonical principal, inbox_file, candidate_index) with a *divergent*
+  body extras-at-next-idx so the remapped stop-candidate still lands.
+  Re-running is a no-op even after the loop resolves a row.
 * ``derived_from.kind`` records what the source file actually declared
   (``null`` for the kind-less Claude Code shape) — Minni logic never stamps
   one agent's label onto another agent's rows.
@@ -237,8 +240,12 @@ def _make_inbox_key(
     by ``principal`` (derived from ``<agent>-vault/inbox``) prevents those
     twins without blocking legitimate same-basename files in other vaults
     (see ``test_cross_vault_live_sibling_does_not_block_other_vaults_copy``).
+
+    Vault-slug aliases (``agy``/``antigravity`` → ``gemini``, ``xai`` →
+    ``grok-build``) collapse to the canonical id so a remap is a merge of
+    the old row, not a new UNIQUE key.
     """
-    return (str(principal or ""), inbox_file, int(candidate_index))
+    return (_canonical_principal(principal), inbox_file, int(candidate_index))
 
 
 def _parse_inbox_key(
@@ -258,15 +265,20 @@ def _existing_keys(db, principals: set | None = None) -> set:
     Status-agnostic so re-runs are no-ops after resolution.
 
     ``principals`` optionally restricts the scan (compact_distillation per-inbox).
+    Alias family is expanded so leftover ``agy``/``xai`` rows still block a
+    remapped ``gemini``/``grok-build`` insert of the same inbox fill.
     """
     keys: set = set()
     with db.cursor() as c:
         if principals:
-            placeholders = ",".join("?" for _ in principals)
+            expanded: set[str] = set()
+            for p in principals:
+                expanded.update(_principal_family(p))
+            placeholders = ",".join("?" for _ in expanded)
             c.execute(
                 f"SELECT principal, derived_from FROM candidate_packets "
                 f"WHERE principal IN ({placeholders})",
-                tuple(principals),
+                tuple(expanded),
             )
         else:
             c.execute("SELECT principal, derived_from FROM candidate_packets")
@@ -283,29 +295,231 @@ def _existing_keys(db, principals: set | None = None) -> set:
     return keys
 
 
+def _packet_content_sha1(content: Any, df: Any) -> str:
+    """Hash the content column; derived_from.content_sha1 is audit metadata.
+
+    Same rule as repair ``_collapse_digest``: a leftover alias row can stamp
+    the live candidate's sha on a different body (``stage_candidate`` dumps
+    caller ``derived_from`` verbatim). Occupancy extras must not treat that
+    stamp as already_present.
+    """
+    if content is not None:
+        text = content if isinstance(content, str) else str(content)
+        return _content_sha1(text)
+    if isinstance(df, str) and df:
+        try:
+            obj = json.loads(df)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            raw_sha = obj.get("content_sha1")
+            if isinstance(raw_sha, str) and raw_sha:
+                return raw_sha
+    return _content_sha1("")
+
+
+def _sha_set(value: Any) -> set:
+    """Normalize occupancy at one slot to a set of content_sha1s."""
+    if isinstance(value, (set, frozenset)):
+        return set(value)
+    if isinstance(value, (list, tuple)):
+        return {v for v in value if isinstance(v, str) and v}
+    if isinstance(value, str) and value:
+        return {value}
+    return set()
+
+
+def _all_occupied_shas(occupied: Dict[int, Any]) -> set:
+    out: set = set()
+    for v in occupied.values():
+        out |= _sha_set(v)
+    return out
+
+
+def _fills_from_packet_rows(rows) -> Dict[Tuple[str, str], Dict[int, set]]:
+    """Build occupancy from ``(principal, content, derived_from)`` rows."""
+    fills: Dict[Tuple[str, str], Dict[int, set]] = {}
+    for row in rows:
+        if isinstance(row, dict) or hasattr(row, "keys"):
+            p, content, df = row["principal"], row["content"], row["derived_from"]
+        else:
+            p, content, df = row[0], row[1], row[2]
+        key = _parse_inbox_key(p, df)
+        if key is None:
+            continue
+        canon, inbox_file, idx = key
+        fills.setdefault((canon, inbox_file), {}).setdefault(idx, set()).add(
+            _packet_content_sha1(content, df)
+        )
+    return fills
+
+
+def _existing_fills_on_cursor(
+    c, principals: set | None = None
+) -> Dict[Tuple[str, str], Dict[int, set]]:
+    """Occupancy map loaded on ``c`` (in-txn; not the pre-scan ``_fills_for_file``)."""
+    if principals:
+        expanded: set[str] = set()
+        for p in principals:
+            expanded.update(_principal_family(p))
+        placeholders = ",".join("?" for _ in expanded)
+        c.execute(
+            f"SELECT principal, content, derived_from FROM candidate_packets "
+            f"WHERE principal IN ({placeholders})",
+            tuple(expanded),
+        )
+    else:
+        c.execute(
+            "SELECT principal, content, derived_from FROM candidate_packets"
+        )
+    return _fills_from_packet_rows(c.fetchall())
+
+
+def _existing_fills(
+    db, principals: set | None = None
+) -> Dict[Tuple[str, str], Dict[int, set]]:
+    """``(canonical principal, inbox_file) -> {candidate_index: set(sha)}``.
+
+    Alias-family leftover rows occupy the canonical (file, index) slot so a
+    remapped vault can extras-at-next-idx when the occupying body diverges.
+    Keep every sha at a slot (CASE UNIQUE may be absent) so a same-slot
+    twin cannot hide from extras skip.
+    """
+    with db.cursor() as c:
+        return _existing_fills_on_cursor(c, principals)
+
+
+def _fills_for_file(db, principal: str, inbox_file: str) -> List[Tuple[int, str]]:
+    """``(candidate_index, content_sha1)`` already stored for this inbox file.
+
+    Alias-family leftover rows occupy the canonical (file, index) slot.
+    Index 0 alone is not the whole fill when the stored body diverges from
+    a later compact_summary section or remapped stop-candidate. Same-slot
+    twins (CASE UNIQUE not installed) yield one tuple per sha.
+    """
+    slot = _existing_fills(db, {principal}).get(
+        (_canonical_principal(principal), inbox_file), {}
+    )
+    out: List[Tuple[int, str]] = []
+    for idx in sorted(slot):
+        for sha in sorted(_sha_set(slot[idx])):
+            out.append((idx, sha))
+    return out
+
+
+def _assign_fill_indices(
+    occupied: Dict[int, Any],
+    requested: List[Tuple[int, str]],
+) -> List[Optional[int]]:
+    """Map each ``(requested_idx, sha)`` to an insert index, or None if present.
+
+    Missing indices keep ``requested_idx``. Occupied indices whose body
+    already exists (same sha at this index or any index) are skipped.
+    Occupied divergent bodies go at the next free index after every
+    reserved missing slot, so extras never steal a still-free distilled
+    index. Identical extra shas share one extra index (agy-vault +
+    gemini-vault grouped into one requested list must not mint a twin).
+    Occupancy values are a set of shas per slot so a same-slot twin is
+    not last-write hidden. Mutates ``occupied``.
+    """
+    for idx in list(occupied):
+        occupied[idx] = _sha_set(occupied[idx])
+    existing_shas = _all_occupied_shas(occupied)
+    assigned: List[Optional[int]] = [None] * len(requested)
+    extras: List[int] = []
+    for i, (idx, sha) in enumerate(requested):
+        if sha in existing_shas:
+            continue
+        if idx not in occupied:
+            occupied[idx] = {sha}
+            existing_shas.add(sha)
+            assigned[i] = idx
+        else:
+            extras.append(i)
+            # Claim the sha now so a later identical extra (agy-vault +
+            # gemini-vault grouped into one requested list) does not mint
+            # a twin at next_idx+1. UNIQUE is (canon, file, idx).
+            existing_shas.add(sha)
+    if extras:
+        next_idx = (max(occupied) if occupied else -1) + 1
+        for i in extras:
+            _idx, sha = requested[i]
+            if sha in _all_occupied_shas(occupied):
+                continue
+            occupied[next_idx] = {sha}
+            existing_shas.add(sha)
+            assigned[i] = next_idx
+            next_idx += 1
+    return assigned
+
+
+def _remap_rows_against_occupancy(
+    rows: List[Dict[str, Any]],
+    occupancy: Dict[Tuple[str, str], Dict[int, set]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Re-run extras-at-next-idx against in-txn occupancy.
+
+    Pre-scan occupancy can miss leftover fills (``_existing_fills`` emptied or
+    a race). UNIQUE is (canon, file, idx) with no content_sha1, so a key hit
+    without this remap unique-skips a divergent index-0 body.
+    """
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    order: List[Tuple[str, str]] = []
+    for r in rows:
+        key = (_canonical_principal(r["principal"]), r["inbox_file"])
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        grouped[key].append(r)
+    out: List[Dict[str, Any]] = []
+    skipped = 0
+    for key in order:
+        file_rows = grouped[key]
+        slot = occupancy.setdefault(key, {})
+        requested = [
+            (int(r["candidate_index"]), _content_sha1(r["content"]))
+            for r in file_rows
+        ]
+        assigned = _assign_fill_indices(slot, requested)
+        for r, new_idx in zip(file_rows, assigned):
+            if new_idx is None:
+                skipped += 1
+                continue
+            if new_idx != r["candidate_index"]:
+                r = dict(r)
+                r["candidate_index"] = new_idx
+            out.append(r)
+    return out, skipped
+
+
 def _existing_keys_for_on_cursor(c, wanted: set) -> set:
     """Return which of ``wanted`` keys already exist — narrow scan under txn.
 
     ``wanted`` entries are ``(principal, inbox_file, candidate_index)``.
+    Principals are canonicalized (``agy`` → ``gemini``) so the
+    ``key[0] == principal`` check matches leftover alias-family rows.
     Avoids full-table scan under ``BEGIN IMMEDIATE``.
     """
     if not wanted:
         return set()
-    # Group by (principal, inbox_file) → indices
+    # Group by (canonical principal, inbox_file) → indices
     by_scope: Dict[Tuple[str, str], set] = {}
     for principal, inbox_file, idx in wanted:
-        by_scope.setdefault((principal, inbox_file), set()).add(idx)
+        canon, inbox_file, idx = _make_inbox_key(principal, inbox_file, idx)
+        by_scope.setdefault((canon, inbox_file), set()).add(idx)
     found: set = set()
     for (principal, inbox_file), indices in by_scope.items():
+        family = _principal_family(principal)
+        placeholders = ",".join("?" for _ in family)
         c.execute(
-            """
+            f"""
             SELECT principal, derived_from FROM candidate_packets
-            WHERE principal = ?
+            WHERE principal IN ({placeholders})
               AND derived_from IS NOT NULL
               AND json_extract(derived_from, '$.source') = 'inbox'
               AND json_extract(derived_from, '$.inbox_file') = ?
             """,
-            (principal, inbox_file),
+            (*family, inbox_file),
         )
         for row in c.fetchall():
             if isinstance(row, dict) or hasattr(row, "keys"):
@@ -356,13 +570,43 @@ _VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
     "codex": "codex",
     "cursor": "cursor",
     "gemini": "gemini",
+    "agy": "gemini",
+    "antigravity": "gemini",
     "hermes": "hermes",
     "kilocode": "kilocode",
     "openclaw": "openclaw",
     "grok-build": "grok-build",
     "grok-beta": "grok-build",
     "grok": "grok-build",
+    "xai": "grok-build",
 }
+
+
+def _canonical_principal(principal: Any) -> str:
+    """Map a vault slug / leftover packet principal onto its canonical id.
+
+    ``agy``/``antigravity`` → ``gemini``; ``xai``/``grok``/``grok-beta`` →
+    ``grok-build``. Unknown values pass through so a genuine other-agent
+    row stays a distinct UNIQUE key.
+    """
+    raw = str(principal or "")
+    return _VAULT_SLUG_TO_AGENT_ID.get(raw, raw)
+
+
+def _principal_family(principal: Any) -> tuple[str, ...]:
+    """All principals that share identity with ``principal`` (including itself).
+
+    Inbox UNIQUE is (principal, inbox_file, candidate_index). Remapping a
+    vault slug without this family turns leftover ``agy``/``xai`` rows into
+    a *new* key beside ``gemini``/``grok-build`` and dual-inserts #239.
+    """
+    raw = str(principal or "")
+    canon = _canonical_principal(raw)
+    family = {raw, canon}
+    for slug, agent_id in _VAULT_SLUG_TO_AGENT_ID.items():
+        if agent_id == canon:
+            family.add(slug)
+    return tuple(sorted(family))
 
 
 def _principal_for_inbox(inbox: Path, fallback_principal: str) -> str:
@@ -375,6 +619,25 @@ def _principal_for_inbox(inbox: Path, fallback_principal: str) -> str:
         slug = parent[: -len("-vault")]
         return _VAULT_SLUG_TO_AGENT_ID.get(slug, slug) or fallback_principal
     return fallback_principal
+
+
+def _alias_source_principal_for_inbox(
+    inbox: Path, canonical_principal: str
+) -> Optional[str]:
+    """Raw vault slug when ingest remaps an alias vault to a canonical id.
+
+    ``agy-vault`` stores principal=gemini; without ``source_principal``
+    archive treats the row as a gemini-vault fill and gemini-first discover
+    archives never-ingested ``gemini-vault/inbox``. Canonical vaults
+    (slug == principal) return None.
+    """
+    parent = Path(inbox).parent.name
+    if not parent.endswith("-vault"):
+        return None
+    slug = parent[: -len("-vault")]
+    if slug and slug != canonical_principal:
+        return slug
+    return None
 
 
 def _scan_inbox(
@@ -390,6 +653,7 @@ def _scan_inbox(
     out: List[Dict[str, Any]] = []
     skipped_by_kind: Dict[str, int] = {}
     inbox_principal = _principal_for_inbox(inbox, fallback_principal)
+    source_principal = _alias_source_principal_for_inbox(inbox, inbox_principal)
     for path in sorted(inbox.glob("*.json")):
         # An unreadable or non-object payload used to be dropped with a bare
         # `continue`, incrementing nothing — so it was invisible to every
@@ -439,7 +703,7 @@ def _scan_inbox(
         else:
             privacy_level = str(raw_privacy).strip()
         file_agent = str(doc.get("agent_id") or "").strip()
-        if file_agent and file_agent != inbox_principal:
+        if file_agent and _canonical_principal(file_agent) != inbox_principal:
             skipped_by_kind["_agent_mismatch"] = skipped_by_kind.get("_agent_mismatch", 0) + 1
             continue
         principal = inbox_principal
@@ -463,21 +727,22 @@ def _scan_inbox(
                 skipped_by_kind["_audit_echo"] = skipped_by_kind.get("_audit_echo", 0) + 1
                 continue
             content = cand.strip()[:CONTENT_CAP]
-            out.append(
-                {
-                    "principal": principal,
-                    "workspace_id": ws,
-                    "privacy_level": privacy_level,
-                    "content": content,
-                    "inbox_file": path.name,
-                    "candidate_index": idx,
-                    "proposed_at": proposed_at,
-                    # Record what the file actually declared; null for the
-                    # kind-less Claude Code shape. Never stamp an agent-specific
-                    # label onto another agent's rows.
-                    "kind": kind,
-                }
-            )
+            row = {
+                "principal": principal,
+                "workspace_id": ws,
+                "privacy_level": privacy_level,
+                "content": content,
+                "inbox_file": path.name,
+                "candidate_index": idx,
+                "proposed_at": proposed_at,
+                # Record what the file actually declared; null for the
+                # kind-less Claude Code shape. Never stamp an agent-specific
+                # label onto another agent's rows.
+                "kind": kind,
+            }
+            if source_principal:
+                row["source_principal"] = source_principal
+            out.append(row)
     return out, skipped_by_kind
 
 
@@ -499,78 +764,118 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
         for label, count in skipped.items():
             skipped_by_kind[label] = skipped_by_kind.get(label, 0) + count
 
-    existing = _existing_keys(db)
+    occupancy = _existing_fills(db)
+
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in scanned:
+        file_key = (_canonical_principal(r["principal"]), r["inbox_file"])
+        grouped.setdefault(file_key, []).append(r)
 
     to_insert: List[Dict[str, Any]] = []
     already = 0
-    for r in scanned:
-        key = _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
-        if key in existing:
-            already += 1
-            continue
-        existing.add(key)  # guard within-run dup
-        to_insert.append(r)
+    for file_key, rows in grouped.items():
+        slot = occupancy.setdefault(file_key, {})
+        requested = [
+            (int(r["candidate_index"]), _content_sha1(r["content"])) for r in rows
+        ]
+        assigned = _assign_fill_indices(slot, requested)
+        for r, new_idx in zip(rows, assigned):
+            if new_idx is None:
+                already += 1
+                continue
+            if new_idx != r["candidate_index"]:
+                r = dict(r)
+                r["candidate_index"] = new_idx
+            to_insert.append(r)
 
     inserted = 0
     if not dry_run and to_insert:
         with db.transaction() as c:
-            # Issue #239: re-load only the keys we intend to insert (not the
-            # full table) under BEGIN IMMEDIATE so concurrent ingest cannot
-            # both pass the pre-txn check and create twins. UNIQUE swallow
-            # remains the last backstop if the operator applied the index.
-            # Key is principal-scoped so multi-vault same basenames coexist.
-            wanted = {
-                _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
-                for r in to_insert
+            # In-txn occupancy, not the pre-scan _existing_fills map: leftover
+            # 0 with a divergent body extras-at-next-idx even when occupancy
+            # extras were skipped (stale pre-scan / TOCTOU). UNIQUE is
+            # (canon, file, idx) with no content_sha1; a key-only skip
+            # unique-swallows remapped qty.
+            durable_occupancy = _existing_fills_on_cursor(
+                c, {r["principal"] for r in to_insert}
+            )
+            occupancy: Dict[Tuple[str, str], Dict[int, set]] = {
+                k: {idx: set(shas) for idx, shas in slot.items()}
+                for k, slot in durable_occupancy.items()
             }
-            txn_existing = _existing_keys_for_on_cursor(c, wanted)
+            remapped, remap_skipped = _remap_rows_against_occupancy(
+                to_insert, occupancy
+            )
+            already += remap_skipped
 
-            for r in to_insert:
-                key = _make_inbox_key(
-                    r["principal"], r["inbox_file"], r["candidate_index"]
+            for r in remapped:
+                sha = _content_sha1(r["content"])
+                file_key = (
+                    _canonical_principal(r["principal"]), r["inbox_file"]
                 )
-                if key in txn_existing:
-                    already += 1
-                    continue
-                derived_from = json.dumps(
-                    {
+                attempts = 0
+                while True:
+                    derived_obj: Dict[str, Any] = {
                         "source": "inbox",
                         "inbox_file": r["inbox_file"],
                         "candidate_index": r["candidate_index"],
                         "kind": r.get("kind"),
-                        "content_sha1": _content_sha1(r["content"]),
+                        "content_sha1": sha,
                     }
-                )
-                try:
-                    c.execute(
-                        """
-                        INSERT INTO candidate_packets
-                        (principal, workspace_id, layer, privacy_level, content,
-                         evidence_refs, derived_from, instruction_like, status, proposed_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                        """,
-                        (
-                            r["principal"],
-                            r["workspace_id"],
-                            None,
-                            r["privacy_level"],
-                            r["content"],
-                            json.dumps([]),
-                            derived_from,
-                            1 if is_instruction_like(r["content"]) else 0,
-                            r["proposed_at"],
-                        ),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    # Unique-index collision (post-#239 repair) or rare race:
-                    # treat as already_present rather than aborting the batch.
-                    # Re-raise CHECK/NOT NULL/FK integrity failures.
-                    if not _is_unique_integrity_error(exc):
-                        raise
-                    already += 1
-                    continue
-                txn_existing.add(key)
-                inserted += 1
+                    source_principal = r.get("source_principal")
+                    if source_principal:
+                        derived_obj["source_principal"] = source_principal
+                    derived_from = json.dumps(derived_obj)
+                    try:
+                        c.execute(
+                            """
+                            INSERT INTO candidate_packets
+                            (principal, workspace_id, layer, privacy_level, content,
+                             evidence_refs, derived_from, instruction_like, status, proposed_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                            """,
+                            (
+                                r["principal"],
+                                r["workspace_id"],
+                                None,
+                                r["privacy_level"],
+                                r["content"],
+                                json.dumps([]),
+                                derived_from,
+                                1 if is_instruction_like(r["content"]) else 0,
+                                r["proposed_at"],
+                            ),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        # Unique-index collision: compare sha against the
+                        # durable leftover and extras-at-next-idx when
+                        # divergent rather than treating leftover 0 as
+                        # already_present.
+                        if not _is_unique_integrity_error(exc):
+                            raise
+                        held = _all_occupied_shas(
+                            durable_occupancy.get(file_key, {})
+                        )
+                        if sha in held:
+                            already += 1
+                            break
+                        slot = occupancy.setdefault(file_key, {})
+                        next_idx = (max(slot) if slot else -1) + 1
+                        if next_idx <= int(r["candidate_index"]):
+                            next_idx = int(r["candidate_index"]) + 1
+                        r = dict(r)
+                        r["candidate_index"] = next_idx
+                        slot[next_idx] = {sha}
+                        attempts += 1
+                        if attempts > 8:
+                            already += 1
+                            break
+                        continue
+                    occupancy.setdefault(file_key, {}).setdefault(
+                        r["candidate_index"], set()
+                    ).add(sha)
+                    inserted += 1
+                    break
 
     return {
         "inboxes": [str(p) for p in inboxes],

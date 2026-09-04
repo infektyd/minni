@@ -228,6 +228,580 @@ def test_skips_agent_mismatch_and_empty_and_foreign_kinds(tmp_path, monkeypatch)
     assert res["files_scanned"] == 2  # foreign kinds are not compact files at all
 
 
+def test_slug_alias_stamped_agent_id_is_not_compact_mismatch(tmp_path, monkeypatch):
+    """Parity with test_slug_alias_stamped_agent_id_is_not_mismatch:
+    leftover agent_id=agy in agy-vault (canonical gemini) is usable.
+    Both classify_unusable_compact_file and distill must agree — a raw
+    file_agent != principal compare would skip/quarantine the leftover."""
+    from minni.afm_passes.compact_distillation import (
+        classify_unusable_compact_file,
+        distill,
+    )
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(inbox, "stamped.json", _summary_doc(agent_id="agy"))
+
+    assert classify_unusable_compact_file(inbox / "stamped.json", "gemini") is None
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["skipped"].get("_agent_mismatch", 0) == 0, res
+    assert res["inserted"] > 0, res
+
+
+def test_distill_in_txn_canonicalizes_alias_wanted_against_leftover_gemini(
+    tmp_path, monkeypatch
+):
+    """In-txn compact keys must use _make_inbox_key like inbox_ingest.
+
+    Leftover candidate_packets.principal='gemini' for session.json index 0;
+    distill(..., fallback_principal='agy') on a non-*-vault inbox so
+    _principal_for_inbox leaves principal='agy'; kind-less agent_id skips
+    the mismatch gate; monkeypatch-empty _existing_keys forces the in-txn
+    path. Family scan finds the gemini row, but wanted (agy, file, 0) misses
+    because _parse_inbox_key always returns canonical key[0]. Without the
+    operator CASE UNIQUE that INSERT would mint an agy twin.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    monkeypatch.setattr(mod, "default_provider_chain", lambda: None)
+    monkeypatch.setattr(mod, "_existing_keys", lambda db, principals=None: set())
+    monkeypatch.setattr(mod, "_fills_for_file", lambda db, principal, inbox_file: [])
+
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = (
+        "Compaction summary — Key technical concepts: "
+        "race on bootout after launchctl error 5"
+    )
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('gemini', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    inbox = tmp_path / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(
+            agent_id="",
+            summary_text=(
+                "1. Key technical concepts:\n"
+                "race on bootout after launchctl error 5\n\n"
+                "2. All user messages:\n"
+                "please fix it\n"
+            ),
+        ),
+    )
+
+    res = distill(
+        db_obj, cfg, inboxes=[inbox], fallback_principal="agy", dry_run=False
+    )
+    assert res["inserted"] == 0, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT principal FROM candidate_packets ORDER BY candidate_id"
+        )
+        principals = [dict(r)["principal"] for r in c.fetchall()]
+    assert principals == ["gemini"], principals
+
+
+THREE_SHARED_BODY = (
+    "1. Key Technical Concepts:\n"
+    "   SovereignDB caches one sqlite connection per thread so the RPC pool\n"
+    "   multiplies open fds past the launchd soft limit.\n"
+    "2. Errors and fixes:\n"
+    "   launchctl bootstrap error 5 right after bootout is a teardown race;\n"
+    "   sleeping two seconds and retrying succeeds.\n"
+    "3. Decisions:\n"
+    "   Keep the unique inbox key canonical so leftover agy rows merge.\n"
+)
+
+
+def test_leftover_alias_index0_does_not_archive_compact_without_extra_fills(
+    tmp_path, monkeypatch
+):
+    """Leftover agy index 0 must not treat a later 3-section compact_summary
+    as fully received. File-key0 UNIQUE/family skip used to archive the live
+    file before indices 1–2 were inserted.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = (
+        "Key technical concepts: leftover alias fill occupying index 0 only"
+    )
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "channel": "compact_distillation",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=THREE_SHARED_BODY),
+    )
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    # Occupied leftover 0 is not compact section 0: missing=[1,2] still
+    # extras-at-next-idx the divergent qty (SovereignDB…) so it is not
+    # archived unmerged. expected_keys must not treat leftover 0 as the fill.
+    assert res["inserted"] == 3, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, principal, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    by_idx = {
+        json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
+    }
+    assert sorted(by_idx) == [0, 1, 2, 3], by_idx
+    assert leftover in by_idx[0]["content"]
+    assert by_idx[0]["principal"] == "agy"
+    qty = [r for r in rows if "SovereignDB caches" in r["content"]]
+    assert qty, [r["content"] for r in rows]
+    qty_idx = json.loads(qty[0]["derived_from"]).get("candidate_index")
+    assert qty_idx not in {0}, qty_idx
+    assert {r["principal"] for r in rows[1:]} == {"gemini"}
+    assert not (inbox / "session.json").exists()
+    assert (inbox / ".archive" / "session.json").is_file()
+
+
+def test_unique_skip_does_not_archive_compact_file_before_insert(
+    tmp_path, monkeypatch
+):
+    """In-txn UNIQUE/key skip of leftover index 0 used to treat the hit as
+    already_present without comparing content_sha1, then archive because
+    expected_keys ⊆ durable_keys as index tuples (leftover 0 covers slot 0
+    even when distilled section-0 qty never inserted).
+
+    True TOCTOU: INSERT reloads occupancy via _existing_fills_on_cursor, not
+    the pre-scan _existing_keys / _fills_for_file hooks. Emptying that loader
+    assigns section-0 the leftover key; CASE UNIQUE then fires. Do not
+    monkeypatch unused pre-scan names — those stay green on UNIQUE skip.
+    Archive occupancy after commit must still see durable distilled shas.
+    """
+    import time
+
+    from minni.afm_passes import inbox_ingest as ii
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+    from minni.repair_dual_candidates import ensure_inbox_dedup_index
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    real_fills = ii._existing_fills_on_cursor
+    state = {"insert_seen": False}
+
+    def _pre_scan_empty_until_insert(c, principals=None):
+        if state["insert_seen"]:
+            return real_fills(c, principals)
+        return {}
+
+    def _in_txn_empty(c, principals=None):
+        state["insert_seen"] = True
+        return {}
+
+    monkeypatch.setattr(ii, "_existing_fills_on_cursor", _pre_scan_empty_until_insert)
+    monkeypatch.setattr(mod, "_existing_fills_on_cursor", _in_txn_empty)
+
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = "Key technical concepts: in-txn unique skip of leftover index 0"
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+    created = ensure_inbox_dedup_index(db_obj)
+    assert created["status"] in {"created", "exists"}, created
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=THREE_SHARED_BODY),
+    )
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 3, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, principal, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    by_idx = {
+        json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
+    }
+    assert sorted(by_idx) == [0, 1, 2, 3], by_idx
+    assert leftover in by_idx[0]["content"]
+    qty = [r for r in rows if "SovereignDB caches" in r["content"]]
+    assert qty, [r["content"] for r in rows]
+    qty_idx = json.loads(qty[0]["derived_from"]).get("candidate_index")
+    assert qty_idx not in {0}, qty_idx
+    assert (inbox / ".archive" / "session.json").is_file()
+    assert not (inbox / "session.json").exists()
+
+
+ONE_SHARED_BODY = (
+    "1. Key Technical Concepts:\n"
+    "   Compact extra fill that leftover index 0 must not swallow.\n"
+    "2. All user messages:\n"
+    "   please ignore this personal narration\n"
+)
+
+
+def test_leftover_alias_index0_does_not_archive_one_section_compact_without_merge(
+    tmp_path, monkeypatch
+):
+    """Leftover agy index 0 with a different body must not treat a later
+    compact_summary that distills to a SINGLE shared section as fully
+    received. (principal, inbox_file, candidate_index) UNIQUE has no
+    content_sha1, so missing=[] used to archive immediately and never
+    insert the extra fill. Merge the divergent body; do not archive on
+    UNIQUE skip of leftover index 0.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = (
+        "Key technical concepts: leftover alias fill occupying index 0 only"
+    )
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "channel": "compact_distillation",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=ONE_SHARED_BODY),
+    )
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, principal, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    contents = [r["content"] for r in rows]
+    assert leftover in contents
+    extra = [
+        r
+        for r in rows
+        if "Compact extra fill that leftover index 0 must not swallow" in r["content"]
+    ]
+    assert extra, contents
+    assert {r["principal"] for r in extra} == {"gemini"}
+    extra_indices = {
+        json.loads(r["derived_from"]).get("candidate_index") for r in extra
+    }
+    assert extra_indices.isdisjoint({0}), extra_indices
+    # Archive only after the extra fill landed — UNIQUE skip of leftover
+    # index 0 must not retire the live file unmerged.
+    assert not (inbox / "session.json").exists()
+    assert (inbox / ".archive" / "session.json").is_file()
+
+
+AGY_ONLY_COMPACT = (
+    "1. Key Technical Concepts:\n"
+    "   AGY-ONLY compact qty that gemini-vault must not UNIQUE-swallow.\n"
+    "2. All user messages:\n"
+    "   personal agy narration\n"
+)
+
+GEMINI_ONLY_COMPACT = (
+    "1. Key Technical Concepts:\n"
+    "   GEMINI-ONLY compact qty that must land as an extra fill.\n"
+    "2. All user messages:\n"
+    "   personal gemini narration\n"
+)
+
+
+def test_second_alias_vault_compact_is_not_unique_skipped_and_archived(
+    tmp_path, monkeypatch
+):
+    """agy-vault and gemini-vault both canonicalize to gemini.
+
+    distill() used to reload _existing_keys per inbox while buffering
+    to_insert until after every vault was scanned, so the same
+    (principal, inbox_file, candidate_index) was queued twice. INSERT
+    kept the first body, UNIQUE-swallowed the second, and archive
+    retired the unmerged second vault file. One occupancy map over the
+    whole scan extras-at-next-idx the divergent second body.
+    """
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    agy_inbox = tmp_path / "agy-vault" / "inbox"
+    gemini_inbox = tmp_path / "gemini-vault" / "inbox"
+    _write_inbox_file(
+        agy_inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=AGY_ONLY_COMPACT),
+    )
+    _write_inbox_file(
+        gemini_inbox,
+        "session.json",
+        _summary_doc(agent_id="gemini", summary_text=GEMINI_ONLY_COMPACT),
+    )
+
+    res = distill(
+        db_obj, cfg, inboxes=[agy_inbox, gemini_inbox], dry_run=False
+    )
+    assert res["inserted"] == 2, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, principal, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    joined = "\n".join(r["content"] for r in rows)
+    assert "AGY-ONLY compact qty" in joined, joined
+    assert "GEMINI-ONLY compact qty" in joined, joined
+    indices = sorted(
+        json.loads(r["derived_from"]).get("candidate_index") for r in rows
+    )
+    assert indices == [0, 1], (indices, rows)
+    assert {r["principal"] for r in rows} == {"gemini"}
+    # Neither live file may be archived until its body actually landed.
+    assert not (agy_inbox / "session.json").exists()
+    assert (agy_inbox / ".archive" / "session.json").is_file()
+    assert not (gemini_inbox / "session.json").exists()
+    assert (gemini_inbox / ".archive" / "session.json").is_file()
+
+
+IDENTICAL_D_COMPACT = (
+    "1. Key Technical Concepts:\n"
+    "   Identical D body shared by agy-vault and gemini-vault session.json.\n"
+    "2. All user messages:\n"
+    "   personal narration both vaults share\n"
+)
+
+
+def test_second_alias_identical_body_does_not_archive_before_insert(
+    tmp_path, monkeypatch
+):
+    """identical-body D in agy-vault and gemini-vault session.json.
+
+    Leftover occupies 0; first vault extras D into to_insert. Occupancy is
+    the in-memory map mutated by that first file, so the second vault gets
+    assigned=[None] / insert_slots=[] and used to archive immediately —
+    before the INSERT txn. A crash (or UNIQUE skip) then loses D and the
+    second vault file. Archive only after durable_keys confirm the extra
+    committed.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = "Key technical concepts: leftover occupying index 0, not D"
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "channel": "compact_distillation",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    agy_inbox = tmp_path / "agy-vault" / "inbox"
+    gemini_inbox = tmp_path / "gemini-vault" / "inbox"
+    _write_inbox_file(
+        agy_inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=IDENTICAL_D_COMPACT),
+    )
+    _write_inbox_file(
+        gemini_inbox,
+        "session.json",
+        _summary_doc(agent_id="gemini", summary_text=IDENTICAL_D_COMPACT),
+    )
+
+    def crash_txn(*_a, **_k):
+        raise RuntimeError("crash before INSERT")
+
+    monkeypatch.setattr(db_obj, "transaction", crash_txn)
+    try:
+        distill(
+            db_obj, cfg, inboxes=[agy_inbox, gemini_inbox], dry_run=False
+        )
+        raise AssertionError("distill must not swallow the crash before INSERT")
+    except RuntimeError as exc:
+        assert "crash before INSERT" in str(exc)
+
+    # Second vault must still be live — occupancy skip is not durable.
+    assert (gemini_inbox / "session.json").is_file()
+    assert not (gemini_inbox / ".archive" / "session.json").exists()
+    assert (agy_inbox / "session.json").is_file()
+    assert not (agy_inbox / ".archive" / "session.json").exists()
+    with db_obj.cursor() as c:
+        c.execute("SELECT content FROM candidate_packets")
+        contents = [dict(r)["content"] for r in c.fetchall()]
+    assert leftover in contents
+    assert all("Identical D body" not in body for body in contents), contents
+
+
+def test_second_alias_identical_body_archives_after_extra_commits(
+    tmp_path, monkeypatch
+):
+    """Same leftover + identical D in both alias vaults: after INSERT lands
+    the extra, both files archive. inserted==1, leftover 0 + extra 1.
+    """
+    import time
+
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    leftover = "Key technical concepts: leftover occupying index 0, not D"
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "channel": "compact_distillation",
+            "inbox_file": "session.json",
+            "candidate_index": 0,
+            "kind": "compact_summary",
+        }
+    )
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES ('agy', 'default', NULL, 'safe', ?, '[]', ?, 0, 'proposed', ?)
+            """,
+            (leftover, derived, time.time()),
+        )
+
+    agy_inbox = tmp_path / "agy-vault" / "inbox"
+    gemini_inbox = tmp_path / "gemini-vault" / "inbox"
+    _write_inbox_file(
+        agy_inbox,
+        "session.json",
+        _summary_doc(agent_id="agy", summary_text=IDENTICAL_D_COMPACT),
+    )
+    _write_inbox_file(
+        gemini_inbox,
+        "session.json",
+        _summary_doc(agent_id="gemini", summary_text=IDENTICAL_D_COMPACT),
+    )
+
+    res = distill(
+        db_obj, cfg, inboxes=[agy_inbox, gemini_inbox], dry_run=False
+    )
+    assert res["inserted"] == 1, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    indices = sorted(
+        json.loads(r["derived_from"]).get("candidate_index") for r in rows
+    )
+    assert indices == [0, 1], (indices, rows)
+    joined = "\n".join(r["content"] for r in rows)
+    assert leftover in joined
+    assert "Identical D body" in joined
+    assert not (agy_inbox / "session.json").exists()
+    assert (agy_inbox / ".archive" / "session.json").is_file()
+    assert not (gemini_inbox / "session.json").exists()
+    assert (gemini_inbox / ".archive" / "session.json").is_file()
+
+
 FLAT_SUMMARY = "One paragraph of genuinely useful session findings about the migration."
 
 
@@ -287,6 +861,48 @@ def test_unsectioned_summary_upgraded_to_shared_when_afm_distills(tmp_path, monk
     # immediately rather than waiting on the resolve-time drain lifecycle.
     assert not (inbox / "flat.json").exists()
     assert (inbox / ".archive" / "flat.json").is_file()
+
+
+def test_session_distill_receives_redacted_shared_section():
+    """Native session_distill must not see raw local paths / keys.
+
+    compact_distillation used to hand shared-section bodies to AFM unredacted
+    and only _redact the stored candidate afterward.
+    """
+    import minni.afm_passes.compact_distillation as mod
+
+    secret = "sk-testhook"
+    local = "/Users/someone/secret/token.log"
+    calls = []
+
+    class FakeResult:
+        ok = True
+        data = {
+            "title": "Path leak",
+            "assertion": "Never send local paths to AFM",
+        }
+
+    class FakeChain:
+        def native_op(self, operation, payload, timeout=2.0):
+            calls.append(payload.get("text") or "")
+            return FakeResult()
+
+    doc = {
+        "summary_text": (
+            "1. Key technical concepts:\n"
+            f"   Durable fd leak fix documented at {local} key {secret}\n"
+            "2. All user messages:\n"
+            "   ignore this personal narration\n"
+        )
+    }
+    candidates, _personal, _dropped = mod._distill_file(doc, FakeChain())
+    assert calls, "session_distill must be invoked for the shared section"
+    payload = calls[0]
+    assert secret not in payload, payload
+    assert local not in payload, payload
+    assert "[local-path]" in payload
+    assert "[redacted-key]" in payload
+    assert candidates, "redacted shared section must still yield a candidate"
 
 
 def test_afm_path_uses_session_distill_with_fallback(tmp_path, monkeypatch):
