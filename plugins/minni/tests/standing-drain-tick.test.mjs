@@ -168,7 +168,7 @@ test("standing-drain-tick is minnid tick and is not MCP main", async () => {
   assert.match(lock, /const DEFAULT_WAIT_MS = 5_000;/);
 });
 
-test("accept start, kill that MCP, minnid tick journals slice.started with no later MCP", async (t) => {
+test("accept start, kill that MCP, minnid tick journals slice.started with no later MCP", { timeout: 45_000 }, async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "minni-standing-drain-"));
   t.after(async () => {
     await rm(root, { recursive: true, force: true }).catch(() => {});
@@ -202,6 +202,11 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  // A failed assertion before the explicit kill must not leave the MCP and
+  // its stdio pipes alive, hiding the failure behind an unfinished test file.
+  t.after(() => {
+    if (mcp.exitCode === null && mcp.signalCode === null) mcp.kill("SIGKILL");
+  });
   const { send, awaitResponse, call, allocId } = attachMcpClient(mcp);
   const initId = allocId();
   send({
@@ -228,7 +233,7 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
     worker_agent_id: "worker-0",
     idempotency_key: "claim-0",
   });
-  assert.ok(claim.token);
+  assert.ok(claim.token, `claim must return a token: ${JSON.stringify(claim)}`);
 
   let release;
   const held = new Promise((resolve) => {
@@ -330,7 +335,7 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
         "}))",
       ].join("\n"),
     ],
-    { env: tickEnv, encoding: "utf8" },
+    { env: tickEnv, encoding: "utf8", timeout: 10_000 },
   );
   assert.equal(probe.status, 0, `installed-daemon probe failed: ${probe.stderr || probe.stdout}`);
   const resolved = JSON.parse(probe.stdout.trim().split("\n").at(-1));
