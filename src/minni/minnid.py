@@ -2092,6 +2092,12 @@ async def _worker_write_drain_runner():
 def main():
     global _start_time, _unix_socket_path
 
+    # Make the long-lived service distinguishable from generic Python in
+    # ps/top/Activity Monitor.  This is deliberately before daemon startup
+    # work, but remains best-effort on unsupported platforms.
+    from minni.process_identity import set_process_identity
+
+    set_process_identity()
     _start_time = time.time()
 
     # #284: pin daemon models to CPU by default BEFORE any singleton warmup.

@@ -579,6 +579,7 @@ _VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
     "grok-beta": "grok-build",
     "grok": "grok-build",
     "xai": "grok-build",
+    "devin": "devin",
 }
 
 

@@ -1454,6 +1454,10 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
                     "file, then re-run."
                 ) from exc
 
+    # Install roots deliberately exclude node_modules. Bundle the MCP server
+    # before copying, including --no-build callers whose current dist came
+    # from ordinary tsc output rather than wire's bundled build.
+    run(["node", str((source / "scripts" / "bundle_server.mjs").resolve())], cwd=source)
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
     write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env, afm_env=afm_env))
