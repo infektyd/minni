@@ -360,8 +360,14 @@ class TestCorrectionSalience:
         correction = _rrf_doc(2, "correction", 1.0)
         correction["chunk_id"] = 9102
         model_name, model_version = engine._reranker_identity(engine._reranker)
-        GLOBAL_RERANK_CACHE.set(model_name, model_version, query, 9101, 1.0)
-        GLOBAL_RERANK_CACHE.set(model_name, model_version, query, 9102, 0.9)
+        GLOBAL_RERANK_CACHE.set(
+            model_name, model_version, query, 9101, 1.0,
+            corpus=engine._rerank_corpus(), passage=engine._rerank_passage(habitual),
+        )
+        GLOBAL_RERANK_CACHE.set(
+            model_name, model_version, query, 9102, 0.9,
+            corpus=engine._rerank_corpus(), passage=engine._rerank_passage(correction),
+        )
         try:
             ranked = engine._rerank(query, [habitual, correction])
         finally:

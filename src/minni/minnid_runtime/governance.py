@@ -40,7 +40,7 @@ class GovernanceContext:
     lazy_writeback: Callable[[], Any]
     lazy_episodic: Callable[[], Any]
     record_latency: Callable[[str, float], None]
-    index_durable_learning: Callable[..., None]
+    index_durable_learning: Callable[..., bool | None]
     maybe_archive_inbox_source: Callable[[Any, int], None]
     # M4: purge the synthetic durable doc when a learning is superseded/rejected
     # so its stale chunks stop surfacing in doc search. Default no-op keeps
@@ -284,14 +284,19 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         if wb.config.writeback_enabled:
             wb._write_to_disk(lid, agent_id, category, content, now)
 
-        context.index_durable_learning(agent_id, content, key=f"learning:{lid}", db=wb.db)
+        indexed = context.index_durable_learning(
+            agent_id, content, key=f"learning:{lid}", db=wb.db
+        )
 
-        return context.make_response({
+        result = {
             "status": "ok",
             "learning_id": lid,
             "agent_id": agent_id,
             "category": category,
-        }, request_id)
+        }
+        if indexed is False:
+            result["indexed"] = False
+        return context.make_response(result, request_id)
     except Exception as exc:
         context.logger.exception("learn failed")
         return context.make_error(-32000, f"Learn error: {exc}", request_id)
@@ -744,9 +749,13 @@ def settle_accepted_candidate(
     """
     indexed_ok = True
     try:
-        context.index_durable_learning(
+        indexed = context.index_durable_learning(
             agent_id, content, key=f"learning:{learning_id}", db=db
         )
+        # Production returns an explicit bool, including its fail-open paths.
+        # Older injected adapters returned None after a successful call; keep
+        # that contract without losing the production failure signal.
+        indexed_ok = indexed is True or indexed is None
     except Exception as exc:
         indexed_ok = False
         context.logger.warning(
@@ -940,7 +949,10 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             # the base path: on any failure the candidate still stages as
             # proposed, which is exactly where it would have gone anyway.
             try:
-                from minni.afm_passes.consolidation import content_hash as _content_hash
+                from minni.afm_passes.consolidation import (
+                    content_hash as _content_hash,
+                    has_active_learning_hash,
+                )
 
                 if not ensure_content_hash_column(db):
                     # The INSERT below names content_hash unconditionally, so a
@@ -1014,12 +1026,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 # a live duplicate, and matching it blocked re-learning content
                 # that no active learning carries any more — the correction
                 # machinery would have permanently poisoned the hash.
-                c.execute(
-                    "SELECT 1 FROM learnings WHERE content_hash=? AND agent_id=? "
-                    "AND status='active' LIMIT 1",
-                    (chash, principal.agent_id),
-                )
-                if c.fetchone() is not None:
+                if has_active_learning_hash(c, chash, principal.agent_id):
                     auto_accept = False
                     withheld = ["duplicate of an existing learning"]
             if auto_accept:
@@ -1431,8 +1438,9 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
             )
             apply_accepted_candidate_effects(c, cid)
 
+        indexed_ok = True
         if lid is not None:
-            settle_accepted_candidate(
+            indexed_ok = settle_accepted_candidate(
                 context, db, cid, principal.agent_id,
                 str(rowd.get("content") or ""), lid,
             )
@@ -1445,16 +1453,16 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
             principal.agent_id, cid, decision, new_status, reason[:80],
         )
 
-        return context.make_response(
-            {
-                "status": "resolved",
-                "candidate_id": cid,
-                "new_status": new_status,
-                "learning_id": lid,
-                "principal": principal.agent_id,
-            },
-            request_id,
-        )
+        result = {
+            "status": "resolved",
+            "candidate_id": cid,
+            "new_status": new_status,
+            "learning_id": lid,
+            "principal": principal.agent_id,
+        }
+        if not indexed_ok:
+            result["indexed"] = False
+        return context.make_response(result, request_id)
     except ResolveRejected as exc:
         return exc.response
     except Exception as exc:

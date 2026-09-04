@@ -360,13 +360,25 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
 
 
 def reject_candidate_dedup(candidate_id: int, context: AFMContext) -> bool:
-    """Mark a proposed candidate rejected as a duplicate."""
+    """Reject only while an active same-owner replacement actually exists."""
+    from minni.afm_passes.consolidation import content_hash, has_active_learning_hash
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
     wb = context.lazy_writeback()
     now = time.time()
     with wb.db.transaction() as c:
-        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+        c.execute(
+            "SELECT status, principal, content FROM candidate_packets WHERE candidate_id=?",
+            (candidate_id,),
+        )
         row = c.fetchone()
         if not row or row["status"] != "proposed":
+            return False
+        # Selection can precede a failed batch promotion or a supersession.
+        # Prove the replacement inside the rejecting transaction; otherwise
+        # leave the proposal available for the next pass instead of losing it.
+        owner = _canonical_principal(row["principal"] or "afm-loop")
+        if not has_active_learning_hash(c, content_hash(row["content"] or ""), owner):
             return False
         c.execute(
             """

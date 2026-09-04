@@ -491,6 +491,20 @@ def test_consolidation_dedup_reject_archives_inbox_source(tmp_path, monkeypatch)
     assert ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)["inserted"] == 1
     (cid,) = _candidate_ids(db_obj)
 
+    from minni.afm_passes.consolidation import content_hash
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT principal, content FROM candidate_packets WHERE candidate_id=?", (cid,)
+        ).fetchone()
+        c.execute(
+            """INSERT INTO learnings
+               (agent_id, content, content_hash, created_at, status)
+               VALUES (?, ?, ?, ?, 'active')""",
+            (_canonical_principal(row["principal"]), row["content"],
+             content_hash(row["content"]), 1),
+        )
     assert minnid._reject_candidate_dedup(cid) is True
     assert not (inbox / "dedup.json").exists(), "file must leave the live inbox"
     assert (inbox / ".archive" / "dedup.json").is_file()

@@ -411,6 +411,16 @@ def test_afm_dedup_reject_path_retires_the_fence(tmp_path):
     from minni.minnid_runtime.afm import reject_candidate_dedup
 
     db_obj = _db_with_fenced_candidate(tmp_path, 2)
+    from minni.afm_passes.consolidation import content_hash
+
+    content = "a durable lesson worth keeping"
+    with db_obj.cursor() as c:
+        c.execute(
+            """INSERT INTO learnings
+               (agent_id, content, content_hash, created_at, status)
+               VALUES ('test', ?, ?, ?, 'active')""",
+            (content, content_hash(content), time.time()),
+        )
     assert reject_candidate_dedup(2, _afm_context(db_obj)) is True
 
     assert _fence_status(db_obj, 2) == "superseded"

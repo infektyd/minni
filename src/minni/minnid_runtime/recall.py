@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -509,6 +510,12 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # shared lazy_retrieval() engine. scope=personal with a vault returns
         # from the vault leg on a deadline miss and never touches shared.
         cycle_deadline_poisoned = False
+        # scope=both reaches the own vault again in combined. All retrieve
+        # arguments are request constants; only presentation src changes.
+        # Keep one raw snapshot before tagging mutates rows/provenance and
+        # before another engine call can overwrite thread-local diagnostics.
+        # Shared fallback and failed calls retain their existing retry behavior.
+        personal_snapshot = None
 
         def record_shared(entry: dict, *, bucket: str, sink: list) -> None:
             key = json.dumps(entry, sort_keys=True, default=str)
@@ -524,35 +531,50 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             principal_for_documents,
             shared: bool = False,
             source_agent: Optional[str] = None,
+            personal: bool = False,
         ) -> list:
-            nonlocal cycle_deadline_poisoned
-            rows = retrieval_engine.retrieve(
-                query=query,
-                agent_id=agent_id,
-                limit=limit,
-                depth=depth,
-                backend=resolved_backend,
-                layers=layers,
-                sort=sort,
-                start_date=start_date,
-                end_date=end_date,
-                expand=expand,
-                summarize_neighborhood=summarize_neighborhood,
-                cross_agent=learnings_cross_agent,
-                claim=claim,
-                principal=principal_for_documents,
-                workspace=(
-                    principal_for_documents.workspace_id
-                    if principal_for_documents is not None
-                    else "default"
-                ),
-                deadline_monotonic=deadline_monotonic,
-                update_access=False,
-            )
-            poisoned = _ranking_deadline_poisoned(retrieval_engine)
+            nonlocal cycle_deadline_poisoned, personal_snapshot
+            if (
+                not shared
+                and personal_snapshot is not None
+                and personal_snapshot[0] is retrieval_engine
+                and personal_snapshot[1] is principal_for_documents
+            ):
+                rows, poisoned, suppression, degradation = deepcopy(personal_snapshot[2])
+            else:
+                rows = retrieval_engine.retrieve(
+                    query=query,
+                    agent_id=agent_id,
+                    limit=limit,
+                    depth=depth,
+                    backend=resolved_backend,
+                    layers=layers,
+                    sort=sort,
+                    start_date=start_date,
+                    end_date=end_date,
+                    expand=expand,
+                    summarize_neighborhood=summarize_neighborhood,
+                    cross_agent=learnings_cross_agent,
+                    claim=claim,
+                    principal=principal_for_documents,
+                    workspace=(
+                        principal_for_documents.workspace_id
+                        if principal_for_documents is not None
+                        else "default"
+                    ),
+                    deadline_monotonic=deadline_monotonic,
+                    update_access=False,
+                )
+                poisoned = _ranking_deadline_poisoned(retrieval_engine)
+                suppression = getattr(retrieval_engine, "last_auth_suppression", None)
+                degradation = _degradation_for(retrieval_engine, src)
+                if personal and document_scope == "both":
+                    personal_snapshot = (
+                        retrieval_engine, principal_for_documents,
+                        deepcopy((rows, poisoned, suppression, degradation)),
+                    )
             if poisoned:
                 cycle_deadline_poisoned = True
-            suppression = getattr(retrieval_engine, "last_auth_suppression", None)
             if suppression:
                 # Review round 2: the suppression channel had the same
                 # double-report on the same two-leg shared path, and the
@@ -563,7 +585,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     record_shared(entry, bucket="auth", sink=auth_suppressions)
                 else:
                     auth_suppressions.append(entry)
-            degradation = _degradation_for(retrieval_engine, src, source_agent=source_agent)
+            degradation["src"] = src
+            if source_agent:
+                degradation["source_agent"] = source_agent
             if shared:
                 record_shared(degradation, bucket="degradation", sink=degradations)
             else:
@@ -649,6 +673,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         vault_engine,
                         src="p",
                         principal_for_documents=principal,
+                        personal=True,
                     )
                 except Exception as exc:
                     # Round 13 (PR #260): personal leg failure was log-only while

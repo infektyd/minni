@@ -26,6 +26,7 @@ import re
 import sqlite3
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
 
@@ -74,6 +75,22 @@ def remaining_search_budget(deadline_monotonic: Optional[float]) -> Optional[flo
     if deadline_monotonic is None:
         return None
     return deadline_monotonic - time.monotonic()
+
+
+@contextmanager
+def search_model_lock(lock, deadline_monotonic: Optional[float]):
+    """Bound queueing by the stage budget; an acquired predict is not cancelled."""
+    remaining = remaining_search_budget(deadline_monotonic)
+    if remaining is None:
+        acquired = lock.acquire()
+    else:
+        timeout = remaining - SEARCH_STAGE_MIN_REMAINING_S
+        acquired = timeout > 0 and lock.acquire(timeout=timeout)
+    try:
+        yield bool(acquired)
+    finally:
+        if acquired:
+            lock.release()
 
 
 def past_search_deadline(
@@ -610,6 +627,17 @@ class RetrievalEngine:
             self._degradation_local = local
         local.deadline_monotonic = value
 
+    @contextmanager
+    def _query_encoding_scope(self):
+        """Reuse successful embeddings only during one request's refill loop."""
+        local = self._degradation_local
+        previous = getattr(local, "query_embeddings", None)
+        local.query_embeddings = {}
+        try:
+            yield
+        finally:
+            local.query_embeddings = previous
+
     @property
     def model(self):
         """Return the process-wide embedding model singleton."""
@@ -662,8 +690,8 @@ class RetrievalEngine:
         try:
             from minni.models import get_attribution_lock
 
-            with get_attribution_lock():
-                if past_search_deadline(self._current_deadline()):
+            with search_model_lock(get_attribution_lock(), self._current_deadline()) as acquired:
+                if not acquired or past_search_deadline(self._current_deadline()):
                     return None
                 raw = model.predict(
                     [(str(evidence_text or ""), claim_text)],
@@ -1586,6 +1614,8 @@ class RetrievalEngine:
         missing = []
         missing_indexes = []
         all_scores = [None] * len(candidates)
+        corpus = self._rerank_corpus()
+        generation = cache.generation if cache is not None else None
         if cache is not None:
             for i, c in enumerate(candidates):
                 chunk_id = c.get("chunk_id")
@@ -1593,7 +1623,10 @@ class RetrievalEngine:
                     missing.append(c)
                     missing_indexes.append(i)
                     continue
-                cached = cache.get(model_name, model_version, query, int(chunk_id))
+                cached = cache.get(
+                    model_name, model_version, query, int(chunk_id),
+                    corpus=corpus, passage=self._rerank_passage(c),
+                )
                 if cached is None:
                     missing.append(c)
                     missing_indexes.append(i)
@@ -1611,33 +1644,32 @@ class RetrievalEngine:
             return candidates
 
         # Prepare pairs for the cross-encoder
-        pairs = []
-        for c in missing:
-            passage = c.get("chunk_text", "")
-            heading = c.get("heading_context", "")
-            # Prepend heading context so the re-ranker knows the section
-            if heading:
-                passage = f"[{heading}] {passage}"
-            pairs.append([query, passage])
+        pairs = [[query, self._rerank_passage(c)] for c in missing]
 
         try:
             from minni.models import get_cross_encoder_lock
 
-            with get_cross_encoder_lock():
+            with search_model_lock(get_cross_encoder_lock(), self._current_deadline()) as acquired:
                 # Concurrent search can pass the pre-lock floor, then wait
                 # through another predict. Re-check after the lock so a waiter
                 # does not score after the client 30s kill.
-                if past_search_deadline(self._current_deadline()):
+                if not acquired or past_search_deadline(self._current_deadline()):
                     self.last_rerank_degraded = "search deadline; skipped rerank"
                     return candidates
                 scores = reranker.predict(pairs, show_progress_bar=False)
+                if past_search_deadline(self._current_deadline(), min_remaining=0):
+                    self.last_rerank_degraded = "search deadline exceeded during nonpreemptible rerank"
 
             for score_index, c, score_value in zip(missing_indexes, missing, scores):
                 score = float(score_value)
                 all_scores[score_index] = score
                 chunk_id = c.get("chunk_id")
                 if cache is not None and chunk_id is not None:
-                    cache.set(model_name, model_version, query, int(chunk_id), score)
+                    cache.set(
+                        model_name, model_version, query, int(chunk_id), score,
+                        corpus=corpus, passage=self._rerank_passage(c),
+                        expected_generation=generation,
+                    )
 
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i] or 0.0)
@@ -1655,6 +1687,19 @@ class RetrievalEngine:
             self.last_rerank_degraded = str(e)
 
         return candidates
+
+    def _rerank_corpus(self) -> str:
+        db_path = getattr(self.config, "db_path", None)
+        if not db_path or str(db_path) == ":memory:":
+            db = getattr(self, "db", None)
+            return f"memory:{id(db if db is not None else self)}"
+        return str(Path(db_path).expanduser().resolve())
+
+    @staticmethod
+    def _rerank_passage(candidate: Dict) -> str:
+        passage = candidate.get("chunk_text", "") or ""
+        heading = candidate.get("heading_context", "")
+        return f"[{heading}] {passage}" if heading else passage
 
     def _reranker_identity(self, reranker) -> tuple[str, str]:
         model_name = getattr(self.config, "reranker_model", None) or "unknown"
@@ -2153,6 +2198,10 @@ class RetrievalEngine:
         if past_search_deadline(deadline_monotonic):
             self.last_vector_degraded = "search deadline; lexical (FTS) only"
             return np.array([], dtype=np.float32)
+        embeddings = getattr(getattr(self, "_degradation_local", None), "query_embeddings", None)
+        if embeddings is not None and query in embeddings:
+            # Backends may normalize/mutate their input; keep the memo intact.
+            return embeddings[query].copy()
         # Round 18: only clear the process-wide down flag AFTER a successful
         # encode. Clearing before encode() meant an OOM/runtime fault left
         # health reading "encoder up" and hard-failed the request instead of
@@ -2164,11 +2213,11 @@ class RetrievalEngine:
                 self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 return np.array([], dtype=np.float32)
 
-            with get_embedder_lock():
+            with search_model_lock(get_embedder_lock(), deadline_monotonic) as acquired:
                 # Concurrent search can pass the pre-lock floor, then wait
                 # through another encode/FAISS. Re-check after the lock so a
                 # waiter does not encode after the client 30s kill.
-                if past_search_deadline(deadline_monotonic):
+                if not acquired or past_search_deadline(deadline_monotonic):
                     self.last_vector_degraded = "search deadline; lexical (FTS) only"
                     return np.array([], dtype=np.float32)
                 if should_skip_cold_model_load(deadline_monotonic, get_embedder):
@@ -2178,6 +2227,8 @@ class RetrievalEngine:
                     self._note_vector_model_down()
                     return np.array([], dtype=np.float32)
                 vec = self.model.encode(query, show_progress_bar=False).astype(np.float32)
+                if past_search_deadline(deadline_monotonic, min_remaining=0):
+                    self.last_vector_degraded = "search deadline exceeded during nonpreemptible encode"
         except Exception as exc:
             if not self.vector_model_down:
                 logger.warning(
@@ -2191,6 +2242,8 @@ class RetrievalEngine:
             )
             return np.array([], dtype=np.float32)
         self.vector_model_down = False
+        if embeddings is not None and vec.size:
+            embeddings[query] = vec.copy()
         return vec
 
     def _normalize_backend_names(self, backend_names: list) -> list:
@@ -3221,24 +3274,63 @@ class RetrievalEngine:
         skip_statuses.update(WikiFrontmatter.EXCLUDED_STATUSES)
         skip_list = sorted(skip_statuses)
 
-        def _drop_skipped(rows: List[Dict]) -> List[Dict]:
-            if not skip_statuses:
-                return rows
-            return [
-                r for r in rows
-                if (r.get("page_status") or "candidate") not in skip_statuses
-            ]
+        ws = (workspace or getattr(principal, "workspace_id", "default")) if principal else (workspace or "default")
+        denied_by_scope: dict[tuple, Dict] = {}
+        saw_authorized = False
 
-        rerank_k = self.config.reranker_top_k if self.config.reranker_enabled else limit
+        def _eligible(rows: List[Dict]) -> List[Dict]:
+            # Before fusion/reranking/truncation, enforce the same read gate
+            # as the final defense, plus lifecycle and caller filters.
+            nonlocal saw_authorized
+            rows = [r for r in rows if
+                    (r.get("page_status") or "candidate") not in skip_statuses
+                    and (r.get("privacy_level") or "safe") != "blocked"]
+            rows = self._filter_candidates(rows, layers, start_date, end_date)
+            agent_scope = self._normalize_agent_filter(document_agent_filter)
+            if agent_scope:
+                rows = [r for r in rows if r.get("agent") in agent_scope]
+            if principal is None:
+                return rows
+            allowed = []
+            for row in rows:
+                if can_read_document(principal, ws, row):
+                    saw_authorized = True
+                    allowed.append(row)
+                else:
+                    denied_by_scope[(row.get("doc_id"), row.get("path"))] = row
+            return allowed
+
+        def _collect_eligible(fetch, wanted: int) -> List[Dict]:
+            # Backends expose top-k, not policy-aware pagination. Refill their
+            # bounded window when denied rows consume it, stopping when enough
+            # eligible rows are found, at the deadline, or at a finite ceiling.
+            # At that ceiling a trace records incomplete candidate coverage;
+            # no result is admitted merely to fill the requested count.
+            window = max(1, wanted)
+            ceiling = max(window, 512)
+            with self._query_encoding_scope():
+                while True:
+                    raw = fetch(window)
+                    rows = _eligible(raw)
+                    if len(rows) >= wanted or len(rows) == len(raw):
+                        return rows
+                    # Identical document lists do not prove exhaustion: many
+                    # top-ranked chunks can collapse to one denied document.
+                    if window >= ceiling or past_search_deadline(deadline_monotonic):
+                        trace["candidate_window_exhausted"] = True
+                        return rows
+                    window = min(ceiling, window * 2)
+
+        rerank_k = max(limit, self.config.reranker_top_k if self.config.reranker_enabled else limit)
 
         if sort == "chronological":
             if past_search_deadline(deadline_monotonic):
                 self.last_vector_degraded = "search deadline; lexical (FTS) only"
             chrono_t0 = time.perf_counter()
-            merged = self._chronological_search(
-                query, rerank_k, layers, start_date, end_date,
+            merged = _collect_eligible(lambda window: self._chronological_search(
+                query, window, layers, start_date, end_date,
                 exclude_statuses=skip_list,
-            )
+            ), rerank_k)
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
             merged = merged[:limit]
@@ -3246,14 +3338,14 @@ class RetrievalEngine:
             # Step 1-2: Dual retrieval
             fts_t0 = time.perf_counter()
             if document_agent_filter is None:
-                fts_results = self._fts_search(
-                    query, rerank_k, exclude_statuses=skip_list
-                )
+                fts_results = _collect_eligible(lambda window: self._fts_search(
+                    query, window, exclude_statuses=skip_list
+                ), rerank_k)
             else:
-                fts_results = self._fts_search(
-                    query, rerank_k, agent_filter=document_agent_filter,
+                fts_results = _collect_eligible(lambda window: self._fts_search(
+                    query, window, agent_filter=document_agent_filter,
                     exclude_statuses=skip_list,
-                )
+                ), rerank_k)
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
                 {
@@ -3279,36 +3371,37 @@ class RetrievalEngine:
                 trace["backends"] = ["faiss-disk-empty"]
             elif backend is None:
                 # Default path — bit-identical to pre-PR-3
-                if document_agent_filter is None:
-                    semantic_results = self._semantic_search(query, rerank_k)
-                else:
-                    semantic_results = self._semantic_search(
-                        query, rerank_k, agent_filter=document_agent_filter
-                    )
+                # Gate taxonomy after fetching: filtering the SQL lookup of
+                # a bounded FAISS window would hide why it needs refilling.
+                semantic_results = _collect_eligible(
+                    lambda window: self._semantic_search(query, window), rerank_k,
+                )
                 trace["backends"] = ["faiss-disk"]
             elif isinstance(backend, list):
                 # Fan-out: build a MultiBackend from the list of backend names/objects
                 from minni.backends.multi import MultiBackend
                 resolved = self._resolve_backends(backend)
                 if len(resolved) == 1:
-                    semantic_results = self._backend_search(
-                        self._encode_query(query),
-                        rerank_k,
-                        resolved[0],
-                    )
+                    query_emb = self._encode_query(query)
+                    semantic_results = _collect_eligible(lambda window: self._backend_search(
+                        query_emb, window, resolved[0],
+                    ), rerank_k)
                 else:
                     multi = MultiBackend(resolved)
                     query_emb = self._encode_query(query)
                     # Same encoder-down guard as _backend_search (round 3,
                     # PR #260): degrade to FTS-only instead of raising.
-                    hits = [] if query_emb.size == 0 else multi.search(query_emb, k=rerank_k)
-                    # Convert VectorHit list to the dict format expected by _rrf_merge
-                    semantic_results = self._hits_to_dicts(hits, query_emb)
+                    semantic_results = _collect_eligible(lambda window: self._hits_to_dicts(
+                        [] if query_emb.size == 0 else multi.search(query_emb, k=window),
+                        query_emb,
+                    ), rerank_k)
                 trace["backends"] = [getattr(b, "name", str(b)) for b in resolved]
             else:
                 # Single explicit backend object
                 query_emb = self._encode_query(query)
-                semantic_results = self._backend_search(query_emb, rerank_k, backend)
+                semantic_results = _collect_eligible(lambda window: self._backend_search(
+                    query_emb, window, backend,
+                ), rerank_k)
                 trace["backends"] = [getattr(backend, "name", "custom")]
             timing["semantic_ms"] = round((time.perf_counter() - semantic_t0) * 1000, 3)
             timing["embedding_ms"] = timing["semantic_ms"]
@@ -3327,8 +3420,8 @@ class RetrievalEngine:
             # slots in the fusion pool. FTS is already filtered in SQL; the
             # vector legs are filtered here, since a chunk embedded before its
             # page changed status can still be returned by FAISS.
-            semantic_results = _drop_skipped(semantic_results)
-            extra_backend_results = [_drop_skipped(rows) for rows in extra_backend_results]
+            semantic_results = _eligible(semantic_results)
+            extra_backend_results = [_eligible(rows) for rows in extra_backend_results]
 
             # Step 3: RRF merge — with extra streams if multi-backend
             if extra_backend_results:
@@ -3353,7 +3446,7 @@ class RetrievalEngine:
                 ],
             }
 
-            merged = self._filter_candidates(merged, layers, start_date, end_date)
+            merged = _eligible(merged)
 
             # Step 4: Cross-encoder re-rank.
             # Deadline before `self.reranker`: that property lazily calls
@@ -3468,14 +3561,14 @@ class RetrievalEngine:
                             else:
                                 trace["hyde"]["hypothetical_chars"] = len(hypothetical)
                                 if document_agent_filter is None:
-                                    hyde_fts = self._fts_search(
-                                        hypothetical, rerank_k, exclude_statuses=skip_list
-                                    )
+                                    hyde_fts = _collect_eligible(lambda window: self._fts_search(
+                                        hypothetical, window, exclude_statuses=skip_list
+                                    ), rerank_k)
                                 else:
-                                    hyde_fts = self._fts_search(
-                                        hypothetical, rerank_k, agent_filter=document_agent_filter,
+                                    hyde_fts = _collect_eligible(lambda window: self._fts_search(
+                                        hypothetical, window, agent_filter=document_agent_filter,
                                         exclude_statuses=skip_list,
-                                    )
+                                    ), rerank_k)
                                 first_pass_vector = self.last_vector_degraded
                                 first_pass_rerank = self.last_rerank_degraded
                                 hyde_apply = True
@@ -3489,16 +3582,10 @@ class RetrievalEngine:
                                         trace["hyde"]["completed"] = False
                                         trace["hyde"]["skipped"] = "deadline"
                                         hyde_apply = False
-                                    elif document_agent_filter is None:
-                                        hyde_semantic = self._semantic_search(
-                                            hypothetical, rerank_k
-                                        )
                                     else:
-                                        hyde_semantic = self._semantic_search(
-                                            hypothetical,
-                                            rerank_k,
-                                            agent_filter=document_agent_filter,
-                                        )
+                                        hyde_semantic = _collect_eligible(lambda window: self._semantic_search(
+                                            hypothetical, window
+                                        ), rerank_k)
                                     vector_flag = self.last_vector_degraded
                                     if hyde_apply and vector_flag and (
                                         "search deadline" in str(vector_flag).lower()
@@ -3510,13 +3597,11 @@ class RetrievalEngine:
                                         trace["hyde"]["skipped"] = "deadline"
                                         hyde_apply = False
                                     if hyde_apply:
-                                        hyde_semantic = _drop_skipped(hyde_semantic)
+                                        hyde_semantic = _eligible(hyde_semantic)
                                         hyde_merged = self._rrf_merge(
                                             hyde_fts, hyde_semantic, rerank_k
                                         )
-                                        hyde_merged = self._filter_candidates(
-                                            hyde_merged, layers, start_date, end_date
-                                        )
+                                        hyde_merged = _eligible(hyde_merged)
                                         if self.config.reranker_enabled:
                                             # Deadline before `self.reranker`: that
                                             # property lazily calls get_cross_encoder()
@@ -3625,6 +3710,10 @@ class RetrievalEngine:
         if principal is not None:
             merged, suppression = self.apply_read_gate(principal, ws, merged)
             self.last_auth_suppression = suppression
+            if not merged and denied_by_scope and not saw_authorized:
+                _, self.last_auth_suppression = self.apply_read_gate(
+                    principal, ws, list(denied_by_scope.values())
+                )
 
         # G22: attach evidence-only envelope + instruction_like + provenance/reasoning to every result
         # Model-facing content is always wrapped; raw executable instructions never treated as policy.

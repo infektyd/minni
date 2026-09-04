@@ -369,7 +369,7 @@ def _durable_doc_path(
 _UNSET = object()
 
 
-def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> None:
+def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> bool:
     """Semantically index a just-stored durable learning (FAIL-OPEN).
 
     Hook for BOTH durable-store socket paths (_resolve_candidate(accept) and
@@ -393,7 +393,9 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
 
     Never raises — neither a programmer error (omitted ``db=``) nor an
     availability failure (embedder/FAISS down) may undo or fail a durable store
-    that already committed. Both degrade gracefully (log + return).
+    that already committed. Return False on failure, including a degraded
+    engine result or a lexical-only write, so the caller can report that the
+    durable learning still needs semantic indexing.
     """
     try:
         # Data-safety: ``db`` MUST be supplied explicitly. A ``None``/omitted
@@ -416,7 +418,7 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
                 "lexical until reindex). agent=%s",
                 agent_id,
             )
-            return
+            return False
 
         from minni.retrieval import RetrievalEngine
 
@@ -468,7 +470,7 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
         except Exception:
             pass  # fail-open: keep prior defaults
 
-        engine.index_durable_document(
+        result = engine.index_durable_document(
             content=content,
             path=_durable_doc_path(
                 agent_id, key, vault_path=engine.config.vault_path,
@@ -481,12 +483,14 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
             page_type=page_type,
             layer=layer,
         )
+        return result.get("status") == "ok" and result.get("chunks", 0) > 0
     except Exception as exc:
         logger.warning(
             "durable store: store-time semantic index failed for agent=%s (%s) "
             "— store stands, recall degraded to lexical until reindex",
             agent_id, exc,
         )
+        return False
 
 
 def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:

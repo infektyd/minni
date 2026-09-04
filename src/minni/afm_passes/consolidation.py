@@ -114,10 +114,24 @@ def _ensure_dedup_index(db) -> None:
                 )
 
 
-def _hash_in_learnings(db, h: str) -> bool:
+def has_active_learning_hash(cursor, h: str, agent_id: str) -> bool:
+    """Duplicate predicate shared by AFM and operator-enabled auto-accept.
+
+    A terminal row or another owner's memory cannot replace this owner's
+    learning. Accept an existing cursor so auto-accept keeps its check inside
+    the write transaction rather than opening a cursor that commits it early.
+    """
+    cursor.execute(
+        "SELECT 1 FROM learnings WHERE content_hash=? AND agent_id=? "
+        "AND status='active' AND superseded_by IS NULL LIMIT 1",
+        (h, agent_id),
+    )
+    return cursor.fetchone() is not None
+
+
+def _hash_in_learnings(db, h: str, agent_id: str) -> bool:
     with db.cursor() as c:
-        c.execute("SELECT 1 FROM learnings WHERE content_hash=? LIMIT 1", (h,))
-        return c.fetchone() is not None
+        return has_active_learning_hash(c, h, agent_id)
 
 
 def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
@@ -317,7 +331,7 @@ def run(db, config, vault_path: Optional[str] = None,
     total = _total_proposed(db)
     candidates = _proposed_candidates(db, max_per_run)
 
-    seen_this_run: set = set()
+    seen_this_run: set[tuple[str, str]] = set()
     promote_candidate_ids: List[int] = []
     dedup_candidate_ids: List[int] = []
     review_candidate_ids: List[int] = []
@@ -336,7 +350,13 @@ def run(db, config, vault_path: Optional[str] = None,
             continue
 
         h = content_hash(content)
-        if h in seen_this_run or _hash_in_learnings(db, h):
+        # Match the owner promote_candidate_durable writes, including its
+        # legacy fallback for packets without a principal.
+        from minni.afm_passes.inbox_ingest import _canonical_principal
+
+        agent_id = _canonical_principal(cand.get("principal") or "afm-loop")
+        batch_key = (agent_id, h)
+        if batch_key in seen_this_run or _hash_in_learnings(db, h, agent_id):
             dedup_candidate_ids.append(cand["candidate_id"])
             continue
 
@@ -362,7 +382,7 @@ def run(db, config, vault_path: Optional[str] = None,
             continue
 
         promote_candidate_ids.append(cand["candidate_id"])
-        seen_this_run.add(h)
+        seen_this_run.add(batch_key)
 
     summary = {
         "total_proposed": total,

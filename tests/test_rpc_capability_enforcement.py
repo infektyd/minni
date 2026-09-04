@@ -300,8 +300,8 @@ def test_platform_agent_empty_or_malformed_vault_roots_fail_closed(tmp_path: Pat
 def test_platform_agent_missing_roots_map_keeps_own_vault(tmp_path: Path, monkeypatch):
     """PR167 review: strict installs predating platform_agent_vault_roots must
     keep pathed access to the platform agent's OWN vault (never the
-    operator's). Both the literal id and the dashless installer alias count
-    (claude-code -> claudecode-vault)."""
+    operator's). The canonical installer mapping is authoritative
+    (claude-code -> claudecode-vault); arbitrary literal-id roots stay denied."""
     principals = tmp_path / "principals"
     principals.mkdir()
     minni_home = tmp_path / "minni-home"
@@ -331,6 +331,6 @@ def test_platform_agent_missing_roots_map_keeps_own_vault(tmp_path: Path, monkey
     p = resolve_effective_principal(
         supplied_agent_id="claude-code", transport="uds", principals_dir=principals
     )
-    assert p.allows_vault_root(minni_home / "claude-code-vault")
+    assert not p.allows_vault_root(minni_home / "claude-code-vault")
     assert p.allows_vault_root(minni_home / "claudecode-vault")
     assert not p.allows_vault_root(operator_root)
