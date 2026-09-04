@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(os.environ.get("MINNI_CHECK_DEPLOYMENTS_REPO_ROOT") or Path(__file__).resolve().parent.parent)
@@ -214,6 +215,151 @@ def source_sha() -> str:
         ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return "unknown"
+
+
+def source_dirty() -> bool | None:
+    """A matching HEAD does not identify uncommitted build inputs."""
+    try:
+        return bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL,
+        ).strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def check_wire_launch_bindings(home: Path) -> tuple[list[str], list[str]]:
+    """Check recorded active host MCP launch bindings, without exposing config data.
+
+    This does not verify host hook/rule registration, process restart, arbitrary
+    launcher scripts, or host-level configuration precedence/overrides.
+    """
+    wired = home / ".minni/plugin/wired.json"
+    if not wired.exists():
+        return [], ["host launch bindings not checked: no wired.json records"]
+    try:
+        data = json.loads(wired.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("wires", []), list):
+            raise ValueError("invalid wire record shape")
+        entries = data.get("wires", [])
+    except (OSError, ValueError):
+        return ["wired.json unreadable or malformed; host launch bindings unverified"], []
+
+    _src = Path(__file__).resolve().parent.parent / "src"
+    if _src.is_dir() and str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+    from minni.wire.platform import config_root_exists, platform_spec
+    from minni.wire.verify import _readback_server_path
+
+    latest: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        platform = str(entry.get("platform") or "")
+        # Select before checking payload validity. The active-root helper
+        # excludes broken installs; using it here would hide exactly the
+        # dangling host launch binding this check needs to report.
+        previous = latest.get(platform)
+        if previous is None or str(entry.get("wired_at") or "") >= str(previous.get("wired_at") or ""):
+            latest[platform] = entry
+
+    problems: list[str] = []
+    notes: list[str] = []
+    supported = {"toml", "claude-json", "kilo-json", "mcp-json-only", "antigravity"}
+    for platform, record in sorted(latest.items()):
+        raw_root = record.get("install_root")
+        root = Path(raw_root) if isinstance(raw_root, str) and raw_root else Path()
+        try:
+            kind = platform_spec(platform, install_root=str(root), agent="main").config_kind
+        except ValueError:
+            notes.append(f"{platform}: host launch binding not checked (unsupported platform)")
+            continue
+        if kind not in supported:
+            notes.append(f"{platform}: host launch binding not checked (unsupported adapter)")
+            continue
+        host_present, _probed = config_root_exists(platform, home=home)
+        if not host_present:
+            notes.append(f"{platform}: host launch binding not checked (host config root removed)")
+            continue
+        if not isinstance(raw_root, str) or not raw_root or not root.is_absolute():
+            problems.append(f"{platform}: recorded install_root is missing or not absolute")
+            continue
+        if not root.is_dir():
+            problems.append(f"{platform}: recorded install_root directory is missing")
+            continue
+        if not (root / "payload-manifest.json").is_file():
+            problems.append(f"{platform}: recorded install_root has no payload manifest")
+            continue
+        raw_path = record.get("config_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            problems.append(f"{platform}: active wire has no recorded config_path")
+            continue
+        config_path = home / raw_path[2:] if raw_path.startswith("~/") else Path(raw_path)
+        if not config_path.is_absolute():
+            problems.append(f"{platform}: recorded config_path is not absolute")
+            continue
+        if not config_path.is_file():
+            problems.append(f"{platform}: recorded host config is missing or unreadable")
+            continue
+        try:
+            text = config_path.read_text(encoding="utf-8")
+            config = tomllib.loads(text) if kind == "toml" else json.loads(text)
+            container = "mcp_servers" if kind == "toml" else ("mcp" if kind == "kilo-json" else "mcpServers")
+            entry = config.get(container, {}).get("minni")
+            if not isinstance(entry, dict):
+                problems.append(f"{platform}: recorded host config has no Minni MCP entry")
+                continue
+            if entry.get("enabled") is False or entry.get("disabled") is True:
+                problems.append(f"{platform}: host Minni MCP entry is disabled")
+            if kind == "kilo-json":
+                command = entry.get("command")
+                if not isinstance(command, list) or len(command) != 2:
+                    problems.append(f"{platform}: unsupported MCP command array")
+                    continue
+                launcher, server = command
+                launch_kind = entry.get("type", "local")
+                valid_type = launch_kind == "local"
+            else:
+                launcher = entry.get("command")
+                args = entry.get("args")
+                if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+                    problems.append(f"{platform}: malformed MCP argument list")
+                    continue
+                # Match the existing Antigravity writer's optional wrapper.
+                if kind == "antigravity" and isinstance(launcher, str) and Path(launcher).name == "mcp-env-run":
+                    if not Path(launcher).is_absolute() or not Path(launcher).is_file():
+                        problems.append(f"{platform}: MCP wrapper path is missing or not absolute")
+                        continue
+                    if len(args) != 2 or args[0] != "node":
+                        problems.append(f"{platform}: unsupported MCP wrapper arguments")
+                        continue
+                    launcher, server = args
+                elif len(args) == 1:
+                    server = args[0]
+                else:
+                    problems.append(f"{platform}: unsupported MCP argument layout")
+                    continue
+                valid_type = entry.get("type", "stdio") == "stdio" and not entry.get("url")
+            if not isinstance(launcher, str) or Path(launcher).name not in {"node", "nodejs"} or not valid_type:
+                problems.append(f"{platform}: unsupported MCP launch command or transport")
+                continue
+            if Path(launcher).is_absolute() and not Path(launcher).is_file():
+                problems.append(f"{platform}: MCP executable path is missing")
+                continue
+            if not isinstance(server, str) or not Path(server).is_absolute():
+                problems.append(f"{platform}: MCP server path is not absolute")
+                continue
+            stamped = _readback_server_path(config_path, kind)
+            expected = root / "dist/server.js"
+            if not expected.is_file():
+                problems.append(f"{platform}: recorded install_root has no server entrypoint")
+            elif stamped is None or Path(stamped).resolve() != expected.resolve():
+                problems.append(f"{platform}: host MCP server differs from recorded install_root")
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError):
+            # Parser errors may embed credential-bearing source lines. Only
+            # report the category; never print the exception or config values.
+            problems.append(f"{platform}: host config is malformed or unreadable")
+    return problems, notes
 
 
 def _home() -> Path:
@@ -465,6 +611,11 @@ def main(argv: list[str] | None = None) -> int:
 
     head = source_sha()
     print(f"source HEAD: {head[:8]}  ({REPO_ROOT})")
+    dirty_source = source_dirty()
+    if dirty_source:
+        print("SOURCE DIRTY: uncommitted files are not identified by source HEAD")
+    elif dirty_source is None:
+        print("NOTE  source worktree state unavailable (no Git provenance check)")
     print(f"content compared: {', '.join(COMPARED_SUBTREES)}")
     for name, why in NOT_COMPARED.items():
         print(f"not compared: {name} — {why}")
@@ -489,7 +640,13 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[tuple[str, str, str]] = []
     details: list[tuple[str, list[str]]] = []
     stale = unknown = drifted_count = unreadable_count = 0
-    worktree_linked = badconfig_count = 0
+    worktree_linked = badconfig_count = dirty_builds = 0
+    host_problems, host_notes = check_wire_launch_bindings(home)
+    for note in host_notes:
+        print(f"NOTE  {note}")
+    for problem in host_problems:
+        print(f"HOSTCONFIG  {problem}")
+    print("Host launch scope: recorded MCP bindings only; hooks, rules, overrides and running processes are not checked.")
     dists, skip_notes = discover_active()
     for note in skip_notes:
         print(f"NOTE  {note}")
@@ -539,7 +696,10 @@ def main(argv: list[str] | None = None) -> int:
                 sha = str(m.get("git_sha", "unknown"))
                 dirty = " +dirty" if m.get("git_dirty") else ""
                 built = str(m.get("built_at", "?"))
-                if sha == head:
+                if dirty:
+                    rows.append(("DIRTY", "dist built from uncommitted inputs", label))
+                    dirty_builds += 1
+                elif sha == head:
                     rows.append(("OK", f"dist {sha[:8]}{dirty}", label))
                 else:
                     rows.append(("STALE", f"dist {sha[:8]}{dirty} built {built}", label))
@@ -584,11 +744,12 @@ def main(argv: list[str] | None = None) -> int:
             f"{roots} deployment(s): {stale} stale dist, {drifted_count} with content drift, "
             f"{unknown} unknown vintage, {unreadable_count} partly unreadable, "
             f"{worktree_linked} dist symlinked at the working tree, "
-            f"{badconfig_count} with .mcp.json problems."
+            f"{badconfig_count} with .mcp.json problems, "
+            f"{dirty_builds} dirty build(s), {len(host_problems)} host binding problem(s)."
         )
     failed = (
         stale or unknown or drifted_count or unreadable_count or source_bad
-        or worktree_linked or badconfig_count
+        or worktree_linked or badconfig_count or dirty_source or dirty_builds or host_problems
     )
     if failed:
         print("\nRefresh with: make stage-payload  (payload)  /  npm run build  (source dist)")
