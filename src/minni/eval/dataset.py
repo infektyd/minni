@@ -11,8 +11,11 @@ logger = logging.getLogger("sovereign.eval")
 
 
 def repo_root() -> Path:
-    """Return the repository root (two levels up from engine/eval/)."""
-    return Path(__file__).resolve().parent.parent.parent
+    """Locate the checkout containing the source-layout evaluation package."""
+    root = Path(__file__).resolve().parents[3]
+    if not (root / "pyproject.toml").is_file() or not (root / "eval").is_dir():
+        raise RuntimeError("Default evaluation paths require a Minni source checkout")
+    return root
 
 
 def queries_path() -> Path:

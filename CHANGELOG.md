@@ -18,9 +18,29 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   Drain-queue list defaults to `status=proposed`, redacts POLICY §2 secrets
   and local paths, exposes `total`/`has_more` so truncation is not silent,
   and does not return redacted/rejected packet content to the model.
+- Fleet slug aliases across registries: `xai` normalizes to `grok-build`, and
+  `agy` / `antigravity` normalize to `gemini` across candidate ingest
+  (`inbox_ingest.py`), hook utilities (`hook-utils.ts`), and inbox maintenance
+  (`inbox_cleanup.py`).
+- Wire adapter fallback safety (`unprofiledWire`): unknown and unprofiled host IDs
+  no longer fall through to Claude Code's wire shape. The adapter retains the authentic
+  host `agent_id`, suppresses unsupported injection channels (`inject`/`note` return null),
+  and explicitly records intent drops in audit telemetry.
+- Agent vault contract seeding: `ensure_agent_vault` now idempotently seeds standard
+  wiki structure and contract files (`index.md`, `log.md`) even when the target agent vault
+  directory already exists on disk, ensuring all registered vaults carry valid contracts.
 
 ### Changed
 
+- `privacy=review` candidate packets are AFM-examinable: learn-only `stage_candidate`
+  clamps non-operator proposals to `privacy=review`. Consolidation now treats
+  `privacy=review` as examinable (`_EXAMINABLE_PRIVACY`) so multi-agent candidate queues
+  (Claude, Grok, Gemini, Hermes, Cursor) re-enter the consolidation drain rather than
+  permanently parking behind the `afm_review` fence (`examined=0`). Rows passing quality,
+  deduplication, and non-instruction checks are triaged; durable promotion into active
+  memory still strictly requires operator resolution or `auto_accept_own`, and unset/NULL
+  privacy remains parked. Consolidation wiki synthesis drafts land in the shared vault
+  (`~/.minni/vault`) as `agent: afm-loop`.
 - Default platform-agent vault roots no longer include the dashless alias:
   a platform principal without an explicit `platform_agent_vault_roots`
   entry is now scoped to its canonical vault only
@@ -56,6 +76,17 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   (filed refs marked apart from PROPOSED titles) (#354) — superseding the
   0.5.0 note below that workflow emission "is still open as #354". Filing
   the issue itself remains a wright/operator act.
+
+### Fixed
+
+- Monotonic search deadline enforcement before JSON-RPC timeout: retrieval operations
+  (`retrieve()`) now check a cooperative deadline budget (`deadline_monotonic`, defaulting to 25s
+  / 90% of client `timeout_ms`). When the budget expires, query expansion, FAISS semantic
+  search, and cross-encoder reranking are bypassed to return deterministic FTS results, reducing work after expiry. Native inference already in progress remains non-preemptible.
+- Dropped inject recall state guard: `writeRecallState(consumed=false)` is skipped on
+  platforms where UserPromptSubmit stdout is dropped or unsupported (such as Grok passive
+  events and Cursor prompt submit), preventing uninjectable memory envelopes from causing
+  false `UNCONSULTED` pre-tool denials.
 
 ## [0.5.0] - 2026-08-06
 

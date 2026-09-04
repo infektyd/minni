@@ -42,7 +42,7 @@ that another agent can pick up later.
 ## Eval Gate
 
 A retrieval feature may flip its default only after
-`python -m engine.eval.harness run --config baseline,<candidate>` shows at
+`python -m minni.eval.harness run --config baseline,<candidate>` shows at
 least +5% recall@5 on the seed set with no regression on any query class.
 
 ## Runtime Identity

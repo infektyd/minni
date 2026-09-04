@@ -240,7 +240,7 @@ def cmd_record(args: argparse.Namespace) -> None:
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="python -m engine.eval.harness",
+        prog="python -m minni.eval.harness",
         description="Minni offline recall evaluation harness.",
     )
     sub = parser.add_subparsers(dest="command", required=True)

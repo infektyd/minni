@@ -33,17 +33,27 @@ It scopes reads, writes, episodic events, and learnings. Well-known values:
 The wired-platform ids above are the actual principal ids shipped in
 `src/minni/tools/author_principals.py` / `~/.minni/principals/*.json` — note
 `grok-build`, not `grok` (the CLI flag `minni wire grok` maps to this
-principal).
+principal). Common platform aliases are normalized across candidate ingest
+(`inbox_ingest.py`), hook utilities (`hook-utils.ts`), and inbox maintenance
+(`inbox_cleanup.py`): `xai` normalizes to `grok-build`, while `agy` and
+`antigravity` normalize to `gemini`.
+
+Unprofiled or custom agent platforms do not fall back to Claude Code.
+`wireFor()` maps unknown hosts to `unprofiledWire`, which preserves the
+requested `agent_id`, returns null for injection channels (`inject`, `note`),
+and records dropped intents in audit telemetry.
 
 Custom agents use any string that does not begin with `identity:` (reserved).
 
 ### workspace_id
 
-`workspace_id` (not yet surfaced in all APIs, planned for PR-3) identifies the
-project or repository context. Agents with the same `agent_id` in different
-workspaces are treated as separate recall pools. Until `workspace_id` is
-promoted to a first-class field, workspace scoping is encoded in the vault path.
-(PLANNED — G11 / PR-3)
+`workspace_id` identifies project context, but it is not a complete persisted
+isolation boundary for document recall. Search uses the server-stamped
+principal's workspace; the plugin's optional `workspaceId` context label does
+not select a separate database or override that principal. Legacy documents
+without a workspace stamp remain readable to their owner across projects.
+Use distinct principal/vault boundaries when separate recall pools are required.
+First-class persisted document workspace isolation remains planned (G11 / PR-3).
 
 ### Reserved identity layer
 
@@ -114,6 +124,17 @@ it owns; superseding another agent's learning requires an explicitly allowed
 operator. Contradiction events are queryable via `subscribe_contradictions`
 (`minni_subscribe_contradictions`), which returns contradiction events for
 learnings a given agent has recently read.
+
+### Candidate staging and privacy levels
+
+Non-operator calls to `learn` without an eligible `auto_accept_own` grant stage proposals in `candidate_packets` with
+`privacy=review`. Under the AFM consolidation pass, these rows are
+`_EXAMINABLE_PRIVACY` — they are drained, deduplicated, and evaluated against
+quality and instruction-like heuristics rather than remaining permanently parked
+behind an `afm_review` fence. Candidates that pass quality review stay parked as
+`proposed` for operator `resolve_candidate` (or `auto_accept_own`), while synthesis
+drafts land in the shared vault (`~/.minni/vault`) as `agent: afm-loop`. Unset or
+NULL privacy remains strictly unexaminable and parked.
 
 ### Privileged actions (daemon or operator only)
 

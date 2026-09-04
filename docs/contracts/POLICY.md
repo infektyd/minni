@@ -43,6 +43,16 @@ retrieval time:
 | `private` | No (author agent only) | No |
 | `blocked` | Never | Never |
 
+### 1.1 Candidate staging privacy
+
+When non-operator agents submit learnings via `learn` without eligible `auto_accept_own`, proposals are staged in
+`candidate_packets` with `privacy=review`. This clamped level prevents unvetted
+proposals from leaking into cross-agent recall or auto-promoting to durable
+storage. The background AFM consolidation pass inspects and deduplicates
+`privacy=review` candidate packets (`_EXAMINABLE_PRIVACY`), but durable promotion
+into active memory requires explicit operator resolution (`resolve_candidate`)
+or an explicit `auto_accept_own` principal configuration.
+
 See `docs/contracts/VAULT.md` Section 7 for the full privacy level definitions.
 
 ---

@@ -89,12 +89,21 @@ same audit trail:
    [#119](https://github.com/infektyd/minni/issues/119) closed)*. Set
    `MINNI_AFM_LOOP=on` (also `1`/`true`/`yes`) to enable the daemon's AFM
    loop; default is **off**, and `MINNI_AFM_LOOP=off` is an explicit kill
-   switch. When enabled, consolidation drains staged candidates on a schedule,
-   auto-promoting the low-risk subset — explicitly safe privacy level, not
-   instruction-like, not a duplicate, passing the deterministic quality gate —
-   into durable learnings with `resolved_by=afm-consolidation`, and routing
-   everything spicier to review. The gate, promotion write, and loop path are
-   implemented and covered by regression tests (`tests/test_afm_loop_promotion.py`).
+   switch. When enabled, consolidation drains staged candidates on a schedule.
+   Candidates with explicitly safe privacy levels (`safe`, `public`, `low`) that
+   pass deterministic quality, deduplication, and non-instruction gates are
+   auto-promoted into durable learnings with `resolved_by=afm-consolidation`.
+   Learn-only candidate packets clamped to `privacy=review` are treated as
+   examinable (`_EXAMINABLE_PRIVACY`), enabling the fleet's staged proposals to
+   re-enter the consolidation drain and be deduplicated or quality-evaluated rather
+   than permanently parking behind the `afm_review` fence (`examined=0`).
+   Candidates passing quality triage stay parked as `proposed` for operator
+   decision via `resolve_candidate` (they are never auto-promoted without
+   operator authority), while synthesized wiki drafts land in the shared vault
+   (`~/.minni/vault`) as `agent: afm-loop`. Unset/NULL privacy is strictly
+   non-examinable and remains parked (I1/I2 security fence). The gate, promotion
+   write, and loop path are implemented and covered by regression tests
+   (`tests/test_afm_loop_promotion.py`, `tests/test_afm_review_privacy_examinable.py`).
    `minni doctor` does **not** fully wet-exercise this pass (it stays green
    whether the loop is on or off), so enable deliberately and watch daemon logs
    / `consolidation_actions` if you rely on it. (`MINNI_AFM_MODE` is unrelated
@@ -239,6 +248,9 @@ inbox files into `candidate_packets`; **`consolidation`** then proposes
 promote/dedupe/review decisions that the daemon applies according to the
 configured gates. Raw transcripts, status packets, hook envelopes, test junk,
 and unverified claims route to review or rejection, not active memory.
+Non-operator proposals clamped to `privacy=review` are drained and evaluated
+for deduplication and quality triage, but are never auto-promoted without
+operator resolution.
 
 ## Compaction-summary harvest
 

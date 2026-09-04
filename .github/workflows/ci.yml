@@ -50,6 +50,9 @@ jobs:
           make setup
           .venv/bin/python -m pip install pyyaml
 
+      - name: Static checks
+        run: make lint typecheck
+
       - name: Public boundary guard
         run: |
           bash scripts/check-public-boundary.sh
