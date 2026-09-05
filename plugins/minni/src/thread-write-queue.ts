@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { ThreadBusyError, readProcessStartMarker, type ThreadLockOwner } from "./thread-lock.js";
@@ -331,8 +331,12 @@ export async function listQueuedWorkerWrites(
     let item: QueuedWorkerWrite | undefined;
     try {
       item = parseQueuedWrite(await readFile(filePath, "utf8"));
-    } catch {
-      item = undefined;
+    } catch (error) {
+      // A concurrent drain may already have removed this ticket. Other read
+      // failures do not establish corruption and must never delete accepted
+      // work (for example a temporary permission or I/O failure).
+      if (isErrno(error, "ENOENT")) continue;
+      throw error;
     }
     if (item === undefined) {
       await rm(filePath, { force: true }).catch(() => {});
@@ -524,20 +528,38 @@ export async function enqueueWorkerWrite(
     ...(input.applyNow instanceof Date ? { applyNow: input.applyNow.toISOString() } : {}),
     ...(input.generation !== undefined ? { generation: input.generation } : {}),
   };
+  // Readers prune malformed .json tickets. Finish a private sibling first so
+  // they cannot observe (and remove) an empty or partially written final file.
+  // link publishes without replacing an existing idempotency winner; rename
+  // would overwrite that winner. Staging names are outside the .json scan.
+  const stagingPath = path.join(dir, `.${randomUUID()}.tmp`);
+  let cleanupStaging = true;
   try {
-    await writeFile(filePath, `${JSON.stringify(item)}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600,
-    });
-  } catch (error) {
-    if (isErrno(error, "EEXIST")) {
-      const existing = parseQueuedWrite(await readFile(filePath, "utf8"));
-      if (existing !== undefined) {
-        return { alreadyQueued: true, item: existing };
-      }
+    try {
+      await writeFile(stagingPath, `${JSON.stringify(item)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+    } catch (error) {
+      // A collision is not our file. Other write failures can leave a partial
+      // staging file, which still needs cleanup before propagating the error.
+      if (isErrno(error, "EEXIST")) cleanupStaging = false;
+      throw error;
     }
-    throw error;
+    try {
+      await link(stagingPath, filePath);
+    } catch (error) {
+      if (isErrno(error, "EEXIST")) {
+        const existing = parseQueuedWrite(await readFile(filePath, "utf8"));
+        if (existing !== undefined) {
+          return { alreadyQueued: true, item: existing };
+        }
+      }
+      throw error;
+    }
+  } finally {
+    if (cleanupStaging) await rm(stagingPath, { force: true }).catch(() => {});
   }
   return { alreadyQueued: false, item };
 }

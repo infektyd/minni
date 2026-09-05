@@ -5,6 +5,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -313,6 +315,84 @@ async function runWetBurst(t, n) {
     journal,
   };
 }
+
+test("queue scans cannot delete a ticket while its writer is publishing it", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-queue-publication-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const originalWrite = fs.promises.writeFile;
+  let intercepted = 0;
+  fs.promises.writeFile = async (file, data, options) => {
+    if (typeof file !== "string" || !file.startsWith(root) || options?.flag !== "wx") {
+      return originalWrite(file, data, options);
+    }
+    // Force a real queue scan between open(O_EXCL) and writing the contents.
+    const handle = await fs.promises.open(file, options.flag, options.mode);
+    intercepted += 1;
+    try {
+      assert.deepEqual(await listQueuedWorkerWrites(root, "publication"), []);
+      await handle.writeFile(data, options);
+    } finally {
+      await handle.close();
+    }
+  };
+  syncBuiltinESMExports();
+  try {
+    const accepted = await enqueueWorkerWrite({
+      vaultPath: root, planId: "publication", sliceId: "s0", workerAgentId: "worker",
+      token: "test-token", idempotencyKey: "publish-once", action: { action: "start" },
+    });
+    assert.equal(intercepted, 1, "exercise a scan during the actual enqueue write");
+    assert.equal(accepted.alreadyQueued, false);
+    const queued = await listQueuedWorkerWrites(root, "publication");
+    assert.equal(queued.length, 1, "accepted write must survive a scan during publication");
+    assert.equal(queued[0].ticketId, accepted.item.ticketId);
+  } finally {
+    fs.promises.writeFile = originalWrite;
+    syncBuiltinESMExports();
+  }
+});
+
+test("queue read failures preserve accepted tickets for a later drain", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-queue-read-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const accepted = await enqueueWorkerWrite({
+    vaultPath: root, planId: "read-failure", sliceId: "s0", workerAgentId: "worker",
+    token: "test-token", idempotencyKey: "read-later", action: { action: "start" },
+  });
+  const originalRead = fs.promises.readFile;
+  fs.promises.readFile = async (file, ...args) => {
+    if (typeof file === "string" && file.startsWith(root) && file.endsWith(".json")) {
+      throw Object.assign(new Error("simulated read failure"), { code: "EACCES" });
+    }
+    return originalRead(file, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(listQueuedWorkerWrites(root, "read-failure"), { code: "EACCES" });
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+  const queued = await listQueuedWorkerWrites(root, "read-failure");
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].ticketId, accepted.item.ticketId);
+});
+
+test("concurrent publication of one idempotency key preserves one winning ticket", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-queue-idempotent-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const input = {
+    vaultPath: root, planId: "same-key", sliceId: "s0", workerAgentId: "worker",
+    token: "test-token", idempotencyKey: "one-key", action: { action: "start" },
+  };
+  const results = await Promise.all(Array.from({ length: 20 }, () => enqueueWorkerWrite(input)));
+  assert.equal(results.filter(result => !result.alreadyQueued).length, 1);
+  assert.equal(new Set(results.map(result => result.item.ticketId)).size, 1);
+  const queued = await listQueuedWorkerWrites(root, "same-key");
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].ticketId, results[0].item.ticketId);
+  assert.equal((await readdir(workerWriteQueueDir(root, "same-key"))).filter(name => name.endsWith(".tmp")).length, 0);
+});
 
 test("queue timeout diagnostics preserve submission failures and pending actions without secrets", async () => {
   const secret = "secret-claim-token";
