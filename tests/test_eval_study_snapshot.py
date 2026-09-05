@@ -131,7 +131,7 @@ def test_rejects_duplicate_store_tuple_identity():
 
 def test_duplicate_content_is_retained_and_linked_not_conflated(tmp_path):
     dest = tmp_path / "snapshot"
-    manifest = prepare_snapshot(_packet([
+    prepare_snapshot(_packet([
         _record("doc-a1", "store-a", "project-a/a.md", "identical bytes here"),
         _record("doc-b1", "store-b", "project-b/b.md", "identical bytes here"),
     ]), dest)
@@ -144,8 +144,19 @@ def test_duplicate_content_is_retained_and_linked_not_conflated(tmp_path):
     # Separate ownership survives: two identities, two vault files, one group.
     assert (mapping["study-0001"]["store"], mapping["study-0001"]["source_doc_id"]) != \
         (mapping["study-0002"]["store"], mapping["study-0002"]["source_doc_id"])
-    assert manifest["content_groups"] == groups
     assert group == content_group_for(mapping["study-0001"]["content_sha256"])
+
+    verified = verify_snapshot(dest)
+    assert verified["manifest"]["content_groups"] == groups
+    materialized = materialize_snapshot_db(dest)
+    assert sorted(materialized["document_ids"]) == ["study-0001", "study-0002"]
+    assert sorted(check_materialized(dest)["document_ids"]) == ["study-0001", "study-0002"]
+
+    envelope = json.loads((dest / "mapping.json").read_text())
+    envelope["records"]["study-0002"]["content_group"] = "content-forged"
+    (dest / "mapping.json").write_text(json.dumps(envelope))
+    with pytest.raises(StudySnapshotError, match="content group"):
+        verify_snapshot(dest)
 
 
 def test_digest_binds_identity_and_lifecycle_not_just_text():
@@ -243,6 +254,26 @@ def test_rejects_missing_excerpt_label_and_locator():
     packet = _two_record_packet()
     packet["records"][0]["content_kind"] = "excerpt"
     with pytest.raises(StudySnapshotError, match="source_locator"):
+        validate_export_packet(packet)
+
+
+def test_excerpt_round_trip_preserves_locator_and_binds_it(tmp_path):
+    packet = _packet([
+        _record("excerpt-1", "store-a", "project-a/excerpt.md", "excerpt bytes",
+                kind="excerpt", source_locator="vault:original#10-12"),
+    ])
+    dest = tmp_path / "snapshot"
+    prepare_snapshot(packet, dest)
+    verify_snapshot(dest)
+    materialize_snapshot_db(dest)
+    check_materialized(dest)
+
+    mapping = _mapping_records(dest)
+    assert mapping["study-0001"]["source_provenance"]["source_locator"] == \
+        "vault:original#10-12"
+
+    packet["records"][0]["source_locator"] = "vault:original#13-15"
+    with pytest.raises(StudySnapshotError, match="manifest_digest"):
         validate_export_packet(packet)
 
 
