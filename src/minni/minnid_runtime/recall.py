@@ -25,13 +25,22 @@ from .redaction import redact_text, redact_value
 logger = logging.getLogger("minnid")
 
 # perf/parallel-fanout (issue #388): bounded width + kill-switch for the
-# corpus-leg fan-out below (per-vault legs in retrieve_combined, plus the
-# personal/combined legs of scope "both"). Each fan-out site creates its own
+# corpus-leg fan-out below (per-vault legs plus the shared tail gathered by
+# _combined_leg_results; scope "both" still runs personal first, then the
+# combined batch, exactly as serial). Each fan-out site creates its own
 # pool on demand and drains it on gather: legs run per-variant fan-outs of
 # their own inside RetrievalEngine.retrieve, so a single shared pool could
 # deadlock once leg tasks occupy every worker while their variant subtasks
 # queue behind them (see retrieval.py). Set RECALL_LEG_PARALLEL = False for
 # the legacy serial leg order (bit-identical).
+# Deadline guard (correctness over speed): the leg pool engages ONLY when
+# deadline_monotonic is None — the same gate as retrieval's variant pool.
+# handle_search stamps a deadline on EVERY RPC, so production corpus legs
+# always run the serial loop and keep origin/main's remaining-budget
+# truncation (a serial leg observes time its predecessors consumed; parallel
+# legs would each start with a fuller budget and truncate differently,
+# changing result content). The pool path exists for deadline-free callers
+# (unit tests, operator tools) and carries NO RPC latency claim.
 # Cassandra YELLOW-3b: per-site cap is 4 — leg pools compound with the
 # per-variant pools inside every leg (see retrieval._MAX_VARIANT_WORKERS),
 # so 8-wide sites fielded 60+ threads per both-scope search. At 4/4 the
@@ -189,6 +198,57 @@ def _strip_private_search_keys(results: list) -> None:
             continue
         row.pop(_QTY_ENGINE_KEY, None)
         row.pop(_DEADLINE_POISONED_KEY, None)
+
+
+def _gather_leg_results(callables: list, deadline_monotonic) -> list:
+    """Run leg callables, in parallel when enabled, preserving order.
+
+    perf/parallel-fanout (#388): pool.map preserves submission order, so
+    merges and diagnostic sinks observe exactly the serial leg order.
+    Single-leg calls skip the pool (zero overhead, same code path as the
+    kill-switch-off serial loop).
+
+    Deadline guard (correctness over speed): the pool engages ONLY when
+    deadline_monotonic is None — the same gate as retrieval's variant
+    pool. handle_search stamps a deadline on EVERY RPC, so production
+    corpus legs always run the serial loop and keep origin/main's
+    remaining-budget truncation. No RPC latency is claimed for this pool.
+
+    Raise semantics (defensive-only: production legs soft-fail by
+    construction — per-vault try/except plus soft shared tails — so a
+    raising pooled leg is unreachable via handle_search). pool.map
+    submits EVERY leg eagerly at entry, unlike the serial loop, which
+    never starts legs past a raise — never claim a serial abort for the
+    pool. On a raise, list(map) yields in submission order, so the
+    gather waits for the slowest STARTED sibling before the first error
+    surfaces, and the pool join on context exit waits for every started
+    worker; a worker that picks up a queued leg runs it to completion
+    (pool.map can only cancel legs that never started). The
+    submission-order-first error propagates — the serial raise's
+    identity at the envelope. Completed siblings' sink ops are dropped
+    with the batch (no partial replay; both paths land in the outer
+    except as −32000, which carries no per-leg diagnostics), while
+    below-envelope residue stands (trace-ring entries a completed
+    sibling wrote on its worker). No access_count writes happen on this
+    path: legs retrieve with update_access=False and the merged-set qty
+    bump runs only after a successful gather. Explicit fail-fast
+    cancellation was rejected: as_completed could surface a LATER leg's
+    error first, breaking the serial-raise identity for zero gain (leg
+    bodies are not cancellable work). Pinned by test_leg_gather_* in
+    tests/test_parallel_fanout_red.py.
+    """
+    use_leg_pool = (
+        RECALL_LEG_PARALLEL
+        and len(callables) > 1
+        and deadline_monotonic is None
+    )
+    if use_leg_pool:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_MAX_LEG_WORKERS, len(callables)),
+            thread_name_prefix="minni-leg",
+        ) as _leg_pool:
+            return list(_leg_pool.map(lambda fn: fn(), callables))
+    return [fn() for fn in callables]
 
 
 def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
@@ -561,44 +621,6 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 return
             _shared_seen[bucket].add(key)
             sink.append(entry)
-
-        def _gather_leg_results(callables: list) -> list:
-            """Run leg callables, in parallel when enabled, preserving order.
-
-            perf/parallel-fanout (#388): pool.map preserves submission order,
-            so merges and diagnostic sinks observe exactly the serial leg
-            order. A leg that raises propagates on gather — identical to the
-            serial throw, which also aborted the whole search into the outer
-            −32000. Single-leg calls skip the pool (zero overhead, same code
-            path as the kill-switch-off serial loop).
-
-            YELLOW-1/YELLOW-2 (documented, deliberate): a raising leg's
-            already-gathered siblings keep their sink ops un-replayed — the
-            gather throw skips _replay_leg_ops for the whole batch. Both
-            paths land in the outer except as −32000, which carries no
-            per-leg diagnostics (the sinks are dropped with the 200 body
-            either way) — that is the RPC-envelope equality that holds.
-            pool.map submits every leg eagerly; as in the variant fan-out
-            (see retrieval.py) the fate of a not-yet-started leg at abort
-            is a scheduling race between the map iterator's finally-cancel
-            and the worker picking it up, while already-running legs run to
-            completion. Legs now retrieve with update_access=False; qty
-            bumps happen once on the merged caller-visible set. An
-            over-executed sibling may still leave trace-ring entries the
-            serial run never wrote: residue at the trace-ring level,
-            identical at the RPC envelope. The FIRST leg's exception
-            propagates in submission order — the serial raise, under either
-            race outcome. Explicit fail-fast cancellation was rejected:
-            as_completed could surface a later leg's error first, breaking
-            the serial-raise identity for zero gain.
-            """
-            if RECALL_LEG_PARALLEL and len(callables) > 1:
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(_MAX_LEG_WORKERS, len(callables)),
-                    thread_name_prefix="minni-leg",
-                ) as _leg_pool:
-                    return list(_leg_pool.map(lambda fn: fn(), callables))
-            return [fn() for fn in callables]
 
         def _replay_leg_ops(ops: list) -> None:
             """Replay one leg's sink writes on the gathering thread, in order.
@@ -974,7 +996,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             # Round 18: soft-fail shared so agent-vault hits already collected
             # are not erased by a shared-index throw (−32000).
             leg_fns.append(retrieve_shared_soft)
-            outcomes = _gather_leg_results(leg_fns)
+            outcomes = _gather_leg_results(leg_fns, deadline_monotonic)
             result_sets = []
             combined_ops: list = []
             for rows, ops, _trace in outcomes[:-1]:

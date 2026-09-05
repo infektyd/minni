@@ -3494,6 +3494,12 @@ class RetrievalEngine:
             # clock is past. Eager pool.map submits every variant, so a
             # later unused child that raises aborts the whole retrieve
             # (P1) and FTS-counts 3 where serial did 1.
+            # Preservation, not a latency fix: handle_search stamps
+            # deadline_monotonic on EVERY RPC, so this pool is unreachable
+            # on the RPC path by construction — no speedup is claimed or
+            # measured there. The serial truncation order it preserves is
+            # pinned by tests/test_search_deadline.py (loop-gate
+            # truncation, in-flight poisoned-child drop, qty withholding).
             use_variant_pool = (
                 RETRIEVAL_VARIANT_PARALLEL and deadline_monotonic is None
             )

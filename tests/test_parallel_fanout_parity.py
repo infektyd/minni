@@ -15,6 +15,7 @@ Only trace ring ids are normalized (fresh ring entries per run by design);
 everything else must compare exactly equal.
 """
 
+import concurrent.futures
 import logging
 import os
 import sys
@@ -343,14 +344,55 @@ def _scrub_envelope(payload):
     return scrubbed
 
 
+def _unbounded_deadline(monkeypatch):
+    """Deadline-free RPC: the ONLY mode where the leg/variant pools engage.
+
+    handle_search stamps a deadline on every real RPC, and both fan-outs
+    stay serial under a deadline by construction (remaining-budget
+    truncation). Parity runs must clear it, or the "parallel" side
+    silently runs the serial loop and the comparison is vacuous.
+    """
+    monkeypatch.setattr(
+        recall_mod, "_search_deadline_monotonic", lambda params: None
+    )
+
+
+def _spy_pools(monkeypatch):
+    """Record every pool instantiation by thread-name prefix.
+
+    Fake-engine harnesses never touch retrieval pools, so "minni-leg"
+    entries there are leg-pool engagements exactly; the nested real-engine
+    test sees both "minni-leg" and "minni-variant".
+    """
+    created: list = []
+    real_pool = concurrent.futures.ThreadPoolExecutor
+
+    class _SpyPool(real_pool):
+        def __init__(self, *args, **kwargs):
+            created.append(kwargs.get("thread_name_prefix"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _SpyPool)
+    return created
+
+
 @pytest.mark.parametrize("scope", ["both", "combined", "personal"])
 def test_leg_fanout_matches_serial(monkeypatch, scope):
     """Corpus legs: identical envelope, ordering, diagnostics, trace."""
+    _unbounded_deadline(monkeypatch)
+    created = _spy_pools(monkeypatch)
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
     serial, t_serial = _run_scope(_recall_harness(monkeypatch)[0], scope)
+    assert created == [], "serial mode must not instantiate any pool"
 
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
     parallel, t_parallel = _run_scope(_recall_harness(monkeypatch)[0], scope)
+    if scope in ("both", "combined"):
+        assert "minni-leg" in created, (
+            f"parallel {scope} must engage the leg pool: {created}"
+        )
+    else:
+        assert created == [], "single-leg personal scope never pools"
 
     assert serial["ok"] is True and parallel["ok"] is True
     assert _scrub_envelope(parallel) == _scrub_envelope(serial)
@@ -407,7 +449,11 @@ def test_nested_leg_and_variant_fanout_matches_serial(tmp_path, monkeypatch):
         engine._reranker = _BoomReranker()
         return engine
 
-    def _context(personal, shared):
+    def _vault_tuple(name):
+        vault_engine = _engine(name)
+        return (vault_engine, "vault-one", f"/db/{name}.db")
+
+    def _context(personal, shared, vaults=()):
         principal = _owner()
         return RecallContext(
             make_error=lambda code, msg, rid: {
@@ -421,7 +467,7 @@ def test_nested_leg_and_variant_fanout_matches_serial(tmp_path, monkeypatch):
             agent_vault_retrieval=lambda agent_id: (
                 personal, "codex", "/db/personal.db",
             ),
-            all_vault_retrievals=lambda: [],
+            all_vault_retrievals=lambda: list(vaults),
             trace_ring=lambda: None,
             record_latency=lambda *a: None,
             increment_request_count=lambda: None,
@@ -434,13 +480,26 @@ def test_nested_leg_and_variant_fanout_matches_serial(tmp_path, monkeypatch):
         "limit": 5,
         "expand": True,
     }
+    # Deadline-free both runs: the ONLY mode where the pools engage (any
+    # stamped deadline forces the serial loops by the deadline guards).
+    _unbounded_deadline(monkeypatch)
+    created = _spy_pools(monkeypatch)
     monkeypatch.setattr(retrieval_mod, "RETRIEVAL_VARIANT_PARALLEL", False)
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
-    serial = handle_search(params, 1, _context(_engine("p-s"), _engine("s-s")))
+    serial = handle_search(
+        params, 1, _context(_engine("p-s"), _engine("s-s"), [_vault_tuple("v-s")])
+    )
+    assert created == [], "serial mode must not instantiate any pool"
     monkeypatch.setattr(retrieval_mod, "RETRIEVAL_VARIANT_PARALLEL", True)
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
-    parallel = handle_search(params, 1, _context(_engine("p-p"), _engine("s-p")))
+    parallel = handle_search(
+        params, 1, _context(_engine("p-p"), _engine("s-p"), [_vault_tuple("v-p")])
+    )
     assert serial["ok"] is True and parallel["ok"] is True, (serial, parallel)
     assert serial["result"]["results"], "nested fan-out must return hits"
+    # The vault leg + shared tail batch (2 callables) must cross leg
+    # workers while every leg fans its own variants: genuinely composed.
+    assert "minni-leg" in created, f"leg pool must engage: {created}"
+    assert "minni-variant" in created, f"variant pools must engage: {created}"
     assert _scrub_envelope(parallel) == _scrub_envelope(serial)
     assert len(serial["result"]["query_variants"]) >= 2

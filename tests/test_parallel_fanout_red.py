@@ -148,11 +148,13 @@ class _CounterRing:
 def _both_harness(tmp_path, monkeypatch, run_tag):
     """both-scope over REAL engines with a forced shared-call order.
 
-    No vaults (combined = shared tail only) and a SLOW-failing personal
-    vault (0.5 s): serially the fallback is shared-call #1 and the tail #2;
-    in parallel the tail wins the race (#1) and the fallback is #2. The
-    0.5 s margins make scheduling jitter unable to flip either numbering,
-    so each mode's envelope can assert the tail-wins rule literally.
+    One healthy vault (combined = vault leg + shared tail, a 2-callable
+    batch so the parallel reps genuinely cross leg workers) and a
+    SLOW-failing personal vault (0.5 s): serially the fallback is
+    shared-call #1, the vault #2, the tail #3; in parallel the personal
+    fallback still runs first (both-scope sequencing), then the vault and
+    tail race for #2/#3. Ring ids are scrubbed before comparison, so only
+    the 3-trace count and envelope equality are asserted.
     """
     ring = _CounterRing()
     monkeypatch.setattr(retrieval_mod, "_trace_ring", lambda: ring)
@@ -164,6 +166,10 @@ def _both_harness(tmp_path, monkeypatch, run_tag):
     personal = _real_engine(
         tmp_path, monkeypatch, f"personal-{run_tag}",
         [("wiki/p1.md", "alpha beta personal ledger")],
+    )
+    vault = _real_engine(
+        tmp_path, monkeypatch, f"vault-{run_tag}",
+        [("wiki/v1.md", "alpha beta vault ledger")],
     )
 
     def _slow_fail(**kwargs):
@@ -178,7 +184,7 @@ def _both_harness(tmp_path, monkeypatch, run_tag):
         handler_principal=lambda params, rid: (principal, None),
         lazy_retrieval=lambda: shared,
         agent_vault_retrieval=lambda agent_id: (personal, "codex", "/db/personal.db"),
-        all_vault_retrievals=lambda: [],
+        all_vault_retrievals=lambda: [(vault, "vault-one", "/db/vault-one.db")],
         trace_ring=lambda: None,
         record_latency=lambda *a: None,
         increment_request_count=lambda: None,
@@ -209,16 +215,23 @@ def _scrub_traces(payload):
 def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
     """RED-1 + origin/main: both-scope records each successful retrieval
     trace. Singular ``trace_id`` is unset when more than one leg traced.
-    Ring ids may number in wall-clock order (serial fallback-then-tail vs
-    parallel tail-first); gather-order ``trace_ids`` still has two entries
-    and never a stale handler slot. Scrubbed envelopes match."""
+    Three legs trace here (personal fallback, vault, shared tail); ring
+    ids may number in wall-clock order across the pooled vault/tail batch,
+    but gather-order ``trace_ids`` still has three entries and never a
+    stale handler slot. Scrubbed envelopes match.
+
+    Deadline-free throughout: the parallel reps must genuinely cross leg
+    workers (any stamped deadline forces the serial loops by the deadline
+    guard, which would make the "parallel" side vacuous).
+    """
+    parity._unbounded_deadline(monkeypatch)
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
     serial = handle_search(
         _both_params(), 1, _both_harness(tmp_path, monkeypatch, "serial")
     )
     assert serial["ok"] is True
     assert serial["result"]["trace_id"] is None, serial["result"]["trace_id"]
-    assert len(serial["result"]["trace_ids"]) == 2, serial["result"]["trace_ids"]
+    assert len(serial["result"]["trace_ids"]) == 3, serial["result"]["trace_ids"]
     assert serial["result"]["trace_scope"] == "retrieval_leg"
 
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
@@ -228,7 +241,7 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
         )
         assert parallel["ok"] is True
         assert parallel["result"]["trace_id"] is None, parallel["result"]["trace_id"]
-        assert len(parallel["result"]["trace_ids"]) == 2
+        assert len(parallel["result"]["trace_ids"]) == 3
         assert "stale" not in "".join(parallel["result"]["trace_ids"])
         # Everything but the per-run trace ids is identical to serial.
         assert _scrub_traces(parallel) == _scrub_traces(serial)
@@ -251,10 +264,14 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
 )
 def test_unlocked_gate_mapping(monkeypatch, device, pinned, expected):
     """The unlocked path requires CPU device AND a fired pin, nothing else."""
+    # Isolated without touching the shared functools.cache: the gate reads
+    # only _CROSS_ENCODER_CONSTRUCTION_DEVICE + _resolve_model_device() +
+    # _TORCH_THREADS_PINNED, so construction-device None (the
+    # pre-construction fallback) exercises the live-env mapping with no
+    # cache_clear — clearing the process-wide model cache here would evict
+    # a model cached by an earlier test and force a reload elsewhere.
+    # Model-free: this path imports neither torch nor sentence-transformers.
     monkeypatch.setattr(models_mod, "_CROSS_ENCODER_CONSTRUCTION_DEVICE", None)
-    cache_clear = getattr(models_mod.get_cross_encoder, "cache_clear", None)
-    if callable(cache_clear):
-        cache_clear()
     monkeypatch.setattr(models_mod, "_resolve_model_device", lambda: device)
     monkeypatch.setattr(models_mod, "_TORCH_THREADS_PINNED", pinned)
     assert models_mod.cross_encoder_unlocked_predict_safe() is expected
@@ -595,3 +612,125 @@ def test_pin_gate_answers_construction_device_both_orderings(monkeypatch):
         assert models_mod.cross_encoder_unlocked_predict_safe() is False
     finally:
         models_mod.get_cross_encoder.cache_clear()
+
+
+# ── leg-gather precise semantics (finding 4) ──────────────────────────────
+#
+# Production legs soft-fail by construction (per-vault try/except plus soft
+# shared tails), so a raising pooled leg is unreachable via handle_search;
+# these pin the defensive path directly against the extracted helper. No
+# serial abort is claimed for the pool: every leg is submitted eagerly,
+# the gather waits for the slowest STARTED sibling, and the
+# submission-order-first error propagates (the serial raise's identity).
+# Serial mode is pinned alongside as the honest contrast — it never starts
+# legs past a raise.
+
+
+def _leg_ok(marks, name, delay=0.0):
+    def _run():
+        if delay:
+            time.sleep(delay)
+        marks.append(name)
+        return name
+
+    return _run
+
+
+def _leg_boom(name, delay=0.0):
+    def _run():
+        if delay:
+            time.sleep(delay)
+        raise RuntimeError(f"boom-leg {name}")
+
+    return _run
+
+
+def test_leg_gather_first_error_wins_both_modes(monkeypatch):
+    """Two raisers: submission-order-first error, serial and parallel."""
+    for parallel in (False, True):
+        monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", parallel)
+        with pytest.raises(RuntimeError, match="boom-leg A"):
+            recall_mod._gather_leg_results(
+                [_leg_boom("A"), _leg_boom("B")], None
+            )
+
+
+def test_leg_gather_waits_slowest_started_sibling(monkeypatch):
+    """A fast raise does not shortcut a started sibling: the gather (plus
+    the pool join on context exit) waits for it, and the started sibling
+    runs to completion. Serial mode raises the same error but never starts
+    the later leg — that never-starts-later contract belongs to serial
+    ONLY and is asserted here so no reader infers it for the pool."""
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
+    marks: list = []
+    t0 = time.perf_counter()
+    # The raiser waits 0.2 s so the sibling is deterministically STARTED
+    # (worker spawn is millisecond-scale) before the gather aborts — the
+    # fate of a never-started leg would be a scheduling race, not a pin.
+    with pytest.raises(RuntimeError, match="boom-leg fast"):
+        recall_mod._gather_leg_results(
+            [_leg_boom("fast", delay=0.2), _leg_ok(marks, "slow", delay=0.5)],
+            None,
+        )
+    elapsed = time.perf_counter() - t0
+    assert marks == ["slow"], "started sibling must run to completion"
+    assert elapsed >= 0.4, f"gather must wait the slowest sibling: {elapsed:.3f}s"
+
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
+    serial_marks: list = []
+    with pytest.raises(RuntimeError, match="boom-leg fast"):
+        recall_mod._gather_leg_results(
+            [_leg_boom("fast"), _leg_ok(serial_marks, "slow", delay=0.5)], None
+        )
+    assert serial_marks == [], "serial never starts legs past a raise"
+
+
+def test_leg_gather_slow_first_leg_delays_fast_raise(monkeypatch):
+    """Submission order, not wall-clock order: a slow SUCCESSFUL first leg
+    is awaited before the second leg's (already known) failure surfaces."""
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
+    marks: list = []
+    t0 = time.perf_counter()
+    with pytest.raises(RuntimeError, match="boom-leg second"):
+        recall_mod._gather_leg_results(
+            [_leg_ok(marks, "first", delay=0.5), _leg_boom("second")], None
+        )
+    elapsed = time.perf_counter() - t0
+    assert marks == ["first"]
+    assert elapsed >= 0.4, f"gather yields in submission order: {elapsed:.3f}s"
+
+
+def test_leg_gather_deadline_guard_skips_pool(monkeypatch):
+    """Any supplied deadline (what every RPC carries) forces the serial
+    loop even with the parallel flag on: a later leg never starts past an
+    earlier raise. Deadline-free callers still get the pool."""
+    import concurrent.futures
+
+    created: list = []
+    real_pool = concurrent.futures.ThreadPoolExecutor
+
+    class _SpyPool(real_pool):
+        def __init__(self, *args, **kwargs):
+            created.append(1)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _SpyPool)
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
+    # Supplied deadline: serial loop, no pool, later leg never starts.
+    serial_marks: list = []
+    with pytest.raises(RuntimeError, match="boom-leg fast"):
+        recall_mod._gather_leg_results(
+            [_leg_boom("fast"), _leg_ok(serial_marks, "slow")],
+            time.monotonic() + 25.0,
+        )
+    assert serial_marks == []
+    assert created == [], "a supplied deadline must not engage the pool"
+    # Deadline-free: the pool engages for multi-leg batches.
+    assert recall_mod._gather_leg_results(
+        [lambda: "a", lambda: "b"], None
+    ) == ["a", "b"]
+    assert len(created) >= 1
+    # Single-leg batches skip the pool either way.
+    created.clear()
+    assert recall_mod._gather_leg_results([lambda: "solo"], None) == ["solo"]
+    assert created == []
