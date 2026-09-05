@@ -508,6 +508,21 @@ def test_snapshot_provenance_labels_are_honest():
     assert "live" in study_snapshot.__doc__.lower()
 
 
+def test_snapshot_provenance_preserves_manifest_identity():
+    from minni.eval.provenance import corpus_provenance
+
+    corpus = corpus_provenance(
+        is_mock=False,
+        retriever_name="snapshot",
+        snapshot_id="study-0123456789abcdef",
+        manifest_digest="0123456789abcdef" * 4,
+    )
+
+    assert corpus["snapshot"] == "study-0123456789abcdef"
+    assert corpus["manifest_digest"] == "0123456789abcdef" * 4
+    assert corpus["frozen"] is True
+
+
 def test_prepare_rejects_existing_non_private_destination(tmp_path):
     dest = tmp_path / "snapshot"
     dest.mkdir()
