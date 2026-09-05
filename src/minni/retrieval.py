@@ -1963,6 +1963,12 @@ class RetrievalEngine:
             if r.get("chunk_text"):
                 doc_scores[did]["chunk_text"] = r["chunk_text"]
                 doc_scores[did]["heading_context"] = r.get("heading_context", "")
+                # Cache/attribution identity belongs to the selected passage,
+                # never the FTS full page or a previously selected chunk.
+                if r.get("chunk_id") is not None:
+                    doc_scores[did]["chunk_id"] = r["chunk_id"]
+                else:
+                    doc_scores[did].pop("chunk_id", None)
             # Carry forward page metadata from semantic if FTS didn't provide it
             if not doc_scores[did].get("page_type") and r.get("page_type"):
                 doc_scores[did]["page_type"] = r["page_type"]
@@ -2486,6 +2492,8 @@ class RetrievalEngine:
                     doc_scores[did]["heading_context"] = r.get("heading_context", "")
                     if stream_label != "fts":
                         doc_scores[did]["_sem_chunk"] = True
+                        if r.get("chunk_id") is not None:
+                            doc_scores[did]["chunk_id"] = r["chunk_id"]
                 if not doc_scores[did].get("page_type") and r.get("page_type"):
                     doc_scores[did]["page_type"] = r["page_type"]
                 if not doc_scores[did].get("evidence_refs") and r.get("evidence_refs"):
