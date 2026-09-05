@@ -811,10 +811,13 @@ test("fail-closed drain keeps accepted start when apply throws; complete cannot 
   const held = new Promise((resolve) => {
     release = resolve;
   });
+  let entered;
+  const acquired = new Promise((resolve) => { entered = resolve; });
   const holder = withThreadLock(fixture.vaultPath, fixture.planId, "apply-throw-hold", async () => {
+    entered();
     await held;
   });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await acquired;
   const start = await updateClaimedSlice(
     {
       vaultPath: fixture.vaultPath,
@@ -2772,10 +2775,13 @@ test("standing drain applies live start after DEFAULT_WAIT_MS while acceptor sta
   const hold = new Promise((resolve) => {
     releaseHold = resolve;
   });
+  let entered;
+  const acquired = new Promise((resolve) => { entered = resolve; });
   const holder = withThreadLock(fixture.vaultPath, fixture.planId, "aged-standing-hold", async () => {
+    entered();
     await hold;
   });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await acquired;
   const start = await updateClaimedSlice({
     vaultPath: fixture.vaultPath,
     notePath: fixture.notePath,
@@ -2886,4 +2892,81 @@ test('busy completion rejects a superseded parent instead of accepting an undrai
     assert.deepEqual(await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId), []);
   });
   assert.equal((await rehydratePlan(fixture.notePath)).slices.find(s => s.id === 's0').status, 'superseded');
+});
+
+// Counts actual immutable ticket reads, not elapsed time or mocked drain calls.
+test("ordinary drain reads each shrinking queue only for locked selection and fresh progress", async (t) => {
+  const fixture = await burstFixture(t, 3);
+  const claims = await assignAndClaimAll(fixture);
+  const queueDir = workerWriteQueueDir(fixture.vaultPath, fixture.planId);
+  const counts = [];
+  for (const action of ["start", "complete"]) {
+    for (let index = 0; index < fixture.n; index += 1) {
+      await enqueueWorkerWrite({
+        vaultPath: fixture.vaultPath, planId: fixture.planId,
+        sliceId: `s${index}`, workerAgentId: `worker-${index}`,
+        token: claims[index].token, idempotencyKey: `${action}-${index}`,
+        action: action === "complete" ? { action, evidence: "Verified fixture completion" } : { action }, now: new Date("2026-08-18T12:01:00.000Z"),
+      });
+    }
+    const original = fs.promises.readFile;
+    let ticketReads = 0;
+    fs.promises.readFile = async function(file, ...args) {
+      if (typeof file === "string" && path.dirname(file) === queueDir &&
+          file.endsWith(".json") && path.basename(file) !== "progress.json") ticketReads += 1;
+      return original.call(this, file, ...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      await drainWorkerWrites({ ...fixture, now: new Date("2026-08-18T12:01:00.000Z") });
+    } finally {
+      fs.promises.readFile = original;
+      syncBuiltinESMExports();
+    }
+    counts.push(ticketReads);
+    assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0);
+    const current = await rehydratePlan(fixture.notePath);
+    assert.ok(current.slices.every((slice) => slice.status === (action === "start" ? "in_progress" : "done")));
+  }
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 3);
+  assert.equal(journal.completed.length, 3);
+  t.diagnostic(`queue ticket reads start/complete: ${JSON.stringify(counts)}`);
+  assert.deepEqual(counts, [9, 9]);
+});
+
+for (const hold of [withThreadLock, withExclusiveReplanReservation]) {
+  test(`empty ordinary drain returns while ${hold.name} is held`, async (t) => {
+    const fixture = await burstFixture(t, 1);
+    await hold(fixture.vaultPath, fixture.planId, "empty-held", async () => {
+      let timer;
+      try {
+        const result = await Promise.race([
+          drainWorkerWrites(fixture),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("empty drain waited for held lock")), 1000); }),
+        ]);
+        assert.equal(result, false);
+      } finally {
+        clearTimeout(timer);
+      }
+    });
+  });
+}
+
+test("idle ordinary kick does not contend for the persist lock", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const original = fs.promises.mkdir;
+  let lockAttempts = 0;
+  fs.promises.mkdir = async function(dir, ...args) {
+    if (String(dir).includes("thread-locks")) lockAttempts += 1;
+    return original.call(this, dir, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.equal(await drainWorkerWrites(fixture), false);
+  } finally {
+    fs.promises.mkdir = original;
+    syncBuiltinESMExports();
+  }
+  assert.equal(lockAttempts, 0, "empty drain must not force another worker into accepted-only behavior");
 });
