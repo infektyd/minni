@@ -47,6 +47,7 @@ from minni.principal import EffectivePrincipal, agent_scope_for, can_read_docume
 from minni.safety import is_instruction_like
 from minni.timestamps import parse_epoch_or_report
 from minni.wiki_indexer import WikiFrontmatter
+from minni.request_deadline import bind_copied_deadline, run_bound
 
 logger = logging.getLogger("sovereign.retrieval")
 
@@ -3534,11 +3535,15 @@ class RetrievalEngine:
                     # variant's error first, breaking the serial-raise
                     # identity for zero gain (variant bodies are not
                     # cancellable work).
-                    raw_rows = list(
-                        _variant_pool.map(
-                            _run_variant, range(len(query_variants))
-                        )
-                    )
+                    # Independent copy_context per variant: same absolute
+                    # request deadline, never one Context entered from two
+                    # workers. Serial-when-deadline (above) still skips the
+                    # pool when deadline_monotonic is set.
+                    bound = [
+                        bind_copied_deadline(_run_variant, index)
+                        for index in range(len(query_variants))
+                    ]
+                    raw_rows = list(_variant_pool.map(run_bound, bound))
                 for variant, rows, child in zip(
                     query_variants, raw_rows, variant_states
                 ):
@@ -4893,39 +4898,49 @@ class RetrievalEngine:
         # where it crashed on a missing learning_id key).
         if results and update_access:
             now = time.time()
-            with self.db.cursor() as c:
-                for result in results[:limit]:
-                    c.execute(
-                        """UPDATE learnings
-                           SET access_count = access_count + 1, last_accessed = ?
-                           WHERE learning_id = ?""",
-                        (now, result["learning_id"]),
-                    )
-                    try:
-                        # OR IGNORE: two searches in the same clock tick
-                        # collide on the (learning_id, agent_id, read_at) PK;
-                        # the read is already recorded for that instant, so
-                        # the duplicate is dropped instead of raising an
-                        # IntegrityError that the except below would swallow
-                        # as silently dropped tracking.
+            from minni.request_deadline import RequestDeadlineExceeded
+
+            try:
+                with self.db.cursor() as c:
+                    for result in results[:limit]:
                         c.execute(
-                            """INSERT OR IGNORE INTO learning_reads
-                               (learning_id, agent_id, read_at, source)
-                               VALUES (?, ?, ?, ?)""",
-                            (
-                                result["learning_id"],
-                                agent_id or "unknown",
-                                now,
-                                source,
-                            ),
+                            """UPDATE learnings
+                               SET access_count = access_count + 1, last_accessed = ?
+                               WHERE learning_id = ?""",
+                            (now, result["learning_id"]),
                         )
-                    except Exception as exc:
-                        # hooks-PL-5: never silently drop read tracking — a
-                        # missing row here is exactly what makes stale_beliefs
-                        # fire events:[] forever.
-                        logger.warning(
-                            "learning_reads insert failed for learning #%s: %s",
-                            result.get("learning_id"), exc,
-                        )
+                        try:
+                            # OR IGNORE: two searches in the same clock tick
+                            # collide on the (learning_id, agent_id, read_at) PK;
+                            # the read is already recorded for that instant, so
+                            # the duplicate is dropped instead of raising an
+                            # IntegrityError that the except below would swallow
+                            # as silently dropped tracking.
+                            c.execute(
+                                """INSERT OR IGNORE INTO learning_reads
+                                   (learning_id, agent_id, read_at, source)
+                                   VALUES (?, ?, ?, ?)""",
+                                (
+                                    result["learning_id"],
+                                    agent_id or "unknown",
+                                    now,
+                                    source,
+                                ),
+                            )
+                        except RequestDeadlineExceeded:
+                            raise
+                        except Exception as exc:
+                            # hooks-PL-5: never silently drop read tracking — a
+                            # missing row here is exactly what makes stale_beliefs
+                            # fire events:[] forever.
+                            logger.warning(
+                                "learning_reads insert failed for learning #%s: %s",
+                                result.get("learning_id"), exc,
+                            )
+
+            except RequestDeadlineExceeded:
+                # cursor() rolled back the whole tracking transaction. The
+                # completed read is still useful; the RPC reports expiration.
+                pass
 
         return results

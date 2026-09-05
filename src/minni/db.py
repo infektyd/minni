@@ -9,6 +9,7 @@ V3.1 changes:
 """
 
 import os
+import math
 import sqlite3
 import threading
 import time
@@ -16,6 +17,9 @@ from contextlib import contextmanager
 from typing import Optional
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG
+from minni.request_deadline import (
+    RequestDeadlineExceeded, budgeted_lock, check_deadline, current_deadline,
+)
 
 # Module-level flag: True once any SovereignDB has run migrations this process.
 # Kept as a bool for backward-compatibility with test code that manipulates it
@@ -45,6 +49,101 @@ _schema_init_lock = threading.RLock()
 # to once per db-path per process removes that steady-state churn. Reset per
 # test by the conftest autouse fixture, exactly like _migrated_paths.
 _schema_ready_paths: set = set()
+
+
+class _BudgetCursor(sqlite3.Cursor):
+    """Refresh the remaining budget for each SQLite call, including fetches."""
+
+    def execute(self, *args, **kwargs):
+        with self.connection.request_operation():
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self.connection.request_operation():
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self.connection.request_operation():
+            return super().executescript(*args, **kwargs)
+
+    def fetchone(self):
+        with self.connection.request_operation():
+            return super().fetchone()
+
+    def fetchmany(self, *args):
+        with self.connection.request_operation():
+            return super().fetchmany(*args)
+
+    def fetchall(self):
+        with self.connection.request_operation():
+            return super().fetchall()
+
+    def __next__(self):
+        with self.connection.request_operation():
+            return super().__next__()
+
+
+class _BudgetConnection(sqlite3.Connection):
+    """Scoped SQLite controls on a reusable thread-local connection.
+
+    Rollback deliberately uses SQLite's ordinary implementation: cleanup must
+    remain possible after expiration. No timer thread interrupts later requests.
+    """
+
+    _progress_callback = None
+    _progress_steps = 0
+
+    def set_progress_handler(self, callback, n):
+        super().set_progress_handler(callback, n)
+        self._progress_callback, self._progress_steps = callback, n
+
+    @contextmanager
+    def request_operation(self):
+        if current_deadline() is None:
+            yield
+            return
+        remaining = check_deadline()
+        previous_busy = sqlite3.Connection.execute(self, "PRAGMA busy_timeout").fetchone()[0]
+        previous_handler, previous_steps = self._progress_callback, self._progress_steps
+
+        def progress():
+            try:
+                check_deadline()
+            except RequestDeadlineExceeded:
+                return 1
+            return previous_handler() if previous_handler is not None else 0
+
+        # Busy handlers do not run the VM progress callback. Bound lock waits
+        # independently, then recalculate for the next execute/fetch/commit.
+        sqlite3.Connection.execute(self, f"PRAGMA busy_timeout={min(previous_busy, math.ceil(remaining * 1000))}")
+        self.set_progress_handler(progress, min(previous_steps, 1000) if previous_steps else 1000)
+        try:
+            yield
+        except sqlite3.OperationalError as exc:
+            try:
+                check_deadline()
+            except RequestDeadlineExceeded as deadline_exc:
+                raise deadline_exc from exc
+            raise
+        finally:
+            self.set_progress_handler(previous_handler, previous_steps)
+            sqlite3.Connection.execute(self, f"PRAGMA busy_timeout={previous_busy}")
+
+    def cursor(self, factory=None):
+        return super().cursor(factory or _BudgetCursor)
+
+    def execute(self, *args, **kwargs):
+        return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self.cursor().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        return self.cursor().executescript(*args, **kwargs)
+
+    def commit(self):
+        with self.request_operation():
+            return super().commit()
 
 
 class SovereignDB:
@@ -78,7 +177,7 @@ class SovereignDB:
         (and ensure_dirs at construction); callers keep their own configs.
         """
         key = os.path.abspath(config.db_path)
-        with cls._shared_lock:
+        with budgeted_lock(cls._shared_lock):
             inst = cls._shared_instances.get(key)
             if inst is None:
                 if config.db_path != key:
@@ -96,29 +195,35 @@ class SovereignDB:
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (one connection per thread)."""
+        check_deadline()
         if not hasattr(self._local, "conn") or self._local.conn is None:
             # journal_mode is a persistent database write.  Serialize first
             # connection setup with schema creation so fresh daemon workers do
             # not race WAL activation against virtual-table/trigger creation.
-            with _schema_init_lock:
+            with budgeted_lock(_schema_init_lock):
                 conn = sqlite3.connect(
                     self.config.db_path,
                     timeout=30,
-                    check_same_thread=False
+                    check_same_thread=False,
+                    factory=_BudgetConnection,
                 )
-                # WAL mode: concurrent readers, non-blocking writes
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
-                conn.execute("PRAGMA foreign_keys=ON")
-                conn.row_factory = sqlite3.Row
-                self._local.conn = conn
+                try:
+                    # WAL mode: concurrent readers, non-blocking writes
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    conn.row_factory = sqlite3.Row
+                    self._local.conn = conn
+                except Exception:
+                    conn.close()
+                    raise
 
         if not self._schema_initialized:
             # Normalize the key exactly as the migrations block does below, so a
             # single file reached via different path spellings maps to one entry.
             abs_db_path = os.path.abspath(self.config.db_path)
-            with _schema_init_lock, self._lock:
+            with budgeted_lock(_schema_init_lock), budgeted_lock(self._lock):
                 if not self._schema_initialized:
                     # Process-wide gate: schema DDL (FTS5 vtable init + trigger
                     # creation) only needs to run once per db-path per process.
@@ -127,7 +232,11 @@ class SovereignDB:
                     # on its FIRST call too, not re-run the trigger DDL and bump
                     # the schema cookie under concurrent vault_fts readers.
                     if abs_db_path not in _schema_ready_paths:
-                        self._init_schema(self._local.conn)
+                        try:
+                            self._init_schema(self._local.conn)
+                        except Exception:
+                            self._local.conn.rollback()
+                            raise
                         # Mark the path schema-ready only once its migrations have
                         # ALSO succeeded — not merely because _init_schema
                         # returned. The migrations sub-step inside _init_schema
@@ -172,19 +281,23 @@ class SovereignDB:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            c.close()
 
     @contextmanager
     def transaction(self):
         """Explicit transaction block for batched writes."""
         conn = self._get_conn()
         c = conn.cursor()
-        c.execute("BEGIN IMMEDIATE")
         try:
+            c.execute("BEGIN IMMEDIATE")
             yield c
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            c.close()
 
     def _init_schema(self, conn: sqlite3.Connection):
         """Initialize all tables in one place."""
@@ -537,7 +650,7 @@ class SovereignDB:
         abs_db_path = os.path.abspath(self.config.db_path)
         needs_run = (not _migrations_run) or (abs_db_path not in _migrated_paths)
         if needs_run:
-            with _migrations_lock:
+            with budgeted_lock(_migrations_lock):
                 needs_run = (not _migrations_run) or (abs_db_path not in _migrated_paths)
                 if needs_run:
                     try:
@@ -550,6 +663,9 @@ class SovereignDB:
                         # is retried on the next open of this path.
                         _migrations_run = True
                         _migrated_paths.add(abs_db_path)
+                    except RequestDeadlineExceeded:
+                        conn.rollback()
+                        raise
                     except Exception as e:
                         import logging
                         logging.getLogger("sovereign.db").warning(

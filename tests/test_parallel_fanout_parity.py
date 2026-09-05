@@ -444,3 +444,40 @@ def test_nested_leg_and_variant_fanout_matches_serial(tmp_path, monkeypatch):
     assert serial["result"]["results"], "nested fan-out must return hits"
     assert _scrub_envelope(parallel) == _scrub_envelope(serial)
     assert len(serial["result"]["query_variants"]) >= 2
+
+
+def test_variant_pool_workers_see_copied_request_deadline(stubbed_engine, monkeypatch):
+    """Unbounded variant fan-out still carries the request ContextVar.
+
+    handle_search always passes deadline_monotonic so production variant
+    pools stay serial; this covers retrieve() under request_deadline with
+    deadline_monotonic=None (the pool path).
+    """
+    from minni.request_deadline import current_deadline, request_deadline
+
+    monkeypatch.setattr(retrieval_mod, "RETRIEVAL_VARIANT_PARALLEL", True)
+    seen = []
+    orig = stubbed_engine._fts_search
+
+    def counting(query, *args, **kwargs):
+        seen.append(current_deadline())
+        return orig(query, *args, **kwargs)
+
+    stubbed_engine._fts_search = counting
+    deadline = time.monotonic() + 5
+    with request_deadline(deadline):
+        rows = stubbed_engine.retrieve(
+            query="alpha beta gamma",
+            limit=5,
+            update_access=False,
+            use_hyde=False,
+            principal=_owner(),
+            workspace="default",
+            deadline_monotonic=None,
+            expand=True,
+        )
+    assert rows
+    assert seen, "variant retrieve must run FTS"
+    assert None not in seen, seen
+    assert all(item == deadline for item in seen), seen
+    assert current_deadline() is None
