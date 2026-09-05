@@ -105,10 +105,14 @@ Call `minni_thread_events` to follow applied journal events:
 {"plan_id":"<plan_id>","since_seq":0,"limit":100}
 ```
 
-Advance the cursor with the returned `next_seq`. Also call
-`minni_thread_status` with the explicit plan ID and confirm the target slice is
-`done` before reporting completion. Completion clears the live claim; an exact
-retry can still replay its receipt. `minni_prepare_outcome` drafts an outcome
+Advance the cursor with the returned `next_seq` and require a matching
+`slice.completed` event for the intended plan and `slice_id` before reporting
+that queued completion as applied. Check the corresponding operation and
+revision; another slice's completion is not confirmation of this one.
+`minni_thread_status` is a compact progress view: it omits finished slices and
+its resolved count includes superseded slices, so that count alone cannot prove
+a specific slice completed. Completion clears the live claim; an exact retry
+can still replay its receipt. `minni_prepare_outcome` drafts an outcome
 packet; it does not complete the Thread or approve shared memory.
 
 ## Recovery and current limits
