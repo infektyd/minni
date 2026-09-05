@@ -819,3 +819,47 @@ def test_implicit_expansion_default_cannot_pass_as_feature_change(tmp_path, monk
     TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch, {
         "config": "baseline,with-expand", "quality_baseline": "baseline", "quality_candidate": "with-expand",
     })
+
+
+def test_duplicate_config_cli_is_rejected_before_search(tmp_path, monkeypatch):
+    TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch, {
+        'config': 'baseline,baseline', 'quality_baseline': 'baseline',
+    })
+
+
+@pytest.mark.parametrize('defect', ['duplicate', 'notes', 'ids', 'auto_budget', 'float_budget', 'boolean_budget', 'negative_budget'])
+def test_validate_quality_and_run_share_corpus_failures(tmp_path, monkeypatch, defect):
+    from minni.eval import harness
+    helper = TestQualityGateCli()
+    rows = [helper._reviewed_entry(i) for i in range(300)]
+    if defect == 'duplicate':
+        rows[1]['query'] = rows[0]['query']
+    elif defect == 'notes':
+        rows[0]['notes'] = ''
+    elif defect == 'ids':
+        rows[0]['expected_doc_ids'] = [1.9]
+    else:
+        rows[0]['budget_tokens'] = {'auto_budget': 'auto', 'float_budget': 2.1,
+                                   'boolean_budget': True, 'negative_budget': -1}[defect]
+    query_path = tmp_path / 'queries.jsonl'
+    query_path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    calls = helper._bomb_searcher(monkeypatch)
+    with pytest.raises(SystemExit) as validated:
+        harness.main(['validate', '--quality-gate', '--path', str(query_path)])
+    assert validated.value.code == 2
+    with pytest.raises(SystemExit) as run:
+        harness.cmd_run(helper._args(query_path, mock=False))
+    assert run.value.code == 2
+    assert calls == []
+    # Legacy validation remains intentionally less strict.
+    harness.main(['validate', '--path', str(query_path)])
+
+
+def test_quality_validation_accepts_zero_budget_and_default(tmp_path):
+    from minni.eval import harness
+    helper = TestQualityGateCli()
+    rows = [helper._reviewed_entry(i) for i in range(300)]
+    rows[0]['budget_tokens'] = 0
+    query_path = tmp_path / 'queries.jsonl'
+    query_path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    harness.main(['validate', '--quality-gate', '--path', str(query_path)])
