@@ -253,7 +253,7 @@ class ProviderChain:
         for provider in self.providers:
             if not provider.supports(operation):
                 continue
-            if policy.local_only and getattr(provider, "tier", "local") != "local":
+            if policy.local_only and getattr(provider, "tier", None) != "local":
                 continue
             eligible.append(provider)
         return eligible

@@ -107,6 +107,14 @@ def test_providers_for_edge_inference_filters_out_cloud_providers():
     assert [p.name for p in eligible] == ["local_afm"]
 
 
+def test_providers_for_edge_inference_rejects_unclassified_providers():
+    unclassified = MockProvider("unclassified")
+    del unclassified.tier
+    chain = ProviderChain(providers=[unclassified])
+
+    assert chain.providers_for("edge_inference") == []
+
+
 def test_structural_immutability_even_if_chain_manually_initialized_with_false():
     """Even if an in-memory ProviderChain is constructed with local_only=False, providers_for enforces local-only."""
     local_p = MockProvider("local_afm", tier="local")

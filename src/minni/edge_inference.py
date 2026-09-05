@@ -162,8 +162,6 @@ def format_numbered_excerpt(
     """
     bounded_text, _, is_measured = truncate_to_tokens(text, max_tokens, encoding_name=encoding_name)
     raw_lines = [line.strip() for line in bounded_text.splitlines() if line.strip()]
-    if not raw_lines:
-        raw_lines = [bounded_text.strip()] if bounded_text.strip() else ["(empty)"]
 
     numbered_lines = [f"[{i + 1}] {line}" for i, line in enumerate(raw_lines)]
     formatted_block = "\n".join(numbered_lines)

@@ -918,6 +918,32 @@ def test_migration_runner_clean_full_migration(tmp_path):
     conn.close()
 
 
+def test_unexpected_foreign_key_prevents_schema_readiness():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    conn.execute("CREATE TABLE other_parent (id INTEGER PRIMARY KEY)")
+    conn.execute("DROP TABLE learning_documents")
+    conn.execute(
+        """
+        CREATE TABLE learning_documents (
+            learning_id INTEGER NOT NULL REFERENCES learnings(learning_id),
+            doc_id INTEGER NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            created_at REAL,
+            PRIMARY KEY (learning_id, doc_id),
+            FOREIGN KEY (doc_id) REFERENCES other_parent(id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX idx_learning_documents_doc_id ON learning_documents(doc_id)")
+
+    report = verify_graph_schema(conn)
+
+    assert report.ready is False
+    assert any("unexpected foreign key" in error for error in report.errors)
+    conn.close()
+
+
 def test_migration_runner_idempotency(tmp_path):
     """Running migrations twice consecutively is safe and leaves schema ready."""
     db_path = str(tmp_path / "idempotent.db")

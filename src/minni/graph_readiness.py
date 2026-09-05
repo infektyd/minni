@@ -407,6 +407,18 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
             continue
 
         # fk_list tuple: (id, seq, table, from, to, on_update, on_delete, match)
+        expected_signatures = {
+            (from_col.lower(), target_tbl.lower(), target_col.lower())
+            for from_col, target_tbl, target_col, _ in fks
+        }
+        for row in fk_list:
+            signature = (str(row[3]).lower(), str(row[2]).lower(), str(row[4]).lower())
+            if row[1] != 0 or signature not in expected_signatures:
+                errors.append(
+                    f"table '{tbl}' contains unexpected foreign key: "
+                    f"{row[3]} -> {row[2]}({row[4]})"
+                )
+
         for from_col, target_tbl, target_col, allowed_on_delete in fks:
             # First, validate referenced parent table exists
             if not _table_exists(conn, target_tbl):

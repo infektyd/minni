@@ -117,6 +117,15 @@ def test_format_numbered_excerpt_preserves_capped_single_line():
     assert 0 < tokens <= 20
 
 
+def test_format_numbered_excerpt_keeps_empty_body_uncitable():
+    formatted, lines, tokens, is_measured = format_numbered_excerpt("", max_tokens=20)
+
+    assert formatted == ""
+    assert lines == []
+    assert tokens == 0
+    assert is_measured is True
+
+
 def test_render_edge_inference_prompt_within_afm_budget():
     """Render prompt with source and 8 long candidates. Must strictly fit in <= 3,200 tokens."""
     source = {
