@@ -22,7 +22,7 @@ def queries_path() -> Path:
     return repo_root() / "eval" / "queries.jsonl"
 
 
-def load_queries(path: Optional[Path] = None) -> List[Dict[str, Any]]:
+def load_queries(path: Optional[Path] = None, *, strict: bool = False) -> List[Dict[str, Any]]:
     """Load queries from a JSONL file. Returns list of query dicts."""
     p = path or queries_path()
     if not p.exists():
@@ -36,8 +36,13 @@ def load_queries(path: Optional[Path] = None) -> List[Dict[str, Any]]:
             if not line or line.startswith("#"):
                 continue
             try:
-                queries.append(json.loads(line))
+                row = json.loads(line)
+                if strict and not isinstance(row, dict):
+                    raise ValueError(f"query line {lineno}: expected an object")
+                queries.append(row)
             except json.JSONDecodeError as exc:
+                if strict:
+                    raise ValueError(f"query line {lineno}: malformed JSON") from exc
                 logger.warning("queries.jsonl line %d: JSON parse error: %s", lineno, exc)
     return queries
 

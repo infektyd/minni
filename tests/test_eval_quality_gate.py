@@ -433,13 +433,13 @@ class TestQualityGateCli:
         import argparse
 
         params = {
-            "config": "baseline,with-expand",
+            "config": "no-expand,with-expand",
             "queries": str(queries_path),
             "mock": True,
             "retrievers": "minnid",
             "gate": False,
             "quality_gate": True,
-            "quality_baseline": "baseline",
+            "quality_baseline": "no-expand",
             "quality_candidate": "",
             "min_improvement": 0.05,
             "quality_metric": "recall_at_k",
@@ -645,3 +645,177 @@ def test_raw_quality_inputs_rejected_before_retriever(tmp_path, monkeypatch, ove
         cmd_run(fixture._args(path, mock=False, **overrides))
     assert result.value.code == 2
     assert calls == []
+
+
+class TestReviewBoundaryRegressions:
+    @pytest.mark.parametrize("overrides", [
+        {"retrievers": "ripgrep,minnid", "config": "baseline", "quality_baseline": "ripgrep", "quality_candidate": "minnid"},
+        {"quality_candidate": "baseline"},
+        {"gate": True},
+    ])
+    def test_invalid_comparison_exits_before_search(self, tmp_path, monkeypatch, overrides):
+        self._run_invalid(tmp_path, monkeypatch, overrides)
+
+    def _run_invalid(self, tmp_path, monkeypatch, overrides=None, *, bad_line=False, notes="exact"):
+        from minni.eval import harness
+        helper = TestQualityGateCli()
+        rows = [helper._reviewed_entry(i) for i in range(300)]
+        for row in rows:
+            row["notes"] = notes
+        query_path = tmp_path / "queries.jsonl"
+        query_path.write_text("".join(json.dumps(row) + "\n" for row in rows) + ("{ broken\n" if bad_line else ""))
+        calls = helper._bomb_searcher(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            harness.cmd_run(helper._args(query_path, mock=False, **(overrides or {})))
+        assert exc.value.code == 2
+        assert calls == []
+
+    @pytest.mark.parametrize("notes", [None, "", "   ", 5, False])
+    def test_class_required_before_search(self, tmp_path, monkeypatch, notes):
+        self._run_invalid(tmp_path, monkeypatch, notes=notes)
+
+    def test_malformed_line_is_not_dropped(self, tmp_path, monkeypatch):
+        self._run_invalid(tmp_path, monkeypatch, bad_line=True)
+
+    def test_search_failure_aborts_quality_but_legacy_still_describes_empty(self):
+        from minni.eval.metrics import run_eval
+        class Broken:
+            def search(self, query, **kwargs):
+                raise TypeError("backend failure must not trigger retry")
+        queries = [{"query": "q", "expected_doc_ids": [1], "notes": "exact"}]
+        with pytest.raises(RuntimeError, match="retrieval failed"):
+            run_eval(Broken(), queries, "baseline", {}, strict_search=True)
+        assert run_eval(Broken(), queries, "baseline", {})["per_query"][0]["recall_at_k"][5] == 0
+
+    def test_no_expand_pair_passes_distinct_kwargs(self):
+        from minni.eval.harness import CONFIGS
+        from minni.eval.metrics import run_eval
+        calls = []
+        class Recording:
+            def search(self, query, **kwargs):
+                calls.append(kwargs)
+                return []
+        queries = [{"query": "q", "expected_doc_ids": [1], "notes": "exact"}]
+        for config in ("no-expand", "with-expand"):
+            run_eval(Recording(), queries, config, CONFIGS[config], strict_search=True)
+        assert calls[0]["expand"] is False
+        assert calls[1]["expand"] is True
+        assert calls[0]["use_hyde"] is calls[1]["use_hyde"] is False
+        assert {k: v for k, v in calls[0].items() if k != "expand"} == {k: v for k, v in calls[1].items() if k != "expand"}
+        assert CONFIGS["baseline"] == {"use_hyde": False}
+
+    def test_baseline_name_never_matches_part_of_fp32_config(self):
+        assert _resolve_quality_keys({"minnid-baseline": {}, "minnid-fp32-baseline": {}}, "baseline", "fp32-baseline") == ("minnid-baseline", "minnid-fp32-baseline")
+        assert _resolve_quality_keys({"minnid-fp32-baseline": {}, "minnid-with-expand": {}}, "baseline", "with-expand")[0] == "baseline"
+
+    def test_direct_gate_rejects_absent_class(self):
+        a, b = _entry("q", 0), _entry("q", 1)
+        a.pop("notes")
+        b.pop("notes")
+        assert evaluate_quality_gate(_reports([a], [b]))["ok"] is False
+
+
+def test_quality_cli_search_exception_cannot_write_passing_gate(tmp_path, monkeypatch):
+    from minni.eval import harness
+    helper = TestQualityGateCli()
+    query_path = tmp_path / 'queries.jsonl'
+    query_path.write_text(''.join(json.dumps(helper._reviewed_entry(i)) + '\n' for i in range(300)))
+    calls = []
+    class Broken:
+        def search(self, query, **kwargs):
+            calls.append(kwargs)
+            raise TypeError('feature call failed')
+    monkeypatch.setattr(harness, 'make_searcher', lambda *args: Broken())
+    written = []
+    monkeypatch.setattr(harness, '_write_json_report', lambda report, path: written.append(report))
+    monkeypatch.setattr(harness, '_reports_dir', lambda: tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        harness.cmd_run(helper._args(query_path, mock=False))
+    assert exc.value.code == 3
+    assert len(calls) == 1
+    assert written == []
+
+
+def test_strict_search_rejects_unknown_option_without_calling_retriever():
+    from minni.eval.metrics import _safe_search
+    calls = []
+    class Recording:
+        def search(self, query, **kwargs):
+            calls.append(kwargs)
+            return []
+    with pytest.raises(RuntimeError, match="unsupported retrieval options"):
+        _safe_search(Recording(), "q", "typo", {"expnad": True}, strict=True)
+    assert calls == []
+    _safe_search(Recording(), "q", "legacy", {"expnad": True})
+    assert len(calls) == 1 and "expnad" not in calls[0]
+
+
+def test_quality_config_unknown_option_rejected_before_initialization(tmp_path, monkeypatch):
+    from minni.eval import harness
+    monkeypatch.setitem(harness.CONFIGS, "with-expand", {"expnad": True})
+    TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("result", [
+    {"doc_id": True}, {"doc_id": 1.9}, {"doc_id": "1"},
+    {"provenance": {"doc_id": True}}, {"provenance": {"doc_id": 1.9}},
+    {"doc_id": False, "provenance": {"doc_id": 1}}, {},
+])
+def test_quality_rejects_malformed_ranked_ids_before_scoring(result):
+    from minni.eval.metrics import run_eval
+    class Search:
+        def search(self, query, **kwargs):
+            return [result]
+    with pytest.raises(RuntimeError, match="exact integer ID"):
+        run_eval(Search(), [{"query": "q", "expected_doc_ids": [1], "notes": "exact"}], "candidate", {}, strict_search=True)
+
+
+def test_quality_missing_id_never_compresses_rank_six_into_top_five():
+    from minni.eval.metrics import _extract_doc_ids
+    results = [{"doc_id": None, "provenance": {"doc_id": None}}, {"doc_id": 2}, {"doc_id": 3}, {"doc_id": 4}, {"doc_id": 5}, {"doc_id": 1}]
+    with pytest.raises(RuntimeError, match="every rank"):
+        _extract_doc_ids(results, strict=True)
+    assert _extract_doc_ids(results) == [2, 3, 4, 5, 1]  # legacy remains descriptive
+
+
+def test_quality_preserves_exact_primary_and_provenance_ids_in_order():
+    from minni.eval.metrics import _extract_doc_ids
+    assert _extract_doc_ids([{"doc_id": 0}, {"doc_id": 2}, {"provenance": {"doc_id": 1}}], strict=True) == [0, 2, 1]
+
+
+@pytest.mark.parametrize("bad_id", [True, 1.9])
+def test_quality_cli_cannot_approve_coercible_returned_id(tmp_path, monkeypatch, bad_id):
+    from minni.eval import harness
+    helper = TestQualityGateCli()
+    query_path = tmp_path / 'queries.jsonl'
+    query_path.write_text(''.join(json.dumps(helper._reviewed_entry(i)) + '\n' for i in range(300)))
+    class Search:
+        def search(self, query, **kwargs):
+            return [{"doc_id": bad_id}]
+    monkeypatch.setattr(harness, 'make_searcher', lambda *args: Search())
+    reports = []
+    monkeypatch.setattr(harness, '_write_json_report', lambda report, path: reports.append(report))
+    monkeypatch.setattr(harness, '_reports_dir', lambda: tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        harness.cmd_run(helper._args(query_path, mock=False))
+    assert exc.value.code == 3
+    assert reports == []
+
+
+@pytest.mark.parametrize("placeholder", ["fp32-baseline", "int8-quantized", "with-semantic-merge"])
+def test_placeholder_ablation_rejected_before_search(tmp_path, monkeypatch, placeholder):
+    TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch, {
+        "config": f"no-expand,{placeholder}", "quality_candidate": placeholder,
+    })
+
+
+def test_label_only_options_rejected_before_search(tmp_path, monkeypatch):
+    from minni.eval import harness
+    monkeypatch.setitem(harness.CONFIGS, "with-expand", dict(harness.CONFIGS["no-expand"]))
+    TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch)
+
+
+def test_implicit_expansion_default_cannot_pass_as_feature_change(tmp_path, monkeypatch):
+    TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch, {
+        "config": "baseline,with-expand", "quality_baseline": "baseline", "quality_candidate": "with-expand",
+    })

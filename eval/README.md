@@ -117,8 +117,8 @@ Use a reviewed corpus with real document judgments for the retrieval backend:
 ```sh
 PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
   --queries /path/to/reviewed-queries.jsonl \
-  --config baseline,with-expand --retrievers minnid \
-  --quality-gate --quality-baseline baseline --quality-candidate with-expand
+  --config no-expand,with-expand --retrievers minnid \
+  --quality-gate --quality-baseline no-expand --quality-candidate with-expand
 ```
 
 The default check requires a **5% relative** gain in mean recall@5, with no
@@ -149,3 +149,24 @@ because the comparison code exists.
 
 The legacy `--gate` Minni-versus-ripgrep loss-rate check is separate and keeps its
 20% rule. Ungated runs remain available for smaller exploratory datasets.
+
+Quality comparisons require one document-ID retriever and two distinct configs.
+Both configs set `use_hyde=False`, so HyDE stays constant. `no-expand` disables
+query expansion; `with-expand` sets `expand=True`, which uses the engine’s
+`query_expand_default` mode (rule or AFM; unsupported defaults fall back to rule).
+It does not force AFM expansion or guarantee extra variants for every query. The legacy
+`baseline` config retains its existing defaults. Report names resolve by complete
+config identity, so `baseline` never aliases `fp32-baseline`.
+
+Quality mode rejects malformed JSONL, missing or blank query-class labels,
+retrieval exceptions, and unsupported config options. It cannot be combined with
+the legacy `--gate`. These
+checks validate the comparison inputs; passing synthetic tests is not evidence
+of improved real retrieval quality.
+
+`fp32-baseline`, `int8-quantized`, and `with-semantic-merge` are placeholder
+ablations without implemented option changes and are rejected in quality mode.
+They remain available for legacy descriptive reports. Quality mode also rejects
+pairs with identical effective options after accounting for the engine’s
+`expand=True` default; distinct names alone do not
+establish a feature comparison.
