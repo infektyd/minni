@@ -8,18 +8,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import tempfile
 
 from minni.wire.manifest import PayloadManifest, sha256_file, utc_now_iso
-from minni.wire.paths import plugin_base
+from minni.wire.paths import is_safe_version_segment, plugin_base
 from minni.wire.platform import CANONICAL_FLEET
 from minni.wire.wired import WireRecord, upsert_wire
 
 _CUSTOM = {"muse": ".muse/mcp.json", "devin": ".config/devin/mcp_config.json"}
-_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[+.-][A-Za-z0-9_.+-]+)?$")
 
 
 def wire_report_root(text: str) -> Path | None:
@@ -46,7 +44,11 @@ def wire_report_root(text: str) -> Path | None:
 
 
 def _version_root(root: Path, base: Path) -> bool:
-    return root.is_absolute() and root.parent.resolve() == base.resolve() and bool(_VERSION.fullmatch(root.name))
+    # Name check reuses the canonical wire contract (paths.is_safe_version_segment),
+    # which accepts the prerelease/dev names dev_version produces (e.g.
+    # `0.6.0rc1+git.<sha>`). Containment, symlink, and manifest checks below stay.
+    return (root.is_absolute() and root.parent.resolve() == base.resolve()
+            and is_safe_version_segment(root.name))
 
 
 def _payload(root: Path, base: Path) -> PayloadManifest:
@@ -201,9 +203,24 @@ def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
             notes.append("cwd preserved: existing directory is not a verified Minni payload")
         else:
             entry["cwd"] = str(new_root)
-    if (old_root == new_root and record.get("version") == manifest.version
-            and json.loads(original) == data):
-        return {**result, "reason": "registered MCP binding already current"}
+    if json.loads(original) == data:
+        # Verified binding already the exact target: never rewrite the operator
+        # configuration, never write a backup.
+        if old_root == new_root and record.get("version") == manifest.version:
+            return {**result, "reason": "registered MCP binding already current"}
+        if dry_run:
+            return {"platform": platform, "status": "dry-run",
+                    "reason": "registry record lags a binding that already targets the payload",
+                    "notes": notes}
+        # Binding exact, registry lagging (e.g. a prior run wrote the config but
+        # failed before registry publication): repair Minni's own registry row
+        # without touching operator configuration or writing a backup.
+        _check_record(record)
+        upsert_wire(WireRecord(platform=platform, config_path=str(config),
+                    install_root=str(new_root), version=manifest.version,
+                    workspace=record.get("workspace"), wired_at=utc_now_iso()),
+                    expected_record=record)
+        return {**result, "reason": "registered MCP binding already exact target; registry record repaired without rewriting configuration"}
     replacement = (json.dumps(data, indent=2) + "\n").encode()
     if dry_run:
         return {"platform": platform, "status": "dry-run", "reason": "would refresh registered MCP binding", "notes": notes}
