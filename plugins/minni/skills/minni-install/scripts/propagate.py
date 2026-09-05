@@ -994,11 +994,32 @@ def _native_hook_plan(platform: str, install_root: Path) -> dict[str, object]:
         events = data.get("hooks") if platform in {"cursor", "grok"} else data.get(AGY_PLUGIN_NAME)
         if events is not None and (not isinstance(events, dict) or any(not isinstance(v, list) for v in events.values())):
             raise ValueError("native hook events must be lists")
+        def owned(command):
+            return isinstance(command, str) and (
+                entrypoint in command or (platform == "cursor" and CURSOR_WRAPPER_NAME in command)
+            )
+        def contains_owned(node):
+            if isinstance(node, list):
+                return any(contains_owned(item) for item in node)
+            if not isinstance(node, dict):
+                return False
+            return owned(node.get("command")) or (
+                isinstance(node.get("hooks"), list) and contains_owned(node["hooks"])
+            )
+        # File-level or Minni-owned disable only. A sibling enabled:false on a
+        # shared Cursor hooks.json must not abort restamping owned commands.
         def disabled(node):
-            if isinstance(node, dict):
-                return node.get("enabled") is False or node.get("disabled") is True or any(disabled(v) for v in node.values())
-            return isinstance(node, list) and any(disabled(v) for v in node)
-        if disabled(data):
+            if isinstance(node, list):
+                return any(disabled(item) for item in node)
+            if not isinstance(node, dict):
+                return False
+            marked = node.get("enabled") is False or node.get("disabled") is True
+            if marked and contains_owned(node):
+                return True
+            return isinstance(node.get("hooks"), list) and disabled(node["hooks"])
+        if data.get("enabled") is False or data.get("disabled") is True:
+            return {**skip, "reason": "native hook disable marker preserved"}
+        if events is not None and any(disabled(entries) for entries in events.values()):
             return {**skip, "reason": "native hook disable marker preserved"}
         count = 0
         notes = []

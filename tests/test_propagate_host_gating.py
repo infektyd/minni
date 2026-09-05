@@ -116,6 +116,35 @@ def test_bulk_native_hooks_preserve_absent_unrelated_disabled(surface, state):
     assert not module._cursor_wrapper_path().exists()
 
 
+@pytest.mark.parametrize('marker', [{'enabled': False}, {'disabled': True}])
+def test_unrelated_disabled_sibling_does_not_block_owned_refresh(surface, marker):
+    home, _, module, _ = surface
+    old = 'node /old/dist/cursor-hook.js UserPromptSubmit'
+    path = _config(home, '.cursor/hooks.json', json.dumps({'hooks': {
+        'beforeSubmitPrompt': [
+            {'command': old},
+            {'command': 'echo keep', **marker},
+        ]}}))
+    result = module.update_cursor_hooks(home / 'new', existing_only=True)
+    assert result['installed'] is True
+    actual = json.loads(path.read_text())
+    rows = actual['hooks']['beforeSubmitPrompt']
+    assert rows[0]['command'] == f'node {home}/new/dist/cursor-hook.js UserPromptSubmit'
+    assert rows[1] == {'command': 'echo keep', **marker}
+
+
+def test_owned_hook_disable_marker_is_still_preserved(surface):
+    home, _, module, _ = surface
+    data = {'hooks': {'beforeSubmitPrompt': [
+        {'command': 'node /old/dist/cursor-hook.js UserPromptSubmit', 'enabled': False}]}}
+    path = _config(home, '.cursor/hooks.json', json.dumps(data))
+    before = path.read_bytes()
+    result = module.update_cursor_hooks(home / 'new', existing_only=True)
+    assert result['skipped'] is True
+    assert result['reason'] == 'native hook disable marker preserved'
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize('wrapper_state', ['missing', 'custom', 'arbitrary'])
 def test_bulk_cursor_wrapper_never_created_or_overwritten(surface, wrapper_state):
     home, _, module, _ = surface
