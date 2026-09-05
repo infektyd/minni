@@ -2423,9 +2423,12 @@ export async function drainPendingWorkerWritesForVault(
 async function queuedWriteIsLiveWork(
   notePath: string,
   item: { sliceId: string; generation?: number },
+  lockedPlan?: PlanArtifact,
 ): Promise<boolean> {
+  // Unreadable or invalid authority is not evidence that accepted work is
+  // obsolete. Propagate so drain parks the ticket for a later retry.
+  const plan = lockedPlan ?? await rehydratePlan(notePath);
   try {
-    const plan = await rehydratePlan(notePath);
     const slice = findSlice(plan, item.sliceId);
     return isNonTerminal(slice) && queuedWriteMatchesLiveGeneration(item, slice);
   } catch {
@@ -2461,10 +2464,9 @@ async function standingDrainShouldYieldLiveStart(
  */
 async function claimTokenFromExistingStore(
   vaultPath: string,
-  notePath: string,
+  plan: PlanArtifact,
   item: QueuedWorkerWrite,
 ): Promise<string> {
-  const plan = await rehydratePlan(notePath);
   const slice = findSlice(plan, item.sliceId);
   const claimId = slice.claim?.claim_id;
   if (!claimId) {
@@ -2500,7 +2502,10 @@ async function drainOneQueuedWorkerWrite(
     // journal slice.started on a parent that replan then supersedes.
     return;
   }
-  if (!(await queuedWriteIsLiveWork(input.notePath, item))) {
+  // Reuse this strict snapshot only inside this one lock acquisition. Token
+  // lookup must refer to the same generation we just checked for liveness.
+  const lockedPlan = await rehydrateAuthority(input);
+  if (!(await queuedWriteIsLiveWork(input.notePath, item, lockedPlan))) {
     // Leftover Q after generation advance / supersede is not live work.
     // Drop it so drain is not stuck. Do not persist in_progress or journal
     // slice.started on a dead parent. Same persist authority: we are already
@@ -2525,7 +2530,7 @@ async function drainOneQueuedWorkerWrite(
   }
   const token = await claimTokenFromExistingStore(
     input.vaultPath,
-    input.notePath,
+    lockedPlan,
     item,
   );
   const mapped: UpdateClaimedSliceInput = {
@@ -2901,4 +2906,3 @@ async function applyClaimedSliceWithClaimFs(
       });
       return result;
 }
-

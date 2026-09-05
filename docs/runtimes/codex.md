@@ -16,8 +16,8 @@ Propagate's `--platform all` does **not** include codex (only antigravity +
 cursor). To refresh a live checkout fleet, use `make sync-root` or
 `minni wire codex --from-repo .` — see [deploy/README.md](../../deploy/README.md).
 
-This installs the Codex adapter (`plugins/minni/.codex-plugin/` — plugin
-manifest, hooks, and MCP config) with agent identity `codex` and vault
+This copies the Codex adapter payload (including its plugin manifest and hooks)
+and configures the MCP server with agent identity `codex` and vault
 `~/.minni/codex-vault`. The plugin's MCP server is a Node process
 (`dist/server.js`) that talks to the daemon over the Unix socket; under wire
 the install root is versioned under `~/.minni/plugin/<version>/`.
@@ -30,6 +30,28 @@ Reference: `plugins/minni/skills/minni-install/references/install-directive-code
 
 Verify: from a Codex session, call `minni_status` and check `socket.ok`, the
 `codex-vault` path, and the audit tail.
+
+## Automatic hooks and running sessions
+
+`minni wire codex` configures MCP. It does not install or enable the payload as
+an active Codex plugin, approve hook definitions, or restart existing host
+sessions. Its `verify.hook_dry_run` checks the packaged hook entrypoint only;
+it does not show that Codex has loaded or fired a hook. Successful wire output
+therefore reports `lifecycle.automatic_hooks: "not_verified"` and
+`lifecycle.existing_host_sessions: "not_verified"`. Existing independently
+installed hooks may still be active; this result does not declare them absent.
+
+Codex supports hooks beside active config layers (`hooks.json` or inline
+`[hooks]`), and through enabled plugins. Minni's packaged manifest points to
+`hooks/hooks-codex.json`; Codex supplies `PLUGIN_ROOT` for its commands.
+Non-managed hooks must also be reviewed and trusted in Codex before execution.
+Check the host's hook inventory and trust state (CLI `/hooks`) to establish
+activation. See the [official Codex hook documentation](https://learn.chatgpt.com/docs/hooks).
+
+After updating the payload, reconnect the relevant MCP session through its
+host when convenient. Existing processes can keep the old code loaded even
+when the configured path points to the new version. A current manifest or a
+successful fresh probe does not establish the version of every running session.
 
 ## Workspace labels across projects
 

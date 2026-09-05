@@ -394,6 +394,46 @@ test("concurrent publication of one idempotency key preserves one winning ticket
   assert.equal((await readdir(workerWriteQueueDir(root, "same-key"))).filter(name => name.endsWith(".tmp")).length, 0);
 });
 
+for (const failure of ["read", "corrupt"]) {
+ for (const mode of ["full", "one-shot", "standing"]) {
+  test(`${mode} drain preserves accepted work when plan authority is ${failure}`, async (t) => {
+    const fixture = await burstFixture(t, 1);
+    const [claim] = await assignAndClaimAll(fixture);
+    await enqueueWorkerWrite({
+      ...fixture, sliceId: "s0", workerAgentId: "worker-0", token: claim.token,
+      idempotencyKey: "authority-retry", action: { action: "start" },
+      generation: claim.generation, applyNow: new Date("2026-08-18T12:01:00.000Z"),
+    });
+    const originalNote = await readFile(fixture.notePath, "utf8");
+    const originalRead = fs.promises.readFile;
+    if (failure === "corrupt") {
+      await writeFile(fixture.notePath, "temporarily invalid plan", "utf8");
+    } else {
+      fs.promises.readFile = async (file, ...args) => {
+        if (file === fixture.notePath) {
+          throw Object.assign(new Error("temporary plan read failure"), { code: "EIO" });
+        }
+        return originalRead(file, ...args);
+      };
+      syncBuiltinESMExports();
+    }
+    try {
+      await assert.rejects(drainWorkerWrites(fixture, {}, {
+        oneShotYield: mode === "one-shot", standingDefer: mode === "standing",
+      }));
+    } finally {
+      fs.promises.readFile = originalRead;
+      syncBuiltinESMExports();
+      await writeFile(fixture.notePath, originalNote, "utf8");
+    }
+    assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 1);
+    await drainWorkerWrites(fixture);
+    assert.deepEqual((await journalState(fixture)).started, ["s0"]);
+    assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0);
+  });
+ }
+}
+
 test("queue timeout diagnostics preserve submission failures and pending actions without secrets", async () => {
   const secret = "secret-claim-token";
   const details = await journalTimeoutDiagnostics({
