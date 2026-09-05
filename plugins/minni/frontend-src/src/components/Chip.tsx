@@ -41,8 +41,10 @@ export function Chip({ kind = "default", children, dot, square }: ChipProps) {
 export function PrivacyChip({ value }: { value: EvidencePrivacy }) {
   const map: Record<EvidencePrivacy, { kind: ChipKind; label: string }> = {
     private: { kind: "private", label: "PRIVATE" },
-    team: { kind: "team", label: "TEAM" },
-    public: { kind: "public", label: "PUBLIC" },
+    blocked: { kind: "danger", label: "BLOCKED" },
+    "local-only": { kind: "info", label: "LOCAL-ONLY" },
+    safe: { kind: "safe", label: "SAFE" },
+    unknown: { kind: "default", label: "UNKNOWN" },
   };
   const m = map[value] || { kind: "default", label: String(value).toUpperCase() };
   return <Chip kind={m.kind}>{m.label}</Chip>;
@@ -50,10 +52,14 @@ export function PrivacyChip({ value }: { value: EvidencePrivacy }) {
 
 export function AuthorityChip({ value }: { value: EvidenceAuthority }) {
   const map: Record<EvidenceAuthority, { kind: ChipKind; label: string }> = {
-    owner: { kind: "owner", label: "OWNER" },
-    team: { kind: "team", label: "TEAM" },
-    system: { kind: "system", label: "SYSTEM" },
-    public: { kind: "public", label: "PUBLIC" },
+    schema: { kind: "info", label: "SCHEMA" },
+    handoff: { kind: "info", label: "HANDOFF" },
+    decision: { kind: "info", label: "DECISION" },
+    session: { kind: "default", label: "SESSION" },
+    concept: { kind: "default", label: "CONCEPT" },
+    daemon: { kind: "default", label: "DAEMON" },
+    vault: { kind: "default", label: "VAULT" },
+    unknown: { kind: "default", label: "UNKNOWN" },
   };
   const m = map[value] || { kind: "default", label: String(value).toUpperCase() };
   return <Chip kind={m.kind}>{m.label}</Chip>;
@@ -61,6 +67,7 @@ export function AuthorityChip({ value }: { value: EvidenceAuthority }) {
 
 export function AfmChip({ value }: { value: EvidenceAfm }) {
   const map: Record<EvidenceAfm, { kind: ChipKind; label: string }> = {
+    unclassified: { kind: "default", label: "UNCLASSIFIED" },
     safe: { kind: "afm", label: "AFM-SAFE" },
     learn: { kind: "learn", label: "LEARN CANDIDATE" },
     log: { kind: "log", label: "LOG-ONLY" },

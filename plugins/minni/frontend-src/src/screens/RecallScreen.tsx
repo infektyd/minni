@@ -106,7 +106,6 @@ export function RecallScreen({
 
   const incl = filteredRows.filter((r) => selected.has(r.id)).length;
   const budgetTokens = packet?.budget?.tokens ?? 0;
-  const usedTokens = packet?.budgetTokens ?? 0;
 
   return (
     <>
@@ -115,7 +114,7 @@ export function RecallScreen({
         title={query ? `Recall — ${query}` : "Recall"}
         meta={[
           { k: "PROFILE", v: profile },
-          { k: "BUDGET", v: budgetTokens ? `${usedTokens.toLocaleString()} / ${budgetTokens.toLocaleString()} tok` : "—" },
+          { k: "ALLOWANCE", v: budgetTokens ? `${budgetTokens.toLocaleString()} tok` : "—" },
           { k: "DAEMON", v: packet?.recall?.state ?? "unknown" },
           { k: "AFM", v: packet?.afm?.used ? "used" : packet?.afm?.requested ? "requested · skipped" : "off" },
         ]}
@@ -190,7 +189,7 @@ export function RecallScreen({
 
         <PanelHeader
           title={`Local task-packet notes · ${filteredRows.length} ranked`}
-          sub={`Workspace-unscoped vault search · ${incl} included · ${Math.max(0, filteredRows.length - incl)} held back`}
+          sub={`Workspace-unscoped vault search · ${incl} marked for inspection · ${Math.max(0, filteredRows.length - incl)} unmarked`}
         />
         <div className="panel-body--flush">
           {loading && <StateBanner state="loading">Preparing local notes and querying daemon…</StateBanner>}
@@ -268,7 +267,7 @@ export function RecallScreen({
                             setSelected(n);
                           }}
                         >
-                          Exclude
+                          Unmark
                         </button>
                       ) : (
                         <button
@@ -281,7 +280,7 @@ export function RecallScreen({
                             setSelected(n);
                           }}
                         >
-                          Include
+                          Mark
                         </button>
                       )}
                     </div>

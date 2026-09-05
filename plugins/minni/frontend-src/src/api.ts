@@ -321,9 +321,9 @@ export interface DeepResearchStatusRequest {
 // ---- UI-side row shape derived from TaskSource ----
 
 export type EvidenceClass = "wiki" | "raw" | "log" | "inbox" | "code" | "other";
-export type EvidencePrivacy = "private" | "team" | "public";
-export type EvidenceAuthority = "owner" | "team" | "system" | "public";
-export type EvidenceAfm = "safe" | "learn" | "log" | "dns";
+export type EvidencePrivacy = PrivacyLevel | "unknown";
+export type EvidenceAuthority = SourceAuthority | "unknown";
+export type EvidenceAfm = "safe" | "learn" | "log" | "dns" | "unclassified";
 
 export interface EvidenceRow {
   id: string;
@@ -364,12 +364,11 @@ export function privacyFromLevel(level: PrivacyLevel | undefined): EvidencePriva
   switch (level) {
     case "private":
     case "blocked":
-      return "private";
     case "local-only":
-      return "team";
     case "safe":
+      return level;
     default:
-      return "public";
+      return "unknown";
   }
 }
 
@@ -378,15 +377,13 @@ export function authorityFromSource(value: SourceAuthority | undefined): Evidenc
     case "handoff":
     case "decision":
     case "schema":
-      return "owner";
     case "session":
     case "concept":
-      return "team";
     case "daemon":
     case "vault":
-      return "system";
+      return value;
     default:
-      return "public";
+      return "unknown";
   }
 }
 
@@ -398,13 +395,13 @@ function shortIdFromPath(p: string): string {
 
 // AFM classification per source: a source is "dns" if its relativePath
 // matches an entry in outcomeDraft.doNotStore; "log" if in logOnly or
-// expires; "learn" if in learnCandidates; otherwise "safe".
+// expires; "learn" if in learnCandidates; otherwise unclassified.
 export function afmForSource(
   src: TaskSource,
   outcome: OutcomeDraft | undefined,
 ): EvidenceAfm {
   if (src.privacyLevel === "blocked") return "dns";
-  if (!outcome) return "safe";
+  if (!outcome) return "unclassified";
   const haystacks: { kind: EvidenceAfm; list: string[] }[] = [
     { kind: "dns", list: outcome.doNotStore || [] },
     { kind: "log", list: [...(outcome.logOnly || []), ...(outcome.expires || [])] },
@@ -415,7 +412,7 @@ export function afmForSource(
       return h.kind;
     }
   }
-  return "safe";
+  return "unclassified";
 }
 
 export function evidenceFromSource(
@@ -437,7 +434,7 @@ export function evidenceFromSource(
     afm,
     reason: (src.reasons || []).join(" · ") || src.snippet?.slice(0, 80) || "",
     selected: afm !== "dns",
-    private: privacy === "private",
+    private: privacy === "private" || privacy === "blocked",
     locality: "local",
     collection: cls,
     tags: [],
@@ -797,6 +794,11 @@ export interface AgentCapsRow {
 }
 
 export interface AgentApiRow {
+  displayName?: string;
+  description?: string;
+  registered?: boolean;
+  registrationKnown?: boolean;
+  capabilitiesKnown?: boolean;
   id: string;
   vault?: string;
   vaultPath?: string;

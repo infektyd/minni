@@ -58,6 +58,11 @@ export interface AgentCaps {
 }
 
 export interface BoardAgent {
+  displayName?: string;
+  description?: string;
+  registered?: boolean;
+  registrationKnown?: boolean;
+  capabilitiesKnown?: boolean;
   id: string;
   on: boolean;
   vault: string;
@@ -337,6 +342,11 @@ export function mapAgentRow(row: AgentRow): BoardAgent {
     row.stagedUnknown === true || row.staged === null || row.staged === undefined;
   return {
     id: row.id || "—",
+    displayName: row.displayName,
+    description: row.description,
+    registered: row.registered,
+    registrationKnown: row.registrationKnown,
+    capabilitiesKnown: row.capabilitiesKnown,
     on: Boolean(row.on),
     vault: row.vault || row.vaultPath || "—",
     seen: row.seen || "—",
@@ -357,7 +367,7 @@ export function mapAgentRow(row: AgentRow): BoardAgent {
 }
 
 export function mapAgents(rows: AgentRow[]): BoardAgent[] {
-  return rows.map(mapAgentRow);
+  return rows.map(mapAgentRow).sort((a, b) => Number(b.registered === true) - Number(a.registered === true));
 }
 
 /** Map recall-state.json hits → BoardRecallResult list. */
@@ -411,8 +421,8 @@ export const BOARD_ZONES: Record<ZoneId, ZoneDef> = {
     y: 240,
     w: 280,
     h: 660,
-    label: "RUNTIMES",
-    title: "Runtimes",
+    label: "AGENT MEMORY",
+    title: "Agent memory",
     status: "online",
   },
   hub: {

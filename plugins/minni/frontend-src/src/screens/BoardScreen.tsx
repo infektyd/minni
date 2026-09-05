@@ -168,13 +168,13 @@ export function BoardScreen({
 
     z.agents = {
       ...z.agents,
-      label: zoneLabel("RUNTIMES", {
+      label: zoneLabel("AGENT MEMORY", {
         isLive: agentsState.isLive,
         count: agentsState.data.length,
         loading: agentsState.loading,
         error: agentsState.error,
       }),
-      title: titleFor("Runtimes", agentsState.isLive, agentsState.loading, agentsState.error),
+      title: titleFor("Agent memory", agentsState.isLive, agentsState.loading, agentsState.error),
       status:
         offlineStatus(agentsState.isLive, agentsState.loading, agentsState.error) ??
         z.agents.status,

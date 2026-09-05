@@ -1,3 +1,4 @@
+import { AgentSummary } from "../components/AgentSummary";
 // Minni Memory Board — overview layer: draggable zones, live links, flow pulses.
 import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import {
@@ -511,8 +512,8 @@ export function BoardOverview({
       <ZoneBox id="agents" z={zones.agents} scale={scale} mode={zmode.agents} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
         {zoneChip(
           agentsState,
-          "RUNTIMES · OFFLINE",
-          "RUNTIMES · …",
+          "AGENT MEMORY · OFFLINE",
+          "AGENT MEMORY · …",
           "no vaults",
           agents.length === 0,
           () => (
@@ -523,21 +524,7 @@ export function BoardOverview({
                   className="node"
                   style={{ left: L.agents.nodeX, top: L.agents.nodeY0 + i * L.agents.nodeGap }}
                 >
-                  <div className="nn">
-                    <span
-                      className="dot"
-                      style={{ background: a.on ? "var(--verdigris)" : "var(--disabled)" }}
-                    />
-                    {a.id}
-                  </div>
-                  <div className="nv">
-                    {a.vault} · {a.seen}
-                  </div>
-                  <div className="ncaps">
-                    <span className={"bd-chip " + (a.caps.R ? "ok" : "no")}>R</span>
-                    <span className={"bd-chip " + (a.caps.L ? "ok" : "no")}>L</span>
-                    <span className={"bd-chip " + (a.caps.H ? "ok" : "no")}>H</span>
-                  </div>
+                  <AgentSummary agent={a} compact />
                 </div>
               ))}
               {agentsState?.isLive && agents.length > 6 ? (
