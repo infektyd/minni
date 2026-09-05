@@ -178,7 +178,16 @@ def format_numbered_excerpt(
         if "\n" in formatted_block:
             formatted_block = formatted_block.rsplit("\n", 1)[0]
         else:
-            formatted_block = ""
+            prefix = "[1] "
+            prefix_tokens, _ = count_tokens(prefix, encoding_name=encoding_name)
+            available_tokens = max_tokens - prefix_tokens
+            if available_tokens > 0:
+                first_line, _, _ = truncate_to_tokens(
+                    raw_lines[0], available_tokens, encoding_name=encoding_name
+                )
+                formatted_block = prefix + first_line
+            else:
+                formatted_block = ""
         raw_lines = [line for line in formatted_block.splitlines() if line.strip()]
     actual_tokens, is_measured_final = count_tokens(formatted_block, encoding_name=encoding_name)
     return formatted_block, raw_lines, actual_tokens, (is_measured and is_measured_final)

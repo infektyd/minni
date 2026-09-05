@@ -106,6 +106,17 @@ def test_format_numbered_excerpt():
     assert "[3] Line three about AFM loop." in formatted
 
 
+def test_format_numbered_excerpt_preserves_capped_single_line():
+    """A single-line body at the cap retains evidence after numbering."""
+    text = "single line evidence " * 100
+    formatted, lines, tokens, is_measured = format_numbered_excerpt(text, max_tokens=20)
+
+    assert is_measured is True
+    assert formatted.startswith("[1] single line evidence")
+    assert lines == [formatted]
+    assert 0 < tokens <= 20
+
+
 def test_render_edge_inference_prompt_within_afm_budget():
     """Render prompt with source and 8 long candidates. Must strictly fit in <= 3,200 tokens."""
     source = {

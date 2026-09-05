@@ -337,6 +337,38 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                     f"column '{tbl}.{col_name}' default value mismatch: expected {exp_dflt!r}, got {act_dflt!r}"
                 )
 
+    # edge_status must support the full lifecycle, not just its declared shape.
+    try:
+        ddl_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_links'"
+        ).fetchone()
+        ddl = str(ddl_row[0] or "") if ddl_row else ""
+        for check_body in re.findall(r"\bCHECK\s*\(([^()]*)\)", ddl, re.IGNORECASE):
+            if "edge_status" not in check_body.lower():
+                continue
+            allowed_match = re.search(
+                r"edge_status\s+IN\s*\(([^)]*)\)", check_body, re.IGNORECASE
+            )
+            if allowed_match:
+                allowed = {
+                    value.lower()
+                    for value in re.findall(r"['\"]([^'\"]+)['\"]", allowed_match.group(1))
+                }
+                if "active" in allowed and "stale" not in allowed:
+                    errors.append(
+                        "table 'memory_links' CHECK constraint prevents edge_status='stale'"
+                    )
+            elif re.search(
+                r"(?:edge_status\s*=\s*['\"]active['\"]|['\"]active['\"]\s*=\s*edge_status)",
+                check_body,
+                re.IGNORECASE,
+            ) and not re.search(r"\bstale\b", check_body, re.IGNORECASE):
+                errors.append(
+                    "table 'memory_links' CHECK constraint prevents edge_status='stale'"
+                )
+    except sqlite3.Error as e:
+        errors.append(f"Failed to inspect CHECK constraints for 'memory_links': {e}")
+
     # 2. Strict Composite Primary Key check for learning_documents
     try:
         ld_info = conn.execute("PRAGMA table_info(learning_documents)").fetchall()
