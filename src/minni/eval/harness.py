@@ -455,9 +455,10 @@ def cmd_run(args: argparse.Namespace) -> None:
             try:
                 report = run_eval(searcher, queries, report_name, config_kwargs, ks=ks,
                                   strict_search=(getattr(args, "quality_gate", False)
-                                                 or isinstance(searcher, SnapshotSearcher)))
-            except RuntimeError:
-                logger.error("Quality evaluation aborted: retrieval failed; no comparison accepted")
+                                                  or isinstance(searcher, SnapshotSearcher)),
+                                  forbidden_doc_ids=getattr(searcher, "forbidden_doc_ids", None))
+            except RuntimeError as exc:
+                logger.error("Quality evaluation aborted: %s; no comparison accepted", exc)
                 sys.exit(3)
             report["quality_config"] = config_name
             report["quality_retriever"] = retriever_name
@@ -467,7 +468,11 @@ def cmd_run(args: argparse.Namespace) -> None:
                 retrieval=retrieval_options_provenance(
                     config_name, config_kwargs, KNOWN_RETRIEVE_KWARGS
                 ),
-                principal=principal_provenance(retriever_name, is_mock=is_mock),
+                principal=principal_provenance(
+                    retriever_name,
+                    is_mock=is_mock,
+                    principal=getattr(searcher, "_principal", None),
+                ),
                 corpus=corpus_provenance(
                     is_mock=is_mock,
                     retriever_name=retriever_name,

@@ -865,8 +865,7 @@ def prepare_snapshot(packet: Any, dest: Path) -> Dict[str, Any]:
     """
     records = validate_export_packet(packet)
     identity = canonical_identity(packet)
-    dest = Path(dest)
-    _reject_live_destination(dest)
+    dest = _reject_live_destination(Path(dest))
     _ensure_private_dir(dest)
     try:
         preexisting = list(dest.iterdir())
@@ -948,8 +947,7 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
     from minni.config import SovereignConfig
     from minni.db import SovereignDB
 
-    snapshot_dir = Path(snapshot_dir)
-    _reject_live_destination(snapshot_dir)
+    snapshot_dir = _reject_live_destination(Path(snapshot_dir))
     verified = verify_snapshot(snapshot_dir)
     manifest, mapping = verified["manifest"], verified["mapping"]
     vault_root = snapshot_dir / "vault"
@@ -974,7 +972,11 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
         reranker_enabled=False,
         hyde_enabled=False,
     )
-    db = SovereignDB(config)
+    previous_umask = os.umask(0o077)
+    try:
+        db = SovereignDB(config)
+    finally:
+        os.umask(previous_umask)
     try:
         doc_ids: Dict[str, int] = {}
         for study_id in sorted(mapping):
@@ -1002,11 +1004,17 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
             doc_ids[study_id] = doc_id
     finally:
         db.close()
+    for artifact in (Path(config.db_path), Path(f"{config.db_path}-wal"),
+                     Path(f"{config.db_path}-shm")):
+        if artifact.exists():
+            os.chmod(artifact, 0o600)
+    schema_digest = _materialized_schema_digest(Path(config.db_path))
     materialized = {
         "snapshot_version": SNAPSHOT_VERSION,
         "snapshot_id": manifest["snapshot_id"],
         "manifest_digest": manifest["manifest_digest"],
         "document_ids": doc_ids,
+        "schema_digest": schema_digest,
     }
     _write_private_file(
         snapshot_dir / "materialized.json", json.dumps(materialized, indent=2, sort_keys=True))
@@ -1071,6 +1079,27 @@ def _immutable_db_rows(db_path: Path) -> Dict[str, Dict[str, Any]]:
     return rows
 
 
+def _materialized_schema_digest(db_path: Path) -> str:
+    """Digest the SQLite schema that determines snapshot retrieval behavior."""
+    import sqlite3
+
+    uri = "file:" + _url_quote(str(db_path), safe="/:") + "?mode=ro"
+    try:
+        handle = sqlite3.connect(uri, uri=True)
+        try:
+            schema = handle.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+        finally:
+            handle.close()
+    except Exception as exc:  # noqa: BLE001 - schema is integrity evidence
+        raise StudySnapshotError("materialized snapshot schema is unreadable") from exc
+    return hashlib.sha256(
+        json.dumps(schema, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def check_materialized(snapshot_dir: Path) -> Dict[str, Any]:
     """Confirm the disposable DB outputs belong to the verified snapshot.
 
@@ -1106,6 +1135,9 @@ def check_materialized(snapshot_dir: Path) -> Dict[str, Any]:
         raise StudySnapshotError(
             "materialized document IDs do not cover exactly the snapshot mapping"
         )
+    schema_digest = materialized.get("schema_digest")
+    if not isinstance(schema_digest, str) or schema_digest != _materialized_schema_digest(db_path):
+        raise StudySnapshotError("materialized database schema does not match the frozen snapshot")
     rows = _immutable_db_rows(db_path)
     if len(rows) != len(mapping):
         raise StudySnapshotError("materialized database row count does not match the snapshot")
@@ -1158,8 +1190,7 @@ def check_materialized(snapshot_dir: Path) -> Dict[str, Any]:
 
 def snapshot_config_paths(snapshot_dir: Path) -> Dict[str, str]:
     """Disposable backend paths for a snapshot directory (all inside it)."""
-    root = Path(snapshot_dir)
-    _reject_live_destination(root)
+    root = _reject_live_destination(Path(snapshot_dir))
     return {
         "db_path": str(root / "study.db"),
         "vault_path": str(root / "vault"),

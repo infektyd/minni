@@ -178,10 +178,10 @@ class SnapshotSearcher(SearcherProtocol):
     def __init__(self, snapshot_dir: Path) -> None:
         from .study_snapshot import check_materialized, verify_snapshot
 
-        root = Path(snapshot_dir)
+        root = Path(snapshot_dir).resolve()
         try:
             verified = verify_snapshot(root)
-            check_materialized(root)
+            materialized = check_materialized(root)
         except ValueError as exc:
             raise ValueError(f"snapshot directory {root} failed frozen validation: {exc}") from exc
         manifest = verified["manifest"]
@@ -193,6 +193,11 @@ class SnapshotSearcher(SearcherProtocol):
         self.snapshot_id = manifest.get("snapshot_id", "unknown")
         self.manifest_digest = manifest.get("manifest_digest", "unknown")
         self._agent_id = str((identity.get("principal") or {}).get("agent_id") or "study")
+        self.forbidden_doc_ids = set()
+        for study_id, record in verified["mapping"].items():
+            if record.get("expected_eligible") is False:
+                self.forbidden_doc_ids.add(materialized["document_ids"].get(study_id))
+        self.forbidden_doc_ids.discard(None)
         self._engine = None
         self._principal = None
 

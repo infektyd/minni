@@ -201,7 +201,9 @@ def environment_provenance() -> Dict[str, Any]:
     }
 
 
-def principal_provenance(retriever_name: str, *, is_mock: bool) -> Dict[str, Any]:
+def principal_provenance(
+    retriever_name: str, *, is_mock: bool, principal: Any = None
+) -> Dict[str, Any]:
     """State principal/scope availability without inventing authorization facts."""
     key = retriever_name.strip().lower()
     if is_mock or key == "mock":
@@ -233,10 +235,23 @@ def principal_provenance(retriever_name: str, *, is_mock: bool) -> Dict[str, Any
             "note": "File-text baseline; scores describe lexical overlap, not memory quality.",
         }
     if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        if principal is None:
+            return {
+                "supplied": True,
+                "backend": "study-snapshot",
+                "mock": False,
+                "scope": "prepared snapshot vault only (least-privilege study principal)",
+                "note": "Snapshot principal was not initialized; no effective authorization context was recorded.",
+            }
         return {
             "supplied": True,
             "backend": "study-snapshot",
             "mock": False,
+            "agent_id": principal.agent_id,
+            "workspace_id": principal.workspace_id,
+            "transport": principal.transport,
+            "capabilities": list(principal.capabilities),
+            "allowed_vault_roots": list(principal.allowed_vault_roots),
             "scope": "prepared snapshot vault only (least-privilege study principal)",
             "note": "Study principal is scoped to the frozen snapshot vault; "
                     "packet authorization claims are supplied provenance, not "
