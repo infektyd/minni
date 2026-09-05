@@ -22,7 +22,7 @@ def queries_path() -> Path:
     return repo_root() / "eval" / "queries.jsonl"
 
 
-def load_queries(path: Optional[Path] = None) -> List[Dict[str, Any]]:
+def load_queries(path: Optional[Path] = None, *, strict: bool = False) -> List[Dict[str, Any]]:
     """Load queries from a JSONL file. Returns list of query dicts."""
     p = path or queries_path()
     if not p.exists():
@@ -36,8 +36,13 @@ def load_queries(path: Optional[Path] = None) -> List[Dict[str, Any]]:
             if not line or line.startswith("#"):
                 continue
             try:
-                queries.append(json.loads(line))
+                row = json.loads(line)
+                if strict and not isinstance(row, dict):
+                    raise ValueError(f"query line {lineno}: expected an object")
+                queries.append(row)
             except json.JSONDecodeError as exc:
+                if strict:
+                    raise ValueError(f"query line {lineno}: malformed JSON") from exc
                 logger.warning("queries.jsonl line %d: JSON parse error: %s", lineno, exc)
     return queries
 
@@ -56,8 +61,10 @@ def validate_queries(
         query_text = str(q.get("query", "")).strip()
         if not query_text:
             errors.append(f"{label}: query is required")
-        if not q.get("reviewed"):
-            errors.append(f"{label}: reviewed=true is required for gate datasets")
+        if q.get("reviewed") is not True:
+            errors.append(
+                f"{label}: reviewed=true (boolean) is required for gate datasets"
+            )
         else:
             reviewed_count += 1
         if not (q.get("expected_refs") or q.get("expected_doc_ids")):
@@ -85,6 +92,34 @@ def validate_queries(
         "classes": classes,
         "errors": errors,
     }
+
+
+def validate_quality_queries(
+    queries: List[Dict[str, Any]], min_reviewed: int = 300,
+) -> Dict[str, Any]:
+    """The shared strict corpus contract for quality validation and runs."""
+    if any(not isinstance(row, dict) for row in queries):
+        return {"ok": False, "errors": ["quality queries must be objects"]}
+    report = validate_queries(queries, min_reviewed=min_reviewed)
+    errors = report["errors"]
+    seen = set()
+    for index, row in enumerate(queries, start=1):
+        query = row.get("query")
+        ids = row.get("expected_doc_ids", [])
+        cls = row.get("notes")
+        budget = row.get("budget_tokens", 4096)
+        if not isinstance(query, str) or not query.strip() or query in seen:
+            errors.append(f"query[{index}]: unique nonempty query string required")
+        else:
+            seen.add(query)
+        if not isinstance(cls, str) or not cls.strip():
+            errors.append(f"query[{index}]: explicit nonempty class label required")
+        if not isinstance(ids, list) or any(type(value) is not int for value in ids):
+            errors.append(f"query[{index}]: exact integer judgments required")
+        if type(budget) is not int or budget < 0:
+            errors.append(f"query[{index}]: budget_tokens must be a nonnegative integer")
+    report["ok"] = not errors
+    return report
 
 
 def harvest_queries(
