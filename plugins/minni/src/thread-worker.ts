@@ -2600,27 +2600,34 @@ async function drainOneQueuedWorkerWrite(
     });
     return false;
   }
-  const token = await claimTokenFromExistingStore(
-    input.vaultPath,
-    lockedPlan,
-    item,
-  );
-  const mapped: UpdateClaimedSliceInput = {
-    vaultPath: input.vaultPath,
-    notePath: input.notePath,
-    planId: item.planId,
-    sliceId: item.sliceId,
-    workerAgentId: item.workerAgentId,
-    token,
-    idempotencyKey: item.idempotencyKey,
-    action: item.action as WorkerUpdateAction,
-    now:
-      (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
-      input.now,
-  };
+  // One claim-helper session per live ticket: the token lookup and the apply
+  // below share this scope instead of starting/stopping a helper each. The
+  // scope is created fresh for this one ticket inside this one lock
+  // acquisition — never shared across tickets, requests, or lock holdings —
+  // and every logical vault location is still reopened/validated per call.
   // Fail-closed: apply throw must not reach removeQueuedWorkerWrite.
   // Dropping the ticket lets a later complete persist done with no start.
-  await applyClaimedSliceOnLockedPlan(mapped, deps);
+  await withClaimFsScope(async () => {
+    const token = await claimTokenFromExistingStore(
+      input.vaultPath,
+      lockedPlan,
+      item,
+    );
+    const mapped: UpdateClaimedSliceInput = {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId: item.planId,
+      sliceId: item.sliceId,
+      workerAgentId: item.workerAgentId,
+      token,
+      idempotencyKey: item.idempotencyKey,
+      action: item.action as WorkerUpdateAction,
+      now:
+        (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
+        input.now,
+    };
+    await applyClaimedSliceOnLockedPlan(mapped, deps);
+  });
   await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
   const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const next = leftover[0];
