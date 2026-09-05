@@ -58,6 +58,7 @@ SNAPSHOT_VERSION = "minni-study-snapshot-v1"
 
 MACHINE_PROPOSED = "machine_proposed"
 CONTENT_KINDS = {"original", "excerpt"}
+PRIVACY_LEVELS = {"safe", "local-only", "private", "blocked"}
 
 # Hard input bounds, enforced before any hashing, writes, or DB work, so a
 # hostile or malformed packet cannot turn preparation into expensive work.
@@ -431,6 +432,10 @@ def validate_export_packet(packet: Any) -> List[Dict[str, Any]]:
             row.get("privacy_level"), f"{label} privacy_level (privacy metadata)",
             MAX_PRIVACY_CHARS,
         )
+        if privacy_level not in PRIVACY_LEVELS:
+            raise StudySnapshotError(
+                f"{label}: privacy_level must be one of {sorted(PRIVACY_LEVELS)}"
+            )
         origin = _require_bounded_str(
             row.get("origin"), f"{label} origin", MAX_ORIGIN_CHARS)
         if type(row.get("expected_eligible")) is not bool:
@@ -882,6 +887,18 @@ def prepare_snapshot(packet: Any, dest: Path) -> Dict[str, Any]:
     mapping = deterministic_remapping(records)
     groups = content_groups_for(mapping)
 
+    envelope = {
+        "snapshot_version": SNAPSHOT_VERSION,
+        "snapshot_id": snapshot_id,
+        "manifest_digest": manifest_digest,
+        "records": mapping,
+    }
+    mapping_text = json.dumps(envelope, indent=2, sort_keys=True)
+    if len(mapping_text.encode("utf-8")) > MAX_METADATA_BYTES:
+        raise StudySnapshotError(
+            f"snapshot mapping metadata exceeds {MAX_METADATA_BYTES} bytes"
+        )
+
     vault_root = dest / "vault"
     for study_id, row in mapping.items():
         record = next(
@@ -896,13 +913,7 @@ def prepare_snapshot(packet: Any, dest: Path) -> Dict[str, Any]:
             )
         _write_private_file(target, record["text"])
 
-    envelope = {
-        "snapshot_version": SNAPSHOT_VERSION,
-        "snapshot_id": snapshot_id,
-        "manifest_digest": manifest_digest,
-        "records": mapping,
-    }
-    _write_private_file(dest / "mapping.json", json.dumps(envelope, indent=2, sort_keys=True))
+    _write_private_file(dest / "mapping.json", mapping_text)
     manifest = {
         "snapshot_version": SNAPSHOT_VERSION,
         "snapshot_id": snapshot_id,
