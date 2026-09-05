@@ -884,3 +884,67 @@ def test_migration_runner_drifted_schema_raises_and_rolls_back(tmp_path):
     }
     assert 21 not in applied
     conn.close()
+
+
+def test_migration_021_partial_schema_leaves_no_dangling_fk_and_retries(tmp_path):
+    """Regression: 021 must not stamp a REFERENCES clause to a missing parent.
+
+    Partial shape from the field: contradiction_log exists (created by
+    migration 009) but documents was never created (no migration file creates
+    it; db._init_schema does). The old runner executed 021's ALTERs
+    tolerantly, so ADD COLUMN ... REFERENCES documents(doc_id) succeeded
+    against the missing parent, and every later INSERT with foreign_keys=ON
+    failed with "no such table: main.documents". The runner must skip 021's
+    statements entirely (non-destructive), keep contradiction_log writable,
+    leave 021 unstamped, and apply it on a later run once the base tables
+    arrive — with pre-existing rows preserved.
+    """
+    db_path = str(tmp_path / "dangling_fk.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    run_migrations(conn)
+
+    # documents is created by db._init_schema, not by any migration file.
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='documents'"
+    ).fetchone() is None
+    # 021 skipped non-destructively: unstamped, user_version stays honest.
+    applied = {
+        v for (v,) in conn.execute("SELECT version FROM schema_migrations").fetchall()
+    }
+    assert 21 not in applied
+
+    # contradiction_log (from 009) must carry NO FK targeting documents ...
+    fk_targets = {
+        str(row[2]).lower()
+        for row in conn.execute("PRAGMA foreign_key_list(contradiction_log)").fetchall()
+    }
+    assert "documents" not in fk_targets
+    # ... so writes with FK enforcement ON succeed.
+    conn.execute(
+        "INSERT INTO contradiction_log (memory_a_id, memory_b_id, detected_at, detection_method) "
+        "VALUES (1, 2, 0.0, 'test')"
+    )
+    conn.commit()
+
+    # Base tables arrive later; retry applies 021 with data preserved.
+    _create_baseline_schema(conn)
+    run_migrations(conn)
+
+    applied_after = {
+        v for (v,) in conn.execute("SELECT version FROM schema_migrations").fetchall()
+    }
+    assert 21 in applied_after
+    assert verify_graph_schema(conn).ready is True
+    assert conn.execute("SELECT COUNT(*) FROM contradiction_log").fetchone()[0] == 1
+    conn.execute("INSERT INTO documents (path) VALUES ('retry-doc')")
+    doc_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO contradiction_log "
+        "(memory_a_id, memory_b_id, detected_at, detection_method, source_doc_id) "
+        "VALUES (1, 2, 0.0, 'test', ?)",
+        (doc_id,),
+    )
+    conn.commit()
+    conn.close()
