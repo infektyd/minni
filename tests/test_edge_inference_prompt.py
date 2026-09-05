@@ -275,3 +275,136 @@ def test_validate_edge_inference_fail_loud_matrix(corrupt_input, expected_error_
     assert edges is None
     assert err is not None
     assert expected_error_substring in err
+
+
+def _valid_item(pair_id="pair_1", **overrides):
+    item = {
+        "pair_id": pair_id,
+        "label": "updates",
+        "direction": "forward",
+        "confidence": 0.9,
+        "supporting_evidence_indices": [1],
+        "rationale": "ok",
+    }
+    item.update(overrides)
+    return item
+
+
+def test_validate_rejects_bool_confidence():
+    """Booleans are ints in Python; True/False must not pass as confidences."""
+    for bad in (True, False):
+        raw = json.dumps([_valid_item(confidence=bad)])
+        is_valid, edges, err = validate_edge_inference_response(
+            raw, ["pair_1"], line_counts_per_pair={"pair_1": 3}
+        )
+        assert is_valid is False
+        assert edges is None
+        assert err is not None and "invalid_confidence" in err
+
+
+def test_validate_accepts_int_confidence_in_range():
+    """Plain ints 0/1 are valid floats per the Output Schema range (no overreach)."""
+    for good in (0, 1):
+        raw = json.dumps([_valid_item(confidence=good)])
+        is_valid, edges, err = validate_edge_inference_response(
+            raw, ["pair_1"], line_counts_per_pair={"pair_1": 3}
+        )
+        assert is_valid is True, err
+        assert edges is not None and edges[0].confidence == float(good)
+
+
+def test_validate_rejects_unknown_and_missing_fields():
+    """Each item must carry exactly the six Output Schema keys."""
+    extra = _valid_item()
+    extra["injected"] = "prompt"
+    is_valid, _, err = validate_edge_inference_response(
+        json.dumps([extra]), ["pair_1"], line_counts_per_pair={"pair_1": 3}
+    )
+    assert is_valid is False
+    assert err is not None and "unknown_field" in err
+
+    dropped = _valid_item()
+    del dropped["rationale"]
+    is_valid, _, err = validate_edge_inference_response(
+        json.dumps([dropped]), ["pair_1"], line_counts_per_pair={"pair_1": 3}
+    )
+    assert is_valid is False
+    assert err is not None and "missing_field" in err
+
+
+def test_validate_rejects_duplicate_json_keys():
+    """json.loads collapses repeats; a masked pair_id must fail, not last-win."""
+    raw = (
+        '[{"pair_id": "pair_1", "pair_id": "pair_unknown", "label": "updates", '
+        '"direction": "forward", "confidence": 0.9, '
+        '"supporting_evidence_indices": [1], "rationale": "ok"}]'
+    )
+    is_valid, edges, err = validate_edge_inference_response(
+        raw, ["pair_1"], line_counts_per_pair={"pair_1": 3}
+    )
+    assert is_valid is False
+    assert edges is None
+    assert err is not None and "duplicate_field" in err
+
+
+def test_validate_rejects_malformed_expected_pair_ids():
+    """Caller-side ambiguity (dupes, empties, non-strings) fails the batch."""
+    raw = json.dumps([_valid_item()])
+    line_counts = {"pair_1": 3}
+    for bad_expected, code in (
+        (["pair_1", "pair_1"], "duplicate_expected_pair_id"),
+        (["pair_1", ""], "invalid_expected_pair_id"),
+        (["pair_1", 7], "invalid_expected_pair_id"),
+        (None, "invalid_expected_pair_ids"),
+    ):
+        is_valid, edges, err = validate_edge_inference_response(
+            raw, bad_expected, line_counts_per_pair=line_counts
+        )
+        assert is_valid is False
+        assert edges is None
+        assert err is not None and code in err
+
+
+@pytest.mark.parametrize(
+    "label,direction,compatible",
+    [
+        ("updates", "forward", True),
+        ("updates", "backward", True),
+        ("extends", "forward", True),
+        ("extends", "backward", True),
+        ("contradicts", "mutual", True),
+        ("contradicts", "forward", True),  # template allows forward/backward
+        ("contradicts", "backward", True),
+        ("relates", "mutual", True),
+        ("none", "none", True),
+        ("relates", "forward", False),
+        ("relates", "none", False),
+        ("none", "forward", False),
+        ("none", "mutual", False),
+        ("updates", "none", False),
+        ("updates", "mutual", False),
+        ("extends", "mutual", False),
+        ("contradicts", "none", False),
+    ],
+)
+def test_validate_label_direction_compatibility(label, direction, compatible):
+    """Enforce exactly the normative compatibility matrix from the prompt template."""
+    raw = json.dumps([_valid_item(label=label, direction=direction)])
+    is_valid, edges, err = validate_edge_inference_response(
+        raw, ["pair_1"], line_counts_per_pair={"pair_1": 3}
+    )
+    if compatible:
+        assert is_valid is True, err
+        assert edges is not None and len(edges) == 1
+    else:
+        assert is_valid is False
+        assert edges is None
+        assert err is not None and "incompatible_label_direction" in err
+
+
+@pytest.mark.parametrize("length,valid", [(200, True), (201, False)])
+def test_rationale_matches_prompt_limit(length, valid):
+    result, _, error = validate_edge_inference_response([_valid_item(rationale="x" * length)], ["pair_1"])
+    assert result is valid
+    if not valid:
+        assert "rationale_too_long" in error

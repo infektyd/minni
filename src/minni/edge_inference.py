@@ -33,6 +33,29 @@ EdgeDirection = Literal["forward", "backward", "mutual", "none"]
 VALID_EDGE_LABELS = frozenset({"updates", "extends", "contradicts", "relates", "none"})
 VALID_DIRECTIONS = frozenset({"forward", "backward", "mutual", "none"})
 
+# Exact per-item schema from the normative prompt template (Output Schema §).
+EXPECTED_ITEM_KEYS = frozenset(
+    {
+        "pair_id",
+        "label",
+        "direction",
+        "confidence",
+        "supporting_evidence_indices",
+        "rationale",
+    }
+)
+
+# Normative label/direction compatibility from the prompt template:
+# updates/extends take forward|backward; contradicts takes mutual (or
+# forward|backward); relates takes mutual only; none takes none only.
+COMPATIBLE_DIRECTIONS: Dict[str, frozenset] = {
+    "updates": frozenset({"forward", "backward"}),
+    "extends": frozenset({"forward", "backward"}),
+    "contradicts": frozenset({"mutual", "forward", "backward"}),
+    "relates": frozenset({"mutual"}),
+    "none": frozenset({"none"}),
+}
+
 
 @dataclass(frozen=True)
 class InferredEdge:
@@ -315,6 +338,25 @@ def _clean_json_text(raw_text: str) -> str:
     return text
 
 
+class _DuplicateFieldError(ValueError):
+    """Raised when a JSON object in a string response repeats a key."""
+
+
+def _no_duplicate_object_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    """object_pairs_hook that rejects duplicate keys instead of collapsing them.
+
+    json.loads silently keeps the last value for repeated keys, which would
+    let a model mask a bad pair_id (or any field) behind a good one. The
+    fail-loud contract treats duplicated fields as batch-invalid.
+    """
+    obj: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateFieldError(f"duplicate key {key!r} in JSON object")
+        obj[key] = value
+    return obj
+
+
 def validate_edge_inference_response(
     raw_response: Any,
     expected_pair_ids: Sequence[str],
@@ -323,12 +365,17 @@ def validate_edge_inference_response(
     """Strictly validate a model's batch classification response.
 
     Fail-Loud Contract (Spec §2.3, Addendum §7.2):
-    Missing/duplicate/unknown fields, invalid evidence refs, or truncation
-    invalidate the ENTIRE batch — partial graph commits are forbidden.
+    Missing/duplicate/unknown fields, invalid evidence refs, incompatible
+    label/direction pairs, or truncation invalidate the ENTIRE batch —
+    partial graph commits are forbidden. Each item must carry exactly the six
+    Output Schema keys; booleans are not valid confidences; label/direction
+    must satisfy the normative compatibility matrix.
 
     Args:
         raw_response: Raw response string or parsed JSON structure.
         expected_pair_ids: Ordered list of pair_ids included in the request.
+            Must contain unique non-empty strings; a malformed expectation is
+            itself a caller error and fails the batch.
         line_counts_per_pair: Optional map from pair_id to number of numbered excerpt lines.
 
     Returns:
@@ -336,14 +383,27 @@ def validate_edge_inference_response(
         - If valid: (True, [InferredEdge, ...], None)
         - If invalid: (False, None, error_code_or_reason)
     """
-    expected_set = set(expected_pair_ids)
+    # 0. Caller contract: the expectation list must be unambiguous.
+    try:
+        expected_list = list(expected_pair_ids)
+    except TypeError:
+        return False, None, f"invalid_expected_pair_ids: {expected_pair_ids!r} is not a sequence"
+    for eid in expected_list:
+        if not isinstance(eid, str) or not eid:
+            return False, None, f"invalid_expected_pair_id: expected pair ids must be non-empty strings, got {eid!r}"
+    if len(set(expected_list)) != len(expected_list):
+        dupes = sorted({eid for eid in expected_list if expected_list.count(eid) > 1})
+        return False, None, f"duplicate_expected_pair_id: expected batch repeats {dupes}"
+    expected_set = set(expected_list)
 
     # 1. Parse JSON if string
     parsed_items: Any = raw_response
     if isinstance(raw_response, str):
         cleaned = _clean_json_text(raw_response)
         try:
-            parsed_items = json.loads(cleaned)
+            parsed_items = json.loads(cleaned, object_pairs_hook=_no_duplicate_object_pairs)
+        except _DuplicateFieldError as exc:
+            return False, None, f"duplicate_field: {exc}"
         except Exception as exc:
             return False, None, f"json_decode_error: {exc}"
 
@@ -357,13 +417,30 @@ def validate_edge_inference_response(
         if not isinstance(item, dict):
             return False, None, f"schema_error: item {idx} is not a dictionary"
 
+        # Exact schema: no missing keys, no unknown keys.
+        item_keys = set(item.keys())
+        missing_keys = EXPECTED_ITEM_KEYS - item_keys
+        if missing_keys:
+            return (
+                False,
+                None,
+                f"missing_field: item {idx} missing fields {sorted(missing_keys)}",
+            )
+        unknown_keys = item_keys - EXPECTED_ITEM_KEYS
+        if unknown_keys:
+            return (
+                False,
+                None,
+                f"unknown_field: item {idx} has unexpected fields {sorted(unknown_keys)}",
+            )
+
         # Check pair_id
         pair_id = item.get("pair_id")
         if not pair_id or not isinstance(pair_id, str):
             return False, None, f"missing_or_invalid_pair_id: item {idx} has pair_id={pair_id!r}"
 
         if pair_id not in expected_set:
-            return False, None, f"unknown_pair_id: {pair_id} not in expected batch {list(expected_pair_ids)}"
+            return False, None, f"unknown_pair_id: {pair_id} not in expected batch {expected_list}"
 
         if pair_id in seen_pair_ids:
             return False, None, f"duplicate_pair_id: {pair_id} appears multiple times in batch"
@@ -379,9 +456,23 @@ def validate_edge_inference_response(
         if direction not in VALID_DIRECTIONS:
             return False, None, f"invalid_direction: pair {pair_id} has unsupported direction {direction!r}"
 
-        # Check confidence
+        # Check normative label/direction compatibility
+        if direction not in COMPATIBLE_DIRECTIONS[label]:
+            return (
+                False,
+                None,
+                f"incompatible_label_direction: pair {pair_id} label {label!r} "
+                f"is incompatible with direction {direction!r}",
+            )
+
+        # Check confidence (bools are not confidences: isinstance(True, int)).
         confidence = item.get("confidence")
-        if not isinstance(confidence, (int, float)) or math.isnan(confidence) or math.isinf(confidence):
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or math.isnan(confidence)
+            or math.isinf(confidence)
+        ):
             return False, None, f"invalid_confidence: pair {pair_id} confidence {confidence!r} is not finite float"
         confidence_float = float(confidence)
         if not (0.0 <= confidence_float <= 1.0):
@@ -412,8 +503,8 @@ def validate_edge_inference_response(
         rationale = item.get("rationale")
         if not isinstance(rationale, str) or not rationale.strip():
             return False, None, f"missing_or_empty_rationale: pair {pair_id} rationale missing or empty"
-        if len(rationale) > 500:
-            return False, None, f"rationale_too_long: pair {pair_id} rationale length {len(rationale)} > 500 chars"
+        if len(rationale) > 200:
+            return False, None, f"rationale_too_long: pair {pair_id} rationale length {len(rationale)} > 200 chars"
 
         validated_edges.append(
             InferredEdge(
