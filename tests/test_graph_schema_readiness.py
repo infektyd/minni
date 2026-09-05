@@ -449,6 +449,47 @@ def test_tc_ready_07_drifted_index_unique_and_partial_predicate():
     assert report4.ready is True
     assert report4.status == "ready"
 
+    # Sub-case E: Collation drift changes URI deduplication semantics
+    conn5 = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn5)
+    _apply_migration_021_sql(conn5)
+
+    conn5.executescript(
+        """
+        DROP INDEX idx_documents_memory_uri;
+        CREATE UNIQUE INDEX idx_documents_memory_uri
+            ON documents(memory_uri COLLATE NOCASE) WHERE memory_uri IS NOT NULL;
+        """
+    )
+    conn5.commit()
+
+    report5 = verify_graph_schema(conn5)
+    assert report5.ready is False
+    assert report5.status == "schema_drifted"
+    assert any("collation mismatch" in err for err in report5.errors)
+
+
+def test_tc_ready_rejects_unexpectedly_partial_required_index():
+    """A required non-partial index recreated with a WHERE clause flags drift."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+
+    conn.executescript(
+        """
+        DROP INDEX idx_memory_links_target_active;
+        CREATE INDEX idx_memory_links_target_active
+            ON memory_links(target_doc_id, edge_status, link_type, source_doc_id)
+            WHERE edge_status = 'active';
+        """
+    )
+    conn.commit()
+
+    report = verify_graph_schema(conn)
+    assert report.ready is False
+    assert report.status == "schema_drifted"
+    assert any("unexpectedly partial" in err for err in report.errors)
+
 
 def test_tc_ready_drifted_fk_referencing_wrong_column():
     """Regression: FK on learning_documents referencing wrong column learnings(category) flags drift."""
