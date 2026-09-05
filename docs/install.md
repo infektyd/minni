@@ -21,6 +21,8 @@ Operator docs must not lie about **present** behavior. Accuracy work must
 
 ## Keep every agent host current (`minni sync`)
 
+Existing Hermes source bindings receive a read-only artifact check during sync; configuration stays unchanged and loaded sessions require a separate reload. See [Hermes sync coverage and limitations](hermes-sync.md).
+
 After you upgrade the package **or** pull a newer `main` in a dogfood
 checkout, the **daemon can move while each agent host still points at last
 week's plugin tree**. That is a real failure mode, not a power-user tip.
