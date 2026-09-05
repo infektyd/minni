@@ -185,3 +185,61 @@ def test_update_root_hermes_stage_propagates_failure(tmp_path):
         "--wire-report",
         env["_WIRE_JSON"],
     ]
+
+
+def test_merge_defaults_and_explicit_overrides_match_safe_yaml(setup):
+    import yaml
+    from minni.wire.hermes import _yaml
+
+    repo, payload, config, server = setup
+    config.write_text(f"""base: &base
+  command: node
+  enabled: false
+second: &second
+  <<: *base
+  enabled: true
+mcp_servers:
+  minni:
+    <<: [*second, *base]
+    args: [{server}]
+    env: {{MINNI_AGENT_ID: hermes}}
+  other:
+    <<: *second
+""")
+    before = config.read_bytes()
+    assert _yaml(before) == yaml.safe_load(before)
+    assert inspect_hermes(repo=repo, new_root=payload)["artifact"] == "verified"
+    assert config.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "base: &base {enabled: true, enabled: false}\nmcp_servers: {minni: {<<: *base}}",
+        "base: &base {enabled: true}\nmcp_servers: {minni: {<<: *base, enabled: false, enabled: true}}",
+        "base: &base {enabled: true}\nmcp_servers: {minni: {<<: *base, <<: *base}}",
+    ],
+)
+def test_merge_does_not_hide_explicit_duplicate_keys(setup, body):
+    repo, payload, config, _ = setup
+    config.write_text(body)
+    assert inspect_hermes(repo=repo, new_root=payload)["status"] == "incomplete"
+    assert config.read_text() == body
+
+
+@pytest.mark.parametrize("dual", [False, True])
+def test_legacy_binding_and_dual_name_ambiguity(setup, dual):
+    repo, payload, config, _ = setup
+    text = config.read_text().replace("  minni:", "  sovereign-memory:")
+    if dual:
+        text += "  minni: {enabled: false}\n"
+    config.write_text(text)
+    result = inspect_hermes(repo=repo, new_root=payload)
+    assert result["status"] == ("incomplete" if dual else "artifact_current")
+    assert config.read_text() == text
+
+
+def test_dry_run_skipped_from_applied_count(setup):
+    repo, _, _, _ = setup
+    result = inspect_hermes(repo=repo, dry_run=True)
+    assert result["skipped"] is True and result["artifact"] == "not_validated"

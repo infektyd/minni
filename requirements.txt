@@ -34,3 +34,6 @@ ruff>=0.15.20
 
 # Optional: for better SQLite FTS tokenization
 # icu4c (system package)
+
+# Existing Hermes YAML binding validation during sync.
+PyYAML>=6.0.3

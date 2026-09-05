@@ -15,16 +15,25 @@ def _yaml(data: bytes) -> dict:
     import yaml
 
     class UniqueLoader(yaml.SafeLoader):
-        pass
+        def flatten_mapping(self, node):
+            # Check explicit keys before SafeLoader expands merge defaults.
+            # Explicit overrides of merged values are valid YAML semantics.
+            checked = getattr(self, "_checked_mapping_nodes", set())
+            if id(node) in checked:
+                return
+            checked.add(id(node))
+            self._checked_mapping_nodes = checked
+            seen = set()
+            for key_node, _ in node.value:
+                key = "<<" if key_node.tag == "tag:yaml.org,2002:merge" else self.construct_object(key_node)
+                if key in seen:
+                    raise ValueError("duplicate YAML key")
+                seen.add(key)
+            super().flatten_mapping(node)
 
     def mapping(loader, node):
-        result = {}
-        for key_node, value_node in node.value:
-            key = loader.construct_object(key_node)
-            if key in result:
-                raise ValueError("duplicate YAML key")
-            result[key] = loader.construct_object(value_node)
-        return result
+        loader.flatten_mapping(node)
+        return loader.construct_mapping(node, deep=True)
 
     UniqueLoader.add_constructor("tag:yaml.org,2002:map", mapping)
     result = yaml.load(data, Loader=UniqueLoader)
@@ -55,8 +64,11 @@ def inspect_hermes(*, repo: Path | None, new_root: Path | None = None, dry_run: 
         servers = data.get("mcp_servers", {})
         if not isinstance(servers, dict):
             raise ValueError("invalid server table")
-        entry = servers.get("minni")
-        if entry is None:
+        names = [name for name in ("minni", "sovereign-memory") if name in servers]
+        if len(names) > 1:
+            return incomplete("Both Minni and legacy Hermes bindings exist; ambiguous configuration preserved")
+        entry = servers[names[0]] if names else None
+        if not names:
             return skip("Hermes Minni binding absent; no activation")
         if not isinstance(entry, dict):
             raise ValueError("invalid Minni entry")
@@ -85,6 +97,7 @@ def inspect_hermes(*, repo: Path | None, new_root: Path | None = None, dry_run: 
             return {
                 **result,
                 "status": "dry-run",
+                "skipped": True,
                 "artifact": "not_validated",
                 "reason": "Would validate source artifact after build; existing sessions require /reload-mcp",
             }
