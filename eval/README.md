@@ -274,23 +274,35 @@ separately. Arbitrary paths and vault dumps are never accepted.
 Packet shape (`packet_version: "minni-study-export-v1"`):
 
 - `principal.agent_id`, `store.{store_id, origin}`, `source.origin`,
-  `authorization.claimed` — recorded as supplied provenance, never as
-  independently verified permission.
-- `records[]` — each with `source_doc_id`, `store`, relative `.md`
+  `authorization.claimed` — a supplied claim recorded as provenance, never
+  authentication proof and never independently verified permission.
+- `records[]` — each with a `(store, source_doc_id)` tuple identity (the
+  same document number in two stores names two documents), relative `.md`
   `artifact_path` (no absolutes, no `..`), `text` plus matching
   `content_sha256`, `content_kind: original|excerpt` (excerpts must cite a
   `source_locator`), `review_state: machine_proposed` with
-  `human_reviewed: false`, source-ownership `agent`, `privacy_level`,
-  clear `origin`, and an explicit boolean `expected_eligible`
+  `human_reviewed: false`, source-ownership `agent`, `privacy_level`, clear
+  `origin`, original lifecycle `page_status`/`page_type`, an explicit boolean
+  `expected_eligible`, and optional scalar-only `source_detail`
   (cross-project eligibility is annotated before retrieval, never inferred
   from it; project directories are ordinary paths, not authorization
   boundaries).
 
-Validation rejects tampered manifests (digest over canonical records),
-tampered content, duplicate source identity across stores, duplicate content
-digests, unsafe artifact paths, missing excerpt/original labels, any
-human-reviewed claim, and malformed fields. Machine judgments are never
-labeled human-reviewed.
+Hard input bounds (1000 records, 100k chars / 400k UTF-8 bytes per text,
+5M chars total, plus length caps on every metadata string, capability list,
+and scalar-only finite `source_detail`) fire before any hashing, writes, or
+DB work. Validation then rejects tampered manifests — the digest binds
+canonical source/principal/authorization metadata AND lifecycle fields, so
+swapping any of them invalidates the snapshot — tampered content, duplicate
+`(store, source_doc_id)` tuples, unsafe artifact paths (canonical segments
+only: `a/./n.md`, `a//n.md`, and trailing-slash aliases are rejected),
+unbound extra fields, missing excerpt/original labels, any human-reviewed
+claim, and malformed fields. Identical bytes under separate ownership are
+allowed and linked through a shared content group (`content_groups` in the
+manifest), never silently conflated. Machine judgments are never labeled
+human-reviewed: original lifecycle/privacy provenance is preserved in
+`source_provenance`, the study judgment lives separately in
+`study_judgment`.
 
 ```sh
 PYTHONPATH=src .venv/bin/python - <<'EOF'
@@ -310,11 +322,25 @@ EOF
 `prepare_snapshot` freezes vault files, a deterministic opaque remapping
 (`study-0001…`, sorted by store/source identity), and `snapshot.json` whose
 `snapshot_id` derives from the manifest digest only — snapshot IDs are never
-assigned to the live corpus. `materialize_snapshot_db` mirrors the fixture's
-isolated construction with every DB/index/vault path inside the snapshot
-directory, ownership/privacy metadata preserved, writeback disabled, and no
-model loaded. Refreshing the corpus means a new snapshot directory, never
-silent file swaps.
+assigned to the live corpus. Destinations that are, contain, or sit inside
+live/default paths are rejected before anything is written, and preparation
+refuses a non-empty destination so a second packet can never mix bytes into
+an existing snapshot. Frozen files and metadata re-validate on every
+materialization and every search (`verify_snapshot`): symlinks in any path
+component (including vault ancestors and the snapshot root/outputs),
+tampered bytes, inconsistent mappings, unmapped vault files, invented
+snapshot IDs, edited identity mirrors, and digest mismatches all fail, and
+`mapping.json` carries the manifest/snapshot IDs so outputs can never mix
+across snapshots. Reads use strict JSON (no NaN/Infinity) with size
+preflights before any bytes load. `materialize_snapshot_db` runs once per
+prepared directory, mirrors the fixture's isolated construction with every
+DB/index/vault path inside the snapshot directory, preserves original
+ownership/lifecycle/privacy metadata per record, disables writeback, and
+loads no model; `check_materialized` re-binds every `document_ids` entry to
+the actual immutable SQLite rows and FTS text over a read-only handle
+(runtime access counters are excluded, so normal governed search effects
+never read as tampering). Refreshing the corpus means a new snapshot
+directory, never silent file swaps.
 
 Run governed retrieval over the frozen corpus with the isolated backend:
 

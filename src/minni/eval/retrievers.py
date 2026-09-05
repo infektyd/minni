@@ -175,25 +175,22 @@ class SnapshotSearcher(SearcherProtocol):
     backend = "snapshot"
 
     def __init__(self, snapshot_dir: Path) -> None:
-        import json as _json
+        from .study_snapshot import check_materialized, verify_snapshot
 
         root = Path(snapshot_dir)
-        manifest_path = root / "snapshot.json"
         try:
-            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise ValueError(f"snapshot directory {root} has no snapshot.json") from exc
+            verified = verify_snapshot(root)
+            check_materialized(root)
         except ValueError as exc:
-            raise ValueError(f"snapshot directory {root} has an unreadable manifest") from exc
-        from .study_snapshot import SNAPSHOT_VERSION
-
-        if manifest.get("snapshot_version") != SNAPSHOT_VERSION:
-            raise ValueError("snapshot manifest version mismatch; re-prepare the snapshot")
-        if manifest.get("human_reviewed") is not False:
-            raise ValueError("snapshot manifest must keep human_reviewed=false")
+            raise ValueError(f"snapshot directory {root} failed frozen validation: {exc}") from exc
+        manifest = verified["manifest"]
+        # The digest-bound identity block is authoritative; the display
+        # mirrors in the manifest are validated against it by verify and are
+        # never consumed directly.
+        identity = manifest.get("identity") or {}
         self.snapshot_dir = root
         self.snapshot_id = manifest.get("snapshot_id", "unknown")
-        self._agent_id = str((manifest.get("principal") or {}).get("agent_id") or "study")
+        self._agent_id = str((identity.get("principal") or {}).get("agent_id") or "study")
         self._engine = None
         self._principal = None
 
@@ -204,14 +201,21 @@ class SnapshotSearcher(SearcherProtocol):
         from minni.db import SovereignDB
         from minni.principal import EffectivePrincipal
         from minni.retrieval import RetrievalEngine
+        from .study_snapshot import check_materialized, snapshot_config_paths, verify_snapshot
 
         root = self.snapshot_dir
+        # Re-validate frozen files, metadata, and materialized outputs before
+        # opening the disposable backend: symlinks, tampered bytes,
+        # inconsistent mappings, and stale-output mixing all fail here.
+        verify_snapshot(root)
+        materialized = check_materialized(root)
+        paths = snapshot_config_paths(root)
         config = SovereignConfig(
-            db_path=str(root / "study.db"),
-            vault_path=str(root / "vault"),
-            faiss_index_path=str(root / "study.faiss"),
-            graph_export_dir=str(root / "graphs"),
-            writeback_path=str(root / "learnings"),
+            db_path=paths["db_path"],
+            vault_path=paths["vault_path"],
+            faiss_index_path=paths["faiss_index_path"],
+            graph_export_dir=paths["graph_export_dir"],
+            writeback_path=paths["writeback_path"],
             writeback_enabled=False,
             reranker_enabled=False,
             hyde_enabled=False,
@@ -221,11 +225,17 @@ class SnapshotSearcher(SearcherProtocol):
         self._principal = EffectivePrincipal(
             agent_id=self._agent_id,
             capabilities=["search", "read"],
-            allowed_vault_roots=[str(root / "vault")],
+            allowed_vault_roots=[paths["vault_path"]],
         )
+        self._materialized = materialized
         return self._engine
 
     def search(self, query: str, **kwargs) -> List[Dict[str, Any]]:
+        from .study_snapshot import check_materialized, verify_snapshot
+
+        # Frozen state is re-validated before every search, not just at open.
+        verify_snapshot(self.snapshot_dir)
+        check_materialized(self.snapshot_dir)
         engine = self._ensure_engine()
         search_kwargs = {
             "limit": kwargs.get("limit", 10),
