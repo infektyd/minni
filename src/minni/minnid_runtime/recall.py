@@ -788,7 +788,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     degradation["source_agent"] = source_agent
                 elif "source_agent" in degradation:
                     degradation.pop("source_agent", None)
-            else:
+            elif not deadline_interrupted:
                 degradation = _degradation_for(
                     retrieval_engine, src, source_agent=source_agent
                 )
