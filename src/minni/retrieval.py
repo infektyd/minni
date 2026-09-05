@@ -4631,40 +4631,55 @@ class RetrievalEngine:
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
         claim: Optional[str] = None,
+        # Identifier-kind disambiguation: "auto" keeps the legacy chunk-first
+        # then doc fallback; "chunk"/"doc" restrict to that namespace only.
+        id_kind: str = "auto",
     ) -> Optional[Dict]:
         """
         Re-fetch a specific result at a deeper depth tier.
 
-        *result_id* may be either a chunk_id or a doc_id; this method tries
-        chunk_id first, then falls back to doc_id.
+        *result_id* may be either a chunk_id or a doc_id; with the default
+        ``id_kind="auto"`` this method tries chunk_id first, then falls back
+        to doc_id (legacy bare-result_id behavior). Pass ``id_kind="doc"``
+        when the id is known to be a doc_id (source/path/wikilink drill
+        resolution) or ``id_kind="chunk"`` for an explicit chunk_id, so a
+        doc_id that numerically collides with another document's chunk_id
+        cannot resolve to the wrong document.
 
         Args:
             result_id: chunk_id or doc_id from a prior search result.
             depth: Target depth tier ('chunk' or 'document'). Defaults to 'chunk'.
             update_access: Whether to bump access_count on the document.
+            id_kind: "auto" (legacy), "chunk", or "doc".
 
         Returns:
             A result dict at the requested depth, or None if not found.
         """
         if depth not in _VALID_DEPTHS:
             depth = "chunk"
+        normalized_kind = str(id_kind or "auto").strip().lower()
+        if normalized_kind not in {"auto", "chunk", "doc"}:
+            raise ValueError(
+                f'unknown id_kind {id_kind!r}; valid values: "auto", "chunk", "doc"'
+            )
 
         import os
 
         row = None
-        with self.db.cursor() as c:
-            # Try chunk_id first
-            c.execute("""
-                SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
-                       d.path, d.agent, d.sigil, d.decay_score,
-                       d.privacy_level, d.page_type, d.page_status
-                FROM chunk_embeddings ce
-                JOIN documents d ON d.doc_id = ce.doc_id
-                WHERE ce.chunk_id = ?
-            """, (result_id,))
-            row = c.fetchone()
+        if normalized_kind in {"auto", "chunk"}:
+            with self.db.cursor() as c:
+                # Try chunk_id first
+                c.execute("""
+                    SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+                           d.path, d.agent, d.sigil, d.decay_score,
+                           d.privacy_level, d.page_type, d.page_status
+                    FROM chunk_embeddings ce
+                    JOIN documents d ON d.doc_id = ce.doc_id
+                    WHERE ce.chunk_id = ?
+                """, (result_id,))
+                row = c.fetchone()
 
-        if row is None:
+        if row is None and normalized_kind in {"auto", "doc"}:
             # Fall back to doc_id: get the best chunk for this document
             with self.db.cursor() as c:
                 c.execute("""
