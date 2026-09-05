@@ -251,7 +251,9 @@ def principal_provenance(retriever_name: str, *, is_mock: bool) -> Dict[str, Any
     }
 
 
-def corpus_provenance(*, is_mock: bool, retriever_name: str = "") -> Dict[str, Any]:
+def corpus_provenance(*, is_mock: bool, retriever_name: str = "",
+                      snapshot_id: str | None = None,
+                      manifest_digest: str | None = None) -> Dict[str, Any]:
     """Corpus/database identity per backend: only what is verifiably available.
 
     Only the live-engine backends touch a database at all. File baselines
@@ -290,7 +292,8 @@ def corpus_provenance(*, is_mock: bool, retriever_name: str = "") -> Dict[str, A
         }
     if key in {"snapshot", "study-snapshot", "study_snapshot"}:
         return {
-            "snapshot": "study-frozen",
+            "snapshot": snapshot_id or "study-frozen",
+            "manifest_digest": manifest_digest,
             "frozen": True,
             "note": "Disposable study snapshot: all DB/index/vault paths live "
                     "inside the prepared snapshot directory under a manifest "

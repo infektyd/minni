@@ -79,6 +79,8 @@ MAX_AGENT_CHARS = 128
 MAX_PRIVACY_CHARS = 64
 MAX_LIFECYCLE_CHARS = 64
 MAX_LOCATOR_CHARS = 512
+MAX_ARTIFACT_PATH_CHARS = 512
+MAX_TOTAL_ARTIFACT_PATH_CHARS = 256_000
 # Frozen-file read caps: no unbounded read happens before a size preflight.
 MAX_VAULT_FILE_BYTES = MAX_TEXT_BYTES + 1_024
 MAX_METADATA_BYTES = 4_000_000
@@ -133,6 +135,10 @@ def _check_artifact_path(raw: Any) -> str:
     same vault file under different names.
     """
     value = _require_nonempty_str(raw, "record artifact_path")
+    if len(value) > MAX_ARTIFACT_PATH_CHARS:
+        raise StudySnapshotError(
+            f"record artifact_path exceeds {MAX_ARTIFACT_PATH_CHARS} chars"
+        )
     if "\\" in value:
         raise StudySnapshotError("record artifact_path must use forward slashes")
     segments = value.split("/")
@@ -314,7 +320,7 @@ def snapshot_id_for(manifest_digest: str) -> str:
 
 def content_group_for(content_sha256: str) -> str:
     """Relationship label shared by every record carrying identical bytes."""
-    return f"{CONTENT_GROUP_PREFIX}{content_sha256[:12]}"
+    return f"{CONTENT_GROUP_PREFIX}{content_sha256.lower()}"
 
 
 _RECORD_KEYS = frozenset({
@@ -353,6 +359,7 @@ def validate_export_packet(packet: Any) -> List[Dict[str, Any]]:
 
     normalized: List[Dict[str, Any]] = []
     total_chars = 0
+    total_artifact_path_chars = 0
     for index, raw in enumerate(records):
         label = f"record[{index}]"
         row = _require_dict(raw, label)
@@ -367,6 +374,11 @@ def validate_export_packet(packet: Any) -> List[Dict[str, Any]]:
         store_id = _require_bounded_str(
             row.get("store"), f"{label} store", MAX_STORE_ID_CHARS)
         artifact_path = _check_artifact_path(row.get("artifact_path"))
+        total_artifact_path_chars += len(artifact_path)
+        if total_artifact_path_chars > MAX_TOTAL_ARTIFACT_PATH_CHARS:
+            raise StudySnapshotError(
+                f"packet artifact paths exceed {MAX_TOTAL_ARTIFACT_PATH_CHARS} chars in total"
+            )
         text = row.get("text")
         if not isinstance(text, str) or not text.strip():
             raise StudySnapshotError(f"{label} text must be a non-empty string")
@@ -427,7 +439,10 @@ def validate_export_packet(packet: Any) -> List[Dict[str, Any]]:
                 "(cross-project eligibility is annotated, never inferred)"
             )
         page_status = _require_bounded_str(
-            row.get("page_status", "active"), f"{label} page_status", MAX_LIFECYCLE_CHARS)
+            row.get("page_status", "draft"), f"{label} page_status", MAX_LIFECYCLE_CHARS)
+        if page_status not in {"draft", "candidate", "accepted", "superseded",
+                               "rejected", "expired", "complete"}:
+            raise StudySnapshotError(f"{label}: page_status is not a recognized lifecycle status")
         page_type = _require_bounded_str(
             row.get("page_type", "note"), f"{label} page_type", MAX_LIFECYCLE_CHARS)
         if source_locator is not None and len(source_locator) > MAX_LOCATOR_CHARS:
@@ -758,6 +773,8 @@ def verify_snapshot(snapshot_dir: Path) -> Dict[str, Any]:
         raise StudySnapshotError("snapshot manifest must keep human_reviewed=false")
     if not isinstance(envelope, dict) or not isinstance(envelope.get("records"), dict):
         raise StudySnapshotError("mapping.json must hold a records object with the manifest digest")
+    if envelope.get("snapshot_version") != SNAPSHOT_VERSION:
+        raise StudySnapshotError("mapping.json version mismatch; re-prepare the snapshot")
     if envelope.get("snapshot_id") != manifest.get("snapshot_id"):
         raise StudySnapshotError(
             "mapping.json snapshot ID does not match snapshot.json; outputs "
@@ -937,6 +954,10 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
     manifest, mapping = verified["manifest"], verified["mapping"]
     vault_root = snapshot_dir / "vault"
 
+    _assert_no_symlink_components(snapshot_dir / "study.db", snapshot_dir,
+                                  "materialized snapshot database")
+    _assert_no_symlink_components(snapshot_dir / "materialized.json", snapshot_dir,
+                                  "materialized outputs")
     if (snapshot_dir / "study.db").exists() or (snapshot_dir / "materialized.json").exists():
         raise StudySnapshotError(
             "snapshot outputs already exist; materialization runs once per "
@@ -1014,7 +1035,7 @@ def _immutable_db_rows(db_path: Path) -> Dict[str, Dict[str, Any]]:
         try:
             handle.execute("PRAGMA query_only = ON")
             documents = handle.execute(
-                "SELECT doc_id, path, agent, privacy_level, page_status, page_type, sigil"
+                "SELECT doc_id, path, agent, privacy_level, page_status, page_type, sigil, decay_score"
                 " FROM documents"
             ).fetchall()
             fts_rows = handle.execute(
@@ -1040,10 +1061,11 @@ def _immutable_db_rows(db_path: Path) -> Dict[str, Dict[str, Any]]:
         )
     fts = {doc_id: (path, content, agent) for doc_id, path, content, agent in fts_rows}
     rows: Dict[str, Dict[str, Any]] = {}
-    for doc_id, path, agent, privacy_level, page_status, page_type, sigil in documents:
+    for doc_id, path, agent, privacy_level, page_status, page_type, sigil, decay_score in documents:
         rows[str(doc_id)] = {
             "path": path, "agent": agent, "privacy_level": privacy_level,
             "page_status": page_status, "page_type": page_type, "sigil": sigil,
+            "decay_score": decay_score,
             "fts": fts.get(doc_id),
         }
     return rows
@@ -1122,6 +1144,7 @@ def check_materialized(snapshot_dir: Path) -> Dict[str, Any]:
                 or actual["privacy_level"] != provenance.get("privacy_level", row.get("privacy_level"))
                 or actual["page_status"] != provenance.get("page_status", "active")
                 or actual["page_type"] != provenance.get("page_type", "note")
+                or actual["decay_score"] != 1.0
                 or actual["sigil"] != "T"
                 or fts_path != expected_path
                 or fts_content != expected_text

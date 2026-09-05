@@ -59,6 +59,7 @@ from .retrievers import (
     RealSearcher,
     RipgrepSearcher,
     SearcherProtocol,
+    SnapshotSearcher,
     VendorMemorySearcher,
     make_searcher,
 )
@@ -453,7 +454,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             logger.info("Evaluating retriever=%s config=%s", retriever_name, config_name)
             try:
                 report = run_eval(searcher, queries, report_name, config_kwargs, ks=ks,
-                                  strict_search=getattr(args, "quality_gate", False))
+                                  strict_search=(getattr(args, "quality_gate", False)
+                                                 or isinstance(searcher, SnapshotSearcher)))
             except RuntimeError:
                 logger.error("Quality evaluation aborted: retrieval failed; no comparison accepted")
                 sys.exit(3)
@@ -466,7 +468,12 @@ def cmd_run(args: argparse.Namespace) -> None:
                     config_name, config_kwargs, KNOWN_RETRIEVE_KWARGS
                 ),
                 principal=principal_provenance(retriever_name, is_mock=is_mock),
-                corpus=corpus_provenance(is_mock=is_mock, retriever_name=retriever_name),
+                corpus=corpus_provenance(
+                    is_mock=is_mock,
+                    retriever_name=retriever_name,
+                    snapshot_id=getattr(searcher, "snapshot_id", None),
+                    manifest_digest=getattr(searcher, "manifest_digest", None),
+                ),
                 environment=env_prov,
                 retriever_name=retriever_name,
                 run_index=run_order.index(report_name),

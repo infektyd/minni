@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -190,6 +191,7 @@ class SnapshotSearcher(SearcherProtocol):
         identity = manifest.get("identity") or {}
         self.snapshot_dir = root
         self.snapshot_id = manifest.get("snapshot_id", "unknown")
+        self.manifest_digest = manifest.get("manifest_digest", "unknown")
         self._agent_id = str((identity.get("principal") or {}).get("agent_id") or "study")
         self._engine = None
         self._principal = None
@@ -233,6 +235,8 @@ class SnapshotSearcher(SearcherProtocol):
     def search(self, query: str, **kwargs) -> List[Dict[str, Any]]:
         from .study_snapshot import check_materialized, verify_snapshot
 
+        if kwargs.get("expand") not in (None, False, "off") or kwargs.get("use_hyde"):
+            raise ValueError("snapshot retrieval supports lexical-only baseline configuration")
         # Frozen state is re-validated before every search, not just at open.
         verify_snapshot(self.snapshot_dir)
         check_materialized(self.snapshot_dir)
@@ -244,9 +248,12 @@ class SnapshotSearcher(SearcherProtocol):
             "use_hyde": False,
             "budget_tokens": kwargs.get("budget_tokens", True),
             "principal": self._principal,
+            "deadline_monotonic": time.monotonic() - 1,
         }
         if kwargs.get("deadline_monotonic") is not None:
-            search_kwargs["deadline_monotonic"] = kwargs["deadline_monotonic"]
+            search_kwargs["deadline_monotonic"] = min(
+                search_kwargs["deadline_monotonic"], kwargs["deadline_monotonic"]
+            )
         return engine.retrieve(query, **search_kwargs)
 
 
