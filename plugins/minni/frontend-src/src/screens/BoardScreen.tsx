@@ -1,3 +1,4 @@
+import { stagedCountLabel } from "../board/boardData";
 // Minni Memory Board — infinite-canvas prezi shell (camera, morph, chrome).
 import {
   useCallback,
@@ -181,14 +182,13 @@ export function BoardScreen({
     };
     z.staged = {
       ...z.staged,
-      label: zoneLabel("STAGED · LEARN CANDIDATES", {
+      label: zoneLabel(`STAGED · ${stagedState.principal ?? "scope unknown"}${stagedState.isLive ? ` · ${stagedCountLabel(stagedState.learnings.length, stagedState.hasMore)}` : ""}`, {
         isLive: stagedState.isLive,
-        count: stagedState.learnings.length,
         loading: stagedState.loading,
         error: stagedState.error,
       }),
       title: titleFor(
-        "Staged learnings",
+        `Staged learnings · ${stagedState.principal ?? "scope unknown"}`,
         stagedState.isLive,
         stagedState.loading,
         stagedState.error,
@@ -250,6 +250,8 @@ export function BoardScreen({
     stagedState.loading,
     stagedState.error,
     stagedState.learnings.length,
+    stagedState.principal,
+    stagedState.hasMore,
     logState.isLive,
     logState.loading,
     logState.error,
@@ -569,7 +571,7 @@ export function BoardScreen({
           }
         >
           {stagedState.isLive
-            ? `${stagedState.learnings.length} STAGED`
+            ? `${stagedCountLabel(stagedState.learnings.length, stagedState.hasMore)} STAGED · ${stagedState.principal ?? "scope unknown"}`
             : stagedState.loading && !stagedState.error
               ? "STAGED · …"
               : "STAGED · OFFLINE"}

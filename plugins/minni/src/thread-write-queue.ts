@@ -444,6 +444,16 @@ export async function isWorkerWriteDrainStuck(
   stuckMs: number = DEFAULT_DRAIN_STUCK_MS,
 ): Promise<boolean> {
   const items = await listQueuedWorkerWrites(vaultPath, planId);
+  return queueSnapshotLooksStuck(vaultPath, planId, now, stuckMs, items);
+}
+
+async function queueSnapshotLooksStuck(
+  vaultPath: string,
+  planId: string,
+  now: Date,
+  stuckMs: number,
+  items: QueuedWorkerWrite[],
+): Promise<boolean> {
   if (items.length === 0) return false;
   if (!(await lockHeldLive(vaultPath, planId))) return false;
   const head = items[0];
@@ -493,7 +503,10 @@ export async function enqueueWorkerWrite(
   if (items.length >= queueMax) {
     throw new ThreadBusyError();
   }
-  if (await isWorkerWriteDrainStuck(input.vaultPath, input.planId, now, stuckMs)) {
+  // Capacity and stuck detection use the same validated snapshot from this
+  // enqueue attempt. Never retain it across requests or use it to select work
+  // for drain; drain still reads the authoritative queue under its lock.
+  if (await queueSnapshotLooksStuck(input.vaultPath, input.planId, now, stuckMs, items)) {
     const ownerPath = path.join(lockDirFor(input.vaultPath, input.planId), "owner.json");
     let owner: ThreadLockOwner | undefined;
     try {

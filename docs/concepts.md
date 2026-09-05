@@ -5,14 +5,20 @@
 | Verb | What happens | Surface |
 |---|---|---|
 | **Recall** | Cited, provenance-tagged retrieval across the personal and shared legs | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
-| **Learn** | Propose, don't write: stages a `candidate_packets` row with status `proposed` and returns a `candidate_id`. No durable memory is written on this path | `minni_learn`, `minni_learning_quality` |
-| **Approve** | A later resolution decision — accept / reject / redact / log-only / merge / supersede / do-not-store. Only accepting decisions write or keep a durable learning row, disk note, and index entry | `minni_list_candidates`, `minni_resolve_candidate` |
+| **Learn** | Normally stages a persistent `candidate_packets` row with status `proposed`; the MCP tool also writes a personal vault note. Neither is the same as an accepted shared learning | `minni_learn`, `minni_learning_quality` |
+| **Approve** | A later resolution decision — accept / reject / redact / log-only / merge / supersede / do-not-store. Accepting decisions commit the shared learning; indexing follows and may report `indexed=false`. Existing personal notes and staged packets already persist | `minni_list_candidates`, `minni_resolve_candidate` |
 | **Handoff** | Explicit cross-agent transfer under a lease; the receiver acks before the sender releases | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_await_handoff`, `minni_list_pending_handoffs` |
 
-There is exactly one escape around the approve gate: `force=true` on `learn`
+One explicit operator override is `force=true` on `learn`
 writes a durable learning directly, **only** for an operator principal, and is
 audit-stamped `FORCE_DURABLE_LEARN`. A non-operator force attempt is denied
-with an `operator_only` error.
+with an `operator_only` error. Operator-configured `auto_accept_own` and the optional consolidation path are separate approval mechanisms described below; they are not implied by ordinary tool access.
+
+Three success states need different follow-up: a **personal note** can be indexed
+and recalled by its owner before shared approval; a **staged candidate** awaits a
+governance decision; an **accepted shared learning** is durable even if follow-up
+indexing fails. Check the response's indexing result. If `indexed=false`, repair
+or reindex the accepted record rather than resubmitting it as a new learning.
 
 ## Delegating approval
 
@@ -178,6 +184,8 @@ Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → thread → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill
 before context is flushed.
+
+Follow the [Thread workflow](thread-workflow.md) for copyable MCP arguments, lease handling, queued completion, and recovery.
 
 Durable, evidence-gated threads (`minni_thread_*`) survive sessions and
 compaction, backing multi-step orchestration through Markdown graph artifacts

@@ -6,7 +6,7 @@ Unix socket is.
 
     minni up        start the daemon in the background
     minni status    show daemon and engine health in plain language
-    minni doctor    verify the install end to end (same probes as CI's smoke)
+    minni doctor    check local interpreter, socket, daemon, recall, and cache health
     minni wire      wire the plugin payload to an agent platform
     minni wire-adopt cut a platform's plugin surface over to the wire tree
     minni sync      redeploy the plugin to every wired agent (keep hosts current)
@@ -15,9 +15,9 @@ Unix socket is.
 
 Packaging-only surface (PACKAGING_PLAN.md §3): this module is stdlib-only and
 never imports engine internals, so it cannot change how memory is stored,
-recalled, scored, or governed. `doctor` mirrors the exact assertions of
-scripts/repro-smoke.sh (the CI oracle): status returns `daemon` + `engine`,
-search round-trips with a `results` key.
+recalled, scored, or governed. `doctor` shares the status and recall
+response-shape probes with scripts/repro-smoke.sh: status returns `daemon` +
+`engine`, and search returns a `results` key. It does not run the smoke script's isolated-home check.
 """
 
 from __future__ import annotations
@@ -462,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("down", help="stop the daemon")
     sub.add_parser("status", help="daemon and engine health, plain language")
     sub.add_parser("doctor",
-                   help="verify the install (same probes as CI's smoke test)")
+                   help="check local install health (does not run CI home-isolation checks)")
 
     wire = sub.add_parser("wire", help="wire plugin payload to an agent platform")
     wire.add_argument("platform", help="codex, claude-code, kilocode, grok, gemini, "

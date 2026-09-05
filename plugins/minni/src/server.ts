@@ -2345,7 +2345,7 @@ server.registerTool(
   {
     title: "Minni Thread Claim",
     description:
-      "Claim an assigned, dependency-clear Thread slice with an idempotent worker lease. Returns a one-time claim token the worker must present to minni_thread_worker_update. plan_id defaults to the active plan.",
+      "Claim an assigned, dependency-clear Thread slice with an idempotent worker lease. Returns a scoped lease token reusable across worker updates until expiry or claim invalidation; present it to minni_thread_worker_update. plan_id defaults to the active plan.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1),
@@ -2373,7 +2373,7 @@ server.registerTool(
       const { plan_id, notePath } = target;
       // claimSlice already returns thread-claims.ts's ThreadClaimResponse —
       // the one shape in this whole surface that is allowed to carry a
-      // secret (the one-time token). It never carries the envelope's
+      // secret (the scoped lease token). It never carries the envelope's
       // filePath or any other internal metadata; forwarded verbatim.
       const response = await claimSlice({
         vaultPath: DEFAULT_VAULT_PATH,
@@ -2442,7 +2442,7 @@ server.registerTool(
   {
     title: "Minni Thread Worker Update",
     description:
-      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the one-time claim token from minni_thread_claim. idempotency_key is required and must be non-empty — retries with the same key, token, and action replay the original result rather than re-applying, even after an action (like complete) that clears the live claim. When the Thread lock is held the write is accepted onto the per-Thread queue and this call returns immediately; accepted is not applied (no journal/ready/slice change until drain). Same idempotency_key while queued does not double-enqueue. plan_id defaults to the active plan.",
+      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the scoped lease token from minni_thread_claim, reusable across actions while the claim remains valid. idempotency_key is required and must be non-empty — retries with the same key, token, and action replay the original result rather than re-applying, even after an action (like complete) that clears the live claim. When the Thread lock is held the write is accepted onto the per-Thread queue and this call returns immediately; accepted is not applied (no journal/ready/slice change until drain). Same idempotency_key while queued does not double-enqueue. plan_id defaults to the active plan.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1),

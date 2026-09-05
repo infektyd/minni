@@ -745,3 +745,42 @@ def test_from_repo_run_redirects_child_stdout_to_stderr(tmp_path, monkeypatch):
     monkeypatch.setattr(from_repo.subprocess, "run", fake_run)
     from_repo._run(["echo", "hi"], tmp_path)
     assert calls.get("stdout") is sys.stderr
+
+
+@pytest.mark.parametrize("native_hooks_present", [False, True])
+def test_codex_wire_does_not_claim_host_lifecycle_activation(
+    wire_env, monkeypatch, capsys, native_hooks_present,
+):
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    config_path = home / ".codex" / "config.toml"
+    existing = '[model_provider_settings]\nkeep = "untouched"\n'
+    if native_hooks_present:
+        existing += '[plugins."minni@local"]\nenabled = true\n'
+    config_path.write_text(existing, encoding="utf-8")
+    hook_file = home / ".codex" / "hooks.json"
+    hook_bytes = b'{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo fixture"}]}]}}'
+    if native_hooks_present:
+        hook_file.write_bytes(hook_bytes)
+    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: False))
+
+    assert run_wire(_args("codex", home, no_prune=True)) == 0
+    output = json.loads(capsys.readouterr().out)
+    result = next(row for row in output["results"] if row["platform"] == "codex")
+    assert result["status"] == "wired"
+    assert result["verify"]["hook_dry_run"] is True
+    assert result["lifecycle"] == {
+        "automatic_hooks": "not_verified",
+        "hook_probe_scope": "packaged_entrypoint_only",
+        "existing_host_sessions": "not_verified",
+    }
+    assert "MCP configured" in result["reason"]
+    assert "not verified" in result["reason"]
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["model_provider_settings"]["keep"] == "untouched"
+    if native_hooks_present:
+        assert config["plugins"]["minni@local"]["enabled"] is True
+        assert hook_file.read_bytes() == hook_bytes
+    else:
+        assert not hook_file.exists()
+        assert "plugins" not in config

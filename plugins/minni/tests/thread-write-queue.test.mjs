@@ -39,6 +39,7 @@ import { readWorkerUpdateReceipt } from "../dist/thread-claims.js";
 import {
   DEFAULT_QUEUE_MAX,
   enqueueWorkerWrite,
+  isWorkerWriteDrainStuck,
   listPendingWorkerWritePlanIds,
   listQueuedWorkerWrites,
   pickNextQueuedWorkerWrite,
@@ -352,6 +353,34 @@ test("queue scans cannot delete a ticket while its writer is publishing it", asy
   }
 });
 
+test("enqueue shares one validated queue snapshot while independent stuck checks stay fresh", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-queue-snapshot-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const input = { vaultPath: root, planId: "snapshot", sliceId: "s0", workerAgentId: "worker",
+    token: "test-token", idempotencyKey: "first", action: { action: "start" } };
+  await enqueueWorkerWrite(input);
+  const dir = workerWriteQueueDir(root, input.planId);
+  const [name] = await readdir(dir);
+  const ticketPath = path.join(dir, name);
+  const originalRead = fs.promises.readFile;
+  let reads = 0;
+  fs.promises.readFile = async (file, ...args) => {
+    if (file === ticketPath) reads += 1;
+    return originalRead(file, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await enqueueWorkerWrite({ ...input, sliceId: "s1", idempotencyKey: "second" });
+    assert.equal(reads, 1, "capacity and stuck detection should share the validated snapshot");
+    await isWorkerWriteDrainStuck(root, input.planId, new Date());
+    assert.equal(reads, 2, "a separate check must read the current queue again");
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+  assert.equal((await listQueuedWorkerWrites(root, input.planId)).length, 2);
+});
+
 test("queue read failures preserve accepted tickets for a later drain", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "minni-queue-read-failure-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -393,6 +422,46 @@ test("concurrent publication of one idempotency key preserves one winning ticket
   assert.equal(queued[0].ticketId, results[0].item.ticketId);
   assert.equal((await readdir(workerWriteQueueDir(root, "same-key"))).filter(name => name.endsWith(".tmp")).length, 0);
 });
+
+for (const failure of ["read", "corrupt"]) {
+ for (const mode of ["full", "one-shot", "standing"]) {
+  test(`${mode} drain preserves accepted work when plan authority is ${failure}`, async (t) => {
+    const fixture = await burstFixture(t, 1);
+    const [claim] = await assignAndClaimAll(fixture);
+    await enqueueWorkerWrite({
+      ...fixture, sliceId: "s0", workerAgentId: "worker-0", token: claim.token,
+      idempotencyKey: "authority-retry", action: { action: "start" },
+      generation: claim.generation, applyNow: new Date("2026-08-18T12:01:00.000Z"),
+    });
+    const originalNote = await readFile(fixture.notePath, "utf8");
+    const originalRead = fs.promises.readFile;
+    if (failure === "corrupt") {
+      await writeFile(fixture.notePath, "temporarily invalid plan", "utf8");
+    } else {
+      fs.promises.readFile = async (file, ...args) => {
+        if (file === fixture.notePath) {
+          throw Object.assign(new Error("temporary plan read failure"), { code: "EIO" });
+        }
+        return originalRead(file, ...args);
+      };
+      syncBuiltinESMExports();
+    }
+    try {
+      await assert.rejects(drainWorkerWrites(fixture, {}, {
+        oneShotYield: mode === "one-shot", standingDefer: mode === "standing",
+      }));
+    } finally {
+      fs.promises.readFile = originalRead;
+      syncBuiltinESMExports();
+      await writeFile(fixture.notePath, originalNote, "utf8");
+    }
+    assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 1);
+    await drainWorkerWrites(fixture);
+    assert.deepEqual((await journalState(fixture)).started, ["s0"]);
+    assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0);
+  });
+ }
+}
 
 test("queue timeout diagnostics preserve submission failures and pending actions without secrets", async () => {
   const secret = "secret-claim-token";
