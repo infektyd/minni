@@ -246,7 +246,7 @@ def _preflight_quality_gate(
                 expected,
             )
             sys.exit(2)
-    elif len(expected) != 2:
+    elif len(expected) != 2 or candidate_key not in expected:
         logger.error(
             "Quality gate needs exactly two reports to auto-select a "
             "candidate (have %d); pass --quality-candidate",

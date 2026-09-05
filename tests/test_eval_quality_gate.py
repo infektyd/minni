@@ -815,6 +815,13 @@ def test_label_only_options_rejected_before_search(tmp_path, monkeypatch):
     TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch)
 
 
+def test_duplicate_config_names_exit_before_search(tmp_path, monkeypatch):
+    TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch, {
+        "config": "no-expand,no-expand",
+        "quality_baseline": "no-expand",
+    })
+
+
 def test_implicit_expansion_default_cannot_pass_as_feature_change(tmp_path, monkeypatch):
     TestReviewBoundaryRegressions()._run_invalid(tmp_path, monkeypatch, {
         "config": "baseline,with-expand", "quality_baseline": "baseline", "quality_candidate": "with-expand",
