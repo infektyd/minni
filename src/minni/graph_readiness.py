@@ -85,6 +85,10 @@ REQUIRED_COLUMNS: dict[str, list[tuple[str, str, int, str | None, int]]] = {
         ("inferred_at", "REAL", 0, None, 0),
         ("edge_status", "TEXT", 1, "active", 0),
     ],
+    "memory_links": [
+        ("source_doc_id", "documents", "doc_id", ("CASCADE",)),
+        ("target_doc_id", "documents", "doc_id", ("CASCADE",)),
+    ],
     "contradiction_log": [
         ("source_doc_id", "INTEGER", 0, None, 0),
         ("target_doc_id", "INTEGER", 0, None, 0),
@@ -448,6 +452,18 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                 errors.append(
                     f"index '{idx_name}' column sequence mismatch: expected {exp_cols}, got {act_cols}"
                 )
+
+            if idx_name == "idx_documents_memory_uri":
+                xinfo_rows = conn.execute(f"PRAGMA index_xinfo({idx_name})").fetchall()
+                indexed_xinfo = sorted(
+                    (row for row in xinfo_rows if row[5]), key=lambda row: row[0]
+                )
+                act_collations = [str(row[4]).upper() for row in indexed_xinfo]
+                if act_collations != ["BINARY"]:
+                    errors.append(
+                        f"index '{idx_name}' collation mismatch: expected ['BINARY'], "
+                        f"got {act_collations}"
+                    )
         except sqlite3.Error as e:
             errors.append(f"Failed to query index_info for '{idx_name}': {e}")
 

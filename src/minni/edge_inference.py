@@ -250,8 +250,11 @@ def render_edge_inference_prompt(
     source_created = str(source.get("created_at") or "")
     source_raw_body = str(source.get("body") or source.get("content") or source.get("excerpt") or "")
 
+    effective_max_pairs = max(0, min(max_pairs, MAX_CANDIDATE_PAIRS))
+    effective_max_excerpt_tokens = max(0, min(max_excerpt_tokens, MAX_EXCERPT_TOKENS))
+
     source_excerpt_formatted, _, source_tokens, src_measured = format_numbered_excerpt(
-        source_raw_body, max_tokens=max_excerpt_tokens, encoding_name=encoding_name
+        source_raw_body, max_tokens=effective_max_excerpt_tokens, encoding_name=encoding_name
     )
 
     source_meta_parts = [
@@ -263,7 +266,7 @@ def render_edge_inference_prompt(
     source_learning_text = f"{source_meta}\n[Evidence Excerpts]:\n{source_excerpt_formatted}"
 
     # 2. Format Candidate Pairs (strictly capped at max_pairs)
-    effective_candidates = list(candidates)[:max_pairs]
+    effective_candidates = list(candidates)[:effective_max_pairs]
     candidate_blocks = []
     pair_ids: List[str] = []
     candidate_tokens_map: Dict[str, int] = {}
@@ -282,7 +285,7 @@ def render_edge_inference_prompt(
         target_raw_body = str(cand.get("body") or cand.get("content") or cand.get("excerpt") or "")
 
         cand_excerpt, cand_lines, cand_tokens, cand_meas = format_numbered_excerpt(
-            target_raw_body, max_tokens=max_excerpt_tokens, encoding_name=encoding_name
+            target_raw_body, max_tokens=effective_max_excerpt_tokens, encoding_name=encoding_name
         )
         all_measured = all_measured and cand_meas
         candidate_tokens_map[pair_id] = cand_tokens
@@ -455,12 +458,12 @@ def validate_edge_inference_response(
 
         # Check label
         label = item.get("label")
-        if label not in VALID_EDGE_LABELS:
+        if not isinstance(label, str) or label not in VALID_EDGE_LABELS:
             return False, None, f"invalid_label: pair {pair_id} has unsupported label {label!r}"
 
         # Check direction
         direction = item.get("direction")
-        if direction not in VALID_DIRECTIONS:
+        if not isinstance(direction, str) or direction not in VALID_DIRECTIONS:
             return False, None, f"invalid_direction: pair {pair_id} has unsupported direction {direction!r}"
 
         # Check normative label/direction compatibility

@@ -967,7 +967,7 @@ def test_migration_021_backfills_legacy_graph_rows():
     )
     conn.execute(
         "INSERT INTO contradiction_log "
-        "(memory_a_id, memory_b_id, detected_at, resolution_status) VALUES (1, 2, 0.0, 'unresolved')"
+        "(memory_a_id, memory_b_id, detected_at) VALUES (1, 2, 0.0)"
     )
     _apply_migration_021_sql(conn)
 
