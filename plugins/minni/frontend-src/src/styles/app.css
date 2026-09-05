@@ -89,7 +89,7 @@ input, textarea, select { font: inherit; color: inherit; }
 /* ---------- App shell ---------- */
 .app {
   display: grid;
-  grid-template-columns: var(--rail-w) 1fr var(--insp-w);
+  grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--insp-w);
   grid-template-rows: 56px 1fr;
   grid-template-areas:
     "rail band band"
@@ -99,7 +99,7 @@ input, textarea, select { font: inherit; color: inherit; }
   gap: 0;
 }
 .app[data-inspector="bottom"] {
-  grid-template-columns: var(--rail-w) 1fr;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
   grid-template-rows: 56px 1fr 320px;
   grid-template-areas:
     "rail band"
@@ -107,7 +107,7 @@ input, textarea, select { font: inherit; color: inherit; }
     "rail inspector";
 }
 .app[data-inspector="overlay"] {
-  grid-template-columns: var(--rail-w) 1fr;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
   grid-template-rows: 56px 1fr;
   grid-template-areas:
     "rail band"
@@ -242,6 +242,8 @@ input, textarea, select { font: inherit; color: inherit; }
 /* ---------- Status band ---------- */
 .band {
   grid-area: band;
+  min-width: 0;
+  overflow-x: auto;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
   display: grid;
@@ -1058,7 +1060,7 @@ input, textarea, select { font: inherit; color: inherit; }
 /* ---------- Responsive (added: drop prototype's 1280px floor) ---------- */
 @media (max-width: 1180px) {
   .app[data-inspector="right"] {
-    grid-template-columns: var(--rail-w) 1fr;
+    grid-template-columns: var(--rail-w) minmax(0, 1fr);
     grid-template-rows: 56px 1fr 320px;
     grid-template-areas:
       "rail band"

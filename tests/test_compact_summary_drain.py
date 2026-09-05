@@ -99,6 +99,21 @@ def test_a_usable_compact_summary_is_never_touched(tmp_path):
     assert good.exists()
 
 
+def test_slug_alias_stamped_compact_is_not_drained(tmp_path):
+    """Parity with test_slug_alias_stamped_agent_id_is_not_mismatch:
+    leftover agent_id=agy in agy-vault (canonical gemini) is usable, so
+    the compact drain must not classify it as _compact_agent_mismatch."""
+    from minni.afm_passes.inbox_quarantine import quarantine_unusable_compact_summaries
+
+    inbox = tmp_path / "agy-vault" / "inbox"
+    good = _write(inbox, "c-agy.json", _summary(agent_id="agy"))
+
+    result = quarantine_unusable_compact_summaries(None, [inbox], dry_run=False)
+
+    assert result["quarantined"] == 0
+    assert good.exists()
+
+
 def test_other_kinds_are_never_touched(tmp_path):
     """Other kinds share this inbox and are drained by their own pass."""
     from minni.afm_passes.inbox_quarantine import quarantine_unusable_compact_summaries

@@ -232,10 +232,20 @@ def _handler_principal(params, request_id, **kwargs):
 
 
 def _reload_runtime_config(signum=None, frame=None) -> None:
-    """Clear identity and per-vault caches after operator config changes."""
+    """Clear identity and per-vault caches after operator config changes.
+
+    The vault-cache clear strands the replacement engines cold: default
+    leftover never rebuilds a cold FAISSIndex in-request, so the next
+    personal search would degrade to FTS-only. Unbounded-ensure the
+    replacements here, mirroring _vault_watch_runner. This BLOCKS the
+    signal handler on a full SELECT + FAISS build — accepted: a SIGHUP is
+    operator-rare, and the alternative is silent semantic blindness.
+    """
     agent_scope_for.cache_clear()
     _vault_retrieval_cache.clear()
     logger.info("SIGHUP received — cleared identity/runtime caches")
+    _ensure_vault_engines_unbounded()
+    logger.info("SIGHUP: per-vault FAISS rewarmed (blocked handler on ensure)")
 
 
 def _lazy_retrieval():
@@ -359,7 +369,7 @@ def _durable_doc_path(
 _UNSET = object()
 
 
-def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> None:
+def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> bool:
     """Semantically index a just-stored durable learning (FAIL-OPEN).
 
     Hook for BOTH durable-store socket paths (_resolve_candidate(accept) and
@@ -383,7 +393,9 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
 
     Never raises — neither a programmer error (omitted ``db=``) nor an
     availability failure (embedder/FAISS down) may undo or fail a durable store
-    that already committed. Both degrade gracefully (log + return).
+    that already committed. Return False on failure, including a degraded
+    engine result or a lexical-only write, so the caller can report that the
+    durable learning still needs semantic indexing.
     """
     try:
         # Data-safety: ``db`` MUST be supplied explicitly. A ``None``/omitted
@@ -406,7 +418,7 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
                 "lexical until reindex). agent=%s",
                 agent_id,
             )
-            return
+            return False
 
         from minni.retrieval import RetrievalEngine
 
@@ -458,7 +470,7 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
         except Exception:
             pass  # fail-open: keep prior defaults
 
-        engine.index_durable_document(
+        result = engine.index_durable_document(
             content=content,
             path=_durable_doc_path(
                 agent_id, key, vault_path=engine.config.vault_path,
@@ -471,12 +483,14 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
             page_type=page_type,
             layer=layer,
         )
+        return result.get("status") == "ok" and result.get("chunks", 0) > 0
     except Exception as exc:
         logger.warning(
             "durable store: store-time semantic index failed for agent=%s (%s) "
             "— store stands, recall degraded to lexical until reindex",
             agent_id, exc,
         )
+        return False
 
 
 def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:
@@ -1007,11 +1021,22 @@ def _warmup_models() -> None:
         get_embedder()
         if DEFAULT_CONFIG.reranker_enabled:
             get_cross_encoder()
-        _lazy_retrieval()
+        # Constructing the engine is not enough: default leftover (22.5s /
+        # 27s) never starts an in-request FAISS rebuild. Load it here with
+        # no deadline so the first 25s/30s search finds the index ready.
+        # Per-vault engines are a separate cold FAISSIndex; warmup must
+        # unbounded-ensure those too or personal/combined hybrid stays FTS-only.
+        engine = _lazy_retrieval()
+        engine._set_current_deadline(None)
+        engine._ensure_faiss_loaded()
+        _ensure_vault_engines_unbounded()
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("warmup failed after %.1fs: %s", time.monotonic() - start, exc)
         return
-    logger.info("warmup complete in %.1fs (embedder, reranker, retrieval engine)", time.monotonic() - start)
+    logger.info(
+        "warmup complete in %.1fs (embedder, reranker, retrieval engine, FAISS)",
+        time.monotonic() - start,
+    )
 
 
 async def _warmup_runner() -> None:
@@ -1048,15 +1073,40 @@ def _expire_shared_vault_drafts() -> int:
     return _expire_stale_drafts(Path(DEFAULT_CONFIG.vault_path).expanduser())
 
 
+def _ensure_vault_engines_unbounded() -> None:
+    """Load per-vault FAISS off the RPC.
+
+    `_lazy_vault_retrieval` constructs a cold FAISSIndex. Default leftover
+    (22.5s / 27s) never starts an in-request rebuild after a disk miss, and
+    vault-watch cache clear drops the memoized engine so the next search
+    builds another cold one. Warmup and vault-watch must unbounded-ensure
+    these engines the same way `_invalidate_shared_faiss` does for shared.
+    """
+    try:
+        cached_list = _all_vault_retrievals()
+    except Exception:
+        logger.exception("per-vault FAISS unbounded ensure: listing failed")
+        return
+    for cached in cached_list:
+        if not cached:
+            continue
+        engine = cached[0]
+        try:
+            engine._set_current_deadline(None)
+            engine._ensure_faiss_loaded()
+        except Exception:
+            logger.exception("per-vault FAISS unbounded ensure failed")
+
+
 def _invalidate_shared_faiss() -> None:
     """Make chunks the sweep just wrote visible to the live engine's semantic leg.
 
     index_shared_vault writes through its OWN short-lived SovereignDB and
     VaultIndexer, so its FAISS rebuild lands on a throwaway instance. The
     daemon's process-wide RetrievalEngine keeps the in-memory index it built at
-    startup, and _ensure_faiss_loaded returns early while count > 0 — so new
-    chunks stayed invisible to semantic recall until restart even though FTS
-    could see them. Invalidating forces the next search to rebuild from the DB.
+    startup. Invalidating drops that snapshot; reload it here on the vault-watch
+    thread (no deadline) because default leftover (22.5s / 27s) will not start
+    an in-request rebuild.
 
     Deliberately does NOT call _lazy_retrieval(): if the engine has not been
     constructed yet there is nothing stale to fix, and constructing one here
@@ -1066,7 +1116,11 @@ def _invalidate_shared_faiss() -> None:
         return
     try:
         _retrieval.faiss_index.invalidate()
-        logger.info("Vault watch: invalidated live FAISS; next search rebuilds from DB")
+        # Reused to_thread workers can still hold a leftover search deadline
+        # on this engine's thread-local; clear it so ensure is unbounded.
+        _retrieval._set_current_deadline(None)
+        _retrieval._ensure_faiss_loaded()
+        logger.info("Vault watch: invalidated live FAISS and reloaded from DB")
     except Exception:
         logger.exception("Vault watch: FAISS invalidation failed")
 
@@ -1171,6 +1225,10 @@ async def _vault_watch_runner():
                 # daemon restart, with no change to the index itself.
                 _vault_retrieval_cache.clear()
                 logger.info("Vault watch: cleared per-vault retrieval cache")
+                # Cache clear constructs a new cold FAISSIndex on the next
+                # `_lazy_vault_retrieval`. Default leftover never rebuilds
+                # that in-request; unbounded-ensure the replacements here.
+                _ensure_vault_engines_unbounded()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1290,8 +1348,10 @@ def _backfill_sweep_once() -> dict:
     # index (count > 0 → _ensure_faiss_loaded early-returns), so backfilled
     # vault rows would stay invisible to semantic recall until restart — the
     # same blindness the shared-index refresh above exists to prevent. Drop the
-    # cache when any vault made progress, exactly as the vault watch does; the
-    # next search rebuilds the engine and loads the new rows.
+    # cache when any vault made progress, exactly as the vault watch does.
+    # Cache clear constructs a new cold FAISSIndex on the next
+    # `_lazy_vault_retrieval`. Default leftover never rebuilds that in-request;
+    # unbounded-ensure the replacements here, mirroring _vault_watch_runner.
     for name, s in results.items():
         if name == "shared" or not isinstance(s, dict):
             continue
@@ -1302,6 +1362,7 @@ def _backfill_sweep_once() -> dict:
                 "Backfill: vault %s gained vectors — cleared per-vault "
                 "retrieval cache", name,
             )
+            _ensure_vault_engines_unbounded()
             break
 
     # R7: reconcile episodic_fts on every sweep, not only in migration 018.
@@ -2017,11 +2078,30 @@ def _warn_if_sync_root(label: str, path: Path) -> None:
             return
 
 
+def _worker_write_drain_enabled() -> bool:
+    from minni.worker_write_drain import worker_write_drain_enabled
+
+    return worker_write_drain_enabled()
+
+
+async def _worker_write_drain_runner():
+    """Named standing drain: minnid tick. Kick only. Not Thread SoT."""
+    from minni.worker_write_drain import minnid_tick_runner
+
+    await minnid_tick_runner()
+
+
 # ── Entry point ──────────────────────────────────────────────────────────
 
 def main():
     global _start_time, _unix_socket_path
 
+    # Make the long-lived service distinguishable from generic Python in
+    # ps/top/Activity Monitor.  This is deliberately before daemon startup
+    # work, but remains best-effort on unsupported platforms.
+    from minni.process_identity import set_process_identity
+
+    set_process_identity()
     _start_time = time.time()
 
     # #284: pin daemon models to CPU by default BEFORE any singleton warmup.
@@ -2170,6 +2250,12 @@ def main():
     if _backfill_enabled():
         backfill_task = loop.create_task(_backfill_runner())
 
+    # Standing drain: minnid tick kicks leftover Q when nobody boots MCP
+    # on that vault. Same apply entry. Not Thread SoT. Not G3.
+    worker_write_drain_task = None
+    if _worker_write_drain_enabled():
+        worker_write_drain_task = loop.create_task(_worker_write_drain_runner())
+
     # Model warmup. Scheduled AFTER the socket is being served, so the daemon is
     # answerable during the load: an early caller still gets the lazy path, it
     # just no longer has to be the one that pays for it.
@@ -2182,7 +2268,8 @@ def main():
     footprint_task = None
     background_tasks = lambda: [
         main_task, http_task, afm_task, vault_watch_task,
-        decay_task, backfill_task, warmup_task, footprint_task,
+        decay_task, backfill_task, worker_write_drain_task,
+        warmup_task, footprint_task,
     ]
     if _footprint_watchdog_enabled():
         footprint_task = loop.create_task(

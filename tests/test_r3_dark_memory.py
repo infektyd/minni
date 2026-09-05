@@ -1777,27 +1777,38 @@ def test_lifecycle_rewrites_are_atomic(tmp_path, monkeypatch):
     )["path"]
     before = page.read_text(encoding="utf-8")
 
-    real_write = Path.write_text
+    orig_open = os.open
+    orig_write = os.write
+    tmp_fds: set[int] = set()
 
-    def disk_full(self, data, *args, **kwargs):
-        with open(self, "w", encoding="utf-8") as f:
-            f.write(data[:12])
-        raise OSError("disk full")
+    def tracking_open(path, flags, *args, **kwargs):
+        fd = orig_open(path, flags, *args, **kwargs)
+        try:
+            name = Path(os.fsdecode(path)).name
+        except (TypeError, ValueError, OSError):
+            return fd
+        if ".tmp" in name:
+            tmp_fds.add(fd)
+        return fd
 
-    monkeypatch.setattr(Path, "write_text", disk_full)
-    try:
-        with pytest.raises(OSError):
-            endorse_draft(str(vault), "page-torn", "accept")
-        assert page.read_text(encoding="utf-8") == before, (
-            "a failed endorse left a torn page behind"
-        )
-        with pytest.raises(OSError):
-            _expire_stale_drafts(vault, now=now)
-        assert page.read_text(encoding="utf-8") == before, (
-            "a failed expiry left a torn page behind"
-        )
-    finally:
-        monkeypatch.setattr(Path, "write_text", real_write)
+    def disk_full(fd, data):
+        if fd in tmp_fds:
+            orig_write(fd, data[:12])
+            raise OSError("disk full")
+        return orig_write(fd, data)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "write", disk_full)
+    with pytest.raises(OSError):
+        endorse_draft(str(vault), "page-torn", "accept")
+    assert page.read_text(encoding="utf-8") == before, (
+        "a failed endorse left a torn page behind"
+    )
+    with pytest.raises(OSError):
+        _expire_stale_drafts(vault, now=now)
+    assert page.read_text(encoding="utf-8") == before, (
+        "a failed expiry left a torn page behind"
+    )
 
 
 # ── Round 13: findings from the twelfth Grok review of #256 ────────────────
@@ -2446,20 +2457,32 @@ def test_write_one_is_atomic_against_mid_write_failure(tmp_path, monkeypatch):
     import pytest
 
     vault = tmp_path / "vault"
-    real_write = Path.write_text
+    orig_open = os.open
+    orig_write = os.write
+    tmp_fds: set[int] = set()
     calls = {"n": 0}
 
-    def flaky_write(self, data, *args, **kwargs):
-        # _atomic_write_text writes the temp file first; fail that write so the
-        # target path is never replaced (and never truncated in place).
-        calls["n"] += 1
-        if self.name.endswith(".tmp"):
-            with open(self, "w", encoding="utf-8") as f:
-                f.write(data[:12])
-            raise OSError("disk full")
-        return real_write(self, data, *args, **kwargs)
+    def tracking_open(path, flags, *args, **kwargs):
+        fd = orig_open(path, flags, *args, **kwargs)
+        try:
+            name = Path(os.fsdecode(path)).name
+        except (TypeError, ValueError, OSError):
+            return fd
+        if ".tmp" in name:
+            tmp_fds.add(fd)
+        return fd
 
-    monkeypatch.setattr(Path, "write_text", flaky_write)
+    def flaky_write(fd, data):
+        # _atomic_write_text exclusive-creates a unique tmp first; fail that
+        # write so the target path is never replaced (and never truncated).
+        if fd in tmp_fds:
+            calls["n"] += 1
+            orig_write(fd, data[:12])
+            raise OSError("disk full")
+        return orig_write(fd, data)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "write", flaky_write)
     with pytest.raises(OSError):
         _write_one(vault, _draft(page_id="page-atomic"))
 

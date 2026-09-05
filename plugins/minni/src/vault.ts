@@ -1,6 +1,7 @@
+import { randomBytes } from "node:crypto";
 import {
   access,
-  appendFile,
+  lstat,
   mkdir,
   readFile,
   readdir,
@@ -829,31 +830,97 @@ Append-only audit of Codex memory operations.
 `;
 }
 
+function isErrno(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException).code === code;
+}
+
+async function refuseSymlink(filePath: string, kind: "seed" | "append"): Promise<void> {
+  try {
+    const st = await lstat(filePath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`refusing to ${kind} through symlink: ${filePath}`);
+    }
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
+
+async function rejectSymlinkOrEscape(
+  destPath: string,
+  vaultPath: string,
+  rel: string,
+): Promise<void> {
+  try {
+    const st = await lstat(destPath);
+    if (st.isSymbolicLink()) {
+      throw new Error(
+        `vault contract ${rel} is a symlink; refusing to seed through it: ${destPath}`,
+      );
+    }
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
+  }
+  assertWriteTargetUnder(destPath, vaultPath);
+}
+
+async function seedExclusiveFile(
+  filePath: string,
+  content: string,
+): Promise<boolean> {
+  await refuseSymlink(filePath, "seed");
+  let fh;
+  try {
+    fh = await open(filePath, "ax", 0o600);
+  } catch (error) {
+    if (isErrno(error, "EEXIST")) {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    const st = await fh.stat();
+    if (st.size > 0) {
+      return false;
+    }
+    await fh.write(Buffer.from(content, "utf8"));
+    return true;
+  } finally {
+    await fh.close();
+  }
+}
+
 export async function ensureVault(
   vaultPath: string,
 ): Promise<EnsureVaultResult> {
   const created: string[] = [];
+  try {
+    const st = await lstat(vaultPath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`refusing symlinked vault root: ${vaultPath}`);
+    }
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
+  }
   await mkdir(vaultPath, { recursive: true });
   for (const dir of VAULT_DIRS) {
     const full = path.join(vaultPath, dir);
+    await rejectSymlinkOrEscape(full, vaultPath, dir);
     await mkdir(full, { recursive: true });
     created.push(full);
   }
 
-  const schemaPath = path.join(vaultPath, "schema", "AGENTS.md");
-  if (!(await exists(schemaPath))) {
-    await writeFile(schemaPath, schemaContent(), "utf8");
-  }
-
-  const indexPath = path.join(vaultPath, "index.md");
-  if (!(await exists(indexPath))) {
-    await writeFile(indexPath, indexContent(), "utf8");
-  }
-
-  const logPath = path.join(vaultPath, "log.md");
-  if (!(await exists(logPath))) {
-    await writeFile(logPath, logContent(), "utf8");
-  }
+  await seedExclusiveFile(
+    path.join(vaultPath, "schema", "AGENTS.md"),
+    schemaContent(),
+  );
+  await seedExclusiveFile(path.join(vaultPath, "index.md"), indexContent());
+  await seedExclusiveFile(path.join(vaultPath, "log.md"), logContent());
 
   return { vaultPath, created };
 }
@@ -957,7 +1024,11 @@ export function getAgentIdFromVaultPath(vaultPath: string): string {
 }
 
 export async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
-  const fh = await open(filePath, "a");
+  const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+  const fh = await open(
+    filePath,
+    fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow,
+  );
   try {
     await fh.writeFile(content, "utf8");
     await fh.sync();
@@ -971,9 +1042,9 @@ export async function writeFileAtomic(filePath: string, content: string): Promis
   // pointer, this fix's journal init + plan/vault note) that assumed this
   // helper's guarantee was complete:
   //
-  // 1. Preserve the destination's existing mode. `open(tempPath, "w")` with no
-  //    explicit mode creates the temp file at the umask default; renaming it
-  //    onto an existing, differently-permissioned file (e.g. operator-tightened
+  // 1. Preserve the destination's existing mode. Exclusive-creating the unique
+  //    tmp without an explicit mode uses the umask default; renaming it onto
+  //    an existing, differently-permissioned file (e.g. operator-tightened
   //    to 0600) would silently widen it back to the default on every write —
   //    a permanent, silent permission downgrade nobody asked for.
   let mode: number | undefined;
@@ -983,15 +1054,47 @@ export async function writeFileAtomic(filePath: string, content: string): Promis
     // Destination does not exist yet — first write, default mode is correct.
   }
 
-  const tempPath = `${filePath}.${Math.random().toString(36).substring(2)}.tmp`;
-  const fh = await open(tempPath, "w", mode);
-  try {
-    await fh.writeFile(content, "utf8");
-    await fh.sync();
-  } finally {
-    await fh.close();
+  const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+  const flags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | nofollow;
+  let lastErr: unknown;
+  let wrote = false;
+  for (let i = 0; i < 8; i++) {
+    const tempPath = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    let created = false;
+    try {
+      const fh = await open(tempPath, flags, mode ?? 0o666);
+      created = true;
+      try {
+        await fh.writeFile(content, "utf8");
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      await rename(tempPath, filePath);
+      wrote = true;
+      lastErr = undefined;
+      break;
+    } catch (error) {
+      lastErr = error;
+      if (created) {
+        try {
+          await unlink(tempPath);
+        } catch {
+          // Best-effort; rename may already have consumed the tmp.
+        }
+      }
+      if (isErrno(error, "EEXIST")) {
+        continue;
+      }
+      throw error;
+    }
   }
-  await rename(tempPath, filePath);
+  if (!wrote) {
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(`could not exclusive-create unique tmp for ${filePath}`);
+  }
 
   // 2. fsync the parent directory. fsync'ing the temp file's data (above)
   //    makes the CONTENT durable, but on POSIX the rename's directory-entry
@@ -1130,7 +1233,9 @@ export async function recordAudit(
       await rename(logPath, path1);
     }
 
-    await writeFileAtomic(logPath, logContent());
+    // Exclusive seed, then the append below. writeFileAtomic replace would
+    // wipe a second tap that O_EXCL-created+appended the new log.md.
+    await seedExclusiveFile(logPath, logContent());
   }
 
   // --- 3. Format and Append Audit Line ---
@@ -1150,11 +1255,11 @@ export async function recordAudit(
   }
   const line = `## [${timestamp.toISOString()}] ${safeTool} | ${safeSummary}\n\n${detailBlock}`;
 
+  await refuseSymlink(logPath, "append");
   await appendFileWithFsync(logPath, line);
 
-  if (!(await exists(dailyPath))) {
-    await writeFileAtomic(dailyPath, `# ${date} Minni Audit\n\n`);
-  }
+  await seedExclusiveFile(dailyPath, `# ${date} Minni Audit\n\n`);
+  await refuseSymlink(dailyPath, "append");
   await appendFileWithFsync(dailyPath, line);
 
   // --- 4. Daily-log prune (older than 30 days) ---
@@ -1235,7 +1340,7 @@ async function appendIndex(
   const link = wikilinkFor(relativePath);
   if (existing.includes(link)) return;
   const line = `- ${link} - ${summary.replace(/\s+/g, " ").slice(0, 160)}\n`;
-  await appendFile(indexPath, line, "utf8");
+  await appendFileWithFsync(indexPath, line);
 }
 
 // Bugbot on #309 (campaign scar #3): the durability of this write must be

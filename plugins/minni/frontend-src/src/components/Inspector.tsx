@@ -128,7 +128,7 @@ export function Inspector({ source, mode, onClose }: Props) {
             {source.afm === "dns" &&
               "Exclude from any compile pass. Confirm redaction at envelope-build time."}
             {source.afm === "learn" &&
-              "Marked as a learn candidate by the dry-run pass. Approve from the Dry-run Review screen."}
+              "Suggested for learning by the dry-run pass. Dry-run review marks do not store or approve a real candidate."}
           </RiskCallout>
         </div>
       )}
@@ -141,8 +141,7 @@ export function Inspector({ source, mode, onClose }: Props) {
             fontFamily: "var(--font-mono)",
           }}
         >
-          Inspecting a source does not store, learn, export, or publish. Use Include /
-          Exclude on the Recall ledger to shape the packet.
+          Inspection marks help you review sources. They do not change the prepared packet, store memories, or approve candidates.
         </div>
       </div>
     </aside>

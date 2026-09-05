@@ -178,6 +178,10 @@ def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     assert "update-plugin --platform antigravity" in proc.stdout
     assert "update-plugin --platform cursor" in proc.stdout
     assert "update-plugin --platform all" not in proc.stdout
+    # Locked JS dependencies must refresh before compiling the new checkout.
+    install = "would run: npm --prefix plugins/minni ci"
+    build = "would run: npm --prefix plugins/minni run build"
+    assert proc.stdout.index(install) < proc.stdout.index(build)
 
 
 def test_dry_run_notes_socket_probe_when_launchd_missing(cloned, tmp_path):

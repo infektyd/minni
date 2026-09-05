@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm, writeFile, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, rm, utimes, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,12 +10,21 @@ import {
   unmetDependencies,
   diffDependsOn,
   diffSupersededDependencies,
+  landedReplanTopology,
   applySliceDelta,
+  landedAddSlices,
+  structuralProposalDelta,
   computePlanDigest,
   computePlanDigestV1,
+  computePlanDigestHexV2,
+  PlanDigestVersionError,
+  PlanHistoryAppendError,
   rehydratePlan,
   createPlan,
+  replan,
   persistPlan,
+  findPlanNote,
+  journalPathFor,
   setActivePlan,
   clearActivePlan,
   getActivePlan,
@@ -28,7 +38,110 @@ import {
   historyPathFor,
   readHistory
 } from "../dist/plan.js";
-import { ensureVault, writeVaultPage } from "../dist/vault.js";
+import { appendFileWithFsync as realAppendFileWithFsync, ensureVault, writeFileAtomic, writeVaultPage } from "../dist/vault.js";
+
+test("createPlan rejects duplicate explicit slice ids before writing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-duplicate-create-"));
+  try {
+    await assert.rejects(
+      createPlan({
+        goal: "Reject duplicate explicit slice ids",
+        slices: [
+          { id: "same", title: "First" },
+          { id: "same", title: "Second" },
+        ],
+        vaultPath: root,
+      }, { vaultPath: root }),
+      /duplicate explicit slice id "same"/,
+    );
+    await assert.rejects(
+      createPlan({
+        goal: "Reject generated and explicit slice id collision",
+        slices: [
+          { title: "Generated Same" },
+          { id: "generated-same", title: "Explicit Same" },
+        ],
+        vaultPath: root,
+      }, { vaultPath: root }),
+      /duplicate slice id "generated-same"/,
+    );
+    await assert.rejects(
+      readdir(path.join(root, "wiki", "artifacts")),
+      /ENOENT/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("replan rejects duplicate explicit slice ids before graph mutation", () => {
+  const plan = {
+    plan_id: "duplicate-replan",
+    goal: "Reject duplicate replan ids",
+    status: "draft",
+    constraints: [],
+    slices: [
+      { id: "a", title: "Original A", status: "pending" },
+      { id: "b", title: "Original B", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "a",
+    plan_digest: "",
+    created: "2026-08-18T12:00:00.000Z",
+    updated: "2026-08-18T12:00:00.000Z",
+    rev: 1,
+  };
+  plan.plan_digest = computePlanDigest(plan);
+  assert.throws(
+    () => replan(plan, [
+      { id: "a", title: "First A" },
+      { id: "a", title: "Second A" },
+    ]),
+    /duplicate explicit slice id "a"/,
+  );
+  assert.deepEqual(plan.slices.map((slice) => slice.title), [
+    "Original A",
+    "Original B",
+  ]);
+});
+
+test("strict rehydrate rejects a digest-valid note with duplicate slice ids", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-duplicate-note-"));
+  try {
+    const { plan, write } = await createPlan({
+      goal: "Reject persisted duplicate ids",
+      slices: [
+        { id: "a", title: "Slice A" },
+        { id: "b", title: "Slice B" },
+      ],
+      vaultPath: root,
+    }, { vaultPath: root });
+    const duplicate = {
+      ...plan,
+      slices: [
+        { ...plan.slices[0] },
+        { ...plan.slices[1], id: "a" },
+      ],
+    };
+    duplicate.plan_digest = computePlanDigest(duplicate);
+    const raw = await readFile(write.notePath, "utf8");
+    const tampered = raw
+      .replace(
+        /^plan_slices:.*$/m,
+        `plan_slices: ${JSON.stringify(duplicate.slices)}`,
+      )
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${duplicate.plan_digest}`);
+    await writeFile(write.notePath, tampered, "utf8");
+
+    await assert.rejects(
+      rehydratePlan(write.notePath),
+      /duplicate slice id "a"/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("isTrivialEvidence check in updateSlice prevents trivial/empty evidence for done status", () => {
   const plan = {
@@ -583,10 +696,21 @@ test("minni_thread_status/_update/_history accept an OPTIONAL plan_id (C5 schema
   // the five handlers keep the active-plan default through one code path.
   const helperStart = source.indexOf("async function resolvePlanTarget(");
   assert.ok(helperStart >= 0, "shared resolvePlanTarget helper must exist");
+  const helper = source.slice(helperStart, helperStart + 1800);
   assert.match(
-    source.slice(helperStart, helperStart + 1200),
+    helper,
     /resolvePlanIdOrActive\(/,
     "resolvePlanTarget must default to the active plan via resolvePlanIdOrActive",
+  );
+  assert.match(
+    helper,
+    /try \{/,
+    "resolvePlanTarget must catch remaining discovery I/O instead of leaking a raw JSON-RPC error",
+  );
+  assert.match(
+    helper,
+    /threadWorkerErrorText\(error\)/,
+    "resolvePlanTarget must sanitize discovery throws through threadWorkerErrorText",
   );
 });
 
@@ -755,6 +879,546 @@ test("H7: rehydratePlan upgrades a pre-H7 (v1-digest) plan instead of hard-faili
   }
 });
 
+// ---------------------------------------------------------------------------
+// Task 2 (Thread Phase 1): worker slice metadata + digest v3 compatibility.
+// ---------------------------------------------------------------------------
+
+/** Minimal two-slice plan for pure digest-coverage assertions (no I/O). */
+function makePlan() {
+  const plan = {
+    plan_id: "digest-v3-plan",
+    goal: "digest v3 coverage",
+    status: "draft",
+    constraints: [],
+    slices: [
+      { id: "a", title: "Slice A", status: "pending" },
+      { id: "b", title: "Slice B", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "test",
+    plan_digest: "",
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    rev: 1,
+  };
+  plan.plan_digest = computePlanDigest(plan);
+  return plan;
+}
+
+/**
+ * Applies `extra` to slice index 0 ONLY, leaving slice count, slice "b", and
+ * every other plan-level field byte-for-byte identical to `base`. This is
+ * the isolation review finding #1 fixed: the original version of this
+ * helper replaced the whole `slices` array with a ONE-element array
+ * (dropping slice "b" entirely), so every assertion below would have passed
+ * even if computePlanDigestHexV3 ignored every new field completely — the
+ * digest would still have changed purely because the slice COUNT changed.
+ * Preserving slice "b" and everything else means the *only* possible cause
+ * of a digest change is the specific field(s) in `extra`.
+ */
+function withSliceZeroField(base, extra) {
+  return {
+    ...base,
+    slices: base.slices.map((slice, i) => (i === 0 ? { ...slice, ...extra } : slice)),
+  };
+}
+
+test("digest v3 changes for assignment, generation, claim metadata, and proposals", () => {
+  const base = makePlan();
+  const variants = [
+    { assigned_to: "worker-a" },
+    { generation: 2 },
+    { attempt: 1 },
+    { claim: {
+      claim_id: "claim-a",
+      worker_agent_id: "worker-a",
+      claimed_at: "2026-08-18T00:00:00.000Z",
+      expires_at: "2026-08-18T00:10:00.000Z",
+    }},
+    { proposals: [{ kind: "contract", reason: "enough evidence", slice_ids: ["b"] }] },
+  ];
+  for (const extra of variants) {
+    const changed = withSliceZeroField(base, extra);
+    // Sanity guard for the isolation itself: slice count and slice "b" must
+    // be untouched, so a failure below can only be explained by the
+    // specific field in `extra`, never a structural side effect.
+    assert.equal(changed.slices.length, base.slices.length, JSON.stringify(extra));
+    assert.deepEqual(changed.slices[1], base.slices[1], JSON.stringify(extra));
+    assert.notEqual(computePlanDigest(base), computePlanDigest(changed), JSON.stringify(extra));
+  }
+});
+
+// Gate T2 requires EVERY new durable slice field to affect v3, not just the
+// five exercised above — `requirements`, `assignment_profile`, and
+// `replaced_by` (exclusive-split remount honesty) are the remaining named
+// optional fields on PlanSlice.
+test("digest v3 also changes for requirements, assignment_profile, and replaced_by", () => {
+  const base = makePlan();
+  const variants = [
+    { requirements: ["needs-shell-access"] },
+    { assignment_profile: "profile-research" },
+    { replaced_by: ["child-a", "child-b"] },
+  ];
+  for (const extra of variants) {
+    const changed = withSliceZeroField(base, extra);
+    assert.equal(changed.slices.length, base.slices.length, JSON.stringify(extra));
+    assert.deepEqual(changed.slices[1], base.slices[1], JSON.stringify(extra));
+    assert.notEqual(computePlanDigest(base), computePlanDigest(changed), JSON.stringify(extra));
+  }
+});
+
+/**
+ * Writes a real vault note that DECLARES digest v2 (plan_digest_v: 2, bare
+ * v2-computed hex) — simulating a note still owned by an older-plugin host
+ * mid rolling-upgrade. Caller is responsible for removing the returned root.
+ */
+async function writeDeclaredV2Plan() {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v2-"));
+  await ensureVault(root);
+  const { plan, write } = await createPlan(
+    { goal: "declared v2 compatibility", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+    { vaultPath: root },
+  );
+  const raw = await readFile(write.notePath, "utf8");
+  const v2Hex = computePlanDigestHexV2(plan);
+  const rewritten = raw
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${v2Hex}`)
+    .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 2");
+  assert.notEqual(rewritten, raw, "expected to actually stamp a declared v2 note for this fixture");
+  await writeFile(write.notePath, rewritten, "utf8");
+  return { notePath: write.notePath, plan, root };
+}
+
+test("rehydratePlan reads declared v2 without write-on-read upgrade", async () => {
+  const fixture = await writeDeclaredV2Plan();
+  try {
+    const before = await readFile(fixture.notePath, "utf8");
+    const plan = await rehydratePlan(fixture.notePath);
+    const after = await readFile(fixture.notePath, "utf8");
+    assert.equal(plan.plan_id, fixture.plan.plan_id);
+    assert.equal(after, before);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan reads declared v1 without write-on-read upgrade", async () => {
+  // Same contract as declared v2 above, but for a note that declares the
+  // OLDEST known algorithm via plan_digest_v: 1 (v1 predates the plan_digest_v
+  // tagging field, but the declared-version gate treats it uniformly through
+  // PLAN_DIGEST_ALGORITHMS — this must not be special-cased into a write).
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v1-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "declared v1 compatibility", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    const v1Hex = computePlanDigestV1(plan);
+    const rewritten = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${v1Hex}`)
+      .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 1");
+    assert.notEqual(rewritten, raw, "expected to actually stamp a declared v1 note for this fixture");
+    await writeFile(write.notePath, rewritten, "utf8");
+
+    const before = await readFile(write.notePath, "utf8");
+    const rehydrated = await rehydratePlan(write.notePath);
+    const after = await readFile(write.notePath, "utf8");
+    assert.equal(rehydrated.plan_id, plan.plan_id);
+    assert.equal(after, before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const V3_ONLY_FIELD_SAMPLES = {
+  requirements: ["needs-shell-access"],
+  assigned_to: "worker-a",
+  assignment_profile: "profile-research",
+  generation: 2,
+  attempt: 1,
+  claim: {
+    claim_id: "claim-a",
+    worker_agent_id: "worker-a",
+    claimed_at: "2026-08-18T00:00:00.000Z",
+    expires_at: "2026-08-18T00:10:00.000Z",
+  },
+  proposals: [{ kind: "contract", reason: "enough evidence", slice_ids: ["s1"] }],
+  replaced_by: ["child-a", "child-b"],
+};
+
+/**
+ * Writes a note that DECLARES an older digest version (1 or 2) whose
+ * declared-algorithm digest genuinely validates — computed over a slice that
+ * ALSO carries one v3-only field the older algorithm never looks at. This is
+ * exactly the review's tamper scenario: a real v1/v2 algorithm run (proven
+ * below) picks specific known keys and ignores anything else, so the
+ * declared hash matching says nothing about whether the field was
+ * injected/edited outside a genuine older writer's reach.
+ */
+async function writeDeclaredOlderPlanWithV3Field(declaredVersion, field) {
+  const root = await mkdtemp(path.join(tmpdir(), `sm-plan-declared-v${declaredVersion}-v3field-`));
+  await ensureVault(root);
+  const { plan, write } = await createPlan(
+    { goal: `declared v${declaredVersion} tamper probe`, slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+    { vaultPath: root },
+  );
+  const mutatedSlices = [{ ...plan.slices[0], [field]: V3_ONLY_FIELD_SAMPLES[field] }];
+  const mutatedPlan = { ...plan, slices: mutatedSlices };
+  const olderAlgo = declaredVersion === 1 ? computePlanDigestV1 : computePlanDigestHexV2;
+  const olderHex = olderAlgo(mutatedPlan);
+  // Prove the older algorithm truly ignores this field — otherwise this
+  // fixture would not be testing what it claims to.
+  assert.equal(olderHex, olderAlgo(plan), `expected declared-v${declaredVersion} digest to be blind to "${field}"`);
+
+  const raw = await readFile(write.notePath, "utf8");
+  const rewritten = raw
+    .replace(/^plan_slices:.*$/m, `plan_slices: ${JSON.stringify(JSON.stringify(mutatedSlices))}`)
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${olderHex}`)
+    .replace(/^plan_digest_v:.*$/m, `plan_digest_v: ${declaredVersion}`);
+  assert.notEqual(rewritten, raw, "expected to actually inject a v3-only field into this fixture");
+  await writeFile(write.notePath, rewritten, "utf8");
+  return { notePath: write.notePath, root };
+}
+
+test("rehydratePlan rejects a declared v2 note whose slice carries a v3-only field outside v2's digest coverage", async (t) => {
+  for (const field of Object.keys(V3_ONLY_FIELD_SAMPLES)) {
+    await t.test(field, async () => {
+      const fixture = await writeDeclaredOlderPlanWithV3Field(2, field);
+      try {
+        const before = await readFile(fixture.notePath, "utf8");
+        await assert.rejects(
+          () => rehydratePlan(fixture.notePath),
+          (err) => {
+            assert.match(err.message, /v3-only field/);
+            assert.match(err.message, new RegExp(field));
+            assert.match(err.message, /tampered/);
+            return true;
+          },
+        );
+        const after = await readFile(fixture.notePath, "utf8");
+        assert.equal(after, before, "a rejected read must not rewrite the note either");
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("rehydratePlan rejects a declared v1 note whose slice carries a v3-only field outside v1's digest coverage", async () => {
+  const fixture = await writeDeclaredOlderPlanWithV3Field(1, "assigned_to");
+  try {
+    const before = await readFile(fixture.notePath, "utf8");
+    await assert.rejects(
+      () => rehydratePlan(fixture.notePath),
+      (err) => {
+        assert.match(err.message, /v3-only field/);
+        assert.match(err.message, /assigned_to/);
+        return true;
+      },
+    );
+    const after = await readFile(fixture.notePath, "utf8");
+    assert.equal(after, before);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Writes a note with NO plan_digest_v field at all (the pre-H7 legacy
+ * shape) whose plan_digest genuinely equals computePlanDigestV1 — but one
+ * slice ALSO carries a v3-only field the v1 algorithm never looks at. This
+ * is the re-review's scenario: an UNDECLARED note is just as blind to the
+ * v3-only keys as a declared-v1 note is, and — unlike the declared
+ * case — it was about to be silently upgraded (persisted) as a genuine v3
+ * note, which would bless the injected field permanently.
+ */
+async function writeUndeclaredV1PlanWithV3Field(field) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-undeclared-v1-v3field-"));
+  await ensureVault(root);
+  const { write } = await createPlan(
+    { goal: "undeclared v1 tamper probe", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+    { vaultPath: root },
+  );
+  const canonical = await rehydratePlan(write.notePath);
+  const mutatedSlices = [{ ...canonical.slices[0], [field]: V3_ONLY_FIELD_SAMPLES[field] }];
+  const mutatedPlan = { ...canonical, slices: mutatedSlices };
+  const v1Hex = computePlanDigestV1(mutatedPlan);
+  // Prove v1 is genuinely blind to this field, exactly as for the declared
+  // case above — otherwise this fixture would not test what it claims.
+  assert.equal(v1Hex, computePlanDigestV1(canonical), `expected undeclared-v1 digest to be blind to "${field}"`);
+
+  const raw = await readFile(write.notePath, "utf8");
+  const rewritten = raw
+    .replace(/^plan_slices:.*$/m, `plan_slices: ${JSON.stringify(JSON.stringify(mutatedSlices))}`)
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${v1Hex}`)
+    // A real pre-H7 note carries no plan_digest_v field either (see the H7
+    // test above) — with it present this would hit the DECLARED branch,
+    // not the undeclared-legacy fallback this test targets.
+    .replace(/^plan_digest_v:.*\n/m, "");
+  assert.notEqual(rewritten, raw, "expected to actually inject a v3-only field into this fixture");
+  await writeFile(write.notePath, rewritten, "utf8");
+  return { notePath: write.notePath, root };
+}
+
+test("rehydratePlan rejects an undeclared legacy (no plan_digest_v) valid-v1 note whose slice carries a v3-only field", async (t) => {
+  for (const field of ["assigned_to", "claim", "replaced_by"]) {
+    await t.test(field, async () => {
+      const fixture = await writeUndeclaredV1PlanWithV3Field(field);
+      try {
+        const before = await readFile(fixture.notePath, "utf8");
+        await assert.rejects(
+          () => rehydratePlan(fixture.notePath),
+          (err) => {
+            assert.match(err.message, /v3-only field/);
+            assert.match(err.message, new RegExp(field));
+            assert.match(err.message, /tampered/);
+            return true;
+          },
+        );
+        const after = await readFile(fixture.notePath, "utf8");
+        assert.equal(after, before, "a rejected read must not upgrade/rewrite the note either");
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("rehydratePlan still upgrades a CLEAN undeclared legacy (no plan_digest_v) valid-v1 note on read", async () => {
+  // The new legacy-path guard above must not be a false positive: a genuine
+  // pre-H7 note with none of the v3-only keys must keep upgrading in
+  // place exactly as the pre-existing H7 test already proves — this test
+  // re-confirms that specifically alongside the new tamper guard, using the
+  // same note shape (single slice, no plan_digest_v) as the rejection test
+  // above so the only variable between "clean" and "tampered" is the
+  // injected field itself.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-undeclared-v1-clean-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "undeclared v1 clean upgrade", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const canonical = await rehydratePlan(write.notePath);
+    const v1Hex = computePlanDigestV1(canonical);
+    const v3Hex = computePlanDigest(canonical);
+    assert.notEqual(v1Hex, v3Hex, "v1 and v3 digests must differ for this to be a real migration");
+
+    const raw = await readFile(write.notePath, "utf8");
+    const withLegacy = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${v1Hex}`)
+      .replace(/^plan_digest_v:.*\n/m, "");
+    assert.notEqual(withLegacy, raw, "expected to actually rewrite plan_digest to the legacy v1 hex");
+    await writeFile(write.notePath, withLegacy, "utf8");
+
+    const upgraded = await rehydratePlan(write.notePath);
+    assert.equal(upgraded.plan_digest, v3Hex, "a clean undeclared v1 note must still upgrade to the current digest");
+
+    const after = await readFile(write.notePath, "utf8");
+    assert.match(after, new RegExp(`^plan_digest: ${v3Hex}$`, "m"), "note must be re-persisted with the current digest");
+    assert.match(after, /^plan_digest_v: 3$/m, "upgrade must stamp the current plan_digest_v going forward");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Writes a note with NO plan_digest_v field at all whose plan_digest
+ * genuinely equals computePlanDigestHexV2 — simulating a genuine v2-era
+ * writer that predated the plan_digest_v tagging field. One slice ALSO
+ * carries a v3-only field the v2 algorithm never looks at, mirroring
+ * writeUndeclaredV1PlanWithV3Field above but for the "bare v2-or-v1"
+ * fallback's other half. Task 2 final review: this half of the undeclared
+ * fallback regressed to "v1 only" and stopped recognizing v2 at all, which
+ * this test's sibling (the clean bare-v2 upgrade test) targets; this test
+ * targets the OTHER failure mode — a bare-v2 note tampered with a v3-only
+ * field must still be rejected, not silently upgraded/blessed.
+ */
+async function writeUndeclaredV2PlanWithV3Field(field) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-undeclared-v2-v3field-"));
+  await ensureVault(root);
+  const { write } = await createPlan(
+    { goal: "undeclared v2 tamper probe", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+    { vaultPath: root },
+  );
+  const canonical = await rehydratePlan(write.notePath);
+  const mutatedSlices = [{ ...canonical.slices[0], [field]: V3_ONLY_FIELD_SAMPLES[field] }];
+  const mutatedPlan = { ...canonical, slices: mutatedSlices };
+  const v2Hex = computePlanDigestHexV2(mutatedPlan);
+  assert.equal(v2Hex, computePlanDigestHexV2(canonical), `expected undeclared-v2 digest to be blind to "${field}"`);
+
+  const raw = await readFile(write.notePath, "utf8");
+  const rewritten = raw
+    .replace(/^plan_slices:.*$/m, `plan_slices: ${JSON.stringify(JSON.stringify(mutatedSlices))}`)
+    .replace(/^plan_digest:.*$/m, `plan_digest: ${v2Hex}`)
+    .replace(/^plan_digest_v:.*\n/m, "");
+  assert.notEqual(rewritten, raw, "expected to actually inject a v3-only field into this fixture");
+  await writeFile(write.notePath, rewritten, "utf8");
+  return { notePath: write.notePath, root };
+}
+
+test("rehydratePlan rejects an undeclared legacy (no plan_digest_v) valid-v2 note whose slice carries a v3-only field", async (t) => {
+  for (const field of ["assigned_to", "claim", "replaced_by"]) {
+    await t.test(field, async () => {
+      const fixture = await writeUndeclaredV2PlanWithV3Field(field);
+      try {
+        const before = await readFile(fixture.notePath, "utf8");
+        await assert.rejects(
+          () => rehydratePlan(fixture.notePath),
+          (err) => {
+            assert.match(err.message, /v3-only field/);
+            assert.match(err.message, new RegExp(field));
+            assert.match(err.message, /tampered/);
+            return true;
+          },
+        );
+        const after = await readFile(fixture.notePath, "utf8");
+        assert.equal(after, before, "a rejected read must not upgrade/rewrite the note either");
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("rehydratePlan still upgrades a CLEAN undeclared legacy (no plan_digest_v) valid-v2 note on read", async () => {
+  // The "bare v2-or-v1" contract (see PLAN_DIGEST_VERSION's doc comment)
+  // means an undeclared note validating against v2 — not just v1 — must
+  // keep upgrading in place. Same note shape (single slice, no
+  // plan_digest_v) as the rejection test above, no injected field, so the
+  // only variable is the field itself.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-undeclared-v2-clean-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "undeclared v2 clean upgrade", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const canonical = await rehydratePlan(write.notePath);
+    const v2Hex = computePlanDigestHexV2(canonical);
+    const v3Hex = computePlanDigest(canonical);
+    assert.notEqual(v2Hex, v3Hex, "v2 and v3 digests must differ for this to be a real migration");
+
+    const raw = await readFile(write.notePath, "utf8");
+    const withLegacy = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: ${v2Hex}`)
+      .replace(/^plan_digest_v:.*\n/m, "");
+    assert.notEqual(withLegacy, raw, "expected to actually rewrite plan_digest to the legacy v2 hex");
+    await writeFile(write.notePath, withLegacy, "utf8");
+
+    const upgraded = await rehydratePlan(write.notePath);
+    assert.equal(upgraded.plan_digest, v3Hex, "a clean undeclared v2 note must still upgrade to the current digest");
+
+    const after = await readFile(write.notePath, "utf8");
+    assert.match(after, new RegExp(`^plan_digest: ${v3Hex}$`, "m"), "note must be re-persisted with the current digest");
+    assert.match(after, /^plan_digest_v: 3$/m, "upgrade must stamp the current plan_digest_v going forward");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan normalizes a declared v1 note's interim 'v1:<hex>' tag to bare hex in memory without writing the note", async () => {
+  // Focused assertion for the review's second ask: the no-write-on-read
+  // contract only says the FILE is left alone for a declared-older version.
+  // The returned in-memory plan.plan_digest must still be the bare hex, not
+  // leak the "v1:" on-disk tag encoding to callers.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v1-tag-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "declared v1 interim tag", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const v1Hex = computePlanDigestV1(plan);
+    const raw = await readFile(write.notePath, "utf8");
+    const rewritten = raw
+      .replace(/^plan_digest:.*$/m, `plan_digest: v1:${v1Hex}`)
+      .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 1");
+    assert.notEqual(rewritten, raw);
+    await writeFile(write.notePath, rewritten, "utf8");
+
+    const before = await readFile(write.notePath, "utf8");
+    const rehydrated = await rehydratePlan(write.notePath);
+    const after = await readFile(write.notePath, "utf8");
+    assert.equal(rehydrated.plan_digest, v1Hex, "in-memory digest must be normalized to bare hex");
+    assert.equal(after, before, "the note itself must not be rewritten for a declared-older version");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan still normalizes an interim 'v3:<hex>' tag on the CURRENT declared version", async () => {
+  // The no-write-on-read rule above applies only to a declared OLDER
+  // algorithm. A note whose EFFECTIVE declared version is already current
+  // (v3) but still carries an interim "v3:<hex>" prefix (as an in-flight
+  // build of this task might emit transiently) keeps normalizing to bare
+  // hex on read, exactly like the pre-existing v1->v2 interim-tag behavior.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-v3-tag-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "declared v3 interim tag", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    assert.match(raw, /^plan_digest_v: 3$/m, "new plans must declare the current v3 algorithm");
+    const bare = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)?.[1];
+    assert.ok(bare, "expected a bare-hex digest to prefix");
+    await writeFile(
+      write.notePath,
+      raw.replace(/^plan_digest:.*$/m, `plan_digest: v3:${bare}`),
+      "utf8",
+    );
+
+    const rehydrated = await rehydratePlan(write.notePath);
+    assert.equal(rehydrated.plan_digest, bare, "in-memory digest must be normalized bare hex");
+    const rewritten = await readFile(write.notePath, "utf8");
+    assert.match(rewritten, /^plan_digest: "?[0-9a-f]{16}"?$/m, "note must be re-stamped bare hex");
+    assert.match(rewritten, /^plan_digest_v: 3$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rehydratePlan still rejects a newer-than-current declared digest version", async () => {
+  // Preserve the existing newer-version fail-closed contract across the v3
+  // bump: a plugin build that has never heard of v4 must refuse to guess at
+  // it, not treat it as tampered and not silently downgrade-write it.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-declared-newer-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "newer than v3", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 4"), "utf8");
+    await assert.rejects(
+      () => rehydratePlan(write.notePath),
+      (err) => {
+        assert.ok(err instanceof PlanDigestVersionError, "must be the typed newer-version error");
+        assert.equal(err.code, "PLAN_DIGEST_NEWER");
+        assert.match(err.message, /newer than this plugin/);
+        assert.equal(err.notePath, write.notePath, "notePath stays a typed internal field");
+        assert.equal(
+          err.message.includes(write.notePath),
+          false,
+          "PlanDigestVersionError.message must not interpolate notePath",
+        );
+        assert.equal(err.message.includes("wiki/artifacts"), false);
+        return true;
+      },
+    );
+    const untouched = await readFile(write.notePath, "utf8");
+    assert.match(untouched, /^plan_digest_v: 4$/m, "newer-version note must not be rewritten");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("createPlan with shelf_ref configures shelfDrift (punch-list §4b: MCP layer must actually thread shelf_ref through)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-plan-shelf-"));
   try {
@@ -889,6 +1553,126 @@ test("resolveActivePlanView never crashes on a plan with no shelf_ref even when 
     const view = await resolveActivePlanView(root, "some live content nobody asked to compare against");
     assert.ok(view);
     assert.equal(Object.hasOwn(view, "shelf_drift"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Wave 2 residual: self-heal wrote legacy appendJournal({ kind: "status_reconciled" })
+// which the ordered parser ignores. Heal must land on the ordered cursor.
+test("resolveActivePlanView self-heal writes status_reconciled onto the ordered cursor", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-heal-ordered-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      {
+        goal: "Finish the stuck plan",
+        slices: [
+          { id: "s1", title: "Slice one" },
+          { id: "s2", title: "Slice two" },
+        ],
+        vaultPath: root,
+      },
+      { vaultPath: root },
+    );
+    plan.slices[0] = {
+      ...plan.slices[0],
+      status: "done",
+      evidence: "tests/plan.test.mjs ordered self-heal pin",
+    };
+    plan.slices[1] = {
+      ...plan.slices[1],
+      status: "superseded",
+      superseded_by: "replan-test",
+    };
+    assert.equal(plan.status, "draft");
+    await persistPlan(plan, { vaultPath: root, notePath: write.notePath });
+
+    const view = await resolveActivePlanView(root);
+    assert.equal(view, undefined);
+
+    const healed = await rehydratePlan(write.notePath);
+    assert.equal(healed.status, "complete");
+
+    const { readThreadEvents } = await import("../dist/thread-events.js");
+    const journalPath = journalPathFor(write.notePath, plan.plan_id);
+    const { events } = await readThreadEvents(journalPath, 0, 100);
+    const reconciled = events.find((event) => event.kind === "status_reconciled");
+    assert.ok(
+      reconciled,
+      `expected ordered status_reconciled, got kinds: ${events.map((e) => e.kind)}`,
+    );
+    assert.equal(typeof reconciled.seq, "number");
+    assert.deepEqual(reconciled.payload, { from: "draft", to: "complete" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Wave 2 residual: FS/lock failures from getActivePlan / resolveActivePlanView
+// used to return undefined and look like "no active plan."
+test("resolveActivePlanView distinguishes FS errors from an empty active pointer", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-active-fs-"));
+  try {
+    await ensureVault(root);
+    const pointerPath = path.join(root, "wiki", "artifacts", "_active_plan.json");
+    await mkdir(path.dirname(pointerPath), { recursive: true });
+    await rm(pointerPath, { force: true });
+    await mkdir(pointerPath); // EISDIR on readFile
+
+    await assert.rejects(
+      resolveActivePlanView(root),
+      (error) =>
+        error?.code === "ACTIVE_PLAN_READ_FAILED" &&
+        typeof error.message === "string" &&
+        !error.message.includes(pointerPath),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("getActivePlan still returns undefined for a missing pointer (empty, not error)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-active-empty-"));
+  try {
+    await ensureVault(root);
+    assert.equal(await getActivePlan(root), undefined);
+    assert.equal(await resolveActivePlanView(root), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Wave 2 residual: a live held lock used to be indistinguishable from "no
+// active plan" if the view swallowed THREAD_BUSY. Domain rethrows; this pin
+// is the missing active-plan-view proof.
+test("resolveActivePlanView rethrows THREAD_BUSY when the plan lock is held", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-active-busy-"));
+  try {
+    await ensureVault(root);
+    const { plan } = await createPlan(
+      { goal: "held lock is busy, not empty", vaultPath: root },
+      { vaultPath: root },
+    );
+    const key = createHash("sha256").update(plan.plan_id).digest("hex").slice(0, 32);
+    const lockDir = path.join(root, ".runtime", "thread-locks", `${key}.lock`);
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(
+      path.join(lockDir, "owner.json"),
+      `${JSON.stringify({
+        pid: process.pid,
+        operationId: "live-holder",
+        acquiredAt: "2026-01-01T00:00:00.000Z",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const old = new Date("2026-01-01T00:00:00.000Z");
+    await utimes(lockDir, old, old);
+
+    await assert.rejects(
+      resolveActivePlanView(root),
+      (error) => error?.code === "THREAD_BUSY",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1032,6 +1816,62 @@ test("appendJournal round-trips real init + append with no leftover .tmp sibling
   }
 });
 
+// Cassandra PR #371 G1: appendJournal's catch-all used to treat ANY
+// append/fsync failure as "journal missing" and overwrite it via
+// writeFileAtomic. This file is also the ordered Thread event journal —
+// rewriting it after a failed fsync is real lost-events, not recovery.
+test("appendJournal does not rewrite an existing journal when append/fsync fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-journal-fsync-"));
+  try {
+    const journalPath = path.join(root, "test.log.md");
+    await appendJournal(journalPath, { kind: "rehydrated", at: "2026-01-01T00:00:00.000Z" });
+    await appendJournal(journalPath, { kind: "status_changed", at: "2026-01-01T00:01:00.000Z" });
+    const before = parseJournal(await readFile(journalPath, "utf8"));
+    assert.deepEqual(
+      before.map((e) => e.at),
+      ["2026-01-01T00:00:00.000Z", "2026-01-01T00:01:00.000Z"],
+    );
+
+    const atomicCalls = [];
+    const landedThenThrows = async (filePath, content) => {
+      await realAppendFileWithFsync(filePath, content);
+      throw Object.assign(new Error("simulated fsync failure after write landed"), {
+        code: "EIO",
+      });
+    };
+
+    await assert.rejects(
+      () =>
+        appendJournal(
+          journalPath,
+          { kind: "gate_passed", at: "2026-01-01T00:02:00.000Z" },
+          {
+            appendFileWithFsync: landedThenThrows,
+            writeFileAtomic: async (p, c) => {
+              atomicCalls.push([p, c]);
+              await writeFileAtomic(p, c);
+            },
+          },
+        ),
+      /simulated fsync failure/,
+    );
+
+    assert.equal(
+      atomicCalls.length,
+      0,
+      "fsync-fail on an existing journal must not rewrite via writeFileAtomic",
+    );
+    const after = parseJournal(await readFile(journalPath, "utf8"));
+    assert.deepEqual(
+      after.map((e) => e.at),
+      ["2026-01-01T00:00:00.000Z", "2026-01-01T00:01:00.000Z", "2026-01-01T00:02:00.000Z"],
+      "prior events must survive; the line that landed before the throw must remain",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // Bugbot on #309 (campaign scar #3 — source-grep tests are false confidence):
 // same lesson as appendJournal's test above. Spy on the injected dependency
 // to prove writeVaultPage actually invokes writeFileAtomic with the note's
@@ -1118,7 +1958,6 @@ test("freeze guard: createPlan still mints plan- prefixed ids after the threads 
     assert.match(write.wikilink, /\[\[.*plan-[0-9a-f]{16}\]\]/, "wikilink is frozen");
 
     // and lookup still resolves by the frozen frontmatter key, not the filename
-    const { findPlanNote } = await import("../dist/plan.js");
     assert.equal(await findPlanNote(root, plan.plan_id), write.notePath);
     const note = await readFile(write.notePath, "utf8");
     assert.match(note, /minni_plan:\s*true/, "legacy frontmatter marker is frozen");
@@ -1130,6 +1969,47 @@ test("freeze guard: createPlan still mints plan- prefixed ids after the threads 
     await setActivePlan(root, plan.plan_id, write.notePath);
     const pointer = await readFile(path.join(root, "wiki", "artifacts", "_active_plan.json"), "utf8");
     assert.equal(JSON.parse(pointer).plan_id, plan.plan_id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Cassandra PR #371 round 3: findPlanNote used to readFile every wiki/artifacts
+// *.md, including plan-*.log.md journals, with no per-file catch. An EISDIR
+// journal (or any sibling *.md directory) threw a path-bearing Node error
+// before MCP handlers reached threadWorkerErrorResult.
+test("findPlanNote skips an EISDIR journal and still locates the plan note", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-find-eisdir-journal-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "findPlanNote must survive a directory-at-journal-path", vaultPath: root },
+      { vaultPath: root },
+    );
+    const journalPath = journalPathFor(write.notePath, plan.plan_id);
+    await rm(journalPath, { force: true });
+    await mkdir(journalPath);
+
+    const found = await findPlanNote(root, plan.plan_id);
+    assert.equal(found, write.notePath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("findPlanNote skips an unreadable sibling *.md and still locates the plan note", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-find-eisdir-sibling-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "findPlanNote must catch per-file read failures", vaultPath: root },
+      { vaultPath: root },
+    );
+    const poison = path.join(root, "wiki", "artifacts", "poison.md");
+    await mkdir(poison);
+
+    const found = await findPlanNote(root, plan.plan_id);
+    assert.equal(found, write.notePath);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1441,6 +2321,157 @@ test("persistPlan wires real plan writes through the capped history append (#294
   }
 });
 
+test("PlanHistoryAppendError keeps notePath typed and out of .message", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const error = new PlanHistoryAppendError(
+    notePath,
+    4,
+    new Error("EISDIR: illegal operation on a directory"),
+  );
+  assert.equal(error.notePath, notePath);
+  assert.equal(error.rev, 4);
+  assert.equal(error.code, "PLAN_HISTORY_APPEND_FAILED");
+  assert.equal(
+    error.message,
+    "persistPlan: note committed at rev 4, but appending the history snapshot failed: history append failed",
+  );
+  assert.equal(error.message.includes(notePath), false);
+  assert.equal(error.message.includes("wiki/artifacts"), false);
+});
+
+test("PlanHistoryAppendError drops a Node-style cause path (history file, not notePath)", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const historyPath = historyPathFor(notePath);
+  const cause = Object.assign(
+    new Error(`EISDIR: illegal operation on a directory, open '${historyPath}'`),
+    { code: "EISDIR", path: historyPath },
+  );
+  const error = new PlanHistoryAppendError(notePath, 4, cause);
+  assert.equal(error.notePath, notePath);
+  assert.equal(
+    error.message,
+    "persistPlan: note committed at rev 4, but appending the history snapshot failed: EISDIR",
+  );
+  assert.equal(error.message.includes(historyPath), false);
+  assert.equal(error.message.includes(notePath), false);
+  assert.equal(error.message.includes("wiki/artifacts"), false);
+});
+
+test("PlanHistoryAppendError does not interpolate a path-bearing cause that has no syscall code", () => {
+  const notePath = "/tmp/minni-vault/wiki/artifacts/plan-secret-path.md";
+  const historyPath = historyPathFor(notePath);
+  const error = new PlanHistoryAppendError(
+    notePath,
+    4,
+    new Error(`append failed at ${historyPath}`),
+  );
+  assert.equal(
+    error.message,
+    "persistPlan: note committed at rev 4, but appending the history snapshot failed: history append failed",
+  );
+  assert.equal(error.message.includes(historyPath), false);
+  assert.equal(error.message.includes("wiki/artifacts"), false);
+});
+
+// persistPlan performs two durable steps: it writes the canonical vault note,
+// then appends a history snapshot line. A real EISDIR on the history file
+// proves the note write itself already committed while the second step
+// throws — this must surface as the typed PlanHistoryAppendError (never a
+// bare Error a caller could mistake for "nothing was written"), so a caller
+// holding a freshly staged secret (thread-worker's claimSlice) can tell this
+// apart from a genuine pre-commit failure without guessing from message text.
+test("persistPlan throws the typed PlanHistoryAppendError when the note commits but history append fails", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-append-error-"));
+  try {
+    await ensureVault(root);
+    const created = await createPlan(
+      { goal: "Reproduce a real post-commit history failure", vaultPath: root },
+      { vaultPath: root },
+    );
+    const { plan, write } = created;
+    const historyFile = historyPathFor(write.notePath);
+    await rm(historyFile, { force: true });
+    await mkdir(historyFile);
+
+    const before = await rehydratePlan(write.notePath);
+    await assert.rejects(
+      persistPlan(plan, { vaultPath: root, notePath: write.notePath }),
+      (error) => {
+        assert.ok(
+          error instanceof PlanHistoryAppendError,
+          `expected PlanHistoryAppendError, got ${error?.constructor?.name}`,
+        );
+        assert.equal(error.code, "PLAN_HISTORY_APPEND_FAILED");
+        assert.equal(error.notePath, write.notePath);
+        assert.match(error.message, /persistPlan: note committed at rev/);
+        assert.match(error.message, /history snapshot failed/);
+        assert.match(error.message, /EISDIR/);
+        assert.equal(
+          error.message.includes(write.notePath),
+          false,
+          "PlanHistoryAppendError.message must keep notePath as a typed field only",
+        );
+        assert.equal(
+          error.message.includes(historyFile),
+          false,
+          "PlanHistoryAppendError.message must not embed the history file path from cause.message",
+        );
+        assert.equal(
+          error.message.includes("wiki/artifacts"),
+          false,
+          "PlanHistoryAppendError.message must not leak a vault artifacts path",
+        );
+        return true;
+      },
+    );
+
+    // The note write already landed durably despite the thrown error.
+    // persistPlan mutates `plan` in place before the history append is
+    // attempted, so the in-memory rev/digest already match what is on disk.
+    const after = await rehydratePlan(write.notePath);
+    assert.equal(after.rev, before.rev + 1);
+    assert.equal(after.rev, plan.rev);
+    assert.equal(after.plan_digest, plan.plan_digest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("persistPlan notePath mismatch after durable write does not embed vault paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-history-notepath-mismatch-"));
+  try {
+    await ensureVault(root);
+    const created = await createPlan(
+      { goal: "Reproduce a post-commit notePath mismatch", vaultPath: root },
+      { vaultPath: root },
+    );
+    const { plan, write } = created;
+    const otherPath = path.join(root, "wiki", "artifacts", "plan-other.md");
+    await assert.rejects(
+      persistPlan(plan, {
+        vaultPath: root,
+        notePath: write.notePath,
+        writeVaultPage: async () => ({
+          notePath: otherPath,
+          relativePath: "wiki/artifacts/plan-other.md",
+          wikilink: "[[plan-other]]",
+        }),
+      }),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /different notePath than the caller expected/);
+        assert.equal(error.message.includes(write.notePath), false);
+        assert.equal(error.message.includes(otherPath), false);
+        assert.equal(error.message.includes("wiki/artifacts"), false);
+        assert.equal(error.message.includes(root), false);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // #291 (audit N4): depends_on was advisory only — a slice whose dependency
 // was still open could be silently marked done. Pure-function coverage of
@@ -1506,6 +2537,683 @@ test("updateSlice: superseded (not just done) also satisfies a dependency", () =
   const aSuperseded = updateSlice(plan, "a", "superseded", "replaced by a different approach, see replan");
   const bDone = updateSlice(aSuperseded, "b", "done", "B is finished, verified via logs/b.log");
   assert.equal(bDone.slices.find((s) => s.id === "b").status, "done");
+});
+
+// Exclusive split is replacement, not drop-without-replacement: superseding the
+// parent while adding children must NOT treat depends_on as resolved. Plain
+// contract drop (drop-only) still unblocks — that residual stays disclosed.
+test("unmetDependencies: exclusive split keeps dependents blocked; contract drop still resolves", () => {
+  const plan = {
+    plan_id: "split-dep",
+    goal: "split remount",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-20T12:00:00.000Z",
+    updated: "2026-08-20T12:00:00.000Z",
+    rev: 1,
+  };
+
+  const contracted = applySliceDelta(plan, { drop_slice_ids: ["s0"] });
+  assert.equal(contracted.slices.find((s) => s.id === "s0").status, "superseded");
+  assert.deepEqual(
+    unmetDependencies(contracted, "b"),
+    [],
+    "plain contract drop-without-replacement still resolves depends_on",
+  );
+  assert.equal(
+    contracted.slices.find((s) => s.id === "s0").replaced_by,
+    undefined,
+    "drop-only must not mark replacement",
+  );
+
+  const split = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "two independently verifiable outputs",
+        slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+        ],
+      },
+      "s0",
+    ),
+  );
+  const parent = split.slices.find((s) => s.id === "s0");
+  assert.equal(parent.status, "superseded");
+  assert.deepEqual(
+    [...(parent.replaced_by ?? [])].sort(),
+    ["child-a", "child-b"],
+    "split marks the superseded parent as replaced by the children",
+  );
+  assert.deepEqual(
+    unmetDependencies(split, "b"),
+    ["s0"],
+    "dependents of a replaced parent stay blocked until orch remounts depends_on",
+  );
+  assert.deepEqual(unmetDependencies(split, "child-a"), [], "children do not inherit parent deps");
+  assert.deepEqual(unmetDependencies(split, "child-b"), []);
+  assert.deepEqual(unmetDependencies(split, "indie"), []);
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "structuralProposalDelta / applySliceDelta must not auto-remount depends_on",
+  );
+
+  // Leftover rewrite pin: new_slices remount still restates the live set.
+  // Omit a live id and it is superseded — that is a rewrite, not an edge edit.
+  const remounted = replan(split, [
+    { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+    { id: "child-a", title: "Child A" },
+    { id: "child-b", title: "Child B" },
+    { id: "indie", title: "Independent" },
+  ]);
+  assert.deepEqual(remounted.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+  assert.deepEqual(
+    unmetDependencies(remounted, "b").sort(),
+    ["child-a", "child-b"],
+    "after orch remount on the existing replan surface, b waits on the children",
+  );
+  assert.equal(remounted.slices.find((s) => s.id === "indie").status, "pending");
+});
+
+test("replan new_slices: omitting a live id still supersedes it", () => {
+  const plan = {
+    plan_id: "omit-indie-rewrite",
+    goal: "omit indie",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "superseded", superseded_by: "replan-x", replaced_by: ["child-a", "child-b"] },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+      { id: "child-a", title: "Child A", status: "pending" },
+      { id: "child-b", title: "Child B", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "child-a",
+    plan_digest: "x",
+    created: "2026-08-20T12:00:00.000Z",
+    updated: "2026-08-20T12:00:00.000Z",
+    rev: 1,
+  };
+  const rewritten = replan(plan, [
+    { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+    { id: "child-a", title: "Child A" },
+    { id: "child-b", title: "Child B" },
+  ]);
+  assert.equal(
+    rewritten.slices.find((s) => s.id === "indie").status,
+    "superseded",
+    "omitting indie from new_slices is still a rewrite",
+  );
+  assert.deepEqual(rewritten.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+});
+
+test("applySliceDelta: remounts named depends_on without superseding omitted live slices", () => {
+  const plan = {
+    plan_id: "split-dep-edge",
+    goal: "split remount edge",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-20T12:00:00.000Z",
+    updated: "2026-08-20T12:00:00.000Z",
+    rev: 1,
+  };
+  const split = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "two independently verifiable outputs",
+        slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+        ],
+      },
+      "s0",
+    ),
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "applySliceDelta add/drop-only still does not remount dependents",
+  );
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["ghost"] }] }),
+    /applySliceDelta: cannot remount onto "ghost"/,
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "ghost remount must not persist; b still depends_on s0",
+  );
+  assert.equal(
+    split.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "ghost remount must not touch indie",
+  );
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["s0"] }] }),
+    /applySliceDelta: cannot remount onto "s0"/,
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "superseded-target remount must not persist; b still depends_on s0",
+  );
+  assert.equal(split.slices.find((s) => s.id === "indie").status, "pending");
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "ghost"] }] }),
+    /applySliceDelta: cannot remount onto "ghost"/,
+    "any missing target rejects the whole remount",
+  );
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["b"] }] }),
+    /applySliceDelta: cannot remount onto "b" — target is the remounted slice/,
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "self remount must not persist; b still depends_on s0",
+  );
+  assert.equal(
+    split.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "self remount must not touch indie",
+  );
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "b", depends_on: ["b", "child-a"] }] }),
+    /applySliceDelta: cannot remount onto "b" — target is the remounted slice/,
+    "mixed self+valid rejects the whole remount",
+  );
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "mixed self remount must not persist; b still depends_on s0",
+  );
+  assert.equal(split.slices.find((s) => s.id === "indie").status, "pending");
+
+  const remounted = applySliceDelta(split, {
+    set_depends_on: [{ slice_id: "b", depends_on: ["child-a", "child-b"] }],
+  });
+  assert.deepEqual(remounted.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+  assert.equal(
+    remounted.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "unnamed live slices stay; remount must not supersede indie",
+  );
+  assert.equal(remounted.slices.find((s) => s.id === "s0").status, "superseded");
+  assert.deepEqual(
+    unmetDependencies(remounted, "b").sort(),
+    ["child-a", "child-b"],
+    "after named remount, b waits on the children",
+  );
+  assert.deepEqual(diffDependsOn(split, remounted), [
+    { slice_id: "b", from: ["s0"], to: ["child-a", "child-b"] },
+  ]);
+  assert.deepEqual(landedReplanTopology(split, remounted), {});
+
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "ghost", depends_on: ["child-a"] }] }),
+    /applySliceDelta: cannot remount depends_on on "ghost"/,
+  );
+  assert.throws(
+    () => applySliceDelta(split, { set_depends_on: [{ slice_id: "s0", depends_on: ["child-a"] }] }),
+    /applySliceDelta: cannot remount depends_on on "s0"/,
+  );
+});
+
+test("replan: new_slices self-edge throws; topology unchanged", () => {
+  const plan = {
+    plan_id: "newslices-self-edge",
+    goal: "new_slices must not write a self-edge",
+    status: "active",
+    constraints: [],
+    slices: [
+      {
+        id: "s0",
+        title: "Parent",
+        status: "superseded",
+        superseded_by: "replan-split",
+        replaced_by: ["child-a", "child-b"],
+      },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "child-a", title: "Child A", status: "pending" },
+      { id: "child-b", title: "Child B", status: "pending" },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "child-a",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  assert.throws(
+    () =>
+      replan(plan, [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["b"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent" },
+      ]),
+    /replan: refused self-edge on slice "b"/,
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "new_slices self-edge must not land; b still depends_on s0",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "rejected new_slices self-edge must not supersede indie",
+  );
+});
+
+test("applySliceDelta: add_slices self-edge throws; x does not land", () => {
+  const plan = {
+    plan_id: "addslices-self-edge",
+    goal: "add_slices must not write a self-edge",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "keep", title: "Keep", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        add_slices: [{ id: "x", title: "Self loop", depends_on: ["x"] }],
+      }),
+    /applySliceDelta: refused self-edge on slice "x"/,
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "x"),
+    undefined,
+    "add_slices self-edge must not land x",
+  );
+  assert.deepEqual(
+    plan.slices.map((s) => s.id),
+    ["keep"],
+    "rejected add_slices self-edge must not change topology",
+  );
+});
+
+test("applySliceDelta: remount onto pending/in_progress/done/blocked targets lands", () => {
+  for (const status of ["pending", "in_progress", "done", "blocked"]) {
+    const plan = {
+      plan_id: `remount-${status}-target`,
+      goal: "live remount targets",
+      status: "active",
+      constraints: [],
+      slices: [
+        { id: "target", title: "Live target", status },
+        { id: "b", title: "Waiter", status: "pending", depends_on: ["old"] },
+      ],
+      open_questions: [],
+      scar_tissue: [],
+      next_action: "b",
+      plan_digest: "x",
+      created: "2026-08-21T12:00:00.000Z",
+      updated: "2026-08-21T12:00:00.000Z",
+      rev: 1,
+    };
+    const remounted = applySliceDelta(plan, {
+      set_depends_on: [{ slice_id: "b", depends_on: ["target"] }],
+    });
+    assert.deepEqual(
+      remounted.slices.find((s) => s.id === "b").depends_on,
+      ["target"],
+      `remount onto ${status} target must land`,
+    );
+  }
+});
+
+test("applySliceDelta: remount onto slices added in the same call lands", () => {
+  const plan = {
+    plan_id: "remount-same-call-add",
+    goal: "nextSlices remount targets",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Waiter", status: "pending", depends_on: ["s0"] },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  const remounted = applySliceDelta(plan, {
+    add_slices: [{ id: "child-a", title: "Child A" }],
+    set_depends_on: [{ slice_id: "b", depends_on: ["child-a"] }],
+  });
+  assert.deepEqual(
+    remounted.slices.find((s) => s.id === "b").depends_on,
+    ["child-a"],
+    "remount targets are nextSlices after add in this same call",
+  );
+  assert.equal(remounted.slices.find((s) => s.id === "child-a").status, "pending");
+});
+
+function exclusiveSplitLivePlan(planId = "split-live-dep-targets") {
+  return {
+    plan_id: planId,
+    goal: "new_slices/add_slices must not write a dangling depends_on",
+    status: "active",
+    constraints: [],
+    slices: [
+      {
+        id: "s0",
+        title: "Parent",
+        status: "superseded",
+        superseded_by: "replan-split",
+        replaced_by: ["child-a", "child-b"],
+      },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "child-a", title: "Child A", status: "pending" },
+      { id: "child-b", title: "Child B", status: "pending" },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "child-a",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+}
+
+function liveExclusiveSplitPlan(planId = "split-same-call-waiter") {
+  return {
+    plan_id: planId,
+    goal: "same-call exclusive split must not persist a waiter on the dead parent",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "s0", title: "Parent", status: "pending" },
+      { id: "b", title: "Sibling depends on s0", status: "pending", depends_on: ["s0"] },
+      { id: "indie", title: "Independent", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "s0",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+}
+
+test("replan: new_slices restating live with b.depends_on=[ghost] throws; topology unchanged", () => {
+  const plan = exclusiveSplitLivePlan("newslices-ghost-dep");
+  assert.throws(
+    () =>
+      replan(plan, [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["ghost"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent" },
+      ]),
+    /replan: cannot depend on "ghost" — missing or superseded/,
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "ghost new_slices must not land; b still depends_on s0",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "rejected new_slices ghost must not supersede indie",
+  );
+});
+
+test("replan: new_slices restating live with b.depends_on=[s0] throws; topology unchanged", () => {
+  const plan = exclusiveSplitLivePlan("newslices-superseded-dep");
+  assert.throws(
+    () =>
+      replan(plan, [
+        { id: "b", title: "Sibling depends on s0", depends_on: ["s0"] },
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+        { id: "indie", title: "Independent" },
+      ]),
+    /replan: cannot depend on "s0" — missing or superseded/,
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "superseded-target new_slices must not land; b still depends_on s0",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "rejected new_slices superseded target must not supersede indie",
+  );
+});
+
+test("applySliceDelta: add_slices {id:x, depends_on:[ghost]} throws; x does not land", () => {
+  const plan = exclusiveSplitLivePlan("addslices-ghost-dep");
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        add_slices: [{ id: "x", title: "Ghost waiter", depends_on: ["ghost"] }],
+      }),
+    /applySliceDelta: cannot depend on "ghost" — missing or superseded/,
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "x"),
+    undefined,
+    "add_slices ghost must not land x",
+  );
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "rejected add_slices ghost must not change leftover b.depends_on",
+  );
+});
+
+test("applySliceDelta: add_slices {id:x, depends_on:[s0]} throws; x does not land", () => {
+  const plan = exclusiveSplitLivePlan("addslices-superseded-dep");
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        add_slices: [{ id: "x", title: "Dead waiter", depends_on: ["s0"] }],
+      }),
+    /applySliceDelta: cannot depend on "s0" — missing or superseded/,
+  );
+  assert.equal(plan.slices.find((s) => s.id === "x"), undefined);
+  assert.deepEqual(plan.slices.find((s) => s.id === "b").depends_on, ["s0"]);
+});
+
+test("applySliceDelta: unrelated add_slices still lands while leftover b.depends_on stays [s0]", () => {
+  const plan = exclusiveSplitLivePlan("addslices-parked-leftover");
+  const added = applySliceDelta(plan, {
+    add_slices: [{ id: "x", title: "Unrelated" }],
+  });
+  assert.equal(added.slices.find((s) => s.id === "x").status, "pending");
+  assert.deepEqual(
+    added.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "parked leftover b.depends_on [s0] is honest until orch remounts",
+  );
+  assert.equal(added.slices.find((s) => s.id === "indie").status, "pending");
+
+  const liveDep = applySliceDelta(plan, {
+    add_slices: [{ id: "y", title: "Waits on child-a", depends_on: ["child-a"] }],
+  });
+  assert.deepEqual(liveDep.slices.find((s) => s.id === "y").depends_on, ["child-a"]);
+  assert.deepEqual(liveDep.slices.find((s) => s.id === "b").depends_on, ["s0"]);
+});
+
+test("applySliceDelta: same-call exclusive split with waiter on s0 throws; x does not land", () => {
+  const plan = liveExclusiveSplitPlan("addslices-same-call-dead-parent");
+  assert.throws(
+    () =>
+      applySliceDelta(plan, {
+        drop_slice_ids: ["s0"],
+        add_slices: [
+          { id: "child-a", title: "Child A" },
+          { id: "child-b", title: "Child B" },
+          { id: "x", title: "Waiter on dead parent", depends_on: ["s0"] },
+        ],
+      }),
+    /applySliceDelta: cannot depend on "s0" — missing or superseded/,
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "x"),
+    undefined,
+    "same-call waiter must not land x on the input",
+  );
+  assert.equal(
+    plan.slices.find((s) => s.id === "s0").status,
+    "pending",
+    "rejected same-call waiter must not mutate s0 on the input",
+  );
+  assert.equal(plan.slices.find((s) => s.id === "s0").replaced_by, undefined);
+  assert.deepEqual(
+    plan.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "parked leftover b.depends_on stays [s0] on the input",
+  );
+  assert.equal(plan.slices.find((s) => s.id === "indie").status, "pending");
+});
+
+test("applySliceDelta: honest exclusive split without waiter lands; leftover b stays parked", () => {
+  const plan = liveExclusiveSplitPlan("addslices-honest-exclusive-split");
+  const split = applySliceDelta(plan, {
+    drop_slice_ids: ["s0"],
+    add_slices: [
+      { id: "child-a", title: "Child A" },
+      { id: "child-b", title: "Child B" },
+    ],
+  });
+  const parent = split.slices.find((s) => s.id === "s0");
+  assert.equal(parent.status, "superseded");
+  assert.ok(parent.replaced_by?.length, "exclusive split stamps replaced_by");
+  assert.deepEqual([...parent.replaced_by].sort(), ["child-a", "child-b"]);
+  assert.deepEqual(
+    split.slices.find((s) => s.id === "b").depends_on,
+    ["s0"],
+    "honest exclusive split must not auto-remount leftover b",
+  );
+  assert.equal(split.slices.find((s) => s.id === "indie").status, "pending");
+  assert.equal(split.slices.find((s) => s.id === "x"), undefined);
+});
+
+test("replan: new_slices remount onto children still lands; indie stays", () => {
+  const plan = exclusiveSplitLivePlan("newslices-honest-remount");
+  const remounted = replan(plan, [
+    { id: "b", title: "Sibling depends on s0", depends_on: ["child-a", "child-b"] },
+    { id: "child-a", title: "Child A" },
+    { id: "child-b", title: "Child B" },
+    { id: "indie", title: "Independent" },
+  ]);
+  assert.deepEqual(remounted.slices.find((s) => s.id === "b").depends_on, ["child-a", "child-b"]);
+  assert.equal(
+    remounted.slices.find((s) => s.id === "indie").status,
+    "pending",
+    "honest new_slices remount restates indie; it stays live",
+  );
+});
+
+test("applySliceDelta: add_slices depending on a sibling added in the same call lands", () => {
+  const plan = {
+    plan_id: "addslices-same-call-dep",
+    goal: "same-call added ids stay valid targets",
+    status: "active",
+    constraints: [],
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  const added = applySliceDelta(plan, {
+    add_slices: [
+      { id: "sib-b", title: "Sib B", depends_on: ["sib-a"] },
+      { id: "sib-a", title: "Sib A" },
+    ],
+  });
+  assert.deepEqual(
+    added.slices.find((s) => s.id === "sib-b").depends_on,
+    ["sib-a"],
+    "same-call added ids are valid depends_on targets after add in this call",
+  );
+  assert.equal(added.slices.find((s) => s.id === "sib-a").status, "pending");
+  assert.equal(added.slices.find((s) => s.id === "keep").status, "pending");
+});
+
+test("replan: new_slices that adds a slice depending on another id added in this same call lands", () => {
+  const plan = {
+    plan_id: "newslices-same-call-dep",
+    goal: "same-call added ids stay valid targets",
+    status: "active",
+    constraints: [],
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-21T12:00:00.000Z",
+    updated: "2026-08-21T12:00:00.000Z",
+    rev: 1,
+  };
+  const next = replan(plan, [
+    { id: "keep", title: "Keep" },
+    { id: "sib-b", title: "Sib B", depends_on: ["sib-a"] },
+    { id: "sib-a", title: "Sib A" },
+  ]);
+  assert.deepEqual(
+    next.slices.find((s) => s.id === "sib-b").depends_on,
+    ["sib-a"],
+    "same-call added ids are valid depends_on targets after refresh/add in this call",
+  );
+  assert.equal(next.slices.find((s) => s.id === "sib-a").status, "pending");
+  assert.equal(next.slices.find((s) => s.id === "keep").status, "pending");
 });
 
 test("updateSlice: succeeds once the dependency actually resolves, no force needed", () => {
@@ -1650,6 +3358,80 @@ test("diffSupersededDependencies: a superseded dependency with no surviving depe
   assert.deepEqual(diffSupersededDependencies(before, after), [], "b is done — no longer a live dependent to report");
 });
 
+test("landedReplanTopology: new_slices-shaped apply reports landed add ids and superseded ids", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "keep", title: "Keep", status: "pending" },
+      { id: "drop-me", title: "Drop", status: "pending" },
+    ],
+  };
+  const after = replan(before, [
+    { id: "keep", title: "Keep" },
+    { id: "child-a", title: "Child A", depends_on: ["keep"] },
+  ]);
+  const landed = landedReplanTopology(before, after);
+  assert.deepEqual(landed.drop_slice_ids, ["drop-me"]);
+  assert.deepEqual(landed.add_slices, [
+    { id: "child-a", title: "Child A", depends_on: ["keep"] },
+  ]);
+  assert.equal(
+    JSON.stringify(landed).includes("claim"),
+    false,
+    "claim tokens stay off the landed topology payload",
+  );
+});
+
+test("landedReplanTopology omits evidence from ordered add_slices", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+  };
+  const after = replan(before, [
+    { id: "keep", title: "Keep" },
+    {
+      id: "child",
+      title: "Child",
+      evidence: "vault/secret/path.log passed",
+    },
+  ]);
+  assert.equal(
+    after.slices.find((s) => s.id === "child")?.evidence,
+    "vault/secret/path.log passed",
+    "plan note still stores evidence; only the ordered payload omits it",
+  );
+  const landed = landedReplanTopology(before, after);
+  assert.deepEqual(landed.add_slices, [{ id: "child", title: "Child" }]);
+  assert.equal(
+    JSON.stringify(landed).includes("evidence"),
+    false,
+    "ordered replan payload must not copy freeform evidence",
+  );
+  assert.equal(
+    JSON.stringify(landed).includes("vault/secret"),
+    false,
+    "path-bearing evidence must not reach the ordered journal",
+  );
+});
+
+test("landedReplanTopology: depends_on-only remount (no add/supersede) omits add/drop", () => {
+  const before = {
+    ...dependsOnPlan(),
+    slices: [
+      { id: "b", title: "B", status: "pending", depends_on: ["s0"] },
+      { id: "child-a", title: "Child A", status: "pending" },
+    ],
+  };
+  const after = replan(before, [
+    { id: "b", title: "B", depends_on: ["child-a"] },
+    { id: "child-a", title: "Child A" },
+  ]);
+  assert.deepEqual(landedReplanTopology(before, after), {});
+  assert.deepEqual(diffDependsOn(before, after), [
+    { slice_id: "b", from: ["s0"], to: ["child-a"] },
+  ]);
+});
+
 // #291 round-2 cassandra finding HIGH-2 (confirmed by independent
 // reproduction via applySliceDelta below, and matching a real duplicate-id
 // shape found in two live vaults). NOTE: replan()'s own new_slices path
@@ -1788,8 +3570,13 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       status: "done",
       evidence: "B is finished, verified via logs/b.log",
     });
-    assert.ok(blocked.result?.isError, `expected an error result, got: ${JSON.stringify(blocked)}`);
-    assert.match(blocked.result.content[0].text, /depends_on unmet: a/);
+    // Same contract as claim/assign: domain refusals are typed JSON via
+    // threadWorkerErrorResult, not MCP isError (which would trip thread-server call()).
+    assert.ok(blocked.result && !blocked.result.isError, `expected typed JSON error, got: ${JSON.stringify(blocked)}`);
+    const blockedBody = JSON.parse(blocked.result.content[0].text);
+    assert.equal(blockedBody.status, "error");
+    assert.equal(blockedBody.operation, "plan.update");
+    assert.match(blockedBody.error, /depends_on unmet: a/);
 
     // 2. force without a reason: still refused — force alone cannot bypass silently.
     const forceNoReason = await call("minni_thread_update", {
@@ -1798,7 +3585,10 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       evidence: "B is finished, verified via logs/b.log",
       force: true,
     });
-    assert.ok(forceNoReason.result?.isError, `expected an error result, got: ${JSON.stringify(forceNoReason)}`);
+    assert.ok(forceNoReason.result && !forceNoReason.result.isError, `expected typed JSON error, got: ${JSON.stringify(forceNoReason)}`);
+    const forceNoReasonBody = JSON.parse(forceNoReason.result.content[0].text);
+    assert.equal(forceNoReasonBody.status, "error");
+    assert.equal(forceNoReasonBody.operation, "plan.update");
     // #291 round-1 cassandra finding 8: the refusal message must name the
     // MCP-facing field (force_reason) a retrying model can actually pass,
     // not the internal TS option name (forceReason).
@@ -1807,7 +3597,7 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
     // reason/ regex here would pass even if this scenario's specific
     // "force without a reason" refusal were silently replaced by the wrong
     // error. Match the discriminating phrase instead.
-    assert.match(forceNoReason.result.content[0].text, /requires a non-empty force reason/);
+    assert.match(forceNoReasonBody.error, /requires a non-empty force reason/);
 
     // 2b. round-1 finding 7: a non-"done" transition with an unmet dep must
     // NOT emit an override record even if force is set — there's nothing
@@ -2034,8 +3824,11 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       drop_slice_ids: ["a"],
       add_slices: [{ id: "a", title: "A retry" }],
     });
-    assert.ok(dupIdAttempt.result?.isError, `expected an error result, got: ${JSON.stringify(dupIdAttempt)}`);
-    assert.match(dupIdAttempt.result.content[0].text, /cannot add slice with id "a"/);
+    assert.ok(dupIdAttempt.result && !dupIdAttempt.result.isError, `expected typed JSON error, got: ${JSON.stringify(dupIdAttempt)}`);
+    const dupIdBody = JSON.parse(dupIdAttempt.result.content[0].text);
+    assert.equal(dupIdBody.status, "error");
+    assert.equal(dupIdBody.operation, "plan.replan");
+    assert.match(dupIdBody.error, /cannot add slice with id "a"/);
     // And the plan itself must be unchanged on disk — the rejected replan
     // (thrown before persistPlan is ever called) must not have partially
     // applied (a is still live, pending, exactly one slice with that id).
@@ -2046,4 +3839,164 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
     child.kill("SIGKILL");
     await rm(root, { recursive: true, force: true });
   }
+});
+
+
+test("structuralProposalDelta: expand is add-only; proposer stays", () => {
+  const delta = structuralProposalDelta(
+    {
+      kind: "expand",
+      reason: "Need a sibling branch",
+      slices: [{ id: "extra", title: "Extra branch" }],
+    },
+    "parent",
+  );
+  assert.deepEqual(delta, {
+    add_slices: [{ id: "extra", title: "Extra branch" }],
+  });
+  assert.equal("drop_slice_ids" in delta, false);
+});
+
+test("structuralProposalDelta: split supersedes parent and rejects parent-id reuse", () => {
+  const delta = structuralProposalDelta(
+    {
+      kind: "split",
+      reason: "Two independent outputs",
+      slices: [
+        { id: "child-a", title: "Child A" },
+        { id: "child-b", title: "Child B" },
+      ],
+    },
+    "parent",
+  );
+  assert.deepEqual(delta, {
+    add_slices: [
+      { id: "child-a", title: "Child A" },
+      { id: "child-b", title: "Child B" },
+    ],
+    drop_slice_ids: ["parent"],
+  });
+  assert.throws(
+    () => structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "Reuse is not a split",
+        slices: [{ id: "parent", title: "Same id" }],
+      },
+      "parent",
+    ),
+    /split cannot reuse parent id "parent"/,
+  );
+});
+
+test("structuralProposalDelta: contract is drop-only", () => {
+  const delta = structuralProposalDelta(
+    {
+      kind: "contract",
+      reason: "These slices are no longer needed",
+      slice_ids: ["gone", "also-gone"],
+    },
+    "proposer",
+  );
+  assert.deepEqual(delta, { drop_slice_ids: ["gone", "also-gone"] });
+  assert.equal("add_slices" in delta, false);
+});
+
+test("applySliceDelta via structuralProposalDelta: expand keeps proposer; split supersedes; contract never deletes", () => {
+  const plan = {
+    plan_id: "p",
+    goal: "evolution helper",
+    status: "active",
+    constraints: [],
+    slices: [
+      { id: "parent", title: "Parent", status: "in_progress", assigned_to: "worker-a" },
+      { id: "keep", title: "Keep", status: "pending" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "parent",
+    plan_digest: "x",
+    created: "2026-08-18T12:00:00.000Z",
+    updated: "2026-08-18T12:00:00.000Z",
+    rev: 1,
+  };
+
+  const expanded = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      { kind: "expand", reason: "branch", slices: [{ id: "extra", title: "Extra" }] },
+      "parent",
+    ),
+  );
+  assert.deepEqual(expanded.slices.map((s) => s.id), ["parent", "keep", "extra"]);
+  assert.equal(expanded.slices.find((s) => s.id === "parent").status, "in_progress");
+  assert.equal(expanded.slices.find((s) => s.id === "parent").assigned_to, "worker-a");
+  assert.equal(expanded.slices.find((s) => s.id === "extra").status, "pending");
+
+  const split = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      {
+        kind: "split",
+        reason: "split",
+        slices: [{ id: "child-a", title: "Child A" }, { id: "child-b", title: "Child B" }],
+      },
+      "parent",
+    ),
+  );
+  const splitParent = split.slices.find((s) => s.id === "parent");
+  assert.equal(splitParent.status, "superseded");
+  assert.ok(splitParent.superseded_by);
+  assert.deepEqual(
+    split.slices.filter((s) => s.status !== "superseded").map((s) => s.id).sort(),
+    ["child-a", "child-b", "keep"],
+  );
+  assert.equal(split.slices.filter((s) => s.id === "parent").length, 1, "split never deletes the parent");
+
+  const contracted = applySliceDelta(
+    plan,
+    structuralProposalDelta(
+      { kind: "contract", reason: "drop keep", slice_ids: ["keep"] },
+      "parent",
+    ),
+  );
+  const dropped = contracted.slices.find((s) => s.id === "keep");
+  assert.ok(dropped, "contract never deletes");
+  assert.equal(dropped.status, "superseded");
+  assert.equal(contracted.slices.find((s) => s.id === "parent").status, "in_progress");
+});
+
+test("landedAddSlices reports generated ids after applySliceDelta omits them", () => {
+  const before = {
+    plan_id: "p",
+    goal: "generated-id journal",
+    status: "active",
+    constraints: [],
+    slices: [{ id: "keep", title: "Keep", status: "pending" }],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "keep",
+    plan_digest: "x",
+    created: "2026-08-18T12:00:00.000Z",
+    updated: "2026-08-18T12:00:00.000Z",
+    rev: 1,
+  };
+  const requestAdds = [
+    { title: "Generated Child", gate: "review", depends_on: ["keep"] },
+  ];
+  const after = applySliceDelta(before, { add_slices: requestAdds });
+  const landed = landedAddSlices(before, after);
+  assert.equal(landed.length, 1);
+  assert.equal(landed[0].title, "Generated Child");
+  assert.equal(landed[0].gate, "review");
+  assert.deepEqual(landed[0].depends_on, ["keep"]);
+  assert.ok(landed[0].id, "generated id must be present on the landed payload");
+  assert.notEqual(landed[0].id, undefined);
+  assert.equal(
+    after.slices.some((s) => s.id === landed[0].id && s.title === "Generated Child"),
+    true,
+    "journaled id must be the one that landed on the plan",
+  );
+  assert.equal("id" in requestAdds[0], false, "request omitted id; journal must not echo that");
+  assert.equal("evidence" in landed[0], false, "ordered journal omits evidence");
 });

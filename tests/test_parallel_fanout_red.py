@@ -197,6 +197,9 @@ def _scrub_traces(payload):
 
     scrubbed = copy.deepcopy(payload)
     scrubbed["result"]["trace_id"] = "<trace>"
+    ids = scrubbed["result"].get("trace_ids")
+    if isinstance(ids, list):
+        scrubbed["result"]["trace_ids"] = ["<trace>"] * len(ids)
     for row in scrubbed["result"]["results"]:
         if "trace_id" in row:
             row["trace_id"] = "<trace>"
@@ -204,18 +207,19 @@ def _scrub_traces(payload):
 
 
 def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
-    """RED-1, recall level: the both-scope envelope must carry the combined
-    TAIL's trace — the serially-last shared leg — in serial AND parallel
-    mode. The fallback ran too, on the same engine; carrying its id, or the
-    gathering thread's stale slot, fails this test. Serially the tail is
-    shared-call #2; in parallel it wins the race (#1) — same rule, both
-    asserted literally."""
+    """RED-1 + origin/main: both-scope records each successful retrieval
+    trace. Singular ``trace_id`` is unset when more than one leg traced.
+    Ring ids may number in wall-clock order (serial fallback-then-tail vs
+    parallel tail-first); gather-order ``trace_ids`` still has two entries
+    and never a stale handler slot. Scrubbed envelopes match."""
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
     serial = handle_search(
         _both_params(), 1, _both_harness(tmp_path, monkeypatch, "serial")
     )
     assert serial["ok"] is True
-    assert serial["result"]["trace_id"] == "test-trace-2", serial["result"]["trace_id"]
+    assert serial["result"]["trace_id"] is None, serial["result"]["trace_id"]
+    assert len(serial["result"]["trace_ids"]) == 2, serial["result"]["trace_ids"]
+    assert serial["result"]["trace_scope"] == "retrieval_leg"
 
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
     for rep in range(3):
@@ -223,9 +227,9 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
             _both_params(), 1, _both_harness(tmp_path, monkeypatch, f"par{rep}")
         )
         assert parallel["ok"] is True
-        assert parallel["result"]["trace_id"] == "test-trace-1", (
-            parallel["result"]["trace_id"]
-        )
+        assert parallel["result"]["trace_id"] is None, parallel["result"]["trace_id"]
+        assert len(parallel["result"]["trace_ids"]) == 2
+        assert "stale" not in "".join(parallel["result"]["trace_ids"])
         # Everything but the per-run trace ids is identical to serial.
         assert _scrub_traces(parallel) == _scrub_traces(serial)
 
@@ -247,6 +251,10 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
 )
 def test_unlocked_gate_mapping(monkeypatch, device, pinned, expected):
     """The unlocked path requires CPU device AND a fired pin, nothing else."""
+    monkeypatch.setattr(models_mod, "_CROSS_ENCODER_CONSTRUCTION_DEVICE", None)
+    cache_clear = getattr(models_mod.get_cross_encoder, "cache_clear", None)
+    if callable(cache_clear):
+        cache_clear()
     monkeypatch.setattr(models_mod, "_resolve_model_device", lambda: device)
     monkeypatch.setattr(models_mod, "_TORCH_THREADS_PINNED", pinned)
     assert models_mod.cross_encoder_unlocked_predict_safe() is expected
@@ -266,14 +274,23 @@ def test_rerank_holds_lock_unless_gate(monkeypatch, tmp_path):
     acquired = {"n": 0}
 
     class _RecordingLock:
-        def __enter__(self):
+        def acquire(self, blocking=True, timeout=-1):
             acquired["n"] += 1
+            return True
+
+        def release(self):
+            return None
+
+        def __enter__(self):
+            self.acquire()
             return self
 
         def __exit__(self, *exc):
+            self.release()
             return False
 
-    monkeypatch.setattr(models_mod, "get_cross_encoder_lock", _RecordingLock)
+    lock = _RecordingLock()
+    monkeypatch.setattr(models_mod, "get_cross_encoder_lock", lambda: lock)
 
     def run_once(query, chunk_base):
         cands = [
@@ -499,8 +516,11 @@ def test_both_scope_failed_shared_envelope_trace_is_none_not_stale(monkeypatch):
         monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", parallel)
         out = handle_search({"query": "q", "scope": "both", "limit": 5}, 1, context)
         assert out["ok"] is True, out
-        trace = out["result"]["trace_id"]
-        assert trace is None, f"parallel={parallel}: stale envelope {trace!r}"
+        traces = out["result"].get("trace_ids") or []
+        assert "stale-previous-request-trace" not in traces, traces
+        assert out["result"]["trace_id"] != "stale-previous-request-trace"
+        assert any(t.startswith("trace-personal-") for t in traces), traces
+        assert not any(t.startswith("trace-shared-") for t in traces), traces
         assert out["result"]["degraded"] is True, out
         assert any(
             d.get("shared_index_failed") for d in out["result"]["degradation"]

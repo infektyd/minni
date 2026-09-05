@@ -10,8 +10,8 @@ That matrix is a **contract**, not aspirational prose:
 |------|--------------------|-------------------------|
 | Claude Code | Deny all tools; guard live | Native Claude protocol + shared handlers |
 | Codex | Deny **Bash only**; cold-file guard **not** live | Documented limitation — do not fake it |
-| **Grok Build** | Deny broad tools; guard **live** | `grok-adapter.ts` + `grok-hook.ts` (camelCase + native tool names + `{decision,reason}` out) |
-| Cursor | Deny broad; guard live | Cursor adapters |
+| **Grok Build** | Deny broad tools; guard **PARTIAL** (host deny ≠ s6 liveness; UPS inject dropped; leftover cannot deny) | `grok-adapter.ts` + `grok-hook.ts` map camelCase + native tool names + `{decision,reason}` out — **capability, not liveness** |
+| Cursor | Deny broad; guard **PARTIAL** (UPS inject dropped; leftover cannot deny) | Cursor adapters (host deny capability; s6 not live) |
 | agy / Antigravity | Deny broad; guard live | `gemini-adapter.ts` |
 | Kilo | Deny broad; guard live | Bridge plugin |
 
@@ -20,6 +20,11 @@ That matrix is a **contract**, not aspirational prose:
 If the matrix says **guard live** for a host, shipping without a working
 adapter is a **defect**, not a docs problem. Prefer **`implement_now`** (code
 up to contract) over cutting the matrix row.
+
+If the matrix says **PARTIAL**, host deny / adapter mapping is capability, not
+s6 liveness — do not treat that row as live, and do not expand
+`GROK_INJECTABLE` to fake it. Goal (`honesty_partial` + `goal_next_pr`): live
+deny-to-surface once UPS (or equivalent) actually delivers the envelope.
 
 If a host **cannot** meet the contract (vendor limit), the matrix must say so
 explicitly (Codex Bash-only) — that is honesty, not abandoned ambition.
@@ -42,13 +47,15 @@ Then restart agent apps so they reload `server.js` / hook entrypoints.
 
 ## Verification bar (Grok cold-tool guard)
 
-**2026-08-04 (local, post-#274):** Unit bar accepted for dogfood gate —
+**2026-09-01 (local, PR #45):** Unit bar pins **allow**, not deny —
 
 ```bash
 cd plugins/minni && node --test tests/grok-hook.test.mjs
-# 8 pass, including: native Grok read_file denied when strong recall pending;
-# stdout is {decision,reason} (not Claude permissionDecision).
+# native Grok read_file **allows** leftover consumed=false — UPS inject is dropped;
+# leftover file is not consumed; stdout is {decision,reason} (not Claude permissionDecision).
 ```
 
-Wet session proof (live Grok Build + pending strong recall → deny `read_file`)
-remains optional follow-up; host restart after `minni sync` required first.
+s6 deny-to-surface is **not live** on Grok: PreToolUse allows immediately when
+UPS cannot inject, so a leftover file cannot deny. `grok-adapter.ts` mapping
+remains host-deny **capability**. A wet session that expects deny `read_file`
+on pending strong recall is not current and is not the bar.

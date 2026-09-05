@@ -40,9 +40,11 @@ Claude Code is the most deeply integrated runtime:
   Host **deny capability** is broader than Claude (Kilo, Cursor, Grok,
   Antigravity/agy also expose pre-tool deny; Codex deny is Bash-only). **Live
   Minni s6 cold-tool guard** (adapter + tool map + file-backed recall-state)
-  is complete on Claude Code, Cursor, agy, Kilo, and Grok Build — not on every
-  host that merely registers a PreToolUse hook. Claude remains the deepest
-  integration (all-tool coverage + full envelope). Full matrix:
+  is complete on Claude Code, agy, and Kilo. Grok Build and Cursor are
+  **PARTIAL**: host deny ≠ s6 liveness; UPS inject is dropped so leftover
+  `consumed=false` cannot deny. Registration or host deny alone is not
+  enough. Claude remains the deepest integration (all-tool coverage + full
+  envelope). Full matrix:
   [docs/contracts/hook-platforms.md](../contracts/hook-platforms.md). Knobs:
   `MINNI_RECALL_GUARD_MODE` (`off`/`soft`/`strict`),
   `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables). The guard fails open.

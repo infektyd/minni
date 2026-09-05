@@ -138,35 +138,52 @@ def _build_proposals(db, vault_path: str, trace_id: str) -> tuple[List[Dict[str,
 
 
 def _append_audit(vault: Path, trace_id: str, proposal_count: int, inbox_rel: Optional[str]) -> None:
+    from minni.vault_layout import (
+        _LOG_HEADER,
+        _append_regular_file,
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
+
     ts = _utc()
-    for rel, header in (("log.md", "# Minni Log\n\n"), (f"logs/{ts[:10]}.md", f"# {ts[:10]} Minni Audit\n\n")):
-        path = vault / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            path.write_text(header, encoding="utf-8")
-        details = {"trace_id": trace_id, "proposal_count": proposal_count, "inbox_path": inbox_rel}
-        line = f"## [{ts}] afm_loop | pruning proposed {proposal_count} transition(s)\n\n```json\n{json.dumps(details, indent=2, sort_keys=True)}\n```\n\n"
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+    details = {"trace_id": trace_id, "proposal_count": proposal_count, "inbox_path": inbox_rel}
+    line = (
+        f"## [{ts}] afm_loop | pruning proposed {proposal_count} transition(s)\n\n"
+        f"```json\n{json.dumps(details, indent=2, sort_keys=True)}\n```\n\n"
+    )
+    daily = vault / "logs" / f"{ts[:10]}.md"
+    root_real = _resolved_vault_root(vault)
+    # Exclusive header seed, then append — never exists()+write_text (truncate).
+    # lstat before skip-or-append so log.md/daily cannot follow into shop.
+    for dest, header in (
+        (vault / "log.md", _LOG_HEADER),
+        (daily, f"# {ts[:10]} Minni Audit\n\n"),
+    ):
+        _reject_symlink_or_escape(dest, root_real, dest.name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _seed_exclusive_file(dest, header)
+        _append_regular_file(dest, line)
 
 
 def _write_inbox(vault_path: str, trace_id: str, proposals: List[Dict[str, Any]]) -> Dict[str, Any]:
+    from minni.afm_writer import _atomic_write_text, _prepare_inbox_ledger
+
     vault = Path(vault_path).expanduser()
-    inbox = vault / "inbox" / f"afm-pruning-{_utc()[:10]}.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox_rel = f"inbox/afm-pruning-{_utc()[:10]}.json"
     payload = {
         "trace_id": trace_id,
         "pass_name": "pruning",
         "created_at": _utc(),
         "proposals": proposals,
     }
-    existing: List[dict] = []
-    if inbox.exists():
-        try:
-            existing = json.loads(inbox.read_text(encoding="utf-8")).get("runs", [])
-        except Exception:
-            existing = []
-    inbox.write_text(json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    inbox, existing = _prepare_inbox_ledger(
+        vault, inbox_rel, kind="AFM pruning inbox ledger"
+    )
+    _atomic_write_text(
+        inbox,
+        json.dumps({"runs": existing + [payload]}, indent=2, sort_keys=True) + "\n",
+    )
     rel = str(inbox.relative_to(vault))
     _append_audit(vault, trace_id, len(proposals), rel)
     return {"path": rel, "proposal_count": len(proposals)}

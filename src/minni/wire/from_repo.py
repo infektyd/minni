@@ -13,6 +13,7 @@ from minni.wire.manifest import PayloadManifest, deterministic_built_at, dev_ver
 PAYLOAD_ITEMS = (
     "dist", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin",
     ".kilocode-plugin", ".mcp.json", "commands", "hooks", "skills", "README.md",
+    "frontend", "package.json",
 )
 MANIFEST_STAMP_PATHS = (
     ".claude-plugin/plugin.json",
@@ -40,7 +41,7 @@ def build_from_repo(repo_root: Path) -> tuple[Path, PayloadManifest]:
         raise ValueError(f"no plugins/minni under {repo_root}")
 
     try:
-        _run(["npm", "run", "build:server"], cwd=plugin_dir)
+        _run(["npm", "run", "build"], cwd=plugin_dir)
         bundle_script = plugin_dir / "scripts" / "bundle_server.mjs"
         if bundle_script.exists():
             _run(["node", str(bundle_script)], cwd=plugin_dir)

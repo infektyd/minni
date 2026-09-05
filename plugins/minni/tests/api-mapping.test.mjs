@@ -1,78 +1,22 @@
-// Pure-data contract tests for the TaskSource → EvidenceRow mapper that the
-// frontend uses. Re-implements the rules from
-// frontend-src/src/api.ts in plain JS so the test stays runnable with
-// `node --test` (no TS toolchain). When you change the rules over there,
-// update this file in lockstep — the assertions below are the invariants.
-
+// Exercise the actual frontend mappers and rendered privacy chip.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import path from "node:path";
+import { build } from "esbuild";
+import { fileURLToPath } from "node:url";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
-// -----------------------------------------------------------------------------
-// Mirror of the mapping rules in frontend-src/src/api.ts
-// -----------------------------------------------------------------------------
-
-function classFromPath(p) {
-  p = p || "";
-  if (/^vault\/wiki\/|wiki\//.test(p)) return "wiki";
-  if (/^vault\/raw\/|raw\//.test(p)) return "raw";
-  if (/^vault\/logs?\/|logs?\//.test(p)) return "log";
-  if (/^vault\/inbox\/|inbox\//.test(p)) return "inbox";
-  if (/\.(ts|tsx|js|jsx|py|rs|go|md)$/i.test(p) && /(^|\/)(src|code|app)\//.test(p))
-    return "code";
-  return "other";
-}
-
-function privacyFromLevel(level) {
-  switch (level) {
-    case "private":
-    case "blocked":
-      return "private";
-    case "local-only":
-      return "team";
-    case "safe":
-    default:
-      return "public";
-  }
-}
-
-function authorityFromSource(value) {
-  switch (value) {
-    case "handoff":
-    case "decision":
-    case "schema":
-      return "owner";
-    case "session":
-    case "concept":
-      return "team";
-    case "daemon":
-    case "vault":
-      return "system";
-    default:
-      return "public";
-  }
-}
-
-function afmForSource(src, outcome) {
-  if (src.privacyLevel === "blocked") return "dns";
-  if (!outcome) return "safe";
-  const haystacks = [
-    { kind: "dns", list: outcome.doNotStore || [] },
-    { kind: "log", list: [...(outcome.logOnly || []), ...(outcome.expires || [])] },
-    { kind: "learn", list: outcome.learnCandidates || [] },
-  ];
-  for (const h of haystacks) {
-    if (h.list.some((entry) => entry.includes(src.relativePath) || entry.includes(src.title))) {
-      return h.kind;
-    }
-  }
-  return "safe";
-}
-
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
+const output = new URL("./.compiled/api-mapping-test.mjs", import.meta.url);
+await build({
+  stdin: {
+    contents: 'export { classFromPath, privacyFromLevel, authorityFromSource, afmForSource, evidenceFromSource } from "./api"; export { PrivacyChip, AuthorityChip, AfmChip } from "./components/Chip";',
+    resolveDir: fileURLToPath(new URL("../frontend-src/src", import.meta.url)),
+    loader: "tsx",
+  },
+  outfile: fileURLToPath(output), bundle: true, platform: "node", format: "esm",
+  packages: "external", jsx: "automatic", logLevel: "silent",
+});
+const { classFromPath, privacyFromLevel, authorityFromSource, afmForSource, evidenceFromSource, PrivacyChip, AuthorityChip, AfmChip } = await import(output.href);
 
 test("classFromPath classifies vault sub-trees", () => {
   assert.equal(classFromPath("vault/wiki/handoffs/v4-envelope-schema.md"), "wiki");
@@ -85,21 +29,22 @@ test("classFromPath classifies vault sub-trees", () => {
 
 test("privacyFromLevel maps daemon privacy onto the UI shape", () => {
   assert.equal(privacyFromLevel("private"), "private");
-  assert.equal(privacyFromLevel("blocked"), "private");
-  assert.equal(privacyFromLevel("local-only"), "team");
-  assert.equal(privacyFromLevel("safe"), "public");
-  assert.equal(privacyFromLevel(undefined), "public");
+  assert.equal(privacyFromLevel("blocked"), "blocked");
+  assert.equal(privacyFromLevel("local-only"), "local-only");
+  assert.equal(privacyFromLevel("safe"), "safe");
+  assert.equal(privacyFromLevel(undefined), "unknown");
 });
 
-test("authorityFromSource collapses authority kinds onto the chip palette", () => {
-  assert.equal(authorityFromSource("handoff"), "owner");
-  assert.equal(authorityFromSource("decision"), "owner");
-  assert.equal(authorityFromSource("schema"), "owner");
-  assert.equal(authorityFromSource("session"), "team");
-  assert.equal(authorityFromSource("concept"), "team");
-  assert.equal(authorityFromSource("daemon"), "system");
-  assert.equal(authorityFromSource("vault"), "system");
-  assert.equal(authorityFromSource(undefined), "public");
+test("source authority is provenance, not a sharing or ownership grant", () => {
+  for (const authority of ["handoff", "decision", "schema", "session", "concept", "daemon", "vault", undefined, "unrecognized"]) {
+    const expected = authority === undefined || authority === "unrecognized" ? "unknown" : authority;
+    assert.equal(authorityFromSource(authority), expected);
+    const row = evidenceFromSource({ title: "Source", relativePath: "wiki/source.md", snippet: "evidence", score: 1, authority });
+    assert.equal(row.authority, expected);
+    const html = renderToStaticMarkup(createElement(AuthorityChip, { value: row.authority }));
+    assert.ok(html.includes(expected.toUpperCase()));
+    assert.doesNotMatch(html, /OWNER|TEAM|PUBLIC|SYSTEM/);
+  }
 });
 
 test("afmForSource picks dns when source is blocked or do-not-store", () => {
@@ -131,9 +76,9 @@ test("afmForSource prefers dns over log over learn", () => {
   assert.equal(afmForSource(src, learn), "learn");
 });
 
-test("afmForSource defaults to safe when no outcome match", () => {
+test("afmForSource stays unclassified when no outcome match", () => {
   const src = { relativePath: "vault/wiki/foo.md", title: "Foo" };
-  assert.equal(afmForSource(src, undefined), "safe");
+  assert.equal(afmForSource(src, undefined), "unclassified");
   assert.equal(
     afmForSource(src, {
       learnCandidates: ["bar"],
@@ -141,34 +86,34 @@ test("afmForSource defaults to safe when no outcome match", () => {
       expires: [],
       doNotStore: [],
     }),
-    "safe",
+    "unclassified",
   );
 });
 
-// -----------------------------------------------------------------------------
-// Drift guard: assert frontend-src/src/api.ts still contains the literals
-// that the rules above mirror. If you change one, fail the other.
-// -----------------------------------------------------------------------------
+test("source privacy survives mapping and rendering without invented sharing grants", () => {
+  for (const level of ["safe", "local-only", "private", "blocked", undefined, "unrecognized"]) {
+    const expected = level === undefined || level === "unrecognized" ? "unknown" : level;
+    const row = evidenceFromSource({
+      title: "Source", relativePath: "wiki/source.md", snippet: "evidence", score: 1,
+      privacyLevel: level,
+    });
+    assert.equal(row.privacy, expected);
+    const html = renderToStaticMarkup(createElement(PrivacyChip, { value: row.privacy }));
+    assert.ok(html.includes(expected.toUpperCase()));
+    assert.doesNotMatch(html, /PUBLIC|TEAM/);
+    if (level === "blocked") {
+      assert.equal(row.private, true);
+      assert.equal(row.selected, false);
+      assert.equal(row.afm, "dns");
+    }
+  }
+});
 
-test("frontend mapper source still encodes the same rule branches", async () => {
-  const apiTs = await readFile(
-    path.join(process.cwd(), "frontend-src", "src", "api.ts"),
-    "utf8",
-  );
-  // class branches
-  assert.match(apiTs, /vault\\\/wiki\\\/\|wiki\\\//);
-  assert.match(apiTs, /vault\\\/raw\\\/\|raw\\\//);
-  assert.match(apiTs, /vault\\\/logs\?\\\/\|logs\?\\\//);
-  assert.match(apiTs, /vault\\\/inbox\\\/\|inbox\\\//);
-  // privacy branches
-  assert.match(apiTs, /case "blocked":/);
-  assert.match(apiTs, /case "local-only":/);
-  // authority branches
-  assert.match(apiTs, /case "handoff":/);
-  assert.match(apiTs, /case "decision":/);
-  assert.match(apiTs, /case "schema":/);
-  // outcome partition order: dns first, then log, then learn
-  assert.match(apiTs, /kind: "dns"/);
-  assert.match(apiTs, /kind: "log"/);
-  assert.match(apiTs, /kind: "learn"/);
+test("unassessed sources remain selected without an AFM safety assertion", () => {
+  const row = evidenceFromSource({ title: "Source", relativePath: "wiki/source.md", snippet: "text", score: 1, privacyLevel: "safe" });
+  assert.equal(row.afm, "unclassified");
+  assert.equal(row.selected, true);
+  const html = renderToStaticMarkup(createElement(AfmChip, { value: row.afm }));
+  assert.match(html, /UNCLASSIFIED/);
+  assert.doesNotMatch(html, /AFM-SAFE/);
 });

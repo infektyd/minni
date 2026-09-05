@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import stat
+import tomllib
 import types
 from argparse import Namespace
 from contextlib import contextmanager
@@ -25,7 +26,7 @@ def _fake_node_script(tmp_path: Path) -> Path:
 case "$1" in
   *server.js)
     read _line
-    printf '%s\\n' '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+    printf '%s\\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"wire-fixture","version":"1"}}}'
     ;;
 esac
 exit 0
@@ -442,7 +443,10 @@ def test_wire_codex_non_dry_run(wire_env, monkeypatch, capsys):
     server = home / ".minni" / "plugin" / manifest.version / "dist" / "server.js"
     assert str(server) in config
     assert "[mcp_servers.minni]" in config
-    assert 'MINNI_AGENT_ID = "codex"' in config
+    env = tomllib.loads(config)["mcp_servers"]["minni"]["env"]
+    assert env["MINNI_AGENT_ID"] == "codex"
+    assert "MINNI_WORKSPACE_ID" not in env
+    assert "MINNI_CODEX_WORKSPACE_ID" not in env
 
 
 def test_wire_kilocode_non_dry_run(wire_env, monkeypatch, capsys):

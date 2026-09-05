@@ -1,4 +1,4 @@
-import type { EvidenceRow, PreparedTaskPacket } from "../api";
+import { evidenceFromSource, type EvidenceRow, type PreparedTaskPacket } from "../api";
 import { AfmChip, AuthorityChip, PrivacyChip } from "../components/Chip";
 import {
   ArchivalBand,
@@ -15,9 +15,7 @@ interface Props {
   selected: Set<string>;
 }
 
-export function PacketScreen({ packet, evidence, selected }: Props) {
-  const inclSources = evidence.filter((e) => selected.has(e.id));
-
+export function PacketScreen({ packet }: Props) {
   if (!packet) {
     return (
       <>
@@ -39,9 +37,8 @@ export function PacketScreen({ packet, evidence, selected }: Props) {
     );
   }
 
-  const used = packet.budgetTokens || 0;
-  const total = packet.budget?.tokens || 0;
-  const pct = total ? Math.min(100, Math.round((used / total) * 100)) : 0;
+  const allowance = packet.budget?.tokens ?? packet.budgetTokens ?? 0;
+  const inclSources = packet.relevantSources.map((source) => evidenceFromSource(source, packet.outcomeDraft));
 
   const envelopeJson = packet.contextMarkdown
     ? packet.contextMarkdown
@@ -79,18 +76,15 @@ export function PacketScreen({ packet, evidence, selected }: Props) {
 
       <div className="packet-meta">
         <div className="packet-meta-cell">
-          <div className="packet-meta-label">Token budget</div>
+          <div className="packet-meta-label">Token allowance</div>
           <div className="packet-meta-value">
-            {used.toLocaleString()} / {total.toLocaleString()}
-          </div>
-          <div className="meter" style={{ marginTop: 6 }}>
-            <span style={{ width: pct + "%" }} />
+            {allowance.toLocaleString()} tokens
           </div>
         </div>
         <div className="packet-meta-cell">
           <div className="packet-meta-label">Sources included</div>
           <div className="packet-meta-value">
-            {inclSources.length} / {evidence.length}
+            {inclSources.length}
           </div>
         </div>
         <div className="packet-meta-cell">
@@ -111,7 +105,7 @@ export function PacketScreen({ packet, evidence, selected }: Props) {
         <div className="panel">
           <PanelHeader
             title="<minni:context> envelope"
-            sub={packet.contextMarkdown ? "markdown · read-only" : "json preview"}
+            sub={packet.contextMarkdown ? "prepared markdown · read-only" : "prepared json preview"}
             actions={
               <>
                 <button
@@ -129,6 +123,7 @@ export function PacketScreen({ packet, evidence, selected }: Props) {
             }
           />
           <div className="panel-body">
+            <p className="muted">This is the prepared response. Recall selections are inspection marks and do not change this preview or the copied context.</p>
             <CodeBlock>{envelopeJson}</CodeBlock>
             {packet.risks.length > 0 && (
               <div style={{ marginTop: 12 }}>
@@ -145,7 +140,7 @@ export function PacketScreen({ packet, evidence, selected }: Props) {
         </div>
 
         <div className="panel">
-          <PanelHeader title="Included sources" sub={`${inclSources.length} ranked`} />
+          <PanelHeader title="Prepared sources" sub={`${inclSources.length} ranked`} />
           <div>
             {inclSources.map((e, i) => (
               <div
@@ -181,7 +176,7 @@ export function PacketScreen({ packet, evidence, selected }: Props) {
             ))}
             {inclSources.length === 0 && (
               <div style={{ padding: 20 }} className="muted mono">
-                No sources included. Return to <b>Recall</b> and select evidence rows.
+                No ranked sources in this prepared response.
               </div>
             )}
           </div>

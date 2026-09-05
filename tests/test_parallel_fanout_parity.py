@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -236,17 +237,32 @@ class _FakeEngine:
         self.last_vector_degraded = None
         self.last_hyde_degraded = None
         self.last_trace_id = None
+        self._trace_seq = 0
         import types
 
         self.config = types.SimpleNamespace(embedding_model="fake-model")
-        self.db = object()
+
+        class _NoopDB:
+            @contextmanager
+            def cursor(self):
+                class _Cursor:
+                    def execute(self, *args, **kwargs):
+                        return self
+
+                yield _Cursor()
+
+        self.db = _NoopDB()
         self.EPISODIC_NON_MEMORY_TYPES = []
 
     def retrieve(self, **kwargs):
         time.sleep(self._delay)
         if self._fail:
             raise RuntimeError(f"boom-index {self._name}")
-        self.last_trace_id = f"trace-{self._name}"
+        # origin/main drops traces whose last_trace_id did not change.
+        # A constant id made the second handle_search on the same fake
+        # look like a stale slot (failed-shared reuse).
+        self._trace_seq += 1
+        self.last_trace_id = f"trace-{self._name}-{self._trace_seq}"
         return [dict(r) for r in self._rows]
 
     def search_learnings(self, *args, **kwargs):
@@ -310,24 +326,121 @@ def _run_scope(context, scope):
     return out, time.perf_counter() - t0
 
 
+def _scrub_envelope(payload):
+    """Drop per-run trace ids so serial vs parallel envelopes can compare."""
+    import copy
+
+    scrubbed = copy.deepcopy(payload)
+    result = scrubbed.get("result") or {}
+    if "trace_id" in result:
+        result["trace_id"] = "<trace>" if result["trace_id"] else None
+    ids = result.get("trace_ids")
+    if isinstance(ids, list):
+        result["trace_ids"] = ["<trace>"] * len(ids)
+    for row in result.get("results") or []:
+        if isinstance(row, dict) and "trace_id" in row:
+            row["trace_id"] = "<trace>"
+    return scrubbed
+
+
 @pytest.mark.parametrize("scope", ["both", "combined", "personal"])
 def test_leg_fanout_matches_serial(monkeypatch, scope):
     """Corpus legs: identical envelope, ordering, diagnostics, trace."""
-    context, calls = _recall_harness(monkeypatch)
-
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
-    serial, t_serial = _run_scope(context, scope)
+    serial, t_serial = _run_scope(_recall_harness(monkeypatch)[0], scope)
 
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
-    parallel, t_parallel = _run_scope(context, scope)
+    parallel, t_parallel = _run_scope(_recall_harness(monkeypatch)[0], scope)
 
     assert serial["ok"] is True and parallel["ok"] is True
-    assert parallel == serial
+    assert _scrub_envelope(parallel) == _scrub_envelope(serial)
     # The failing vault leg must soft-fail identically in combined/both.
     if scope in ("both", "combined"):
         degs = parallel["result"]["degradation"]
         assert any(
             d.get("combined_index_failed") for d in degs
         ), f"expected soft-failed vault entry: {degs}"
-        assert parallel["result"]["trace_id"] == "trace-shared"
+        traces = parallel["result"]["trace_ids"]
+        assert any(t.startswith("trace-shared-") for t in traces)
+        assert parallel["result"]["trace_scope"] == "retrieval_leg"
+        if scope == "both":
+            assert traces == [
+                "trace-personal-1", "trace-vault-a-1", "trace-shared-1",
+            ]
+            assert parallel["result"]["trace_id"] is None
+        else:
+            assert traces == ["trace-vault-a-1", "trace-shared-1"]
+            assert parallel["result"]["trace_id"] is None
+    else:
+        assert parallel["result"]["trace_ids"] == ["trace-personal-1"]
+        assert parallel["result"]["trace_id"] == "trace-personal-1"
     print(f"\nscope={scope}: serial={t_serial:.3f}s parallel={t_parallel:.3f}s")
+
+
+def test_nested_leg_and_variant_fanout_matches_serial(tmp_path, monkeypatch):
+    """Composed both-scope legs × per-leg variant pool on real engines.
+
+    Review: recall-level parity used canned retrieve(); real-engine recall
+    tests used expand=False. This drives both pools together with the
+    stubbed-engine pattern (no model download).
+    """
+    import minni.models as models_mod
+
+    monkeypatch.setattr(models_mod, "get_embedder", lambda: None)
+    monkeypatch.setattr(
+        retrieval_mod,
+        "expand_query_with_status",
+        lambda query, mode="rule": (
+            ["alpha beta", "gamma delta"],
+            "afm_unavailable_for_test",
+        ),
+    )
+
+    def _engine(name):
+        engine, db = _make_engine(tmp_path / name)
+        _seed_docs(db)
+
+        class _BoomReranker:
+            def predict(self, *args, **kwargs):
+                raise RuntimeError("reranker down for nested test")
+
+        engine._reranker = _BoomReranker()
+        return engine
+
+    def _context(personal, shared):
+        principal = _owner()
+        return RecallContext(
+            make_error=lambda code, msg, rid: {
+                "ok": False, "id": rid, "error": [code, msg],
+            },
+            make_response=lambda payload, rid: {
+                "ok": True, "id": rid, "result": payload,
+            },
+            handler_principal=lambda params, rid: (principal, None),
+            lazy_retrieval=lambda: shared,
+            agent_vault_retrieval=lambda agent_id: (
+                personal, "codex", "/db/personal.db",
+            ),
+            all_vault_retrievals=lambda: [],
+            trace_ring=lambda: None,
+            record_latency=lambda *a: None,
+            increment_request_count=lambda: None,
+            logger=logging.getLogger("test-parity-nested"),
+        )
+
+    params = {
+        "query": "alpha beta gamma",
+        "scope": "both",
+        "limit": 5,
+        "expand": True,
+    }
+    monkeypatch.setattr(retrieval_mod, "RETRIEVAL_VARIANT_PARALLEL", False)
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
+    serial = handle_search(params, 1, _context(_engine("p-s"), _engine("s-s")))
+    monkeypatch.setattr(retrieval_mod, "RETRIEVAL_VARIANT_PARALLEL", True)
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
+    parallel = handle_search(params, 1, _context(_engine("p-p"), _engine("s-p")))
+    assert serial["ok"] is True and parallel["ok"] is True, (serial, parallel)
+    assert serial["result"]["results"], "nested fan-out must return hits"
+    assert _scrub_envelope(parallel) == _scrub_envelope(serial)
+    assert len(serial["result"]["query_variants"]) >= 2

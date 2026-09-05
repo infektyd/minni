@@ -16,6 +16,7 @@
   },
   "files": [
     "dist",
+    "frontend",
     ".claude-plugin",
     ".codex-plugin",
     ".cursor-plugin",
@@ -60,17 +61,17 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@google/design.md": "^0.4.0",
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.2.0",
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "esbuild": "^0.28.1",
-    "eslint": "^10.8.0",
+    "eslint": "^10.8.1",
     "eslint-plugin-react-hooks": "^7.1.1",
-    "globals": "^17.8.0",
+    "globals": "^17.9.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.65.0",
-    "vite": "^8.1.5"
+    "typescript-eslint": "^8.66.0",
+    "vite": "^8.2.1"
   },
   "overrides": {
     "@hono/node-server": "2.0.11"

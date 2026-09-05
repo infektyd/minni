@@ -9,11 +9,13 @@ Protocol:
 2. Recall narrow Layer 1 and Layer 2 context for the task.
 3. Call `minni_team_runtime` with:
    - `task`: $ARGUMENTS
-   - `coordinatorAgentId`: the current host agent id
+   - `plan_id`: the Thread to project, when you already have one (absent `plan_id` creates one Thread)
    - `profile`: `standard` unless the task is architecture-heavy, then `deep`
    - `includeVault`: `true`
    - `agents`: 3-5 temporary lanes only when the work can be split safely
-4. Delegate through the current host adapter. For Codex, map each `temporaryProfile` and `hydrationPacket` onto a Codex subagent.
+   - Do not pass `coordinatorAgentId`. The server stamps it (G11).
+   Ready is the expiry sweep plus `readySlices`. Leftover `taskLedger` is a view of `ready`, not a second graph.
+4. After assign → claim, call library `buildWorkerPacketAfterClaim`, then `dispatchWorkerPacket` with that one packet. Neither is an MCP tool. One Wave 2 worker packet is one host worker session. grok worker-start is MISSING. agy default allowlist cannot run `minni_thread_worker_update`. For Codex, map that packet onto one Codex subagent (replaces `temporaryProfile` + `hydrationPacket`). Codex dispatch is UNPROVEN and `spawned` is false. Cursor is out of this first wet set. Do not treat `minni_team_evidence` as the worker SoT. G3 daemon relay, automatic spawning, and immediate wake are not implemented.
 5. Require each temporary agent to return evidence: inspected files/APIs/docs, changed files or findings, verification, and blockers.
 6. Call `minni_team_evidence` before claiming completion.
 7. Integrate, run final verification, and report the result.

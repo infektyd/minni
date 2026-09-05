@@ -20,6 +20,9 @@ rank-bm25>=0.2.2
 # File watcher
 watchdog>=6.0.0
 
+# Make long-lived daemon processes recognizable in host process monitors
+setproctitle>=1.3.7
+
 # Testing
 pytest
 # Coverage visibility (see `make coverage` / engine/.coveragerc). Not wired into

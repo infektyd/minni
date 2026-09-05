@@ -31,6 +31,36 @@ class _FakeLoader:
         return object()
 
 
+class _FakeFaiss:
+    def __init__(self):
+        self.ready = False
+
+
+class _FakeRetrievalEngine:
+    """Warmup must call _ensure_faiss_loaded with no deadline.
+
+    Start with a stale leftover deadline so a missing clear would skip the
+    27s rebuild floor the same way a reused to_thread worker would.
+    """
+
+    def __init__(self):
+        self.faiss_index = _FakeFaiss()
+        self.ensure_calls = 0
+        self._deadline = 1_000.0 + 22.5
+        self.ensure_deadline = "unset"
+
+    def _current_deadline(self):
+        return self._deadline
+
+    def _set_current_deadline(self, value):
+        self._deadline = value
+
+    def _ensure_faiss_loaded(self):
+        self.ensure_calls += 1
+        self.ensure_deadline = self._current_deadline()
+        self.faiss_index.ready = True
+
+
 @pytest.fixture
 def fake_models(monkeypatch):
     """Inject fake model loaders into the module `_warmup_models` imports from."""
@@ -38,10 +68,14 @@ def fake_models(monkeypatch):
 
     embedder = _FakeLoader()
     cross_encoder = _FakeLoader()
+    engine = _FakeRetrievalEngine()
     monkeypatch.setattr(models, "get_embedder", embedder)
     monkeypatch.setattr(models, "get_cross_encoder", cross_encoder)
-    monkeypatch.setattr(minnid, "_lazy_retrieval", _FakeLoader())
-    return {"embedder": embedder, "cross_encoder": cross_encoder}
+    monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: engine)
+    # Warmup now unbounded-ensures vault engines too. Default to none so
+    # these unit tests never construct a live per-vault RetrievalEngine.
+    monkeypatch.setattr(minnid, "_all_vault_retrievals", lambda: [])
+    return {"embedder": embedder, "cross_encoder": cross_encoder, "engine": engine}
 
 
 def test_warmup_enabled_by_default(monkeypatch):
@@ -70,6 +104,35 @@ def test_warmup_loads_embedder_and_reranker(fake_models, monkeypatch, caplog):
     assert fake_models["cross_encoder"].calls == 1
     # The duration is the operator's only evidence that warmup is doing its job.
     assert any("warmup complete" in record.message for record in caplog.records)
+
+
+def test_warmup_ensures_faiss_loaded_without_deadline(fake_models, monkeypatch):
+    """Constructing the engine is not enough: default leftover never warms
+    FAISS in-request, so warmup must call _ensure_faiss_loaded unbounded."""
+    monkeypatch.setattr(minnid.DEFAULT_CONFIG, "reranker_enabled", False)
+    minnid._warmup_models()
+    engine = fake_models["engine"]
+    assert engine.ensure_calls == 1
+    assert engine.faiss_index.ready
+    assert engine.ensure_deadline is None
+
+
+def test_warmup_ensures_vault_faiss_loaded_without_deadline(fake_models, monkeypatch):
+    """Warmup used to unbounded-ensure only `_lazy_retrieval()` (shared).
+    `_lazy_vault_retrieval` builds a cold FAISSIndex; default leftover
+    (22.5s / 27s) then skips in-request rebuild, so personal/combined
+    hybrid never recovers. Vault engines must warm here too."""
+    monkeypatch.setattr(minnid.DEFAULT_CONFIG, "reranker_enabled", False)
+    vault_engine = _FakeRetrievalEngine()
+    monkeypatch.setattr(
+        minnid, "_all_vault_retrievals", lambda: [(vault_engine, "codex", "db")]
+    )
+    minnid._warmup_models()
+    assert fake_models["engine"].ensure_calls == 1
+    assert fake_models["engine"].ensure_deadline is None
+    assert vault_engine.ensure_calls == 1
+    assert vault_engine.faiss_index.ready
+    assert vault_engine.ensure_deadline is None
 
 
 def test_warmup_skips_reranker_when_disabled(fake_models, monkeypatch):
@@ -113,3 +176,43 @@ def test_warmup_runner_offloads_to_thread(fake_models, monkeypatch):
     monkeypatch.setattr(minnid, "_warmup_models", recording)
     asyncio.run(minnid._warmup_runner())
     assert seen["thread"] != loop_thread
+
+
+def test_vault_watch_change_unbounded_ensures_vault_faiss(monkeypatch):
+    """Vault-watch `_vault_retrieval_cache.clear()` constructs a new cold
+    FAISSIndex on the next `_lazy_vault_retrieval`. Default leftover never
+    rebuilds that in-request, so personal/combined hybrid stays FTS-only.
+    After a change, unbounded-ensure the replacement vault engines."""
+    import asyncio
+
+    vault_engine = _FakeRetrievalEngine()
+    monkeypatch.setattr(minnid, "_vault_watch_interval", lambda: 60)
+    monkeypatch.setattr(
+        minnid, "_vault_watch_sweep_once",
+        lambda: {"codex-vault": {"indexed": 1, "pruned": 0, "chunks_purged": 0}},
+    )
+    monkeypatch.setattr(
+        minnid, "_all_vault_retrievals", lambda: [(vault_engine, "codex", "db")]
+    )
+    minnid._vault_retrieval_cache["stale"] = ("old", "codex", "db")
+
+    async def _run_one_tick():
+        task = asyncio.create_task(minnid._vault_watch_runner())
+        for _ in range(50):
+            if vault_engine.ensure_calls:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run_one_tick())
+    assert "stale" not in minnid._vault_retrieval_cache
+    assert vault_engine.ensure_calls == 1, (
+        "vault-watch cache clear must unbounded-ensure replacement engines; "
+        "default leftover never rebuilds a cold vault FAISS in-request"
+    )
+    assert vault_engine.faiss_index.ready
+    assert vault_engine.ensure_deadline is None

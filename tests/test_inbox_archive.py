@@ -11,7 +11,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from test_inbox_ingest import _make_db, _stop_doc, _write_inbox_file
+from test_inbox_ingest import (  # noqa: E402
+    _cc_stop_doc,
+    _make_db,
+    _seed_inbox_packet,
+    _stop_doc,
+    _write_inbox_file,
+)
 
 
 def _set_status(db_obj, status, principal="codex"):
@@ -485,6 +491,20 @@ def test_consolidation_dedup_reject_archives_inbox_source(tmp_path, monkeypatch)
     assert ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)["inserted"] == 1
     (cid,) = _candidate_ids(db_obj)
 
+    from minni.afm_passes.consolidation import content_hash
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT principal, content FROM candidate_packets WHERE candidate_id=?", (cid,)
+        ).fetchone()
+        c.execute(
+            """INSERT INTO learnings
+               (agent_id, content, content_hash, created_at, status)
+               VALUES (?, ?, ?, ?, 'active')""",
+            (_canonical_principal(row["principal"]), row["content"],
+             content_hash(row["content"]), 1),
+        )
     assert minnid._reject_candidate_dedup(cid) is True
     assert not (inbox / "dedup.json").exists(), "file must leave the live inbox"
     assert (inbox / ".archive" / "dedup.json").is_file()
@@ -572,3 +592,520 @@ def test_identical_cross_vault_archives_only_owner(tmp_path, monkeypatch):
     assert archived == str(inbox_b / ".archive" / "same.json")
     assert not (inbox_b / "same.json").exists()
     assert (inbox_a / "same.json").is_file(), "peer vault must stay live while proposed"
+
+
+_ALIAS_VAULT_CASES = (
+    ("agy-vault", "agy", "gemini"),
+    ("xai-vault", "xai", "grok-build"),
+)
+
+
+def test_leftover_alias_principal_archives_vault_file(tmp_path, monkeypatch):
+    """After alias collapse, agy-vault/xai-vault owners are gemini/grok-build
+    while leftover rows stay agy/xai. Archive must still close the source file
+    when that leftover is accepted — exact principal == inbox_owner misses it.
+    """
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    for vault_dir, leftover, _canonical in _ALIAS_VAULT_CASES:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"durable leftover fill from {leftover}"
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=content,
+        )
+        inbox = home / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([content]))
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' WHERE principal=?",
+                (leftover,),
+            )
+            c.execute(
+                "SELECT candidate_id FROM candidate_packets WHERE principal=?",
+                (leftover,),
+            )
+            cid = dict(c.fetchone())["candidate_id"]
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        assert archived is not None, vault_dir
+        assert not (inbox / "session.json").exists(), vault_dir
+        assert (inbox / ".archive" / "session.json").is_file(), vault_dir
+
+
+def test_canonical_resolution_sees_leftover_alias_proposed_twin(
+    tmp_path, monkeypatch
+):
+    """Exact-match sibling load hides leftover proposed twins when a
+    canonical-principal row resolves, so the file archives while leftover
+    qty is still proposed (second fill on the next consolidation tick).
+    """
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    for vault_dir, leftover, canonical in _ALIAS_VAULT_CASES:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"shared fill {leftover} and {canonical}"
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=content,
+        )
+        _seed_inbox_packet(
+            db_obj,
+            principal=canonical,
+            inbox_file="session.json",
+            content=content,
+        )
+        inbox = home / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([content]))
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' WHERE principal=?",
+                (canonical,),
+            )
+            c.execute(
+                "SELECT candidate_id FROM candidate_packets WHERE principal=?",
+                (canonical,),
+            )
+            cid = dict(c.fetchone())["candidate_id"]
+        assert maybe_archive_for_candidate(db_obj, cfg, cid) is None, vault_dir
+        assert (inbox / "session.json").is_file(), vault_dir
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' WHERE principal=?",
+                (leftover,),
+            )
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        assert archived is not None, vault_dir
+        assert not (inbox / "session.json").exists(), vault_dir
+        assert (inbox / ".archive" / "session.json").is_file(), vault_dir
+
+
+def test_leftover_alias_accept_does_not_archive_remapped_vault_live_file(
+    tmp_path, monkeypatch
+):
+    """Leftover accepted principal='agy' must archive agy-vault, never the
+    remapped gemini-vault copy that was never ingested. Canonical-owner
+    matching treated both vaults as one agent; discover order then archived
+    whichever live file matched first.
+
+    This case keeps principal='agy' (no collapse rewrite). The collapse
+    rewrite hole is pinned by
+    test_leftover_alias_collapse_rewrite_does_not_archive_remapped_vault.
+    """
+    import minni.afm_passes.inbox_archive as archive_mod
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    home = tmp_path
+    db_obj, cfg = _make_db(home)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+    content = "byte-identical leftover fill shared across alias vaults"
+    _seed_inbox_packet(
+        db_obj,
+        principal="agy",
+        inbox_file="same.json",
+        content=content,
+    )
+    agy_inbox = home / "agy-vault" / "inbox"
+    gemini_inbox = home / "gemini-vault" / "inbox"
+    _write_inbox_file(agy_inbox, "same.json", _cc_stop_doc([content]))
+    _write_inbox_file(gemini_inbox, "same.json", _cc_stop_doc([content]))
+    with db_obj.cursor() as c:
+        c.execute(
+            "UPDATE candidate_packets SET status='accepted' WHERE principal='agy'"
+        )
+        c.execute(
+            "SELECT candidate_id FROM candidate_packets WHERE principal='agy'"
+        )
+        cid = dict(c.fetchone())["candidate_id"]
+    monkeypatch.setattr(
+        archive_mod,
+        "discover_inboxes",
+        lambda _cfg: [gemini_inbox, agy_inbox],
+    )
+    archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+    assert archived == str(agy_inbox / ".archive" / "same.json")
+    assert not (agy_inbox / "same.json").exists()
+    assert (agy_inbox / ".archive" / "same.json").is_file()
+    assert (gemini_inbox / "same.json").is_file(), (
+        "remapped vault live file was never ingested and must stay"
+    )
+
+
+def test_leftover_alias_collapse_rewrite_does_not_archive_remapped_vault(
+    tmp_path, monkeypatch
+):
+    """Collapse deletes the gemini/grok-build twin then UPDATE leftover
+    winner principal agy/xai → gemini/grok-build. Archive must still
+    refuse the remapped vault: owner_is_alias is false after the rewrite,
+    so discover order used to archive never-ingested gemini-vault.
+
+    Pin: leftover principal='agy' + gemini twins on session.json index 0;
+    repair_duplicate_candidate_pairs(dry_run=False); then accept;
+    remapped-vault live file stays.
+    """
+    import minni.afm_passes.inbox_archive as archive_mod
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    cases = (
+        ("agy-vault", "agy", "gemini-vault", "gemini"),
+        ("xai-vault", "xai", "grok-build-vault", "grok-build"),
+    )
+    for leftover_dir, leftover, remapped_dir, canonical in cases:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"collapse-rewrite leftover fill {leftover} {canonical}"
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=content,
+            candidate_index=0,
+        )
+        _seed_inbox_packet(
+            db_obj,
+            principal=canonical,
+            inbox_file="session.json",
+            content=content,
+            candidate_index=0,
+        )
+        leftover_inbox = home / leftover_dir / "inbox"
+        remapped_inbox = home / remapped_dir / "inbox"
+        _write_inbox_file(leftover_inbox, "session.json", _cc_stop_doc([content]))
+        _write_inbox_file(remapped_inbox, "session.json", _cc_stop_doc([content]))
+
+        applied = repair_duplicate_candidate_pairs(db_obj, dry_run=False)
+        assert applied["deleted"] == 1, leftover
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT candidate_id, principal, status FROM candidate_packets"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, leftover
+        assert rows[0]["principal"] == canonical, leftover
+        cid = rows[0]["candidate_id"]
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' "
+                "WHERE candidate_id=?",
+                (cid,),
+            )
+        monkeypatch.setattr(
+            archive_mod,
+            "discover_inboxes",
+            lambda _cfg, _ri=remapped_inbox, _li=leftover_inbox: [_ri, _li],
+        )
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        assert archived == str(leftover_inbox / ".archive" / "session.json"), leftover
+        assert not (leftover_inbox / "session.json").exists(), leftover
+        assert (leftover_inbox / ".archive" / "session.json").is_file(), leftover
+        assert (remapped_inbox / "session.json").is_file(), (
+            f"{remapped_dir} live file was never ingested and must stay"
+        )
+
+
+def _insert_afm_review_fence(db_obj, candidate_id: int, *, status: str = "pending"):
+    import time
+
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO consolidation_actions
+            (action_type, claim, category, status, detail, created_at)
+            VALUES ('afm_review', ?, 'general', ?, 'test fence', ?)
+            """,
+            (str(candidate_id), status, time.time()),
+        )
+
+
+def test_prefer_unfenced_collapse_does_not_archive_only_leftover_vault(
+    tmp_path, monkeypatch
+):
+    """Prefer-unfenced keeps the unfenced gemini/grok-build twin and deletes
+    the fenced leftover. Collapse used to stamp source_principal only when
+    the winner's raw principal was still an alias, so accept archived the
+    leftover vault as the only drain of the remapped fill.
+
+    Pin: fenced leftover agy + unfenced gemini same session.json index 0;
+    repair dry_run=False; accept gemini; leftover vault archived OR remapped
+    live file stays — leftover vault must not be the only archive of the
+    remapped fill. Discover visits agy-vault first.
+    """
+    import minni.afm_passes.inbox_archive as archive_mod
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    cases = (
+        ("agy-vault", "agy", "gemini-vault", "gemini"),
+        ("xai-vault", "xai", "grok-build-vault", "grok-build"),
+    )
+    for leftover_dir, leftover, remapped_dir, canonical in cases:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"prefer-unfenced leftover fill {leftover} {canonical}"
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=content,
+            candidate_index=0,
+        )
+        _seed_inbox_packet(
+            db_obj,
+            principal=canonical,
+            inbox_file="session.json",
+            content=content,
+            candidate_index=0,
+        )
+        leftover_inbox = home / leftover_dir / "inbox"
+        remapped_inbox = home / remapped_dir / "inbox"
+        _write_inbox_file(leftover_inbox, "session.json", _cc_stop_doc([content]))
+        _write_inbox_file(remapped_inbox, "session.json", _cc_stop_doc([content]))
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT candidate_id FROM candidate_packets WHERE principal=?",
+                (leftover,),
+            )
+            leftover_cid = dict(c.fetchone())["candidate_id"]
+        _insert_afm_review_fence(db_obj, leftover_cid, status="pending")
+
+        applied = repair_duplicate_candidate_pairs(db_obj, dry_run=False)
+        assert applied["deleted"] == 1, leftover
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT candidate_id, principal, derived_from FROM candidate_packets"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, leftover
+        assert rows[0]["principal"] == canonical, leftover
+        df = json.loads(rows[0]["derived_from"])
+        assert df.get("source_principal") == leftover, leftover
+        cid = rows[0]["candidate_id"]
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' "
+                "WHERE candidate_id=?",
+                (cid,),
+            )
+        monkeypatch.setattr(
+            archive_mod,
+            "discover_inboxes",
+            lambda _cfg, _li=leftover_inbox, _ri=remapped_inbox: [_li, _ri],
+        )
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        leftover_archived = leftover_inbox / ".archive" / "session.json"
+        remapped_live = remapped_inbox / "session.json"
+        remapped_archived = remapped_inbox / ".archive" / "session.json"
+        assert leftover_archived.is_file() or remapped_live.is_file(), leftover
+        assert not (
+            leftover_archived.is_file()
+            and not remapped_live.is_file()
+            and not remapped_archived.is_file()
+        ), (
+            f"{leftover}: leftover vault must not be the only archive of the "
+            "remapped fill"
+        )
+        assert remapped_live.is_file(), (
+            f"{remapped_dir} live file must stay; leftover vault is not the "
+            "source of the remaining fill"
+        )
+        assert archived == str(leftover_archived), leftover
+        assert not (leftover_inbox / "session.json").exists(), leftover
+
+
+def test_alias_vault_ingest_does_not_archive_never_ingested_remapped_vault(
+    tmp_path, monkeypatch
+):
+    """Ingest from agy-vault/xai-vault stores principal=gemini/grok-build via
+    _principal_for_inbox. Without source_principal, source_is_alias is false
+    and gemini-first discover archives never-ingested gemini-vault/inbox.
+    """
+    import minni.afm_passes.inbox_archive as archive_mod
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.afm_passes.inbox_ingest import ingest
+
+    cases = (
+        ("agy-vault", "agy", "gemini-vault", "gemini"),
+        ("xai-vault", "xai", "grok-build-vault", "grok-build"),
+    )
+    for leftover_dir, leftover, remapped_dir, canonical in cases:
+        home = tmp_path / leftover
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        content = f"ingest-from-alias vault fill {leftover} {canonical}"
+        leftover_inbox = home / leftover_dir / "inbox"
+        remapped_inbox = home / remapped_dir / "inbox"
+        _write_inbox_file(leftover_inbox, "same.json", _cc_stop_doc([content]))
+        _write_inbox_file(remapped_inbox, "same.json", _cc_stop_doc([content]))
+
+        res = ingest(db_obj, cfg, inboxes=[leftover_inbox], dry_run=False)
+        assert res["inserted"] == 1, leftover
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT candidate_id, principal, derived_from FROM candidate_packets"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, leftover
+        assert rows[0]["principal"] == canonical, leftover
+        df = json.loads(rows[0]["derived_from"])
+        assert df.get("source_principal") == leftover, leftover
+        cid = rows[0]["candidate_id"]
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE candidate_packets SET status='accepted' "
+                "WHERE candidate_id=?",
+                (cid,),
+            )
+        monkeypatch.setattr(
+            archive_mod,
+            "discover_inboxes",
+            lambda _cfg, _ri=remapped_inbox, _li=leftover_inbox: [_ri, _li],
+        )
+        archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+        assert archived == str(leftover_inbox / ".archive" / "same.json"), leftover
+        assert not (leftover_inbox / "same.json").exists(), leftover
+        assert (leftover_inbox / ".archive" / "same.json").is_file(), leftover
+        assert (remapped_inbox / "same.json").is_file(), (
+            f"{remapped_dir} live file was never ingested and must stay"
+        )
+
+
+def test_extras_at_next_idx_accept_archives_live_file(tmp_path, monkeypatch):
+    """extras-at-next-idx remaps derived_from.candidate_index off the file slot.
+
+    Leftover occupies 0 with body L; live file is [D]; extra lands at 1.
+    Archive used to require idx in _eligible_candidates keys AND sha-match,
+    so leftover 0 sha-mismatches D, extra idx is not eligible, covered !=
+    eligible, and maybe_archive never archives. Accepting the extra must
+    archive agy-vault/inbox/session.json; leftover row stays.
+    """
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.afm_passes.inbox_ingest import ingest
+
+    leftover_body = "L leftover occupying index 0"
+    live_body = "D live stop-candidate remapped off slot 0"
+    home = tmp_path / "agy"
+    db_obj, cfg = _make_db(home)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+    _seed_inbox_packet(
+        db_obj,
+        principal="agy",
+        inbox_file="session.json",
+        content=leftover_body,
+    )
+    inbox = home / "agy-vault" / "inbox"
+    _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, content, derived_from, status "
+            "FROM candidate_packets ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    leftover_row = next(r for r in rows if leftover_body in r["content"])
+    extra_row = next(r for r in rows if live_body in r["content"])
+    extra_idx = json.loads(extra_row["derived_from"]).get("candidate_index")
+    assert extra_idx == 1, extra_idx
+    leftover_id = leftover_row["candidate_id"]
+    extra_id = extra_row["candidate_id"]
+
+    with db_obj.cursor() as c:
+        c.execute(
+            "UPDATE candidate_packets SET status='accepted' WHERE candidate_id=?",
+            (extra_id,),
+        )
+    archived = maybe_archive_for_candidate(db_obj, cfg, extra_id)
+    assert archived == str(inbox / ".archive" / "session.json")
+    assert not (inbox / "session.json").exists()
+    assert (inbox / ".archive" / "session.json").is_file()
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT status, content FROM candidate_packets WHERE candidate_id=?",
+            (leftover_id,),
+        )
+        leftover_after = dict(c.fetchone())
+    assert leftover_after["status"] == "proposed"
+    assert leftover_body in leftover_after["content"]
+
+
+def test_stamp_lie_does_not_archive_unmerged_one_candidate_file(tmp_path, monkeypatch):
+    """One-candidate same-vault stamp lie must not retire unmerged qty.
+
+    Leftover 0 content L + stamp(sha(D)) + live [D]: occupancy used the stamp
+    as already_present, and _matching_rows_for_file treated the stamp as
+    coverage without hashing candidate_packets.content. Tests only pinned a
+    forged sha on a two-candidate file; a terminal leftover still archived.
+    D must extras at next_idx; the file stays live until sha1(content) matches.
+    """
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.afm_passes.inbox_ingest import _content_sha1, ingest
+
+    leftover_body = "L leftover occupying index 0"
+    live_body = "D live stop-candidate that stamp must not cover"
+    home = tmp_path / "agy"
+    db_obj, cfg = _make_db(home)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+    _seed_inbox_packet(
+        db_obj,
+        principal="agy",
+        inbox_file="session.json",
+        content=leftover_body,
+        content_sha1=_content_sha1(live_body),
+        status="accepted",
+    )
+    inbox = home / "agy-vault" / "inbox"
+    _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+    with db_obj.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets")
+        leftover_id = dict(c.fetchone())["candidate_id"]
+    assert maybe_archive_for_candidate(db_obj, cfg, leftover_id) is None
+    assert (inbox / "session.json").is_file(), "stamp must not cover unmerged D"
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    assert res["already_present"] == 0, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, content, derived_from, status "
+            "FROM candidate_packets ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    leftover_row = next(r for r in rows if leftover_body in r["content"])
+    extra_row = next(r for r in rows if live_body in r["content"])
+    extra_idx = json.loads(extra_row["derived_from"]).get("candidate_index")
+    assert extra_idx not in {0}, extra_idx
+    assert leftover_row["status"] == "accepted"
+    assert extra_row["status"] == "proposed"
+    assert maybe_archive_for_candidate(db_obj, cfg, leftover_id) is None
+    assert (inbox / "session.json").is_file()
+
+    extra_id = extra_row["candidate_id"]
+    with db_obj.cursor() as c:
+        c.execute(
+            "UPDATE candidate_packets SET status='accepted' WHERE candidate_id=?",
+            (extra_id,),
+        )
+    archived = maybe_archive_for_candidate(db_obj, cfg, extra_id)
+    assert archived == str(inbox / ".archive" / "session.json")
+    assert not (inbox / "session.json").exists()
+    assert (inbox / ".archive" / "session.json").is_file()
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT status, content FROM candidate_packets WHERE candidate_id=?",
+            (leftover_id,),
+        )
+        leftover_after = dict(c.fetchone())
+    assert leftover_after["status"] == "accepted"
+    assert leftover_body in leftover_after["content"]

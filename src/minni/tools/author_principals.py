@@ -23,6 +23,18 @@ AGENT_VAULT_DIRS: dict[str, str] = {
     "kilocode": "kilocode-vault",
 }
 
+
+def vault_dirname_for(agent_id: str) -> str:
+    """Return the unique on-disk vault directory name for this agent_id.
+
+    AGENT_VAULT_DIRS is the product key (claude-code → claudecode-vault,
+    grok-build → grok-build-vault). Unknown ids keep their hyphens:
+    ``{agent_id}-vault``. Never synthesize a dash-stripped alias — inbox
+    ingest maps directory slugs via ``_VAULT_SLUG_TO_AGENT_ID.get(slug, slug)``,
+    so a seeded grokbuild-vault would be attributed as agent_id ``grokbuild``.
+    """
+    return AGENT_VAULT_DIRS.get(agent_id, f"{agent_id}-vault")
+
 TEMPLATE_TOKEN = "__MINNI_HOME__"
 DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "principal_templates"
 

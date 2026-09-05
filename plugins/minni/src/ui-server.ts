@@ -13,6 +13,7 @@ import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTask
 import { auditTail, getAgentIdFromVaultPath, listSessions, type SessionSummary } from "./vault.js";
 import { readRecallState } from "./recall-state.js";
 import { routeMemoryIntent } from "./policy.js";
+import { agentDisplayMetadata } from "./agent-display.js";
 
 const MAX_JSON_BYTES = 256 * 1024;
 const DEFAULT_UI_HOST = process.env.MINNI_UI_HOST ?? "127.0.0.1";
@@ -311,6 +312,17 @@ function capsFromCapabilityList(caps: unknown): { R: 0 | 1; L: 0 | 1; H: 0 | 1 }
   return { R: r as 0 | 1, L: l as 0 | 1, H: h as 0 | 1 };
 }
 
+function validPrincipalCapsRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  const validList = (caps: unknown) => Array.isArray(caps) && caps.every(cap => typeof cap === "string");
+  if (!validList(raw.capabilities)) return false;
+  if (raw.agent_id !== undefined && (typeof raw.agent_id !== "string" || !AGENT_ID_RE.test(raw.agent_id))) return false;
+  const platform = raw.platform_agent_capabilities;
+  return platform === undefined || (platform !== null && typeof platform === "object" && !Array.isArray(platform)
+    && Object.entries(platform).every(([id, caps]) => AGENT_ID_RE.test(id) && validList(caps)));
+}
+
 /** Load R/L/H caps from principals/*.json (+ platform_agent_capabilities). */
 export async function loadAgentCapsMap(homePath: string): Promise<Map<string, { R: 0 | 1; L: 0 | 1; H: 0 | 1 }>> {
   const out = new Map<string, { R: 0 | 1; L: 0 | 1; H: 0 | 1 }>();
@@ -324,8 +336,10 @@ export async function loadAgentCapsMap(homePath: string): Promise<Map<string, { 
   for (const file of files) {
     if (!file.endsWith(".json") || file.includes(".bak")) continue;
     try {
-      const raw = JSON.parse(await readFile(path.join(principalsDir, file), "utf8")) as Record<string, unknown>;
+      const raw: unknown = JSON.parse(await readFile(path.join(principalsDir, file), "utf8"));
+      if (!validPrincipalCapsRecord(raw)) continue;
       const agentId = typeof raw.agent_id === "string" ? raw.agent_id : file.replace(/\.json$/, "");
+      if (!AGENT_ID_RE.test(agentId)) continue;
       out.set(agentId, capsFromCapabilityList(raw.capabilities));
       const platform = raw.platform_agent_capabilities;
       if (platform && typeof platform === "object" && !Array.isArray(platform)) {
@@ -378,6 +392,17 @@ export async function buildAgentsCatalogue(options: {
 }): Promise<{ agents: Array<Record<string, unknown>>; count: number }> {
   const homePath = options.homePath;
   const capsMap = await loadAgentCapsMap(homePath);
+  // A failed/malformed record may hide an identity or platform alias. Do not
+  // describe an absent map entry as unregistered when the scan is incomplete.
+  const registrationKnown = await readdir(path.join(homePath, "principals")).then(async files => {
+    const readable = await Promise.all(files.filter(file => file.endsWith(".json") && !file.includes(".bak")).map(async file => {
+      try {
+        const record = JSON.parse(await readFile(path.join(homePath, "principals", file), "utf8"));
+        return validPrincipalCapsRecord(record);
+      } catch { return false; }
+    }));
+    return readable.every(Boolean);
+  }, () => false);
   const tailFn = options.auditTailFn ?? readOnlyAuditTail;
 
   let dirs: string[] = [];
@@ -406,8 +431,10 @@ export async function buildAgentsCatalogue(options: {
   const agents = await Promise.all(
     targets.map(async ({ vaultAbs, id }) => {
       let lastSeenMs: number | null = null;
+      let auditEntries: string[] = [];
       try {
         const tail = await tailFn(vaultAbs, 5);
+        auditEntries = tail.entries || [];
         for (const entry of [...(tail.entries || [])].reverse()) {
           const ms = parseAuditTimestampMs(entry);
           if (ms != null) {
@@ -445,6 +472,7 @@ export async function buildAgentsCatalogue(options: {
 
       return {
         id,
+        ...agentDisplayMetadata({ id, registered: capsMap.has(id), registrationKnown: capsMap.has(id) || registrationKnown, auditEntries }),
         vault: homeDisplayPath(vaultAbs),
         // Display path only — no absolute vaultPath on the wire (path leak).
         seen,
@@ -1143,10 +1171,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             "minni_recall_state",
             "minni_handoffs",
             "minni_policy",
-            "deep_research_plan",
-            "deep_research_run",
-            "deep_research_status",
-            "deep_research_local_docs",
+            ...(DEEP_RESEARCH_ENABLED ? [
+              "deep_research_plan",
+              "deep_research_run",
+              "deep_research_status",
+              "deep_research_local_docs",
+            ] : []),
           ],
           automaticLearning: false,
         });

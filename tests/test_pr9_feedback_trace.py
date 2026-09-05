@@ -291,8 +291,20 @@ def test_trace_ring_capacity_and_size_bound():
     assert ring.approx_bytes <= 600
 
 
-def test_daemon_trace_round_trip(monkeypatch, tmp_path):
+@pytest.mark.parametrize("scope, expected_traces", [("personal", 1), ("both", 2)])
+def test_daemon_trace_round_trip(monkeypatch, tmp_path, scope, expected_traces):
     import minni.minnid as minnid
+    import minni.retrieval as retrieval
+    from minni.trace import TraceRing
+
+    # No ambient vault discovery or process-global trace entries. With no own
+    # vault, personal falls back to shared once; both reaches shared twice.
+    ring = TraceRing()
+    monkeypatch.setattr(retrieval, "_trace_ring", lambda: ring)
+    monkeypatch.setattr(minnid, "_trace_ring", lambda: ring)
+    monkeypatch.setattr(minnid, "_agent_vault_retrieval", lambda _agent: None)
+    monkeypatch.setattr(minnid, "_all_vault_retrievals", lambda: [])
+    monkeypatch.setattr(minnid.DEFAULT_CONFIG, "recall_trace", False)
 
     engine, db_obj, _ = _make_engine(tmp_path)
     doc_id, _ = _seed_doc(db_obj, "/wiki/auth.md", "main", "auth migration")
@@ -315,18 +327,35 @@ def test_daemon_trace_round_trip(monkeypatch, tmp_path):
         "jsonrpc": "2.0",
         "id": 1,
         "method": "search",
-        "params": {"query": "auth migration", "agent_id": "main"},
+        "params": {
+            "query": "auth migration", "agent_id": "main", "scope": scope,
+            "expand": False, "layers": ["knowledge"],
+        },
     })
-    trace_id = search_response["result"]["trace_id"]
+    assert "error" not in search_response
+    result = search_response["result"]
+    assert result["results"], "round-trip requires an actual retrieval hit"
+    trace_ids = result["trace_ids"]
+    assert len(trace_ids) == expected_traces
+    assert len(set(trace_ids)) == expected_traces
+    assert result["trace_scope"] == "retrieval_leg"
+    assert result["trace_id"] == (trace_ids[0] if expected_traces == 1 else None)
+    assert all(row["trace_id"] in trace_ids for row in result["results"])
 
-    trace_response = minnid._dispatch_sync({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "trace",
-        "params": {"trace_id": trace_id},
-    })
+    for trace_id in trace_ids:
+        trace_response = minnid._dispatch_sync({
+            "jsonrpc": "2.0", "id": 2, "method": "trace",
+            "params": {"trace_id": trace_id, "agent_id": "main"},
+        })
+        assert trace_response["result"]["status"] == "ok"
+        trace = trace_response["result"]["trace"]
+        assert trace["query"] == "auth migration"
+        assert trace["fts_hits"], "the trace must retain the seeded FTS evidence"
+        assert "timing" in trace
 
-    trace = trace_response["result"]["trace"]
-    assert trace["query"] == "auth migration"
-    assert "fts_hits" in trace
-    assert "timing" in trace
+        other_response = minnid._dispatch_sync({
+            "jsonrpc": "2.0", "id": 3, "method": "trace",
+            "params": {"trace_id": trace_id, "agent_id": "codex"},
+        })
+        assert other_response["result"]["status"] == "not_found"
+        assert other_response["result"]["trace"] is None

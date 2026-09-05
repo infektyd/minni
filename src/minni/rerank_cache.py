@@ -8,24 +8,31 @@ from collections import OrderedDict
 from typing import Iterable, Optional, Tuple
 
 
-CacheKey = Tuple[str, str, str, int]
+CacheKey = Tuple[str, str, str, int, str, str]
 
 
 class RerankCache:
-    """Small per-process LRU keyed by model identity, query hash, and chunk_id."""
+    """LRU of raw model scores, scoped to corpus and exact model input."""
 
     def __init__(self, capacity: int = 1024):
         self.capacity = max(1, int(capacity))
         self._scores: OrderedDict[CacheKey, float] = OrderedDict()
         self._lock = threading.Lock()
+        self._generation = 0
 
     @staticmethod
     def _query_hash(query: str) -> str:
-        return hashlib.sha256(query.encode("utf-8", errors="ignore")).hexdigest()
+        return hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()
 
-    def _key(self, model_name: str, model_version: str, query: str, chunk_id: int) -> CacheKey:
+    def _key(self, model_name: str, model_version: str, query: str, chunk_id: int,
+             corpus: str, passage: str) -> CacheKey:
         return (model_name or "unknown", model_version or "unknown",
-                self._query_hash(query), int(chunk_id))
+                self._query_hash(query), int(chunk_id), corpus, self._query_hash(passage))
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     def get(
         self,
@@ -33,8 +40,11 @@ class RerankCache:
         model_version: str,
         query: str,
         chunk_id: int,
+        *,
+        corpus: str = "",
+        passage: str = "",
     ) -> Optional[float]:
-        key = self._key(model_name, model_version, query, chunk_id)
+        key = self._key(model_name, model_version, query, chunk_id, corpus, passage)
         with self._lock:
             if key not in self._scores:
                 return None
@@ -49,9 +59,17 @@ class RerankCache:
         query: str,
         chunk_id: int,
         score: float,
+        *,
+        corpus: str = "",
+        passage: str = "",
+        expected_generation: Optional[int] = None,
     ) -> None:
-        key = self._key(model_name, model_version, query, chunk_id)
+        key = self._key(model_name, model_version, query, chunk_id, corpus, passage)
         with self._lock:
+            # A prediction started before invalidation must not repopulate
+            # the cache after the indexer has deleted/replaced its inputs.
+            if expected_generation is not None and expected_generation != self._generation:
+                return
             self._scores.pop(key, None)
             self._scores[key] = float(score)
             while len(self._scores) > self.capacity:
@@ -62,6 +80,7 @@ class RerankCache:
         if not doomed:
             return 0
         with self._lock:
+            self._generation += 1
             keys = [key for key in self._scores if key[3] in doomed]
             for key in keys:
                 self._scores.pop(key, None)
@@ -69,6 +88,7 @@ class RerankCache:
 
     def clear(self) -> None:
         with self._lock:
+            self._generation += 1
             self._scores.clear()
 
 

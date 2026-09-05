@@ -44,6 +44,9 @@ Every vault is a directory with the following canonical structure:
   full; only new lines are appended.
 - `log.md` is appended on every create, edit, or supersession. It is never
   truncated.
+- First-create of `log.md` and `index.md` is exclusive (`O_EXCL` / mode `x`).
+  A racing `ensureVault`/`recordAudit` that already appended must never be
+  truncated by a stub header. Existing files are merge-not-wipe.
 - All durable writes go through the daemon JSON-RPC or the vault plugin API.
   Direct filesystem writes bypass audit logging and are strongly discouraged.
 
