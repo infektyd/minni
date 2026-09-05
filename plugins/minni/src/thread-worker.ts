@@ -1,5 +1,6 @@
 import { withClaimFsScope } from "./claim-fs.js";
 import { randomUUID } from "node:crypto";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -74,6 +75,7 @@ import {
   queuedWriteHasAcceptor,
   recordWorkerWriteDrainProgress,
   removeQueuedWorkerWrite,
+  workerWriteQueueDir,
   type QueuedWorkerWrite,
 } from "./thread-write-queue.js";
 
@@ -2231,6 +2233,19 @@ function drainKickKey(vaultPath: string, planId: string): string {
   return `${path.resolve(vaultPath)}\0${planId}`;
 }
 
+// Advisory emptiness only: never select or authorize work from file names.
+// Avoid taking the persist lock for an idle kick, which could turn a competing
+// direct update into queue acceptance. The locked scan still validates tickets.
+async function queueHasTicketEntries(vaultPath: string, planId: string): Promise<boolean> {
+  try {
+    const names = await readdir(workerWriteQueueDir(vaultPath, planId));
+    return names.some((name) => name.endsWith(".json") && name !== "progress.json");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 /**
  * Apply queued worker writes one-at-a-time under the existing one persist
  * authority. Not a second graph. Not G3. Replan is never queued.
@@ -2262,14 +2277,24 @@ export async function drainWorkerWrites(
   let oneShotPending = runOptions.oneShotYield === true;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
-    if (remaining.length === 0) return false;
+    // Ordinary drains only check names before the authoritative locked read.
+    // Standing drains still need the pre-lock head for acceptor deferral.
+    if (runOptions.standingDefer !== true &&
+        !(await queueHasTicketEntries(input.vaultPath, input.planId))) return false;
+    const remaining = runOptions.standingDefer === true
+      ? await listQueuedWorkerWrites(input.vaultPath, input.planId)
+      : undefined;
+    if (remaining?.length === 0) return false;
     if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
+      // Preserve the empty/malformed/error verdict even when a reservation
+      // prevents reaching the locked read. No snapshot survives this retry.
+      if (remaining === undefined &&
+          (await listQueuedWorkerWrites(input.vaultPath, input.planId)).length === 0) return false;
       await new Promise((resolve) => setTimeout(resolve, 25));
       continue;
     }
     if (runOptions.standingDefer === true) {
-      const head = pickNextQueuedWorkerWrite(remaining);
+      const head = pickNextQueuedWorkerWrite(remaining!);
       if (await standingDrainShouldYieldLiveStart(input.notePath, head)) {
         // Yield this tick. Do not journal slice.started. Do not sit the
         // 60s drain loop — minnid must not block. Next interval retries.
@@ -2278,6 +2303,7 @@ export async function drainWorkerWrites(
     }
     try {
       let oneShotYieldedLive = false;
+      let queueEmpty = false;
       await withThreadLock(
         input.vaultPath,
         input.planId,
@@ -2287,12 +2313,15 @@ export async function drainWorkerWrites(
             oneShotPending = false;
             const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
             const head = pickNextQueuedWorkerWrite(items);
+            if (head === undefined) {
+              queueEmpty = true;
+              return;
+            }
             if (
-              head !== undefined &&
               !(await queuedWriteIsLiveWork(input.notePath, head))
             ) {
               // Dead leftover after supersede: drop now. Not a live apply.
-              await drainOneQueuedWorkerWrite(input, deps);
+              queueEmpty = await drainOneQueuedWorkerWrite(input, deps);
               return;
             }
             // Live accepted start: yield once. Do not journal slice.started
@@ -2300,13 +2329,15 @@ export async function drainWorkerWrites(
             oneShotYieldedLive = true;
             return;
           }
-          await drainOneQueuedWorkerWrite(input, deps);
+          queueEmpty = await drainOneQueuedWorkerWrite(input, deps);
         },
         { waitMs: 0 },
       );
+      if (queueEmpty) return false;
       if (oneShotYieldedLive) return true;
     } catch (error) {
       if (error instanceof ThreadBusyError) {
+        if ((await listQueuedWorkerWrites(input.vaultPath, input.planId)).length === 0) return false;
         await new Promise((resolve) => setTimeout(resolve, 25));
         continue;
       }
@@ -2490,17 +2521,18 @@ async function claimTokenFromExistingStore(
   return envelope.token;
 }
 
+/** True only when the authoritative locked queue read found no work. */
 async function drainOneQueuedWorkerWrite(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps,
-): Promise<void> {
+): Promise<boolean> {
   const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const item = pickNextQueuedWorkerWrite(items);
-  if (item === undefined) return;
+  if (item === undefined) return true;
   if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
     // Yield: keep the ticket. Exclusive replan owns persist. Do not
     // journal slice.started on a parent that replan then supersedes.
-    return;
+    return false;
   }
   // Reuse this strict snapshot only inside this one lock acquisition. Token
   // lookup must refer to the same generation we just checked for liveness.
@@ -2526,7 +2558,7 @@ async function drainOneQueuedWorkerWrite(
       remaining: leftoverStale.length,
       at: new Date().toISOString(),
     });
-    return;
+    return false;
   }
   const token = await claimTokenFromExistingStore(
     input.vaultPath,
@@ -2557,6 +2589,7 @@ async function drainOneQueuedWorkerWrite(
     remaining: leftover.length,
     at: new Date().toISOString(),
   });
+  return false;
 }
 
 async function applyClaimedSliceOnLockedPlan(
