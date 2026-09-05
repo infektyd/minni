@@ -232,6 +232,16 @@ def principal_provenance(retriever_name: str, *, is_mock: bool) -> Dict[str, Any
             "scope": "repository working-tree files (no authorization boundary)",
             "note": "File-text baseline; scores describe lexical overlap, not memory quality.",
         }
+    if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        return {
+            "supplied": True,
+            "backend": "study-snapshot",
+            "mock": False,
+            "scope": "prepared snapshot vault only (least-privilege study principal)",
+            "note": "Study principal is scoped to the frozen snapshot vault; "
+                    "packet authorization claims are supplied provenance, not "
+                    "independently verified permission.",
+        }
     return {
         "supplied": False,
         "backend": key or "unknown",
@@ -277,6 +287,17 @@ def corpus_provenance(*, is_mock: bool, retriever_name: str = "") -> Dict[str, A
             "frozen": False,
             "note": "Vendor-memory baseline is not configured and returns no "
                     "results; no corpus identity applies.",
+        }
+    if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        return {
+            "snapshot": "study-frozen",
+            "frozen": True,
+            "note": "Disposable study snapshot: all DB/index/vault paths live "
+                    "inside the prepared snapshot directory under a manifest "
+                    "digest (see snapshot.json). The live corpus is never "
+                    "assigned a snapshot ID. Bounded packet study only: not "
+                    "representative private-memory quality and not a "
+                    "retrieval-performance claim.",
         }
     return {
         "snapshot": "unknown",

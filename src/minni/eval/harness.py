@@ -426,7 +426,18 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     for retriever_name in retriever_names:
         try:
-            searcher = _MockSearcher(queries) if args.mock else make_searcher(retriever_name, queries)
+            if args.mock:
+                searcher = _MockSearcher(queries)
+            elif retriever_name.strip().lower() in {"snapshot", "study-snapshot", "study_snapshot"}:
+                snapshot_dir = getattr(args, "snapshot_dir", "")
+                if not snapshot_dir:
+                    logger.error("The snapshot retriever requires --snapshot-dir <prepared-snapshot-dir>")
+                    sys.exit(2)
+                searcher = make_searcher(retriever_name, queries, root=Path(snapshot_dir))
+            else:
+                searcher = make_searcher(retriever_name, queries)
+        except SystemExit:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.error("Could not initialise retriever %r: %s", retriever_name, exc)
             sys.exit(1)
@@ -617,7 +628,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     run_p.add_argument(
         "--retrievers",
         default="minnid",
-        help="Comma-separated retrievers: minnid,ripgrep,raw-context,vendor,mock",
+        help="Comma-separated retrievers: minnid,ripgrep,raw-context,vendor,mock,snapshot",
+    )
+    run_p.add_argument(
+        "--snapshot-dir",
+        default="",
+        help="Prepared study-snapshot directory (required with --retrievers snapshot; "
+             "see src/minni/eval/study_snapshot.py). Never the live vault.",
     )
     run_p.add_argument(
         "--gate",

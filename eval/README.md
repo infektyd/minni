@@ -262,3 +262,83 @@ They remain available for legacy descriptive reports. Quality mode also rejects
 pairs with identical effective options after accounting for the engine’s
 `expand=True` default; distinct names alone do not
 establish a feature comparison.
+
+## Bounded study snapshot (authorized-export packet in, frozen corpus out)
+
+`src/minni/eval/study_snapshot.py` is the snapshot foundation for the
+private-memory campaign. It collects nothing: the only input is a bounded,
+explicit **authorized-export packet** (principal/store/source identity plus
+record content) supplied by the parent, which connects the governed export
+separately. Arbitrary paths and vault dumps are never accepted.
+
+Packet shape (`packet_version: "minni-study-export-v1"`):
+
+- `principal.agent_id`, `store.{store_id, origin}`, `source.origin`,
+  `authorization.claimed` — recorded as supplied provenance, never as
+  independently verified permission.
+- `records[]` — each with `source_doc_id`, `store`, relative `.md`
+  `artifact_path` (no absolutes, no `..`), `text` plus matching
+  `content_sha256`, `content_kind: original|excerpt` (excerpts must cite a
+  `source_locator`), `review_state: machine_proposed` with
+  `human_reviewed: false`, source-ownership `agent`, `privacy_level`,
+  clear `origin`, and an explicit boolean `expected_eligible`
+  (cross-project eligibility is annotated before retrieval, never inferred
+  from it; project directories are ordinary paths, not authorization
+  boundaries).
+
+Validation rejects tampered manifests (digest over canonical records),
+tampered content, duplicate source identity across stores, duplicate content
+digests, unsafe artifact paths, missing excerpt/original labels, any
+human-reviewed claim, and malformed fields. Machine judgments are never
+labeled human-reviewed.
+
+```sh
+PYTHONPATH=src .venv/bin/python - <<'EOF'
+import json
+from pathlib import Path
+from minni.eval.study_snapshot import (
+    prepare_snapshot, materialize_snapshot_db,
+)
+packet = json.loads(Path("/private/study-export/packet.json").read_text())
+dest = Path("/private/study-snapshots/study-01")  # 0700 dirs / 0600 files
+manifest = prepare_snapshot(packet, dest)      # no DB, engine, or model imports
+info = materialize_snapshot_db(dest)           # disposable lexical FTS corpus
+print(manifest["snapshot_id"], info["document_ids"])
+EOF
+```
+
+`prepare_snapshot` freezes vault files, a deterministic opaque remapping
+(`study-0001…`, sorted by store/source identity), and `snapshot.json` whose
+`snapshot_id` derives from the manifest digest only — snapshot IDs are never
+assigned to the live corpus. `materialize_snapshot_db` mirrors the fixture's
+isolated construction with every DB/index/vault path inside the snapshot
+directory, ownership/privacy metadata preserved, writeback disabled, and no
+model loaded. Refreshing the corpus means a new snapshot directory, never
+silent file swaps.
+
+Run governed retrieval over the frozen corpus with the isolated backend:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
+  --queries /private/study-queries.jsonl --retrievers snapshot \
+  --snapshot-dir /private/study-snapshots/study-01 \
+  --output-dir /private/study-reports
+```
+
+The snapshot retriever requires `--snapshot-dir`, opens only that directory
+under a least-privilege principal scoped to the snapshot vault, and never
+instantiates the live `DEFAULT_CONFIG`. Provenance labels it `study-frozen`
+with supplied (not verified) authorization; the snapshot backend is excluded
+from quality-gate config comparisons. Normal governed search/drill
+access/trace effects apply — no zero-write forensic claim is made.
+`sm_export_pack` stays what it is (shared snippets under an export
+capability, not a corpus snapshot) and no capability is bypassed.
+
+Scope honesty: a bounded packet study only — not representative
+private-memory quality, not a retrieval-performance claim, not a
+default-change signal. Decisive acceptance stays with the parent.
+
+Unresolved (parent-owned): the governed daemon export that produces the
+packet, and the collection limits for the real day-to-day memory corpus,
+are not implemented here — this module only validates, freezes, and serves
+whatever bounded packet the parent supplies.

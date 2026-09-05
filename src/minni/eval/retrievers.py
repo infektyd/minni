@@ -162,6 +162,84 @@ class VendorMemorySearcher(SearcherProtocol):
         return []
 
 
+class SnapshotSearcher(SearcherProtocol):
+    """Governed retrieval over a prepared study snapshot directory only.
+
+    Opens the disposable database/index/vault inside ``snapshot_dir`` (see
+    ``eval/study_snapshot.py``) under a least-privilege principal scoped to
+    the snapshot vault. Never instantiates the live ``DEFAULT_CONFIG``.
+    Normal governed search applies; access/trace effects are the engine's
+    own and no zero-write forensic claim is made.
+    """
+
+    backend = "snapshot"
+
+    def __init__(self, snapshot_dir: Path) -> None:
+        import json as _json
+
+        root = Path(snapshot_dir)
+        manifest_path = root / "snapshot.json"
+        try:
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(f"snapshot directory {root} has no snapshot.json") from exc
+        except ValueError as exc:
+            raise ValueError(f"snapshot directory {root} has an unreadable manifest") from exc
+        from .study_snapshot import SNAPSHOT_VERSION
+
+        if manifest.get("snapshot_version") != SNAPSHOT_VERSION:
+            raise ValueError("snapshot manifest version mismatch; re-prepare the snapshot")
+        if manifest.get("human_reviewed") is not False:
+            raise ValueError("snapshot manifest must keep human_reviewed=false")
+        self.snapshot_dir = root
+        self.snapshot_id = manifest.get("snapshot_id", "unknown")
+        self._agent_id = str((manifest.get("principal") or {}).get("agent_id") or "study")
+        self._engine = None
+        self._principal = None
+
+    def _ensure_engine(self):  # lazy so import never touches a database
+        if self._engine is not None:
+            return self._engine
+        from minni.config import SovereignConfig
+        from minni.db import SovereignDB
+        from minni.principal import EffectivePrincipal
+        from minni.retrieval import RetrievalEngine
+
+        root = self.snapshot_dir
+        config = SovereignConfig(
+            db_path=str(root / "study.db"),
+            vault_path=str(root / "vault"),
+            faiss_index_path=str(root / "study.faiss"),
+            graph_export_dir=str(root / "graphs"),
+            writeback_path=str(root / "learnings"),
+            writeback_enabled=False,
+            reranker_enabled=False,
+            hyde_enabled=False,
+        )
+        db = SovereignDB(config)
+        self._engine = RetrievalEngine(db, config)
+        self._principal = EffectivePrincipal(
+            agent_id=self._agent_id,
+            capabilities=["search", "read"],
+            allowed_vault_roots=[str(root / "vault")],
+        )
+        return self._engine
+
+    def search(self, query: str, **kwargs) -> List[Dict[str, Any]]:
+        engine = self._ensure_engine()
+        search_kwargs = {
+            "limit": kwargs.get("limit", 10),
+            "update_access": False,
+            "expand": False,
+            "use_hyde": False,
+            "budget_tokens": False,
+            "principal": self._principal,
+        }
+        if kwargs.get("deadline_monotonic") is not None:
+            search_kwargs["deadline_monotonic"] = kwargs["deadline_monotonic"]
+        return engine.retrieve(query, **search_kwargs)
+
+
 class MockSearcher(SearcherProtocol):
     """
     Deterministic mock searcher.
@@ -198,6 +276,7 @@ def make_searcher(
 ) -> SearcherProtocol:
     """Build a named retriever for adversarial baseline comparisons."""
     key = name.strip().lower()
+    explicit_root = root
     search_root = root or repo_root()
     if key in {"mock"}:
         return MockSearcher(queries)
@@ -209,8 +288,16 @@ def make_searcher(
         return RawContextSearcher(search_root)
     if key in {"vendor", "vendor-memory", "vendor_memory"}:
         return VendorMemorySearcher()
+    if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        if explicit_root is None:
+            raise ValueError(
+                "The snapshot retriever needs a prepared snapshot directory "
+                "(see eval/study_snapshot.py); pass root=<snapshot-dir>"
+            )
+        return SnapshotSearcher(Path(explicit_root))
     raise ValueError(
-        f"Unknown retriever {name!r}. Available: minnid, ripgrep, raw-context, vendor-memory, mock"
+        "Unknown retriever {!r}. Available: minnid, ripgrep, raw-context, "
+        "vendor-memory, mock, snapshot".format(name)
     )
 
 
