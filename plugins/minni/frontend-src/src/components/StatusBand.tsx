@@ -16,22 +16,22 @@ export function deriveStatusStats(
   const stats: BandStat[] = [];
   stats.push({
     label: "Daemon",
-    value: status?.socket?.ok ? "sovrd · ready" : "sovrd · offline",
+    value: !status ? "minnid · unknown" : status.socket?.ok ? "minnid · ready" : "minnid · unavailable",
     tone: status?.socket?.ok ? "ok" : "warn",
   });
   stats.push({
     label: "AFM",
-    value: status?.afm?.ok ? "loop · on (dry)" : "loop · idle",
+    value: !status ? "generation · unknown" : status.afm?.ok ? "generation · verified" : "generation · not verified",
     tone: status?.afm?.ok ? "ok" : "info",
   });
   stats.push({
     label: "Vault",
-    value: status?.vault?.exists ? "ready" : "not initialized",
+    value: !status ? "unknown" : status.vault?.exists ? "ready" : "not initialized",
     tone: status?.vault?.exists ? "ok" : "warn",
   });
   stats.push({
     label: "Privacy",
-    value: "local-only",
+    value: "per-source policy",
     tone: "ok",
   });
   stats.push({
@@ -41,7 +41,7 @@ export function deriveStatusStats(
   });
   stats.push({
     label: "Bridge",
-    value: health?.ok ? `:${health.port ?? "?"}` : "offline",
+    value: !health ? "unknown" : health.ok ? `:${health.port ?? "?"}` : "unavailable",
     tone: health?.ok ? "ok" : "danger",
   });
   return stats;

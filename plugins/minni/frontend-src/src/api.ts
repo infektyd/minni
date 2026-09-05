@@ -64,7 +64,13 @@ export interface PreparedTaskPacket {
   relevantSources: TaskSource[];
   recommendedNextActions: string[];
   risks: string[];
-  recall: { daemonOk: boolean; daemonLead?: string; error?: string };
+  recall: { daemonOk: boolean; daemonLead?: string; error?: string;
+    /** Display-only evidence; never added to AFM/model packet context. */
+    evidence?: { kind: "document" | "learning" | "episode"; text: string }[];
+    diagnostic?: string;
+    state?: "responded" | "degraded" | "error" | "unknown";
+    agent?: string; workspace?: string; backend?: string;
+  };
   afm: { requested: boolean; used: boolean; url?: string; error?: string };
   outcomeDraft?: OutcomeDraft;
   contextMarkdown: string;
