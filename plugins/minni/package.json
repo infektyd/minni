@@ -16,6 +16,7 @@
   },
   "files": [
     "dist",
+    "frontend",
     ".claude-plugin",
     ".codex-plugin",
     ".cursor-plugin",

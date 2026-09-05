@@ -57,7 +57,7 @@ def _deployment(home: Path, *, link_dist_to: Path) -> Path:
     root = home / ".config" / "kilo" / "plugins" / "minni"
     root.mkdir(parents=True)
     (root / "dist").symlink_to(link_dist_to)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -331,7 +331,7 @@ def _agents_tree_deployment(home: Path) -> Path:
     """A deployment in the shared agents tree (the D14 live location)."""
     root = home / ".agents" / "plugins" / "minni@minni"
     root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -488,7 +488,7 @@ def test_inactive_wire_version_dist_is_skipped_not_strict_failed(tmp_path):
         json.dumps({"git_sha": "0" * 40, "built_at": "2026-07-01T00:00:00Z"}),
         encoding="utf-8",
     )
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -502,7 +502,7 @@ def test_inactive_wire_version_dist_is_skipped_not_strict_failed(tmp_path):
     if fresh.exists():
         shutil.rmtree(fresh)
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -538,7 +538,7 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -565,7 +565,7 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
         home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0"
     )
     cache_root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -595,7 +595,7 @@ def test_repo_plugin_payload_skipped_when_env_set(tmp_path):
     (root / "plugins").symlink_to(REPO / "plugins")
     payload = root / "src" / "minni" / "plugin_payload"
     payload.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -633,7 +633,7 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -659,7 +659,7 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
         home / ".codex" / "plugins" / "cache" / "minni" / "minni" / "0.2.9"
     )
     codex_cache.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -687,7 +687,7 @@ def test_kilo_plugins_tree_skipped_when_kilocode_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -712,7 +712,7 @@ def test_kilo_plugins_tree_skipped_when_kilocode_wire_active(tmp_path):
     # Stale pre-wire kilo plugins tree (would STALE without skip).
     kilo_root = home / ".config" / "kilo" / "plugins" / "minni"
     kilo_root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -737,7 +737,7 @@ def test_kilo_plugins_tree_judged_when_kilocode_not_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -761,7 +761,7 @@ def test_kilo_plugins_tree_judged_when_kilocode_not_wire_active(tmp_path):
     )
     kilo_root = home / ".config" / "kilo" / "plugins" / "minni"
     kilo_root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -786,7 +786,7 @@ def test_plugin_current_skipped_when_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -811,7 +811,7 @@ def test_plugin_current_skipped_when_wire_active(tmp_path):
     # Lagging release current symlink target.
     old = plugin / "0.3.0"
     old.mkdir()
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -840,7 +840,7 @@ def test_empty_wires_skips_all_historical_plugin_dirs(tmp_path):
     plugin = home / ".minni" / "plugin"
     old = plugin / "0.4.0"
     old.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -863,7 +863,7 @@ def test_empty_wires_skips_all_historical_plugin_dirs(tmp_path):
     # clean deploy to report without inventing a wire root.
     cursor = home / ".cursor" / "plugins" / "local" / "minni"
     cursor.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -1034,7 +1034,7 @@ def test_dirty_source_fails_even_when_build_head_matches(tmp_path):
 
 def test_host_mismatch_fails_strict_with_matching_plugin_artifacts(tmp_path):
     home, root, config = _wire_home(tmp_path, "codex")
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         _copytree(SOURCE / sub, root / sub)
     _artifact_dist(root)
     repo = _isolated_repo_root(tmp_path)
@@ -1085,3 +1085,19 @@ def test_retired_host_does_not_reactivate_broken_payload(tmp_path):
     problems, notes = _checker().check_wire_launch_bindings(home)
     assert problems == []
     assert any("host config root removed" in note for note in notes)
+
+
+@pytest.mark.parametrize("damage", ["missing", "drifted"])
+def test_installed_frontend_damage_fails_strict(tmp_path, damage):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    _artifact_dist(root)
+    script = root / "frontend/app.js"
+    if damage == "missing":
+        script.unlink()
+    else:
+        script.write_text("stale frontend")
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1
+    assert "frontend/app.js" in proc.stdout

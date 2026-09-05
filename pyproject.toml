@@ -93,6 +93,7 @@ minni = [
     "plugin_payload/.mcp.json",
     "plugin_payload/.kilocode-plugin/.mcp.json",
     "plugin_payload/dist/*",
+    "plugin_payload/frontend/*",
     "plugin_payload/hooks/*",
     "plugin_payload/.claude-plugin/*",
     "plugin_payload/.codex-plugin/*",

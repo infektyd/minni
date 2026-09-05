@@ -70,6 +70,7 @@ REPO_DEPLOYMENTS = ["src/minni/plugin_payload/dist"]
 # Subtrees copied verbatim into every deployment. These are what the runtimes
 # actually execute and read; none of them is ever symlinked.
 COMPARED_SUBTREES = (
+    "frontend",
     "hooks",
     "commands",
     "skills",

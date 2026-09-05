@@ -35,6 +35,8 @@ PAYLOAD_ITEMS = (
     "hooks",
     "skills",
     "README.md",
+    "frontend",
+    "package.json",
 )
 
 JUNK_NAMES = {".DS_Store", "__pycache__", ".pytest_cache"}
