@@ -11,6 +11,9 @@ import argparse
 import json
 import logging
 import math
+import os
+import stat
+import uuid
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,14 +103,55 @@ def _resolve_reports_dir(output_dir: Any = None) -> Path:
     """
     if output_dir:
         d = Path(output_dir).expanduser()
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Do not chmod an existing directory: it may be a shared /tmp or an
+        # unrelated user folder. The caller must select a private destination.
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                raise ValueError("Explicit report directory must be owned by this user and private (0700)")
+        finally:
+            os.close(fd)
         return d
     return _reports_dir()
 
 
+def _write_private_report(path: Path, text: str) -> None:
+    """Publish private bytes through a pinned directory, never a report symlink."""
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = f".minni-report-{uuid.uuid4().hex}.tmp"
+    created = False
+    try:
+        info = os.fstat(directory)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError("Report directory must be owned by this user and not writable by others")
+        try:
+            previous = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(previous.st_mode) or previous.st_nlink != 1:
+                raise ValueError("Report destination must be a regular, unlinked file")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        created = True
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        # Replacement never follows a destination symlink, including one
+        # introduced after the check. Existing broad file modes are replaced.
+        os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+    finally:
+        if created:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        os.close(directory)
+
+
 def _write_json_report(report: Dict[str, Any], path: Path) -> None:
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2)
+    _write_private_report(path, json.dumps(report, indent=2))
     logger.info("JSON report written to %s", path)
 
 
@@ -177,8 +221,7 @@ def _write_markdown_comparison(
         )
         lines.append("")
 
-    with path.open("w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
+    _write_private_report(path, "\n".join(lines) + "\n")
     logger.info("Markdown comparison written to %s", path)
 
 
@@ -329,6 +372,22 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.error("Unknown config(s): %s. Available: %s", unknown, list(CONFIGS))
         sys.exit(1)
 
+    run_order = [
+        retriever if len(config_names) == 1 else f"{retriever}-{config}"
+        for retriever in retriever_names
+        for config in config_names
+    ]
+    reserved = ({"gate"} if getattr(args, "gate", False) else set()) | (
+        {"quality-gate"} if getattr(args, "quality_gate", False) else set()
+    )
+    if (not run_order or len(set(run_order)) != len(run_order)
+            or reserved.intersection(run_order)):
+        logger.error("Each evaluation must have a unique report name; remove repeated configs/retrievers")
+        sys.exit(2)
+    if any(Path(name).name != name or name in (".", "..") for name in run_order):
+        logger.error("Report names must be plain filenames")
+        sys.exit(2)
+
     query_path = Path(args.queries) if getattr(args, "queries", "") else None
     try:
         queries = load_queries(query_path, strict=True) if getattr(args, "quality_gate", False) else load_queries(query_path)
@@ -360,11 +419,6 @@ def cmd_run(args: argparse.Namespace) -> None:
     query_prov = query_file_provenance(query_path, effective_query_path, queries)
     code_prov = code_provenance(repo_root())
     env_prov = environment_provenance()
-    run_order = [
-        retriever if len(config_names) == 1 else f"{retriever}-{config}"
-        for retriever in retriever_names
-        for config in config_names
-    ]
     # Actual constructed backend states, collected per report below. The run
     # summary is derived from these, never from CLI flags alone: e.g.
     # `--retrievers mock` without `--mock` still constructs a mock backend.

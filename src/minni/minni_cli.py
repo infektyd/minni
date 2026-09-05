@@ -57,8 +57,9 @@ DOWN_TIMEOUT_SECONDS = 15
 # Doctor-only diagnostic budget (#388). Passed explicitly as this probe's
 # socket timeout; the global _rpc default stays 30.0 for every other caller.
 # The probe also passes a matching timeout_ms (an existing search param the
-# daemon turns into its own work deadline via recall._search_deadline_monotonic),
-# so daemon work stays bounded strictly inside the transport kill.
+# daemon uses as a cooperative retrieval deadline). This does not cancel the
+# worker: post-retrieval bookkeeping and noninterruptible work can outlast the
+# socket timeout. A transport timeout is not evidence that server work stopped.
 RECALL_PROBE_BUDGET_S = 120.0
 # A successful probe slower than this is transport-ok but NOT healthy
 # performance (prompt-time hook callers discard at 30s; #388 shows warm

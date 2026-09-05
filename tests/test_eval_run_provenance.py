@@ -236,3 +236,117 @@ class TestCmdRunProvenance:
         assert prov["run_order"] == ["a", "mock"]
         assert prov["run_index"] == 1
         assert "certification" in prov and "none" in prov["certification"]
+
+
+class TestPrivateReports:
+    def test_explicit_run_files_private_under_permissive_umask(self, tmp_path):
+        import os
+        import stat
+
+        query = tmp_path / "queries.jsonl"
+        _write_queries(query)
+        out = tmp_path / "reports"
+        old = os.umask(0)
+        try:
+            harness.cmd_run(_namespace(queries=str(query), output_dir=str(out)))
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(out.stat().st_mode) == 0o700
+        reports = list(out.iterdir())
+        assert {p.suffix for p in reports} == {".json", ".md"}
+        assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in reports)
+
+    def test_existing_shared_directory_rejected_without_chmod(self, tmp_path):
+        import stat
+        import pytest
+
+        shared = tmp_path / "shared"
+        shared.mkdir(mode=0o755)
+        shared.chmod(0o755)
+        with pytest.raises(ValueError, match="private"):
+            harness._resolve_reports_dir(shared)
+        assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+        assert list(shared.iterdir()) == []
+
+    def test_symlink_directory_and_report_preserve_target(self, tmp_path):
+        import pytest
+
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+        directory_link = tmp_path / "linked"
+        directory_link.symlink_to(private, target_is_directory=True)
+        with pytest.raises(OSError):
+            harness._resolve_reports_dir(directory_link)
+        target = tmp_path / "untouched"
+        target.write_text("original")
+        report = private / "report.json"
+        report.symlink_to(target)
+        with pytest.raises(ValueError, match="regular"):
+            harness._write_json_report({"query": "private"}, report)
+        assert target.read_text() == "original"
+        assert report.is_symlink()
+        assert not list(private.glob("*.tmp"))
+
+    def test_existing_public_report_replaced_privately_without_changing_other_link(self, tmp_path):
+        import os
+        import stat
+        import pytest
+
+        report = tmp_path / "report.json"
+        report.write_text("old")
+        report.chmod(0o644)
+        harness._write_json_report({"query": "private"}, report)
+        assert stat.S_IMODE(report.stat().st_mode) == 0o600
+        assert json.loads(report.read_text()) == {"query": "private"}
+        alias = tmp_path / "alias"
+        os.link(report, alias)
+        with pytest.raises(ValueError, match="regular"):
+            harness._write_json_report({"query": "changed"}, report)
+        assert json.loads(alias.read_text()) == {"query": "private"}
+
+    def test_replace_failure_does_not_leave_private_staging(self, tmp_path, monkeypatch):
+        import pytest
+
+        def fail(*args, **kwargs):
+            raise OSError("publication failed")
+
+        monkeypatch.setattr(harness.os, "replace", fail)
+        with pytest.raises(OSError, match="publication failed"):
+            harness._write_json_report({"query": "private"}, tmp_path / "report.json")
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestUniqueReportNames:
+    def test_duplicates_fail_before_loading_or_creating_output(self, tmp_path, monkeypatch):
+        import pytest
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("duplicate preflight must precede side effects")
+
+        monkeypatch.setattr(harness, "load_queries", forbidden)
+        monkeypatch.setattr(harness, "make_searcher", forbidden)
+        monkeypatch.setattr(harness, "_resolve_reports_dir", forbidden)
+        for config, retrievers in [("baseline,baseline", "mock"),
+                                   ("baseline", "mock,mock"),
+                                   ("baseline,no-expand", "mock,mock")]:
+            with pytest.raises(SystemExit) as exc:
+                harness.cmd_run(_namespace(config=config, retrievers=retrievers,
+                                          output_dir=str(tmp_path / "out")))
+            assert exc.value.code == 2
+        for name, flag in [("gate", "gate"), ("quality-gate", "quality_gate")]:
+            with pytest.raises(SystemExit) as exc:
+                harness.cmd_run(_namespace(retrievers=name, **{flag: True}))
+            assert exc.value.code == 2
+        assert not (tmp_path / "out").exists()
+
+    def test_distinct_run_indices_and_reports(self, tmp_path):
+        query = tmp_path / "queries.jsonl"
+        _write_queries(query)
+        out = tmp_path / "reports"
+        harness.cmd_run(_namespace(config="baseline,no-expand", queries=str(query),
+                                  output_dir=str(out)))
+        rows = [json.loads(p.read_text()) for p in out.glob("*.json")]
+        assert len(rows) == 2
+        assert sorted(row["provenance"]["run_index"] for row in rows) == [0, 1]
+        assert all(row["provenance"]["run_order"] == ["mock-baseline", "mock-no-expand"]
+                   for row in rows)
