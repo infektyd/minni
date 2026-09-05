@@ -948,3 +948,38 @@ def test_migration_021_partial_schema_leaves_no_dangling_fk_and_retries(tmp_path
     )
     conn.commit()
     conn.close()
+
+
+def test_migration_021_backfills_legacy_graph_rows():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    conn.execute("INSERT INTO documents (path) VALUES ('legacy-source')")
+    source_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("INSERT INTO documents (path) VALUES ('legacy-target')")
+    target_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.executemany(
+        "INSERT INTO memory_links (source_doc_id, target_doc_id, link_type) VALUES (?, ?, ?)",
+        [
+            (source_id, target_id, "wikilink"),
+            (target_id, source_id, "derived_from"),
+            (source_id, source_id, "other"),
+        ],
+    )
+    conn.execute(
+        "INSERT INTO contradiction_log "
+        "(memory_a_id, memory_b_id, detected_at, resolution_status) VALUES (1, 2, 0.0, 'unresolved')"
+    )
+    _apply_migration_021_sql(conn)
+
+    rows = conn.execute(
+        "SELECT link_type, confidence, inference_method FROM memory_links ORDER BY link_type"
+    ).fetchall()
+    assert rows == [
+        ("derived_from", 1.0, "writeback_evidence"),
+        ("other", 1.0, "legacy"),
+        ("wikilink", 1.0, "explicit_wikilink"),
+    ]
+    assert conn.execute(
+        "SELECT resolution_status FROM contradiction_log"
+    ).fetchone()[0] == "legacy_unclassified"
+    conn.close()

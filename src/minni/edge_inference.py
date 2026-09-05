@@ -167,6 +167,13 @@ def format_numbered_excerpt(
 
     numbered_lines = [f"[{i + 1}] {line}" for i, line in enumerate(raw_lines)]
     formatted_block = "\n".join(numbered_lines)
+    # Number prefixes are part of the prompt, so enforce the cap after adding
+    # them rather than only on the unnumbered body.
+    if count_tokens(formatted_block, encoding_name=encoding_name)[0] > max_tokens:
+        formatted_block, _, _ = truncate_to_tokens(
+            formatted_block, max_tokens, encoding_name=encoding_name
+        )
+        raw_lines = [line for line in formatted_block.splitlines() if line.strip()]
     actual_tokens, is_measured_final = count_tokens(formatted_block, encoding_name=encoding_name)
     return formatted_block, raw_lines, actual_tokens, (is_measured and is_measured_final)
 

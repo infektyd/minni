@@ -283,16 +283,10 @@ In `src/minni/migrations.py`, the runner applies statements using `_execute_tole
 1. **Runner Schema Probe (`_migration_present_in_schema`)**:
    ```python
    if version == 21:
-       return (
-           _column_exists(conn, "documents", "memory_kind")
-           and _column_exists(conn, "documents", "memory_uri")
-           and _table_exists(conn, "learning_documents")
-           and _column_exists(conn, "memory_links", "edge_status")
-           and _column_exists(conn, "contradiction_log", "source_doc_id")
-       )
+       return verify_graph_schema(conn).ready
    ```
 2. **Post-Batch Strict Validation Hook (`_verify_migration_021_graph_schema`)**:
-   Executed immediately after statement flushing for version 21 within `_flush_batch()`. It runs the full readiness check. If any required column, table, or index is absent, it **raises a hard exception**, forcing `conn.rollback()` so that `schema_migrations` is NOT stamped and the runner retries on next startup.
+   Executed immediately after statement flushing for version 21 within `_flush_batch()`. It runs the full readiness check. If the base tables are incomplete, it returns false, skips the `schema_migrations` stamp, and commits the batch without 021; the runner retries on next startup once the base schema is supplied. If the existing tables are present but drifted, it raises a hard exception, forcing `conn.rollback()` so that `schema_migrations` is NOT stamped.
 
 ### 5.3 Retry and Multi-Store Compatibility
 
@@ -324,7 +318,7 @@ Let $G = (V, E)$ be the stored memory graph. For any requesting principal $P$, l
 | `TEST-MG-02` | Readiness | Fault Isolation | Create DB missing `learning_documents`; verify `check_graph_readiness()` returns `(False, "schema_missing: table 'learning_documents' missing")` and `graph_status` is `schema_missing`. |
 | `TEST-MG-03` | Inference | Local-Only Enforcement | Invoke `providers_for("edge_inference")` under configuration with active cloud providers. Assert returned provider list contains only local/loopback instances. |
 | `TEST-MG-04` | Durability | Fail-Loud Promotion | Simulate local model timeout (mock latency > 2.0s). Attempt `resolve_candidate(accept)`. Assert candidate remains `proposed`, no learning is inserted, and response code is `edge_inference_timeout`. |
-| `TEST-MG-05` | Durability | Standing Repair Safety | Trigger `reconstruct_learning_projections` with local model mock down. Assert existing durable learnings are **not** modified/deleted, document projection is reconstructed, and `edges_skipped='degraded'` is logged. |
+| `TEST-MG-05` | Durability | Standing Repair Safety | Trigger `reconstruct_learning_projections` with local model mock down. Assert existing durable learnings are **not** modified/deleted, document projection is reconstructed, and `edges_deferred='degraded'` is logged. |
 | `TEST-MG-06` | Privacy | Indistinguishability | Populate Node A (public) linked to Node B (private to Agent X). Query as Agent Y. Assert Node A is returned with `graph_paths` showing no reference or count of Node B. Compare caller-visible graph content against a DB where Node B was never inserted, excluding volatile timing/request identifiers; authorized content and topology must be identical. |
 | `TEST-MG-07` | Lifecycle | N:1 Aggregate Liveness | Commit two identical learnings $L_1$ and $L_2$ mapping to canonical Doc $D$. Supersede $L_1$. Query recall pool. Assert Doc $D$ is **still returned** as active. Supersede $L_2$. Assert Doc $D$ is now excluded. |
 | `TEST-MG-08` | Retrieval | Multi-hop Expansion | Query requiring 1-hop traversal to connect non-lexical match. Assert Recall@5 increases without precision regression on baseline query set. |
