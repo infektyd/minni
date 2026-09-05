@@ -85,10 +85,6 @@ REQUIRED_COLUMNS: dict[str, list[tuple[str, str, int, str | None, int]]] = {
         ("inferred_at", "REAL", 0, None, 0),
         ("edge_status", "TEXT", 1, "active", 0),
     ],
-    "memory_links": [
-        ("source_doc_id", "documents", "doc_id", ("CASCADE",)),
-        ("target_doc_id", "documents", "doc_id", ("CASCADE",)),
-    ],
     "contradiction_log": [
         ("source_doc_id", "INTEGER", 0, None, 0),
         ("target_doc_id", "INTEGER", 0, None, 0),
