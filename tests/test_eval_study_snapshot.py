@@ -129,6 +129,15 @@ def test_rejects_duplicate_store_tuple_identity():
         validate_export_packet(packet)
 
 
+def test_rejects_duplicate_artifact_path():
+    packet = _packet([
+        _record("doc-a1", "store-a", "project-a/a.md", "text one"),
+        _record("doc-b1", "store-b", "project-a/a.md", "text two"),
+    ])
+    with pytest.raises(StudySnapshotError, match="duplicate artifact path"):
+        validate_export_packet(packet)
+
+
 def test_duplicate_content_is_retained_and_linked_not_conflated(tmp_path):
     dest = tmp_path / "snapshot"
     prepare_snapshot(_packet([
