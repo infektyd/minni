@@ -662,6 +662,11 @@ def run_fleet_sync(
     # Custom JSON bindings are registered MCP consumers, not native hosts.
     from minni.wire.custom_refresh import refresh_custom_wires
     steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
+    from minni.wire.hermes import inspect_hermes
+    hermes = inspect_hermes(repo=from_repo, new_root=wire_step.get("install_root"), dry_run=dry_run)
+    steps.append(hermes)
+    if hermes.get("reload_required"):
+        next_actions.append("Existing Hermes sessions: run /reload-mcp to load the verified source build")
 
     if propagate_hosts and not dry_run:
         for plat in ("antigravity", "cursor"):

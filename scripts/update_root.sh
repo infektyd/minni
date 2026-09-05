@@ -296,6 +296,13 @@ elif ! "$VENV_PY" -m minni.wire.custom_refresh --wire-report "$_WIRE_JSON"; then
   echo "update-root: custom MCP refresh failed — continuing" >&2
   REDEPLOY_EXIT=1
 fi
+# Validate existing Hermes source binding; never rewrite or activate the host.
+if [ "$DRY_RUN" = 1 ]; then
+  act "$VENV_PY" -m minni.wire.hermes --repo "$REPO" --dry-run
+elif ! "$VENV_PY" -m minni.wire.hermes --repo "$REPO" --wire-report "$_WIRE_JSON"; then
+  echo "update-root: Hermes source binding incomplete — continuing" >&2
+  REDEPLOY_EXIT=1
+fi
 if [ "$DRY_RUN" != 1 ]; then rm -f "$_WIRE_JSON"; fi
 if [ "$DRY_RUN" = 1 ]; then
   act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \

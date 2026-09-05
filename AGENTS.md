@@ -81,4 +81,4 @@ Durable, non-obvious notes for agents working in the Cloud Agent VM. Standard co
 ### Optional surfaces
 - Web console / Memory Board: `cd plugins/minni && MINNI_CONSOLE_TOKEN=<token> node dist/ui-server.js` (build first via `make build`). Serves on `127.0.0.1:8765`; every data route requires `Authorization: Bearer <token>` (a token is auto-generated and printed if `MINNI_CONSOLE_TOKEN` is unset). Open `http://127.0.0.1:8765/?token=<token>`.
 - The AFM bridge (`127.0.0.1:11437`) is **not** running by default. The console/daemon logging `[Errno 111] Connection refused` for AFM is expected and optional (see `.env.example` / `MINNI_AFM_PROVIDER_MODE`); it does not affect the core memory loop.
-- CI additionally installs `pyyaml` into the venv purely for `scripts/check-public-boundary.sh`; it is not needed for normal dev/test.
+- PyYAML is a runtime dependency for existing Hermes YAML binding validation during sync; CI also uses it for `scripts/check-public-boundary.sh`.
