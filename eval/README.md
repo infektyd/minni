@@ -236,7 +236,12 @@ PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
 ```
 
 `--output-dir` defaults to `eval/reports`, preserving existing behavior; pass
-an outside-the-repo directory for anything private. Every JSON report carries
+an outside-the-repo directory for anything private. A new explicit directory
+is created with mode `0700`; an existing directory must already be owned by
+you and private. Shared directories such as `/tmp` itself are rejected; use
+a dedicated child directory. JSON and Markdown reports are written with mode
+`0600`. Repeated config/retriever combinations are rejected before a run starts.
+Every JSON report carries
 a `provenance` block: a digest of the exact parsed queries scored
 (`loaded_queries_digest`), the separately observed query-file bytes with
 explicitly unverified correspondence, code revision/dirty state,
