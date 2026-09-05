@@ -26,6 +26,7 @@ import re
 import sqlite3
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
 
@@ -46,6 +47,109 @@ from minni.timestamps import parse_epoch_or_report
 from minni.wiki_indexer import WikiFrontmatter
 
 logger = logging.getLogger("sovereign.retrieval")
+
+
+# Encode/FAISS/CE/HyDE cannot be cancelled once started inside to_thread.
+# A binary elapsed check still launches those stages with a sliver of budget
+# and the worker outlives DEFAULT_JSON_RPC_TIMEOUT_MS (30s).
+# 1.0s still starts get_embedder()/get_cross_encoder() (HuggingFace download
+# + uncancellable encode/predict). Match HyDE AFM's 2s remaining floor.
+SEARCH_STAGE_MIN_REMAINING_S = 2.0
+# Default leftover is 22.5s (25s * 0.9); MCP/CLI omit timeoutMs so
+# recallMemory sends 30s → leftover 27s. 8s still starts get_embedder()
+# / HF download that cannot finish before DEFAULT_JSON_RPC kill.
+# Warm cache hits still use SEARCH_STAGE_MIN_REMAINING_S.
+SEARCH_MODEL_LOAD_MIN_REMAINING_S = 27.0
+# 2.1s leftover still passes SEARCH_STAGE_MIN_REMAINING_S; a cold/empty index
+# with ~20s left must not wait on _faiss_load_lock for warmup/vault-watch's
+# unbounded SELECT + FAISS build. Disk restore is <500ms and must run on
+# default leftover (22.5s / 27s) when the lock is free; skip the rebuild
+# after a disk miss, and skip the lock wait when leftover cannot finish a
+# rebuild. Do not cancel an in-flight build. Default leftover is 22.5s
+# (25s * 0.9); MCP/CLI omit timeoutMs so recallMemory sends 30s → leftover 27s.
+SEARCH_FAISS_REBUILD_MIN_REMAINING_S = 27.0
+
+
+def remaining_search_budget(deadline_monotonic: Optional[float]) -> Optional[float]:
+    """Seconds left before ``deadline_monotonic``, or None if unbounded."""
+    if deadline_monotonic is None:
+        return None
+    return deadline_monotonic - time.monotonic()
+
+
+@contextmanager
+def search_model_lock(lock, deadline_monotonic: Optional[float]):
+    """Bound queueing by the stage budget; an acquired predict is not cancelled."""
+    remaining = remaining_search_budget(deadline_monotonic)
+    if remaining is None:
+        acquired = lock.acquire()
+    else:
+        timeout = remaining - SEARCH_STAGE_MIN_REMAINING_S
+        acquired = timeout > 0 and lock.acquire(timeout=timeout)
+    try:
+        yield bool(acquired)
+    finally:
+        if acquired:
+            lock.release()
+
+
+def past_search_deadline(
+    deadline_monotonic: Optional[float],
+    *,
+    min_remaining: float = SEARCH_STAGE_MIN_REMAINING_S,
+) -> bool:
+    """True when a retrieve() call has exhausted its client-facing budget.
+
+    Search runs inside ``asyncio.to_thread`` and cannot be cancelled; the
+    handler must stop starting FAISS/expand/CE once remaining time is at or
+    below ``min_remaining`` (DEFAULT_JSON_RPC_TIMEOUT_MS = 30s).
+    """
+    remaining = remaining_search_budget(deadline_monotonic)
+    if remaining is None:
+        return False
+    return remaining <= min_remaining
+
+
+def _cached_singleton_ready(getter) -> bool:
+    """True when ``functools.cache`` already holds the process-wide model."""
+    cache_info = getattr(getter, "cache_info", None)
+    if not callable(cache_info):
+        return False
+    try:
+        return cache_info().currsize > 0
+    except Exception:
+        return False
+
+
+def should_skip_cold_model_load(deadline_monotonic: Optional[float], getter) -> bool:
+    """True when leftover budget cannot finish a cold HuggingFace/ST load."""
+    if not past_search_deadline(
+        deadline_monotonic, min_remaining=SEARCH_MODEL_LOAD_MIN_REMAINING_S
+    ):
+        return False
+    return not _cached_singleton_ready(getter)
+
+
+def should_skip_faiss_rebuild(deadline_monotonic: Optional[float]) -> bool:
+    """True when leftover budget cannot finish a full-table FAISS rebuild."""
+    return past_search_deadline(
+        deadline_monotonic, min_remaining=SEARCH_FAISS_REBUILD_MIN_REMAINING_S
+    )
+
+
+def faiss_load_lock_timeout(deadline_monotonic: Optional[float]) -> Optional[float]:
+    """Seconds to wait for `_faiss_load_lock`, or None for unbounded.
+
+    Default leftover (22.5s / 27s) is at or below the rebuild floor, so
+    timeout is 0: acquire if free (disk restore still runs), skip if
+    warmup or vault-watch holds the lock for a rebuild. Do not wait that
+    rebuild out past JSON-RPC kill. Remaining above the floor may wait
+    the surplus.
+    """
+    remaining = remaining_search_budget(deadline_monotonic)
+    if remaining is None:
+        return None
+    return max(0.0, remaining - SEARCH_FAISS_REBUILD_MIN_REMAINING_S)
 
 # Valid depth tiers for progressive disclosure.
 DepthTier = Literal["headline", "snippet", "chunk", "document"]
@@ -371,7 +475,6 @@ class RetrievalEngine:
         self._tokenizer = None
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
-        self.last_trace_id: Optional[str] = None
         # P0-B (2026-07-19 blackout): the semantic leg must never die silently.
         # Set when _semantic_search finds no embedding model; cleared when the
         # model comes back. Surfaced by status/recall so an FTS-only session is
@@ -389,6 +492,7 @@ class RetrievalEngine:
         # reporting a degraded search as healthy, or pinning one caller's
         # failure on another. Review round 1 on PR #260 caught this.
         self._degradation_local = threading.local()
+        self.last_trace_id = None
         # P0-A contract: when the read-authorization gate suppresses a
         # non-empty candidate set to zero, the reason is recorded so the caller
         # can return a diagnostic envelope instead of a bare [].
@@ -445,6 +549,19 @@ class RetrievalEngine:
         setattr(local, name, value)
 
     @property
+    def last_trace_id(self) -> Optional[str]:
+        """Trace from the last retrieve on this thread, for same-thread callers.
+
+        Search workers share this engine, so another request must neither
+        replace this ID nor clear it when its own trace capture fails.
+        """
+        return self._degradation_flag("trace_id")
+
+    @last_trace_id.setter
+    def last_trace_id(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("trace_id", value)
+
+    @property
     def last_rerank_degraded(self) -> Optional[str]:
         """R5 (#226): why the reranker failed on THIS thread's last retrieve().
 
@@ -496,6 +613,44 @@ class RetrievalEngine:
     def last_hyde_degraded(self, value: Optional[str]) -> None:
         self._set_degradation_flag("hyde", value)
 
+    def _deadline_skipped_vector(self) -> bool:
+        """True when the returned ranking is FTS-only or CE-skipped due to deadline.
+
+        A skipped HyDE enrichment does not change the first-pass ranking, so it
+        must not withhold qty/calibration from hybrid winners.
+        """
+        for flag in (
+            self.last_vector_degraded,
+            self.last_rerank_degraded,
+        ):
+            if flag and "search deadline" in str(flag).lower():
+                return True
+        return False
+
+    def _current_deadline(self) -> Optional[float]:
+        local = getattr(self, "_degradation_local", None)
+        if local is None:
+            return None
+        return getattr(local, "deadline_monotonic", None)
+
+    def _set_current_deadline(self, value: Optional[float]) -> None:
+        local = getattr(self, "_degradation_local", None)
+        if local is None:
+            local = threading.local()
+            self._degradation_local = local
+        local.deadline_monotonic = value
+
+    @contextmanager
+    def _query_encoding_scope(self):
+        """Reuse successful embeddings only during one request's refill loop."""
+        local = self._degradation_local
+        previous = getattr(local, "query_embeddings", None)
+        local.query_embeddings = {}
+        try:
+            yield
+        finally:
+            local.query_embeddings = previous
+
     @property
     def model(self):
         """Return the process-wide embedding model singleton."""
@@ -508,6 +663,9 @@ class RetrievalEngine:
         if self._reranker is not None:
             return self._reranker
         from minni.models import get_cross_encoder
+        if should_skip_cold_model_load(self._current_deadline(), get_cross_encoder):
+            self.last_rerank_degraded = "search deadline; skipped rerank"
+            return None
         self._reranker = get_cross_encoder()
         return self._reranker
 
@@ -517,6 +675,10 @@ class RetrievalEngine:
         if self._attribution_model is not None:
             return self._attribution_model
         from minni.models import get_attribution_cross_encoder
+        if should_skip_cold_model_load(
+            self._current_deadline(), get_attribution_cross_encoder
+        ):
+            return None
         self._attribution_model = get_attribution_cross_encoder()
         return self._attribution_model
 
@@ -527,13 +689,23 @@ class RetrievalEngine:
             return None
         if not getattr(self.config, "attribution_enabled", True):
             return None
+        if past_search_deadline(self._current_deadline()):
+            return None
+        from minni.models import get_attribution_cross_encoder
+
+        if should_skip_cold_model_load(
+            self._current_deadline(), get_attribution_cross_encoder
+        ):
+            return None
         model = self.attribution_model
         if model is None:
             return None
         try:
             from minni.models import get_attribution_lock
 
-            with get_attribution_lock():
+            with search_model_lock(get_attribution_lock(), self._current_deadline()) as acquired:
+                if not acquired or past_search_deadline(self._current_deadline()):
+                    return None
                 raw = model.predict(
                     [(str(evidence_text or ""), claim_text)],
                     show_progress_bar=False,
@@ -767,8 +939,12 @@ class RetrievalEngine:
         # backend path — an encode-side degrade fixed only there would
         # otherwise miss the default path. Empty vector = encoder down, flag
         # already raised.
-        query_emb = self._encode_query(query)
+        deadline_monotonic = self._current_deadline()
+        query_emb = self._encode_query(query, deadline_monotonic=deadline_monotonic)
         if query_emb.size == 0:
+            return []
+        if past_search_deadline(deadline_monotonic):
+            self.last_vector_degraded = "search deadline; lexical (FTS) only"
             return []
 
         # Search FAISS for top candidates
@@ -776,8 +952,32 @@ class RetrievalEngine:
         faiss_results = self.faiss_index.search(query_emb, top_k=search_limit)
 
         if not faiss_results:
-            # Fallback: build index from DB if empty
+            # Fallback: load index from disk / rebuild from DB if empty.
+            # Disk restore is <500ms and must run on default leftover
+            # (22.5s / 27s). Do not skip _ensure_faiss_loaded at the 27s
+            # rebuild floor — that floor lives inside ensure, after a disk
+            # miss. Rebuild is uncancellable inside to_thread; skip starting
+            # it once leftover cannot finish. A warm genuine miss must not
+            # inherit this degrade — only a still-cold leftover skip is the
+            # work that outlives DEFAULT_JSON_RPC kill.
+            if past_search_deadline(deadline_monotonic):
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                return []
             self._ensure_faiss_loaded()
+            # Inner leftover skip / lock-acquire timeout can leave the index
+            # cold with remaining in (2, 27]: past_search_deadline (2s floor)
+            # is still false, and an empty search would look like a genuine
+            # miss — FTS-only ranking treated as healthy. Encode-after-lock
+            # and a failed load-lock acquire already set this flag.
+            if past_search_deadline(deadline_monotonic) or (
+                not self.faiss_index.ready
+                and (
+                    should_skip_faiss_rebuild(deadline_monotonic)
+                    or self._deadline_skipped_vector()
+                )
+            ):
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                return []
             faiss_results = self.faiss_index.search(query_emb, top_k=search_limit)
 
         if not faiss_results:
@@ -849,12 +1049,30 @@ class RetrievalEngine:
         # non-zero count was suddenly the index of record.
         if self.faiss_index.ready:
             return
+        if past_search_deadline(self._current_deadline()):
+            self.last_vector_degraded = "search deadline; lexical (FTS) only"
+            return
 
-        # One worker rebuilds; the rest wait here and find it warm. Without
-        # this, every RPC worker that arrives after an invalidate runs its own
-        # full-table SELECT + build, from potentially different DB snapshots.
-        with self._faiss_load_lock:
+        # One worker rebuilds; the rest wait here and find it warm — unless
+        # leftover cannot finish a rebuild. Default leftover uses timeout=0:
+        # acquire if free (disk restore still runs), skip if warmup/vault-watch
+        # holds the lock for an unbounded SELECT+build. Do not wait that
+        # rebuild out past JSON-RPC kill. Without the lock, every RPC worker
+        # that arrives after an invalidate runs its own full-table SELECT +
+        # build, from potentially different DB snapshots.
+        timeout = faiss_load_lock_timeout(self._current_deadline())
+        if timeout is None:
+            acquired = self._faiss_load_lock.acquire()
+        else:
+            acquired = self._faiss_load_lock.acquire(timeout=timeout)
+        if not acquired:
+            self.last_vector_degraded = "search deadline; lexical (FTS) only"
+            return
+        try:
             if self.faiss_index.ready:
+                return
+            if past_search_deadline(self._current_deadline()):
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 return
 
             # PR-2: Try disk cache first. try_load_from_disk re-checks the
@@ -867,6 +1085,12 @@ class RetrievalEngine:
                     return
             except Exception as e:
                 logger.debug("Disk cache load failed (non-fatal): %s", e)
+
+            # Disk miss. Full-table SELECT + FAISS build cannot be cancelled
+            # once started; skip it when leftover cannot finish.
+            if should_skip_faiss_rebuild(self._current_deadline()):
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                return
 
             # Rebuild from DB, into a STAGED structure. The live index stays
             # cold while the build is unvalidated — a concurrent search sees
@@ -925,6 +1149,8 @@ class RetrievalEngine:
                 "index cold for the next search"
             )
             self.faiss_index.invalidate()
+        finally:
+            self._faiss_load_lock.release()
 
     # ── Store-time semantic indexing (durable recall) ─────────
 
@@ -1249,12 +1475,22 @@ class RetrievalEngine:
                 "durable-index: live FAISS refresh failed (%s) — invalidating "
                 "so next search reloads from DB", exc,
             )
-            # Force a cold reload on the next search so the new DB rows are
-            # picked up even if the in-place add path failed.
+            # Force a cold reload. Default leftover (22.5s / 27s) skips
+            # in-request rebuild after invalidate, and disk restore misses
+            # because generation/checksum moved — so unbounded-ensure here,
+            # the same way vault-watch reloads the shared engine.
             try:
                 self.faiss_index.invalidate()
             except Exception:
                 pass
+            try:
+                self._set_current_deadline(None)
+                self._ensure_faiss_loaded()
+            except Exception as reload_exc:
+                logger.debug(
+                    "durable-index: unbounded FAISS reload after refresh "
+                    "failure skipped: %s", reload_exc,
+                )
 
     # ── Cross-Encoder Re-Ranking ──────────────────────────────
 
@@ -1391,6 +1627,8 @@ class RetrievalEngine:
         missing = []
         missing_indexes = []
         all_scores = [None] * len(candidates)
+        corpus = self._rerank_corpus()
+        generation = cache.generation if cache is not None else None
         if cache is not None:
             for i, c in enumerate(candidates):
                 chunk_id = c.get("chunk_id")
@@ -1398,7 +1636,10 @@ class RetrievalEngine:
                     missing.append(c)
                     missing_indexes.append(i)
                     continue
-                cached = cache.get(model_name, model_version, query, int(chunk_id))
+                cached = cache.get(
+                    model_name, model_version, query, int(chunk_id),
+                    corpus=corpus, passage=self._rerank_passage(c),
+                )
                 if cached is None:
                     missing.append(c)
                     missing_indexes.append(i)
@@ -1416,27 +1657,32 @@ class RetrievalEngine:
             return candidates
 
         # Prepare pairs for the cross-encoder
-        pairs = []
-        for c in missing:
-            passage = c.get("chunk_text", "")
-            heading = c.get("heading_context", "")
-            # Prepend heading context so the re-ranker knows the section
-            if heading:
-                passage = f"[{heading}] {passage}"
-            pairs.append([query, passage])
+        pairs = [[query, self._rerank_passage(c)] for c in missing]
 
         try:
             from minni.models import get_cross_encoder_lock
 
-            with get_cross_encoder_lock():
+            with search_model_lock(get_cross_encoder_lock(), self._current_deadline()) as acquired:
+                # Concurrent search can pass the pre-lock floor, then wait
+                # through another predict. Re-check after the lock so a waiter
+                # does not score after the client 30s kill.
+                if not acquired or past_search_deadline(self._current_deadline()):
+                    self.last_rerank_degraded = "search deadline; skipped rerank"
+                    return candidates
                 scores = reranker.predict(pairs, show_progress_bar=False)
+                if past_search_deadline(self._current_deadline(), min_remaining=0):
+                    self.last_rerank_degraded = "search deadline exceeded during nonpreemptible rerank"
 
             for score_index, c, score_value in zip(missing_indexes, missing, scores):
                 score = float(score_value)
                 all_scores[score_index] = score
                 chunk_id = c.get("chunk_id")
                 if cache is not None and chunk_id is not None:
-                    cache.set(model_name, model_version, query, int(chunk_id), score)
+                    cache.set(
+                        model_name, model_version, query, int(chunk_id), score,
+                        corpus=corpus, passage=self._rerank_passage(c),
+                        expected_generation=generation,
+                    )
 
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i] or 0.0)
@@ -1454,6 +1700,19 @@ class RetrievalEngine:
             self.last_rerank_degraded = str(e)
 
         return candidates
+
+    def _rerank_corpus(self) -> str:
+        db_path = getattr(self.config, "db_path", None)
+        if not db_path or str(db_path) == ":memory:":
+            db = getattr(self, "db", None)
+            return f"memory:{id(db if db is not None else self)}"
+        return str(Path(db_path).expanduser().resolve())
+
+    @staticmethod
+    def _rerank_passage(candidate: Dict) -> str:
+        passage = candidate.get("chunk_text", "") or ""
+        heading = candidate.get("heading_context", "")
+        return f"[{heading}] {passage}" if heading else passage
 
     def _reranker_identity(self, reranker) -> tuple[str, str]:
         model_name = getattr(self.config, "reranker_model", None) or "unknown"
@@ -1704,6 +1963,12 @@ class RetrievalEngine:
             if r.get("chunk_text"):
                 doc_scores[did]["chunk_text"] = r["chunk_text"]
                 doc_scores[did]["heading_context"] = r.get("heading_context", "")
+                # Cache/attribution identity belongs to the selected passage,
+                # never the FTS full page or a previously selected chunk.
+                if r.get("chunk_id") is not None:
+                    doc_scores[did]["chunk_id"] = r["chunk_id"]
+                else:
+                    doc_scores[did].pop("chunk_id", None)
             # Carry forward page metadata from semantic if FTS didn't provide it
             if not doc_scores[did].get("page_type") and r.get("page_type"):
                 doc_scores[did]["page_type"] = r["page_type"]
@@ -1932,7 +2197,11 @@ class RetrievalEngine:
             "embedding model unavailable; lexical (FTS) only"
         )
 
-    def _encode_query(self, query: str) -> np.ndarray:
+    def _encode_query(
+        self,
+        query: str,
+        deadline_monotonic: Optional[float] = None,
+    ) -> np.ndarray:
         """Encode ``query``, raising the P0-B flag when the encoder is down.
 
         R4(b) (#226): the explicit-backend branches used to inline
@@ -1943,18 +2212,42 @@ class RetrievalEngine:
         goes through here, so degradation is reported on the same code path as
         the default branch.
         """
-        if not self.model:
-            self._note_vector_model_down()
+        if deadline_monotonic is None:
+            deadline_monotonic = self._current_deadline()
+        if past_search_deadline(deadline_monotonic):
+            self.last_vector_degraded = "search deadline; lexical (FTS) only"
             return np.array([], dtype=np.float32)
+        embeddings = getattr(getattr(self, "_degradation_local", None), "query_embeddings", None)
+        if embeddings is not None and query in embeddings:
+            # Backends may normalize/mutate their input; keep the memo intact.
+            return embeddings[query].copy()
         # Round 18: only clear the process-wide down flag AFTER a successful
         # encode. Clearing before encode() meant an OOM/runtime fault left
         # health reading "encoder up" and hard-failed the request instead of
         # FTS-only degrade with last_vector_degraded set (R4(b) throw path).
         try:
-            from minni.models import get_embedder_lock
+            from minni.models import get_embedder, get_embedder_lock
 
-            with get_embedder_lock():
+            if should_skip_cold_model_load(deadline_monotonic, get_embedder):
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                return np.array([], dtype=np.float32)
+
+            with search_model_lock(get_embedder_lock(), deadline_monotonic) as acquired:
+                # Concurrent search can pass the pre-lock floor, then wait
+                # through another encode/FAISS. Re-check after the lock so a
+                # waiter does not encode after the client 30s kill.
+                if not acquired or past_search_deadline(deadline_monotonic):
+                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                    return np.array([], dtype=np.float32)
+                if should_skip_cold_model_load(deadline_monotonic, get_embedder):
+                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                    return np.array([], dtype=np.float32)
+                if not self.model:
+                    self._note_vector_model_down()
+                    return np.array([], dtype=np.float32)
                 vec = self.model.encode(query, show_progress_bar=False).astype(np.float32)
+                if past_search_deadline(deadline_monotonic, min_remaining=0):
+                    self.last_vector_degraded = "search deadline exceeded during nonpreemptible encode"
         except Exception as exc:
             if not self.vector_model_down:
                 logger.warning(
@@ -1968,6 +2261,8 @@ class RetrievalEngine:
             )
             return np.array([], dtype=np.float32)
         self.vector_model_down = False
+        if embeddings is not None and vec.size:
+            embeddings[query] = vec.copy()
         return vec
 
     def _normalize_backend_names(self, backend_names: list) -> list:
@@ -2197,6 +2492,8 @@ class RetrievalEngine:
                     doc_scores[did]["heading_context"] = r.get("heading_context", "")
                     if stream_label != "fts":
                         doc_scores[did]["_sem_chunk"] = True
+                        if r.get("chunk_id") is not None:
+                            doc_scores[did]["chunk_id"] = r["chunk_id"]
                 if not doc_scores[did].get("page_type") and r.get("page_type"):
                     doc_scores[did]["page_type"] = r["page_type"]
                 if not doc_scores[did].get("evidence_refs") and r.get("evidence_refs"):
@@ -2588,6 +2885,7 @@ class RetrievalEngine:
         *,
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
+        deadline_monotonic: Optional[float] = None,
     ) -> List[Dict]:
         """Attach AFM summaries of 1-hop wikilinks; degrade to metadata."""
         for result in results:
@@ -2606,15 +2904,28 @@ class RetrievalEngine:
             prompt = "\n\n".join(
                 f"{ctx['link']} ({ctx['path']}):\n{ctx['text']}" for ctx in contexts
             )
+            context_meta = [
+                {"link": ctx["link"], "doc_id": ctx["doc_id"], "path": ctx["path"]}
+                for ctx in contexts
+            ]
+            # AFM summarize timeout is 1.5s; skip remaining neighbors if
+            # the leftover budget cannot finish even one call.
+            if contexts and past_search_deadline(
+                deadline_monotonic, min_remaining=1.5
+            ):
+                result["neighborhood_summary"] = {
+                    "status": "unavailable",
+                    "summary": None,
+                    "links": links,
+                    "contexts": context_meta,
+                }
+                break
             summary = summarize_with_afm(prompt) if contexts else None
             result["neighborhood_summary"] = {
                 "status": "ok" if summary else "unavailable",
                 "summary": summary,
                 "links": links,
-                "contexts": [
-                    {"link": ctx["link"], "doc_id": ctx["doc_id"], "path": ctx["path"]}
-                    for ctx in contexts
-                ],
+                "contexts": context_meta,
             }
         return results
 
@@ -2644,6 +2955,7 @@ class RetrievalEngine:
         # G19/G20/G22: principal for can_read_document gate + evidence envelope (default None = back-compat)
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
+        deadline_monotonic: Optional[float] = None,
     ) -> List[Dict]:
         """
         Hybrid retrieval: FTS5 + FAISS semantic, RRF fusion, cross-encoder re-rank,
@@ -2682,6 +2994,9 @@ class RetrievalEngine:
                 supplied, Minni runs local NLI attribution scoring.
             document_agent_filter: Optional explicit document agent taxonomy
                 filter for future callers. Default None preserves shared wiki recall.
+            deadline_monotonic: Optional time.monotonic() cutoff. When elapsed,
+                skip query expand, FAISS/encode, rerank, and HyDE; return FTS
+                hits and set last_*_degraded. Search cannot cancel to_thread.
 
         Returns list of ranked results filtered to the requested depth tier.
         Existing callers that pass no depth receive identical results (snippet).
@@ -2699,7 +3014,13 @@ class RetrievalEngine:
         self.last_query_expand_degraded = None
         self.last_vector_degraded = None
         self.last_hyde_degraded = None
-        query_variants = self._resolve_query_variants(query, expand)
+        self._set_current_deadline(deadline_monotonic)
+        if past_search_deadline(deadline_monotonic):
+            query_variants = [query]
+            if expand not in (False, None, "off"):
+                self.last_query_expand_degraded = "search deadline; skipped query expand"
+        else:
+            query_variants = self._resolve_query_variants(query, expand)
         # Round 25: expand soft-fail (mode=afm → afm_unavailable) is set on the
         # parent by _resolve_query_variants *before* multi-variant recursion.
         # Children run with expand=False and clear flags on entry, so the
@@ -2720,8 +3041,22 @@ class RetrievalEngine:
             variant_expand_degraded: List[str] = []
             variant_vector_degraded: List[str] = []
             variant_hyde_degraded: List[str] = []
+            truncated_expand = None
             for variant in query_variants:
-                per_variant.append(self.retrieve(
+                # Gate on a completed ranking, not list-of-lists nonempty.
+                # After an original-query miss, per_variant == [[]] is truthy
+                # but any(per_variant) is False — variant 2 must still start
+                # so cheap FTS after the deadline can fill.
+                if any(per_variant) and past_search_deadline(deadline_monotonic):
+                    truncated_expand = "search deadline; truncated query expand"
+                    if self.last_query_expand_degraded:
+                        self.last_query_expand_degraded = (
+                            f"{self.last_query_expand_degraded}; {truncated_expand}"
+                        )
+                    else:
+                        self.last_query_expand_degraded = truncated_expand
+                    break
+                child_rows = self.retrieve(
                     query=variant,
                     limit=limit,
                     agent_id=agent_id,
@@ -2745,7 +3080,35 @@ class RetrievalEngine:
                     document_agent_filter=document_agent_filter,
                     principal=principal,
                     workspace=workspace,
-                ))
+                    deadline_monotonic=deadline_monotonic,
+                )
+                # In-flight later retrieve can FTS-only/CE-skip after the
+                # loop gate passed. Drop it before RRF-by-doc_id so it cannot
+                # wipe a completed first-pass hybrid (HyDE banana-pudding class).
+                # Gate on a prior ranking, not list-of-lists nonempty: a miss
+                # is per_variant == [[]] and must keep the degraded later fill.
+                prior_ranking = any(per_variant)
+                prior_deadline_poisoned = any(
+                    "search deadline" in str(flag).lower()
+                    for flag in (
+                        *variant_vector_degraded,
+                        *variant_rerank_degraded,
+                    )
+                )
+                if (
+                    prior_ranking
+                    and self._deadline_skipped_vector()
+                    and not prior_deadline_poisoned
+                ):
+                    truncated_expand = "search deadline; truncated query expand"
+                    if self.last_query_expand_degraded:
+                        self.last_query_expand_degraded = (
+                            f"{self.last_query_expand_degraded}; {truncated_expand}"
+                        )
+                    else:
+                        self.last_query_expand_degraded = truncated_expand
+                    break
+                per_variant.append(child_rows)
                 if self.last_auth_suppression:
                     variant_suppressions.append(
                         {**self.last_auth_suppression, "variant": variant}
@@ -2766,10 +3129,13 @@ class RetrievalEngine:
                     variant_hyde_degraded.append(
                         f"{variant}: {self.last_hyde_degraded}"
                     )
-            results = self._merge_expanded_results(per_variant, query_variants, limit)
-            # A degrade in ANY variant degrades the merge — the merged ordering
-            # mixed a leg that was not reranked. Set AFTER the loop, because the
-            # last variant's clear would otherwise decide the whole verdict.
+            ran_variants = query_variants[: len(per_variant)]
+            results = self._merge_expanded_results(per_variant, ran_variants, limit)
+            # Only variants that contributed to the merge stamp ranking-poison
+            # flags. A dropped deadline variant must not sticky-join
+            # last_vector_degraded onto a completed first-pass hybrid.
+            # Set AFTER the loop, because the last variant's clear would
+            # otherwise decide the whole verdict.
             self.last_rerank_degraded = (
                 "; ".join(variant_rerank_degraded) if variant_rerank_degraded else None
             )
@@ -2777,11 +3143,21 @@ class RetrievalEngine:
                 "; ".join(variant_expand_degraded) if variant_expand_degraded else None
             )
             if parent_expand_degraded and child_expand:
-                self.last_query_expand_degraded = (
-                    f"{parent_expand_degraded}; {child_expand}"
-                )
+                merged_expand = f"{parent_expand_degraded}; {child_expand}"
             else:
-                self.last_query_expand_degraded = parent_expand_degraded or child_expand
+                merged_expand = parent_expand_degraded or child_expand
+            # Truncation is neither parent (captured before the loop) nor child
+            # (children run expand=False). Keep it or the merge wipes the only
+            # signal that expand did not finish.
+            if truncated_expand:
+                if merged_expand:
+                    self.last_query_expand_degraded = (
+                        f"{merged_expand}; {truncated_expand}"
+                    )
+                else:
+                    self.last_query_expand_degraded = truncated_expand
+            else:
+                self.last_query_expand_degraded = merged_expand
             self.last_vector_degraded = (
                 "; ".join(variant_vector_degraded) if variant_vector_degraded else None
             )
@@ -2803,11 +3179,16 @@ class RetrievalEngine:
                 }
             else:
                 self.last_auth_suppression = None
-            if summarize_neighborhood:
+            if summarize_neighborhood and not past_search_deadline(
+                deadline_monotonic
+            ):
                 results = self._add_neighborhood_summaries(
-                    results, principal=principal, workspace=workspace
+                    results,
+                    principal=principal,
+                    workspace=workspace,
+                    deadline_monotonic=deadline_monotonic,
                 )
-            if update_access:
+            if update_access and not self._deadline_skipped_vector():
                 with self.db.cursor() as c:
                     for result in results:
                         if result.get("doc_id") is None:
@@ -2821,8 +3202,8 @@ class RetrievalEngine:
             try:
                 expanded_trace = {
                     "query": query,
-                    "variants": query_variants,
-                    "expansion": {"mode": expand, "variant_count": len(query_variants)},
+                    "variants": ran_variants,
+                    "expansion": {"mode": expand, "variant_count": len(ran_variants)},
                     "final_ordering": [
                         {
                             "doc_id": r.get("doc_id"),
@@ -2848,11 +3229,12 @@ class RetrievalEngine:
                         for r in results
                         if r.get("attribution_score") is not None
                     ]
-                self.last_trace_id = _trace_ring().add(
+                trace_id = _trace_ring().add(
                     expanded_trace, owner=getattr(principal, "agent_id", None)
                 )
+                self.last_trace_id = trace_id
                 for result in results:
-                    result["trace_id"] = self.last_trace_id
+                    result["trace_id"] = trace_id
             except Exception as exc:
                 logger.debug("expanded trace capture failed: %s", exc)
                 self.last_trace_id = None
@@ -2914,22 +3296,63 @@ class RetrievalEngine:
         skip_statuses.update(WikiFrontmatter.EXCLUDED_STATUSES)
         skip_list = sorted(skip_statuses)
 
-        def _drop_skipped(rows: List[Dict]) -> List[Dict]:
-            if not skip_statuses:
-                return rows
-            return [
-                r for r in rows
-                if (r.get("page_status") or "candidate") not in skip_statuses
-            ]
+        ws = (workspace or getattr(principal, "workspace_id", "default")) if principal else (workspace or "default")
+        denied_by_scope: dict[tuple, Dict] = {}
+        saw_authorized = False
 
-        rerank_k = self.config.reranker_top_k if self.config.reranker_enabled else limit
+        def _eligible(rows: List[Dict]) -> List[Dict]:
+            # Before fusion/reranking/truncation, enforce the same read gate
+            # as the final defense, plus lifecycle and caller filters.
+            nonlocal saw_authorized
+            rows = [r for r in rows if
+                    (r.get("page_status") or "candidate") not in skip_statuses
+                    and (r.get("privacy_level") or "safe") != "blocked"]
+            rows = self._filter_candidates(rows, layers, start_date, end_date)
+            agent_scope = self._normalize_agent_filter(document_agent_filter)
+            if agent_scope:
+                rows = [r for r in rows if r.get("agent") in agent_scope]
+            if principal is None:
+                return rows
+            allowed = []
+            for row in rows:
+                if can_read_document(principal, ws, row):
+                    saw_authorized = True
+                    allowed.append(row)
+                else:
+                    denied_by_scope[(row.get("doc_id"), row.get("path"))] = row
+            return allowed
+
+        def _collect_eligible(fetch, wanted: int) -> List[Dict]:
+            # Backends expose top-k, not policy-aware pagination. Refill their
+            # bounded window when denied rows consume it, stopping when enough
+            # eligible rows are found, at the deadline, or at a finite ceiling.
+            # At that ceiling a trace records incomplete candidate coverage;
+            # no result is admitted merely to fill the requested count.
+            window = max(1, wanted)
+            ceiling = max(window, 512)
+            with self._query_encoding_scope():
+                while True:
+                    raw = fetch(window)
+                    rows = _eligible(raw)
+                    if len(rows) >= wanted or len(rows) == len(raw):
+                        return rows
+                    # Identical document lists do not prove exhaustion: many
+                    # top-ranked chunks can collapse to one denied document.
+                    if window >= ceiling or past_search_deadline(deadline_monotonic):
+                        trace["candidate_window_exhausted"] = True
+                        return rows
+                    window = min(ceiling, window * 2)
+
+        rerank_k = max(limit, self.config.reranker_top_k if self.config.reranker_enabled else limit)
 
         if sort == "chronological":
+            if past_search_deadline(deadline_monotonic):
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
             chrono_t0 = time.perf_counter()
-            merged = self._chronological_search(
-                query, rerank_k, layers, start_date, end_date,
+            merged = _collect_eligible(lambda window: self._chronological_search(
+                query, window, layers, start_date, end_date,
                 exclude_statuses=skip_list,
-            )
+            ), rerank_k)
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
             merged = merged[:limit]
@@ -2937,14 +3360,14 @@ class RetrievalEngine:
             # Step 1-2: Dual retrieval
             fts_t0 = time.perf_counter()
             if document_agent_filter is None:
-                fts_results = self._fts_search(
-                    query, rerank_k, exclude_statuses=skip_list
-                )
+                fts_results = _collect_eligible(lambda window: self._fts_search(
+                    query, window, exclude_statuses=skip_list
+                ), rerank_k)
             else:
-                fts_results = self._fts_search(
-                    query, rerank_k, agent_filter=document_agent_filter,
+                fts_results = _collect_eligible(lambda window: self._fts_search(
+                    query, window, agent_filter=document_agent_filter,
                     exclude_statuses=skip_list,
-                )
+                ), rerank_k)
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
                 {
@@ -2961,41 +3384,46 @@ class RetrievalEngine:
             # _semantic_search path is taken — bit-identical to pre-PR-3.
             extra_backend_results: List[List[Dict]] = []
             semantic_t0 = time.perf_counter()
-            if backend is None and not fts_results and self._chunk_index_empty():
+            if past_search_deadline(deadline_monotonic):
+                semantic_results = []
+                trace["backends"] = ["fts-deadline"]
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+            elif backend is None and not fts_results and self._chunk_index_empty():
                 semantic_results = []
                 trace["backends"] = ["faiss-disk-empty"]
             elif backend is None:
                 # Default path — bit-identical to pre-PR-3
-                if document_agent_filter is None:
-                    semantic_results = self._semantic_search(query, rerank_k)
-                else:
-                    semantic_results = self._semantic_search(
-                        query, rerank_k, agent_filter=document_agent_filter
-                    )
+                # Gate taxonomy after fetching: filtering the SQL lookup of
+                # a bounded FAISS window would hide why it needs refilling.
+                semantic_results = _collect_eligible(
+                    lambda window: self._semantic_search(query, window), rerank_k,
+                )
                 trace["backends"] = ["faiss-disk"]
             elif isinstance(backend, list):
                 # Fan-out: build a MultiBackend from the list of backend names/objects
                 from minni.backends.multi import MultiBackend
                 resolved = self._resolve_backends(backend)
                 if len(resolved) == 1:
-                    semantic_results = self._backend_search(
-                        self._encode_query(query),
-                        rerank_k,
-                        resolved[0],
-                    )
+                    query_emb = self._encode_query(query)
+                    semantic_results = _collect_eligible(lambda window: self._backend_search(
+                        query_emb, window, resolved[0],
+                    ), rerank_k)
                 else:
                     multi = MultiBackend(resolved)
                     query_emb = self._encode_query(query)
                     # Same encoder-down guard as _backend_search (round 3,
                     # PR #260): degrade to FTS-only instead of raising.
-                    hits = [] if query_emb.size == 0 else multi.search(query_emb, k=rerank_k)
-                    # Convert VectorHit list to the dict format expected by _rrf_merge
-                    semantic_results = self._hits_to_dicts(hits, query_emb)
+                    semantic_results = _collect_eligible(lambda window: self._hits_to_dicts(
+                        [] if query_emb.size == 0 else multi.search(query_emb, k=window),
+                        query_emb,
+                    ), rerank_k)
                 trace["backends"] = [getattr(b, "name", str(b)) for b in resolved]
             else:
                 # Single explicit backend object
                 query_emb = self._encode_query(query)
-                semantic_results = self._backend_search(query_emb, rerank_k, backend)
+                semantic_results = _collect_eligible(lambda window: self._backend_search(
+                    query_emb, window, backend,
+                ), rerank_k)
                 trace["backends"] = [getattr(backend, "name", "custom")]
             timing["semantic_ms"] = round((time.perf_counter() - semantic_t0) * 1000, 3)
             timing["embedding_ms"] = timing["semantic_ms"]
@@ -3014,8 +3442,8 @@ class RetrievalEngine:
             # slots in the fusion pool. FTS is already filtered in SQL; the
             # vector legs are filtered here, since a chunk embedded before its
             # page changed status can still be returned by FAISS.
-            semantic_results = _drop_skipped(semantic_results)
-            extra_backend_results = [_drop_skipped(rows) for rows in extra_backend_results]
+            semantic_results = _eligible(semantic_results)
+            extra_backend_results = [_eligible(rows) for rows in extra_backend_results]
 
             # Step 3: RRF merge — with extra streams if multi-backend
             if extra_backend_results:
@@ -3040,31 +3468,42 @@ class RetrievalEngine:
                 ],
             }
 
-            merged = self._filter_candidates(merged, layers, start_date, end_date)
+            merged = _eligible(merged)
 
-            # Step 4: Cross-encoder re-rank
-            if merged and self.config.reranker_enabled and self.reranker:
-                ce_t0 = time.perf_counter()
-                merged = self._rerank(query, merged)
-                timing["ce_ms"] = round((time.perf_counter() - ce_t0) * 1000, 3)
-                trace["cross_encoder_scores"] = [
-                    {"doc_id": r.get("doc_id"), "score": r.get("rerank_score")}
-                    for r in merged
-                ]
-                # S-1 fix: respect the caller's limit. reranker_final_k is a
-                # precision-tuning floor (controls how many cross-encoder scores
-                # we pay for), NOT a hard recall cap. When limit > final_k
-                # (e.g. limit=10, final_k=5) the old code structurally capped
-                # recall@10 at 0.5 — we keep max(final_k, limit) so that
-                # limit=5 callers see no behaviour change and limit=10 callers
-                # get up to 10 post-rerank results.
-                merged = merged[:max(self.config.reranker_final_k, limit)]
+            # Step 4: Cross-encoder re-rank.
+            # Deadline before `self.reranker`: that property lazily calls
+            # get_cross_encoder() / CrossEncoder() and can outlive the client.
+            if merged and self.config.reranker_enabled:
+                if past_search_deadline(deadline_monotonic):
+                    self.last_rerank_degraded = "search deadline; skipped rerank"
+                    merged = merged[:limit]
+                elif self.reranker:
+                    ce_t0 = time.perf_counter()
+                    merged = self._rerank(query, merged)
+                    timing["ce_ms"] = round((time.perf_counter() - ce_t0) * 1000, 3)
+                    trace["cross_encoder_scores"] = [
+                        {"doc_id": r.get("doc_id"), "score": r.get("rerank_score")}
+                        for r in merged
+                    ]
+                    # S-1 fix: respect the caller's limit. reranker_final_k is a
+                    # precision-tuning floor (controls how many cross-encoder scores
+                    # we pay for), NOT a hard recall cap. When limit > final_k
+                    # (e.g. limit=10, final_k=5) the old code structurally capped
+                    # recall@10 at 0.5 — we keep max(final_k, limit) so that
+                    # limit=5 callers see no behaviour change and limit=10 callers
+                    # get up to 10 post-rerank results.
+                    merged = merged[:max(self.config.reranker_final_k, limit)]
+                else:
+                    merged = merged[:limit]
             else:
                 merged = merged[:limit]
 
             # PR-8: HyDE cold-query second pass. This runs at most once and
             # gracefully returns the original pass if AFM is unavailable.
             hyde_enabled = self.config.hyde_enabled if use_hyde is None else bool(use_hyde)
+            if hyde_enabled and past_search_deadline(deadline_monotonic):
+                self.last_hyde_degraded = "search deadline; skipped hyde"
+                hyde_enabled = False
             if hyde_enabled:
                 try:
                     from minni.hyde import (
@@ -3108,57 +3547,146 @@ class RetrievalEngine:
                     ):
                         trace["hyde"]["triggered"] = True
                         trace["hyde"]["confidence_floor"] = self.config.hyde_confidence_floor
-                        hypothetical = generate_hypothetical_answer(query, config=self.config)
-                        if hypothetical:
-                            trace["hyde"]["hypothetical_chars"] = len(hypothetical)
-                            if document_agent_filter is None:
-                                hyde_fts = self._fts_search(
-                                    hypothetical, rerank_k, exclude_statuses=skip_list
-                                )
-                                hyde_semantic = self._semantic_search(hypothetical, rerank_k)
-                            else:
-                                hyde_fts = self._fts_search(
-                                    hypothetical, rerank_k, agent_filter=document_agent_filter,
-                                    exclude_statuses=skip_list,
-                                )
-                                hyde_semantic = self._semantic_search(
-                                    hypothetical, rerank_k, agent_filter=document_agent_filter
-                                )
-                            hyde_semantic = _drop_skipped(hyde_semantic)
-                            hyde_merged = self._rrf_merge(hyde_fts, hyde_semantic, rerank_k)
-                            hyde_merged = self._filter_candidates(
-                                hyde_merged, layers, start_date, end_date
-                            )
-                            if self.config.reranker_enabled and self.reranker:
-                                hyde_merged = self._rerank(query, hyde_merged)
-                                # S-1 fix (HyDE branch): same max() guard as the
-                                # main rerank path — limit must not be capped
-                                # below the caller's requested count.
-                                hyde_merged = hyde_merged[:max(self.config.reranker_final_k, limit)]
-                            else:
-                                hyde_merged = hyde_merged[:limit]
-                            merged = merge_hyde_results(
-                                merged,
-                                hyde_merged,
-                                limit=rerank_k,
-                                rrf_k=self.config.rrf_k,
-                            )[:limit]
-                            trace["hyde"]["result_doc_ids"] = [
-                                r.get("doc_id") for r in hyde_merged
-                            ]
-                        else:
-                            # AFM-6 (#230): the leg was attempted and produced
-                            # nothing. `triggered` above records the DECISION to
-                            # run; `completed` records whether it actually did.
-                            # Reading `triggered` alone told anyone debugging a
-                            # bad result that the enrichment ran when it had not.
+                        if past_search_deadline(deadline_monotonic):
+                            self.last_hyde_degraded = "search deadline; skipped hyde"
                             trace["hyde"]["completed"] = False
-                            trace["hyde"]["skipped"] = "afm_unavailable"
-                            self.last_hyde_degraded = "afm_unavailable"
-                            logger.warning(
-                                "HyDE leg degraded: AFM produced no hypothetical "
-                                "answer — results are the un-enriched first pass"
+                            trace["hyde"]["skipped"] = "deadline"
+                        elif past_search_deadline(
+                            deadline_monotonic, min_remaining=2.0
+                        ):
+                            # AFM's default timeout is 2s; skip rather than
+                            # start a call that cannot finish in-budget.
+                            self.last_hyde_degraded = "search deadline; skipped hyde"
+                            trace["hyde"]["completed"] = False
+                            trace["hyde"]["skipped"] = "deadline"
+                        else:
+                            hypothetical = generate_hypothetical_answer(
+                                query, config=self.config
                             )
+                            if not hypothetical:
+                                # AFM-6 (#230): the leg was attempted and produced
+                                # nothing. `triggered` above records the DECISION to
+                                # run; `completed` records whether it actually did.
+                                # Reading `triggered` alone told anyone debugging a
+                                # bad result that the enrichment ran when it had not.
+                                trace["hyde"]["completed"] = False
+                                trace["hyde"]["skipped"] = "afm_unavailable"
+                                self.last_hyde_degraded = "afm_unavailable"
+                                logger.warning(
+                                    "HyDE leg degraded: AFM produced no hypothetical "
+                                    "answer — results are the un-enriched first pass"
+                                )
+                            elif past_search_deadline(deadline_monotonic):
+                                self.last_hyde_degraded = "search deadline; skipped hyde"
+                                trace["hyde"]["completed"] = False
+                                trace["hyde"]["skipped"] = "deadline"
+                            else:
+                                trace["hyde"]["hypothetical_chars"] = len(hypothetical)
+                                if document_agent_filter is None:
+                                    hyde_fts = _collect_eligible(lambda window: self._fts_search(
+                                        hypothetical, window, exclude_statuses=skip_list
+                                    ), rerank_k)
+                                else:
+                                    hyde_fts = _collect_eligible(lambda window: self._fts_search(
+                                        hypothetical, window, agent_filter=document_agent_filter,
+                                        exclude_statuses=skip_list,
+                                    ), rerank_k)
+                                first_pass_vector = self.last_vector_degraded
+                                first_pass_rerank = self.last_rerank_degraded
+                                hyde_apply = True
+                                hyde_merged_applied = False
+                                try:
+                                    if past_search_deadline(deadline_monotonic):
+                                        hyde_semantic = []
+                                        self.last_hyde_degraded = (
+                                            "search deadline; skipped hyde"
+                                        )
+                                        trace["hyde"]["completed"] = False
+                                        trace["hyde"]["skipped"] = "deadline"
+                                        hyde_apply = False
+                                    else:
+                                        hyde_semantic = _collect_eligible(lambda window: self._semantic_search(
+                                            hypothetical, window
+                                        ), rerank_k)
+                                    vector_flag = self.last_vector_degraded
+                                    if hyde_apply and vector_flag and (
+                                        "search deadline" in str(vector_flag).lower()
+                                    ):
+                                        self.last_hyde_degraded = (
+                                            "search deadline; skipped hyde"
+                                        )
+                                        trace["hyde"]["completed"] = False
+                                        trace["hyde"]["skipped"] = "deadline"
+                                        hyde_apply = False
+                                    if hyde_apply:
+                                        hyde_semantic = _eligible(hyde_semantic)
+                                        hyde_merged = self._rrf_merge(
+                                            hyde_fts, hyde_semantic, rerank_k
+                                        )
+                                        hyde_merged = _eligible(hyde_merged)
+                                        if self.config.reranker_enabled:
+                                            # Deadline before `self.reranker`: that
+                                            # property lazily calls get_cross_encoder()
+                                            # and can outlive the client.
+                                            if past_search_deadline(deadline_monotonic):
+                                                self.last_hyde_degraded = (
+                                                    "search deadline; skipped hyde"
+                                                )
+                                                trace["hyde"]["completed"] = False
+                                                trace["hyde"]["skipped"] = "deadline"
+                                                hyde_apply = False
+                                            elif self.reranker:
+                                                hyde_merged = self._rerank(
+                                                    query, hyde_merged
+                                                )
+                                                rerank_flag = self.last_rerank_degraded
+                                                if rerank_flag and (
+                                                    "search deadline"
+                                                    in str(rerank_flag).lower()
+                                                ):
+                                                    self.last_hyde_degraded = (
+                                                        "search deadline; skipped hyde"
+                                                    )
+                                                    trace["hyde"]["completed"] = False
+                                                    trace["hyde"]["skipped"] = "deadline"
+                                                    hyde_apply = False
+                                                else:
+                                                    # S-1 fix (HyDE branch): same max()
+                                                    # guard as the main rerank path —
+                                                    # limit must not be capped below the
+                                                    # caller's requested count.
+                                                    hyde_merged = hyde_merged[:max(
+                                                        self.config.reranker_final_k, limit
+                                                    )]
+                                            else:
+                                                hyde_merged = hyde_merged[:limit]
+                                        else:
+                                            hyde_merged = hyde_merged[:limit]
+                                    if hyde_apply and (
+                                        past_search_deadline(deadline_monotonic)
+                                        or self._deadline_skipped_vector()
+                                    ):
+                                        hyde_apply = False
+                                        self.last_hyde_degraded = (
+                                            "search deadline; skipped hyde"
+                                        )
+                                        trace["hyde"]["completed"] = False
+                                        trace["hyde"]["skipped"] = "deadline"
+                                    if hyde_apply:
+                                        merged = merge_hyde_results(
+                                            merged,
+                                            hyde_merged,
+                                            limit=rerank_k,
+                                            rrf_k=self.config.rrf_k,
+                                        )[:limit]
+                                        hyde_merged_applied = True
+                                        trace["hyde"]["result_doc_ids"] = [
+                                            r.get("doc_id") for r in hyde_merged
+                                        ]
+                                finally:
+                                    if not hyde_merged_applied:
+                                        self.last_vector_degraded = first_pass_vector
+                                        self.last_rerank_degraded = first_pass_rerank
                         trace["hyde"].setdefault("completed", True)
                 except Exception as exc:  # noqa: BLE001 - recall must not stack trace.
                     # Was DEBUG — invisible at normal log levels, so a HyDE leg
@@ -3204,13 +3732,21 @@ class RetrievalEngine:
         if principal is not None:
             merged, suppression = self.apply_read_gate(principal, ws, merged)
             self.last_auth_suppression = suppression
+            if not merged and denied_by_scope and not saw_authorized:
+                _, self.last_auth_suppression = self.apply_read_gate(
+                    principal, ws, list(denied_by_scope.values())
+                )
 
         # G22: attach evidence-only envelope + instruction_like + provenance/reasoning to every result
         # Model-facing content is always wrapped; raw executable instructions never treated as policy.
         for r in merged:
             txt = str(r.get("chunk_text") or r.get("full_document_text") or r.get("content") or "")
             r["instruction_like"] = bool(is_instruction_like(txt))
-            attribution = self._score_attribution(claim_text, txt) if claim_text else None
+            attribution = (
+                self._score_attribution(claim_text, txt)
+                if claim_text and not past_search_deadline(deadline_monotonic)
+                else None
+            )
             if attribution is not None:
                 r.update(attribution)
             vis = "authorized"
@@ -3482,7 +4018,7 @@ class RetrievalEngine:
                     raw["recommended_action"] = _recommended_action(
                         raw.get("review_state"), doc_flag, raw.get("confidence")
                     )
-                    if claim_text:
+                    if claim_text and not past_search_deadline(deadline_monotonic):
                         attribution = self._score_attribution(claim_text, full_text)
                         if attribution is not None:
                             raw.update(attribution)
@@ -3530,7 +4066,7 @@ class RetrievalEngine:
             projected["query_variants"] = query_variants
             results.append(projected)
 
-            if update_access:
+            if update_access and not self._deadline_skipped_vector():
                 with self.db.cursor() as c:
                     c.execute(
                         """UPDATE documents
@@ -3567,18 +4103,22 @@ class RetrievalEngine:
             ]
         timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
         try:
-            self.last_trace_id = _trace_ring().add(
+            trace_id = _trace_ring().add(
                 trace, owner=getattr(principal, "agent_id", None)
             )
+            self.last_trace_id = trace_id
             for result in results:
-                result["trace_id"] = self.last_trace_id
+                result["trace_id"] = trace_id
         except Exception as exc:
             logger.debug("trace capture failed: %s", exc)
             self.last_trace_id = None
 
-        if summarize_neighborhood:
+        if summarize_neighborhood and not past_search_deadline(deadline_monotonic):
             results = self._add_neighborhood_summaries(
-                results, principal=principal, workspace=workspace
+                results,
+                principal=principal,
+                workspace=workspace,
+                deadline_monotonic=deadline_monotonic,
             )
 
         return results
@@ -3828,12 +4368,15 @@ class RetrievalEngine:
         cross_agent: bool = False,
         limit: int = 10,
         source: str = "retrieval.search_learnings",
+        update_access: bool = True,
     ) -> List[Dict]:
         """Search write-back learnings via FTS5.
 
         ``source`` labels the learning_reads rows written below, so callers
         (e.g. the daemon search RPC) can distinguish their read channel in
         diagnostics.
+        ``update_access`` False skips access_count / learning_reads writes —
+        same qty gate as document retrieve() when the search deadline aborted.
         """
         safe_q = self._sanitize_fts_query(query)
         if not safe_q:
@@ -3899,7 +4442,7 @@ class RetrievalEngine:
         # match a correction against this read (the search path previously
         # wrote no learning_reads at all — moved here from search_episodic,
         # where it crashed on a missing learning_id key).
-        if results:
+        if results and update_access:
             now = time.time()
             with self.db.cursor() as c:
                 for result in results[:limit]:

@@ -6,7 +6,7 @@
 |---|---|---|
 | **Recall** | Cited, provenance-tagged retrieval across the personal and shared legs | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
 | **Learn** | Propose, don't write: stages a `candidate_packets` row with status `proposed` and returns a `candidate_id`. No durable memory is written on this path | `minni_learn`, `minni_learning_quality` |
-| **Approve** | A later resolution decision — accept / reject / redact / log-only / merge / supersede / do-not-store. Only accepting decisions write or keep a durable learning row, disk note, and index entry | `minni_resolve_candidate` |
+| **Approve** | A later resolution decision — accept / reject / redact / log-only / merge / supersede / do-not-store. Only accepting decisions write or keep a durable learning row, disk note, and index entry | `minni_list_candidates`, `minni_resolve_candidate` |
 | **Handoff** | Explicit cross-agent transfer under a lease; the receiver acks before the sender releases | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_await_handoff`, `minni_list_pending_handoffs` |
 
 There is exactly one escape around the approve gate: `force=true` on `learn`
@@ -45,12 +45,15 @@ serialized into the team packet for host adapters to honor, not a boundary
 the daemon enforces — a spawned helper handed the same host-level
 `minni_learn` tool access can still call it, so scope tool permissions at
 the runtime level if that matters for your setup. A note
-on maturity while we're here: the temporary-team surface itself hasn't been
-exercised beyond its unit tests yet. What *is* battle-tested daily is the
-core multi-agent loop — several approved principals (e.g. `claude-code` and
-`codex`) sharing one daemon, staging and resolving each other's candidates —
-because Minni is developed using Minni. At that scale it holds up; the team
-harness is the untested frontier.
+on maturity while we're here: Team projection, the post-claim worker packet,
+and the honesty dispatch are in the tree and covered by unit tests. Host
+start is still the untested frontier. grok has no worker-start, default agy
+cannot run `minni_thread_worker_update`, and Codex dispatch stays UNPROVEN.
+What *is* battle-tested daily is the core multi-agent loop — several approved
+principals (e.g. `claude-code` and `codex`) sharing one daemon, staging and
+resolving each other's candidates — because Minni is developed using Minni.
+At that scale it holds up. Automatic spawning and immediate wake are not
+the untested frontier; they are not implemented.
 
 **Approval.** Who gets to resolve candidates is decided per principal, and the
 operator can delegate it. Four resolution paths exist, all landing in the
@@ -86,12 +89,21 @@ same audit trail:
    [#119](https://github.com/infektyd/minni/issues/119) closed)*. Set
    `MINNI_AFM_LOOP=on` (also `1`/`true`/`yes`) to enable the daemon's AFM
    loop; default is **off**, and `MINNI_AFM_LOOP=off` is an explicit kill
-   switch. When enabled, consolidation drains staged candidates on a schedule,
-   auto-promoting the low-risk subset — explicitly safe privacy level, not
-   instruction-like, not a duplicate, passing the deterministic quality gate —
-   into durable learnings with `resolved_by=afm-consolidation`, and routing
-   everything spicier to review. The gate, promotion write, and loop path are
-   implemented and covered by regression tests (`tests/test_afm_loop_promotion.py`).
+   switch. When enabled, consolidation drains staged candidates on a schedule.
+   Candidates with explicitly safe privacy levels (`safe`, `public`, `low`) that
+   pass deterministic quality, deduplication, and non-instruction gates are
+   auto-promoted into durable learnings with `resolved_by=afm-consolidation`.
+   Learn-only candidate packets clamped to `privacy=review` are treated as
+   examinable (`_EXAMINABLE_PRIVACY`), enabling the fleet's staged proposals to
+   re-enter the consolidation drain and be deduplicated or quality-evaluated rather
+   than permanently parking behind the `afm_review` fence (`examined=0`).
+   Candidates passing quality triage stay parked as `proposed` for operator
+   decision via `resolve_candidate` (they are never auto-promoted without
+   operator authority), while synthesized wiki drafts land in the shared vault
+   (`~/.minni/vault`) as `agent: afm-loop`. Unset/NULL privacy is strictly
+   non-examinable and remains parked (I1/I2 security fence). The gate, promotion
+   write, and loop path are implemented and covered by regression tests
+   (`tests/test_afm_loop_promotion.py`, `tests/test_afm_review_privacy_examinable.py`).
    `minni doctor` does **not** fully wet-exercise this pass (it stays green
    whether the loop is on or off), so enable deliberately and watch daemon logs
    / `consolidation_actions` if you rely on it. (`MINNI_AFM_MODE` is unrelated
@@ -166,8 +178,15 @@ Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → thread → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill
 before context is flushed.
+
 Durable, evidence-gated threads (`minni_thread_*`) survive sessions and
-compaction.
+compaction, backing multi-step orchestration through Markdown graph artifacts
+(`plan-*.md`) and ordered event journals (`plan-*.log.md`).
+
+- **Team projection**: `minni_team_runtime` projects one vault Thread. `plan_id` present reads that Thread and fails if it is missing. `plan_id` absent creates one Thread (`goal = task.trim()`, independent pending slices). Ready is the expiry sweep plus `readySlices`. `ledgerFor` and the compat invented-ready chain are gone. A leftover `taskLedger` name is a view of `ready`, not a second graph. The coordinator id is stamped server-side (G11); the model-facing schema does not take `coordinatorAgentId`.
+- **Orchestrator tools vs worker tools**: The orchestrator manages graph topology (`minni_thread_create`, `minni_thread_replan`), inspects ready slices (`minni_thread_ready`), assigns workers (`minni_thread_assign`, which accepts `worker_agent_id` and sets durable slice field `assigned_to`), and monitors progress via ordered event streams (`minni_thread_events`). Workers claim an assigned slice via `minni_thread_claim` to obtain a lease `token`. After assign → claim, the library adapter `buildWorkerPacketAfterClaim` builds one worker packet from that `ThreadClaimResponse` (`token` is labeled `claim_token`) plus the claimed slice, thread goal/constraints, completed-dep evidence refs, and bounded `prepare_task` recall. It is not built inside `minni_team_runtime` and is not a new MCP tool. Workers mutate slice execution state via `minni_thread_worker_update` only. Action `start` transitions any claimed non-terminal worker-updatable slice (`pending`, `in_progress`, or `blocked`) to `in_progress` (slice statuses are `pending`, `in_progress`, `done`, `blocked`, `superseded`; there is no `assigned` status). Workers cannot directly alter topology; they propose structural expansions or contractions via `propose_structure` for orchestrator replan.
+- **Ordered event cursors**: The thread journal records monotonic events readable via `minni_thread_events(plan_id?, since_seq?, limit?)`. Cursors enable state catch-up, deterministic replay, and crash recovery without daemon-canonical state divergence or out-of-order delivery. A dropped prefix or a cursor-path tail bound is a `journal_truncated` / `cursor_gap` event (`last_dropped_seq` + `first_kept_seq`); an unmarked hole is `THREAD_CURSOR_GAP`. Seq is never renumbered. If the tail cannot name those bounds, or bounding would hide a hole, the cursor full-parses.
+- **Authority boundary & honest limits**: Same-platform workers share `EffectivePrincipal`; no current host adapter yet implements structural-tool hiding, so structural-tool restriction depends on host tool exposure / scoping, while claim scope (`plan_id`, `slice_id`, `generation`, `worker_agent_id`, `claim_token`, idempotency identity) is strictly enforced by the Thread engine regardless of caller principal. Wave 3 `dispatchWorkerPacket` is the host-dispatch honesty adapter (library, not MCP): grok worker-start is MISSING, default agy allowlist is CANNOT (`minni_thread_worker_update` is not granted), Codex is UNPROVEN, and `spawned` is always false. Completion is `minni_thread_worker_update`. The named agy worker allowlist exists as `minni_thread_worker_update` only; default dispatch stays CANNOT and `spawned` stays false. G3 is a notification relay, not a second graph: plugin `cursors.json` on journal append, not the unused SQLite 020 table; journal seq rebuilds the queue; failed wake leaves the cursor behind the event. Hooks read pending attention and do not poll `minni_thread_events`. Immediate wake is unsupported (not wet). agy/grok deferred on the existing wire; Codex UNPROVEN; Cursor out. Notifications are concise attributed state deltas for an already-working orchestrator, not raw evidence, not instructions, not a human inbox. Automatic spawning and grok worker-start are not implemented. Do not invent a grok or agy start API. `GROK_WORKER_START` stays null. Default agy cannot write `minni_thread_worker_update`.
 
 ## Recall is evidence, not instruction
 
@@ -229,6 +248,9 @@ inbox files into `candidate_packets`; **`consolidation`** then proposes
 promote/dedupe/review decisions that the daemon applies according to the
 configured gates. Raw transcripts, status packets, hook envelopes, test junk,
 and unverified claims route to review or rejection, not active memory.
+Non-operator proposals clamped to `privacy=review` are drained and evaluated
+for deduplication and quality triage, but are never auto-promoted without
+operator resolution.
 
 ## Compaction-summary harvest
 

@@ -1,3 +1,4 @@
+import { AgentSummary } from "../components/AgentSummary";
 // Minni Memory Board — zone detail views (what each zone morphs into).
 import { Fragment, useEffect, useMemo, useState } from "react";
 import {
@@ -266,12 +267,12 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
   );
 }
 
-// ── RUNTIMES ────────────────────────────────────────────────────────────────
+// ── AGENT MEMORY ────────────────────────────────────────────────────────────────
 function AgentsDetail({ agentsState }: { agentsState?: ZoneDataState<BoardAgent[]> }) {
-  const gate = zoneGate(agentsState, "runtimes");
-  if (gate === "loading") return <ZoneLoading label="runtimes" />;
+  const gate = zoneGate(agentsState, "agent memory");
+  if (gate === "loading") return <ZoneLoading label="agent memory" />;
   if (gate === "offline") {
-    return <ZoneOffline error={agentsState?.error ?? "Runtimes offline"} onRetry={agentsState?.refresh} />;
+    return <ZoneOffline error={agentsState?.error ?? "Agent memory offline"} onRetry={agentsState?.refresh} />;
   }
   const agents = agentsState?.data || [];
   return (
@@ -282,38 +283,13 @@ function AgentsDetail({ agentsState }: { agentsState?: ZoneDataState<BoardAgent[
         <div className="agrid">
           {agents.map((a) => (
             <div key={a.id} className="acard">
-              <div className="ac-hd">
-                <span
-                  className="dot lg"
-                  style={{ background: a.on ? "var(--verdigris)" : "var(--disabled)" }}
-                />
-                <span className="ac-name">{a.id}</span>
-                <span className="ac-seen">seen {a.seen}</span>
-              </div>
-              <div className="ac-vault">{a.vault}</div>
-              <div className="ac-caps">
-                <span className={"bd-chip " + (a.caps.R ? "safe" : "danger")}>
-                  RECALL{a.caps.R ? "" : " ✕"}
-                </span>
-                <span className={"bd-chip " + (a.caps.L ? "safe" : "danger")}>
-                  LEARN{a.caps.L ? "" : " ✕"}
-                </span>
-                <span className={"bd-chip " + (a.caps.H ? "safe" : "danger")}>
-                  HANDOFF{a.caps.H ? "" : " ✕"}
-                </span>
-              </div>
-              <div className="ac-stats">
-                <span>
-                  <b>{a.staged == null ? "—" : a.staged}</b> staged
-                </span>
-                {a.note ? <span className="ac-note">⚠ {a.note}</span> : null}
-              </div>
+              <AgentSummary agent={a} />
             </div>
           ))}
         </div>
       )}
       <div className="dz-foot">
-        Live runtime catalogue from /api/agents (vault scan + principals caps + staged counts).
+        Memory identity catalogue from vaults, registration records, and pending review counts.
       </div>
     </div>
   );

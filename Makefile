@@ -208,7 +208,7 @@ check-deployments:
 	$(VENV_PY) scripts/check_deployments.py --strict
 
 stage-payload:
-	cd $(PLUGIN_DIR) && npm ci && npm run build:server && npm run build:server:bundle
+	cd $(PLUGIN_DIR) && npm ci && npm run build && npm run build:server:bundle
 	$(VENV_PY) scripts/stage_payload.py
 
 release-wheel: stage-payload

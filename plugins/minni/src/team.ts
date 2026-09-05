@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID } from "./config.js";
+import { createPlan, findPlanNote } from "./plan.js";
+import type { CreatePlanInput, PlanArtifact, PlanSlice } from "./plan.js";
 import { prepareTask } from "./task.js";
 import type { PreparedTaskPacket, PrepareTaskInput, TaskProfile } from "./task.js";
 import { harvestEvidence } from "./team-harvest.js";
@@ -7,6 +9,10 @@ import type { HarvestDeps, HarvestedLearning } from "./team-harvest.js";
 import { findRepeatedAgents } from "./team-repetition.js";
 import type { RepeatedAgentSuggestion } from "./team-repetition.js";
 import { bootstrapApprenticeVault } from "./team-vault-bootstrap.js";
+import {
+  readySlices,
+  synchronizeExpiredClaimsAndReadReady,
+} from "./thread-worker.js";
 import { recordAudit } from "./vault.js";
 
 export const DEFAULT_TEAM_TTL_SECONDS = 86400;
@@ -16,6 +22,7 @@ export const MAX_TEAM_TTL_SECONDS = 7 * 24 * 3600;
 export type TeamAgentRole = "explorer" | "worker" | "reviewer" | "scribe";
 export type TeamPermission = "read" | "write" | "test" | "network" | "memory-recall";
 export type LedgerStatus = "queued" | "in_progress" | "blocked" | "completed";
+export type ReadySliceStatus = "pending" | "in_progress" | "blocked";
 export type EvidenceStatus = "missing" | "partial" | "complete";
 
 export interface TeamAgentRequest {
@@ -46,10 +53,10 @@ export interface TemporaryAgentProfile {
 export interface TaskLedgerEntry {
   id: string;
   assignedTo: string;
-  role: TeamAgentRole;
+  role?: TeamAgentRole;
   task: string;
   ownership: string[];
-  status: LedgerStatus;
+  status: ReadySliceStatus;
   evidenceRequired: string[];
   dependencies: string[];
 }
@@ -66,11 +73,17 @@ export interface HydrationPacket {
 
 export interface TeamRuntimePacket {
   runtimeId: string;
+  plan_id: string;
+  rev: number;
+  ready: PlanSlice[];
+  /** Incumbent plan_id when createPlan displaced a non-terminal active Thread. Absent on present plan_id path and when createPlan is silent. */
+  displaced_active?: string;
   task: string;
   coordinatorAgentId: string;
   workspaceId: string;
   profile: TaskProfile;
   temporaryProfiles: TemporaryAgentProfile[];
+  /** View of `ready` keyed by PlanSlice.id. Not a second graph. */
   taskLedger: TaskLedgerEntry[];
   hydrationPackets: HydrationPacket[];
   gates: string[];
@@ -89,6 +102,7 @@ export interface TeamRuntimePacket {
 
 export interface BuildTeamRuntimeInput {
   task: string;
+  plan_id?: string;
   agents?: TeamAgentRequest[];
   coordinatorAgentId?: string;
   workspaceId?: string;
@@ -107,6 +121,9 @@ export interface TeamRuntimeDeps {
   audit?: typeof recordAudit;
   now?: () => Date;
   findRepeated?: typeof findRepeatedAgents;
+  createPlan?: typeof createPlan;
+  findPlanNote?: typeof findPlanNote;
+  synchronizeExpiredClaimsAndReadReady?: typeof synchronizeExpiredClaimsAndReadReady;
 }
 
 export interface TeamAgentResultInput {
@@ -277,21 +294,96 @@ function normalizeAgents(input: TeamAgentRequest[] | undefined): TemporaryAgentP
   });
 }
 
-function ledgerFor(task: string, profiles: TemporaryAgentProfile[]): TaskLedgerEntry[] {
-  return profiles.map((profile, index) => ({
-    id: stableId("task", `${task}:${profile.agentId}:${profile.focus}`),
-    assignedTo: profile.agentId,
-    role: profile.role,
-    task: `${task}\nFocus: ${profile.focus}`,
-    ownership: profile.ownership,
-    status: "queued",
-    evidenceRequired: [
-      "Specific files, APIs, or docs inspected.",
-      "Concrete output, diff summary, or finding list.",
-      "Verification command, live check, or explicit blocker.",
-    ],
-    dependencies: index === 0 ? [] : [profiles[0].agentId],
+function readyStatus(status: PlanSlice["status"]): ReadySliceStatus {
+  if (status === "blocked") return "blocked";
+  if (status === "in_progress") return "in_progress";
+  return "pending";
+}
+
+function taskLedgerView(ready: PlanSlice[]): TaskLedgerEntry[] {
+  return ready.map((slice) => ({
+    id: slice.id,
+    assignedTo: slice.assigned_to ?? "",
+    task: slice.title,
+    ownership: [],
+    status: readyStatus(slice.status),
+    evidenceRequired: [],
+    dependencies: [...(slice.depends_on ?? [])],
   }));
+}
+
+function seedSlicesFromHints(task: string, hints: Array<{ title: string }> | undefined): NonNullable<CreatePlanInput["slices"]> {
+  if (hints?.length) {
+    return hints.map((hint) => ({
+      title: hint.title.trim(),
+      depends_on: [],
+    }));
+  }
+  return [{ title: task.trim() }];
+}
+
+/**
+ * Wave 1 Team projection: one vault Thread is SoT.
+ * plan_id present reads that Thread (missing fails closed).
+ * plan_id absent creates exactly one Thread, then takes the same path.
+ * Ready is synchronizeExpiredClaimsAndReadReady + readySlices, never a
+ * synthetic Team ledger or DEFAULT_TEAM-as-slices.
+ */
+async function loadTeamThread(
+  input: {
+    plan_id?: string;
+    task: string;
+    sliceHints?: Array<{ title: string }>;
+    vaultPath: string;
+    now: Date;
+  },
+  deps: TeamRuntimeDeps,
+): Promise<{ plan: PlanArtifact; ready: PlanSlice[]; displaced_active?: string }> {
+  const create = deps.createPlan ?? createPlan;
+  const findNote = deps.findPlanNote ?? findPlanNote;
+  const readReady = deps.synchronizeExpiredClaimsAndReadReady ?? synchronizeExpiredClaimsAndReadReady;
+  const now = input.now;
+
+  if (input.plan_id !== undefined) {
+    const planId = input.plan_id.trim();
+    if (!planId) {
+      throw new Error("plan not found: ");
+    }
+    const notePath = await findNote(input.vaultPath, planId);
+    if (!notePath) {
+      throw new Error(`plan not found: ${planId}`);
+    }
+    const swept = await readReady({
+      vaultPath: input.vaultPath,
+      notePath,
+      planId,
+      actor: DEFAULT_AGENT_ID,
+      now,
+    });
+    // Present plan_id reads only; do not invent displaced_active.
+    return { plan: swept.plan, ready: readySlices(swept.plan, now) };
+  }
+
+  const created = await create(
+    {
+      goal: input.task.trim(),
+      slices: seedSlicesFromHints(input.task, input.sliceHints),
+      vaultPath: input.vaultPath,
+    },
+    { vaultPath: input.vaultPath, now: () => now },
+  );
+  const swept = await readReady({
+    vaultPath: input.vaultPath,
+    notePath: created.write.notePath,
+    planId: created.plan.plan_id,
+    actor: DEFAULT_AGENT_ID,
+    now,
+  });
+  return {
+    plan: swept.plan,
+    ready: readySlices(swept.plan, now),
+    ...(created.displaced_active ? { displaced_active: created.displaced_active } : {}),
+  };
 }
 
 function instructionsFor(profile: TemporaryAgentProfile, recallPrincipal: string): string[] {
@@ -319,6 +411,7 @@ function teamContextMarkdown(packet: Omit<TeamRuntimePacket, "contextMarkdown">)
   const sections = [
     "# Minni Team Runtime",
     `Runtime: ${packet.runtimeId}`,
+    `Plan: ${packet.plan_id} rev ${packet.rev}`,
     `Task: ${packet.task}`,
     `Coordinator: ${packet.coordinatorAgentId}`,
     `Created: ${packet.createdAt}`,
@@ -326,6 +419,10 @@ function teamContextMarkdown(packet: Omit<TeamRuntimePacket, "contextMarkdown">)
     "## Temporary Profiles",
     packet.temporaryProfiles
       .map((profile) => `- ${profile.agentId} (${profile.role}) ${profile.focus}`)
+      .join("\n"),
+    "## Ready",
+    packet.ready
+      .map((slice) => `- ${slice.id}: ${slice.status}; ${slice.title}`)
       .join("\n"),
     "## Task Ledger",
     packet.taskLedger
@@ -378,12 +475,27 @@ async function buildPreparedTeamRuntime(
   const recallPrincipal = DEFAULT_AGENT_ID;
   const profile = input.profile ?? "standard";
   const temporaryProfiles = normalizeAgents(input.agents);
-  const taskLedger = ledgerFor(input.task, temporaryProfiles);
   const runtimeId = stableId("team", `${workspaceId}:${coordinatorAgentId}:${input.task}:${temporaryProfiles.map((agent) => agent.agentId).join(",")}`);
   const ttlSeconds = Math.max(MIN_TEAM_TTL_SECONDS, Math.min(input.ttlSeconds ?? DEFAULT_TEAM_TTL_SECONDS, MAX_TEAM_TTL_SECONDS));
   const createdAtDate = now();
   const createdAt = createdAtDate.toISOString();
   const expiresAt = new Date(createdAtDate.getTime() + ttlSeconds * 1000).toISOString();
+  // agents[] seed independent Thread slices only when creating a Thread.
+  // When plan_id is present they are later-wave hints, not a ledger.
+  const sliceHints = input.plan_id === undefined && input.agents?.length
+    ? input.agents.map((agent) => ({ title: agent.focus.trim() }))
+    : undefined;
+  const { plan, ready, displaced_active } = await loadTeamThread(
+    {
+      plan_id: input.plan_id,
+      task: input.task,
+      sliceHints,
+      vaultPath,
+      now: createdAtDate,
+    },
+    deps,
+  );
+  const taskLedger = taskLedgerView(ready);
 
   const hydrationPackets = await Promise.all(
     temporaryProfiles.map(async (agent) => {
@@ -428,6 +540,7 @@ async function buildPreparedTeamRuntime(
     summary: input.task.slice(0, 120),
     details: {
       runtimeId,
+      plan_id: plan.plan_id,
       coordinatorAgentId,
       workspaceId,
       agents: temporaryProfiles.map((agent) => ({ agentId: agent.agentId, role: agent.role, focus: agent.focus })),
@@ -451,6 +564,10 @@ async function buildPreparedTeamRuntime(
 
   const packet: Omit<TeamRuntimePacket, "contextMarkdown"> = {
     runtimeId,
+    plan_id: plan.plan_id,
+    rev: plan.rev,
+    ready,
+    ...(displaced_active ? { displaced_active } : {}),
     task: input.task,
     coordinatorAgentId,
     workspaceId,
@@ -544,7 +661,7 @@ export interface RuntimeLedgerItem {
   title: string;
   role: string;
   agentId: string;
-  status: "ready" | "waiting" | "done" | "blocked";
+  status: ReadySliceStatus;
   dependsOn: string[];
 }
 
@@ -558,8 +675,10 @@ export interface RuntimePromotionCandidate {
 
 export interface CompatTeamRuntimeInput {
   task: string;
+  plan_id?: string;
   ownerAgentId: string;
   workspaceId: string;
+  vaultPath?: string;
   sources?: RuntimeSource[];
   agents: RuntimeAgentInput[];
 }
@@ -567,10 +686,16 @@ export interface CompatTeamRuntimeInput {
 export interface CompatTeamRuntimePacket {
   kind: "minni-team-runtime";
   version: 1;
+  plan_id: string;
+  rev: number;
+  ready: PlanSlice[];
+  /** Incumbent plan_id when createPlan displaced a non-terminal active Thread. Absent on present plan_id path and when createPlan is silent. */
+  displaced_active?: string;
   task: string;
   ownerAgentId: string;
   workspaceId: string;
   agents: NormalizedRuntimeAgent[];
+  /** View of `ready` keyed by PlanSlice.id. Not a second graph. */
   ledger: RuntimeLedgerItem[];
   hydrationPackets: RuntimeHydrationPacket[];
   evidenceReport: SourceEvidenceReport;
@@ -690,7 +815,7 @@ export function buildPromotionCandidates(input: {
       evidenceRefs,
     },
   ];
-  if (input.ledger.some((item) => item.status === "ready" || item.status === "done")) {
+  if (input.ledger.length > 0) {
     candidates.push({
       kind: "learning",
       status: "manual-review",
@@ -711,23 +836,46 @@ export function buildPromotionCandidates(input: {
   return candidates;
 }
 
-function buildCompatRuntime(input: CompatTeamRuntimeInput): CompatTeamRuntimePacket {
+function compatLedgerView(ready: PlanSlice[]): RuntimeLedgerItem[] {
+  return ready.map((slice) => ({
+    id: slice.id,
+    title: slice.title,
+    role: "",
+    agentId: slice.assigned_to ?? "",
+    status: readyStatus(slice.status),
+    dependsOn: [...(slice.depends_on ?? [])],
+  }));
+}
+
+async function buildCompatRuntime(
+  input: CompatTeamRuntimeInput,
+  deps: TeamRuntimeDeps = {},
+): Promise<CompatTeamRuntimePacket> {
+  if (!input.task.trim()) throw new Error("team runtime requires task.");
+  const now = (deps.now ?? (() => new Date()))();
+  const vaultPath = input.vaultPath ?? DEFAULT_VAULT_PATH;
+  const sliceHints = input.plan_id === undefined && input.agents?.length
+    ? input.agents.map((agent) => ({ title: (agent.role || agent.id).trim() }))
+    : undefined;
+  const { plan, ready, displaced_active } = await loadTeamThread(
+    {
+      plan_id: input.plan_id,
+      task: input.task,
+      sliceHints,
+      vaultPath,
+      now,
+    },
+    deps,
+  );
   const agents = normalizeAgentProfiles({
     ownerAgentId: input.ownerAgentId,
     agents: input.agents,
   });
-  const ledger = agents.map<RuntimeLedgerItem>((agent, index) => ({
-    id: stableId("task", `${input.task}:${agent.id}:${index}`),
-    title: `${agent.role} track`,
-    role: agent.role,
-    agentId: agent.id,
-    status: "ready",
-    dependsOn: index === 0 ? [] : [stableId("task", `${input.task}:${agents[index - 1].id}:${index - 1}`)],
-  }));
+  const ledger = compatLedgerView(ready);
   const evidenceReport = buildEvidenceReport(input.sources ?? []);
   const hydrationPackets = agents.map((profile, index) =>
     buildHydrationPacket({
-      taskId: ledger[index].id,
+      taskId: ready[index]?.id ?? profile.id,
       task: input.task,
       ownerAgentId: input.ownerAgentId,
       profile,
@@ -737,6 +885,10 @@ function buildCompatRuntime(input: CompatTeamRuntimeInput): CompatTeamRuntimePac
   return {
     kind: "minni-team-runtime",
     version: 1,
+    plan_id: plan.plan_id,
+    rev: plan.rev,
+    ready,
+    ...(displaced_active ? { displaced_active } : {}),
     task: input.task,
     ownerAgentId: input.ownerAgentId,
     workspaceId: input.workspaceId,
@@ -752,12 +904,12 @@ function buildCompatRuntime(input: CompatTeamRuntimeInput): CompatTeamRuntimePac
   };
 }
 
-export function buildTeamRuntime(
+export async function buildTeamRuntime(
   input: BuildTeamRuntimeInput | CompatTeamRuntimeInput,
   deps: TeamRuntimeDeps = {},
-): Promise<TeamRuntimePacket> | CompatTeamRuntimePacket {
+): Promise<TeamRuntimePacket | CompatTeamRuntimePacket> {
   if ("ownerAgentId" in input || "sources" in input) {
-    return buildCompatRuntime(input as CompatTeamRuntimeInput);
+    return buildCompatRuntime(input as CompatTeamRuntimeInput, deps);
   }
   return buildPreparedTeamRuntime(input, deps);
 }

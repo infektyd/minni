@@ -119,6 +119,468 @@ def test_ingest_is_idempotent(tmp_path):
     assert _count_proposed(db_obj) == 1
 
 
+def _seed_inbox_packet(
+    db_obj,
+    *,
+    principal,
+    inbox_file,
+    content,
+    candidate_index=0,
+    content_sha1=None,
+    status="proposed",
+):
+    import hashlib
+    import time
+
+    sha = (
+        content_sha1
+        if isinstance(content_sha1, str) and content_sha1
+        else hashlib.sha1(content.encode("utf-8")).hexdigest()
+    )
+    derived = json.dumps(
+        {
+            "source": "inbox",
+            "inbox_file": inbox_file,
+            "candidate_index": candidate_index,
+            "kind": None,
+            "content_sha1": sha,
+        }
+    )
+    now = time.time()
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES (?, 'default', NULL, 'safe', ?, '[]', ?, 0, ?, ?)
+            """,
+            (principal, content, derived, status, now),
+        )
+
+
+def test_slug_alias_kindless_file_does_not_dual_insert(tmp_path):
+    """agy/xai vault slugs remap principal; that must not mint a second UNIQUE key.
+
+    Inbox idempotency is (principal, inbox_file, candidate_index). Kind-less
+    stop files skip the agent_id mismatch gate, so a remap used to INSERT
+    gemini/grok-build beside leftover agy/xai packets for the same source file.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        content = f"durable lesson from {legacy_principal} vault"
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=content,
+        )
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([content]))
+
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 0, (vault_dir, res)
+        assert res["already_present"] == 1, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute("SELECT principal FROM candidate_packets ORDER BY candidate_id")
+            principals = [dict(r)["principal"] for r in c.fetchall()]
+        assert principals == [legacy_principal], (vault_dir, principals)
+        assert _count_proposed(db_obj, principal=canonical) == 0
+
+
+def test_ingest_divergent_leftover_body_extras_at_next_index(tmp_path):
+    """Remapped stop-candidate with a different body at leftover index 0
+    must extras-at-next-idx, not already_present. Compact 1-section got
+    that merge; ingest still treated key-in-existing as done with no
+    content_sha1 compare.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    leftover_body = "leftover remapped stop body occupying index 0"
+    live_body = "divergent remapped stop body that leftover UNIQUE must not swallow"
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=leftover_body,
+        )
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, principal, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, (vault_dir, contents)
+        assert live_body in contents, (vault_dir, contents)
+        by_idx = {
+            json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
+        }
+        assert 0 in by_idx and leftover_body in by_idx[0]["content"]
+        extra = [r for r in rows if live_body in r["content"]]
+        extra_idx = json.loads(extra[0]["derived_from"]).get("candidate_index")
+        assert extra_idx not in {0}, (vault_dir, extra_idx)
+        assert {r["principal"] for r in extra} == {canonical}
+
+
+def test_ingest_in_txn_leftover_unique_extras_divergent_body(tmp_path, monkeypatch):
+    """Leftover 0 body L + remapped D at the same app key must extras-at-next-idx.
+
+    True TOCTOU: INSERT reloads occupancy via _existing_fills_on_cursor, not
+    the pre-scan _existing_fills / _existing_keys / _fills_for_file hooks.
+    Emptying that in-txn loader assigns D the leftover key; CASE UNIQUE then
+    fires. IntegrityError used to count already_present with no extras remap.
+    Do not monkeypatch unused pre-scan names — those stay green on UNIQUE skip.
+    """
+    from minni.afm_passes import inbox_ingest as ii
+    from minni.repair_dual_candidates import ensure_inbox_dedup_index
+
+    leftover_body = "leftover L occupying session.json index 0"
+    live_body = "divergent remapped D that leftover UNIQUE must not swallow"
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    monkeypatch.setattr(
+        ii, "_existing_fills_on_cursor", lambda c, principals=None: {}
+    )
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=leftover_body,
+        )
+        created = ensure_inbox_dedup_index(db_obj)
+        assert created["status"] in {"created", "exists"}, (vault_dir, created)
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+        res = ii.ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, (vault_dir, res)
+        assert res["already_present"] == 0, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, principal, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, (vault_dir, contents)
+        assert live_body in contents, (vault_dir, contents)
+        by_idx = {
+            json.loads(r["derived_from"]).get("candidate_index"): r for r in rows
+        }
+        assert 0 in by_idx and leftover_body in by_idx[0]["content"]
+        extra = [r for r in rows if live_body in r["content"]]
+        extra_idx = json.loads(extra[0]["derived_from"]).get("candidate_index")
+        assert extra_idx not in {0}, (vault_dir, extra_idx)
+        assert {r["principal"] for r in extra} == {canonical}
+
+
+def test_packet_content_sha1_ignores_stamp_when_body_present():
+    """Occupancy must hash candidate_packets.content, not derived_from stamp.
+
+    stage_candidate dumps caller derived_from verbatim, so a leftover alias
+    row can stamp sha(D) on body L. Preferring the stamp skips extras of D.
+    """
+    from minni.afm_passes.inbox_ingest import _content_sha1, _packet_content_sha1
+
+    leftover_body = "leftover L occupying index 0"
+    live_body = "divergent D that stamp must not occupy"
+    df = json.dumps({"content_sha1": _content_sha1(live_body)})
+    assert _packet_content_sha1(leftover_body, df) == _content_sha1(leftover_body)
+
+
+def test_ingest_stamp_lie_leftover_extras_divergent_body(tmp_path):
+    """Leftover 0 content L + stamp(sha(D)) must extras live [D] at next_idx.
+
+    Occupancy used derived_from.content_sha1 as the slot fingerprint, so a
+    same-family leftover whose stamp equals the stop-candidate sha skipped D
+    as already_present. Stamp is audit metadata; extras key on sha1(content).
+    """
+    from minni.afm_passes.inbox_ingest import _content_sha1, ingest
+
+    leftover_body = "leftover L occupying session.json index 0"
+    live_body = "divergent D that leftover stamp sha must not swallow"
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    for vault_dir, legacy_principal, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / canonical)
+        _seed_inbox_packet(
+            db_obj,
+            principal=legacy_principal,
+            inbox_file="session.json",
+            content=leftover_body,
+            content_sha1=_content_sha1(live_body),
+        )
+        inbox = tmp_path / canonical / vault_dir / "inbox"
+        _write_inbox_file(inbox, "session.json", _cc_stop_doc([live_body]))
+
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, (vault_dir, res)
+        assert res["already_present"] == 0, (vault_dir, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, principal, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, (vault_dir, contents)
+        assert live_body in contents, (vault_dir, contents)
+        extra = [r for r in rows if live_body in r["content"]]
+        extra_idx = json.loads(extra[0]["derived_from"]).get("candidate_index")
+        assert extra_idx not in {0}, (vault_dir, extra_idx)
+        assert {r["principal"] for r in extra} == {canonical}
+
+
+def test_assign_fill_indices_skips_duplicate_extra_sha():
+    """Occupied leftover 0 + two identical D extras must share one next_idx.
+
+    The extras loop used to be sha-blind: both D bodies queued, then D at 1
+    and D at 2. UNIQUE is (canon, file, idx) so both insert — a new dual.
+    """
+    from minni.afm_passes.inbox_ingest import _assign_fill_indices
+
+    occupied = {0: "shaL"}
+    assigned = _assign_fill_indices(occupied, [(0, "shaD"), (0, "shaD")])
+    assert assigned == [1, None], assigned
+    assert occupied == {0: {"shaL"}, 1: {"shaD"}}
+
+    occupied_divergent = {0: "shaL"}
+    two_bodies = _assign_fill_indices(
+        occupied_divergent, [(0, "shaD"), (0, "shaE")]
+    )
+    assert two_bodies == [1, 2], two_bodies
+    assert occupied_divergent == {0: {"shaL"}, 1: {"shaD"}, 2: {"shaE"}}
+
+
+def test_assign_fill_indices_skips_hidden_same_slot_twin():
+    """Occupancy last-write hid a same-slot twin so extras minted a duplicate.
+
+    Two shas can share one slot when CASE UNIQUE is not installed. extras
+    skip if sha is already present at any slot, not just last-write.
+    """
+    from minni.afm_passes.inbox_ingest import _assign_fill_indices
+
+    occupied = {0: {"shaA", "shaB"}}
+    assigned = _assign_fill_indices(occupied, [(0, "shaA")])
+    assert assigned == [None], assigned
+    assert occupied == {0: {"shaA", "shaB"}}
+
+    occupied_b = {0: {"shaA", "shaB"}}
+    assigned_b = _assign_fill_indices(occupied_b, [(0, "shaC")])
+    assert assigned_b == [1], assigned_b
+    assert occupied_b == {0: {"shaA", "shaB"}, 1: {"shaC"}}
+
+
+def test_ingest_identical_alias_vault_bodies_do_not_mint_twin_extras(tmp_path):
+    """Leftover occupies 0; agy-vault + gemini-vault both session.json with
+    the SAME new body D. ingest groups alias vaults by (canonical, basename)
+    into one requested list, so sha-blind extras assigned D at 1 and D at 2.
+
+    Pin: leftover 0 + two alias session.json with identical D → inserted==1,
+    indices {0,1}, no twin at 2.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    leftover_body = "leftover occupying index 0"
+    live_body = "identical D body from both alias vaults"
+    cases = (
+        ("agy-vault", "agy", "gemini-vault"),
+        ("xai-vault", "xai", "grok-build-vault"),
+    )
+    for leftover_dir, leftover, remapped_dir in cases:
+        db_obj, cfg = _make_db(tmp_path / leftover)
+        _seed_inbox_packet(
+            db_obj,
+            principal=leftover,
+            inbox_file="session.json",
+            content=leftover_body,
+        )
+        leftover_inbox = tmp_path / leftover / leftover_dir / "inbox"
+        remapped_inbox = tmp_path / leftover / remapped_dir / "inbox"
+        _write_inbox_file(
+            leftover_inbox, "session.json", _cc_stop_doc([live_body])
+        )
+        _write_inbox_file(
+            remapped_inbox, "session.json", _cc_stop_doc([live_body])
+        )
+
+        res = ingest(
+            db_obj,
+            cfg,
+            inboxes=[leftover_inbox, remapped_inbox],
+            dry_run=False,
+        )
+        assert res["inserted"] == 1, (leftover, res)
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT content, derived_from FROM candidate_packets "
+                "ORDER BY candidate_id"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        indices = {
+            json.loads(r["derived_from"]).get("candidate_index") for r in rows
+        }
+        assert indices == {0, 1}, (leftover, indices)
+        contents = [r["content"] for r in rows]
+        assert leftover_body in contents, leftover
+        assert contents.count(live_body) == 1, (leftover, contents)
+
+
+def test_existing_fills_keeps_every_sha_at_a_slot(tmp_path):
+    """_existing_fills overwrote dict[idx]=sha with no ORDER BY. Two shas
+    sharing one slot (CASE UNIQUE not installed) must both occupy occupancy.
+    """
+    from minni.afm_passes.inbox_ingest import _content_sha1, _existing_fills
+
+    db_obj, _cfg = _make_db(tmp_path)
+    body_a = "twin A occupying index 0"
+    body_b = "twin B occupying index 0"
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_a,
+    )
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_b,
+    )
+    fills = _existing_fills(db_obj)
+    held = fills[("gemini", "session.json")][0]
+    shas = set(held) if isinstance(held, (set, frozenset)) else {held}
+    assert shas == {_content_sha1(body_a), _content_sha1(body_b)}, held
+
+
+def test_ingest_same_slot_twin_does_not_mint_duplicate_extra(tmp_path):
+    """Same-slot twins without CASE UNIQUE: ingesting the hidden twin must
+    skip, not extras-at-next-idx a third packet.
+    """
+    from minni.afm_passes.inbox_ingest import (
+        _content_sha1,
+        _existing_fills,
+        ingest,
+    )
+
+    body_a = "twin A occupying index 0"
+    body_b = "twin B occupying index 0"
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_a,
+    )
+    _seed_inbox_packet(
+        db_obj,
+        principal="gemini",
+        inbox_file="session.json",
+        content=body_b,
+    )
+    fills = _existing_fills(db_obj)
+    held = fills[("gemini", "session.json")][0]
+    sha_a = _content_sha1(body_a)
+    sha_b = _content_sha1(body_b)
+    if isinstance(held, str):
+        hidden_body = body_a if held == sha_b else body_b
+    else:
+        hidden_body = body_a
+
+    inbox = tmp_path / "gemini-vault" / "inbox"
+    _write_inbox_file(inbox, "session.json", _cc_stop_doc([hidden_body]))
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 0, res
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT content, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 2, [r["content"] for r in rows]
+    indices = {
+        json.loads(r["derived_from"]).get("candidate_index") for r in rows
+    }
+    assert indices == {0}, indices
+    contents = [r["content"] for r in rows]
+    assert body_a in contents and body_b in contents, contents
+
+
+def test_slug_alias_stamped_agent_id_is_not_mismatch(tmp_path):
+    """Files that still stamp the pre-alias agent_id must ingest, not wipe."""
+    from minni.afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "agy-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "stamped.json",
+        _stop_doc(["agy-stamped durable lesson"], agent_id="agy"),
+    )
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["skipped_by_kind"].get("_agent_mismatch", 0) == 0, res
+    assert res["inserted"] == 1, res
+    assert _count_proposed(db_obj, principal="gemini") == 1
+    assert _count_proposed(db_obj, principal="agy") == 0
+    with db_obj.cursor() as c:
+        c.execute("SELECT derived_from FROM candidate_packets WHERE principal='gemini'")
+        df = json.loads(dict(c.fetchone())["derived_from"])
+    assert df.get("source_principal") == "agy"
+
+
+def test_alias_vault_ingest_stamps_source_principal(tmp_path):
+    """agy/xai vault ingest stores canonical principal; archive still needs
+    the leftover slug. Stamp source_principal at ingest, not only at collapse.
+    """
+    from minni.afm_passes.inbox_ingest import ingest
+
+    cases = (
+        ("agy-vault", "agy", "gemini"),
+        ("xai-vault", "xai", "grok-build"),
+    )
+    for vault_dir, leftover, canonical in cases:
+        db_obj, cfg = _make_db(tmp_path / leftover)
+        inbox = tmp_path / leftover / vault_dir / "inbox"
+        _write_inbox_file(
+            inbox, "session.json", _cc_stop_doc([f"alias ingest {leftover}"])
+        )
+        res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 1, vault_dir
+        with db_obj.cursor() as c:
+            c.execute(
+                "SELECT principal, derived_from FROM candidate_packets"
+            )
+            row = dict(c.fetchone())
+        assert row["principal"] == canonical, vault_dir
+        df = json.loads(row["derived_from"])
+        assert df.get("source_principal") == leftover, vault_dir
+
+
 def test_ingest_idempotent_after_status_change(tmp_path):
     """Re-run must be a no-op even after the loop resolves the row."""
     from minni.afm_passes.inbox_ingest import ingest

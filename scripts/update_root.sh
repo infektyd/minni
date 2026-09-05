@@ -206,6 +206,7 @@ act "$VENV_PY" -m pip install --no-deps -q -e .
 
 # ── 3. plugin build ──────────────────────────────────────────────────────────
 say "step 3/6: rebuild plugin"
+act npm --prefix plugins/minni ci
 act npm --prefix plugins/minni run build
 
 # ── 4. redeploy platform surfaces ────────────────────────────────────────────

@@ -62,6 +62,35 @@ def test_half_written_root_not_active(tmp_path, monkeypatch):
     assert half.resolve() not in {r for r, _ in ordered}
 
 
+def test_shared_root_preserves_all_platforms(tmp_path, monkeypatch):
+    """wire all shares a payload; cache retirement still needs every host."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    (home / ".codex").mkdir()
+    (home / ".grok").mkdir()
+    (home / ".config/kilo").mkdir(parents=True)
+    plugin = home / ".minni/plugin"
+    root = plugin / "shared"
+    _stamp(root)
+    expected = {"claude-code", "codex", "grok", "kilocode"}
+    (plugin / "wired.json").write_text(json.dumps({
+        "wires": [
+            {"platform": platform, "install_root": str(root),
+             "wired_at": "2026-09-04T00:00:00Z"}
+            for platform in sorted(expected)
+        ],
+    }), encoding="utf-8")
+    roots, platforms = active_wire_plugin_state(home)
+    assert roots == {root.resolve()}
+    assert platforms == expected
+    # Status should continue reading/counting the shared payload only once.
+    assert active_wire_plugin_roots_ordered(home) == [
+        (root.resolve(), "wired.json:claude-code"),
+    ]
+
+
 def test_latest_per_platform_and_current_fallback(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
@@ -219,4 +248,3 @@ def test_zombie_platform_does_not_fallback_to_version_dir(tmp_path, monkeypatch)
     )
     ordered = active_wire_plugin_roots_ordered(home)
     assert ordered == [], ordered
-

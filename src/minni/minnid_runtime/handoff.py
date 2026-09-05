@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -70,6 +71,15 @@ def agent_vault(agent_id: str) -> tuple[Path, bool]:
 
 
 def ensure_handoff_vault(vault_path: Path) -> None:
+    from minni.vault_layout import (
+        _INDEX_HEADER,
+        _LOG_HEADER,
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
+
+    root_real = _resolved_vault_root(vault_path)
     for rel in (
         "raw",
         "wiki",
@@ -79,13 +89,15 @@ def ensure_handoff_vault(vault_path: Path) -> None:
         "inbox",
         "outbox",
     ):
-        (vault_path / rel).mkdir(parents=True, exist_ok=True)
-    log_path = vault_path / "log.md"
-    if not log_path.exists():
-        log_path.write_text("# Minni Log\n\n", encoding="utf-8")
-    index_path = vault_path / "index.md"
-    if not index_path.exists():
-        index_path.write_text("# Minni Index\n\n", encoding="utf-8")
+        dest = vault_path / rel
+        _reject_symlink_or_escape(dest, root_real, rel)
+        dest.mkdir(parents=True, exist_ok=True)
+    for rel, header in (("log.md", _LOG_HEADER), ("index.md", _INDEX_HEADER)):
+        dest = vault_path / rel
+        _reject_symlink_or_escape(dest, root_real, rel)
+        if dest.exists():
+            continue
+        _seed_exclusive_file(dest, header)
 
 
 def slugify(text: str) -> str:
@@ -93,8 +105,29 @@ def slugify(text: str) -> str:
     return slug[:80] or "handoff"
 
 
+def _handoff_wiki_filename(packet: dict, stamp: str) -> str:
+    """Date+slug+lease slug still collides when slugify lowercases the PK."""
+    title = packet["task"].strip()
+    slug = slugify(f"{packet['from_agent']}-to-{packet['to_agent']}-{title}")
+    raw = str(packet.get("lease_id") or packet.get("trace_id") or stamp)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{stamp[:8]}-{slug}-{slugify(raw)}-{digest}.md"
+
+
+def _handoff_packet_filename(packet: dict, stamp: str) -> str:
+    """stamp+task-slug+trace[:8] collides; include lease_id (or full trace)."""
+    slug = slugify(str(packet.get("task") or "handoff"))
+    raw = str(packet.get("lease_id") or packet.get("trace_id") or stamp)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{stamp}-{slug}-{slugify(raw)}-{digest}.json"
+
+
 def write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    from minni.afm_writer import _atomic_write_text
+
+    _atomic_write_text(
+        path, json.dumps(data, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def parse_iso_ts(value: Optional[str]) -> Optional[float]:
@@ -173,6 +206,14 @@ def escape_audit_details_block(raw: str) -> str:
 
 
 def append_handoff_audit(vault_path: Path, tool: str, summary: str, details: dict) -> None:
+    from minni.vault_layout import (
+        _LOG_HEADER,
+        _append_regular_file,
+        _reject_symlink_or_escape,
+        _resolved_vault_root,
+        _seed_exclusive_file,
+    )
+
     ensure_handoff_vault(vault_path)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     safe_tool = escape_audit_field(tool, mode="inline", max_len=200)
@@ -180,11 +221,17 @@ def append_handoff_audit(vault_path: Path, tool: str, summary: str, details: dic
     raw_details = json.dumps(details, indent=2, sort_keys=True)
     safe_details = escape_audit_details_block(raw_details)
     line = f"## [{ts}] {safe_tool} | {safe_summary}\n\n```json\n{safe_details}\n```\n\n"
-    for path in (vault_path / "log.md", vault_path / "logs" / f"{ts[:10]}.md"):
-        if not path.exists():
-            path.write_text(f"# {ts[:10]} Minni Audit\n\n", encoding="utf-8")
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+    daily = vault_path / "logs" / f"{ts[:10]}.md"
+    root_real = _resolved_vault_root(vault_path)
+    # Exclusive header seed, then append — never exists()+write_text (truncate).
+    # lstat before skip-or-append so log.md/daily cannot follow into shop.
+    for dest, header in (
+        (vault_path / "log.md", _LOG_HEADER),
+        (daily, f"# {ts[:10]} Minni Audit\n\n"),
+    ):
+        _reject_symlink_or_escape(dest, root_real, dest.name)
+        _seed_exclusive_file(dest, header)
+        _append_regular_file(dest, line)
 
 
 def validate_handoff_packet(from_agent: str, to_agent: str, packet: Any) -> tuple[Optional[dict], Optional[str]]:
@@ -236,8 +283,7 @@ def compile_handoff_page(sender_vault: Path, packet: dict, stamp: str) -> Option
     if packet.get("kind") != "handoff":
         return None
     title = packet["task"].strip()
-    slug = slugify(f"{packet['from_agent']}-to-{packet['to_agent']}-{title}")
-    page_path = sender_vault / "wiki" / "handoffs" / f"{stamp[:8]}-{slug}.md"
+    page_path = sender_vault / "wiki" / "handoffs" / _handoff_wiki_filename(packet, stamp)
     refs = "\n".join(f"- [[{ref.removesuffix('.md')}]]" for ref in packet.get("wikilink_refs", []))
     page = (
         "---\n"
@@ -258,7 +304,9 @@ def compile_handoff_page(sender_vault: Path, packet: dict, stamp: str) -> Option
         "## Wikilink References\n\n"
         f"{refs or '- None'}\n"
     )
-    page_path.write_text(page, encoding="utf-8")
+    from minni.afm_writer import _atomic_write_text
+
+    _atomic_write_text(page_path, page)
     return page_path
 
 
@@ -373,7 +421,7 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
         context.ensure_handoff_vault(sender_vault)
         context.ensure_handoff_vault(recipient_vault)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        suffix = f"{stamp}-{context.slugify(redacted_packet['task'])}-{redacted_packet['trace_id'][:8]}.json"
+        suffix = _handoff_packet_filename(redacted_packet, stamp)
         outbox_path = sender_vault / "outbox" / suffix
         inbox_path = recipient_vault / "inbox" / suffix
         context.write_json(outbox_path, redacted_packet)

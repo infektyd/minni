@@ -42,5 +42,28 @@ that another agent can pick up later.
 ## Eval Gate
 
 A retrieval feature may flip its default only after
-`python -m engine.eval.harness run --config baseline,<candidate>` shows at
+`python -m minni.eval.harness run --config baseline,<candidate>` shows at
 least +5% recall@5 on the seed set with no regression on any query class.
+
+## Runtime Identity
+
+The daemon is a long-lived service and must be recognizable in process
+monitors. Every supported launch path enters `minnid.main`, which calls the
+process-identity hook. The packaged `setproctitle` extension sets the command
+title to `minni`. The executable name shown by a particular monitor can still
+depend on the OS. Module, socket, launchd label, and RPC names remain stable.
+
+For changes to daemon startup or worker orchestration:
+
+1. Inspect all launch paths (`minni up`, foreground/module invocation, and the
+   launchd example) before editing one of them.
+2. Keep process naming best-effort; a platform API failure or missing native
+   extension must not prevent the daemon from serving its socket. Do not
+   overwrite native argv buffers with ctypes or mutate Python's `sys.argv`.
+3. Add a focused unit test, then run the daemon through the real CLI and check
+   the OS process display (`ps`/Activity Monitor) plus `minni doctor`.
+4. Record any new worker or runtime role in the persona/workflow handoff so a
+   parallel agent can resume without rediscovering the launch topology.
+
+The canonical handoff materials are [the runtime-identity workflow](../ops/workflows/minni-runtime-identity.md)
+and [the runtime steward persona](../ops/personas/minni-runtime-steward.md).

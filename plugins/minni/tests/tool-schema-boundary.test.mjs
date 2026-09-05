@@ -53,7 +53,9 @@ test("model-facing MCP input schemas do not expose local path authority", async 
     await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
   );
   const schemas = extractInputSchemas(source);
-  assert.equal(schemas.length, 37, "expected one schema per registered MCP tool");
+  // Task 6 added 5 tools (minni_thread_ready/assign/claim/worker_update/events).
+  // minni_list_candidates is the host drain pair with minni_resolve_candidate.
+  assert.equal(schemas.length, 43, "expected one schema per registered MCP tool");
 
   const forbiddenFields = [
     "vaultPath",
@@ -84,6 +86,23 @@ test("minni_recall schema exposes scope enum and keeps cross_agent back-compat",
 
   assert.match(recallBlock, /scope:\s*z\.enum\(\["personal",\s*"combined",\s*"both"\]\)\.optional\(\)/);
   assert.match(recallBlock, /cross_agent:\s*z\.boolean\(\)\.optional\(\)/);
+});
+
+test("minni_list_candidates carries server principal without model-facing identity spoofing", async () => {
+  const source = stripLineComments(
+    await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
+  );
+  const start = source.indexOf('"minni_list_candidates"');
+  assert.notEqual(start, -1, "minni_list_candidates tool registration not found");
+  const nextTool = source.indexOf("server.registerTool(", start + 1);
+  const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+
+  const schemaStart = block.indexOf("inputSchema:");
+  const handlerStart = block.indexOf("async");
+  const schema = block.slice(schemaStart, handlerStart);
+  assert.doesNotMatch(schema, /\bagent(?:_id|Id)?\s*:/, "model-facing schema must not accept caller identity");
+  assert.match(block, /agent_id:\s*DEFAULT_AGENT_ID/, "list RPC must stamp the configured server principal");
+  assert.match(block, /list_candidates/, "list tool must call the daemon list_candidates method");
 });
 
 test("minni_resolve_candidate carries server principal without model-facing identity spoofing", async () => {

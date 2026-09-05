@@ -288,6 +288,7 @@ export async function recallMemory(input: {
   // (~120 tokens/result) rather than headline-only (wikilink + score, no text).
   // The daemon's previous default was "headline" despite the docstring claiming
   // "snippet". Both the daemon default and this call-site now agree on "snippet".
+  const timeoutMs = input.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
   return jsonRpcSocketRequestWithFallbackRequester("search", {
     query: input.query,
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
@@ -296,11 +297,14 @@ export async function recallMemory(input: {
     scope: input.scope,
     cross_agent: input.crossAgent ?? input.cross_agent,
     depth: "snippet",
+    // Daemon search is to_thread and uncancellable; pass the same budget so
+    // retrieve() can stop FAISS/expand/CE before this client kills the socket.
+    timeout_ms: timeoutMs,
     // Session receipts: the daemon records a durable episodic recall-trace event
     // (thread_id=session_id) when this is present. Omit it entirely when the
     // caller has no session context so the daemon param stays absent, not null.
     ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
-  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}) as Promise<
+  }, requester, { timeoutMs }) as Promise<
     JsonResult<RecallResponse>
   >;
 }
@@ -616,16 +620,19 @@ export async function exportContextPack(
     cacheKey: string;
     agentId?: string;
     workspaceId?: string;
+    timeoutMs?: number;
   },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
+  const timeoutMs = input.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
   return jsonRpcSocketRequestWithFallbackRequester("sm_export_pack", {
     query: input.query,
     budget_tokens: input.budgetTokens,
     cache_key: input.cacheKey,
     agent_id: input.agentId,
     workspace_id: input.workspaceId,
-  }, requester);
+    timeout_ms: timeoutMs,
+  }, requester, { timeoutMs });
 }
 
 export async function ackHandoff(

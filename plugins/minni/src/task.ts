@@ -11,7 +11,7 @@ import { resolveAfmProvider, resolvedNativeHelperPath, type AfmProvider, type Af
 import { defaultProviderChain, type ProviderChain } from "./providers.js";
 import { callNativeOpChunked, reduceViaSameOp, type NativeOpResult } from "./afm-chunking.js";
 import { EVIDENCE_AUTHORITY_SENTENCE } from "./agent_envelope.js";
-import { afmHealth, recallMemory } from "./sovereign.js";
+import { afmHealth, recallMemory, formatDegradation } from "./sovereign.js";
 import type { JsonResult, RecallResponse } from "./sovereign.js";
 import { isInstructionLike } from "./safety.js";
 import { recordAudit, searchVaultNotes } from "./vault.js";
@@ -88,6 +88,11 @@ export interface PreparedTaskPacket {
     daemonOk: boolean;
     daemonLead?: string;
     error?: string;
+    /** Display-only evidence; never added to AFM/model packet context. */
+    evidence?: { kind: "document" | "learning" | "episode"; text: string }[];
+    diagnostic?: string;
+    state?: "responded" | "degraded" | "error" | "unknown";
+    agent?: string; workspace?: string; backend?: string;
   };
   afm: {
     requested: boolean;
@@ -494,6 +499,31 @@ function deterministicPacket(input: {
   const intent = classifyIntent(input.task);
   const relevantSources = taskSourcesFromVault(input.vaultResults, input.budget);
   const daemonLead = input.recallResult.ok ? firstLine(input.recallResult.data?.results) : undefined;
+  const response = input.recallResult.ok ? input.recallResult.data : undefined;
+  const diagnostic = response ? formatDegradation(response) : undefined;
+  // The shared formatter also reports successful authorization filtering.
+  // Keep those notices visible without treating them as service degradation.
+  const serviceDegradation = response
+    ? formatDegradation({ ...response, auth_suppression: [] })
+    : undefined;
+  const hasEvidenceFields = response && (
+    typeof response.results === "string" || Array.isArray(response.results)
+    || Array.isArray(response.learnings) || Array.isArray(response.episodic)
+  );
+  const evidence: NonNullable<PreparedTaskPacket["recall"]["evidence"]> = [];
+  if (response) {
+    for (const [kind, value] of [
+      ["document", response.results], ["learning", response.learnings],
+      ["episode", response.episodic],
+    ] as const) {
+      const rows = Array.isArray(value) ? value : typeof value === "string" && value.trim() ? [value] : [];
+      for (const row of rows) {
+        // Preserve envelopes and provenance; the UI renders only inert text.
+        const text = typeof row === "string" ? row : JSON.stringify(row, null, 2);
+        if (text) evidence.push({ kind, text });
+      }
+    }
+  }
   const constraints = constraintsForTask(input.task);
   const currentState = [
     relevantSources.length > 0
@@ -568,6 +598,12 @@ function deterministicPacket(input: {
       daemonOk: input.recallResult.ok,
       daemonLead,
       error: input.recallResult.error,
+      evidence,
+      diagnostic,
+      state: !input.recallResult.ok ? "error" : serviceDegradation ? "degraded" : !hasEvidenceFields ? "unknown" : "responded",
+      agent: response?.agent_id,
+      workspace: response?.workspace_id,
+      backend: response?.backend ?? response?.backend_badge,
     },
     afm: {
       requested: input.afmRequested,

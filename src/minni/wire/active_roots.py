@@ -20,7 +20,7 @@ def active_wire_plugin_state(home: Path) -> tuple[set[Path], set[str]]:
     Roots are resolved Paths. Platforms are the wire ``platform`` strings for
     those records (used to scope marketplace-cache skips per surface).
     """
-    ordered = active_wire_plugin_roots_ordered(home)
+    ordered = _active_wire_plugin_entries(home)
     roots = {root for root, _how in ordered}
     platforms: set[str] = set()
     # Re-read platforms from the same selection rules without inventing a
@@ -33,6 +33,14 @@ def active_wire_plugin_state(home: Path) -> tuple[set[Path], set[str]]:
 
 
 def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
+    """Unique active roots for status reporting, retaining first provenance."""
+    unique: dict[Path, str] = {}
+    for root, how in _active_wire_plugin_entries(home):
+        unique.setdefault(root, how)
+    return list(unique.items())
+
+
+def _active_wire_plugin_entries(home: Path) -> list[tuple[Path, str]]:
     """Active roots as ``(resolved_root, how)`` for honesty/status reporting.
 
     ``how`` is ``wired.json:<platform>``, ``current``, or ``version-dir scan``.
@@ -46,7 +54,6 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
     """
     base = Path(home).expanduser() / ".minni" / "plugin"
     actives: list[tuple[Path, str]] = []
-    seen: set[Path] = set()
     wired_path = base / "wired.json"
     wired_parsed = False
     try:
@@ -94,9 +101,9 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
                     ok, _probed = config_root_exists(platform, home=home)
                     if not ok:
                         continue
-            if root not in seen:
-                actives.append((root, f"wired.json:{platform}"))
-                seen.add(root)
+            # A payload is shared by several hosts. Preserve every platform
+            # here; only the root-only reporting API may deduplicate paths.
+            actives.append((root, f"wired.json:{platform}"))
     except (OSError, json.JSONDecodeError, TypeError):
         pass
     if actives:

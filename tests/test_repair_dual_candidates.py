@@ -648,11 +648,19 @@ def test_repair_dual_does_not_commit_via_cursor_mid_txn(tmp_path, monkeypatch):
 
 
 def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
-    """Medium #4: compact_distillation mirrors ingest UNIQUE / in-txn recheck."""
+    """Medium #4: compact_distillation mirrors ingest UNIQUE / in-txn recheck.
+
+    Keys are sha-scoped: only a same-sha key hit skips. The seed must carry
+    the ACTUAL distilled body (a divergent body extras-at-next-idx instead —
+    see the next test).
+    """
     from minni.afm_passes import compact_distillation as cd
 
     db, cfg = _make_db(tmp_path)
-    content = "Compaction summary — Key technical concepts: race on bootout"
+    content = (
+        "Compaction summary — Key technical concepts: "
+        "race on bootout after launchctl error 5"
+    )
 
     # Pre-seed a twin key as if another process already inserted.
     _insert_candidate(
@@ -689,18 +697,351 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
     monkeypatch.setattr(cd, "resolve_afm_mode", lambda: "off")
     monkeypatch.setattr(cd, "default_provider_chain", lambda: None)
 
-    # Bypass file-level short-circuit by clearing pre-scan existing keys for
-    # this file? The pre-scan uses _existing_keys which will see our seed and
-    # skip the whole file. That is correct prevention for the common path.
-    # Exercise the in-txn UNIQUE path by monkeypatching _existing_keys to
-    # return empty so the insert path runs, then UNIQUE/recheck must hold.
+    # Bypass file-level short-circuit by clearing pre-scan occupancy for
+    # this file. Exercise the in-txn recheck path by emptying occupancy so
+    # the insert path runs, then the sha-compare recheck must skip.
     monkeypatch.setattr(cd, "_existing_keys", lambda db, principals=None: set())
+    monkeypatch.setattr(cd, "_fills_for_file", lambda db, principal, inbox_file: [])
 
     res = cd.distill(db, cfg, inboxes=[inbox], dry_run=False)
     assert res["inserted"] == 0
     with db.cursor() as c:
         c.execute("SELECT COUNT(*) AS n FROM candidate_packets")
         assert dict(c.fetchone())["n"] == 1
+    # The distilled sha is durably present, so the file retires.
+    assert res["archived_with_shared"] == 1
+    assert not (inbox / "compact-1.json").exists()
+    assert (inbox / ".archive" / "compact-1.json").is_file()
+
+
+def test_distill_in_txn_recheck_extras_divergent_body_at_next_idx(
+    tmp_path, monkeypatch
+):
+    """Sha-scoped keys: a leftover (file, index) key with a DIVERGENT body
+    must not swallow the distilled section — it extras-at-next-idx."""
+    from minni.afm_passes import compact_distillation as cd
+
+    db, cfg = _make_db(tmp_path)
+    # Leftover occupies (compact-1.json, 0) with a different body.
+    _insert_candidate(
+        db,
+        content="Compaction summary — Key technical concepts: race on bootout",
+        status="proposed",
+        inbox_file="compact-1.json",
+        candidate_index=0,
+        principal="codex",
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "compact-1.json").write_text(
+        json.dumps(
+            {
+                "kind": "compact_summary",
+                "agent_id": "codex",
+                "workspace_id": "default",
+                "summary_id": "s1",
+                "platform": "codex",
+                "summary_text": (
+                    "1. Key technical concepts:\n"
+                    "race on bootout after launchctl error 5\n\n"
+                    "2. All user messages:\n"
+                    "please fix it\n"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Force no AFM so deterministic fallback is used.
+    monkeypatch.setattr(cd, "resolve_afm_mode", lambda: "off")
+    monkeypatch.setattr(cd, "default_provider_chain", lambda: None)
+
+    # Same empty pre-scan as the skip test so the in-txn recheck path runs.
+    monkeypatch.setattr(cd, "_existing_keys", lambda db, principals=None: set())
+    monkeypatch.setattr(cd, "_fills_for_file", lambda db, principal, inbox_file: [])
+
+    res = cd.distill(db, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1
+    with db.cursor() as c:
+        c.execute(
+            "SELECT content, derived_from FROM candidate_packets "
+            "ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 2
+    extra = [
+        r
+        for r in rows
+        if "race on bootout after launchctl error 5" in r["content"]
+    ]
+    assert len(extra) == 1
+    assert json.loads(extra[0]["derived_from"]).get("candidate_index") == 1
+    # Once the extra fill lands, the file retires — same lifecycle as the
+    # leftover-alias merge case in test_compact_distillation.py.
+    assert res["archived_with_shared"] == 1
+    assert not (inbox / "compact-1.json").exists()
+    assert (inbox / ".archive" / "compact-1.json").is_file()
+
+
+def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
+    """agy/gemini (and xai/grok-build) are one agent: same file+index is a dual.
+
+    Slug aliases remap the vault-derived principal, so leftover agy/xai rows
+    plus a remapped gemini/grok-build insert share one fill and must collapse.
+    """
+    from minni.repair_dual_candidates import (
+        find_app_key_collisions,
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    content = "alias dual lesson about inbox uniqueness"
+    agy_id = _insert_candidate(
+        db, content=content, status="proposed", principal="agy"
+    )
+    gemini_id = _insert_candidate(
+        db, content=content, status="proposed", principal="gemini"
+    )
+
+    collisions = find_app_key_collisions(db)
+    assert len(collisions) == 1, collisions
+    assert collisions[0]["row_count"] == 2
+    assert set(collisions[0]["candidate_ids"]) == {agy_id, gemini_id}
+    assert collisions[0]["key"]["principal"] == "gemini"
+
+    groups = find_duplicate_candidate_groups(db)
+    assert len(groups) == 1
+    assert groups[0]["row_count"] == 2
+    applied = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert applied["deleted"] == 1
+    with db.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, principal, derived_from FROM candidate_packets"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["candidate_id"] == min(agy_id, gemini_id)
+    assert rows[0]["principal"] == "gemini"
+    df = json.loads(rows[0]["derived_from"])
+    assert df.get("source_principal") == "agy"
+
+
+def test_prefer_unfenced_collapse_stamps_deleted_leftover_source_principal(
+    tmp_path,
+):
+    """all_proposed_prefer_unfenced keeps the canonical twin; leftover alias
+    is deleted. Stamp source_principal from that deleted leftover even when
+    the winner is already gemini/grok-build, or accept archives the leftover
+    vault as the only drain of the remapped fill.
+    """
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    cases = (
+        ("agy", "gemini"),
+        ("xai", "grok-build"),
+    )
+    for leftover, canonical in cases:
+        db, _cfg = _make_db(tmp_path / leftover)
+        content = f"prefer-unfenced leftover fill {leftover} {canonical}"
+        leftover_id = _insert_candidate(
+            db, content=content, status="proposed", principal=leftover
+        )
+        canonical_id = _insert_candidate(
+            db, content=content, status="proposed", principal=canonical
+        )
+        assert leftover_id < canonical_id
+        _insert_afm_review_fence(db, leftover_id, status="pending")
+
+        applied = repair_duplicate_candidate_pairs(db, dry_run=False)
+        assert applied["deleted"] == 1, leftover
+        with db.cursor() as c:
+            c.execute(
+                "SELECT candidate_id, principal, derived_from "
+                "FROM candidate_packets"
+            )
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, leftover
+        assert rows[0]["candidate_id"] == canonical_id, leftover
+        assert rows[0]["principal"] == canonical, leftover
+        df = json.loads(rows[0]["derived_from"])
+        assert df.get("source_principal") == leftover, leftover
+
+
+def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(
+    tmp_path, monkeypatch
+):
+    """SQL UNIQUE must key the canonical fill, not the raw leftover principal.
+
+    Failing input: leftover candidate_packets principal='agy' (or 'xai') for
+    session.json index 0; repair keeps that row (no twin to collapse, and
+    collapse keeps min(candidate_id) without rewriting principal); operator
+    index is created. A later INSERT principal='gemini' (or 'grok-build') for
+    the same inbox_file+index must collide so inbox_ingest's IntegrityError
+    swallow is a #239 backstop, not a silent dual PK.
+    """
+    import sqlite3
+
+    from minni.afm_passes import inbox_ingest as ii
+    from minni.repair_dual_candidates import (
+        ensure_inbox_dedup_index,
+        repair_duplicate_candidate_pairs,
+    )
+
+    cases = (
+        ("agy", "gemini", "agy-vault"),
+        ("xai", "grok-build", "xai-vault"),
+    )
+    for leftover, canonical, vault_dir in cases:
+        db, cfg = _make_db(tmp_path / leftover)
+        content = f"leftover {leftover} session fill"
+        leftover_id = _insert_candidate(
+            db,
+            content=content,
+            status="proposed",
+            inbox_file="session.json",
+            candidate_index=0,
+            principal=leftover,
+        )
+
+        repair = repair_duplicate_candidate_pairs(db, dry_run=False)
+        assert repair["deleted"] == 0
+        created = ensure_inbox_dedup_index(db)
+        assert created["status"] == "created"
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_candidate(
+                db,
+                content=f"canonical {canonical} twin of leftover",
+                status="proposed",
+                inbox_file="session.json",
+                candidate_index=0,
+                principal=canonical,
+            )
+
+        monkeypatch.setattr(ii, "_existing_keys", lambda db, principals=None: set())
+        inbox = tmp_path / leftover / vault_dir / "inbox"
+        inbox.mkdir(parents=True)
+        (inbox / "session.json").write_text(
+            json.dumps(
+                {
+                    "slug": "s",
+                    "createdAt": "2026-06-06T12:00:00.000Z",
+                    "kind": "stop_candidates",
+                    "agent_id": leftover,
+                    "workspace_id": "default",
+                    "candidates": [content],
+                    "log_only": [],
+                    "expires": [],
+                    "do_not_store": [],
+                    "last_task": "t",
+                }
+            ),
+            encoding="utf-8",
+        )
+        res = ii.ingest(db, cfg, inboxes=[inbox], dry_run=False)
+        assert res["inserted"] == 0, (leftover, res)
+        assert res["already_present"] >= 1, (leftover, res)
+        with db.cursor() as c:
+            c.execute("SELECT candidate_id, principal FROM candidate_packets")
+            rows = [dict(r) for r in c.fetchall()]
+        assert len(rows) == 1, (leftover, rows)
+        assert rows[0]["candidate_id"] == leftover_id
+        assert rows[0]["principal"] == leftover
+
+
+def test_dry_run_stale_raw_principal_unique_is_not_exists(tmp_path):
+    """Stale UNIQUE on raw principal must not report dry-run status=exists.
+
+    ``"principal" in sql.lower()`` is true for both the leftover raw-column
+    index and the CASE canonical fill. Dry-run has to reuse
+    ``_inbox_dedup_index_sql_is_current`` so a named-but-stale index falls
+    through to collision preflight (would_create / would_block), then
+    ``ensure_inbox_dedup_index`` recreates the CASE index and leftover
+    ``agy``/``xai`` rows collide with ``gemini``/``grok-build`` inserts.
+    """
+    import sqlite3
+
+    from minni.repair_dual_candidates import (
+        INBOX_DEDUP_INDEX,
+        _inbox_dedup_index_sql_is_current,
+        ensure_inbox_dedup_index,
+        run_full_repair,
+    )
+
+    cases = (
+        ("agy", "gemini"),
+        ("xai", "grok-build"),
+    )
+    for leftover, canonical in cases:
+        db, _cfg = _make_db(tmp_path / leftover)
+        _insert_candidate(
+            db,
+            content=f"leftover {leftover} session fill",
+            status="proposed",
+            inbox_file="session.json",
+            candidate_index=0,
+            principal=leftover,
+        )
+        with db.transaction() as c:
+            c.execute(
+                f"""
+                CREATE UNIQUE INDEX {INBOX_DEDUP_INDEX}
+                ON candidate_packets (
+                    principal,
+                    json_extract(derived_from, '$.inbox_file'),
+                    CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER)
+                )
+                WHERE json_extract(derived_from, '$.source') = 'inbox'
+                  AND json_extract(derived_from, '$.inbox_file') IS NOT NULL
+                  AND json_extract(derived_from, '$.candidate_index') IS NOT NULL
+                """
+            )
+        with db.cursor() as c:
+            c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (INBOX_DEDUP_INDEX,),
+            )
+            stale_sql = (c.fetchone() or [None])[0]
+        assert stale_sql
+        assert "principal" in str(stale_sql).lower()
+        assert not _inbox_dedup_index_sql_is_current(stale_sql)
+
+        dry = run_full_repair(db, dry_run=True, create_index=True)
+        idx = dry["inbox_dedup_index"]
+        assert idx["status"] != "exists", (leftover, idx)
+        assert idx["status"] in {"would_create", "would_block"}, (leftover, idx)
+        assert idx.get("dry_run") is True
+        with db.cursor() as c:
+            c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (INBOX_DEDUP_INDEX,),
+            )
+            after_dry = (c.fetchone() or [None])[0]
+        assert after_dry == stale_sql
+
+        created = ensure_inbox_dedup_index(db)
+        assert created["status"] == "created", (leftover, created)
+        with db.cursor() as c:
+            c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (INBOX_DEDUP_INDEX,),
+            )
+            new_sql = (c.fetchone() or [None])[0]
+        assert _inbox_dedup_index_sql_is_current(new_sql)
+        dry_after = run_full_repair(db, dry_run=True, create_index=True)
+        assert dry_after["inbox_dedup_index"]["status"] == "exists"
+
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_candidate(
+                db,
+                content=f"canonical {canonical} twin of leftover",
+                status="proposed",
+                inbox_file="session.json",
+                candidate_index=0,
+                principal=canonical,
+            )
 
 
 def test_ingest_allows_same_basename_under_other_principal(tmp_path):
@@ -1611,6 +1952,110 @@ def test_all_proposed_superseded_fence_does_not_prefer(tmp_path):
     assert groups[0]["winner_id"] == low
     assert groups[0]["collapse_reason"] == "all_proposed"
     assert groups[0]["loser_ids"] == [high]
+
+
+def test_fence_query_lock_is_not_laundered_into_empty_set():
+    """High: a broken fence SELECT must raise, not look like nobody is fenced."""
+    import sqlite3
+
+    from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
+
+    class BoomCursor:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        _active_afm_review_ids_on_cursor(BoomCursor())
+
+
+def test_fence_query_unexpected_schema_is_not_laundered_into_empty_set():
+    """Only 'no such table' is excused; missing claim column must surface."""
+    import sqlite3
+
+    from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
+
+    class BoomCursor:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("no such column: claim")
+
+    with pytest.raises(sqlite3.OperationalError, match="no such column"):
+        _active_afm_review_ids_on_cursor(BoomCursor())
+
+
+def test_fence_query_missing_table_returns_empty_set():
+    """Pre-014 installs lack consolidation_actions — that is not a fault."""
+    import sqlite3
+
+    from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
+
+    class MissingTableCursor:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("no such table: consolidation_actions")
+
+    assert _active_afm_review_ids_on_cursor(MissingTableCursor()) == set()
+
+
+class _FenceSelectLockCursor:
+    """Proxy that fails only the apply-path fence SELECT (table still exists)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def execute(self, sql, *args, **kwargs):
+        import sqlite3
+
+        text = " ".join(str(sql).split())
+        if "SELECT claim FROM consolidation_actions" in text:
+            raise sqlite3.OperationalError("database is locked")
+        return self._inner.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_apply_fence_select_error_does_not_delete_unfenced_twin(tmp_path):
+    """High: lock/schema error on apply fence SELECT must not DELETE the fill.
+
+    Two proposed alias twins (agy fenced, gemini unfenced). Swallowing the
+    SELECT into fenced={} keeps lowest id and deletes the unfenced gemini
+    row; the leftover agy packet stays behind afm_review and examinable
+    fills go 1→0. The error must raise and both rows must survive.
+    """
+    import sqlite3
+
+    from minni import repair_dual_candidates as mod
+
+    db, _cfg = _make_db(tmp_path)
+    content = "alias twins one fenced by afm_review"
+    agy = _insert_candidate(
+        db, content=content, status="proposed", principal="agy"
+    )
+    gemini = _insert_candidate(
+        db, content=content, status="proposed", principal="gemini"
+    )
+    assert agy < gemini
+    _insert_afm_review_fence(db, agy, status="pending")
+
+    real_txn = db.transaction
+
+    @contextlib.contextmanager
+    def txn_fence_select_locked():
+        with real_txn() as c:
+            yield _FenceSelectLockCursor(c)
+
+    db.transaction = txn_fence_select_locked
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        mod.repair_duplicate_candidate_pairs(db, dry_run=False)
+
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT candidate_id FROM candidate_packets ORDER BY candidate_id"
+        )
+        remaining = [r["candidate_id"] for r in cur.fetchall()]
+    assert remaining == [agy, gemini], (
+        "unfenced gemini twin must survive a broken fence SELECT"
+    )
 
 
 def test_cli_warns_on_dual_accepted_groups(tmp_path, capsys):

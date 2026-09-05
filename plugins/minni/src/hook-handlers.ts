@@ -56,6 +56,15 @@ import type { HookIntent } from "./hook-intent.js";
 import { canInject, renderIntent, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
+import {
+  activePlanIdFromVault,
+  confirmDeliveryInVault,
+  deliverySucceededForHostHook,
+  pendingAttentionForHook,
+} from "./thread-notification-relay.js";
+import type { RelayHook } from "./thread-notification-relay.js";
+
+
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildRecallPointer,
@@ -120,6 +129,63 @@ import {
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
+
+/**
+ * Confirm delivery=true only when HOST_INJECTION_TABLE says this host+hook
+ * actually injects. ignored / rejects / cannot / out leave the cursor behind.
+ */
+function confirmPendingIfInjects(args: {
+  vaultPath: string;
+  subscriberId: string;
+  planId: string;
+  lastSeq: number;
+  hostId: string;
+  hook: RelayHook;
+}): void {
+  if (!deliverySucceededForHostHook(args.hostId, args.hook)) return;
+  const { vaultPath, subscriberId, planId, lastSeq } = args;
+  deferUntilDelivered(async () => {
+    await confirmDeliveryInVault(vaultPath, subscriberId, planId, lastSeq, true);
+  });
+}
+
+/** G3 hook fallback: read pending attention. Not minni_thread_events. */
+async function attachPendingAttention(args: {
+  vaultPath: string;
+  subscriberId: string;
+  planId?: string;
+  envelopeBody: Record<string, unknown>;
+  hostId: string;
+  hook: RelayHook;
+}): Promise<void> {
+  try {
+    const pending = await pendingAttentionForHook({
+      vaultPath: args.vaultPath,
+      subscriberId: args.subscriberId,
+      planId: args.planId,
+    });
+    if (!pending || !args.planId) return;
+    args.envelopeBody.pending_attention = pending.notifications.map((item) => ({
+      seq: item.seq,
+      actor: item.actor,
+      kind: item.kind,
+      ...(item.slice_id ? { slice_id: item.slice_id } : {}),
+      delta: item.delta,
+    }));
+    const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
+    if (lastSeq === undefined) return;
+    confirmPendingIfInjects({
+      vaultPath: args.vaultPath,
+      subscriberId: args.subscriberId,
+      planId: args.planId,
+      lastSeq,
+      hostId: args.hostId,
+      hook: args.hook,
+    });
+  } catch {
+    // Relay is not SoT. A missed attach leaves the cursor behind.
+  }
+}
 
 export interface AgentHookConfig {
   /** Stamped agent identity (e.g. "codex", "grok-build"). */
@@ -897,37 +963,17 @@ export function createHookHandlers(
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
     // boot/rehydration, exactly like the claude-code hook.
-    // `undefined` from resolveActivePlanView MEANS "no active plan", so it cannot
-    // double as the budget-cut fallback — the two must stay distinguishable.
+    // `undefined` from resolveActivePlanView MEANS "no active plan" (or a
+    // terminal/healed plan suppressed from injection). FS/lock failures throw
+    // ActivePlanReadError / ThreadBusyError — withBudget maps those rejections
+    // onto planRead.ok === false so a failed read is degraded, not empty.
     let planRead: { ok: boolean; view: Awaited<ReturnType<typeof resolveActivePlanView>> } = {
       ok: true,
       view: undefined,
     };
-    // No try/catch: it would be DEAD CODE, and a catch that implies an audit
-    // row which can never be written is exactly the health-signal overstatement
-    // this work is removing elsewhere. Neither call can reject —
-    // resolveActivePlanView swallows its own failures and returns undefined,
-    // and withBudget turns any rejection into its fallback. A budget cut still
-    // surfaces, via planRead.ok === false -> degraded.sections.
-    //
-    // Note the honest limit that leaves: a plan FS failure is indistinguishable
-    // from 'no active plan', because resolveActivePlanView conflates them at
-    // source. Pre-existing and out of scope here — fixing it belongs in plan.ts.
-    // #295: reuse the layer1Shelf body already read above (readLayer1Shelf)
-    // rather than a second read — shelfDrift's "never pulls" contract means
-    // this is a comparison against content the boot already has, not a new
-    // fetch. Omitted (undefined) when the shelf read itself failed, so a
-    // degraded shelf read reads as "drift not checked", not "checked clean".
-    //
-    // Review round: also omit on `truncated`. readLayer1Shelf caps at
-    // LAYER1_SHELF_MAX_BYTES and still returns ok:true with the truncated
-    // prefix — hashing that prefix as if it were the whole file makes
-    // shelfDrift compare against content the stored hash was never computed
-    // from, producing a PERMANENT false "drifted" that pulling can never
-    // clear (the live hash can never match the stored one again, since the
-    // stored hash covers bytes this reader will never see again). That is
-    // the exact false-confidence inversion this feature exists to avoid —
-    // "not checked" must win over "checked, but on the wrong bytes."
+    // No try/catch around resolveActivePlanView: withBudget turns rejection
+    // into its fallback. A budget cut still surfaces via planRead.ok === false
+    // -> degraded.sections.
     planRead = await withBudget(
       resolveActivePlanView(
         config.vaultPath,
@@ -1080,6 +1126,14 @@ export function createHookHandlers(
     if (activePlan !== undefined) {
       envelopeBody.active_thread = activePlan;
     }
+    await attachPendingAttention({
+      vaultPath: config.vaultPath,
+      subscriberId: config.agentId,
+      planId: activePlan?.plan_id,
+      envelopeBody,
+      hostId: wire.id,
+      hook: "sessionStart",
+    });
 
     const budget = envelopeBudgetFor(config.contextWindow);
     if (identityRead.ok && identityRead.data?.context) {
@@ -1285,42 +1339,76 @@ export function createHookHandlers(
     let recallStateFile: string | undefined;
     let stalePointer: string | undefined;
     if (strong) {
-      try {
-        recallStateFile = await writeRecallState(config.vaultPath, {
-          task_signature: signature,
-          intent: intent.action,
-          top_hits: strong.topHits,
-          top_score: strong.topScore,
-        });
-      } catch {
-        // best-effort: a state-write failure must not break the hook
+      // s6 UNCONSULTED deny is a backstop for an envelope the model actually
+      // received. Grok UPS/SS and Cursor UPS structurally drop inject
+      // (GROK_INJECTABLE={Stop}, CURSOR_INJECTABLE={SessionStart}); planting
+      // consumed=false here would deny cold tools against memory the model
+      // never saw. Do not expand those injectable sets — this gate follows them.
+      if (canInject(wire, "UserPromptSubmit")) {
+        try {
+          recallStateFile = await writeRecallState(config.vaultPath, {
+            task_signature: signature,
+            intent: intent.action,
+            top_hits: strong.topHits,
+            top_score: strong.topScore,
+          });
+        } catch {
+          // best-effort: a state-write failure must not break the hook
+        }
+      } else {
+        // Prior dropped-UPS plants left consumed=false on disk; this turn
+        // would have overwritten them with another false plant. Clear instead
+        // of leaving the guard armed against an undelivered envelope.
+        await clearRecallState(config.vaultPath).catch(() => {});
       }
     } else if (daemonTimedOut) {
-      // DEGRADED, not weak. Keep the existing state file — clearing it would
-      // destroy the s6 guard's only pointer on exactly the turns the daemon
-      // cannot rebuild it — and surface it clearly flagged.
-      stalePointer = buildStaleRecallPointer(
-        await readRecallState(config.vaultPath).catch(() => null),
-      );
+      // DEGRADED, not weak — but only keep the pointer if this wire could
+      // have delivered it. Grok UPS/SS and Cursor UPS drop inject, so a
+      // leftover consumed=false would arm UNCONSULTED against an envelope
+      // the model never saw. Same gate as the plant: canInject(UPS) or clear.
+      if (canInject(wire, "UserPromptSubmit")) {
+        stalePointer = buildStaleRecallPointer(
+          await readRecallState(config.vaultPath).catch(() => null),
+        );
+      } else {
+        await clearRecallState(config.vaultPath).catch(() => {});
+      }
     } else {
       await clearRecallState(config.vaultPath).catch(() => {});
     }
 
-    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
-    try {
-      activePlan = await resolveActivePlanView(config.vaultPath);
-    } catch (error) {
-      await recordAudit(config.vaultPath, {
-        tool: `${config.auditPrefix}_active_plan_error`,
-        summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
-      }).catch(() => {});
+    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>> = undefined;
+    let activePlanReadOk = true;
+    // Same contract as SessionStart: withBudget maps FS/lock throws AND a
+    // spent prompt budget onto ok=false so a failed/unread plan is degraded,
+    // not empty. A raw await here waits out THREAD_BUSY (default 5s lock)
+    // after the recall budget — the host then kills the hook and discards
+    // the envelope, which looks like "no active plan" again.
+    const planRead = await withBudget(
+      resolveActivePlanView(config.vaultPath)
+        .then((view) => ({ ok: true as const, view }))
+        .catch(async (error: unknown) => {
+          await recordAudit(config.vaultPath, {
+            tool: `${config.auditPrefix}_active_plan_error`,
+            summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
+          }).catch(() => {});
+          return { ok: false as const, view: undefined };
+        }),
+      remainingMs(),
+      { ok: false as const, view: undefined },
+    );
+    if (!planRead.ok) {
+      activePlanReadOk = false;
+    } else {
+      activePlan = planRead.view;
     }
 
     const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
 
     // Nothing salient to inject this turn: no strong recall, no stale fallback
-    // pointer AND no active plan.
-    if (!strong && stalePointer === undefined && planRef === undefined) {
+    // pointer AND no active plan. A failed plan read is salient — degraded,
+    // not the empty-pointer path.
+    if (!strong && stalePointer === undefined && planRef === undefined && activePlanReadOk) {
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_user_prompt_submit`,
         summary: prompt.slice(0, 120),
@@ -1380,6 +1468,37 @@ export function createHookHandlers(
     if (activePlan !== undefined) {
       envelopeBody.active_thread_ref = compactPlanPointer(activePlan);
     }
+    await attachPendingAttention({
+      vaultPath: config.vaultPath,
+      subscriberId: config.agentId,
+      planId: activePlan?.plan_id,
+      envelopeBody,
+      hostId: wire.id,
+      hook: "promptSubmit",
+    });
+    if (!activePlanReadOk) {
+      const existing =
+        envelopeBody.degraded !== undefined &&
+        typeof envelopeBody.degraded === "object" &&
+        !Array.isArray(envelopeBody.degraded)
+          ? (envelopeBody.degraded as Record<string, unknown>)
+          : {};
+      const sections = Array.isArray(existing.sections)
+        ? existing.sections.filter((section): section is string => typeof section === "string")
+        : [];
+      if (!sections.includes("active_thread")) {
+        sections.push("active_thread");
+      }
+      envelopeBody.degraded = {
+        ...existing,
+        sections,
+        ...(typeof existing.note === "string"
+          ? {}
+          : {
+              note: "Active thread was not read (filesystem or lock). Treat it as unknown, not empty.",
+            }),
+      };
+    }
 
     const envelope = wrapEnvelope({
       event: "UserPromptSubmit",
@@ -1416,6 +1535,10 @@ export function createHookHandlers(
   ): Promise<PreToolUseDecisionOutput> {
     const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
     if (mode === "off") return preToolUseAllow();
+    // s6 deny is a backstop for an envelope the model actually received.
+    // Dropped UPS (Grok, Cursor, unprofiled) never delivers that envelope;
+    // leftover consumed=false must not deny cold tools.
+    if (!canInject(wire, "UserPromptSubmit")) return preToolUseAllow();
 
     const toolName = asString(payload.tool_name);
     if (!toolName) return preToolUseAllow();
@@ -1685,12 +1808,38 @@ export function createHookHandlers(
       }
     }
 
-    if (correctionsEnvelope) {
+    let pendingStopText = "";
+    try {
+      const planId = await activePlanIdFromVault(config.vaultPath);
+      const pending = await pendingAttentionForHook({
+        vaultPath: config.vaultPath,
+        subscriberId: config.agentId,
+        planId,
+      });
+      if (pending && planId) {
+        pendingStopText = pending.text;
+        const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
+        if (lastSeq !== undefined) {
+          confirmPendingIfInjects({
+            vaultPath: config.vaultPath,
+            subscriberId: config.agentId,
+            planId,
+            lastSeq,
+            hostId: wire.id,
+            hook: "stop",
+          });
+        }
+      }
+    } catch {
+      // Relay is not SoT.
+    }
+
+    if (correctionsEnvelope || pendingStopText) {
       // Inject is the model-facing channel; append any stop note (receipt /
       // candidates CTA) so both land in one Stop output. Prefer inject over
       // note alone — on Grok both channels work at Stop, but inject is what
-      // carries structured memory.
-      const text = [correctionsEnvelope, result.systemMessage]
+      // carries structured memory. Pending attention rides the same inject.
+      const text = [correctionsEnvelope, pendingStopText, result.systemMessage]
         .filter((part): part is string => Boolean(part && part.trim()))
         .join("\n\n");
       return render(injectIntent("Stop", text));

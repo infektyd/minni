@@ -33,5 +33,14 @@ if ! command -v make >/dev/null 2>&1; then
 fi
 
 echo "[pre-push] running 'make check'…" >&2
-make check
+# Git exports repository-local variables to hooks. Test fixtures create other
+# repositories; inherited GIT_DIR/GIT_COMMON_DIR can redirect their git commands
+# back into this checkout. Clear only Git's documented local environment for
+# the validation subprocess, after selecting this repository and running guards.
+(
+  while IFS= read -r git_local_var; do
+    unset "$git_local_var"
+  done < <(git rev-parse --local-env-vars)
+  make check
+)
 echo "[pre-push] OK" >&2

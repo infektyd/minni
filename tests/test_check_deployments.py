@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "check_deployments.py"
 SOURCE = REPO / "plugins" / "minni"
@@ -55,7 +57,7 @@ def _deployment(home: Path, *, link_dist_to: Path) -> Path:
     root = home / ".config" / "kilo" / "plugins" / "minni"
     root.mkdir(parents=True)
     (root / "dist").symlink_to(link_dist_to)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -329,7 +331,7 @@ def _agents_tree_deployment(home: Path) -> Path:
     """A deployment in the shared agents tree (the D14 live location)."""
     root = home / ".agents" / "plugins" / "minni@minni"
     root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -486,7 +488,7 @@ def test_inactive_wire_version_dist_is_skipped_not_strict_failed(tmp_path):
         json.dumps({"git_sha": "0" * 40, "built_at": "2026-07-01T00:00:00Z"}),
         encoding="utf-8",
     )
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -500,7 +502,7 @@ def test_inactive_wire_version_dist_is_skipped_not_strict_failed(tmp_path):
     if fresh.exists():
         shutil.rmtree(fresh)
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -536,7 +538,7 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -552,6 +554,7 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
             "wires": [{
                 "platform": "claude-code",
                 "install_root": str(fresh),
+                "config_path": str(_write_host_binding(home, fresh, "claude-code")),
                 "wired_at": "2026-08-02T00:00:00Z",
             }],
         }),
@@ -562,7 +565,7 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
         home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0"
     )
     cache_root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -592,7 +595,7 @@ def test_repo_plugin_payload_skipped_when_env_set(tmp_path):
     (root / "plugins").symlink_to(REPO / "plugins")
     payload = root / "src" / "minni" / "plugin_payload"
     payload.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -630,7 +633,7 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -656,7 +659,7 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
         home / ".codex" / "plugins" / "cache" / "minni" / "minni" / "0.2.9"
     )
     codex_cache.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -684,7 +687,7 @@ def test_kilo_plugins_tree_skipped_when_kilocode_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -700,6 +703,7 @@ def test_kilo_plugins_tree_skipped_when_kilocode_wire_active(tmp_path):
             "wires": [{
                 "platform": "kilocode",
                 "install_root": str(fresh),
+                "config_path": str(_write_host_binding(home, fresh, "kilocode")),
                 "wired_at": "2026-08-02T00:00:00Z",
             }],
         }),
@@ -708,7 +712,7 @@ def test_kilo_plugins_tree_skipped_when_kilocode_wire_active(tmp_path):
     # Stale pre-wire kilo plugins tree (would STALE without skip).
     kilo_root = home / ".config" / "kilo" / "plugins" / "minni"
     kilo_root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -733,7 +737,7 @@ def test_kilo_plugins_tree_judged_when_kilocode_not_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -757,7 +761,7 @@ def test_kilo_plugins_tree_judged_when_kilocode_not_wire_active(tmp_path):
     )
     kilo_root = home / ".config" / "kilo" / "plugins" / "minni"
     kilo_root.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -782,7 +786,7 @@ def test_plugin_current_skipped_when_wire_active(tmp_path):
     plugin = home / ".minni" / "plugin"
     fresh = plugin / "0.4.1+git.deadbeef"
     fresh.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -798,6 +802,7 @@ def test_plugin_current_skipped_when_wire_active(tmp_path):
             "wires": [{
                 "platform": "claude-code",
                 "install_root": str(fresh),
+                "config_path": str(_write_host_binding(home, fresh, "claude-code")),
                 "wired_at": "2026-08-02T00:00:00Z",
             }],
         }),
@@ -806,7 +811,7 @@ def test_plugin_current_skipped_when_wire_active(tmp_path):
     # Lagging release current symlink target.
     old = plugin / "0.3.0"
     old.mkdir()
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -835,7 +840,7 @@ def test_empty_wires_skips_all_historical_plugin_dirs(tmp_path):
     plugin = home / ".minni" / "plugin"
     old = plugin / "0.4.0"
     old.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -858,7 +863,7 @@ def test_empty_wires_skips_all_historical_plugin_dirs(tmp_path):
     # clean deploy to report without inventing a wire root.
     cursor = home / ".cursor" / "plugins" / "local" / "minni"
     cursor.mkdir(parents=True)
-    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
                 ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
         src = SOURCE / sub
         if src.is_dir():
@@ -869,3 +874,230 @@ def test_empty_wires_skips_all_historical_plugin_dirs(tmp_path):
     assert "historical version dir" in proc.stdout or "skipped" in proc.stdout, proc.stdout
     assert "STALE" not in proc.stdout, proc.stdout
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+
+
+
+def _write_host_binding(home, root, platform):
+    paths = {
+        "codex": home / ".codex/config.toml",
+        "grok": home / ".grok/config.toml",
+        "claude-code": home / ".claude.json",
+        "kilocode": home / ".config/kilo/kilo.json",
+        "antigravity": home / ".gemini/config/mcp_config.json",
+        "generic": root / ".mcp.json",
+    }
+    config = paths[platform]
+    config.parent.mkdir(parents=True, exist_ok=True)
+    server = str(root / "dist/server.js")
+    if platform in {"codex", "grok"}:
+        config.write_text('[mcp_servers.minni]\ncommand = "node"\nargs = [' + json.dumps(server) + ']\n')
+    elif platform == "kilocode":
+        config.write_text(json.dumps({"mcp": {"minni": {"type": "local", "command": ["node", server], "enabled": True}}}))
+    else:
+        config.write_text(json.dumps({"mcpServers": {"minni": {"command": "node", "args": [server]}}}))
+    return config
+
+
+def _checker():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_checker_bindings", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _wire_home(tmp_path, platform="codex"):
+    home = tmp_path / "home"
+    root = home / ".minni/plugin/current-version"
+    (root / "dist").mkdir(parents=True)
+    (root / "dist/server.js").write_text("// fixture server\n")
+    (root / "payload-manifest.json").write_text('{"version":"test"}')
+    config = _write_host_binding(home, root, platform)
+    record = {"platform": platform, "install_root": str(root), "config_path": str(config), "wired_at": "2026-09-04T00:00:00Z"}
+    (root.parent / "wired.json").write_text(json.dumps({"wires": [record]}))
+    return home, root, config
+
+
+@pytest.mark.parametrize("platform", ["codex", "grok", "claude-code", "kilocode", "antigravity", "generic"])
+def test_recorded_host_binding_passes_for_wire_adapter_shapes(tmp_path, platform):
+    home, root, config = _wire_home(tmp_path, platform)
+    before = config.read_bytes()
+    problems, notes = _checker().check_wire_launch_bindings(home)
+    assert problems == []
+    assert notes == []
+    assert config.read_bytes() == before
+
+
+@pytest.mark.parametrize("platform", ["codex", "grok", "claude-code", "kilocode", "antigravity", "generic"])
+def test_recorded_host_binding_rejects_different_existing_server(tmp_path, platform):
+    home, root, config = _wire_home(tmp_path, platform)
+    other = home / "old/dist/server.js"
+    other.parent.mkdir(parents=True)
+    other.write_text("// existing old server\n")
+    config.write_text(config.read_text().replace(str(root / "dist/server.js"), str(other)))
+    problems, _notes = _checker().check_wire_launch_bindings(home)
+    assert problems == [f"{platform}: host MCP server differs from recorded install_root"]
+
+
+@pytest.mark.parametrize("change", ["missing", "malformed", "disabled", "wrong-command", "missing-entry", "relative-server"])
+def test_host_binding_failure_reports_no_config_contents(tmp_path, change):
+    home, root, config = _wire_home(tmp_path)
+    secret = "DO-NOT-PRINT-CONFIG-SECRET"
+    if change == "missing":
+        config.unlink()
+    elif change == "malformed":
+        config.write_text('[mcp_servers.minni]\npassword = "' + secret + '\n')
+    elif change == "disabled":
+        config.write_text(config.read_text() + 'enabled = false\npassword = "' + secret + '"\n')
+    elif change == "wrong-command":
+        config.write_text(config.read_text().replace('"node"', json.dumps(secret)))
+    elif change == "missing-entry":
+        config.write_text('password = "' + secret + '"\n')
+    elif change == "relative-server":
+        config.write_text(config.read_text().replace(str(root / "dist/server.js"), secret + '/server.js'))
+    problems, notes = _checker().check_wire_launch_bindings(home)
+    assert problems
+    assert secret not in repr(problems + notes)
+
+
+def test_missing_recorded_config_path_fails_and_unsupported_platform_is_not_claimed(tmp_path):
+    home, root, config = _wire_home(tmp_path)
+    wired = root.parent / "wired.json"
+    data = json.loads(wired.read_text())
+    del data["wires"][0]["config_path"]
+    wired.write_text(json.dumps(data))
+    assert "no recorded config_path" in _checker().check_wire_launch_bindings(home)[0][0]
+    data["wires"][0]["platform"] = "future-host"
+    wired.write_text(json.dumps(data))
+    problems, notes = _checker().check_wire_launch_bindings(home)
+    assert problems == []
+    assert any("unsupported platform" in note for note in notes)
+
+
+def test_antigravity_wrapper_binding_is_checked(tmp_path):
+    home, root, config = _wire_home(tmp_path, "antigravity")
+    wrapper = home / ".agents/bin/mcp-env-run"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\nexec node \"$@\"\n")
+    config.write_text(json.dumps({"mcpServers": {"minni": {
+        "command": str(wrapper), "args": ["node", str(root / "dist/server.js")],
+    }}}))
+    assert _checker().check_wire_launch_bindings(home)[0] == []
+    wrapper.unlink()
+    assert "wrapper path" in _checker().check_wire_launch_bindings(home)[0][0]
+
+
+def test_shared_root_checks_each_active_hosts_own_config(tmp_path):
+    home, root, codex = _wire_home(tmp_path, "codex")
+    claude = _write_host_binding(home, root, "claude-code")
+    wired = root.parent / "wired.json"
+    data = json.loads(wired.read_text())
+    data["wires"].append({"platform": "claude-code", "install_root": str(root), "config_path": str(claude), "wired_at": "2026-09-04T00:00:00Z"})
+    wired.write_text(json.dumps(data))
+    codex.write_text(codex.read_text().replace(str(root / "dist/server.js"), str(home / "wrong/server.js")))
+    problems, notes = _checker().check_wire_launch_bindings(home)
+    assert len(problems) == 1 and problems[0].startswith("codex:")
+    assert notes == []
+
+
+def test_dirty_build_cannot_pass_matching_head(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    _artifact_dist(root)
+    manifest = root / "dist/build-manifest.json"
+    data = json.loads(manifest.read_text())
+    data["git_dirty"] = True
+    manifest.write_text(json.dumps(data))
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1
+    assert "DIRTY" in proc.stdout
+    assert "1 dirty build(s)" in proc.stdout
+
+
+def test_dirty_source_fails_even_when_build_head_matches(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _isolated_repo_root(tmp_path)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "plugins"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"], check=True)
+    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    _artifact_dist(root, git_sha=head)
+    assert _run("--strict", home=home, repo_root=repo).returncode == 0
+    (repo / "uncommitted.txt").write_text("not in HEAD")
+    proc = _run("--strict", home=home, repo_root=repo)
+    assert proc.returncode == 1
+    assert "SOURCE DIRTY" in proc.stdout
+
+
+def test_host_mismatch_fails_strict_with_matching_plugin_artifacts(tmp_path):
+    home, root, config = _wire_home(tmp_path, "codex")
+    for sub in ("frontend", "hooks", "commands", "skills", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        _copytree(SOURCE / sub, root / sub)
+    _artifact_dist(root)
+    repo = _isolated_repo_root(tmp_path)
+    assert _run("--strict", home=home, repo_root=repo).returncode == 0
+    config.write_text(config.read_text().replace(str(root / "dist/server.js"), str(home / "different/server.js")))
+    proc = _run("--strict", home=home, repo_root=repo)
+    assert proc.returncode == 1
+    assert "HOSTCONFIG" in proc.stdout
+    assert "host MCP server differs" in proc.stdout
+
+
+@pytest.mark.parametrize("missing", ["directory", "manifest"])
+def test_extant_host_cannot_hide_broken_recorded_payload(tmp_path, missing):
+    import shutil
+    home, root, config = _wire_home(tmp_path)
+    if missing == "directory":
+        shutil.rmtree(root)
+    else:
+        (root / "payload-manifest.json").unlink()
+    assert config.is_file(), "the host still points at its recorded install"
+    problems, notes = _checker().check_wire_launch_bindings(home)
+    assert len(problems) == 1
+    assert "directory is missing" in problems[0] if missing == "directory" else "no payload manifest" in problems[0]
+    assert notes == []
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1
+    assert "HOSTCONFIG" in proc.stdout
+
+
+def test_latest_broken_record_does_not_fall_back_to_older_valid_payload(tmp_path):
+    home, root, config = _wire_home(tmp_path)
+    wired = root.parent / "wired.json"
+    data = json.loads(wired.read_text())
+    latest = {**data["wires"][0], "install_root": str(root.parent / "missing"),
+              "wired_at": "2026-09-05T00:00:00Z"}
+    data["wires"].append(latest)
+    wired.write_text(json.dumps(data))
+    problems, notes = _checker().check_wire_launch_bindings(home)
+    assert problems == ["codex: recorded install_root directory is missing"]
+    assert notes == []
+
+
+def test_retired_host_does_not_reactivate_broken_payload(tmp_path):
+    import shutil
+    home, root, config = _wire_home(tmp_path)
+    shutil.rmtree(config.parent)
+    shutil.rmtree(root)
+    problems, notes = _checker().check_wire_launch_bindings(home)
+    assert problems == []
+    assert any("host config root removed" in note for note in notes)
+
+
+@pytest.mark.parametrize("damage", ["missing", "drifted"])
+def test_installed_frontend_damage_fails_strict(tmp_path, damage):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    _artifact_dist(root)
+    script = root / "frontend/app.js"
+    if damage == "missing":
+        script.unlink()
+    else:
+        script.write_text("stale frontend")
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1
+    assert "frontend/app.js" in proc.stdout

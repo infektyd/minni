@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -46,14 +48,15 @@ import {
   findPlanNote,
   persistPlan,
   PlanDigestVersionError,
+  PlanHistoryAppendError,
   rehydratePlan,
   rehydratePlanScalars,
   replan,
   shelfDrift,
-  updateSlice,
   unmetDependencies,
   diffDependsOn,
   diffSupersededDependencies,
+  landedReplanTopology,
   applySliceDelta,
   readHistory,
   getRevision,
@@ -63,6 +66,7 @@ import {
   clearActivePlan,
   getActivePlan,
   resolvePlanIdOrActive,
+  journalPathFor,
   type PlanArtifact,
 } from "./plan.js";
 import {
@@ -86,6 +90,37 @@ import {
   listAgentPingInbox,
 } from "./agent_ping.js";
 import { planHandoffDelivery } from "./handoff_guard.js";
+import {
+  applyOrchestratorSliceUpdate,
+  assignSlice,
+  claimIds,
+  claimSlice,
+  deleteClaimSecretsBestEffort,
+  drainPendingWorkerWritesForVault,
+  pruneSliceReceiptsAfterPlanMutation,
+  pruneSliceReceiptsOnGenerationAdvance,
+  prepareThreadMutation,
+  readyIds,
+  readySlices,
+  recordThreadMutationEvents,
+  revokedClaimIds,
+  synchronizeExpiredClaimsAndReadReady,
+  synchronizeExpiredClaims,
+  MAX_THREAD_CLAIM_TTL_SECONDS,
+  threadWorkerErrorText,
+  updateClaimedSlice,
+  workerUpdateMcpPayload,
+  withThreadPlanLock,
+  type WorkerUpdateAction,
+} from "./thread-worker.js";
+import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
+import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
+import {
+  drainStatusForModel,
+  modelListCandidatesPayload,
+  modelSharedGatePayload,
+  redactLocalValue,
+} from "./list-candidates-model.js";
 
 // #339: searchVaultNotes reads/scores/snippets every markdown file in the
 // vault's wiki tree regardless of `limit` — the limit is a post-scoring
@@ -116,12 +151,12 @@ async function requireSharedGate(
   if (data?.status === "recovery_required") {
     return textResult(
       JSON.stringify(
-        {
+        modelSharedGatePayload({
           status: "gate-rejected",
           operation,
           reason: data.reason ?? "recovery_required",
           gate: data,
-        },
+        }),
         null,
         2,
       ),
@@ -132,11 +167,11 @@ async function requireSharedGate(
   if (isSharedGateUnavailable(error)) {
     return textResult(
       JSON.stringify(
-        {
+        modelSharedGatePayload({
           status: "gate-unavailable",
           operation,
           error,
-        },
+        }),
         null,
         2,
       ),
@@ -144,10 +179,67 @@ async function requireSharedGate(
   }
   return textResult(
     JSON.stringify(
-      {
+      modelSharedGatePayload({
         status: "gate-rejected",
         operation,
         gate,
+      }),
+      null,
+      2,
+    ),
+  );
+}
+
+// Task 6: every minni_thread_{ready,assign,claim,worker_update,events} handler
+// and the orchestrator mutation tools (update/scar/replan) funnel journal
+// and thread-worker failures through here instead of letting a thrown error
+// become a raw JSON-RPC transport error. Only `.message` and a typed `.code`
+// (ThreadInconsistentError, ThreadEventIdempotencyConflictError,
+// PlanHistoryAppendError, ...) are ever read off the error — never the whole
+// object. PlanHistoryAppendError.notePath and PlanDigestVersionError.notePath
+// stay typed internal fields; threadWorkerErrorText rebuilds those cases
+// from rev + cause.code / version only, never notePath / history file /
+// cause.message. Raw Node EISDIR/EACCES from prepareThreadMutation /
+// appendJournal / appendJournalLine is rebuilt from the syscall code.
+async function persistPlanThenRevokeClaimSecrets(
+  plan: PlanArtifact,
+  opts: { vaultPath: string; notePath: string },
+  planId: string,
+  claimIdsToDelete: Iterable<string>,
+): Promise<void> {
+  try {
+    await persistPlan(plan, opts);
+  } catch (error) {
+    // Same contract as assign/complete: a typed history-append failure
+    // means the note write already landed. Any revoked claim envelope is
+    // an orphan and must go even though this error is rethrown.
+    if (error instanceof PlanHistoryAppendError) {
+      await deleteClaimSecretsBestEffort(
+        opts.vaultPath,
+        planId,
+        claimIdsToDelete,
+      );
+    }
+    throw error;
+  }
+  await deleteClaimSecretsBestEffort(opts.vaultPath, planId, claimIdsToDelete);
+}
+
+function threadWorkerErrorResult(
+  operation: string,
+  error: unknown,
+): ReturnType<typeof textResult> {
+  const message = threadWorkerErrorText(error);
+  const errorCode =
+    error instanceof Error ? (error as unknown as { code?: unknown }).code : undefined;
+  const code = typeof errorCode === "string" ? errorCode : undefined;
+  return textResult(
+    JSON.stringify(
+      {
+        status: "error",
+        operation,
+        error: message,
+        ...(code ? { code } : {}),
       },
       null,
       2,
@@ -163,7 +255,7 @@ export { MINNI_INSTRUCTIONS };
 const server = new McpServer(
   {
     name: "minni",
-    version: "0.1.0",
+    version: JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version,
   },
   { instructions: MINNI_INSTRUCTIONS },
 );
@@ -317,9 +409,10 @@ server.registerTool(
   {
     title: "Minni Team Runtime",
     description:
-      "Build a deterministic temporary team runtime: agent profiles, task ledger, hydration packets, gates, and non-goals. Does not spawn agents or write durable learnings.",
+      "Project a vault Thread as a Team packet: plan_id, rev, and ready slices after the expiry sweep. Absent plan_id creates one Thread. Does not spawn, claim, assign, or write durable learnings.",
     inputSchema: {
       task: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       agents: z.array(teamAgentSchema).optional(),
       // G11: coordinatorAgentId removed from the model-facing schema (model no
       // longer supplies the coordinator identity). A caller-supplied name would
@@ -336,6 +429,7 @@ server.registerTool(
   },
   async ({
     task,
+    plan_id,
     agents,
     workspaceId,
     profile,
@@ -346,10 +440,13 @@ server.registerTool(
     const gated = await requireSharedGate("team.runtime", {
       agents: agents?.length ?? 0,
       coordinatorAgentId: DEFAULT_AGENT_ID,
+      plan_id,
     });
     if (gated) return gated;
-    const packet = await buildTeamRuntime({
+    try {
+      const packet = await buildTeamRuntime({
       task,
+      plan_id,
       agents,
       coordinatorAgentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies coordinator identity)
       workspaceId,
@@ -359,7 +456,10 @@ server.registerTool(
       includeVault,
       useAfm,
     });
-    return textResult(JSON.stringify(packet, null, 2));
+      return textResult(JSON.stringify(packet, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("team.runtime", error);
+    }
   },
 );
 
@@ -756,12 +856,43 @@ server.registerTool(
 
 // G15 / RCM-009 "THREE places" literal match: (1) this TS handler surface (no agentId in schema), (2) sovrd._resolve_candidate (does resolve_effective_principal + is_operator_principal check + -32004), (3) principal resolver + is_operator_principal itself.
 // Enforcement delegated to daemon RPC (correct per design); explicit comment here documents the surface for plan fidelity. Model cannot spoof operator.
+// List is the missing half of the drain pair: hosts (Cursor included) stage via
+// minni_learn but could not see their own candidate_id without this tool.
+server.registerTool(
+  "minni_list_candidates",
+  {
+    title: "Minni List Candidates",
+    description:
+      "List staged learning candidates for this runtime principal (own rows only). Defaults to status=proposed (the drain queue). Only proposed packet content is returned.",
+    inputSchema: {
+      status: z.enum(["proposed"]).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+      // G11: no caller-controlled identity. Server stamps DEFAULT_AGENT_ID; daemon list_candidates filters WHERE principal=stamped.
+    },
+  },
+  async ({ status, limit }) => {
+    const gated = await requireSharedGate("candidates.list", { status, limit });
+    if (gated) return gated;
+    const drainStatus = drainStatusForModel(status);
+    // Schema pins status to z.enum(["proposed"]), so drainStatus is always
+    // "proposed" here — no hidden-status branch (it could never fire).
+    // Non-proposed rows are still filtered inside modelListCandidatesPayload.
+    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
+      status: drainStatus,
+      ...(limit != null ? { limit } : {}),
+      agent_id: DEFAULT_AGENT_ID,
+    });
+    return textResult(JSON.stringify(modelListCandidatesPayload(rpc, drainStatus), null, 2));
+  },
+);
+
 server.registerTool(
   "minni_resolve_candidate",
   {
     title: "Minni Resolve Candidate",
     description:
-      "Resolve a staged candidate (accept→durable learn, reject, redact, merge, etc.). Operator-only via principal gating. Privacy/expiry/scope marking decisions are not yet implemented and were removed from this surface — see issue #123.",
+      "Resolve a staged candidate (accept→durable learn, reject, redact, merge, etc.). Owner may resolve own rows; accept into durable memory still requires operator/govern. Cross-principal resolve requires an explicit resolve_candidate/govern grant. Privacy/expiry/scope marking decisions are not yet implemented and were removed from this surface — see issue #123.",
     inputSchema: {
       candidate_id: z.number().int(),
       decision: z.enum([
@@ -781,7 +912,7 @@ server.registerTool(
   async ({ candidate_id, decision, reason }) => {
     const gated = await requireSharedGate("candidates.resolve", { candidate_id, decision });
     if (gated) return gated;
-    // Delegate to daemon RPC (will enforce operator principal on server)
+    // Delegate to daemon RPC (owner-or-explicit-operator inside the transaction)
     const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
     const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
       candidate_id,
@@ -789,7 +920,7 @@ server.registerTool(
       reason: reason || "",
       agent_id: DEFAULT_AGENT_ID,
     });
-    return textResult(JSON.stringify(rpc, null, 2));
+    return textResult(JSON.stringify(redactLocalValue(rpc), null, 2));
   },
 );
 
@@ -1321,19 +1452,26 @@ async function resolvePlanTarget(
   | { ok: true; plan_id: string; notePath: string }
   | { ok: false; result: ReturnType<typeof textResult> }
 > {
-  const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput);
-  if ("error" in resolved) {
-    return { ok: false, result: textResult(JSON.stringify({ error: resolved.error }, null, 2)) };
+  try {
+    const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput);
+    if ("error" in resolved) {
+      return { ok: false, result: textResult(JSON.stringify({ error: resolved.error }, null, 2)) };
+    }
+    const plan_id = resolved.plan_id;
+    const notePath = await findPlanNote(DEFAULT_VAULT_PATH, plan_id);
+    if (!notePath) {
+      return {
+        ok: false,
+        result: textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2)),
+      };
+    }
+    return { ok: true, plan_id, notePath };
+  } catch (error) {
+    // findPlanNote is fail-closed per file, but any remaining throw (or a
+    // resolvePlanIdOrActive I/O error) must not escape as a path-bearing
+    // JSON-RPC / MCP transport error.
+    return { ok: false, result: textResult(JSON.stringify({ error: threadWorkerErrorText(error) }, null, 2)) };
   }
-  const plan_id = resolved.plan_id;
-  const notePath = await findPlanNote(DEFAULT_VAULT_PATH, plan_id);
-  if (!notePath) {
-    return {
-      ok: false,
-      result: textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2)),
-    };
-  }
-  return { ok: true, plan_id, notePath };
 }
 
 server.registerTool(
@@ -1359,73 +1497,158 @@ server.registerTool(
     // itself is made with the override visible.
     const gated = await requireSharedGate("plan.update", { plan_id: planIdInput, slice_id, status, force, force_reason });
     if (gated) return gated;
+    try {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
-    const targetSlice = plan.slices.find((s) => s.id === slice_id);
-    const from = targetSlice?.status ?? ("pending" as const);
-    // #291: compute against the PRE-update plan — this is the only point
-    // that still has "what was unmet" available; updateSlice is pure and
-    // does no I/O, so it cannot journal the override itself.
-    const unmetBeforeUpdate = status === "done" ? unmetDependencies(plan, slice_id) : [];
-    const next = updateSlice(plan, slice_id, status, evidence, { force, forceReason: force_reason });
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    // #291 round-1 cassandra finding 5: a force override past an unmet
-    // depends_on gate must never be silent. updateSlice already refuses to
-    // force without a force reason, so reaching here with
-    // unmetBeforeUpdate non-empty means the transition succeeded only
-    // because force+force_reason were both supplied. This used to be a
-    // SECOND appendJournal call after status_changed — reproduced with a
-    // mutant, but also true in the unmutated code: a crash between the two
-    // writes left "done" durable with no override record at all. Folded
-    // into the single status_changed write instead, so the override record
-    // can never be missing from the journal ENTRY that describes the
-    // transition (journal-vs-journal atomicity). This does NOT close the
-    // window between persistPlan (above) and this appendJournal call —
-    // round-2 cassandra finding MEDIUM-5 caught an earlier version of this
-    // comment overclaiming that it did. A crash in that window still
-    // leaves "done" durable in the vault note with no journal entry at
-    // all (state-vs-journal), the same pre-existing property every other
-    // status_changed write in this handler already has — not new to
-    // #291, and closing it is a separate, larger durability design
-    // (journal-before-persist + reconciliation on rehydrate), out of scope
-    // here. Who: server-stamped DEFAULT_AGENT_ID (G11 pattern elsewhere in
-    // this file — the model cannot spoof this).
-    await appendJournal(journalPath, {
-      kind: "status_changed",
-      slice_id,
-      from,
-      to: status,
-      evidence,
-      at: new Date().toISOString(),
-      ...(unmetBeforeUpdate.length > 0
-        ? { depends_on_override: { unmet: unmetBeforeUpdate, reason: force_reason, forced_by: DEFAULT_AGENT_ID } }
-        : {}),
-    });
-    if (status === "done" && targetSlice && targetSlice.gate && targetSlice.gate.trim()) {
-      await appendJournal(journalPath, {
-        kind: "gate_passed",
-        slice_id,
-        evidence: evidence ?? "",
-        at: new Date().toISOString(),
-      });
-    }
-    // P10: if updateSlice moved the plan to a terminal status (all slices resolved), clear the
-    // active pointer when it still points at this plan, so a finished plan stops being injected.
-    // H6: model-driven completion lands in "complete" (not "accepted").
-    if (next.status === "complete" || next.status === "accepted") {
-      try {
-        const active = await getActivePlan(effectiveVaultPath);
-        if (active && active.plan_id === plan_id) {
-          await clearActivePlan(effectiveVaultPath);
+    const next = await withThreadPlanLock(
+      {
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        operationId: `server-status-update:${randomUUID()}`,
+      },
+      async (plan) => {
+        const now = new Date();
+        const targetSlice = plan.slices.find((s) => s.id === slice_id);
+        const from = targetSlice?.status ?? ("pending" as const);
+        // #291: compute against the PRE-update plan — this is the only point
+        // that still has "what was unmet" available.
+        const unmetBeforeUpdate = status === "done"
+          ? unmetDependencies(plan, slice_id)
+          : [];
+        const readyBefore = readyIds(plan, now);
+        const { journalPath, ordered } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          plan,
+          now,
+        );
+        const applied = applyOrchestratorSliceUpdate(
+          plan,
+          slice_id,
+          status,
+          evidence,
+          { force, forceReason: force_reason },
+        );
+        const updated = applied.plan;
+        try {
+          await persistPlanThenRevokeClaimSecrets(
+            updated,
+            { vaultPath: effectiveVaultPath, notePath },
+            plan_id,
+            applied.revoked_claim_id ? [applied.revoked_claim_id] : [],
+          );
+        } catch (error) {
+          if (error instanceof PlanHistoryAppendError && applied.revoked_claim_id) {
+            await pruneSliceReceiptsOnGenerationAdvance(
+              effectiveVaultPath,
+              plan_id,
+              slice_id,
+              applied.previous_slice.generation ?? 0,
+            );
+          }
+          throw error;
         }
-      } catch {
-        // active pointer maintenance is advisory; never fail the update on it
-      }
-    }
+        if (applied.revoked_claim_id) {
+          await pruneSliceReceiptsOnGenerationAdvance(
+            effectiveVaultPath,
+            plan_id,
+            slice_id,
+            applied.previous_slice.generation ?? 0,
+          );
+        }
+        // #291: keep the dependency override in the same status event.
+        // Legacy appendJournal line and frozen history behavior unchanged.
+        await appendJournal(journalPath, {
+          kind: "status_changed",
+          slice_id,
+          from,
+          to: status,
+          evidence,
+          at: now.toISOString(),
+          ...(unmetBeforeUpdate.length > 0
+            ? {
+                depends_on_override: {
+                  unmet: unmetBeforeUpdate,
+                  reason: force_reason,
+                  forced_by: DEFAULT_AGENT_ID,
+                },
+              }
+            : {}),
+        });
+        if (
+          status === "done" &&
+          targetSlice &&
+          targetSlice.gate &&
+          targetSlice.gate.trim()
+        ) {
+          await appendJournal(journalPath, {
+            kind: "gate_passed",
+            slice_id,
+            evidence: evidence ?? "",
+            at: now.toISOString(),
+          });
+        }
+        // Ordered mirror, after persistence: safe payload only (from/to
+        // status enum values — never the freeform evidence string). Stable
+        // derived idempotency key (plan/slice/resulting rev) rather than a
+        // client-supplied one — this tool has no idempotency_key input.
+        const supplemental: Array<{
+          idempotencyKey: string;
+          kind: string;
+          sliceId?: string;
+          payload?: Record<string, unknown>;
+        }> = [];
+        if (applied.revoked_claim_id) {
+          supplemental.push({
+            idempotencyKey: deriveSystemEventKey(
+              "slice.claim_revoked",
+              plan_id,
+              slice_id,
+              String(updated.rev),
+            ),
+            kind: "slice.claim_revoked",
+            sliceId: slice_id,
+            payload: { slice_id },
+          });
+        }
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: updated.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: deriveSystemEventKey(
+            "status_changed",
+            plan_id,
+            slice_id,
+            String(updated.rev),
+          ),
+          kind: "status_changed",
+          sliceId: slice_id,
+          payload: { from, to: status },
+          readyBefore,
+          readyAfter: readyIds(updated, now),
+          plan: updated,
+          planBefore: plan,
+          now,
+          orderedSnapshot: ordered,
+          supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
+        });
+        // P10/H6: terminal plans stop being injected.
+        if (updated.status === "complete" || updated.status === "accepted") {
+          try {
+            const active = await getActivePlan(effectiveVaultPath);
+            if (active && active.plan_id === plan_id) {
+              await clearActivePlan(effectiveVaultPath);
+            }
+          } catch {
+            // active pointer maintenance is advisory
+          }
+        }
+        return updated;
+      },
+    );
     // P3: lead the response with plan-level progress so closing one slice is never misread as
     // closing the whole plan.
     const view = compactPlanView(next);
@@ -1436,6 +1659,9 @@ server.registerTool(
         2,
       ),
     );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.update", error);
+    }
   },
 );
 
@@ -1455,20 +1681,63 @@ server.registerTool(
   async ({ plan_id: planIdInput, kind, signal, resolution }) => {
     const gated = await requireSharedGate("plan.scar", { plan_id: planIdInput, kind });
     if (gated) return gated;
+    try {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
-    const next = addScar(plan, { kind, signal, resolution });
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    await appendJournal(journalPath, {
-      kind: "scar_added",
-      signal,
-      at: new Date().toISOString(),
-    });
+    const next = await withThreadPlanLock(
+      {
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        operationId: `server-scar:${randomUUID()}`,
+      },
+      async (plan) => {
+        const now = new Date();
+        const readyBefore = readyIds(plan, now);
+        const { journalPath, ordered } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          plan,
+          now,
+        );
+        const updated = addScar(plan, { kind, signal, resolution });
+        await persistPlan(updated, {
+          vaultPath: effectiveVaultPath,
+          notePath,
+        });
+        // Legacy appendJournal line unchanged.
+        await appendJournal(journalPath, {
+          kind: "scar_added",
+          signal,
+          at: now.toISOString(),
+        });
+        // Ordered mirror: only the scar KIND (an enum), never the freeform
+        // signal/resolution text. addScar never changes slice status or
+        // dependencies, so the ready set is provably unchanged here and
+        // recordThreadMutationEvents's own before/after equality check
+        // never emits a ready.changed for a scar — no special-casing needed.
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: updated.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: deriveSystemEventKey("scar_added", plan_id, String(updated.rev)),
+          kind: "scar_added",
+          payload: { kind },
+          readyBefore,
+          readyAfter: readyIds(updated, now),
+          plan: updated,
+          now,
+          orderedSnapshot: ordered,
+        });
+        return updated;
+      },
+    );
     return textResult(JSON.stringify(next, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.scar", error);
+    }
   },
 );
 
@@ -1487,19 +1756,30 @@ server.registerTool(
     const gated = await requireSharedGate("plan.status", { plan_id: planIdInput });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const target = await resolvePlanTarget(planIdInput);
-    if (!target.ok) return target.result;
-    const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
-    const view = compactPlanView(plan);
-    const drift = live_shelf_content
-      ? shelfDrift(plan, live_shelf_content)
-      : undefined;
-    const activePointer = await getActivePlan(effectiveVaultPath);
-    const active = activePointer?.plan_id === plan_id;
-    return textResult(
-      JSON.stringify({ view, drift, status: plan.status, rev: plan.rev, active }, null, 2),
-    );
+    try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
+      // Same locked expiry sweep ready/claim already use — a status poll must
+      // not leave a dead claim looking live for an orchestrator that skips ready.
+      const { plan } = await synchronizeExpiredClaims({
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        actor: DEFAULT_AGENT_ID,
+      });
+      const activePointer = await getActivePlan(effectiveVaultPath);
+      const active = activePointer?.plan_id === plan_id;
+      const view = compactPlanView(plan);
+      const drift = live_shelf_content
+        ? shelfDrift(plan, live_shelf_content)
+        : undefined;
+      return textResult(
+        JSON.stringify({ view, drift, status: plan.status, rev: plan.rev, active }, null, 2),
+      );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.status", error);
+    }
   },
 );
 
@@ -1508,15 +1788,24 @@ server.registerTool(
   {
     title: "Minni Thread Replan",
     description:
-      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan.",
+      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan. Worker propose_structure does not apply. Orch apply is add/drop, not a kind enum: expand = add_slices only (proposer stays); split = drop_slice_ids of the claimed parent + add_slices children (no parent-id reuse; dependents of the replaced parent stay blocked until orch remounts named depends_on onto the children via set_depends_on — unnamed live slices stay; remount targets must exist, not be superseded, and must not be the remounted slice); contract = drop_slice_ids only (drop-without-replacement still unblocks dependents). Remount-only set_depends_on is valid without new_slices. new_slices/add_slices fail closed if a slice depends_on includes its own id. Drop supersedes; it never deletes.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       new_slices: z.array(planSliceInputSchema).optional(),
       add_slices: z.array(planSliceInputSchema).optional(),
       drop_slice_ids: z.array(z.string()).optional(),
+      set_depends_on: z
+        .array(
+          z.object({
+            slice_id: z.string().min(1),
+            depends_on: z.array(z.string()),
+          }),
+        )
+        .min(1)
+        .optional(),
     },
   },
-  async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids }) => {
+  async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids, set_depends_on }) => {
     // #291 round-2 cassandra finding LOW-8: replan is now capable of
     // silently satisfying a dependency via supersession (see
     // diffSupersededDependencies below) — the shared-gate approval decision
@@ -1534,20 +1823,44 @@ server.registerTool(
       drop_slice_ids,
     });
     if (gated) return gated;
+    try {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
-    const plan = await rehydratePlan(notePath);
-    let next: PlanArtifact;
-    if (add_slices || drop_slice_ids) {
-      next = applySliceDelta(plan, { add_slices, drop_slice_ids });
-    } else {
-      if (!new_slices) {
-        return textResult(JSON.stringify({ error: "Either new_slices or add_slices/drop_slice_ids must be provided" }, null, 2));
-      }
-      next = replan(plan, new_slices);
+    if (new_slices && set_depends_on) {
+      return textResult(JSON.stringify({
+        error: "Cannot mix new_slices with set_depends_on; remount named depends_on as an edge edit, or send a full-set new_slices rewrite",
+      }, null, 2));
     }
+    if (!new_slices && !add_slices && !drop_slice_ids && !set_depends_on) {
+      return textResult(JSON.stringify({
+        error: "Either new_slices, add_slices/drop_slice_ids, or set_depends_on must be provided",
+      }, null, 2));
+    }
+    const replanOperationId = `server-replan:${randomUUID()}`;
+    const next = await withExclusiveReplanReservation(
+      effectiveVaultPath,
+      plan_id,
+      replanOperationId,
+      () => withThreadPlanLock(
+      {
+        vaultPath: effectiveVaultPath,
+        notePath,
+        planId: plan_id,
+        operationId: replanOperationId,
+      },
+      async (plan) => {
+        const now = new Date();
+        const readyBefore = readyIds(plan, now);
+        const { journalPath, ordered } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          plan,
+          now,
+        );
+        const updated = add_slices || drop_slice_ids || set_depends_on
+          ? applySliceDelta(plan, { add_slices, drop_slice_ids, set_depends_on })
+          : replan(plan, new_slices!);
     // #291 round-1 cassandra finding 1 (HIGH, confirmed by independent
     // reproduction against the real compiled server): replan()'s `??` on
     // depends_on only guards null/undefined, not `[]` — a caller can wipe
@@ -1557,27 +1870,110 @@ server.registerTool(
     // plan; hard-blocking dependency edits themselves is a separate, larger
     // design decision outside this fix's brief) — it makes the edit visible
     // instead of silent, which is the actual invariant #291 requires.
-    const dependsOnChanged = diffDependsOn(plan, next);
+    const dependsOnChanged = diffDependsOn(plan, updated);
     // #291 round-2 cassandra finding HIGH-1 (confirmed by independent
     // reproduction before trusting the review): diffDependsOn alone missed
     // the ordinary, cheaper way to satisfy a dependency for free — omitting
     // the dependency slice from new_slices (or listing it in
-    // drop_slice_ids) supersedes it, and unmetDependencies already treats
-    // superseded as resolved. That path produced zero journal trail before
+    // drop_slice_ids) supersedes it, and unmetDependencies treats plain
+    // superseded (drop-without-replacement) as resolved. Exclusive split
+    // (drop+add) stamps replaced_by so dependents stay blocked until orch
+    // remounts named depends_on. That path produced zero journal trail before
     // this. Journaled here, not blocked: replan's purpose is restructuring
     // the plan, and hard-gating supersession itself is a separate, larger
     // design decision outside this fix's brief (see diffSupersededDependencies'
     // docstring).
-    const dependsOnSuperseded = diffSupersededDependencies(plan, next);
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    await appendJournal(journalPath, {
-      kind: "replan",
-      at: new Date().toISOString(),
-      ...(dependsOnChanged.length > 0 ? { depends_on_changed: dependsOnChanged } : {}),
-      ...(dependsOnSuperseded.length > 0 ? { depends_on_superseded: dependsOnSuperseded } : {}),
-    });
+        const dependsOnSuperseded = diffSupersededDependencies(plan, updated);
+        // Landed add/drop from before→after so new_slices full-set replan
+        // (and add/drop MCP args) both put topology on the journal. Named
+        // remount is set_depends_on (edge edit); omitted live ids stay and
+        // journal via depends_on_changed, not add/drop. Never claim tokens.
+        const landedTopology = landedReplanTopology(plan, updated);
+        const revokedClaimIdList = revokedClaimIds(plan, updated);
+        await persistPlanThenRevokeClaimSecrets(
+          updated,
+          { vaultPath: effectiveVaultPath, notePath },
+          plan_id,
+          revokedClaimIdList,
+        );
+        await pruneSliceReceiptsAfterPlanMutation(
+          effectiveVaultPath,
+          plan_id,
+          plan,
+          updated,
+        );
+        // Legacy appendJournal: include landed add/drop so both journals
+        // agree that replan apply carried the topology delta that landed.
+        // Landed ids from before→after — applySliceDelta may generate ids
+        // when callers omit them; new_slices full-set replan has no MCP
+        // add/drop args to echo.
+        await appendJournal(journalPath, {
+          kind: "replan",
+          at: now.toISOString(),
+          ...(dependsOnChanged.length > 0
+            ? { depends_on_changed: dependsOnChanged }
+            : {}),
+          ...(dependsOnSuperseded.length > 0
+            ? { depends_on_superseded: dependsOnSuperseded }
+            : {}),
+          ...(landedTopology.add_slices
+            ? { add_slices: landedTopology.add_slices }
+            : {}),
+          ...(landedTopology.drop_slice_ids
+            ? { drop_slice_ids: landedTopology.drop_slice_ids }
+            : {}),
+        });
+        // Ordered mirror: carry the add/drop that landed (never claim
+        // tokens). Coalesces ready.changed when supersession or a
+        // depends_on edit frees or blocks a dependent.
+        const replanPayload: Record<string, unknown> = {};
+        if (dependsOnChanged.length > 0) replanPayload.depends_on_changed = dependsOnChanged;
+        if (dependsOnSuperseded.length > 0) replanPayload.depends_on_superseded = dependsOnSuperseded;
+        if (landedTopology.add_slices) replanPayload.add_slices = landedTopology.add_slices;
+        if (landedTopology.drop_slice_ids) {
+          replanPayload.drop_slice_ids = landedTopology.drop_slice_ids;
+        }
+        const replanSupplemental = plan.slices
+          .filter(
+            (slice) =>
+              slice.claim &&
+              revokedClaimIdList.includes(slice.claim.claim_id),
+          )
+          .map((slice) => ({
+            idempotencyKey: deriveSystemEventKey(
+              "slice.claim_revoked",
+              plan_id,
+              slice.id,
+              String(updated.rev),
+            ),
+            kind: "slice.claim_revoked",
+            sliceId: slice.id,
+            payload: { slice_id: slice.id },
+          }));
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: updated.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: deriveSystemEventKey("replan", plan_id, String(updated.rev)),
+          kind: "replan",
+          payload: Object.keys(replanPayload).length > 0 ? replanPayload : undefined,
+          readyBefore,
+          readyAfter: readyIds(updated, now),
+          plan: updated,
+          now,
+          orderedSnapshot: ordered,
+          supplementalEvents:
+            replanSupplemental.length > 0 ? replanSupplemental : undefined,
+        });
+        return updated;
+      },
+    ),
+    );
     return textResult(JSON.stringify(next, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.replan", error);
+    }
   },
 );
 
@@ -1679,41 +2075,108 @@ server.registerTool(
     const gated = await requireSharedGate("plan.restore", { plan_id, rev });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
-    // #122 F-PLAN-RESTORE-SELFBLOCK: the recovery tool must not be gated on the
-    // corrupt state it exists to heal. restorePlan consumes only frontmatter
-    // scalars from `current` (every digest-covered field comes from the history
-    // snapshot, and persistPlan recomputes the digest on write), so when the
-    // strict rehydrate throws — e.g. a bricked plan_digest — fall back to the
-    // bare-scalar read and proceed with the restore. EXCEPT for the typed
-    // PlanDigestVersionError: a note declaring a NEWER digest version belongs
-    // to a newer writer, and restoring through this (older) plugin would
-    // silently downgrade fields the newer schema introduced — refuse instead.
-    let current: PlanArtifact;
     try {
-      current = await rehydratePlan(notePath);
-    } catch (err) {
-      if (err instanceof PlanDigestVersionError) {
-        return textResult(JSON.stringify({ error: err.message }, null, 2));
+      const notePath = await findPlanNote(effectiveVaultPath, plan_id);
+      if (!notePath) {
+        return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
       }
-      current = await rehydratePlanScalars(notePath);
-    }
-    const snapshot = await getRevision(notePath, rev);
-    if (!snapshot) {
-      return textResult(JSON.stringify({ error: `revision ${rev} not found` }, null, 2));
-    }
-    const next = restorePlan(current, snapshot);
-    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
-    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
-    await appendJournal(journalPath, {
-      kind: "restored",
-      from_rev: rev,
-      at: new Date().toISOString(),
-    });
+    const next = await withThreadLock(
+      effectiveVaultPath,
+      plan_id,
+      `server-restore:${randomUUID()}`,
+      async () => {
+        // #122 F-PLAN-RESTORE-SELFBLOCK: strict rehydrate remains first. A
+        // digest-bricked note may use the recovery scalar read, but restorePlan
+        // never copies claim authority from either source: every restored
+        // claim is cleared and every generation advances beyond the current
+        // and historical high-water marks.
+        let current: PlanArtifact;
+        try {
+          current = await rehydratePlan(notePath);
+        } catch (err) {
+          if (err instanceof PlanDigestVersionError) {
+            throw err;
+          }
+          current = await rehydratePlanScalars(notePath);
+        }
+        const now = new Date();
+        const readyBefore = readyIds(current, now);
+        // Restore does not go through thread-worker.ts's withThreadPlanLock
+        // (it must survive a digest-bricked note via the scalar-read
+        // fallback above, which strict rehydration cannot do) but it is
+        // still fully inside this same withThreadLock — reconcile/ensure
+        // the ordered baseline here before persisting the restored state,
+        // exactly like every other locked mutation.
+        const { journalPath, ordered } = await prepareThreadMutation(
+          { vaultPath: effectiveVaultPath, notePath, planId: plan_id, actor: DEFAULT_AGENT_ID },
+          current,
+          now,
+        );
+        const snapshot = await getRevision(notePath, rev);
+        if (!snapshot) {
+          throw new Error(`revision ${rev} not found`);
+        }
+        const restored = restorePlan(current, snapshot);
+        const restoreRevoked = [...claimIds(current), ...claimIds(snapshot)];
+        await persistPlanThenRevokeClaimSecrets(
+          restored,
+          { vaultPath: effectiveVaultPath, notePath },
+          plan_id,
+          restoreRevoked,
+        );
+        await pruneSliceReceiptsAfterPlanMutation(
+          effectiveVaultPath,
+          plan_id,
+          current,
+          restored,
+        );
+        // Legacy appendJournal line unchanged.
+        await appendJournal(journalPath, {
+          kind: "restored",
+          from_rev: rev,
+          at: now.toISOString(),
+        });
+        // Ordered mirror: only the numeric from_rev (never scar/evidence
+        // text or claim identity). Coalesces ready.changed when the
+        // restored slice statuses/dependencies change what's ready.
+        const restoreSupplemental = current.slices
+          .filter((slice) => slice.claim)
+          .map((slice) => ({
+            idempotencyKey: deriveSystemEventKey(
+              "slice.claim_revoked",
+              plan_id,
+              slice.id,
+              String(restored.rev),
+            ),
+            kind: "slice.claim_revoked",
+            sliceId: slice.id,
+            payload: { slice_id: slice.id },
+          }));
+        await recordThreadMutationEvents({
+          journalPath,
+          planId: plan_id,
+          rev: restored.rev,
+          actor: DEFAULT_AGENT_ID,
+          operationKey: deriveSystemEventKey("restored", plan_id, String(restored.rev)),
+          kind: "restored",
+          payload: { from_rev: rev },
+          readyBefore,
+          readyAfter: readyIds(restored, now),
+          plan: restored,
+          now,
+          orderedSnapshot: ordered,
+          supplementalEvents:
+            restoreSupplemental.length > 0 ? restoreSupplemental : undefined,
+        });
+        return restored;
+      },
+    );
     return textResult(JSON.stringify(next, null, 2));
+    } catch (error: unknown) {
+      return textResult(
+        JSON.stringify({ error: threadWorkerErrorText(error) }, null, 2),
+      );
+    }
   },
 );
 
@@ -1760,10 +2223,362 @@ server.registerTool(
   },
 );
 
+// Task 6: typed MCP worker surface. These five tools are the ONLY
+// model-facing entry points into thread-worker.ts's slice-scoped claim/lease
+// machinery. Every handler: (1) calls requireSharedGate with its exact
+// plan.* key before touching thread-worker/thread-events; (2) pins vaultPath
+// (DEFAULT_VAULT_PATH) and resolves plan_id via the same id-less
+// resolvePlanTarget contract every other optional-plan_id Thread tool
+// already uses; (3) passes only schema-discriminated fields into
+// thread-worker — never the raw parsed request object; (4) turns a thrown
+// domain error into a typed { error, code? } result via
+// threadWorkerErrorResult instead of letting it escape as a transport-level
+// JSON-RPC error; (5) never serializes a claim secret's file path — claimSlice
+// already returns the safe ThreadClaimResponse shape (thread-claims.ts),
+// which this file forwards unmodified.
+
+server.registerTool(
+  "minni_thread_ready",
+  {
+    title: "Minni Thread Ready",
+    description:
+      "List Thread slices that are structurally ready for a worker to claim: non-terminal, dependencies resolved, no live claim. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+    },
+  },
+  async ({ plan_id: planIdInput }) => {
+    const gated = await requireSharedGate("plan.ready", { plan_id: planIdInput });
+    if (gated) return gated;
+    try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
+      const { plan, ready } = await synchronizeExpiredClaimsAndReadReady({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        actor: DEFAULT_AGENT_ID,
+      });
+      return textResult(
+        JSON.stringify(
+          { plan_id, rev: plan.rev, ready },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.ready", error);
+    }
+  },
+);
+
+server.registerTool(
+  "minni_thread_assign",
+  {
+    title: "Minni Thread Assign",
+    description:
+      "Assign a Thread slice to a worker agent (clears any existing claim). This only records who may claim the slice next; it does not itself lease it. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      slice_id: z.string().min(1),
+      worker_agent_id: z.string().min(1),
+      assignment_profile: z.string().min(1).optional(),
+    },
+  },
+  async ({ plan_id: planIdInput, slice_id, worker_agent_id, assignment_profile }) => {
+    const gated = await requireSharedGate("plan.assign", {
+      plan_id: planIdInput,
+      slice_id,
+      worker_agent_id,
+      assignment_profile,
+    });
+    if (gated) return gated;
+    try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
+      const result = await assignSlice({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        sliceId: slice_id,
+        workerAgentId: worker_agent_id,
+        // Server-stamped orchestrator actor — never model-supplied. The
+        // input schema above has no actor-like field, so there is nothing
+        // for a caller to override here.
+        actorAgentId: DEFAULT_AGENT_ID,
+        assignmentProfile: assignment_profile,
+      });
+      return textResult(
+        JSON.stringify(
+          {
+            slice: result.slice,
+            ready_before: result.ready_before,
+            ready_after: result.ready_after,
+            rev: result.plan.rev,
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      return threadWorkerErrorResult("plan.assign", error);
+    }
+  },
+);
+
+// Task 6 followup: a whitespace-only key satisfied z.string().min(1) — the
+// SDK layer accepted it and thread-worker.ts's own requireNonEmpty caught it
+// several layers deeper as a generic domain error. Reject it here instead,
+// at the same layer every other structural validation for these tools
+// happens, with a message that names the offending field.
+const nonBlankIdempotencyKey = z
+  .string()
+  .min(1)
+  .refine((value) => value.trim().length > 0, {
+    message: "idempotency_key must not be blank",
+  });
+
+server.registerTool(
+  "minni_thread_claim",
+  {
+    title: "Minni Thread Claim",
+    description:
+      "Claim an assigned, dependency-clear Thread slice with an idempotent worker lease. Returns a one-time claim token the worker must present to minni_thread_worker_update. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      slice_id: z.string().min(1),
+      worker_agent_id: z.string().min(1),
+      idempotency_key: nonBlankIdempotencyKey,
+      ttl_seconds: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_THREAD_CLAIM_TTL_SECONDS)
+        .optional(),
+    },
+  },
+  async ({ plan_id: planIdInput, slice_id, worker_agent_id, idempotency_key, ttl_seconds }) => {
+    const gated = await requireSharedGate("plan.claim", {
+      plan_id: planIdInput,
+      slice_id,
+      worker_agent_id,
+      idempotency_key,
+    });
+    if (gated) return gated;
+    try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
+      // claimSlice already returns thread-claims.ts's ThreadClaimResponse —
+      // the one shape in this whole surface that is allowed to carry a
+      // secret (the one-time token). It never carries the envelope's
+      // filePath or any other internal metadata; forwarded verbatim.
+      const response = await claimSlice({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        sliceId: slice_id,
+        workerAgentId: worker_agent_id,
+        idempotencyKey: idempotency_key,
+        ttlSeconds: ttl_seconds,
+      });
+      return textResult(JSON.stringify(response, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.claim", error);
+    }
+  },
+);
+
+// Task 6 Step 3: the structural-proposal slice shape a worker may propose.
+// Reuses the same fields createPlan/replan accept (planSliceInputSchema)
+// so a proposal can only ever describe a durable REQUEST for the
+// orchestrator to apply later (plan.ts's StructuralProposal contract) —
+// propose_structure below never mutates plan topology itself.
+const workerProposalInputSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("expand"),
+    reason: z.string().min(1),
+    slices: z.array(planSliceInputSchema).min(1),
+  }),
+  z.object({
+    kind: z.literal("split"),
+    reason: z.string().min(1),
+    slices: z.array(planSliceInputSchema).min(1),
+  }),
+  z.object({
+    kind: z.literal("contract"),
+    reason: z.string().min(1),
+    slice_ids: z.array(z.string().min(1)).min(1),
+  }),
+]);
+
+// Task 6 Step 3: discriminated union by `action`, matching thread-worker.ts's
+// WorkerUpdateAction type field-for-field. Each branch is a closed z.object —
+// zod strips any key not declared on the matched branch — so no dependency,
+// gate, assignee, constraint, sibling-slice, force, or replan field can ever
+// reach thread-worker.ts's updateClaimedSlice, no matter what an caller sends
+// alongside a valid action.
+const workerUpdateActionSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("start") }),
+  z.object({ action: z.literal("progress"), evidence: z.string().min(1) }),
+  z.object({ action: z.literal("block"), evidence: z.string().min(1) }),
+  z.object({
+    action: z.literal("scar"),
+    kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]),
+    signal: z.string().min(1),
+    resolution: z.string().optional(),
+  }),
+  z.object({
+    action: z.literal("propose_structure"),
+    proposal: workerProposalInputSchema,
+  }),
+  z.object({ action: z.literal("complete"), evidence: z.string().min(1) }),
+]);
+
+server.registerTool(
+  "minni_thread_worker_update",
+  {
+    title: "Minni Thread Worker Update",
+    description:
+      "Apply one claimed-slice worker mutation (start, progress, block, scar, propose_structure, or complete) using the one-time claim token from minni_thread_claim. idempotency_key is required and must be non-empty — retries with the same key, token, and action replay the original result rather than re-applying, even after an action (like complete) that clears the live claim. When the Thread lock is held the write is accepted onto the per-Thread queue and this call returns immediately; accepted is not applied (no journal/ready/slice change until drain). Same idempotency_key while queued does not double-enqueue. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      slice_id: z.string().min(1),
+      worker_agent_id: z.string().min(1),
+      claim_token: z.string().min(1),
+      idempotency_key: nonBlankIdempotencyKey,
+      action: z.enum([
+        "start",
+        "progress",
+        "block",
+        "scar",
+        "propose_structure",
+        "complete",
+      ]),
+      evidence: z.string().min(1).optional(),
+      kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]).optional(),
+      signal: z.string().min(1).optional(),
+      resolution: z.string().optional(),
+      proposal: workerProposalInputSchema.optional(),
+    },
+  },
+  async ({
+    plan_id: planIdInput,
+    slice_id,
+    worker_agent_id,
+    claim_token,
+    idempotency_key,
+    action,
+    evidence,
+    kind,
+    signal,
+    resolution,
+    proposal,
+  }) => {
+    const gated = await requireSharedGate("plan.worker_update", {
+      plan_id: planIdInput,
+      slice_id,
+      worker_agent_id,
+      action,
+    });
+    if (gated) return gated;
+    // Re-validate through the discriminated union so ONLY the fields that
+    // belong to this action are ever constructed into a WorkerUpdateAction —
+    // e.g. a "complete" call that also sent `signal` never lets `signal`
+    // reach thread-worker.ts, because the "complete" branch does not declare it.
+    const parsedAction = workerUpdateActionSchema.safeParse({
+      action,
+      evidence,
+      kind,
+      signal,
+      resolution,
+      proposal,
+    });
+    if (!parsedAction.success) {
+      return textResult(
+        JSON.stringify(
+          {
+            status: "error",
+            operation: "plan.worker_update",
+            error: `invalid worker update action: ${parsedAction.error.issues
+              .map((issue) => issue.message)
+              .join("; ")}`,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
+      const result = await updateClaimedSlice({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        sliceId: slice_id,
+        workerAgentId: worker_agent_id,
+        token: claim_token,
+        idempotencyKey: idempotency_key,
+        action: parsedAction.data as WorkerUpdateAction,
+      });
+      return textResult(JSON.stringify(workerUpdateMcpPayload(result), null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.worker_update", error);
+    }
+  },
+);
+
+server.registerTool(
+  "minni_thread_events",
+  {
+    title: "Minni Thread Events",
+    description:
+      "Read durable, ordered Thread events after a cursor (since_seq) for scheduler/worker replay. plan_id defaults to the active plan.",
+    inputSchema: {
+      plan_id: z.string().min(1).optional(),
+      since_seq: z.number().int().min(0).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+  },
+  async ({ plan_id: planIdInput, since_seq, limit }) => {
+    const gated = await requireSharedGate("plan.events", {
+      plan_id: planIdInput,
+      since_seq,
+      limit,
+    });
+    if (gated) return gated;
+    try {
+      const target = await resolvePlanTarget(planIdInput);
+      if (!target.ok) return target.result;
+      const { plan_id, notePath } = target;
+      // Same locked expiry sweep ready/claim already use — land
+      // slice.lease_expired / thread.attention_required before the cursor read
+      // so an events-only orchestrator cannot miss a dead claim.
+      await synchronizeExpiredClaims({
+        vaultPath: DEFAULT_VAULT_PATH,
+        notePath,
+        planId: plan_id,
+        actor: DEFAULT_AGENT_ID,
+      });
+      const journalPath = journalPathFor(notePath, plan_id);
+      const result = await readThreadEvents(journalPath, since_seq, limit);
+      return textResult(JSON.stringify({ plan_id, ...result }, null, 2));
+    } catch (error) {
+      return threadWorkerErrorResult("plan.events", error);
+    }
+  },
+);
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Later process (not the accepting kick): pick pending Q + stamp and
+  // apply under the same withThreadLock persist authority.
+  void drainPendingWorkerWritesForVault(DEFAULT_VAULT_PATH).catch(() => {});
 }
 
 main().catch((error) => {

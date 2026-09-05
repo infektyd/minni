@@ -68,6 +68,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -132,6 +133,41 @@ def _file_index_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     return (inbox_file, idx_i)
 
 
+def _sql_quote_str(value: str) -> str:
+    """Single-quote a SQL string literal (map keys, not user input)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _canonical_principal_sql_expr(column: str = "principal") -> str:
+    """SQLite expression matching ``inbox_ingest._canonical_principal``.
+
+    Operator UNIQUE must key the canonical fill so leftover ``agy``/``xai``
+    rows collide with remapped ``gemini``/``grok-build`` inserts. Raw
+    ``principal`` is a different tuple and cannot backstop #239 duals.
+    """
+    from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+
+    remaps = [
+        (slug, agent)
+        for slug, agent in sorted(_VAULT_SLUG_TO_AGENT_ID.items())
+        if slug != agent
+    ]
+    if not remaps:
+        return column
+    whens = " ".join(
+        f"WHEN {_sql_quote_str(slug)} THEN {_sql_quote_str(agent)}"
+        for slug, agent in remaps
+    )
+    return f"CASE {column} {whens} ELSE {column} END"
+
+
+def _inbox_dedup_index_sql_is_current(sql: Any) -> bool:
+    """True when sqlite_master SQL keys canonical fill, not raw principal."""
+    sql_s = " ".join(str(sql or "").split()).lower()
+    expr = " ".join(_canonical_principal_sql_expr("principal").split()).lower()
+    return expr in sql_s
+
+
 def _inbox_key(
     principal: Any, derived: Dict[str, Any]
 ) -> Optional[Tuple[str, str, int]]:
@@ -139,12 +175,73 @@ def _inbox_key(
 
     Matches ``inbox_ingest`` / ``compact_distillation`` principal-scoped
     idempotency. Same basename in two agent vaults is not a dual.
+    Vault-slug aliases (``agy``→``gemini``, ``xai``→``grok-build``) collapse
+    to the canonical id so a remap is the same fill, not a new key.
     ``content_sha1`` is not part of the app key.
     """
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
     fi = _file_index_key(derived)
     if fi is None:
         return None
-    return (str(principal or ""), fi[0], fi[1])
+    return (_canonical_principal(principal), fi[0], fi[1])
+
+
+def _alias_source_principal(row: Dict[str, Any]) -> Optional[str]:
+    """Leftover vault slug from raw principal or stamped ``derived_from``.
+
+    Prefer-unfenced collapse deletes a fenced leftover ``agy``/``xai`` row
+    and keeps an already-canonical winner. Archive still needs the leftover
+    slug so the remapped vault's live file is not the only drain.
+    """
+    from minni.afm_passes.inbox_ingest import _canonical_principal
+
+    def _if_alias(raw: str) -> Optional[str]:
+        if not raw:
+            return None
+        canon = _canonical_principal(raw)
+        if canon and canon != raw:
+            return raw
+        return None
+
+    from_principal = _if_alias(str(row.get("principal") or ""))
+    if from_principal:
+        return from_principal
+    raw_df = row.get("derived_from")
+    if not isinstance(raw_df, str) or not raw_df:
+        return None
+    try:
+        df = json.loads(raw_df)
+    except Exception:
+        return None
+    if not isinstance(df, dict):
+        return None
+    stamped = df.get("source_principal")
+    if isinstance(stamped, str):
+        return _if_alias(stamped)
+    return None
+
+
+def _stamp_source_principal(derived_from: Any, leftover_principal: str) -> Optional[str]:
+    """Return derived_from JSON with leftover slug preserved, or None.
+
+    Collapse rewrites ``principal`` to the canonical host, or keeps an
+    already-canonical unfenced twin after deleting a leftover alias.
+    Archive uses ``source_principal`` to refuse the remapped vault's live
+    file in both cases.
+    """
+    if not leftover_principal:
+        return None
+    if not isinstance(derived_from, str) or not derived_from:
+        return None
+    try:
+        df = json.loads(derived_from)
+    except Exception:
+        return None
+    if not isinstance(df, dict):
+        return None
+    df.setdefault("source_principal", leftover_principal)
+    return json.dumps(df)
 
 
 def _content_sha1_of(derived: Dict[str, Any]) -> Optional[str]:
@@ -350,7 +447,11 @@ def _active_afm_review_ids_on_cursor(c) -> set:
               AND COALESCE(status, '') != 'superseded'
             """
         )
-    except Exception:
+    except sqlite3.Error as exc:
+        # Only a missing table is excused (pre-014). Empty set on lock/schema
+        # looks like nobody is fenced and collapse deletes the unfenced twin.
+        if "no such table" not in str(exc).lower():
+            raise
         return set()
     out: set = set()
     for row in c.fetchall():
@@ -590,28 +691,34 @@ def _load_collapse_group_on_cursor(
 ) -> List[Dict[str, Any]]:
     """Re-read byte-identical twins for one collapse key under an open txn.
 
-    Always scopes by principal (including empty-string principal) so a
-    same-basename peer under another agent cannot be hard-deleted.
+    Always scopes by principal family (canonical id plus vault-slug aliases)
+    so a leftover ``agy``/``xai`` twin of a remapped ``gemini``/``grok-build``
+    row is the same fill. A same-basename peer under another agent still
+    cannot be hard-deleted.
     """
+    from minni.afm_passes.inbox_ingest import _principal_family
+
     principal = str(key.get("principal") or "")
     inbox_file = key.get("inbox_file")
     candidate_index = key.get("candidate_index")
     content_sha1 = key.get("content_sha1")
     if not isinstance(inbox_file, str) or candidate_index is None:
         return []
+    family = _principal_family(principal)
+    placeholders = ",".join("?" for _ in family)
     # COALESCE so empty-string principal matches rows with '' or NULL.
     c.execute(
-        """
+        f"""
         SELECT candidate_id, principal, status, content, derived_from,
                proposed_at, resolved_at, resolved_by, resolution_reason
         FROM candidate_packets
-        WHERE COALESCE(principal, '') = ?
+        WHERE COALESCE(principal, '') IN ({placeholders})
           AND derived_from IS NOT NULL
           AND json_extract(derived_from, '$.source') = 'inbox'
           AND json_extract(derived_from, '$.inbox_file') = ?
           AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
         """,
-        (principal, inbox_file, int(candidate_index)),
+        (*family, inbox_file, int(candidate_index)),
     )
     want_sha = (
         content_sha1.strip().lower()
@@ -787,6 +894,7 @@ def repair_duplicate_candidate_pairs(
 
     if not dry_run and plan:
         now = time.time()
+        from minni.afm_passes.inbox_ingest import _canonical_principal
         # Probe once outside the write loop so we never open db.cursor()
         # (which commits) while BEGIN IMMEDIATE is held.
         has_audit = _table_exists(db, "consolidation_actions")
@@ -821,6 +929,7 @@ def repair_duplicate_candidate_pairs(
                     winner_replanned += 1
                 live_losers = list(decision["losers"])
                 group_deleted = 0
+                deleted_losers: List[Dict[str, Any]] = []
                 for loser in live_losers:
                     loser_id = int(loser["candidate_id"])
                     loser_status = _norm_status(loser.get("status"))
@@ -846,8 +955,49 @@ def repair_duplicate_candidate_pairs(
                     )
                     deleted += 1
                     group_deleted += 1
+                    deleted_losers.append(loser)
                 if group_deleted:
                     groups_applied += 1
+                    # Leftover agy/xai winners keep the raw principal; list/
+                    # resolve match that column, so rewrite to the canonical
+                    # id after losers are gone (UNIQUE CASE already agrees).
+                    # Prefer-unfenced keeps an already-canonical twin and
+                    # deletes the leftover alias — still stamp that leftover
+                    # slug so archive refuses the remapped vault.
+                    winner_principal = str(live_winner.get("principal") or "")
+                    canon = _canonical_principal(winner_principal)
+                    leftover_source = _alias_source_principal(live_winner)
+                    if leftover_source is None:
+                        for loser in deleted_losers:
+                            leftover_source = _alias_source_principal(loser)
+                            if leftover_source:
+                                break
+                    new_derived = (
+                        _stamp_source_principal(
+                            live_winner.get("derived_from"), leftover_source
+                        )
+                        if leftover_source is not None
+                        else None
+                    )
+                    if canon and canon != winner_principal:
+                        if new_derived is not None:
+                            c.execute(
+                                "UPDATE candidate_packets SET principal=?, "
+                                "derived_from=? WHERE candidate_id=?",
+                                (canon, new_derived, live_keep),
+                            )
+                        else:
+                            c.execute(
+                                "UPDATE candidate_packets SET principal=? "
+                                "WHERE candidate_id=?",
+                                (canon, live_keep),
+                            )
+                    elif new_derived is not None:
+                        c.execute(
+                            "UPDATE candidate_packets SET derived_from=? "
+                            "WHERE candidate_id=?",
+                            (new_derived, live_keep),
+                        )
                 elif live_losers:
                     # All losers were accepted-guarded — group unresolved.
                     groups_skipped_stale += 1
@@ -919,14 +1069,17 @@ def repair_duplicate_candidate_pairs(
 def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
     """Create a partial unique index matching app-level inbox idempotency.
 
-    Key is ``(principal, inbox_file, candidate_index)`` for ``source='inbox'``
-    — the same key ``inbox_ingest`` / ``compact_distillation`` use.
-    ``content_sha1`` is not part of the constraint.
+    Key is ``(canonical principal, inbox_file, candidate_index)`` for
+    ``source='inbox'`` — the same key ``inbox_ingest`` /
+    ``compact_distillation`` use. Vault-slug aliases (``agy``→``gemini``,
+    ``xai``→``grok-build``) are folded in SQL so leftover alias rows collide
+    with remapped inserts. ``content_sha1`` is not part of the constraint.
 
     Requires principal-scoped (file, index) duplicates to already be collapsed
     (call repair first). Migrates off the legacy weaker
-    ``…_inbox_sha1_unique`` and any pre-principal ``…_inbox_key_unique``
-    (file, index only) index if present.
+    ``…_inbox_sha1_unique``, any pre-principal ``…_inbox_key_unique``
+    (file, index only) index, and any raw-``principal`` ``…_inbox_key_unique``
+    that would still admit alias twins.
 
     **Operator-only, not a migration.** Schema rebuilds of
     ``candidate_packets`` drop this index; re-run
@@ -941,12 +1094,12 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
         row = c.fetchone()
         if row:
             sql = row["sql"] if hasattr(row, "keys") else row[0]
-            sql_s = str(sql or "")
-            if "principal" in sql_s.lower():
+            if _inbox_dedup_index_sql_is_current(sql):
                 c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
                 return {"status": "exists", "index": index_name}
-            # Stale global (file, index) index exists — do NOT drop until we
-            # know principal-scoped CREATE can succeed (collision preflight).
+            # Stale global (file, index) or raw-principal index exists — do
+            # NOT drop until we know canonical-fill CREATE can succeed
+            # (collision preflight).
 
     collisions = find_app_key_collisions(db)
     if collisions:
@@ -973,13 +1126,15 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
             ],
             "note": (
                 "Existing UNIQUE index left in place until collisions clear; "
-                "stale global (file,index) indexes are only replaced on CREATE."
+                "stale global (file,index) or raw-principal indexes are only "
+                "replaced on CREATE."
             ),
         }
 
     try:
+        canon_principal = _canonical_principal_sql_expr("principal")
         with db.transaction() as c:
-            # Drop legacy + any stale global index inside the same txn as CREATE
+            # Drop legacy + any stale index inside the same txn as CREATE
             # so we never leave zero uniqueness backstop on a failed upgrade.
             c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
             c.execute(f"DROP INDEX IF EXISTS {index_name}")
@@ -987,7 +1142,7 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
                 f"""
                 CREATE UNIQUE INDEX {index_name}
                 ON candidate_packets (
-                    principal,
+                    {canon_principal},
                     json_extract(derived_from, '$.inbox_file'),
                     CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER)
                 )
@@ -1458,10 +1613,11 @@ def _dry_run_inbox_dedup_index_status(
         )
         row = c.fetchone()
         if row:
-            sql = str((row["sql"] if hasattr(row, "keys") else row[0]) or "")
-            if "principal" in sql.lower():
+            sql = row["sql"] if hasattr(row, "keys") else row[0]
+            if _inbox_dedup_index_sql_is_current(sql):
                 return {"status": "exists", "index": index_name, "dry_run": True}
-            # Stale global index — would be replaced on apply.
+            # Stale global (file, index) or raw-principal index — would be
+            # replaced on apply. Fall through to collision preflight.
     loser_ids: set = set()
     if dual_plan:
         # repair_duplicate_candidate_pairs dry-run exposes plan in ``sample``

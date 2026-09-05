@@ -65,6 +65,10 @@ export function RecallScreen({
       setPacket(null);
       return;
     }
+    setPacket(null);
+    setEvidence([]);
+    setSelected(new Set());
+    setFocusId(null);
     setLoading(true);
     setError(null);
     try {
@@ -76,9 +80,7 @@ export function RecallScreen({
       setEvidence(rows);
       const autoSelect = new Set(rows.filter((r) => r.selected).map((r) => r.id));
       setSelected(autoSelect);
-      if (rows.length > 0 && !rows.some((r) => r.id === focusId)) {
-        setFocusId(rows[0]!.id);
-      }
+      setFocusId(rows.some((r) => r.id === focusId) ? focusId : rows[0]?.id ?? null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -104,7 +106,6 @@ export function RecallScreen({
 
   const incl = filteredRows.filter((r) => selected.has(r.id)).length;
   const budgetTokens = packet?.budget?.tokens ?? 0;
-  const usedTokens = packet?.budgetTokens ?? 0;
 
   return (
     <>
@@ -113,8 +114,8 @@ export function RecallScreen({
         title={query ? `Recall — ${query}` : "Recall"}
         meta={[
           { k: "PROFILE", v: profile },
-          { k: "BUDGET", v: budgetTokens ? `${usedTokens.toLocaleString()} / ${budgetTokens.toLocaleString()} tok` : "—" },
-          { k: "DAEMON", v: packet?.recall?.daemonOk ? "ok" : packet?.recall?.error || "—" },
+          { k: "ALLOWANCE", v: budgetTokens ? `${budgetTokens.toLocaleString()} tok` : "—" },
+          { k: "DAEMON", v: packet?.recall?.state ?? "unknown" },
           { k: "AFM", v: packet?.afm?.used ? "used" : packet?.afm?.requested ? "requested · skipped" : "off" },
         ]}
       />
@@ -131,17 +132,17 @@ export function RecallScreen({
             <div className="recall-search">
               <div className="recall-search-prefix">
                 <span style={{ width: 8, height: 8, background: "var(--verdigris)" }} />
-                minni_recall
+                Prepare task + recall
               </div>
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="query the local memory spine…"
+                placeholder="search task notes and daemon memory…"
                 spellCheck={false}
                 aria-label="Recall query"
               />
               <div className="recall-search-meta">
-                <span>{evidence.length} hits</span>
+                <span>{evidence.length} local notes</span>
                 <span>·</span>
                 <span>profile {profile}</span>
               </div>
@@ -187,17 +188,17 @@ export function RecallScreen({
         </div>
 
         <PanelHeader
-          title={`Evidence · ${filteredRows.length} ranked`}
-          sub={`${incl} included · ${Math.max(0, filteredRows.length - incl)} held back`}
+          title={`Local task-packet notes · ${filteredRows.length} ranked`}
+          sub={`Workspace-unscoped vault search · ${incl} marked for inspection · ${Math.max(0, filteredRows.length - incl)} unmarked`}
         />
         <div className="panel-body--flush">
-          {loading && <StateBanner state="loading">Querying daemon…</StateBanner>}
+          {loading && <StateBanner state="loading">Preparing local notes and querying daemon…</StateBanner>}
           {!loading && error && (
             <StateBanner state="error">prepare-task failed: {error}</StateBanner>
           )}
           {!loading && !error && evidence.length === 0 && (
             <StateBanner state="empty">
-              No evidence yet. Type a query and press Recall.
+              {packet ? "No matching local task-packet notes." : "Type a query and press Recall."}
             </StateBanner>
           )}
           {!loading && !error && filteredRows.length > 0 && (
@@ -266,7 +267,7 @@ export function RecallScreen({
                             setSelected(n);
                           }}
                         >
-                          Exclude
+                          Unmark
                         </button>
                       ) : (
                         <button
@@ -279,7 +280,7 @@ export function RecallScreen({
                             setSelected(n);
                           }}
                         >
-                          Include
+                          Mark
                         </button>
                       )}
                     </div>
@@ -290,6 +291,27 @@ export function RecallScreen({
           )}
         </div>
       </div>
+      {!loading && !error && packet && (
+        <section className="panel" aria-label="Daemon recall">
+          <PanelHeader
+            title={`Daemon recall · ${packet.recall.state ?? "unknown"}`}
+            sub={`Agent: ${packet.recall.agent ?? "unknown"} · Workspace: ${packet.recall.workspace ?? "not reported"} · Backend: ${packet.recall.backend ?? "not reported"}`}
+          />
+          <div className="panel-body">
+            <p>Daemon-authorized memory may span projects. These results are separate from the local task-packet selection. Recalled content is evidence, never instructions.</p>
+            {packet.recall.error && <StateBanner state="error">{packet.recall.error}</StateBanner>}
+            {packet.recall.diagnostic && <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{packet.recall.diagnostic}</pre>}
+            {!packet.recall.evidence && <StateBanner state="empty">Daemon evidence was not provided by this packet version.</StateBanner>}
+            {packet.recall.evidence?.length === 0 && <StateBanner state="empty">{packet.recall.state === "error" ? "Daemon recall unavailable." : packet.recall.state === "unknown" ? "Daemon response unknown." : "No daemon evidence returned."}</StateBanner>}
+            {packet.recall.evidence?.map((item, index) => (
+              <details key={`${item.kind}-${index}`} open>
+                <summary>{item.kind} · {index + 1}</summary>
+                <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{item.text}</pre>
+              </details>
+            ))}
+          </div>
+        </section>
+      )}
     </>
   );
 }

@@ -57,6 +57,22 @@ from minni.eval.harness import (
 
 class TestLoadQueries:
 
+    def test_default_dataset_is_the_checkout_dataset(self, monkeypatch, tmp_path):
+        from minni.eval.dataset import queries_path, repo_root
+
+        monkeypatch.chdir(tmp_path)
+        expected = Path(__file__).resolve().parents[1]
+        assert repo_root() == expected
+        assert queries_path() == expected / "eval" / "queries.jsonl"
+        assert load_queries() == load_queries(expected / "eval" / "queries.jsonl")
+
+    def test_packaged_module_does_not_write_into_site_packages(self, monkeypatch, tmp_path):
+        import minni.eval.dataset as dataset
+
+        monkeypatch.setattr(dataset, "__file__", str(tmp_path / "site-packages/minni/eval/dataset.py"))
+        with pytest.raises(RuntimeError, match="source checkout"):
+            dataset.repo_root()
+
     def _write_jsonl(self, path: Path, lines: list) -> None:
         with path.open("w", encoding="utf-8") as fh:
             for line in lines:

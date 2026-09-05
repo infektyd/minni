@@ -38,7 +38,7 @@ export function Rail({
         <div className="rail-brand-mark" />
         <div className="rail-brand-text">
           <div className="rail-brand-title">MINNI</div>
-          <div className="rail-brand-sub">memory · v4.2</div>
+          <div className="rail-brand-sub">memory console</div>
         </div>
       </div>
       {NAV.map((n, i) => {
@@ -73,9 +73,6 @@ export function Rail({
         <div className="rail-meter-row">
           <span>VAULT</span>
           <span>{counts.__vault || "local"}</span>
-        </div>
-        <div className="rail-meter">
-          <span style={{ width: "62%" }} />
         </div>
         <div className="rail-meter-row" style={{ marginTop: 6 }}>
           <span>AUDIT</span>

@@ -3392,6 +3392,11 @@ def _hyde_engine(tmp_path, monkeypatch):
         monkeypatch.setattr(retrieval_mod, "get_embedder", lambda: None)
     engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
     engine._model = None
+    # Explicitly disable this unrelated leg. An uncached get_embedder stub
+    # alone looks like a cold model to the deadline guard, which correctly
+    # reports a skipped vector/HyDE pass rather than the completed HyDE this
+    # fixture is intended to exercise.
+    monkeypatch.setattr(engine, "_semantic_search", lambda *_args, **_kwargs: [])
     return engine
 
 

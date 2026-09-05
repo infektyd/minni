@@ -8,13 +8,85 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- MCP `minni_list_candidates` — hosts (Cursor included) can list their own
+  staged `candidate_packets` and pair that with existing
+  `minni_resolve_candidate`. List is this-principal only. Owner reject/redact
+  stays; accept into durable memory still requires operator/govern; a platform
+  template does not gain the cross-principal `resolve_candidate` grant.
+  Drain-queue list defaults to `status=proposed`, redacts POLICY §2 secrets
+  and local paths, exposes `total`/`has_more` so truncation is not silent,
+  and does not return redacted/rejected packet content to the model.
+- Fleet slug aliases across registries: `xai` normalizes to `grok-build`, and
+  `agy` / `antigravity` normalize to `gemini` across candidate ingest
+  (`inbox_ingest.py`), hook utilities (`hook-utils.ts`), and inbox maintenance
+  (`inbox_cleanup.py`).
+- Wire adapter fallback safety (`unprofiledWire`): unknown and unprofiled host IDs
+  no longer fall through to Claude Code's wire shape. The adapter retains the authentic
+  host `agent_id`, suppresses unsupported injection channels (`inject`/`note` return null),
+  and explicitly records intent drops in audit telemetry.
+- Agent vault contract seeding: `ensure_agent_vault` now idempotently seeds standard
+  wiki structure and contract files (`index.md`, `log.md`) even when the target agent vault
+  directory already exists on disk, ensuring all registered vaults carry valid contracts.
+
 ### Changed
+
+- `privacy=review` candidate packets are AFM-examinable: learn-only `stage_candidate`
+  clamps non-operator proposals to `privacy=review`. Consolidation now treats
+  `privacy=review` as examinable (`_EXAMINABLE_PRIVACY`) so multi-agent candidate queues
+  (Claude, Grok, Gemini, Hermes, Cursor) re-enter the consolidation drain rather than
+  permanently parking behind the `afm_review` fence (`examined=0`). Rows passing quality,
+  deduplication, and non-instruction checks are triaged; durable promotion into active
+  memory still strictly requires operator resolution or `auto_accept_own`, and unset/NULL
+  privacy remains parked. Consolidation wiki synthesis drafts land in the shared vault
+  (`~/.minni/vault`) as `agent: afm-loop`.
+- Default platform-agent vault roots no longer include the dashless alias:
+  a platform principal without an explicit `platform_agent_vault_roots`
+  entry is now scoped to its canonical vault only
+  (`MINNI_HOME/<vault_dirname_for(id)>`, e.g. `grok-build` →
+  `grok-build-vault`), not the hyphen-stripped variant as well
+  (e.g. `~/.minni/grokbuild-vault`). Installs with live data in a dashless
+  directory lose pathed access on upgrade. Remedy, either: add an explicit
+  per-agent entry (`"platform_agent_vault_roots": {"<id>": ["~/.minni/<dir>"]}`
+  in the operator principal file), or move the directory to the canonical
+  name (`mv ~/.minni/grokbuild-vault ~/.minni/grok-build-vault`). The
+  `gemini` legacy fallback (`~/.gemini/minni-vault`) is unchanged.
+- Thread lock Q is dump-and-return, not sit-and-wait: when the plan lock is
+  held, a worker write is accepted onto a per-Thread queue and the caller
+  returns immediately. Accepted is not applied. The daemon drains one item
+  at a time under the existing `withThreadLock` persist authority. Replan
+  stays exclusive (not a queue item). `THREAD_BUSY` is overflow (queue full
+  or drain stuck), not the N=40 default. `DEFAULT_WAIT_MS` remains 5s.
+  Drain is fail-closed: an accepted ticket stays (is not dropped) when
+  apply throws, and a start accepted onto the Q writes a pending
+  worker-update receipt (`slice.start_accepted`, digest only — not
+  `slice.started`, not ready, not in_progress). Apply throw keeps that
+  stamp. Complete cannot persist `done` while that stamp or start ticket
+  exists; start still applies first. A claimed pending slice with no start,
+  no stamp, and no start ticket also cannot persist `done` (old apply path).
+  That path journals no `slice.completed` without `slice.started`. Claim tokens stay off the journal. In-process `kickWorkerWriteDrain` dies with the accepting MCP process; a later drain (`drainWorkerWrites` / `drainPendingWorkerWritesForVault`) still applies one-at-a-time under `withThreadLock`. Stamp is not applied until that later apply. Not minnid-canonical, not a second graph, no new MCP tool.
+  Leftover Q + `slice.start_accepted` are bound to the slice generation they were accepted at. After exclusive replan/split advances generation or supersedes the parent, drain does not apply that start as live `in_progress` and does not journal it as live work on the dead parent. A generation-N stamp does not block or authorize N+1. Complete on a superseded parent still cannot persist `done`. Start still applies first when the slice is still live.
+  In-process kick yields to exclusive replan: exclusive replan reserves before the persist lock, and kick/drain does not apply an accepted start while that reservation is live. Accept-path kick also one-shot yields once under lock when reservation is not yet live — so kick cannot apply after accept returns and before orch reserves, without holding the persist lock across accept→replan. Complete-behind-start is the same yield (start still unapplied); a follow-up full drain after that live yield does not apply the start. A live accepting process can stay up; journal has no `slice.started` on a parent that exclusive split then supersedes. After supersede, leftover Q still drops (later drain / post-replan kick). Kick still drains when no exclusive replan is in flight. `THREAD_BUSY` stays overflow, not the default. No SIGKILL required. No new MCP tool.
+  Standing drain (`minnidStandingDrainTick` / `drainPendingWorkerWritesForVault`) yields a live queued start while the accepting process is still alive and the ticket is younger than `DEFAULT_WAIT_MS`, so minnid tick cannot journal `slice.started` in the accept→orch-reserve window. Dead/stale acceptor still applies. Kick/`drainWorkerWrites` without standing-defer still applies when no exclusive replan is in flight. Legacy tickets without acceptor pid apply as today. Q still stores token digest only.
+  Orch can remount `depends_on` on named live slice(s) via existing `minni_thread_replan` (`set_depends_on`) without a full-set `new_slices` rewrite. Unnamed live slices stay. Journal `depends_on_changed`. No claim token. Remount fails closed if a `depends_on` target is missing or superseded, or is the remounted slice itself (do not persist, do not journal that dangling edge); mixed self+valid rejects the whole remount; honest remount onto pending/in_progress/done still lands. `new_slices`/`add_slices` fail closed if a slice's `depends_on` includes its own id (do not persist, do not journal that self-edge), and also fail closed if a `depends_on` target is missing or superseded (do not persist, do not journal that dangling edge), including a same-call exclusive split (drop + add) that must not persist a written `depends_on` onto the dead parent.
 
 - `docs-accuracy-converge.rhai` now binds `risk_acceptance`/`re_check_issue`
   into both loom gap arrays and emits a `Re-checks required` report section
   (filed refs marked apart from PROPOSED titles) (#354) — superseding the
   0.5.0 note below that workflow emission "is still open as #354". Filing
   the issue itself remains a wright/operator act.
+
+### Fixed
+
+- Monotonic search deadline enforcement before JSON-RPC timeout: retrieval operations
+  (`retrieve()`) now check a cooperative deadline budget (`deadline_monotonic`, defaulting to 25s
+  / 90% of client `timeout_ms`). When the budget expires, query expansion, FAISS semantic
+  search, and cross-encoder reranking are bypassed to return deterministic FTS results, reducing work after expiry. Native inference already in progress remains non-preemptible.
+- Dropped inject recall state guard: `writeRecallState(consumed=false)` is skipped on
+  platforms where UserPromptSubmit stdout is dropped or unsupported (such as Grok passive
+  events and Cursor prompt submit), preventing uninjectable memory envelopes from causing
+  false `UNCONSULTED` pre-tool denials.
 
 ## [0.5.0] - 2026-08-06
 

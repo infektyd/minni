@@ -25,6 +25,23 @@ The frontend is a Vite + React + TypeScript app under [frontend-src/](frontend-s
 
 Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris accents) and **Phosphor** (CRT operator board with telemetry rail and live activity stream). Toggle from the gear button bottom-right. Layout sizes and theme persist to `localStorage`.
 
+## macOS Thread claim storage
+
+Thread claims and worker receipts on macOS use a bundled, standard-library Python
+helper for descriptor-relative filesystem operations. The helper inherits an
+already-open vault descriptor; it does not follow `/dev/fd` child paths or fall
+back to mutable logical paths. Python is required only when this storage backend
+runs. Interpreter selection is `MINNI_CLAIM_PYTHON`, then `PYTHON`, then `PYTHON3`,
+then `python3` on PATH. Set `MINNI_CLAIM_PYTHON` to an absolute interpreter path
+when the plugin host has a minimal PATH. No extra Python packages are needed.
+
+The helper runs in isolated Python mode, ships inside the compiled JavaScript
+payload, and is reused only within one awaited Thread mutation before being
+closed. Each location still closes its child descriptors; separate mutations
+never share an idle helper. Missing or failed helpers
+fail the claim operation explicitly; a stuck helper is killed after a 10-second
+request deadline. Linux continues using its native descriptor-path backend.
+
 ## Runtime Defaults
 
 All paths and env var names below are read in `src/config.ts` (and `src/afm.ts`
@@ -102,8 +119,13 @@ rejected outright and disables the cloud provider.
 - `minni_export_pack`
 - `minni_learning_quality`
 - `minni_learn`
+- `minni_list_candidates` — list this runtime principal's staged candidates
+  (own rows only; defaults to `status=proposed`; redacted/rejected content
+  is not returned to the model)
 - `minni_resolve_candidate` — owner-or-explicit-operator candidate resolution
-  for staged learning candidates
+  for staged learning candidates. Accept into durable memory still requires
+  operator/govern; a platform host may reject/redact its own rows without that
+  grant, and must not resolve another principal's rows unless explicitly allowed.
 - `minni_vault_write`
 - `minni_audit_report`
 - `minni_audit_tail`
@@ -113,7 +135,7 @@ rejected outright and disables the cloud provider.
 - `minni_list_pending_handoffs`
 - `minni_await_handoff`
 - `minni_thread_create` / `minni_thread_update` / `minni_thread_status` / `minni_thread_activate` / `minni_thread_deactivate` / `minni_thread_replan` / `minni_thread_history` / `minni_thread_revision` / `minni_thread_diff` / `minni_thread_restore` / `minni_thread_scar` (11 tools; the pre-rename `minni_plan_*` aliases were removed in v0.5.0 — canonical names only)
-- `minni_team_runtime` — temporary team packet with agent profiles, task ledger, hydration packets, gates, and non-goals
+- `minni_team_runtime` — project one vault Thread as a Team packet (`plan_id`, `rev`, `readySlices`); leftover `taskLedger` is a view of ready, not a second graph
 - `minni_team_evidence` — dry-run evidence report plus promotion candidates; never promotes or learns automatically
 - `minni_team_promotion` — dry-run permanent-profile draft gated by explicit approval; never writes durable memory
 - `minni_ping_agent_request` / `minni_ping_agent_inbox` / `minni_ping_agent_decide` / `minni_ping_agent_status`
@@ -124,12 +146,14 @@ these tools, but new integrations should use the `minni_*` names above.
 
 ## Minni Team Runtime
 
-`minni_team_runtime` is a coordinator-side planning surface for short-lived helper agents. It creates:
+`minni_team_runtime` projects one vault Thread for short-lived helper agents. `plan_id` present reads that Thread and fails if it is missing. `plan_id` absent creates one Thread from the task. Ready is the expiry sweep plus `readySlices`. It also returns:
 
 - temporary profiles with role, focus, ownership, permissions, and recall-only memory policy
-- a task ledger with evidence requirements and dependencies
-- one hydration packet per temporary agent, built with `minni_prepare_task`
+- leftover `taskLedger`, a view of `ready` keyed by `PlanSlice.id` (not a second graph; `ledgerFor` is gone)
+- one coordinator-side hydration packet per temporary agent, built with `prepare_task` (not the worker contract)
 - gates and non-goals that keep promotion, learning, and vault writes explicit
+
+The worker contract is library `buildWorkerPacketAfterClaim` after assign → claim, then honesty-only `dispatchWorkerPacket`. Neither is an MCP tool. grok worker-start is missing. Default agy cannot run `minni_thread_worker_update`. Codex dispatch is UNPROVEN and `spawned` is false. G3 daemon relay, automatic spawning, and immediate wake are not implemented.
 
 `minni_team_evidence` is the matching close-out surface. It grades each temporary agent report as `missing`, `partial`, or `complete`, collects blockers, and marks promotion candidates for human review only.
 
@@ -140,9 +164,10 @@ The team runtime does not spawn agents, execute background work, write durable m
 ## Candidate Learning
 
 Durable learning is proposal-first. Ordinary learn calls stage candidate packets
-through the daemon instead of silently mutating long-term memory. Operators can
-list and resolve candidates through the local console API (`/api/candidates`,
-`/api/resolve-candidate`) or the explicit `minni_resolve_candidate` tool.
+through the daemon instead of silently mutating long-term memory. Hosts can
+list their own staged rows with `minni_list_candidates` and resolve them with
+`minni_resolve_candidate`. Operators can also list and resolve through the
+local console API (`/api/candidates`, `/api/resolve-candidate`).
 
 Candidate acceptance writes a durable learning. Rejection, redaction, log-only,
 and sensitivity decisions remain auditable without promoting the content into

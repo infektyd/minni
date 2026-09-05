@@ -128,7 +128,7 @@ export function App() {
 
   const counts: Record<string, string> = {
     recall: evidence.length ? String(evidence.length) : "",
-    packet: selected.size ? `${selected.size} incl` : "",
+    packet: selected.size ? `${selected.size} marked` : "",
     dryrun: outcome ? String(
       outcome.outcomeDraft.learnCandidates.length +
         outcome.outcomeDraft.logOnly.length +

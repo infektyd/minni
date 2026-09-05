@@ -20,6 +20,7 @@ test("shared model-facing tools gate before local shared work", async () => {
     ["minni_team_promotion", "team.promotion"],
     ["minni_status", "audit.status"],
     ["minni_route", "audit.route"],
+    ["minni_list_candidates", "candidates.list"],
     ["minni_resolve_candidate", "candidates.resolve"],
     ["minni_learning_quality", "audit.learning_quality"],
     ["minni_audit_report", "audit.report"],
@@ -44,6 +45,11 @@ test("shared model-facing tools gate before local shared work", async () => {
     ["minni_thread_restore", "plan.restore"],
     ["minni_thread_activate", "plan.activate"],
     ["minni_thread_deactivate", "plan.deactivate"],
+    ["minni_thread_ready", "plan.ready"],
+    ["minni_thread_assign", "plan.assign"],
+    ["minni_thread_claim", "plan.claim"],
+    ["minni_thread_worker_update", "plan.worker_update"],
+    ["minni_thread_events", "plan.events"],
   ]);
 
   for (const [toolName, operation] of expected) {
