@@ -17,11 +17,21 @@ onto legacy trees and can undo wire-managed roots. Propagate's
 Refresh with `minni wire kilocode --from-repo .` or `make sync-root` — see
 [deploy/README.md](../../deploy/README.md).
 
-This registers the MCP server (`plugins/minni/.kilocode-plugin/`,
-`~/.config/kilo/kilo.json`), pins the agent identity
+Current source wiring registers the MCP server in `~/.config/kilo/kilo.json`,
+pins the agent identity
 (`MINNI_KILOCODE_AGENT_ID=kilocode`), the per-agent vault
 (`~/.minni/kilocode-vault`), and installs the Kilo hook entrypoint
-(`dist/kilocode-hook.js`) from the wire-managed plugin tree.
+(`dist/kilocode-hook.js`) from the wire-managed plugin tree. It installs a stamped
+native bridge at `~/.config/kilo/plugin/minni.js`, with explicit identity, vault,
+socket, workspace, and compiled-hook bindings. The bridge and MCP configuration
+are read back; ordinary write failures restore both previous files. This is not
+an atomic transaction across a process crash.
+
+Explicit wiring refuses an unrecognized plugin at that path. Bulk wiring only
+refreshes a recognized existing bridge; an MCP-only setup stays MCP-only and the
+result names explicit wiring as the next step. Missing hosts and deliberately
+disabled MCP bindings are preserved during bulk refresh. These guarantees apply
+to this source revision; verify the payload revision of an older wheel.
 
 ## In-process bridge, not a manifest
 

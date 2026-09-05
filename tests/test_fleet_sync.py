@@ -31,6 +31,14 @@ OK_AUDIT = {"name": "deploy_symlink_audit", "exit_code": 0}
 REPO = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def isolated_host_home(tmp_path, monkeypatch):
+    # Fleet now also refreshes registered custom MCP consumers. Never read or
+    # update developer registrations when the canonical wire step is mocked.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("minni.wire.host_discovery._SYSTEM_LAUNCHER_ROOTS", ())
+
+
 def test_sync_result_to_dict():
     r = SyncResult(ok=True, install_kind="packaged", message="ok", next_actions=["a"])
     d = r.to_dict()
@@ -232,12 +240,18 @@ FAKE_PROPAGATE = '''
 CALLS = []
 
 
-def update_grok_hooks(install_root):
+def preflight_grok_native(install_root):
+    pass
+
+
+def update_grok_hooks(install_root, *, existing_only=False):
+    assert existing_only
     CALLS.append(("hooks", str(install_root)))
     return {"installed": INSTALLED, "path": "hooks.json"}
 
 
-def write_grok_rules():
+def write_grok_rules(*, existing_only=False):
+    assert existing_only
     CALLS.append(("rules", None))
     return {"installed": INSTALLED, "path": "rules.md"}
 '''
@@ -267,6 +281,12 @@ def _grok_home(tmp_path: Path, monkeypatch, *, wired: bool = True) -> Path:
             encoding="utf-8",
         )
     monkeypatch.setenv("HOME", str(home))
+    executable = tmp_path / "grok"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    (home / ".grok").mkdir()
+    (home / ".grok/config.toml").write_text("[mcp_servers.minni]\n")
     return root
 
 
@@ -897,11 +917,18 @@ def test_full_sync_nonzero_update_root_fails(mock_kind, mock_popen, tmp_path):
     assert result.ok is False
 
 
-def test_run_propagate_plumbs_a_real_nonzero_exit(tmp_path):
+def test_run_propagate_plumbs_a_real_nonzero_exit(tmp_path, monkeypatch):
     """The pre-fix laundering bug transplanted to propagate: a cursor failure
     must arrive as a nonzero step."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    executable = tmp_path / "cursor"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    (tmp_path / ".cursor").mkdir()
+    (tmp_path / ".cursor/mcp.json").write_text('{"mcpServers":{"minni":{}}}')
     script = tmp_path / "propagate.py"
-    script.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+    script.write_text("import sys\nassert '--existing-only' in sys.argv\nsys.exit(7)\n", encoding="utf-8")
     with patch("minni.fleet_sync._propagate_py", return_value=script):
         step = _run_propagate("cursor", None, dry_run=False)
     assert step["exit_code"] == 7
@@ -1052,3 +1079,31 @@ def test_audit_excludes_the_staged_repo_payload(tmp_path, monkeypatch):
         )
         _audit_deploy_symlinks(REPO, dry_run=False)
     assert run.call_args.kwargs["env"]["MINNI_CHECK_DEPLOYMENTS_SKIP_REPO"] == "1"
+
+
+@pytest.mark.parametrize('leftover_config', [False, True])
+def test_optional_grok_skips_before_loading_propagation(tmp_path, monkeypatch, leftover_config):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('PATH', '')
+    if leftover_config:
+        (tmp_path / '.grok').mkdir()
+        (tmp_path / '.grok/config.toml').write_text('[mcp_servers.minni]\n')
+    with patch('minni.fleet_sync._propagate_py') as locate:
+        result = _restamp_grok_hooks(None, dry_run=False)
+    locate.assert_not_called()
+    assert result['skipped'] is True
+    assert result['exit_code'] == 0
+    assert not (tmp_path / '.minni').exists()
+
+
+def test_malformed_grok_config_is_visible_without_loading_propagation(tmp_path, monkeypatch):
+    root = _grok_home(tmp_path, monkeypatch)
+    config = tmp_path / 'home/.grok/config.toml'
+    config.write_text('bad = [')
+    with patch('minni.fleet_sync._propagate_py') as locate:
+        result = _restamp_grok_hooks(None, dry_run=False)
+    locate.assert_not_called()
+    assert result['status'] == 'failed'
+    assert _step_failed(result)
+    assert config.read_text() == 'bad = ['
+    assert root.is_dir()
