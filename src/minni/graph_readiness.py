@@ -350,6 +350,22 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
     except sqlite3.Error as e:
         errors.append(f"Failed to inspect PK for 'learning_documents': {e}")
 
+    # memory_links retains the baseline edge identity used by triple-key upserts.
+    try:
+        link_info = conn.execute("PRAGMA table_info(memory_links)").fetchall()
+        link_pk_cols = sorted(
+            [row for row in link_info if row[5] > 0], key=lambda r: r[5]
+        )
+        expected_link_pk = ["source_doc_id", "target_doc_id", "link_type"]
+        link_pk_names = [row[1] for row in link_pk_cols]
+        if link_pk_names != expected_link_pk:
+            errors.append(
+                f"table 'memory_links' primary key shape mismatch: expected "
+                f"{expected_link_pk}, got {link_pk_names}"
+            )
+    except sqlite3.Error as e:
+        errors.append(f"Failed to inspect PK for 'memory_links': {e}")
+
     # 3. Foreign Key Constraints & Referenced Parent Semantics check
     for tbl, fks in REQUIRED_FOREIGN_KEYS.items():
         try:
@@ -500,6 +516,22 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                 errors.append(
                     f"index '{idx_name}' is unexpectedly partial"
                 )
+
+    # learning_documents is an N:1 mapping: multiple learnings may share a doc.
+    try:
+        for idx_row in conn.execute("PRAGMA index_list(learning_documents)").fetchall():
+            if not bool(idx_row[2]):
+                continue
+            index_name = idx_row[1]
+            index_info = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+            index_columns = [row[2] for row in sorted(index_info, key=lambda r: r[0])]
+            if index_columns == ["doc_id"]:
+                errors.append(
+                    "table 'learning_documents' has unexpected unique constraint on 'doc_id'"
+                )
+    except sqlite3.Error as e:
+        errors.append("Failed to inspect unique constraints for 'learning_documents': "
+                      f"{e}")
 
     if errors or missing_items:
         return SchemaVerificationReport(

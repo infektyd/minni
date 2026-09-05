@@ -171,6 +171,38 @@ def test_tc_ready_01_clean_db_ready():
     assert msg == "ready"
 
 
+def test_memory_links_primary_key_must_exclude_weight():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    conn.execute("DROP TABLE memory_links")
+    conn.execute(
+        """CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type, weight)
+        )"""
+    )
+
+    report = verify_graph_schema(conn)
+    assert not report.ready
+    assert any("memory_links' primary key shape mismatch" in error for error in report.errors)
+
+
+def test_learning_documents_rejects_unique_doc_id_constraint():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    conn.execute("CREATE UNIQUE INDEX unique_learning_documents_doc_id ON learning_documents(doc_id)")
+
+    report = verify_graph_schema(conn)
+    assert not report.ready
+    assert any("unique constraint on 'doc_id'" in error for error in report.errors)
+
+
 def test_tc_ready_02_missing_learning_documents():
     """TC-READY-02: Fresh DB missing table learning_documents yields schema_missing."""
     conn = sqlite3.connect(":memory:")

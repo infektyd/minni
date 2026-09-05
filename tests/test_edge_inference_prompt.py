@@ -258,6 +258,10 @@ def test_validate_edge_inference_response_success():
             "evidence_index_out_of_range",  # line count is 3, 99 is invalid
         ),
         (
+            '[{"pair_id": "pair_1", "label": "updates", "direction": "forward", "confidence": 0.9, "supporting_evidence_indices": [], "rationale": "ok"}]',
+            "missing_evidence",
+        ),
+        (
             '[{"pair_id": "pair_1", "label": "updates", "direction": "forward", "confidence": 0.9, "supporting_evidence_indices": [1], "rationale": ""}]',
             "missing_or_empty_rationale",
         ),

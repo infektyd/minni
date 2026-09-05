@@ -492,6 +492,12 @@ def validate_edge_inference_response(
         evidence_indices = item.get("supporting_evidence_indices")
         if evidence_indices is None or not isinstance(evidence_indices, list):
             return False, None, f"invalid_evidence_indices: pair {pair_id} indices must be a list"
+        if label != "none" and not evidence_indices:
+            return (
+                False,
+                None,
+                f"missing_evidence: pair {pair_id} non-none labels require at least one evidence index",
+            )
 
         clean_indices: List[int] = []
         max_line_count = line_counts_per_pair.get(pair_id) if line_counts_per_pair else None
