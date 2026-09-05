@@ -8,20 +8,28 @@ from minni.wire import custom_refresh as refresh
 from minni.wire.manifest import sha256_file
 
 
+def _make_payload(base, version):
+    root = base / version
+    (root / 'dist').mkdir(parents=True)
+    (root / 'dist/server.js').write_text('console.log("fixture")')
+    (root / 'payload-manifest.json').write_text(json.dumps({
+        'schema': 1, 'version': version,
+        'files': {'dist/server.js': sha256_file(root / 'dist/server.js')},
+    }))
+    return root
+
+
+def _backups(config):
+    return sorted(config.parent.glob(config.name + '.minni-backup-*'))
+
+
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.setattr(refresh.shutil, 'which', lambda command: '/bin/' + command)
     base = tmp_path / '.minni/plugin'
     def payload(version):
-        root = base / version
-        (root / 'dist').mkdir(parents=True)
-        (root / 'dist/server.js').write_text('console.log("fixture")')
-        (root / 'payload-manifest.json').write_text(json.dumps({
-            'schema': 1, 'version': version,
-            'files': {'dist/server.js': sha256_file(root / 'dist/server.js')},
-        }))
-        return root
+        return _make_payload(base, version)
     old, new = payload('0.5.0+git.11111111'), payload('0.5.0+git.22222222')
     records = []
     def host(name='muse', **overrides):
@@ -427,3 +435,100 @@ def test_no_target_unverifiable_registered_root_still_fails(setup):
     assert result['exit_code'] == 1
     assert result['results'][0]['status'] == 'failed'
     assert config.read_bytes() == before
+
+
+def test_prerelease_target_refreshes_binding(setup):
+    """Prerelease/dev names dev_version produces are valid payload roots."""
+    base, _, _, host = setup
+    pre = _make_payload(base, '0.6.0rc1+git.abcdef12')
+    config = host()
+    result = refresh.refresh_custom_wires(new_root=pre)
+    assert result['exit_code'] == 0
+    row = result['results'][0]
+    assert row['status'] == 'refreshed'
+    assert json.loads(config.read_text())['mcpServers']['minni']['args'] == [str(pre / 'dist/server.js')]
+    assert json.loads((base / 'wired.json').read_text())['wires'][0]['version'] == pre.name
+
+
+def test_prerelease_registered_root_accepted(setup):
+    """A registered prerelease root verifies like any release root."""
+    base, _, _, host = setup
+    pre = _make_payload(base, '0.6.0rc1+git.abcdef12')
+    config = host()
+    assert refresh.refresh_custom_wires(new_root=pre)['exit_code'] == 0
+    _point_current_at(base, pre)
+    result = refresh.refresh_custom_wires(new_root=None)
+    assert result['exit_code'] == 0
+    assert result['results'][0]['status'] == 'skipped'
+    assert 'tracks the installer' in result['results'][0]['reason']
+
+
+@pytest.mark.parametrize('name', ['..', '.', '', '../evil', '0.5.0/../../x', '0.5.0/evil', '/abs/0.5.0'])
+def test_version_escape_rejected(setup, name):
+    base, _, _, _ = setup
+    assert refresh._version_root(base / name, base) is False
+
+
+def test_outside_base_target_fails_without_write(setup):
+    _, _, _, host = setup
+    config = host()
+    before = config.read_bytes()
+    result = refresh.refresh_custom_wires(new_root=Path('/tmp'))
+    assert result['exit_code'] == 1
+    assert result['results'][0]['status'] == 'failed'
+    assert config.read_bytes() == before
+    assert _backups(config) == []
+
+
+def test_second_identical_refresh_writes_no_additional_backup(setup):
+    base, _, new, host = setup
+    config = host()
+    assert refresh.refresh_custom_wires(new_root=new)['exit_code'] == 0
+    first = _backups(config)
+    assert len(first) == 1
+    result = refresh.refresh_custom_wires(new_root=new)
+    assert result['exit_code'] == 0
+    assert result['results'][0]['status'] == 'skipped'
+    assert _backups(config) == first
+
+
+def test_exact_target_with_lagging_record_repairs_registry_without_backup(setup):
+    """Refreshed bytes but stale record version: no rewrite, no backup, record fixed.
+
+    A lagging install_root is indistinguishable from an out-of-band operator edit
+    and stays preserved; only a version-only lag on byte-exact config is repaired.
+    """
+    base, old, new, host = setup
+    config = host()
+    assert refresh.refresh_custom_wires(new_root=new)['exit_code'] == 0
+    first = _backups(config)
+    assert len(first) == 1
+    registry = base / 'wired.json'
+    data = json.loads(registry.read_text())
+    data['wires'][0]['version'] = old.name
+    registry.write_text(json.dumps(data))
+    before = config.read_bytes()
+    result = refresh.refresh_custom_wires(new_root=new)
+    assert result['exit_code'] == 0
+    row = result['results'][0]
+    assert row['status'] == 'skipped'
+    assert 'registry record repaired' in row['reason']
+    assert config.read_bytes() == before
+    assert _backups(config) == first
+    assert json.loads(registry.read_text())['wires'][0]['version'] == new.name
+
+
+def test_diverged_binding_stays_preserved_despite_newer_target(setup):
+    """Out-of-band config edits are preserved even when a newer target exists."""
+    base, old, new, host = setup
+    config = host()
+    data = json.loads(config.read_text())
+    data['mcpServers']['minni']['args'] = ['/operator/custom/server.js']
+    config.write_text(json.dumps(data, indent=2) + '\n')
+    before = config.read_bytes()
+    result = refresh.refresh_custom_wires(new_root=new)
+    assert result['exit_code'] == 0
+    assert result['results'][0]['status'] == 'skipped'
+    assert 'differ from registered payload' in result['results'][0]['reason']
+    assert config.read_bytes() == before
+    assert _backups(config) == []
