@@ -167,12 +167,21 @@ def _both_harness(tmp_path, monkeypatch, run_tag, *, reuse_personal=False):
         tmp_path, monkeypatch, f"personal-{run_tag}",
         [("wiki/p1.md", "alpha beta personal ledger")],
     )
+    personal_retrieve_calls = []
     vault = _real_engine(
         tmp_path, monkeypatch, f"vault-{run_tag}",
         [("wiki/v1.md", "alpha beta vault ledger")],
     )
 
-    if not reuse_personal:
+    if reuse_personal:
+        original_personal_retrieve = personal.retrieve
+
+        def _count_personal_retrieve(**kwargs):
+            personal_retrieve_calls.append(None)
+            return original_personal_retrieve(**kwargs)
+
+        monkeypatch.setattr(personal, "retrieve", _count_personal_retrieve)
+    else:
         def _slow_fail(**kwargs):
             time.sleep(0.5)
             raise RuntimeError("boom-personal")
@@ -195,6 +204,7 @@ def _both_harness(tmp_path, monkeypatch, run_tag, *, reuse_personal=False):
         increment_request_count=lambda: None,
         logger=logging.getLogger("test-red"),
     )
+    context._personal_retrieve_calls = personal_retrieve_calls
     return context
 
 
@@ -259,19 +269,17 @@ def test_both_scope_parallel_reuses_personal_snapshot(tmp_path, monkeypatch):
     serial_context = _both_harness(
         tmp_path, monkeypatch, "reuse-serial", reuse_personal=True
     )
-    serial_personal = serial_context.agent_vault_retrieval("codex")[0]
     serial = handle_search(_both_params(), 1, serial_context)
     assert serial["ok"] is True
-    assert len(serial_personal.calls) == 1
+    assert len(serial_context._personal_retrieve_calls) == 1
 
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
     parallel_context = _both_harness(
         tmp_path, monkeypatch, "reuse-parallel", reuse_personal=True
     )
-    parallel_personal = parallel_context.agent_vault_retrieval("codex")[0]
     parallel = handle_search(_both_params(), 1, parallel_context)
     assert parallel["ok"] is True
-    assert len(parallel_personal.calls) == 1
+    assert len(parallel_context._personal_retrieve_calls) == 1
     assert _scrub_traces(parallel) == _scrub_traces(serial)
 
 
