@@ -204,8 +204,7 @@ def _both_harness(tmp_path, monkeypatch, run_tag, *, reuse_personal=False):
         increment_request_count=lambda: None,
         logger=logging.getLogger("test-red"),
     )
-    context._personal_retrieve_calls = personal_retrieve_calls
-    return context
+    return context, personal_retrieve_calls
 
 
 def _both_params():
@@ -242,7 +241,7 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
     parity._unbounded_deadline(monkeypatch)
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
     serial = handle_search(
-        _both_params(), 1, _both_harness(tmp_path, monkeypatch, "serial")
+        _both_params(), 1, _both_harness(tmp_path, monkeypatch, "serial")[0]
     )
     assert serial["ok"] is True
     assert serial["result"]["trace_id"] is None, serial["result"]["trace_id"]
@@ -252,7 +251,7 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
     for rep in range(3):
         parallel = handle_search(
-            _both_params(), 1, _both_harness(tmp_path, monkeypatch, f"par{rep}")
+            _both_params(), 1, _both_harness(tmp_path, monkeypatch, f"par{rep}")[0]
         )
         assert parallel["ok"] is True
         assert parallel["result"]["trace_id"] is None, parallel["result"]["trace_id"]
@@ -266,20 +265,20 @@ def test_both_scope_parallel_reuses_personal_snapshot(tmp_path, monkeypatch):
     """The pooled combined own-vault leg reuses the personal snapshot."""
     parity._unbounded_deadline(monkeypatch)
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
-    serial_context = _both_harness(
+    serial_context, serial_calls = _both_harness(
         tmp_path, monkeypatch, "reuse-serial", reuse_personal=True
     )
     serial = handle_search(_both_params(), 1, serial_context)
     assert serial["ok"] is True
-    assert len(serial_context._personal_retrieve_calls) == 1
+    assert len(serial_calls) == 1
 
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
-    parallel_context = _both_harness(
+    parallel_context, parallel_calls = _both_harness(
         tmp_path, monkeypatch, "reuse-parallel", reuse_personal=True
     )
     parallel = handle_search(_both_params(), 1, parallel_context)
     assert parallel["ok"] is True
-    assert len(parallel_context._personal_retrieve_calls) == 1
+    assert len(parallel_calls) == 1
     assert _scrub_traces(parallel) == _scrub_traces(serial)
 
 
