@@ -1409,7 +1409,24 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
   assert.equal(claimClockSamples, 1);
   assert.equal(claim.expires_at, "2026-08-18T12:06:00.000Z");
 
+  // Prove the transition guard with a valid lease, independently of expiry.
+  await assert.rejects(workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    action: { action: "complete", evidence: "No start was applied" },
+    now: new Date("2026-08-18T12:05:10.000Z"),
+  }), /cannot persist done without start/);
+  const started = await startClaimedSlice(
+    fixture, claim, "a", new Date("2026-08-18T12:05:20.000Z"),
+  );
+  assert.equal(isAcceptedWorkerWrite(started), false);
+  assert.equal(started.slice.status, "in_progress");
+
   let updateClockSamples = 0;
+  let clockObserved;
+  const sampled = new Promise((resolve) => { clockObserved = resolve; });
   let queuedUpdate;
   await withThreadLock(
     fixture.vaultPath,
@@ -1427,13 +1444,18 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
         },
         now: () => {
           updateClockSamples += 1;
+          clockObserved();
           return new Date("2026-08-18T12:07:00.000Z");
         },
       }).then(
         (value) => ({ ok: true, value }),
         (error) => ({ ok: false, error }),
       );
-      await Promise.resolve();
+      // Await acceptance while the holder is still active: this guarantees
+      // the durable-queue route instead of racing direct apply after release.
+      const accepted = await queuedUpdate;
+      assert.equal(accepted.ok, true, accepted.error?.message);
+      assert.equal(isAcceptedWorkerWrite(accepted.value), true);
       assert.equal(
         updateClockSamples,
         0,
@@ -1441,15 +1463,28 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
       );
     },
   );
-  const update = await queuedUpdate;
-  assert.equal(update.ok, false, "complete without start must refuse, not dump-and-return");
-  assert.match(
-    String(update.error?.message ?? ""),
-    /cannot persist done without start/,
-  );
+  let timer;
+  try {
+    await Promise.race([
+      sampled,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("queued update never sampled its apply clock")), 5000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.ok(updateClockSamples >= 1);
   await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
+  assert.deepEqual(await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId), []);
   const final = await rehydratePlan(fixture.notePath);
-  assert.equal(final.slices[0].status, "pending");
+  assert.equal(final.slices[0].status, "in_progress", "expired completion must not persist done");
+  assert.equal(final.slices[0].claim, undefined, "post-lock clock must revoke the expired lease");
+  assert.equal(final.slices[0].generation, started.slice.generation + 1);
+  const { events } = await readThreadEvents(journalPathFor(fixture.notePath, fixture.planId), 0, 100);
+  assert.equal(events.filter((event) => event.kind === "slice.started").length, 1);
+  assert.equal(events.filter((event) => event.kind === "slice.completed").length, 0);
+
 });
 
 test("expired orphan idempotency envelopes cannot be replayed into a new claim", async (t) => {
