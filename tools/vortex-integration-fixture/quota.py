@@ -18,4 +18,4 @@ def remaining_capacity(used: int, capacity: int) -> int:
     """Return nonnegative available capacity, even if already over capacity."""
     if min(used, capacity) < 0:
         raise ValueError("counts must be nonnegative")
-    return min(0, capacity - used)
+    return max(0, capacity - used)
