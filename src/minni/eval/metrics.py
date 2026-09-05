@@ -164,16 +164,20 @@ def _safe_search(
     config_name: str,
     config_kwargs: Dict[str, Any],
     limit: int = 10,
+    *, strict: bool = False,
 ) -> Tuple[List[Dict[str, Any]], float]:
     """
     Run search() with the given config, stripping unrecognised kwargs with
-    a warning (logged once per config/kwarg pair).
+    a warning (logged once per config/kwarg pair). Strict quality mode
+    rejects unsupported options before calling the retriever.
     """
     safe_kwargs: Dict[str, Any] = {"limit": limit, "update_access": False}
     for k, v in config_kwargs.items():
         if k in KNOWN_RETRIEVE_KWARGS:
             safe_kwargs[k] = v
         else:
+            if strict:
+                raise RuntimeError("quality evaluation contains unsupported retrieval options")
             key = (config_name, k)
             if key not in _warned_unknown_kwargs:
                 logger.warning(
@@ -185,14 +189,31 @@ def _safe_search(
     try:
         results = searcher.search(query, **safe_kwargs)
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise RuntimeError("quality evaluation retrieval failed") from exc
         logger.error("search() raised for config %r query %r: %s", config_name, query, exc)
         results = []
     elapsed = time.perf_counter() - t0
     return results, elapsed
 
 
-def _extract_doc_ids(results: List[Dict[str, Any]]) -> List[int]:
+def _extract_doc_ids(results: List[Dict[str, Any]], *, strict: bool = False) -> List[int]:
     """Extract doc_ids from a list of search results."""
+    if strict:
+        if not isinstance(results, list):
+            raise RuntimeError("quality retrieval results must be a ranked list")
+        ids = []
+        for row in results:
+            if not isinstance(row, dict):
+                raise RuntimeError("quality retrieval result must be an object")
+            did = row.get("doc_id")
+            if did is None:
+                provenance = row.get("provenance")
+                did = provenance.get("doc_id") if isinstance(provenance, dict) else None
+            if isinstance(did, bool) or not isinstance(did, int):
+                raise RuntimeError("quality retrieval requires an exact integer ID at every rank")
+            ids.append(did)
+        return ids
     ids = []
     for r in results:
         did = r.get("doc_id") or r.get("provenance", {}) and r.get("provenance", {}).get("doc_id")
@@ -222,6 +243,7 @@ def run_eval(
     config_name: str,
     config_kwargs: Dict[str, Any],
     ks: Tuple[int, ...] = (1, 3, 5, 10),
+    *, strict_search: bool = False,
 ) -> Dict[str, Any]:
     """Run evaluation over all queries for a single config."""
     per_query = []
@@ -240,9 +262,9 @@ def run_eval(
         budget_tokens = int(q.get("budget_tokens", 4096))
 
         results, latency = _safe_search(
-            searcher, query_text, config_name, config_kwargs
+            searcher, query_text, config_name, config_kwargs, strict=strict_search
         )
-        result_ids = _extract_doc_ids(results)
+        result_ids = _extract_doc_ids(results, strict=strict_search)
         token_counts = _extract_token_counts(results)
 
         r_at_k = {k: _recall_at_k(expected_ids, result_ids, k) for k in ks}
@@ -550,6 +572,10 @@ def evaluate_quality_gate(
                 "baseline_expected_doc_ids": base_judgment,
                 "candidate_expected_doc_ids": cand_judgment,
             })
+            continue
+        if any(not isinstance(item.get("notes"), str) or not item["notes"].strip()
+               for item in (base_item, cand_item)):
+            incomparable.append({"query": query, "issue": "missing explicit query class"})
             continue
         base_class = _query_class(base_item)
         cand_class = _query_class(cand_item)

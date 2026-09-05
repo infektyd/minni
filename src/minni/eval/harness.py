@@ -55,7 +55,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 CONFIGS: Dict[str, Dict[str, Any]] = {
     "baseline": {"use_hyde": False},
-    "with-expand": {"expand": True},
+    "no-expand": {"use_hyde": False, "expand": False},
+    "with-expand": {"use_hyde": False, "expand": True},
     "with-hyde": {"use_hyde": True},
     "fp32-baseline": {},
     "int8-quantized": {},
@@ -134,21 +135,27 @@ def _resolve_quality_keys(
     """
     Resolve user-supplied baseline/candidate names to report keys.
 
-    ``cmd_run`` names multi-config reports ``{retriever}-{config}``, so an
-    exact miss falls back to a unique ``-{name}`` suffix match (e.g.
-    ``with-expand`` resolves ``minnid-with-expand``). An empty candidate
-    auto-resolves only when exactly two reports exist. An explicitly named
-    but unresolvable candidate is returned verbatim (never None) so the
-    evaluator reports it missing instead of silently auto-selecting some
-    other report.
+    ``cmd_run`` supplies explicit retriever/config metadata. Bare reports
+    accept only exact known retriever/config names, never an arbitrary suffix.
+    An explicit unresolved candidate remains explicit and cannot auto-select.
     """
 
     def resolve(name: str) -> Optional[str]:
         if name in reports:
             return name
-        suffixed = [key for key in reports if key.endswith(f"-{name}")]
-        if len(suffixed) == 1:
-            return suffixed[0]
+        matched = []
+        for key, report in reports.items():
+            config = report.get("quality_config") if isinstance(report, dict) else None
+            if config is not None:
+                if config == name:
+                    matched.append(key)
+            elif name in CONFIGS and any(key == f"{retriever}-{name}" for retriever in
+                    ("minnid", "sovrd", "baseline", "mock", "ripgrep", "rg",
+                     "raw-context", "raw_context", "raw", "vendor",
+                     "vendor-memory", "vendor_memory")):
+                matched.append(key)
+        if len(matched) == 1:
+            return matched[0]
         return None
 
     baseline_key = resolve(baseline)
@@ -170,6 +177,19 @@ def _preflight_quality_gate(
     retriever work: non-normative metric, unresolvable explicit names, or
     no auto-selectable candidate.
     """
+    if getattr(args, "gate", False):
+        logger.error("--gate and --quality-gate are mutually exclusive")
+        sys.exit(2)
+    if len(retriever_names) != 1 or retriever_names[0] not in {"minnid", "sovrd", "baseline", "mock"}:
+        logger.error("Quality gate requires one document-ID retriever with multiple configs")
+        sys.exit(2)
+    if set(config_names) & {"fp32-baseline", "int8-quantized", "with-semantic-merge"}:
+        logger.error("Quality gate does not support placeholder ablations without implemented options")
+        sys.exit(2)
+    if any(key not in KNOWN_RETRIEVE_KWARGS
+           for config in config_names for key in CONFIGS[config]):
+        logger.error("Quality gate config contains unsupported retrieval options")
+        sys.exit(2)
     metric = getattr(args, "quality_metric", "recall_at_k") or "recall_at_k"
     if metric != "recall_at_k":
         logger.error(
@@ -191,7 +211,9 @@ def _preflight_quality_gate(
     for row in queries or []:
         query = row.get("query")
         ids = row.get("expected_doc_ids", [])
+        cls = row.get("notes")
         if (not isinstance(query, str) or not query.strip() or query in seen
+                or not isinstance(cls, str) or not cls.strip()
                 or not isinstance(ids, list)
                 or any(isinstance(value, bool) or not isinstance(value, int) for value in ids)):
             logger.error("Quality gate requires unique nonempty query strings and exact integer judgments")
@@ -205,7 +227,9 @@ def _preflight_quality_gate(
     baseline_req = getattr(args, "quality_baseline", "baseline") or "baseline"
     candidate_req = getattr(args, "quality_candidate", "") or ""
     baseline_key, candidate_key = _resolve_quality_keys(
-        dict.fromkeys(expected), baseline_req, candidate_req
+        {key: {"quality_config": config} for key, config in
+         zip(expected, [config for _ in retriever_names for config in config_names])},
+        baseline_req, candidate_req
     )
     if baseline_key not in expected:
         logger.error(
@@ -230,6 +254,19 @@ def _preflight_quality_gate(
         )
         sys.exit(2)
 
+    if baseline_key == candidate_key:
+        logger.error("Quality gate baseline and candidate must be distinct configs")
+        sys.exit(2)
+    configs_by_key = {
+        key: config for key, config in
+        zip(expected, [config for _ in retriever_names for config in config_names])
+    }
+    baseline_options = {"expand": True, **CONFIGS[configs_by_key[baseline_key]]}
+    candidate_options = {"expand": True, **CONFIGS[configs_by_key[candidate_key]]}
+    if baseline_options == candidate_options:
+        logger.error("Quality gate requires different effective retrieval options, not only labels")
+        sys.exit(2)
+
 
 def cmd_run(args: argparse.Namespace) -> None:
     """Run evaluation for one or more configs and write reports."""
@@ -244,7 +281,11 @@ def cmd_run(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     query_path = Path(args.queries) if getattr(args, "queries", "") else None
-    queries = load_queries(query_path)
+    try:
+        queries = load_queries(query_path, strict=True) if getattr(args, "quality_gate", False) else load_queries(query_path)
+    except ValueError as exc:
+        logger.error("Invalid quality corpus: %s", exc)
+        sys.exit(2)
     if not queries:
         logger.warning("No queries loaded - producing empty report.")
 
@@ -278,7 +319,14 @@ def cmd_run(args: argparse.Namespace) -> None:
                 else f"{retriever_name}-{config_name}"
             )
             logger.info("Evaluating retriever=%s config=%s", retriever_name, config_name)
-            report = run_eval(searcher, queries, report_name, config_kwargs, ks=ks)
+            try:
+                report = run_eval(searcher, queries, report_name, config_kwargs, ks=ks,
+                                  strict_search=getattr(args, "quality_gate", False))
+            except RuntimeError:
+                logger.error("Quality evaluation aborted: retrieval failed; no comparison accepted")
+                sys.exit(3)
+            report["quality_config"] = config_name
+            report["quality_retriever"] = retriever_name
             reports[report_name] = report
 
             json_path = _reports_dir() / f"{timestamp}-{report_name}.json"
