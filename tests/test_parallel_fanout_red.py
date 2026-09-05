@@ -145,7 +145,7 @@ class _CounterRing:
         return f"test-trace-{self.n}"
 
 
-def _both_harness(tmp_path, monkeypatch, run_tag):
+def _both_harness(tmp_path, monkeypatch, run_tag, *, reuse_personal=False):
     """both-scope over REAL engines with a forced shared-call order.
 
     One healthy vault (combined = vault leg + shared tail, a 2-callable
@@ -172,11 +172,12 @@ def _both_harness(tmp_path, monkeypatch, run_tag):
         [("wiki/v1.md", "alpha beta vault ledger")],
     )
 
-    def _slow_fail(**kwargs):
-        time.sleep(0.5)
-        raise RuntimeError("boom-personal")
+    if not reuse_personal:
+        def _slow_fail(**kwargs):
+            time.sleep(0.5)
+            raise RuntimeError("boom-personal")
 
-    monkeypatch.setattr(personal, "retrieve", _slow_fail)
+        monkeypatch.setattr(personal, "retrieve", _slow_fail)
     principal = parity._owner()
     context = RecallContext(
         make_error=lambda code, msg, rid: {"ok": False, "id": rid, "error": [code, msg]},
@@ -184,7 +185,11 @@ def _both_harness(tmp_path, monkeypatch, run_tag):
         handler_principal=lambda params, rid: (principal, None),
         lazy_retrieval=lambda: shared,
         agent_vault_retrieval=lambda agent_id: (personal, "codex", "/db/personal.db"),
-        all_vault_retrievals=lambda: [(vault, "vault-one", "/db/vault-one.db")],
+        all_vault_retrievals=lambda: [
+            (personal, "codex", "/db/personal.db")
+            if reuse_personal
+            else (vault, "vault-one", "/db/vault-one.db")
+        ],
         trace_ring=lambda: None,
         record_latency=lambda *a: None,
         increment_request_count=lambda: None,
@@ -247,6 +252,29 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
         assert _scrub_traces(parallel) == _scrub_traces(serial)
 
 
+def test_both_scope_parallel_reuses_personal_snapshot(tmp_path, monkeypatch):
+    """The pooled combined own-vault leg reuses the personal snapshot."""
+    parity._unbounded_deadline(monkeypatch)
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", False)
+    serial_context = _both_harness(
+        tmp_path, monkeypatch, "reuse-serial", reuse_personal=True
+    )
+    serial_personal = serial_context.agent_vault_retrieval("codex")[0]
+    serial = handle_search(_both_params(), 1, serial_context)
+    assert serial["ok"] is True
+    assert len(serial_personal.calls) == 1
+
+    monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
+    parallel_context = _both_harness(
+        tmp_path, monkeypatch, "reuse-parallel", reuse_personal=True
+    )
+    parallel_personal = parallel_context.agent_vault_retrieval("codex")[0]
+    parallel = handle_search(_both_params(), 1, parallel_context)
+    assert parallel["ok"] is True
+    assert len(parallel_personal.calls) == 1
+    assert _scrub_traces(parallel) == _scrub_traces(serial)
+
+
 # ── RED-2: gated cross-encoder lock ─────────────────────────────────────────
 
 
@@ -263,7 +291,9 @@ def test_both_scope_parallel_trace_matches_serial(tmp_path, monkeypatch):
     ],
 )
 def test_unlocked_gate_mapping(monkeypatch, device, pinned, expected):
-    """The unlocked path requires CPU device AND a fired pin, nothing else."""
+    """The unlocked path requires CPU device, thread pin, and env pins."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    monkeypatch.setenv("MKL_NUM_THREADS", "1")
     # Isolated without touching the shared functools.cache: the gate reads
     # only _CROSS_ENCODER_CONSTRUCTION_DEVICE + _resolve_model_device() +
     # _TORCH_THREADS_PINNED, so construction-device None (the
@@ -275,6 +305,17 @@ def test_unlocked_gate_mapping(monkeypatch, device, pinned, expected):
     monkeypatch.setattr(models_mod, "_resolve_model_device", lambda: device)
     monkeypatch.setattr(models_mod, "_TORCH_THREADS_PINNED", pinned)
     assert models_mod.cross_encoder_unlocked_predict_safe() is expected
+
+
+@pytest.mark.parametrize("missing", ["OMP_NUM_THREADS", "MKL_NUM_THREADS"])
+def test_unlocked_gate_requires_openmp_env_pins(monkeypatch, missing):
+    """A CPU thread pin alone is insufficient without the native env pins."""
+    monkeypatch.setattr(models_mod, "_CROSS_ENCODER_CONSTRUCTION_DEVICE", "cpu")
+    monkeypatch.setattr(models_mod, "_TORCH_THREADS_PINNED", True)
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    monkeypatch.setenv("MKL_NUM_THREADS", "1")
+    monkeypatch.delenv(missing)
+    assert models_mod.cross_encoder_unlocked_predict_safe() is False
 
 
 def test_rerank_holds_lock_unless_gate(monkeypatch, tmp_path):
