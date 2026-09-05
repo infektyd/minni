@@ -273,6 +273,32 @@ def test_bulk_unavailable_hosts_skip_before_node_payload_or_bootstrap(wire_env, 
     assert not (home / '.minni').exists()
 
 
+def test_bulk_unreadable_bridge_refreshes_mcp_and_reports_unmanaged(wire_env, monkeypatch, capsys):
+    """An existing-but-unreadable bridge must take the designed graceful path:
+    MCP binding refreshed, bridge reported unmanaged — never a failed platform
+    that also skips the binding refresh."""
+    home, payload, _ = wire_env
+    bridge = home / '.config/kilo/plugin/minni.js'
+    _install(home, payload)
+    assert bridge.is_file()
+    real_read_bytes = Path.read_bytes
+
+    def guarded(self):
+        if self == bridge:
+            raise PermissionError('fixture unreadable bridge')
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', guarded)
+    _patch_payload(wire_env, monkeypatch)
+    assert run_wire(_args('all', home, no_prune=True)) == 0
+    result = next(row for row in json.loads(capsys.readouterr().out)['results'] if row['platform'] == 'kilocode')
+    assert result['status'] == 'wired'
+    assert result['kilo_bridge']['installed'] is False
+    assert 'explicit wire' in result['kilo_bridge']['reason']
+    kilo_config = json.loads((home / '.config/kilo/kilo.json').read_text())
+    assert kilo_config['mcp']['minni']['command'][-1].endswith('/dist/server.js')
+
+
 def test_bulk_mixed_absent_broken_and_ready_hosts_continue(wire_env, monkeypatch, capsys):
     home = wire_env[0]
     (home.parent / 'kilo').unlink()

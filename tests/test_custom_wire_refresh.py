@@ -259,12 +259,20 @@ def test_real_wire_output_schema_selects_root_without_current_symlink(setup):
     assert refresh.refresh_custom_wires(new_root=target)['results'][0]['status'] == 'refreshed'
 
 
-def test_missing_target_never_guesses_newest_directory(setup):
-    _, _, _, host = setup
+def test_missing_target_skips_custom_only_fleet_instead_of_failing(setup):
+    """Wire-skipped (no installer target) is not a redeploy failure: the
+    binding is assessed against its registered root, never auto-moved."""
+    base, old, new, host = setup
     config = host()
-    before = config.read_bytes()
-    assert refresh.refresh_custom_wires()['exit_code'] == 1
-    assert config.read_bytes() == before
+    _point_current_at(base, new)
+    before = config.read_bytes(), (base / 'wired.json').read_bytes()
+    result = refresh.refresh_custom_wires()
+    assert result['exit_code'] == 0
+    row = result['results'][0]
+    assert row['status'] == 'skipped'
+    assert new.name in row['reason']
+    assert json.loads(config.read_text())['mcpServers']['minni']['args'] == [str(old / 'dist/server.js')]
+    assert before == (config.read_bytes(), (base / 'wired.json').read_bytes())
 
 
 def test_fleet_wire_step_carries_actual_report_root(setup, monkeypatch):
@@ -335,4 +343,87 @@ def test_version_mismatch_rejected_on_apply(setup):
     manifest['version'] = '9.9.9'
     path.write_text(json.dumps(manifest))
     assert refresh.refresh_custom_wires(new_root=new)['exit_code'] == 1
+    assert config.read_bytes() == before
+
+
+def _point_current_at(base, root):
+    """Mirror install_payload: `current` is a relative symlink to the version."""
+    link = base / 'current'
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(root.name)
+
+
+def test_no_target_tracking_installer_pointer_skips(setup):
+    """D5: binding on the validated installer `current` payload is current."""
+    base, _, new, host = setup
+    config = host()
+    assert refresh.refresh_custom_wires(new_root=new)['exit_code'] == 0
+    _point_current_at(base, new)
+    before = config.read_bytes(), (base / 'wired.json').read_bytes()
+    result = refresh.refresh_custom_wires(new_root=None)
+    assert result['exit_code'] == 0
+    row = result['results'][0]
+    assert row['status'] == 'skipped'
+    assert 'tracks the installer' in row['reason'] and new.name in row['reason']
+    assert row['status'] != 'refreshed'
+    assert before == (config.read_bytes(), (base / 'wired.json').read_bytes())
+
+
+def test_no_target_diverged_pointer_names_remedy_without_moving(setup):
+    """D5: binding behind the installer pointer is skipped, never auto-moved."""
+    base, old, new, host = setup
+    config = host()
+    _point_current_at(base, new)
+    before = config.read_bytes(), (base / 'wired.json').read_bytes()
+    result = refresh.refresh_custom_wires(new_root=None)
+    assert result['exit_code'] == 0
+    row = result['results'][0]
+    assert row['status'] == 'skipped'
+    assert 'current pointer names' in row['reason'] and new.name in row['reason']
+    assert '--new-root' in row['reason']
+    assert json.loads(config.read_text())['mcpServers']['minni']['args'] == [str(old / 'dist/server.js')]
+    assert before == (config.read_bytes(), (base / 'wired.json').read_bytes())
+
+
+@pytest.mark.parametrize('sabotage', ['absent', 'plain_file', 'tampered_target'])
+def test_no_target_without_validated_pointer_makes_no_newest_claim(setup, sabotage):
+    """Without a validated pointer, no newest/already-current language at all."""
+    base, old, new, host = setup
+    config = host()
+    if sabotage == 'plain_file':
+        (base / 'current').write_text('not a symlink')
+    elif sabotage == 'tampered_target':
+        _point_current_at(base, new)
+        (new / 'dist/server.js').write_text('tampered')
+    before = config.read_bytes()
+    result = refresh.refresh_custom_wires(new_root=None)
+    assert result['exit_code'] == 0
+    row = result['results'][0]
+    assert row['status'] == 'skipped'
+    assert 'matches its verified payload' in row['reason']
+    assert 'no validated installer pointer' in row['reason']
+    assert 'already current' not in row['reason'] and 'newer' not in row['reason']
+    assert config.read_bytes() == before
+
+
+def test_no_target_dry_run_represents_state_instead_of_failing(setup):
+    base, _, _, host = setup
+    config = host()
+    before = config.read_bytes()
+    result = refresh.refresh_custom_wires(dry_run=True, new_root=None)
+    assert result['exit_code'] == 0
+    assert result['results'][0]['status'] == 'dry-run'
+    assert config.read_bytes() == before
+
+
+def test_no_target_unverifiable_registered_root_still_fails(setup):
+    """D5 skip never excuses a registered root that no longer verifies."""
+    base, old, _, host = setup
+    config = host()
+    (old / 'dist/server.js').write_text('tampered')
+    before = config.read_bytes()
+    result = refresh.refresh_custom_wires(new_root=None)
+    assert result['exit_code'] == 1
+    assert result['results'][0]['status'] == 'failed'
     assert config.read_bytes() == before
