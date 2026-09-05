@@ -23,6 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # Source-grounded evaluation verifies excerpts against pinned commits.
+          fetch-depth: 0
           # This job executes PR-authored code (make setup / pytest); a credential in
           # .git/config would be readable by it.
           # Default checkout persists the token into .git/config as an http
