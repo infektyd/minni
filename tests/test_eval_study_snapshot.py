@@ -511,6 +511,8 @@ def test_snapshot_searcher_never_uses_live_default_config(tmp_path, monkeypatch)
 
 
 def test_snapshot_searcher_revalidates_before_every_search(tmp_path, monkeypatch):
+    import sqlite3
+
     from minni import retrieval as retrieval_mod
     from minni.eval.retrievers import SnapshotSearcher
 
@@ -530,6 +532,14 @@ def test_snapshot_searcher_revalidates_before_every_search(tmp_path, monkeypatch
         "project-a/launch.md", "project-b/launch.md",
     }
     assert searcher._principal.allowed_vault_roots == [str(dest / "vault")]
+
+    connection = sqlite3.connect(dest / "study.db")
+    connection.execute("UPDATE documents SET agent='mallory' WHERE doc_id=1")
+    connection.execute("UPDATE vault_fts SET content='evil content' WHERE doc_id=1")
+    connection.commit()
+    connection.close()
+    with pytest.raises(StudySnapshotError, match="tamper"):
+        searcher.search("launch", limit=5)
 
     # Tampering after open fails the next search instead of serving bad bytes.
     (dest / "vault" / "project-b" / "launch.md").write_text("edited after open")
