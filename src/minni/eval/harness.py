@@ -24,6 +24,16 @@ from .dataset import (
     validate_queries,
     validate_quality_queries,
 )
+from .provenance import (
+    LIVE_BACKENDS,
+    build_report_provenance,
+    code_provenance,
+    corpus_provenance,
+    environment_provenance,
+    principal_provenance,
+    query_file_provenance,
+    retrieval_options_provenance,
+)
 from .judging import JudgeUnavailable, RubricScore, score_answer_placeholder
 from .metrics import (
     KNOWN_RETRIEVE_KWARGS,
@@ -81,6 +91,20 @@ def _reports_dir() -> Path:
     return d
 
 
+def _resolve_reports_dir(output_dir: Any = None) -> Path:
+    """User-selected report directory, defaulting to the in-repo reports dir.
+
+    A private study keeps its reports outside version control by passing
+    ``--output-dir``; the default preserves the existing ``eval/reports``
+    location for legacy runs.
+    """
+    if output_dir:
+        d = Path(output_dir).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return _reports_dir()
+
+
 def _write_json_report(report: Dict[str, Any], path: Path) -> None:
     with path.open("w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
@@ -91,6 +115,7 @@ def _write_markdown_comparison(
     reports: Dict[str, Dict[str, Any]],
     path: Path,
     ks: Tuple[int, ...] = (1, 3, 5, 10),
+    run_provenance: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Write a Markdown comparison table across all configs."""
     lines = []
@@ -122,6 +147,35 @@ def _write_markdown_comparison(
         "compared to the `baseline` config, with no regression on any individual query class."
     )
     lines.append("")
+    if run_provenance is not None:
+        lines.append("\n## Run Provenance\n")
+        lines.append(
+            f"Query file: `{run_provenance.get('query_effective_path')}` "
+            f"(scored-content digest "
+            f"`{run_provenance.get('query_loaded_digest') or 'unknown'}`; "
+            f"separately observed file bytes "
+            f"`{run_provenance.get('query_file_sha256') or 'unknown'}` "
+            "with unverified correspondence)."
+        )
+        lines.append(
+            f"Code revision: `{run_provenance.get('code_revision')}` "
+            f"(dirty: {run_provenance.get('code_dirty')})."
+        )
+        lines.append(
+            f"Mock run: {run_provenance.get('mock')}; "
+            f"live backends mutable: {run_provenance.get('live_backend_present')}."
+        )
+        lines.append(
+            "Corpus snapshot: "
+            f"`{run_provenance.get('corpus_snapshot')}` "
+            "(live databases are never hashed; unknown means unverifiable, not frozen)."
+        )
+        lines.append(
+            "Per-report JSON carries the full provenance block, including "
+            "requested/effective options, principal availability, run order, "
+            "and timing caveats. Provenance is not a passing certification."
+        )
+        lines.append("")
 
     with path.open("w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -297,8 +351,24 @@ def cmd_run(args: argparse.Namespace) -> None:
         _preflight_quality_gate(args, config_names, retriever_names, queries)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_started_iso = datetime.now(timezone.utc).isoformat()
     reports: Dict[str, Dict[str, Any]] = {}
     ks = (1, 3, 5, 10)
+    reports_dir = _resolve_reports_dir(getattr(args, "output_dir", ""))
+
+    effective_query_path = query_path or _queries_path()
+    query_prov = query_file_provenance(query_path, effective_query_path, queries)
+    code_prov = code_provenance(repo_root())
+    env_prov = environment_provenance()
+    run_order = [
+        retriever if len(config_names) == 1 else f"{retriever}-{config}"
+        for retriever in retriever_names
+        for config in config_names
+    ]
+    # Actual constructed backend states, collected per report below. The run
+    # summary is derived from these, never from CLI flags alone: e.g.
+    # `--retrievers mock` without `--mock` still constructs a mock backend.
+    backend_states: list = []
 
     for retriever_name in retriever_names:
         try:
@@ -306,6 +376,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.error("Could not initialise retriever %r: %s", retriever_name, exc)
             sys.exit(1)
+        is_mock = bool(getattr(args, "mock", False)) or retriever_name.strip().lower() == "mock"
 
         for config_name in config_names:
             config_kwargs = CONFIGS[config_name]
@@ -323,18 +394,54 @@ def cmd_run(args: argparse.Namespace) -> None:
                 sys.exit(3)
             report["quality_config"] = config_name
             report["quality_retriever"] = retriever_name
+            report["provenance"] = build_report_provenance(
+                query=query_prov,
+                code=code_prov,
+                retrieval=retrieval_options_provenance(
+                    config_name, config_kwargs, KNOWN_RETRIEVE_KWARGS
+                ),
+                principal=principal_provenance(retriever_name, is_mock=is_mock),
+                corpus=corpus_provenance(is_mock=is_mock, retriever_name=retriever_name),
+                environment=env_prov,
+                retriever_name=retriever_name,
+                run_index=run_order.index(report_name),
+                run_order=run_order,
+                started_iso=run_started_iso,
+                mock=is_mock,
+            )
             reports[report_name] = report
+            backend_states.append((retriever_name, is_mock))
 
-            json_path = _reports_dir() / f"{timestamp}-{report_name}.json"
+            json_path = reports_dir / f"{timestamp}-{report_name}.json"
             _write_json_report(report, json_path)
 
-    md_path = _reports_dir() / f"{timestamp}-comparison.md"
-    _write_markdown_comparison(reports, md_path, ks=ks)
+    snapshots = sorted({
+        report["provenance"]["corpus"]["snapshot"] for report in reports.values()
+    })
+    run_prov_summary = {
+        "query_effective_path": query_prov["effective_path"],
+        "query_loaded_digest": query_prov["loaded_queries_digest"],
+        "query_file_sha256": query_prov["file_sha256"],
+        "code_revision": code_prov["revision"],
+        "code_dirty": code_prov["dirty"],
+        "mock": bool(backend_states) and all(mock for _, mock in backend_states),
+        "live_backend_present": any(
+            not mock and name.strip().lower() in LIVE_BACKENDS
+            for name, mock in backend_states
+        ),
+        "corpus_snapshot": (
+            snapshots[0] if len(snapshots) == 1
+            else f"mixed: {', '.join(snapshots)}" if snapshots
+            else "unknown"
+        ),
+    }
+    md_path = reports_dir / f"{timestamp}-comparison.md"
+    _write_markdown_comparison(reports, md_path, ks=ks, run_provenance=run_prov_summary)
 
     gate_report = None
     if getattr(args, "gate", False):
         gate_report = evaluate_gate(reports)
-        gate_path = _reports_dir() / f"{timestamp}-gate.json"
+        gate_path = reports_dir / f"{timestamp}-gate.json"
         _write_json_report(gate_report, gate_path)
         if not gate_report["ok"]:
             logger.error("Gate failed: %s loss_rate=%s", gate_report["metric"], gate_report["loss_rate"])
@@ -357,7 +464,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 args, "min_improvement", QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT
             ),
         )
-        quality_path = _reports_dir() / f"{timestamp}-quality-gate.json"
+        quality_path = reports_dir / f"{timestamp}-quality-gate.json"
         _write_json_report(quality_report, quality_path)
         if not quality_report["ok"]:
             logger.error("Quality gate failed: %s", quality_report["reason"])
@@ -374,7 +481,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         print(f"  gate                 ok={gate_report['ok']} loss_rate={gate_report['loss_rate']:.4f}")
     if quality_report:
         print(f"  quality gate         ok={quality_report['ok']} reason={quality_report['reason']}")
-    print(f"\nReports: {_reports_dir()}")
+    print(f"\nReports: {reports_dir}")
 
 
 def cmd_validate(args: argparse.Namespace) -> None:
@@ -446,6 +553,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--mock",
         action="store_true",
         help="Use the deterministic mock searcher instead of the live engine",
+    )
+    run_p.add_argument(
+        "--output-dir",
+        default="",
+        help="Report output directory (default: eval/reports). Point it "
+             "outside the repo to keep private study reports out of version control.",
     )
     run_p.add_argument(
         "--retrievers",
@@ -565,6 +678,7 @@ __all__ = [
     "_queries_path",
     "_recall_at_k",
     "_repo_root",
+    "_resolve_reports_dir",
     "_safe_search",
     "_token_budget_recall_at_k",
     "_write_json_report",

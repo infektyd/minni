@@ -175,6 +175,82 @@ the legacy `--gate`. These
 checks validate the comparison inputs; passing synthetic tests is not evidence
 of improved real retrieval quality.
 
+## Private-study preparation runbook (no corpus collected yet)
+
+Hans chose private day-to-day cross-project memories as the study target. No
+private corpus has been collected, and nothing below reads, exports, or
+benchmarks live memories. This section prepares the procedure so a later,
+separately authorized collection step can run it without improvising.
+
+### 1. Freeze an eligible corpus before scoring anything
+
+- Copy the selected memories into a **frozen snapshot directory** with a
+  recorded identity (e.g. a manifest of file paths plus SHA-256 per file and
+  one manifest digest). The snapshot is read-only for the whole study.
+- Every document carries an explicit eligibility annotation for the fixed
+  study principal (like the fixture's `expected_eligible`), decided before
+  retrieval runs, not derived from retrieval output.
+- Keep the snapshot and all study reports **outside version control**
+  (e.g. under Minni's private data dir or `/tmp`), never in `eval/`.
+- Refreshing the corpus means a new snapshot with a new identity and new
+  review; never silently swap files under a recorded digest.
+
+### 2. Scope reads and govern access
+
+- Run retrieval under a **least-privilege principal** whose allowed roots
+  cover only the frozen snapshot, with `update_access=False`, writeback
+  disabled, and no daemon side effects. Record the principal id,
+  capabilities, and allowed roots in the report.
+- The study harness must open the snapshot database only; it must not open
+  the live vault for reads, writes, or metadata.
+
+### 3. Review authentically, not via the legacy boolean
+
+- The existing `"reviewed": true` flag is a gate-shape marker: it says a row
+  has the required fields. It is **not** evidence that a human judged
+  relevance, wrote an answer rubric, or set a privacy expectation.
+- Authentic review means independent reviewers apply a written rubric to
+  each query, record relevance grades and privacy expectations per document,
+  adjudicate disagreements, and log the review method and date. The
+  provenance block records `human_review: not-established` until that
+  process exists; do not relabel it by hand.
+
+### 4. Why the legacy `run` still accesses DEFAULT_CONFIG
+
+- `RealSearcher` wraps `RetrievalEngine` over the mutable `DEFAULT_CONFIG`
+  live database for convenient smoke and comparison plumbing. That is why
+  ordinary `run` commands touch the live engine.
+- Treat those reports as **comparison plumbing over mutable content**, not
+  study evidence: the backend is recorded as live-mutable with snapshot
+  `unknown`, never as frozen or safe. The fixture command is the model for
+  study isolation (disposable database, fixed principal, recorded hashes).
+
+### 5. Keep private reports out of the repo
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
+  --queries /path/to/reviewed-queries.jsonl \
+  --config no-expand,with-expand --retrievers minnid \
+  --quality-gate --quality-baseline no-expand --quality-candidate with-expand \
+  --output-dir /private/study-reports
+```
+
+`--output-dir` defaults to `eval/reports`, preserving existing behavior; pass
+an outside-the-repo directory for anything private. Every JSON report carries
+a `provenance` block: a digest of the exact parsed queries scored
+(`loaded_queries_digest`), the separately observed query-file bytes with
+explicitly unverified correspondence, code revision/dirty state,
+requested/effective retrieval settings, config/dependency metadata when
+importable (model names are configured defaults, not observed inference),
+principal availability, run order and timing caveats (searcher construction
+happens before, and outside, the measured per-query timing), and
+backend-specific corpus identity (live databases stay `unknown`, never
+hashed; file baselines and placeholders get their own labels). The Markdown
+comparison adds a short Run Provenance section derived from the actually
+constructed backends, not from CLI flags alone. Provenance describes how a
+report was produced; it is not a passing certification, and `unknown` means
+unverifiable, not safe.
+
 `fp32-baseline`, `int8-quantized`, and `with-semantic-merge` are placeholder
 ablations without implemented option changes and are rejected in quality mode.
 They remain available for legacy descriptive reports. Quality mode also rejects
