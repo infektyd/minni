@@ -3796,10 +3796,15 @@ class RetrievalEngine:
             # no result is admitted merely to fill the requested count.
             window = max(1, wanted)
             ceiling = max(window, 512)
+            last_rows: List[Dict] = []
             with self._query_encoding_scope():
                 while True:
-                    raw = fetch(window)
-                    rows = _eligible(raw)
+                    try:
+                        raw = fetch(window)
+                        rows = _eligible(raw)
+                    except RequestDeadlineExceeded:
+                        return last_rows
+                    last_rows = rows
                     if len(rows) >= wanted or len(rows) == len(raw):
                         return rows
                     # Identical document lists do not prove exhaustion: many
@@ -3811,20 +3816,28 @@ class RetrievalEngine:
 
         rerank_k = max(limit, self.config.reranker_top_k if self.config.reranker_enabled else limit)
 
+        lexical_searched = False
+
         def _lexical_eligible(fetch):
             """Ranking-deadline lexical fill: short FTS/chrono may still run.
 
             Entry uses allow_expired_sql; the VM progress handler stays on
             so a recursive CTE cannot run unbounded after expiry.
             """
+            nonlocal lexical_searched
+
+            def tracked_fetch(window):
+                nonlocal lexical_searched
+                rows = fetch(window)
+                lexical_searched = True
+                return rows
+
             if past_search_deadline(deadline_monotonic):
                 with allow_expired_sql():
-                    return _collect_eligible(fetch, rerank_k)
-            return _collect_eligible(fetch, rerank_k)
+                    return _collect_eligible(tracked_fetch, rerank_k)
+            return _collect_eligible(tracked_fetch, rerank_k)
 
         if sort == "chronological":
-            if past_search_deadline(deadline_monotonic):
-                self.last_vector_degraded = "search deadline; lexical (FTS) only"
             chrono_t0 = time.perf_counter()
             try:
                 merged = _lexical_eligible(lambda window: self._chronological_search(
@@ -3832,7 +3845,8 @@ class RetrievalEngine:
                     exclude_statuses=skip_list,
                 ))
             except RequestDeadlineExceeded:
-                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                if lexical_searched:
+                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 merged = []
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
@@ -3851,7 +3865,8 @@ class RetrievalEngine:
                         exclude_statuses=skip_list,
                     ))
             except RequestDeadlineExceeded:
-                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                if lexical_searched:
+                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 fts_results = []
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
@@ -3872,7 +3887,8 @@ class RetrievalEngine:
             if past_search_deadline(deadline_monotonic):
                 semantic_results = []
                 trace["backends"] = ["fts-deadline"]
-                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                if lexical_searched:
+                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
             elif backend is None and not fts_results and self._chunk_index_empty():
                 semantic_results = []
                 trace["backends"] = ["faiss-disk-empty"]
@@ -3880,9 +3896,14 @@ class RetrievalEngine:
                 # Default path — bit-identical to pre-PR-3
                 # Gate taxonomy after fetching: filtering the SQL lookup of
                 # a bounded FAISS window would hide why it needs refilling.
-                semantic_results = _collect_eligible(
-                    lambda window: self._semantic_search(query, window), rerank_k,
-                )
+                try:
+                    semantic_results = _collect_eligible(
+                        lambda window: self._semantic_search(query, window), rerank_k,
+                    )
+                except RequestDeadlineExceeded:
+                    semantic_results = []
+                    if lexical_searched:
+                        self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 trace["backends"] = ["faiss-disk"]
             elif isinstance(backend, list):
                 # Fan-out: build a MultiBackend from the list of backend names/objects

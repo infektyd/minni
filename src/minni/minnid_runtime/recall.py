@@ -712,6 +712,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 trace_id = None
             else:
                 previous_trace_id = getattr(retrieval_engine, "last_trace_id", None)
+                deadline_interrupted = False
                 try:
                     rows = retrieval_engine.retrieve(
                         query=query,
@@ -737,15 +738,11 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                         update_access=False,
                     )
                 except RequestDeadlineExceeded:
-                    # Handler fallback: skip a new retrieve that expired,
-                    # keep the RPC as a degraded 200 rather than -32000.
+                    # A database deadline is request degradation, not an index
+                    # failure. In particular, do not claim an FTS-only result
+                    # when the leg expired before its first successful query.
                     rows = []
-                    try:
-                        retrieval_engine.last_vector_degraded = (
-                            "search deadline; lexical (FTS) only"
-                        )
-                    except Exception:
-                        pass
+                    deadline_interrupted = True
                 # Capture this leg immediately, including empty results. An
                 # unchanged diagnostic can belong to an earlier request when
                 # retrieval returns before creating a trace. Failed calls
@@ -761,6 +758,13 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 poisoned = _ranking_deadline_poisoned(retrieval_engine)
                 suppression = getattr(retrieval_engine, "last_auth_suppression", None)
                 degradation = _degradation_for(retrieval_engine, src)
+                if deadline_interrupted:
+                    degradation = {
+                        "src": src,
+                        "degraded": True,
+                        "stage": "retrieve",
+                        "reason": "search request deadline; stage skipped or interrupted",
+                    }
                 if personal and document_scope == "both":
                     with _snapshot_lock:
                         personal_snapshot = (
