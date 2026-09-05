@@ -274,7 +274,7 @@ def _canonical_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "agent": record["agent"],
         "artifact_path": record["artifact_path"],
         "content_kind": record["content_kind"],
-        "content_sha256": record["content_sha256"],
+        "content_sha256": record["content_sha256"].lower(),
         "expected_eligible": record["expected_eligible"],
         "human_reviewed": record["human_reviewed"],
         "origin": record["origin"],
@@ -481,8 +481,10 @@ def _live_path_set() -> set:
     """Live/default paths a snapshot must never target (lazy, import-free otherwise)."""
     try:
         from minni.config import DEFAULT_CONFIG
-    except Exception:  # noqa: BLE001 - without config there is nothing to guard
-        return set()
+    except Exception as exc:  # noqa: BLE001 - destination safety cannot be proved
+        raise StudySnapshotError(
+            "cannot verify live/default paths because minni config is unavailable"
+        ) from exc
     paths = set()
     for attr in ("db_path", "vault_path", "faiss_index_path", "graph_export_dir",
                  "writeback_path"):

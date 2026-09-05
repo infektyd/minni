@@ -242,7 +242,7 @@ class SnapshotSearcher(SearcherProtocol):
             "update_access": False,
             "expand": False,
             "use_hyde": False,
-            "budget_tokens": False,
+            "budget_tokens": kwargs.get("budget_tokens", True),
             "principal": self._principal,
         }
         if kwargs.get("deadline_monotonic") is not None:
