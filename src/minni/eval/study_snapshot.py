@@ -439,8 +439,8 @@ def validate_export_packet(packet: Any) -> List[Dict[str, Any]]:
                 "(cross-project eligibility is annotated, never inferred)"
             )
         page_status = _require_bounded_str(
-            row.get("page_status", "draft"), f"{label} page_status", MAX_LIFECYCLE_CHARS)
-        if page_status not in {"draft", "candidate", "accepted", "superseded",
+            row.get("page_status", "active"), f"{label} page_status", MAX_LIFECYCLE_CHARS)
+        if page_status not in {"active", "draft", "candidate", "accepted", "superseded",
                                "rejected", "expired", "complete"}:
             raise StudySnapshotError(f"{label}: page_status is not a recognized lifecycle status")
         page_type = _require_bounded_str(

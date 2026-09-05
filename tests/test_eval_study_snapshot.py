@@ -380,6 +380,8 @@ def test_verify_rejects_unmapped_vault_file_and_mixed_mapping(tmp_path):
     (dest / "mapping.json").write_text(json.dumps(envelope))
     # Bring the grafted record's bytes along so the failure under test is
     # output mixing (digest mismatch), not a missing file.
+    (dest / "vault" / "project-a" / "launch.md").unlink()
+    (dest / "vault" / "project-a" / "stowaway.md").unlink()
     grafted = dest / "vault" / "project-a" / "x.md"
     grafted.write_text((other / "vault" / "project-a" / "x.md").read_text())
     with pytest.raises(StudySnapshotError, match="mix|tamper|digest"):
