@@ -38,7 +38,7 @@ class SchemaVerificationReport:
     def __iter__(self):
         """Enable tuple unpacking (ready, message) for backward-compatible callers."""
         yield self.ready
-        if self.missing_items:
+        if self.missing_items or self.errors:
             detail = "; ".join(self.errors) if self.errors else ", ".join(self.missing_items)
             yield f"{self.status}: {detail}"
         else:
@@ -532,6 +532,29 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
     except sqlite3.Error as e:
         errors.append("Failed to inspect unique constraints for 'learning_documents': "
                       f"{e}")
+
+    # Any additional UNIQUE constraint touching memory_uri can reject distinct
+    # URIs and make the graph unusable, even when the required index is valid.
+    try:
+        for idx_row in conn.execute("PRAGMA index_list(documents)").fetchall():
+            index_name = str(idx_row[1])
+            if not bool(idx_row[2]) or index_name == "idx_documents_memory_uri":
+                continue
+            index_info = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+            index_columns = [row[2] for row in sorted(index_info, key=lambda r: r[0])]
+            index_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (index_name,),
+            ).fetchone()
+            if "memory_uri" in index_columns or (
+                index_sql and index_sql[0] and "memory_uri" in index_sql[0].lower()
+            ):
+                errors.append(
+                    f"table 'documents' has unexpected unique constraint involving 'memory_uri': "
+                    f"{index_name}"
+                )
+    except sqlite3.Error as e:
+        errors.append("Failed to inspect unique constraints for 'documents': " f"{e}")
 
     if errors or missing_items:
         return SchemaVerificationReport(

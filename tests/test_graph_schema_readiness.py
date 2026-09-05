@@ -840,8 +840,9 @@ def test_tc_ready_expression_unique_index_does_not_crash():
     conn.commit()
 
     report = verify_graph_schema(conn)
-    assert report.ready is True
-    assert report.status == "ready"
+    assert report.ready is False
+    assert report.status == "schema_drifted"
+    assert any("unique constraint involving 'memory_uri'" in err for err in report.errors)
 
 
 # =========================================================================

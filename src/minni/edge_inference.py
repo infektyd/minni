@@ -173,6 +173,12 @@ def format_numbered_excerpt(
         formatted_block, _, _ = truncate_to_tokens(
             formatted_block, max_tokens, encoding_name=encoding_name
         )
+        # Token truncation can split the final numbered line, which would make
+        # a citation appear valid even though its evidence text was omitted.
+        if "\n" in formatted_block:
+            formatted_block = formatted_block.rsplit("\n", 1)[0]
+        else:
+            formatted_block = ""
         raw_lines = [line for line in formatted_block.splitlines() if line.strip()]
     actual_tokens, is_measured_final = count_tokens(formatted_block, encoding_name=encoding_name)
     return formatted_block, raw_lines, actual_tokens, (is_measured and is_measured_final)

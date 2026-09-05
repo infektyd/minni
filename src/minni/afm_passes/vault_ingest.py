@@ -173,10 +173,13 @@ def _insert_wikilinks(cursor, source_doc_id: int, wikilinks: List[str], target_m
     for target_doc_id in keep_ids:
         cursor.execute(
             """INSERT INTO memory_links
-               (source_doc_id, target_doc_id, link_type, weight, created_at)
-               VALUES (?, ?, 'wikilink', 1.0, ?)
+               (source_doc_id, target_doc_id, link_type, weight, created_at,
+                confidence, inference_method)
+               VALUES (?, ?, 'wikilink', 1.0, ?, 1.0, 'explicit_wikilink')
                ON CONFLICT(source_doc_id, target_doc_id, link_type)
-               DO UPDATE SET weight=excluded.weight""",
+               DO UPDATE SET weight=excluded.weight,
+                             confidence=excluded.confidence,
+                             inference_method=excluded.inference_method""",
             (source_doc_id, target_doc_id, now),
         )
         inserted += 1

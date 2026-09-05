@@ -246,10 +246,13 @@ class WriteBackMemory:
                     c.execute(
                         """
                         INSERT INTO memory_links
-                        (source_doc_id, target_doc_id, link_type, weight, created_at)
-                        VALUES (?, ?, 'derived_from', 1.0, ?)
+                        (source_doc_id, target_doc_id, link_type, weight, created_at,
+                         confidence, inference_method)
+                        VALUES (?, ?, 'derived_from', 1.0, ?, 1.0, 'writeback_evidence')
                         ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                        DO UPDATE SET weight=excluded.weight
+                        DO UPDATE SET weight=excluded.weight,
+                                      confidence=excluded.confidence,
+                                      inference_method=excluded.inference_method
                         """,
                         (learning_doc_id, evidence_doc_id, now),
                     )
@@ -585,8 +588,9 @@ created: {dt.isoformat()}
                     c.execute(
                         """
                         INSERT INTO contradiction_log
-                        (memory_a_id, memory_b_id, detected_at, detection_method)
-                        VALUES (?, ?, ?, ?)
+                        (memory_a_id, memory_b_id, detected_at, detection_method,
+                         resolution_status)
+                        VALUES (?, ?, ?, ?, 'legacy_unclassified')
                         """,
                         (cand.get("id"), None, now, "cosine"),
                     )

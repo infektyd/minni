@@ -693,7 +693,7 @@ class WikiIndexer:
         # One row per unique target (PR94-3: removed the duplicate append that
         # double-counted every wikilink).
         insert_data = [
-            (source_doc_id, target_doc_id, "wikilink", 1.0, now)
+            (source_doc_id, target_doc_id, "wikilink", 1.0, now, 1.0, "explicit_wikilink")
             for target_doc_id in keep_ids
         ]
 
@@ -702,10 +702,13 @@ class WikiIndexer:
             if insert_data:
                 cursor.executemany(
                     """INSERT INTO memory_links
-                       (source_doc_id, target_doc_id, link_type, weight, created_at)
-                       VALUES (?, ?, ?, ?, ?)
+                       (source_doc_id, target_doc_id, link_type, weight, created_at,
+                        confidence, inference_method)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                       DO UPDATE SET weight=excluded.weight""",
+                       DO UPDATE SET weight=excluded.weight,
+                                     confidence=excluded.confidence,
+                                     inference_method=excluded.inference_method""",
                     insert_data,
                 )
                 link_count += len(insert_data)
@@ -715,10 +718,13 @@ class WikiIndexer:
                 try:
                     cursor.execute(
                         """INSERT INTO memory_links
-                           (source_doc_id, target_doc_id, link_type, weight, created_at)
-                           VALUES (?, ?, ?, ?, ?)
+                           (source_doc_id, target_doc_id, link_type, weight, created_at,
+                            confidence, inference_method)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                           DO UPDATE SET weight=excluded.weight""",
+                           DO UPDATE SET weight=excluded.weight,
+                                         confidence=excluded.confidence,
+                                         inference_method=excluded.inference_method""",
                         data,
                     )
                     link_count += 1
