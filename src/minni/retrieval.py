@@ -2084,6 +2084,9 @@ class RetrievalEngine:
                     (cutoff,),
                 )
                 rows = c.fetchall()
+        except RequestDeadlineExceeded:
+            logger.debug("feedback cache refresh skipped after deadline")
+            return
         except Exception as exc:
             logger.debug("feedback cache refresh skipped: %s", exc)
             self._feedback_cache = {}
@@ -4488,7 +4491,10 @@ class RetrievalEngine:
             # never ride outside the perturbed <EVIDENCE> form (same leak class as
             # chunk_text).
             if depth == "document":
-                full_text = self._fetch_full_document(r["doc_id"])
+                try:
+                    full_text = self._fetch_full_document(r["doc_id"])
+                except RequestDeadlineExceeded:
+                    full_text = None
                 if full_text:
                     doc_flag = bool(raw.get("instruction_like")) or bool(
                         is_instruction_like(full_text)

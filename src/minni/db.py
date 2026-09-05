@@ -204,7 +204,17 @@ class SovereignDB:
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (one connection per thread)."""
-        if not expired_sql_allowed():
+        remaining = remaining_seconds()
+        if expired_sql_allowed() and remaining is not None and remaining <= 0:
+            if (
+                not hasattr(self._local, "conn")
+                or self._local.conn is None
+                or not self._schema_initialized
+            ):
+                raise RequestDeadlineExceeded(
+                    "search request deadline exceeded before database setup"
+                )
+        else:
             check_deadline()
         if not hasattr(self._local, "conn") or self._local.conn is None:
             # journal_mode is a persistent database write.  Serialize first

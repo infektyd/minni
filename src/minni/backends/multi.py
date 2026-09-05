@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from minni.vector_backend import VectorBackend, VectorItem, VectorHit
+from minni.request_deadline import bind_copied_deadline, run_bound
 
 logger = logging.getLogger("sovereign.backends.multi")
 
@@ -138,7 +139,10 @@ class MultiBackend:
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as ex:
             futures = {
-                ex.submit(b.search, query_vec, k * 2, filter): b.name
+                ex.submit(
+                    run_bound,
+                    bind_copied_deadline(b.search, query_vec, k * 2, filter),
+                ): b.name
                 for b in self._backends
             }
             for future in as_completed(futures):
