@@ -36,6 +36,7 @@ PAYLOAD_ITEMS = (
     "skills",
     "README.md",
     "frontend",
+    "kilo",
     "package.json",
 )
 

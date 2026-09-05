@@ -975,7 +975,111 @@ def update_claude_desktop_config(
     return {"installed": True, "path": str(path), "agent": agent}
 
 
-def update_grok_hooks(install_root: Path) -> dict[str, object]:
+def _native_hook_plan(platform: str, install_root: Path) -> dict[str, object]:
+    """Validate and plan an existing-only refresh without creating host state."""
+    paths = {
+        "grok": ("~/.grok/hooks/minni.json", "grok-hook.js"),
+        "cursor": ("~/.cursor/hooks.json", "cursor-hook.js"),
+        "antigravity": (f"{AGY_PLUGINS_DIR}/{AGY_PLUGIN_NAME}/hooks.json", "gemini-hook.js"),
+    }
+    location, entrypoint = paths[platform]
+    target = Path(location).expanduser()
+    skip = {"installed": False, "skipped": True, "reason": "no existing owned native hooks; preserving MCP-only integration"}
+    if not target.exists():
+        return skip
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("native hooks must be an object")
+        events = data.get("hooks") if platform in {"cursor", "grok"} else data.get(AGY_PLUGIN_NAME)
+        if events is not None and (not isinstance(events, dict) or any(not isinstance(v, list) for v in events.values())):
+            raise ValueError("native hook events must be lists")
+        def disabled(node):
+            if isinstance(node, dict):
+                return node.get("enabled") is False or node.get("disabled") is True or any(disabled(v) for v in node.values())
+            return isinstance(node, list) and any(disabled(v) for v in node)
+        if disabled(data):
+            return {**skip, "reason": "native hook disable marker preserved"}
+        count = 0
+        notes = []
+        def visit(node):
+            nonlocal count
+            if isinstance(node, list):
+                return [visit(v) for v in node]
+            if not isinstance(node, dict):
+                return node
+            result = dict(node)
+            if isinstance(node.get("hooks"), list):
+                result["hooks"] = visit(node["hooks"])
+            command = node.get("command")
+            if not isinstance(command, str):
+                return result
+            # Only the owned entrypoint or Cursor wrapper is eligible. Do not
+            # reserialize unrelated commands or add missing events.
+            if entrypoint not in command and not (platform == "cursor" and CURSOR_WRAPPER_NAME in command):
+                return result
+            lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+            if any(token and all(ch in "();<>|&" for ch in token) for token in tokens) or "$" in command or "`" in command:
+                raise ValueError("compound owned hook command needs explicit repair")
+            if platform == "cursor" and tokens and Path(tokens[0]).name == CURSOR_WRAPPER_NAME:
+                canonical = _cursor_wrapper_path()
+                if tokens[0] not in {CURSOR_WRAPPER_REL, str(canonical)}:
+                    notes.append("unrecognized Cursor wrapper path preserved; explicit repair required")
+                elif canonical.is_file() and canonical.read_text(encoding="utf-8") == CURSOR_WRAPPER_BODY:
+                    notes.append("existing Cursor wrapper preserved; follows the local payload")
+                else:
+                    notes.append("missing or custom Cursor wrapper preserved; explicit repair required")
+                return result
+            if len(tokens) < 2 or Path(tokens[0]).name not in {"node", "nodejs"} or not tokens[1].endswith("/dist/" + entrypoint):
+                raise ValueError("unrecognized owned hook command needs explicit repair")
+            tokens[1] = str(install_root / "dist" / entrypoint)
+            result["command"] = shlex.join(tokens)
+            count += 1
+            return result
+        refreshed = dict(data)
+        if events is not None:
+            event_key = "hooks" if platform in {"cursor", "grok"} else AGY_PLUGIN_NAME
+            refreshed[event_key] = {name: visit(entries) for name, entries in events.items()}
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ValueError(f"{platform} native hook configuration unreadable or unsupported ({type(exc).__name__})") from None
+    notes = list(dict.fromkeys(notes))
+    if not count:
+        return {**skip, "reason": "; ".join(notes)} if notes else skip
+    return {"installed": True, "path": str(target), "data": refreshed, "notes": notes,
+            "registration": "preserved; not verified" if platform == "antigravity" else "existing entries preserved"}
+
+
+def _apply_native_hook_plan(plan: dict[str, object]) -> dict[str, object]:
+    if plan.get("skipped"):
+        return plan
+    write_json(Path(str(plan["path"])), plan["data"])
+    return {k: v for k, v in plan.items() if k != "data"}
+
+
+def _existing_grok_rules() -> dict[str, object]:
+    target = Path("~/.grok/rules/minni.md").expanduser()
+    if not target.exists():
+        return {"installed": False, "skipped": True, "reason": "no existing Minni boot rule; preserving MCP-only integration"}
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise ValueError("grok boot rule unreadable") from None
+    # Rules have no portable enabled flag. Preserve custom/disabled content.
+    if text != GROK_RULES_BODY:
+        return {"installed": False, "skipped": True, "reason": "custom or unrecognized boot rule preserved"}
+    return {"installed": True, "path": str(target), "unchanged": True}
+
+
+def preflight_grok_native(install_root: Path) -> None:
+    """Validate both existing Grok surfaces before either can be refreshed."""
+    _native_hook_plan("grok", install_root)
+    _existing_grok_rules()
+
+
+def update_grok_hooks(install_root: Path, *, existing_only: bool = False) -> dict[str, object]:
     """Install the Grok Build hook manifest into ~/.grok/hooks/minni.json.
 
     Grok merges hooks from several roots; ~/.grok/hooks/*.json is the global one
@@ -988,6 +1092,8 @@ def update_grok_hooks(install_root: Path) -> dict[str, object]:
     installed it, and the only working Grok hooks on any machine were
     hand-written outside version control.
     """
+    if existing_only:
+        return _apply_native_hook_plan(_native_hook_plan("grok", install_root))
     template = install_root / "hooks" / "hooks-grok.json"
     if not template.exists():
         return {"installed": False, "reason": f"missing hooks template: {template}"}
@@ -1044,7 +1150,7 @@ asks for in this session.
 """
 
 
-def write_grok_rules() -> dict[str, object]:
+def write_grok_rules(*, existing_only: bool = False) -> dict[str, object]:
     """Install the boot-hydration instruction at ~/.grok/rules/minni.md.
 
     $GROK_HOME/rules/ is documented as "always scanned ... applies to all
@@ -1055,6 +1161,8 @@ def write_grok_rules() -> dict[str, object]:
     machine, including repos where Minni is irrelevant, and long rules files are
     followed less reliably.
     """
+    if existing_only:
+        return _existing_grok_rules()
     target = Path("~/.grok/rules/minni.md").expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(GROK_RULES_BODY, encoding="utf-8")
@@ -1103,7 +1211,7 @@ def _is_minni_cursor_user_hook(entry: object) -> bool:
     return any(marker in command for marker in markers)
 
 
-def update_cursor_hooks(install_root: Path) -> dict[str, object]:
+def update_cursor_hooks(install_root: Path, *, existing_only: bool = False) -> dict[str, object]:
     """Install Minni's hooks into ~/.cursor/hooks.json via the User wrapper.
 
     Sole fire path: User hooks → ./hooks/minni-cursor.sh → local dist/cursor-hook.js.
@@ -1114,6 +1222,8 @@ def update_cursor_hooks(install_root: Path) -> dict[str, object]:
     only the wrapper command set — never append beside survivors.
     Non-Minni user hooks are preserved.
     """
+    if existing_only:
+        return _apply_native_hook_plan(_native_hook_plan("cursor", install_root))
     template = install_root / "hooks" / "hooks-cursor.json"
     if not template.exists():
         return {"installed": False, "reason": f"missing hooks template: {template}"}
@@ -1161,7 +1271,7 @@ def update_cursor_hooks(install_root: Path) -> dict[str, object]:
     }
 
 
-def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
+def update_agy_plugin_hooks(install_root: Path, *, existing_only: bool = False) -> dict[str, object]:
     """Register the Minni hook plugin with the agy (Antigravity CLI) plugin system.
 
     agy loads hooks.json manifests from ~/.gemini/config/plugins/<name>/.
@@ -1183,6 +1293,8 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
     hooks.json whose stamped commands point at dist/gemini-hook.js under this
     install root.
     """
+    if existing_only:
+        return _apply_native_hook_plan(_native_hook_plan("antigravity", install_root))
     template = install_root / "hooks" / "hooks-gemini.json"
     if not template.exists():
         return {"installed": False, "reason": f"missing hooks template: {template}"}
@@ -1396,7 +1508,26 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
     return specs[platform]
 
 
+def platform_update_decision(platform: str, *, bulk: bool = False) -> dict[str, object]:
+    # Shipped beside this standalone script; identical to the engine discovery
+    # module, enforced by a parity test. No installed minni package required.
+    import importlib.util
+    module_name = "_minni_propagate_host_discovery"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(module_name, Path(__file__).with_name("host_discovery.py"))
+        if spec is None or spec.loader is None:
+            raise RuntimeError("optional host discovery is missing from the plugin payload")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    return module.host_decision(canonical_platform(platform), bulk=bulk)
+
+
 def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, object]:
+    decision = platform_update_decision(platform, bulk=getattr(args, "platform", platform) == "all" or getattr(args, "existing_only", False))
+    if not decision["eligible"]:
+        return {"platform": canonical_platform(platform), **decision}
     repo_root = Path(args.repo).expanduser()
     # Use explicit --workspace for surface-specific MINNI_WORKSPACE_ID (e.g. pixelAgents for grok-build)
     # so that update-plugin does not force the Minni source tree on per-agent launch configs or the
@@ -1404,15 +1535,21 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     stamp_workspace = Path(getattr(args, "workspace", None) or args.repo).expanduser()
     explicit_workspace = getattr(args, "workspace", None) is not None
     source = plugin_source(repo_root)
-    if not args.no_build:
-        run(["npm", "run", "build"], cwd=source)
-
     spec = platform_spec(platform, repo_root, args.install_root)
     afm_env = native_afm_env(repo_root)
     if canonical_platform(platform) == "generic" and not args.agent:
         raise SystemExit("generic update-plugin requires --agent so it cannot inherit another agent's vault")
     agent = args.agent or str(spec["agent"])
     install_root = Path(args.install_root).expanduser() if args.install_root else Path(spec["install"]).expanduser()
+    existing_only = getattr(args, "platform", platform) == "all" or getattr(args, "existing_only", False)
+    native_platform = canonical_platform(platform)
+    if existing_only:
+        if native_platform in {"cursor", "grok", "antigravity", "gemini"}:
+            _native_hook_plan("antigravity" if native_platform == "gemini" else native_platform, install_root)
+        if native_platform == "grok":
+            _existing_grok_rules()
+    if not args.no_build:
+        run(["npm", "run", "build"], cwd=source)
     vault = vault_for(agent)
     bootstrap_args = argparse.Namespace(agent=agent)
     bootstrap_vault(bootstrap_args)
@@ -1484,19 +1621,19 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     # agy CLI hook plugin (skipped with a reason when agy is not installed).
     agy_hooks: dict[str, object] | None = None
     if config_kind in ("gemini-manifest", "antigravity"):
-        agy_hooks = update_agy_plugin_hooks(install_root)
+        agy_hooks = update_agy_plugin_hooks(install_root, existing_only=True) if existing_only else update_agy_plugin_hooks(install_root)
 
     # Grok Build: hooks were never installed by anything before this. Also drop
     # the rules file that carries boot hydration, which hooks cannot do here.
     grok_hooks: dict[str, object] | None = None
     grok_rules: dict[str, object] | None = None
     if canonical_platform(platform) == "grok":
-        grok_hooks = update_grok_hooks(install_root)
-        grok_rules = write_grok_rules()
+        grok_hooks = update_grok_hooks(install_root, existing_only=True) if existing_only else update_grok_hooks(install_root)
+        grok_rules = write_grok_rules(existing_only=True) if existing_only else write_grok_rules()
 
     cursor_hooks: dict[str, object] | None = None
     if canonical_platform(platform) == "cursor":
-        cursor_hooks = update_cursor_hooks(install_root)
+        cursor_hooks = update_cursor_hooks(install_root, existing_only=True) if existing_only else update_cursor_hooks(install_root)
 
     base: dict[str, object] = {
         "platform": canonical_platform(platform),
@@ -1563,7 +1700,7 @@ def _subresult_problems(result: dict) -> tuple[list[str], list[str]]:
             reason = str(sub.get("reason", "not installed"))
             # Structured flag from update_* helpers; substring matching is
             # fragile (registration failures can mention "path" in tool text).
-            if sub.get("error_class") == "missing_cli":
+            if sub.get("skipped") or sub.get("error_class") == "missing_cli":
                 notes.append(f"{key}: {reason}")
             else:
                 problems.append(f"{key}: {reason}")
@@ -1584,9 +1721,6 @@ def update_plugin(args: argparse.Namespace) -> int:
             )
             results.append({"platform": plat, "status": "skipped", "reason": reason})
     restore_no_build = args.no_build
-    if len(platforms) > 1 and not args.no_build:
-        run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))
-        args.no_build = True
     try:
         # D6 (#232): per-platform isolation — one platform raising must not
         # abort the rest of the fleet silently, and each status is DERIVED
@@ -1601,6 +1735,12 @@ def update_plugin(args: argparse.Namespace) -> int:
                     "error": str(exc),
                 })
                 continue
+            if result.get("status") in {"skipped", "failed"}:
+                results.append(result)
+                continue
+            # Only an actual successful build/update can cover later platforms.
+            if not args.no_build:
+                args.no_build = True
             problems, notes = _subresult_problems(result)
             result["status"] = "degraded" if problems else "updated"
             if problems:
@@ -1612,8 +1752,8 @@ def update_plugin(args: argparse.Namespace) -> int:
         args.no_build = restore_no_build
 
     attempted = {str(r["status"]) for r in results if r["status"] != "skipped"}
-    # D5 parity with wire: nothing attempted (all skipped / empty expansion)
-    # is not success — exit 1 so bulk "updated" never green-washes a no-op.
+    # Optional hosts may legitimately be absent. Report an explicit skipped
+    # no-op with exit zero; never relabel it updated.
     if not attempted:
         overall = "skipped"
     elif attempted == {"updated"}:
@@ -1625,7 +1765,7 @@ def update_plugin(args: argparse.Namespace) -> int:
     else:
         overall = "partial"
     print(json.dumps({"status": overall, "results": results}, indent=2))
-    return 0 if overall == "updated" else 1
+    return 0 if overall in {"updated", "skipped"} else 1
 
 
 DISTILL_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "distill"
@@ -2254,6 +2394,7 @@ def main() -> int:
     p_update.add_argument("--agent", type=valid_agent_id, help="Override agent id; required for generic platforms")
     p_update.add_argument("--install-root", help="Required for --platform generic; optional override for known platforms")
     p_update.add_argument("--workspace", help="Explicit MINNI_WORKSPACE_ID (and surface env) to stamp. If omitted (flagless), and the target config already has surface env keys (MINNI_AGENT_ID/VAULT_PATH/SOCKET_PATH/WORKSPACE_ID), those are preserved (belt-and-suspenders); only the plugin server pointer (command/args/cwd) is refreshed. Falls back to --repo for fresh targets. Explicit --workspace forces the value.")
+    p_update.add_argument("--existing-only", action="store_true", help="Update only installed hosts with an existing Minni binding; never activate a new integration")
     p_update.add_argument("--no-build", action="store_true", help="Skip npm run build when dist is already current")
     p_update.set_defaults(func=update_plugin)
 

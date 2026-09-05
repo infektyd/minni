@@ -216,6 +216,10 @@ def _run_wire(
 
 
 def _run_propagate(platform: str, repo: Optional[Path], dry_run: bool) -> dict[str, Any]:
+    from minni.wire.host_discovery import host_decision
+    decision = host_decision(platform, bulk=True)
+    if not decision["eligible"]:
+        return {"name": f"propagate:{platform}", "exit_code": 1 if decision["status"] == "failed" else 0, "skipped": decision["status"] == "skipped", **decision}
     script = _propagate_py(repo)
     if script is None:
         return {
@@ -223,7 +227,7 @@ def _run_propagate(platform: str, repo: Optional[Path], dry_run: bool) -> dict[s
             "exit_code": 2,
             "error": "propagate.py not found in package payload or checkout",
         }
-    cmd = [sys.executable, str(script), "update-plugin", "--platform", platform]
+    cmd = [sys.executable, str(script), "update-plugin", "--platform", platform, "--existing-only"]
     if dry_run:
         # propagate may not support dry-run universally; skip with note
         return {
@@ -296,6 +300,10 @@ def _restamp_grok_hooks(repo: Optional[Path], *, dry_run: bool) -> dict[str, Any
     and counts a failure as a redeploy failure.
     """
     step: dict[str, Any] = {"name": "grok_hooks_rules"}
+    from minni.wire.host_discovery import host_decision
+    decision = host_decision("grok", bulk=True)
+    if not decision["eligible"]:
+        return {**step, "exit_code": 1 if decision["status"] == "failed" else 0, "skipped": decision["status"] == "skipped", **decision}
     if dry_run:
         return {**step, "exit_code": 0, "skipped": True, "reason": "dry-run"}
     script = _propagate_py(repo)
@@ -321,11 +329,12 @@ def _restamp_grok_hooks(repo: Optional[Path], *, dry_run: bool) -> dict[str, Any
             raise ImportError(f"cannot load {script}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        hooks = mod.update_grok_hooks(root)
-        rules = mod.write_grok_rules()
+        mod.preflight_grok_native(root)
+        hooks = mod.update_grok_hooks(root, existing_only=True)
+        rules = mod.write_grok_rules(existing_only=True)
         # Inside the try on purpose: a propagate.py whose return contract
         # drifted must fail this step, not crash `minni sync`.
-        installed = bool(hooks.get("installed")) and bool(rules.get("installed"))
+        installed = all(bool(result.get("installed") or result.get("skipped")) for result in (hooks, rules))
     except Exception as exc:
         return {**step, "exit_code": 1, "install_root": str(root), "error": str(exc)}
     return {

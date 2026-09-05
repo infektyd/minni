@@ -74,7 +74,7 @@ def config_root_candidates(home: Path | None = None) -> dict[str, tuple[Path, ..
     )
     return {
         "codex": (base / ".codex",),
-        "claude-code": (base,),
+        "claude-code": (base / ".claude.json", base / ".claude"),
         "kilocode": (base / ".config/kilo",),
         "grok": (base / ".grok",),
         "gemini": (base / ".gemini",),

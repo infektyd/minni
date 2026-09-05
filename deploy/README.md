@@ -66,7 +66,9 @@ Runs `scripts/update_root.sh`, which loudly and idempotently:
 **Antigravity half-state (D11):** if `wire antigravity` fails on hook
 registration (`agy` is on PATH but `agy plugin install` fails), MCP views may
 already be updated while hooks are not. Fix `agy`, then re-run
-`minni wire antigravity --from-repo .` (or `make sync-root`) to complete hooks.
+`minni wire antigravity --from-repo .` to complete hooks deliberately.
+Bulk sync preserves existing plugin registration and refreshes recognized
+installed hook commands; it does not install or enable missing native hooks.
 Wire records the install root for GC protection and names the hook gap in the
 platform result.
 

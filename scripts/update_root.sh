@@ -291,19 +291,19 @@ else:
 fi
 if [ "$DRY_RUN" = 1 ]; then
   act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
-    --repo "$REPO" update-plugin --platform antigravity --no-build
+    --repo "$REPO" update-plugin --platform antigravity --existing-only --no-build
   act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
-    --repo "$REPO" update-plugin --platform cursor --no-build
+    --repo "$REPO" update-plugin --platform cursor --existing-only --no-build
 else
   printf 'running:   propagate update-plugin --platform antigravity\n'
   if ! "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
-      --repo "$REPO" update-plugin --platform antigravity --no-build; then
+      --repo "$REPO" update-plugin --platform antigravity --existing-only --no-build; then
     echo "update-root: propagate antigravity failed — continuing" >&2
     REDEPLOY_EXIT=1
   fi
   printf 'running:   propagate update-plugin --platform cursor\n'
   if ! "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
-      --repo "$REPO" update-plugin --platform cursor --no-build; then
+      --repo "$REPO" update-plugin --platform cursor --existing-only --no-build; then
     echo "update-root: propagate cursor failed — continuing" >&2
     REDEPLOY_EXIT=1
   fi
@@ -320,6 +320,11 @@ else
 import json, sys
 from pathlib import Path
 repo = Path(sys.argv[1])
+from minni.wire.host_discovery import host_decision
+decision = host_decision("grok", bulk=True)
+if not decision["eligible"]:
+    print(json.dumps({"platform": "grok", **decision}))
+    raise SystemExit(1 if decision["status"] == "failed" else 0)
 prop = repo / "plugins/minni/skills/minni-install/scripts/propagate.py"
 import importlib.util
 spec = importlib.util.spec_from_file_location("minni_propagate", prop)
@@ -359,11 +364,12 @@ if root is None:
         "— hooks refresh not needed"
     )
     sys.exit(0)
-hooks = mod.update_grok_hooks(root)
-rules = mod.write_grok_rules()
+mod.preflight_grok_native(root)
+hooks = mod.update_grok_hooks(root, existing_only=True)
+rules = mod.write_grok_rules(existing_only=True)
 print("grok hooks:", hooks)
 print("grok rules:", rules)
-if not hooks.get("installed") or not rules.get("installed"):
+if not all(result.get("installed") or result.get("skipped") for result in (hooks, rules)):
     sys.exit(1)
 PY
   then

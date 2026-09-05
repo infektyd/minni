@@ -85,10 +85,11 @@ class WireOutput:
         return 2 if out.emit() == 1 else 2
 
     def finalize_status(self, *, dry_run: bool) -> None:
-        if dry_run:
+        statuses = {r.status for r in self.results}
+        # A preview suppresses writes, not known validation failures.
+        if dry_run and "failed" not in statuses:
             self.status = "dry-run"
             return
-        statuses = {r.status for r in self.results}
         if not self.results:
             self.status = "failed"
         elif statuses <= {"skipped"}:

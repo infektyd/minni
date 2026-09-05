@@ -112,7 +112,7 @@ def test_update_plugin_all_failed_is_failed(monkeypatch, capsys):
 
 def test_update_plugin_nothing_attempted_is_skipped_not_updated(monkeypatch, capsys):
     """Round-2 Low / D5: empty attempted set (all skips, no expansions) must
-    not green-wash as status=updated / exit 0."""
+    not green-wash as status=updated; optional no-op exits zero."""
     monkeypatch.setattr(propagate, "ALL_PLATFORMS", ())
     monkeypatch.setattr(
         propagate, "ALL_SKIPS",
@@ -124,7 +124,7 @@ def test_update_plugin_nothing_attempted_is_skipped_not_updated(monkeypatch, cap
     )
     rc = propagate.update_plugin(_update_args("all"))
     doc = json.loads(capsys.readouterr().out)
-    assert rc == 1
+    assert rc == 0
     assert doc["status"] == "skipped"
     assert all(r["status"] == "skipped" for r in doc["results"])
 
@@ -548,8 +548,9 @@ def test_propagate_unparseable_host_toml_refuses_before_copy(tmp_path, monkeypat
         repo=str(REPO),
         socket=str(tmp_path / "sock"),
     )
-    with pytest.raises(ValueError, match="cannot parse existing TOML"):
-        propagate.update_one_plugin("codex", args)
+    result = propagate.update_one_plugin("codex", args)
+    assert result["status"] == "failed"
+    assert "unreadable" in result["reason"]
     assert copy_calls == [], "copy_tree must not run after corrupt host TOML"
     assert toml_path.read_text(encoding="utf-8") == original_toml
     assert marker.read_text(encoding="utf-8") == "keep"

@@ -80,16 +80,30 @@ minni wire claude-code        # or: codex, kilocode, grok, generic, all
   `propagate --platform antigravity` (also covered by `make sync-root`); pure
   `gemini` remains provisional-skip on wire (`gemini-provisional`), not the
   day-to-day install path. `generic` requires `--agent` and `--install-root`.
-- Every wire ends with verification probes (MCP handshake, hook dry-run,
+- Attempted wiring ends with verification probes (MCP handshake, hook dry-run,
   config readback). Re-run `minni wire <platform>` to repeat them; `minni
   doctor` never substitutes for wire verify (doctor is interpreter / socket /
   status / recall / models only). Output is a single JSON document on stdout
   with per-platform results; exit code 0 = all attempted platforms wired, 1 =
-  at least one failed, 2 = preflight/usage error before any change.
+  a failed attempt or an all-skipped run, 2 = preflight/usage error before any change.
 - Old version dirs are pruned only when no runtime's config references them
   (`--prune` / `--no-prune`; prompts are skipped when stdin isn't a TTY).
   `--use-version <ver>` re-stamps a platform's config against an
   already-installed version — rollback without touching the Python package.
+- Host availability is checked before builds or configuration changes. A leftover
+  config directory does not establish that a host is installed. Unavailable
+  hosts skip; unreadable or malformed configuration is a visible failure.
+  Bulk refresh requires an existing, enabled Minni binding. Use an explicit
+  named wire command for initial setup on an installed host.
+- `minni sync`, `make sync-root`, and bulk propagation preserve disabled bindings
+  and MCP-only setups. They refresh recognized existing native hooks without
+  adding missing event subscriptions or enabling host plugins. Standalone
+  propagation accepts `--existing-only` for the same policy. An all-skipped
+  propagation run exits zero with `status: skipped`; it did not update anything.
+- A successful MCP probe and hook dry-run do not establish delivery by an already
+  running host. Reload the integration in that host and check a real event when
+  lifecycle delivery matters. Antigravity bulk refresh preserves its existing
+  registration state and reports that registration has not been verified.
 - The agent-driven `minni-install` skill handles first-time identity and
   vault seeding after the wire.
 - **After wire adoption**, do **not** re-run
