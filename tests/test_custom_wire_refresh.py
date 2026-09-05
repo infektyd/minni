@@ -1,5 +1,7 @@
 """Custom MCP refresh preserves host intent and confines all writes to temp HOME."""
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -148,11 +150,94 @@ def test_sync_defers_gc_and_includes_custom_failure(setup, monkeypatch):
     assert any(s['name'] == 'custom_mcp_refresh' and s['exit_code'] == 1 for s in result.steps)
 
 
-def test_full_update_preserves_old_payloads_and_refreshes_custom_bindings():
-    script = (Path(__file__).resolve().parents[1] / 'scripts/update_root.sh').read_text()
-    assert '--prune --force-reinstall' not in script
-    assert '--no-prune --force-reinstall' in script
-    assert '-m minni.wire.custom_refresh' in script
+def test_refresh_caps_sibling_backups(setup):
+    _, _, new, host = setup
+    config = host()
+    original = json.loads(config.read_text())
+    leftovers = [config.parent / f'{config.name}.minni-backup-stale{i}' for i in range(3)]
+    for path in leftovers:
+        path.write_text('stale')
+    result = refresh.refresh_custom_wires(new_root=new)
+    assert result['results'][0]['status'] == 'refreshed'
+    backups = list(config.parent.glob(f'{config.name}.minni-backup-*'))
+    assert len(backups) == refresh._BACKUP_KEEP
+    kept = Path(result['results'][0]['backup'])
+    assert kept.resolve() in {path.resolve() for path in backups}
+    assert json.loads(kept.read_text()) == original
+    assert all(not path.exists() for path in leftovers)
+
+
+def test_full_update_preserves_old_payloads_and_refreshes_custom_bindings(tmp_path):
+    script = Path(__file__).resolve().parents[1] / 'scripts/update_root.sh'
+    git_env = {**os.environ, 'GIT_BYPASS': '1'}
+
+    def git(cwd, *args):
+        return subprocess.check_output(['git', *args], cwd=str(cwd), text=True, env=git_env).strip()
+
+    seed = tmp_path / 'seed'
+    seed.mkdir()
+    git(seed, 'init', '-q', '-b', 'main')
+    git(seed, 'config', 'user.email', 't@example.invalid')
+    git(seed, 'config', 'user.name', 't')
+    (seed / 'f.txt').write_text('one\n')
+    (seed / '.gitignore').write_text('.venv/\n')
+    git(seed, 'add', 'f.txt', '.gitignore')
+    git(seed, 'commit', '-qm', 'one')
+    origin = tmp_path / 'origin.git'
+    subprocess.check_call(['git', 'clone', '-q', '--bare', str(seed), str(origin)], env=git_env)
+    clone = tmp_path / 'clone'
+    subprocess.check_call(['git', 'clone', '-q', str(origin), str(clone)], env=git_env)
+    git(clone, 'config', 'user.email', 't@example.invalid')
+    git(clone, 'config', 'user.name', 't')
+
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    (bindir / 'npm').write_text('#!/bin/sh\nexit 0\n')
+    (bindir / 'npm').chmod(0o755)
+    (bindir / 'launchctl').write_text('#!/bin/sh\nexit 1\n')
+    (bindir / 'launchctl').chmod(0o755)
+
+    log = tmp_path / 'python-argv.log'
+    venv_py = clone / '.venv' / 'bin' / 'python'
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text(
+        '#!/usr/bin/env python3\n'
+        'import json, sys\n'
+        f'open({str(log)!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
+        'mod = sys.argv[sys.argv.index("-m") + 1] if "-m" in sys.argv else ""\n'
+        'if mod == "minni.minni_cli":\n'
+        '    print(json.dumps({"schema": 1, "status": "success", "results": [],'
+        '"install_root": "/tmp/0.5.0+git.abcd", "payload_version": "0.5.0+git.abcd"}))\n'
+        'elif mod == "minni.wire.custom_refresh":\n'
+        '    print(json.dumps({"name": "custom_mcp_refresh", "exit_code": 0, "results": []}))\n'
+    )
+    venv_py.chmod(0o755)
+
+    env = {
+        **git_env,
+        'PATH': f'{bindir}{os.pathsep}{os.environ.get("PATH", "")}',
+        'HOME': str(tmp_path / 'home'),
+        'MINNI_SYNC_LOCKDIR': str(tmp_path / 'lock'),
+    }
+    (tmp_path / 'home').mkdir()
+
+    live = subprocess.run(['bash', str(script), '--repo', str(clone)], capture_output=True, text=True, env=env)
+    recorded = log.read_text() if log.exists() else ''
+    assert '-m minni.minni_cli wire all --from-repo' in recorded, live.stdout + live.stderr + recorded
+    assert '--no-prune --force-reinstall' in recorded
+    assert '--prune --force-reinstall' not in recorded
+    assert '-m minni.wire.custom_refresh --wire-report' in recorded
+
+    dry = subprocess.run(
+        ['bash', str(script), '--repo', str(clone), '--dry-run'],
+        capture_output=True, text=True, env=env,
+    )
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert '-m minni.minni_cli wire all' in dry.stdout
+    assert '--no-prune --force-reinstall' in dry.stdout
+    assert 'minni.wire.custom_refresh --dry-run' in dry.stdout
+    assert 'custom_refresh --wire-report' not in dry.stdout
+    assert (log.read_text() if log.exists() else '') == recorded
 
 
 def test_atomic_config_write_failure_leaves_registry_unchanged(setup, monkeypatch):

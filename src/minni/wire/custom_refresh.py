@@ -20,6 +20,24 @@ from minni.wire.wired import WireRecord, upsert_wire
 
 _CUSTOM = {"muse": ".muse/mcp.json", "devin": ".config/devin/mcp_config.json"}
 _VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[+.-][A-Za-z0-9_.+-]+)?$")
+_BACKUP_KEEP = 1
+
+
+def _prune_backups(config: Path, keep: Path | None = None) -> None:
+    """Cap sibling refresh backups so repeated syncs cannot accumulate files."""
+    prefix = config.name + ".minni-backup-"
+    found = [
+        path for path in config.parent.iterdir()
+        if path.name.startswith(prefix) and path.is_file() and not path.is_symlink()
+    ]
+    survivors = {os.path.realpath(keep)} if keep is not None else set()
+    for path in sorted(found, key=lambda p: p.stat().st_mtime_ns, reverse=True):
+        if len(survivors) >= _BACKUP_KEEP:
+            break
+        survivors.add(os.path.realpath(path))
+    for path in found:
+        if os.path.realpath(path) not in survivors:
+            path.unlink(missing_ok=True)
 
 
 def wire_report_root(text: str) -> Path | None:
@@ -152,6 +170,7 @@ def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
     backup_fd, backup_name = tempfile.mkstemp(prefix=config.name + ".minni-backup-", dir=config.parent)
     with os.fdopen(backup_fd, "wb") as backup:
         backup.write(original)
+    _prune_backups(config, keep=Path(backup_name))
     # Optimistic concurrency check avoids overwriting edits made while validating.
     if config.read_bytes() != original:
         raise ValueError("custom config changed during validation; backup retained")
