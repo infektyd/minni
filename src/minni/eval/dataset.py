@@ -94,6 +94,34 @@ def validate_queries(
     }
 
 
+def validate_quality_queries(
+    queries: List[Dict[str, Any]], min_reviewed: int = 300,
+) -> Dict[str, Any]:
+    """The shared strict corpus contract for quality validation and runs."""
+    if any(not isinstance(row, dict) for row in queries):
+        return {"ok": False, "errors": ["quality queries must be objects"]}
+    report = validate_queries(queries, min_reviewed=min_reviewed)
+    errors = report["errors"]
+    seen = set()
+    for index, row in enumerate(queries, start=1):
+        query = row.get("query")
+        ids = row.get("expected_doc_ids", [])
+        cls = row.get("notes")
+        budget = row.get("budget_tokens", 4096)
+        if not isinstance(query, str) or not query.strip() or query in seen:
+            errors.append(f"query[{index}]: unique nonempty query string required")
+        else:
+            seen.add(query)
+        if not isinstance(cls, str) or not cls.strip():
+            errors.append(f"query[{index}]: explicit nonempty class label required")
+        if not isinstance(ids, list) or any(type(value) is not int for value in ids):
+            errors.append(f"query[{index}]: exact integer judgments required")
+        if type(budget) is not int or budget < 0:
+            errors.append(f"query[{index}]: budget_tokens must be a nonnegative integer")
+    report["ok"] = not errors
+    return report
+
+
 def harvest_queries(
     roots: List[Path],
     limit: int = 300,

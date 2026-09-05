@@ -22,6 +22,7 @@ from .dataset import (
     queries_path,
     repo_root,
     validate_queries,
+    validate_quality_queries,
 )
 from .judging import JudgeUnavailable, RubricScore, score_answer_placeholder
 from .metrics import (
@@ -177,6 +178,9 @@ def _preflight_quality_gate(
     retriever work: non-normative metric, unresolvable explicit names, or
     no auto-selectable candidate.
     """
+    if len(config_names) != len(set(config_names)):
+        logger.error("Quality gate config names must be unique")
+        sys.exit(2)
     if getattr(args, "gate", False):
         logger.error("--gate and --quality-gate are mutually exclusive")
         sys.exit(2)
@@ -205,20 +209,11 @@ def _preflight_quality_gate(
             or not math.isfinite(threshold) or threshold < 0):
         logger.error("Quality gate improvement must be finite and nonnegative")
         sys.exit(2)
-    # Check raw corpus evidence before run_eval's legacy integer coercion.
-    # Descriptive reports and the old loss-rate gate keep their existing path.
-    seen = set()
-    for row in queries or []:
-        query = row.get("query")
-        ids = row.get("expected_doc_ids", [])
-        cls = row.get("notes")
-        if (not isinstance(query, str) or not query.strip() or query in seen
-                or not isinstance(cls, str) or not cls.strip()
-                or not isinstance(ids, list)
-                or any(isinstance(value, bool) or not isinstance(value, int) for value in ids)):
-            logger.error("Quality gate requires unique nonempty query strings and exact integer judgments")
+    if queries is not None:
+        validation = validate_quality_queries(queries)
+        if not validation["ok"]:
+            logger.error("Invalid quality corpus: %s", validation["errors"])
             sys.exit(2)
-        seen.add(query)
     expected = [
         retriever if len(config_names) == 1 else f"{retriever}-{config}"
         for retriever in retriever_names
@@ -290,7 +285,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.warning("No queries loaded - producing empty report.")
 
     if getattr(args, "gate", False) or getattr(args, "quality_gate", False):
-        validation = validate_queries(queries)
+        validation = (validate_quality_queries(queries) if getattr(args, "quality_gate", False)
+                      else validate_queries(queries))
         if not validation["ok"]:
             logger.error("Query validation failed for gate run:")
             for error in validation["errors"]:
@@ -382,8 +378,13 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_validate(args: argparse.Namespace) -> None:
-    queries = load_queries(Path(args.path) if args.path else None)
-    report = validate_queries(queries, min_reviewed=args.min_reviewed)
+    quality = getattr(args, "quality_gate", False)
+    try:
+        queries = load_queries(Path(args.path) if args.path else None, strict=quality)
+        validator = validate_quality_queries if quality else validate_queries
+        report = validator(queries, min_reviewed=args.min_reviewed)
+    except ValueError as exc:
+        report = {"ok": False, "errors": [str(exc)]}
     print(json.dumps(report, indent=2))
     if not report["ok"]:
         sys.exit(2)
@@ -501,6 +502,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     rec_p.add_argument("--notes", default="", help="Optional notes / class label")
 
     validate_p = sub.add_parser("validate", help="Validate eval query JSONL for gate use")
+    validate_p.add_argument("--quality-gate", action="store_true",
+                            help="Use the strict corpus contract shared with quality runs")
     validate_p.add_argument("--path", default="", help="Optional JSONL path")
     validate_p.add_argument("--min-reviewed", type=int, default=300)
 

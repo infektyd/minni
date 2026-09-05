@@ -112,6 +112,17 @@ new source text, hashes, and expectations explicitly when refreshing it.
 
 ## Compare a candidate against the baseline
 
+Validate a reviewed corpus using the same strict checks as a quality run:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness validate \
+  --quality-gate --path /path/to/reviewed-queries.jsonl
+```
+
+This requires unique query strings, explicit class labels, exact integer IDs,
+and nonnegative integer `budget_tokens` when supplied (default 4096).
+Plain `validate` retains the legacy validation contract.
+
 Use a reviewed corpus with real document judgments for the retrieval backend:
 
 ```sh
