@@ -296,6 +296,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     harvest_p.add_argument("--limit", type=int, default=300)
     harvest_p.add_argument("--output", default="")
 
+    fixture_p = sub.add_parser("fixture", help="Run machine-curated retrieval against a disposable real corpus")
+    fixture_p.add_argument("--profile", choices=["lexical-deadline", "hybrid"], default="lexical-deadline")
+    fixture_p.add_argument("--repeats", type=int, default=3)
+    fixture_p.add_argument("--output", required=True, help="JSON report path outside the fixture corpus")
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -306,6 +311,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         cmd_validate(args)
     elif args.command == "harvest":
         cmd_harvest(args)
+    elif args.command == "fixture":
+        from .fixture import run_fixture
+        report = run_fixture(profile=args.profile, repeats=args.repeats)
+        _write_json_report(report, Path(args.output))
+        print(json.dumps(report["summary"], indent=2))
+        if not report["summary"]["ok"]:
+            sys.exit(3)
 
 
 if __name__ == "__main__":

@@ -475,7 +475,6 @@ class RetrievalEngine:
         self._tokenizer = None
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
-        self.last_trace_id: Optional[str] = None
         # P0-B (2026-07-19 blackout): the semantic leg must never die silently.
         # Set when _semantic_search finds no embedding model; cleared when the
         # model comes back. Surfaced by status/recall so an FTS-only session is
@@ -493,6 +492,7 @@ class RetrievalEngine:
         # reporting a degraded search as healthy, or pinning one caller's
         # failure on another. Review round 1 on PR #260 caught this.
         self._degradation_local = threading.local()
+        self.last_trace_id = None
         # P0-A contract: when the read-authorization gate suppresses a
         # non-empty candidate set to zero, the reason is recorded so the caller
         # can return a diagnostic envelope instead of a bare [].
@@ -547,6 +547,19 @@ class RetrievalEngine:
             local = threading.local()
             self._degradation_local = local
         setattr(local, name, value)
+
+    @property
+    def last_trace_id(self) -> Optional[str]:
+        """Trace from the last retrieve on this thread, for same-thread callers.
+
+        Search workers share this engine, so another request must neither
+        replace this ID nor clear it when its own trace capture fails.
+        """
+        return self._degradation_flag("trace_id")
+
+    @last_trace_id.setter
+    def last_trace_id(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("trace_id", value)
 
     @property
     def last_rerank_degraded(self) -> Optional[str]:
@@ -3208,11 +3221,12 @@ class RetrievalEngine:
                         for r in results
                         if r.get("attribution_score") is not None
                     ]
-                self.last_trace_id = _trace_ring().add(
+                trace_id = _trace_ring().add(
                     expanded_trace, owner=getattr(principal, "agent_id", None)
                 )
+                self.last_trace_id = trace_id
                 for result in results:
-                    result["trace_id"] = self.last_trace_id
+                    result["trace_id"] = trace_id
             except Exception as exc:
                 logger.debug("expanded trace capture failed: %s", exc)
                 self.last_trace_id = None
@@ -4081,11 +4095,12 @@ class RetrievalEngine:
             ]
         timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
         try:
-            self.last_trace_id = _trace_ring().add(
+            trace_id = _trace_ring().add(
                 trace, owner=getattr(principal, "agent_id", None)
             )
+            self.last_trace_id = trace_id
             for result in results:
-                result["trace_id"] = self.last_trace_id
+                result["trace_id"] = trace_id
         except Exception as exc:
             logger.debug("trace capture failed: %s", exc)
             self.last_trace_id = None
