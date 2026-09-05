@@ -65,6 +65,34 @@ def test_gc_top_two_release_retention(gc_base):
     assert str(gc_base / "0.1.0") in result.pruned
 
 
+def test_gc_scan_includes_kilocode_bridge():
+    """The preserved customized Kilo bridge must be a GC reference source."""
+    from minni.wire.platform import default_config_scan_paths
+    paths = default_config_scan_paths()
+    assert paths["kilocode-bridge"].name == "minni.js"
+    assert ".config/kilo/plugin" in str(paths["kilocode-bridge"])
+
+
+def test_gc_retains_kilocode_bridge_referenced_version(gc_base, monkeypatch, tmp_path):
+    old = gc_base / "0.1.0"
+    _seed_manifest(old, "0.1.0")
+    for ver in ("0.2.0", "0.3.0"):
+        _seed_manifest(gc_base / ver, ver)
+    bridge = tmp_path / "minni.js"
+    bridge.write_text(
+        "// Managed by minni wire kilocode.\n"
+        f"const __MINNI_KILO_HOOK_SCRIPT__ = {json.dumps(str(old / 'dist' / 'kilocode-hook.js'))};\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "minni.wire.gc.default_config_scan_paths",
+        lambda: {"kilocode-bridge": bridge},
+    )
+    result = run_gc(prune=True, stdin_is_tty=False)
+    assert old.exists()
+    assert str(old) not in result.pruned
+
+
 def test_gc_retains_config_referenced_version(gc_base, monkeypatch, tmp_path):
     old = gc_base / "0.1.0"
     _seed_manifest(old, "0.1.0")
