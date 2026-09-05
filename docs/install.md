@@ -88,6 +88,14 @@ minni wire claude-code        # or: codex, kilocode, grok, generic, all
   a failed attempt or an all-skipped run, 2 = preflight/usage error before any change.
 - Old version dirs are pruned only when no runtime's config references them
   (`--prune` / `--no-prune`; prompts are skipped when stdin isn't a TTY).
+  Fleet `minni sync` and `sync --full` defer garbage collection and retain old
+  payloads because native hooks or custom MCP bindings may deliberately remain
+  on them. Sync refreshes existing enabled Muse and Devin JSON MCP bindings
+  when their executables are available; unsupported custom formats are reported
+  as skipped. This does not install native hooks or verify those hosts are running.
+  If every canonical host is skipped, wire produces no new payload target;
+  custom-only refresh then requires an explicitly verified installed root through
+  `python -m minni.wire.custom_refresh --new-root <versioned-payload-root>`.
   `--use-version <ver>` re-stamps a platform's config against an
   already-installed version — rollback without touching the Python package.
 - Host availability is checked before builds or configuration changes. A leftover

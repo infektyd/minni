@@ -174,7 +174,8 @@ def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     # D7: redeploy plan must wire the fleet + explicit antigravity/cursor,
     # not a bulk propagate --platform all (sync-root uses explicit targets).
     assert "wire all" in proc.stdout
-    assert "--prune" in proc.stdout
+    assert "--no-prune" in proc.stdout
+    assert "payload GC deferred" in proc.stderr
     assert "update-plugin --platform antigravity" in proc.stdout
     assert "update-plugin --platform cursor" in proc.stdout
     assert "update-plugin --platform all" not in proc.stdout

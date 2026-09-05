@@ -452,6 +452,10 @@ def test_propagate_snapshot_unparseable_mcp_json_refuses_before_copy(
     mcp_target.write_text(original, encoding="utf-8")
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    executable = tmp_path / "cursor-agent"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(
         propagate, "plugin_source",
         lambda repo_root: tmp_path / "source",

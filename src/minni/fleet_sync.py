@@ -204,6 +204,9 @@ def _run_wire(
     }
     if failure is not None:
         return {**step, "exit_code": 1, "status": None, "error": failure}
+    from minni.wire.custom_refresh import wire_report_root
+    target = wire_report_root(report)
+    step["install_root"] = str(target) if target is not None else None
     status = _wire_status(report)
     step["status"] = status
     if code != 0 and status == "skipped":
@@ -648,10 +651,17 @@ def run_fleet_sync(
     wire_step = _run_wire(
         from_repo=from_repo,
         force_reinstall=force_reinstall,
-        prune=prune,
+        prune=False,
         dry_run=dry_run,
     )
     steps.append(wire_step)
+    if prune:
+        steps.append({"name": "payload_gc", "exit_code": 0, "skipped": True,
+                      "reason": "deferred: native/custom references may remain on older payloads"})
+
+    # Custom JSON bindings are registered MCP consumers, not native hosts.
+    from minni.wire.custom_refresh import refresh_custom_wires
+    steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
 
     if propagate_hosts and not dry_run:
         for plat in ("antigravity", "cursor"):

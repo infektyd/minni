@@ -122,7 +122,7 @@ def wire_env(tmp_path, monkeypatch):
     (app / "Info.plist").write_text("fixture")
     from minni.wire.host_discovery import host_decision
     monkeypatch.setattr("minni.wire.flow.host_decision", lambda platform, **kw: host_decision(
-        platform, app_roots=(home / "Applications",), **kw,
+        platform, app_roots=(home / "Applications",), launcher_roots=(), **kw,
     ))
     monkeypatch.setenv("PATH", str(tmp_path))
     (home / ".claude.json").write_text('{"mcpServers":{"minni":{}}}', encoding="utf-8")
