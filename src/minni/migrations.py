@@ -123,6 +123,9 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
     if version == 15:
         # Applied only when CHECK already admits do_not_store/log_only.
         return _candidate_status_check_allows_dns_log_only(conn)
+    if version == 21:
+        from minni.graph_readiness import verify_graph_schema
+        return verify_graph_schema(conn).ready
     return True
 
 
@@ -164,6 +167,15 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     applied_versions = {
         v for (v,) in conn.execute("SELECT version FROM schema_migrations")
     }
+
+    # Explicit applied-schema drift check: never silently accept a bad stamp!
+    if 21 in applied_versions:
+        from minni.graph_readiness import verify_graph_schema, SchemaVerificationError
+        report = verify_graph_schema(conn)
+        if not report.ready:
+            raise SchemaVerificationError(
+                f"Applied migration 021 schema has drifted ({report.status}): {'; '.join(report.errors)}"
+            )
 
     migration_files = _load_migration_files()
     pending = [(v, p) for v, p in migration_files if v not in applied_versions]
@@ -207,6 +219,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                     _apply_migration_018_episodic_fts_backfill(conn)
                 if version == 19:
                     _apply_migration_019_episodic_fts_update_trigger(conn)
+                if version == 21:
+                    if not _verify_migration_021_graph_schema(conn):
+                        continue
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, os.path.basename(filepath), now),
@@ -232,11 +247,12 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
         _flush_batch(batch)
 
-        # Bump user_version to highest known — PRAGMA cannot be parameterized
-        target_version = int(target_version)
-        conn.execute(f"PRAGMA user_version = {target_version}")
+        # Bump user_version to highest actually applied version — PRAGMA cannot be parameterized
+        max_applied_row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        actual_version = int(max_applied_row[0]) if max_applied_row and max_applied_row[0] is not None else 0
+        conn.execute(f"PRAGMA user_version = {actual_version}")
         conn.commit()
-        logger.info("Migrations complete. user_version=%d", target_version)
+        logger.info("Migrations complete. user_version=%d", actual_version)
 
     except Exception:
         if conn.in_transaction:
@@ -365,6 +381,38 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _verify_migration_021_graph_schema(conn: sqlite3.Connection) -> bool:
+    """
+    Validate migration 021 schema against the normative typed memory graph contract.
+
+    Returns:
+        True if the schema strictly satisfies verify_graph_schema (ready).
+        False if base tables are missing (partial test schema) — skipping
+        recording into schema_migrations so 021 remains pending until the
+        base schema is supplied.
+
+    Raises:
+        SchemaVerificationError: If all 4 tables exist but the schema is
+        drifted (wrong PK shape, missing/wrong column types, nullability,
+        defaults, FK actions, or index definitions). This forces an immediate
+        transaction rollback so drifted migrations cannot be stamped.
+    """
+    from minni.graph_readiness import verify_graph_schema, SchemaVerificationError
+
+    report = verify_graph_schema(conn)
+    if report.ready:
+        return True
+    if report.status == "schema_drifted":
+        raise SchemaVerificationError(
+            f"Migration 021 verification failed ({report.status}): {'; '.join(report.errors)}"
+        )
+    logger.warning(
+        "Migration 021: base tables incomplete (%s) — skipping schema_migrations stamp",
+        ", ".join(report.missing_items),
+    )
+    return False
 
 
 def _apply_migration_019_episodic_fts_update_trigger(conn: sqlite3.Connection) -> None:
@@ -505,6 +553,7 @@ def _execute_tolerant(conn: sqlite3.Connection, statement: str) -> None:
         elif ("no such table" in msg or "no such column" in msg) and (
             statement.strip().upper().startswith("ALTER")
             or statement.strip().upper().startswith("CREATE INDEX")
+            or statement.strip().upper().startswith("CREATE UNIQUE INDEX")
             or statement.strip().upper().startswith("CREATE TRIGGER")
             or statement.strip().upper().startswith("UPDATE")
             or statement.strip().upper().startswith("DELETE")
