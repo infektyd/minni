@@ -39,11 +39,24 @@ that another agent can pick up later.
 3. Reports are written to `logs/hygiene-YYYY-MM-DD.md`.
 4. Agents remediate through file-back or explicit resolution tools.
 
+## Thread work
+
+Use the [current Thread workflow](../thread-workflow.md) for prepare → create →
+ready/assign/claim → start/update/complete → confirm. A queued acceptance is not
+an applied mutation; outcome drafting is not Thread completion.
+
 ## Eval Gate
 
-A retrieval feature may flip its default only after
-`python -m minni.eval.harness run --config baseline,<candidate>` shows at
-least +5% recall@5 on the seed set with no regression on any query class.
+The normative default-change policy remains: demonstrate at least +5% recall@5
+against the baseline with no regression on any query class. This requires a
+reviewed dataset, comparable runs, and explicit review of the evidence.
+
+The current automated `python -m minni.eval.harness run --gate --retrievers minnid,ripgrep` check has a different rule: Minni may lose on at most 20% of
+comparable queries. A config-comparison run without `--gate` produces reports;
+it does not enforce the normative policy. CI tests and release smoke also do not
+certify that policy. A matching automated feature-default gate remains a planned
+improvement. See [evaluation guidance](../../eval/README.md) for source-grounded
+fixtures and the limits of legacy mock-only seed IDs.
 
 ## Runtime Identity
 
