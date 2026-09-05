@@ -61,6 +61,7 @@ import re
 import signal
 import sys
 import time
+import threading
 import importlib.util
 from collections import deque
 from pathlib import Path
@@ -1289,6 +1290,12 @@ def _backfill_interval() -> int:
     return max(300, raw)
 
 
+# A failed notification must outlive the batch that committed its vectors.
+# Keep only a retry token, never vector payloads: the retry reads current SQL.
+_backfill_shared_refresh_pending: dict[str, object] = {}
+_backfill_shared_refresh_lock = threading.Lock()
+
+
 def _backfill_sweep_once() -> dict:
     """Blocking bounded backfill pass over every index. Runs off-loop.
 
@@ -1302,11 +1309,44 @@ def _backfill_sweep_once() -> dict:
     """
     from minni.backfill import run_backfill_all_indexes
 
+    key = os.path.abspath(DEFAULT_CONFIG.db_path)
+    with _backfill_shared_refresh_lock:
+        pending = _backfill_shared_refresh_pending.get(key)
+    refresh_retry = None
+    if pending is not None:
+        try:
+            engine = _lazy_retrieval()
+            engine.faiss_index.invalidate()
+            engine._set_current_deadline(None)
+            # Off-RPC, once per sweep; ensure itself bounds snapshot retries.
+            engine._ensure_faiss_loaded()
+            with engine.db.cursor() as c:
+                empty = c.execute("SELECT 1 FROM chunk_embeddings LIMIT 1").fetchone() is None
+            recovered = engine.faiss_index.ready or empty
+            if recovered:
+                with _backfill_shared_refresh_lock:
+                    if _backfill_shared_refresh_pending.get(key) is pending:
+                        _backfill_shared_refresh_pending.pop(key, None)
+            refresh_retry = {"recovered": recovered}
+        except Exception as exc:
+            refresh_retry = {"recovered": False, "error": str(exc)}
+            logger.warning("Backfill: shared live-index retry failed: %s", exc)
+
     def _refresh(chunk_ids, vectors):
-        engine = _lazy_retrieval()
-        engine._refresh_live_faiss(chunk_ids, vectors)
+        try:
+            engine = _lazy_retrieval()
+            if engine._refresh_live_faiss(chunk_ids, vectors) is False:
+                with _backfill_shared_refresh_lock:
+                    _backfill_shared_refresh_pending[key] = object()
+                logger.warning("Backfill: shared live index remains cold; retry scheduled")
+        except Exception:
+            with _backfill_shared_refresh_lock:
+                _backfill_shared_refresh_pending[key] = object()
+            raise
 
     results = run_backfill_all_indexes(DEFAULT_CONFIG, on_vectors=_refresh)
+    if refresh_retry is not None:
+        results["shared_live_refresh"] = refresh_retry
 
     # grok-review round 2 (finding 2): on_vectors covers the SHARED index only.
     # Vault engines memoized in _vault_retrieval_cache keep their warm FAISS

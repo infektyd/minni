@@ -14,6 +14,14 @@ absent document projections of active committed learnings, and fill missing
 vectors in existing documents. The running shared index is refreshed; affected
 per-vault retrieval caches are rebuilt on the daemon path.
 
+If notifying the running shared index fails after the database commit, the daemon
+retains a retry marker and attempts a reload on a subsequent sweep, even when
+there are no remaining projection/vector rows to repair. Each sweep makes one
+reload attempt (with bounded internal snapshot retries). It reloads current SQL
+state rather than saving old vector payloads, so a projection purged before retry
+is not restored. The marker is process-local; a daemon restart uses normal index
+loading from SQL. Repeated load failures can delay recovery beyond the next sweep.
+
 Reconstruction rechecks the current owner, content and lifecycle in the same
 transaction that publishes the document. Rejected, expired or superseded
 learnings do not regain visibility through repair. Private content retains its

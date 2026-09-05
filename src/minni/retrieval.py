@@ -1471,17 +1471,18 @@ class RetrievalEngine:
 
     def _refresh_live_faiss(
         self, chunk_ids: List[int], vectors: List[np.ndarray]
-    ) -> None:
+    ) -> bool:
         """Make new chunks searchable in the live FAISS index without restart.
 
         Warm index → add the new vectors directly (cheap, immediate). Cold index
         → leave it cold; the next search's _ensure_faiss_loaded rebuilds from the
         DB, which now contains these rows. Failures here are non-fatal: the rows
         are durably in chunk_embeddings, so a later search/rebuild still finds
-        them.
+        them. Return readiness so off-RPC callers can retain a retry when
+        both notification and its immediate recovery fail.
         """
         if not chunk_ids:
-            return
+            return True
         try:
             # add_batch re-checks warm/invalidated under the FAISS lock and
             # holds it for the whole batch. The previous shape — an unlocked
@@ -1500,6 +1501,7 @@ class RetrievalEngine:
                 # ensure sees the rows in the DB.
                 with self._faiss_load_lock:
                     self.faiss_index.add_batch(chunk_ids, vectors)
+            return self.faiss_index.ready
         except Exception as exc:
             logger.warning(
                 "durable-index: live FAISS refresh failed (%s) — invalidating "
@@ -1521,6 +1523,8 @@ class RetrievalEngine:
                     "durable-index: unbounded FAISS reload after refresh "
                     "failure skipped: %s", reload_exc,
                 )
+
+        return self.faiss_index.ready
 
     # ── Cross-Encoder Re-Ranking ──────────────────────────────
 
