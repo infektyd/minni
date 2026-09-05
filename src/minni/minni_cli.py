@@ -468,7 +468,10 @@ def main(argv: list[str] | None = None) -> int:
     wire.add_argument("platform", help="codex, claude-code, kilocode, grok, gemini, "
                       "antigravity, generic, or all")
     wire.add_argument("--agent", help="agent id (required for generic)")
-    wire.add_argument("--workspace", help="workspace path for MINNI_WORKSPACE_ID")
+    workspace_mode = wire.add_mutually_exclusive_group()
+    workspace_mode.add_argument("--workspace", help="workspace path for MINNI_WORKSPACE_ID")
+    workspace_mode.add_argument("--dynamic-workspace", action="store_true",
+                                help="Codex only: remove existing workspace pins so runtime context chooses the workspace")
     wire.add_argument("--install-root", help="override install/config root (required for generic)")
     wire.add_argument("--dry-run", action="store_true",
                       help="show actions without writing")

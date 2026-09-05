@@ -189,20 +189,21 @@ def mcp_json(
     agent: str,
     vault: Path,
     socket_path: Path,
-    workspace: Path,
+    workspace: Path | None,
     *,
     target_path: Path | None = None,
     explicit_workspace: bool = False,
+    dynamic_workspace: bool = False,
     pre_existing_env: dict | None = None,
     afm_env: dict[str, str] | None = None,
 ) -> dict:
-    normalized_workspace = normalize_workspace_id(str(workspace))
     env = {
         "MINNI_AGENT_ID": agent,
         "MINNI_VAULT_PATH": str(vault),
         "MINNI_SOCKET_PATH": str(socket_path),
-        "MINNI_WORKSPACE_ID": normalized_workspace,
     }
+    if workspace is not None:
+        env["MINNI_WORKSPACE_ID"] = normalize_workspace_id(str(workspace))
     env.update(afm_env or {})
     ex_env: dict = {}
     if pre_existing_env is not None:
@@ -219,7 +220,10 @@ def mcp_json(
                 "preserved env would be silently dropped. Fix or remove the "
                 "file, then re-run."
             ) from exc
-    if ex_env:
+    if agent == "codex":
+        env = _resolve_codex_env(env, ex_env, explicit_workspace=explicit_workspace,
+                                 dynamic_workspace=dynamic_workspace)
+    elif ex_env:
         ex_env = _filter_dead_afm_helper(
             _validate_preserved_identity(ex_env, agent),
         )
@@ -245,6 +249,38 @@ def mcp_json(
             },
         },
     }
+
+
+def validate_codex_env(existing: object) -> None:
+    """MCP env values are strings; reject invalid TOML/JSON before any writes."""
+    if not isinstance(existing, dict):
+        raise ValueError("existing Codex MCP env must be an object")
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in existing.items()):
+        raise ValueError("existing Codex MCP env must map string keys to string values")
+
+
+def _resolve_codex_env(
+    fresh: dict, existing: dict, *, explicit_workspace: bool, dynamic_workspace: bool,
+) -> dict:
+    """Preserve the host's env while resolving only its workspace policy.
+
+    No new workspace means dynamic, but absence of a CLI override must not
+    erase an existing deliberate pin. A legacy Codex-only pin also counts.
+    """
+    if explicit_workspace and dynamic_workspace:
+        raise ValueError("--workspace and --dynamic-workspace are mutually exclusive")
+    validate_codex_env(existing)
+    preserved = _filter_dead_afm_helper(_validate_preserved_identity(existing, "codex"))
+    env = {**fresh, **preserved}
+    workspace = fresh.get("MINNI_WORKSPACE_ID")
+    if not explicit_workspace:
+        workspace = preserved.get("MINNI_WORKSPACE_ID", preserved.get("MINNI_CODEX_WORKSPACE_ID", workspace))
+    env.pop("MINNI_WORKSPACE_ID", None)
+    env.pop("MINNI_CODEX_WORKSPACE_ID", None)
+    if not dynamic_workspace and workspace is not None:
+        env["MINNI_WORKSPACE_ID"] = workspace
+    _mirror_codex_hook_env(env, "codex")
+    return env
 
 
 def update_claude_config(
@@ -640,11 +676,35 @@ def update_toml_mcp_config(
     agent: str,
     vault: Path,
     socket_path: Path,
-    workspace: Path,
+    workspace: Path | None,
     *,
     explicit_workspace: bool = False,
+    dynamic_workspace: bool = False,
     afm_env: dict[str, str] | None = None,
 ) -> None:
+    if agent == "codex":
+        # Resolve before replacing sections, including custom env. The legacy
+        # generic section merger intentionally keeps its non-Codex behavior.
+        existing = {}
+        if path.exists():
+            try:
+                existing = tomllib.loads(path.read_text(encoding="utf-8")).get("mcp_servers", {}).get("minni", {}).get("env", {})
+            except (tomllib.TOMLDecodeError, AttributeError) as exc:
+                raise ValueError(f"cannot parse existing TOML at {path}; refusing to rewrite Codex env") from exc
+        env = _resolve_codex_env(
+            {"MINNI_AGENT_ID": agent, "MINNI_VAULT_PATH": str(vault),
+             "MINNI_SOCKET_PATH": str(socket_path), **(afm_env or {}),
+             **({"MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace))} if workspace is not None else {})},
+            existing, explicit_workspace=explicit_workspace, dynamic_workspace=dynamic_workspace,
+        )
+        replace_toml_sections(path, {
+            "mcp_servers.minni": '[mcp_servers.minni]\ncommand = "node"\n'
+                f'args = ["{_toml_basic_str(server_path)}"]\nenabled = true',
+            "mcp_servers.minni.env": "[mcp_servers.minni.env]\n" + "\n".join(
+                f'"{_toml_basic_str(key)}" = "{_toml_basic_str(value)}"' for key, value in env.items()
+            ),
+        })
+        return
     ws = normalize_workspace_id(str(workspace))
     env_lines = [
         f'MINNI_AGENT_ID = "{_toml_basic_str(agent)}"',

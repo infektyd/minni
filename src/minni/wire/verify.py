@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import selectors
 import shutil
+import signal
 import subprocess
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,16 +24,25 @@ class VerifyResult:
 
 
 def mcp_handshake(server_path: Path, timeout: float = 15.0) -> bool:
+    """Probe initialize within a wall-clock budget, then reap the probe process.
+
+    Pipes stay open for the MCP session: communicate() would wait for server
+    exit, and readline() can wait forever on a silent or partial response.
+    """
     node = shutil.which("node")
-    if not node or not server_path.is_file():
+    if not node or not server_path.is_file() or not math.isfinite(timeout) or timeout <= 0:
         return False
-    proc = subprocess.Popen(
-        [node, str(server_path)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+    deadline = time.monotonic() + timeout
+    try:
+        proc = subprocess.Popen(
+            [node, str(server_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=os.name == "posix",
+        )
+    except OSError:
+        return False
     try:
         req = json.dumps({
             "jsonrpc": "2.0",
@@ -41,22 +55,72 @@ def mcp_handshake(server_path: Path, timeout: float = 15.0) -> bool:
             },
         }) + "\n"
         assert proc.stdin is not None
-        proc.stdin.write(req)
+        proc.stdin.write(req.encode("utf-8"))
         proc.stdin.flush()
         assert proc.stdout is not None
-        line = proc.stdout.readline()
-        if not line:
-            return False
-        resp = json.loads(line)
-        return "result" in resp or "error" in resp
-    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        buffered = bytearray()
+        received = 0
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    return False
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    return False
+                received += len(chunk)
+                if received > 1024 * 1024:
+                    return False
+                buffered.extend(chunk)
+                while b"\n" in buffered:
+                    if time.monotonic() >= deadline:
+                        return False
+                    line, _, rest = buffered.partition(b"\n")
+                    buffered = bytearray(rest)
+                    resp = json.loads(line)
+                    if not isinstance(resp, dict) or resp.get("jsonrpc") != "2.0":
+                        return False
+                    # A server can emit notifications before its reply.
+                    if "id" not in resp and isinstance(resp.get("method"), str):
+                        continue
+                    if type(resp.get("id")) is not int or resp["id"] != 1 or "error" in resp:
+                        return False
+                    result = resp.get("result")
+                    if not isinstance(result, dict) or result.get("protocolVersion") != "2024-11-05":
+                        return False
+                    info = result.get("serverInfo")
+                    return (
+                        isinstance(result.get("capabilities"), dict)
+                        and isinstance(info, dict)
+                        and all(isinstance(info.get(key), str) and bool(info[key].strip())
+                                for key in ("name", "version"))
+                    )
+    except (ValueError, OSError, subprocess.SubprocessError):
         return False
     finally:
-        proc.kill()
+        # The probe owns this new process group; do not leave helper children
+        # behind when initialization fails or when a valid server stays alive.
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except OSError:
+            # Darwin can report EPERM for an already-exited session leader.
+            # Popen.kill polls first, so an exited child still gets reaped.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=2)
+        finally:
+            proc.stdin.close()
+            proc.stdout.close()
 
 
 def hook_dry_run(hook_path: Path, event: str = "SessionStart") -> bool:

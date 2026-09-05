@@ -49,6 +49,7 @@ from minni.wire.writers import (
     update_claude_config,
     update_kilo_config,
     update_toml_mcp_config,
+    validate_codex_env,
     vault_for,
     write_json,
 )
@@ -151,12 +152,13 @@ def _wire_platform(
     explicit_workspace: bool,
     dry_run: bool,
     mcp_root: Path | None = None,
+    dynamic_workspace: bool = False,
 ) -> tuple[Path | None, dict[str, object]]:
     server_path = install_root / "dist" / "server.js"
     agent = spec.agent
     vault = bootstrap_vault(agent) if not dry_run else vault_for(agent)
     afm_env = native_afm_env(repo_root)
-    stamp_workspace = workspace or Path.home() / "Projects" / "Minni"
+    stamp_workspace = workspace if spec.platform == "codex" else workspace or Path.home() / "Projects" / "Minni"
     extras: dict[str, object] = {}
 
     mcp_target = (mcp_root or install_root) / ".mcp.json"
@@ -192,7 +194,9 @@ def _wire_platform(
 
         host_toml = Path(spec.config_path).expanduser()
         try:
-            tomllib.loads(host_toml.read_text(encoding="utf-8"))
+            host_config = tomllib.loads(host_toml.read_text(encoding="utf-8"))
+            if spec.platform == "codex":
+                validate_codex_env(host_config.get("mcp_servers", {}).get("minni", {}).get("env", {}))
         except Exception as exc:
             raise ValueError(
                 f"cannot parse existing host TOML at {host_toml}: {exc}. "
@@ -201,11 +205,19 @@ def _wire_platform(
                 "file, then re-run."
             ) from exc
 
+    previous_agent = pre_mcp_env.get("MINNI_AGENT_ID") or pre_mcp_env.get("MINNI_CODEX_AGENT_ID")
+    if spec.platform == "codex" and previous_agent and previous_agent != "codex":
+        # This version root can have been stamped by another host in `wire
+        # all`. Its workspace is not an existing Codex workspace preference.
+        pre_mcp_env = {key: value for key, value in pre_mcp_env.items()
+                       if key not in {"MINNI_WORKSPACE_ID", "MINNI_CODEX_WORKSPACE_ID"}}
+
     if not dry_run:
         generated = mcp_json(
             server_path, agent, vault, socket, stamp_workspace,
             pre_existing_env=pre_mcp_env,
             explicit_workspace=explicit_workspace,
+            dynamic_workspace=dynamic_workspace,
             afm_env=afm_env,
         )
         # Merge into the existing document: only the minni entry is ours;
@@ -234,6 +246,7 @@ def _wire_platform(
             update_toml_mcp_config(
                 config_path, server_path, agent, vault, socket, stamp_workspace,
                 explicit_workspace=explicit_workspace, afm_env=afm_env,
+                dynamic_workspace=dynamic_workspace,
             )
         elif kind == "claude-json":
             config_path = update_claude_config(
@@ -285,6 +298,9 @@ def run_wire(args) -> int:
 
     # Generic / mandatory args — exit 2 before filesystem changes
     plat_arg = canonical_platform(args.platform)
+    dynamic_workspace = bool(getattr(args, "dynamic_workspace", False))
+    if dynamic_workspace and (plat_arg != "codex" or args.workspace is not None):
+        return _exit2("--dynamic-workspace requires platform codex and cannot be combined with --workspace")
     if plat_arg == "generic":
         if not args.install_root:
             return _exit2("generic wire requires --install-root")
@@ -444,6 +460,7 @@ def run_wire(args) -> int:
                         workspace=workspace,
                         repo_root=repo_root if from_repo else None,
                         explicit_workspace=explicit_workspace,
+                        dynamic_workspace=dynamic_workspace,
                         dry_run=dry_run,
                         mcp_root=mcp_root,
                     )
