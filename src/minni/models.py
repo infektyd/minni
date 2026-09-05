@@ -18,9 +18,11 @@ Both functions are safe to call from multiple threads; functools.cache
 provides the lock-free singleton guarantee after the first call completes.
 
 Inference is NOT thread-safe on these shared instances: callers must hold
-get_embedder_lock() / get_cross_encoder_lock() / get_attribution_lock()
-around .encode() / .predict(). See issue #284 (MPS allocator leak under
-concurrent unlocked encode on Apple Silicon).
+get_embedder_lock() / get_attribution_lock() around .encode() / .predict().
+See issue #284 (MPS allocator leak under concurrent unlocked encode on Apple
+Silicon). EXCEPTION: the cross-encoder's predict() is thread-safe on the
+pinned CPU path and retrieval calls it unlocked (perf/parallel-fanout #388 —
+see get_cross_encoder_lock); the torch CPU pin stays mandatory.
 """
 
 import functools
@@ -58,7 +60,18 @@ def get_embedder_lock() -> threading.Lock:
 
 
 def get_cross_encoder_lock() -> threading.Lock:
-    """Lock guarding predict() on the process-wide reranker singleton."""
+    """Legacy accessor for the process-wide reranker lock.
+
+    perf/parallel-fanout (#388): retrieval NO LONGER acquires this around
+    CrossEncoder.predict — a stress probe (24 threads x 3 rounds vs a serial
+    reference, exact-score equality, no exceptions) verified predict() is
+    thread-safe on the daemon's pinned CPU path (torch.set_num_threads(1) +
+    OMP/MKL pins, which stay mandatory: unpinned, the same probe segfaults
+    via OpenMP oversubscription). The function remains so external callers
+    importing it keep working; new code must route through
+    cross_encoder_unlocked_predict_safe() and hold this lock whenever the
+    pinned-CPU precondition does not hold.
+    """
     return _CROSS_ENCODER_LOCK
 
 
@@ -87,6 +100,13 @@ def _resolve_model_device() -> Optional[str]:
 
 _TORCH_THREADS_PINNED = False
 _TORCH_THREADS_PIN_LOCK = threading.Lock()
+
+# Construction-time device of the cross-encoder singleton (None until the
+# first successful build). perf/parallel-fanout YELLOW (round 2, TOCTOU):
+# the pin gate must answer for the model that was actually BUILT, not the
+# live env — MINNI_MODEL_DEVICE mutated mid-process after an MPS build
+# would otherwise resolve "cpu" here and unlock predict on an MPS model.
+_CROSS_ENCODER_CONSTRUCTION_DEVICE: Optional[str] = None
 
 
 def _pin_torch_threads_for_cpu_once(device: Optional[str]) -> None:
@@ -132,6 +152,40 @@ def _pin_torch_threads_for_cpu_once(device: Optional[str]) -> None:
             _TORCH_THREADS_PINNED = True
         except Exception:
             pass  # best-effort; the env pins in main() are the primary defense
+
+
+def cross_encoder_unlocked_predict_safe() -> bool:
+    """True only when the pinned-CPU precondition for unlocked predict holds.
+
+    perf/parallel-fanout (#388, Cassandra RED-2): retrieval calls
+    CrossEncoder.predict() WITHOUT get_cross_encoder_lock() only when BOTH
+    hold: the CONSTRUCTION device of the loaded singleton is CPU, the
+    torch-thread pin has actually fired (``_TORCH_THREADS_PINNED``), AND the
+    OMP/MKL environment pins are present. The
+    stress probe verified byte-identical concurrent predict on that path,
+    and segfaulted without the pin (OpenMP oversubscription) — so any
+    other device (MPS/CUDA/auto) or an unfired pin takes the locked path.
+    Construction device, not the live env (YELLOW round 2 TOCTOU): once
+    built, the singleton keeps answering for the device it was built with
+    no matter how MINNI_MODEL_DEVICE mutates mid-process. An auto build
+    (no device= kwarg, the standard MPS route) stashes the explicit
+    'auto' sentinel — library auto-select, NOT cpu — so a later live
+    MINNI_MODEL_DEVICE=cpu can never unlock predict on it. Pre-construction
+    (stash still None, no build yet) falls back to the live resolution. Errs toward
+    locked: a missing torch import leaves the flag False, and callers must
+    treat False as "hold the lock".
+    """
+    device = _CROSS_ENCODER_CONSTRUCTION_DEVICE
+    if device is None:
+        device = _resolve_model_device()
+    normalized = (device or "").strip().lower().split(":")[0]
+    if normalized != "cpu":
+        return False
+    return (
+        _TORCH_THREADS_PINNED
+        and os.environ.get("OMP_NUM_THREADS") == "1"
+        and os.environ.get("MKL_NUM_THREADS") == "1"
+    )
 
 
 def _announce_download_once(model_name: str, role: str) -> None:
@@ -213,6 +267,8 @@ def get_cross_encoder():
         if device is not None:
             kwargs["device"] = device
         model = CrossEncoder(DEFAULT_CONFIG.reranker_model, **kwargs)
+        global _CROSS_ENCODER_CONSTRUCTION_DEVICE
+        _CROSS_ENCODER_CONSTRUCTION_DEVICE = device if device is not None else "auto"
         logger.info(
             "Cross-encoder loaded (singleton): %s device=%s",
             DEFAULT_CONFIG.reranker_model,
