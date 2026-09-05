@@ -10,7 +10,7 @@ def can_reserve(used: int, requested: int, capacity: int) -> bool:
     """Return whether an inclusive capacity limit permits the reservation."""
     if min(used, requested, capacity) < 0:
         raise ValueError("counts must be nonnegative")
-    return used + requested < capacity
+    return used + requested <= capacity
 
 
 def remaining_capacity(used: int, capacity: int) -> int:
