@@ -20,8 +20,8 @@ A single local **daemon** (`minnid`) over a Unix socket, a typed **MCP surface**
 Four verbs cover the lifecycle:
 
 - **Recall** — cited, provenance-tagged retrieval (lexical + vector + rank fusion + rerank) across the personal and shared legs.
-- **Learn** — propose, don't write: `learn` stages a **candidate**, not a memory.
-- **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent, including the background AFM auto-consolidation pass (functional since [#119](https://github.com/infektyd/minni/issues/119) closed) — every path lands in the same audited gate.
+- **Learn** — normally stage a shared-learning candidate. The MCP tool also persists a personal vault note; operator-configured approval paths are described in [Concepts](docs/concepts.md#delegating-approval).
+- **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Acceptance makes the shared learning durable; indexing is a separate follow-up and can require repair. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent, including the background AFM auto-consolidation pass (functional since [#119](https://github.com/infektyd/minni/issues/119) closed) — every path lands in the same audited gate.
 - **Handoff** — explicit cross-agent transfers with leases, so work and context move between runtimes deliberately.
 
 Compaction is not a loss event either: platform compaction summaries are harvested at the hook into the agent's vault inbox, then distilled into review candidates ([details](docs/concepts.md#compaction-summary-harvest)).
@@ -34,9 +34,9 @@ All of it is local-first: no hosted dependency, no cloud tier, and vaults you ca
 
 ## Recall is evidence, not instruction
 
-Recalled memory in Minni is **cited and weighed, never obeyed**. Every result arrives in an evidence envelope with provenance (source, owning agent, score, review state): material to evaluate, not text with authority. Instruction-shaped content is detected and defused at the data layer, before it reaches a prompt.
+Recalled memory in Minni is **cited and weighed, never obeyed**. Every result arrives in an evidence envelope with provenance (source, owning agent, score, review state): material to evaluate, not text with authority. Data-layer instruction detection and evidence framing help consumers recognize text that should not acquire authority.
 
-This is a memory-poisoning defense enforced in the engine, not asserted in a prompt: a note that reaches a vault can be *seen* and *cited*, but never gets to *command*. The write side is filtered too — the learn gate blocks credential-shaped values, with an AFM tier, fail-open when AFM is off, for the unquoted passphrases regex cannot judge. Combined with the propose→approve gate, nothing writes itself into durable memory and nothing recalled speaks with your voice.
+Minni enforces its read/write policy and labels recalled text as evidence. These controls reduce memory-poisoning risk; they cannot guarantee how an external model interprets text. Consumers must keep recalled material below instructions and verify consequential actions. The write side is filtered too — the learn gate blocks credential-shaped values, with an AFM tier, fail-open when AFM is off, for the unquoted passphrases regex cannot judge. Shared-learning approval, personal-note persistence, and optional auto-accept are distinct paths. Adversarial consumer testing remains part of the assurance goal.
 
 ## How it compares
 
@@ -54,7 +54,7 @@ Honest caveats: Minni is **early (v0.5)**, with tiny adoption, no published benc
 
 ## Quickstart
 
-Minni is two pieces: the **daemon + CLI** (PyPI) and the **agent wiring** (the MCP plugin and per-runtime hooks), which `minni wire <platform>` installs. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. Wheels have shipped the plugin payload bundled inside the package since **v0.3**. This tree is stamped **v0.5.0** (changelog ready); **PyPI still serves the last tagged release until `v0.5.0` is tagged and the release workflow publishes** — check [pypi.org/project/minni](https://pypi.org/project/minni/) for what `pipx install minni` installs today. A source checkout (`--from-repo`) is only needed for contributors working from `main`.
+Minni is two pieces: the **daemon + CLI** (PyPI) and the **agent wiring** (the MCP plugin and per-runtime hooks), which `minni wire <platform>` installs. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. Wheels have shipped the plugin payload bundled inside the package since **v0.3**. [PyPI publishes Minni 0.5.0](https://pypi.org/project/minni/0.5.0/). A source checkout can contain newer fixes while retaining the same package version; `--from-repo` installs the chosen checkout’s plugin payload rather than establishing parity with the published wheel.
 
 ### 1. Install the daemon + CLI (PyPI)
 
@@ -172,7 +172,15 @@ Two things reach the daemon that are not the same thing. **Agents call** MCP too
 
 ## Status
 
-Minni's **repo tip is stamped v0.5.0** ([CHANGELOG.md](CHANGELOG.md)) — the close of the 2026-08 audit remediation campaign (81 findings worked off; the release's theme is honesty: health that derives from state, memory that is actually reachable, queues that drain, and branch rules that bind admins too). **PyPI lags until a `v0.5.0` GitHub tag triggers OIDC trusted publishing** — the badge above and [pypi.org/project/minni](https://pypi.org/project/minni/) show what installs today (currently the last published tag, often still 0.4.1). After publish, the daemon and CLI install with one `pipx install minni`. Hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
+Minni is pre-1.0. Version **0.5.0 is published on PyPI** ([release](https://pypi.org/project/minni/0.5.0/)); the daemon and CLI install with `pipx install minni`. The [changelog](CHANGELOG.md) records release history, while `main` can carry subsequent fixes under the same version string.
+
+| Surface | What identifies the content |
+|---|---|
+| Published package | PyPI version and artifact hash; a version label alone does not identify the current source commit |
+| Source checkout | Git commit plus local changes; `--from-repo` selects this checkout's plugin payload |
+| Installed / running system | Installed build metadata, effective host configuration, and the process/session actually loaded; updating source does not reload every host |
+
+Runtime integrations cover Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code, with host-specific activation requirements described in [runtime setup](docs/runtimes/). A payload or MCP initialization check does not certify every native hook event. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
 
 What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation under a throwaway `MINNI_HOME` on every push. Locally, `minni doctor` covers a related subset (interpreter, socket, status, recall, models) without the home-isolation assert. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 
@@ -184,6 +192,7 @@ What "works" is not asserted, it is *executed in public*: CI stands the daemon u
 | Install & troubleshooting (incl. Docker eval image) | [docs/install.md](docs/install.md) |
 | Keep live checkout current (`make sync-root`, fleet partition) | [deploy/README.md](deploy/README.md) |
 | Per-runtime setup | [docs/runtimes/](docs/runtimes/) |
+| Run a Thread — claim, update, confirm, recover | [docs/thread-workflow.md](docs/thread-workflow.md) |
 | Architecture — components, data model, MCP tools | [docs/architecture.md](docs/architecture.md) |
 | Security model | [docs/security.md](docs/security.md) · [SECURITY_PLAN.md](docs/archive/SECURITY_PLAN.md) |
 | Contracts (agent, capabilities, vault, workflows, threat model) | [docs/contracts/](docs/contracts/) |

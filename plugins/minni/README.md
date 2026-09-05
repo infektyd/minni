@@ -12,16 +12,25 @@ information request contracts, candidate resolution, audit tools, and temporary
 team runtime packets. On Claude Code and KiloCode, hooks wire memory in as a
 session spine.
 
-The frontend is a Vite + React + TypeScript app under [frontend-src/](frontend-src/), built into the served [frontend/](frontend/) directory. Run `npm run console` (which runs `tsc && vite build && node dist/ui-server.js`) to start the local-only bridge at `http://127.0.0.1:8765/`. Eight screens are wired through the Tweaks panel-controlled rail:
+The Vite/React console starts on **Memory Board**. From this directory run
+`npm run console`, then open the token-bearing localhost URL printed at startup.
+The bearer token protects HTTP access; daemon operations still use the console's
+stamped principal. Use the navigation rail to open:
 
-- **Recall** — POST `/api/prepare-task`. Type a query, get ranked vault sources with privacy / authority / AFM chips and an Inspector pane.
-- **Prepare Packet** — reads the same `prepare-task` response and renders the `<sovereign:context>` envelope, token-budget meter, included-source list, and risk callouts.
-- **Dry-run Review** — POST `/api/prepare-outcome`. Submit task + summary; the response's `outcomeDraft` partitions into LEARN CANDIDATES / LOG-ONLY / DO-NOT-STORE columns. Approve/Defer/Reject is a UI decision only — nothing is stored.
-- **Audit Trail** — GET `/api/audit-tail?limit=N`. Parses the daemon's `## [iso-ts] tool | summary` markdown into a sortable table.
-- **Settings** — GET `/api/status` + `/api/health`. Shows daemon socket, AFM adapter, vault path, and bridge tools.
-- **Handoffs / Vaults / Policy & AFM** — read-only placeholders for surfaces
-  that are still operated through MCP tools or daemon calls rather than console
-  screens.
+- **Memory Board** — live agent/catalogue state, owner-scoped pending suggestions,
+  log-only/quarantine views, and recent recall. A limited page is a lower bound,
+  not a fleet-wide total. Refresh and update-time labels expose freshness.
+- **Recall / Prepare Packet** — `/api/prepare-task` results and the exact context
+  packet. Token allowance is not a measured usage percentage.
+- **Dry-run Review** — `/api/prepare-outcome` drafts candidate/log-only/do-not-store
+  suggestions; preview decisions do not resolve staged candidates.
+- **Handoffs, Vaults, Policy & AFM, Sessions** — live route-backed views with empty,
+  unavailable, and error states; these are not placeholder screens. Host delivery
+  and actual model availability still need their own verification.
+- **Audit / Settings** — activity and runtime status. Observability differs from
+  Board candidate resolution: **Approve/Reject performs a real governed decision**.
+  Acceptance requires operator authority; owners can reject/redact their own
+  candidates under daemon policy.
 
 Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris accents) and **Phosphor** (CRT operator board with telemetry rail and live activity stream). Toggle from the gear button bottom-right. Layout sizes and theme persist to `localStorage`.
 
@@ -134,7 +143,7 @@ rejected outright and disables the cloud provider.
 - `minni_ack_handoff`
 - `minni_list_pending_handoffs`
 - `minni_await_handoff`
-- `minni_thread_create` / `minni_thread_update` / `minni_thread_status` / `minni_thread_activate` / `minni_thread_deactivate` / `minni_thread_replan` / `minni_thread_history` / `minni_thread_revision` / `minni_thread_diff` / `minni_thread_restore` / `minni_thread_scar` (11 tools; the pre-rename `minni_plan_*` aliases were removed in v0.5.0 — canonical names only)
+- `minni_thread_create` / `minni_thread_update` / `minni_thread_status` / `minni_thread_activate` / `minni_thread_deactivate` / `minni_thread_replan` / `minni_thread_history` / `minni_thread_revision` / `minni_thread_diff` / `minni_thread_restore` / `minni_thread_scar` / `minni_thread_ready` / `minni_thread_assign` / `minni_thread_claim` / `minni_thread_worker_update` / `minni_thread_events` (16 tools; the pre-rename `minni_plan_*` aliases were removed in v0.5.0 — canonical names only)
 - `minni_team_runtime` — project one vault Thread as a Team packet (`plan_id`, `rev`, `readySlices`); leftover `taskLedger` is a view of ready, not a second graph
 - `minni_team_evidence` — dry-run evidence report plus promotion candidates; never promotes or learns automatically
 - `minni_team_promotion` — dry-run permanent-profile draft gated by explicit approval; never writes durable memory
@@ -143,6 +152,10 @@ rejected outright and disables the cloud provider.
 
 Compatibility aliases for older `sovereign_*` workflows may still resolve to
 these tools, but new integrations should use the `minni_*` names above.
+
+For a complete claim/start/complete sequence and queued-response handling, see
+[Run a Thread](../../docs/thread-workflow.md). A lease token can authorize several
+mutations until expiry/revocation; a queued completion is not yet applied.
 
 ## Minni Team Runtime
 
@@ -210,9 +223,10 @@ Automatic behavior should remain recall-only. `minni_route` can recommend recall
 
 ## Agent Information Requests
 
-Direct cross-agent recall is intentionally not exposed. When one model needs
-information from another agent, it must create a pseudo-contract with
-`minni_ping_agent_request`. The plugin stamps the sender from the runtime
+Authorized shared recall is exposed through `minni_recall` scope and
+`cross_agent` options. Shared document eligibility and explicit cross-agent
+learning recall have separate gates; this does not grant access to private peer
+sessions. For an explicit addressed question, use `minni_ping_agent_request`. The plugin stamps the sender from the runtime
 principal (`MINNI_AGENT_ID`, with `MINNI_CODEX_AGENT_ID` as a Codex-scoped
 fallback; default `unknown-agent`), writes a pending contract to the sender
 outbox and recipient inbox, and records an audit entry. The request contains
@@ -289,7 +303,7 @@ The bridge defaults to the Codex vault resolved from `MINNI_VAULT_PATH` (or `MIN
 npm ci                   # deterministic install from package-lock.json
 npm run build            # writes dist/server.js for MCP/plugin manifests
 npm test                 # full pipeline: build + node --test suite
-npm run test:server      # server/hook tests only (build:server + node --test, no vite build)
+npm run test:server      # builds server, board test bundle, frontend, then Node tests
 npm run test:file tests/hook-behavior.test.mjs   # single test file
 npm run typecheck        # tsc --noEmit
 npm run lint             # eslint . — lints src/, tests/, and frontend-src/ (built frontend/ is ignored)

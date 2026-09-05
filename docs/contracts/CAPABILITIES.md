@@ -3,7 +3,7 @@
 **Contract version:** 1.1.0
 **Last updated:** 2026-06-15
 
-This document lists every JSON-RPC method exposed by the Sovereign Memory daemon
+This document summarizes JSON-RPC methods exposed by the Minni daemon
 (`src/minni/minnid.py`; the authoritative dispatch table is `_METHODS`). Methods not
 yet implemented are marked `[PLANNED: PR-N]`.
 
@@ -13,8 +13,8 @@ yet implemented are marked `[PLANNED: PR-N]`.
 
 | Level | Meaning |
 |-------|---------|
-| `agent` | Any connected agent may call this. |
-| `operator` | Daemon or human operator only; not exposed over the IPC socket. |
+| `agent` | Requires the registered/stamped principal and the method capability; ownership and resource gates still apply. |
+| `operator` | Requires operator/governance authority; authorized calls can use the local IPC socket. |
 
 ---
 
@@ -26,21 +26,21 @@ yet implemented are marked `[PLANNED: PR-N]`.
 | `status` | agent | None | Daemon uptime, request count, DB and FAISS health snapshot. |
 | `search` | agent | Updates `access_count` and `last_accessed` on matched documents. | Hybrid FTS5 + FAISS + cross-encoder retrieval. Accepts optional `depth` (`headline | snippet | chunk | document`, default `snippet`) and `budget_tokens`. |
 | `read` | agent | Updates `access_count` and `last_accessed` on returned documents. | Agent startup context: identity anchor, top documents, recent learnings, recent episodic events. The plugin's `minni_recall` tool routes here (and to `search`); `read` is the JSON-RPC method — see `recall` row. |
-| `learn` | agent | Writes a row to `learnings`. | Stores a durable learning keyed by `agent_id` and `category`. |
+| `learn` | agent | Normally persists a staged candidate; approved paths write a shared learning. | Proposal-first by default; configured own auto-accept and operator force are explicit exceptions. MCP personal-note persistence is separate. |
 | `log_event` | agent | Writes a row to `episodic_events`. | Appends an episodic event. Fields: `event_type`, `content`, `agent_id`, `task_id?`, `thread_id?`. |
 | `expand` | agent | Updates `access_count` and `last_accessed` on the expanded document. | Re-fetch a specific result at a deeper depth tier. Accepts `result_id` (chunk_id or doc_id) and `depth`. |
 | `recall` | — | n/a | **Not a JSON-RPC method.** `_METHODS` has no `recall` entry and dispatch does no aliasing, so a raw `recall` call returns `-32601 Method not found`. "Recall" is the plugin-side `minni_recall` tool, which routes to the `read`/`search` daemon methods. JSON-RPC clients must call `read` (or `search`) directly. |
 | `health_report` | agent | None | Structured health report including index freshness, decay stats, and schema version. |
 | `feedback` | agent | Writes a row to `feedback_events`. | Signal quality of a recall result (thumbs-up / thumbs-down + comment). Used to calibrate confidence scoring. |
-| `trace` | agent | None | Retrieve full provenance trace for a `result_id`. Returns the chain of FTS rank, semantic rank, RRF score, cross-encoder score, decay factor. |
+| `trace` | agent | None | Look up a search `trace_id` owned by the requesting principal. Ephemeral process-local diagnostics; unavailable/expired entries return `not_found`. |
 | `handoff` | agent | Writes a handoff packet to `wiki/handoffs/` and `inbox/`. | Package current agent context (identity, pending learnings, open questions) for a peer agent. Also reachable as `daemon.handoff`. |
 | `compile` | agent | Writes vault pages; updates index.md and log.md. | Synthesize raw notes + learnings into structured wiki pages (entity, concept, decision, etc.). Wired as `daemon.compile`. |
 | `endorse` | agent | Updates `review_state` from `candidate` to `accepted` on a vault page. | Peer-agent endorsement of a candidate page. Wired as `daemon.endorse`. |
 | `hygiene_report` | agent | None | Report on vault health: orphan pages, pages missing sources, expired pages, supersession chains. |
 | `minni_subscribe_contradictions` | agent | None | Return contradiction events for learnings recently read by the calling agent (belief-correction surface). |
-| `stage_candidate` | agent | None (no durable write). | G14/G16 candidate pipeline: stage a candidate packet (default learn path) for operator review. |
+| `stage_candidate` | agent | Persists a candidate packet, not an accepted learning. | G14/G16 candidate pipeline: stage a candidate packet (default learn path) for operator review. |
 | `list_candidates` | agent | None | G14/G17: list staged candidates for the stamped principal (console/governance view). Defaults to `status=proposed`; responses are POLICY §2 redacted and include `total`/`has_more` — when `has_more` is true, `total` is the `LIMIT n+1` lower bound (`len(page)+1`), not an exact count. |
-| `resolve_candidate` | operator | Accept → durable `learn`; reject/redact otherwise. | G15: resolve a staged candidate. Authorization is owner-or-explicit-operator, enforced inside the transaction. |
+| `resolve_candidate` | decision-dependent | Accept commits a shared learning; indexing can fail afterward. | Accept/learn require operator authority. Owners can resolve their own rows with non-accept decisions; merge/supersede change candidate status and do not themselves merge learning content. Authorization is checked inside the transaction. |
 | `ax_snapshot_store` | agent | Writes an accessibility-tree snapshot (TTL-bounded, default 3600s). | OmniSense: persist an AX/app snapshot (`agent_id`, `app_name`, `tree_json`). Returns `snapshot_id`. |
 | `ax_snapshot_get` | agent | None | OmniSense: retrieve a stored AX/app snapshot by `agent_id` / `app_name`. |
 
@@ -73,6 +73,19 @@ Default tier: `snippet` (matches all existing callers; zero behavior change).
 }
 ```
 
+### `trace`
+
+Read `trace_ids` (or a single `trace_id`, when present) from a search response.
+For each returned ID, call the daemon using the **same principal**:
+
+```json
+{"method":"trace","params":{"trace_id":"<returned trace ID>"},"id":2,"jsonrpc":"2.0"}
+```
+
+These IDs identify retrieval legs, not document IDs or authorization tokens.
+Traces expire or disappear on daemon restart; `status=not_found` is expected in
+those cases. Per-leg timings do not measure the entire client/daemon round trip.
+
 ### `expand`
 
 ```json
@@ -87,7 +100,7 @@ Default tier: `snippet` (matches all existing callers; zero behavior change).
 ```json
 {
   "content":   "string (required)",
-  "agent_id":  "string (optional, default: \"hermes\")",
+  "agent_id":  "string (optional; use the registered runtime principal)",
   "category":  "string (optional, default: \"general\")"
 }
 ```
@@ -98,7 +111,7 @@ Default tier: `snippet` (matches all existing callers; zero behavior change).
 {
   "event_type": "string (required)",
   "content":    "string (required)",
-  "agent_id":   "string (optional, default: \"hermes\")",
+  "agent_id":   "string (optional; use the registered runtime principal)",
   "task_id":    "string (optional)",
   "thread_id":  "string (optional)"
 }
@@ -108,7 +121,7 @@ Default tier: `snippet` (matches all existing callers; zero behavior change).
 
 ```json
 {
-  "agent_id": "string (optional, default: \"hermes\")",
+  "agent_id": "string (optional; use the registered runtime principal)",
   "limit":    "integer (optional, default: 5, max: 20)"
 }
 ```
