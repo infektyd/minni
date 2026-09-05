@@ -26,7 +26,8 @@
         "path": "docs/concepts.md",
         "start_line": 3,
         "end_line": 15,
-        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe"
+        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe",
+        "git_blob_oid": "6d9769a022466a829adefb00d5f7f827b846fd61"
       },
       "text_sha256": "f6b871e7893f85f2b3cdbe9299325d00840f3188656aa347a4174ec0f2ac29e8"
     },
@@ -42,7 +43,8 @@
         "path": "docs/concepts.md",
         "start_line": 17,
         "end_line": 56,
-        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe"
+        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe",
+        "git_blob_oid": "6d9769a022466a829adefb00d5f7f827b846fd61"
       },
       "text_sha256": "fa2d137923b7740fec1a6efb9b48e8d533a0f744a1642ae963129a370b4d259c"
     },
@@ -58,7 +60,8 @@
         "path": "docs/concepts.md",
         "start_line": 58,
         "end_line": 86,
-        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe"
+        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe",
+        "git_blob_oid": "6d9769a022466a829adefb00d5f7f827b846fd61"
       },
       "text_sha256": "cb3750cf1dd43cdf6226197be5df38d59aa804314f023c77ebf409a093fb718e"
     },
@@ -74,7 +77,8 @@
         "path": "docs/concepts.md",
         "start_line": 88,
         "end_line": 111,
-        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe"
+        "sha256": "1a85cb960d9bcc87cbe7ca56b43e6b0c64ea91a23ddb6019f2492a20c5f11efe",
+        "git_blob_oid": "6d9769a022466a829adefb00d5f7f827b846fd61"
       },
       "text_sha256": "9bdaab1c6f231102d8cf142a0154f3d00ed56c8eca65f609926b87d6124ea085"
     },
@@ -90,7 +94,8 @@
         "path": "docs/runtimes/codex.md",
         "start_line": 1,
         "end_line": 32,
-        "sha256": "937bb9380d78c3e2fe365b6622469d945c13de22b6b999d09d5a3462381686b7"
+        "sha256": "937bb9380d78c3e2fe365b6622469d945c13de22b6b999d09d5a3462381686b7",
+        "git_blob_oid": "32b875df36c15f7012b5c4dbb85e78b3d89ca0ea"
       },
       "text_sha256": "abb6950640e8920dbec2268e2cb2560c1cebe1e6f7f613713ece2a422862bbf6"
     },
@@ -106,7 +111,8 @@
         "path": "docs/runtimes/codex.md",
         "start_line": 34,
         "end_line": 63,
-        "sha256": "937bb9380d78c3e2fe365b6622469d945c13de22b6b999d09d5a3462381686b7"
+        "sha256": "937bb9380d78c3e2fe365b6622469d945c13de22b6b999d09d5a3462381686b7",
+        "git_blob_oid": "32b875df36c15f7012b5c4dbb85e78b3d89ca0ea"
       },
       "text_sha256": "09075cdd3eac651a8420d79ca2b61d25cf7347ac134696ddc57fc139ad474587"
     },
@@ -122,7 +128,8 @@
         "path": "docs/contracts/AGENT.md",
         "start_line": 48,
         "end_line": 56,
-        "sha256": "8f86f5d8fa7204f3d374240b65402c386e799c114a20117be0f0871357e23601"
+        "sha256": "8f86f5d8fa7204f3d374240b65402c386e799c114a20117be0f0871357e23601",
+        "git_blob_oid": "c88dc66e9e43e3e4568fba3336cdff8f94a0a42a"
       },
       "text_sha256": "90abd741efbb5503a6d65efa02d482b01b8bd2bcf83e6c691ce80bb8b127e374"
     },
@@ -138,7 +145,8 @@
         "path": "docs/contracts/AGENT.md",
         "start_line": 171,
         "end_line": 191,
-        "sha256": "8f86f5d8fa7204f3d374240b65402c386e799c114a20117be0f0871357e23601"
+        "sha256": "8f86f5d8fa7204f3d374240b65402c386e799c114a20117be0f0871357e23601",
+        "git_blob_oid": "c88dc66e9e43e3e4568fba3336cdff8f94a0a42a"
       },
       "text_sha256": "b0a617cf7fc41cf118a26050add79c1480543585eff6d771fb68723ac569ab92"
     },
@@ -154,7 +162,8 @@
         "path": "docs/contracts/VAULT.md",
         "start_line": 184,
         "end_line": 206,
-        "sha256": "2c1ff2fab4ea01e76c212028fca0fdd38d87be87cbbaa571ad4cb9a7f10d843a"
+        "sha256": "2c1ff2fab4ea01e76c212028fca0fdd38d87be87cbbaa571ad4cb9a7f10d843a",
+        "git_blob_oid": "704115dac5be290a077b7669e271ffdaad7b27ec"
       },
       "text_sha256": "cc097670e7b403defb8101bca38bcb72ea5e7d2f88996560623d9ad2763d4032"
     },
@@ -170,7 +179,8 @@
         "path": "docs/contracts/VAULT.md",
         "start_line": 210,
         "end_line": 242,
-        "sha256": "2c1ff2fab4ea01e76c212028fca0fdd38d87be87cbbaa571ad4cb9a7f10d843a"
+        "sha256": "2c1ff2fab4ea01e76c212028fca0fdd38d87be87cbbaa571ad4cb9a7f10d843a",
+        "git_blob_oid": "704115dac5be290a077b7669e271ffdaad7b27ec"
       },
       "text_sha256": "a4968651294068a966c77d4c3731aa5b3bab79b781569497e1673a9c7c322f52"
     },
@@ -186,7 +196,8 @@
         "path": "docs/architecture.md",
         "start_line": 78,
         "end_line": 91,
-        "sha256": "2e9ec04b84fef2c1a7d794c881ac715967d3d938b4a5f83bf98467bd2d18b4b7"
+        "sha256": "2e9ec04b84fef2c1a7d794c881ac715967d3d938b4a5f83bf98467bd2d18b4b7",
+        "git_blob_oid": "6196634cda03ba9a0701051eeef92988ff570715"
       },
       "text_sha256": "7b7f2e0735a3937d938f30b0d4771869133efe1cf367f652ac8e60e197dae021"
     },
@@ -202,7 +213,8 @@
         "path": "docs/architecture.md",
         "start_line": 93,
         "end_line": 103,
-        "sha256": "2e9ec04b84fef2c1a7d794c881ac715967d3d938b4a5f83bf98467bd2d18b4b7"
+        "sha256": "2e9ec04b84fef2c1a7d794c881ac715967d3d938b4a5f83bf98467bd2d18b4b7",
+        "git_blob_oid": "6196634cda03ba9a0701051eeef92988ff570715"
       },
       "text_sha256": "ea4a374f119b8fc2cc332b980117cd6fe25a5cd6673ca72f735f0f38de594bdf"
     },
@@ -218,7 +230,8 @@
         "path": "docs/install.md",
         "start_line": 152,
         "end_line": 166,
-        "sha256": "c9062192598bb70b20b8f8c15b897ff883dd71629a3ce8088014edb439353d89"
+        "sha256": "c9062192598bb70b20b8f8c15b897ff883dd71629a3ce8088014edb439353d89",
+        "git_blob_oid": "f50aa8b2a9ed92e4b8dc034ce41da4c138fadf2e"
       },
       "text_sha256": "b5e7b466c7e6de175138ccd227d92d4f9ef7f2b86cd647ac47757fcd93425752"
     },
@@ -234,7 +247,8 @@
         "path": "docs/install.md",
         "start_line": 168,
         "end_line": 182,
-        "sha256": "c9062192598bb70b20b8f8c15b897ff883dd71629a3ce8088014edb439353d89"
+        "sha256": "c9062192598bb70b20b8f8c15b897ff883dd71629a3ce8088014edb439353d89",
+        "git_blob_oid": "f50aa8b2a9ed92e4b8dc034ce41da4c138fadf2e"
       },
       "text_sha256": "1812c0ed5a5a1992a82cd0374c05c93292726152a738ebb6440c2cc48fc5a13d"
     },
@@ -250,7 +264,8 @@
         "path": "docs/security.md",
         "start_line": 18,
         "end_line": 36,
-        "sha256": "43e83c499767d610058185790fd75d270d0a1603f1a928f7380298834487053b"
+        "sha256": "43e83c499767d610058185790fd75d270d0a1603f1a928f7380298834487053b",
+        "git_blob_oid": "3de6484c6cec0f7fb61e00b15233d60b0eec0199"
       },
       "text_sha256": "2230073e97178ed92344f5e7b96fc3a52f744c305b38c6847173e2d7cf74efeb"
     },
@@ -266,7 +281,8 @@
         "path": "docs/security.md",
         "start_line": 38,
         "end_line": 65,
-        "sha256": "43e83c499767d610058185790fd75d270d0a1603f1a928f7380298834487053b"
+        "sha256": "43e83c499767d610058185790fd75d270d0a1603f1a928f7380298834487053b",
+        "git_blob_oid": "3de6484c6cec0f7fb61e00b15233d60b0eec0199"
       },
       "text_sha256": "fc91b693397792b38dc4b37597c558fd0128bf7f453a91a087cce89220c2a9cf"
     },
@@ -282,7 +298,8 @@
         "path": "docs/security.md",
         "start_line": 67,
         "end_line": 77,
-        "sha256": "43e83c499767d610058185790fd75d270d0a1603f1a928f7380298834487053b"
+        "sha256": "43e83c499767d610058185790fd75d270d0a1603f1a928f7380298834487053b",
+        "git_blob_oid": "3de6484c6cec0f7fb61e00b15233d60b0eec0199"
       },
       "text_sha256": "691099013c8de178c4cdc86d1764dbaef29b2c3181e9f0668da419ff3e651083"
     },
@@ -298,7 +315,8 @@
         "path": "docs/contracts/AGENT.md",
         "start_line": 13,
         "end_line": 46,
-        "sha256": "8f86f5d8fa7204f3d374240b65402c386e799c114a20117be0f0871357e23601"
+        "sha256": "8f86f5d8fa7204f3d374240b65402c386e799c114a20117be0f0871357e23601",
+        "git_blob_oid": "c88dc66e9e43e3e4568fba3336cdff8f94a0a42a"
       },
       "text_sha256": "73d07e1b7870d66273ad7df1ee42cee9b473ce9fb8a72209b9c6b0e7cbbd278c"
     }

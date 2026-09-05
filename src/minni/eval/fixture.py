@@ -38,7 +38,7 @@ def load_fixture(path: Path) -> dict:
         if type(doc.get("expected_eligible")) is not bool:
             raise ValueError("every document requires an explicit expected_eligible boolean")
         if source_grounded:
-            _validate_source(doc, data["source_revision"])
+            _validate_source(doc)
     globally_forbidden = {d["ref"] for d in documents if not d["expected_eligible"]}
     if not queries:
         raise ValueError("fixture queries are required")
@@ -58,16 +58,37 @@ def load_fixture(path: Path) -> dict:
     return data
 
 
-def _validate_source(doc: dict, revision: str) -> None:
-    """Verify an excerpt against its immutable Git source, not current docs."""
+def _validate_source(doc: dict) -> None:
+    """Verify immutable source bytes by blob ID, which survives squash merges.
+
+    source_revision records the original annotation context; verification does
+    not require that historical PR commit to remain reachable after squashing.
+    The committed source tree keeps its content-addressed blobs in Git history.
+    """
     source = doc.get("source", {})
     path = Path(source.get("path", ""))
     start, end = source.get("start_line"), source.get("end_line")
+    oid = source.get("git_blob_oid")
     if (path.is_absolute() or ".." in path.parts or path.suffix != ".md"
             or type(start) is not int or type(end) is not int or not 1 <= start <= end):
         raise ValueError("invalid repository source path or line range")
+    if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}", oid):
+        raise ValueError("repository source requires a Git blob object ID")
     try:
-        blob = subprocess.check_output(["git", "show", f"{revision}:{path.as_posix()}"],
+        object_type = subprocess.check_output(["git", "cat-file", "-t", oid],
+                                             cwd=repo_root(), stderr=subprocess.DEVNULL, timeout=10)
+        if object_type.strip() != b"blob":
+            raise ValueError("repository source object must be a blob")
+        # Bind the bytes to their asserted public source path in retained
+        # history. A valid blob/hash alone could otherwise be relabeled as an
+        # unrelated document. A squash tree retains this same path/blob pair.
+        objects = subprocess.check_output(
+            ["git", "rev-list", "--objects", "--all", "--", path.as_posix()],
+            cwd=repo_root(), stderr=subprocess.DEVNULL, timeout=10,
+        ).decode("utf-8").splitlines()
+        if f"{oid} {path.as_posix()}" not in objects:
+            raise ValueError("repository source blob is not recorded at its declared path")
+        blob = subprocess.check_output(["git", "cat-file", "blob", oid],
                                        cwd=repo_root(), stderr=subprocess.DEVNULL, timeout=10)
         lines = blob.decode("utf-8").splitlines(keepends=True)
     except (OSError, UnicodeError, subprocess.SubprocessError) as exc:

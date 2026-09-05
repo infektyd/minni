@@ -87,8 +87,11 @@ comparison. Do not rewrite expectations or tune thresholds to make its lexical
 scores pass: ordinary questions and paraphrases can expose retrieval misses.
 
 Each document records its public source path, inclusive line range, full source
-blob SHA-256, and excerpt SHA-256 at the pinned Git `source_revision`. Text is
-copied exactly, including Markdown and newlines. Each question's `expected_refs`
+blob SHA-256, excerpt SHA-256, and `git_blob_oid`. The original `source_revision`
+is historical annotation context. Verification checks the blob and its source
+path in retained Git history, so squash merging does not require keeping the
+original PR commit reachable. Text is copied exactly, including Markdown and
+newlines. Each question's `expected_refs`
 resolve to those source records; `expected_answer` explains the independent
 relevance judgment. The answer text is explanatory, **not an answer-generation
 metric**. `hard_negative_refs` identify authorized, topically similar distractors,

@@ -1,6 +1,7 @@
 """Source-grounded labels and excerpts, independent of retrieval outcomes."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -22,7 +23,7 @@ def test_public_corpus_provenance_and_exact_source_excerpts():
         assert path.parts[0] == 'docs'
         if str(path) not in blobs:
             blobs[str(path)] = subprocess.check_output(
-                ['git', 'show', f"{data['source_revision']}:{path}"], cwd=root,
+                ['git', 'cat-file', 'blob', source['git_blob_oid']], cwd=root,
             )
         raw = blobs[str(path)]
         assert hashlib.sha256(raw).hexdigest() == source['sha256']
@@ -66,7 +67,7 @@ import pytest
 @pytest.mark.parametrize('tamper', [
     'provenance', 'human-review', 'revision', 'source-path', 'source-hash',
     'negative-range', 'past-end-range', 'excerpt', 'excerpt-and-hash',
-    'text-hash', 'dangling-negative', 'missing-rationale',
+    'text-hash', 'dangling-negative', 'missing-rationale', 'blob-oid', 'blob-type', 'missing-blob', 'wrong-source-path',
 ])
 def test_actual_loader_rejects_tampered_public_provenance(tmp_path, tamper):
     from minni.eval.fixture import load_fixture
@@ -77,7 +78,15 @@ def test_actual_loader_rejects_tampered_public_provenance(tmp_path, tamper):
     elif tamper == 'human-review':
         data['human_reviewed'] = True
     elif tamper == 'revision':
-        data['source_revision'] = '0' * 40
+        data['source_revision'] = 'not-a-revision'
+    elif tamper == 'blob-oid':
+        doc['source']['git_blob_oid'] = 'HEAD:docs/concepts.md'
+    elif tamper == 'blob-type':
+        doc['source']['git_blob_oid'] = data['source_revision']
+    elif tamper == 'missing-blob':
+        doc['source']['git_blob_oid'] = '0' * 40
+    elif tamper == 'wrong-source-path':
+        doc['source']['path'] = 'docs/install.md'
     elif tamper == 'source-path':
         doc['source']['path'] = '../docs/concepts.md'
     elif tamper == 'source-hash':
@@ -100,3 +109,52 @@ def test_actual_loader_rejects_tampered_public_provenance(tmp_path, tamper):
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError):
         load_fixture(path)
+
+
+def test_source_blobs_verify_after_squash_without_original_commit(tmp_path, monkeypatch):
+    import minni.eval.fixture as fixture
+
+    # Never let an invoking Git hook redirect disposable repository commands.
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    original_root = repo_root()
+    data = json.loads((original_root / 'eval/fixtures/public_repo.json').read_text())
+    # A brand-new repository contains only the public source tree, exactly as
+    # a squash commit would. No branch/history from the original repo is used.
+    for doc in data['documents']:
+        source = doc['source']
+        target = tmp_path / source['path']
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output(
+            ['git', 'cat-file', 'blob', source['git_blob_oid']], cwd=original_root,
+        ))
+    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
+    subprocess.run(['git', 'add', 'docs'], cwd=tmp_path, check=True)
+    subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                    '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'Single source snapshot'],
+                   cwd=tmp_path, check=True)
+    assert subprocess.run(['git', 'cat-file', '-e', data['source_revision']],
+                          cwd=tmp_path, stderr=subprocess.DEVNULL).returncode != 0
+    path = tmp_path / 'corpus.json'
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(fixture, 'repo_root', lambda: tmp_path)
+    assert len(fixture.load_fixture(path)['documents']) == 18
+
+    # Substituting a real but altered source blob must still fail the original
+    # whole-file hash/excerpt contract; resolving an object alone is not enough.
+    source = data['documents'][0]['source']
+    changed = tmp_path / source['path']
+    changed.write_text(changed.read_text() + '\nAltered source bytes.\n')
+    altered_oid = subprocess.check_output(['git', 'hash-object', '-w', str(changed)],
+                                          cwd=tmp_path, text=True).strip()
+    subprocess.run(['git', 'add', source['path']], cwd=tmp_path, check=True)
+    subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                    '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'Changed source'],
+                   cwd=tmp_path, check=True)
+    # Old snapshots remain verifiable after a later docs edit in the new history.
+    assert len(fixture.load_fixture(path)['documents']) == 18
+    source['git_blob_oid'] = altered_oid
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='hash or excerpt mismatch'):
+        fixture.load_fixture(path)
