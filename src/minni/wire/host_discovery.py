@@ -22,8 +22,13 @@ _SPECS = {
                     (".gemini/config/mcp_config.json", ".gemini/antigravity/mcp_config.json",
                      ".gemini/antigravity-ide/mcp_config.json", ".gemini/antigravity-cli/plugins/minni/mcp_config.json")),
     "grok": (("grok", "grok-beta"), (), (".grok/config.toml",)),
-    "cursor": (("cursor",), ("Cursor.app",), (".cursor/mcp.json",)),
+    "cursor": (("cursor", "cursor-agent"), ("Cursor.app",),
+               (".cursor/mcp.json", ".cursor/plugins/local/minni/.mcp.json")),
 }
+# Standard user-local and Homebrew/npm launcher locations. Presence is checked
+# without executing a host; stale or non-executable symlinks do not qualify.
+_SYSTEM_LAUNCHER_ROOTS = (Path("/opt/homebrew/bin"), Path("/usr/local/bin"))
+
 _ALIASES = {"claude": "claude-code", "kilo": "kilocode", "agy": "antigravity",
             "grok-build": "grok", "grok-beta": "grok", "grok-tui": "grok",
             "antigravity-cli": "antigravity", "antigravity-ide": "antigravity"}
@@ -75,7 +80,8 @@ def _binding(config: dict) -> tuple[bool, bool]:
 
 
 def discover_host(platform: str, *, home: Path | None = None, path: str | None = None,
-                  app_roots: tuple[Path, ...] | None = None) -> HostPresence:
+                  app_roots: tuple[Path, ...] | None = None,
+                  launcher_roots: tuple[Path, ...] | None = None) -> HostPresence:
     platform = platform.strip().lower().replace("_", "-")
     platform = _ALIASES.get(platform, platform)
     home = Path(home) if home is not None else Path(os.environ.get("HOME") or Path.home())
@@ -88,6 +94,16 @@ def discover_host(platform: str, *, home: Path | None = None, path: str | None =
         found = shutil.which(command, path=path)
         if found:
             executables.append(found)
+    # An explicit path argument is a caller-supplied search boundary. Normal
+    # scheduled calls use ambient PATH plus these known launcher roots.
+    launchers = launcher_roots if launcher_roots is not None else (
+        (home / ".local/bin", *_SYSTEM_LAUNCHER_ROOTS) if path is None else ()
+    )
+    for root in launchers:
+        for command in commands:
+            candidate = Path(root) / command
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                executables.append(str(candidate))
     applications = []
     for root in roots:
         for name in apps:
@@ -130,7 +146,8 @@ def discover_host(platform: str, *, home: Path | None = None, path: str | None =
 
 
 def host_decision(platform: str, *, bulk: bool = False, home: Path | None = None,
-                  path: str | None = None, app_roots: tuple[Path, ...] | None = None) -> dict:
+                  path: str | None = None, app_roots: tuple[Path, ...] | None = None,
+                  launcher_roots: tuple[Path, ...] | None = None) -> dict:
     """Decide before Node checks, payload builds, bootstrap or config mutations.
 
     Explicit generic remains the deliberate headless/custom-host escape; its
@@ -139,7 +156,7 @@ def host_decision(platform: str, *, bulk: bool = False, home: Path | None = None
     if platform.strip().lower() == "generic" and not bulk:
         return {"eligible": True, "status": "ready", "reason": "explicit generic integration",
                 "host": HostPresence("generic", "explicit", False, None, False).to_dict()}
-    host = discover_host(platform, home=home, path=path, app_roots=app_roots)
+    host = discover_host(platform, home=home, path=path, app_roots=app_roots, launcher_roots=launcher_roots)
     if host.config_errors:
         return {"eligible": False, "status": "failed",
                 "reason": "host configuration unreadable; repair before wiring",

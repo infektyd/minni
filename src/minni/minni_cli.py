@@ -517,7 +517,7 @@ def main(argv: list[str] | None = None) -> int:
              "same-version rebuilds still land)")
     sync.add_argument(
         "--no-prune", action="store_true",
-        help="keep old ~/.minni/plugin version dirs")
+        help="compatibility flag: sync always retains old payloads while native/custom references may remain")
     sync.add_argument(
         "--no-restart", action="store_true",
         help="do not kickstart minnid after redeploy")

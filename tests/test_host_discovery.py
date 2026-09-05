@@ -184,3 +184,33 @@ def test_invalid_mcp_structure_fails_without_rewriting(tmp_path, payload):
         assert not result["eligible"]
         assert "sensitive" not in json.dumps(result)
         assert target.read_bytes() == before
+
+
+def test_cursor_agent_with_propagated_binding_is_bulk_eligible(tmp_path):
+    executable(tmp_path, 'cursor-agent')
+    config(tmp_path, '.cursor/plugins/local/minni/.mcp.json', '{"mcpServers":{"minni":{"command":"node"}}}')
+    assert probe(tmp_path, 'cursor', bulk=True)['eligible'] is True
+
+
+@pytest.mark.parametrize('location', ['user', 'homebrew', 'local'])
+def test_restricted_ambient_path_finds_real_known_launcher(tmp_path, monkeypatch, location):
+    from minni.wire import host_discovery as discovery
+    monkeypatch.setenv('PATH', '')
+    system = (tmp_path / 'opt/homebrew/bin', tmp_path / 'usr/local/bin')
+    monkeypatch.setattr(discovery, '_SYSTEM_LAUNCHER_ROOTS', system)
+    root = {'user': tmp_path / '.local/bin', 'homebrew': system[0], 'local': system[1]}[location]
+    root.mkdir(parents=True)
+    launcher = root / 'grok'
+    marker = tmp_path / 'host-executed'
+    launcher.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 99\n')
+    launcher.chmod(0o700)
+    config(tmp_path, '.grok/config.toml', '[mcp_servers.minni]\n')
+    result = host_decision('grok', home=tmp_path, bulk=True, app_roots=())
+    assert result['eligible'] is True
+    assert str(launcher) in result['host']['executables']
+    assert not marker.exists()
+    launcher.chmod(0o600)
+    assert host_decision('grok', home=tmp_path, bulk=True, app_roots=())['eligible'] is False
+    launcher.unlink()
+    launcher.symlink_to(root / 'removed-cli')
+    assert host_decision('grok', home=tmp_path, bulk=True, app_roots=())['eligible'] is False

@@ -31,6 +31,14 @@ OK_AUDIT = {"name": "deploy_symlink_audit", "exit_code": 0}
 REPO = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def isolated_host_home(tmp_path, monkeypatch):
+    # Fleet now also refreshes registered custom MCP consumers. Never read or
+    # update developer registrations when the canonical wire step is mocked.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("minni.wire.host_discovery._SYSTEM_LAUNCHER_ROOTS", ())
+
+
 def test_sync_result_to_dict():
     r = SyncResult(ok=True, install_kind="packaged", message="ok", next_actions=["a"])
     d = r.to_dict()

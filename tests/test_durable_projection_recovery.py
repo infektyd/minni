@@ -190,7 +190,9 @@ def test_governed_accept_failure_then_real_scheduled_sweep(store, monkeypatch):
     # Context DB factory must bind to this test store even though the function's
     # default config was imported before the fixture existed.
     from dataclasses import replace
+    from minni.writeback import WriteBackMemory
     context = replace(daemon._governance_context(), sovereign_db=lambda: SovereignDB(config),
+                      lazy_writeback=lambda: WriteBackMemory(db, config),
                       maybe_archive_inbox_source=lambda *args: None)
     monkeypatch.setattr(daemon, "_governance_context", lambda: context)
     op = EffectivePrincipal(agent_id="main", capabilities=["*"])
@@ -200,6 +202,7 @@ def test_governed_accept_failure_then_real_scheduled_sweep(store, monkeypatch):
         patch.setattr(daemon, "_lazy_retrieval", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
         accepted = daemon._resolve_candidate(
             {"candidate_id": cid, "decision": "accept", "_principal": op}, 2)
+    assert "result" in accepted, accepted
     assert accepted["result"]["indexed"] is False
     assert not rows(db, "documents")
     result = daemon._backfill_sweep_once()
@@ -208,3 +211,58 @@ def test_governed_accept_failure_then_real_scheduled_sweep(store, monkeypatch):
     assert len(rows(db, "documents")) == 1
     assert rows(db, "candidate_packets")[0]["status"] == "accepted"
     assert daemon._backfill_sweep_once()["shared"]["projections"]["repaired"] == 0
+
+
+@pytest.mark.parametrize("failure", ["lazy", "callback", "false_result"])
+@pytest.mark.parametrize("purge_before_retry", [False, True])
+def test_next_sweep_retries_live_refresh_from_current_database(
+    store, monkeypatch, failure, purge_before_retry,
+):
+    import minni.minnid as daemon
+    import minni.index_all as indexing
+
+    db, config, _ = store
+    monkeypatch.setattr(daemon, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(indexing, "discover_agent_vaults", lambda *args: [])
+    monkeypatch.setattr(daemon, "_backfill_shared_refresh_pending", {})
+    warm = RetrievalEngine(db, config)
+    warm.index_durable_document(content="Warm seed", path=config.vault_path + "/seed.md",
+                                agent="codex")
+    warm._set_current_deadline(None)
+    warm._ensure_faiss_loaded()
+    assert warm.faiss_index.ready and warm.faiss_index.count == 1
+    monkeypatch.setattr(daemon, "_lazy_retrieval", lambda: warm)
+    lid = learning(db)
+    with monkeypatch.context() as patch:
+        def unavailable(*args):
+            raise RuntimeError("transient callback unavailable")
+        if failure == "lazy":
+            patch.setattr(daemon, "_lazy_retrieval", unavailable)
+        elif failure == "callback":
+            patch.setattr(warm, "_refresh_live_faiss", unavailable)
+        else:
+            patch.setattr(warm, "_refresh_live_faiss", lambda *args: False)
+        daemon._backfill_sweep_once()
+    assert len(rows(db, "documents")) == 2  # commit survived lost notification
+    assert warm.faiss_index.count == 1
+    assert daemon._backfill_shared_refresh_pending
+    projection_path = durable_doc_path("codex", "", config.vault_path, "Recovery specimen")
+    if purge_before_retry:
+        with db.cursor() as c:
+            c.execute("UPDATE learnings SET status='superseded' WHERE learning_id=?", (lid,))
+        warm.purge_durable_document(projection_path)
+    chunks_before = [r["chunk_id"] for r in rows(db, "chunk_embeddings")]
+    # Failure of the retry itself must also remain pending across sweeps.
+    with monkeypatch.context() as patch:
+        patch.setattr(daemon, "_lazy_retrieval", unavailable)
+        assert daemon._backfill_sweep_once()["shared_live_refresh"]["recovered"] is False
+    retry = daemon._backfill_sweep_once()
+    assert retry["shared_live_refresh"]["recovered"] is True
+    assert retry["shared"]["projections"]["repaired"] == 0
+    assert retry["shared"]["documents"]["documents"] == 0
+    assert not daemon._backfill_shared_refresh_pending
+    assert [r["chunk_id"] for r in rows(db, "chunk_embeddings")] == chunks_before
+    assert warm.faiss_index.ready
+    assert warm.faiss_index.count == (1 if purge_before_retry else 2)
+    hits = warm._semantic_search("specimen", 5)
+    assert any(r["path"] == projection_path for r in hits) is (not purge_before_retry)

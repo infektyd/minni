@@ -23,7 +23,7 @@ def surface(tmp_path, monkeypatch):
     discovery = sys.modules['_minni_propagate_host_discovery']
     original = discovery.discover_host
     monkeypatch.setattr(discovery, 'discover_host', lambda platform, **kw: original(
-        platform, **{**kw, 'app_roots': (home / 'Applications',)},
+        platform, **{**kw, 'app_roots': (home / 'Applications',), 'launcher_roots': ()},
     ))
     args = Namespace(repo=str(tmp_path / 'repo'), platform='all', existing_only=False,
                      no_build=False, agent=None, install_root=None, workspace=None,
@@ -231,3 +231,39 @@ def test_other_native_hosts_refresh_existing_event_only_without_activation(
     assert list(rows) == ['SessionStart']
     assert rows['SessionStart'][0]['command'] == f'node {home}/new/dist/{entrypoint} SessionStart'
     assert rows['SessionStart'][1] == {'command': 'echo mine'}
+
+
+def test_unrelated_disabled_metadata_does_not_block_active_owned_hook(surface):
+    home, _, module, _ = surface
+    data = {'metadata': {'enabled': False}, 'hooks': {'SessionStart': [
+        {'disabled': True, 'command': 'echo unrelated'},
+        {'command': 'node /old/dist/cursor-hook.js SessionStart'},
+        {'disabled': True, 'command': 'node /disabled/dist/cursor-hook.js SessionStart'}]}}
+    target = _config(home, '.cursor/hooks.json', json.dumps(data))
+    assert module.update_cursor_hooks(home / 'new', existing_only=True)['installed'] is True
+    actual = json.loads(target.read_text())
+    assert actual['metadata'] == data['metadata']
+    rows = actual['hooks']['SessionStart']
+    assert rows[0] == data['hooks']['SessionStart'][0]
+    assert rows[2] == data['hooks']['SessionStart'][2]
+    assert '/new/dist/' in rows[1]['command']
+
+
+@pytest.mark.parametrize('custom', [False, True])
+def test_historical_grok_body_refreshes_but_custom_body_is_preserved(surface, custom):
+    home, _, module, _ = surface
+    old = module.LEGACY_GROK_RULES_BODY + ('\nUser addition\n' if custom else '')
+    target = _config(home, '.grok/rules/minni.md', old)
+    module.preflight_grok_native(home / 'new')
+    assert target.read_text() == old  # preflight is read-only
+    result = module.write_grok_rules(existing_only=True)
+    assert target.read_text() == (old if custom else module.GROK_RULES_BODY)
+    assert result.get('skipped', False) is custom
+
+
+def test_legacy_grok_body_matches_recorded_shipped_version(surface):
+    import hashlib
+    _, _, module, _ = surface
+    # Independently extracted from git 1f126a81^; no Git history needed in CI.
+    assert hashlib.sha256(module.LEGACY_GROK_RULES_BODY.encode()).hexdigest() == (
+        'e5e8dde4b78a8ca1496028959a3ab65dfce17d627ea99f656a971a0743f9257e')
