@@ -30,6 +30,7 @@ import {
   type BoardRecallResult,
   type AgentRow,
   mapCandidates,
+  candidatePageInfo,
   mapLogOnlyCandidates,
   mapQuarantineCandidates,
   mapAgents,
@@ -57,6 +58,9 @@ export interface StagedLearningsState {
   /** Plan alias for learnings (plan shape: { data, isLive, error }). */
   data: BoardLearning[];
   learnings: BoardLearning[];
+  principal: string | null;
+  hasMore: boolean;
+  refreshedAt: number | null;
   isLive: boolean;
   loading: boolean;
   error: string | null;
@@ -73,6 +77,9 @@ export function useStagedLearnings(
   onAuthRequired?: () => void,
 ): StagedLearningsState {
   const [learnings, setLearnings] = useState<BoardLearning[]>([]);
+  const [pageInfo, setPageInfo] = useState<{ principal: string | null; hasMore: boolean }>({ principal: null, hasMore: false });
+  const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
+  const requestId = useRef(0);
   const [isLive, setIsLive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -81,31 +88,42 @@ export function useStagedLearnings(
   authCb.current = onAuthRequired;
 
   const fetchLearnings = useCallback(async () => {
+    const request = ++requestId.current;
     setLoading(true);
     try {
       const response = await listCandidates(200, "proposed");
-      if (isMounted.current) {
+      if (isMounted.current && request === requestId.current) {
         const result = zoneFetchSuccess(mapCandidates(response.candidates || []));
         setLearnings(result.data);
+        setPageInfo(candidatePageInfo(response, 200));
+        setRefreshedAt(Date.now());
         setIsLive(true);
         setError(null);
       }
     } catch (err: unknown) {
-      if (isMounted.current) {
+      if (isMounted.current && request === requestId.current) {
         const result = zoneFetchFailure<BoardLearning[]>([], err, isAuthErr);
         setLearnings(result.data);
         setIsLive(false);
+        setPageInfo({ principal: null, hasMore: false });
+        setRefreshedAt(null);
         setError(result.error);
         if (result.kind === "error" && result.authRequired) authCb.current?.();
       }
     } finally {
-      if (isMounted.current) setLoading(false);
+      if (isMounted.current && request === requestId.current) setLoading(false);
     }
   }, [isMounted]);
 
   useEffect(() => {
     void fetchLearnings();
   }, [fetchLearnings, refreshTrigger]);
+
+  useEffect(() => {
+    const onFocus = () => { void fetchLearnings(); };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [fetchLearnings]);
 
   const resolve = useCallback(
     async (id: string, decision: "accepted" | "rejected") => {
@@ -132,6 +150,8 @@ export function useStagedLearnings(
   return {
     data: learnings,
     learnings,
+    ...pageInfo,
+    refreshedAt,
     isLive,
     loading,
     error,

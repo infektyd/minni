@@ -3,6 +3,7 @@ import { AgentSummary } from "../components/AgentSummary";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   agentColor,
+  stagedCountLabel,
   zoneGate,
   type BoardAgent,
   type BoardDeny,
@@ -149,13 +150,22 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
 
   return (
     <div className="dz">
+      <div className="dz-foot" role="status">
+        Pending suggestions visible to {stagedState?.principal ?? "an unconfirmed identity"}.
+        {stagedState?.hasMore ? ` Showing the latest ${learnings.length}; more suggestions remain.` : ""}
+        {stagedState?.refreshedAt ? ` Updated ${new Date(stagedState.refreshedAt).toLocaleTimeString()}.` : ""}
+        <button className="bd-btn sm" type="button" disabled={stagedState?.loading}
+          onClick={() => void stagedState?.refresh()}>
+          {stagedState?.loading ? "Refreshing…" : "Refresh suggestions"}
+        </button>
+      </div>
       <div className="dz-bar">
         <div className="fchips" role="tablist">
           <button
             className={"fchip" + (filter === "all" ? " on" : "")}
             onClick={() => setFilter("all")}
           >
-            All · {learnings.length}
+            Shown · {learnings.length}
           </button>
           {Object.keys(agents).map((a) => (
             <button
@@ -169,7 +179,7 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
           ))}
         </div>
         <div className="dz-bar-r">
-          <span className="bd-chip warn">{pending} PENDING</span>
+          <span className="bd-chip warn">{stagedCountLabel(pending, stagedState?.hasMore)} PENDING</span>
           <button
             className={"fchip" + (sort === "score" ? " on" : "")}
             onClick={() => setSort(sort === "score" ? "age" : "score")}

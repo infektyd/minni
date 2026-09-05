@@ -686,6 +686,9 @@ export interface ListCandidatesResponse {
   candidates: CandidateRow[];
   principal?: string;
   count?: number;
+  total?: number; // Lower bound when has_more is true.
+  limit?: number;
+  has_more?: boolean;
 }
 
 /**
@@ -695,7 +698,7 @@ export interface ListCandidatesResponse {
  * - {ok: false, error: "msg"} → throws error
  * - {candidates: [], error: "msg"} (route catch) → throws error
  */
-export function unwrapCandidatesResponse(response: unknown): { candidates: CandidateRow[]; principal?: string; count?: number } {
+export function unwrapCandidatesResponse(response: unknown): ListCandidatesResponse {
   const r = response as any;
   
   // JsonResult envelope: check ok field

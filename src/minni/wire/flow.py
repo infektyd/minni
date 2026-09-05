@@ -640,6 +640,23 @@ def run_wire(args) -> int:
                             file=sys.stderr,
                         )
 
+                if spec.platform == "codex":
+                    # Copying the manifest and smoke-running its entrypoint is
+                    # not evidence that Codex enabled/trusted plugin hooks, or
+                    # that already-running MCP sessions loaded this payload.
+                    extras["lifecycle"] = {
+                        "automatic_hooks": "not_verified",
+                        "hook_probe_scope": "packaged_entrypoint_only",
+                        "existing_host_sessions": "not_verified",
+                    }
+                    hook_gap_reason = (
+                        "MCP wiring planned; automatic Codex hooks and existing "
+                        "host sessions are not verified."
+                        if dry_run else
+                        "MCP configured; automatic Codex hooks and existing "
+                        "host sessions were not verified."
+                    )
+
                 out.results.append(PlatformResult(
                     platform, "wired",
                     config_path=str(config_path) if config_path else None,

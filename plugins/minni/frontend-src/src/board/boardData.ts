@@ -7,7 +7,7 @@
 // and distinct from error (hooks surface error → OFFLINE zone UI).
 // ============================================================================
 
-import type { AgentApiRow, HandoffRow, PolicyReport, RecallStateResponse } from "../api";
+import type { ListCandidatesResponse, AgentApiRow, HandoffRow, PolicyReport, RecallStateResponse } from "../api";
 
 export type ZoneId = "agents" | "hub" | "staged" | "logs" | "quarantine" | "recall";
 export type ZoneStatus = "online" | "pending" | "private" | "danger";
@@ -573,4 +573,18 @@ export function zoneFetchFailure<T>(
     error: message,
     authRequired: auth,
   };
+}
+
+/** A limited owner-scoped page is not a fleet-wide exact count. */
+export function candidatePageInfo(response: ListCandidatesResponse, requestedLimit: number) {
+  return {
+    principal: typeof response.principal === "string" && response.principal.trim()
+      ? response.principal.trim() : null,
+    hasMore: typeof response.has_more === "boolean"
+      ? response.has_more : response.candidates.length >= requestedLimit,
+  };
+}
+
+export function stagedCountLabel(count: number, hasMore = false): string {
+  return `${count}${hasMore ? "+" : ""}`;
 }

@@ -3322,7 +3322,7 @@ class RetrievalEngine:
                     denied_by_scope[(row.get("doc_id"), row.get("path"))] = row
             return allowed
 
-        def _collect_eligible(fetch, wanted: int) -> List[Dict]:
+        def _collect_eligible(fetch, wanted: int, *, sql_window: bool = False) -> List[Dict]:
             # Backends expose top-k, not policy-aware pagination. Refill their
             # bounded window when denied rows consume it, stopping when enough
             # eligible rows are found, at the deadline, or at a finite ceiling.
@@ -3335,6 +3335,12 @@ class RetrievalEngine:
                     raw = fetch(window)
                     rows = _eligible(raw)
                     if len(rows) >= wanted or len(rows) == len(raw):
+                        return rows
+                    # SQL returns rows without vector-style document collapse.
+                    # A short window therefore proves exhaustion. FTS currently
+                    # over-fetches 3x; using the requested window is conservative
+                    # and keeps this independent of that over-fetch factor.
+                    if sql_window and len(raw) < window:
                         return rows
                     # Identical document lists do not prove exhaustion: many
                     # top-ranked chunks can collapse to one denied document.
@@ -3352,7 +3358,7 @@ class RetrievalEngine:
             merged = _collect_eligible(lambda window: self._chronological_search(
                 query, window, layers, start_date, end_date,
                 exclude_statuses=skip_list,
-            ), rerank_k)
+            ), rerank_k, sql_window=True)
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
             merged = merged[:limit]
@@ -3362,12 +3368,12 @@ class RetrievalEngine:
             if document_agent_filter is None:
                 fts_results = _collect_eligible(lambda window: self._fts_search(
                     query, window, exclude_statuses=skip_list
-                ), rerank_k)
+                ), rerank_k, sql_window=True)
             else:
                 fts_results = _collect_eligible(lambda window: self._fts_search(
                     query, window, agent_filter=document_agent_filter,
                     exclude_statuses=skip_list,
-                ), rerank_k)
+                ), rerank_k, sql_window=True)
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
                 {
@@ -3585,12 +3591,12 @@ class RetrievalEngine:
                                 if document_agent_filter is None:
                                     hyde_fts = _collect_eligible(lambda window: self._fts_search(
                                         hypothetical, window, exclude_statuses=skip_list
-                                    ), rerank_k)
+                                    ), rerank_k, sql_window=True)
                                 else:
                                     hyde_fts = _collect_eligible(lambda window: self._fts_search(
                                         hypothetical, window, agent_filter=document_agent_filter,
                                         exclude_statuses=skip_list,
-                                    ), rerank_k)
+                                    ), rerank_k, sql_window=True)
                                 first_pass_vector = self.last_vector_degraded
                                 first_pass_rerank = self.last_rerank_degraded
                                 hyde_apply = True
