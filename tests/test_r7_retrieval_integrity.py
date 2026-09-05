@@ -231,6 +231,20 @@ def _patch_engine_and_writeback(tmp_path, monkeypatch):
     from minni.retrieval import RetrievalEngine
     from minni.writeback import WriteBackMemory
 
+    # This harness models an encoder that has already failed to load, not an
+    # unattempted cold load. The real deadline guard consults the singleton's
+    # cache before reading engine.model; mirror the stubbed model there too.
+    # Otherwise the default 22.5s budget deliberately skips a 27s cold load and
+    # excludes the deadline-only ranking from calibration.
+    from functools import cache
+    import minni.models as models
+
+    @cache
+    def unavailable_embedder():
+        return None
+
+    unavailable_embedder()
+    monkeypatch.setattr(models, "get_embedder", unavailable_embedder)
     db_obj, cfg = _make_db(tmp_path, reranker_enabled=False, hyde_enabled=False)
     wb = WriteBackMemory(db_obj, cfg)
     monkeypatch.setattr(minnid, "_writeback", wb)
@@ -3895,3 +3909,46 @@ class TestTraceReapingFollowsTheSharedList:
 
         assert "recall" in self._surviving(db_obj), "unexpired traces must stay"
         db_obj.close()
+
+
+@pytest.mark.parametrize("cold", [False, True])
+def test_calibration_distinguishes_unavailable_encoder_from_deadline_skip(
+    tmp_path, monkeypatch, hermetic_principals, cold,
+):
+    """Real deadline policy excludes cold-load skips but feeds encoder-down FTS."""
+    import minni.models as models
+    from minni.retrieval import RetrievalEngine
+
+    _, db_obj, _ = _patch_engine_and_writeback(tmp_path, monkeypatch)
+    if cold:
+        models.get_embedder.cache_clear()
+    encoder_down = []
+    original = RetrievalEngine._note_vector_model_down
+
+    def note_down(engine):
+        encoder_down.append(True)
+        original(engine)
+
+    monkeypatch.setattr(RetrievalEngine, "_note_vector_model_down", note_down)
+    with db_obj.cursor() as c:
+        c.execute(
+            "INSERT INTO documents (path, agent, sigil, layer) "
+            "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+            "VALUES (?, 'a.md', 'deployment rollback procedure', 'codex', 'vault')",
+            (doc_id,),
+        )
+    response = _dispatch("search", {
+        "query": "deployment rollback", "agent_id": "codex", "expand": False,
+    })
+    assert "error" not in response
+    results = response["result"]["results"]
+    assert results
+    assert bool(encoder_down) is not cold
+    with db_obj.cursor() as c:
+        recorded = c.execute("SELECT COUNT(*) AS n FROM score_distribution").fetchone()["n"]
+    assert recorded == (0 if cold else len(results))
+    assert all("confidence_raw" not in row for row in results)
