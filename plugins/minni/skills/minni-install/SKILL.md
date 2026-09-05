@@ -52,7 +52,10 @@ your perspective as the agent who lives with it:
   its native mechanism, but all of them delegate Minni semantics
   (recall-at-boot, stop-candidate drafting, correction re-assert) to one shared
   factory. Never assume one platform's hook works in another; never fork the
-  semantics.
+  semantics. Codex wire copies its hook payload and configures MCP, but native
+  plugin activation and hook trust require separate host verification; follow
+  [the Codex directive](references/install-directive-codex.md). A successful
+  packaged hook smoke test is not proof of automatic host delivery.
 - **Local-first is a posture, not just a default.** No telemetry, no remote
   endpoints; model providers are configured in `~/.minni/providers.json`, where
   secrets are forbidden inline (env/key-file only) and a provider only counts

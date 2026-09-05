@@ -335,6 +335,21 @@ export function mapQuarantineCandidates(rows: CandidateRow[]): BoardDeny[] {
   });
 }
 
+export type AgentRegistrationFilter = "all" | "registered" | "unregistered" | "unknown";
+
+export function agentRegistration(agent: BoardAgent): Exclude<AgentRegistrationFilter, "all"> {
+  if (agent.registered === true) return "registered";
+  return agent.registrationKnown === true ? "unregistered" : "unknown";
+}
+
+export function filterAgentCatalogue(agents: BoardAgent[], registration: AgentRegistrationFilter, query: string): BoardAgent[] {
+  const needle = query.trim().toLocaleLowerCase();
+  return agents.filter((agent) =>
+    (registration === "all" || agentRegistration(agent) === registration) &&
+    (!needle || [agent.id, agent.displayName, agent.description, agent.vault].some((value) => value?.toLocaleLowerCase().includes(needle))),
+  );
+}
+
 /** Map /api/agents row → BoardAgent. */
 export function mapAgentRow(row: AgentRow): BoardAgent {
   const capsIn = row.caps || { R: 0, L: 0, H: 0 };

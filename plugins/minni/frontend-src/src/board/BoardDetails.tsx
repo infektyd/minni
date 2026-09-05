@@ -3,6 +3,9 @@ import { AgentSummary } from "../components/AgentSummary";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   agentColor,
+  agentRegistration,
+  filterAgentCatalogue,
+  type AgentRegistrationFilter,
   stagedCountLabel,
   zoneGate,
   type BoardAgent,
@@ -279,19 +282,36 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
 
 // ── AGENT MEMORY ────────────────────────────────────────────────────────────────
 function AgentsDetail({ agentsState }: { agentsState?: ZoneDataState<BoardAgent[]> }) {
+  const [registration, setRegistration] = useState<AgentRegistrationFilter>("all");
+  const [query, setQuery] = useState("");
   const gate = zoneGate(agentsState, "agent memory");
   if (gate === "loading") return <ZoneLoading label="agent memory" />;
   if (gate === "offline") {
     return <ZoneOffline error={agentsState?.error ?? "Agent memory offline"} onRetry={agentsState?.refresh} />;
   }
   const agents = agentsState?.data || [];
+  const shown = filterAgentCatalogue(agents, registration, query);
   return (
     <div className="dz">
+      <p className="muted">Registered identities have a Minni registration record. Other vaults may be historical or have an unknown registration status; a vault does not mean an agent is running.</p>
+      <label>Find an identity or vault
+        <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Name, identity, description, or path" style={{ display: "block", width: "100%", margin: "8px 0" }} />
+      </label>
+      <div role="group" aria-label="Registration filter">
+        {([ ["all", "All"], ["registered", "Registered"], ["unregistered", "Unregistered"], ["unknown", "Unknown registration"] ] as const).map(([value, label]) => (
+          <button key={value} type="button" className="bd-btn sm" aria-pressed={registration === value} onClick={() => setRegistration(value)}>
+            {label} · {value === "all" ? agents.length : agents.filter((agent) => agentRegistration(agent) === value).length}
+          </button>
+        ))}
+      </div>
+      <p role="status">Showing {shown.length} of {agents.length} memory identities.</p>
       {agents.length === 0 ? (
-        <div className="callout-band">no agent vaults under ~/.minni/*-vault</div>
+        <div className="callout-band">No memory vaults found.</div>
+      ) : shown.length === 0 ? (
+        <div className="callout-band">No identities match these filters.</div>
       ) : (
         <div className="agrid">
-          {agents.map((a) => (
+          {shown.map((a) => (
             <div key={a.id} className="acard">
               <AgentSummary agent={a} />
             </div>

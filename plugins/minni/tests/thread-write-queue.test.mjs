@@ -39,6 +39,7 @@ import { readWorkerUpdateReceipt } from "../dist/thread-claims.js";
 import {
   DEFAULT_QUEUE_MAX,
   enqueueWorkerWrite,
+  isWorkerWriteDrainStuck,
   listPendingWorkerWritePlanIds,
   listQueuedWorkerWrites,
   pickNextQueuedWorkerWrite,
@@ -350,6 +351,34 @@ test("queue scans cannot delete a ticket while its writer is publishing it", asy
     fs.promises.writeFile = originalWrite;
     syncBuiltinESMExports();
   }
+});
+
+test("enqueue shares one validated queue snapshot while independent stuck checks stay fresh", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-queue-snapshot-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const input = { vaultPath: root, planId: "snapshot", sliceId: "s0", workerAgentId: "worker",
+    token: "test-token", idempotencyKey: "first", action: { action: "start" } };
+  await enqueueWorkerWrite(input);
+  const dir = workerWriteQueueDir(root, input.planId);
+  const [name] = await readdir(dir);
+  const ticketPath = path.join(dir, name);
+  const originalRead = fs.promises.readFile;
+  let reads = 0;
+  fs.promises.readFile = async (file, ...args) => {
+    if (file === ticketPath) reads += 1;
+    return originalRead(file, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await enqueueWorkerWrite({ ...input, sliceId: "s1", idempotencyKey: "second" });
+    assert.equal(reads, 1, "capacity and stuck detection should share the validated snapshot");
+    await isWorkerWriteDrainStuck(root, input.planId, new Date());
+    assert.equal(reads, 2, "a separate check must read the current queue again");
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+  assert.equal((await listQueuedWorkerWrites(root, input.planId)).length, 2);
 });
 
 test("queue read failures preserve accepted tickets for a later drain", async (t) => {
