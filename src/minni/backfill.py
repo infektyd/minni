@@ -610,6 +610,77 @@ def backfill_document_vectors(
     return stats
 
 
+def backfill_learning_projections(
+    db: SovereignDB,
+    config: SovereignConfig = DEFAULT_CONFIG,
+    *,
+    limit: int = DEFAULT_BATCH,
+    on_vectors=None,
+) -> Dict[str, int]:
+    """Reconstruct absent synthetic documents from committed active learnings.
+
+    Counts describe this bounded batch, not the entire backlog. Existing
+    projections are untouched; their missing vectors use the existing repair.
+    A forward cursor prevents a permanently failing row from starving the tail.
+    """
+    from minni.durable_projection import (
+        ACTIVE_LEARNING_SQL, durable_doc_path, durable_metadata,
+    )
+    from minni.retrieval import RetrievalEngine
+
+    stats = {"examined": 0, "missing": 0, "repaired": 0, "skipped": 0, "failed": 0}
+    if limit <= 0:
+        return stats
+    # Never bind a projection to a separately resolved/default database.
+    if str(db.config.db_path) != str(config.db_path):
+        raise ValueError("projection repair config must match source database")
+    key = (str(config.db_path), "learning_projections")
+    with db.cursor() as c:
+        rows = _cursor_batch(c, f"""
+            SELECT learning_id, agent_id, content FROM learnings
+            WHERE {ACTIVE_LEARNING_SQL} AND content IS NOT NULL
+              AND TRIM(content) != '' AND learning_id > ?
+            ORDER BY learning_id LIMIT ?
+        """, key, limit)
+        _batch_cursors[key] = rows[-1]["learning_id"] if rows else 0
+    engine = None
+    for row in rows:
+        stats["examined"] += 1
+        try:
+            agent, content = row["agent_id"], row["content"]
+            if not isinstance(agent, str) or not agent.strip():
+                stats["skipped"] += 1
+                continue
+            path = durable_doc_path(agent, "", config.vault_path, content)
+            with db.cursor() as c:
+                exists = c.execute("SELECT 1 FROM documents WHERE path=?", (path,)).fetchone()
+            if exists:
+                continue
+            metadata = durable_metadata(content)
+            if (metadata["privacy_level"] == "blocked" or metadata["page_status"] in
+                    {"draft", "expired", "rejected", "superseded"}):
+                stats["skipped"] += 1
+                continue
+            stats["missing"] += 1
+            if engine is None:
+                engine = RetrievalEngine(db, config)
+            result = engine.index_durable_document(
+                content=content, path=path, agent=agent, **metadata,
+                repair_projection=True, on_vectors=on_vectors,
+            )
+            if result.get("status") == "ok":
+                stats["repaired"] += 1
+            elif result.get("status") == "skipped":
+                stats["skipped"] += 1
+            else:
+                stats["failed"] += 1
+        except Exception:
+            stats["failed"] += 1
+            logger.warning("Learning projection repair failed for learning %s",
+                           row["learning_id"], exc_info=True)
+    return stats
+
+
 def run_backfill(
     db: SovereignDB,
     config: SovereignConfig = DEFAULT_CONFIG,
@@ -617,8 +688,11 @@ def run_backfill(
     limit: int = DEFAULT_BATCH,
     on_vectors=None,
 ) -> Dict[str, object]:
-    """Both backfills plus the resulting coverage, for one index."""
+    """Repair derived projections/vectors plus coverage, for one index."""
     return {
+        "projections": backfill_learning_projections(
+            db, config, limit=limit, on_vectors=on_vectors,
+        ),
         "documents": backfill_document_vectors(
             db, config, limit=limit, on_vectors=on_vectors
         ),

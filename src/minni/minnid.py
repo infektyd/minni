@@ -61,6 +61,7 @@ import re
 import signal
 import sys
 import time
+import threading
 import importlib.util
 from collections import deque
 from pathlib import Path
@@ -359,11 +360,9 @@ def _durable_doc_path(
     disk here — the markdown writeback is handled separately); the path is only
     a stable identity for the documents/chunk_embeddings rows.
     """
-    import hashlib
-    seed = content if content is not None else key
-    digest = hashlib.sha1(f"{agent_id}\x00{seed}".encode("utf-8")).hexdigest()[:16]
-    base = vault_path or DEFAULT_CONFIG.vault_path
-    return os.path.join(base, "_durable", f"{agent_id}__{digest}.md")
+    from minni.durable_projection import durable_doc_path
+
+    return durable_doc_path(agent_id, key, vault_path or DEFAULT_CONFIG.vault_path, content)
 
 
 _UNSET = object()
@@ -438,56 +437,23 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
             # untouched (data-safety). No shared FAISS to refresh in this case.
             engine = RetrievalEngine(db, db.config)
 
-        # Derive indexing metadata from YAML frontmatter (M-3 privacy bridge).
-        # Reuse VaultIndexer._extract_frontmatter so durable-store indexing
-        # honors the same privacy floor as out-of-band vault indexing.
-        doc_agent = agent_id
-        sigil = "❓"
-        page_status = "accepted"
-        privacy_level = "safe"
-        page_type = None
-        layer = "knowledge"
-        try:
-            from minni.indexer import VaultIndexer
+        from minni.durable_projection import durable_metadata
 
-            meta = VaultIndexer._extract_frontmatter(content)
-            doc_agent = agent_id  # server-stamped ownership; never trust frontmatter agent
-            sigil = meta.get("sigil", "❓")
-            page_status = (
-                meta["page_status"]
-                if meta["page_status"] != "candidate"
-                else "accepted"
-            )
-            privacy_level = meta["privacy_level"]
-            # M2: do NOT copy page_type from model-supplied frontmatter into the
-            # durable-learn synthetic doc. can_read_document treats page_type in
-            # {wiki,handoff,synthesis,decision,session} as cross-agent-readable, so
-            # a `type: wiki` learn would make a private learning cross-visible.
-            # A durable learning is always owner-scoped: pin a fixed, non-cross-
-            # visible type.
-            page_type = "learning"
-            layer = meta["layer"]
-        except Exception:
-            pass  # fail-open: keep prior defaults
-
+        metadata = durable_metadata(content)
         result = engine.index_durable_document(
             content=content,
             path=_durable_doc_path(
                 agent_id, key, vault_path=engine.config.vault_path,
                 content=content,
             ),
-            agent=doc_agent,
-            sigil=sigil,
-            page_status=page_status,
-            privacy_level=privacy_level,
-            page_type=page_type,
-            layer=layer,
+            agent=agent_id,
+            **metadata,
         )
         return result.get("status") == "ok" and result.get("chunks", 0) > 0
     except Exception as exc:
         logger.warning(
             "durable store: store-time semantic index failed for agent=%s (%s) "
-            "— store stands, recall degraded to lexical until reindex",
+            "— store stands; document projection needs repair",
             agent_id, exc,
         )
         return False
@@ -1324,6 +1290,12 @@ def _backfill_interval() -> int:
     return max(300, raw)
 
 
+# A failed notification must outlive the batch that committed its vectors.
+# Keep only a retry token, never vector payloads: the retry reads current SQL.
+_backfill_shared_refresh_pending: dict[str, object] = {}
+_backfill_shared_refresh_lock = threading.Lock()
+
+
 def _backfill_sweep_once() -> dict:
     """Blocking bounded backfill pass over every index. Runs off-loop.
 
@@ -1337,11 +1309,44 @@ def _backfill_sweep_once() -> dict:
     """
     from minni.backfill import run_backfill_all_indexes
 
+    key = os.path.abspath(DEFAULT_CONFIG.db_path)
+    with _backfill_shared_refresh_lock:
+        pending = _backfill_shared_refresh_pending.get(key)
+    refresh_retry = None
+    if pending is not None:
+        try:
+            engine = _lazy_retrieval()
+            engine.faiss_index.invalidate()
+            engine._set_current_deadline(None)
+            # Off-RPC, once per sweep; ensure itself bounds snapshot retries.
+            engine._ensure_faiss_loaded()
+            with engine.db.cursor() as c:
+                empty = c.execute("SELECT 1 FROM chunk_embeddings LIMIT 1").fetchone() is None
+            recovered = engine.faiss_index.ready or empty
+            if recovered:
+                with _backfill_shared_refresh_lock:
+                    if _backfill_shared_refresh_pending.get(key) is pending:
+                        _backfill_shared_refresh_pending.pop(key, None)
+            refresh_retry = {"recovered": recovered}
+        except Exception as exc:
+            refresh_retry = {"recovered": False, "error": str(exc)}
+            logger.warning("Backfill: shared live-index retry failed: %s", exc)
+
     def _refresh(chunk_ids, vectors):
-        engine = _lazy_retrieval()
-        engine._refresh_live_faiss(chunk_ids, vectors)
+        try:
+            engine = _lazy_retrieval()
+            if engine._refresh_live_faiss(chunk_ids, vectors) is False:
+                with _backfill_shared_refresh_lock:
+                    _backfill_shared_refresh_pending[key] = object()
+                logger.warning("Backfill: shared live index remains cold; retry scheduled")
+        except Exception:
+            with _backfill_shared_refresh_lock:
+                _backfill_shared_refresh_pending[key] = object()
+            raise
 
     results = run_backfill_all_indexes(DEFAULT_CONFIG, on_vectors=_refresh)
+    if refresh_retry is not None:
+        results["shared_live_refresh"] = refresh_retry
 
     # grok-review round 2 (finding 2): on_vectors covers the SHARED index only.
     # Vault engines memoized in _vault_retrieval_cache keep their warm FAISS
@@ -1355,8 +1360,9 @@ def _backfill_sweep_once() -> dict:
     for name, s in results.items():
         if name == "shared" or not isinstance(s, dict):
             continue
-        docs = s.get("documents")
-        if isinstance(docs, dict) and (docs.get("documents") or 0) > 0:
+        docs = s.get("documents") or {}
+        projections = s.get("projections") or {}
+        if (docs.get("documents") or 0) > 0 or (projections.get("repaired") or 0) > 0:
             _vault_retrieval_cache.clear()
             logger.info(
                 "Backfill: vault %s gained vectors — cleared per-vault "
@@ -1433,6 +1439,9 @@ async def _backfill_runner():
                         "Backfill: %s failed: %s", index_name, result["error"]
                     )
                     continue
+                projections = result.get("projections") or {}
+                if projections.get("missing") or projections.get("failed"):
+                    logger.info("Backfill: %s — projection batch %s", index_name, projections)
                 docs = result.get("documents") or {}
                 learnings = result.get("learnings") or {}
                 if docs.get("documents") or learnings.get("embedded"):

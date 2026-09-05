@@ -21,3 +21,5 @@ Operational references that predate this tree and remain canonical:
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md), [VAULT_INGEST.md](VAULT_INGEST.md),
 [runtime-integration.md](runtime-integration.md),
 [native-afm-implementation-note.md](native-afm-implementation-note.md).
+
+- [Accepted memory indexing recovery](index-recovery.md) — committed learning versus search indexes, scheduled repair and diagnosis.
