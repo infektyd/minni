@@ -1,10 +1,10 @@
 # Minni Typed Memory Graph — Design & Migration Acceptance Addendum
 
-**Date:** 2026-09-05  
-**Status:** Proposed Reconciliation & Migration Acceptance Specification (Pending Independent Parent Acceptance)  
-**Baseline SHA:** `2af2d888`  
-**Parent Document:** [2026-07-09-typed-memory-graph-design.md](2026-07-09-typed-memory-graph-design.md)  
-**Authors:** Antigravity (Autonomous Peer) in collaboration with Codex; approved core design by Hans (2026-07-09).  
+**Date:** 2026-09-05
+**Status:** Proposed Reconciliation & Migration Acceptance Specification (Pending Independent Parent Acceptance)
+**Baseline SHA:** `2af2d888`
+**Parent Document:** [2026-07-09-typed-memory-graph-design.md](2026-07-09-typed-memory-graph-design.md)
+**Authors:** Antigravity (Autonomous Peer) in collaboration with Codex; approved core design by Hans (2026-07-09).
 
 ---
 
@@ -306,7 +306,7 @@ In `src/minni/migrations.py`, the runner applies statements using `_execute_tole
 
 ### 6.1 Denied-Node Indistinguishability Specification
 
-**Theorem (Graph Indistinguishability):**  
+**Theorem (Graph Indistinguishability):**
 Let $G = (V, E)$ be the stored memory graph. For any requesting principal $P$, let $V_{\text{denied}} = \{v \in V \mid \neg \text{can\_read\_document}(P, \text{ws}, v)\}$. Let $G_P = (V \setminus V_{\text{denied}}, E_P)$ be the subgraph observable by $P$.
 
 *Security Invariant:* The output of `retrieve(query, principal=P)` on graph $G$ must be **strictly bit-identical** to the output of `retrieve(query, principal=P)` executed on a hypothetical database containing only $G_P$.

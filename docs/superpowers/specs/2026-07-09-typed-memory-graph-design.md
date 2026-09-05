@@ -1,14 +1,14 @@
 # Minni Typed Memory Graph — Design Spec
 
-**Date:** 2026-07-09  
-**Reconciled:** 2026-09-05 (against `main` baseline `2af2d888`)  
-**Status:** approved design, reconciled for implementation  
-**Approach:** A — "Extend the spine" (extend `memory_links` and existing machinery; additive schema only)  
-**Acceptance Addendum:** [2026-07-09-typed-memory-graph-acceptance-addendum.md](2026-07-09-typed-memory-graph-acceptance-addendum.md)  
-**Provenance:** drafted by GPT-5.6 Sol (max effort, repo-grounded), red-teamed by Grok 4.5  
-(8 findings, 2 critical — folded in below), arbitrated and synthesized by Claude Fable  
-against pre-registered positions. Approved by Hans 2026-07-09. Reconciled 2026-09-05 by Antigravity  
-peer in collaboration with Codex.  
+**Date:** 2026-07-09
+**Reconciled:** 2026-09-05 (against `main` baseline `2af2d888`)
+**Status:** approved design, reconciled for implementation
+**Approach:** A — "Extend the spine" (extend `memory_links` and existing machinery; additive schema only)
+**Acceptance Addendum:** [2026-07-09-typed-memory-graph-acceptance-addendum.md](2026-07-09-typed-memory-graph-acceptance-addendum.md)
+**Provenance:** drafted by GPT-5.6 Sol (max effort, repo-grounded), red-teamed by Grok 4.5
+(8 findings, 2 critical — folded in below), arbitrated and synthesized by Claude Fable
+against pre-registered positions. Approved by Hans 2026-07-09. Reconciled 2026-09-05 by Antigravity
+peer in collaboration with Codex.
 
 
 ## Locked decisions
