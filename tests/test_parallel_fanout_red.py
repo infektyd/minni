@@ -139,10 +139,12 @@ class _CounterRing:
 
     def __init__(self):
         self.n = 0
+        self._lock = threading.Lock()
 
     def add(self, payload, owner=None):
-        self.n += 1
-        return f"test-trace-{self.n}"
+        with self._lock:
+            self.n += 1
+            return f"test-trace-{self.n}"
 
 
 def _both_harness(tmp_path, monkeypatch, run_tag, *, reuse_personal=False):
