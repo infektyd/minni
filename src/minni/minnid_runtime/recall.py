@@ -25,9 +25,11 @@ from .redaction import redact_text, redact_value
 
 from minni.request_deadline import (
     RequestDeadlineExceeded,
+    allow_expired_sql,
     bind_copied_deadline,
     check_deadline,
     current_deadline,
+    remaining_seconds,
     request_deadline,
     run_bound,
 )
@@ -199,6 +201,17 @@ def _strip_private_search_keys(results: list) -> None:
             continue
         row.pop(_QTY_ENGINE_KEY, None)
         row.pop(_DEADLINE_POISONED_KEY, None)
+
+
+def _normalize_caller_visible_results(results: list) -> list:
+    """Drop private carriers before any caller-visible search payload."""
+    visible = list(results or [])
+    for row in visible:
+        if not isinstance(row, dict):
+            continue
+        row.pop("confidence_raw", None)
+    _strip_private_search_keys(visible)
+    return visible
 
 
 def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
@@ -699,29 +712,40 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 trace_id = None
             else:
                 previous_trace_id = getattr(retrieval_engine, "last_trace_id", None)
-                rows = retrieval_engine.retrieve(
-                    query=query,
-                    agent_id=agent_id,
-                    limit=limit,
-                    depth=depth,
-                    backend=resolved_backend,
-                    layers=layers,
-                    sort=sort,
-                    start_date=start_date,
-                    end_date=end_date,
-                    expand=expand,
-                    summarize_neighborhood=summarize_neighborhood,
-                    cross_agent=learnings_cross_agent,
-                    claim=claim,
-                    principal=principal_for_documents,
-                    workspace=(
-                        principal_for_documents.workspace_id
-                        if principal_for_documents is not None
-                        else "default"
-                    ),
-                    deadline_monotonic=deadline_monotonic,
-                    update_access=False,
-                )
+                try:
+                    rows = retrieval_engine.retrieve(
+                        query=query,
+                        agent_id=agent_id,
+                        limit=limit,
+                        depth=depth,
+                        backend=resolved_backend,
+                        layers=layers,
+                        sort=sort,
+                        start_date=start_date,
+                        end_date=end_date,
+                        expand=expand,
+                        summarize_neighborhood=summarize_neighborhood,
+                        cross_agent=learnings_cross_agent,
+                        claim=claim,
+                        principal=principal_for_documents,
+                        workspace=(
+                            principal_for_documents.workspace_id
+                            if principal_for_documents is not None
+                            else "default"
+                        ),
+                        deadline_monotonic=deadline_monotonic,
+                        update_access=False,
+                    )
+                except RequestDeadlineExceeded:
+                    # Handler fallback: skip a new retrieve that expired,
+                    # keep the RPC as a degraded 200 rather than -32000.
+                    rows = []
+                    try:
+                        retrieval_engine.last_vector_degraded = (
+                            "search deadline; lexical (FTS) only"
+                        )
+                    except Exception:
+                        pass
                 # Capture this leg immediately, including empty results. An
                 # unchanged diagnostic can belong to an earlier request when
                 # retrieval returns before creating a trace. Failed calls
@@ -1140,11 +1164,13 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         skip_score_record = _caller_visible_deadline_poisoned(results) or (
             not results and cycle_deadline_poisoned
         )
-        if stage_open("document_access"):
+
+        def run_document_access():
             try:
                 _bump_merged_document_access(results)
             except RequestDeadlineExceeded:
                 stage_open("document_access")
+
         def record_scores():
             try:
                 from minni.rationale import explain
@@ -1158,8 +1184,11 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 # first, then calibrate every row against the same post-record
                 # window so the whole response shares one basis.
                 recorded: list = []
+                rem0 = remaining_seconds()
+                started_expired = rem0 is not None and rem0 <= 0
                 for r in results:
-                    check_deadline()
+                    if not started_expired:
+                        check_deadline()
                     if not isinstance(r, dict):
                         continue
                     poisoned_row = bool(r.get(_DEADLINE_POISONED_KEY))
@@ -1176,7 +1205,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     except Exception as exc:
                         context.logger.debug("search: score record failed: %s", exc)
                 for r, raw_score in recorded:
-                    check_deadline()
+                    if not started_expired:
+                        check_deadline()
                     if r.get("confidence") is None:
                         continue
                     try:
@@ -1219,7 +1249,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 raise
             except Exception as exc:
                 context.logger.warning("search: score recording failed: %s", exc)
-        if stage_open("score_calibration"):
+
+        def run_score_calibration():
             # If expiration interrupts calibration, preserve the original
             # consistent confidence/action/rationale set on every result.
             prior_scores = [
@@ -1228,17 +1259,28 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
             ]
             try:
                 record_scores()
-                check_deadline()
             except RequestDeadlineExceeded:
                 for row, prior in prior_scores:
                     row.update(prior)
                 stage_open("score_calibration")
-        for row in results:
-            if isinstance(row, dict):
-                row.pop("confidence_raw", None)
-        _strip_private_search_keys(results)
+
+        if skip_score_record:
+            if stage_open("document_access"):
+                run_document_access()
+            if stage_open("score_calibration"):
+                run_score_calibration()
+        else:
+            # Completed hybrid ranking: qty/calibration are part of the
+            # ranking contract, not optional tails. A later skipped HyDE
+            # or expand variant must not withhold them.
+            with allow_expired_sql():
+                run_document_access()
+                run_score_calibration()
+        results = _normalize_caller_visible_results(results)
 
         learnings: list = []
+        # Learnings are a new search tail, not completed-ranking bookkeeping.
+        # Skip after expiry regardless of hybrid vs poisoned ranking.
         if stage_open("learnings"):
             try:
                 learnings = engine.search_learnings(
@@ -1251,7 +1293,6 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 )
             except Exception as exc:
                 context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
-
             finally:
                 stage_open("learnings")
 
@@ -1356,6 +1397,36 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         response_payload["degradation"] = degradations
         response_payload["degraded"] = any(d.get("degraded") for d in degradations)
         return context.make_response(response_payload, request_id)
+    except RequestDeadlineExceeded as exc:
+        context.logger.warning("search: request deadline exceeded: %s", exc)
+        partial = _normalize_caller_visible_results(locals().get("results") or [])
+        degs = list(locals().get("degradations") or [])
+        degs.append({
+            "src": "request",
+            "degraded": True,
+            "stage": "retrieve",
+            "reason": "search request deadline; stage skipped or interrupted",
+        })
+        return context.make_response(
+            {
+                "query": query,
+                "agent_id": agent_id,
+                "depth": locals().get("depth") or "snippet",
+                "count": len(partial),
+                "backend": backend_badge(locals().get("resolved_backend")),
+                "trace_id": None,
+                "trace_ids": list(locals().get("retrieval_trace_ids") or []),
+                "trace_scope": "retrieval_leg",
+                "query_variants": [query],
+                "results": partial,
+                "learnings": [],
+                "episodic": [],
+                "episodic_count": 0,
+                "degradation": degs,
+                "degraded": True,
+            },
+            request_id,
+        )
     except Exception as exc:
         context.logger.exception("search failed")
         return context.make_error(-32000, f"Search error: {exc}", request_id)

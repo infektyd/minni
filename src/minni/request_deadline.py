@@ -6,6 +6,7 @@ import math
 import time
 
 _deadline = ContextVar("minni_request_deadline", default=None)
+_allow_expired_sql = ContextVar("minni_allow_expired_sql", default=False)
 
 
 class RequestDeadlineExceeded(TimeoutError):
@@ -22,10 +23,33 @@ def remaining_seconds():
 
 
 def check_deadline():
+    """Always fail-closed at remaining 0 so the VM progress handler can interrupt.
+
+    ``allow_expired_sql`` only skips the *entry* raise in ``request_operation``.
+    It does not silence this check.
+    """
     remaining = remaining_seconds()
     if remaining is not None and remaining <= 0:
         raise RequestDeadlineExceeded("search request deadline exceeded")
     return remaining
+
+
+def expired_sql_allowed() -> bool:
+    return bool(_allow_expired_sql.get())
+
+
+@contextmanager
+def allow_expired_sql():
+    """Narrow entry permit for completed-ranking bookkeeping / lexical fill.
+
+    Does not disable the SQLite progress handler. Expensive statements still
+    interrupt at remaining 0. Does not open a general SQL exemption.
+    """
+    token = _allow_expired_sql.set(True)
+    try:
+        yield
+    finally:
+        _allow_expired_sql.reset(token)
 
 
 @contextmanager
@@ -77,12 +101,18 @@ def run_bound(bound):
 
 @contextmanager
 def budgeted_lock(lock):
-    remaining = check_deadline()
-    acquired = lock.acquire() if remaining is None else lock.acquire(timeout=remaining)
+    remaining = remaining_seconds()
+    if remaining is None:
+        acquired = lock.acquire()
+    elif remaining <= 0:
+        if not expired_sql_allowed():
+            raise RequestDeadlineExceeded("search request deadline waiting for database lock")
+        acquired = lock.acquire(blocking=False)
+    else:
+        acquired = lock.acquire(timeout=remaining)
     if not acquired:
         raise RequestDeadlineExceeded("search request deadline waiting for database lock")
     try:
-        check_deadline()
         yield
     finally:
         lock.release()

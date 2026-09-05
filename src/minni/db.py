@@ -18,7 +18,12 @@ from typing import Optional
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.request_deadline import (
-    RequestDeadlineExceeded, budgeted_lock, check_deadline, current_deadline,
+    RequestDeadlineExceeded,
+    budgeted_lock,
+    check_deadline,
+    current_deadline,
+    expired_sql_allowed,
+    remaining_seconds,
 )
 
 # Module-level flag: True once any SovereignDB has run migrations this process.
@@ -102,7 +107,11 @@ class _BudgetConnection(sqlite3.Connection):
         if current_deadline() is None:
             yield
             return
-        remaining = check_deadline()
+        remaining = remaining_seconds()
+        if remaining is not None and remaining <= 0 and not expired_sql_allowed():
+            raise RequestDeadlineExceeded("search request deadline exceeded")
+        if remaining is None:
+            remaining = 0.0
         previous_busy = sqlite3.Connection.execute(self, "PRAGMA busy_timeout").fetchone()[0]
         previous_handler, previous_steps = self._progress_callback, self._progress_steps
 
@@ -113,8 +122,8 @@ class _BudgetConnection(sqlite3.Connection):
                 return 1
             return previous_handler() if previous_handler is not None else 0
 
-        # Busy handlers do not run the VM progress callback. Bound lock waits
-        # independently, then recalculate for the next execute/fetch/commit.
+        # Always install the progress handler, including remaining 0 inside
+        # allow_expired_sql: expensive statements must still interrupt.
         sqlite3.Connection.execute(self, f"PRAGMA busy_timeout={min(previous_busy, math.ceil(remaining * 1000))}")
         self.set_progress_handler(progress, min(previous_steps, 1000) if previous_steps else 1000)
         try:
@@ -195,7 +204,8 @@ class SovereignDB:
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (one connection per thread)."""
-        check_deadline()
+        if not expired_sql_allowed():
+            check_deadline()
         if not hasattr(self._local, "conn") or self._local.conn is None:
             # journal_mode is a persistent database write.  Serialize first
             # connection setup with schema creation so fresh daemon workers do

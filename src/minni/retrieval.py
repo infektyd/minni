@@ -47,7 +47,12 @@ from minni.principal import EffectivePrincipal, agent_scope_for, can_read_docume
 from minni.safety import is_instruction_like
 from minni.timestamps import parse_epoch_or_report
 from minni.wiki_indexer import WikiFrontmatter
-from minni.request_deadline import bind_copied_deadline, run_bound
+from minni.request_deadline import (
+    RequestDeadlineExceeded,
+    allow_expired_sql,
+    bind_copied_deadline,
+    run_bound,
+)
 
 logger = logging.getLogger("sovereign.retrieval")
 
@@ -3568,7 +3573,13 @@ class RetrievalEngine:
                             "search deadline; truncated query expand"
                         )
                         break
-                    rows = _run_variant(index)
+                    try:
+                        rows = _run_variant(index)
+                    except RequestDeadlineExceeded:
+                        truncated_expand = (
+                            "search deadline; truncated query expand"
+                        )
+                        break
                     child = variant_states[index]
                     if _should_drop_deadline_child(child, per_variant):
                         truncated_expand = (
@@ -3797,29 +3808,48 @@ class RetrievalEngine:
 
         rerank_k = max(limit, self.config.reranker_top_k if self.config.reranker_enabled else limit)
 
+        def _lexical_eligible(fetch):
+            """Ranking-deadline lexical fill: short FTS/chrono may still run.
+
+            Entry uses allow_expired_sql; the VM progress handler stays on
+            so a recursive CTE cannot run unbounded after expiry.
+            """
+            if past_search_deadline(deadline_monotonic):
+                with allow_expired_sql():
+                    return _collect_eligible(fetch, rerank_k)
+            return _collect_eligible(fetch, rerank_k)
+
         if sort == "chronological":
             if past_search_deadline(deadline_monotonic):
                 self.last_vector_degraded = "search deadline; lexical (FTS) only"
             chrono_t0 = time.perf_counter()
-            merged = _collect_eligible(lambda window: self._chronological_search(
-                query, window, layers, start_date, end_date,
-                exclude_statuses=skip_list,
-            ), rerank_k)
+            try:
+                merged = _lexical_eligible(lambda window: self._chronological_search(
+                    query, window, layers, start_date, end_date,
+                    exclude_statuses=skip_list,
+                ))
+            except RequestDeadlineExceeded:
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                merged = []
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
             merged = merged[:limit]
         else:
             # Step 1-2: Dual retrieval
             fts_t0 = time.perf_counter()
-            if document_agent_filter is None:
-                fts_results = _collect_eligible(lambda window: self._fts_search(
-                    query, window, exclude_statuses=skip_list
-                ), rerank_k)
-            else:
-                fts_results = _collect_eligible(lambda window: self._fts_search(
-                    query, window, agent_filter=document_agent_filter,
-                    exclude_statuses=skip_list,
-                ), rerank_k)
+            try:
+                if document_agent_filter is None:
+                    fts_results = _lexical_eligible(lambda window: self._fts_search(
+                        query, window, exclude_statuses=skip_list
+                    ))
+                else:
+                    fts_results = _lexical_eligible(lambda window: self._fts_search(
+                        query, window, agent_filter=document_agent_filter,
+                        exclude_statuses=skip_list,
+                    ))
+            except RequestDeadlineExceeded:
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                fts_results = []
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
                 {

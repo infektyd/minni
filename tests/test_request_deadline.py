@@ -90,6 +90,47 @@ def test_progress_interrupts_query_and_resets(db):
     assert db._get_conn().execute('SELECT 1').fetchone()[0] == 1
 
 
+def test_expensive_sql_after_expiry_is_interrupted_and_connection_resets(db):
+    """Remaining 0 must not run an unbounded recursive query, even on an open conn."""
+    expensive = (
+        'WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000) '
+        'SELECT sum(x) FROM n'
+    )
+    db._get_conn()
+    started = time.monotonic()
+    with pytest.raises(RequestDeadlineExceeded):
+        with request_deadline(time.monotonic() - 1):
+            with db.cursor() as c:
+                c.execute(expensive)
+                c.fetchone()
+    assert time.monotonic() - started < 1.0
+    assert not db._get_conn().in_transaction
+    assert db._get_conn()._progress_callback is None
+    with db.cursor() as c:
+        assert c.execute('SELECT 1').fetchone()[0] == 1
+
+
+def test_bookkeeping_scope_still_interrupts_expensive_sql(db):
+    """allow_expired_sql is entry-only; the progress handler still bounds work."""
+    from minni.request_deadline import allow_expired_sql
+    expensive = (
+        'WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000) '
+        'SELECT sum(x) FROM n'
+    )
+    db._get_conn()
+    started = time.monotonic()
+    with pytest.raises(RequestDeadlineExceeded):
+        with request_deadline(time.monotonic() - 1):
+            with allow_expired_sql():
+                with db.cursor() as c:
+                    c.execute(expensive)
+                    c.fetchone()
+    assert time.monotonic() - started < 2.0
+    assert not db._get_conn().in_transaction
+    with db.cursor() as c:
+        assert c.execute('SELECT 1').fetchone()[0] == 1
+
+
 def test_expired_scope_does_not_open_connection(tmp_path):
     database = SovereignDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'cold.db'), vault_path=str(tmp_path / 'vault')))
     with request_deadline(time.monotonic() - 1), pytest.raises(RequestDeadlineExceeded):
@@ -124,6 +165,12 @@ def _context(engine):
 
 
 def test_completed_ranking_survives_expiry_without_tail_work(monkeypatch):
+    """New tails skip after expiry; completed hybrid still attempts calibration.
+
+    search_learnings / episodic are new queries and must not run. Document
+    access and score calibration for a non-poisoned ranking still attempt.
+    """
+    from contextlib import contextmanager
     import minni.request_deadline as deadline_module
     from minni.minnid_runtime.recall import handle_search
     clock = {'now': 1000.0}
@@ -135,18 +182,77 @@ def test_completed_ranking_survives_expiry_without_tail_work(monkeypatch):
     def forbidden(*args, **kwargs):
         calls.append(True)
         raise AssertionError('post-deadline operation')
-    engine = SimpleNamespace(retrieve=retrieve, search_learnings=forbidden, search_episodic=forbidden,
-                             db=SimpleNamespace(cursor=forbidden), config=DEFAULT_CONFIG)
+    @contextmanager
+    def noop_cursor():
+        class Cursor:
+            def execute(self, *args, **kwargs):
+                return self
+            def fetchone(self):
+                return None
+        yield Cursor()
+    engine = SimpleNamespace(
+        retrieve=retrieve, search_learnings=forbidden,
+        search_episodic=forbidden, db=SimpleNamespace(cursor=noop_cursor),
+        config=DEFAULT_CONFIG,
+    )
     response = handle_search({'query': 'known', 'timeout_ms': 1000, 'layers': ['episodic']}, 1, _context(engine))
     assert 'error' not in response, response
     assert response['result']['results'][0]['doc_id'] == 1
     assert 'confidence_raw' not in response['result']['results'][0]
     assert response['result']['degraded'] is True
-    assert {'document_access', 'score_calibration', 'learnings', 'episodic'} <= {
-        d.get('stage') for d in response['result']['degradation']
-    }
+    skipped = {d.get('stage') for d in response['result']['degradation']}
+    assert {'learnings', 'episodic'} <= skipped
+    assert 'document_access' not in skipped
+    assert 'score_calibration' not in skipped
     assert calls == []
     assert current_deadline() is None
+
+
+def test_deadline_fallback_strips_private_result_keys(monkeypatch):
+    """Outer RequestDeadlineExceeded payload must not leak private carriers."""
+    from contextlib import contextmanager
+    import minni.minnid_runtime.recall as recall_mod
+    import minni.request_deadline as deadline_module
+    from minni.minnid_runtime.recall import handle_search
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(deadline_module.time, 'monotonic', lambda: clock['now'])
+    sentinel = object()
+    def retrieve(*args, **kwargs):
+        clock['now'] = 1002.0
+        return [{
+            'doc_id': 1, 'path': 'a.md', 'score': .9, 'confidence_raw': .9,
+            recall_mod._QTY_ENGINE_KEY: sentinel,
+            recall_mod._DEADLINE_POISONED_KEY: False,
+        }]
+    real_strip = recall_mod._strip_private_search_keys
+    calls = {'n': 0}
+    def raise_before_first_strip(rows):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RequestDeadlineExceeded('before strip')
+        real_strip(rows)
+    monkeypatch.setattr(recall_mod, '_strip_private_search_keys', raise_before_first_strip)
+    @contextmanager
+    def noop_cursor():
+        class Cursor:
+            def execute(self, *args, **kwargs):
+                return self
+            def fetchone(self):
+                return None
+        yield Cursor()
+    engine = SimpleNamespace(
+        retrieve=retrieve, search_learnings=lambda *a, **k: [],
+        search_episodic=lambda *a, **k: [], db=SimpleNamespace(cursor=noop_cursor),
+        config=DEFAULT_CONFIG,
+    )
+    response = handle_search({'query': 'known', 'timeout_ms': 1000}, 1, _context(engine))
+    assert 'error' not in response, response
+    row = response['result']['results'][0]
+    assert row['doc_id'] == 1
+    assert 'confidence_raw' not in row
+    assert recall_mod._QTY_ENGINE_KEY not in row
+    assert recall_mod._DEADLINE_POISONED_KEY not in row
+    assert response['result']['degraded'] is True
 
 
 def test_learning_rows_survive_tracking_expiry_and_transaction_rolls_back(db, monkeypatch):

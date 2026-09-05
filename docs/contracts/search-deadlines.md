@@ -15,10 +15,20 @@ operation, including failure. Expired transactions roll back; cleanup is allowed
 after expiration. No background cancellation timer can interrupt a later request
 that reuses the connection.
 
-After document retrieval, expiration skips optional packing, document access
-updates, score recording/calibration, learning reads/tracking, episodic reads,
-and recall-trace writes/cleanup. The response retains completed rankings and
-reports the skipped or interrupted stages in `degradation` with `src=request`.
+Generic SQL is fail-closed at remaining 0: a new statement raises, and the
+VM progress handler stays installed so an expensive query cannot run
+unbounded. ``allow_expired_sql`` is a narrow *entry* permit for (1)
+completed-hybrid qty/calibration bookkeeping and (2) ranking-deadline
+lexical FTS/chrono fills. It does not silence the progress handler.
+
+After document retrieval, expiration skips optional packing, learning search,
+episodic reads, and recall-trace writes/cleanup. A completed hybrid ranking
+still receives document-access qty and score calibration. Deadline-poisoned
+FTS-only rankings skip that accounting. A retrieve that expires becomes a
+degraded 200 with whatever ranking already completed, not ``-32000``.
+Caller-visible results always drop ``confidence_raw`` and private carriers.
+Dirty transactions still roll back. The response reports skipped or interrupted
+stages in `degradation` with `src=request`.
 An empty omitted layer therefore does not claim that its corpus was searched.
 If learning tracking expires after its read completed, that tracking transaction
 rolls back and the completed learning rows remain available. If score calibration
