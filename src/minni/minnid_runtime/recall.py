@@ -1635,6 +1635,25 @@ def reference_matches(result: dict, reference: dict) -> bool:
     return True
 
 
+def reference_id_kind(reference: dict) -> str:
+    """Identifier kind for a drill reference, mirroring reference_ids_for_engine.
+
+    Explicit ``chunk_id`` resolves in chunk namespace only; explicit
+    ``doc_id`` and source/path/wikilink lookups (which resolve to doc_ids via
+    the documents table) resolve in doc namespace only. A bare legacy
+    ``result_id`` keeps the ambiguous chunk-first fallback ("auto"). The
+    truthiness chain matches reference_ids_for_engine so the kind always
+    describes the id that function actually returned.
+    """
+    if reference.get("chunk_id"):
+        return "chunk"
+    if reference.get("doc_id"):
+        return "doc"
+    if reference.get("result_id"):
+        return "auto"
+    return "doc"
+
+
 def reference_ids_for_engine(reference: dict, retrieval_engine) -> list[int]:
     raw_id = reference.get("chunk_id") or reference.get("doc_id") or reference.get("result_id")
     if raw_id is not None:
@@ -1691,10 +1710,12 @@ def expand_reference(
         shared_engine,
         context,
     ):
+        id_kind = reference_id_kind(reference)
         for result_id in reference_ids_for_engine(reference, retrieval_engine):
             result = retrieval_engine.expand_result(
                 result_id=result_id,
                 depth=depth,
+                id_kind=id_kind,
                 principal=principal_for_documents,
                 workspace=(
                     principal_for_documents.workspace_id
