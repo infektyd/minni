@@ -239,7 +239,31 @@ async function journalState(fixture) {
   };
 }
 
-async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false }, timeoutMs = 20_000) {
+async function journalTimeoutDiagnostics({ last, startFail = [], completeFail = [] }, readQueue) {
+  // Never serialize exception text, tokens/digests, idempotency keys or action
+  // payloads. Only fixture slice numbers, known actions and error codes help.
+  const failures = rows => rows.map(row => ({
+    index: Number.isSafeInteger(row.index) ? row.index : null,
+    code: typeof row.code === "string" && /^(?:THREAD_[A-Z_]+|E[A-Z0-9_]+)$/.test(row.code) ? row.code : "unclassified",
+  }));
+  let pending;
+  let queueReadFailed = false;
+  try { pending = await readQueue(); } catch { queueReadFailed = true; }
+  return {
+    started: last?.started?.length,
+    completed: last?.completed?.length,
+    completesWithoutStarts: last?.completesWithoutStarts,
+    startFail: failures(startFail), completeFail: failures(completeFail),
+    queueReadFailed,
+    leftover: pending?.length ?? null,
+    remainingTickets: pending?.map(item => ({
+      slice: /^s\d+$/.test(item.sliceId) ? item.sliceId : "other",
+      action: ["start", "complete", "progress", "propose_structure"].includes(item.action?.action) ? item.action.action : "other",
+    })) ?? null,
+  };
+}
+
+async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false, startFail = [], completeFail = [] }, timeoutMs = 20_000) {
   const begin = Date.now();
   let last;
   let leftover;
@@ -262,14 +286,9 @@ async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty 
     });
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error(
-    `timeout waiting for ${started} starts / ${completed} completes; got ${JSON.stringify({
-      started: last?.started?.length,
-      completed: last?.completed?.length,
-      completesWithoutStarts: last?.completesWithoutStarts,
-      leftover: leftover?.length,
-    })}`,
-  );
+  const diagnostic = await journalTimeoutDiagnostics({ last, startFail, completeFail },
+    () => listQueuedWorkerWrites(fixture.vaultPath, fixture.planId));
+  throw new Error(`timeout waiting for ${started} starts / ${completed} completes; got ${JSON.stringify(diagnostic)}`);
 }
 
 async function runWetBurst(t, n) {
@@ -281,7 +300,7 @@ async function runWetBurst(t, n) {
   const completes = await completeBurst(fixture, claims);
   const completeBusy = completes.filter((result) => result.code === "THREAD_BUSY");
   const completeFail = completes.filter((result) => !result.ok);
-  const journal = await waitForJournal(fixture, { started: n, completed: n });
+  const journal = await waitForJournal(fixture, { started: n, completed: n, startFail, completeFail });
   return {
     n,
     startOk: starts.filter((result) => result.ok).length,
@@ -294,6 +313,27 @@ async function runWetBurst(t, n) {
     journal,
   };
 }
+
+test("queue timeout diagnostics preserve submission failures and pending actions without secrets", async () => {
+  const secret = "secret-claim-token";
+  const details = await journalTimeoutDiagnostics({
+    last: { started: ["s0", "s1"], completed: ["s0"], completesWithoutStarts: [] },
+    startFail: [{ index: 1, code: "THREAD_BUSY", message: secret }],
+    completeFail: [{ index: 2, code: secret, message: secret }],
+  }, async () => [{ sliceId: "s1", action: { action: "complete", evidence: secret }, token: secret, tokenDigest: secret, idempotencyKey: secret }]);
+  assert.equal(details.started, 2);
+  assert.equal(details.completed, 1);
+  assert.deepEqual(details.startFail, [{ index: 1, code: "THREAD_BUSY" }]);
+  assert.deepEqual(details.completeFail, [{ index: 2, code: "unclassified" }]);
+  assert.equal(details.leftover, 1);
+  assert.deepEqual(details.remainingTickets, [{ slice: "s1", action: "complete" }]);
+  assert.equal(JSON.stringify(details).includes(secret), false);
+  const unreadable = await journalTimeoutDiagnostics({}, async () => { throw new Error(secret); });
+  assert.equal(unreadable.queueReadFailed, true);
+  assert.equal(unreadable.leftover, null);
+  assert.equal(unreadable.remainingTickets, null);
+  assert.equal(JSON.stringify(unreadable).includes(secret), false);
+});
 
 test("accepted-into-Q is not applied until drain", async (t) => {
   const fixture = await burstFixture(t, 1);
