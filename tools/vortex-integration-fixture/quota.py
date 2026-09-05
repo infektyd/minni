@@ -3,6 +3,7 @@
 Counts are nonnegative integers. A reservation is allowed when the resulting
 usage is at most the capacity, including exactly filling the available space.
 No state, network, filesystem, or production Minni imports are involved.
+This base-layer note exercises descendant restacking without changing behavior.
 """
 
 
