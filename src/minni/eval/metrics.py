@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -314,6 +315,430 @@ def _metric_value(per_query: Dict[str, Any], metric: str, k: int) -> float:
     if isinstance(values, dict):
         return float(values.get(k, values.get(str(k), 0.0)) or 0.0)
     return 0.0
+
+
+QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT = 0.05
+
+_FLOAT_TOLERANCE = 1e-9
+
+
+def _query_class(item: Dict[str, Any]) -> str:
+    """Query-class label for the no-regression check (``notes`` field)."""
+    return str(item.get("notes", "uncategorized") or "uncategorized")
+
+
+def _judgment_key(item: Dict[str, Any]) -> Optional[List[int]]:
+    """
+    Exact integer judgment identity, or None when malformed.
+
+    Only true integers are supported IDs: floats (even integral ones),
+    strings, and booleans are malformed evidence and are never coerced,
+    so 1.1/1.9 can never collapse onto ID 1.
+    """
+    raw = item.get("expected_doc_ids")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return None
+    ids = []
+    for entry in raw:
+        if isinstance(entry, bool) or not isinstance(entry, int):
+            return None
+        ids.append(entry)
+    return sorted(ids)
+
+
+def _identity_problems(report: Dict[str, Any]) -> List[str]:
+    """Duplicate or empty query identities within one report."""
+    seen: set = set()
+    problems = []
+    for item in report.get("per_query", []):
+        query = item.get("query")
+        if not isinstance(query, str) or not query.strip():
+            problems.append("<empty query identity>")
+        elif query in seen:
+            problems.append(query)
+        else:
+            seen.add(query)
+    return problems
+
+
+def _strict_metric_value(
+    item: Dict[str, Any],
+    metric: str,
+    k: int,
+) -> Tuple[Optional[float], str]:
+    """
+    Extract a validated bounded-metric value, or (None, error).
+
+    Missing metrics default to nothing: unlike the descriptive
+    ``_metric_value`` helper, the gate never treats an absent, non-finite,
+    or out-of-range score as zero evidence.
+    """
+    values = item.get(metric)
+    if not isinstance(values, dict):
+        return None, f"metric {metric!r} missing"
+    if k in values:
+        raw = values[k]
+    elif str(k) in values:
+        raw = values[str(k)]
+    else:
+        return None, f"{metric}@{k} missing"
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        or not math.isfinite(raw)
+        or not 0.0 <= raw <= 1.0
+    ):
+        return None, f"{metric}@{k} invalid ({raw!r})"
+    return float(raw), ""
+
+
+def evaluate_quality_gate(
+    reports: Dict[str, Dict[str, Any]],
+    baseline: str = "baseline",
+    candidate: Optional[str] = None,
+    metric: str = "recall_at_k",
+    k: int = 5,
+    min_relative_improvement: float = QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT,
+) -> Dict[str, Any]:
+    """
+    Baseline-versus-candidate acceptance gate matching the normative rule:
+    at least ``min_relative_improvement`` *relative* gain on ``metric@k``
+    (candidate >= baseline * (1 + min_relative_improvement)) with no
+    regression on any query class.
+
+    This is separate from :func:`evaluate_gate` (minnid-vs-ripgrep per-query
+    loss rate), which is preserved unchanged for backward compatibility.
+
+    Comparability is validated *before* any numerical scoring, and
+    incomplete evidence never authorises defaults:
+    - invalid parameters (anything but the normative ``recall_at_k``
+      metric, non-positive ``k``, negative or non-finite improvement
+      threshold) -> ``ok=False``. Graded metrics such as ``ndcg_at_k``
+      are rejected: changed grades can move scores without changing IDs,
+      and this gate does not compare grade judgments.
+    - missing baseline/candidate reports -> ``ok=False`` with a reason.
+    - duplicate or empty query identities within a report -> ``ok=False``.
+    - different query sets -> ``ok=False`` (incompatible, not comparable).
+    - same query with different judgments (``expected_doc_ids``) or class
+      metadata (``notes``) -> ``ok=False``; changed expectations are not
+      scored against each other.
+    - absent, non-finite, or out-of-range ``metric@k`` on either side ->
+      ``ok=False``; a missing score is never defaulted to zero.
+    - queries without judgments (empty ``expected_doc_ids``) are excluded
+      from means and listed under ``unevaluable_queries``; a whole class
+      without judged queries fails under ``unevaluable_classes`` instead
+      of disappearing from no-regression acceptance. Excluded probes are
+      reported as unevaluable, never as passed.
+    - zero comparable judged queries -> ``ok=False``.
+    - zero baseline mean: relative gain is undefined, so any strict
+      improvement on valid finite evidence passes the improvement leg
+      (both-zero fails: no evidence).
+    - ties count as no regression; float noise below 1e-9 is ignored.
+    """
+    metric_label = f"{metric}@{k}"
+
+    def _fail(reason: str, **extra: Any) -> Dict[str, Any]:
+        report = {
+            "ok": False,
+            "reason": reason,
+            "gate": "quality",
+            "baseline": baseline,
+            "candidate": candidate,
+            "metric": metric_label,
+            "min_relative_improvement": min_relative_improvement,
+            "baseline_score": None,
+            "candidate_score": None,
+            "absolute_improvement": None,
+            "relative_improvement": None,
+            "improvement_ok": False,
+            "comparable_queries": 0,
+            "unevaluable_queries": [],
+            "classes": [],
+            "unevaluable_classes": [],
+            "regressions": [],
+            "label_mismatches": [],
+            "incomparable_queries": [],
+            "limitations": [],
+        }
+        report.update(extra)
+        return report
+
+    if metric != "recall_at_k":
+        return _fail(
+            f"unsupported metric={metric!r}: quality gate compares the "
+            "normative recall_at_k only"
+        )
+    if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+        return _fail(f"invalid k={k!r}: must be a positive integer")
+    if (
+        isinstance(min_relative_improvement, bool)
+        or not isinstance(min_relative_improvement, (int, float))
+        or not math.isfinite(min_relative_improvement)
+        or min_relative_improvement < 0
+    ):
+        return _fail(
+            "invalid min_relative_improvement="
+            f"{min_relative_improvement!r}: must be a finite number >= 0"
+        )
+
+    if candidate is None:
+        others = [name for name in reports if name != baseline]
+        candidate = others[0] if len(reports) == 2 and len(others) == 1 else None
+
+    baseline_report = reports.get(baseline) if baseline else None
+    candidate_report = reports.get(candidate) if candidate else None
+    if not baseline_report or not candidate_report:
+        return _fail(
+            f"missing reports for baseline {baseline!r} and/or "
+            f"candidate {candidate!r}"
+        )
+
+    baseline_id_problems = _identity_problems(baseline_report)
+    candidate_id_problems = _identity_problems(candidate_report)
+    if baseline_id_problems or candidate_id_problems:
+        return _fail(
+            "duplicate or empty query identities: "
+            f"{len(baseline_id_problems)} in baseline, "
+            f"{len(candidate_id_problems)} in candidate",
+            incomparable_queries=sorted(set(
+                baseline_id_problems + candidate_id_problems
+            ))[:10],
+        )
+
+    baseline_by_query = {
+        item.get("query"): item for item in baseline_report.get("per_query", [])
+    }
+    candidate_by_query = {
+        item.get("query"): item for item in candidate_report.get("per_query", [])
+    }
+    only_in_baseline = sorted(set(baseline_by_query) - set(candidate_by_query))
+    only_in_candidate = sorted(set(candidate_by_query) - set(baseline_by_query))
+    if only_in_baseline or only_in_candidate:
+        return _fail(
+            "incompatible query sets: "
+            f"{len(only_in_baseline)} only in baseline, "
+            f"{len(only_in_candidate)} only in candidate",
+            only_in_baseline=only_in_baseline[:10],
+            only_in_candidate=only_in_candidate[:10],
+            limitations=[
+                "reports must cover the same query set before quality "
+                "evidence is comparable.",
+            ],
+        )
+
+    comparable: List[Tuple[str, float, float, str]] = []
+    unevaluable_queries = []
+    unevaluable_classes: List[str] = []
+    label_mismatches = []
+    incomparable = []
+    for query, base_item in baseline_by_query.items():
+        cand_item = candidate_by_query[query]
+        base_judgment = _judgment_key(base_item)
+        cand_judgment = _judgment_key(cand_item)
+        if base_judgment is None or cand_judgment is None:
+            incomparable.append({
+                "query": query,
+                "issue": "malformed expected_doc_ids",
+            })
+            continue
+        if base_judgment != cand_judgment:
+            incomparable.append({
+                "query": query,
+                "issue": "changed judgments",
+                "baseline_expected_doc_ids": base_judgment,
+                "candidate_expected_doc_ids": cand_judgment,
+            })
+            continue
+        base_class = _query_class(base_item)
+        cand_class = _query_class(cand_item)
+        if cand_class != base_class:
+            incomparable.append({
+                "query": query,
+                "issue": "changed class metadata",
+                "baseline_class": base_class,
+                "candidate_class": cand_class,
+            })
+            label_mismatches.append({
+                "query": query,
+                "baseline_class": base_class,
+                "candidate_class": cand_class,
+            })
+            continue
+        if not base_judgment:
+            unevaluable_queries.append(query)
+            unevaluable_classes.append(base_class)
+            continue
+        base_score, base_error = _strict_metric_value(base_item, metric, k)
+        cand_score, cand_error = _strict_metric_value(cand_item, metric, k)
+        if base_error or cand_error:
+            incomparable.append({
+                "query": query,
+                "issue": "; ".join(
+                    f"{side}: {error}"
+                    for side, error in (
+                        ("baseline", base_error),
+                        ("candidate", cand_error),
+                    )
+                    if error
+                ),
+            })
+            continue
+        comparable.append((query, base_score, cand_score, base_class))
+
+    if incomparable:
+        return _fail(
+            f"incomparable evidence for {len(incomparable)} querie(s): "
+            "judgments, class metadata, and metric scores must match in "
+            "shape before numerical comparison",
+            incomparable_queries=incomparable[:10],
+            unevaluable_queries=sorted(unevaluable_queries),
+            unevaluable_classes=sorted(set(unevaluable_classes)),
+            label_mismatches=label_mismatches,
+            limitations=[
+                "incomplete evidence authorises no defaults: fix judgments, "
+                "labels, or metric coverage and re-run.",
+            ],
+        )
+
+    if not comparable:
+        return _fail(
+            "no comparable judged queries (all excluded as unevaluable)",
+            unevaluable_queries=sorted(unevaluable_queries),
+            unevaluable_classes=sorted(set(unevaluable_classes)),
+            limitations=[
+                "recall is undefined without relevance judgments; judge or "
+                "remove unevaluable queries before gating.",
+            ],
+        )
+
+    baseline_mean = sum(b for _, b, _, _ in comparable) / len(comparable)
+    candidate_mean = sum(c for _, _, c, _ in comparable) / len(comparable)
+    absolute = candidate_mean - baseline_mean
+    if baseline_mean > 0:
+        relative: Optional[float] = absolute / baseline_mean
+        improvement_ok = candidate_mean + _FLOAT_TOLERANCE >= baseline_mean * (
+            1 + min_relative_improvement
+        )
+    else:
+        relative = None
+        improvement_ok = candidate_mean > 0
+
+    by_class: Dict[str, List[Tuple[float, float]]] = {}
+    for _, b, c, cls in comparable:
+        by_class.setdefault(cls, []).append((b, c))
+    class_rows = []
+    regressions = []
+    for cls in sorted(by_class):
+        pairs = by_class[cls]
+        b_mean = sum(b for b, _ in pairs) / len(pairs)
+        c_mean = sum(c for _, c in pairs) / len(pairs)
+        regressed = c_mean < b_mean - _FLOAT_TOLERANCE
+        if regressed:
+            regressions.append(cls)
+        class_rows.append({
+            "class": cls,
+            "n": len(pairs),
+            "baseline": round(b_mean, 4),
+            "candidate": round(c_mean, 4),
+            "delta": round(c_mean - b_mean, 4),
+            "regression": regressed,
+        })
+
+    missing_classes = sorted(set(unevaluable_classes) - set(by_class))
+    if missing_classes:
+        return _fail(
+            "missing evidence for query class(es): "
+            f"{', '.join(missing_classes)} — whole classes without judged "
+            "queries cannot pass no-class-regression acceptance",
+            baseline_score=round(baseline_mean, 4),
+            candidate_score=round(candidate_mean, 4),
+            comparable_queries=len(comparable),
+            unevaluable_queries=sorted(unevaluable_queries),
+            classes=class_rows,
+            unevaluable_classes=missing_classes,
+            label_mismatches=label_mismatches,
+            limitations=[
+                "excluded probes are reported as unevaluable, never as "
+                "passed; negative/private probes need an explicit "
+                "non-recall category contract before they can gate.",
+                "judge or remove unevaluable queries before gating.",
+            ],
+        )
+
+    ok = bool(improvement_ok) and not regressions
+    if ok:
+        if relative is None:
+            reason = (
+                f"candidate improves over zero baseline "
+                f"({metric_label} 0.0000 -> {candidate_mean:.4f}) "
+                f"with no regression on {len(class_rows)} query class(es)"
+            )
+        else:
+            reason = (
+                f"candidate shows {relative * 100:.1f}% relative {metric_label} "
+                f"gain ({baseline_mean:.4f} -> {candidate_mean:.4f}) "
+                f"with no regression on {len(class_rows)} query class(es)"
+            )
+    elif regressions and not improvement_ok:
+        reason = (
+            f"candidate fails improvement leg ({metric_label} "
+            f"{baseline_mean:.4f} -> {candidate_mean:.4f}) and regresses "
+            f"on class(es): {', '.join(sorted(regressions))}"
+        )
+    elif regressions:
+        reason = (
+            f"candidate regresses on class(es): {', '.join(sorted(regressions))}"
+        )
+    elif baseline_mean > 0:
+        reason = (
+            f"candidate gain below +{min_relative_improvement * 100:.0f}% "
+            f"({metric_label} {baseline_mean:.4f} -> {candidate_mean:.4f})"
+        )
+    else:
+        reason = (
+            f"no measurable improvement ({metric_label} baseline 0.0000, "
+            f"candidate {candidate_mean:.4f})"
+        )
+
+    limitations = [
+        f"descriptive comparison over {len(comparable)} judged queries; "
+        "no significance test or confidence interval is computed.",
+        f"{len(unevaluable_queries)} unevaluable querie(s) excluded: recall "
+        "is undefined without relevance judgments.",
+        "mock or placeholder doc_ids exercise harness plumbing only; gate "
+        "evidence requires a reviewed seed set, not a synthetic fixture pass.",
+        "per-class means over small samples are noisy; ties count as no "
+        "regression and float noise below 1e-9 is ignored.",
+        "latency, degradation, and answer quality are reported elsewhere "
+        "and are not gated here.",
+    ]
+
+    return {
+        "ok": ok,
+        "reason": reason,
+        "gate": "quality",
+        "baseline": baseline,
+        "candidate": candidate,
+        "metric": metric_label,
+        "min_relative_improvement": min_relative_improvement,
+        "baseline_score": round(baseline_mean, 4),
+        "candidate_score": round(candidate_mean, 4),
+        "absolute_improvement": round(absolute, 4),
+        "relative_improvement": round(relative, 4) if relative is not None else None,
+        "improvement_ok": bool(improvement_ok),
+        "comparable_queries": len(comparable),
+        "unevaluable_queries": sorted(unevaluable_queries),
+        "classes": class_rows,
+        "unevaluable_classes": sorted(
+            set(unevaluable_classes) - set(by_class)
+        ),
+        "regressions": sorted(regressions),
+        "label_mismatches": label_mismatches,
+        "incomparable_queries": [],
+        "limitations": limitations,
+    }
 
 
 def evaluate_gate(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from .dataset import (
 from .judging import JudgeUnavailable, RubricScore, score_answer_placeholder
 from .metrics import (
     KNOWN_RETRIEVE_KWARGS,
+    QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT,
     _calibration_error,
     _extract_doc_ids,
     _mrr,
@@ -33,6 +35,7 @@ from .metrics import (
     _safe_search,
     _token_budget_recall_at_k,
     evaluate_gate,
+    evaluate_quality_gate,
     run_eval,
 )
 from .retrievers import (
@@ -123,6 +126,111 @@ def _write_markdown_comparison(
     logger.info("Markdown comparison written to %s", path)
 
 
+def _resolve_quality_keys(
+    reports: Dict[str, Dict[str, Any]],
+    baseline: str,
+    candidate: str,
+) -> Tuple[str, Optional[str]]:
+    """
+    Resolve user-supplied baseline/candidate names to report keys.
+
+    ``cmd_run`` names multi-config reports ``{retriever}-{config}``, so an
+    exact miss falls back to a unique ``-{name}`` suffix match (e.g.
+    ``with-expand`` resolves ``minnid-with-expand``). An empty candidate
+    auto-resolves only when exactly two reports exist. An explicitly named
+    but unresolvable candidate is returned verbatim (never None) so the
+    evaluator reports it missing instead of silently auto-selecting some
+    other report.
+    """
+
+    def resolve(name: str) -> Optional[str]:
+        if name in reports:
+            return name
+        suffixed = [key for key in reports if key.endswith(f"-{name}")]
+        if len(suffixed) == 1:
+            return suffixed[0]
+        return None
+
+    baseline_key = resolve(baseline)
+    candidate_key = resolve(candidate) if candidate else None
+    if candidate_key is None and not candidate and len(reports) == 2 and baseline_key:
+        others = [key for key in reports if key != baseline_key]
+        candidate_key = others[0] if len(others) == 1 else None
+    return baseline_key or baseline, candidate_key or candidate or None
+
+
+def _preflight_quality_gate(
+    args: argparse.Namespace,
+    config_names: list,
+    retriever_names: list,
+    queries: Optional[list] = None,
+) -> None:
+    """
+    Fail fast (exit 2) on an unusable quality-gate invocation before any
+    retriever work: non-normative metric, unresolvable explicit names, or
+    no auto-selectable candidate.
+    """
+    metric = getattr(args, "quality_metric", "recall_at_k") or "recall_at_k"
+    if metric != "recall_at_k":
+        logger.error(
+            "Quality gate compares normative recall_at_k only, not %r", metric
+        )
+        sys.exit(2)
+    k = getattr(args, "quality_k", 5)
+    threshold = getattr(args, "min_improvement", QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT)
+    if (isinstance(k, bool) or not isinstance(k, int) or k not in (1, 3, 5, 10)):
+        logger.error("Quality gate K must be one of 1, 3, 5, 10; got %r", k)
+        sys.exit(2)
+    if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold) or threshold < 0):
+        logger.error("Quality gate improvement must be finite and nonnegative")
+        sys.exit(2)
+    # Check raw corpus evidence before run_eval's legacy integer coercion.
+    # Descriptive reports and the old loss-rate gate keep their existing path.
+    seen = set()
+    for row in queries or []:
+        query = row.get("query")
+        ids = row.get("expected_doc_ids", [])
+        if (not isinstance(query, str) or not query.strip() or query in seen
+                or not isinstance(ids, list)
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in ids)):
+            logger.error("Quality gate requires unique nonempty query strings and exact integer judgments")
+            sys.exit(2)
+        seen.add(query)
+    expected = [
+        retriever if len(config_names) == 1 else f"{retriever}-{config}"
+        for retriever in retriever_names
+        for config in config_names
+    ]
+    baseline_req = getattr(args, "quality_baseline", "baseline") or "baseline"
+    candidate_req = getattr(args, "quality_candidate", "") or ""
+    baseline_key, candidate_key = _resolve_quality_keys(
+        dict.fromkeys(expected), baseline_req, candidate_req
+    )
+    if baseline_key not in expected:
+        logger.error(
+            "Quality gate baseline %r matches no expected report %s",
+            baseline_req,
+            expected,
+        )
+        sys.exit(2)
+    if candidate_req:
+        if candidate_key not in expected:
+            logger.error(
+                "Quality gate candidate %r matches no expected report %s",
+                candidate_req,
+                expected,
+            )
+            sys.exit(2)
+    elif len(expected) != 2:
+        logger.error(
+            "Quality gate needs exactly two reports to auto-select a "
+            "candidate (have %d); pass --quality-candidate",
+            len(expected),
+        )
+        sys.exit(2)
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Run evaluation for one or more configs and write reports."""
     config_names = [c.strip() for c in args.config.split(",")]
@@ -140,13 +248,16 @@ def cmd_run(args: argparse.Namespace) -> None:
     if not queries:
         logger.warning("No queries loaded - producing empty report.")
 
-    if getattr(args, "gate", False):
+    if getattr(args, "gate", False) or getattr(args, "quality_gate", False):
         validation = validate_queries(queries)
         if not validation["ok"]:
             logger.error("Query validation failed for gate run:")
             for error in validation["errors"]:
                 logger.error("  - %s", error)
             sys.exit(2)
+
+    if getattr(args, "quality_gate", False):
+        _preflight_quality_gate(args, config_names, retriever_names, queries)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     reports: Dict[str, Dict[str, Any]] = {}
@@ -185,6 +296,29 @@ def cmd_run(args: argparse.Namespace) -> None:
             logger.error("Gate failed: %s loss_rate=%s", gate_report["metric"], gate_report["loss_rate"])
             sys.exit(3)
 
+    quality_report = None
+    if getattr(args, "quality_gate", False):
+        baseline_key, candidate_key = _resolve_quality_keys(
+            reports,
+            getattr(args, "quality_baseline", "baseline") or "baseline",
+            getattr(args, "quality_candidate", "") or "",
+        )
+        quality_report = evaluate_quality_gate(
+            reports,
+            baseline=baseline_key,
+            candidate=candidate_key,
+            metric=getattr(args, "quality_metric", "recall_at_k") or "recall_at_k",
+            k=getattr(args, "quality_k", 5),
+            min_relative_improvement=getattr(
+                args, "min_improvement", QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT
+            ),
+        )
+        quality_path = _reports_dir() / f"{timestamp}-quality-gate.json"
+        _write_json_report(quality_report, quality_path)
+        if not quality_report["ok"]:
+            logger.error("Quality gate failed: %s", quality_report["reason"])
+            sys.exit(3)
+
     print(f"\n{'='*60}")
     print(f"Eval complete - {len(queries)} queries, {len(reports)} report(s)")
     print(f"{'='*60}")
@@ -194,6 +328,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         print(f"  {config_name:<20} R@5={r5:.4f}  MRR={s['mrr']:.4f}")
     if gate_report:
         print(f"  gate                 ok={gate_report['ok']} loss_rate={gate_report['loss_rate']:.4f}")
+    if quality_report:
+        print(f"  quality gate         ok={quality_report['ok']} reason={quality_report['reason']}")
     print(f"\nReports: {_reports_dir()}")
 
 
@@ -271,6 +407,40 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--gate",
         action="store_true",
         help="Validate queries and fail if minnid loses to ripgrep on >20%% of comparable queries",
+    )
+    run_p.add_argument(
+        "--quality-gate",
+        action="store_true",
+        help="Enforce the baseline-vs-candidate quality gate: +5%% recall@5 "
+             "with no query-class regression (WORKFLOWS Eval Gate)",
+    )
+    run_p.add_argument(
+        "--quality-baseline",
+        default="baseline",
+        help="Baseline config report name (default: baseline)",
+    )
+    run_p.add_argument(
+        "--quality-candidate",
+        default="",
+        help="Candidate config report name (default: auto-resolve when two reports exist)",
+    )
+    run_p.add_argument(
+        "--min-improvement",
+        type=float,
+        default=QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT,
+        help="Required relative gain on the quality metric (default: 0.05)",
+    )
+    run_p.add_argument(
+        "--quality-metric",
+        default="recall_at_k",
+        help="Per-query metric compared by the quality gate "
+             "(only the normative recall_at_k is accepted)",
+    )
+    run_p.add_argument(
+        "--quality-k",
+        type=int,
+        default=5,
+        help="K for the quality-gate metric (default: 5)",
     )
 
     rec_p = sub.add_parser("record", help="Append a query to eval/queries.jsonl")
@@ -352,7 +522,10 @@ __all__ = [
     "cmd_record",
     "cmd_run",
     "cmd_validate",
+    "_preflight_quality_gate",
+    "_resolve_quality_keys",
     "evaluate_gate",
+    "evaluate_quality_gate",
     "harvest_queries",
     "load_queries",
     "make_searcher",

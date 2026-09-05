@@ -56,8 +56,10 @@ def validate_queries(
         query_text = str(q.get("query", "")).strip()
         if not query_text:
             errors.append(f"{label}: query is required")
-        if not q.get("reviewed"):
-            errors.append(f"{label}: reviewed=true is required for gate datasets")
+        if q.get("reviewed") is not True:
+            errors.append(
+                f"{label}: reviewed=true (boolean) is required for gate datasets"
+            )
         else:
             reviewed_count += 1
         if not (q.get("expected_refs") or q.get("expected_doc_ids")):

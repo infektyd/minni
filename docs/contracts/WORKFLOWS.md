@@ -51,12 +51,18 @@ The normative default-change policy remains: demonstrate at least +5% recall@5
 against the baseline with no regression on any query class. This requires a
 reviewed dataset, comparable runs, and explicit review of the evidence.
 
-The current automated `python -m minni.eval.harness run --gate --retrievers minnid,ripgrep` check has a different rule: Minni may lose on at most 20% of
-comparable queries. A config-comparison run without `--gate` produces reports;
-it does not enforce the normative policy. CI tests and release smoke also do not
-certify that policy. A matching automated feature-default gate remains a planned
-improvement. See [evaluation guidance](../../eval/README.md) for source-grounded
-fixtures and the limits of legacy mock-only seed IDs.
+`python -m minni.eval.harness run --quality-gate --config baseline,with-expand`
+checks at least **5% relative** recall@5 improvement and no query-class mean
+regression. It rejects incomparable judgments, missing metrics, and wholly
+unjudged classes. Both runs must use the same reviewed query set; the existing
+300-reviewed-query prerequisite applies. Passing synthetic tests or `--mock`
+does not establish actual retrieval quality or authorize a default change.
+
+The separate legacy `--gate --retrievers minnid,ripgrep` check retains its rule:
+Minni may lose on at most 20% of comparable queries. Report-only runs, CI tests,
+and release smoke do not certify the default-change policy. See
+[evaluation guidance](../../eval/README.md) for commands, the zero-baseline case,
+and remaining evidence limits.
 
 ## Runtime Identity
 

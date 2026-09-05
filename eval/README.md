@@ -109,3 +109,43 @@ historical or planned behavior outside the selected excerpts. Keep this corpus
 separate from the synthetic corpus when reporting quality; they test different
 things. Later documentation changes do not silently change the snapshot: review
 new source text, hashes, and expectations explicitly when refreshing it.
+
+## Compare a candidate against the baseline
+
+Use a reviewed corpus with real document judgments for the retrieval backend:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
+  --queries /path/to/reviewed-queries.jsonl \
+  --config baseline,with-expand --retrievers minnid \
+  --quality-gate --quality-baseline baseline --quality-candidate with-expand
+```
+
+The default check requires a **5% relative** gain in mean recall@5, with no
+regression in any query class (`notes`). For example, 0.40 to 0.42 meets the
+improvement threshold; a declining class still fails. A zero baseline needs a
+strictly positive candidate score; both zero fails. Reports must contain the
+same unique queries, exact integer document judgments, and class metadata.
+Missing, nonfinite, or out-of-range scores fail. A whole class without judgments
+cannot disappear from the check; partially unjudged queries remain explicitly
+listed as unevaluable. Negative/privacy probes require a separate outcome
+contract and are not certified by recall scores.
+
+The existing corpus validator requires at least 300 queries with explicit JSON
+`"reviewed": true`, relevance metadata, answer rubric, and privacy expectation.
+Malformed raw IDs and invalid comparison arguments are rejected before
+retriever initialization. Quality mode currently supports recall only; graded
+nDCG comparisons require preserving additional comparable judgment evidence.
+The default policy is recall@5 with `--min-improvement 0.05`; other supported K
+values or thresholds are custom comparisons, not evidence for that policy.
+
+A failed invocation exits 2; failed comparison exits 3 and writes a quality-gate
+JSON report. Success writes the report with compared means, class results,
+excluded queries, and limitations. The check computes no confidence intervals
+and does not assess latency, answer quality, or consumer resistance to hostile
+recalled content. `--mock` exercises plumbing only. Existing fixture studies and
+placeholder seed IDs do not become a reviewed real-world quality study merely
+because the comparison code exists.
+
+The legacy `--gate` Minni-versus-ripgrep loss-rate check is separate and keeps its
+20% rule. Ungated runs remain available for smaller exploratory datasets.
