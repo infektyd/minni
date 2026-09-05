@@ -135,18 +135,29 @@ def _resolve_quality_keys(
     Resolve user-supplied baseline/candidate names to report keys.
 
     ``cmd_run`` names multi-config reports ``{retriever}-{config}``, so an
-    exact miss falls back to a unique ``-{name}`` suffix match (e.g.
-    ``with-expand`` resolves ``minnid-with-expand``). An empty candidate
-    auto-resolves only when exactly two reports exist. An explicitly named
-    but unresolvable candidate is returned verbatim (never None) so the
-    evaluator reports it missing instead of silently auto-selecting some
-    other report.
+    exact miss falls back to a unique full-config suffix match (e.g.
+    ``with-expand`` resolves ``minnid-with-expand``). Config names can
+    themselves contain hyphens, so the longest known ``CONFIGS`` suffix
+    wins: ``minnid-fp32-baseline`` is ``fp32-baseline``, not ``baseline``.
+    An empty candidate auto-resolves only when exactly two reports exist.
+    An explicitly named but unresolvable candidate is returned verbatim
+    (never None) so the evaluator reports it missing instead of silently
+    auto-selecting some other report.
     """
+    known_configs = tuple(sorted(CONFIGS, key=len, reverse=True))
+
+    def config_of(key: str) -> Optional[str]:
+        if key in CONFIGS:
+            return key
+        for config in known_configs:
+            if key.endswith(f"-{config}"):
+                return config
+        return None
 
     def resolve(name: str) -> Optional[str]:
         if name in reports:
             return name
-        suffixed = [key for key in reports if key.endswith(f"-{name}")]
+        suffixed = [key for key in reports if config_of(key) == name]
         if len(suffixed) == 1:
             return suffixed[0]
         return None

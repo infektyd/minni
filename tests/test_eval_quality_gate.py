@@ -209,6 +209,21 @@ class TestResolveQualityKeys:
         baseline_key, _ = _resolve_quality_keys(reports, "baseline", "")
         assert baseline_key == "baseline"
 
+    def test_fp32_baseline_does_not_collide_with_baseline(self):
+        reports = {"minnid-baseline": {}, "minnid-fp32-baseline": {}}
+        assert _resolve_quality_keys(reports, "baseline", "fp32-baseline") == (
+            "minnid-baseline",
+            "minnid-fp32-baseline",
+        )
+
+    def test_lone_fp32_baseline_does_not_bind_as_baseline(self):
+        reports = {"minnid-fp32-baseline": {}, "minnid-int8-quantized": {}}
+        baseline_key, candidate_key = _resolve_quality_keys(
+            reports, "baseline", "int8-quantized"
+        )
+        assert baseline_key == "baseline"
+        assert candidate_key == "minnid-int8-quantized"
+
     def test_explicit_unknown_candidate_returned_verbatim_never_none(self):
         reports = {"baseline": {}, "candidate": {}}
         baseline_key, candidate_key = _resolve_quality_keys(
