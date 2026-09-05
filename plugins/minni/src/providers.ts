@@ -23,10 +23,10 @@ import {
 import { AFM_PREPARE_TASK_URL, loadProvidersConfig, type ProvidersConfig } from "./config.js";
 import type { JsonResult } from "./sovereign.js";
 
-export type OperationClass = "retrieval" | "prepare" | "extraction";
+export type OperationClass = "retrieval" | "prepare" | "extraction" | "edge_inference";
 export type ProviderTier = "local" | "cloud";
 
-const OPERATION_CLASSES = new Set<OperationClass>(["retrieval", "prepare", "extraction"]);
+const OPERATION_CLASSES = new Set<OperationClass>(["retrieval", "prepare", "extraction", "edge_inference"]);
 
 export interface ChatRequest {
   /** OpenAI-compatible chat-completions body — shape frozen by the P0 goldens. */
@@ -138,7 +138,11 @@ export class ProviderChain {
   ) {}
 
   providersFor(operation: OperationClass): ModelProvider[] {
-    const policy = this.operations[operation] ?? {};
+    let policy = this.operations[operation] ?? {};
+    if (operation === "edge_inference") {
+      // Structural local-only guarantee: edge_inference cannot route to cloud
+      policy = { localOnly: true };
+    }
     return this.providers.filter(
       (provider) => provider.supports(operation) && !(policy.localOnly && provider.tier !== "local"),
     );
@@ -174,15 +178,19 @@ export class ProviderChain {
 export function defaultProviderChain(config: ProvidersConfig = loadProvidersConfig()): ProviderChain {
   const operations: Partial<Record<OperationClass, OperationPolicy>> = {
     retrieval: { localOnly: true },
+    edge_inference: { localOnly: true },
   };
   for (const [name, policy] of Object.entries(config.operations ?? {})) {
     if (OPERATION_CLASSES.has(name as OperationClass) && policy && typeof policy === "object") {
       // Secure default: retrieval stays localOnly unless EXPLICITLY set false.
       // {"operations":{"retrieval":{}}} must not flip retrieval cloud-eligible.
+      // Immutable Safety Override: edge_inference cannot be weakened by config.
       const localOnly =
-        name === "retrieval"
-          ? (policy as OperationPolicy).localOnly !== false
-          : Boolean((policy as OperationPolicy).localOnly);
+        name === "edge_inference"
+          ? true
+          : name === "retrieval"
+            ? (policy as OperationPolicy).localOnly !== false
+            : Boolean((policy as OperationPolicy).localOnly);
       operations[name as OperationClass] = { localOnly };
     }
   }

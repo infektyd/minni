@@ -170,6 +170,20 @@ class SovereignConfig:
     hyde_enabled: bool = False
     hyde_confidence_floor: float = 0.4
 
+    # Typed Memory Graph Substrate (Phase 1)
+    # Governs write-time candidate shortlisting and edge inference during promotion (default True).
+    graph_classification_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "MINNI_GRAPH_CLASSIFICATION_ENABLED", "on"
+        ).lower() not in {"0", "false", "no", "off"}
+    )
+    # Governs read-time 1-hop neighbor traversal in retrieve() (default False during bootstrap).
+    graph_expansion_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "MINNI_GRAPH_EXPANSION_ENABLED", "off"
+        ).lower() in {"1", "true", "yes", "on"}
+    )
+
     # AFM self-organization loop (PR-12)
     # Opt-in. Set MINNI_AFM_LOOP=on/1/true to enable; "off" is a kill switch.
     afm_loop_schedule: dict = field(default_factory=lambda: {
