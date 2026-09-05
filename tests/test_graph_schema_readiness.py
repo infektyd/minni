@@ -229,6 +229,50 @@ def test_tc_ready_03_drifted_edge_status_nullability_and_default():
     assert "nullability mismatch" in error_text or "default value mismatch" in error_text
 
 
+def test_tc_ready_declared_type_drift():
+    """A required column with the wrong declared type flags schema drift."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+
+    conn.executescript(
+        """
+        DROP TABLE memory_links;
+        CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            confidence INTEGER,
+            inference_method TEXT,
+            model_id TEXT,
+            prompt_version TEXT,
+            inference_run_id TEXT,
+            evidence_json TEXT,
+            inferred_at REAL,
+            edge_status TEXT NOT NULL DEFAULT 'active',
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type),
+            FOREIGN KEY(source_doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE,
+            FOREIGN KEY(target_doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_memory_links_target_active
+            ON memory_links(target_doc_id, edge_status, link_type, source_doc_id);
+        CREATE INDEX idx_memory_links_source_active
+            ON memory_links(source_doc_id, edge_status, link_type, target_doc_id);
+        """
+    )
+    conn.commit()
+
+    report = verify_graph_schema(conn)
+    assert report.ready is False
+    assert report.status == "schema_drifted"
+    assert (
+        "column 'memory_links.confidence' declared type mismatch: expected REAL, got INTEGER"
+        in report.errors
+    )
+
+
 def test_tc_ready_04_drifted_pk_shape_learning_documents():
     """TC-READY-04: learning_documents with 3-column PK or inverted sequence flags drift."""
     # Sub-case A: 3-column PK

@@ -322,6 +322,11 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                     f"column '{tbl}.{col_name}' declared type mismatch: expected {exp_type}, got {act_type}"
                 )
 
+            if act_pk != exp_pk:
+                errors.append(
+                    f"column '{tbl}.{col_name}' primary key position mismatch: expected {exp_pk}, got {act_pk}"
+                )
+
             if act_notnull != exp_notnull:
                 errors.append(
                     f"column '{tbl}.{col_name}' nullability mismatch: expected notnull={exp_notnull}, got {act_notnull}"
