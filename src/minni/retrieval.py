@@ -1182,6 +1182,8 @@ class RetrievalEngine:
         layer: str = "knowledge",
         whole_document: int = 0,
         model_name: Optional[str] = None,
+        repair_projection: bool = False,
+        on_vectors=None,
     ) -> Dict:
         """Chunk + embed + index a durable document into the SEMANTIC index.
 
@@ -1208,6 +1210,19 @@ class RetrievalEngine:
         try:
             if not content or not content.strip():
                 return {"status": "skipped", "reason": "empty_content"}
+
+            if repair_projection:
+                from minni.durable_projection import durable_doc_path, durable_metadata
+
+                expected = durable_metadata(content)
+                if (path != durable_doc_path(agent, "", self.config.vault_path, content)
+                        or page_type != "learning"
+                        or any(locals_value != expected[key] for key, locals_value in (
+                            ("sigil", sigil), ("privacy_level", privacy_level),
+                            ("page_status", page_status), ("layer", layer)))
+                        or privacy_level == "blocked"
+                        or page_status in {"draft", "expired", "rejected", "superseded"}):
+                    return {"status": "skipped", "reason": "ineligible_projection"}
 
             now = time.time()
             model_name = model_name or self.config.embedding_model
@@ -1265,10 +1280,23 @@ class RetrievalEngine:
             #    FTS/chunk rows. Mirrors the new/changed-file branch of
             #    index_vault so retrieval's chunk↔document JOIN reads it the same.
             with self.db.transaction() as c:
+                if repair_projection:
+                    from minni.durable_projection import ACTIVE_LEARNING_SQL
+
+                    # BEGIN IMMEDIATE serializes this check and publication with
+                    # lifecycle writes. Encoding above never holds the DB lock.
+                    active = c.execute(
+                        f"SELECT 1 FROM learnings WHERE agent_id=? AND content=? "
+                        f"AND {ACTIVE_LEARNING_SQL} LIMIT 1", (agent, content),
+                    ).fetchone()
+                    if not active:
+                        return {"status": "skipped", "reason": "learning_changed"}
                 c.execute(
                     "SELECT doc_id FROM documents WHERE path = ?", (path,)
                 )
                 row = c.fetchone()
+                if row and repair_projection:
+                    return {"status": "skipped", "reason": "projection_exists"}
                 if row:
                     doc_id = row["doc_id"]
                     c.execute(
@@ -1348,6 +1376,8 @@ class RetrievalEngine:
             #    (which now includes these rows). Either way the chunks become
             #    searchable in-process.
             self._refresh_live_faiss(new_chunk_ids, new_vectors)
+            if on_vectors is not None and new_chunk_ids:
+                on_vectors(new_chunk_ids, new_vectors)
 
             return {
                 "status": "ok",
@@ -1360,7 +1390,7 @@ class RetrievalEngine:
             # degrades to lexical-only until the next index run.
             logger.warning(
                 "durable-index: semantic indexing failed for %r (%s) — "
-                "store succeeded, recall degraded to lexical until reindex",
+                "store succeeded; document projection needs repair",
                 path, exc,
             )
             return {"status": "degraded", "reason": str(exc)}
