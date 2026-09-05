@@ -299,6 +299,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     fixture_p = sub.add_parser("fixture", help="Run machine-curated retrieval against a disposable real corpus")
     fixture_p.add_argument("--profile", choices=["lexical-deadline", "hybrid"], default="lexical-deadline")
     fixture_p.add_argument("--repeats", type=int, default=3)
+    fixture_p.add_argument("--corpus", type=Path, help="Synthetic or source-grounded fixture JSON")
     fixture_p.add_argument("--output", required=True, help="JSON report path outside the fixture corpus")
 
     args = parser.parse_args(argv)
@@ -313,7 +314,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         cmd_harvest(args)
     elif args.command == "fixture":
         from .fixture import run_fixture
-        report = run_fixture(profile=args.profile, repeats=args.repeats)
+        report = run_fixture(path=args.corpus, profile=args.profile, repeats=args.repeats)
         _write_json_report(report, Path(args.output))
         print(json.dumps(report["summary"], indent=2))
         if not report["summary"]["ok"]:

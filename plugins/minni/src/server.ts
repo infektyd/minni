@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -254,7 +255,7 @@ export { MINNI_INSTRUCTIONS };
 const server = new McpServer(
   {
     name: "minni",
-    version: "0.1.0",
+    version: JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version,
   },
   { instructions: MINNI_INSTRUCTIONS },
 );

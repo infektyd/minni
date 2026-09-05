@@ -64,3 +64,45 @@ corpora and reports outside version control. The existing `run --mock` and
 `reviewed_seed.jsonl` are legacy harness/scoring smokes with mock-only IDs; their
 scores do not establish retrieval quality. The fixture command is separate from
 the legacy 300-reviewed-query feature gate and makes no claim to satisfy it.
+
+## Public repository corpus
+
+`fixtures/public_repo.json` adds 20 machine-reviewed questions over 18 verbatim,
+coherent excerpts from public Minni documentation (3,086 words). It includes
+paraphrases, concrete operational questions, answers requiring multiple sources,
+and false premises that should retrieve correcting evidence. Neighboring topics
+remain in the corpus as plausible distractors; two excerpts are distractor-only.
+No private memories, model-generated facts, or observed retrieval outputs were
+used to establish the expected sources.
+
+```sh
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src \
+  .venv/bin/python -m minni.eval.harness fixture \
+  --corpus eval/fixtures/public_repo.json --profile hybrid \
+  --repeats 3 --output /tmp/minni-public-repo.json
+```
+
+Use `--profile lexical-deadline` for the deliberately degraded, model-free
+comparison. Do not rewrite expectations or tune thresholds to make its lexical
+scores pass: ordinary questions and paraphrases can expose retrieval misses.
+
+Each document records its public source path, inclusive line range, full source
+blob SHA-256, and excerpt SHA-256 at the pinned Git `source_revision`. Text is
+copied exactly, including Markdown and newlines. Each question's `expected_refs`
+resolve to those source records; `expected_answer` explains the independent
+relevance judgment. The answer text is explanatory, **not an answer-generation
+metric**. `hard_negative_refs` identify authorized, topically similar distractors,
+not forbidden content: returning one is not a privacy violation. False-premise
+questions have positive correcting sources rather than artificial empty-answer
+requirements. All corpus documents are deliberately eligible for the fixture's
+fixed Codex principal; use the separate synthetic corpus for authorization and
+lifecycle exclusion tests.
+
+This is **machine-reviewed public-document retrieval**, not human-reviewed ground
+truth, a representative private-memory study, or a production latency benchmark.
+It measures retrieval of the pinned documentation, not independent proof that
+all documentation describes deployed behavior. The source contracts may contain
+historical or planned behavior outside the selected excerpts. Keep this corpus
+separate from the synthetic corpus when reporting quality; they test different
+things. Later documentation changes do not silently change the snapshot: review
+new source text, hashes, and expectations explicitly when refreshing it.

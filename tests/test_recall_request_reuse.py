@@ -212,3 +212,50 @@ def test_request_state_and_deadline_are_not_reused_across_calls(engines, monkeyp
     assert engines[0].calls[-1]["query"] == "different"
     assert engines[0].calls[-1]["principal"].agent_id == "claude-code"
     assert any(r["text"] == "new content" for r in result["results"])
+
+
+def install_trace_capture(engine):
+    def capture():
+        engine.last_trace_id = f"{engine.name}-{len(engine.calls)}"
+        for row in engine.rows:
+            row["trace_id"] = engine.last_trace_id
+    engine.before_retrieve = capture
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_personal_response_trace_is_current_even_with_stale_shared_trace(engines, empty):
+    own, _, shared = engines
+    shared.last_trace_id = "previous-shared-request"
+    install_trace_capture(own)
+    if empty:
+        own.rows = []
+    result = search(context(engines), scope="personal")
+    assert result["trace_id"] == "own-1"
+    assert result["trace_ids"] == ["own-1"]
+    assert result["trace_scope"] == "retrieval_leg"
+    assert not shared.calls
+    assert all(row["trace_id"] == "own-1" for row in result["results"])
+
+
+def test_multicorpus_response_retains_each_trace_without_claiming_one_request_trace(engines):
+    for engine in engines:
+        install_trace_capture(engine)
+    result = search(context(engines), scope="both")
+    assert result["trace_id"] is None
+    assert result["trace_ids"] == ["own-1", "other-1", "shared-1"]
+    assert {row["trace_id"] for row in result["results"]} == set(result["trace_ids"])
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_previous_trace_is_excluded_when_retrieval_produces_no_new_trace(engines, failure):
+    own, _, shared = engines
+    own.last_trace_id = "stale-own"
+    shared.last_trace_id = "stale-shared"
+    own.rows = shared.rows = []
+    if failure:
+        def fail():
+            raise RuntimeError("temporary failure before trace capture")
+        own.before_retrieve = fail
+    result = search(context(engines), scope="personal")
+    assert result["trace_id"] is None
+    assert result["trace_ids"] == []

@@ -419,6 +419,12 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
       "auto" (default)   — use config.vector_backends priority cascade
       "faiss-disk"       — force specific backend
       ["faiss-disk", X]  — fan-out via multi-backend
+
+    Response ``trace_ids`` contains the fresh traces captured by this request's
+    successful corpus retrievals, including searches returning no documents.
+    ``trace_scope="retrieval_leg"`` means their timings cover those retrievals,
+    not the whole RPC. Legacy ``trace_id`` is populated only for a single trace;
+    per-result trace IDs retain their original attribution.
     """
     if context.increment_request_count is not None:
         context.increment_request_count()
@@ -516,6 +522,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # before another engine call can overwrite thread-local diagnostics.
         # Shared fallback and failed calls retain their existing retry behavior.
         personal_snapshot = None
+        retrieval_trace_ids: list[str] = []
 
         def record_shared(entry: dict, *, bucket: str, sink: list) -> None:
             key = json.dumps(entry, sort_keys=True, default=str)
@@ -542,6 +549,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             ):
                 rows, poisoned, suppression, degradation = deepcopy(personal_snapshot[2])
             else:
+                previous_trace_id = getattr(retrieval_engine, "last_trace_id", None)
                 rows = retrieval_engine.retrieve(
                     query=query,
                     agent_id=agent_id,
@@ -565,6 +573,17 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     deadline_monotonic=deadline_monotonic,
                     update_access=False,
                 )
+                # Capture this leg immediately, including empty results. An
+                # unchanged diagnostic can belong to an earlier request when
+                # retrieval returns before creating a trace. Failed calls never
+                # reach this point; reused personal snapshots add no new trace.
+                trace_id = getattr(retrieval_engine, "last_trace_id", None)
+                if (
+                    isinstance(trace_id, str) and trace_id
+                    and trace_id != previous_trace_id
+                    and trace_id not in retrieval_trace_ids
+                ):
+                    retrieval_trace_ids.append(trace_id)
                 poisoned = _ranking_deadline_poisoned(retrieval_engine)
                 suppression = getattr(retrieval_engine, "last_auth_suppression", None)
                 degradation = _degradation_for(retrieval_engine, src)
@@ -968,7 +987,12 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             "depth": depth,
             "count": len(results),
             "backend": backend_badge(resolved_backend),
-            "trace_id": getattr(engine, "last_trace_id", None),
+            # Traces describe individual corpus retrievals, not total RPC
+            # latency (which also includes merging, learnings and episodic).
+            # Keep the singular compatibility field only when unambiguous.
+            "trace_id": retrieval_trace_ids[0] if len(retrieval_trace_ids) == 1 else None,
+            "trace_ids": retrieval_trace_ids,
+            "trace_scope": "retrieval_leg",
             "query_variants": (
                 results[0].get("query_variants", [query])
                 if results else [query]
