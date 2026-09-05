@@ -76,8 +76,6 @@ def preflight_platform(platform: str) -> list[str]:
                 "[wire] mcp-env-run not on PATH; gemini surfaces will use command: node",
                 file=sys.stderr,
             )
-    if platform not in ("generic", "gemini"):
-        ok_root, root_msg = check_config_root(platform)
-        if not ok_root and platform != "antigravity":
-            errors.append(root_msg)
+    # run_wire applies host_decision before reaching this dependency check.
+    # Explicit wiring may initialize a present host with no configuration yet.
     return errors

@@ -55,6 +55,7 @@ def upsert_wire(
     record: WireRecord,
     *,
     dry_run: bool = False,
+    expected_record: dict | None = None,
 ) -> tuple[dict, str | None]:
     """Return (updated wired.json dict, warning or None)."""
     wired_json = plugin_base() / "wired.json"
@@ -69,6 +70,12 @@ def upsert_wire(
         # write path below still takes the exclusive lock.
         data = _load_wired(wired_json)
         wires: list[dict] = list(data.get("wires", []))
+        if expected_record is not None:
+            matches = [wire for wire in wires
+                       if wire.get("platform") == record.platform
+                       and wire.get("config_path") == record.config_path]
+            if matches != [expected_record]:
+                raise ValueError("wire registration changed before publication")
         entry = _wire_entry(record)
         replaced = False
         for idx, wire in enumerate(wires):
@@ -92,6 +99,12 @@ def upsert_wire(
         data = _load_wired(wired_json)
         start_gen = int(data.get("generation", 0))
         wires: list[dict] = list(data.get("wires", []))
+        if expected_record is not None:
+            matches = [wire for wire in wires
+                       if wire.get("platform") == record.platform
+                       and wire.get("config_path") == record.config_path]
+            if matches != [expected_record]:
+                raise ValueError("wire registration changed before publication")
         entry = _wire_entry(record)
         replaced = False
         for idx, wire in enumerate(wires):

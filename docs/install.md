@@ -21,6 +21,8 @@ Operator docs must not lie about **present** behavior. Accuracy work must
 
 ## Keep every agent host current (`minni sync`)
 
+Existing Hermes source bindings receive a read-only artifact check during sync; configuration stays unchanged and loaded sessions require a separate reload. See [Hermes sync coverage and limitations](hermes-sync.md).
+
 After you upgrade the package **or** pull a newer `main` in a dogfood
 checkout, the **daemon can move while each agent host still points at last
 week's plugin tree**. That is a real failure mode, not a power-user tip.
@@ -80,16 +82,38 @@ minni wire claude-code        # or: codex, kilocode, grok, generic, all
   `propagate --platform antigravity` (also covered by `make sync-root`); pure
   `gemini` remains provisional-skip on wire (`gemini-provisional`), not the
   day-to-day install path. `generic` requires `--agent` and `--install-root`.
-- Every wire ends with verification probes (MCP handshake, hook dry-run,
+- Attempted wiring ends with verification probes (MCP handshake, hook dry-run,
   config readback). Re-run `minni wire <platform>` to repeat them; `minni
   doctor` never substitutes for wire verify (doctor is interpreter / socket /
   status / recall / models only). Output is a single JSON document on stdout
   with per-platform results; exit code 0 = all attempted platforms wired, 1 =
-  at least one failed, 2 = preflight/usage error before any change.
+  a failed attempt or an all-skipped run, 2 = preflight/usage error before any change.
 - Old version dirs are pruned only when no runtime's config references them
   (`--prune` / `--no-prune`; prompts are skipped when stdin isn't a TTY).
+  Fleet `minni sync` and `sync --full` defer garbage collection and retain old
+  payloads because native hooks or custom MCP bindings may deliberately remain
+  on them. Sync refreshes existing enabled Muse and Devin JSON MCP bindings
+  when their executables are available; unsupported custom formats are reported
+  as skipped. This does not install native hooks or verify those hosts are running.
+  If every canonical host is skipped, wire produces no new payload target;
+  custom-only refresh then requires an explicitly verified installed root through
+  `python -m minni.wire.custom_refresh --new-root <versioned-payload-root>`.
   `--use-version <ver>` re-stamps a platform's config against an
   already-installed version — rollback without touching the Python package.
+- Host availability is checked before builds or configuration changes. A leftover
+  config directory does not establish that a host is installed. Unavailable
+  hosts skip; unreadable or malformed configuration is a visible failure.
+  Bulk refresh requires an existing, enabled Minni binding. Use an explicit
+  named wire command for initial setup on an installed host.
+- `minni sync`, `make sync-root`, and bulk propagation preserve disabled bindings
+  and MCP-only setups. They refresh recognized existing native hooks without
+  adding missing event subscriptions or enabling host plugins. Standalone
+  propagation accepts `--existing-only` for the same policy. An all-skipped
+  propagation run exits zero with `status: skipped`; it did not update anything.
+- A successful MCP probe and hook dry-run do not establish delivery by an already
+  running host. Reload the integration in that host and check a real event when
+  lifecycle delivery matters. Antigravity bulk refresh preserves its existing
+  registration state and reports that registration has not been verified.
 - The agent-driven `minni-install` skill handles first-time identity and
   vault seeding after the wire.
 - **After wire adoption**, do **not** re-run

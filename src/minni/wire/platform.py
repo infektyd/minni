@@ -74,7 +74,7 @@ def config_root_candidates(home: Path | None = None) -> dict[str, tuple[Path, ..
     )
     return {
         "codex": (base / ".codex",),
-        "claude-code": (base,),
+        "claude-code": (base / ".claude.json", base / ".claude"),
         "kilocode": (base / ".config/kilo",),
         "grok": (base / ".grok",),
         "gemini": (base / ".gemini",),
@@ -207,6 +207,11 @@ def default_config_scan_paths() -> dict[str, Path]:
             "~/Library/Application Support/Claude/claude_desktop_config.json",
         ).expanduser(),
         "kilocode": Path("~/.config/kilo/kilo.json").expanduser(),
+        # The native Kilo bridge holds a literal versioned hook path. Bulk
+        # wiring deliberately preserves a customized bridge while moving the
+        # MCP config and wired record to the new root; without this entry GC
+        # would prune the payload the still-active native hook loads.
+        "kilocode-bridge": Path("~/.config/kilo/plugin/minni.js").expanduser(),
         "grok": Path("~/.grok/config.toml").expanduser(),
         # Gemini/antigravity MCP views hold versioned install paths. D11
         # hard-fail can leave views rewritten without a wired.json row;

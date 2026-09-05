@@ -168,6 +168,7 @@ def test_plugin_dist_tracks_wired_local_payload_without_current(
         }),
         encoding="utf-8",
     )
+    (home / ".claude.json").write_text("{}")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
     deploy_honesty.capture_start_state()
@@ -222,6 +223,7 @@ def test_plugin_dist_prefers_wired_record_over_zombie_current(
         }),
         encoding="utf-8",
     )
+    (home / ".claude.json").write_text("{}")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
     deploy_honesty.capture_start_state()
@@ -302,6 +304,7 @@ def test_top_level_stale_rolls_up_plugin_dist(checkout, monkeypatch, tmp_path):
         }),
         encoding="utf-8",
     )
+    (home / ".claude.json").write_text("{}")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
     deploy_honesty.capture_start_state()
