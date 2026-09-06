@@ -11,6 +11,7 @@ import minni.obs as obs
 from minni.afm_review_markers import supersede_afm_review
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.graph_commit import ensure_canonical_learning_node
 from minni.principal import (
     OPERATOR_RESERVED_AGENT_IDS,
     EffectivePrincipal,
@@ -32,6 +33,12 @@ class AFMContext:
     trace_ring: Callable[[], Any]
     record_latency: Callable[[str, float], None]
     maybe_archive_inbox_source: Callable[[Any, int], None]
+    # Post-commit semantic-index delivery for promoted learnings. Wired to
+    # the explicit db-bound production mechanism; None means no delivery is
+    # attempted (standing repair covers the projection). Never raises the
+    # promotion: already-committed memory is never reported failed for an
+    # index hiccup.
+    index_durable_learning: Callable[..., bool | None] | None = None
     increment_request_count: Callable[[], None] | None = None
     writeback_ref: Callable[[], Any] = lambda: None
     sovereign_db: Callable[..., Any] = SovereignDB
@@ -201,6 +208,47 @@ def maybe_archive_inbox_source(db, candidate_id: int, config=DEFAULT_CONFIG, log
         )
 
 
+def _candidate_snapshot(cand: dict) -> dict:
+    """The exact prepared fields a later transaction must still see."""
+    return {
+        "content": cand.get("content"),
+        "principal": cand.get("principal"),
+        "privacy_level": cand.get("privacy_level"),
+        "instruction_like": int(cand.get("instruction_like") or 0),
+        "evidence_refs": cand.get("evidence_refs"),
+    }
+
+
+def _row_matches_snapshot(c, candidate_id: int, snap: dict) -> bool:
+    """True when the row is still proposed with the exact prepared fields.
+
+    Closes the prepare/embed-to-transaction window: a concurrent edit to
+    content, owner, privacy, instruction flag, or evidence must not promote,
+    stamp, or fence replacement content from a stale decision. Safety gates
+    (safe-privacy set, instruction predicate, owner canonicalization) are
+    pure functions of these fields, so an exact match re-validates the
+    admission decision; any drift returns the candidate unresolved to the
+    next pass, which re-decides on current values.
+    """
+    c.execute(
+        "SELECT status, content, principal, privacy_level,"
+        " instruction_like, evidence_refs FROM candidate_packets"
+        " WHERE candidate_id=?",
+        (candidate_id,),
+    )
+    row = c.fetchone()
+    if not row or row["status"] != "proposed":
+        return False
+    current = {
+        "content": row["content"],
+        "principal": row["principal"],
+        "privacy_level": row["privacy_level"],
+        "instruction_like": int(row["instruction_like"] or 0),
+        "evidence_refs": row["evidence_refs"],
+    }
+    return all(current[key] == snap[key] for key in current)
+
+
 def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContext):
     """Promote one proposed candidate into a durable, embedded learning.
 
@@ -219,13 +267,16 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
     cand = dict(row)
     if cand.get("status") != "proposed":
         return None
+    # Snapshot the exact prepared fields; every later transaction re-matches
+    # them before writing (promote, stamp, or fence).
+    prepared = _candidate_snapshot(cand)
     content = cand.get("content") or ""
     if int(cand["instruction_like"] or 0) == 1 or is_instruction_like(content):
         now = time.time()
         with wb.db.transaction() as c:
-            c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
-            chk = c.fetchone()
-            if not chk or chk["status"] != "proposed":
+            if not _row_matches_snapshot(c, candidate_id, prepared):
+                # Replacement content arrived after the decision: never stamp
+                # or fence it from this stale branch. Unresolved for next pass.
                 return None
             c.execute(
                 "UPDATE candidate_packets SET instruction_like=1 WHERE candidate_id=?",
@@ -258,9 +309,9 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
     if privacy not in _SAFE_PRIVACY:
         now = time.time()
         with wb.db.transaction() as c:
-            c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
-            chk = c.fetchone()
-            if not chk or chk["status"] != "proposed":
+            if not _row_matches_snapshot(c, candidate_id, prepared):
+                # Same staleness bar as the instruction branch: no fence for
+                # replacement content decided under different privacy.
                 return None
             c.execute(
                 """SELECT 1 FROM consolidation_actions
@@ -308,48 +359,111 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
             context.logger.warning("consolidation: embedding failed (%s) - storing without", exc)
 
     now = time.time()
-    with wb.db.transaction() as c:
-        # Re-check status inside the txn (closes TOCTOU with a concurrent resolve).
-        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
-        chk = c.fetchone()
-        if not chk or chk["status"] != "proposed":
-            return None
-        c.execute(
-            """
-            INSERT INTO learnings
-            (agent_id, category, content, source_doc_ids, source_query,
-             confidence, embedding, created_at,
-             assertion, applies_when, evidence_doc_ids, contradicts_id, status,
-             content_hash)
-            VALUES (?, 'general', ?, NULL, 'afm-consolidation',
-                    ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
-            """,
-            (agent_id, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
+    try:
+        with wb.db.transaction() as c:
+            # Re-match the full prepared snapshot inside the txn — status
+            # alone cannot see a concurrent content/owner/privacy/evidence
+            # swap. Any drift leaves the candidate unresolved with zero
+            # learning, promote event, canonical, index, archive, or disk
+            # effects, and the review fence stays pending.
+            if not _row_matches_snapshot(c, candidate_id, prepared):
+                return None
+            c.execute(
+                """
+                INSERT INTO learnings
+                (agent_id, category, content, source_doc_ids, source_query,
+                 confidence, embedding, created_at,
+                 assertion, applies_when, evidence_doc_ids, contradicts_id, status,
+                 content_hash)
+                VALUES (?, 'general', ?, NULL, 'afm-consolidation',
+                        ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
+                """,
+                (agent_id, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
+            )
+            lid = c.lastrowid
+            # Atomic canonical identity: the node + join share this cursor.
+            # Owner is the candidate's existing owner (agent_id), matching the
+            # learning row — AFM never reassigns ownership. A None return
+            # (absent schema) tolerates the pre-graph baseline; a raise rolls
+            # back to zero partial writes and the proposal stays staged. A
+            # caller without its own config uses the committed store's config,
+            # never a separately resolved default/live store.
+            wb_config = getattr(wb, "config", None) or getattr(wb.db, "config", None)
+            vault_path = getattr(wb_config, "vault_path", None)
+            if vault_path is None:
+                context.logger.info(
+                    "AFM consolidation promote of candidate #%d proceeds "
+                    "without canonical node (no vault path configured)",
+                    candidate_id,
+                )
+            else:
+                ensure_canonical_learning_node(
+                    c,
+                    learning_id=lid,
+                    agent_id=agent_id,
+                    content=content,
+                    vault_path=vault_path,
+                    created_at=now,
+                )
+            c.execute(
+                """
+                UPDATE candidate_packets
+                SET status='accepted', resolved_at=?, resolved_by='afm-consolidation',
+                    resolution_reason=?
+                WHERE candidate_id=?
+                """,
+                (now, reason[:500], candidate_id),
+            )
+            # M5: retire the review fence with the candidate it fenced.
+            supersede_afm_review(c, candidate_id)
+            c.execute(
+                """
+                INSERT INTO consolidation_actions
+                (action_type, target_learning_id, claim, category, confidence,
+                 status, detail, created_at)
+                VALUES ('afm_promote', ?, ?, 'general', ?, 'applied', ?, ?)
+                """,
+                (lid, content[:200], 0.9, reason[:500], now),
+            )
+    except Exception as exc:
+        # The transaction rolled back: learning, accept mark, effects, and
+        # canonical rows are all gone, so the candidate is still proposed for
+        # the next pass. Never partially durable, never lost.
+        context.logger.warning(
+            "AFM consolidation promote of candidate #%d failed (%s); "
+            "proposal stays staged", candidate_id, exc,
         )
-        lid = c.lastrowid
-        c.execute(
-            """
-            UPDATE candidate_packets
-            SET status='accepted', resolved_at=?, resolved_by='afm-consolidation',
-                resolution_reason=?
-            WHERE candidate_id=?
-            """,
-            (now, reason[:500], candidate_id),
+        return None
+
+    # Post-commit index delivery (explicit db-bound mechanism). Fail-open by
+    # contract: the learning is already durable, so an index hiccup only
+    # degrades recall until repair — it never fails the promotion and never
+    # duplicates the write.
+    deliver = getattr(context, "index_durable_learning", None)
+    if deliver is None:
+        context.logger.debug(
+            "AFM consolidation promoted candidate #%d -> learning #%d "
+            "without index delivery (no callback; repair covers projection)",
+            candidate_id, lid,
         )
-        # M5: retire the review fence with the candidate it fenced.
-        supersede_afm_review(c, candidate_id)
-        c.execute(
-            """
-            INSERT INTO consolidation_actions
-            (action_type, target_learning_id, claim, category, confidence,
-             status, detail, created_at)
-            VALUES ('afm_promote', ?, ?, 'general', ?, 'applied', ?, ?)
-            """,
-            (lid, content[:200], 0.9, reason[:500], now),
-        )
+    else:
+        try:
+            indexed = deliver(agent_id, content, key=f"learning:{lid}", db=wb.db)
+            if indexed is not True and indexed is not None:
+                context.logger.warning(
+                    "AFM consolidation promoted candidate #%d -> learning #%d "
+                    "but semantic indexing is pending repair",
+                    candidate_id, lid,
+                )
+        except Exception as exc:
+            context.logger.warning(
+                "AFM consolidation promoted candidate #%d -> learning #%d; "
+                "index delivery failed (%s), repair covers projection",
+                candidate_id, lid, exc,
+            )
 
     try:
-        if wb.config.writeback_enabled:
+        if wb_config is not None and wb_config.writeback_enabled:
             wb._write_to_disk(lid, agent_id, "general", content, now)
     except Exception as exc:
         context.logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
