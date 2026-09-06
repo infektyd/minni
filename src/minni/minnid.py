@@ -888,6 +888,7 @@ def _afm_context() -> AFMContext:
         trace_ring=_trace_ring,
         record_latency=_record_latency,
         maybe_archive_inbox_source=_maybe_archive_inbox_source,
+        index_durable_learning=_index_durable_learning,
         increment_request_count=_increment_ops_request_count,
         writeback_ref=lambda: _writeback,
         sovereign_db=SovereignDB,
