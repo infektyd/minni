@@ -60,6 +60,19 @@ class ResolveRejected(Exception):
         self.response = response
 
 
+class _CanonicalCommitFailed(Exception):
+    """Canonical node/join write failed inside an acceptance transaction.
+
+    Caught by the accept path that raised it: the enclosing transaction has
+    already rolled back (zero partial durable writes), so the handler stages
+    the proposal for review instead of losing the learn.
+    """
+
+    def __init__(self, cause: Exception):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 # #290: ``auto_accept_own`` is OPERATOR CONFIGURATION, read from
 # principals/<id>.json. It is never read from wire params, and a caller that
 # supplies it is refused rather than ignored.
@@ -1008,7 +1021,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 emb_bytes = None
                 withheld = list(withheld) + ["durable-write preparation failed"]
 
-        with db.transaction() as c:
+        def _stage_proposal(c):
             c.execute(
                 """
                 INSERT INTO candidate_packets
@@ -1028,62 +1041,95 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                     now,
                 ),
             )
-            cid = c.lastrowid
-            if auto_accept and chash is not None:
-                # Inside the txn: a read-then-insert outside it races another
-                # auto-accept of the same content.
-                # Scoped to the caller, matching where the row is written. A
-                # global probe is an exact-match existence oracle over every
-                # agent's durable content, and the echoed "duplicate" reason
-                # confirms the hit — the same class this repo already closed on
-                # handle_learn's contradiction scan (R5, 2026-07-02 triage).
-                # status='active' matters: a superseded or rejected row is not
-                # a live duplicate, and matching it blocked re-learning content
-                # that no active learning carries any more — the correction
-                # machinery would have permanently poisoned the hash.
-                if has_active_learning_hash(c, chash, principal.agent_id):
-                    auto_accept = False
-                    withheld = ["duplicate of an existing learning"]
-            if auto_accept:
-                # 'general' matches both resolve_candidate and afm.py's
-                # promote, so the category cannot diverge by acceptance route.
-                #
-                # The OWNER does diverge, and it is worth being exact: a manual
-                # accept records the RESOLVER as agent_id, so a human accepting
-                # agent X's candidate produces a learning owned by the operator.
-                # This path records X. That is the intended reading of "the
-                # learnings are the agent's own" — and it is also why X can now
-                # own a learning at all, which is what made resolve_contradiction
-                # reachable and gave it the floor above.
-                c.execute(
-                    """
-                    INSERT INTO learnings
-                    (agent_id, category, content, created_at, embedding,
-                     content_hash, status)
-                    VALUES (?, 'general', ?, ?, ?, ?, 'active')
-                    """,
-                    (
-                        principal.agent_id, stored_content, now,
-                        emb_bytes, chash,
-                    ),
-                )
-                lid = c.lastrowid
-                c.execute(
-                    """
-                    UPDATE candidate_packets
-                    SET status='accepted', resolved_at=?, resolved_by=?,
-                        resolution_reason=?
-                    WHERE candidate_id=?
-                    """,
-                    (
-                        now,
-                        resolved_by,
-                        "auto_accept_own: operator-enabled auto-acceptance of the "
-                        "principal's own candidate (#290)",
-                        cid,
-                    ),
-                )
-                apply_accepted_candidate_effects(c, cid)
+            return c.lastrowid
+
+        try:
+            with db.transaction() as c:
+                cid = _stage_proposal(c)
+                if auto_accept and chash is not None:
+                    # Inside the txn: a read-then-insert outside it races another
+                    # auto-accept of the same content.
+                    # Scoped to the caller, matching where the row is written. A
+                    # global probe is an exact-match existence oracle over every
+                    # agent's durable content, and the echoed "duplicate" reason
+                    # confirms the hit — the same class this repo already closed on
+                    # handle_learn's contradiction scan (R5, 2026-07-02 triage).
+                    # status='active' matters: a superseded or rejected row is not
+                    # a live duplicate, and matching it blocked re-learning content
+                    # that no active learning carries any more — the correction
+                    # machinery would have permanently poisoned the hash.
+                    if has_active_learning_hash(c, chash, principal.agent_id):
+                        auto_accept = False
+                        withheld = ["duplicate of an existing learning"]
+                if auto_accept:
+                    # 'general' matches both resolve_candidate and afm.py's
+                    # promote, so the category cannot diverge by acceptance route.
+                    #
+                    # The OWNER does diverge, and it is worth being exact: a manual
+                    # accept records the RESOLVER as agent_id, so a human accepting
+                    # agent X's candidate produces a learning owned by the operator.
+                    # This path records X. That is the intended reading of "the
+                    # learnings are the agent's own" — and it is also why X can now
+                    # own a learning at all, which is what made resolve_contradiction
+                    # reachable and gave it the floor above.
+                    c.execute(
+                        """
+                        INSERT INTO learnings
+                        (agent_id, category, content, created_at, embedding,
+                         content_hash, status)
+                        VALUES (?, 'general', ?, ?, ?, ?, 'active')
+                        """,
+                        (
+                            principal.agent_id, stored_content, now,
+                            emb_bytes, chash,
+                        ),
+                    )
+                    lid = c.lastrowid
+                    # Atomic canonical identity: the node + join share this
+                    # cursor, so a mid-commit failure rolls the learning back
+                    # too. Owner is the proposer (principal), matching the
+                    # learning row. A None return (absent schema) tolerates the
+                    # pre-graph baseline; a raise rolls back and falls through
+                    # to proposal-only staging below.
+                    try:
+                        ensure_canonical_learning_node(
+                            c,
+                            learning_id=lid,
+                            agent_id=principal.agent_id,
+                            content=stored_content,
+                            vault_path=wb.config.vault_path,
+                            created_at=now,
+                        )
+                    except Exception as exc:
+                        raise _CanonicalCommitFailed(exc)
+                    c.execute(
+                        """
+                        UPDATE candidate_packets
+                        SET status='accepted', resolved_at=?, resolved_by=?,
+                            resolution_reason=?
+                        WHERE candidate_id=?
+                        """,
+                        (
+                            now,
+                            resolved_by,
+                            "auto_accept_own: operator-enabled auto-acceptance of the "
+                            "principal's own candidate (#290)",
+                            cid,
+                        ),
+                    )
+                    apply_accepted_candidate_effects(c, cid)
+        except _CanonicalCommitFailed as exc:
+            # Zero partial durable writes (the txn above rolled back); stage
+            # the proposal so the learn is routed to review, not lost.
+            context.logger.warning(
+                "auto_accept_own: canonical commit failed (%s); "
+                "staging as proposed instead (G15 audit)", exc.cause,
+            )
+            auto_accept = False
+            lid = None
+            withheld = list(withheld) + ["canonical commit failed"]
+            with db.transaction() as c2:
+                cid = _stage_proposal(c2)
 
         indexed_ok = True
         if lid is not None:
