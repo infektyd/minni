@@ -51,7 +51,9 @@ from minni.request_deadline import (
     RequestDeadlineExceeded,
     allow_expired_sql,
     bind_copied_deadline,
+    check_deadline,
     current_query_embed_cache,
+    request_deadline,
     run_bound,
 )
 
@@ -222,6 +224,7 @@ _DEGRADATION_STATE_ATTRS = {
     "vector": "vector_degraded",
     "hyde": "hyde_degraded",
     "document_hydration": "document_hydration_degraded",
+    "contradiction_sidecars": "contradiction_sidecars_degraded",
 }
 
 
@@ -250,6 +253,7 @@ class RetrievalCallState:
     vector_degraded: Optional[str] = None
     hyde_degraded: Optional[str] = None
     document_hydration_degraded: Optional[str] = None
+    contradiction_sidecars_degraded: Optional[str] = None
     # Cassandra RED-1 (#388): the trace id stamped onto this call's rows.
     # last_trace_id used to be a plain shared instance attribute, so two
     # both-scope legs running concurrently on the same engine overwrote and
@@ -318,6 +322,14 @@ class _ThreadLocalStateProxy:
     @document_hydration_degraded.setter
     def document_hydration_degraded(self, value: Optional[str]) -> None:
         self._engine.last_document_hydration_degraded = value
+
+    @property
+    def contradiction_sidecars_degraded(self) -> Optional[str]:
+        return self._engine.last_contradiction_sidecars_degraded
+
+    @contradiction_sidecars_degraded.setter
+    def contradiction_sidecars_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_contradiction_sidecars_degraded = value
 
     @property
     def trace_id(self) -> Optional[str]:
@@ -601,6 +613,42 @@ def _recommended_action(
     return "cite"
 
 
+# Graph P2.2: unresolved authorized contradictions overlay follow_up, but
+# never downgrade instruction-like escalate or terminal ignore.
+_PROTECTED_RECALL_ACTIONS = frozenset({"escalate", "ignore"})
+_MAX_GRAPH_CONTRADICTION_DOCS = 32
+_MAX_GRAPH_CONTRADICTION_SIDECARS = 4
+_GRAPH_CONTRADICTION_PAGE = 32
+_CONTRADICTION_SIDECARS_SKIPPED = "search deadline; skipped contradiction sidecars"
+_CONTRADICTION_SIDECARS_INCOMPLETE = (
+    "search deadline; contradiction sidecars incomplete"
+)
+
+
+def _contradiction_scan_expired(deadline_monotonic: Optional[float]) -> bool:
+    """True when the explicit retrieve deadline or request deadline is gone.
+
+    Sidecar paging checks this during and after work. Unlike
+    ``past_search_deadline`` this uses a zero leftover floor so an in-flight
+    scan stops at the caller's cutoff instead of draining the rest of the log.
+    """
+    remaining = remaining_search_budget(deadline_monotonic)
+    if remaining is not None and remaining <= 0:
+        return True
+    try:
+        check_deadline()
+    except RequestDeadlineExceeded:
+        return True
+    return False
+
+
+def overlay_contradiction_action(action: Optional[str]) -> str:
+    """Keep escalate/ignore; otherwise follow_up for an authorized contradiction."""
+    if action in _PROTECTED_RECALL_ACTIONS:
+        return str(action)
+    return "follow_up"
+
+
 class RetrievalEngine:
     """Hybrid FTS5 + FAISS semantic retrieval with cross-encoder re-ranking."""
 
@@ -830,6 +878,15 @@ class RetrievalEngine:
     def last_document_hydration_degraded(self, value: Optional[str]) -> None:
         self._set_degradation_flag("document_hydration", value)
 
+    @property
+    def last_contradiction_sidecars_degraded(self) -> Optional[str]:
+        """Contradiction sidecar scan hit the deadline or page budget."""
+        return self._degradation_flag("contradiction_sidecars")
+
+    @last_contradiction_sidecars_degraded.setter
+    def last_contradiction_sidecars_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("contradiction_sidecars", value)
+
     def _current_state(self) -> Any:
         """Innermost per-call state on THIS thread (never None).
 
@@ -875,6 +932,9 @@ class RetrievalEngine:
         self.last_vector_degraded = state.vector_degraded
         self.last_hyde_degraded = state.hyde_degraded
         self.last_document_hydration_degraded = state.document_hydration_degraded
+        self.last_contradiction_sidecars_degraded = (
+            state.contradiction_sidecars_degraded
+        )
         # RED-1: the call's own trace id (None when the merge never ran, e.g.
         # a raising variant — see the documented exception-path delta below).
         # Publish runs after the pop, so this lands in the thread-local slot.
@@ -2430,6 +2490,313 @@ class RetrievalEngine:
 
     # ── Depth-tier field filtering ─────────────────────────────
 
+    def _unresolved_graph_contradictions(
+        self,
+        doc_ids: Sequence[Any],
+        *,
+        principal: Optional[EffectivePrincipal],
+        workspace: str,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Dict[int, Tuple[Dict[str, Any], ...]]:
+        """Page authorized unresolved graph contradiction sidecars.
+
+        Keyset pages (not fetchall). Metadata IN lists stay page-sized.
+        Authorization is cached per doc and skipped for duplicate pairs.
+        Denied rows do not consume output slots. Deadline during/after work
+        keeps already-authorized sidecars and stamps incomplete degradation
+        instead of returning a complete empty map.
+        """
+        work = {
+            "log_rows_seen": 0,
+            "auth_checks": 0,
+            "metadata_ids": 0,
+            "pages": 0,
+            "incomplete": False,
+        }
+        self._last_graph_contradiction_work = work
+        if principal is None:
+            return {}
+        ids: List[int] = []
+        seen = set()
+        for raw in doc_ids:
+            try:
+                doc_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            ids.append(doc_id)
+            if len(ids) >= _MAX_GRAPH_CONTRADICTION_DOCS:
+                break
+        if not ids:
+            return {}
+
+        def _stamp(reason: str) -> None:
+            work["incomplete"] = True
+            self.last_contradiction_sidecars_degraded = reason
+
+        if _contradiction_scan_expired(deadline_monotonic):
+            _stamp(_CONTRADICTION_SIDECARS_SKIPPED)
+            return {}
+
+        with request_deadline(deadline_monotonic):
+            return self._page_graph_contradictions(
+                ids,
+                principal=principal,
+                workspace=workspace,
+                deadline_monotonic=deadline_monotonic,
+                work=work,
+                stamp=_stamp,
+            )
+
+    def _page_graph_contradictions(
+        self,
+        ids: List[int],
+        *,
+        principal: EffectivePrincipal,
+        workspace: str,
+        deadline_monotonic: Optional[float],
+        work: Dict[str, Any],
+        stamp,
+    ) -> Dict[int, Tuple[Dict[str, Any], ...]]:
+        placeholders = ",".join("?" * len(ids))
+        attached: Dict[int, List[Dict[str, Any]]] = {doc_id: [] for doc_id in ids}
+        meta_by_id: Dict[int, Dict[str, Any]] = {}
+        auth_cache: Dict[int, bool] = {}
+        pair_seen: set = set()
+        after_id = 0
+        ws = workspace or getattr(principal, "workspace_id", "default") or "default"
+        conn = self.db._get_conn()
+        nested = bool(getattr(conn, "in_transaction", False))
+        cur = conn.cursor()
+        savepoint = f"minni_graph_contra_{id(cur) & 0xFFFFFFFF:x}"
+        started = False
+
+        def _buckets_full() -> bool:
+            return all(
+                len(attached[doc_id]) >= _MAX_GRAPH_CONTRADICTION_SIDECARS
+                for doc_id in ids
+            )
+
+        def _load_meta(needed: List[int]) -> bool:
+            fresh = []
+            seen_need = set()
+            for doc_id in needed:
+                if doc_id in meta_by_id or doc_id in seen_need:
+                    continue
+                seen_need.add(doc_id)
+                fresh.append(doc_id)
+            if not fresh:
+                return True
+            for offset in range(0, len(fresh), _GRAPH_CONTRADICTION_PAGE):
+                if _contradiction_scan_expired(deadline_monotonic):
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+                chunk = fresh[offset:offset + _GRAPH_CONTRADICTION_PAGE]
+                marks = ",".join("?" * len(chunk))
+                try:
+                    for doc in cur.execute(
+                        f"""SELECT doc_id, path, agent, privacy_level,
+                                   page_status, page_type, memory_kind
+                            FROM documents WHERE doc_id IN ({marks})""",
+                        chunk,
+                    ).fetchall():
+                        meta_by_id[int(doc["doc_id"])] = {
+                            "doc_id": doc["doc_id"],
+                            "path": doc["path"],
+                            "agent": doc["agent"],
+                            "privacy_level": doc["privacy_level"],
+                            "page_status": doc["page_status"],
+                            "page_type": doc["page_type"],
+                            "memory_kind": doc["memory_kind"],
+                        }
+                        work["metadata_ids"] += 1
+                except RequestDeadlineExceeded:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+                except sqlite3.OperationalError:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+                if _contradiction_scan_expired(deadline_monotonic):
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    return False
+            return True
+
+        def _readable(doc_id: int) -> Optional[bool]:
+            cached = auth_cache.get(doc_id)
+            if cached is not None:
+                return cached
+            if _contradiction_scan_expired(deadline_monotonic):
+                stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                return None
+            meta = meta_by_id.get(doc_id)
+            work["auth_checks"] += 1
+            allowed = False
+            if meta is not None:
+                try:
+                    allowed = bool(can_read_document(principal, ws, meta))
+                except Exception:
+                    allowed = False
+            auth_cache[doc_id] = allowed
+            if _contradiction_scan_expired(deadline_monotonic):
+                stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+            return allowed
+
+        try:
+            if nested:
+                cur.execute(f"SAVEPOINT {savepoint}")
+            else:
+                cur.execute("BEGIN DEFERRED")
+            started = True
+            while not _buckets_full():
+                if _contradiction_scan_expired(deadline_monotonic):
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    break
+                try:
+                    page = cur.execute(
+                        f"""SELECT id, memory_a_id, source_doc_id, target_doc_id,
+                                   edge_run_id, confidence, detection_method
+                            FROM contradiction_log
+                            WHERE resolution_status = 'unresolved'
+                              AND id > ?
+                              AND (source_doc_id IN ({placeholders})
+                                   OR target_doc_id IN ({placeholders}))
+                            ORDER BY id ASC
+                            LIMIT ?""",
+                        (after_id, *ids, *ids, _GRAPH_CONTRADICTION_PAGE),
+                    ).fetchall()
+                except RequestDeadlineExceeded:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    break
+                except sqlite3.OperationalError:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    break
+                except Exception as exc:
+                    stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                    logger.debug("graph contradictions: log query skipped (%s)", exc)
+                    break
+                work["pages"] += 1
+                if not page:
+                    break
+                after_id = int(page[-1]["id"])
+                needed: List[int] = []
+                parsed_page = []
+                for row in page:
+                    work["log_rows_seen"] += 1
+                    try:
+                        source_id = (
+                            int(row["source_doc_id"])
+                            if row["source_doc_id"] is not None else None
+                        )
+                        target_id = (
+                            int(row["target_doc_id"])
+                            if row["target_doc_id"] is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if source_id is None or target_id is None:
+                        continue
+                    pair_key = (
+                        source_id, target_id
+                    ) if source_id <= target_id else (target_id, source_id)
+                    if pair_key in pair_seen:
+                        continue
+                    need_source = (
+                        source_id in attached
+                        and len(attached[source_id]) < _MAX_GRAPH_CONTRADICTION_SIDECARS
+                    )
+                    need_target = (
+                        target_id in attached
+                        and len(attached[target_id]) < _MAX_GRAPH_CONTRADICTION_SIDECARS
+                    )
+                    if not need_source and not need_target:
+                        continue
+                    parsed_page.append((row, source_id, target_id, pair_key))
+                    if source_id not in meta_by_id:
+                        needed.append(source_id)
+                    if target_id not in meta_by_id:
+                        needed.append(target_id)
+                if not _load_meta(needed):
+                    break
+                stop = False
+                for row, source_id, target_id, pair_key in parsed_page:
+                    if pair_key in pair_seen:
+                        continue
+                    pair_seen.add(pair_key)
+                    source_ok = _readable(source_id)
+                    if source_ok is None:
+                        stop = True
+                        break
+                    target_ok = _readable(target_id)
+                    if target_ok is None:
+                        stop = True
+                        break
+                    if not source_ok or not target_ok:
+                        continue
+                    confidence = row["confidence"]
+                    try:
+                        confidence = (
+                            float(confidence) if confidence is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        confidence = None
+                    if confidence is not None and not math.isfinite(confidence):
+                        confidence = None
+                    sidecar = {
+                        "id": int(row["id"]),
+                        "confidence": confidence,
+                        "detection_method": row["detection_method"],
+                        "edge_run_id": row["edge_run_id"],
+                        "graph_path": {
+                            "link_type": "contradicts",
+                            "source_doc_id": source_id,
+                            "target_doc_id": target_id,
+                        },
+                    }
+                    for node_id, counterpart in (
+                        (source_id, target_id),
+                        (target_id, source_id),
+                    ):
+                        bucket = attached.get(node_id)
+                        if bucket is None:
+                            continue
+                        if len(bucket) >= _MAX_GRAPH_CONTRADICTION_SIDECARS:
+                            continue
+                        if any(item["id"] == sidecar["id"] for item in bucket):
+                            continue
+                        bucket.append({**sidecar, "counterpart_doc_id": counterpart})
+                    if _buckets_full():
+                        break
+                    if _contradiction_scan_expired(deadline_monotonic):
+                        stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+                        stop = True
+                        break
+                if stop or _buckets_full():
+                    break
+                if len(page) < _GRAPH_CONTRADICTION_PAGE:
+                    break
+        except RequestDeadlineExceeded:
+            stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+        except sqlite3.OperationalError:
+            stamp(_CONTRADICTION_SIDECARS_INCOMPLETE)
+        finally:
+            try:
+                if started:
+                    if nested:
+                        sqlite3.Cursor.execute(cur, f"ROLLBACK TO SAVEPOINT {savepoint}")
+                        sqlite3.Cursor.execute(cur, f"RELEASE SAVEPOINT {savepoint}")
+                    else:
+                        conn.rollback()
+            finally:
+                cur.close()
+
+        return {
+            doc_id: tuple(items)
+            for doc_id, items in attached.items()
+            if items
+        }
+
     def _apply_depth(self, result: Dict, depth: str) -> Dict:
         """
         Filter a result dict to only the fields appropriate for *depth*.
@@ -2464,6 +2831,8 @@ class RetrievalEngine:
                 "attribution_score": result.get("attribution_score"),
                 "attribution_model": result.get("attribution_model"),
             }
+            if result.get("contradictions"):
+                fields["contradictions"] = result.get("contradictions")
             if result.get("full_provenance") is not None:
                 fields["full_provenance"] = result.get("full_provenance")
             # Only include provenance if not already in existing dict
@@ -2498,6 +2867,8 @@ class RetrievalEngine:
                 "wikilink": result.get("wikilink"),
                 "depth": "headline",
             }
+            if result.get("contradictions"):
+                out["contradictions"] = result.get("contradictions")
             if result.get("provenance") is not None:
                 out["provenance"] = result["provenance"]
             return out
@@ -3609,6 +3980,7 @@ class RetrievalEngine:
         state.vector_degraded = None
         state.hyde_degraded = None
         state.document_hydration_degraded = None
+        state.contradiction_sidecars_degraded = None
         self._reset_encode_ms()
         self._set_current_deadline(deadline_monotonic)
         if past_search_deadline(deadline_monotonic):
@@ -3637,6 +4009,7 @@ class RetrievalEngine:
             variant_vector_degraded: List[str] = []
             variant_hyde_degraded: List[str] = []
             variant_document_hydration_degraded: List[str] = []
+            variant_contradiction_sidecars_degraded: List[str] = []
             # perf/parallel-fanout (#388): one isolated state per variant,
             # gathered in submission order (pool.map preserves it), so the
             # merge and every aggregation string below are deterministic and
@@ -3705,6 +4078,10 @@ class RetrievalEngine:
                 if child.document_hydration_degraded:
                     variant_document_hydration_degraded.append(
                         f"{variant}: {child.document_hydration_degraded}"
+                    )
+                if child.contradiction_sidecars_degraded:
+                    variant_contradiction_sidecars_degraded.append(
+                        f"{variant}: {child.contradiction_sidecars_degraded}"
                     )
 
             def _should_drop_deadline_child(
@@ -3868,6 +4245,11 @@ class RetrievalEngine:
             state.document_hydration_degraded = (
                 "; ".join(variant_document_hydration_degraded)
                 if variant_document_hydration_degraded
+                else None
+            )
+            state.contradiction_sidecars_degraded = (
+                "; ".join(variant_contradiction_sidecars_degraded)
+                if variant_contradiction_sidecars_degraded
                 else None
             )
             # Aggregate: any variant whose non-empty candidate set was gated to
@@ -4578,6 +4960,13 @@ class RetrievalEngine:
         from minni.scoring import compute_confidence
         from minni.rationale import explain
 
+        contradiction_sidecars = self._unresolved_graph_contradictions(
+            [row.get("doc_id") for row in merged],
+            principal=principal,
+            workspace=workspace,
+            deadline_monotonic=deadline_monotonic,
+        )
+
         results = []
         for r in merged:
             # Build a rich intermediate dict with all raw fields available.
@@ -4755,6 +5144,17 @@ class RetrievalEngine:
             }
             if r.get("full_provenance") is not None:
                 raw["full_provenance"] = r.get("full_provenance")
+            graph_pairs = contradiction_sidecars.get(int(r["doc_id"])) if r.get("doc_id") is not None else None
+            if graph_pairs:
+                raw["contradictions"] = graph_pairs
+                raw["recommended_action"] = overlay_contradiction_action(
+                    raw.get("recommended_action")
+                )
+                if isinstance(provenance, dict):
+                    provenance["contradictions"] = tuple(
+                        {"id": item["id"], "confidence": item.get("confidence")}
+                        for item in graph_pairs
+                    )
 
             # Rationale is computed after provenance is assembled
             try:
@@ -4787,6 +5187,10 @@ class RetrievalEngine:
                     raw["recommended_action"] = _recommended_action(
                         raw.get("review_state"), doc_flag, raw.get("confidence")
                     )
+                    if raw.get("contradictions"):
+                        raw["recommended_action"] = overlay_contradiction_action(
+                            raw.get("recommended_action")
+                        )
                     if claim_text and not past_search_deadline(deadline_monotonic):
                         attribution = self._score_attribution(claim_text, full_text)
                         if attribution is not None:

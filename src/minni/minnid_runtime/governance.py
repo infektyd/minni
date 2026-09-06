@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -11,7 +12,12 @@ from minni.afm_review_markers import supersede_afm_review
 from minni.db import SovereignDB
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.migrations import _candidate_status_check_allows_dns_log_only
-from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
+from minni.principal import (
+    EffectivePrincipal,
+    can_read_document,
+    is_operator_principal,
+    validate_agent_id,
+)
 from minni.safety import is_instruction_like
 
 from .redaction import redact_value
@@ -578,6 +584,241 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         return context.make_error(-32000, f"Resolve contradiction error: {exc}", request_id)
 
 
+_GRAPH_SUBSCRIBE_PAGE = 32
+_GRAPH_SUBSCRIBE_MAX_EVENTS = 32
+
+
+def _graph_contradiction_events_for_reads(
+    cursor: Any,
+    *,
+    agent_id: str,
+    event_since: float,
+    read_since: Optional[float],
+    principal: EffectivePrincipal,
+) -> tuple[list[dict], dict]:
+    """Page unresolved graph contradiction_log rows via learning_reads.
+
+    Bounded keyset pages, bounded metadata IN lists, cached authorization.
+    Duplicate pairs are skipped. Denied counterparts do not consume the
+    result cap. Exhausted page/time budget sets incomplete rather than
+    dropping already-authorized events.
+    """
+    from minni.request_deadline import RequestDeadlineExceeded, check_deadline
+
+    work = {
+        "log_rows_seen": 0,
+        "auth_checks": 0,
+        "pages": 0,
+        "incomplete": False,
+    }
+    clauses = [
+        "cl.resolution_status = 'unresolved'",
+        "cl.detected_at >= ?",
+        "lr.agent_id = ?",
+        "cl.source_doc_id IS NOT NULL",
+        "cl.target_doc_id IS NOT NULL",
+    ]
+    base_params: list = [event_since, agent_id]
+    if read_since is not None:
+        clauses.append("lr.read_at >= ?")
+        base_params.append(read_since)
+    where_sql = " AND ".join(clauses)
+    workspace = getattr(principal, "workspace_id", "default") or "default"
+    events: list[dict] = []
+    meta_by_id: dict[int, dict] = {}
+    auth_cache: dict[int, bool] = {}
+    pair_seen: set = set()
+    seen_logs: set = set()
+    cursor_ts = float(event_since)
+    cursor_id = 0
+
+    def _expired() -> bool:
+        try:
+            check_deadline()
+        except RequestDeadlineExceeded:
+            return True
+        except Exception:
+            return False
+        return False
+
+    def _readable(doc_id: Any) -> Optional[bool]:
+        try:
+            key = int(doc_id)
+        except (TypeError, ValueError):
+            return False
+        cached = auth_cache.get(key)
+        if cached is not None:
+            return cached
+        if _expired():
+            work["incomplete"] = True
+            return None
+        meta = meta_by_id.get(key)
+        work["auth_checks"] += 1
+        allowed = False
+        if meta is not None:
+            try:
+                allowed = bool(can_read_document(principal, workspace, meta))
+            except Exception:
+                allowed = False
+        auth_cache[key] = allowed
+        if _expired():
+            work["incomplete"] = True
+        return allowed
+
+    while len(events) < _GRAPH_SUBSCRIBE_MAX_EVENTS:
+        if _expired():
+            work["incomplete"] = True
+            break
+        params = list(base_params) + [cursor_ts, cursor_ts, cursor_id, _GRAPH_SUBSCRIBE_PAGE]
+        try:
+            page = cursor.execute(
+                f"""
+                SELECT DISTINCT
+                       cl.id AS log_id,
+                       cl.memory_a_id,
+                       cl.source_doc_id,
+                       cl.target_doc_id,
+                       cl.confidence,
+                       cl.detection_method,
+                       cl.edge_run_id,
+                       cl.detected_at
+                FROM contradiction_log cl
+                JOIN learning_documents ld
+                  ON ld.doc_id IN (cl.source_doc_id, cl.target_doc_id)
+                JOIN learning_reads lr
+                  ON lr.learning_id = ld.learning_id
+                WHERE {where_sql}
+                  AND (cl.detected_at > ?
+                       OR (cl.detected_at = ? AND cl.id > ?))
+                ORDER BY cl.detected_at ASC, cl.id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        except RequestDeadlineExceeded:
+            work["incomplete"] = True
+            break
+        except sqlite3.OperationalError:
+            work["incomplete"] = True
+            break
+        except Exception:
+            work["incomplete"] = True
+            break
+        work["pages"] += 1
+        if not page:
+            break
+        needed: list[int] = []
+        parsed = []
+        for row in page:
+            work["log_rows_seen"] += 1
+            try:
+                source_id = int(row["source_doc_id"])
+                target_id = int(row["target_doc_id"])
+                log_id = int(row["log_id"])
+            except (TypeError, ValueError):
+                continue
+            if log_id in seen_logs:
+                continue
+            pair_key = (
+                (source_id, target_id) if source_id <= target_id
+                else (target_id, source_id)
+            )
+            if pair_key in pair_seen:
+                continue
+            parsed.append((row, source_id, target_id, pair_key, log_id))
+            if source_id not in meta_by_id:
+                needed.append(source_id)
+            if target_id not in meta_by_id:
+                needed.append(target_id)
+        last = page[-1]
+        cursor_ts = float(last["detected_at"] or cursor_ts)
+        cursor_id = int(last["log_id"])
+        fresh = []
+        seen_need = set()
+        for doc_id in needed:
+            if doc_id in meta_by_id or doc_id in seen_need:
+                continue
+            seen_need.add(doc_id)
+            fresh.append(doc_id)
+        for offset in range(0, len(fresh), _GRAPH_SUBSCRIBE_PAGE):
+            if _expired():
+                work["incomplete"] = True
+                break
+            chunk = fresh[offset:offset + _GRAPH_SUBSCRIBE_PAGE]
+            marks = ",".join("?" * len(chunk))
+            try:
+                for doc in cursor.execute(
+                    f"""SELECT doc_id, path, agent, privacy_level, page_status,
+                               page_type, memory_kind
+                        FROM documents WHERE doc_id IN ({marks})""",
+                    chunk,
+                ).fetchall():
+                    meta_by_id[int(doc["doc_id"])] = {
+                        "doc_id": doc["doc_id"],
+                        "path": doc["path"],
+                        "agent": doc["agent"],
+                        "privacy_level": doc["privacy_level"],
+                        "page_status": doc["page_status"],
+                        "page_type": doc["page_type"],
+                        "memory_kind": doc["memory_kind"],
+                    }
+            except RequestDeadlineExceeded:
+                work["incomplete"] = True
+                break
+            except sqlite3.OperationalError:
+                work["incomplete"] = True
+                break
+            except Exception:
+                work["incomplete"] = True
+                break
+        if work["incomplete"] and not parsed:
+            break
+        stop = False
+        for row, source_id, target_id, pair_key, log_id in parsed:
+            if len(events) >= _GRAPH_SUBSCRIBE_MAX_EVENTS:
+                work["incomplete"] = True
+                stop = True
+                break
+            pair_seen.add(pair_key)
+            seen_logs.add(log_id)
+            source_ok = _readable(source_id)
+            if source_ok is None:
+                stop = True
+                break
+            target_ok = _readable(target_id)
+            if target_ok is None:
+                stop = True
+                break
+            if not source_ok or not target_ok:
+                continue
+            confidence = row["confidence"]
+            try:
+                confidence = float(confidence) if confidence is not None else None
+            except (TypeError, ValueError):
+                confidence = None
+            if confidence is not None and not math.isfinite(confidence):
+                confidence = None
+            events.append({
+                "event_id": f"graph:{log_id}",
+                "kind": "graph",
+                "source_doc_id": source_id,
+                "target_doc_id": target_id,
+                "memory_a_id": row["memory_a_id"],
+                "confidence": confidence,
+                "detection_method": row["detection_method"],
+                "created_at": row["detected_at"],
+            })
+        if stop:
+            break
+        if len(page) < _GRAPH_SUBSCRIBE_PAGE:
+            break
+        if len(events) >= _GRAPH_SUBSCRIBE_MAX_EVENTS:
+            work["incomplete"] = True
+            break
+    _graph_contradiction_events_for_reads.last_work = work  # type: ignore[attr-defined]
+    return events, work
+
+
 def handle_subscribe_contradictions(params: dict, request_id: Any, context: GovernanceContext) -> dict:
     """Return contradiction events for learnings recently read by an agent.
 
@@ -681,6 +922,13 @@ def handle_subscribe_contradictions(params: dict, request_id: Any, context: Gove
                 "SELECT COUNT(*) AS n FROM learning_reads WHERE agent_id = ?",
                 (agent_id,),
             ).fetchone()["n"]
+            graph_events, graph_work = _graph_contradiction_events_for_reads(
+                c,
+                agent_id=agent_id,
+                event_since=event_since,
+                read_since=read_since,
+                principal=principal,
+            )
         events = [
             {
                 "event_id": row["event_id"],
@@ -691,18 +939,29 @@ def handle_subscribe_contradictions(params: dict, request_id: Any, context: Gove
             }
             for row in rows
         ]
+        events.extend(graph_events)
+        events.sort(key=lambda item: (item.get("created_at") or 0, str(item.get("event_id"))))
+        graph_incomplete = bool(graph_work.get("incomplete"))
+        if events:
+            status = "matched"
+        elif graph_incomplete:
+            status = "checked_incomplete"
+        else:
+            status = "checked_no_match"
+        checked = {
+            "contradiction_events_for_agent_reads": agent_events,
+            "learning_reads_for_agent": reads_for_agent,
+            "event_window_days": event_window_days,
+            "read_window_hours": read_window_hours,
+            "since_ts": since_ts,
+            "event_since": event_since,
+            "graph_scan_incomplete": graph_incomplete,
+        }
         return context.make_response({
             "agent_id": agent_id,
             "events": events,
-            "status": "matched" if events else "checked_no_match",
-            "checked": {
-                "contradiction_events_for_agent_reads": agent_events,
-                "learning_reads_for_agent": reads_for_agent,
-                "event_window_days": event_window_days,
-                "read_window_hours": read_window_hours,
-                "since_ts": since_ts,
-                "event_since": event_since,
-            },
+            "status": status,
+            "checked": checked,
         }, request_id)
     except Exception as exc:
         context.logger.exception("subscribe_contradictions failed")

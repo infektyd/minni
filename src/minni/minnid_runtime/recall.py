@@ -452,6 +452,7 @@ def _degradation_for(
         ("last_query_expand_degraded", "query_expand_degraded"),
         ("last_hyde_degraded", "hyde_degraded"),
         ("last_document_hydration_degraded", "document_hydration_degraded"),
+        ("last_contradiction_sidecars_degraded", "contradiction_sidecars_degraded"),
     ):
         value = getattr(retrieval_engine, flag, None)
         if value:
@@ -1198,7 +1199,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         def record_scores():
             try:
                 from minni.rationale import explain
-                from minni.retrieval import _recommended_action
+                from minni.retrieval import _recommended_action, overlay_contradiction_action
                 from minni.scoring import calibrated_confidence, record_score
 
                 # grok-review round 6 (finding 1): TWO passes. Recording and
@@ -1249,16 +1250,19 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     # old value so one payload has one meaning of confidence.
                     if "recommended_action" in r:
                         try:
-                            r["recommended_action"] = _recommended_action(
+                            action = _recommended_action(
                                 r.get("review_state"),
                                 r.get("instruction_like"),
                                 r.get("confidence"),
                             )
+                            if r.get("contradictions"):
+                                action = overlay_contradiction_action(action)
+                            r["recommended_action"] = action
                         except RequestDeadlineExceeded:
                             raise
-                        except Exception as exc:
+                        except Exception as extra:
                             context.logger.debug(
-                                "search: recommended_action refresh failed: %s", exc
+                                "search: recommended_action refresh failed: %s", extra
                             )
                     if "rationale" in r:
                         try:
