@@ -2229,6 +2229,14 @@ type DrainKickEntry = {
 
 const drainKicks = new Map<string, DrainKickEntry>();
 
+/**
+ * Owned in-flight kick promises, keyed like drainKicks. Test-support join
+ * only: production keeps fire-and-forget kick semantics, and this map never
+ * selects, authorizes, or steers work. Entries are deleted when their chain
+ * (including any follow-up re-kick registration) completes.
+ */
+const drainTasks = new Map<string, Promise<boolean>>();
+
 function drainKickKey(vaultPath: string, planId: string): string {
   return `${path.resolve(vaultPath)}\0${planId}`;
 }
@@ -2397,7 +2405,7 @@ export function kickWorkerWriteDrain(
     followUpFull: false,
   };
   drainKicks.set(key, entry);
-  void drainWorkerWrites(input, deps, {
+  const task = drainWorkerWrites(input, deps, {
     oneShotYield: options.oneShotYield === true,
   })
     .catch(() => {
@@ -2407,6 +2415,7 @@ export function kickWorkerWriteDrain(
     })
     .then((yieldedLive) => {
       drainKicks.delete(key);
+      drainTasks.delete(key);
       // One-shot yielded a live start: do not apply it here. Orch may still
       // reserve. Standing drain must not apply a live start in that window
       // while the acceptor is live. Later drainWorkerWrites / post-replan
@@ -2414,7 +2423,38 @@ export function kickWorkerWriteDrain(
       if (entry.followUpFull && yieldedLive !== true) {
         kickWorkerWriteDrain(input, deps);
       }
+      return yieldedLive;
     });
+  // Same fire-and-forget production semantics: the chain is tracked for the
+  // test-support join below, never awaited here.
+  drainTasks.set(key, task);
+  void task;
+}
+
+/**
+ * Test-support join for owned in-process kick drains. Awaits every tracked
+ * kick task for the vault (optionally one plan), including follow-up
+ * re-kicks registered as a chain completes, so trailing writes (progress
+ * record, lock release) have landed before teardown rm. Production callers
+ * must keep using fire-and-forget kick semantics; this join selects and
+ * authorizes nothing. Do not call while holding the plan lock: an in-flight
+ * drain waiting on that lock only resolves at its own deadline.
+ */
+export async function joinWorkerWriteDrains(
+  vaultPath: string,
+  planId?: string,
+): Promise<void> {
+  const prefix = `${path.resolve(vaultPath)}\0`;
+  const want = (key: string): boolean =>
+    planId === undefined ? key.startsWith(prefix) : key === `${prefix}${planId}`;
+  for (;;) {
+    const pending: Array<Promise<boolean>> = [];
+    for (const [key, task] of drainTasks) {
+      if (want(key)) pending.push(task);
+    }
+    if (pending.length === 0) return;
+    await Promise.allSettled(pending);
+  }
 }
 
 /**
@@ -2560,27 +2600,34 @@ async function drainOneQueuedWorkerWrite(
     });
     return false;
   }
-  const token = await claimTokenFromExistingStore(
-    input.vaultPath,
-    lockedPlan,
-    item,
-  );
-  const mapped: UpdateClaimedSliceInput = {
-    vaultPath: input.vaultPath,
-    notePath: input.notePath,
-    planId: item.planId,
-    sliceId: item.sliceId,
-    workerAgentId: item.workerAgentId,
-    token,
-    idempotencyKey: item.idempotencyKey,
-    action: item.action as WorkerUpdateAction,
-    now:
-      (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
-      input.now,
-  };
+  // One claim-helper session per live ticket: the token lookup and the apply
+  // below share this scope instead of starting/stopping a helper each. The
+  // scope is created fresh for this one ticket inside this one lock
+  // acquisition — never shared across tickets, requests, or lock holdings —
+  // and every logical vault location is still reopened/validated per call.
   // Fail-closed: apply throw must not reach removeQueuedWorkerWrite.
   // Dropping the ticket lets a later complete persist done with no start.
-  await applyClaimedSliceOnLockedPlan(mapped, deps);
+  await withClaimFsScope(async () => {
+    const token = await claimTokenFromExistingStore(
+      input.vaultPath,
+      lockedPlan,
+      item,
+    );
+    const mapped: UpdateClaimedSliceInput = {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId: item.planId,
+      sliceId: item.sliceId,
+      workerAgentId: item.workerAgentId,
+      token,
+      idempotencyKey: item.idempotencyKey,
+      action: item.action as WorkerUpdateAction,
+      now:
+        (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
+        input.now,
+    };
+    await applyClaimedSliceOnLockedPlan(mapped, deps);
+  });
   await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
   const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const next = leftover[0];

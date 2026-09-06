@@ -1,7 +1,9 @@
+import concurrent.futures
 import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -21,6 +23,40 @@ from .redaction import redact_text, redact_value
 
 
 logger = logging.getLogger("minnid")
+
+# perf/parallel-fanout (issue #388): bounded width + kill-switch for the
+# corpus-leg fan-out below (per-vault legs plus the shared tail gathered by
+# _combined_leg_results; scope "both" still runs personal first, then the
+# combined batch, exactly as serial). Each fan-out site creates its own
+# pool on demand and drains it on gather: legs run per-variant fan-outs of
+# their own inside RetrievalEngine.retrieve, so a single shared pool could
+# deadlock once leg tasks occupy every worker while their variant subtasks
+# queue behind them (see retrieval.py). Set RECALL_LEG_PARALLEL = False for
+# the legacy serial leg order (bit-identical).
+# Deadline guard (correctness over speed): the leg pool engages ONLY when
+# deadline_monotonic is None — the same gate as retrieval's variant pool.
+# handle_search stamps a deadline on EVERY RPC, so production corpus legs
+# always run the serial loop and keep origin/main's remaining-budget
+# truncation (a serial leg observes time its predecessors consumed; parallel
+# legs would each start with a fuller budget and truncate differently,
+# changing result content). The pool path exists for deadline-free callers
+# (unit tests, operator tools) and carries NO RPC latency claim.
+# Cassandra YELLOW-3b: per-site cap is 4 — leg pools compound with the
+# per-variant pools inside every leg (see retrieval._MAX_VARIANT_WORKERS),
+# so 8-wide sites fielded 60+ threads per both-scope search. At 4/4 the
+# worst case is ~30 threads (2 legs + 4 vault legs x 4 variant workers +
+# tails); queueing absorbs wider vault sets with identical merge order.
+_MAX_LEG_WORKERS = 4
+RECALL_LEG_PARALLEL = True
+
+# Sentinel: a leg that NEVER executed the shared engine (e.g. a personal
+# vault leg that hit, so no shared fallback ran) contributes no trace. The
+# envelope then reads the handler thread's thread-local slot — exactly what
+# the serial code observed there (a stale id or None). A shared leg that
+# RAN and failed is NOT this sentinel: retrieve_shared_soft returns None
+# (the published partial) so the envelope is None, never a stale id from a
+# previous request on the reused handler thread.
+_SHARED_TRACE_NOT_RUN = object()
 
 # Plugin DEFAULT_JSON_RPC_TIMEOUT_MS is 30_000. Search runs in to_thread and
 # cannot be cancelled; finish inside the client kill or the worker keeps
@@ -162,6 +198,57 @@ def _strip_private_search_keys(results: list) -> None:
             continue
         row.pop(_QTY_ENGINE_KEY, None)
         row.pop(_DEADLINE_POISONED_KEY, None)
+
+
+def _gather_leg_results(callables: list, deadline_monotonic) -> list:
+    """Run leg callables, in parallel when enabled, preserving order.
+
+    perf/parallel-fanout (#388): pool.map preserves submission order, so
+    merges and diagnostic sinks observe exactly the serial leg order.
+    Single-leg calls skip the pool (zero overhead, same code path as the
+    kill-switch-off serial loop).
+
+    Deadline guard (correctness over speed): the pool engages ONLY when
+    deadline_monotonic is None — the same gate as retrieval's variant
+    pool. handle_search stamps a deadline on EVERY RPC, so production
+    corpus legs always run the serial loop and keep origin/main's
+    remaining-budget truncation. No RPC latency is claimed for this pool.
+
+    Raise semantics (defensive-only: production legs soft-fail by
+    construction — per-vault try/except plus soft shared tails — so a
+    raising pooled leg is unreachable via handle_search). pool.map
+    submits EVERY leg eagerly at entry, unlike the serial loop, which
+    never starts legs past a raise — never claim a serial abort for the
+    pool. On a raise, list(map) yields in submission order, so the
+    gather waits for the slowest STARTED sibling before the first error
+    surfaces, and the pool join on context exit waits for every started
+    worker; a worker that picks up a queued leg runs it to completion
+    (pool.map can only cancel legs that never started). The
+    submission-order-first error propagates — the serial raise's
+    identity at the envelope. Completed siblings' sink ops are dropped
+    with the batch (no partial replay; both paths land in the outer
+    except as −32000, which carries no per-leg diagnostics), while
+    below-envelope residue stands (trace-ring entries a completed
+    sibling wrote on its worker). No access_count writes happen on this
+    path: legs retrieve with update_access=False and the merged-set qty
+    bump runs only after a successful gather. Explicit fail-fast
+    cancellation was rejected: as_completed could surface a LATER leg's
+    error first, breaking the serial-raise identity for zero gain (leg
+    bodies are not cancellable work). Pinned by test_leg_gather_* in
+    tests/test_parallel_fanout_red.py.
+    """
+    use_leg_pool = (
+        RECALL_LEG_PARALLEL
+        and len(callables) > 1
+        and deadline_monotonic is None
+    )
+    if use_leg_pool:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_MAX_LEG_WORKERS, len(callables)),
+            thread_name_prefix="minni-leg",
+        ) as _leg_pool:
+            return list(_leg_pool.map(lambda fn: fn(), callables))
+    return [fn() for fn in callables]
 
 
 def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
@@ -523,6 +610,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # Shared fallback and failed calls retain their existing retry behavior.
         personal_snapshot = None
         retrieval_trace_ids: list[str] = []
+        _snapshot_lock = threading.Lock()
+        _personal_snapshot_ready = threading.Event()
+        if document_scope != "both":
+            _personal_snapshot_ready.set()
 
         def record_shared(entry: dict, *, bucket: str, sink: list) -> None:
             key = json.dumps(entry, sort_keys=True, default=str)
@@ -530,6 +621,39 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 return
             _shared_seen[bucket].add(key)
             sink.append(entry)
+
+        def _replay_leg_ops(ops: list) -> None:
+            """Replay one leg's sink writes on the gathering thread, in order.
+
+            Workers never touch auth_suppressions / degradations / _shared_seen
+            / retrieval_trace_ids / cycle_deadline_poisoned themselves; they
+            return ops and the gatherer replays them in deterministic leg
+            order, so parallel legs report in exactly the serial order.
+            """
+            nonlocal cycle_deadline_poisoned
+            for kind, entry, is_shared in ops:
+                if kind == "auth":
+                    if is_shared:
+                        record_shared(entry, bucket="auth", sink=auth_suppressions)
+                    else:
+                        auth_suppressions.append(entry)
+                elif kind == "degradation":
+                    if is_shared:
+                        record_shared(
+                            entry, bucket="degradation", sink=degradations
+                        )
+                    else:
+                        degradations.append(entry)
+                elif kind == "trace":
+                    if (
+                        isinstance(entry, str)
+                        and entry
+                        and entry not in retrieval_trace_ids
+                    ):
+                        retrieval_trace_ids.append(entry)
+                elif kind == "poison":
+                    if entry:
+                        cycle_deadline_poisoned = True
 
         def retrieve_from(
             retrieval_engine,
@@ -539,15 +663,42 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             shared: bool = False,
             source_agent: Optional[str] = None,
             personal: bool = False,
-        ) -> list:
-            nonlocal cycle_deadline_poisoned, personal_snapshot
+        ) -> tuple:
+            """Run one corpus leg; return (rows, sink_ops, trace_id).
+
+            sink_ops are replayed on the gathering thread in serial leg
+            order (auth / degradation / trace / poison). Workers never
+            mutate those sinks, so parallel legs report exactly as serial.
+
+            trace_id is this leg's OWN call trace: retrieve() publishes its
+            RetrievalCallState.trace_id to the calling thread's slot on
+            return (RED-1), so sampling last_trace_id HERE — on the worker
+            that ran the call — can never observe a sibling's id.
+
+            origin/main snapshot: scope=both reuses the personal vault
+            retrieve for the combined own-vault leg (one retrieve, one
+            trace, src rewritten p→c). Parallel both-scope waits for that
+            snapshot so combined cannot double-retrieve the own vault.
+            """
+            nonlocal personal_snapshot
+            reused = False
             if (
                 not shared
-                and personal_snapshot is not None
-                and personal_snapshot[0] is retrieval_engine
-                and personal_snapshot[1] is principal_for_documents
+                and not personal
+                and document_scope == "both"
             ):
-                rows, poisoned, suppression, degradation = deepcopy(personal_snapshot[2])
+                _personal_snapshot_ready.wait()
+            with _snapshot_lock:
+                snapshot = personal_snapshot
+            if (
+                not shared
+                and snapshot is not None
+                and snapshot[0] is retrieval_engine
+                and snapshot[1] is principal_for_documents
+            ):
+                rows, poisoned, suppression, degradation = deepcopy(snapshot[2])
+                reused = True
+                trace_id = None
             else:
                 previous_trace_id = getattr(retrieval_engine, "last_trace_id", None)
                 rows = retrieval_engine.retrieve(
@@ -575,42 +726,51 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 )
                 # Capture this leg immediately, including empty results. An
                 # unchanged diagnostic can belong to an earlier request when
-                # retrieval returns before creating a trace. Failed calls never
-                # reach this point; reused personal snapshots add no new trace.
+                # retrieval returns before creating a trace. Failed calls
+                # never reach this point; reused personal snapshots add no
+                # new trace. Sample on THIS worker thread (RED-1).
                 trace_id = getattr(retrieval_engine, "last_trace_id", None)
-                if (
-                    isinstance(trace_id, str) and trace_id
+                if not (
+                    isinstance(trace_id, str)
+                    and trace_id
                     and trace_id != previous_trace_id
-                    and trace_id not in retrieval_trace_ids
                 ):
-                    retrieval_trace_ids.append(trace_id)
+                    trace_id = None
                 poisoned = _ranking_deadline_poisoned(retrieval_engine)
                 suppression = getattr(retrieval_engine, "last_auth_suppression", None)
                 degradation = _degradation_for(retrieval_engine, src)
                 if personal and document_scope == "both":
-                    personal_snapshot = (
-                        retrieval_engine, principal_for_documents,
-                        deepcopy((rows, poisoned, suppression, degradation)),
-                    )
-            if poisoned:
-                cycle_deadline_poisoned = True
+                    with _snapshot_lock:
+                        personal_snapshot = (
+                            retrieval_engine,
+                            principal_for_documents,
+                            deepcopy((rows, poisoned, suppression, degradation)),
+                        )
+                    _personal_snapshot_ready.set()
+            ops: list = []
             if suppression:
                 # Review round 2: the suppression channel had the same
                 # double-report on the same two-leg shared path, and the
                 # plugin now RENDERS it — one blackout of one corpus was
                 # about to be announced to the agent twice.
                 entry = {"src": src, **suppression}
-                if shared:
-                    record_shared(entry, bucket="auth", sink=auth_suppressions)
-                else:
-                    auth_suppressions.append(entry)
-            degradation["src"] = src
-            if source_agent:
-                degradation["source_agent"] = source_agent
-            if shared:
-                record_shared(degradation, bucket="degradation", sink=degradations)
+                ops.append(("auth", entry, shared))
+            if reused:
+                degradation = dict(degradation)
+                degradation["src"] = src
+                if source_agent:
+                    degradation["source_agent"] = source_agent
+                elif "source_agent" in degradation:
+                    degradation.pop("source_agent", None)
             else:
-                degradations.append(degradation)
+                degradation = _degradation_for(
+                    retrieval_engine, src, source_agent=source_agent
+                )
+            ops.append(("degradation", degradation, shared))
+            if trace_id:
+                ops.append(("trace", trace_id, False))
+            if poisoned:
+                ops.append(("poison", True, False))
             tagged = tag_document_results(rows, src=src)
             for row in tagged:
                 if not isinstance(row, dict):
@@ -618,17 +778,18 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 row[_QTY_ENGINE_KEY] = retrieval_engine
                 if poisoned:
                     row[_DEADLINE_POISONED_KEY] = True
-            return tagged
+            return tagged, ops, trace_id if not reused else None
 
-        def retrieve_shared() -> list:
-            return retrieve_from(
+        def retrieve_shared() -> tuple:
+            rows, ops, trace_id = retrieve_from(
                 engine,
                 src="c",
                 principal_for_documents=principal,
                 shared=True,
             )
+            return rows, ops, trace_id
 
-        def retrieve_shared_soft() -> list:
+        def retrieve_shared_soft() -> tuple:
             """Shared leg that soft-fails when other corpora may already have hits.
 
             Round 18 (PR #260): retrieve_combined / both-scope already soft-failed
@@ -637,6 +798,15 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             Mirror the agent-leg contract: log, record degradation, return [].
             Sole-shared callers (principal is None / pure shared scope) still use
             hard retrieve_shared so a total failure surfaces as an RPC error.
+
+            Returns (rows, sink_ops, trace_id); the failure entry is a
+            replayable op, and the trace is None — the shared leg ran and
+            failed, so there is no fresh id. None (not the sentinel) so the
+            caller does NOT fall back to the handler thread's slot: under
+            parallel legs the shared retrieve ran on a pool worker, and the
+            handler slot may hold a PREVIOUS request's id on these reused
+            threads. _SHARED_TRACE_NOT_RUN stays reserved for legs where the
+            shared engine never executed at all.
             """
             try:
                 return retrieve_shared()
@@ -657,21 +827,23 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         "embedding_model",
                         None,
                     )
-                record_shared(
-                    {
-                        "src": "c",
-                        "vector_model": emb_model,
-                        "vector_degraded": False,
-                        "degraded": True,
-                        "shared_index_failed": detail,
-                        "reason": detail,
-                    },
-                    bucket="degradation",
-                    sink=degradations,
-                )
-                return []
+                ops: list = [
+                    (
+                        "degradation",
+                        {
+                            "src": "c",
+                            "vector_model": emb_model,
+                            "vector_degraded": False,
+                            "degraded": True,
+                            "shared_index_failed": detail,
+                            "reason": detail,
+                        },
+                        True,
+                    )
+                ]
+                return [], ops, None
 
-        def retrieve_personal(*, soft: bool = False) -> list:
+        def retrieve_personal(vault_retrieval, *, soft: bool = False) -> tuple:
             """Personal vault leg; optional soft shared fallback for multi-leg scopes.
 
             When the personal vault never ran (no agent vault), sole personal
@@ -682,19 +854,28 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             (dual-corpus total failure is exactly when that signal matters).
             Scope "both" also soft-fails shared so a personal boom + shared boom
             cannot erase combined hits with −32000.
+
+            ``vault_retrieval`` is resolved by the CALLER on the gathering
+            thread (lazy engine singletons stay off pool workers). Returns
+            (rows, sink_ops, shared_trace) where shared_trace is the shared
+            fallback's trace, or _SHARED_TRACE_NOT_RUN when the shared engine
+            never ran here.
             """
             personal_failed = False
-            vault_retrieval = context.agent_vault_retrieval(agent_id) if agent_id else None
+            personal_ops: list = []
             if vault_retrieval is not None:
                 vault_engine, _source_agent, _source_db_path = vault_retrieval
                 try:
-                    return retrieve_from(
+                    rows, ops, _trace = retrieve_from(
                         vault_engine,
                         src="p",
                         principal_for_documents=principal,
                         personal=True,
                     )
+                    _personal_snapshot_ready.set()
+                    return rows, ops, _SHARED_TRACE_NOT_RUN
                 except Exception as exc:
+                    _personal_snapshot_ready.set()
                     # Round 13 (PR #260): personal leg failure was log-only while
                     # the shared fallback could still report degraded:false —
                     # personal memory never ran, response looked healthy.
@@ -718,39 +899,52 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                             "embedding_model",
                             None,
                         )
-                    degradations.append(
-                        {
-                            "src": "p",
-                            "vector_model": emb_model,
-                            "vector_degraded": False,
-                            "degraded": True,
-                            "personal_index_failed": detail,
-                            "reason": detail,
-                        }
+                    personal_ops.append(
+                        (
+                            "degradation",
+                            {
+                                "src": "p",
+                                "vector_model": emb_model,
+                                "vector_degraded": False,
+                                "degraded": True,
+                                "personal_index_failed": detail,
+                                "reason": detail,
+                            },
+                            False,
+                        )
                     )
+            else:
+                _personal_snapshot_ready.set()
             # Round 19: soft shared when other legs may still run (scope both).
             # Round 22: also soft when personal already failed — dual-corpus
             # total failure must keep personal_index_failed on the 200 body,
             # not discard it via outer −32000.
             if soft or personal_failed:
-                return retrieve_shared_soft()
-            return retrieve_shared()
+                rows, ops, trace_id = retrieve_shared_soft()
+            else:
+                rows, ops, trace_id = retrieve_shared()
+            return rows, personal_ops + ops, trace_id
 
-        def retrieve_combined() -> list:
+        def _combined_leg_results(vault_legs: list) -> tuple:
+            """Fan out vault legs + shared tail; return (result_sets, ops, tail_trace).
+
+            The shared tail is the LAST leg in submission order, so the gather
+            order — and therefore the merge input and the replay order — match
+            the serial loop exactly. ops across all legs are concatenated in
+            leg order for the caller to replay.
+            """
             # Round 16: mirror personal-leg hardening — one agent vault throw
             # must not JSON-RPC −32000 the whole combined search. Per-engine
             # try/except, degradation entry, continue with partial hits.
-            result_sets = []
-            for vault_engine, source_agent, _source_db_path in context.all_vault_retrievals():
+            def _vault_leg(vault_engine, source_agent) -> tuple:
                 try:
-                    result_sets.append(
-                        retrieve_from(
-                            vault_engine,
-                            src="c",
-                            principal_for_documents=principal,
-                            source_agent=source_agent,
-                        )
+                    rows, ops, _trace = retrieve_from(
+                        vault_engine,
+                        src="c",
+                        principal_for_documents=principal,
+                        source_agent=source_agent,
                     )
+                    return rows, ops, None
                 except Exception as exc:
                     detail = _degrade_detail(
                         f"combined vault index failed"
@@ -774,35 +968,124 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                             "embedding_model",
                             None,
                         )
-                    degradations.append(
-                        {
-                            "src": "c",
-                            "vector_model": emb_model,
-                            "vector_degraded": False,
-                            "degraded": True,
-                            "combined_index_failed": detail,
-                            "reason": detail,
-                            "source_agent": source_agent,
-                        }
+                    return (
+                        [],
+                        [
+                            (
+                                "degradation",
+                                {
+                                    "src": "c",
+                                    "vector_model": emb_model,
+                                    "vector_degraded": False,
+                                    "degraded": True,
+                                    "combined_index_failed": detail,
+                                    "reason": detail,
+                                    "source_agent": source_agent,
+                                },
+                                False,
+                            )
+                        ],
+                        None,
                     )
+
+            leg_fns = []
+            for vault_engine, source_agent, _source_db_path in vault_legs:
+                leg_fns.append(
+                    lambda _ve=vault_engine, _sa=source_agent: _vault_leg(_ve, _sa)
+                )
             # Round 18: soft-fail shared so agent-vault hits already collected
             # are not erased by a shared-index throw (−32000).
-            result_sets.append(retrieve_shared_soft())
-            return merge_document_results(result_sets, limit)
+            leg_fns.append(retrieve_shared_soft)
+            outcomes = _gather_leg_results(leg_fns, deadline_monotonic)
+            result_sets = []
+            combined_ops: list = []
+            for rows, ops, _trace in outcomes[:-1]:
+                result_sets.append(rows)
+                combined_ops.extend(ops)
+            tail_rows, tail_ops, tail_trace = outcomes[-1]
+            result_sets.append(tail_rows)
+            combined_ops.extend(tail_ops)
+            return result_sets, combined_ops, tail_trace
 
+        def retrieve_combined(vault_legs: list) -> tuple:
+            """Combined scope: merge vault legs + shared tail.
+
+            Returns (merged_rows, tail_trace) after replaying every leg's sink
+            writes in deterministic leg order.
+            """
+            result_sets, combined_ops, tail_trace = _combined_leg_results(
+                vault_legs
+            )
+            _replay_leg_ops(combined_ops)
+            return merge_document_results(result_sets, limit), tail_trace
+
+        # Lazy engine singletons resolve HERE, on the gathering thread, in the
+        # same order and multiplicity as the serial code (personal scope never
+        # touches all_vault_retrievals; combined never touches
+        # agent_vault_retrieval; both resolves agent vault first, then all
+        # vaults). Pool workers only ever use already-resolved engines.
         if principal is None:
-            results = retrieve_shared()
+            results, results_ops, envelope_trace = retrieve_shared()
+            _replay_leg_ops(results_ops)
         elif document_scope == "personal":
-            results = retrieve_personal()
+            personal_vault = (
+                context.agent_vault_retrieval(agent_id) if agent_id else None
+            )
+            results, results_ops, personal_shared_trace = retrieve_personal(
+                personal_vault
+            )
+            _replay_leg_ops(results_ops)
+            # Slot fallback ONLY for the never-ran sentinel (vault hit, no
+            # shared fallback executed): a ran-and-failed shared leg reports
+            # None, which selects None here — never a stale handler id.
+            envelope_trace = (
+                personal_shared_trace
+                if personal_shared_trace is not _SHARED_TRACE_NOT_RUN
+                else getattr(engine, "last_trace_id", None)
+            )
         elif document_scope == "combined":
-            results = retrieve_combined()
+            combined_vaults = list(context.all_vault_retrievals())
+            results, envelope_trace = retrieve_combined(combined_vaults)
+            # As above: only the never-ran sentinel reads the handler slot;
+            # a failed shared tail is None and stays None.
+            if envelope_trace is _SHARED_TRACE_NOT_RUN:
+                envelope_trace = getattr(engine, "last_trace_id", None)
         else:
             # scope "both": personal + combined. Combined already soft-fails
             # shared; personal must soft-fail its shared fallback too — a hard
             # shared throw here (−32000) ran before combined and dropped every
             # agent-vault hit that combined would have returned.
-            result_sets = [retrieve_personal(soft=True), retrieve_combined()]
+            both_personal_vault = (
+                context.agent_vault_retrieval(agent_id) if agent_id else None
+            )
+            # origin/main runs personal retrieve, then all_vault_retrievals
+            # (a between-legs hook that may mutate diagnostics), then the
+            # combined own-vault snapshot reuse. Resolving vaults before
+            # personal would snapshot the post-mutate verdict. Combined
+            # vault legs still parallelize inside _combined_leg_results.
+            personal_rows, personal_ops, personal_shared_trace = retrieve_personal(
+                both_personal_vault, soft=True
+            )
+            _replay_leg_ops(personal_ops)
+            both_combined_vaults = list(context.all_vault_retrievals())
+            combined_sets, combined_ops, combined_tail_trace = _combined_leg_results(
+                both_combined_vaults
+            )
+            _replay_leg_ops(combined_ops)
+            combined_rows = merge_document_results(combined_sets, limit)
+            result_sets = [personal_rows, combined_rows]
             results = merge_document_results(result_sets, limit, prefer_personal=True)
+            # Serial last-shared-leg-wins: combined's tail ran after personal's
+            # fallback, so it wins when it ran (a ran-and-failed tail is None
+            # and selects None — never the handler slot); else personal's
+            # fallback trace; else the handler thread's slot (vault-only
+            # path, shared never executed), as serial.
+            if combined_tail_trace is not _SHARED_TRACE_NOT_RUN:
+                envelope_trace = combined_tail_trace
+            elif personal_shared_trace is not _SHARED_TRACE_NOT_RUN:
+                envelope_trace = personal_shared_trace
+            else:
+                envelope_trace = getattr(engine, "last_trace_id", None)
 
         if budget_tokens_param is not None:
             try:
@@ -990,6 +1273,8 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             # Traces describe individual corpus retrievals, not total RPC
             # latency (which also includes merging, learnings and episodic).
             # Keep the singular compatibility field only when unambiguous.
+            # Gather-order replay of per-leg trace ops preserves origin/main
+            # serial capture order under the #388 fan-out.
             "trace_id": retrieval_trace_ids[0] if len(retrieval_trace_ids) == 1 else None,
             "trace_ids": retrieval_trace_ids,
             "trace_scope": "retrieval_leg",
@@ -1350,6 +1635,25 @@ def reference_matches(result: dict, reference: dict) -> bool:
     return True
 
 
+def reference_id_kind(reference: dict) -> str:
+    """Identifier kind for a drill reference, mirroring reference_ids_for_engine.
+
+    Explicit ``chunk_id`` resolves in chunk namespace only; explicit
+    ``doc_id`` and source/path/wikilink lookups (which resolve to doc_ids via
+    the documents table) resolve in doc namespace only. A bare legacy
+    ``result_id`` keeps the ambiguous chunk-first fallback ("auto"). The
+    truthiness chain matches reference_ids_for_engine so the kind always
+    describes the id that function actually returned.
+    """
+    if reference.get("chunk_id"):
+        return "chunk"
+    if reference.get("doc_id"):
+        return "doc"
+    if reference.get("result_id"):
+        return "auto"
+    return "doc"
+
+
 def reference_ids_for_engine(reference: dict, retrieval_engine) -> list[int]:
     raw_id = reference.get("chunk_id") or reference.get("doc_id") or reference.get("result_id")
     if raw_id is not None:
@@ -1406,10 +1710,12 @@ def expand_reference(
         shared_engine,
         context,
     ):
+        id_kind = reference_id_kind(reference)
         for result_id in reference_ids_for_engine(reference, retrieval_engine):
             result = retrieval_engine.expand_result(
                 result_id=result_id,
                 depth=depth,
+                id_kind=id_kind,
                 principal=principal_for_documents,
                 workspace=(
                     principal_for_documents.workspace_id

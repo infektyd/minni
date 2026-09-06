@@ -105,10 +105,19 @@ async function waitForWorkerQueue(vaultPath, notePath, planId, timeoutMs = 15000
   const begin = Date.now();
   while (Date.now() - begin < timeoutMs) {
     const leftover = await listQueuedWorkerWrites(vaultPath, planId);
-    if (leftover.length === 0) return;
+    if (leftover.length === 0) break;
     kickWorkerWriteDrain({ vaultPath, notePath, planId });
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+  // Join owned in-process kick drains by actual promise happens-before, not
+  // by polling: trailing progress writes and follow-up re-kicks land before
+  // teardown rm, so rmdir cannot race them. joinWorkerWriteDrains is
+  // test-support on dist/thread-worker.js; fail loudly on a stale dist.
+  const join = threadWorkerRuntime.joinWorkerWriteDrains;
+  if (typeof join !== "function") {
+    throw new Error("stale dist: rebuild plugins/minni for joinWorkerWriteDrains");
+  }
+  await join(vaultPath, planId);
 }
 
 let workerUpdateSeq = 0;
@@ -1409,7 +1418,24 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
   assert.equal(claimClockSamples, 1);
   assert.equal(claim.expires_at, "2026-08-18T12:06:00.000Z");
 
+  // Prove the transition guard with a valid lease, independently of expiry.
+  await assert.rejects(workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    action: { action: "complete", evidence: "No start was applied" },
+    now: new Date("2026-08-18T12:05:10.000Z"),
+  }), /cannot persist done without start/);
+  const started = await startClaimedSlice(
+    fixture, claim, "a", new Date("2026-08-18T12:05:20.000Z"),
+  );
+  assert.equal(isAcceptedWorkerWrite(started), false);
+  assert.equal(started.slice.status, "in_progress");
+
   let updateClockSamples = 0;
+  let clockObserved;
+  const sampled = new Promise((resolve) => { clockObserved = resolve; });
   let queuedUpdate;
   await withThreadLock(
     fixture.vaultPath,
@@ -1427,13 +1453,18 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
         },
         now: () => {
           updateClockSamples += 1;
+          clockObserved();
           return new Date("2026-08-18T12:07:00.000Z");
         },
       }).then(
         (value) => ({ ok: true, value }),
         (error) => ({ ok: false, error }),
       );
-      await Promise.resolve();
+      // Await acceptance while the holder is still active: this guarantees
+      // the durable-queue route instead of racing direct apply after release.
+      const accepted = await queuedUpdate;
+      assert.equal(accepted.ok, true, accepted.error?.message);
+      assert.equal(isAcceptedWorkerWrite(accepted.value), true);
       assert.equal(
         updateClockSamples,
         0,
@@ -1441,15 +1472,128 @@ test("queued claim and update clocks are sampled only after the Thread lock", as
       );
     },
   );
-  const update = await queuedUpdate;
-  assert.equal(update.ok, false, "complete without start must refuse, not dump-and-return");
-  assert.match(
-    String(update.error?.message ?? ""),
-    /cannot persist done without start/,
-  );
+  let timer;
+  try {
+    await Promise.race([
+      sampled,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("queued update never sampled its apply clock")), 5000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.ok(updateClockSamples >= 1);
   await waitForWorkerQueue(fixture.vaultPath, fixture.notePath, fixture.planId);
+  assert.deepEqual(await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId), []);
   const final = await rehydratePlan(fixture.notePath);
-  assert.equal(final.slices[0].status, "pending");
+  assert.equal(final.slices[0].status, "in_progress", "expired completion must not persist done");
+  assert.equal(final.slices[0].claim, undefined, "post-lock clock must revoke the expired lease");
+  assert.equal(final.slices[0].generation, started.slice.generation + 1);
+  const { events } = await readThreadEvents(journalPathFor(fixture.notePath, fixture.planId), 0, 100);
+  assert.equal(events.filter((event) => event.kind === "slice.started").length, 1);
+  assert.equal(events.filter((event) => event.kind === "slice.completed").length, 0);
+
+});
+
+test("teardown join stays pending until an owned drain releases its lock", async (t) => {
+  const join = threadWorkerRuntime.joinWorkerWriteDrains;
+  assert.equal(typeof join, "function", "stale dist: rebuild plugins/minni");
+  const fixture = await threadFixture(t, [
+    { id: "a", title: "Slice A" },
+  ]);
+  await assignWorker(fixture, "a", "worker-a");
+  const claim = await claimSlice({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    idempotencyKey: "join-regression-claim",
+    ttlSeconds: 3600,
+    now: new Date("2026-08-18T12:00:00.000Z"),
+  });
+
+  // Hold the persist lock well beyond any poll window so the kicked drain
+  // cannot finish; the join must stay pending until this holder releases.
+  const HOLDER_MS = 800;
+  const holder = withThreadLock(
+    fixture.vaultPath,
+    fixture.planId,
+    "join-regression-holder",
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, HOLDER_MS));
+    },
+  );
+  const ownerPath = path.join(
+    fixture.vaultPath,
+    ".runtime",
+    "thread-locks",
+    `${createHash("sha256").update(fixture.planId).digest("hex").slice(0, 32)}.lock`,
+    "owner.json",
+  );
+  const holderBegin = Date.now();
+  let holderSeen = false;
+  while (Date.now() - holderBegin < 5000) {
+    try {
+      const raw = await readFile(ownerPath, "utf8");
+      if (raw.includes("join-regression-holder")) {
+        holderSeen = true;
+        break;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(holderSeen, true, "test holder never acquired the persist lock");
+
+  // Lock is held: this update is accepted onto the durable queue and its
+  // accept-path kick leaves an owned drain blocked on the holder.
+  const accepted = await workerUpdate({
+    ...fixture,
+    sliceId: "a",
+    workerAgentId: "worker-a",
+    token: claim.token,
+    action: { action: "start" },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  assert.equal(isAcceptedWorkerWrite(accepted), true);
+  kickWorkerWriteDrain({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId });
+
+  let joined = false;
+  const pending = join(fixture.vaultPath, fixture.planId).then(() => {
+    joined = true;
+  });
+  // Holder releases no earlier than 800ms: the join must still be pending
+  // at half that, by structural happens-before on the owned drain promise.
+  await new Promise((resolve) => setTimeout(resolve, HOLDER_MS / 2));
+  assert.equal(joined, false, "join settled while the owned drain was still lock-blocked");
+  await holder;
+  const joinBegin = Date.now();
+  while (!joined && Date.now() - joinBegin < 15000) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  await pending;
+  assert.equal(joined, true);
+  // The accept-path kick one-shot yields the live start without applying,
+  // so the ticket is still queued — and the join already covered that whole
+  // chain. A full kick now applies it; the second join covers the apply
+  // plus its trailing progress write.
+  assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 1);
+  kickWorkerWriteDrain({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId });
+  await join(fixture.vaultPath, fixture.planId);
+  // No sleep between join resolution and this read: the trailing progress
+  // write is inside the joined promise chain, so it has landed by
+  // happens-before — the exact guarantee polling could never give.
+  const progressPath = path.join(
+    fixture.vaultPath,
+    ".runtime",
+    "thread-locks",
+    `${createHash("sha256").update(fixture.planId).digest("hex").slice(0, 32)}.q`,
+    "progress.json",
+  );
+  const progress = JSON.parse(await readFile(progressPath, "utf8"));
+  assert.equal(progress.remaining, 0);
+  assert.deepEqual(await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId), []);
 });
 
 test("expired orphan idempotency envelopes cannot be replayed into a new claim", async (t) => {
