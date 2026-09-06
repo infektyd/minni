@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 
 from minni.afm_review_markers import supersede_afm_review
 from minni.db import SovereignDB
+from minni.graph_commit import ensure_canonical_learning_node
 from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
 from minni.safety import is_instruction_like
@@ -267,14 +268,28 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                     (lid, supersedes),
                 )
 
-        wb.add_derived_from_edges(
-            learning_id=lid,
-            agent_id=agent_id,
-            category=category,
-            content=content,
-            evidence_doc_ids=evidence_doc_ids,
-            created_at=now,
-        )
+            # Coordinated canonical commit: canonical node + join + explicit
+            # edges share this cursor block, so a mid-commit failure rolls the
+            # learning back too. No edge inference is invoked (activation gate).
+            canonical_doc_id = ensure_canonical_learning_node(
+                c,
+                learning_id=lid,
+                agent_id=agent_id,
+                content=content,
+                vault_path=wb.config.vault_path,
+                created_at=now,
+            )
+
+            wb.add_derived_from_edges(
+                learning_id=lid,
+                agent_id=agent_id,
+                category=category,
+                content=content,
+                evidence_doc_ids=evidence_doc_ids,
+                created_at=now,
+                _cursor=c,
+                canonical_doc_id=canonical_doc_id,
+            )
 
         context.logger.info(
             "Stored learning #%d [%s/%s]: %.60s...",
@@ -1409,6 +1424,18 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     (principal.agent_id, content, now),
                 )
                 lid = c.lastrowid
+                # Coordinated canonical commit: the join row lands in the same
+                # transaction as the learning + candidate status update, so a
+                # mid-commit failure rolls all three back. Typed edges come
+                # from the classifier (activation gate), not this path.
+                ensure_canonical_learning_node(
+                    c,
+                    learning_id=lid,
+                    agent_id=principal.agent_id,
+                    content=content,
+                    vault_path=db.config.vault_path,
+                    created_at=now,
+                )
 
             # Migration-015 guard: on a pre-015 schema the candidate_packets
             # CHECK does not admit do_not_store / log_only, so the UPDATE would

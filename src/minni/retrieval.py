@@ -1564,22 +1564,50 @@ class RetrievalEngine:
                     if not active:
                         return {"status": "skipped", "reason": "learning_changed"}
                 c.execute(
-                    "SELECT doc_id FROM documents WHERE path = ?", (path,)
+                    "SELECT doc_id, agent, sigil, page_status, privacy_level,"
+                    " layer FROM documents WHERE path = ?", (path,)
                 )
                 row = c.fetchone()
+                fill_placeholder = False
                 if row and repair_projection:
-                    return {"status": "skipped", "reason": "projection_exists"}
+                    fts = c.execute(
+                        "SELECT 1 FROM vault_fts WHERE doc_id = ?", (row["doc_id"],)
+                    ).fetchone()
+                    if fts is not None:
+                        return {"status": "skipped", "reason": "projection_exists"}
+                    # Incomplete projection (canonical placeholder committed
+                    # without FTS/chunks): fill this SAME node below — the
+                    # FTS/chunk insert path reuses row["doc_id"], so no
+                    # duplicate or orphan is minted. The STORED row is
+                    # authoritative: a lifecycle-closed or restricted row
+                    # (rejected/blocked since commit) is left entirely alone —
+                    # this in-transaction gate closes the race between the
+                    # backfill pre-check and this write.
+                    from minni.durable_projection import projection_row_closed
+
+                    if projection_row_closed(row["page_status"], row["privacy_level"]):
+                        return {"status": "skipped", "reason": "projection_closed"}
+                    fill_placeholder = True
                 if row:
                     doc_id = row["doc_id"]
-                    c.execute(
-                        """UPDATE documents
-                           SET agent=?, sigil=?, last_modified=?, indexed_at=?,
-                               page_status=?, privacy_level=?, page_type=?,
-                               layer=?, whole_document=?
-                           WHERE doc_id=?""",
-                        (agent, sigil, now, now, page_status, privacy_level,
-                         page_type, layer, whole_document, doc_id),
-                    )
+                    if fill_placeholder:
+                        # Preserve the authoritative stored ownership/status/
+                        # privacy — never overwrite them from content defaults.
+                        # Only the missing FTS/chunk rows are filled below,
+                        # keyed to the stored agent/sigil/layer.
+                        agent, sigil = row["agent"], row["sigil"]
+                        if row["layer"]:
+                            layer = row["layer"]
+                    else:
+                        c.execute(
+                            """UPDATE documents
+                               SET agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                   page_status=?, privacy_level=?, page_type=?,
+                                   layer=?, whole_document=?
+                               WHERE doc_id=?""",
+                            (agent, sigil, now, now, page_status, privacy_level,
+                             page_type, layer, whole_document, doc_id),
+                        )
                     old_chunk_ids = [
                         r["chunk_id"]
                         for r in c.execute(
@@ -1677,17 +1705,32 @@ class RetrievalEngine:
         chunk_embeddings rows (tombstoning them out of the live FAISS index and
         invalidating the rerank cache), then the document row itself.
 
+        N:1 liveness preserves a canonical node and every historical mapping
+        while any attached learning is active. Once all are inactive, retire
+        the node and remove serving projections without deleting its identity
+        or graph history. Unmapped legacy documents retain the deletion path.
+
         Best-effort and fail-open: the learnings-table lifecycle is the source of
         truth; a purge hiccup only means recall stays slightly stale until the
         next reindex, never a lost write.
         """
         try:
             with self.db.transaction() as c:
-                c.execute("SELECT doc_id FROM documents WHERE path = ?", (path,))
+                c.execute("SELECT * FROM documents WHERE path = ?", (path,))
                 row = c.fetchone()
                 if row is None:
                     return {"status": "not_found", "path": path}
                 doc_id = row["doc_id"]
+                from minni.graph_commit import canonical_node_learning_state
+                mapped, active, retired_status, successor = canonical_node_learning_state(c, doc_id)
+                from minni.durable_projection import projection_row_closed
+
+                closed = projection_row_closed(row["page_status"], row["privacy_level"])
+                canonical = mapped or ("memory_kind" in row.keys() and row["memory_kind"] == "learning")
+                if canonical and not mapped:
+                    return {"status": "unmapped_kept", "doc_id": doc_id}
+                if active and not closed:
+                    return {"status": "shared_kept", "doc_id": doc_id}
                 old_chunk_ids = [
                     r["chunk_id"]
                     for r in c.execute(
@@ -1697,7 +1740,16 @@ class RetrievalEngine:
                 ]
                 c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                 c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
-                c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                if mapped:
+                    # Explicit document restrictions remain authoritative even
+                    # if the learning-level aggregate would otherwise differ.
+                    if not closed:
+                        c.execute(
+                            "UPDATE documents SET page_status=?, superseded_by=? WHERE doc_id=?",
+                            (retired_status, successor, doc_id),
+                        )
+                else:
+                    c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
             # Outside the txn: live-index maintenance is best-effort.
             self._invalidate_durable_rerank(old_chunk_ids)
             self._remove_live_faiss(old_chunk_ids)

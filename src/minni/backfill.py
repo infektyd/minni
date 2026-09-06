@@ -625,6 +625,7 @@ def backfill_learning_projections(
     """
     from minni.durable_projection import (
         ACTIVE_LEARNING_SQL, durable_doc_path, durable_metadata,
+        projection_row_closed,
     )
     from minni.retrieval import RetrievalEngine
 
@@ -653,9 +654,30 @@ def backfill_learning_projections(
                 continue
             path = durable_doc_path(agent, "", config.vault_path, content)
             with db.cursor() as c:
-                exists = c.execute("SELECT 1 FROM documents WHERE path=?", (path,)).fetchone()
-            if exists:
-                continue
+                doc = c.execute(
+                    "SELECT doc_id, page_status, privacy_level FROM documents"
+                    " WHERE path=?", (path,)
+                ).fetchone()
+                if doc is not None:
+                    fts = c.execute(
+                        "SELECT 1 FROM vault_fts WHERE doc_id=?", (doc["doc_id"],)
+                    ).fetchone()
+                    if fts is not None:
+                        continue
+                    # Incomplete projection (canonical placeholder): a documents
+                    # row was committed without its FTS/chunk rows — e.g. a
+                    # governed promotion whose semantic indexing failed. Fall
+                    # through and fill the SAME node below; never mint a
+                    # duplicate. A doc WITH an FTS row but no chunks stays
+                    # skipped here — backfill_document_vectors owns that case.
+                    # The STORED row is authoritative: a lifecycle-closed or
+                    # restricted row (rejected/blocked since commit) must stay
+                    # untouched — repair never resurrects it from content
+                    # defaults. The engine re-checks this inside its write
+                    # transaction; this pre-check only avoids wasted encodes.
+                    if projection_row_closed(doc["page_status"], doc["privacy_level"]):
+                        stats["skipped"] += 1
+                        continue
             metadata = durable_metadata(content)
             if (metadata["privacy_level"] == "blocked" or metadata["page_status"] in
                     {"draft", "expired", "rejected", "superseded"}):
