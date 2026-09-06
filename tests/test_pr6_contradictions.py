@@ -1334,3 +1334,91 @@ class TestFullWorkflow:
             assert rows[0]["detected_at"] is not None
             assert rows[0]["detection_method"] == "cosine"
             assert rows[0]["resolution_id"] is None
+
+
+class TestContradictionLogResolutionStatusShapes:
+    """Audit rows must persist with and without the 021 resolution_status column."""
+
+    def _seed_learning(self, db_obj, content):
+        emb = _fixed_embedding(content)
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO learnings
+                   (agent_id, category, content, confidence, embedding, created_at, status)
+                   VALUES ('agent1', 'fact', ?, 1.0, ?, ?, 'active')""",
+                (content, emb.astype(np.float32).tobytes(), time.time()),
+            )
+            return c.lastrowid, emb
+
+    def _detect(self, tmp_path, content):
+        import minni.writeback as wb_mod
+
+        db_obj, cfg = _make_db(tmp_path)
+        seeded_id, base_emb = self._seed_learning(db_obj, content)
+        wb = wb_mod.WriteBackMemory(db_obj, cfg)
+
+        close_emb = _nearly_identical_embedding(base_emb, noise=0.001)
+
+        class _FakeModel:
+            def encode(self, _text, **kwargs):
+                return close_emb
+
+        original_model_prop = wb_mod.WriteBackMemory.model.fget
+        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
+        try:
+            candidates = wb.detect_contradictions(content)
+        finally:
+            wb_mod.WriteBackMemory.model = property(original_model_prop)
+        assert [cand["id"] for cand in candidates] == [seeded_id]
+        return db_obj, seeded_id
+
+    def test_audit_row_written_without_resolution_status_column(self, tmp_path):
+        """Baseline 009 shape: legacy insert must record the audit row."""
+        import minni.writeback as wb_mod
+
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            # Reconstruct the true 009 shape: 021's index references the
+            # column, so drop the dependent index before dropping the column.
+            c.execute("DROP INDEX IF EXISTS idx_contradiction_graph_pair")
+            c.execute("ALTER TABLE contradiction_log DROP COLUMN resolution_status")
+            cols = {row[1] for row in c.execute("PRAGMA table_info(contradiction_log)").fetchall()}
+            assert "resolution_status" not in cols
+
+        content = "The auth system uses JWT tokens"
+        seeded_id, base_emb = self._seed_learning(db_obj, content)
+        wb = wb_mod.WriteBackMemory(db_obj, cfg)
+
+        close_emb = _nearly_identical_embedding(base_emb, noise=0.001)
+
+        class _FakeModel:
+            def encode(self, _text, **kwargs):
+                return close_emb
+
+        original_model_prop = wb_mod.WriteBackMemory.model.fget
+        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
+        try:
+            candidates = wb.detect_contradictions(content)
+        finally:
+            wb_mod.WriteBackMemory.model = property(original_model_prop)
+
+        assert [cand["id"] for cand in candidates] == [seeded_id]
+        with db_obj.cursor() as c:
+            rows = c.execute(
+                "SELECT memory_a_id, detection_method FROM contradiction_log WHERE memory_a_id = ?",
+                (seeded_id,),
+            ).fetchall()
+            assert len(rows) == 1
+            assert rows[0]["detection_method"] == "cosine"
+
+    def test_audit_row_marked_legacy_unclassified_with_typed_schema(self, tmp_path):
+        """Migrated 021 shape: audit row keeps legacy_unclassified status."""
+        content = "The auth system uses JWT tokens"
+        db_obj, seeded_id = self._detect(tmp_path, content)
+        with db_obj.cursor() as c:
+            rows = c.execute(
+                "SELECT resolution_status FROM contradiction_log WHERE memory_a_id = ?",
+                (seeded_id,),
+            ).fetchall()
+            assert len(rows) == 1
+            assert rows[0]["resolution_status"] == "legacy_unclassified"

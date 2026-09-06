@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+from minni.graph_readiness import memory_links_typed_columns_present
 from minni.indexer import VaultIndexer
 from minni.principal import validate_agent_id
 from minni.timestamps import parse_epoch_or_report
@@ -169,14 +170,27 @@ def _insert_wikilinks(cursor, source_doc_id: int, wikilinks: List[str], target_m
             (source_doc_id, *batch),
         )
 
-    inserted = 0
-    for target_doc_id in keep_ids:
-        cursor.execute(
-            """INSERT INTO memory_links
+    # Baseline fallback: without the 021 typed columns, write the legacy
+    # 5-column edge instead of failing the ingestion.
+    if memory_links_typed_columns_present(cursor):
+        edge_sql = """INSERT INTO memory_links
+               (source_doc_id, target_doc_id, link_type, weight, created_at,
+                confidence, inference_method)
+               VALUES (?, ?, 'wikilink', 1.0, ?, 1.0, 'explicit_wikilink')
+               ON CONFLICT(source_doc_id, target_doc_id, link_type)
+               DO UPDATE SET weight=excluded.weight,
+                             confidence=excluded.confidence,
+                             inference_method=excluded.inference_method"""
+    else:
+        edge_sql = """INSERT INTO memory_links
                (source_doc_id, target_doc_id, link_type, weight, created_at)
                VALUES (?, ?, 'wikilink', 1.0, ?)
                ON CONFLICT(source_doc_id, target_doc_id, link_type)
-               DO UPDATE SET weight=excluded.weight""",
+               DO UPDATE SET weight=excluded.weight"""
+    inserted = 0
+    for target_doc_id in keep_ids:
+        cursor.execute(
+            edge_sql,
             (source_doc_id, target_doc_id, now),
         )
         inserted += 1
