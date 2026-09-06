@@ -3,10 +3,48 @@
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 import math
+import threading
 import time
 
 _deadline = ContextVar("minni_request_deadline", default=None)
 _allow_expired_sql = ContextVar("minni_allow_expired_sql", default=False)
+_query_embed_cache = ContextVar("minni_query_embed_cache", default=None)
+
+
+class _QueryEmbedMemo:
+    """Request-scoped query vectors shared by serial corpus legs.
+
+    handle_search stamps one request_deadline around every production RPC, and
+    those legs stay serial. The same query string against the process-wide
+    embedder must not be encoded once per vault. Deadline-free callers that
+    never enter request_deadline keep the previous per-retrieve memo only.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._vecs = {}
+
+    def get(self, query):
+        with self._lock:
+            vec = self._vecs.get(query)
+        if vec is None:
+            return None
+        copy = getattr(vec, "copy", None)
+        return copy() if callable(copy) else vec
+
+    def set(self, query, vec):
+        if vec is None:
+            return
+        size = getattr(vec, "size", None)
+        if size is not None and size == 0:
+            return
+        stored = vec.copy() if callable(getattr(vec, "copy", None)) else vec
+        with self._lock:
+            self._vecs[query] = stored
+
+
+def current_query_embed_cache():
+    return _query_embed_cache.get()
 
 
 class RequestDeadlineExceeded(TimeoutError):
@@ -69,10 +107,15 @@ def request_deadline(deadline):
         previous if deadline is None else min(previous, deadline)
     )
     token = _deadline.set(effective)
+    cache_token = None
+    if _query_embed_cache.get() is None:
+        cache_token = _query_embed_cache.set(_QueryEmbedMemo())
     try:
         yield
     finally:
         _deadline.reset(token)
+        if cache_token is not None:
+            _query_embed_cache.reset(cache_token)
 
 
 def bind_copied_deadline(fn, /, *args, **kwargs):
