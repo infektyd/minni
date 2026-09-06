@@ -1,7 +1,11 @@
 import json
 import logging
 import os
+import re
+import sqlite3
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -808,6 +812,396 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         report = redact_health_report_for_recovery(report)
 
     return context.make_response(report, request_id)
+
+
+# fullmatch() is used at the call site, so no ^/$ anchors: a trailing
+# newline must never smuggle an id through.
+_ALIAS_PATH_RE = re.compile(r"learning://([0-9]+)")
+
+
+@dataclass(frozen=True)
+class LegacyAliasFinding:
+    """One legacy alias verdict. Read-only: proposals are text, never writes."""
+
+    kind: str  # "migrate_candidate" | "ambiguous" | "malformed"
+    alias_doc_id: int
+    alias_path: str
+    learning_id: Optional[int]
+    agent: Optional[str]
+    canonical_doc_id: Optional[int]
+    canonical_path: Optional[str]
+    out_edge_count: int
+    in_edge_count: int
+    reason: str
+    proposal: str
+
+
+@dataclass(frozen=True)
+class LegacyAliasDiagnostic:
+    findings: tuple = ()
+    scanned: int = 0
+    candidates: int = 0
+    ambiguous: int = 0
+    malformed: int = 0
+    truncated: bool = False
+
+
+@contextmanager
+def _alias_read_snapshot(conn: Any):
+    """Coherent read-only snapshot that never commits caller state.
+
+    Mirrors the graph-expansion pattern: SAVEPOINT when the caller already
+    holds a transaction, else a deferred read transaction; both are rolled
+    back / released, never committed. SELECT-only callers see one stable
+    version across every check below.
+    """
+    cur = conn.cursor()
+    nested = bool(getattr(conn, "in_transaction", False))
+    savepoint = "minni_alias_diag_" + uuid.uuid4().hex
+    if nested:
+        cur.execute(f"SAVEPOINT {savepoint}")
+    else:
+        cur.execute("BEGIN DEFERRED")
+    try:
+        yield cur
+    finally:
+        try:
+            if nested:
+                sqlite3.Cursor.execute(cur, f"ROLLBACK TO SAVEPOINT {savepoint}")
+                sqlite3.Cursor.execute(cur, f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                conn.rollback()
+        finally:
+            cur.close()
+
+
+def diagnose_legacy_aliases(db: Any, *, limit: int = 200) -> LegacyAliasDiagnostic:
+    """Offline read-only diagnostic for legacy ``learning://<id>`` aliases.
+
+    Only SELECTs inside one read snapshot; never writes, migrates, or
+    classifies, and never commits the caller's transaction. A
+    ``migrate_candidate`` is provable 1:1 ONLY when every check holds: the
+    alias path full-matches ``learning://<digits>`` with a bounded id, the
+    learning exists and is active, the alias owner matches
+    ``learning:<agent>``, the alias itself carries no foreign join claim and
+    no conflicting FTS evidence, a canonical ``_durable`` node exists at the
+    durable address of that exact (agent, content) owned by the same agent,
+    the canonical node is a live learning projection (not restricted/
+    retired, not a wiki/other kind), the canonical FTS content equals the
+    learning content where projection evidence exists (missing or
+    conflicting evidence is ambiguity, not proof), the exact
+    (learning, canonical) join row exists, and no OTHER learning maps to the
+    canonical node. Everything else is ``ambiguous`` (with the blocking
+    reason) or ``malformed`` — never guessed. The future migration copies
+    the alias's out-edges to the canonical node and marks the alias
+    superseded; this function only proposes that in text.
+    """
+    from minni.durable_projection import durable_doc_path
+
+    limit = max(1, int(limit))
+    getter = getattr(db, "_get_conn", None)
+    conn = getter() if callable(getter) else db
+    with _alias_read_snapshot(conn) as c:
+        tables = {
+            row[0]
+            for row in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "documents" not in tables:
+            return LegacyAliasDiagnostic()
+        total = c.execute(
+            "SELECT COUNT(*) FROM documents WHERE path LIKE 'learning://%'"
+        ).fetchone()[0]
+        rows = c.execute(
+            "SELECT doc_id, path, agent, privacy_level, page_status"
+            " FROM documents WHERE path LIKE 'learning://%'"
+            " ORDER BY doc_id LIMIT ?",
+            (limit + 1,),
+        ).fetchall()
+        join_table = "learning_documents" in tables
+        learnings_table = "learnings" in tables
+        links_table = "memory_links" in tables
+        fts_table = "vault_fts" in tables
+
+        findings: list = []
+        for alias in rows[:limit]:
+            findings.append(_diagnose_one_alias(
+                c, alias, db, join_table, learnings_table, links_table,
+                fts_table, durable_doc_path,
+            ))
+    kinds = [f.kind for f in findings]
+    return LegacyAliasDiagnostic(
+        findings=tuple(findings),
+        scanned=int(total),
+        candidates=sum(1 for k in kinds if k == "migrate_candidate"),
+        ambiguous=sum(1 for k in kinds if k == "ambiguous"),
+        malformed=sum(1 for k in kinds if k == "malformed"),
+        truncated=int(total) > limit,
+    )
+
+
+_MAX_SQLITE_ID = 9223372036854775807
+
+
+def _diagnose_one_alias(
+    c: Any, alias: Any, db: Any, join_table: bool, learnings_table: bool,
+    links_table: bool, fts_table: bool, durable_doc_path: Any,
+) -> LegacyAliasFinding:
+    alias_doc_id = int(alias["doc_id"])
+    alias_path = str(alias["path"])
+
+    def _edges():
+        out_edges = in_edges = 0
+        if links_table:
+            out_edges = c.execute(
+                "SELECT COUNT(*) FROM memory_links WHERE source_doc_id = ?",
+                (alias_doc_id,),
+            ).fetchone()[0]
+            in_edges = c.execute(
+                "SELECT COUNT(*) FROM memory_links WHERE target_doc_id = ?",
+                (alias_doc_id,),
+            ).fetchone()[0]
+        return int(out_edges), int(in_edges)
+
+    def _verdict(kind, reason, proposal="", **kw):
+        out_edges, in_edges = _edges()
+        return LegacyAliasFinding(
+            kind=kind, alias_doc_id=alias_doc_id, alias_path=alias_path,
+            learning_id=kw.get("learning_id"), agent=kw.get("agent"),
+            canonical_doc_id=kw.get("canonical_doc_id"),
+            canonical_path=kw.get("canonical_path"),
+            out_edge_count=out_edges, in_edge_count=in_edges,
+            reason=reason, proposal=proposal,
+        )
+
+    # fullmatch: a trailing newline must not smuggle an id through.
+    match = _ALIAS_PATH_RE.fullmatch(alias_path)
+    if not match:
+        return _verdict(
+            "malformed",
+            f"alias path {alias_path!r} is not exactly learning://<digits>; "
+            "no learning id can be recovered, left alone",
+        )
+    digits = match.group(1).lstrip("0") or "0"
+    if len(digits) > 19 or int(digits) > _MAX_SQLITE_ID:
+        return _verdict(
+            "malformed",
+            f"alias id {match.group(1)!r} exceeds the SQLite integer range; "
+            "bounded ids only, left alone",
+        )
+    learning_id = int(digits)
+    if not learnings_table:
+        return _verdict(
+            "ambiguous", f"learning {learning_id}: learnings table absent, "
+            "ownership unprovable", learning_id=learning_id)
+    try:
+        learning = c.execute(
+            "SELECT learning_id, agent_id, content, status, superseded_by"
+            " FROM learnings WHERE learning_id = ?",
+            (learning_id,),
+        ).fetchone()
+    except OverflowError:
+        return _verdict(
+            "malformed",
+            f"alias id {learning_id} is not a bounded SQLite integer; "
+            "left alone",
+            learning_id=None)
+    if learning is None:
+        return _verdict(
+            "ambiguous", f"learning {learning_id} no longer exists; "
+            "alias is orphaned, left alone", learning_id=learning_id)
+    agent_id = learning["agent_id"]
+    if (
+        learning["superseded_by"] is not None
+        or str(learning["status"] or "") in ("rejected", "expired", "superseded")
+    ):
+        return _verdict(
+            "ambiguous", f"learning {learning_id} is retired "
+            f"(status={learning['status']!r}); retired memories are never "
+            "migrated", learning_id=learning_id, agent=agent_id)
+    expected_owner = f"learning:{agent_id}"
+    if alias["agent"] != expected_owner:
+        return _verdict(
+            "ambiguous", f"alias owner {alias['agent']!r} does not match "
+            f"learning owner {expected_owner!r}; ownership unprovable",
+            learning_id=learning_id, agent=agent_id)
+    if alias["privacy_level"] == "blocked" or str(
+            alias["page_status"] or "") != "accepted":
+        return _verdict(
+            "ambiguous", "alias node itself is restricted/retired; left alone",
+            learning_id=learning_id, agent=agent_id)
+    if join_table:
+        # The alias is a URI-only claim: if the join table maps it to any
+        # OTHER learning, the alias is a foreign/aggregate claim, not this
+        # learning's private alias.
+        foreign = c.execute(
+            "SELECT learning_id FROM learning_documents WHERE doc_id = ?"
+            " AND learning_id != ? LIMIT 1",
+            (alias_doc_id, learning_id),
+        ).fetchone()
+        if foreign is not None:
+            return _verdict(
+                "ambiguous", f"alias node also maps learning "
+                f"{foreign['learning_id']}: foreign/aggregate claim, never "
+                "merged on URI alone",
+                learning_id=learning_id, agent=agent_id)
+    content = learning["content"] or ""
+    vault_path = db.config.vault_path
+    canonical_path = durable_doc_path(agent_id, "", vault_path, content)
+    canonical = c.execute(
+        "SELECT doc_id, agent, memory_kind, page_type, privacy_level,"
+        " page_status FROM documents WHERE path = ?",
+        (canonical_path,),
+    ).fetchone()
+    if canonical is None:
+        return _verdict(
+            "ambiguous", "no canonical _durable node at the durable address "
+            "of this exact (agent, content); index/repair the learning first",
+            learning_id=learning_id, agent=agent_id,
+            canonical_path=canonical_path)
+    canonical_doc_id = int(canonical["doc_id"])
+    if canonical["agent"] != agent_id:
+        return _verdict(
+            "ambiguous", f"canonical node owner {canonical['agent']!r} does "
+            f"not match learning owner {agent_id!r}; wrong-owner collision, "
+            "left alone",
+            learning_id=learning_id, agent=agent_id,
+            canonical_doc_id=canonical_doc_id, canonical_path=canonical_path)
+    kind = canonical["memory_kind"]
+    if kind not in ("learning", None) or str(
+            canonical["page_type"] or "") != "learning":
+        return _verdict(
+            "ambiguous", f"canonical node kind={kind!r} "
+            f"page_type={canonical['page_type']!r} is not a learning "
+            "projection; left alone",
+            learning_id=learning_id, agent=agent_id,
+            canonical_doc_id=canonical_doc_id, canonical_path=canonical_path)
+    if canonical["privacy_level"] == "blocked" or str(
+            canonical["page_status"] or "") != "accepted":
+        return _verdict(
+            "ambiguous", "canonical node is restricted/retired; migrating "
+            "edges onto it would resurrect it, left alone",
+            learning_id=learning_id, agent=agent_id,
+            canonical_doc_id=canonical_doc_id, canonical_path=canonical_path)
+    if not join_table:
+        return _verdict(
+            "ambiguous", "learning_documents join table absent: the exact "
+            "mapping cannot be proven on this store",
+            learning_id=learning_id, agent=agent_id,
+            canonical_doc_id=canonical_doc_id, canonical_path=canonical_path)
+    exact = c.execute(
+        "SELECT 1 FROM learning_documents WHERE learning_id = ?"
+        " AND doc_id = ?",
+        (learning_id, canonical_doc_id),
+    ).fetchone()
+    if exact is None:
+        return _verdict(
+            "ambiguous", "no exact (learning, canonical) join row: mapping "
+            "unproven, left alone",
+            learning_id=learning_id, agent=agent_id,
+            canonical_doc_id=canonical_doc_id, canonical_path=canonical_path)
+    other = c.execute(
+        "SELECT learning_id FROM learning_documents WHERE doc_id = ?"
+        " AND learning_id != ? LIMIT 1",
+        (canonical_doc_id, learning_id),
+    ).fetchone()
+    if other is not None:
+        return _verdict(
+            "ambiguous", f"canonical node also backs learning "
+            f"{other['learning_id']}: N:1 aggregate, never conflated",
+            learning_id=learning_id, agent=agent_id,
+            canonical_doc_id=canonical_doc_id,
+            canonical_path=canonical_path)
+    if fts_table:
+        # The durable path can collide with a stale mutated row: the
+        # canonical FTS content must equal the learning content. Missing or
+        # conflicting projection evidence is ambiguity, never proof.
+        stored = c.execute(
+            "SELECT content FROM vault_fts WHERE doc_id = ?",
+            (canonical_doc_id,),
+        ).fetchone()
+        if stored is None or stored["content"] is None:
+            return _verdict(
+                "ambiguous", "canonical node has no FTS content evidence; "
+                "content identity unproven, left alone",
+                learning_id=learning_id, agent=agent_id,
+                canonical_doc_id=canonical_doc_id,
+                canonical_path=canonical_path)
+        if stored["content"] != content:
+            return _verdict(
+                "ambiguous", "canonical FTS content conflicts with the "
+                "learning content: stale collision, left alone",
+                learning_id=learning_id, agent=agent_id,
+                canonical_doc_id=canonical_doc_id,
+                canonical_path=canonical_path)
+        alias_stored = c.execute(
+            "SELECT content FROM vault_fts WHERE doc_id = ?",
+            (alias_doc_id,),
+        ).fetchone()
+        if (
+            alias_stored is not None
+            and alias_stored["content"] is not None
+            and alias_stored["content"] != content
+        ):
+            return _verdict(
+                "ambiguous", "alias FTS content conflicts with the learning "
+                "content; left alone",
+                learning_id=learning_id, agent=agent_id,
+                canonical_doc_id=canonical_doc_id,
+                canonical_path=canonical_path)
+    else:
+        return _verdict(
+            "ambiguous", "vault_fts table absent: content evidence "
+            "unavailable, left alone",
+            learning_id=learning_id, agent=agent_id,
+            canonical_doc_id=canonical_doc_id, canonical_path=canonical_path)
+    return _verdict(
+        "migrate_candidate",
+        f"provable 1:1: live learning {learning_id} owned by {agent_id}, "
+        "exact join to the canonical node at the durable address of that "
+        "exact (agent, content) with matching FTS evidence, no other "
+        "claimants",
+        proposal=f"copy alias out-edges to canonical doc {canonical_doc_id} "
+        f"and mark alias doc {alias_doc_id} superseded",
+        learning_id=learning_id, agent=agent_id,
+        canonical_doc_id=canonical_doc_id, canonical_path=canonical_path)
+
+
+def format_legacy_alias_report(diag: LegacyAliasDiagnostic) -> str:
+    """Human-readable rendering of a legacy-alias diagnostic."""
+    lines = [
+        "Legacy learning:// alias diagnostic (read-only, P2.3):",
+        f"scanned={diag.scanned} candidates={diag.candidates} "
+        f"ambiguous={diag.ambiguous} malformed={diag.malformed}"
+        + (" TRUNCATED" if diag.truncated else ""),
+    ]
+    for finding in diag.findings:
+        if finding.kind == "migrate_candidate":
+            lines.append(
+                f"CANDIDATE alias doc {finding.alias_doc_id} "
+                f"({finding.alias_path}) owner {finding.agent} -> canonical "
+                f"doc {finding.canonical_doc_id} ({finding.canonical_path}): "
+                f"{finding.out_edge_count} out-edge(s), "
+                f"{finding.in_edge_count} in-edge(s). "
+                f"Proposal: {finding.proposal}.")
+        elif finding.kind == "malformed":
+            lines.append(
+                f"MALFORMED alias doc {finding.alias_doc_id} "
+                f"({finding.alias_path}): {finding.reason}.")
+        else:
+            lines.append(
+                f"AMBIGUOUS alias doc {finding.alias_doc_id} "
+                f"({finding.alias_path}): {finding.reason}.")
+    lines.append(
+        "Limitations: no migration was performed and none is proposed "
+        "automatically; N:1 canonical aggregates, restricted/retired "
+        "memories, owner mismatches, missing/conflicting content evidence, "
+        "and malformed aliases are reported, never merged; identity rests "
+        "on the live learning row plus the durable (agent, content) address "
+        "with matching FTS evidence and an exact join row, not on titles "
+        "or excerpts.")
+    return "\n".join(lines)
 
 
 def handle_hygiene_report(params: dict, request_id: Any, context: HealthContext) -> dict:
