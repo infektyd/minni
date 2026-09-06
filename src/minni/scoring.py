@@ -14,6 +14,8 @@ import logging
 import math
 from typing import Optional
 
+from minni.request_deadline import RequestDeadlineExceeded
+
 logger = logging.getLogger("sovereign.scoring")
 
 # Rolling window size for percentile calibration
@@ -211,6 +213,8 @@ def _calibrate(raw: float, db) -> float:
 
         return below / total
 
+    except RequestDeadlineExceeded:
+        raise
     except Exception as e:
         logger.debug("Calibration failed (non-fatal): %s", e)
         return raw
@@ -243,5 +247,7 @@ def record_score(raw_score: float, kind: str, db) -> None:
                 """,
                 (kind, _WINDOW_SIZE * 2, kind),
             )
+    except RequestDeadlineExceeded:
+        raise
     except Exception as e:
         logger.debug("record_score failed (non-fatal): %s", e)
