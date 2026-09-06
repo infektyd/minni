@@ -65,6 +65,10 @@ _BACKEND_SWALLOWED = {
                            "budget_tokens", "depth", "include_superseded",
                            "include_rejected", "include_drafts",
                            "include_expired", "deadline_monotonic"}),
+    "snapshot-semantic": frozenset({"expand", "use_hyde", "agent_id", "update_access",
+                                    "budget_tokens", "depth", "include_superseded",
+                                    "include_rejected", "include_drafts",
+                                    "include_expired", "deadline_monotonic"}),
 }
 
 # Harness envelope defaults (limit / update_access) each adapter consumes.
@@ -78,6 +82,7 @@ _BACKEND_ENVELOPE = {
     "vendor": frozenset(),
     "vendor-memory": frozenset(),
     "snapshot": frozenset({"limit"}),
+    "snapshot-semantic": frozenset({"limit"}),
 }
 
 def _canonical_backend(retriever_name: str) -> str:
@@ -329,19 +334,24 @@ def principal_provenance(
             "scope": "repository working-tree files (no authorization boundary)",
             "note": "File-text baseline; scores describe lexical overlap, not memory quality.",
         }
-    if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+    if key in {"snapshot", "study-snapshot", "study_snapshot",
+               "snapshot-semantic", "snapshot_semantic"}:
+        semantic = key in {"snapshot-semantic", "snapshot_semantic"}
+        backend_label = "snapshot-semantic" if semantic else "study-snapshot"
+        leg_note = ("Semantic ranking leg over the same frozen vault. "
+                    if semantic else "")
         if principal is None:
             return {
                 "supplied": True,
-                "backend": "study-snapshot",
+                "backend": backend_label,
                 "mock": False,
                 "scope": "prepared snapshot vault only (least-privilege study principal)",
-                "note": "Snapshot principal was not initialized; no effective authorization context was recorded. "
+                "note": f"{leg_note}Snapshot principal was not initialized; no effective authorization context was recorded. "
                         "Packet authorization claims are supplied provenance, not independently verified permission.",
             }
         return {
             "supplied": True,
-            "backend": "study-snapshot",
+            "backend": backend_label,
             "mock": False,
             "agent_id": principal.agent_id,
             "workspace_id": principal.workspace_id,
@@ -349,7 +359,7 @@ def principal_provenance(
             "capabilities": list(principal.capabilities),
             "allowed_vault_roots": list(principal.allowed_vault_roots),
             "scope": "prepared snapshot vault only (least-privilege study principal)",
-            "note": "Study principal is scoped to the frozen snapshot vault; "
+            "note": f"{leg_note}Study principal is scoped to the frozen snapshot vault; "
                     "packet authorization claims are supplied provenance, not "
                     "independently verified permission.",
         }
@@ -364,7 +374,8 @@ def principal_provenance(
 
 def corpus_provenance(*, is_mock: bool, retriever_name: str = "",
                       snapshot_id: Optional[str] = None,
-                      manifest_digest: Optional[str] = None) -> Dict[str, Any]:
+                      manifest_digest: Optional[str] = None,
+                      model: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Corpus/database identity per backend: only what is verifiably available.
 
     Only the live-engine backends touch a database at all. File baselines
@@ -421,6 +432,50 @@ def corpus_provenance(*, is_mock: bool, retriever_name: str = "",
                     "assigned a snapshot ID. Bounded packet study only: not "
                     "representative private-memory quality and not a "
                     "retrieval-performance claim.",
+        }
+    if key in {"snapshot-semantic", "snapshot_semantic"}:
+        if not snapshot_id or snapshot_id == "unknown":
+            return {
+                "snapshot": "unknown",
+                "frozen": False,
+                "note": "Semantic snapshot backend without a verified snapshot "
+                        "ID: no frozen claim is made. A verified prepared "
+                        "snapshot reports its manifest-derived ID instead.",
+            }
+        embedding = dict(model) if isinstance(model, dict) else None
+        if not embedding:
+            return {
+                "snapshot": snapshot_id,
+                "manifest_digest": manifest_digest,
+                "frozen": True,
+                "embedding": "unrecorded",
+                "note": "Disposable study snapshot, semantic ranking leg, but "
+                        "no embedding provenance was supplied: model identity "
+                        "is unrecorded, so this run establishes no model claim.",
+            }
+        return {
+            "snapshot": snapshot_id,
+            "manifest_digest": manifest_digest,
+            "frozen": True,
+            "embedding": {
+                "model": embedding.get("model"),
+                "caller_label": embedding.get("caller_label"),
+                "revision": embedding.get("revision", "unknown"),
+                "artifact": embedding.get("artifact", "unknown"),
+                "encoding": embedding.get("encoding", {}),
+                "dim": embedding.get("dim"),
+                "vector_sha256": embedding.get("vector_sha256"),
+                "vector_count": embedding.get("vector_count"),
+                "injected": bool(embedding.get("injected")),
+            },
+            "note": "Disposable study snapshot with a separate semantic "
+                    "ranking leg (document-level cosine over frozen vectors; "
+                    "vector_sha256 binds the scored bytes): all DB/vault "
+                    "paths live inside the prepared snapshot directory under "
+                    "a manifest digest. The live corpus is never assigned a "
+                    "snapshot ID. Injected-model runs exercise plumbing only "
+                    "and establish no retrieval quality; bounded packet study "
+                    "only.",
         }
     return {
         "snapshot": "unknown",

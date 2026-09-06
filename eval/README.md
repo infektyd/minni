@@ -234,6 +234,48 @@ separately authorized collection step can run it without improvising.
   mapping entry. `check_materialized` likewise rejects
   `materialized.json` with an absent or stale `snapshot_version` before
   interpreting it.
+
+### 4. Semantic leg (separate backend, same frozen corpus)
+
+- Backend `snapshot-semantic` (`src/minni/eval/semantic_snapshot.py`) ranks
+  the same prepared snapshot by exact brute-force cosine similarity over
+  document-level vectors from the engine embedding interface
+  (`minni.models.get_embedder` / `SentenceTransformer.encode`). It inherits
+  frozen validation, the least-privilege vault-scoped principal, generation
+  pinning, and lifecycle gates from the lexical baseline unmodified; only
+  the ranking leg differs.
+- Retrieval filtering uses the real authorization gate and lifecycle
+  statuses only, before the output limit. The `expected_eligible`
+  judgments are evaluation ground truth for SCORING, never authorization:
+  a policy-readable row is returned even when its judgment label says
+  ineligible, so the evaluator can observe the error (no answer leakage).
+- Backend, config (`semantic`), and provenance are explicit and separate:
+  reports carry `retriever: snapshot-semantic`, `quality_config: semantic`,
+  and a corpus block with the snapshot ID/digest plus the resolved model
+  identity, caller label, revision/artifact (or explicit `unknown`, never
+  invented), encoding config, dimension, vector-content digest
+  (`vector_sha256`), vector count, and injected flag. An arbitrary
+  `embedder_name` never relabels the actual model. The mandatory
+  snapshot+manifest query binding covers this backend too.
+- No-model fails closed (never degrades to lexical); expand, HyDE, hybrid,
+  and explicit rerank options are rejected when enabled, keeping the
+  semantic-only claim honest. Without chunking, re-rank, or a FAISS lane
+  this runner is a ranking-leg comparison, not a production hybrid
+  certification.
+- Injected-model runs exercise plumbing only and establish no quality.
+
+Parent real-model frozen pilot (decisive acceptance, run by parent):
+
+```
+PYTHONPATH=src:. <venv>/bin/python -m minni.eval.harness run \
+  --retrievers snapshot-semantic --config semantic \
+  --snapshot-dir <prepared-snapshot-dir> --queries <bound-queries.jsonl>
+```
+
+Remaining limits: document-level vectors (no chunking), exact in-memory
+cosine (no FAISS lane — `FAISSIndex` stays live-config-bound), no
+re-rank/HyDE, and quality acceptance belongs to the parent pilot, not to
+the injected-model tests here.
 - Refreshing the corpus means a new snapshot with a new identity and new
   review; never silently swap files under a recorded digest.
 
