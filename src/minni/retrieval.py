@@ -51,6 +51,7 @@ from minni.request_deadline import (
     RequestDeadlineExceeded,
     allow_expired_sql,
     bind_copied_deadline,
+    current_query_embed_cache,
     run_bound,
 )
 
@@ -2572,6 +2573,53 @@ class RetrievalEngine:
             "embedding model unavailable; lexical (FTS) only"
         )
 
+    def _reset_encode_ms(self) -> None:
+        local = getattr(self, "_degradation_local", None)
+        if local is None:
+            local = threading.local()
+            self._degradation_local = local
+        local.encode_ms = 0.0
+
+    def _add_encode_ms(self, ms: float) -> None:
+        local = getattr(self, "_degradation_local", None)
+        if local is None:
+            local = threading.local()
+            self._degradation_local = local
+        local.encode_ms = float(getattr(local, "encode_ms", 0.0) or 0.0) + ms
+
+    def _take_encode_ms(self) -> float:
+        local = getattr(self, "_degradation_local", None)
+        if local is None:
+            return 0.0
+        ms = float(getattr(local, "encode_ms", 0.0) or 0.0)
+        local.encode_ms = 0.0
+        return ms
+
+    def _lookup_query_embedding(self, query: str):
+        embeddings = getattr(getattr(self, "_degradation_local", None), "query_embeddings", None)
+        if embeddings is not None and query in embeddings:
+            # Backends may normalize/mutate their input; keep the memo intact.
+            return embeddings[query].copy()
+        memo = current_query_embed_cache()
+        if memo is None:
+            return None
+        cached = memo.get(query)
+        if cached is None:
+            return None
+        if embeddings is not None:
+            embeddings[query] = cached.copy()
+        return cached
+
+    def _store_query_embedding(self, query: str, vec: np.ndarray) -> None:
+        if vec is None or vec.size == 0:
+            return
+        embeddings = getattr(getattr(self, "_degradation_local", None), "query_embeddings", None)
+        if embeddings is not None:
+            embeddings[query] = vec.copy()
+        memo = current_query_embed_cache()
+        if memo is not None:
+            memo.set(query, vec)
+
     def _encode_query(
         self,
         query: str,
@@ -2586,16 +2634,22 @@ class RetrievalEngine:
         from a healthy hybrid search. Every path that needs a query vector now
         goes through here, so degradation is reported on the same code path as
         the default branch.
+
+        Production search stamps one request_deadline around every corpus
+        leg. The request-scoped memo reuses a successful encode of the same
+        query string so serial vault legs do not pay the embedder again.
+        Deadline and cold-load skips still run before any cache hit is used
+        to start FAISS: an expired budget must not turn a cached vector into
+        a silent hybrid ranking.
         """
         if deadline_monotonic is None:
             deadline_monotonic = self._current_deadline()
         if past_search_deadline(deadline_monotonic):
             self.last_vector_degraded = "search deadline; lexical (FTS) only"
             return np.array([], dtype=np.float32)
-        embeddings = getattr(getattr(self, "_degradation_local", None), "query_embeddings", None)
-        if embeddings is not None and query in embeddings:
-            # Backends may normalize/mutate their input; keep the memo intact.
-            return embeddings[query].copy()
+        cached = self._lookup_query_embedding(query)
+        if cached is not None:
+            return cached
         # Round 18: only clear the process-wide down flag AFTER a successful
         # encode. Clearing before encode() meant an OOM/runtime fault left
         # health reading "encoder up" and hard-failed the request instead of
@@ -2617,10 +2671,17 @@ class RetrievalEngine:
                 if should_skip_cold_model_load(deadline_monotonic, get_embedder):
                     self.last_vector_degraded = "search deadline; lexical (FTS) only"
                     return np.array([], dtype=np.float32)
+                cached = self._lookup_query_embedding(query)
+                if cached is not None:
+                    return cached
                 if not self.model:
                     self._note_vector_model_down()
                     return np.array([], dtype=np.float32)
-                vec = self.model.encode(query, show_progress_bar=False).astype(np.float32)
+                started = time.perf_counter()
+                try:
+                    vec = self.model.encode(query, show_progress_bar=False).astype(np.float32)
+                finally:
+                    self._add_encode_ms((time.perf_counter() - started) * 1000)
                 if past_search_deadline(deadline_monotonic, min_remaining=0):
                     self.last_vector_degraded = "search deadline exceeded during nonpreemptible encode"
         except Exception as exc:
@@ -2636,8 +2697,7 @@ class RetrievalEngine:
             )
             return np.array([], dtype=np.float32)
         self.vector_model_down = False
-        if embeddings is not None and vec.size:
-            embeddings[query] = vec.copy()
+        self._store_query_embedding(query, vec)
         return vec
 
     def _normalize_backend_names(self, backend_names: list) -> list:
@@ -3475,6 +3535,7 @@ class RetrievalEngine:
         state.vector_degraded = None
         state.hyde_degraded = None
         state.document_hydration_degraded = None
+        self._reset_encode_ms()
         self._set_current_deadline(deadline_monotonic)
         if past_search_deadline(deadline_monotonic):
             query_variants = [query]
@@ -4055,7 +4116,6 @@ class RetrievalEngine:
                 ), rerank_k)
                 trace["backends"] = [getattr(backend, "name", "custom")]
             timing["semantic_ms"] = round((time.perf_counter() - semantic_t0) * 1000, 3)
-            timing["embedding_ms"] = timing["semantic_ms"]
             trace["semantic_hits"] = [
                 {
                     "doc_id": r.get("doc_id"),
@@ -4737,6 +4797,7 @@ class RetrievalEngine:
                 if r.get("attribution_score") is not None
             ]
         timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
+        timing["embedding_ms"] = round(self._take_encode_ms(), 3)
         try:
             # RED-1: see the expanded-trace branch above — routes into this
             # call's own state, never a sibling's.
