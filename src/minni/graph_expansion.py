@@ -1,4 +1,4 @@
-"""P1.4 read-only 1-hop typed-graph expansion (spec §3.1–3.2).
+"""Read-only typed-graph expansion: 1-hop (P1.4) plus bounded 2-hop (P3.1).
 
 Privacy-safe neighbor generation for a later retrieve() slot between RRF and
 CE. This module is not invoked from retrieval yet.
@@ -38,7 +38,7 @@ from minni.request_deadline import (
 
 logger = logging.getLogger("sovereign.graph_expansion")
 
-# Spec §3.2 type factors. Phase 1 ships 1-hop only (depth cap unused here).
+# Spec §3.2 type factors and P3.1 two-hop edge set with hop decay.
 TYPE_FACTORS: Dict[str, float] = {
     "updates": 1.00,
     "contradicts": 0.95,
@@ -48,6 +48,9 @@ TYPE_FACTORS: Dict[str, float] = {
     "relates": 0.55,
 }
 ALLOWED_LINK_TYPES = frozenset(TYPE_FACTORS)
+# P3.1: only these types may carry the second hop, either direction.
+TWO_HOP_TYPES = frozenset({"updates", "extends", "derived_from"})
+HOP_DECAY = 0.65
 BIDIRECTIONAL_TYPES = frozenset({"relates", "contradicts"})
 
 MAX_SEEDS = 8
@@ -66,8 +69,8 @@ REQUIRED_MEMORY_KIND = "learning"
 REQUIRED_PAGE_TYPE = "learning"
 _CLOSED_STATUSES = frozenset({"draft", "expired", "rejected", "superseded"})
 _CLOSED_SQL = ",".join("?" * len(_CLOSED_STATUSES))
-_TYPE_SQL = ",".join("?" * len(ALLOWED_LINK_TYPES))
 _SORTED_TYPES = tuple(sorted(ALLOWED_LINK_TYPES))
+_SORTED_TWO_HOP = tuple(sorted(TWO_HOP_TYPES))
 
 _SEED_META_SQL = """
 SELECT doc_id, path, agent, sigil, privacy_level, page_status, page_type, memory_kind
@@ -132,11 +135,16 @@ def expand_typed_graph(
     principal: Optional[EffectivePrincipal],
     workspace: str = "default",
     deadline_monotonic: Optional[float] = None,
+    max_depth: int = 1,
 ) -> GraphExpansionResult:
-    """Return ≤12 privacy-safe 1-hop learning neighbors for authorized seeds.
+    """Return ≤12 privacy-safe learning neighbors for authorized seeds.
 
     Designed to sit between RRF fusion and CE. Retrieval is not wired to
     this function in this slice.
+
+    ``max_depth`` is 1 (default, one-hop only — all current callers) or 2
+    (P3.1 bounded two-hop through ``updates``/``extends``/``derived_from``
+    with 0.65 hop decay). Anything else raises ``ValueError``.
 
     Seeds must be a **pre-ranked envelope** (highest first), each tagged
     with ``store_id`` equal to this connection's ``PRAGMA database_list``
@@ -160,6 +168,8 @@ def expand_typed_graph(
         return GraphExpansionResult(graph_status="disabled")
     if not isinstance(store_id, str) or not store_id.strip():
         raise ValueError("store_id must be a non-empty opaque storage identity")
+    if max_depth not in (1, 2):
+        raise ValueError("max_depth must be 1 or 2")
     deadline = _validated_deadline(deadline_monotonic)
     if deadline is None:
         return GraphExpansionResult(graph_status="disabled")
@@ -205,6 +215,7 @@ def expand_typed_graph(
                             seed_ids=seed_ids,
                             principal=principal,
                             workspace=workspace,
+                            max_depth=max_depth,
                         )
                     )
     except RequestDeadlineExceeded:
@@ -446,6 +457,7 @@ def _eligible_neighbors_for_seed(
     seed_ids: set,
     principal: EffectivePrincipal,
     workspace: str,
+    max_depth: int = 1,
 ) -> List[Dict[str, Any]]:
     best: Dict[int, Dict[str, Any]] = {}
     for direction, seed_col, neighbor_col in (
@@ -491,6 +503,16 @@ def _eligible_neighbors_for_seed(
                     best[doc_id] = candidate
             if len(rows) < EDGE_PAGE_SIZE:
                 break
+    if max_depth >= 2:
+        _merge_second_hop(
+            cursor,
+            best,
+            store_id=store_id,
+            seed_doc_id=seed_doc_id,
+            seed_ids=seed_ids,
+            principal=principal,
+            workspace=workspace,
+        )
     scored = sorted(best.values(), key=lambda item: (-item["graph_score"], item["doc_id"]))
     chosen = scored[:MAX_NEIGHBORS_PER_SEED]
     hydrated: List[Dict[str, Any]] = []
@@ -513,19 +535,20 @@ def _fetch_edge_page(
     direction: str,
     after_id: int,
     after_type: str,
+    link_types: Sequence[str] = _SORTED_TYPES,
 ) -> List[Any]:
     sql = _EDGE_PAGE_SQL.format(
         direction=direction,
         seed_col=seed_col,
         neighbor_col=neighbor_col,
-        types=_TYPE_SQL,
+        types=",".join("?" * len(link_types)),
         closed=_CLOSED_SQL,
     )
     cursor.execute(
         sql,
         (
             seed_doc_id,
-            *_SORTED_TYPES,
+            *link_types,
             REQUIRED_MEMORY_KIND,
             REQUIRED_PAGE_TYPE,
             *_CLOSED_STATUSES,
@@ -535,6 +558,211 @@ def _fetch_edge_page(
         ),
     )
     return list(cursor.fetchall())
+
+
+def _merge_second_hop(
+    cursor,
+    best: Dict[int, Dict[str, Any]],
+    *,
+    store_id: str,
+    seed_doc_id: int,
+    seed_ids: set,
+    principal: EffectivePrincipal,
+    workspace: str,
+) -> None:
+    """Expand admitted hop-1 nodes one more hop, merging winners into ``best``.
+
+    The frontier is the top-ranked hop-1 slice, not the whole result set:
+    the same MAX_NEIGHBORS_PER_SEED ranked cap that admits output entries
+    admits traversal first — lower-ranked entries are never expanded to
+    backfill it. Within that slice, only intermediates reached via a
+    two-hop type (updates/extends/derived_from) expand: both edges of a
+    two-hop path must belong to the allowed set, so relates/contradicts
+    first edges stop at depth 1 while their direct entries stay in the
+    output pool. A denied or closed intermediate is never traversed merely
+    because its far neighbor would be readable. Seeds are never echoed and
+    never traversed through (each seed walks its own first hop). The
+    frontier is fixed before walking, so cycles and repeated paths
+    terminate even though a two-hop path may outscore — and replace — a
+    direct entry for the same node (max-scoring path wins, no duplicate
+    support). Per node at most MAX_NEIGHBORS_PER_SEED far candidates
+    survive; the per-seed and global caps still apply downstream.
+    """
+    ranked = sorted(best.values(), key=lambda item: (-item["graph_score"], item["doc_id"]))
+    frontier = [
+        item for item in ranked[:MAX_NEIGHBORS_PER_SEED]
+        if item["link_type"] in TWO_HOP_TYPES
+    ]
+    for parent in frontier:
+        check_deadline()
+        for item in _second_hop_for_parent(
+            cursor,
+            store_id=store_id,
+            parent=parent,
+            seed_doc_id=seed_doc_id,
+            seed_ids=seed_ids,
+            principal=principal,
+            workspace=workspace,
+        ):
+            doc_id = item["doc_id"]
+            prev = best.get(doc_id)
+            if prev is None or _far_wins(item, prev):
+                best[doc_id] = item
+
+
+def _far_wins(item: Dict[str, Any], prev: Dict[str, Any]) -> bool:
+    """Max-scoring path wins per node with no duplicate support.
+
+    A strictly higher score always wins. Ties prefer fewer hops (a direct
+    neighbor over a two-hop path explaining the same node), then the
+    smaller link type for a total deterministic order.
+    """
+    if item["graph_score"] != prev["graph_score"]:
+        return item["graph_score"] > prev["graph_score"]
+    if item["graph_depth"] != prev["graph_depth"]:
+        return item["graph_depth"] < prev["graph_depth"]
+    return item["link_type"] < prev["link_type"]
+
+
+def _second_hop_for_parent(
+    cursor,
+    *,
+    store_id: str,
+    parent: Dict[str, Any],
+    seed_doc_id: int,
+    seed_ids: set,
+    principal: EffectivePrincipal,
+    workspace: str,
+) -> List[Dict[str, Any]]:
+    """Walk both edge directions off one intermediate, two-hop types only."""
+    best: Dict[int, Dict[str, Any]] = {}
+    parent_id = parent["doc_id"]
+    for direction, seed_col, neighbor_col in (
+        ("outgoing", "source_doc_id", "target_doc_id"),
+        ("incoming", "target_doc_id", "source_doc_id"),
+    ):
+        after_id = 0
+        after_type = ""
+        while True:
+            check_deadline()
+            rows = _fetch_edge_page(
+                cursor,
+                parent_id,
+                seed_col=seed_col,
+                neighbor_col=neighbor_col,
+                direction=direction,
+                after_id=after_id,
+                after_type=after_type,
+                link_types=_SORTED_TWO_HOP,
+            )
+            if not rows:
+                break
+            for edge in rows:
+                after_id = int(_row_value(edge, "neighbor_doc_id"))
+                after_type = str(_row_value(edge, "link_type") or "")
+                candidate = _consider_second_hop(
+                    edge,
+                    direction=direction,
+                    store_id=store_id,
+                    parent=parent,
+                    seed_doc_id=seed_doc_id,
+                    seed_ids=seed_ids,
+                    principal=principal,
+                    workspace=workspace,
+                )
+                if candidate is None:
+                    continue
+                doc_id = candidate["doc_id"]
+                prev = best.get(doc_id)
+                if prev is None or _far_wins(candidate, prev):
+                    best[doc_id] = candidate
+            if len(rows) < EDGE_PAGE_SIZE:
+                break
+    scored = sorted(best.values(), key=lambda item: (-item["graph_score"], item["doc_id"]))
+    return scored[:MAX_NEIGHBORS_PER_SEED]
+
+
+def _consider_second_hop(
+    row: Any,
+    *,
+    direction: str,
+    store_id: str,
+    parent: Dict[str, Any],
+    seed_doc_id: int,
+    seed_ids: set,
+    principal: EffectivePrincipal,
+    workspace: str,
+) -> Optional[Dict[str, Any]]:
+    """Score one far edge off an authorized, eligible intermediate.
+
+    The intermediate was admitted as a hop-1 result, so it already passed
+    authorization and eligibility in this snapshot — that is the only
+    reason its edges may be walked. The far node is authorized here,
+    before any text is hydrated, and must be eligible itself. Seeds are
+    never echoed back; any other node — including an admitted hop-1 node —
+    competes on score via _far_wins, so a stronger two-hop path replaces
+    a weaker direct entry without duplicating support.
+    """
+    link_type = str(_row_value(row, "link_type") or "")
+    if link_type not in TWO_HOP_TYPES:
+        return None
+    neighbor_id = _row_value(row, "neighbor_doc_id")
+    if not _is_doc_id(neighbor_id) or neighbor_id == parent["doc_id"]:
+        return None
+    if neighbor_id in seed_ids:
+        return None
+    weight = _legacy_or_weight(_row_value(row, "weight"))
+    confidence = _legacy_or_unit(_row_value(row, "confidence"))
+    if weight is None or confidence is None:
+        return None
+    metadata = {
+        "doc_id": neighbor_id,
+        "store_id": store_id,
+        "path": _row_value(row, "path"),
+        "agent": _row_value(row, "agent"),
+        "sigil": _row_value(row, "sigil"),
+        "privacy_level": _row_value(row, "privacy_level") or "safe",
+        "page_status": _row_value(row, "page_status") or "candidate",
+        "page_type": _row_value(row, "page_type"),
+        "memory_kind": _row_value(row, "memory_kind"),
+    }
+    if not _authorized(principal, workspace, metadata):
+        return None
+    if not _neighbor_eligible(metadata):
+        return None
+    factor = TYPE_FACTORS[link_type]
+    graph_score = parent["graph_score"] * factor * weight * confidence * HOP_DECAY
+    hop = {
+        "from_doc_id": parent["doc_id"],
+        "to_doc_id": neighbor_id,
+        "link_type": link_type,
+        "direction": direction,
+        "confidence": confidence,
+        "weight": weight,
+        "inference_run_id": _row_value(row, "inference_run_id"),
+        "model_id": _row_value(row, "model_id"),
+        "inference_method": _row_value(row, "inference_method"),
+        "store_id": store_id,
+    }
+    return {
+        "doc_id": neighbor_id,
+        "store_id": store_id,
+        "path": metadata["path"],
+        "source": metadata["path"],
+        "agent": metadata["agent"],
+        "sigil": metadata["sigil"],
+        "privacy_level": metadata["privacy_level"],
+        "page_status": metadata["page_status"],
+        "page_type": metadata["page_type"],
+        "memory_kind": metadata["memory_kind"],
+        "score": graph_score,
+        "graph_score": graph_score,
+        "retrieval_origin": "graph",
+        "seed_doc_id": seed_doc_id,
+        "graph_paths": [*parent["graph_paths"], hop],
+        "graph_depth": 2,
+        "link_type": link_type,
+    }
 
 
 def _row_value(row: Any, key: str, index: int = None):
@@ -616,6 +844,7 @@ def _consider_edge(
         "retrieval_origin": "graph",
         "seed_doc_id": seed_doc_id,
         "graph_paths": [path],
+        "graph_depth": 1,
         "link_type": link_type,
     }
 

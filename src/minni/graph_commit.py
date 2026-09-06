@@ -21,9 +21,9 @@ Slice scope (deliberately minimal):
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
-from minni.durable_projection import durable_doc_path
+from minni.durable_projection import ACTIVE_LEARNING_SQL, durable_doc_path
 
 logger = logging.getLogger("sovereign.graph_commit")
 
@@ -223,3 +223,97 @@ def _reconcile_new_active_mapping(cur, row, learning_id, agent_id, content, meta
         "UPDATE documents SET page_status='accepted', superseded_by=NULL WHERE doc_id=?",
         (doc_id,),
     )
+
+
+def supersession_target_state(cur: Any, *, doc_id: int) -> Optional[dict]:
+    """Fresh in-transaction supersession state for one target doc.
+
+    Returns the authoritative documents row plus every mapped learning
+    (learning_id, agent_id, status, superseded_by), or None when the doc
+    row is gone. No authorization or eligibility judgment here — the
+    coordinator plans retire-vs-review from this state. Call inside the
+    caller's cursor/transaction; raises on DB errors so the whole commit
+    rolls back.
+    """
+    doc = cur.execute(
+        "SELECT doc_id, agent, page_type, memory_kind, privacy_level,"
+        " page_status, superseded_by FROM documents WHERE doc_id = ?",
+        (doc_id,),
+    ).fetchone()
+    if doc is None:
+        return None
+    join_present = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='learning_documents'"
+    ).fetchone() is not None
+    members: list = []
+    if join_present:
+        members = [
+            {
+                "learning_id": int(m["learning_id"]),
+                "agent_id": m["agent_id"],
+                "status": m["status"],
+                "superseded_by": m["superseded_by"],
+            }
+            for m in cur.execute(
+                """SELECT l.learning_id, l.agent_id, l.status, l.superseded_by
+                   FROM learning_documents jd
+                   JOIN learnings l ON l.learning_id = jd.learning_id
+                   WHERE jd.doc_id = ? ORDER BY l.learning_id""",
+                (doc_id,),
+            ).fetchall()
+        ]
+    return {"doc": dict(doc), "members": members}
+
+
+def retire_superseded_members(
+    cur: Any,
+    *,
+    doc_id: int,
+    learning_ids: Sequence[int],
+    new_learning_id: int,
+    new_doc_id: int,
+    now: float,
+) -> tuple:
+    """Retire caller-chosen mapped learnings, then apply aggregate liveness.
+
+    Sets each listed learning to ``status='superseded', superseded_by=new``
+    (only rows still active — the UPDATE re-checks, so repeats retire
+    nothing). Then flips the canonical doc to ``page_status='superseded',
+    superseded_by=new_doc`` ONLY when no active mapped learning remains
+    (any agent) and the doc is still ``accepted`` — a shared N:1 node with
+    surviving siblings stays accepted, and closed/restricted states are
+    never rewritten or resurrected. Returns ``(retired_lids, doc_flipped)``.
+
+    This never selects WHO to retire: the coordinator plans that from
+    :func:`supersession_target_state`. Explicit ``LearningFields.supersedes``
+    (caller-directed, status untouched) composes independently.
+    """
+    retired: list = []
+    for learning_id in learning_ids:
+        hit = cur.execute(
+            """UPDATE learnings SET status='superseded', superseded_by=?
+               WHERE learning_id=? AND superseded_by IS NULL
+               AND (status IS NULL
+                    OR status NOT IN ('rejected', 'expired', 'superseded'))""",
+            (new_learning_id, int(learning_id)),
+        )
+        if hit.rowcount:
+            retired.append(int(learning_id))
+    flipped = False
+    if retired:
+        remaining = cur.execute(
+            f"""SELECT 1 FROM learning_documents jd
+                JOIN learnings l ON l.learning_id = jd.learning_id
+                WHERE jd.doc_id = ? AND {ACTIVE_LEARNING_SQL} LIMIT 1""",
+            (doc_id,),
+        ).fetchone()
+        if remaining is None:
+            hit = cur.execute(
+                """UPDATE documents SET page_status='superseded',
+                   superseded_by=?, last_modified=?
+                   WHERE doc_id=? AND page_status='accepted'""",
+                (new_doc_id, now, doc_id),
+            )
+            flipped = bool(hit.rowcount)
+    return tuple(retired), flipped

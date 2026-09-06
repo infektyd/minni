@@ -41,6 +41,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from minni.durable_projection import (
     ACTIVE_LEARNING_SQL,
+    CLOSED_PROJECTION_STATUSES,
     durable_doc_path,
     durable_metadata,
     projection_row_closed,
@@ -53,7 +54,11 @@ from minni.graph_candidates import (
     CandidateDescriptor,
     prepare_candidate_shortlist,
 )
-from minni.graph_commit import ensure_canonical_learning_node
+from minni.graph_commit import (
+    ensure_canonical_learning_node,
+    retire_superseded_members,
+    supersession_target_state,
+)
 from minni.principal import EffectivePrincipal, can_read_document
 
 logger = logging.getLogger("sovereign.graph_coordinator")
@@ -66,6 +71,10 @@ PERSIST_CONFIDENCE: Dict[str, float] = {
     "relates": 0.78,
 }
 TYPED_LINK_TYPES = frozenset(PERSIST_CONFIDENCE)
+# Spec §2.4: only `updates` at this HIGHER floor may auto-supersede. The
+# persist floors above are unchanged — lower-confidence accepted updates
+# edges persist as provenance without retiring anything.
+SUPERSEDE_CONFIDENCE = 0.96
 INFERENCE_METHOD = "local_classifier"
 
 NEXT_INTEGRATION = (
@@ -104,6 +113,8 @@ class CommitResult:
     new_chunk_ids: Tuple[int, ...] = ()
     new_chunk_vectors: Tuple[bytes, ...] = ()
     contradiction_logged: bool = False
+    superseded_learning_ids: Tuple[int, ...] = ()
+    update_reviews_queued: int = 0
     error_code: Optional[str] = None
     error: Optional[str] = None
 
@@ -118,6 +129,7 @@ class RepairResult:
     edges_deferred: Optional[str] = None  # "degraded" | "disabled" | None
     new_chunk_ids: Tuple[int, ...] = ()
     new_chunk_vectors: Tuple[bytes, ...] = ()
+    update_reviews_queued: int = 0
     error_code: Optional[str] = None
     error: Optional[str] = None
 
@@ -535,6 +547,184 @@ def _write_edges(
             )
             contradiction_logged = True
     return tuple(committed), contradiction_logged
+
+
+def _plan_updates_action(
+    *,
+    label: str,
+    direction: str,
+    confidence: float,
+    new_agent_id: str,
+    new_learning_id: int,
+    target_state: Optional[Dict[str, Any]],
+) -> Tuple[Tuple[int, ...], Optional[int], Optional[str]]:
+    """Decide retire-vs-review for one validated `updates` candidate.
+
+    Returns ``(retire_lids, review_ref_lid, review_reason)``; ``((), None,
+    None)`` means persist the edge with no lifecycle action. Only a
+    FORWARD `updates` edge at >= SUPERSEDE_CONFIDENCE whose target doc maps
+    at least one ACTIVE same-agent learning may retire — and then only
+    those same-agent actives. Everything else at or above the persist
+    floor downgrades to a pending `graph_update_review` row: backward
+    direction (wrong target), non-learning or closed targets, other
+    agents' active learnings, already-superseded targets — and, per locked
+    8.1.1, every FORWARD `updates` edge in the lower band [0.88, 0.96),
+    which persists the edge but never retires. Below the persist floor is
+    a no-op. Pure unit logic over an in-transaction state snapshot — no I/O.
+    """
+    none: Tuple[Tuple[int, ...], Optional[int], Optional[str]] = ((), None, None)
+    if label != "updates":
+        return none
+    if not math.isfinite(confidence) or confidence < PERSIST_CONFIDENCE["updates"]:
+        return none
+    members: List[Dict[str, Any]] = (
+        list(target_state["members"]) if target_state is not None else []
+    )
+    first_ref = members[0]["learning_id"] if members else None
+    if direction != "forward":
+        return ((), first_ref, f"non_forward_updates:{direction}")
+    if target_state is None:
+        # Unreachable: revalidation aborts gone targets before binding.
+        return none
+    doc = target_state["doc"]
+    if (
+        doc.get("memory_kind") != "learning"
+        or str(doc.get("page_type") or "").lower() != "learning"
+    ):
+        return ((), first_ref, "non_learning_target")
+    if (
+        doc.get("privacy_level") == "blocked"
+        or str(doc.get("page_status") or "") in CLOSED_PROJECTION_STATUSES
+    ):
+        return ((), first_ref, "target_closed")
+    if confidence < SUPERSEDE_CONFIDENCE:
+        # Locked 8.1.1: the lower band persists the edge and queues a
+        # pending review — retirement is structurally impossible here.
+        return ((), first_ref, "below_supersede_floor")
+    self_active: List[int] = []
+    self_done: List[int] = []
+    self_other: List[int] = []
+    other_active: List[int] = []
+    for member in members:
+        lid = int(member["learning_id"])
+        active = member["superseded_by"] is None and str(
+            member["status"] or ""
+        ) not in ("rejected", "expired", "superseded")
+        if member["agent_id"] == new_agent_id:
+            if active:
+                self_active.append(lid)
+            elif member["superseded_by"] == new_learning_id:
+                self_done.append(lid)
+            else:
+                self_other.append(lid)
+        elif active:
+            other_active.append(lid)
+        # Other agents' inactive rows are not ours to touch or review.
+    retire = tuple(self_active)
+    if other_active:
+        return (retire, retire[0] if retire else other_active[0],
+                "other_agent_active")
+    if not retire:
+        if self_other:
+            return ((), self_other[0], "already_superseded")
+        if self_done:
+            return none  # This learning already applied its supersession.
+        return ((), None, "no_mapped_learning")
+    return (retire, None, None)
+
+
+def _queue_update_review(
+    c: Any,
+    *,
+    new_learning_id: int,
+    target_learning_id: Optional[int],
+    confidence: float,
+    reason: str,
+    now: float,
+) -> bool:
+    """Insert one pending `graph_update_review` consolidation action.
+
+    Idempotent per (new learning, target learning): an existing pending
+    review for the same pair is kept, so repeated repairs never spam the
+    queue. Returns True when a row was inserted.
+    """
+    if target_learning_id is not None:
+        dup = c.execute(
+            """SELECT 1 FROM consolidation_actions
+               WHERE action_type='graph_update_review'
+               AND target_learning_id=? AND superseded_learning_id=?
+               AND status='pending' LIMIT 1""",
+            (new_learning_id, target_learning_id),
+        ).fetchone()
+        if dup is not None:
+            return False
+    c.execute(
+        """INSERT INTO consolidation_actions
+           (action_type, source_event_id, target_learning_id,
+            superseded_learning_id, claim, category, confidence, status,
+            detail, created_at)
+           VALUES ('graph_update_review', NULL, ?, ?, NULL, 'updates', ?,
+                   'pending', ?, ?)""",
+        (new_learning_id, target_learning_id, float(confidence), reason, now),
+    )
+    return True
+
+
+def _apply_updates_supersession(
+    c: Any,
+    *,
+    validated: Sequence[Tuple[CandidateDescriptor, str, str, float]],
+    source_doc_id: int,
+    new_learning_id: int,
+    new_doc_id: int,
+    agent_id: str,
+    now: float,
+    allow_retire: bool,
+) -> Tuple[Tuple[int, ...], int]:
+    """P2.1 auto-supersession over validated pairs, inside the caller txn.
+
+    For each distinct non-self target planned by `_plan_updates_action`:
+    retire the planned same-agent actives (commit only) and queue a
+    `graph_update_review` row when the plan carries a reason. Repair
+    (``allow_retire=False``) never retires a durable learning — qualifying
+    targets downgrade to reviews instead. Returns
+    ``(retired_learning_ids, reviews_queued)``. Raises on DB errors so the
+    whole commit/repair rolls back with zero partial lifecycle writes.
+    """
+    retired_all: List[int] = []
+    reviews = 0
+    seen: set = set()
+    for descriptor, label, direction, confidence in validated:
+        target = int(descriptor.doc_id)
+        if target == source_doc_id or target in seen:
+            continue
+        seen.add(target)
+        state = supersession_target_state(c, doc_id=target)
+        retire, ref, reason = _plan_updates_action(
+            label=label, direction=direction, confidence=confidence,
+            new_agent_id=agent_id, new_learning_id=new_learning_id,
+            target_state=state,
+        )
+        if not allow_retire and retire:
+            reason = reason or "repair_no_retire"
+            if ref is None:
+                ref = retire[0]
+            retire = ()
+        if retire:
+            done, _flipped = retire_superseded_members(
+                c, doc_id=target, learning_ids=retire,
+                new_learning_id=new_learning_id, new_doc_id=new_doc_id,
+                now=now,
+            )
+            retired_all.extend(done)
+        if reason is not None:
+            if _queue_update_review(
+                c, new_learning_id=new_learning_id,
+                target_learning_id=ref, confidence=float(confidence),
+                reason=reason, now=now,
+            ):
+                reviews += 1
+    return tuple(retired_all), reviews
 
 
 def _require_snapshot(
@@ -1193,6 +1383,15 @@ def commit_prepared_learning(
             evidence={"evidence_hash": info["evidence_hash"]},
             now=prepared.prepared_at, new_learning_id=learning_id,
         )
+    superseded: Tuple[int, ...] = ()
+    update_reviews = 0
+    if prepared.graph_enabled and prepared.validated:
+        superseded, update_reviews = _apply_updates_supersession(
+            c, validated=prepared.validated, source_doc_id=int(doc_id),
+            new_learning_id=learning_id, new_doc_id=int(doc_id),
+            agent_id=prepared.principal.agent_id, now=prepared.prepared_at,
+            allow_retire=True,
+        )
     return CommitResult(
         status="staged", learning_id=learning_id, doc_id=doc_id,
         edges=committed,
@@ -1200,6 +1399,8 @@ def commit_prepared_learning(
         edges_deferred=None if prepared.graph_enabled else "disabled",
         new_chunk_ids=new_chunk_ids, new_chunk_vectors=new_vectors,
         contradiction_logged=contradiction_logged,
+        superseded_learning_ids=superseded,
+        update_reviews_queued=update_reviews,
     )
 
 
@@ -1470,6 +1671,15 @@ def repair_learning_projection(
                     evidence={"evidence_hash": classifier_info["evidence_hash"]},
                     now=now, new_learning_id=learning_id,
                 )
+            # Standing repair never retires a durable learning: qualifying
+            # updates targets downgrade to graph_update_review rows.
+            update_reviews = 0
+            if validated and not schema_missing:
+                _, update_reviews = _apply_updates_supersession(
+                    c, validated=validated, source_doc_id=int(doc_id),
+                    new_learning_id=learning_id, new_doc_id=int(doc_id),
+                    agent_id=agent_id, now=now, allow_retire=False,
+                )
             # Truthful status from actual post-fill state, not from which
             # code path ran: complete requires FTS AND vectors present.
             chunks_ok = (
@@ -1493,6 +1703,7 @@ def repair_learning_projection(
                 new_chunk_ids=new_chunk_ids,
                 new_chunk_vectors=tuple(
                     v for _, v in chunks) if new_chunk_ids else (),
+                update_reviews_queued=update_reviews,
             )
     except _Abort as abort:
         return _fail(f"repair_{abort.code}", str(abort))
