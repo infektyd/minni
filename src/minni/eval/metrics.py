@@ -244,6 +244,7 @@ def run_eval(
     config_kwargs: Dict[str, Any],
     ks: Tuple[int, ...] = (1, 3, 5, 10),
     *, strict_search: bool = False,
+    forbidden_doc_ids: Optional[set[int]] = None,
 ) -> Dict[str, Any]:
     """Run evaluation over all queries for a single config."""
     per_query = []
@@ -265,6 +266,7 @@ def run_eval(
             searcher, query_text, config_name, config_kwargs, strict=strict_search
         )
         result_ids = _extract_doc_ids(results, strict=strict_search)
+        forbidden = sorted(set(result_ids) & (forbidden_doc_ids or set()))
         token_counts = _extract_token_counts(results)
 
         r_at_k = {k: _recall_at_k(expected_ids, result_ids, k) for k in ks}
@@ -296,6 +298,7 @@ def run_eval(
             "expected_doc_ids": expected_ids,
             "notes": notes,
             "result_doc_ids": result_ids[:10],
+            "forbidden_doc_ids": forbidden,
             "recall_at_k": r_at_k,
             "ndcg_at_k": {k: round(ndcg_at_k[k], 4) for k in ks},
             "token_budget_recall_at_k": {
@@ -311,6 +314,9 @@ def run_eval(
     summary = {
         "config": config_name,
         "n_queries": len(queries),
+        "forbidden_doc_ids": sorted({
+            doc_id for row in per_query for doc_id in row["forbidden_doc_ids"]
+        }),
         "total_latency_s": round(total_latency, 3),
         "mean_latency_s": round(total_latency / n, 4),
         "recall_at_k": {
@@ -329,7 +335,13 @@ def run_eval(
         ),
     }
 
-    return {"summary": summary, "per_query": per_query}
+    report = {"summary": summary, "per_query": per_query}
+    if strict_search and summary["forbidden_doc_ids"]:
+        raise RuntimeError(
+            "snapshot retrieval returned forbidden document IDs: "
+            + ", ".join(str(i) for i in summary["forbidden_doc_ids"])
+        )
+    return report
 
 
 def _metric_value(per_query: Dict[str, Any], metric: str, k: int) -> float:

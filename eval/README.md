@@ -217,6 +217,23 @@ separately authorized collection step can run it without improvising.
   retrieval runs, not derived from retrieval output.
 - Keep the snapshot and all study reports **outside version control**
   (e.g. under Minni's private data dir or `/tmp`), never in `eval/`.
+  `prepare_snapshot` enforces this: a destination inside a Git checkout is
+  refused unless `git check-ignore` verifiably reports it ignored (the
+  user-approved `_private/` tree is ignored, so it keeps working; worktree
+  `.git` files count as checkout markers, and not-yet-created descendants
+  of ignored directories are accepted). No usable git binary means no
+  verification, which fails closed.
+- Numeric `expected_doc_ids` are corpus-relative. Every snapshot query must
+  bind its judgments to the corpus with `snapshot_id` plus `manifest_digest`.
+  The harness refuses missing, partial or mismatched bindings before scoring,
+  including negative judgments with no expected hits. No generic frozen
+  identity is assumed.
+- Verification pins the machine labels: the manifest must keep
+  `review_state: machine_proposed` and the supplied-claim provenance note;
+  a `human_reviewed` label on the manifest is rejected just like one on a
+  mapping entry. `check_materialized` likewise rejects
+  `materialized.json` with an absent or stale `snapshot_version` before
+  interpreting it.
 - Refreshing the corpus means a new snapshot with a new identity and new
   review; never silently swap files under a recorded digest.
 
@@ -301,3 +318,113 @@ They remain available for legacy descriptive reports. Quality mode also rejects
 pairs with identical effective options after accounting for the engine’s
 `expand=True` default; distinct names alone do not
 establish a feature comparison.
+## Bounded study snapshot (authorized-export packet in, frozen corpus out)
+
+`src/minni/eval/study_snapshot.py` is the snapshot foundation for the
+private-memory campaign. It collects nothing: the only input is a bounded,
+explicit **authorized-export packet** (principal/store/source identity plus
+record content) supplied by the parent, which connects the governed export
+separately. Arbitrary paths and vault dumps are never accepted.
+
+Packet shape (`packet_version: "minni-study-export-v1"`):
+
+- `principal.agent_id`, `store.{store_id, origin}`, `source.origin`,
+  `authorization.claimed` — a supplied claim recorded as provenance, never
+  authentication proof and never independently verified permission.
+- `records[]` — each with a `(store, source_doc_id)` tuple identity (the
+  same document number in two stores names two documents), relative `.md`
+  `artifact_path` (no absolutes, no `..`), `text` plus matching
+  `content_sha256`, `content_kind: original|excerpt` (excerpts must cite a
+  `source_locator`), `review_state: machine_proposed` with
+  `human_reviewed: false`, source-ownership `agent`, `privacy_level`, clear
+  `origin`, original lifecycle `page_status`/`page_type`, an explicit boolean
+  `expected_eligible`, and optional scalar-only `source_detail`
+  (cross-project eligibility is annotated before retrieval, never inferred
+  from it; project directories are ordinary paths, not authorization
+  boundaries).
+
+Hard input bounds (1000 records, 100k chars / 400k UTF-8 bytes per text,
+5M chars total, plus length caps on every metadata string, capability list,
+and scalar-only finite `source_detail`) fire before any hashing, writes, or
+DB work. Validation then rejects tampered manifests — the digest binds
+canonical source/principal/authorization metadata AND lifecycle fields, so
+swapping any of them invalidates the snapshot — tampered content, duplicate
+`(store, source_doc_id)` tuples, unsafe artifact paths (canonical segments
+only: `a/./n.md`, `a//n.md`, and trailing-slash aliases are rejected),
+unbound extra fields, missing excerpt/original labels, any human-reviewed
+claim, and malformed fields. Identical bytes under separate ownership are
+allowed and linked through a shared content group (`content_groups` in the
+manifest), never silently conflated. Machine judgments are never labeled
+human-reviewed: original lifecycle/privacy provenance is preserved in
+`source_provenance`, the study judgment lives separately in
+`study_judgment`.
+
+```sh
+PYTHONPATH=src .venv/bin/python - <<'EOF'
+import json
+from pathlib import Path
+from minni.eval.study_snapshot import (
+    prepare_snapshot, materialize_snapshot_db,
+)
+packet = json.loads(Path("/private/study-export/packet.json").read_text())
+dest = Path("/private/study-snapshots/study-01")  # 0700 dirs / 0600 files
+manifest = prepare_snapshot(packet, dest)      # no DB, engine, or model imports
+info = materialize_snapshot_db(dest)           # disposable lexical FTS corpus
+print(manifest["snapshot_id"], info["document_ids"])
+EOF
+```
+
+`prepare_snapshot` freezes vault files, a deterministic opaque remapping
+(`study-0001…`, sorted by store/source identity), and `snapshot.json` whose
+`snapshot_id` derives from the manifest digest only — snapshot IDs are never
+assigned to the live corpus. Destinations that are, contain, or sit inside
+live/default paths are rejected before anything is written, and preparation
+refuses a non-empty destination so a second packet can never mix bytes into
+an existing snapshot. Frozen files and metadata re-validate on every
+materialization and every search (`verify_snapshot`): symlinks in any path
+component (including vault ancestors and the snapshot root/outputs),
+tampered bytes, inconsistent mappings, unmapped vault files, invented
+snapshot IDs, edited identity mirrors, and digest mismatches all fail, and
+`mapping.json` carries the manifest/snapshot IDs so outputs can never mix
+across snapshots. Reads use strict JSON (no NaN/Infinity) with size
+preflights before any bytes load. `materialize_snapshot_db` runs once per
+prepared directory, mirrors the fixture's isolated construction with every
+DB/index/vault path inside the snapshot directory, preserves original
+ownership/lifecycle/privacy metadata per record, disables writeback, and
+loads no model; `check_materialized` re-binds every `document_ids` entry to
+the actual immutable SQLite rows and FTS text over a read-only handle
+(runtime access counters are excluded, so normal governed search effects
+never read as tampering). Refreshing the corpus means a new snapshot
+directory, never silent file swaps.
+
+Run governed retrieval over the frozen corpus with the isolated backend:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
+  --queries /private/study-queries.jsonl --retrievers snapshot \
+  --snapshot-dir /private/study-snapshots/study-01 \
+  --output-dir /private/study-reports
+```
+
+The snapshot retriever requires `--snapshot-dir`, opens only that directory
+under a least-privilege principal scoped to the snapshot vault, and never
+instantiates the live `DEFAULT_CONFIG`, a retrieval engine, or a model.
+Retrieval is an explicit offline lexical baseline (FTS5 MATCH with the
+engine's default lifecycle exclusions plus the central read gate) — not a
+full-engine quality comparison — and takes no deadline, so expiry semantics
+cannot empty its results. Provenance labels the verified snapshot ID plus its manifest digest
+(failing closed to `unknown`/unfrozen without a verified ID)
+with supplied (not verified) authorization; the snapshot backend is excluded
+from quality-gate config comparisons. The search path is fully read-only;
+no zero-write forensic claim is made beyond that.
+`sm_export_pack` stays what it is (shared snippets under an export
+capability, not a corpus snapshot) and no capability is bypassed.
+
+Scope honesty: a bounded packet study only — not representative
+private-memory quality, not a retrieval-performance claim, not a
+default-change signal. Decisive acceptance stays with the parent.
+
+Unresolved (parent-owned): the governed daemon export that produces the
+packet, and the collection limits for the real day-to-day memory corpus,
+are not implemented here — this module only validates, freezes, and serves
+whatever bounded packet the parent supplies.

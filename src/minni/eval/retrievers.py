@@ -26,6 +26,9 @@ _BACKEND_ALIASES = {
     "vendor-memory": "vendor-memory",
     "vendor_memory": "vendor-memory",
     "mock": "mock",
+    "snapshot": "snapshot",
+    "study-snapshot": "snapshot",
+    "study_snapshot": "snapshot",
 }
 
 
@@ -188,6 +191,247 @@ class VendorMemorySearcher(SearcherProtocol):
         return []
 
 
+def _sanitize_snapshot_query(query: str) -> str:
+    """FTS5-safe query terms; mirrors RetrievalEngine._sanitize_fts_query.
+
+    A contract test pins parity so snapshot lexical semantics cannot drift
+    from the engine's FTS leg. Local copy (not an engine call) keeps the
+    snapshot search path free of model-adjacent imports.
+    """
+    import re as _re
+
+    words = _re.sub(r"[^\w\s]", " ", query).split()
+    return " ".join(words)
+
+
+class SnapshotSearcher(SearcherProtocol):
+    """Governed lexical retrieval over a prepared study snapshot directory.
+
+    Explicit offline lexical implementation over the disposable study
+    database: FTS5 MATCH (strict AND, OR fallback) with the engine's default
+    lifecycle exclusions and the central ``can_read_document`` gate under a
+    least-privilege principal scoped to the snapshot vault. Eligibility
+    filtering happens BEFORE the output limit and BEFORE the
+    strict/OR-fallback decision, so an ineligible top row can never starve
+    an eligible row below it. No retrieval engine is instantiated, no model
+    is loaded, no network is touched, and NO deadline is passed anywhere in
+    this path — so present and future whole-request expiry semantics cannot
+    degrade it to empty. Never touches the live ``DEFAULT_CONFIG``
+    database. Read-only: access counters are never updated and no zero-write
+    forensic claim is made beyond that.
+
+    Generation pinning: the snapshot identity accepted at initialization is
+    re-compared on every search. A valid replacement snapshot at the same
+    path fails closed instead of serving new rows under the old ID. This
+    detects replacement between searches, not a racing writer mid-search;
+    the filesystem itself is not claimed tamper-proof.
+    """
+
+    backend = "snapshot"
+
+    def __init__(self, snapshot_dir: Path) -> None:
+        from minni.principal import EffectivePrincipal, is_operator_principal
+
+        from .study_snapshot import check_materialized, snapshot_config_paths, verify_snapshot
+
+        root = Path(snapshot_dir).resolve()
+        try:
+            verified = verify_snapshot(root)
+            materialized = check_materialized(root)
+        except ValueError as exc:
+            raise ValueError(f"snapshot directory {root} failed frozen validation: {exc}") from exc
+        manifest = verified["manifest"]
+        # The digest-bound identity block is authoritative; the display
+        # mirrors in the manifest are validated against it by verify and are
+        # never consumed directly.
+        identity = manifest.get("identity") or {}
+        self.snapshot_dir = root
+        self.snapshot_id = manifest.get("snapshot_id", "unknown")
+        self.manifest_digest = manifest.get("manifest_digest", "unknown")
+        self._agent_id = str((identity.get("principal") or {}).get("agent_id") or "study")
+        self.forbidden_doc_ids = set()
+        for study_id, record in verified["mapping"].items():
+            judgment = record.get("study_judgment") or {}
+            if judgment.get("expected_eligible") is False:
+                self.forbidden_doc_ids.add(materialized["document_ids"].get(study_id))
+        self.forbidden_doc_ids.discard(None)
+        paths = snapshot_config_paths(root)
+        self._principal = EffectivePrincipal(
+            agent_id=self._agent_id,
+            capabilities=["search", "read"],
+            allowed_vault_roots=[paths["vault_path"]],
+        )
+        if is_operator_principal(self._principal):
+            raise ValueError("snapshot study principal cannot use a reserved operator identity")
+        self._pinned = self._fingerprint(
+            manifest, verified["mapping"], materialized,
+            tuple(self._principal.allowed_vault_roots),
+        )
+
+    @staticmethod
+    def _fingerprint(manifest, mapping, materialized, vault_roots):
+        """Immutable generation identity pinned at initialization."""
+        identity = manifest.get("identity") or {}
+        forbidden = set()
+        for study_id, record in mapping.items():
+            judgment = record.get("study_judgment") or {}
+            if judgment.get("expected_eligible") is False:
+                forbidden.add(materialized["document_ids"].get(study_id))
+        forbidden.discard(None)
+        return {
+            "snapshot_id": manifest.get("snapshot_id", "unknown"),
+            "manifest_digest": manifest.get("manifest_digest", "unknown"),
+            "agent_id": str((identity.get("principal") or {}).get("agent_id") or "study"),
+            "vault_roots": tuple(vault_roots),
+            "forbidden": frozenset(forbidden),
+            "record_count": manifest.get("record_count"),
+        }
+
+    def search(self, query: str, **kwargs) -> List[Dict[str, Any]]:
+        from minni.principal import can_read_document
+
+        from .study_snapshot import (
+            DEFAULT_EXCLUDED_STATUSES,
+            MAX_VAULT_FILE_BYTES,
+            StudySnapshotError,
+            _read_sized_bytes,
+            check_materialized,
+            verify_snapshot,
+        )
+
+        if kwargs.get("expand") not in (None, False, "off") or kwargs.get("use_hyde"):
+            raise ValueError("snapshot retrieval supports lexical-only baseline configuration")
+        # Frozen state is re-validated before every search, not just at open.
+        verified = verify_snapshot(self.snapshot_dir)
+        materialized = check_materialized(self.snapshot_dir)
+        # Fail closed on generation replacement: a valid snapshot B at this
+        # path must never be served under snapshot A's pinned identity.
+        current = self._fingerprint(
+            verified["manifest"], verified["mapping"], materialized,
+            tuple(self._principal.allowed_vault_roots),
+        )
+        if current != self._pinned:
+            raise StudySnapshotError(
+                "snapshot identity changed since searcher initialization "
+                f"(was {self._pinned['snapshot_id']}); refusing to serve a "
+                "replacement generation under a stale ID"
+            )
+        # Deadline-free by construction: any caller-supplied deadline is
+        # ignored, never forwarded, so expiry semantics cannot empty results.
+        limit = max(1, int(kwargs.get("limit", 10)))
+        if not isinstance(query, str) or not query.strip():
+            return []
+        safe_query = _sanitize_snapshot_query(query)
+        if not safe_query:
+            return []
+        terms = safe_query.split()
+        match_exprs = [safe_query]
+        if len(terms) > 1:
+            match_exprs.append(" OR ".join(term.lower() for term in terms))
+
+        import hashlib
+        import os
+        import sqlite3
+        from urllib.parse import quote as _quote
+
+        db_path = self.snapshot_dir / "study.db"
+        uri = "file:" + _quote(str(db_path), safe="/:") + "?mode=ro"
+        skip = sorted(DEFAULT_EXCLUDED_STATUSES)
+        placeholders = ",".join("?" * len(skip))
+
+        def eligible_rows(handle, match_expr):
+            """Eligible rows first: the read gate runs BEFORE the limit."""
+            found = []
+            for row in handle.execute(
+                "SELECT f.doc_id, d.path, d.agent, d.page_status,"
+                " d.privacy_level, d.page_type, f.content"
+                " FROM vault_fts f JOIN documents d ON d.doc_id = f.doc_id"
+                " WHERE vault_fts MATCH ?"
+                f" AND COALESCE(d.page_status, 'candidate') NOT IN ({placeholders})"
+                " ORDER BY rank",
+                [match_expr, *skip],
+            ):
+                metadata = {
+                    "path": row[1], "agent": row[2],
+                    "page_type": row[5], "privacy_level": row[4],
+                }
+                if not can_read_document(self._principal, "default", metadata):
+                    continue
+                found.append({
+                    "doc_id": row[0], "path": row[1], "agent": row[2],
+                    "page_status": row[3] or "candidate",
+                    "privacy_level": row[4], "page_type": row[5],
+                    "content": row[6],
+                })
+                if len(found) >= limit:
+                    break
+            return found
+
+        try:
+            before = os.stat(db_path)
+            handle = sqlite3.connect(uri, uri=True)
+            try:
+                handle.execute("PRAGMA query_only = ON")
+                eligible = eligible_rows(handle, match_exprs[0])
+                # OR fallback fires on eligible exhaustion, not raw hits: an
+                # ineligible-only strict set must not suppress the fallback.
+                if not eligible and len(match_exprs) > 1:
+                    eligible = eligible_rows(handle, match_exprs[1])
+            finally:
+                handle.close()
+            after = os.stat(db_path)
+        except Exception as exc:  # noqa: BLE001 - a DB failure is an integrity failure
+            raise StudySnapshotError(
+                f"snapshot lexical search failed: {type(exc).__name__}"
+            ) from exc
+        if (before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns) != (
+                after.st_ino, after.st_dev, after.st_size, after.st_mtime_ns):
+            raise StudySnapshotError(
+                "snapshot database changed during search; refusing results "
+                "from a mid-search replacement"
+            )
+
+        results = []
+        for rank, row in enumerate(eligible[:limit], start=1):
+            text = row["content"] or ""
+            # Bind the served DB bytes to the frozen vault file: a swapped
+            # database cannot serve foreign bytes under frozen provenance.
+            # The DB path itself is validated for vault containment by the
+            # sized read (relative_to + symlink-component checks).
+            try:
+                raw = _read_sized_bytes(
+                    Path(row["path"]), self.snapshot_dir,
+                    f"snapshot vault file {row['path']!r}", MAX_VAULT_FILE_BYTES)
+            except ValueError as exc:
+                raise StudySnapshotError(
+                    f"snapshot served row no longer matches frozen files: {exc}"
+                ) from exc
+            if hashlib.sha256(raw).hexdigest() != hashlib.sha256(
+                    text.encode("utf-8")).hexdigest():
+                raise StudySnapshotError(
+                    "snapshot served row diverges from frozen vault bytes"
+                )
+            results.append({
+                "doc_id": row["doc_id"],
+                "source": row["path"],
+                "filename": Path(row["path"]).name,
+                "text": text,
+                "score": round(1.0 / rank, 4),
+                "token_count": max(1, len(text) // 4),
+                "agent": row["agent"],
+                "privacy_level": row["privacy_level"],
+                "page_status": row["page_status"],
+                "retriever": "snapshot",
+                "provenance": {
+                    "doc_id": row["doc_id"],
+                    "backend": "snapshot",
+                    "snapshot_id": self._pinned["snapshot_id"],
+                    "lexical_only": True,
+                },
+            })
+        return results
+
+
 class MockSearcher(SearcherProtocol):
     """
     Deterministic mock searcher.
@@ -224,6 +468,7 @@ def make_searcher(
 ) -> SearcherProtocol:
     """Build a named retriever for adversarial baseline comparisons."""
     key = canonical_backend_name(name)
+    explicit_root = root
     search_root = root or repo_root()
     if key == "mock":
         return MockSearcher(queries)
@@ -235,8 +480,16 @@ def make_searcher(
         return RawContextSearcher(search_root)
     if key in {"vendor", "vendor-memory"}:
         return VendorMemorySearcher()
+    if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        if explicit_root is None:
+            raise ValueError(
+                "The snapshot retriever needs a prepared snapshot directory "
+                "(see eval/study_snapshot.py); pass root=<snapshot-dir>"
+            )
+        return SnapshotSearcher(Path(explicit_root))
     raise ValueError(
-        f"Unknown retriever {name!r}. Available: minnid, ripgrep, raw-context, vendor-memory, mock"
+        "Unknown retriever {!r}. Available: minnid, ripgrep, raw-context, "
+        "vendor-memory, mock, snapshot".format(name)
     )
 
 

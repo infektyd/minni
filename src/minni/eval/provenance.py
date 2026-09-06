@@ -61,6 +61,10 @@ _BACKEND_SWALLOWED = {
                                  "update_access", "budget_tokens", "depth",
                                  "include_superseded", "include_rejected",
                                  "include_drafts", "include_expired"}),
+    "snapshot": frozenset({"expand", "use_hyde", "agent_id", "update_access",
+                           "budget_tokens", "depth", "include_superseded",
+                           "include_rejected", "include_drafts",
+                           "include_expired", "deadline_monotonic"}),
 }
 
 # Harness envelope defaults (limit / update_access) each adapter consumes.
@@ -73,6 +77,7 @@ _BACKEND_ENVELOPE = {
     "raw-context": frozenset({"limit", "budget_tokens"}),
     "vendor": frozenset(),
     "vendor-memory": frozenset(),
+    "snapshot": frozenset({"limit"}),
 }
 
 def _canonical_backend(retriever_name: str) -> str:
@@ -291,7 +296,9 @@ def environment_provenance() -> Dict[str, Any]:
     }
 
 
-def principal_provenance(retriever_name: str, *, is_mock: bool) -> Dict[str, Any]:
+def principal_provenance(
+    retriever_name: str, *, is_mock: bool, principal: Any = None
+) -> Dict[str, Any]:
     """State principal/scope availability without inventing authorization facts."""
     key = retriever_name.strip().lower()
     if is_mock or key == "mock":
@@ -322,6 +329,30 @@ def principal_provenance(retriever_name: str, *, is_mock: bool) -> Dict[str, Any
             "scope": "repository working-tree files (no authorization boundary)",
             "note": "File-text baseline; scores describe lexical overlap, not memory quality.",
         }
+    if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        if principal is None:
+            return {
+                "supplied": True,
+                "backend": "study-snapshot",
+                "mock": False,
+                "scope": "prepared snapshot vault only (least-privilege study principal)",
+                "note": "Snapshot principal was not initialized; no effective authorization context was recorded. "
+                        "Packet authorization claims are supplied provenance, not independently verified permission.",
+            }
+        return {
+            "supplied": True,
+            "backend": "study-snapshot",
+            "mock": False,
+            "agent_id": principal.agent_id,
+            "workspace_id": principal.workspace_id,
+            "transport": principal.transport,
+            "capabilities": list(principal.capabilities),
+            "allowed_vault_roots": list(principal.allowed_vault_roots),
+            "scope": "prepared snapshot vault only (least-privilege study principal)",
+            "note": "Study principal is scoped to the frozen snapshot vault; "
+                    "packet authorization claims are supplied provenance, not "
+                    "independently verified permission.",
+        }
     return {
         "supplied": False,
         "backend": key or "unknown",
@@ -331,12 +362,15 @@ def principal_provenance(retriever_name: str, *, is_mock: bool) -> Dict[str, Any
     }
 
 
-def corpus_provenance(*, is_mock: bool, retriever_name: str = "") -> Dict[str, Any]:
+def corpus_provenance(*, is_mock: bool, retriever_name: str = "",
+                      snapshot_id: Optional[str] = None,
+                      manifest_digest: Optional[str] = None) -> Dict[str, Any]:
     """Corpus/database identity per backend: only what is verifiably available.
 
     Only the live-engine backends touch a database at all. File baselines
     and placeholders get their own honest labels instead of inheriting the
-    live-database description.
+    live-database description. The snapshot backend fails closed: without a
+    verified snapshot ID it is unknown, never frozen.
     """
     key = retriever_name.strip().lower()
     if is_mock or key == "mock":
@@ -367,6 +401,26 @@ def corpus_provenance(*, is_mock: bool, retriever_name: str = "") -> Dict[str, A
             "frozen": False,
             "note": "Vendor-memory baseline is not configured and returns no "
                     "results; no corpus identity applies.",
+        }
+    if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        if not snapshot_id or snapshot_id == "unknown":
+            return {
+                "snapshot": "unknown",
+                "frozen": False,
+                "note": "Snapshot backend without a verified snapshot ID: "
+                        "no frozen claim is made. A verified prepared "
+                        "snapshot reports its manifest-derived ID instead.",
+            }
+        return {
+            "snapshot": snapshot_id,
+            "manifest_digest": manifest_digest,
+            "frozen": True,
+            "note": "Disposable study snapshot: all DB/index/vault paths live "
+                    "inside the prepared snapshot directory under a manifest "
+                    "digest (see snapshot.json). The live corpus is never "
+                    "assigned a snapshot ID. Bounded packet study only: not "
+                    "representative private-memory quality and not a "
+                    "retrieval-performance claim.",
         }
     return {
         "snapshot": "unknown",
@@ -407,8 +461,6 @@ def build_report_provenance(
         "certification": "none: provenance describes how a report was produced; "
                          "it is not a passing certification.",
     }
-
-
 def build_gate_provenance(
     *,
     kind: str,
