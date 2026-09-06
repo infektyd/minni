@@ -1135,3 +1135,429 @@ def test_wrapper_maps_staged_to_ok_only_after_commit(store):
     assert result.status == "ok"
     assert result.learning_id is not None
     assert _counts(db)["learnings"] == 1
+
+
+# --- P2.1 high-confidence auto-supersession --------------------------------
+# Fake classifier + disposable SQLite only. Covers: forward updates >= 0.96
+# retires the same-agent active target atomically with edge + node flip;
+# the 0.96 floor boundary; lower-confidence accepted updates persist with
+# no lifecycle action; backward/mutual downgrade to one graph_update_review
+# (would-be cycles); N:1 mixed statuses and cross-agent siblings; repair
+# never retires (review once via dedup); lifecycle-write failure rolls
+# back everything; restricted-target race aborts with zero writes;
+# non-updates labels never retire; unit-level plan downgrades unreachable
+# via shortlist auth (cross-agent/wiki/already-superseded).
+
+CONTENT_C = ("The staging deploy requires a signed release checklist, "
+             "countersigned by the release captain.")
+
+
+def _learning_state(db, learning_id):
+    return _rows(db, "SELECT status, superseded_by FROM learnings"
+                     " WHERE learning_id=?", (learning_id,))[0]
+
+
+def _doc_state(db, doc_id):
+    return _rows(db, "SELECT page_status, superseded_by FROM documents"
+                     " WHERE doc_id=?", (doc_id,))[0]
+
+
+def _reviews(db):
+    return _rows(db, "SELECT target_learning_id, superseded_learning_id,"
+                     " confidence, status, detail FROM consolidation_actions"
+                     " WHERE action_type='graph_update_review'"
+                     " ORDER BY action_id")
+
+
+def _seed_updates_target(db, config):
+    seed = _Fakes(db, classifier=_ok_classifier())
+    first = _commit(db, config, CONTENT_A, seed)
+    assert first.status == "ok", first.error
+    return first
+
+
+def _targeted_classifier(target_doc, label, direction, confidence):
+    """Canned classifier covering EVERY sent pair: the target doc (by id)
+    gets the requested edge, all other pairs get none.
+
+    Pair indexes shift as the store gains docs, so targeting by document
+    id — not pair index — is required; an unclassified pair fails the
+    whole batch by contract.
+    """
+
+    def classify(source, candidates):
+        return _FakeBatch(source, candidates, edges=[
+            _edge(c["pair_id"], label, direction, confidence)
+            if c["doc_id"] == target_doc
+            else _edge(c["pair_id"], "none", "none", 0.99)
+            for c in candidates
+        ])
+
+    return classify
+
+
+def _commit_updates(db, config, content, confidence, direction="forward",
+                    label="updates", target_doc=None, principal=None):
+    fakes = _Fakes(
+        db, classifier=_targeted_classifier(target_doc, label, direction,
+                                            confidence))
+    over = {} if principal is None else {"principal": principal}
+    return _commit(db, config, content, fakes, **over)
+
+
+def test_forward_updates_at_floor_retires_target_and_flips_node(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    result = _commit_updates(db, config, CONTENT_B, 0.99, target_doc=first.doc_id)
+    assert result.status == "ok", result.error
+    assert len(result.edges) == 1
+    edge = result.edges[0]
+    assert (edge.source_doc_id, edge.target_doc_id) == (
+        result.doc_id, first.doc_id)
+    assert result.superseded_learning_ids == (first.learning_id,)
+    assert result.update_reviews_queued == 0
+    assert _reviews(db) == []
+    status, successor = _learning_state(db, first.learning_id)
+    assert status == "superseded" and successor == result.learning_id
+    page_status, node_successor = _doc_state(db, first.doc_id)
+    assert page_status == "superseded" and node_successor == result.doc_id
+
+
+@pytest.mark.parametrize("confidence,retires",
+                         [(0.88, False), (0.90, False), (0.9599, False),
+                          (0.96, True)])
+def test_supersede_floor_boundary(store, confidence, retires):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    result = _commit_updates(db, config, CONTENT_B, confidence, target_doc=first.doc_id)
+    assert result.status == "ok", result.error
+    assert len(result.edges) == 1  # persist floor 0.88 kept in every band
+    if retires:
+        assert result.superseded_learning_ids == (first.learning_id,)
+        assert result.update_reviews_queued == 0
+        assert _reviews(db) == []
+        assert _learning_state(db, first.learning_id)[0] == "superseded"
+        assert _doc_state(db, first.doc_id)[0] == "superseded"
+    else:
+        # Locked 8.1.1: lower band persists the edge AND queues a pending
+        # review — never retires.
+        assert result.superseded_learning_ids == ()
+        assert result.update_reviews_queued == 1
+        reviews = _reviews(db)
+        assert len(reviews) == 1
+        assert reviews[0][0] == result.learning_id
+        assert reviews[0][1] == first.learning_id
+        assert reviews[0][2] == confidence and reviews[0][3] == "pending"
+        assert reviews[0][4] == "below_supersede_floor"
+        assert _learning_state(db, first.learning_id) == ("active", None)
+        assert _doc_state(db, first.doc_id)[0] == "accepted"
+
+
+def test_lower_confidence_updates_persists_with_review_not_retire(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    result = _commit_updates(db, config, CONTENT_B, 0.90, target_doc=first.doc_id)
+    assert result.status == "ok", result.error
+    assert len(result.edges) == 1
+    assert result.superseded_learning_ids == ()
+    assert result.update_reviews_queued == 1
+    assert len(_reviews(db)) == 1
+    assert _reviews(db)[0][4] == "below_supersede_floor"
+    assert _learning_state(db, first.learning_id) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+
+
+def test_backward_updates_queues_review_without_retire(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    result = _commit_updates(db, config, CONTENT_B, 0.99,
+                             direction="backward", target_doc=first.doc_id)
+    assert result.status == "ok", result.error
+    # Wrong direction: the edge binds old -> new, nothing retires.
+    assert [(e.source_doc_id, e.target_doc_id) for e in result.edges] == [
+        (first.doc_id, result.doc_id)]
+    assert result.superseded_learning_ids == ()
+    assert result.update_reviews_queued == 1
+    reviews = _reviews(db)
+    assert len(reviews) == 1
+    assert reviews[0][0] == result.learning_id
+    assert reviews[0][1] == first.learning_id
+    assert reviews[0][2] == 0.99 and reviews[0][3] == "pending"
+    assert reviews[0][4] == "non_forward_updates:backward"
+    assert _learning_state(db, first.learning_id) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+
+
+def test_mutual_updates_rejected_by_validation_with_zero_writes(store):
+    # `updates` is new -> old only: the classifier contract rejects the
+    # mutual direction, so mutual updates is a validation failure (zero
+    # writes), never a supported supersession direction.
+    db, config = store
+    first = _seed_updates_target(db, config)
+    before = _counts(db)
+    result = _commit_updates(db, config, CONTENT_B, 0.99, direction="mutual", target_doc=first.doc_id)
+    assert result.status == "error"
+    assert result.error_code == "edge_inference_failed"
+    assert _counts(db) == before
+    assert _rows(db, "SELECT COUNT(*) FROM consolidation_actions")[0][0] == 0
+    assert _learning_state(db, first.learning_id) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+
+
+def test_non_updates_labels_never_retire(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    for label, direction, confidence in (("extends", "forward", 0.99),
+                                         ("contradicts", "mutual", 0.99),
+                                         ("relates", "mutual", 0.99)):
+        result = _commit_updates(db, config, CONTENT_B + label, confidence,
+                                 direction=direction, label=label,
+                                 target_doc=first.doc_id)
+        assert result.status == "ok", result.error
+        assert result.superseded_learning_ids == ()
+        assert result.update_reviews_queued == 0
+    assert _reviews(db) == []
+    assert _learning_state(db, first.learning_id) == ("active", None)
+
+
+def test_n1_second_mapping_retires_all_and_flips_node(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    # Re-promotion of identical content shares the canonical node: two
+    # active same-agent learnings on one doc.
+    repeat = _commit(db, config, CONTENT_A,
+                     _Fakes(db, classifier=_targeted_classifier(
+                         first.doc_id, "extends", "forward", 0.9)))
+    assert repeat.status == "ok", repeat.error
+    assert repeat.doc_id == first.doc_id
+    result = _commit_updates(db, config, CONTENT_C, 0.99, target_doc=first.doc_id)
+    assert result.status == "ok", result.error
+    assert set(result.superseded_learning_ids) == {
+        first.learning_id, repeat.learning_id}
+    assert result.update_reviews_queued == 0
+    assert _learning_state(db, first.learning_id)[0] == "superseded"
+    assert _learning_state(db, repeat.learning_id)[1] == result.learning_id
+    assert _doc_state(db, first.doc_id)[0] == "superseded"
+
+
+def test_n1_mixed_statuses_retires_remainder_without_review(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    repeat = _commit(db, config, CONTENT_A,
+                     _Fakes(db, classifier=_targeted_classifier(
+                         first.doc_id, "extends", "forward", 0.9)))
+    assert repeat.status == "ok", repeat.error
+    assert repeat.doc_id == first.doc_id
+    # One sibling already superseded by another durable learning: direct,
+    # real successor id — no synthetic row.
+    with db.transaction() as c:
+        c.execute("UPDATE learnings SET status='superseded', superseded_by=?"
+                  " WHERE learning_id=?", (repeat.learning_id,
+                                           first.learning_id))
+    result = _commit_updates(db, config, CONTENT_C, 0.99, target_doc=first.doc_id)
+    assert result.status == "ok", result.error
+    assert result.superseded_learning_ids == (repeat.learning_id,)
+    assert result.update_reviews_queued == 0
+    assert _reviews(db) == []
+    assert _doc_state(db, first.doc_id)[0] == "superseded"
+
+
+def test_n1_other_agent_sibling_kept_doc_stays_accepted(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    with db.transaction() as c:
+        c.execute("INSERT INTO learnings"
+                  " (agent_id, category, content, confidence, created_at)"
+                  " VALUES ('mallory', 'general', ?, 1.0, 0.0)",
+                  (CONTENT_A + " mallory note",))
+        sibling = int(c.lastrowid)
+        c.execute("INSERT INTO learning_documents (learning_id, doc_id,"
+                  " created_at) VALUES (?, ?, 0.0)", (sibling, first.doc_id))
+    result = _commit_updates(db, config, CONTENT_B, 0.99, target_doc=first.doc_id)
+    assert result.status == "ok", result.error
+    assert result.superseded_learning_ids == (first.learning_id,)
+    assert _learning_state(db, sibling) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+    assert result.update_reviews_queued == 1
+    reviews = _reviews(db)
+    assert len(reviews) == 1
+    assert reviews[0][4] == "other_agent_active"
+
+
+def test_repair_never_retires_and_dedups_review(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    # A non-updates edge keeps the target active — and the queue empty —
+    # for the repair pass.
+    plain = _Fakes(db, classifier=_targeted_classifier(
+        first.doc_id, "extends", "forward", 0.85))
+    second = _commit(db, config, CONTENT_B, plain)
+    assert second.status == "ok", second.error
+    assert _reviews(db) == []
+    hot = _Fakes(db, classifier=_targeted_classifier(
+        first.doc_id, "updates", "forward", 0.99))
+    repaired = _repair(db, config, second.learning_id, hot)
+    assert repaired.status == "complete", repaired.error
+    assert repaired.update_reviews_queued == 1
+    assert len(_reviews(db)) == 1
+    assert _reviews(db)[0][4] == "repair_no_retire"
+    assert _learning_state(db, first.learning_id) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+    again = _repair(db, config, second.learning_id, hot)
+    assert again.status == "complete", again.error
+    assert again.update_reviews_queued == 0
+    assert len(_reviews(db)) == 1
+
+
+def test_repair_lower_band_queues_and_dedups_review(store):
+    # Locked 8.1.1 applies to repair too: a lower-band updates edge queues
+    # a pending review (never retires), and a repeated repair dedups it.
+    db, config = store
+    first = _seed_updates_target(db, config)
+    plain = _Fakes(db, classifier=_targeted_classifier(
+        first.doc_id, "extends", "forward", 0.85))
+    second = _commit(db, config, CONTENT_B, plain)
+    assert second.status == "ok", second.error
+    assert _reviews(db) == []
+    hot = _Fakes(db, classifier=_targeted_classifier(
+        first.doc_id, "updates", "forward", 0.90))
+    repaired = _repair(db, config, second.learning_id, hot)
+    assert repaired.status == "complete", repaired.error
+    assert repaired.update_reviews_queued == 1
+    assert len(_reviews(db)) == 1
+    assert _reviews(db)[0][4] == "below_supersede_floor"
+    assert _learning_state(db, first.learning_id) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+    again = _repair(db, config, second.learning_id, hot)
+    assert again.status == "complete", again.error
+    assert again.update_reviews_queued == 0
+    assert len(_reviews(db)) == 1
+
+
+def test_lifecycle_write_failure_rolls_back_everything(store, monkeypatch):
+    import minni.graph_coordinator as coordinator
+
+    db, config = store
+    first = _seed_updates_target(db, config)
+    before = _counts(db)
+    real = coordinator.retire_superseded_members
+
+    def _boom(*args, **kwargs):
+        real(*args, **kwargs)
+        raise RuntimeError("synthetic lifecycle outage")
+
+    monkeypatch.setattr(coordinator, "retire_superseded_members", _boom)
+    result = _commit_updates(db, config, CONTENT_B, 0.99, target_doc=first.doc_id)
+    assert result.status == "error"
+    assert _counts(db) == before
+    assert _rows(db, "SELECT COUNT(*) FROM consolidation_actions")[0][0] == 0
+    assert _learning_state(db, first.learning_id) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+
+
+def test_restricted_target_race_aborts_with_zero_writes(store):
+    db, config = store
+    first = _seed_updates_target(db, config)
+    before = _counts(db)
+    prepared = _prepare(db, config, CONTENT_B, _Fakes(
+        db, classifier=_ok_classifier((0, "updates", "forward", 0.99))))
+    assert prepared.status == "ok" and prepared.payload is not None
+    with db.transaction() as c:
+        c.execute("UPDATE documents SET privacy_level='blocked' WHERE doc_id=?",
+                  (first.doc_id,))
+    with pytest.raises(GraphCommitAborted):
+        with db.transaction() as c:
+            commit_prepared_learning(
+                c, prepared.payload, db=db, principal=_principal(),
+            )
+    assert _counts(db) == before
+    assert _rows(db, "SELECT COUNT(*) FROM consolidation_actions")[0][0] == 0
+    assert _learning_state(db, first.learning_id) == ("active", None)
+
+
+def test_plan_downgrades_unreachable_via_shortlist():
+    from minni.graph_coordinator import _plan_updates_action
+
+    def state(agent, status=None, by=None, kind="learning", doc_status="accepted",
+              privacy="safe"):
+        return {
+            "doc": {"memory_kind": kind, "page_type": kind,
+                    "page_status": doc_status, "privacy_level": privacy},
+            "members": [{"learning_id": 7, "agent_id": agent, "status": status,
+                         "superseded_by": by}],
+        }
+
+    # Cross-agent active target: never auto-retired, routed to review.
+    assert _plan_updates_action(
+        label="updates", direction="forward", confidence=0.99,
+        new_agent_id="codex", new_learning_id=9,
+        target_state=state("mallory")) == ((), 7, "other_agent_active")
+    # Wiki-kind target downgrades even though shortlist never emits one.
+    assert _plan_updates_action(
+        label="updates", direction="forward", confidence=0.99,
+        new_agent_id="codex", new_learning_id=9,
+        target_state=state("codex", kind="wiki"))[2] == "non_learning_target"
+    # Already superseded by another learning routes to review, not retire.
+    assert _plan_updates_action(
+        label="updates", direction="forward", confidence=0.99,
+        new_agent_id="codex", new_learning_id=9,
+        target_state=state("codex", status="superseded", by=3)) == (
+            (), 7, "already_superseded")
+    # This learning already applied its supersession: silent no-op.
+    assert _plan_updates_action(
+        label="updates", direction="forward", confidence=0.99,
+        new_agent_id="codex", new_learning_id=9,
+        target_state=state("codex", status="superseded", by=9)) == (
+            (), None, None)
+    # Lower band: edge persists, pending review, never retire (8.1.1).
+    assert _plan_updates_action(
+        label="updates", direction="forward", confidence=0.95,
+        new_agent_id="codex", new_learning_id=9,
+        target_state=state("codex")) == (
+            (), 7, "below_supersede_floor")
+    # Below the persist floor: true no-op.
+    assert _plan_updates_action(
+        label="updates", direction="forward", confidence=0.87,
+        new_agent_id="codex", new_learning_id=9,
+        target_state=state("codex")) == ((), None, None)
+
+
+def test_operator_principal_cross_agent_target_queues_review(store):
+    # Cross-agent updates pairs ARE reachable: the read gate denies plain
+    # foreign-safe learning recall but admits operator principals, so a
+    # governed cross-agent updates edge at the floor must queue
+    # graph_update_review and never retire the foreign learning.
+    db, config = store
+    first = _seed_updates_target(db, config)
+    op = EffectivePrincipal(agent_id="main", capabilities=["learn", "govern"])
+    result = _commit_updates(db, config, CONTENT_B, 0.99,
+                             target_doc=first.doc_id, principal=op)
+    assert result.status == "ok", result.error
+    assert len(result.edges) == 1
+    edge = result.edges[0]
+    assert (edge.source_doc_id, edge.target_doc_id) == (
+        result.doc_id, first.doc_id)
+    assert result.superseded_learning_ids == ()
+    assert result.update_reviews_queued == 1
+    reviews = _reviews(db)
+    assert len(reviews) == 1
+    assert reviews[0][0] == result.learning_id
+    assert reviews[0][1] == first.learning_id
+    assert reviews[0][4] == "other_agent_active"
+    assert _learning_state(db, first.learning_id) == ("active", None)
+    assert _doc_state(db, first.doc_id)[0] == "accepted"
+
+
+def test_read_gate_cross_agent_boundary():
+    # Pins the exact authorization boundary the operator test relies on:
+    # a foreign safe learning doc is default-deny for plain principals
+    # but visible to operator principals.
+    from minni.principal import can_read_document
+
+    meta = {"agent": "mallory", "privacy_level": "safe",
+            "page_type": "learning", "memory_kind": "learning",
+            "path": "vault/mallory/checklist.md", "page_status": "accepted"}
+    plain = EffectivePrincipal(agent_id="codex", capabilities=["learn"])
+    assert can_read_document(plain, "default", meta) is False
+    op = EffectivePrincipal(agent_id="main", capabilities=["learn", "govern"])
+    assert can_read_document(op, "default", meta) is True
