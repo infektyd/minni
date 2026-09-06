@@ -1068,7 +1068,10 @@ def test_handle_search_records_scores_when_hyde_deadline_skipped_after_hybrid(
     assert n >= 1, (
         "skipped HyDE enrichment must not withhold calibration from a completed hybrid fill"
     )
-    assert int(access["access_count"] or 0) == 1
+    # Whole-request budgeting preserves accounting for the completed document
+    # ranking, but does not start a new learning search after expiry.
+    assert int(access["access_count"] or 0) == 0
+    assert any(d.get("stage") == "learnings" for d in resp["result"]["degradation"])
     _assert_qty_once_on_winner(engine, before)
 
 
@@ -1555,7 +1558,10 @@ def test_handle_search_mixed_legs_keeps_calibration_after_healthy_then_deadline(
     assert n >= 1, (
         "healthy first-pass hybrid scores must still enter the calibration window"
     )
-    assert int(access["access_count"] or 0) == 1
+    # Whole-request budgeting preserves accounting for the completed document
+    # ranking, but does not start a new learning search after expiry.
+    assert int(access["access_count"] or 0) == 0
+    assert any(d.get("stage") == "learnings" for d in resp["result"]["degradation"])
     assert _access_count(engine) == before + 1
 
 
@@ -1781,7 +1787,10 @@ def test_handle_search_expand_deadline_variant_still_records_hybrid_qty(
     assert n >= 1, (
         "expand deadline variant must not withhold calibration from a completed hybrid fill"
     )
-    assert int(access["access_count"] or 0) == 1
+    # Whole-request budgeting preserves accounting for the completed document
+    # ranking, but does not start a new learning search after expiry.
+    assert int(access["access_count"] or 0) == 0
+    assert any(d.get("stage") == "learnings" for d in resp["result"]["degradation"])
     _assert_qty_once_on_winner(engine, before)
 
 

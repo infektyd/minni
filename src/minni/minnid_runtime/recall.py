@@ -2,6 +2,7 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -21,6 +22,17 @@ from minni.principal import (
 
 from .redaction import redact_text, redact_value
 
+
+from minni.request_deadline import (
+    RequestDeadlineExceeded,
+    allow_expired_sql,
+    bind_copied_deadline,
+    check_deadline,
+    current_deadline,
+    remaining_seconds,
+    request_deadline,
+    run_bound,
+)
 
 logger = logging.getLogger("minnid")
 
@@ -73,7 +85,7 @@ def _search_deadline_monotonic(params: dict) -> float:
             budget_ms = DEFAULT_SEARCH_BUDGET_MS
         else:
             budget_ms = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         budget_ms = DEFAULT_SEARCH_BUDGET_MS
     budget_ms = max(1, min(budget_ms, _SEARCH_BUDGET_MS_MAX))
     work_ms = max(1, int(budget_ms * SEARCH_BUDGET_CLIENT_FRACTION))
@@ -86,7 +98,7 @@ def _search_deadline_monotonic(params: dict) -> float:
     try:
         if accepted is not None and accepted != "":
             accepted_f = float(accepted)
-            if accepted_f <= now:
+            if math.isfinite(accepted_f) and accepted_f <= now:
                 start = accepted_f
     except (TypeError, ValueError):
         pass
@@ -200,6 +212,17 @@ def _strip_private_search_keys(results: list) -> None:
         row.pop(_DEADLINE_POISONED_KEY, None)
 
 
+def _normalize_caller_visible_results(results: list) -> list:
+    """Drop private carriers before any caller-visible search payload."""
+    visible = list(results or [])
+    for row in visible:
+        if not isinstance(row, dict):
+            continue
+        row.pop("confidence_raw", None)
+    _strip_private_search_keys(visible)
+    return visible
+
+
 def _gather_leg_results(callables: list, deadline_monotonic) -> list:
     """Run leg callables, in parallel when enabled, preserving order.
 
@@ -243,11 +266,12 @@ def _gather_leg_results(callables: list, deadline_monotonic) -> list:
         and deadline_monotonic is None
     )
     if use_leg_pool:
+        bound = [bind_copied_deadline(fn) for fn in callables]
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(_MAX_LEG_WORKERS, len(callables)),
             thread_name_prefix="minni-leg",
         ) as _leg_pool:
-            return list(_leg_pool.map(lambda fn: fn(), callables))
+            return list(_leg_pool.map(run_bound, bound))
     return [fn() for fn in callables]
 
 
@@ -427,6 +451,7 @@ def _degradation_for(
         ("last_rerank_degraded", "rerank_degraded"),
         ("last_query_expand_degraded", "query_expand_degraded"),
         ("last_hyde_degraded", "hyde_degraded"),
+        ("last_document_hydration_degraded", "document_hydration_degraded"),
     ):
         value = getattr(retrieval_engine, flag, None)
         if value:
@@ -488,6 +513,12 @@ def _episodic_layer_requested(layers: Any) -> bool:
 
 
 def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict:
+    """Apply one cooperative budget to retrieval and all request database work."""
+    with request_deadline(_search_deadline_monotonic(params)):
+        return _handle_search(params, request_id, context)
+
+
+def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dict:
     """Search Minni via hybrid retrieval.
 
     Accepts optional ``depth`` parameter for progressive disclosure:
@@ -516,7 +547,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()
-    deadline_monotonic = _search_deadline_monotonic(params)
+    deadline_monotonic = current_deadline()
 
     query = params.get("query", "")
     if not query:
@@ -701,29 +732,37 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 trace_id = None
             else:
                 previous_trace_id = getattr(retrieval_engine, "last_trace_id", None)
-                rows = retrieval_engine.retrieve(
-                    query=query,
-                    agent_id=agent_id,
-                    limit=limit,
-                    depth=depth,
-                    backend=resolved_backend,
-                    layers=layers,
-                    sort=sort,
-                    start_date=start_date,
-                    end_date=end_date,
-                    expand=expand,
-                    summarize_neighborhood=summarize_neighborhood,
-                    cross_agent=learnings_cross_agent,
-                    claim=claim,
-                    principal=principal_for_documents,
-                    workspace=(
-                        principal_for_documents.workspace_id
-                        if principal_for_documents is not None
-                        else "default"
-                    ),
-                    deadline_monotonic=deadline_monotonic,
-                    update_access=False,
-                )
+                deadline_interrupted = False
+                try:
+                    rows = retrieval_engine.retrieve(
+                        query=query,
+                        agent_id=agent_id,
+                        limit=limit,
+                        depth=depth,
+                        backend=resolved_backend,
+                        layers=layers,
+                        sort=sort,
+                        start_date=start_date,
+                        end_date=end_date,
+                        expand=expand,
+                        summarize_neighborhood=summarize_neighborhood,
+                        cross_agent=learnings_cross_agent,
+                        claim=claim,
+                        principal=principal_for_documents,
+                        workspace=(
+                            principal_for_documents.workspace_id
+                            if principal_for_documents is not None
+                            else "default"
+                        ),
+                        deadline_monotonic=deadline_monotonic,
+                        update_access=False,
+                    )
+                except RequestDeadlineExceeded:
+                    # A database deadline is request degradation, not an index
+                    # failure. In particular, do not claim an FTS-only result
+                    # when the leg expired before its first successful query.
+                    rows = []
+                    deadline_interrupted = True
                 # Capture this leg immediately, including empty results. An
                 # unchanged diagnostic can belong to an earlier request when
                 # retrieval returns before creating a trace. Failed calls
@@ -739,6 +778,13 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 poisoned = _ranking_deadline_poisoned(retrieval_engine)
                 suppression = getattr(retrieval_engine, "last_auth_suppression", None)
                 degradation = _degradation_for(retrieval_engine, src)
+                if deadline_interrupted:
+                    degradation = {
+                        "src": src,
+                        "degraded": True,
+                        "stage": "retrieve",
+                        "reason": "search request deadline; stage skipped or interrupted",
+                    }
                 if personal and document_scope == "both":
                     with _snapshot_lock:
                         personal_snapshot = (
@@ -762,7 +808,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     degradation["source_agent"] = source_agent
                 elif "source_agent" in degradation:
                     degradation.pop("source_agent", None)
-            else:
+            elif not deadline_interrupted:
                 degradation = _degradation_for(
                     retrieval_engine, src, source_agent=source_agent
                 )
@@ -1087,7 +1133,23 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             else:
                 envelope_trace = getattr(engine, "last_trace_id", None)
 
-        if budget_tokens_param is not None:
+        skipped_stages: set[str] = set()
+
+        def stage_open(stage: str) -> bool:
+            try:
+                check_deadline()
+                return True
+            except RequestDeadlineExceeded:
+                if stage not in skipped_stages:
+                    skipped_stages.add(stage)
+                    degradations.append({
+                        "src": "request", "degraded": True,
+                        "stage": stage,
+                        "reason": "search request deadline; stage skipped or interrupted",
+                    })
+                return False
+
+        if budget_tokens_param is not None and stage_open("packing"):
             try:
                 budget = int(budget_tokens_param)
                 from minni.tokens import pack_results
@@ -1126,82 +1188,137 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         skip_score_record = _caller_visible_deadline_poisoned(results) or (
             not results and cycle_deadline_poisoned
         )
-        _bump_merged_document_access(results)
-        try:
-            from minni.rationale import explain
-            from minni.retrieval import _recommended_action
-            from minni.scoring import calibrated_confidence, record_score
 
-            # grok-review round 6 (finding 1): TWO passes. Recording and
-            # calibrating row-by-row let the window cross
-            # _ACTIVATION_THRESHOLD mid-response — hit 1 served raw_blend,
-            # hits 2..n percentile_rank, inside one payload. Record everything
-            # first, then calibrate every row against the same post-record
-            # window so the whole response shares one basis.
-            recorded: list = []
-            for r in results:
-                if not isinstance(r, dict):
-                    continue
-                poisoned_row = bool(r.get(_DEADLINE_POISONED_KEY))
-                raw_score = r.pop("confidence_raw", None)
-                if raw_score is None:
-                    continue
-                if skip_score_record or poisoned_row:
-                    continue
-                try:
-                    record_score(float(raw_score), "combined", engine.db)
-                    recorded.append((r, float(raw_score)))
-                except Exception as exc:
-                    context.logger.debug("search: score record failed: %s", exc)
-            for r, raw_score in recorded:
-                if r.get("confidence") is None:
-                    continue
-                try:
-                    r["confidence"] = calibrated_confidence(raw_score, engine.db)
-                except Exception as exc:
-                    context.logger.debug("search: calibration failed: %s", exc)
-                    continue
-                # grok-review round 8 (finding 1): formatting freezes
-                # recommended_action and rationale from the PRE-calibration
-                # blend. Rewriting confidence alone left the envelope
-                # disagreeing with itself after activation — e.g. confidence
-                # 0.85 with recommended_action "follow_up" and rationale
-                # "…; confidence 0.15.". Re-derive anything that consumed the
-                # old value so one payload has one meaning of confidence.
-                if "recommended_action" in r:
+        def run_document_access():
+            try:
+                _bump_merged_document_access(results)
+            except RequestDeadlineExceeded:
+                stage_open("document_access")
+
+        def record_scores():
+            try:
+                from minni.rationale import explain
+                from minni.retrieval import _recommended_action
+                from minni.scoring import calibrated_confidence, record_score
+
+                # grok-review round 6 (finding 1): TWO passes. Recording and
+                # calibrating row-by-row let the window cross
+                # _ACTIVATION_THRESHOLD mid-response — hit 1 served raw_blend,
+                # hits 2..n percentile_rank, inside one payload. Record everything
+                # first, then calibrate every row against the same post-record
+                # window so the whole response shares one basis.
+                recorded: list = []
+                rem0 = remaining_seconds()
+                started_expired = rem0 is not None and rem0 <= 0
+                for r in results:
+                    if not started_expired:
+                        check_deadline()
+                    if not isinstance(r, dict):
+                        continue
+                    poisoned_row = bool(r.get(_DEADLINE_POISONED_KEY))
+                    raw_score = r.pop("confidence_raw", None)
+                    if raw_score is None:
+                        continue
+                    if skip_score_record or poisoned_row:
+                        continue
                     try:
-                        r["recommended_action"] = _recommended_action(
-                            r.get("review_state"),
-                            r.get("instruction_like"),
-                            r.get("confidence"),
-                        )
+                        record_score(float(raw_score), "combined", engine.db)
+                        recorded.append((r, float(raw_score)))
+                    except RequestDeadlineExceeded:
+                        raise
                     except Exception as exc:
-                        context.logger.debug(
-                            "search: recommended_action refresh failed: %s", exc
-                        )
-                if "rationale" in r:
+                        context.logger.debug("search: score record failed: %s", exc)
+                for r, raw_score in recorded:
+                    if not started_expired:
+                        check_deadline()
+                    if r.get("confidence") is None:
+                        continue
                     try:
-                        r["rationale"] = explain(r)
+                        r["confidence"] = calibrated_confidence(raw_score, engine.db)
+                    except RequestDeadlineExceeded:
+                        raise
                     except Exception as exc:
-                        context.logger.debug(
-                            "search: rationale refresh failed: %s", exc
-                        )
-        except Exception as exc:
-            context.logger.warning("search: score recording failed: %s", exc)
-        _strip_private_search_keys(results)
+                        context.logger.debug("search: calibration failed: %s", exc)
+                        continue
+                    # grok-review round 8 (finding 1): formatting freezes
+                    # recommended_action and rationale from the PRE-calibration
+                    # blend. Rewriting confidence alone left the envelope
+                    # disagreeing with itself after activation — e.g. confidence
+                    # 0.85 with recommended_action "follow_up" and rationale
+                    # "…; confidence 0.15.". Re-derive anything that consumed the
+                    # old value so one payload has one meaning of confidence.
+                    if "recommended_action" in r:
+                        try:
+                            r["recommended_action"] = _recommended_action(
+                                r.get("review_state"),
+                                r.get("instruction_like"),
+                                r.get("confidence"),
+                            )
+                        except RequestDeadlineExceeded:
+                            raise
+                        except Exception as exc:
+                            context.logger.debug(
+                                "search: recommended_action refresh failed: %s", exc
+                            )
+                    if "rationale" in r:
+                        try:
+                            r["rationale"] = explain(r)
+                        except RequestDeadlineExceeded:
+                            raise
+                        except Exception as exc:
+                            context.logger.debug(
+                                "search: rationale refresh failed: %s", exc
+                            )
+            except RequestDeadlineExceeded:
+                raise
+            except Exception as exc:
+                context.logger.warning("search: score recording failed: %s", exc)
+
+        def run_score_calibration():
+            # If expiration interrupts calibration, preserve the original
+            # consistent confidence/action/rationale set on every result.
+            prior_scores = [
+                (row, {key: row[key] for key in ("confidence", "recommended_action", "rationale") if key in row})
+                for row in results if isinstance(row, dict)
+            ]
+            try:
+                record_scores()
+            except RequestDeadlineExceeded:
+                for row, prior in prior_scores:
+                    row.update(prior)
+                stage_open("score_calibration")
+
+        if skip_score_record:
+            if stage_open("document_access"):
+                run_document_access()
+            if stage_open("score_calibration"):
+                run_score_calibration()
+        else:
+            # Completed hybrid ranking: qty/calibration are part of the
+            # ranking contract, not optional tails. A later skipped HyDE
+            # or expand variant must not withhold them.
+            with allow_expired_sql():
+                run_document_access()
+                run_score_calibration()
+        results = _normalize_caller_visible_results(results)
 
         learnings: list = []
-        try:
-            learnings = engine.search_learnings(
-                query,
-                agent_id=agent_id,
-                cross_agent=learnings_cross_agent,
-                limit=limit,
-                source="minnid.search",
-                update_access=not skip_score_record,
-            )
-        except Exception as exc:
-            context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
+        # Learnings are a new search tail, not completed-ranking bookkeeping.
+        # Skip after expiry regardless of hybrid vs poisoned ranking.
+        if stage_open("learnings"):
+            try:
+                learnings = engine.search_learnings(
+                    query,
+                    agent_id=agent_id,
+                    cross_agent=learnings_cross_agent,
+                    limit=limit,
+                    source="minnid.search",
+                    update_access=not skip_score_record,
+                )
+            except Exception as exc:
+                context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
+            finally:
+                stage_open("learnings")
 
         # Audit #225-R1: the episodic layer was advertised (the `layer` enum and
         # BOOT_RECALL_LAYERS both expose it) but search_episodic had ZERO
@@ -1212,7 +1329,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # and must not be merged into a result set whose consumers assume a
         # doc_id.
         episodic_hits: list = []
-        if _episodic_layer_requested(layers):
+        if _episodic_layer_requested(layers) and stage_open("episodic"):
             try:
                 episodic_hits = engine.search_episodic(
                     query,
@@ -1222,6 +1339,8 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 )
             except Exception as exc:
                 context.logger.warning("search: episodic surfacing failed: %s", exc)
+            finally:
+                stage_open("episodic")
 
         # Durable recall trace (observability, config.recall_trace): a TTL'd
         # episodic event per search so `minni watch` can show raw-RPC recalls
@@ -1231,6 +1350,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             principal is not None
             and context.lazy_episodic is not None
             and getattr(context.default_config, "recall_trace", False)
+            and stage_open("recall_trace")
         ):
             try:
                 top_score = float(results[0].get("score") or 0.0) if results else 0.0
@@ -1263,6 +1383,8 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 episodic.trim_recall_traces()
             except Exception as exc:
                 context.logger.debug("search: recall trace failed: %s", exc)
+            finally:
+                stage_open("recall_trace")
 
         response_payload = {
             "query": query,
@@ -1299,6 +1421,36 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         response_payload["degradation"] = degradations
         response_payload["degraded"] = any(d.get("degraded") for d in degradations)
         return context.make_response(response_payload, request_id)
+    except RequestDeadlineExceeded as exc:
+        context.logger.warning("search: request deadline exceeded: %s", exc)
+        partial = _normalize_caller_visible_results(locals().get("results") or [])
+        degs = list(locals().get("degradations") or [])
+        degs.append({
+            "src": "request",
+            "degraded": True,
+            "stage": "retrieve",
+            "reason": "search request deadline; stage skipped or interrupted",
+        })
+        return context.make_response(
+            {
+                "query": query,
+                "agent_id": agent_id,
+                "depth": locals().get("depth") or "snippet",
+                "count": len(partial),
+                "backend": backend_badge(locals().get("resolved_backend")),
+                "trace_id": None,
+                "trace_ids": list(locals().get("retrieval_trace_ids") or []),
+                "trace_scope": "retrieval_leg",
+                "query_variants": [query],
+                "results": partial,
+                "learnings": [],
+                "episodic": [],
+                "episodic_count": 0,
+                "degradation": degs,
+                "degraded": True,
+            },
+            request_id,
+        )
     except Exception as exc:
         context.logger.exception("search failed")
         return context.make_error(-32000, f"Search error: {exc}", request_id)
