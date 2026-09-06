@@ -826,6 +826,14 @@ function parseFrontmatter(raw: string): { frontmatter: Record<string, unknown>; 
       valStr = valStr.slice(1, -1);
       value = valStr;
     }
+    // A digest is opaque text, even when every hex character is a digit.
+    // Preserve the raw/decoded lexical value before numeric coercion loses
+    // leading zeros or precision. This also reads already-written bare
+    // digests; strict rehydration still verifies them against the plan.
+    if (key === "plan_digest") {
+      fm[key] = valStr;
+      continue;
+    }
     // parse json-ish or primitives (our pre-stringified arrays/objects land here)
     const trimmed = valStr;
     if (/^[\[{]/.test(trimmed) || /^(true|false|null|-?\d(\.\d+)?([eE][+-]?\d+)?$)/.test(trimmed)) {
