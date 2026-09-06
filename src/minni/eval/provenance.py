@@ -241,7 +241,8 @@ def principal_provenance(
                 "backend": "study-snapshot",
                 "mock": False,
                 "scope": "prepared snapshot vault only (least-privilege study principal)",
-                "note": "Snapshot principal was not initialized; no effective authorization context was recorded.",
+                "note": "Snapshot principal was not initialized; no effective authorization context was recorded. "
+                        "Packet authorization claims are supplied provenance, not independently verified permission.",
             }
         return {
             "supplied": True,
