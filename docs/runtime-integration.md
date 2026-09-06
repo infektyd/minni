@@ -74,7 +74,7 @@ Two views answer "did the model actually use minni?":
   Together the lanes cover both hook-wired runtimes and agents speaking
   JSON-RPC directly, matching `minni watch`'s coverage.
 
-The console's data paths are read-only: vault logs are read without
+The console's observability routes read data: vault logs are read without
 materializing vault skeletons, and `list_events` is capability-gated under
 `read` and performs a single parameterized SELECT. Cross-agent event
 listing follows the same gate as cross-agent recall: a plain principal is
@@ -83,6 +83,14 @@ scoped to its own stamped agent id, so in a strict-identity home (any
 author `principals/main.json` with at least `"capabilities": ["read"]`
 (add `"govern"` for the fleet-wide view), exactly as the candidate routes
 already require `learn`.
+
+Candidate review is a separate **governed mutation**: Board Approve/Reject calls
+`/api/resolve-candidate`. Accepting requires operator authority; an owner may
+reject or redact its own candidate under the daemon policy. The bearer token is
+HTTP access, not a substitute for the stamped principal's capabilities.
+Prepare-outcome decisions are dry-run previews and do not resolve candidates.
+Prepare-task can leave audit/recall receipts. A console-wide “read-only” label
+would therefore be misleading.
 
 ## Recall Guard (verifiable memory use)
 

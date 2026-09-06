@@ -7,7 +7,7 @@
 // and distinct from error (hooks surface error → OFFLINE zone UI).
 // ============================================================================
 
-import type { AgentApiRow, HandoffRow, PolicyReport, RecallStateResponse } from "../api";
+import type { ListCandidatesResponse, AgentApiRow, HandoffRow, PolicyReport, RecallStateResponse } from "../api";
 
 export type ZoneId = "agents" | "hub" | "staged" | "logs" | "quarantine" | "recall";
 export type ZoneStatus = "online" | "pending" | "private" | "danger";
@@ -335,6 +335,21 @@ export function mapQuarantineCandidates(rows: CandidateRow[]): BoardDeny[] {
   });
 }
 
+export type AgentRegistrationFilter = "all" | "registered" | "unregistered" | "unknown";
+
+export function agentRegistration(agent: BoardAgent): Exclude<AgentRegistrationFilter, "all"> {
+  if (agent.registered === true) return "registered";
+  return agent.registrationKnown === true ? "unregistered" : "unknown";
+}
+
+export function filterAgentCatalogue(agents: BoardAgent[], registration: AgentRegistrationFilter, query: string): BoardAgent[] {
+  const needle = query.trim().toLocaleLowerCase();
+  return agents.filter((agent) =>
+    (registration === "all" || agentRegistration(agent) === registration) &&
+    (!needle || [agent.id, agent.displayName, agent.description, agent.vault].some((value) => value?.toLocaleLowerCase().includes(needle))),
+  );
+}
+
 /** Map /api/agents row → BoardAgent. */
 export function mapAgentRow(row: AgentRow): BoardAgent {
   const capsIn = row.caps || { R: 0, L: 0, H: 0 };
@@ -573,4 +588,18 @@ export function zoneFetchFailure<T>(
     error: message,
     authRequired: auth,
   };
+}
+
+/** A limited owner-scoped page is not a fleet-wide exact count. */
+export function candidatePageInfo(response: ListCandidatesResponse, requestedLimit: number) {
+  return {
+    principal: typeof response.principal === "string" && response.principal.trim()
+      ? response.principal.trim() : null,
+    hasMore: typeof response.has_more === "boolean"
+      ? response.has_more : response.candidates.length >= requestedLimit,
+  };
+}
+
+export function stagedCountLabel(count: number, hasMore = false): string {
+  return `${count}${hasMore ? "+" : ""}`;
 }

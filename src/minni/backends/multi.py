@@ -27,7 +27,11 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from minni.vector_backend import VectorBackend, VectorItem, VectorHit
-from minni.request_deadline import bind_copied_deadline, run_bound
+from minni.request_deadline import (
+    RequestDeadlineExceeded,
+    bind_copied_deadline,
+    run_bound,
+)
 
 logger = logging.getLogger("sovereign.backends.multi")
 
@@ -150,6 +154,8 @@ class MultiBackend:
                 try:
                     hits = future.result()
                     backend_results[bname] = hits or []
+                except RequestDeadlineExceeded:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "MultiBackend.search: backend %r failed: %s — excluding from merge",

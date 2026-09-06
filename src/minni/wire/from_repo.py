@@ -13,7 +13,7 @@ from minni.wire.manifest import PayloadManifest, deterministic_built_at, dev_ver
 PAYLOAD_ITEMS = (
     "dist", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin",
     ".kilocode-plugin", ".mcp.json", "commands", "hooks", "skills", "README.md",
-    "frontend", "package.json",
+    "frontend", "kilo", "package.json",
 )
 MANIFEST_STAMP_PATHS = (
     ".claude-plugin/plugin.json",

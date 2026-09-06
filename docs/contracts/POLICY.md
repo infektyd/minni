@@ -23,25 +23,42 @@ Specific defaults:
 | Database | Local SQLite only (`~/.minni/minni.db`) |
 | FAISS index | Local disk only (`~/.minni/minni_faiss.index`) |
 | Daemon socket | Unix domain socket, local only (`~/.minni/run/minnid.sock`) |
-| Cross-agent recall | Enabled for `privacy_level=safe` pages within the same installation |
+| Cross-agent recall | Authorized shared documents; see the layered matrix below |
 | Handoff packets | Opt-in per handoff; never automatic |
 
-### Cross-agent recall sharing
+### Cross-agent document recall
 
-Cross-agent recall is enabled by design: agents share a common recall pool
-indexed from all agents' vaults. Every result carries `agent_origin` in its
-provenance envelope so the consuming agent knows the source.
+The document read gate combines stamped principal capabilities, ownership,
+document type, privacy, allowed vault roots, workspace metadata, and retrieval
+lifecycle filters. A `safe` label alone is not permission to read every peer's
+notes. The source of truth is `can_read_document` in `src/minni/principal.py`.
 
-Only documents tagged `privacy_level=safe` participate in the shared recall
-pool. Documents tagged `local-only`, `private`, or `blocked` are filtered at
-retrieval time:
+The following matrix applies **after** method capability, root containment,
+workspace matching, and lifecycle checks:
 
-| privacy_level | Cross-agent recall | Handoff packets |
-|---------------|-------------------|-----------------|
-| `safe` | Yes | Yes |
-| `local-only` | Yes (same workspace only) | No |
-| `private` | No (author agent only) | No |
-| `blocked` | Never | Never |
+| Document | Same owner | Ordinary foreign principal | Operator within permitted roots |
+|---|---|---|---|
+| `blocked`, any type | Denied | Denied | Denied |
+| Attributed session, nonblocked | Allowed | Denied, including `safe` | Allowed |
+| Attributed `private` / `local-only`, non-session | Allowed | Denied, even in the same workspace | Allowed |
+| Nonprivate shared wiki / handoff / synthesis / decision | Allowed | Allowed when its type/attribution qualifies as shared | Allowed |
+| Other attributed documents | Allowed | Default deny | Allowed |
+
+Legacy `agent=unknown` non-session rows have a compatibility exception for
+capable principals; unattributed sessions do not acquire a shared grant. This
+exception is not a recommended attribution scheme. Absolute source paths are
+checked against allowed roots; legacy relative paths and missing workspace
+metadata have restricted owner compatibility behavior.
+
+Workspace labels do not create universal per-project isolation. The gate accepts
+matching workspace IDs or `*` on the document/request; missing legacy workspace
+metadata is owner-readable across named workspaces. Cross-project recall remains
+available through authorized scope. Foreign `local-only` content is still denied
+to ordinary principals. Explicit cross-agent **learning** recall additionally
+requires its capability; shared document visibility is a separate decision.
+
+Handoffs have their own addressed-recipient, capability and lease contract;
+this document matrix is not a grant to transfer arbitrary content.
 
 ### 1.1 Candidate staging privacy
 
@@ -175,12 +192,10 @@ calibration (the engine weights recent scores more heavily).
 
 ### 4.1 Reading across agents
 
-An agent may **read** from the shared recall pool regardless of which agent
-indexed a document. The shared pool includes all documents with
-`privacy_level=safe` or `local-only` (same workspace).
-
-Results always carry `agent_origin` in the provenance envelope so the consuming
-agent can evaluate the source authority of each result.
+Read access follows the layered document matrix in §1 and the separate learning
+recall capability. Neither shared indexing nor a `safe` tag grants unrestricted
+peer-session access. Results carry source/agent provenance for evaluation as
+evidence, not authority.
 
 ### 4.2 Writing — agent vault boundary
 
@@ -212,13 +227,10 @@ it remains as an immutable record in the sender's vault.
 
 ### 4.5 Privacy-level inheritance in cross-agent results
 
-When an agent recalls a document authored by a peer, the document's
-`privacy_level` is respected:
-
-- `safe`: returned normally.
-- `local-only`: returned if the requesting agent is in the same workspace.
-- `private`: not returned; treated as if the document does not exist.
-- `blocked`: not returned under any circumstances.
+Peer results must pass §1 in full. `blocked` is always excluded; ordinary
+principals cannot read attributed foreign private/local-only documents or sessions
+(the legacy unknown-attribution exception is described in §1).
+Operators remain constrained by roots, workspace metadata, and blocked privacy.
 
 The consuming agent MUST NOT attempt to infer the content of redacted or
 excluded documents from the absence of a result.

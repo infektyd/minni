@@ -39,11 +39,31 @@ that another agent can pick up later.
 3. Reports are written to `logs/hygiene-YYYY-MM-DD.md`.
 4. Agents remediate through file-back or explicit resolution tools.
 
+## Thread work
+
+Use the [current Thread workflow](../thread-workflow.md) for prepare → create →
+ready/assign/claim → start/update/complete → confirm. A queued acceptance is not
+an applied mutation; outcome drafting is not Thread completion.
+
 ## Eval Gate
 
-A retrieval feature may flip its default only after
-`python -m minni.eval.harness run --config baseline,<candidate>` shows at
-least +5% recall@5 on the seed set with no regression on any query class.
+The normative default-change policy remains: demonstrate at least +5% recall@5
+against the baseline with no regression on any query class. This requires a
+reviewed dataset, comparable runs, and explicit review of the evidence.
+
+`python -m minni.eval.harness run --quality-gate --config no-expand,with-expand
+--quality-baseline no-expand --quality-candidate with-expand`
+checks at least **5% relative** recall@5 improvement and no query-class mean
+regression. It rejects incomparable judgments, missing metrics, and wholly
+unjudged classes. Both runs must use the same reviewed query set; the existing
+300-reviewed-query prerequisite applies. Passing synthetic tests or `--mock`
+does not establish actual retrieval quality or authorize a default change.
+
+The separate legacy `--gate --retrievers minnid,ripgrep` check retains its rule:
+Minni may lose on at most 20% of comparable queries. Report-only runs, CI tests,
+and release smoke do not certify the default-change policy. See
+[evaluation guidance](../../eval/README.md) for commands, the zero-baseline case,
+and remaining evidence limits.
 
 ## Runtime Identity
 

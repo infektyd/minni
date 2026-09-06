@@ -109,3 +109,195 @@ historical or planned behavior outside the selected excerpts. Keep this corpus
 separate from the synthetic corpus when reporting quality; they test different
 things. Later documentation changes do not silently change the snapshot: review
 new source text, hashes, and expectations explicitly when refreshing it.
+
+## Compare a candidate against the baseline
+
+Validate a reviewed corpus using the same strict checks as a quality run:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness validate \
+  --quality-gate --path /path/to/reviewed-queries.jsonl
+```
+
+This requires unique query strings, explicit class labels, exact integer IDs,
+and nonnegative integer `budget_tokens` when supplied (default 4096).
+Plain `validate` retains the legacy validation contract.
+
+Use a reviewed corpus with real document judgments for the retrieval backend:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
+  --queries /path/to/reviewed-queries.jsonl \
+  --config no-expand,with-expand --retrievers minnid \
+  --quality-gate --quality-baseline no-expand --quality-candidate with-expand
+```
+
+The default check requires a **5% relative** gain in mean recall@5, with no
+regression in any query class (`notes`). For example, 0.40 to 0.42 meets the
+improvement threshold; a declining class still fails. A zero baseline needs a
+strictly positive candidate score; both zero fails. Reports must contain the
+same unique queries, exact integer document judgments, and class metadata.
+Missing, nonfinite, or out-of-range scores fail. A whole class without judgments
+cannot disappear from the check; partially unjudged queries remain explicitly
+listed as unevaluable. Negative/privacy probes require a separate outcome
+contract and are not certified by recall scores.
+
+The existing corpus validator requires at least 300 queries with explicit JSON
+`"reviewed": true`, relevance metadata, answer rubric, and privacy expectation.
+Malformed raw IDs and invalid comparison arguments are rejected before
+retriever initialization. Quality mode currently supports recall only; graded
+nDCG comparisons require preserving additional comparable judgment evidence.
+The default policy is recall@5 with `--min-improvement 0.05`; other supported K
+values or thresholds are custom comparisons, not evidence for that policy.
+
+A failed invocation exits 2; failed comparison exits 3 and writes a quality-gate
+JSON report. Success writes the report with compared means, class results,
+excluded queries, and limitations. The check computes no confidence intervals
+and does not assess latency, answer quality, or consumer resistance to hostile
+recalled content. `--mock` exercises plumbing only. Existing fixture studies and
+placeholder seed IDs do not become a reviewed real-world quality study merely
+because the comparison code exists.
+
+The legacy `--gate` Minni-versus-ripgrep loss-rate check is separate and keeps its
+20% rule. Ungated runs remain available for smaller exploratory datasets.
+
+Quality comparisons require one document-ID retriever and two distinct configs.
+Both configs must set `use_hyde=False` explicitly — HyDE on either side
+(including the `with-hyde` config) is rejected before any retrieval work, so a
+two-dimension change can never certify as expansion evidence. `no-expand`
+disables query expansion; `with-expand` sets `expand=True`, which uses the
+engine’s `query_expand_default` mode (rule or AFM; unsupported defaults fall
+back to rule).
+It does not force AFM expansion or guarantee extra variants for every query. The legacy
+`baseline` config retains its existing defaults. Report names resolve by complete
+config identity, so `baseline` never aliases `fp32-baseline`. Report names must
+also be unique case-insensitively (`minnid,MINNID` share one backend and one
+report file on case-insensitive filesystems) and must not collide with the
+`gate` / `quality-gate` artifact names.
+
+Quality mode rejects malformed JSONL, missing or blank query-class labels,
+retrieval exceptions, and unsupported config options. An absent or null
+`expected_doc_ids` field is malformed evidence, never an empty judgment: only
+an explicitly present `[]` marks an unevaluable probe. It cannot be combined with
+the legacy `--gate`. These
+checks validate the comparison inputs; passing synthetic tests is not evidence
+of improved real retrieval quality.
+
+Real acceptance requires a positively recorded frozen snapshot with the
+same explicit identity on both sides. Absent provenance, a missing or
+`"unknown"` snapshot, frozen-without-identity, a snapshot mismatch, or mixed
+evidence kinds all fail — nothing is inferred from absence, so a bare report
+without provenance fails rather than passing as synthetic. Positively labeled
+mock evidence keeps the numeric comparison but never certifies: the decision
+is forced to fail with a synthetic-plumbing reason and evidence label (exit
+3). Matching snapshot strings are packet identity, not authenticated proof of
+a frozen corpus. Rerun both configs against a frozen snapshot with a recorded
+identity (snapshot support lands separately) before gating; this gate invents
+no frozen proof.
+
+Gate artifacts (`*-gate.json`, `*-quality-gate.json`) carry their own
+`provenance` block — query digest, code revision, corpus snapshot, gate inputs,
+and the recorded decision — so a retained artifact identifies its evidence
+when copied independently.
+
+## Private-study preparation runbook (no corpus collected yet)
+
+Hans chose private day-to-day cross-project memories as the study target. No
+private corpus has been collected, and nothing below reads, exports, or
+benchmarks live memories. This section prepares the procedure so a later,
+separately authorized collection step can run it without improvising.
+
+### 1. Freeze an eligible corpus before scoring anything
+
+- Copy the selected memories into a **frozen snapshot directory** with a
+  recorded identity (e.g. a manifest of file paths plus SHA-256 per file and
+  one manifest digest). The snapshot is read-only for the whole study.
+- Every document carries an explicit eligibility annotation for the fixed
+  study principal (like the fixture's `expected_eligible`), decided before
+  retrieval runs, not derived from retrieval output.
+- Keep the snapshot and all study reports **outside version control**
+  (e.g. under Minni's private data dir or `/tmp`), never in `eval/`.
+- Refreshing the corpus means a new snapshot with a new identity and new
+  review; never silently swap files under a recorded digest.
+
+### 2. Scope reads and govern access
+
+- Run retrieval under a **least-privilege principal** whose allowed roots
+  cover only the frozen snapshot, with `update_access=False`, writeback
+  disabled, and no daemon side effects. Record the principal id,
+  capabilities, and allowed roots in the report.
+- The study harness must open the snapshot database only; it must not open
+  the live vault for reads, writes, or metadata.
+
+### 3. Review authentically, not via the legacy boolean
+
+- The existing `"reviewed": true` flag is a gate-shape marker: it says a row
+  has the required fields. It is **not** evidence that a human judged
+  relevance, wrote an answer rubric, or set a privacy expectation.
+- Authentic review means independent reviewers apply a written rubric to
+  each query, record relevance grades and privacy expectations per document,
+  adjudicate disagreements, and log the review method and date. The
+  provenance block records `human_review: not-established` until that
+  process exists; do not relabel it by hand.
+
+### 4. Why the legacy `run` still accesses DEFAULT_CONFIG
+
+- `RealSearcher` wraps `RetrievalEngine` over the mutable `DEFAULT_CONFIG`
+  live database for convenient smoke and comparison plumbing. That is why
+  ordinary `run` commands touch the live engine.
+- Treat those reports as **comparison plumbing over mutable content**, not
+  study evidence: the backend is recorded as live-mutable with snapshot
+  `unknown`, never as frozen or safe. The fixture command is the model for
+  study isolation (disposable database, fixed principal, recorded hashes).
+
+### 5. Keep private reports out of the repo
+
+```sh
+PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
+  --queries /path/to/reviewed-queries.jsonl \
+  --config no-expand,with-expand --retrievers minnid \
+  --quality-gate --quality-baseline no-expand --quality-candidate with-expand \
+  --output-dir /private/study-reports
+```
+
+`--output-dir` defaults to `eval/reports`, preserving existing behavior; pass
+an outside-the-repo directory for anything private. A new directory (explicit
+or default) is created with mode `0700`; a pre-existing group/other-writable
+directory fails fast with exit 2 before any retrieval work, instead of running
+the study and then writing zero reports. An existing explicit directory must
+already be owned by you and private. Shared report directories such as `/tmp`
+itself are rejected; use a dedicated child directory. JSON and Markdown
+reports are written with mode `0600`. Repeated config/retriever combinations
+(including case-insensitive collisions) are rejected before a run starts.
+Every JSON report carries
+a `provenance` block: a digest of the exact parsed queries scored
+(`loaded_queries_digest`), the separately observed query-file bytes with
+explicitly unverified correspondence, code revision/dirty state,
+requested/effective retrieval settings (options an adapter swallows without
+effect are listed under `ignored_by_backend`, never claimed as compared;
+harness envelope defaults such as `update_access` appear as effective only
+for backends that actually consume them — the live engine alone),
+config/dependency metadata when
+importable (model names are configured defaults, not observed inference),
+principal availability, run order and timing caveats (searcher construction
+happens before, and outside, the measured per-query timing), and
+backend-specific corpus identity (live databases stay `unknown`, never
+hashed; file baselines and placeholders get their own labels). The Markdown
+comparison adds a short Run Provenance section derived from the actually
+constructed backends, not from CLI flags alone. Provenance describes how a
+report was produced; it is not a passing certification, and `unknown` means
+unverifiable, not safe.
+
+`fixture --output` writes a single `0600` file, so the documented
+`/tmp/minni-fixture.json` paths keep working: a sticky shared parent such as
+`/tmp` is accepted for one private file (the sticky bit stops other users
+renaming or replacing it), while a non-sticky shared parent is rejected. The
+destination is preflighted before the fixture runs, so an unusable path exits
+2 instead of discarding a completed evaluation.
+
+`fp32-baseline`, `int8-quantized`, and `with-semantic-merge` are placeholder
+ablations without implemented option changes and are rejected in quality mode.
+They remain available for legacy descriptive reports. Quality mode also rejects
+pairs with identical effective options after accounting for the engine’s
+`expand=True` default; distinct names alone do not
+establish a feature comparison.

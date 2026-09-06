@@ -49,11 +49,19 @@ def _build_payload(home: Path, version: str = "0.2.0") -> tuple[Path, PayloadMan
     (root / "hooks" / "hooks-gemini.json").write_text("{}", encoding="utf-8")
     gemini_hook = dist / "gemini-hook.js"
     gemini_hook.write_text("// stub gemini hook\n", encoding="utf-8")
+    (root / "kilo").mkdir()
+    (root / "kilo" / "minni-plugin.js").write_text(
+        (Path(__file__).resolve().parents[1] / "plugins/minni/kilo/minni-plugin.js").read_text(),
+        encoding="utf-8",
+    )
+    (dist / "kilocode-hook.js").write_text("// stub kilo hook\n", encoding="utf-8")
     (root / ".mcp.json").write_text("{}", encoding="utf-8")
 
     files = {
         "dist/server.js": sha256_file(server),
         "dist/hook.js": sha256_file(hook),
+        "dist/kilocode-hook.js": sha256_file(dist / "kilocode-hook.js"),
+        "kilo/minni-plugin.js": sha256_file(root / "kilo/minni-plugin.js"),
         "dist/gemini-hook.js": sha256_file(gemini_hook),
         ".mcp.json": sha256_file(root / ".mcp.json"),
     }
@@ -104,16 +112,28 @@ def wire_env(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     _fake_node_script(tmp_path)
+    # Executable/GUI evidence is separate from leftover configuration.
+    for command in ("claude", "codex", "kilo", "grok"):
+        executable = tmp_path / command
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+    app = home / "Applications/Antigravity.app/Contents"
+    app.mkdir(parents=True)
+    (app / "Info.plist").write_text("fixture")
+    from minni.wire.host_discovery import host_decision
+    monkeypatch.setattr("minni.wire.flow.host_decision", lambda platform, **kw: host_decision(
+        platform, app_roots=(home / "Applications",), launcher_roots=(), **kw,
+    ))
     monkeypatch.setenv("PATH", str(tmp_path))
-    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    (home / ".claude.json").write_text('{"mcpServers":{"minni":{}}}', encoding="utf-8")
     (home / ".codex").mkdir()
-    (home / ".codex" / "config.toml").write_text("", encoding="utf-8")
+    (home / ".codex" / "config.toml").write_text("[mcp_servers.minni]\n", encoding="utf-8")
     kilo = home / ".config" / "kilo"
     kilo.mkdir(parents=True)
-    (kilo / "kilo.json").write_text("{}", encoding="utf-8")
+    (kilo / "kilo.json").write_text('{"mcp":{"minni":{}}}', encoding="utf-8")
     grok = home / ".grok"
     grok.mkdir()
-    (grok / "config.toml").write_text("", encoding="utf-8")
+    (grok / "config.toml").write_text("[mcp_servers.minni]\n", encoding="utf-8")
     payload_root, manifest = _build_payload(home)
     return home, payload_root, manifest
 
@@ -231,7 +251,7 @@ def test_wire_missing_node(tmp_path, monkeypatch, capsys):
         yield payload_root, manifest, False
 
     monkeypatch.setattr("minni.wire.flow.payload_tree", fake_tree)
-    rc = run_wire(_args("claude-code", home))
+    rc = run_wire(_args("generic", home, agent="test", install_root=str(home / "target")))
     assert rc == 2
 
 
@@ -627,106 +647,23 @@ def test_wire_from_repo_relative_path_resolved(wire_env, monkeypatch):
     assert captured["repo_root"].is_absolute()
 
 
-def test_wire_missing_config_root_is_skipped(wire_env, monkeypatch, capsys):
-    """Optional fleet members without a host config root skip, not fail."""
+def test_wire_unavailable_host_keeps_stale_config_and_wire_records(wire_env, monkeypatch, capsys):
     _patch_payload(wire_env, monkeypatch)
     home = wire_env[0]
-    # Remove kilocode surface so preflight reports no config root.
-    kilo = home / ".config" / "kilo"
-    if kilo.exists():
-        import shutil
-        shutil.rmtree(kilo)
-    rc = run_wire(_args("kilocode", home, dry_run=True))
-    # dry-run with only skipped platforms: emit path still dry-run if it
-    # reaches finalize before wiring; missing root skips before dry-run body.
+    (home.parent / "kilo").unlink()
+    plugin = home / ".minni/plugin"
+    plugin.mkdir(parents=True)
+    records = plugin / "wired.json"
+    records.write_text('{"schema":1,"wires":[{"platform":"kilocode","install_root":"/old"}]}')
+    config = home / ".config/kilo/kilo.json"
+    before = records.read_bytes(), config.read_bytes()
+    assert run_wire(_args("kilocode", home)) == 1
     out = json.loads(capsys.readouterr().out)
-    by = {r["platform"]: r for r in out["results"]}
-    assert "kilocode" in by, out
-    assert by["kilocode"]["status"] == "skipped", out
-    assert "no config root" in by["kilocode"].get("reason", "")
-    # Single-platform all-skipped is exit 1 (D5); status is skipped not failed.
-    assert out["status"] in ("skipped", "dry-run"), out
-    if out["status"] == "skipped":
-        assert rc == 1
+    assert out["results"][0]["status"] == "skipped"
+    assert "host unavailable" in out["results"][0]["reason"]
+    assert (records.read_bytes(), config.read_bytes()) == before
+    assert not (plugin / wire_env[2].version).exists()
 
-
-def test_wire_skip_missing_config_retires_zombie_and_honesty_green(
-    wire_env, monkeypatch, capsys,
-):
-    """High pin: codex lagging in wired.json with no ~/.codex must not keep
-    plugin_dist.stale true after wire skip + active claude payload.
-
-    wired.json has {codex: old_root, claude-code: fresh_root}
-    HOME has no ~/.codex, has claude surface
-    wire codex → skipped + retired
-    deploy_status plugin_dist.stale is False  # codex must not count
-    """
-    import shutil
-
-    from minni.minnid_runtime import deploy_honesty
-    from minni.wire.active_roots import active_wire_plugin_roots_ordered
-
-    _patch_payload(wire_env, monkeypatch)
-    home = wire_env[0]
-    plugin = home / ".minni" / "plugin"
-    old = plugin / "0.4.0"
-    old.mkdir(parents=True)
-    (old / "payload-manifest.json").write_text(
-        json.dumps({"git_sha": "0" * 40, "version": "0.4.0"}),
-        encoding="utf-8",
-    )
-    head = "b" * 40
-    fresh = plugin / "0.4.1+git.bbbbbbb"
-    fresh.mkdir(parents=True)
-    (fresh / "payload-manifest.json").write_text(
-        json.dumps({"git_sha": head, "version": "0.4.1+git.bbbbbbb"}),
-        encoding="utf-8",
-    )
-    (plugin / "wired.json").write_text(
-        json.dumps({
-            "schema": 1,
-            "generation": 1,
-            "wires": [
-                {
-                    "platform": "codex",
-                    "install_root": str(old),
-                    "wired_at": "2026-08-01T00:00:00Z",
-                },
-                {
-                    "platform": "claude-code",
-                    "install_root": str(fresh),
-                    "wired_at": "2026-08-02T00:00:00Z",
-                },
-            ],
-        }),
-        encoding="utf-8",
-    )
-    # Abandon codex host surface (zombie wire record remains until skip).
-    shutil.rmtree(home / ".codex")
-
-    rc = run_wire(_args("codex", home))
-    out = json.loads(capsys.readouterr().out)
-    by = {r["platform"]: r for r in out["results"]}
-    assert by["codex"]["status"] == "skipped"
-    assert "no config root" in by["codex"].get("reason", "")
-    # Single-platform skip → D5 exit 1; retirement still must land on disk.
-    assert rc == 1
-
-    wired = json.loads((plugin / "wired.json").read_text(encoding="utf-8"))
-    plats = [w.get("platform") for w in wired.get("wires", [])]
-    assert "codex" not in plats, wired
-    assert "claude-code" in plats
-
-    ordered = active_wire_plugin_roots_ordered(home)
-    assert not any("codex" in how for _r, how in ordered), ordered
-    assert any("claude-code" in how for _r, how in ordered), ordered
-
-    monkeypatch.setattr(
-        deploy_honesty, "_active_payload_roots",
-        lambda: active_wire_plugin_roots_ordered(home),
-    )
-    status = deploy_honesty._plugin_dist_status(head)
-    assert status["stale"] is False, status
 
 
 def test_from_repo_run_redirects_child_stdout_to_stderr(tmp_path, monkeypatch):
@@ -745,3 +682,42 @@ def test_from_repo_run_redirects_child_stdout_to_stderr(tmp_path, monkeypatch):
     monkeypatch.setattr(from_repo.subprocess, "run", fake_run)
     from_repo._run(["echo", "hi"], tmp_path)
     assert calls.get("stdout") is sys.stderr
+
+
+@pytest.mark.parametrize("native_hooks_present", [False, True])
+def test_codex_wire_does_not_claim_host_lifecycle_activation(
+    wire_env, monkeypatch, capsys, native_hooks_present,
+):
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    config_path = home / ".codex" / "config.toml"
+    existing = '[model_provider_settings]\nkeep = "untouched"\n'
+    if native_hooks_present:
+        existing += '[plugins."minni@local"]\nenabled = true\n'
+    config_path.write_text(existing, encoding="utf-8")
+    hook_file = home / ".codex" / "hooks.json"
+    hook_bytes = b'{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo fixture"}]}]}}'
+    if native_hooks_present:
+        hook_file.write_bytes(hook_bytes)
+    monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: False))
+
+    assert run_wire(_args("codex", home, no_prune=True)) == 0
+    output = json.loads(capsys.readouterr().out)
+    result = next(row for row in output["results"] if row["platform"] == "codex")
+    assert result["status"] == "wired"
+    assert result["verify"]["hook_dry_run"] is True
+    assert result["lifecycle"] == {
+        "automatic_hooks": "not_verified",
+        "hook_probe_scope": "packaged_entrypoint_only",
+        "existing_host_sessions": "not_verified",
+    }
+    assert "MCP configured" in result["reason"]
+    assert "not verified" in result["reason"]
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["model_provider_settings"]["keep"] == "untouched"
+    if native_hooks_present:
+        assert config["plugins"]["minni@local"]["enabled"] is True
+        assert hook_file.read_bytes() == hook_bytes
+    else:
+        assert not hook_file.exists()
+        assert "plugins" not in config

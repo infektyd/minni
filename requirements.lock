@@ -146,6 +146,7 @@ pytest-cov==7.1.0
     # via -r requirements.txt
 pyyaml==6.0.3
     # via
+    #   -r requirements.txt
     #   huggingface-hub
     #   transformers
 rank-bm25==0.2.2

@@ -55,7 +55,7 @@ def test_check_config_root_missing(tmp_path, monkeypatch):
     assert str(codex_root) in msg
 
 
-def test_preflight_platform_config_root_missing(tmp_path, monkeypatch):
+def test_preflight_platform_accepts_fresh_config_after_host_discovery(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -63,8 +63,9 @@ def test_preflight_platform_config_root_missing(tmp_path, monkeypatch):
         "minni.wire.preflight.check_node", lambda min_version=20: (True, "v22.0.0"),
     )
     errors = preflight_platform("kilocode")
-    assert len(errors) == 1
-    assert "no config root found for kilocode" in errors[0]
+    # Host eligibility is checked by discovery before this dependency preflight.
+    # A present host can be explicitly wired before its config directory exists.
+    assert errors == []
 
 
 def test_check_config_root_present(tmp_path, monkeypatch):

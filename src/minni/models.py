@@ -159,8 +159,9 @@ def cross_encoder_unlocked_predict_safe() -> bool:
 
     perf/parallel-fanout (#388, Cassandra RED-2): retrieval calls
     CrossEncoder.predict() WITHOUT get_cross_encoder_lock() only when BOTH
-    hold: the CONSTRUCTION device of the loaded singleton is CPU, AND the
-    torch-thread pin has actually fired (``_TORCH_THREADS_PINNED``). The
+    hold: the CONSTRUCTION device of the loaded singleton is CPU, the
+    torch-thread pin has actually fired (``_TORCH_THREADS_PINNED``), AND the
+    OMP/MKL environment pins are present. The
     stress probe verified byte-identical concurrent predict on that path,
     and segfaulted without the pin (OpenMP oversubscription) — so any
     other device (MPS/CUDA/auto) or an unfired pin takes the locked path.
@@ -180,7 +181,11 @@ def cross_encoder_unlocked_predict_safe() -> bool:
     normalized = (device or "").strip().lower().split(":")[0]
     if normalized != "cpu":
         return False
-    return _TORCH_THREADS_PINNED
+    return (
+        _TORCH_THREADS_PINNED
+        and os.environ.get("OMP_NUM_THREADS") == "1"
+        and os.environ.get("MKL_NUM_THREADS") == "1"
+    )
 
 
 def _announce_download_once(model_name: str, role: str) -> None:

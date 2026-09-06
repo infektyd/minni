@@ -850,6 +850,18 @@ def can_read_document(
         if not (same_agent and not doc_ws_raw):
             return False
 
+    # Foreign sessions are denied independently of their filesystem location.
+    # Apply this cheap gate before resolving every candidate path/root during
+    # retrieval refill. Potential grants still pass the full symlink-aware
+    # containment check below, including same-owner and operator sessions.
+    agent_l = _agent_early.lower()
+    if not same_agent and (
+        _page_type_early == "session"
+        or agent_l == "wiki:session"
+        or agent_l.startswith("session:")
+    ) and not is_operator_principal(principal):
+        return False
+
     # Vault root containment (realpath, symlink-aware, via G12).
     # Absolute paths are root-checked as before (same-agent escape via an
     # absolute path outside the allowed roots stays denied). Relative paths
@@ -910,18 +922,6 @@ def can_read_document(
         page_type == "session" and agent_l == "unknown"
     ):
         return True
-
-    # Finding 10: session notes are agent-scoped. Deny foreign sessions BEFORE
-    # the legacy agent="unknown" grant — otherwise unattributed sessions with
-    # missing agent metadata become cross-agent readable.
-    if (
-        page_type == "session"
-        or agent_l == "wiki:session"
-        or agent_l.startswith("session:")
-    ):
-        # Operators may still audit (governance) below.
-        if not is_operator_principal(principal):
-            return False
 
     # Legacy "unknown"-attributed docs are visible to any *capable* principal,
     # but never to a default-deny stamp (no capabilities AND no vault roots = an

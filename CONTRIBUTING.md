@@ -126,3 +126,12 @@ it's not obvious.
 
 See `.github/CODEOWNERS`. Everything currently routes through @infektyd for
 review.
+
+### Test process budget
+
+The full Node test and coverage commands run at most four test files at once.
+Several files launch their own workers and perform durable filesystem writes;
+unbounded file-level concurrency can exhaust a stress test's deadline through
+competition with unrelated suites. The queue tests retain their 40-worker
+bursts, completion deadlines, and persistence/order assertions. A passing bounded
+suite does not establish queue latency under arbitrary machine load.

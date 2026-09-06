@@ -1,5 +1,6 @@
 import { withClaimFsScope } from "./claim-fs.js";
 import { randomUUID } from "node:crypto";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -74,6 +75,7 @@ import {
   queuedWriteHasAcceptor,
   recordWorkerWriteDrainProgress,
   removeQueuedWorkerWrite,
+  workerWriteQueueDir,
   type QueuedWorkerWrite,
 } from "./thread-write-queue.js";
 
@@ -2227,8 +2229,29 @@ type DrainKickEntry = {
 
 const drainKicks = new Map<string, DrainKickEntry>();
 
+/**
+ * Owned in-flight kick promises, keyed like drainKicks. Test-support join
+ * only: production keeps fire-and-forget kick semantics, and this map never
+ * selects, authorizes, or steers work. Entries are deleted when their chain
+ * (including any follow-up re-kick registration) completes.
+ */
+const drainTasks = new Map<string, Promise<boolean>>();
+
 function drainKickKey(vaultPath: string, planId: string): string {
   return `${path.resolve(vaultPath)}\0${planId}`;
+}
+
+// Advisory emptiness only: never select or authorize work from file names.
+// Avoid taking the persist lock for an idle kick, which could turn a competing
+// direct update into queue acceptance. The locked scan still validates tickets.
+async function queueHasTicketEntries(vaultPath: string, planId: string): Promise<boolean> {
+  try {
+    const names = await readdir(workerWriteQueueDir(vaultPath, planId));
+    return names.some((name) => name.endsWith(".json") && name !== "progress.json");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 /**
@@ -2262,14 +2285,24 @@ export async function drainWorkerWrites(
   let oneShotPending = runOptions.oneShotYield === true;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
-    const remaining = await listQueuedWorkerWrites(input.vaultPath, input.planId);
-    if (remaining.length === 0) return false;
+    // Ordinary drains only check names before the authoritative locked read.
+    // Standing drains still need the pre-lock head for acceptor deferral.
+    if (runOptions.standingDefer !== true &&
+        !(await queueHasTicketEntries(input.vaultPath, input.planId))) return false;
+    const remaining = runOptions.standingDefer === true
+      ? await listQueuedWorkerWrites(input.vaultPath, input.planId)
+      : undefined;
+    if (remaining?.length === 0) return false;
     if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
+      // Preserve the empty/malformed/error verdict even when a reservation
+      // prevents reaching the locked read. No snapshot survives this retry.
+      if (remaining === undefined &&
+          (await listQueuedWorkerWrites(input.vaultPath, input.planId)).length === 0) return false;
       await new Promise((resolve) => setTimeout(resolve, 25));
       continue;
     }
     if (runOptions.standingDefer === true) {
-      const head = pickNextQueuedWorkerWrite(remaining);
+      const head = pickNextQueuedWorkerWrite(remaining!);
       if (await standingDrainShouldYieldLiveStart(input.notePath, head)) {
         // Yield this tick. Do not journal slice.started. Do not sit the
         // 60s drain loop — minnid must not block. Next interval retries.
@@ -2278,6 +2311,7 @@ export async function drainWorkerWrites(
     }
     try {
       let oneShotYieldedLive = false;
+      let queueEmpty = false;
       await withThreadLock(
         input.vaultPath,
         input.planId,
@@ -2287,12 +2321,15 @@ export async function drainWorkerWrites(
             oneShotPending = false;
             const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
             const head = pickNextQueuedWorkerWrite(items);
+            if (head === undefined) {
+              queueEmpty = true;
+              return;
+            }
             if (
-              head !== undefined &&
               !(await queuedWriteIsLiveWork(input.notePath, head))
             ) {
               // Dead leftover after supersede: drop now. Not a live apply.
-              await drainOneQueuedWorkerWrite(input, deps);
+              queueEmpty = await drainOneQueuedWorkerWrite(input, deps);
               return;
             }
             // Live accepted start: yield once. Do not journal slice.started
@@ -2300,13 +2337,15 @@ export async function drainWorkerWrites(
             oneShotYieldedLive = true;
             return;
           }
-          await drainOneQueuedWorkerWrite(input, deps);
+          queueEmpty = await drainOneQueuedWorkerWrite(input, deps);
         },
         { waitMs: 0 },
       );
+      if (queueEmpty) return false;
       if (oneShotYieldedLive) return true;
     } catch (error) {
       if (error instanceof ThreadBusyError) {
+        if ((await listQueuedWorkerWrites(input.vaultPath, input.planId)).length === 0) return false;
         await new Promise((resolve) => setTimeout(resolve, 25));
         continue;
       }
@@ -2366,7 +2405,7 @@ export function kickWorkerWriteDrain(
     followUpFull: false,
   };
   drainKicks.set(key, entry);
-  void drainWorkerWrites(input, deps, {
+  const task = drainWorkerWrites(input, deps, {
     oneShotYield: options.oneShotYield === true,
   })
     .catch(() => {
@@ -2376,6 +2415,7 @@ export function kickWorkerWriteDrain(
     })
     .then((yieldedLive) => {
       drainKicks.delete(key);
+      drainTasks.delete(key);
       // One-shot yielded a live start: do not apply it here. Orch may still
       // reserve. Standing drain must not apply a live start in that window
       // while the acceptor is live. Later drainWorkerWrites / post-replan
@@ -2383,7 +2423,38 @@ export function kickWorkerWriteDrain(
       if (entry.followUpFull && yieldedLive !== true) {
         kickWorkerWriteDrain(input, deps);
       }
+      return yieldedLive;
     });
+  // Same fire-and-forget production semantics: the chain is tracked for the
+  // test-support join below, never awaited here.
+  drainTasks.set(key, task);
+  void task;
+}
+
+/**
+ * Test-support join for owned in-process kick drains. Awaits every tracked
+ * kick task for the vault (optionally one plan), including follow-up
+ * re-kicks registered as a chain completes, so trailing writes (progress
+ * record, lock release) have landed before teardown rm. Production callers
+ * must keep using fire-and-forget kick semantics; this join selects and
+ * authorizes nothing. Do not call while holding the plan lock: an in-flight
+ * drain waiting on that lock only resolves at its own deadline.
+ */
+export async function joinWorkerWriteDrains(
+  vaultPath: string,
+  planId?: string,
+): Promise<void> {
+  const prefix = `${path.resolve(vaultPath)}\0`;
+  const want = (key: string): boolean =>
+    planId === undefined ? key.startsWith(prefix) : key === `${prefix}${planId}`;
+  for (;;) {
+    const pending: Array<Promise<boolean>> = [];
+    for (const [key, task] of drainTasks) {
+      if (want(key)) pending.push(task);
+    }
+    if (pending.length === 0) return;
+    await Promise.allSettled(pending);
+  }
 }
 
 /**
@@ -2423,9 +2494,12 @@ export async function drainPendingWorkerWritesForVault(
 async function queuedWriteIsLiveWork(
   notePath: string,
   item: { sliceId: string; generation?: number },
+  lockedPlan?: PlanArtifact,
 ): Promise<boolean> {
+  // Unreadable or invalid authority is not evidence that accepted work is
+  // obsolete. Propagate so drain parks the ticket for a later retry.
+  const plan = lockedPlan ?? await rehydratePlan(notePath);
   try {
-    const plan = await rehydratePlan(notePath);
     const slice = findSlice(plan, item.sliceId);
     return isNonTerminal(slice) && queuedWriteMatchesLiveGeneration(item, slice);
   } catch {
@@ -2461,10 +2535,9 @@ async function standingDrainShouldYieldLiveStart(
  */
 async function claimTokenFromExistingStore(
   vaultPath: string,
-  notePath: string,
+  plan: PlanArtifact,
   item: QueuedWorkerWrite,
 ): Promise<string> {
-  const plan = await rehydratePlan(notePath);
   const slice = findSlice(plan, item.sliceId);
   const claimId = slice.claim?.claim_id;
   if (!claimId) {
@@ -2488,19 +2561,23 @@ async function claimTokenFromExistingStore(
   return envelope.token;
 }
 
+/** True only when the authoritative locked queue read found no work. */
 async function drainOneQueuedWorkerWrite(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps,
-): Promise<void> {
+): Promise<boolean> {
   const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const item = pickNextQueuedWorkerWrite(items);
-  if (item === undefined) return;
+  if (item === undefined) return true;
   if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
     // Yield: keep the ticket. Exclusive replan owns persist. Do not
     // journal slice.started on a parent that replan then supersedes.
-    return;
+    return false;
   }
-  if (!(await queuedWriteIsLiveWork(input.notePath, item))) {
+  // Reuse this strict snapshot only inside this one lock acquisition. Token
+  // lookup must refer to the same generation we just checked for liveness.
+  const lockedPlan = await rehydrateAuthority(input);
+  if (!(await queuedWriteIsLiveWork(input.notePath, item, lockedPlan))) {
     // Leftover Q after generation advance / supersede is not live work.
     // Drop it so drain is not stuck. Do not persist in_progress or journal
     // slice.started on a dead parent. Same persist authority: we are already
@@ -2521,29 +2598,36 @@ async function drainOneQueuedWorkerWrite(
       remaining: leftoverStale.length,
       at: new Date().toISOString(),
     });
-    return;
+    return false;
   }
-  const token = await claimTokenFromExistingStore(
-    input.vaultPath,
-    input.notePath,
-    item,
-  );
-  const mapped: UpdateClaimedSliceInput = {
-    vaultPath: input.vaultPath,
-    notePath: input.notePath,
-    planId: item.planId,
-    sliceId: item.sliceId,
-    workerAgentId: item.workerAgentId,
-    token,
-    idempotencyKey: item.idempotencyKey,
-    action: item.action as WorkerUpdateAction,
-    now:
-      (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
-      input.now,
-  };
+  // One claim-helper session per live ticket: the token lookup and the apply
+  // below share this scope instead of starting/stopping a helper each. The
+  // scope is created fresh for this one ticket inside this one lock
+  // acquisition — never shared across tickets, requests, or lock holdings —
+  // and every logical vault location is still reopened/validated per call.
   // Fail-closed: apply throw must not reach removeQueuedWorkerWrite.
   // Dropping the ticket lets a later complete persist done with no start.
-  await applyClaimedSliceOnLockedPlan(mapped, deps);
+  await withClaimFsScope(async () => {
+    const token = await claimTokenFromExistingStore(
+      input.vaultPath,
+      lockedPlan,
+      item,
+    );
+    const mapped: UpdateClaimedSliceInput = {
+      vaultPath: input.vaultPath,
+      notePath: input.notePath,
+      planId: item.planId,
+      sliceId: item.sliceId,
+      workerAgentId: item.workerAgentId,
+      token,
+      idempotencyKey: item.idempotencyKey,
+      action: item.action as WorkerUpdateAction,
+      now:
+        (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
+        input.now,
+    };
+    await applyClaimedSliceOnLockedPlan(mapped, deps);
+  });
   await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
   const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const next = leftover[0];
@@ -2552,6 +2636,7 @@ async function drainOneQueuedWorkerWrite(
     remaining: leftover.length,
     at: new Date().toISOString(),
   });
+  return false;
 }
 
 async function applyClaimedSliceOnLockedPlan(
@@ -2901,4 +2986,3 @@ async function applyClaimedSliceWithClaimFs(
       });
       return result;
 }
-

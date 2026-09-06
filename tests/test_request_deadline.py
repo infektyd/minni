@@ -131,6 +131,227 @@ def test_bookkeeping_scope_still_interrupts_expensive_sql(db):
         assert c.execute('SELECT 1').fetchone()[0] == 1
 
 
+def test_expired_commit_without_transaction_keeps_completed_read(db, monkeypatch):
+    """Cursor-exit commit must not drop a finished SELECT after the budget expires."""
+    import minni.request_deadline as deadline_module
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(deadline_module.time, 'monotonic', lambda: clock['now'])
+    db._get_conn()
+    with request_deadline(1000.5):
+        with db.cursor() as c:
+            c.execute('SELECT 1 AS v')
+            row = c.fetchone()
+            clock['now'] = 1002.0
+        assert row['v'] == 1
+
+
+def test_completed_select_survives_real_sleep_after_fetch(db):
+    """Proven read-only SELECT still succeeds when cursor-exit commit expires."""
+    with request_deadline(time.monotonic() + 0.1):
+        with db.cursor() as c:
+            c.execute('SELECT 1 AS v')
+            row = c.fetchone()
+            time.sleep(0.12)
+        assert row['v'] == 1
+    assert not db._get_conn().in_transaction
+
+
+def test_insert_returning_expired_cursor_does_not_false_succeed(db, monkeypatch):
+    """INSERT ... RETURNING must not look successful after an expired rollback.
+
+    SQLite leaves total_changes unchanged until a RETURNING statement is
+    exhausted. fetchone() of the first row therefore looks like a read if
+    that counter is the write heuristic, and cursor-exit rollback is
+    swallowed while nothing persisted.
+    """
+    import minni.request_deadline as deadline_module
+    with db.cursor() as c:
+        c.execute('CREATE TABLE probe (v INTEGER)')
+    changes_after_create = db._get_conn().total_changes
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(deadline_module.time, 'monotonic', lambda: clock['now'])
+    claimed = None
+    with pytest.raises(RequestDeadlineExceeded):
+        with request_deadline(1000.5):
+            with db.cursor() as c:
+                c.execute('INSERT INTO probe VALUES (1), (2) RETURNING v')
+                claimed = tuple(c.fetchone())
+                assert db._get_conn().total_changes == changes_after_create
+                assert db._get_conn().in_transaction
+                clock['now'] = 1002.0
+    assert claimed == (1,)
+    with db.cursor() as c:
+        persisted = c.execute('SELECT COUNT(*) FROM probe').fetchone()[0]
+    assert persisted == 0
+    assert not db._get_conn().in_transaction
+
+
+def test_first_eligibility_fetch_deadline_raises_instead_of_empty(tmp_path, monkeypatch):
+    """A deadline on the first FTS fetch must not look like a quiet miss."""
+    from minni.config import SovereignConfig
+    from minni.db import SovereignDB
+    from minni.retrieval import RetrievalEngine
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / 'elig.db'),
+        vault_path=str(tmp_path / 'vault'),
+        reranker_enabled=False,
+        hyde_enabled=False,
+        query_expand_default='off',
+    )
+    engine = RetrievalEngine(SovereignDB(cfg), cfg)
+
+    def boom(*args, **kwargs):
+        raise RequestDeadlineExceeded('first fetch')
+
+    monkeypatch.setattr(engine, '_fts_search', boom)
+    with pytest.raises(RequestDeadlineExceeded, match='first fetch'):
+        engine.retrieve(
+            'sockets',
+            limit=5,
+            budget_tokens=False,
+            expand=False,
+            use_hyde=False,
+            deadline_monotonic=time.monotonic() + 30,
+        )
+
+
+def test_multi_backend_search_does_not_swallow_deadline():
+    import numpy as np
+    from minni.backends.multi import MultiBackend
+    from minni.vector_backend import VectorHit
+
+    class Boom:
+        name = 'boom'
+        dim = 8
+        def search(self, *args, **kwargs):
+            raise RequestDeadlineExceeded('copied context deadline')
+
+    class Ok:
+        name = 'ok'
+        dim = 8
+        def search(self, *args, **kwargs):
+            return [VectorHit(chunk_id=1, doc_id=1, score=1.0, backend='ok')]
+
+    multi = MultiBackend([Boom(), Ok()])
+    with pytest.raises(RequestDeadlineExceeded, match='copied context deadline'):
+        multi.search(np.zeros(8, dtype=np.float32), k=3)
+
+
+def test_document_depth_hydration_timeout_preserves_chunk_and_reports_degradation(
+    tmp_path, monkeypatch,
+):
+    """Document-depth _fetch_full_document timeout keeps the ranked chunk.
+
+    FAISS disk-cache load is a different surface. This drives retrieve(depth=
+    document) through the ranked-result hydration path.
+    """
+    from minni.config import SovereignConfig
+    from minni.db import SovereignDB
+    from minni.minnid_runtime.recall import _degradation_for
+    from minni.retrieval import RetrievalEngine
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / 'doc-hydrate.db'),
+        faiss_index_path=str(tmp_path / 'doc-hydrate.faiss'),
+        vault_path=str(tmp_path / 'vault'),
+        reranker_enabled=False,
+        hyde_enabled=False,
+        feedback_enabled=False,
+        query_expand_default='off',
+    )
+    engine = RetrievalEngine(SovereignDB(cfg), cfg)
+    engine.index_durable_document(
+        content='# Deadline slice\n\nFTS must still find this paragraph about sockets.\n',
+        path='wiki/concepts/deadline-slice.md',
+        agent='claude-code',
+        sigil='📄',
+        privacy_level='safe',
+        page_status='accepted',
+        layer='knowledge',
+    )
+
+    def boom(_doc_id):
+        raise RequestDeadlineExceeded('document hydrate timeout')
+
+    monkeypatch.setattr(engine, '_fetch_full_document', boom)
+    rows = engine.retrieve(
+        'sockets',
+        limit=5,
+        budget_tokens=False,
+        expand=False,
+        use_hyde=False,
+        depth='document',
+        deadline_monotonic=time.monotonic() - 1.0,
+    )
+    assert rows, 'ranked chunk must survive document hydration timeout'
+    row = rows[0]
+    assert row.get('text'), 'chunk body must still ship'
+    assert 'full_document_text' not in row
+    assert row.get('depth') == 'chunk'
+    assert row.get('requested_depth') == 'document'
+    assert row.get('delivered_depth') == 'chunk'
+    assert 'deadline' in str(row.get('document_hydration', '')).lower()
+    prov = row.get('provenance') or {}
+    assert prov.get('requested_depth') == 'document'
+    assert prov.get('delivered_depth') == 'chunk'
+    assert 'deadline' in str(prov.get('document_hydration', '')).lower()
+    assert engine.last_document_hydration_degraded
+    assert 'deadline' in str(engine.last_document_hydration_degraded).lower()
+    assert 'skipped full document' in str(engine.last_document_hydration_degraded).lower()
+    entry = _degradation_for(engine, 'c')
+    assert entry.get('degraded') is True
+    assert 'deadline' in str(entry.get('document_hydration_degraded', '')).lower()
+
+
+def test_faiss_hydration_timeout_sets_vector_degraded(tmp_path, monkeypatch):
+    """Disk-cache hydration timeout must degrade, not look like a healthy miss."""
+    from minni.config import SovereignConfig
+    from minni.db import SovereignDB
+    from minni.retrieval import RetrievalEngine
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / 'hydrate.db'),
+        vault_path=str(tmp_path / 'vault'),
+        reranker_enabled=False,
+        hyde_enabled=False,
+    )
+    engine = RetrievalEngine(SovereignDB(cfg), cfg)
+
+    def boom(*args, **kwargs):
+        raise RequestDeadlineExceeded('hydrate timeout')
+
+    monkeypatch.setattr(engine.db, '_get_conn', boom)
+    engine._ensure_faiss_loaded()
+    assert engine.last_vector_degraded
+    assert 'deadline' in str(engine.last_vector_degraded).lower()
+
+
+def test_faiss_disk_postfilter_does_not_swallow_deadline():
+    from minni.backends.faiss_disk import FaissDiskBackend
+
+    backend = object.__new__(FaissDiskBackend)
+    backend.name = 'faiss-disk'
+
+    class _Boom:
+        def cursor(self):
+            raise RequestDeadlineExceeded('post-filter deadline')
+
+    backend.db = _Boom()
+
+    class _Index:
+        count = 1
+
+        def search(self, query, top_k=5):
+            return [(1, 0.9)]
+
+    backend._faiss = _Index()
+    backend.dim = 8
+    import numpy as np
+    with pytest.raises(RequestDeadlineExceeded, match='post-filter deadline'):
+        backend.search(np.zeros(8, dtype=np.float32), k=1)
+
+
 def test_expired_scope_does_not_open_connection(tmp_path):
     database = SovereignDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'cold.db'), vault_path=str(tmp_path / 'vault')))
     with request_deadline(time.monotonic() - 1), pytest.raises(RequestDeadlineExceeded):

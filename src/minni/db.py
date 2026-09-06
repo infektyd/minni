@@ -151,6 +151,11 @@ class _BudgetConnection(sqlite3.Connection):
         return self.cursor().executescript(*args, **kwargs)
 
     def commit(self):
+        # A completed SELECT does not open a transaction. Checking the
+        # expired budget here used to raise on cursor exit and drop the
+        # already-fetched rows. Writes still go through request_operation.
+        if not self.in_transaction:
+            return None
         with self.request_operation():
             return super().commit()
 
@@ -292,7 +297,13 @@ class SovereignDB:
 
     @contextmanager
     def cursor(self):
-        """Context manager yielding a cursor with auto-commit."""
+        """Auto-commit pending writes; preserve every commit failure.
+
+        _BudgetConnection.commit is a no-op without a transaction, so a
+        completed SELECT survives budget expiry. Once commit does raise,
+        rollback and propagate: neither total_changes nor post-error
+        transaction state proves that the requested write succeeded.
+        """
         conn = self._get_conn()
         c = conn.cursor()
         try:

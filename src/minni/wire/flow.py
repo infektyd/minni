@@ -17,6 +17,8 @@ from minni.wire.claude_plugin import (
 )
 from minni.wire.from_repo import build_from_repo, self_check_manifest
 from minni.wire.gc import run_gc
+from minni.wire.host_discovery import host_decision
+from minni.wire.kilo import _is_managed_bridge, install_kilo_bridge
 from minni.wire.install import (
     HashMismatchError,
     InstallError,
@@ -153,6 +155,7 @@ def _wire_platform(
     dry_run: bool,
     mcp_root: Path | None = None,
     dynamic_workspace: bool = False,
+    bulk: bool = False,
 ) -> tuple[Path | None, dict[str, object]]:
     server_path = install_root / "dist" / "server.js"
     agent = spec.agent
@@ -253,12 +256,41 @@ def _wire_platform(
                 server_path, agent, vault, socket, stamp_workspace, afm_env,
             )
         elif kind == "kilo-json":
-            config_path = update_kilo_config(
-                server_path, agent, vault, socket, stamp_workspace, afm_env,
-            )
+            bridge = Path.home() / ".config/kilo/plugin/minni.js"
+            if bulk:
+                try:
+                    bridge_managed = (
+                        bridge.is_file() and not bridge.is_symlink()
+                        and _is_managed_bridge(bridge.read_bytes())
+                    )
+                except OSError:
+                    # stat-then-read race: an existing but unreadable bridge
+                    # (mode 000, ACL, foreign-user HOME) must fall into the
+                    # designed graceful path below — MCP binding refreshed,
+                    # bridge reported unmanaged — instead of failing the whole
+                    # platform before its binding is refreshed.
+                    bridge_managed = False
+                refresh_bridge = bridge_managed
+            else:
+                refresh_bridge = True
+            if refresh_bridge:
+                config_path, extras["kilo_bridge"] = install_kilo_bridge(
+                    install_root, agent, vault, socket, stamp_workspace, afm_env,
+                )
+            else:
+                config_path = update_kilo_config(
+                    server_path, agent, vault, socket, stamp_workspace, afm_env,
+                )
+                extras["kilo_bridge"] = {
+                    "installed": False, "host_delivery": "not_verified",
+                    "reason": "Native bridge not managed; explicit wire kilocode required",
+                }
         elif kind == "antigravity":
             extras["antigravity"] = update_antigravity_config(
                 install_root, agent, vault, socket, stamp_workspace, afm_env,
+                # Bulk refresh must not activate views the operator never
+                # enabled; explicit `wire antigravity` keeps full-surface write.
+                existing_only=bulk,
             )
             extras["agy_hooks"] = update_agy_plugin_hooks(install_root)
             views_written = extras["antigravity"].get("views_written", [])
@@ -308,6 +340,27 @@ def run_wire(args) -> int:
             return _exit2(
                 "generic wire requires --agent so it cannot inherit another agent's vault",
             )
+
+    # Read-only intent/presence gate precedes payload builds and all mutation.
+    bulk = plat_arg == "all"
+    eligible_platforms = []
+    host_decisions = {}
+    for platform in platforms:
+        if any(result.platform == platform for result in out.results):
+            continue
+        decision = host_decision(platform, bulk=bulk)
+        host_decisions[platform] = decision
+        if decision["eligible"]:
+            eligible_platforms.append(platform)
+        else:
+            out.results.append(PlatformResult(
+                platform, decision["status"], reason=decision["reason"],
+                extra={"host": decision["host"]},
+            ))
+    platforms = eligible_platforms
+    if not platforms:
+        out.finalize_status(dry_run=dry_run)
+        return out.emit()
 
     from minni.wire.preflight import check_node  # patched in tests
     ok, node_msg = check_node()
@@ -403,51 +456,10 @@ def run_wire(args) -> int:
 
                 plat_errors = preflight_platform(platform)
                 if plat_errors:
-                    # Missing config root is a host-surface skip (optional
-                    # platform not installed), not a hard failure. Without this
-                    # `wire all` / sync-root fails on hosts that only run a
-                    # subset of the fleet. Real preflight defects (node, etc.)
-                    # still fail the platform. Classify by the stable marker
-                    # from preflight.NO_CONFIG_ROOT_MARKER (not free prose).
-                    from minni.wire.preflight import NO_CONFIG_ROOT_MARKER
-
-                    if plat_errors and all(
-                        e.startswith(NO_CONFIG_ROOT_MARKER) for e in plat_errors
-                    ):
-                        # Retire any prior wire rows for this platform so a
-                        # removed host surface cannot leave a lagging root
-                        # active in honesty / --strict forever.
-                        try:
-                            from minni.wire.wired import retire_platform
-
-                            _data, n = retire_platform(
-                                platform, dry_run=dry_run,
-                            )
-                            if n:
-                                print(
-                                    f"[wire] retired {n} wired.json row(s) "
-                                    f"for {platform} (no config root)",
-                                    file=sys.stderr,
-                                )
-                        except Exception as exc:  # best-effort; skip still wins
-                            print(
-                                f"[wire] warning: could not retire "
-                                f"{platform} wire rows: {exc}",
-                                file=sys.stderr,
-                            )
-                        out.results.append(
-                            PlatformResult(
-                                platform, "skipped",
-                                reason="; ".join(plat_errors),
-                            ),
-                        )
-                    else:
-                        out.results.append(
-                            PlatformResult(
-                                platform, "failed",
-                                reason="; ".join(plat_errors),
-                            ),
-                        )
+                    out.results.append(PlatformResult(
+                        platform, "failed", reason="; ".join(plat_errors),
+                        extra={"host": host_decisions[platform]["host"]},
+                    ))
                     continue
 
                 mcp_root = None
@@ -463,12 +475,15 @@ def run_wire(args) -> int:
                         dynamic_workspace=dynamic_workspace,
                         dry_run=dry_run,
                         mcp_root=mcp_root,
+                        bulk=bulk,
                     )
                 except Exception as exc:
                     out.results.append(
                         PlatformResult(platform, "failed", reason=str(exc)),
                     )
                     continue
+
+                extras["host"] = host_decisions[platform]["host"]
 
                 # D11 (#232): the antigravity surface only fully participates
                 # when its agy hook plugin actually registered. Reporting
@@ -639,6 +654,23 @@ def run_wire(args) -> int:
                             "revert the plugin surface off the wire tree.",
                             file=sys.stderr,
                         )
+
+                if spec.platform == "codex":
+                    # Copying the manifest and smoke-running its entrypoint is
+                    # not evidence that Codex enabled/trusted plugin hooks, or
+                    # that already-running MCP sessions loaded this payload.
+                    extras["lifecycle"] = {
+                        "automatic_hooks": "not_verified",
+                        "hook_probe_scope": "packaged_entrypoint_only",
+                        "existing_host_sessions": "not_verified",
+                    }
+                    hook_gap_reason = (
+                        "MCP wiring planned; automatic Codex hooks and existing "
+                        "host sessions are not verified."
+                        if dry_run else
+                        "MCP configured; automatic Codex hooks and existing "
+                        "host sessions were not verified."
+                    )
 
                 out.results.append(PlatformResult(
                     platform, "wired",

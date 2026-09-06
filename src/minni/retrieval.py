@@ -220,6 +220,7 @@ _DEGRADATION_STATE_ATTRS = {
     "query_expand": "query_expand_degraded",
     "vector": "vector_degraded",
     "hyde": "hyde_degraded",
+    "document_hydration": "document_hydration_degraded",
 }
 
 
@@ -227,7 +228,7 @@ _DEGRADATION_STATE_ATTRS = {
 class RetrievalCallState:
     """Per-call mutable verdicts for one retrieve() invocation.
 
-    Hoisted off the engine (perf/parallel-fanout, #388): these five fields
+    Hoisted off the engine (perf/parallel-fanout, #388): these verdict fields
     used to live only in thread-local properties on the engine
     (last_auth_suppression, last_*_degraded), which keeps concurrent REQUESTS
     on distinct threads apart but is invisible across the variant/corpus
@@ -247,6 +248,7 @@ class RetrievalCallState:
     query_expand_degraded: Optional[str] = None
     vector_degraded: Optional[str] = None
     hyde_degraded: Optional[str] = None
+    document_hydration_degraded: Optional[str] = None
     # Cassandra RED-1 (#388): the trace id stamped onto this call's rows.
     # last_trace_id used to be a plain shared instance attribute, so two
     # both-scope legs running concurrently on the same engine overwrote and
@@ -307,6 +309,14 @@ class _ThreadLocalStateProxy:
     @hyde_degraded.setter
     def hyde_degraded(self, value: Optional[str]) -> None:
         self._engine.last_hyde_degraded = value
+
+    @property
+    def document_hydration_degraded(self) -> Optional[str]:
+        return self._engine.last_document_hydration_degraded
+
+    @document_hydration_degraded.setter
+    def document_hydration_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_document_hydration_degraded = value
 
     @property
     def trace_id(self) -> Optional[str]:
@@ -810,6 +820,15 @@ class RetrievalEngine:
     def last_hyde_degraded(self, value: Optional[str]) -> None:
         self._set_degradation_flag("hyde", value)
 
+    @property
+    def last_document_hydration_degraded(self) -> Optional[str]:
+        """Document-depth fetch timed out; ranked chunk still returned."""
+        return self._degradation_flag("document_hydration")
+
+    @last_document_hydration_degraded.setter
+    def last_document_hydration_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("document_hydration", value)
+
     def _current_state(self) -> Any:
         """Innermost per-call state on THIS thread (never None).
 
@@ -854,6 +873,7 @@ class RetrievalEngine:
         self.last_query_expand_degraded = state.query_expand_degraded
         self.last_vector_degraded = state.vector_degraded
         self.last_hyde_degraded = state.hyde_degraded
+        self.last_document_hydration_degraded = state.document_hydration_degraded
         # RED-1: the call's own trace id (None when the merge never ran, e.g.
         # a raising variant — see the documented exception-path delta below).
         # Publish runs after the pop, so this lands in the thread-local slot.
@@ -1332,6 +1352,9 @@ class RetrievalEngine:
                 conn = self.db._get_conn()
                 if self.faiss_index.try_load_from_disk(db_conn=conn):
                     return
+            except RequestDeadlineExceeded:
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                return
             except Exception as e:
                 logger.debug("Disk cache load failed (non-fatal): %s", e)
 
@@ -1431,6 +1454,8 @@ class RetrievalEngine:
         layer: str = "knowledge",
         whole_document: int = 0,
         model_name: Optional[str] = None,
+        repair_projection: bool = False,
+        on_vectors=None,
     ) -> Dict:
         """Chunk + embed + index a durable document into the SEMANTIC index.
 
@@ -1457,6 +1482,19 @@ class RetrievalEngine:
         try:
             if not content or not content.strip():
                 return {"status": "skipped", "reason": "empty_content"}
+
+            if repair_projection:
+                from minni.durable_projection import durable_doc_path, durable_metadata
+
+                expected = durable_metadata(content)
+                if (path != durable_doc_path(agent, "", self.config.vault_path, content)
+                        or page_type != "learning"
+                        or any(locals_value != expected[key] for key, locals_value in (
+                            ("sigil", sigil), ("privacy_level", privacy_level),
+                            ("page_status", page_status), ("layer", layer)))
+                        or privacy_level == "blocked"
+                        or page_status in {"draft", "expired", "rejected", "superseded"}):
+                    return {"status": "skipped", "reason": "ineligible_projection"}
 
             now = time.time()
             model_name = model_name or self.config.embedding_model
@@ -1514,10 +1552,23 @@ class RetrievalEngine:
             #    FTS/chunk rows. Mirrors the new/changed-file branch of
             #    index_vault so retrieval's chunk↔document JOIN reads it the same.
             with self.db.transaction() as c:
+                if repair_projection:
+                    from minni.durable_projection import ACTIVE_LEARNING_SQL
+
+                    # BEGIN IMMEDIATE serializes this check and publication with
+                    # lifecycle writes. Encoding above never holds the DB lock.
+                    active = c.execute(
+                        f"SELECT 1 FROM learnings WHERE agent_id=? AND content=? "
+                        f"AND {ACTIVE_LEARNING_SQL} LIMIT 1", (agent, content),
+                    ).fetchone()
+                    if not active:
+                        return {"status": "skipped", "reason": "learning_changed"}
                 c.execute(
                     "SELECT doc_id FROM documents WHERE path = ?", (path,)
                 )
                 row = c.fetchone()
+                if row and repair_projection:
+                    return {"status": "skipped", "reason": "projection_exists"}
                 if row:
                     doc_id = row["doc_id"]
                     c.execute(
@@ -1597,6 +1648,8 @@ class RetrievalEngine:
             #    (which now includes these rows). Either way the chunks become
             #    searchable in-process.
             self._refresh_live_faiss(new_chunk_ids, new_vectors)
+            if on_vectors is not None and new_chunk_ids:
+                on_vectors(new_chunk_ids, new_vectors)
 
             return {
                 "status": "ok",
@@ -1609,7 +1662,7 @@ class RetrievalEngine:
             # degrades to lexical-only until the next index run.
             logger.warning(
                 "durable-index: semantic indexing failed for %r (%s) — "
-                "store succeeded, recall degraded to lexical until reindex",
+                "store succeeded; document projection needs repair",
                 path, exc,
             )
             return {"status": "degraded", "reason": str(exc)}
@@ -1690,17 +1743,18 @@ class RetrievalEngine:
 
     def _refresh_live_faiss(
         self, chunk_ids: List[int], vectors: List[np.ndarray]
-    ) -> None:
+    ) -> bool:
         """Make new chunks searchable in the live FAISS index without restart.
 
         Warm index → add the new vectors directly (cheap, immediate). Cold index
         → leave it cold; the next search's _ensure_faiss_loaded rebuilds from the
         DB, which now contains these rows. Failures here are non-fatal: the rows
         are durably in chunk_embeddings, so a later search/rebuild still finds
-        them.
+        them. Return readiness so off-RPC callers can retain a retry when
+        both notification and its immediate recovery fail.
         """
         if not chunk_ids:
-            return
+            return True
         try:
             # add_batch re-checks warm/invalidated under the FAISS lock and
             # holds it for the whole batch. The previous shape — an unlocked
@@ -1719,6 +1773,7 @@ class RetrievalEngine:
                 # ensure sees the rows in the DB.
                 with self._faiss_load_lock:
                     self.faiss_index.add_batch(chunk_ids, vectors)
+            return self.faiss_index.ready
         except Exception as exc:
             logger.warning(
                 "durable-index: live FAISS refresh failed (%s) — invalidating "
@@ -1740,6 +1795,8 @@ class RetrievalEngine:
                     "durable-index: unbounded FAISS reload after refresh "
                     "failure skipped: %s", reload_exc,
                 )
+
+        return self.faiss_index.ready
 
     # ── Cross-Encoder Re-Ranking ──────────────────────────────
 
@@ -2436,6 +2493,41 @@ class RetrievalEngine:
 
         # Fallback: snippet
         return self._apply_depth(result, "snippet")
+
+    _DOCUMENT_HYDRATION_DEADLINE = "search deadline; skipped full document"
+
+    def _stamp_document_hydration_degraded(self, raw: Dict) -> None:
+        """Keep the ranked chunk; record that document depth did not complete."""
+        reason = self._DOCUMENT_HYDRATION_DEADLINE
+        self.last_document_hydration_degraded = reason
+        raw["requested_depth"] = "document"
+        raw["delivered_depth"] = "chunk"
+        raw["document_hydration"] = reason
+        prov = raw.get("provenance")
+        if isinstance(prov, dict):
+            prov["requested_depth"] = "document"
+            prov["delivered_depth"] = "chunk"
+            prov["document_hydration"] = reason
+
+    def _project_depth(self, raw: Dict, depth: str) -> Dict:
+        apply_as = depth
+        if (
+            raw.get("document_hydration")
+            and raw.get("delivered_depth") in _VALID_DEPTHS
+        ):
+            apply_as = raw["delivered_depth"]
+        projected = self._apply_depth(raw, apply_as)
+        for key in ("requested_depth", "delivered_depth", "document_hydration"):
+            if key in raw:
+                projected[key] = raw[key]
+        if raw.get("document_hydration"):
+            projected["depth"] = raw.get("delivered_depth") or "chunk"
+            prov = projected.get("provenance")
+            if isinstance(prov, dict):
+                prov["requested_depth"] = raw.get("requested_depth")
+                prov["delivered_depth"] = raw.get("delivered_depth")
+                prov["document_hydration"] = raw.get("document_hydration")
+        return projected
 
     def _fetch_full_document(self, doc_id: int) -> Optional[str]:
         """Fetch the full concatenated text for a whole_document row."""
@@ -3382,6 +3474,7 @@ class RetrievalEngine:
         state.query_expand_degraded = None
         state.vector_degraded = None
         state.hyde_degraded = None
+        state.document_hydration_degraded = None
         self._set_current_deadline(deadline_monotonic)
         if past_search_deadline(deadline_monotonic):
             query_variants = [query]
@@ -3408,6 +3501,7 @@ class RetrievalEngine:
             variant_expand_degraded: List[str] = []
             variant_vector_degraded: List[str] = []
             variant_hyde_degraded: List[str] = []
+            variant_document_hydration_degraded: List[str] = []
             # perf/parallel-fanout (#388): one isolated state per variant,
             # gathered in submission order (pool.map preserves it), so the
             # merge and every aggregation string below are deterministic and
@@ -3473,6 +3567,10 @@ class RetrievalEngine:
                     variant_hyde_degraded.append(
                         f"{variant}: {child.hyde_degraded}"
                     )
+                if child.document_hydration_degraded:
+                    variant_document_hydration_degraded.append(
+                        f"{variant}: {child.document_hydration_degraded}"
+                    )
 
             def _should_drop_deadline_child(
                 child: RetrievalCallState, kept_rows: List[List[Dict]]
@@ -3503,6 +3601,12 @@ class RetrievalEngine:
             # clock is past. Eager pool.map submits every variant, so a
             # later unused child that raises aborts the whole retrieve
             # (P1) and FTS-counts 3 where serial did 1.
+            # Preservation, not a latency fix: handle_search stamps
+            # deadline_monotonic on EVERY RPC, so this pool is unreachable
+            # on the RPC path by construction — no speedup is claimed or
+            # measured there. The serial truncation order it preserves is
+            # pinned by tests/test_search_deadline.py (loop-gate
+            # truncation, in-flight poisoned-child drop, qty withholding).
             use_variant_pool = (
                 RETRIEVAL_VARIANT_PARALLEL and deadline_monotonic is None
             )
@@ -3625,6 +3729,11 @@ class RetrievalEngine:
             )
             state.hyde_degraded = (
                 "; ".join(variant_hyde_degraded) if variant_hyde_degraded else None
+            )
+            state.document_hydration_degraded = (
+                "; ".join(variant_document_hydration_degraded)
+                if variant_document_hydration_degraded
+                else None
             )
             # Aggregate: any variant whose non-empty candidate set was gated to
             # zero keeps the blackout visible, regardless of variant order.
@@ -3788,7 +3897,7 @@ class RetrievalEngine:
                     denied_by_scope[(row.get("doc_id"), row.get("path"))] = row
             return allowed
 
-        def _collect_eligible(fetch, wanted: int) -> List[Dict]:
+        def _collect_eligible(fetch, wanted: int, *, sql_window: bool = False) -> List[Dict]:
             # Backends expose top-k, not policy-aware pagination. Refill their
             # bounded window when denied rows consume it, stopping when enough
             # eligible rows are found, at the deadline, or at a finite ceiling.
@@ -3803,9 +3912,17 @@ class RetrievalEngine:
                         raw = fetch(window)
                         rows = _eligible(raw)
                     except RequestDeadlineExceeded:
+                        if not last_rows:
+                            raise
                         return last_rows
                     last_rows = rows
                     if len(rows) >= wanted or len(rows) == len(raw):
+                        return rows
+                    # SQL returns rows without vector-style document collapse.
+                    # A short window therefore proves exhaustion. FTS currently
+                    # over-fetches 3x; using the requested window is conservative
+                    # and keeps this independent of that over-fetch factor.
+                    if sql_window and len(raw) < window:
                         return rows
                     # Identical document lists do not prove exhaustion: many
                     # top-ranked chunks can collapse to one denied document.
@@ -3834,10 +3951,14 @@ class RetrievalEngine:
 
             if past_search_deadline(deadline_monotonic):
                 with allow_expired_sql():
-                    return _collect_eligible(tracked_fetch, rerank_k)
-            return _collect_eligible(tracked_fetch, rerank_k)
+                    return _collect_eligible(
+                        tracked_fetch, rerank_k, sql_window=True
+                    )
+            return _collect_eligible(tracked_fetch, rerank_k, sql_window=True)
 
         if sort == "chronological":
+            if past_search_deadline(deadline_monotonic):
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
             chrono_t0 = time.perf_counter()
             try:
                 merged = _lexical_eligible(lambda window: self._chronological_search(
@@ -3845,8 +3966,9 @@ class RetrievalEngine:
                     exclude_statuses=skip_list,
                 ))
             except RequestDeadlineExceeded:
-                if lexical_searched:
-                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                if not lexical_searched:
+                    raise
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 merged = []
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
@@ -3865,8 +3987,9 @@ class RetrievalEngine:
                         exclude_statuses=skip_list,
                     ))
             except RequestDeadlineExceeded:
-                if lexical_searched:
-                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                if not lexical_searched:
+                    raise
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 fts_results = []
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
@@ -4091,12 +4214,12 @@ class RetrievalEngine:
                                 if document_agent_filter is None:
                                     hyde_fts = _collect_eligible(lambda window: self._fts_search(
                                         hypothetical, window, exclude_statuses=skip_list
-                                    ), rerank_k)
+                                    ), rerank_k, sql_window=True)
                                 else:
                                     hyde_fts = _collect_eligible(lambda window: self._fts_search(
                                         hypothetical, window, agent_filter=document_agent_filter,
                                         exclude_statuses=skip_list,
-                                    ), rerank_k)
+                                    ), rerank_k, sql_window=True)
                                 first_pass_vector = self.last_vector_degraded
                                 first_pass_rerank = self.last_rerank_degraded
                                 hyde_apply = True
@@ -4512,10 +4635,13 @@ class RetrievalEngine:
             # never ride outside the perturbed <EVIDENCE> form (same leak class as
             # chunk_text).
             if depth == "document":
+                hydration_degraded = False
                 try:
                     full_text = self._fetch_full_document(r["doc_id"])
                 except RequestDeadlineExceeded:
                     full_text = None
+                    hydration_degraded = True
+                    self._stamp_document_hydration_degraded(raw)
                 if full_text:
                     doc_flag = bool(raw.get("instruction_like")) or bool(
                         is_instruction_like(full_text)
@@ -4560,7 +4686,7 @@ class RetrievalEngine:
                             self.config, "instruction_body_perturbation_enabled", True
                         ),
                     )
-                else:
+                elif not hydration_degraded:
                     raw["full_document_text"] = full_text
 
             # S7: self-labeling recall package — primary (rank 1) vs related (2..N).
@@ -4569,7 +4695,7 @@ class RetrievalEngine:
             raw["match_kind"] = "primary" if _result_rank == 1 else "related"
             raw["related_rank"] = None if _result_rank == 1 else _result_rank - 1
 
-            projected = self._apply_depth(raw, depth)
+            projected = self._project_depth(raw, depth)
             projected["match_kind"] = raw["match_kind"]
             projected["related_rank"] = raw["related_rank"]
             projected["query_variants"] = query_variants
@@ -4647,40 +4773,55 @@ class RetrievalEngine:
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
         claim: Optional[str] = None,
+        # Identifier-kind disambiguation: "auto" keeps the legacy chunk-first
+        # then doc fallback; "chunk"/"doc" restrict to that namespace only.
+        id_kind: str = "auto",
     ) -> Optional[Dict]:
         """
         Re-fetch a specific result at a deeper depth tier.
 
-        *result_id* may be either a chunk_id or a doc_id; this method tries
-        chunk_id first, then falls back to doc_id.
+        *result_id* may be either a chunk_id or a doc_id; with the default
+        ``id_kind="auto"`` this method tries chunk_id first, then falls back
+        to doc_id (legacy bare-result_id behavior). Pass ``id_kind="doc"``
+        when the id is known to be a doc_id (source/path/wikilink drill
+        resolution) or ``id_kind="chunk"`` for an explicit chunk_id, so a
+        doc_id that numerically collides with another document's chunk_id
+        cannot resolve to the wrong document.
 
         Args:
             result_id: chunk_id or doc_id from a prior search result.
             depth: Target depth tier ('chunk' or 'document'). Defaults to 'chunk'.
             update_access: Whether to bump access_count on the document.
+            id_kind: "auto" (legacy), "chunk", or "doc".
 
         Returns:
             A result dict at the requested depth, or None if not found.
         """
         if depth not in _VALID_DEPTHS:
             depth = "chunk"
+        normalized_kind = str(id_kind or "auto").strip().lower()
+        if normalized_kind not in {"auto", "chunk", "doc"}:
+            raise ValueError(
+                f'unknown id_kind {id_kind!r}; valid values: "auto", "chunk", "doc"'
+            )
 
         import os
 
         row = None
-        with self.db.cursor() as c:
-            # Try chunk_id first
-            c.execute("""
-                SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
-                       d.path, d.agent, d.sigil, d.decay_score,
-                       d.privacy_level, d.page_type, d.page_status
-                FROM chunk_embeddings ce
-                JOIN documents d ON d.doc_id = ce.doc_id
-                WHERE ce.chunk_id = ?
-            """, (result_id,))
-            row = c.fetchone()
+        if normalized_kind in {"auto", "chunk"}:
+            with self.db.cursor() as c:
+                # Try chunk_id first
+                c.execute("""
+                    SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+                           d.path, d.agent, d.sigil, d.decay_score,
+                           d.privacy_level, d.page_type, d.page_status
+                    FROM chunk_embeddings ce
+                    JOIN documents d ON d.doc_id = ce.doc_id
+                    WHERE ce.chunk_id = ?
+                """, (result_id,))
+                row = c.fetchone()
 
-        if row is None:
+        if row is None and normalized_kind in {"auto", "doc"}:
             # Fall back to doc_id: get the best chunk for this document
             with self.db.cursor() as c:
                 c.execute("""
@@ -4730,7 +4871,10 @@ class RetrievalEngine:
         }
 
         if depth == "document":
-            raw["full_document_text"] = self._fetch_full_document(row["doc_id"])
+            try:
+                raw["full_document_text"] = self._fetch_full_document(row["doc_id"])
+            except RequestDeadlineExceeded:
+                self._stamp_document_hydration_degraded(raw)
 
         if update_access:
             with self.db.cursor() as c:
@@ -4801,7 +4945,7 @@ class RetrievalEngine:
             if "full_document_text" in raw:
                 raw["full_document_text"] = raw["evidence_envelope"]
 
-        return self._apply_depth(raw, depth)
+        return self._project_depth(raw, depth)
 
     #: Event types that exist for observability, not as recallable memory.
     #: `recall` rows are the durable recall trace (minnid_runtime.recall writes
