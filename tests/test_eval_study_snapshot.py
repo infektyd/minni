@@ -327,7 +327,8 @@ def test_deterministic_remapping_is_stable_and_opaque():
 
 def test_snapshot_id_derives_from_manifest_only():
     digest = "ab" * 32
-    assert snapshot_id_for(digest) == "study-abababababababab"
+    assert snapshot_id_for(digest) == "study-" + digest
+    assert snapshot_id_for(digest) != snapshot_id_for(digest[:16] + "0" * 48)
     assert "live" not in snapshot_id_for(digest)
 
 
@@ -1117,3 +1118,44 @@ def test_snapshot_query_binding_accepts_matching_and_rejects_stale(tmp_path):
     del half[0]["manifest_digest"]
     with pytest.raises(ValueError, match="binding mismatch"):
         _require_snapshot_query_binding(searcher, half)
+
+
+@pytest.mark.parametrize("value", ["a" * 65, "é" * 64, "a" * 1_000_000, "g" * 64])
+def test_digest_rejected_before_normalization(value):
+    class NoLower(str):
+        def lower(self):
+            raise AssertionError("unvalidated digest normalized")
+    packet = _two_record_packet()
+    packet["records"][0]["content_sha256"] = NoLower(value)
+    with pytest.raises(StudySnapshotError, match="64 hexadecimal"):
+        validate_export_packet(packet)
+
+
+@pytest.mark.parametrize("mutation, message", [
+    ("rows", "bounded row count"),
+    ("content", "value exceeds byte bound"),
+    ("path", "value exceeds byte bound"),
+    ("aggregate", "total byte bound"),
+])
+def test_materialized_database_bounds_before_loading(tmp_path, monkeypatch, mutation, message):
+    import sqlite3
+    dest = _prepared_materialized(tmp_path)
+    with sqlite3.connect(dest / "study.db") as connection:
+        if mutation == "rows":
+            connection.executemany(
+                "INSERT INTO vault_fts(doc_id,path,content,agent,sigil) VALUES(?,?,?,?,?)",
+                ((100 + i, "p", "x", "codex", "T") for i in range(MAX_RECORDS)),
+            )
+        elif mutation == "content":
+            connection.execute("UPDATE vault_fts SET content=?", ("x" * (study_snapshot.MAX_VAULT_FILE_BYTES + 1),))
+        elif mutation == "path":
+            connection.execute("UPDATE documents SET path=? WHERE doc_id=(SELECT min(doc_id) FROM documents)",
+                               ("x" * (study_snapshot.MAX_VAULT_FILE_BYTES + 1),))
+        else:
+            # Keep each value below its cap while exceeding the corpus total.
+            connection.executemany(
+                "INSERT INTO vault_fts(doc_id,path,content,agent,sigil) VALUES(?,?,?,?,?)",
+                ((100 + i, "p", "x" * 400_000, "codex", "T") for i in range(80)),
+            )
+    with pytest.raises(StudySnapshotError, match=message):
+        check_materialized(dest)

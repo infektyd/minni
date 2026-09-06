@@ -332,7 +332,7 @@ def manifest_digest_for(records: List[Dict[str, Any]], identity: Dict[str, Any])
 
 def snapshot_id_for(manifest_digest: str) -> str:
     """Opaque study ID derived from packet content only; never a live-corpus ID."""
-    return f"{STUDY_ID_PREFIX}{manifest_digest[:16]}"
+    return f"{STUDY_ID_PREFIX}{manifest_digest}"
 
 
 def content_group_for(content_sha256: str) -> str:
@@ -413,7 +413,10 @@ def validate_export_packet(packet: Any) -> List[Dict[str, Any]]:
                 f"packet text exceeds {MAX_TOTAL_TEXT_CHARS} chars in total"
             )
 
-        content_sha256 = _require_nonempty_str(row.get("content_sha256"), f"{label} content_sha256")
+        content_sha256 = row.get("content_sha256")
+        if (not isinstance(content_sha256, str) or len(content_sha256) != 64
+                or any(char not in "0123456789abcdefABCDEF" for char in content_sha256)):
+            raise StudySnapshotError(f"{label} content_sha256 must be exactly 64 hexadecimal characters")
         actual_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if not hmac.compare_digest(actual_digest, content_sha256.lower()):
             raise StudySnapshotError(f"{label}: content_sha256 does not match record text")
@@ -1122,6 +1125,34 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
     }
 
 
+def _bounded_db_rows(handle, table: str, columns: Tuple[str, ...], *,
+                     max_value_bytes: int = MAX_VAULT_FILE_BYTES,
+                     max_total_bytes: int = 4 * MAX_TOTAL_TEXT_CHARS + MAX_RECORDS * 10_240):
+    """Preflight SQLite sizes without transferring unchecked values to Python.
+
+    Table/column names are internal constants. Callers hold a read transaction
+    so the validated rows cannot change between the preflight and the read.
+    """
+    count = handle.execute(
+        f"SELECT count(*) FROM (SELECT 1 FROM {table} LIMIT ?)", (MAX_RECORDS + 1,)
+    ).fetchone()[0]
+    if count > MAX_RECORDS:
+        raise StudySnapshotError("materialized database exceeds bounded row count")
+    sizes = [f"coalesce(length(CAST({column} AS BLOB)), 0)" for column in columns]
+    oversized = " OR ".join(f"{size} > ?" for size in sizes)
+    if handle.execute(f"SELECT 1 FROM {table} WHERE {oversized} LIMIT 1",
+                      (max_value_bytes,) * len(sizes)).fetchone():
+        raise StudySnapshotError("materialized database value exceeds byte bound")
+    total = handle.execute(
+        f"SELECT coalesce(sum({' + '.join(sizes)}), 0) FROM {table}"
+    ).fetchone()[0]
+    if total > max_total_bytes:
+        raise StudySnapshotError("materialized database content exceeds total byte bound")
+    return handle.execute(
+        f"SELECT {', '.join(columns)} FROM {table} LIMIT ?", (MAX_RECORDS,)
+    ).fetchmany(MAX_RECORDS)
+
+
 def _immutable_db_rows(db_path: Path) -> Dict[str, Dict[str, Any]]:
     """Immutable retrieval content per doc_id from a read-only handle.
 
@@ -1137,15 +1168,14 @@ def _immutable_db_rows(db_path: Path) -> Dict[str, Dict[str, Any]]:
         handle = sqlite3.connect(uri, uri=True)
         try:
             handle.execute("PRAGMA query_only = ON")
-            documents = handle.execute(
-                "SELECT doc_id, path, agent, privacy_level, page_status, page_type, sigil, decay_score"
-                " FROM documents"
-            ).fetchall()
-            fts_rows = handle.execute(
-                "SELECT doc_id, path, content, agent FROM vault_fts"
-            ).fetchall()
+            handle.execute("BEGIN")
+            documents = _bounded_db_rows(handle, "documents", (
+                "doc_id", "path", "agent", "privacy_level", "page_status", "page_type", "sigil", "decay_score"))
+            fts_rows = _bounded_db_rows(handle, "vault_fts", ("doc_id", "path", "content", "agent"))
         finally:
             handle.close()
+    except StudySnapshotError:
+        raise
     except Exception as exc:  # noqa: BLE001 - any DB problem is an integrity failure
         raise StudySnapshotError(f"materialized snapshot database is unreadable: {type(exc).__name__}") from exc
     # Exact one-to-one identities: no dict collapse. Duplicate document rows,
@@ -1182,12 +1212,17 @@ def _materialized_schema_digest(db_path: Path) -> str:
     try:
         handle = sqlite3.connect(uri, uri=True)
         try:
-            schema = handle.execute(
-                "SELECT type, name, tbl_name, sql FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-            ).fetchall()
+            handle.execute("BEGIN")
+            schema = _bounded_db_rows(
+                handle, "sqlite_master", ("type", "name", "tbl_name", "sql"),
+                max_value_bytes=MAX_METADATA_BYTES, max_total_bytes=MAX_METADATA_BYTES,
+            )
+            schema = sorted((row for row in schema if not row[1].startswith("sqlite_")),
+                            key=lambda row: (row[0], row[1]))
         finally:
             handle.close()
+    except StudySnapshotError:
+        raise
     except Exception as exc:  # noqa: BLE001 - schema is integrity evidence
         raise StudySnapshotError("materialized snapshot schema is unreadable") from exc
     return hashlib.sha256(

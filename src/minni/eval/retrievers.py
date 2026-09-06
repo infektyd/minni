@@ -229,13 +229,8 @@ class SnapshotSearcher(SearcherProtocol):
 
     backend = "snapshot"
 
-    # Scan window multiple: each FTS pass scans at most limit * _SCAN_WINDOW
-    # rows. Bounded by construction; eligibility filtering cannot reach past
-    # the window, so extreme ineligible density may yield fewer than limit.
-    _SCAN_WINDOW = 10
-
     def __init__(self, snapshot_dir: Path) -> None:
-        from minni.principal import EffectivePrincipal
+        from minni.principal import EffectivePrincipal, is_operator_principal
 
         from .study_snapshot import check_materialized, snapshot_config_paths, verify_snapshot
 
@@ -266,6 +261,8 @@ class SnapshotSearcher(SearcherProtocol):
             capabilities=["search", "read"],
             allowed_vault_roots=[paths["vault_path"]],
         )
+        if is_operator_principal(self._principal):
+            raise ValueError("snapshot study principal cannot use a reserved operator identity")
         self._pinned = self._fingerprint(
             manifest, verified["mapping"], materialized,
             tuple(self._principal.allowed_vault_roots),
@@ -341,7 +338,6 @@ class SnapshotSearcher(SearcherProtocol):
         uri = "file:" + _quote(str(db_path), safe="/:") + "?mode=ro"
         skip = sorted(DEFAULT_EXCLUDED_STATUSES)
         placeholders = ",".join("?" * len(skip))
-        window = limit * self._SCAN_WINDOW
 
         def eligible_rows(handle, match_expr):
             """Eligible rows first: the read gate runs BEFORE the limit."""
@@ -352,9 +348,9 @@ class SnapshotSearcher(SearcherProtocol):
                 " FROM vault_fts f JOIN documents d ON d.doc_id = f.doc_id"
                 " WHERE vault_fts MATCH ?"
                 f" AND COALESCE(d.page_status, 'candidate') NOT IN ({placeholders})"
-                " ORDER BY rank LIMIT ?",
-                [match_expr, *skip, window],
-            ).fetchall():
+                " ORDER BY rank",
+                [match_expr, *skip],
+            ):
                 metadata = {
                     "path": row[1], "agent": row[2],
                     "page_type": row[5], "privacy_level": row[4],
