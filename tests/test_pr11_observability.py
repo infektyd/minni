@@ -115,18 +115,24 @@ def test_writeback_learning_with_evidence_adds_derived_from_edges(tmp_path, monk
         wb_mod.WriteBackMemory.model = property(original_prop)
 
     with db_obj.cursor() as c:
-        learning_doc = c.execute(
-            "SELECT doc_id, path FROM documents WHERE path = ?",
+        # Canonical edge source: no learning:// alias orphan is created; the
+        # edge attaches to the canonical node mapped in learning_documents.
+        assert c.execute(
+            "SELECT doc_id FROM documents WHERE path = ?",
             (f"learning://{learning_id}",),
+        ).fetchone() is None
+        canon = c.execute(
+            "SELECT doc_id FROM learning_documents WHERE learning_id = ?",
+            (learning_id,),
         ).fetchone()
-        assert learning_doc is not None
+        assert canon is not None
         edge = c.execute(
             """
             SELECT source_doc_id, target_doc_id, link_type
             FROM memory_links
             WHERE source_doc_id = ? AND target_doc_id = ? AND link_type = 'derived_from'
             """,
-            (learning_doc["doc_id"], evidence_id),
+            (canon["doc_id"], evidence_id),
         ).fetchone()
     assert edge is not None
 
@@ -160,16 +166,20 @@ def test_minnid_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatc
 
     learning_id = resp["result"]["learning_id"]
     with db_obj.cursor() as c:
-        learning_doc_id = c.execute(
+        assert c.execute(
             "SELECT doc_id FROM documents WHERE path = ?",
             (f"learning://{learning_id}",),
+        ).fetchone() is None
+        canonical_doc_id = c.execute(
+            "SELECT doc_id FROM learning_documents WHERE learning_id = ?",
+            (learning_id,),
         ).fetchone()["doc_id"]
         edge_count = c.execute(
             """
             SELECT COUNT(*) AS n FROM memory_links
             WHERE source_doc_id = ? AND target_doc_id = ? AND link_type = 'derived_from'
             """,
-            (learning_doc_id, evidence_id),
+            (canonical_doc_id, evidence_id),
         ).fetchone()["n"]
     assert edge_count == 1
 

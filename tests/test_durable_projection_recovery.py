@@ -204,9 +204,18 @@ def test_governed_accept_failure_then_real_scheduled_sweep(store, monkeypatch):
             {"candidate_id": cid, "decision": "accept", "_principal": op}, 2)
     assert "result" in accepted, accepted
     assert accepted["result"]["indexed"] is False
-    assert not rows(db, "documents")
+    # Promotion now commits its canonical identity even when the later
+    # semantic projection fails. Repair must fill that same node, not replace it.
+    canonical = rows(db, "documents")
+    assert len(canonical) == 1
+    canonical_id = canonical[0]["doc_id"]
+    assert canonical[0]["memory_kind"] == "learning"
+    assert len(rows(db, "learning_documents")) == 1
+    assert not rows(db, "chunk_embeddings")
     result = daemon._backfill_sweep_once()
     assert result["shared"]["projections"]["repaired"] == 1
+    assert rows(db, "documents")[0]["doc_id"] == canonical_id
+    assert rows(db, "chunk_embeddings")
     assert len(rows(db, "learnings")) == 1
     assert len(rows(db, "documents")) == 1
     assert rows(db, "candidate_packets")[0]["status"] == "accepted"
@@ -266,3 +275,335 @@ def test_next_sweep_retries_live_refresh_from_current_database(
     assert warm.faiss_index.count == (1 if purge_before_retry else 2)
     hits = warm._semantic_search("specimen", 5)
     assert any(r["path"] == projection_path for r in hits) is (not purge_before_retry)
+
+
+def _placeholder(store, content, agent="codex"):
+    """A committed canonical node + join with no FTS/chunk rows."""
+    from minni.graph_commit import ensure_canonical_learning_node
+
+    db, config, _ = store
+    lid = learning(db, content, agent=agent)
+    with db.transaction() as c:
+        doc_id = ensure_canonical_learning_node(
+            c, learning_id=lid, agent_id=agent, content=content,
+            vault_path=config.vault_path, created_at=0.0,
+        )
+    assert doc_id is not None
+    assert not rows(db, "chunk_embeddings")
+    return lid, doc_id
+
+
+@pytest.mark.parametrize("privacy,status", [("blocked", "accepted"), ("safe", "rejected")])
+def test_closed_placeholder_is_never_resurrected(store, privacy, status):
+    """A lifecycle-closed/restricted placeholder stays untouched: no repair
+    count, no rewritten metadata, no vectors — through the actual backfill."""
+    db, config, _ = store
+    content = "Restricted repair specimen"
+    lid, doc_id = _placeholder(store, content)
+    with db.cursor() as c:
+        c.execute("UPDATE documents SET privacy_level=?, page_status=? WHERE doc_id=?",
+                  (privacy, status, doc_id))
+    result = backfill_learning_projections(db, config)
+    assert result["repaired"] == 0
+    assert result["skipped"] == 1
+    doc = rows(db, "documents")[0]
+    assert (doc["doc_id"], doc["privacy_level"], doc["page_status"]) == (doc_id, privacy, status)
+    assert len(rows(db, "documents")) == 1
+    assert not rows(db, "chunk_embeddings")
+    assert len(rows(db, "learning_documents")) == 1
+    assert backfill_learning_projections(db, config)["repaired"] == 0
+
+
+def test_engine_repair_gate_holds_inside_write_transaction(store):
+    """The in-transaction stored-row gate refuses a closed placeholder even
+    when the backfill pre-check is bypassed (concurrent lifecycle change)."""
+    db, config, _ = store
+    content = "Racy repair specimen"
+    _, doc_id = _placeholder(store, content)
+    engine = RetrievalEngine(db, config)
+    path = durable_doc_path("codex", "", config.vault_path, content)
+    result = engine.index_durable_document(
+        content=content, path=path, agent="codex", page_type="learning",
+        repair_projection=True,
+    )
+    assert result["status"] == "ok"
+    assert result["doc_id"] == doc_id
+    with db.cursor() as c:
+        c.execute("UPDATE documents SET privacy_level='blocked', page_status='rejected'"
+                  " WHERE doc_id=?", (doc_id,))
+        c.execute("DELETE FROM vault_fts WHERE doc_id=?", (doc_id,))
+        c.execute("DELETE FROM chunk_embeddings WHERE doc_id=?", (doc_id,))
+    rerun = engine.index_durable_document(
+        content=content, path=path, agent="codex", page_type="learning",
+        repair_projection=True,
+    )
+    assert rerun["status"] == "skipped"
+    assert rerun["reason"] == "projection_closed"
+    doc = rows(db, "documents")[0]
+    assert (doc["privacy_level"], doc["page_status"]) == ("blocked", "rejected")
+    assert not rows(db, "chunk_embeddings")
+
+
+def _shared_projected_node(store):
+    from minni.graph_commit import ensure_canonical_learning_node
+
+    db, config, _ = store
+    content = "Shared historical recovery specimen"
+    first, doc_id = _placeholder(store, content)
+    second = learning(db, content)
+    with db.transaction() as c:
+        assert ensure_canonical_learning_node(
+            c, learning_id=second, agent_id="codex", content=content,
+            vault_path=config.vault_path, created_at=0.0,
+        ) == doc_id
+    engine = RetrievalEngine(db, config)
+    path = durable_doc_path("codex", "", config.vault_path, content)
+    assert engine.index_durable_document(
+        content=content, path=path, agent="codex", page_type="learning",
+        repair_projection=True,
+    )["status"] == "ok"
+    engine._set_current_deadline(None)
+    engine._ensure_faiss_loaded()
+    return first, second, doc_id, path, engine
+
+
+@pytest.mark.parametrize("first_status", ["active", "superseded", "rejected", "expired"])
+def test_shared_purge_preserves_live_projection_and_every_historical_join(store, first_status):
+    db, config, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    joins = rows(db, "learning_documents")
+    chunks = rows(db, "chunk_embeddings")
+    with db.cursor() as c:
+        c.execute("UPDATE learnings SET status=? WHERE learning_id=?", (first_status, first))
+    assert engine.purge_durable_document(path)["status"] == "shared_kept"
+    assert rows(db, "learning_documents") == joins
+    assert rows(db, "chunk_embeddings") == chunks
+    assert rows(db, "documents")[0]["page_status"] == "accepted"
+    assert engine.faiss_index.count == 1
+    assert doc_id in [hit["doc_id"] for hit in engine._semantic_search("specimen", 5)]
+    assert backfill_learning_projections(db, config)["repaired"] == 0
+
+
+def test_final_purge_retires_identity_but_preserves_all_historical_joins(store):
+    db, config, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    joins = rows(db, "learning_documents")
+    with db.cursor() as c:
+        c.execute("UPDATE learnings SET status='superseded' WHERE learning_id IN (?, ?)",
+                  (first, second))
+        c.execute("UPDATE documents SET privacy_level='private' WHERE doc_id=?", (doc_id,))
+    assert engine.purge_durable_document(path)["status"] == "ok"
+    doc = rows(db, "documents")[0]
+    assert (doc["doc_id"], doc["page_status"], doc["privacy_level"]) == (doc_id, "superseded", "private")
+    assert rows(db, "learning_documents") == joins
+    assert not rows(db, "vault_fts")
+    assert not rows(db, "chunk_embeddings")
+    # FAISS retains physical slots; removal tombstones them from live search.
+    assert not engine.faiss_index.search(store[2].encode("specimen"), top_k=5)
+    assert not engine._semantic_search("specimen", 5)
+    assert backfill_learning_projections(db, config)["repaired"] == 0
+    assert engine.purge_durable_document(path)["status"] == "ok"
+    assert rows(db, "learning_documents") == joins
+
+
+def test_governed_contradiction_preserves_shared_node_until_last_learning(store, monkeypatch):
+    import minni.minnid as daemon
+    from dataclasses import replace
+    from minni.minnid_runtime.governance import handle_resolve_contradiction
+    from minni.principal import EffectivePrincipal
+    from minni.writeback import WriteBackMemory
+
+    db, config, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    monkeypatch.setattr(daemon, "DEFAULT_CONFIG", config)
+    monkeypatch.setattr(daemon, "_lazy_retrieval", lambda: engine)
+    monkeypatch.setattr(config, "writeback_enabled", False)
+    context = replace(daemon._governance_context(),
+                      lazy_writeback=lambda: WriteBackMemory(db, config))
+    principal = EffectivePrincipal(agent_id="codex", capabilities=["*"])
+    joins = rows(db, "learning_documents")
+    for index, lid in enumerate((first, second)):
+        reply = handle_resolve_contradiction({
+            "new_content": f"Corrected recovery specimen version {index}",
+            "supersede_ids": [lid], "agent_id": "codex", "_principal": principal,
+        }, index, context)
+        assert "result" in reply, reply
+        assert reply["result"]["superseded"] == [lid]
+        assert rows(db, "learning_documents") == joins
+        doc = next(row for row in rows(db, "documents") if row["doc_id"] == doc_id)
+        assert doc["page_status"] == ("accepted" if index == 0 else "superseded")
+        assert bool(rows(db, "chunk_embeddings")) is (index == 0)
+    assert not engine._semantic_search("specimen", 5)
+
+
+@pytest.mark.parametrize("statuses,expected", [
+    (("expired", "rejected"), "expired"),
+    (("rejected", "rejected"), "rejected"),
+    (("superseded", "superseded"), "superseded"),
+])
+def test_canonical_purge_inactive_status_precedence(store, statuses, expected):
+    db, _, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    joins = rows(db, "learning_documents")
+    with db.cursor() as c:
+        for lid, status in zip((first, second), statuses):
+            c.execute("UPDATE learnings SET status=? WHERE learning_id=?", (status, lid))
+    assert engine.purge_durable_document(path)["status"] == "ok"
+    doc = rows(db, "documents")[0]
+    assert (doc["page_status"], doc["superseded_by"]) == (expected, None)
+    assert rows(db, "learning_documents") == joins
+    assert not rows(db, "chunk_embeddings")
+
+
+def test_canonical_purge_chooses_largest_successor_learning(store):
+    from minni.graph_commit import ensure_canonical_learning_node
+
+    db, config, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    successors = [learning(db, "Successor one"), learning(db, "Successor two")]
+    with db.transaction() as c:
+        for lid, content in zip(successors, ("Successor one", "Successor two")):
+            successor_doc = ensure_canonical_learning_node(
+                c, learning_id=lid, agent_id="codex", content=content,
+                vault_path=config.vault_path, created_at=0.0,
+            )
+        for old, new in zip((first, second), reversed(successors)):
+            c.execute("UPDATE learnings SET status='superseded', superseded_by=? WHERE learning_id=?",
+                      (new, old))
+    joins = rows(db, "learning_documents")
+    assert engine.purge_durable_document(path)["status"] == "ok"
+    doc = next(row for row in rows(db, "documents") if row["doc_id"] == doc_id)
+    assert (doc["page_status"], doc["superseded_by"]) == ("superseded", successor_doc)
+    assert rows(db, "learning_documents") == joins
+
+
+@pytest.mark.parametrize("privacy,status", [("blocked", "accepted"), ("safe", "rejected")])
+def test_canonical_purge_preserves_explicit_restriction_even_with_live_learning(store, privacy, status):
+    db, config, _ = store
+    _, _, doc_id, path, engine = _shared_projected_node(store)
+    joins = rows(db, "learning_documents")
+    with db.cursor() as c:
+        c.execute("UPDATE documents SET privacy_level=?, page_status=? WHERE doc_id=?",
+                  (privacy, status, doc_id))
+    assert engine.purge_durable_document(path)["status"] == "ok"
+    doc = rows(db, "documents")[0]
+    assert (doc["privacy_level"], doc["page_status"]) == (privacy, status)
+    assert rows(db, "learning_documents") == joins
+    assert not rows(db, "vault_fts")
+    assert not rows(db, "chunk_embeddings")
+    assert not engine._semantic_search("specimen", 5)
+    assert backfill_learning_projections(db, config)["repaired"] == 0
+
+
+def test_unmapped_canonical_purge_preserves_existing_retirement(store):
+    db, _, _ = store
+    _, _, doc_id, path, engine = _shared_projected_node(store)
+    with db.cursor() as c:
+        c.execute("DELETE FROM learning_documents WHERE doc_id=?", (doc_id,))
+        c.execute("UPDATE documents SET page_status='superseded', superseded_by=42 WHERE doc_id=?", (doc_id,))
+    before = rows(db, "documents")
+    assert engine.purge_durable_document(path)["status"] == "unmapped_kept"
+    assert rows(db, "documents") == before
+
+
+@pytest.mark.parametrize("privacy,status", [("blocked", "accepted"), ("safe", "rejected")])
+def test_placeholder_repair_rechecks_restriction_changed_during_encoding(store, privacy, status):
+    db, config, model = store
+    _, doc_id = _placeholder(store, "Concurrent restricted repair specimen")
+    def restrict():
+        other = SovereignDB(config)
+        try:
+            with other.cursor() as c:
+                c.execute("UPDATE documents SET privacy_level=?, page_status=? WHERE doc_id=?",
+                          (privacy, status, doc_id))
+        finally:
+            other.close()
+    model.before_encode = restrict
+    assert backfill_learning_projections(db, config)["repaired"] == 0
+    doc = rows(db, "documents")[0]
+    assert (doc["privacy_level"], doc["page_status"]) == (privacy, status)
+    assert not rows(db, "vault_fts")
+    assert not rows(db, "chunk_embeddings")
+
+
+def test_new_active_mapping_reactivates_aggregate_retirement_for_scheduled_repair(store, monkeypatch):
+    from minni.writeback import WriteBackMemory
+
+    db, config, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    with db.cursor() as c:
+        c.execute("UPDATE learnings SET status='superseded' WHERE learning_id IN (?, ?)",
+                  (first, second))
+    assert engine.purge_durable_document(path)["status"] == "ok"
+    assert rows(db, "documents")[0]["page_status"] == "superseded"
+    monkeypatch.setattr(config, "writeback_enabled", False)
+    # store_learning commits canonical state without doing the later optional
+    # normal document projection. The scheduled repair must recover this case.
+    new_lid = WriteBackMemory(db, config).store_learning(
+        agent_id="codex", content="Shared historical recovery specimen",
+    )
+    assert len(rows(db, "learning_documents")) == 3
+    assert rows(db, "documents")[0]["doc_id"] == doc_id
+    assert rows(db, "documents")[0]["page_status"] == "accepted"
+    assert not rows(db, "chunk_embeddings")
+    assert backfill_learning_projections(db, config)["repaired"] == 1
+    assert rows(db, "documents")[0]["doc_id"] == doc_id
+    assert rows(db, "chunk_embeddings")
+    assert new_lid in [row["learning_id"] for row in rows(db, "learning_documents")]
+    assert backfill_learning_projections(db, config)["repaired"] == 0
+
+
+@pytest.mark.parametrize("restriction", ["blocked", "rejected", "draft", "expired",
+                                          "aggregate_status", "successor", "active_sibling", "file"])
+def test_repromotion_does_not_override_unproven_or_explicit_retirement(store, monkeypatch, restriction):
+    from pathlib import Path
+    from minni.writeback import WriteBackMemory
+
+    db, config, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    with db.cursor() as c:
+        c.execute("UPDATE learnings SET status='superseded' WHERE learning_id IN (?, ?)", (first, second))
+    engine.purge_durable_document(path)
+    with db.cursor() as c:
+        if restriction == "blocked":
+            c.execute("UPDATE documents SET privacy_level='blocked' WHERE doc_id=?", (doc_id,))
+        elif restriction in {"rejected", "draft", "expired"}:
+            c.execute("UPDATE documents SET page_status=? WHERE doc_id=?", (restriction, doc_id))
+        elif restriction == "successor":
+            c.execute("UPDATE documents SET superseded_by=42 WHERE doc_id=?", (doc_id,))
+        elif restriction == "aggregate_status":
+            c.execute("UPDATE learnings SET status='expired' WHERE learning_id IN (?, ?)", (first, second))
+        elif restriction == "active_sibling":
+            c.execute("UPDATE learnings SET status='active' WHERE learning_id=?", (first,))
+    if restriction == "file":
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text("---\nstatus: superseded\n---\nExplicit file lifecycle")
+    before = rows(db, "documents")[0]
+    monkeypatch.setattr(config, "writeback_enabled", False)
+    WriteBackMemory(db, config).store_learning(agent_id="codex", content="Shared historical recovery specimen")
+    after = rows(db, "documents")[0]
+    assert (after["page_status"], after["privacy_level"], after["superseded_by"]) == (
+        before["page_status"], before["privacy_level"], before["superseded_by"])
+    assert backfill_learning_projections(db, config)["repaired"] == 0
+
+
+def test_repromotion_clears_matching_canonical_successor_pointer(store, monkeypatch):
+    from minni.graph_commit import ensure_canonical_learning_node
+    from minni.writeback import WriteBackMemory
+
+    db, config, _ = store
+    first, second, doc_id, path, engine = _shared_projected_node(store)
+    successor = learning(db, "Intermediate successor")
+    with db.transaction() as c:
+        successor_doc = ensure_canonical_learning_node(c, learning_id=successor, agent_id="codex",
+            content="Intermediate successor", vault_path=config.vault_path, created_at=0.0)
+        c.execute("UPDATE learnings SET status='superseded', superseded_by=? WHERE learning_id IN (?, ?)",
+                  (successor, first, second))
+    engine.purge_durable_document(path)
+    assert rows(db, "documents")[0]["superseded_by"] == successor_doc
+    monkeypatch.setattr(config, "writeback_enabled", False)
+    WriteBackMemory(db, config).store_learning(agent_id="codex", content="Shared historical recovery specimen")
+    doc = rows(db, "documents")[0]
+    assert (doc["page_status"], doc["superseded_by"]) == ("accepted", None)
+    assert backfill_learning_projections(db, config)["repaired"] >= 1
+    assert any(chunk["doc_id"] == doc_id for chunk in rows(db, "chunk_embeddings"))
