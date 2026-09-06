@@ -109,6 +109,28 @@ def test_format_numbered_excerpt():
     assert "[3] Line three about AFM loop." in formatted
 
 
+def test_format_numbered_excerpt_preserves_capped_single_line():
+    """A single-line body at the cap retains evidence after numbering."""
+    text = "single line evidence " * 100
+    formatted, lines, tokens, is_measured = format_numbered_excerpt(text, max_tokens=20)
+
+    assert is_measured is True
+    assert formatted.startswith("[1] single line evidence")
+    # lines are raw evidence lines; numbering is exactly one prefix + raw line.
+    assert len(lines) == 1
+    assert formatted == f"[1] {lines[0]}"
+    assert 0 < tokens <= 20
+
+
+def test_format_numbered_excerpt_keeps_empty_body_uncitable():
+    formatted, lines, tokens, is_measured = format_numbered_excerpt("", max_tokens=20)
+
+    assert formatted == ""
+    assert lines == []
+    assert tokens == 0
+    assert is_measured is True
+
+
 def test_render_edge_inference_prompt_within_afm_budget():
     """Render prompt with source and 8 long candidates. Must strictly fit in <= 3,200 tokens."""
     source = {
@@ -463,9 +485,18 @@ def test_numbered_excerpt_keeps_complete_raw_lines():
             "alpha\nbeta\ngamma", max_tokens=3
         )
     assert measured is False
+    # Number prefixes consume budget too: "[1] alpha\n[2] beta" exceeds the
+    # 3-token cap, so whole trailing lines drop — prefixes never split.
+    assert raw_lines == ["alpha"]
+    assert formatted == "[1] alpha"
+    assert all("[" not in line for line in raw_lines)
+
+    with mock.patch.dict(sys.modules, {"tiktoken": None}):
+        formatted, raw_lines, _, _ = format_numbered_excerpt(
+            "alpha\nbeta\ngamma", max_tokens=6
+        )
     assert raw_lines == ["alpha", "beta"]
     assert formatted == "[1] alpha\n[2] beta"
-    assert all("[" not in line for line in raw_lines)
 
     with mock.patch.dict(sys.modules, {"tiktoken": None}):
         formatted, raw_lines, _, _ = format_numbered_excerpt("abcdefghij", max_tokens=1)
@@ -515,7 +546,7 @@ def test_missing_malformed_line_counts_rejected():
     )
     assert is_valid is False and "incomplete_line_counts" in (err or "")
     for bad_counts, code in (
-        ({"pair_1": 0}, "invalid_line_counts"),
+        ({"pair_1": -1}, "invalid_line_counts"),
         ({"pair_1": True}, "invalid_line_counts"),
         ({"pair_1": "3"}, "invalid_line_counts"),
     ):

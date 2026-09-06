@@ -107,6 +107,16 @@ REQUIRED_FOREIGN_KEYS: dict[str, list[tuple[str, str, str, tuple[str, ...]]]] = 
     ],
 }
 
+# Pre-existing FKs the unexpected-foreign-key scan must tolerate. These are
+# real schema history, not drift: migration 009 defines
+# contradiction_log.resolution_id -> candidate_packets(candidate_id), so every
+# database that ran migrations 001-020 carries it into 021 verification.
+# Deliberately NOT in REQUIRED_FOREIGN_KEYS: presence is not required and no
+# on-delete semantics are enforced — the scan only skips flagging them.
+ALLOWED_EXTRA_FOREIGN_KEYS: dict[str, set[tuple[str, str, str]]] = {
+    "contradiction_log": {("resolution_id", "candidate_packets", "candidate_id")},
+}
+
 # 5 Required Secondary Indexes:
 # (index_name, table_name, is_unique, indexed_columns, partial_predicate)
 REQUIRED_INDEXES: list[tuple[str, str, bool, list[str], str | None]] = [
@@ -337,6 +347,38 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                     f"column '{tbl}.{col_name}' default value mismatch: expected {exp_dflt!r}, got {act_dflt!r}"
                 )
 
+    # edge_status must support the full lifecycle, not just its declared shape.
+    try:
+        ddl_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_links'"
+        ).fetchone()
+        ddl = str(ddl_row[0] or "") if ddl_row else ""
+        for check_body in re.findall(r"\bCHECK\s*\(([^()]*)\)", ddl, re.IGNORECASE):
+            if "edge_status" not in check_body.lower():
+                continue
+            allowed_match = re.search(
+                r"edge_status\s+IN\s*\(([^)]*)\)", check_body, re.IGNORECASE
+            )
+            if allowed_match:
+                allowed = {
+                    value.lower()
+                    for value in re.findall(r"['\"]([^'\"]+)['\"]", allowed_match.group(1))
+                }
+                if "active" in allowed and "stale" not in allowed:
+                    errors.append(
+                        "table 'memory_links' CHECK constraint prevents edge_status='stale'"
+                    )
+            elif re.search(
+                r"(?:edge_status\s*=\s*['\"]active['\"]|['\"]active['\"]\s*=\s*edge_status)",
+                check_body,
+                re.IGNORECASE,
+            ) and not re.search(r"\bstale\b", check_body, re.IGNORECASE):
+                errors.append(
+                    "table 'memory_links' CHECK constraint prevents edge_status='stale'"
+                )
+    except sqlite3.Error as e:
+        errors.append(f"Failed to inspect CHECK constraints for 'memory_links': {e}")
+
     # 2. Strict Composite Primary Key check for learning_documents
     try:
         ld_info = conn.execute("PRAGMA table_info(learning_documents)").fetchall()
@@ -375,6 +417,18 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
             continue
 
         # fk_list tuple: (id, seq, table, from, to, on_update, on_delete, match)
+        expected_signatures = {
+            (from_col.lower(), target_tbl.lower(), target_col.lower())
+            for from_col, target_tbl, target_col, _ in fks
+        } | ALLOWED_EXTRA_FOREIGN_KEYS.get(tbl, set())
+        for row in fk_list:
+            signature = (str(row[3]).lower(), str(row[2]).lower(), str(row[4]).lower())
+            if row[1] != 0 or signature not in expected_signatures:
+                errors.append(
+                    f"table '{tbl}' contains unexpected foreign key: "
+                    f"{row[3]} -> {row[2]}({row[4]})"
+                )
+
         for from_col, target_tbl, target_col, allowed_on_delete in fks:
             # First, validate referenced parent table exists
             if not _table_exists(conn, target_tbl):

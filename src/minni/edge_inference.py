@@ -163,23 +163,48 @@ def format_numbered_excerpt(
         (formatted_numbered_block, raw_lines, token_count, is_measured)
     """
     bounded_text, _, is_measured = truncate_to_tokens(text, max_tokens, encoding_name=encoding_name)
-    # Truncation applies to the RAW text before numbering. Numbering first and
-    # truncating after can split a "[N]" prefix (dangling "[2") and silently
-    # rewrites raw_lines into numbered lines, breaking the evidence-index
-    # contract that line_counts_per_pair describes. Numbering after truncation
-    # keeps every prefix structurally intact, which subsumes the rsplit guard.
+    # Truncation applies to the RAW text before numbering, so a "[N]" prefix
+    # can never split (no dangling "[2") and raw_lines stays raw lines for the
+    # evidence-index contract. Number prefixes still consume budget, so the cap
+    # is then enforced on the numbered block by whole lines only — never by
+    # splitting a line, which would make a citation look valid while its
+    # evidence text was omitted.
     was_cut = bounded_text != text
     raw_lines = [line.strip() for line in bounded_text.splitlines() if line.strip()]
     if was_cut and not bounded_text.endswith("\n") and len(raw_lines) > 1:
-        # Truncation split the final line mid-line: drop the fragment so every
-        # numbered evidence line is complete and raw_lines stays raw lines. A
-        # lone fragment is kept: deleting it would erase single-line evidence
-        # entirely, and numbering after truncation keeps its prefix intact.
+        # Truncation split the final raw line mid-line: drop the fragment so
+        # every numbered evidence line is complete. A lone fragment is kept:
+        # deleting it would erase single-line evidence entirely.
         raw_lines.pop()
     if not raw_lines:
-        raw_lines = [bounded_text.strip()] if bounded_text.strip() and not was_cut else ["(empty)"]
+        # No citable lines: return empty, never a phantom "(empty)" line a
+        # citation could falsely reference.
+        return "", [], 0, is_measured
 
     numbered_lines = [f"[{i + 1}] {line}" for i, line in enumerate(raw_lines)]
+    while (
+        len(numbered_lines) > 1
+        and count_tokens("\n".join(numbered_lines), encoding_name=encoding_name)[0] > max_tokens
+    ):
+        numbered_lines.pop()
+        raw_lines.pop()
+    if (
+        numbered_lines
+        and count_tokens("\n".join(numbered_lines), encoding_name=encoding_name)[0] > max_tokens
+    ):
+        # Single remaining line still exceeds the cap: shrink its text to fit
+        # after the "[N] " prefix instead of dropping the evidence entirely.
+        prefix = "[1] "
+        prefix_tokens, _ = count_tokens(prefix, encoding_name=encoding_name)
+        available_tokens = max_tokens - prefix_tokens
+        if available_tokens > 0:
+            first_line, _, _ = truncate_to_tokens(
+                raw_lines[0], available_tokens, encoding_name=encoding_name
+            )
+            raw_lines[0] = first_line
+            numbered_lines[0] = prefix + first_line
+        # else: even the prefix does not fit (degenerate cap); keep best effort
+        # and let the caller-level budget loop and flag handle the remainder.
     formatted_block = "\n".join(numbered_lines)
     actual_tokens, is_measured_final = count_tokens(formatted_block, encoding_name=encoding_name)
     return formatted_block, raw_lines, actual_tokens, (is_measured and is_measured_final)
@@ -516,11 +541,11 @@ def validate_edge_inference_response(
             f"incomplete_line_counts: no line counts for {sorted(missing_counts)}",
         )
     for pid, count in line_counts_per_pair.items():
-        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             return (
                 False,
                 None,
-                f"invalid_line_counts: line count for {pid!r} must be a positive int, got {count!r}",
+                f"invalid_line_counts: line count for {pid!r} must be a non-negative int, got {count!r}",
             )
 
     # 1. Parse JSON if string
