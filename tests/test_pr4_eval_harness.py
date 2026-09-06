@@ -658,3 +658,68 @@ class TestMockSearcher:
         results = mock.search("q1")
         scores = [r["score"] for r in results]
         assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot query-corpus binding: bound judgments score only against the
+# snapshot they were judged against (stale/unrelated snapshots fail before
+# any comparison; unbound queries score as before).
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from minni.eval.harness import _require_snapshot_query_binding
+
+
+def _stub_searcher(snapshot_id="snap-1", manifest_digest="digest-1"):
+    return SimpleNamespace(snapshot_id=snapshot_id, manifest_digest=manifest_digest)
+
+
+class TestSnapshotQueryBinding:
+
+    @pytest.mark.parametrize("expected", [[1], []])
+    def test_unbound_judgments_fail_closed(self, expected):
+        searcher = _stub_searcher()
+        with pytest.raises(ValueError, match="binding mismatch"):
+            _require_snapshot_query_binding(searcher, [
+                {"query": "alpha", "expected_doc_ids": expected},
+            ])
+        _require_snapshot_query_binding(searcher, [])
+
+    def test_matching_binding_passes(self):
+        searcher = _stub_searcher()
+        _require_snapshot_query_binding(searcher, [
+            {"query": "alpha", "expected_doc_ids": [1],
+             "snapshot_id": "snap-1", "manifest_digest": "digest-1"},
+        ])
+
+    def test_stale_snapshot_id_fails(self):
+        searcher = _stub_searcher()
+        with pytest.raises(ValueError, match="binding mismatch"):
+            _require_snapshot_query_binding(searcher, [
+                {"query": "alpha", "expected_doc_ids": [1],
+                 "snapshot_id": "snap-2", "manifest_digest": "digest-1"},
+            ])
+
+    def test_stale_manifest_digest_fails(self):
+        searcher = _stub_searcher()
+        with pytest.raises(ValueError, match="binding mismatch"):
+            _require_snapshot_query_binding(searcher, [
+                {"query": "alpha", "expected_doc_ids": [1],
+                 "snapshot_id": "snap-1", "manifest_digest": "digest-2"},
+            ])
+
+    def test_half_declared_pair_fails_closed(self):
+        searcher = _stub_searcher()
+        with pytest.raises(ValueError, match="binding mismatch"):
+            _require_snapshot_query_binding(searcher, [
+                {"query": "alpha", "expected_doc_ids": [1], "snapshot_id": "snap-1"},
+            ])
+
+    def test_bound_query_against_identity_free_searcher_fails(self):
+        searcher = SimpleNamespace()
+        with pytest.raises(ValueError, match="binding mismatch"):
+            _require_snapshot_query_binding(searcher, [
+                {"query": "alpha", "expected_doc_ids": [1],
+                 "snapshot_id": "snap-1", "manifest_digest": "digest-1"},
+            ])
