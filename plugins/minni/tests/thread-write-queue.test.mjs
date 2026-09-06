@@ -3,11 +3,12 @@
 // THREAD_BUSY is overflow (Q full or drain stuck), not N=40.
 // Durable drain outlives the accepting process; in-process kick does not.
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -36,6 +37,7 @@ import {
   withThreadPlanLock,
 } from "../dist/thread-worker.js";
 import { readWorkerUpdateReceipt } from "../dist/thread-claims.js";
+import { CLAIM_FS_HELPER } from "../dist/claim-fs-helper.js";
 import {
   DEFAULT_QUEUE_MAX,
   enqueueWorkerWrite,
@@ -266,14 +268,24 @@ async function journalTimeoutDiagnostics({ last, startFail = [], completeFail = 
   };
 }
 
-async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false, startFail = [], completeFail = [] }, timeoutMs = 20_000) {
-  const begin = Date.now();
+async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false, startFail = [], completeFail = [] }, timeoutMs = 20_000, options = {}) {
+  const {
+    stallMs = timeoutMs, clock = Date.now, readState = journalState,
+    readQueue = () => listQueuedWorkerWrites(fixture.vaultPath, fixture.planId),
+    kick = () => kickWorkerWriteDrain({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId }),
+    pause = () => new Promise(resolve => setTimeout(resolve, 25)),
+  } = options;
+  const begin = clock();
+  let progressedAt = begin;
+  let progress = 0;
   let last;
   let leftover;
-  while (Date.now() - begin < timeoutMs) {
-    last = await journalState(fixture);
+  while (clock() - begin < timeoutMs && clock() - progressedAt < stallMs) {
+    last = await readState(fixture);
+    const count = last.started.length + last.completed.length;
+    if (count > progress) { progress = count; progressedAt = clock(); }
     leftover = queueEmpty
-      ? await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)
+      ? await readQueue()
       : undefined;
     if (
       last.started.length >= started &&
@@ -282,16 +294,12 @@ async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty 
     ) {
       return last;
     }
-    kickWorkerWriteDrain({
-      vaultPath: fixture.vaultPath,
-      notePath: fixture.notePath,
-      planId: fixture.planId,
-    });
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    kick();
+    await pause();
   }
   const diagnostic = await journalTimeoutDiagnostics({ last, startFail, completeFail },
-    () => listQueuedWorkerWrites(fixture.vaultPath, fixture.planId));
-  throw new Error(`timeout waiting for ${started} starts / ${completed} completes; got ${JSON.stringify(diagnostic)}`);
+    readQueue);
+  throw new Error(`timeout waiting for ${started} starts / ${completed} completes; elapsed=${clock() - begin}ms stalled=${clock() - progressedAt}ms; got ${JSON.stringify(diagnostic)}`);
 }
 
 async function runWetBurst(t, n) {
@@ -303,7 +311,9 @@ async function runWetBurst(t, n) {
   const completes = await completeBurst(fixture, claims);
   const completeBusy = completes.filter((result) => result.code === "THREAD_BUSY");
   const completeFail = completes.filter((result) => !result.ok);
-  const journal = await waitForJournal(fixture, { started: n, completed: n, startFail, completeFail });
+  // A correctness burst may exceed 20s under filesystem contention. Keep a
+  // 20s no-progress failure and a 50s total cap inside the 60s test deadline.
+  const journal = await waitForJournal(fixture, { started: n, completed: n, startFail, completeFail }, 50_000, { stallMs: 20_000 });
   return {
     n,
     startOk: starts.filter((result) => result.ok).length,
@@ -975,6 +985,50 @@ test("claimed pending complete without start/stamp/ticket cannot persist done", 
     }),
     /complete cannot persist done without start/,
   );
+
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "pending");
+  assert.notEqual(plan.slices[0].status, "done");
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 0);
+  assert.equal(journal.completed.length, 0);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0);
+});
+
+test("busy claimed pending complete is refused without queuing an undrainable ticket", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(queued.length, 0, "GO case has no start ticket");
+  const stamp = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stamp, undefined, "GO case has no start-accepted stamp");
+  const planBefore = await rehydratePlan(fixture.notePath);
+  assert.equal(planBefore.slices[0].status, "pending");
+  assert.ok(planBefore.slices[0].claim);
+
+  await withThreadLock(fixture.vaultPath, fixture.planId, "hold-pending-complete", async () => {
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-pending-no-start",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-pending-no-start",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /complete cannot persist done without start/,
+  );
+
+  assert.deepEqual(await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId), []);
+  });
 
   const plan = await rehydratePlan(fixture.notePath);
   assert.equal(plan.slices[0].status, "pending");
@@ -2935,6 +2989,76 @@ test("ordinary drain reads each shrinking queue only for locked selection and fr
   assert.deepEqual(counts, [9, 9]);
 });
 
+// Drain authentication shares the per-ticket apply scope: one helper session
+// per live ticket, never one for lookup plus one for apply. Each phase seeds
+// its enqueue outside its counter. Counts process starts/reaps only; never
+// logs tokens, digests, or payloads.
+test("ordinary drain starts and reaps one claim helper per ticket per phase", async (t) => {
+  // Exercise an arbitrarily named interpreter: production resolves
+  // MINNI_CLAIM_PYTHON (or fallbacks) to any executable path, so the counter
+  // must identify the helper by its exact argv, never by basename.
+  const configuredPython = process.env.MINNI_CLAIM_PYTHON
+    ?? process.env.PYTHON ?? process.env.PYTHON3
+    ?? childProcess.execSync("command -v python3", { encoding: "utf8" }).trim();
+  const aliasDir = await mkdtemp(path.join(tmpdir(), "minni-claim-python-alias-"));
+  t.after(() => rm(aliasDir, { recursive: true, force: true }));
+  const customPython = path.join(aliasDir, "minni-claim-python-custom-3.14");
+  const resolvedPython = childProcess.execFileSync(configuredPython,
+    ["-I", "-c", "import os, sys; print(os.path.abspath(sys.executable))"],
+    { encoding: "utf8" }).trim();
+  await symlink(resolvedPython, customPython);
+  const beforePython = process.env.MINNI_CLAIM_PYTHON;
+  process.env.MINNI_CLAIM_PYTHON = customPython;
+  t.after(() => {
+    if (beforePython === undefined) delete process.env.MINNI_CLAIM_PYTHON;
+    else process.env.MINNI_CLAIM_PYTHON = beforePython;
+  });
+
+  const fixture = await burstFixture(t, 3);
+  const claims = await assignAndClaimAll(fixture);
+  const counts = [];
+  for (const action of ["start", "complete"]) {
+    for (let index = 0; index < fixture.n; index += 1) {
+      await enqueueWorkerWrite({
+        vaultPath: fixture.vaultPath, planId: fixture.planId,
+        sliceId: `s${index}`, workerAgentId: `worker-${index}`,
+        token: claims[index].token, idempotencyKey: `${action}-${index}`,
+        action: action === "complete" ? { action, evidence: "Verified fixture completion" } : { action },
+        now: new Date(action === "start" ? "2026-08-18T12:01:00.000Z" : "2026-08-18T12:02:00.000Z"),
+      });
+    }
+    const originalSpawn = childProcess.spawn;
+    let helperStarts = 0;
+    let helperCloses = 0;
+    childProcess.spawn = function (cmd, args, opts) {
+      if (Array.isArray(args) && args[0] === "-I" && args[1] === "-u" && args[2] === "-c" && args[3] === CLAIM_FS_HELPER) {
+        helperStarts += 1;
+        const child = originalSpawn.call(this, cmd, args, opts);
+        child.once("close", () => { helperCloses += 1; });
+        return child;
+      }
+      return originalSpawn.call(this, cmd, args, opts);
+    };
+    syncBuiltinESMExports();
+    try {
+      await drainWorkerWrites({ ...fixture, now: new Date(action === "start" ? "2026-08-18T12:01:00.000Z" : "2026-08-18T12:02:00.000Z") });
+    } finally {
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+    }
+    assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0, `${action} drain must empty the queue`);
+    counts.push([helperStarts, helperCloses]);
+    t.diagnostic(`claim helper starts/closes for 3 ${action}s via custom interpreter: ${helperStarts}/${helperCloses}`);
+  }
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 3);
+  assert.equal(journal.completed.length, 3);
+  for (const [helperStarts, helperCloses] of counts) {
+    assert.equal(helperCloses, helperStarts, "every helper start must be reaped");
+    assert.equal(helperStarts, process.platform === "darwin" ? 3 : 0);
+  }
+});
+
 for (const hold of [withThreadLock, withExclusiveReplanReservation]) {
   test(`empty ordinary drain returns while ${hold.name} is held`, async (t) => {
     const fixture = await burstFixture(t, 1);
@@ -2970,3 +3094,27 @@ test("idle ordinary kick does not contend for the persist lock", async (t) => {
   }
   assert.equal(lockAttempts, 0, "empty drain must not force another worker into accepted-only behavior");
 });
+
+// Virtual time distinguishes useful progress from a parked queue without a
+// machine-speed assertion. These exercise the same waiter the wet burst uses.
+for (const scenario of ["progress", "stalled", "never-finishes"]) {
+  test(`journal waiter budget: ${scenario}`, async () => {
+    let elapsed = 0;
+    const options = {
+      stallMs: 20_000, clock: () => elapsed, kick: () => {},
+      pause: async () => { elapsed += 10_000; }, readQueue: async () => [],
+      readState: async () => ({
+        started: Array.from({ length: scenario === "stalled" ? 0 : elapsed / 10_000 }),
+        completed: [], completesWithoutStarts: [],
+      }),
+    };
+    if (scenario === "progress") {
+      const result = await waitForJournal({}, { started: 3 }, 50_000, options);
+      assert.equal(result.started.length, 3);
+      assert.equal(elapsed, 30_000);
+    } else {
+      await assert.rejects(waitForJournal({}, { started: 99 }, 50_000, options), /timeout waiting/);
+      assert.equal(elapsed, scenario === "stalled" ? 20_000 : 50_000);
+    }
+  });
+}

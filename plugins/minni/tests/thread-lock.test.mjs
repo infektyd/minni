@@ -501,3 +501,106 @@ test("exclusive replan wx fallback reaps dest when write fails after create", as
   });
   assert.equal(entered, true, "next exclusive replan must acquire immediately after failed wx publish");
 });
+
+test("release retries a transient owner read so the next mutation reacquires", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-lock-release-transient-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const originalRead = fs.promises.readFile;
+  let armed = false;
+  let failures = 0;
+  fs.promises.readFile = async (file, ...args) => {
+    if (armed && String(file).endsWith("owner.json") && failures < 1) {
+      failures += 1;
+      throw Object.assign(new Error("transient owner read"), { code: "EIO" });
+    }
+    return originalRead(file, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    const value = await withThreadLock(root, "plan-transient", "op-transient-1", async () => {
+      armed = true;
+      return "mutation-ok";
+    });
+    armed = false;
+    assert.equal(value, "mutation-ok");
+    assert.equal(failures, 1, "the release read must have hit the transient fault");
+    const ownerPath = path.join(lockDirFor(root, "plan-transient"), "owner.json");
+    await assert.rejects(readFile(ownerPath, "utf8"), { code: "ENOENT" });
+    let second = "";
+    await withThreadLock(root, "plan-transient", "op-transient-2", async () => {
+      second = "acquired";
+    }, { waitMs: 50 });
+    assert.equal(second, "acquired", "next mutation must reacquire immediately after a transient release");
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+});
+
+test("release never deletes a replaced owner", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-lock-release-replaced-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ownerPath = path.join(lockDirFor(root, "plan-replaced"), "owner.json");
+  const value = await withThreadLock(root, "plan-replaced", "op-old", async () => {
+    await writeFile(ownerPath, `${JSON.stringify({
+      pid: process.pid,
+      operationId: "op-new",
+      acquiredAt: new Date().toISOString(),
+    })}\n`, { mode: 0o600 });
+    return "ok";
+  });
+  assert.equal(value, "ok");
+  const raw = JSON.parse(await readFile(ownerPath, "utf8"));
+  assert.equal(raw.operationId, "op-new", "a replaced owner must survive our release");
+});
+
+test("release treats a genuinely absent lock as quiet success", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-lock-release-gone-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const value = await withThreadLock(root, "plan-gone", "op-gone", async () => {
+    await rm(lockDirFor(root, "plan-gone"), { recursive: true, force: true });
+    return "still-ok";
+  });
+  assert.equal(value, "still-ok");
+});
+
+test("release leaves an unparseable owner alone", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-lock-release-garbled-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ownerPath = path.join(lockDirFor(root, "plan-garbled"), "owner.json");
+  const value = await withThreadLock(root, "plan-garbled", "op-garbled", async () => {
+    await writeFile(ownerPath, "not json\n", { mode: 0o600 });
+    return "ok-quiet";
+  });
+  assert.equal(value, "ok-quiet");
+  assert.equal(await readFile(ownerPath, "utf8"), "not json\n");
+});
+
+test("persistent owner read failure at release surfaces loud", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-lock-release-loud-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const originalRead = fs.promises.readFile;
+  fs.promises.readFile = async (file, ...args) => {
+    if (String(file).endsWith("owner.json")) {
+      throw Object.assign(new Error("persistent owner read"), { code: "EIO" });
+    }
+    return originalRead(file, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      () => withThreadLock(root, "plan-loud", "op-loud", async () => "mutation-ok"),
+      (err) => {
+        assert.equal(err.code, "EIO");
+        return true;
+      },
+    );
+    // Never delete what release could not verify.
+    const raw = await originalRead(
+      path.join(lockDirFor(root, "plan-loud"), "owner.json"), "utf8");
+    assert.match(raw, /op-loud/);
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+});

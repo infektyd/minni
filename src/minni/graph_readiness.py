@@ -38,7 +38,7 @@ class SchemaVerificationReport:
     def __iter__(self):
         """Enable tuple unpacking (ready, message) for backward-compatible callers."""
         yield self.ready
-        if self.missing_items:
+        if self.missing_items or self.errors:
             detail = "; ".join(self.errors) if self.errors else ", ".join(self.missing_items)
             yield f"{self.status}: {detail}"
         else:
@@ -107,6 +107,16 @@ REQUIRED_FOREIGN_KEYS: dict[str, list[tuple[str, str, str, tuple[str, ...]]]] = 
     ],
 }
 
+# Pre-existing FKs the unexpected-foreign-key scan must tolerate. These are
+# real schema history, not drift: migration 009 defines
+# contradiction_log.resolution_id -> candidate_packets(candidate_id), so every
+# database that ran migrations 001-020 carries it into 021 verification.
+# Deliberately NOT in REQUIRED_FOREIGN_KEYS: presence is not required and no
+# on-delete semantics are enforced — the scan only skips flagging them.
+ALLOWED_EXTRA_FOREIGN_KEYS: dict[str, set[tuple[str, str, str]]] = {
+    "contradiction_log": {("resolution_id", "candidate_packets", "candidate_id")},
+}
+
 # 5 Required Secondary Indexes:
 # (index_name, table_name, is_unique, indexed_columns, partial_predicate)
 REQUIRED_INDEXES: list[tuple[str, str, bool, list[str], str | None]] = [
@@ -173,6 +183,59 @@ def _normalize_default(val: Any) -> str | None:
 def _normalize_sql(sql: str) -> str:
     """Normalize whitespace and lower-case for predicate comparison."""
     return re.sub(r"\s+", " ", sql).strip().lower()
+
+
+def _iter_check_bodies(ddl: str):
+    """Yield inner text of top-level CHECK(...) constraints, nesting-aware.
+
+    A flat ``[^()]*`` match misses the valid SQLite form
+    ``CHECK(edge_status IN ('active'))`` whose IN-list carries its own
+    parens, letting a restrictive lifecycle pass. Depth counting handles one
+    or more nested levels; parens inside quoted literals are out of scope.
+    """
+    for match in re.finditer(r"\bCHECK\s*\(", ddl, re.IGNORECASE):
+        depth = 0
+        start = match.end()
+        pos = start
+        while pos < len(ddl):
+            char = ddl[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    yield ddl[start:pos]
+                    break
+                depth -= 1
+            pos += 1
+
+
+def _single_pk_column(conn: sqlite3.Connection, table: str) -> str | None:
+    """Name the single-column PK of *table*, or None when not exactly one."""
+    try:
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return None
+    pks = [row for row in info if row[5] > 0]
+    if len(pks) != 1:
+        return None
+    return str(pks[0][1])
+
+
+def memory_links_typed_columns_present(conn: Any) -> bool:
+    """True when memory_links carries the 021 typed-edge columns writers set.
+
+    Accepts a connection or cursor (both expose ``.execute``). Explicit-link
+    writers (writeback, wiki_indexer, vault_ingest) consult this to fall back
+    to the legacy 5-column insert when 021 is unavailable — db.py treats a
+    failed migrations run as non-fatal, so the columns can genuinely be
+    absent at write time.
+    """
+    try:
+        rows = conn.execute("PRAGMA table_info(memory_links)").fetchall()
+    except (sqlite3.Error, AttributeError):
+        return False
+    present = {row[1] for row in rows}
+    return "confidence" in present and "inference_method" in present
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -322,6 +385,11 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                     f"column '{tbl}.{col_name}' declared type mismatch: expected {exp_type}, got {act_type}"
                 )
 
+            if act_pk != exp_pk:
+                errors.append(
+                    f"column '{tbl}.{col_name}' primary key position mismatch: expected {exp_pk}, got {act_pk}"
+                )
+
             if act_notnull != exp_notnull:
                 errors.append(
                     f"column '{tbl}.{col_name}' nullability mismatch: expected notnull={exp_notnull}, got {act_notnull}"
@@ -331,6 +399,38 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                 errors.append(
                     f"column '{tbl}.{col_name}' default value mismatch: expected {exp_dflt!r}, got {act_dflt!r}"
                 )
+
+    # edge_status must support the full lifecycle, not just its declared shape.
+    try:
+        ddl_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_links'"
+        ).fetchone()
+        ddl = str(ddl_row[0] or "") if ddl_row else ""
+        for check_body in _iter_check_bodies(ddl):
+            if "edge_status" not in check_body.lower():
+                continue
+            allowed_match = re.search(
+                r"edge_status\s+IN\s*\(([^)]*)\)", check_body, re.IGNORECASE
+            )
+            if allowed_match:
+                allowed = {
+                    value.lower()
+                    for value in re.findall(r"['\"]([^'\"]+)['\"]", allowed_match.group(1))
+                }
+                if "active" in allowed and "stale" not in allowed:
+                    errors.append(
+                        "table 'memory_links' CHECK constraint prevents edge_status='stale'"
+                    )
+            elif re.search(
+                r"(?:edge_status\s*=\s*['\"]active['\"]|['\"]active['\"]\s*=\s*edge_status)",
+                check_body,
+                re.IGNORECASE,
+            ) and not re.search(r"\bstale\b", check_body, re.IGNORECASE):
+                errors.append(
+                    "table 'memory_links' CHECK constraint prevents edge_status='stale'"
+                )
+    except sqlite3.Error as e:
+        errors.append(f"Failed to inspect CHECK constraints for 'memory_links': {e}")
 
     # 2. Strict Composite Primary Key check for learning_documents
     try:
@@ -345,6 +445,22 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
     except sqlite3.Error as e:
         errors.append(f"Failed to inspect PK for 'learning_documents': {e}")
 
+    # memory_links retains the baseline edge identity used by triple-key upserts.
+    try:
+        link_info = conn.execute("PRAGMA table_info(memory_links)").fetchall()
+        link_pk_cols = sorted(
+            [row for row in link_info if row[5] > 0], key=lambda r: r[5]
+        )
+        expected_link_pk = ["source_doc_id", "target_doc_id", "link_type"]
+        link_pk_names = [row[1] for row in link_pk_cols]
+        if link_pk_names != expected_link_pk:
+            errors.append(
+                f"table 'memory_links' primary key shape mismatch: expected "
+                f"{expected_link_pk}, got {link_pk_names}"
+            )
+    except sqlite3.Error as e:
+        errors.append(f"Failed to inspect PK for 'memory_links': {e}")
+
     # 3. Foreign Key Constraints & Referenced Parent Semantics check
     for tbl, fks in REQUIRED_FOREIGN_KEYS.items():
         try:
@@ -354,6 +470,30 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
             continue
 
         # fk_list tuple: (id, seq, table, from, to, on_update, on_delete, match)
+        expected_signatures = {
+            (from_col.lower(), target_tbl.lower(), target_col.lower())
+            for from_col, target_tbl, target_col, _ in fks
+        } | ALLOWED_EXTRA_FOREIGN_KEYS.get(tbl, set())
+        for row in fk_list:
+            # An omitted FK target (REFERENCES parent with no column) is valid
+            # SQLite meaning the parent's PK: resolve it to the actual single
+            # PK column so semantic matching below judges it, instead of
+            # rejecting a NULL target here. Unresolvable targets stay None and
+            # are still flagged — strictness is preserved, not broadened.
+            to_col = row[4]
+            if to_col is None:
+                to_col = _single_pk_column(conn, str(row[2]))
+            signature = (
+                str(row[3]).lower(),
+                str(row[2]).lower(),
+                str(to_col).lower() if to_col is not None else None,
+            )
+            if row[1] != 0 or signature not in expected_signatures:
+                errors.append(
+                    f"table '{tbl}' contains unexpected foreign key: "
+                    f"{row[3]} -> {row[2]}({row[4]})"
+                )
+
         for from_col, target_tbl, target_col, allowed_on_delete in fks:
             # First, validate referenced parent table exists
             if not _table_exists(conn, target_tbl):
@@ -448,6 +588,18 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                 errors.append(
                     f"index '{idx_name}' column sequence mismatch: expected {exp_cols}, got {act_cols}"
                 )
+
+            if idx_name == "idx_documents_memory_uri":
+                xinfo_rows = conn.execute(f"PRAGMA index_xinfo({idx_name})").fetchall()
+                indexed_xinfo = sorted(
+                    (row for row in xinfo_rows if row[5]), key=lambda row: row[0]
+                )
+                act_collations = [str(row[4]).upper() for row in indexed_xinfo]
+                if act_collations != ["BINARY"]:
+                    errors.append(
+                        f"index '{idx_name}' collation mismatch: expected ['BINARY'], "
+                        f"got {act_collations}"
+                    )
         except sqlite3.Error as e:
             errors.append(f"Failed to query index_info for '{idx_name}': {e}")
 
@@ -483,6 +635,45 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
                 errors.append(
                     f"index '{idx_name}' is unexpectedly partial"
                 )
+
+    # learning_documents is an N:1 mapping: multiple learnings may share a doc.
+    try:
+        for idx_row in conn.execute("PRAGMA index_list(learning_documents)").fetchall():
+            if not bool(idx_row[2]):
+                continue
+            index_name = idx_row[1]
+            index_info = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+            index_columns = [row[2] for row in sorted(index_info, key=lambda r: r[0])]
+            if index_columns == ["doc_id"]:
+                errors.append(
+                    "table 'learning_documents' has unexpected unique constraint on 'doc_id'"
+                )
+    except sqlite3.Error as e:
+        errors.append("Failed to inspect unique constraints for 'learning_documents': "
+                      f"{e}")
+
+    # Any additional UNIQUE constraint touching memory_uri can reject distinct
+    # URIs and make the graph unusable, even when the required index is valid.
+    try:
+        for idx_row in conn.execute("PRAGMA index_list(documents)").fetchall():
+            index_name = str(idx_row[1])
+            if not bool(idx_row[2]) or index_name == "idx_documents_memory_uri":
+                continue
+            index_info = conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+            index_columns = [row[2] for row in sorted(index_info, key=lambda r: r[0])]
+            index_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (index_name,),
+            ).fetchone()
+            if "memory_uri" in index_columns or (
+                index_sql and index_sql[0] and "memory_uri" in index_sql[0].lower()
+            ):
+                errors.append(
+                    f"table 'documents' has unexpected unique constraint involving 'memory_uri': "
+                    f"{index_name}"
+                )
+    except sqlite3.Error as e:
+        errors.append("Failed to inspect unique constraints for 'documents': " f"{e}")
 
     if errors or missing_items:
         return SchemaVerificationReport(

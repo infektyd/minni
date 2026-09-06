@@ -244,6 +244,7 @@ def run_eval(
     config_kwargs: Dict[str, Any],
     ks: Tuple[int, ...] = (1, 3, 5, 10),
     *, strict_search: bool = False,
+    forbidden_doc_ids: Optional[set[int]] = None,
 ) -> Dict[str, Any]:
     """Run evaluation over all queries for a single config."""
     per_query = []
@@ -265,6 +266,7 @@ def run_eval(
             searcher, query_text, config_name, config_kwargs, strict=strict_search
         )
         result_ids = _extract_doc_ids(results, strict=strict_search)
+        forbidden = sorted(set(result_ids) & (forbidden_doc_ids or set()))
         token_counts = _extract_token_counts(results)
 
         r_at_k = {k: _recall_at_k(expected_ids, result_ids, k) for k in ks}
@@ -296,6 +298,7 @@ def run_eval(
             "expected_doc_ids": expected_ids,
             "notes": notes,
             "result_doc_ids": result_ids[:10],
+            "forbidden_doc_ids": forbidden,
             "recall_at_k": r_at_k,
             "ndcg_at_k": {k: round(ndcg_at_k[k], 4) for k in ks},
             "token_budget_recall_at_k": {
@@ -311,6 +314,9 @@ def run_eval(
     summary = {
         "config": config_name,
         "n_queries": len(queries),
+        "forbidden_doc_ids": sorted({
+            doc_id for row in per_query for doc_id in row["forbidden_doc_ids"]
+        }),
         "total_latency_s": round(total_latency, 3),
         "mean_latency_s": round(total_latency / n, 4),
         "recall_at_k": {
@@ -329,7 +335,13 @@ def run_eval(
         ),
     }
 
-    return {"summary": summary, "per_query": per_query}
+    report = {"summary": summary, "per_query": per_query}
+    if strict_search and summary["forbidden_doc_ids"]:
+        raise RuntimeError(
+            "snapshot retrieval returned forbidden document IDs: "
+            + ", ".join(str(i) for i in summary["forbidden_doc_ids"])
+        )
+    return report
 
 
 def _metric_value(per_query: Dict[str, Any], metric: str, k: int) -> float:
@@ -355,11 +367,16 @@ def _judgment_key(item: Dict[str, Any]) -> Optional[List[int]]:
 
     Only true integers are supported IDs: floats (even integral ones),
     strings, and booleans are malformed evidence and are never coerced,
-    so 1.1/1.9 can never collapse onto ID 1.
+    so 1.1/1.9 can never collapse onto ID 1. An absent or null field is
+    malformed evidence, never an empty judgment: only an explicitly
+    present ``[]`` marks an unevaluable probe, so a null-judgment query
+    cannot be silently excluded while its class still passes.
     """
+    if "expected_doc_ids" not in item:
+        return None
     raw = item.get("expected_doc_ids")
     if raw is None:
-        return []
+        return None
     if not isinstance(raw, list):
         return None
     ids = []
@@ -368,6 +385,51 @@ def _judgment_key(item: Dict[str, Any]) -> Optional[List[int]]:
             return None
         ids.append(entry)
     return sorted(ids)
+
+
+def _corpus_evidence_kind(report: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """Classify a report's corpus evidence for gate certification.
+
+    Returns ``(kind, snapshot)`` with kind one of:
+
+    - ``"frozen"``: provenance positively records ``frozen: True`` with an
+      explicit non-empty snapshot identity (anything but ``"unknown"``).
+    - ``"synthetic"``: provenance positively marks mock plumbing
+      (``mock`` true on the report, principal, or a ``"mock"`` snapshot).
+    - ``"unknown"``: everything else — absent provenance, non-dict blocks,
+      ``frozen`` missing or not true, missing/empty/``"unknown"`` snapshot,
+      or a ``frozen: True`` claim with no identity.
+
+    Nothing is inferred from absence: a bare report without provenance is
+    ``"unknown"``, not synthetic, because foreign or persisted real reports
+    can lose metadata. A snapshot string is packet identity, never
+    authenticated proof: equality only shows both sides named the same
+    recorded corpus.
+    """
+    if not isinstance(report, dict):
+        return ("unknown", None)
+    prov = report.get("provenance")
+    if not isinstance(prov, dict):
+        return ("unknown", None)
+    principal = prov.get("principal")
+    corpus = prov.get("corpus")
+    if not isinstance(corpus, dict):
+        return ("unknown", None)
+    snapshot = corpus.get("snapshot")
+    if (
+        prov.get("mock") is True
+        or (isinstance(principal, dict) and principal.get("mock") is True)
+        or (isinstance(snapshot, str) and snapshot.strip().lower() == "mock")
+    ):
+        return ("synthetic", snapshot if isinstance(snapshot, str) else "mock")
+    if (
+        corpus.get("frozen") is True
+        and isinstance(snapshot, str)
+        and snapshot.strip()
+        and snapshot.strip().lower() != "unknown"
+    ):
+        return ("frozen", snapshot.strip())
+    return ("unknown", None)
 
 
 def _identity_problems(report: Dict[str, Any]) -> List[str]:
@@ -448,11 +510,22 @@ def evaluate_quality_gate(
       scored against each other.
     - absent, non-finite, or out-of-range ``metric@k`` on either side ->
       ``ok=False``; a missing score is never defaulted to zero.
-    - queries without judgments (empty ``expected_doc_ids``) are excluded
-      from means and listed under ``unevaluable_queries``; a whole class
-      without judged queries fails under ``unevaluable_classes`` instead
-      of disappearing from no-regression acceptance. Excluded probes are
-      reported as unevaluable, never as passed.
+    - queries without judgments (explicit empty ``expected_doc_ids``) are
+      excluded from means and listed under ``unevaluable_queries``; a whole
+      class without judged queries fails under ``unevaluable_classes``
+      instead of disappearing from no-regression acceptance. Excluded probes
+      are reported as unevaluable, never as passed. An absent or null field
+      is malformed evidence, never an empty judgment.
+    - real acceptance requires a positively recorded frozen snapshot with
+      the same explicit identity on both sides; absent provenance, a
+      missing/``"unknown"`` snapshot, frozen-without-identity, a snapshot
+      mismatch, or mixed evidence kinds all fail. Nothing is inferred from
+      absence: bare reports fail rather than passing as synthetic.
+    - positively labeled synthetic (mock) evidence keeps the numeric
+      comparison but never certifies: the decision is forced ``ok=False``
+      with a synthetic-plumbing reason and evidence label.
+    - snapshot equality is packet identity, not authenticated proof of a
+      frozen corpus.
     - zero comparable judged queries -> ``ok=False``.
     - zero baseline mean: relative gain is undefined, so any strict
       improvement on valid finite evidence passes the improvement leg
@@ -639,6 +712,51 @@ def evaluate_quality_gate(
             ],
         )
 
+    base_kind, base_snapshot = _corpus_evidence_kind(baseline_report)
+    cand_kind, cand_snapshot = _corpus_evidence_kind(candidate_report)
+    synthetic_only = base_kind == "synthetic" and cand_kind == "synthetic"
+    if not (
+        (base_kind == "frozen" and cand_kind == "frozen"
+         and base_snapshot == cand_snapshot)
+        or synthetic_only
+    ):
+        if base_kind == "frozen" and cand_kind == "frozen":
+            reason = (
+                "corpus snapshot mismatch: baseline and candidate name "
+                f"different recorded corpora ({base_snapshot!r} vs "
+                f"{cand_snapshot!r}); a quality comparison must observe one "
+                "frozen corpus on both sides."
+            )
+        elif base_kind != cand_kind:
+            reason = (
+                f"incomparable corpus evidence kinds (baseline {base_kind}, "
+                f"candidate {cand_kind}): quality requires the same frozen "
+                "snapshot identity on both sides."
+            )
+        else:
+            reason = (
+                "missing or malformed corpus identity: quality requires a "
+                "positively recorded frozen snapshot with an explicit "
+                "identity on both sides; absent provenance, a missing "
+                "snapshot, or frozen without identity certifies nothing."
+            )
+        return _fail(
+            reason,
+            comparable_queries=len(comparable),
+            unevaluable_queries=sorted(unevaluable_queries),
+            unevaluable_classes=sorted(set(unevaluable_classes)),
+            label_mismatches=label_mismatches,
+            limitations=[
+                "evidence kinds are never inferred from absence: bare "
+                "reports without provenance fail rather than passing as "
+                "synthetic.",
+                "matching snapshot strings are packet identity, not "
+                "authenticated proof of a frozen corpus.",
+                "frozen-snapshot support lands separately; this gate invents "
+                "no frozen proof and accepts none by default.",
+            ],
+        )
+
     baseline_mean = sum(b for _, b, _, _ in comparable) / len(comparable)
     candidate_mean = sum(c for _, _, c, _ in comparable) / len(comparable)
     absolute = candidate_mean - baseline_mean
@@ -735,16 +853,31 @@ def evaluate_quality_gate(
         "is undefined without relevance judgments.",
         "mock or placeholder doc_ids exercise harness plumbing only; gate "
         "evidence requires a reviewed seed set, not a synthetic fixture pass.",
+        "matching snapshot strings are packet identity, not authenticated "
+        "proof of a frozen corpus.",
         "per-class means over small samples are noisy; ties count as no "
         "regression and float noise below 1e-9 is ignored.",
         "latency, degradation, and answer quality are reported elsewhere "
         "and are not gated here.",
     ]
 
+    if synthetic_only:
+        ok = False
+        reason = (
+            "synthetic plumbing evidence only; not a real quality "
+            "certification: " + reason
+        )
+        limitations = [
+            "explicitly labeled synthetic plumbing: numeric comparison is "
+            "preserved to exercise the harness, but the decision certifies "
+            "no real retrieval quality.",
+        ] + limitations
+
     return {
         "ok": ok,
         "reason": reason,
         "gate": "quality",
+        "evidence": "synthetic-plumbing" if synthetic_only else "frozen-corpus",
         "baseline": baseline,
         "candidate": candidate,
         "metric": metric_label,

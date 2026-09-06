@@ -71,7 +71,6 @@ def test_unregistered_source_verified_bytes_unchanged_and_reload_distinct(setup)
     [
         "packaged",
         "different_checkout",
-        "missing_payload",
         "changed_server",
         "stale_build",
         "dirty_source",
@@ -87,8 +86,6 @@ def test_incomplete_preserves_config(setup, mode):
         repo = None
     elif mode == "different_checkout":
         repo = repo.parent
-    elif mode == "missing_payload":
-        payload = None
     elif mode == "changed_server":
         server.write_text("changed")
     elif mode == "stale_build":
@@ -243,3 +240,44 @@ def test_dry_run_skipped_from_applied_count(setup):
     repo, _, _, _ = setup
     result = inspect_hermes(repo=repo, dry_run=True)
     assert result["skipped"] is True and result["artifact"] == "not_validated"
+
+
+def test_wire_skipped_checkout_binding_is_skip_not_failure(setup):
+    """D5 Hermes-only fleet: checkout-verified binding with no installer target."""
+    repo, _, config, _ = setup
+    before = config.read_bytes()
+    result = inspect_hermes(repo=repo, new_root=None)
+    assert result["exit_code"] == 0 and result["skipped"] is True
+    assert "wire skipped" in result["reason"]
+    assert "without payload cross-verification" in result["reason"]
+    assert "verified" not in result["reason"].replace("without payload cross-verification", "")
+    assert config.read_bytes() == before
+
+
+def test_wire_skipped_packaged_binding_preserved_without_verification(setup):
+    """D5 packaged install: no payload and no checkout means skip, not fail —
+    but the reason must say plainly that nothing was verified."""
+    _, _, config, _ = setup
+    before = config.read_bytes()
+    result = inspect_hermes(repo=None, new_root=None)
+    assert result["exit_code"] == 0 and result["skipped"] is True
+    assert "without verification" in result["reason"]
+    assert config.read_bytes() == before
+
+
+def test_fleet_wire_skipped_shape_does_not_fail_hermes_binding(setup, monkeypatch):
+    """The real D5 wire shape: exit_code 1 with NO install_root key at all."""
+    from minni import fleet_sync as fleet
+
+    repo, _, _, _ = setup
+    monkeypatch.setattr(fleet, "_detect_install_kind", lambda: ("editable-checkout", repo))
+    monkeypatch.setattr(
+        fleet, "_run_wire",
+        lambda **kw: {"name": "wire_all", "exit_code": 1, "status": "skipped", "skipped": True,
+                      "reason": "wire reported nothing to wire (status=skipped)"},
+    )
+    monkeypatch.setattr(fleet, "_audit_deploy_symlinks", lambda *a, **kw: {"name": "audit", "exit_code": 0})
+    result = fleet.run_fleet_sync(propagate_hosts=False, restart_daemon=False)
+    step = next(s for s in result.steps if s["name"] == "hermes_source_binding")
+    assert step.get("skipped") is True
+    assert result.ok is True

@@ -29,6 +29,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from minni.vector_backend import VectorBackend, VectorItem, VectorHit
+from minni.request_deadline import RequestDeadlineExceeded
 
 logger = logging.getLogger("sovereign.backends.faiss_disk")
 
@@ -63,6 +64,8 @@ class FaissDiskBackend:
                         "FaissDiskBackend: loaded %d vectors from disk cache",
                         self._faiss.count,
                     )
+            except RequestDeadlineExceeded:
+                raise
             except Exception as exc:
                 logger.debug("FaissDiskBackend: disk cache load failed (non-fatal): %s", exc)
 
@@ -158,6 +161,8 @@ class FaissDiskBackend:
 
                 hits.sort(key=lambda h: h.score, reverse=True)
                 return hits[:k]
+            except RequestDeadlineExceeded:
+                raise
             except Exception as exc:
                 logger.warning("FaissDiskBackend: SQLite post-filter failed: %s — returning raw hits", exc)
         else:

@@ -257,10 +257,22 @@ def _wire_platform(
             )
         elif kind == "kilo-json":
             bridge = Path.home() / ".config/kilo/plugin/minni.js"
-            refresh_bridge = not bulk or (
-                bridge.is_file() and not bridge.is_symlink()
-                and _is_managed_bridge(bridge.read_bytes())
-            )
+            if bulk:
+                try:
+                    bridge_managed = (
+                        bridge.is_file() and not bridge.is_symlink()
+                        and _is_managed_bridge(bridge.read_bytes())
+                    )
+                except OSError:
+                    # stat-then-read race: an existing but unreadable bridge
+                    # (mode 000, ACL, foreign-user HOME) must fall into the
+                    # designed graceful path below — MCP binding refreshed,
+                    # bridge reported unmanaged — instead of failing the whole
+                    # platform before its binding is refreshed.
+                    bridge_managed = False
+                refresh_bridge = bridge_managed
+            else:
+                refresh_bridge = True
             if refresh_bridge:
                 config_path, extras["kilo_bridge"] = install_kilo_bridge(
                     install_root, agent, vault, socket, stamp_workspace, afm_env,
@@ -276,6 +288,9 @@ def _wire_platform(
         elif kind == "antigravity":
             extras["antigravity"] = update_antigravity_config(
                 install_root, agent, vault, socket, stamp_workspace, afm_env,
+                # Bulk refresh must not activate views the operator never
+                # enabled; explicit `wire antigravity` keeps full-surface write.
+                existing_only=bulk,
             )
             extras["agy_hooks"] = update_agy_plugin_hooks(install_root)
             views_written = extras["antigravity"].get("views_written", [])

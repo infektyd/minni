@@ -8,18 +8,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import tempfile
 
 from minni.wire.manifest import PayloadManifest, sha256_file, utc_now_iso
-from minni.wire.paths import plugin_base
+from minni.wire.paths import is_safe_version_segment, plugin_base
 from minni.wire.platform import CANONICAL_FLEET
 from minni.wire.wired import WireRecord, upsert_wire
 
 _CUSTOM = {"muse": ".muse/mcp.json", "devin": ".config/devin/mcp_config.json"}
-_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:[+.-][A-Za-z0-9_.+-]+)?$")
 
 
 def wire_report_root(text: str) -> Path | None:
@@ -46,7 +44,11 @@ def wire_report_root(text: str) -> Path | None:
 
 
 def _version_root(root: Path, base: Path) -> bool:
-    return root.is_absolute() and root.parent.resolve() == base.resolve() and bool(_VERSION.fullmatch(root.name))
+    # Name check reuses the canonical wire contract (paths.is_safe_version_segment),
+    # which accepts the prerelease/dev names dev_version produces (e.g.
+    # `0.6.0rc1+git.<sha>`). Containment, symlink, and manifest checks below stay.
+    return (root.is_absolute() and root.parent.resolve() == base.resolve()
+            and is_safe_version_segment(root.name))
 
 
 def _payload(root: Path, base: Path) -> PayloadManifest:
@@ -74,6 +76,65 @@ def _replace(path: Path, content: bytes, mode: int) -> None:
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def _installer_current_target(base: Path) -> Path | None:
+    """Payload the installer last blessed via the `current` pointer, or None.
+
+    `current` is written by install_payload on every real release install
+    (never for local/dev versions, never on dry runs), so it is
+    installer-ordered — but it is NOT chronology: version names carry git
+    hashes (`0.5.0+git.<hash>`), and no string or PEP 440 comparison of those
+    names can establish newest. Only a validated pointer counts: it must be a
+    symlink resolving inside the plugin base to a version dir whose manifest
+    verifies. Anything else (absent, non-symlink, loop, outside the base,
+    unverifiable bytes) is untrustworthy and yields None. Read-only.
+    """
+    link = base / "current"
+    try:
+        if not link.is_symlink():
+            return None
+        target = link.resolve()
+        _payload(target, base)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return None
+    return target
+
+
+def _no_installer_target(record: dict, old_root: Path, base: Path, *, dry_run: bool) -> dict:
+    """Verdict for a registered binding when the installer supplied no target.
+
+    A custom-only fleet (wire skipped: nothing to wire) is not a redeploy
+    failure. The binding is checked against its own registered root, which is
+    verified above. Supported claims only:
+    - binding tracks the validated installer `current` pointer -> nothing to
+      do (skipped as already current);
+    - otherwise -> skipped, reporting that the binding matches its verified
+      payload and no target was supplied. A validated `current` pointer is
+      named with the explicit `--new-root` remedy; without one, no
+      newest/already-current language is used at all. Custom bindings are
+      never moved automatically: the installer did not order it.
+    """
+    current = _installer_current_target(base)
+    if current is not None and old_root.resolve() == current.resolve():
+        reason = (
+            "registered MCP binding tracks the installer's current payload "
+            f"({current.name}); no installer target supplied"
+        )
+    elif current is not None:
+        reason = (
+            f"registered binding matches its verified payload {old_root.name}; "
+            f"the installer current pointer names {current.name} — pass "
+            "custom_refresh --new-root with an existing verified payload to move it "
+            "(never moved automatically)"
+        )
+    else:
+        reason = (
+            "registered MCP binding matches its verified payload; "
+            "no installer target supplied and no validated installer pointer"
+        )
+    status = "dry-run" if dry_run else "skipped"
+    return {"platform": record.get("platform"), "status": status, "reason": reason}
 
 
 def _check_record(record: dict) -> None:
@@ -123,9 +184,10 @@ def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
     if entry.get("args") != [str(old_root / "dist/server.js")]:
         return {**result, "reason": "custom MCP arguments differ from registered payload; preserved"}
     if new_root is None:
-        return {**result, "status": "failed", "reason":
-                "installer supplied no target (custom-only fleet is not installed by wire); "
-                "use custom_refresh --new-root with an existing verified payload"}
+        # Custom-only fleet (wire skipped: nothing to wire) is not a redeploy
+        # failure. The binding was verified against its registered root above;
+        # assess it there rather than failing for a target nobody supplied.
+        return _no_installer_target(record, old_root, base, dry_run=dry_run)
     if (dry_run and _version_root(new_root, base)
             and not new_root.exists() and not new_root.is_symlink()):
         return {**result, "status": "dry-run", "target_validation": "not_validated",
@@ -141,9 +203,24 @@ def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
             notes.append("cwd preserved: existing directory is not a verified Minni payload")
         else:
             entry["cwd"] = str(new_root)
-    if (old_root == new_root and record.get("version") == manifest.version
-            and json.loads(original) == data):
-        return {**result, "reason": "registered MCP binding already current"}
+    if json.loads(original) == data:
+        # Verified binding already the exact target: never rewrite the operator
+        # configuration, never write a backup.
+        if old_root == new_root and record.get("version") == manifest.version:
+            return {**result, "reason": "registered MCP binding already current"}
+        if dry_run:
+            return {"platform": platform, "status": "dry-run",
+                    "reason": "registry record lags a binding that already targets the payload",
+                    "notes": notes}
+        # Binding exact, registry lagging (e.g. a prior run wrote the config but
+        # failed before registry publication): repair Minni's own registry row
+        # without touching operator configuration or writing a backup.
+        _check_record(record)
+        upsert_wire(WireRecord(platform=platform, config_path=str(config),
+                    install_root=str(new_root), version=manifest.version,
+                    workspace=record.get("workspace"), wired_at=utc_now_iso()),
+                    expected_record=record)
+        return {**result, "reason": "registered MCP binding already exact target; registry record repaired without rewriting configuration"}
     replacement = (json.dumps(data, indent=2) + "\n").encode()
     if dry_run:
         return {"platform": platform, "status": "dry-run", "reason": "would refresh registered MCP binding", "notes": notes}

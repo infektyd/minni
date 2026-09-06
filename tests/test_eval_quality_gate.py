@@ -22,10 +22,32 @@ def _entry(query, score, expected=(1,), notes="exact-match"):
     }
 
 
+# Explicit frozen-corpus evidence for scoring fixtures: the gate requires a
+# positively recorded snapshot identity on both sides, and nothing is
+# inferred from absence. This is packet identity for test plumbing, not
+# authenticated proof of a frozen corpus.
+FROZEN_SNAPSHOT = "sha256:frozen-study-corpus-v1"
+
+
+def _frozen_provenance(snapshot=FROZEN_SNAPSHOT):
+    return {
+        "corpus": {"snapshot": snapshot, "frozen": True},
+        "principal": {"backend": "frozen-snapshot", "mock": False},
+    }
+
+
 def _reports(baseline_entries, candidate_entries):
     return {
-        "baseline": {"summary": {}, "per_query": baseline_entries},
-        "candidate": {"summary": {}, "per_query": candidate_entries},
+        "baseline": {
+            "summary": {},
+            "per_query": baseline_entries,
+            "provenance": _frozen_provenance(),
+        },
+        "candidate": {
+            "summary": {},
+            "per_query": candidate_entries,
+            "provenance": _frozen_provenance(),
+        },
     }
 
 
@@ -172,8 +194,14 @@ class TestQualityGateEdges:
 
     def test_candidate_auto_resolves_with_two_reports(self):
         reports = {
-            "minnid-baseline": {"per_query": [_entry("a", 0.5)]},
-            "minnid-with-expand": {"per_query": [_entry("a", 0.6)]},
+            "minnid-baseline": {
+                "per_query": [_entry("a", 0.5)],
+                "provenance": _frozen_provenance(),
+            },
+            "minnid-with-expand": {
+                "per_query": [_entry("a", 0.6)],
+                "provenance": _frozen_provenance(),
+            },
         }
         gate = evaluate_quality_gate(
             reports, baseline="minnid-baseline", candidate=None
@@ -579,7 +607,7 @@ class TestQualityGateCli:
         assert gate["comparable_queries"] == 300
         assert gate["unevaluable_classes"] == []
 
-    def test_reviewed_corpus_zero_threshold_passes(self, tmp_path, monkeypatch):
+    def test_reviewed_corpus_zero_threshold_never_certifies_mock(self, tmp_path, monkeypatch):
         from minni.eval.harness import cmd_run
 
         queries_path = tmp_path / "queries.jsonl"
@@ -592,10 +620,21 @@ class TestQualityGateCli:
             "minni.eval.harness._reports_dir", lambda: reports_dir
         )
 
-        cmd_run(self._args(queries_path, min_improvement=0.0))
+        # Mock plumbing keeps the numeric comparison but must not certify
+        # real quality, even at a zero threshold: the tie is computed, then
+        # downgraded to a positively labeled synthetic failure (exit 3).
+        with pytest.raises(SystemExit) as exc:
+            cmd_run(self._args(queries_path, min_improvement=0.0))
+        assert exc.value.code == 3
         gate_reports = list(reports_dir.glob("*-quality-gate.json"))
         assert len(gate_reports) == 1
-        assert json.loads(gate_reports[0].read_text())["ok"] is True
+        gate = json.loads(gate_reports[0].read_text())
+        assert gate["ok"] is False
+        assert gate["evidence"] == "synthetic-plumbing"
+        assert "synthetic plumbing evidence only" in gate["reason"]
+        assert gate["comparable_queries"] == 300
+        assert gate["baseline_score"] == pytest.approx(1.0)
+        assert gate["candidate_score"] == pytest.approx(1.0)
 
 
 class TestLegacyGatePreserved:

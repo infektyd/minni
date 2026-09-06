@@ -137,6 +137,43 @@ test("retrieval operations are local-only by default", () => {
   assert.deepEqual(eligible.map((p) => p.name), ["afm"]);
 });
 
+test("edge_inference remains local-only despite config and cloud providers", async () => {
+  const configured = defaultProviderChain({
+    chain: ["afm"],
+    operations: { edge_inference: { localOnly: false } },
+    providers: {},
+  });
+  assert.equal(configured.operations.edge_inference.localOnly, true);
+
+  const cloud = fakeProvider({ name: "cloud-x", tier: "cloud", result: { ok: true } });
+  const local = fakeProvider({ name: "afm", tier: "local", result: { ok: true } });
+  const chain = new ProviderChain([cloud, local], { edge_inference: { localOnly: false } });
+
+  assert.deepEqual(chain.providersFor("edge_inference").map((p) => p.name), ["afm"]);
+
+  // The calls assertion is only meaningful when the chain actually executes.
+  const result = await chain.chat({ payload: {}, operation: "edge_inference" });
+  assert.equal(result.ok, true);
+  assert.equal(result.provider, "afm");
+  assert.equal(cloud.calls.length, 0);
+  assert.equal(local.calls.length, 1);
+});
+
+test("local-only chain denies allowlisted remote targets without invoking providers", async () => {
+  const local = fakeProvider({ name: "afm", tier: "local", result: { ok: true } });
+  const chain = new ProviderChain([local], { edge_inference: { localOnly: true } });
+
+  const result = await chain.chat({
+    payload: {},
+    operation: "edge_inference",
+    url: "https://afm.internal/v1/chat/completions",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.provider, "none");
+  assert.match(result.error ?? "", /loopback/);
+  assert.equal(local.calls.length, 0);
+});
+
 test("chain returns the first ok result and stops", async () => {
   const first = fakeProvider({ name: "one", result: { ok: true, data: { winner: true } } });
   const second = fakeProvider({ name: "two", result: { ok: true } });

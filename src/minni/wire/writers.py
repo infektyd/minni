@@ -480,6 +480,33 @@ def ensure_worker_permission_grant(
     )
 
 
+def _view_has_minni_binding(view_path: Path) -> bool | None:
+    """Whether a Gemini/Antigravity view already carries a Minni binding.
+
+    True when a `minni`/`sovereign-memory` server entry exists (same name
+    normalization as host discovery); False when the view parses without one;
+    None when it cannot be read. Bulk refresh must never activate a view the
+    operator never enabled, so only True views are eligible there — an
+    unreadable view is not provably configured and is left untouched.
+    """
+    try:
+        data = load_json(view_path)
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return False
+    for name in servers:
+        normalized = str(name).lower().replace("_", "-")
+        if normalized in {"minni", "sovereign-memory"} or normalized.startswith(
+            ("minni-", "sovereign-memory-")
+        ):
+            return True
+    return False
+
+
 def update_antigravity_config(
     install_root: Path,
     agent: str,
@@ -487,15 +514,25 @@ def update_antigravity_config(
     socket_path: Path,
     workspace: Path,
     afm_env: dict[str, str] | None = None,
+    *,
+    existing_only: bool = False,
 ) -> dict[str, object]:
     server_path = install_root / "dist" / "server.js"
     launcher_fallback = not (
         shutil.which("mcp-env-run") or GEMINI_MCP_ENV_RUN.exists()
     )
     written: list[str] = []
+    skipped_unconfigured: list[str] = []
     for surface in GEMINI_SURFACE_CONFIGS:
         surface_path = Path(surface).expanduser()
         target = surface_path.resolve() if surface_path.exists() else surface_path
+        if existing_only and _view_has_minni_binding(target) is not True:
+            # Bulk/refresh path: a view without a Minni binding stays exactly
+            # as the operator left it — refreshing it would activate an
+            # integration that was never enabled.
+            if target.exists():
+                skipped_unconfigured.append(str(target))
+            continue
         if write_view_entry(
             target, server_path, agent, vault, socket_path, workspace, afm_env,
             launcher_fallback=launcher_fallback,
@@ -511,6 +548,7 @@ def update_antigravity_config(
             granted.append(path_str)
     return {
         "views_written": written,
+        "views_skipped_unconfigured": skipped_unconfigured,
         "grants_updated": granted,
         "launcher_fallback": launcher_fallback,
     }

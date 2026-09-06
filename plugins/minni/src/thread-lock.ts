@@ -167,6 +167,97 @@ async function readOwner(ownerPath: string): Promise<ThreadLockOwner | undefined
   }
 }
 
+type StrictOwnerRead =
+  | { status: "missing" }
+  | { status: "unparseable" }
+  | { status: "owner"; value: ThreadLockOwner };
+
+/**
+ * Release-path owner read. Unlike the acquire path (which treats any read
+ * failure as "no observable owner"), release must distinguish absent or
+ * replaced owners (never delete those) from a transient IO failure (retry
+ * bounded, then fail loud rather than leak a live lock while reporting
+ * success). Only ENOENT is quiet; every other IO error throws.
+ */
+async function readOwnerStrict(ownerPath: string): Promise<StrictOwnerRead> {
+  let raw: string;
+  try {
+    raw = await readFile(ownerPath, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return { status: "missing" };
+    throw error;
+  }
+  const owner = parseOwner(raw);
+  if (owner === undefined) return { status: "unparseable" };
+  return { status: "owner", value: owner };
+}
+
+/** Bounded release attempts for transient owner-read failures. */
+const RELEASE_OWNER_READ_ATTEMPTS = 3;
+
+interface LockDirIdentity {
+  dev: number;
+  ino: number;
+}
+
+/**
+ * Remove the lock dir only when it is still verifiably ours: a successful
+ * owner read with our operation nonce plus an unchanged directory identity
+ * (dev+ino captured at acquire). A missing, unparseable, or replaced owner
+ * is never deleted. Returns undefined on release (or clean skip), otherwise
+ * the persistent release error for the caller to surface.
+ */
+async function releaseOwnLock(input: {
+  lockDir: string;
+  ownerPath: string;
+  operationId: string;
+  acquired: LockDirIdentity | undefined;
+  pollMs: number;
+}): Promise<unknown> {
+  let lastReadError: unknown;
+  for (
+    let attempt = 0;
+    attempt < RELEASE_OWNER_READ_ATTEMPTS;
+    attempt += 1
+  ) {
+    if (attempt > 0) await sleep(input.pollMs);
+    let read: StrictOwnerRead;
+    try {
+      read = await readOwnerStrict(input.ownerPath);
+    } catch (error) {
+      lastReadError = error;
+      continue;
+    }
+    lastReadError = undefined;
+    if (read.status === "missing") return undefined;
+    if (read.status === "unparseable") return undefined;
+    if (read.value.operationId !== input.operationId) return undefined;
+    if (input.acquired !== undefined) {
+      let current: LockDirIdentity;
+      try {
+        const lockStat = await stat(input.lockDir);
+        current = { dev: lockStat.dev, ino: lockStat.ino };
+      } catch (error) {
+        if (isErrno(error, "ENOENT")) return undefined;
+        return error;
+      }
+      if (
+        current.dev !== input.acquired.dev ||
+        current.ino !== input.acquired.ino
+      ) {
+        return undefined;
+      }
+    }
+    try {
+      await rm(input.lockDir, { recursive: true, force: true });
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  }
+  return lastReadError;
+}
+
 function recoveryAuditPath(vaultPath: string): string {
   return path.join(vaultPath, ".runtime", "thread-locks", "recovery.jsonl");
 }
@@ -316,14 +407,44 @@ export async function withThreadLock<T>(
     await sleep(Math.min(pollMs, remainingMs));
   }
 
+  // Directory identity at acquire: the release below removes the dir only
+  // when this identity still matches, so a reaped-and-replaced lock (even
+  // under a reused operation id) is never deleted. Best-effort: without it
+  // release falls back to the operation-nonce check alone.
+  let acquiredIdentity: LockDirIdentity | undefined;
   try {
-    return await fn();
-  } finally {
-    const currentOwner = await readOwner(ownerPath);
-    if (currentOwner?.operationId === operationId) {
-      await rm(lockDir, { recursive: true, force: true });
-    }
+    const lockStat = await stat(lockDir);
+    acquiredIdentity = { dev: lockStat.dev, ino: lockStat.ino };
+  } catch {
+    acquiredIdentity = undefined;
   }
+
+  let fnError: unknown;
+  let fnFailed = false;
+  let result: T | undefined;
+  try {
+    result = await fn();
+  } catch (error) {
+    fnError = error;
+    fnFailed = true;
+  }
+  const releaseError = await releaseOwnLock({
+    lockDir,
+    ownerPath,
+    operationId,
+    acquired: acquiredIdentity,
+    pollMs,
+  });
+  // A persistent release failure is loud when the mutation itself succeeded
+  // (returning success while leaking a live lock parks every later waiter).
+  // When the mutation already failed, its error stays authoritative.
+  if (releaseError !== undefined && !fnFailed) {
+    throw releaseError;
+  }
+  if (fnFailed) {
+    throw fnError;
+  }
+  return result as T;
 }
 
 function exclusiveReplanReservationPath(vaultPath: string, planId: string): string {

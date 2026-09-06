@@ -208,6 +208,22 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             conn.execute("BEGIN IMMEDIATE")
             for version, filepath in items:
                 logger.info("  Applying migration %03d: %s", version, os.path.basename(filepath))
+                if version == 21 and not _migration_021_base_tables_present(conn):
+                    # Non-destructive partial-schema guard: 021's ALTERs would
+                    # otherwise succeed against a base table that exists
+                    # (contradiction_log) while stamping a REFERENCES clause to
+                    # a parent that does not (documents). SQLite defers that
+                    # check to enforcement time, so every later INSERT with
+                    # foreign_keys=ON fails with "no such table:
+                    # main.documents". Skip the statements entirely — 021
+                    # stays unstamped and retries on a later run once the base
+                    # schema (db._init_schema) has supplied the tables.
+                    logger.warning(
+                        "Migration 021: base tables incomplete — skipping 021 "
+                        "statements (non-destructive); 021 stays pending and "
+                        "will retry once the base schema is supplied"
+                    )
+                    continue
                 with open(filepath, "r", encoding="utf-8") as fh:
                     sql = fh.read()
                 for statement in _split_statements(sql):
@@ -381,6 +397,22 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migration_021_base_tables_present(conn: sqlite3.Connection) -> bool:
+    """
+    True when every base table 021 mutates already exists.
+
+    learning_documents is created BY 021, so it is not in the gate set; the
+    other four (documents, learnings, memory_links, contradiction_log) must
+    all be present before any 021 statement executes. Gating on the full set
+    (not just the ALTER target) also keeps learning_documents' REFERENCES
+    clauses from dangling the same way.
+    """
+    return all(
+        _table_exists(conn, tbl)
+        for tbl in ("documents", "learnings", "memory_links", "contradiction_log")
+    )
 
 
 def _verify_migration_021_graph_schema(conn: sqlite3.Connection) -> bool:

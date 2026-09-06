@@ -874,8 +874,35 @@ def ensure_permission_grant(
     return True
 
 
+def _view_has_minni_binding(view_path: Path) -> bool | None:
+    """Whether a Gemini/Antigravity view already carries a Minni binding.
+
+    Mirror of the wire writers gate: True when a `minni`/`sovereign-memory`
+    server entry exists, False when the view parses without one, None when it
+    cannot be read. Existing-only refresh must never activate a view the
+    operator never enabled — an unreadable view is not provably configured
+    and is left untouched.
+    """
+    try:
+        data = load_json(view_path)
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return False
+    for name in servers:
+        normalized = str(name).lower().replace("_", "-")
+        if normalized in {"minni", "sovereign-memory"} or normalized.startswith(
+            ("minni-", "sovereign-memory-")
+        ):
+            return True
+    return False
+
+
 def update_antigravity_config(
-    install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None
+    install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None, *, existing_only: bool = False
 ) -> dict[str, object]:
     """Wire the `minni` server across the Antigravity/Gemini surfaces.
 
@@ -883,14 +910,21 @@ def update_antigravity_config(
     symlink to its view file) and ensures the per-tool READ-ONLY permission grants
     (X1: no `mcp(minni/*)` wildcard) in the CLI settings and the shared config.
     The gemini-cli extension manifest is handled separately by
-    update_gemini_manifest.
+    update_gemini_manifest. With `existing_only`, only views that already carry
+    a Minni binding are refreshed; other views stay exactly as the operator
+    left them.
     """
     server_path = install_root / "dist" / "server.js"
     written: list[str] = []
+    skipped_unconfigured: list[str] = []
     for surface in GEMINI_SURFACE_CONFIGS:
         surface_path = Path(surface).expanduser()
         # Follow the symlink to the actual view file; skip broken/missing surfaces.
         target = surface_path.resolve() if surface_path.exists() else surface_path
+        if existing_only and _view_has_minni_binding(target) is not True:
+            if target.exists():
+                skipped_unconfigured.append(str(target))
+            continue
         if write_view_entry(target, server_path, agent, vault, socket_path, workspace, afm_env):
             written.append(str(target))
     grants = {
@@ -901,7 +935,7 @@ def update_antigravity_config(
     for path_str, key_path in grants.items():
         if ensure_permission_grant(Path(path_str).expanduser(), key_path):
             granted.append(path_str)
-    return {"views_written": written, "grants_updated": granted}
+    return {"views_written": written, "views_skipped_unconfigured": skipped_unconfigured, "grants_updated": granted}
 
 
 AGY_PLUGIN_NAME = "minni"
@@ -1626,6 +1660,8 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         # Antigravity CLI/IDE/antigravity surface views + permission grants.
         update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
         antigravity_result = update_antigravity_config(
+            install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env, existing_only=True
+        ) if existing_only else update_antigravity_config(
             install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
         )
 

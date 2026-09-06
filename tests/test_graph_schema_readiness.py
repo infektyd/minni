@@ -171,6 +171,38 @@ def test_tc_ready_01_clean_db_ready():
     assert msg == "ready"
 
 
+def test_memory_links_primary_key_must_exclude_weight():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    conn.execute("DROP TABLE memory_links")
+    conn.execute(
+        """CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type, weight)
+        )"""
+    )
+
+    report = verify_graph_schema(conn)
+    assert not report.ready
+    assert any("memory_links' primary key shape mismatch" in error for error in report.errors)
+
+
+def test_learning_documents_rejects_unique_doc_id_constraint():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    conn.execute("CREATE UNIQUE INDEX unique_learning_documents_doc_id ON learning_documents(doc_id)")
+
+    report = verify_graph_schema(conn)
+    assert not report.ready
+    assert any("unique constraint on 'doc_id'" in error for error in report.errors)
+
+
 def test_tc_ready_02_missing_learning_documents():
     """TC-READY-02: Fresh DB missing table learning_documents yields schema_missing."""
     conn = sqlite3.connect(":memory:")
@@ -227,6 +259,150 @@ def test_tc_ready_03_drifted_edge_status_nullability_and_default():
     assert report.status == "schema_drifted"
     error_text = " ".join(report.errors)
     assert "nullability mismatch" in error_text or "default value mismatch" in error_text
+
+
+def test_memory_links_rejects_restrictive_edge_status_check():
+    """A CHECK allowing only active cannot satisfy the edge lifecycle contract."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+
+    conn.executescript(
+        """
+        DROP TABLE memory_links;
+        CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            confidence REAL,
+            inference_method TEXT,
+            model_id TEXT,
+            prompt_version TEXT,
+            inference_run_id TEXT,
+            evidence_json TEXT,
+            inferred_at REAL,
+            edge_status TEXT NOT NULL DEFAULT 'active' CHECK(edge_status = 'active'),
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type)
+        );
+        CREATE INDEX idx_memory_links_target_active
+            ON memory_links(target_doc_id, edge_status, link_type, source_doc_id);
+        CREATE INDEX idx_memory_links_source_active
+            ON memory_links(source_doc_id, edge_status, link_type, target_doc_id);
+        """
+    )
+
+    report = verify_graph_schema(conn)
+    assert report.status == "schema_drifted"
+    assert any("prevents edge_status='stale'" in error for error in report.errors)
+
+
+def test_memory_links_rejects_nested_restrictive_edge_status_check():
+    """A nested CHECK(edge_status IN ('active')) must also fail the lifecycle."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+
+    conn.executescript(
+        """
+        DROP TABLE memory_links;
+        CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            confidence REAL,
+            inference_method TEXT,
+            model_id TEXT,
+            prompt_version TEXT,
+            inference_run_id TEXT,
+            evidence_json TEXT,
+            inferred_at REAL,
+            edge_status TEXT NOT NULL DEFAULT 'active' CHECK(edge_status IN ('active')),
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type)
+        );
+        CREATE INDEX idx_memory_links_target_active
+            ON memory_links(target_doc_id, edge_status, link_type, source_doc_id);
+        CREATE INDEX idx_memory_links_source_active
+            ON memory_links(source_doc_id, edge_status, link_type, target_doc_id);
+        """
+    )
+
+    report = verify_graph_schema(conn)
+    assert report.status == "schema_drifted"
+    assert any("prevents edge_status='stale'" in error for error in report.errors)
+    conn.close()
+
+
+def test_omitted_fk_target_resolves_to_parent_pk():
+    """FOREIGN KEY (doc_id) REFERENCES documents (no column) means the PK."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    assert verify_graph_schema(conn).ready is True
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE learning_documents")
+    conn.execute(
+        """CREATE TABLE learning_documents (
+            learning_id INTEGER NOT NULL REFERENCES learnings(learning_id),
+            doc_id INTEGER NOT NULL,
+            created_at REAL,
+            PRIMARY KEY (learning_id, doc_id),
+            FOREIGN KEY (doc_id) REFERENCES documents ON DELETE CASCADE)"""
+    )
+    conn.execute("CREATE INDEX idx_learning_documents_doc_id ON learning_documents(doc_id)")
+    conn.commit()
+
+    report = verify_graph_schema(conn)
+    assert report.ready is True, report.errors
+    conn.close()
+
+
+def test_tc_ready_declared_type_drift():
+    """A required column with the wrong declared type flags schema drift."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+
+    conn.executescript(
+        """
+        DROP TABLE memory_links;
+        CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            confidence INTEGER,
+            inference_method TEXT,
+            model_id TEXT,
+            prompt_version TEXT,
+            inference_run_id TEXT,
+            evidence_json TEXT,
+            inferred_at REAL,
+            edge_status TEXT NOT NULL DEFAULT 'active',
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type),
+            FOREIGN KEY(source_doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE,
+            FOREIGN KEY(target_doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_memory_links_target_active
+            ON memory_links(target_doc_id, edge_status, link_type, source_doc_id);
+        CREATE INDEX idx_memory_links_source_active
+            ON memory_links(source_doc_id, edge_status, link_type, target_doc_id);
+        """
+    )
+    conn.commit()
+
+    report = verify_graph_schema(conn)
+    assert report.ready is False
+    assert report.status == "schema_drifted"
+    assert (
+        "column 'memory_links.confidence' declared type mismatch: expected REAL, got INTEGER"
+        in report.errors
+    )
 
 
 def test_tc_ready_04_drifted_pk_shape_learning_documents():
@@ -404,6 +580,47 @@ def test_tc_ready_07_drifted_index_unique_and_partial_predicate():
     report4 = verify_graph_schema(conn4)
     assert report4.ready is True
     assert report4.status == "ready"
+
+    # Sub-case E: Collation drift changes URI deduplication semantics
+    conn5 = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn5)
+    _apply_migration_021_sql(conn5)
+
+    conn5.executescript(
+        """
+        DROP INDEX idx_documents_memory_uri;
+        CREATE UNIQUE INDEX idx_documents_memory_uri
+            ON documents(memory_uri COLLATE NOCASE) WHERE memory_uri IS NOT NULL;
+        """
+    )
+    conn5.commit()
+
+    report5 = verify_graph_schema(conn5)
+    assert report5.ready is False
+    assert report5.status == "schema_drifted"
+    assert any("collation mismatch" in err for err in report5.errors)
+
+
+def test_tc_ready_rejects_unexpectedly_partial_required_index():
+    """A required non-partial index recreated with a WHERE clause flags drift."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+
+    conn.executescript(
+        """
+        DROP INDEX idx_memory_links_target_active;
+        CREATE INDEX idx_memory_links_target_active
+            ON memory_links(target_doc_id, edge_status, link_type, source_doc_id)
+            WHERE edge_status = 'active';
+        """
+    )
+    conn.commit()
+
+    report = verify_graph_schema(conn)
+    assert report.ready is False
+    assert report.status == "schema_drifted"
+    assert any("unexpectedly partial" in err for err in report.errors)
 
 
 def test_tc_ready_drifted_fk_referencing_wrong_column():
@@ -723,8 +940,9 @@ def test_tc_ready_expression_unique_index_does_not_crash():
     conn.commit()
 
     report = verify_graph_schema(conn)
-    assert report.ready is True
-    assert report.status == "ready"
+    assert report.ready is False
+    assert report.status == "schema_drifted"
+    assert any("unique constraint involving 'memory_uri'" in err for err in report.errors)
 
 
 # =========================================================================
@@ -760,6 +978,32 @@ def test_migration_runner_clean_full_migration(tmp_path):
     # Integrity check passes
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     assert integrity == "ok"
+    conn.close()
+
+
+def test_unexpected_foreign_key_prevents_schema_readiness():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    conn.execute("CREATE TABLE other_parent (id INTEGER PRIMARY KEY)")
+    conn.execute("DROP TABLE learning_documents")
+    conn.execute(
+        """
+        CREATE TABLE learning_documents (
+            learning_id INTEGER NOT NULL REFERENCES learnings(learning_id),
+            doc_id INTEGER NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            created_at REAL,
+            PRIMARY KEY (learning_id, doc_id),
+            FOREIGN KEY (doc_id) REFERENCES other_parent(id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX idx_learning_documents_doc_id ON learning_documents(doc_id)")
+
+    report = verify_graph_schema(conn)
+
+    assert report.ready is False
+    assert any("unexpected foreign key" in error for error in report.errors)
     conn.close()
 
 
@@ -883,4 +1127,132 @@ def test_migration_runner_drifted_schema_raises_and_rolls_back(tmp_path):
         v for (v,) in conn.execute("SELECT version FROM schema_migrations").fetchall()
     }
     assert 21 not in applied
+    conn.close()
+
+
+def test_migration_021_partial_schema_leaves_no_dangling_fk_and_retries(tmp_path):
+    """Regression: 021 must not stamp a REFERENCES clause to a missing parent.
+
+    Partial shape from the field: contradiction_log exists (created by
+    migration 009) but documents was never created (no migration file creates
+    it; db._init_schema does). The old runner executed 021's ALTERs
+    tolerantly, so ADD COLUMN ... REFERENCES documents(doc_id) succeeded
+    against the missing parent, and every later INSERT with foreign_keys=ON
+    failed with "no such table: main.documents". The runner must skip 021's
+    statements entirely (non-destructive), keep contradiction_log writable,
+    leave 021 unstamped, and apply it on a later run once the base tables
+    arrive — with pre-existing rows preserved.
+    """
+    db_path = str(tmp_path / "dangling_fk.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    run_migrations(conn)
+
+    # documents is created by db._init_schema, not by any migration file.
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='documents'"
+    ).fetchone() is None
+    # 021 skipped non-destructively: unstamped, user_version stays honest.
+    applied = {
+        v for (v,) in conn.execute("SELECT version FROM schema_migrations").fetchall()
+    }
+    assert 21 not in applied
+
+    # contradiction_log (from 009) must carry NO FK targeting documents ...
+    fk_targets = {
+        str(row[2]).lower()
+        for row in conn.execute("PRAGMA foreign_key_list(contradiction_log)").fetchall()
+    }
+    assert "documents" not in fk_targets
+    # ... so writes with FK enforcement ON succeed.
+    conn.execute(
+        "INSERT INTO contradiction_log (memory_a_id, memory_b_id, detected_at, detection_method) "
+        "VALUES (1, 2, 0.0, 'test')"
+    )
+    conn.commit()
+
+    # Base tables arrive later; retry applies 021 with data preserved.
+    _create_baseline_schema(conn)
+    run_migrations(conn)
+
+    applied_after = {
+        v for (v,) in conn.execute("SELECT version FROM schema_migrations").fetchall()
+    }
+    assert 21 in applied_after
+    assert verify_graph_schema(conn).ready is True
+    assert conn.execute("SELECT COUNT(*) FROM contradiction_log").fetchone()[0] == 1
+    conn.execute("INSERT INTO documents (path) VALUES ('retry-doc')")
+    doc_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO contradiction_log "
+        "(memory_a_id, memory_b_id, detected_at, detection_method, source_doc_id) "
+        "VALUES (1, 2, 0.0, 'test', ?)",
+        (doc_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_migration_021_backfills_legacy_graph_rows():
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    conn.execute("INSERT INTO documents (path) VALUES ('legacy-source')")
+    source_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("INSERT INTO documents (path) VALUES ('legacy-target')")
+    target_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.executemany(
+        "INSERT INTO memory_links (source_doc_id, target_doc_id, link_type) VALUES (?, ?, ?)",
+        [
+            (source_id, target_id, "wikilink"),
+            (target_id, source_id, "derived_from"),
+            (source_id, source_id, "other"),
+        ],
+    )
+    conn.execute(
+        "INSERT INTO contradiction_log "
+        "(memory_a_id, memory_b_id, detected_at, detection_method, resolution_id) "
+        "VALUES (1, 2, 0.0, 'legacy', NULL)"
+    )
+    _apply_migration_021_sql(conn)
+
+    rows = conn.execute(
+        "SELECT link_type, confidence, inference_method FROM memory_links ORDER BY link_type"
+    ).fetchall()
+    assert rows == [
+        ("derived_from", 1.0, "writeback_evidence"),
+        ("other", 1.0, "legacy"),
+        ("wikilink", 1.0, "explicit_wikilink"),
+    ]
+    assert conn.execute(
+        "SELECT resolution_status FROM contradiction_log"
+    ).fetchone()[0] == "legacy_unclassified"
+    conn.close()
+
+
+def test_verifier_rejects_nominal_nonpk_column_carrying_pk_position(tmp_path):
+    """A required column declared nominal non-PK (pk=0) fails at any PK position."""
+    db_path = str(tmp_path / "pkpos.db")
+    conn = sqlite3.connect(db_path)
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    assert verify_graph_schema(conn).ready is True
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE learning_documents")
+    conn.execute(
+        """CREATE TABLE learning_documents (
+            learning_id INTEGER NOT NULL REFERENCES learnings(learning_id),
+            doc_id INTEGER NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            created_at REAL,
+            PRIMARY KEY (learning_id, doc_id, created_at))"""
+    )
+    conn.commit()
+
+    report = verify_graph_schema(conn)
+    assert report.ready is False
+    assert any(
+        "primary key position mismatch" in err and "created_at" in err
+        for err in report.errors
+    )
     conn.close()

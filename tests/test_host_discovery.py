@@ -192,6 +192,111 @@ def test_cursor_agent_with_propagated_binding_is_bulk_eligible(tmp_path):
     assert probe(tmp_path, 'cursor', bulk=True)['eligible'] is True
 
 
+def test_large_claude_history_config_is_accepted(tmp_path):
+    """Established installs whose ~/.claude.json passed 4 MiB still sync."""
+    executable(tmp_path, 'claude')
+    padding = 'x' * (5 * 1024 * 1024)
+    config(tmp_path, '.claude.json', json.dumps({
+        'mcpServers': {'minni': {'command': 'node'}},
+        'projectHistory': [padding],
+    }))
+    result = probe(tmp_path, 'claude-code', bulk=True)
+    assert result['eligible'] is True
+    assert result['host']['configured'] is True
+
+
+def test_absurd_config_size_still_fails_closed(tmp_path, monkeypatch):
+    from minni.wire import host_discovery as discovery
+    monkeypatch.setattr(discovery, '_MAX_CONFIG_BYTES', 16)
+    executable(tmp_path, 'claude')
+    config(tmp_path, '.claude.json', '{"mcpServers":{"minni":{"command":"node"}}}')
+    result = probe(tmp_path, 'claude-code', bulk=True)
+    assert result['eligible'] is False
+    assert result['status'] == 'failed'
+    assert result['host']['configured'] is None
+
+
+def test_claude_registry_only_binding_is_bulk_eligible(tmp_path):
+    executable(tmp_path, 'claude')
+    config(tmp_path, '.claude/plugins/installed_plugins.json', json.dumps({
+        'version': 2,
+        'plugins': {'minni@minni': [{'scope': 'user', 'installPath': '/p/0.5.0'}]},
+    }))
+    result = probe(tmp_path, 'claude-code', bulk=True)
+    assert result['eligible'] is True
+    assert result['host']['configured'] is True
+
+
+@pytest.mark.parametrize('body', [
+    '{"version": 2, "plugins": {}}',
+    '{"version": 2, "plugins": {"minni@minni": [{"scope": "project"}]}}',
+    '{"version": 2, "plugins": {"minni@minni": [{"scope": "user"}]}}',
+])
+def test_claude_registry_without_active_user_binding_not_configured(tmp_path, body):
+    executable(tmp_path, 'claude')
+    config(tmp_path, '.claude/plugins/installed_plugins.json', body)
+    result = probe(tmp_path, 'claude-code', bulk=True)
+    assert result['eligible'] is False
+    assert result['host']['configured'] is False
+
+
+def test_claude_registry_malformed_fails_closed(tmp_path):
+    executable(tmp_path, 'claude')
+    config(tmp_path, '.claude/plugins/installed_plugins.json', '{"plugins": {"minni@minni": "nope"}}')
+    result = probe(tmp_path, 'claude-code', bulk=True)
+    assert result['eligible'] is False
+    assert result['status'] == 'failed'
+
+
+def _claude_registry_home(tmp_path):
+    executable(tmp_path, 'claude')
+    config(tmp_path, '.claude/plugins/installed_plugins.json', json.dumps({
+        'version': 2,
+        'plugins': {'minni@minni': [{'scope': 'user', 'installPath': '/p/0.5.0'}]},
+    }))
+
+
+def test_claude_explicit_disable_is_not_reactivated_by_bulk(tmp_path):
+    """Installed is not active: enabledPlugins false must hold bulk off."""
+    _claude_registry_home(tmp_path)
+    config(tmp_path, '.claude/settings.json', '{"enabledPlugins": {"minni@minni": false}}')
+    result = probe(tmp_path, 'claude-code', bulk=True)
+    assert result['eligible'] is False
+    assert result['status'] == 'skipped'
+    assert 'disabled' in result['reason']
+    assert result['host']['configured'] is True
+    assert result['host']['binding_disabled'] is True
+
+
+def test_claude_explicit_wire_still_reaches_disabled_plugin(tmp_path):
+    _claude_registry_home(tmp_path)
+    config(tmp_path, '.claude/settings.json', '{"enabledPlugins": {"minni@minni": false}}')
+    assert probe(tmp_path, 'claude-code')['eligible'] is True
+
+
+@pytest.mark.parametrize('body', [
+    '{"enabledPlugins": {"minni@minni": true}}',
+    '{"enabledPlugins": {"other@other": false}}',
+    '{}',
+])
+def test_claude_settings_without_disable_keeps_bulk_eligible(tmp_path, body):
+    _claude_registry_home(tmp_path)
+    config(tmp_path, '.claude/settings.json', body)
+    assert probe(tmp_path, 'claude-code', bulk=True)['eligible'] is True
+
+
+@pytest.mark.parametrize('body', [
+    '{"enabledPlugins": []}',
+    '{"enabledPlugins": {"minni@minni": "no"}}',
+])
+def test_claude_settings_malformed_fails_closed(tmp_path, body):
+    _claude_registry_home(tmp_path)
+    config(tmp_path, '.claude/settings.json', body)
+    result = probe(tmp_path, 'claude-code', bulk=True)
+    assert result['eligible'] is False
+    assert result['status'] == 'failed'
+
+
 @pytest.mark.parametrize('location', ['user', 'homebrew', 'local'])
 def test_restricted_ambient_path_finds_real_known_launcher(tmp_path, monkeypatch, location):
     from minni.wire import host_discovery as discovery

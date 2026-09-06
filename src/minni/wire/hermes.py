@@ -83,6 +83,15 @@ def inspect_hermes(*, repo: Path | None, new_root: Path | None = None, dry_run: 
         if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
             raise ValueError("invalid environment mapping")
         if repo is None:
+            if new_root is None:
+                # Packaged install with wire skipped: no payload installed this
+                # run and no checkout to verify against. Nothing here can remedy
+                # that in-band, so skip loud instead of failing every sync.
+                # The binding is preserved WITHOUT verification — said plainly.
+                return skip(
+                    "No installer payload supplied (wire skipped) and no checkout "
+                    "to verify against; Hermes binding preserved without verification"
+                )
             return incomplete("Packaged sync cannot refresh the existing Hermes source binding; build its checkout")
         repo = repo.resolve()
         server = repo / "plugins/minni/dist/server.js"
@@ -116,7 +125,16 @@ def inspect_hermes(*, repo: Path | None, new_root: Path | None = None, dry_run: 
         if git("status", "--porcelain") or build.get("git_dirty") is not False or build.get("git_sha") != sha:
             return incomplete("Hermes source/build provenance is dirty or stale")
         if new_root is None:
-            return incomplete("No installer payload available to verify Hermes source bytes")
+            # Wire skipped (nothing to wire): no payload was installed this run,
+            # so there is nothing to cross-verify against — and no in-band action
+            # could produce one. The checkout-side verification above (launcher,
+            # build manifest, clean tree) did pass; report that honestly as a
+            # skip rather than a failure. Bytes are NOT claimed verified
+            # against an installer payload here.
+            return skip(
+                "No installer payload supplied (wire skipped); Hermes source binding "
+                f"matches checkout build {sha} — preserved without payload cross-verification"
+            )
         from minni.wire.custom_refresh import _payload
         from minni.wire.paths import plugin_base
 
