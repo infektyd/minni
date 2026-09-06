@@ -828,3 +828,109 @@ def test_deadline_free_legacy_pool_workers_see_none_and_keep_busy_timeout(db):
     assert worker_busy == [30000, 30000]
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 4321
     assert current_deadline() is None
+
+
+def _bare_encode_engine():
+    from minni.retrieval import RetrievalEngine
+    engine = object.__new__(RetrievalEngine)
+    engine.vector_model_down = False
+    return engine
+
+
+def test_request_deadline_reuses_query_embedding_across_engines(monkeypatch):
+    """Serial corpus legs under one RPC deadline encode a query once."""
+    import numpy as np
+    import minni.models as models
+    from minni.request_deadline import current_query_embed_cache
+
+    class Embedder:
+        calls = []
+
+        def encode(self, query, **kwargs):
+            self.calls.append(query)
+            return np.array([1.0, 2.0], dtype=np.float32)
+
+    model = Embedder()
+    monkeypatch.setattr(models, "get_embedder", lambda: model)
+    first = _bare_encode_engine()
+    second = _bare_encode_engine()
+    deadline = time.monotonic() + 30
+    with request_deadline(deadline):
+        assert current_query_embed_cache() is not None
+        left = first._encode_query("same query", deadline_monotonic=deadline)
+        left[0] = 99
+        right = second._encode_query("same query", deadline_monotonic=deadline)
+        other = first._encode_query("other query", deadline_monotonic=deadline)
+        assert list(right) == [1.0, 2.0]
+    assert model.calls == ["same query", "other query"]
+    assert list(other) == [1.0, 2.0]
+    with request_deadline(deadline):
+        again = second._encode_query("same query", deadline_monotonic=deadline)
+    assert again[0] == 1.0
+    assert model.calls == ["same query", "other query", "same query"]
+
+
+def test_query_embedding_memo_does_not_survive_deadline_or_scope_exit(monkeypatch):
+    """Cached vectors must not bypass an expired retrieve deadline."""
+    import numpy as np
+    import minni.models as models
+
+    class Embedder:
+        calls = []
+
+        def encode(self, query, **kwargs):
+            self.calls.append(query)
+            return np.array([3.0], dtype=np.float32)
+
+    model = Embedder()
+    monkeypatch.setattr(models, "get_embedder", lambda: model)
+    engine = _bare_encode_engine()
+    live = time.monotonic() + 30
+    with request_deadline(live):
+        filled = engine._encode_query("q", deadline_monotonic=live)
+        assert list(filled) == [3.0]
+        empty = engine._encode_query("q", deadline_monotonic=time.monotonic() - 1)
+        assert empty.size == 0
+    assert model.calls == ["q"]
+    engine._encode_query("q")
+    assert model.calls == ["q", "q"]
+
+
+def test_nested_request_deadline_reuses_outer_query_embedding_memo(monkeypatch):
+    import numpy as np
+    import minni.models as models
+
+    class Embedder:
+        calls = []
+
+        def encode(self, query, **kwargs):
+            self.calls.append(query)
+            return np.array([4.0], dtype=np.float32)
+
+    model = Embedder()
+    monkeypatch.setattr(models, "get_embedder", lambda: model)
+    outer = _bare_encode_engine()
+    inner = _bare_encode_engine()
+    with request_deadline(time.monotonic() + 30):
+        outer._encode_query("q")
+        with request_deadline(time.monotonic() + 10):
+            inner._encode_query("q")
+    assert model.calls == ["q"]
+
+
+def test_failed_encode_time_is_recorded(monkeypatch):
+    import minni.models as models
+    import minni.retrieval as retrieval
+
+    class FailingEmbedder:
+        def encode(self, *args, **kwargs):
+            raise RuntimeError("encoder failed after work")
+
+    monkeypatch.setattr(models, "get_embedder", lambda: FailingEmbedder())
+    ticks = iter([10.0, 10.025])
+    engine = _bare_encode_engine()
+    with monkeypatch.context() as patch:
+        patch.setattr(retrieval.time, "perf_counter", lambda: next(ticks))
+        result = engine._encode_query("failed specimen")
+    assert result.size == 0
+    assert engine._take_encode_ms() == pytest.approx(25.0)
