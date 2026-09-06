@@ -1,11 +1,15 @@
 # Minni Typed Memory Graph — Design Spec
 
 **Date:** 2026-07-09
-**Status:** approved design, pre-implementation
+**Reconciled:** 2026-09-05 (against `main` baseline `2af2d888`)
+**Status:** approved design, reconciled for implementation
 **Approach:** A — "Extend the spine" (extend `memory_links` and existing machinery; additive schema only)
+**Acceptance Addendum:** [2026-07-09-typed-memory-graph-acceptance-addendum.md](2026-07-09-typed-memory-graph-acceptance-addendum.md)
 **Provenance:** drafted by GPT-5.6 Sol (max effort, repo-grounded), red-teamed by Grok 4.5
 (8 findings, 2 critical — folded in below), arbitrated and synthesized by Claude Fable
-against pre-registered positions. Approved by Hans 2026-07-09.
+against pre-registered positions. Approved by Hans 2026-07-09. Reconciled 2026-09-05 by Antigravity
+peer in collaboration with Codex.
+
 
 ## Locked decisions
 
@@ -47,8 +51,8 @@ content-hash-addressed `_durable/*.md` document indexed for retrieval
 (minnid.py:327-353). This spec unifies new writes on the `_durable` document as the
 canonical graph node.
 
-**Red-team critical amendment (Grok F1):** because `_durable_doc_path` is keyed on
-`(agent_id, content)`, distinct live learnings with identical content map to the SAME
+**Red-team critical amendment (Grok F1) & Drift Reconciliation:** because `_durable_doc_path`
+is keyed on `(agent_id, content)`, distinct live learnings with identical content map to the SAME
 physical document row as steady-state behavior, not a legacy artifact. The mapping is
 therefore **many-to-one by design**:
 
@@ -59,14 +63,26 @@ therefore **many-to-one by design**:
 - `documents` gains `memory_kind TEXT` and `memory_uri TEXT` (unique partial index on
   `memory_uri` where not null). `memory_uri` remains `learning://<learning_id>` for the
   most recent mapping; traversal and repair must tolerate N learnings per node.
+- **Aggregate Liveness Rule (Reconciliation Invariant):** The canonical `documents` row
+  remains active (`page_status = 'accepted'`) as long as **at least one** associated learning
+  in `learning_documents` remains active (`superseded_by IS NULL` and `status NOT IN
+  ('rejected', 'expired', 'superseded')`). Only when **all** attached learnings are superseded
+  (or expired/rejected) does the canonical document transition to `page_status = 'superseded'`.
+  This prevents supersession of one learning from accidentally hiding other active learnings
+  sharing that document. See acceptance addendum §4.2 for the complete truth table.
 - `add_derived_from_edges()` receives the canonical doc_id instead of creating an alias.
 - Legacy `learning://` alias rows remain valid. A repair pass maps only provable 1:1
   aliases (copy edges, mark alias superseded); ambiguous content-deduplicated cases are
   reported via health diagnostics, never guessed.
 
-Typed inference operates only over `memory_kind IN ('learning','wiki')`.
+In Phase 1, typed inference operates strictly over `memory_kind = 'learning'`.
+Phase 3 expands typed inference to include `memory_kind = 'wiki'` as wiki pages receive
+schema stamps and stable URIs.
 
-### 1.3 Migration `016_typed_memory_graph.sql` (Phase 1, slimmed)
+### 1.3 Migration `021_typed_memory_graph.sql` (Reconciled from 016)
+
+*Drift note: Migrations 016 (`016_normalize_document_timestamps.sql`) through 020 (`020_thread_delivery_cursors.sql`)
+are already occupied on `main`. The typed memory graph migration is formally assigned number **`021`**.*
 
 ```sql
 ALTER TABLE documents ADD COLUMN memory_kind TEXT;
@@ -80,6 +96,8 @@ CREATE TABLE IF NOT EXISTS learning_documents (
     created_at REAL,
     PRIMARY KEY (learning_id, doc_id)
 );
+CREATE INDEX IF NOT EXISTS idx_learning_documents_doc_id
+    ON learning_documents(doc_id);
 
 ALTER TABLE memory_links ADD COLUMN confidence REAL;
 ALTER TABLE memory_links ADD COLUMN inference_method TEXT;
@@ -105,7 +123,7 @@ ALTER TABLE contradiction_log ADD COLUMN resolution_status TEXT DEFAULT 'unresol
 
 -- Grok F7: legacy rows distinguishable from new unresolved detections
 UPDATE contradiction_log SET resolution_status = 'legacy_unclassified'
-    WHERE resolution_status = 'unresolved';
+    WHERE resolution_status = 'unresolved' AND source_doc_id IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_contradiction_graph_pair
     ON contradiction_log(source_doc_id, target_doc_id, resolution_status);
@@ -115,7 +133,8 @@ UPDATE memory_links SET
     inference_method = COALESCE(inference_method, CASE link_type
         WHEN 'wikilink' THEN 'explicit_wikilink'
         WHEN 'derived_from' THEN 'writeback_evidence'
-        ELSE 'legacy' END);
+        ELSE 'legacy' END)
+    WHERE confidence IS NULL OR inference_method IS NULL;
 ```
 
 **Deferred (Grok F8):** the `memory_link_inference_runs` ledger table moves to Phase 2/3;
@@ -129,22 +148,31 @@ Rehydration goes through normal read authorization; hash mismatch marks the edge
 Application-level validation enforces vocabulary, finite [0,1] confidence/weight, and
 valid statuses (no CHECK constraints — would require table rebuild).
 
-### 1.4 Schema-readiness gate (promoted to Phase 1 hard requirement — Grok F5)
+### 1.4 Schema-readiness gate (Expanded Coverage — Grok F5 & Drift Audit)
 
 `SovereignDB._init_schema()` currently treats migration failure as non-fatal
-(db.py:397-411) and `_execute_tolerant` (migrations.py:387-426) can leave partial column
-sets on drifted schemas. Therefore: at daemon startup and on first graph-enabled request
-per store, a readiness probe compares `PRAGMA table_info(memory_links)` (and
-`learning_documents`, `contradiction_log`) against the expected 016 column set.
+(db.py:553-558) and `_execute_tolerant` (migrations.py:500-518) skips missing tables/columns
+on partial schemas without aborting. Probing only `memory_links` would leave partial schemas
+undetected.
+
+Therefore: at daemon startup and on first graph-enabled request per store, a readiness probe
+(`src/minni/graph_readiness.py`) comprehensively validates **all newly introduced schema objects**:
+- Tables present: `documents`, `learning_documents`, `memory_links`, `contradiction_log`.
+- All 18 added/defined columns present with required nullability/defaults.
+- Semantic constraints: Composite PK `(learning_id, doc_id)` and CASCADE FKs on `learning_documents`.
+- Indexes present and semantically correct: `idx_documents_memory_uri` (UNIQUE partial index),
+  `idx_learning_documents_doc_id`, `idx_memory_links_target_active` (covering),
+  `idx_memory_links_source_active` (covering), `idx_contradiction_graph_pair`.
 
 - Probe fails → graph features disabled for that store with `graph_status='schema_missing'`
-  in traces and health output.
-- `schema_missing` and `degraded` (runtime graph-query failure, §3.4) are **distinct
+  (or `'schema_drifted'`) in traces and health output.
+- `schema_missing` and `degraded` (runtime graph-query or model failure, §3.4) are **distinct
   statuses** — a broken migration must never present as a healthy-but-degraded graph.
+
 
 ## 2. Write path — inference at durable learning commit
 
-### 2.1 One commit coordinator
+### 2.1 One commit coordinator (Disentangling Promotion from Standing Repair)
 
 All durable learning paths converge on one coordinator (today there are four divergent
 paths: writeback.store_learning, governance.handle_learn(force), resolve_candidate,
@@ -156,20 +184,44 @@ infer_typed_edges(new_memory, candidates, run_id) -> EdgeInferenceBatch
 ```
 
 Embeddings, candidate shortlist, and the model call all happen OUTSIDE the write lock
-(prepare-before-transaction, mirroring retrieval.py:642-685). One short `BEGIN IMMEDIATE`
+(prepare-before-transaction, mirroring retrieval.py). One short `BEGIN IMMEDIATE`
 then atomically inserts: learning, canonical document + `learning_documents` row,
 FTS/chunks, typed edges, lifecycle mutations, contradiction rows. FAISS refresh after
 commit. No model call ever runs while holding a SQLite write transaction.
+
+**Standing Repair Decomposition (Reconciliation Invariant):**
+The fail-loud contract applies strictly to **NEW PROMOTIONS** (`resolve_candidate`,
+`handle_learn`). In contrast, **standing repair of already-durable projections**
+(`backfill.reconstruct_learning_projections`, `RetrievalEngine.index_durable_document`)
+governs records that are ALREADY durably committed in SQLite. Standing repair MUST NOT
+be treated as a new promotion:
+1. **Preserved Durable Truth**: The source learning row in `learnings` is committed and immutable.
+   Standing repair NEVER deletes, rolls back, or un-durables a learning.
+2. **Projection Repair Outcome**:
+   - `complete`: Canonical `documents`, `learning_documents`, and all `chunk_embeddings` rows written.
+   - `incomplete_lexical_only`: If embedder fails, canonical `documents`, `learning_documents`,
+     and FTS rows are written (lexical fallback), but vector embeddings are missing.
+     This is an **incomplete projection repair** (NOT a success); it is logged as degraded
+     and remains queued for vector backfill.
+   - `failed`: If SQLite write operations fail (I/O error, disk full), error is propagated.
+3. **Deferred Typed Edges**:
+   - If local classifier model is unavailable or times out during repair, projection repair
+     proceeds without edges, logging `edges_deferred='degraded'`. Edges are deferred to the
+     next `graph_maintenance` sweep.
+   - If schema is missing (`schema_missing`) or classification is disabled, edges are logged
+     as `edges_deferred='schema_missing'` or `'disabled'`.
 
 ### 2.2 Candidate shortlist
 
 1. Query existing FAISS with the new learning's embedding: top 48 chunks.
 2. Dedup to documents by max chunk similarity.
-3. Exclude self, non-memory kinds, terminal/blocked nodes, and any document the
-   committing principal cannot read.
-4. Keep ≤12 documents with cosine ≥ 0.42 (recall-oriented floor, slightly under
+3. Exclude self, terminal/blocked nodes, and any document the committing principal cannot read.
+4. **Phase 1 Filter**: Restrict candidates strictly to canonical **learnings**
+   (`memory_kind = 'learning'` and `page_type = 'learning'`). Wiki documents are excluded in
+   Phase 1 and enter candidate shortlisting in Phase 3.
+5. Keep ≤12 documents with cosine ≥ 0.42 (recall-oriented floor, slightly under
    graph_export's 0.45; the model is the precision gate).
-5. Send ≤8 highest-scoring pairs in ONE batched local-model call (excerpts ≤~220 tokens
+6. Send ≤8 highest-scoring pairs in ONE batched local-model call (excerpts ≤~220 tokens
    each, inside the 3,200-token AFM input budget).
 
 No candidates over the floor → commit normally, record `no_candidates` in the audit log.
@@ -206,13 +258,18 @@ Auto-supersession requires the target to be an active learning owned by the **sa
 in the same store** (Grok F6: cross-store supersession attempts are structurally excluded,
 not raced — they downgrade to a pending `graph_update_review` entry in
 `consolidation_actions`, as do wiki targets, already-superseded targets, other agents'
-learnings, and would-be cycles). The supersession transaction sets
-`learnings.superseded_by` + status, the canonical document's `superseded_by` +
-`page_status`, and keeps the `updates` edge active as historical provenance.
+learnings, and would-be cycles).
+
+**Aggregate Liveness in Auto-Supersession:** The supersession transaction sets
+`learnings.superseded_by = new_lid` and `status = 'superseded'`. However, the canonical
+document's `page_status` is updated to `'superseded'` ONLY if **all** other learnings
+attached to that canonical document via `learning_documents` are also superseded. If any
+attached learning remains active, `documents.page_status` remains `'accepted'`, ensuring
+the shared node remains recallable. The `updates` edge remains active as historical provenance.
 
 `contradicts` inserts doc IDs (and learning IDs when available) into `contradiction_log`.
 Raw detection does NOT emit `contradiction_events` — those retain their meaning of
-resolved supersession (governance.py:379-489).
+resolved supersession (governance.py).
 
 ### 2.5 Idempotency and failure behavior
 
@@ -220,23 +277,30 @@ resolved supersession (governance.py:379-489).
 model identity/revision, prompt version. Re-running: upserts matching edges via the
 composite PK, updates confidence/provenance only on successful runs, marks
 previously-inferred-now-absent edges from that source `stale`, never touches
-`wikilink`/`derived_from` (mirrors wiki_indexer's link-type-scoped pruning,
-wiki_indexer.py:563-601).
+`wikilink`/`derived_from` (mirrors wiki_indexer's link-type-scoped pruning).
 
 Pre-commit recheck of target existence/status/privacy/evidence hashes; one full retry on
 race; second mismatch → `edge_candidates_changed`.
 
-**Fail-loud boundary (approved):** if candidates exist and the local model is
-unavailable/times out/violates the contract — no durable learning, no edges, candidate
-stays staged, sanitized error recorded, RPC returns structured
-`edge_inference_unavailable | edge_inference_timeout | edge_inference_invalid_output`.
-A model outage delays durable promotion; it never loses the proposed memory and never
-silently commits an edge-less learning.
+**Operational Toggles (Decoupled Write vs. Read Flags):**
+- `config.graph_classification_enabled`: Governs write-time edge inference on promotion.
+- `config.graph_expansion_enabled`: Governs read-time 1-hop neighbor traversal in `retrieve()`.
+
+**Exact Outcome Semantics Across Operational States:**
+
+| State | New Promotion (`resolve_candidate`, `handle_learn`) | Standing Repair (`reconstruct_learning_projections`) |
+|---|---|---|
+| `ready` | Atomically commits learning + doc + join + chunks + edges. Returns `ok`. | Reconstructs doc + join + chunks + edges. Returns `complete`. |
+| `schema_missing` | **Fail-Loud**: Candidate stays staged in `proposed`. Zero durable writes. RPC returns `edge_inference_schema_missing`. | **Fail-Open**: Reconstructs baseline doc and chunks. Skips join/edges. Returns `incomplete_schema_missing` (truth preserved). |
+| `degraded` (model down/timeout) | **Fail-Loud**: Candidate stays staged in `proposed`. Zero durable writes. RPC returns `edge_inference_unavailable` or `timeout`. | **Fail-Open**: Reconstructs doc, join row, chunks. Edges deferred (`edges_deferred='degraded'`). Returns `complete_edges_deferred`. If embedder down: returns `incomplete_lexical_only`. |
+| `classification_disabled` (`graph_classification_enabled=False`) | Commits baseline learning + doc + chunks. No edge inference attempted. Returns `ok`. | Reconstructs baseline doc + chunks. Skips edge inference. Returns `complete_edges_disabled`. |
+
 
 Warm-path latency targets (unverified until measured against live AFM; §7 P1 exit
 criteria include measuring them): candidate lookup p95 ≤ 50ms; single batched model call
 p95 ≤ 1.2s, hard timeout 2.0s; added commit latency p95 ≤ 1.5s, p99 ≤ 2.2s; exactly one
 model call per commit.
+
 
 ## 3. Read path — graph-aware recall
 
@@ -300,10 +364,17 @@ already escalates. Both sides may also compete as normal rerank candidates.
 Graph-derived results add: `retrieval_origin='graph'`, `graph_rank`, `graph_score`,
 `graph_paths` (full edge chain with types, confidences, run IDs, model identity),
 `seed_doc_id`, and a human rationale ("one-hop incoming `updates` edge from lexical
-seed"). Extends the provenance assembled at retrieval.py:2519-2543. Neighbor content
+seed"). Extends the provenance assembled at retrieval.py. Neighbor content
 passes through the same instruction-like detection and escaped evidence envelope as
-direct hits; denied nodes are indistinguishable from absent nodes, but withheld-neighbor
-COUNTS appear in provenance ("1 neighbor withheld").
+direct hits; denied nodes are strictly indistinguishable from absent nodes.
+
+**Strict Privacy Indistinguishability (Drift Reconciliation):** In accordance with Minni
+security doctrine (`docs/contracts/AGENT.md`), caller-facing result envelopes and human
+rationales **must not** disclose withheld neighbor counts (e.g. "1 neighbor withheld").
+Disclosing count counters leaks the presence and topology of unauthorized edges.
+Unauthorized neighbors are dropped silently during candidate expansion before hydration,
+matching non-existent nodes bit-for-bit. Diagnostic counters are restricted exclusively to
+internal, operator-level audit traces.
 
 Runtime graph-query failure → baseline results + `graph_status='degraded'` + trace error.
 Distinct from `schema_missing` (§1.4). Never masquerades as successful graph recall.
@@ -344,7 +415,7 @@ actions; it never mutates edges directly ("dreams propose; waking endorses").
 
 ## 6. Testing and acceptance
 
-**Unit/migration:** 016 applies idempotently to shared + every per-vault DB; legacy edge
+**Unit/migration:** 021 applies idempotently to shared + every per-vault DB; legacy edge
 types preserved with timestamps; `EXPLAIN QUERY PLAN` proves backlink index use; all four
 durable-write entry points route through the coordinator; model-output validation rejects
 malformed/forged batches; repeated runs produce no duplicate edges/contradiction rows;
@@ -372,27 +443,33 @@ existing harness (src/minni/eval/) extended with `graph_enabled`. Ship criteria:
 
 ## 7. Phasing
 
-**P1 — smallest shippable retrieval slice:** migration 016 + readiness gate; canonical
-learning nodes (`learning_documents` join table) for new commits; single commit
+**P1 — smallest shippable retrieval slice:** migration 021 + expanded readiness gate;
+canonical learning nodes (`learning_documents` join table) for new commits; single commit
 coordinator; local classifier with hardcoded local-only policy; persisted typed edges +
 provenance; 1-hop expansion before rerank behind a feature flag; privacy gating inside
 expansion; export_graph principal gating; eval harness extension. NO auto-supersession.
+*Phase boundary note:* In Phase 1, edge inference is strictly learning-to-learning.
+Candidate shortlisting is restricted strictly to canonical learnings (`memory_kind = 'learning'`,
+`page_type = 'learning'`). Wiki documents are excluded from candidate shortlisting (neither
+sources nor targets) until Phase 3, when `wiki_indexer.py` stamps `memory_kind = 'wiki'` and
+stable memory URIs.
 *Exit: schema/idempotency/privacy tests green + graph-on/off eval gate + measured
 latency budgets.*
 
 **P2 — lifecycle semantics:** high-confidence same-agent/same-store `updates`
-supersession; extended contradiction_log integration + sidecars + subscription support;
-legacy `learning://` repair report; `memory_link_inference_runs` ledger table if run
-observability proves needed.
+supersession with N:1 aggregate liveness validation; extended contradiction_log integration
++ sidecars + subscription support; legacy `learning://` repair report; `memory_link_inference_runs`
+ledger table if run observability proves needed.
 *Exit: atomic-chain, stale-belief, contradiction-fanout, adversarial-ownership tests.*
 
 **P3 — depth and maintenance:** selective two-hop traversal; daily graph_maintenance
 pass; evidence-hash revalidation; relates upgrades; wiki indexing stamps
-`memory_kind='wiki'` + stable memory URIs.
+`memory_kind='wiki'` + stable memory URIs with active wiki write edge inference.
 *Exit: multi-hop eval split, bounded-latency, consolidation-action audit tests.*
 
 **P4 — outside this spec's gate:** privacy-gated graph export for UI; Memory Board
 visualization of real typed edges; optional /dream proposal integration.
+
 
 ## 8. Open questions and risks
 

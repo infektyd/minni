@@ -27,10 +27,10 @@ from minni.afm_provider import DEFAULT_AFM_CHAT_COMPLETIONS_URL, BridgeClient, r
 
 logger = logging.getLogger("sovereign.model_provider")
 
-OperationClass = Literal["retrieval", "prepare", "extraction"]
+OperationClass = Literal["retrieval", "prepare", "extraction", "edge_inference"]
 ProviderTier = Literal["local", "cloud"]
 
-_OPERATION_CLASSES = {"retrieval", "prepare", "extraction"}
+_OPERATION_CLASSES = {"retrieval", "prepare", "extraction", "edge_inference"}
 
 
 @dataclass(frozen=True)
@@ -217,6 +217,28 @@ class OperationPolicy:
     local_only: bool = False
 
 
+def _is_loopback_request_url(url: Optional[str]) -> bool:
+    """True when a model-target URL addresses the local loopback interface.
+
+    Single source of truth for the host set is minni.config._LOOPBACK_HOSTS
+    (mirror of afm.ts checkModelTarget); only the hostname is compared here —
+    an operator-allowlisted remote HTTPS endpoint is NOT loopback even though
+    check_model_target() would allow it for ordinary non-local requests.
+    """
+    from minni.config import _LOOPBACK_HOSTS
+    from urllib.parse import urlparse as _urlparse
+
+    if not url:
+        return False
+    try:
+        host = (_urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+
+
 def _sanitize_chain_result(result: ProviderResult) -> ProviderResult:
     """SEC (P3): secret hygiene is structural, not per-call-site.
 
@@ -246,16 +268,44 @@ class ProviderChain:
 
     def providers_for(self, operation: OperationClass) -> List[Any]:
         policy = self.operations.get(operation) or OperationPolicy()
+        if operation == "edge_inference":
+            # Structural local-only guarantee: edge_inference cannot route to cloud
+            policy = OperationPolicy(local_only=True)
         eligible = []
         for provider in self.providers:
             if not provider.supports(operation):
                 continue
-            if policy.local_only and getattr(provider, "tier", "local") != "local":
+            if policy.local_only and getattr(provider, "tier", None) != "local":
                 continue
             eligible.append(provider)
         return eligible
 
+    def requires_loopback(self, operation: OperationClass) -> bool:
+        """True when an operation's requests must target the loopback interface.
+
+        Mirrors the providers_for structural override: edge_inference is always
+        local-only; other operations follow their configured policy.
+        """
+        if operation == "edge_inference":
+            return True
+        policy = self.operations.get(operation) or OperationPolicy()
+        return policy.local_only
+
     def chat(self, request: ChatRequest, client: Optional[BridgeClient] = None) -> ProviderResult:
+        if self.requires_loopback(request.operation):
+            # Actual-request enforcement, not tier trust: even a provider that
+            # claims tier "local" must not receive a local-only request aimed
+            # at an allowlisted remote HTTPS endpoint. Ordinary non-local
+            # requests skip this check and keep allowlist compatibility.
+            url = request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL
+            if not _is_loopback_request_url(url):
+                return ProviderResult(
+                    ok=False,
+                    data={},
+                    provider="none",
+                    status="target_denied",
+                    error="afm_target_denied: local-only operation requires a loopback model target",
+                )
         eligible = self.providers_for(request.operation)
         if not eligible:
             return ProviderResult(
@@ -300,14 +350,20 @@ def default_provider_chain() -> ProviderChain:
     except Exception:  # noqa: BLE001 - config must never break retrieval
         cfg = None
 
-    operations: Dict[str, OperationPolicy] = {"retrieval": OperationPolicy(local_only=True)}
+    operations: Dict[str, OperationPolicy] = {
+        "retrieval": OperationPolicy(local_only=True),
+        "edge_inference": OperationPolicy(local_only=True),
+    }
     if cfg:
         for name, op_cfg in (cfg.get("operations") or {}).items():
             if name in _OPERATION_CLASSES and isinstance(op_cfg, dict):
                 # Secure default: retrieval stays local-only unless EXPLICITLY
                 # set false — {"operations": {"retrieval": {}}} must not flip
                 # retrieval cloud-eligible (mirror of providers.ts).
-                if name == "retrieval":
+                # Immutable Safety Override: edge_inference cannot be weakened by config.
+                if name == "edge_inference":
+                    local_only = True
+                elif name == "retrieval":
                     local_only = op_cfg.get("localOnly") is not False
                 else:
                     local_only = bool(op_cfg.get("localOnly", False))

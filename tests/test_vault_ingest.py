@@ -874,3 +874,63 @@ def test_index_wiki_retraction_settles_instead_of_repurging(tmp_path, monkeypatc
 
     assert first["excluded_purged"] == 1
     assert second["excluded_purged"] == 0, "the retraction must settle"
+
+
+def _legacy_links_db():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE documents (doc_id INTEGER PRIMARY KEY, path TEXT UNIQUE)")
+    conn.execute("INSERT INTO documents (path) VALUES ('a'), ('b')")
+    return conn
+
+
+def test_insert_wikilinks_falls_back_when_typed_columns_absent():
+    """Without 021 typed columns the writer must still record the edge."""
+    from minni.afm_passes.vault_ingest import _insert_wikilinks
+
+    conn = _legacy_links_db()
+    conn.execute(
+        """CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type))"""
+    )
+    conn.commit()
+    n = _insert_wikilinks(conn.cursor(), 1, ["b"], {"b": "b"}, 0.0)
+    conn.commit()
+    assert n == 1
+    row = conn.execute(
+        "SELECT link_type, weight FROM memory_links"
+    ).fetchone()
+    assert tuple(row) == ("wikilink", 1.0)
+    conn.close()
+
+
+def test_insert_wikilinks_uses_typed_columns_when_present():
+    """With the 021 schema the writer records confidence and method."""
+    from minni.afm_passes.vault_ingest import _insert_wikilinks
+
+    conn = _legacy_links_db()
+    conn.execute(
+        """CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            confidence REAL,
+            inference_method TEXT,
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type))"""
+    )
+    conn.commit()
+    n = _insert_wikilinks(conn.cursor(), 1, ["b"], {"b": "b"}, 0.0)
+    conn.commit()
+    assert n == 1
+    row = conn.execute(
+        "SELECT confidence, inference_method FROM memory_links"
+    ).fetchone()
+    assert tuple(row) == (1.0, "explicit_wikilink")
+    conn.close()
