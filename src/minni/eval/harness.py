@@ -62,6 +62,7 @@ from .retrievers import (
     RealSearcher,
     RipgrepSearcher,
     SearcherProtocol,
+    SnapshotSearcher,
     VendorMemorySearcher,
     make_searcher,
 )
@@ -458,6 +459,38 @@ def _preflight_quality_gate(
         sys.exit(2)
 
 
+def _require_snapshot_query_binding(searcher: Any, queries: Any) -> None:
+    """Refuse to score bound judgments against a non-matching snapshot.
+
+    Numeric ``expected_doc_ids`` are only meaningful for the corpus they were
+    judged against. Every query must declare that corpus with ``snapshot_id`` plus
+    ``manifest_digest``; every declared pair must equal the searcher's pinned
+    identity or scoring aborts before any comparison. Missing and partial
+    bindings fail closed, including negative judgments with no expected hits.
+    """
+    bound_id = getattr(searcher, "snapshot_id", None)
+    bound_digest = getattr(searcher, "manifest_digest", None)
+    offenders = []
+    for position, item in enumerate(queries or []):
+        if not isinstance(item, dict):
+            continue
+        declared_id = item.get("snapshot_id")
+        declared_digest = item.get("manifest_digest")
+        if (not bound_id or not bound_digest or not declared_id or not declared_digest
+                or declared_id != bound_id or declared_digest != bound_digest):
+            offenders.append(str(item.get("query_id", item.get("query", position))))
+    if offenders:
+        raise ValueError(
+            f"query corpus binding mismatch on {len(offenders)} quer"
+            f"{'y' if len(offenders) == 1 else 'ies'} "
+            f"({', '.join(offenders[:5])}"
+            f"{'...' if len(offenders) > 5 else ''}); searcher pins "
+            f"snapshot_id={bound_id!r} manifest_digest={bound_digest!r}, "
+            "so these judgments belong to a different snapshot — "
+            "no comparison accepted"
+        )
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Run evaluation for one or more configs and write reports."""
     config_names = [c.strip() for c in args.config.split(",")]
@@ -535,11 +568,28 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     for retriever_name in retriever_names:
         try:
-            searcher = _MockSearcher(queries) if args.mock else make_searcher(retriever_name, queries)
+            if args.mock:
+                searcher = _MockSearcher(queries)
+            elif retriever_name.strip().lower() in {"snapshot", "study-snapshot", "study_snapshot"}:
+                snapshot_dir = getattr(args, "snapshot_dir", "")
+                if not snapshot_dir:
+                    logger.error("The snapshot retriever requires --snapshot-dir <prepared-snapshot-dir>")
+                    sys.exit(2)
+                searcher = make_searcher(retriever_name, queries, root=Path(snapshot_dir))
+            else:
+                searcher = make_searcher(retriever_name, queries)
+        except SystemExit:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.error("Could not initialise retriever %r: %s", retriever_name, exc)
             sys.exit(1)
         is_mock = bool(getattr(args, "mock", False)) or retriever_name.strip().lower() == "mock"
+        if isinstance(searcher, SnapshotSearcher):
+            try:
+                _require_snapshot_query_binding(searcher, queries)
+            except ValueError as exc:
+                logger.error("Snapshot query-corpus binding failed: %s", exc)
+                sys.exit(3)
 
         for config_name in config_names:
             config_kwargs = CONFIGS[config_name]
@@ -551,9 +601,11 @@ def cmd_run(args: argparse.Namespace) -> None:
             logger.info("Evaluating retriever=%s config=%s", retriever_name, config_name)
             try:
                 report = run_eval(searcher, queries, report_name, config_kwargs, ks=ks,
-                                  strict_search=getattr(args, "quality_gate", False))
-            except RuntimeError:
-                logger.error("Quality evaluation aborted: retrieval failed; no comparison accepted")
+                                  strict_search=(getattr(args, "quality_gate", False)
+                                                  or isinstance(searcher, SnapshotSearcher)),
+                                  forbidden_doc_ids=getattr(searcher, "forbidden_doc_ids", None))
+            except RuntimeError as exc:
+                logger.error("Quality evaluation aborted: %s; no comparison accepted", exc)
                 sys.exit(3)
             report["quality_config"] = config_name
             report["quality_retriever"] = retriever_name
@@ -565,8 +617,17 @@ def cmd_run(args: argparse.Namespace) -> None:
                     backend_ignored=backend_ignored_options(retriever_name),
                     backend_envelope=backend_envelope_options(retriever_name),
                 ),
-                principal=principal_provenance(retriever_name, is_mock=is_mock),
-                corpus=corpus_provenance(is_mock=is_mock, retriever_name=retriever_name),
+                principal=principal_provenance(
+                    retriever_name,
+                    is_mock=is_mock,
+                    principal=getattr(searcher, "_principal", None),
+                ),
+                corpus=corpus_provenance(
+                    is_mock=is_mock,
+                    retriever_name=retriever_name,
+                    snapshot_id=getattr(searcher, "snapshot_id", None),
+                    manifest_digest=getattr(searcher, "manifest_digest", None),
+                ),
                 environment=env_prov,
                 retriever_name=retriever_name,
                 run_index=run_order.index(report_name),
@@ -752,7 +813,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     run_p.add_argument(
         "--retrievers",
         default="minnid",
-        help="Comma-separated retrievers: minnid,ripgrep,raw-context,vendor,mock",
+        help="Comma-separated retrievers: minnid,ripgrep,raw-context,vendor,mock,snapshot",
+    )
+    run_p.add_argument(
+        "--snapshot-dir",
+        default="",
+        help="Prepared study-snapshot directory (required with --retrievers snapshot; "
+             "see src/minni/eval/study_snapshot.py). Never the live vault.",
     )
     run_p.add_argument(
         "--gate",

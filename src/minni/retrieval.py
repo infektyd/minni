@@ -47,6 +47,12 @@ from minni.principal import EffectivePrincipal, agent_scope_for, can_read_docume
 from minni.safety import is_instruction_like
 from minni.timestamps import parse_epoch_or_report
 from minni.wiki_indexer import WikiFrontmatter
+from minni.request_deadline import (
+    RequestDeadlineExceeded,
+    allow_expired_sql,
+    bind_copied_deadline,
+    run_bound,
+)
 
 logger = logging.getLogger("sovereign.retrieval")
 
@@ -214,6 +220,7 @@ _DEGRADATION_STATE_ATTRS = {
     "query_expand": "query_expand_degraded",
     "vector": "vector_degraded",
     "hyde": "hyde_degraded",
+    "document_hydration": "document_hydration_degraded",
 }
 
 
@@ -221,7 +228,7 @@ _DEGRADATION_STATE_ATTRS = {
 class RetrievalCallState:
     """Per-call mutable verdicts for one retrieve() invocation.
 
-    Hoisted off the engine (perf/parallel-fanout, #388): these five fields
+    Hoisted off the engine (perf/parallel-fanout, #388): these verdict fields
     used to live only in thread-local properties on the engine
     (last_auth_suppression, last_*_degraded), which keeps concurrent REQUESTS
     on distinct threads apart but is invisible across the variant/corpus
@@ -241,6 +248,7 @@ class RetrievalCallState:
     query_expand_degraded: Optional[str] = None
     vector_degraded: Optional[str] = None
     hyde_degraded: Optional[str] = None
+    document_hydration_degraded: Optional[str] = None
     # Cassandra RED-1 (#388): the trace id stamped onto this call's rows.
     # last_trace_id used to be a plain shared instance attribute, so two
     # both-scope legs running concurrently on the same engine overwrote and
@@ -301,6 +309,14 @@ class _ThreadLocalStateProxy:
     @hyde_degraded.setter
     def hyde_degraded(self, value: Optional[str]) -> None:
         self._engine.last_hyde_degraded = value
+
+    @property
+    def document_hydration_degraded(self) -> Optional[str]:
+        return self._engine.last_document_hydration_degraded
+
+    @document_hydration_degraded.setter
+    def document_hydration_degraded(self, value: Optional[str]) -> None:
+        self._engine.last_document_hydration_degraded = value
 
     @property
     def trace_id(self) -> Optional[str]:
@@ -804,6 +820,15 @@ class RetrievalEngine:
     def last_hyde_degraded(self, value: Optional[str]) -> None:
         self._set_degradation_flag("hyde", value)
 
+    @property
+    def last_document_hydration_degraded(self) -> Optional[str]:
+        """Document-depth fetch timed out; ranked chunk still returned."""
+        return self._degradation_flag("document_hydration")
+
+    @last_document_hydration_degraded.setter
+    def last_document_hydration_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("document_hydration", value)
+
     def _current_state(self) -> Any:
         """Innermost per-call state on THIS thread (never None).
 
@@ -848,6 +873,7 @@ class RetrievalEngine:
         self.last_query_expand_degraded = state.query_expand_degraded
         self.last_vector_degraded = state.vector_degraded
         self.last_hyde_degraded = state.hyde_degraded
+        self.last_document_hydration_degraded = state.document_hydration_degraded
         # RED-1: the call's own trace id (None when the merge never ran, e.g.
         # a raising variant — see the documented exception-path delta below).
         # Publish runs after the pop, so this lands in the thread-local slot.
@@ -1326,6 +1352,9 @@ class RetrievalEngine:
                 conn = self.db._get_conn()
                 if self.faiss_index.try_load_from_disk(db_conn=conn):
                     return
+            except RequestDeadlineExceeded:
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                return
             except Exception as e:
                 logger.debug("Disk cache load failed (non-fatal): %s", e)
 
@@ -2112,6 +2141,9 @@ class RetrievalEngine:
                     (cutoff,),
                 )
                 rows = c.fetchall()
+        except RequestDeadlineExceeded:
+            logger.debug("feedback cache refresh skipped after deadline")
+            return
         except Exception as exc:
             logger.debug("feedback cache refresh skipped: %s", exc)
             self._feedback_cache = {}
@@ -2461,6 +2493,41 @@ class RetrievalEngine:
 
         # Fallback: snippet
         return self._apply_depth(result, "snippet")
+
+    _DOCUMENT_HYDRATION_DEADLINE = "search deadline; skipped full document"
+
+    def _stamp_document_hydration_degraded(self, raw: Dict) -> None:
+        """Keep the ranked chunk; record that document depth did not complete."""
+        reason = self._DOCUMENT_HYDRATION_DEADLINE
+        self.last_document_hydration_degraded = reason
+        raw["requested_depth"] = "document"
+        raw["delivered_depth"] = "chunk"
+        raw["document_hydration"] = reason
+        prov = raw.get("provenance")
+        if isinstance(prov, dict):
+            prov["requested_depth"] = "document"
+            prov["delivered_depth"] = "chunk"
+            prov["document_hydration"] = reason
+
+    def _project_depth(self, raw: Dict, depth: str) -> Dict:
+        apply_as = depth
+        if (
+            raw.get("document_hydration")
+            and raw.get("delivered_depth") in _VALID_DEPTHS
+        ):
+            apply_as = raw["delivered_depth"]
+        projected = self._apply_depth(raw, apply_as)
+        for key in ("requested_depth", "delivered_depth", "document_hydration"):
+            if key in raw:
+                projected[key] = raw[key]
+        if raw.get("document_hydration"):
+            projected["depth"] = raw.get("delivered_depth") or "chunk"
+            prov = projected.get("provenance")
+            if isinstance(prov, dict):
+                prov["requested_depth"] = raw.get("requested_depth")
+                prov["delivered_depth"] = raw.get("delivered_depth")
+                prov["document_hydration"] = raw.get("document_hydration")
+        return projected
 
     def _fetch_full_document(self, doc_id: int) -> Optional[str]:
         """Fetch the full concatenated text for a whole_document row."""
@@ -3407,6 +3474,7 @@ class RetrievalEngine:
         state.query_expand_degraded = None
         state.vector_degraded = None
         state.hyde_degraded = None
+        state.document_hydration_degraded = None
         self._set_current_deadline(deadline_monotonic)
         if past_search_deadline(deadline_monotonic):
             query_variants = [query]
@@ -3433,6 +3501,7 @@ class RetrievalEngine:
             variant_expand_degraded: List[str] = []
             variant_vector_degraded: List[str] = []
             variant_hyde_degraded: List[str] = []
+            variant_document_hydration_degraded: List[str] = []
             # perf/parallel-fanout (#388): one isolated state per variant,
             # gathered in submission order (pool.map preserves it), so the
             # merge and every aggregation string below are deterministic and
@@ -3497,6 +3566,10 @@ class RetrievalEngine:
                 if child.hyde_degraded:
                     variant_hyde_degraded.append(
                         f"{variant}: {child.hyde_degraded}"
+                    )
+                if child.document_hydration_degraded:
+                    variant_document_hydration_degraded.append(
+                        f"{variant}: {child.document_hydration_degraded}"
                     )
 
             def _should_drop_deadline_child(
@@ -3574,11 +3647,15 @@ class RetrievalEngine:
                     # variant's error first, breaking the serial-raise
                     # identity for zero gain (variant bodies are not
                     # cancellable work).
-                    raw_rows = list(
-                        _variant_pool.map(
-                            _run_variant, range(len(query_variants))
-                        )
-                    )
+                    # Independent copy_context per variant: same absolute
+                    # request deadline, never one Context entered from two
+                    # workers. Serial-when-deadline (above) still skips the
+                    # pool when deadline_monotonic is set.
+                    bound = [
+                        bind_copied_deadline(_run_variant, index)
+                        for index in range(len(query_variants))
+                    ]
+                    raw_rows = list(_variant_pool.map(run_bound, bound))
                 for variant, rows, child in zip(
                     query_variants, raw_rows, variant_states
                 ):
@@ -3603,7 +3680,13 @@ class RetrievalEngine:
                             "search deadline; truncated query expand"
                         )
                         break
-                    rows = _run_variant(index)
+                    try:
+                        rows = _run_variant(index)
+                    except RequestDeadlineExceeded:
+                        truncated_expand = (
+                            "search deadline; truncated query expand"
+                        )
+                        break
                     child = variant_states[index]
                     if _should_drop_deadline_child(child, per_variant):
                         truncated_expand = (
@@ -3646,6 +3729,11 @@ class RetrievalEngine:
             )
             state.hyde_degraded = (
                 "; ".join(variant_hyde_degraded) if variant_hyde_degraded else None
+            )
+            state.document_hydration_degraded = (
+                "; ".join(variant_document_hydration_degraded)
+                if variant_document_hydration_degraded
+                else None
             )
             # Aggregate: any variant whose non-empty candidate set was gated to
             # zero keeps the blackout visible, regardless of variant order.
@@ -3817,10 +3905,17 @@ class RetrievalEngine:
             # no result is admitted merely to fill the requested count.
             window = max(1, wanted)
             ceiling = max(window, 512)
+            last_rows: List[Dict] = []
             with self._query_encoding_scope():
                 while True:
-                    raw = fetch(window)
-                    rows = _eligible(raw)
+                    try:
+                        raw = fetch(window)
+                        rows = _eligible(raw)
+                    except RequestDeadlineExceeded:
+                        if not last_rows:
+                            raise
+                        return last_rows
+                    last_rows = rows
                     if len(rows) >= wanted or len(rows) == len(raw):
                         return rows
                     # SQL returns rows without vector-style document collapse.
@@ -3838,29 +3933,64 @@ class RetrievalEngine:
 
         rerank_k = max(limit, self.config.reranker_top_k if self.config.reranker_enabled else limit)
 
+        lexical_searched = False
+
+        def _lexical_eligible(fetch):
+            """Ranking-deadline lexical fill: short FTS/chrono may still run.
+
+            Entry uses allow_expired_sql; the VM progress handler stays on
+            so a recursive CTE cannot run unbounded after expiry.
+            """
+            nonlocal lexical_searched
+
+            def tracked_fetch(window):
+                nonlocal lexical_searched
+                rows = fetch(window)
+                lexical_searched = True
+                return rows
+
+            if past_search_deadline(deadline_monotonic):
+                with allow_expired_sql():
+                    return _collect_eligible(
+                        tracked_fetch, rerank_k, sql_window=True
+                    )
+            return _collect_eligible(tracked_fetch, rerank_k, sql_window=True)
+
         if sort == "chronological":
             if past_search_deadline(deadline_monotonic):
                 self.last_vector_degraded = "search deadline; lexical (FTS) only"
             chrono_t0 = time.perf_counter()
-            merged = _collect_eligible(lambda window: self._chronological_search(
-                query, window, layers, start_date, end_date,
-                exclude_statuses=skip_list,
-            ), rerank_k, sql_window=True)
+            try:
+                merged = _lexical_eligible(lambda window: self._chronological_search(
+                    query, window, layers, start_date, end_date,
+                    exclude_statuses=skip_list,
+                ))
+            except RequestDeadlineExceeded:
+                if not lexical_searched:
+                    raise
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                merged = []
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
             merged = merged[:limit]
         else:
             # Step 1-2: Dual retrieval
             fts_t0 = time.perf_counter()
-            if document_agent_filter is None:
-                fts_results = _collect_eligible(lambda window: self._fts_search(
-                    query, window, exclude_statuses=skip_list
-                ), rerank_k, sql_window=True)
-            else:
-                fts_results = _collect_eligible(lambda window: self._fts_search(
-                    query, window, agent_filter=document_agent_filter,
-                    exclude_statuses=skip_list,
-                ), rerank_k, sql_window=True)
+            try:
+                if document_agent_filter is None:
+                    fts_results = _lexical_eligible(lambda window: self._fts_search(
+                        query, window, exclude_statuses=skip_list
+                    ))
+                else:
+                    fts_results = _lexical_eligible(lambda window: self._fts_search(
+                        query, window, agent_filter=document_agent_filter,
+                        exclude_statuses=skip_list,
+                    ))
+            except RequestDeadlineExceeded:
+                if not lexical_searched:
+                    raise
+                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                fts_results = []
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
                 {
@@ -3880,7 +4010,8 @@ class RetrievalEngine:
             if past_search_deadline(deadline_monotonic):
                 semantic_results = []
                 trace["backends"] = ["fts-deadline"]
-                self.last_vector_degraded = "search deadline; lexical (FTS) only"
+                if lexical_searched:
+                    self.last_vector_degraded = "search deadline; lexical (FTS) only"
             elif backend is None and not fts_results and self._chunk_index_empty():
                 semantic_results = []
                 trace["backends"] = ["faiss-disk-empty"]
@@ -3888,9 +4019,14 @@ class RetrievalEngine:
                 # Default path — bit-identical to pre-PR-3
                 # Gate taxonomy after fetching: filtering the SQL lookup of
                 # a bounded FAISS window would hide why it needs refilling.
-                semantic_results = _collect_eligible(
-                    lambda window: self._semantic_search(query, window), rerank_k,
-                )
+                try:
+                    semantic_results = _collect_eligible(
+                        lambda window: self._semantic_search(query, window), rerank_k,
+                    )
+                except RequestDeadlineExceeded:
+                    semantic_results = []
+                    if lexical_searched:
+                        self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 trace["backends"] = ["faiss-disk"]
             elif isinstance(backend, list):
                 # Fan-out: build a MultiBackend from the list of backend names/objects
@@ -4499,7 +4635,13 @@ class RetrievalEngine:
             # never ride outside the perturbed <EVIDENCE> form (same leak class as
             # chunk_text).
             if depth == "document":
-                full_text = self._fetch_full_document(r["doc_id"])
+                hydration_degraded = False
+                try:
+                    full_text = self._fetch_full_document(r["doc_id"])
+                except RequestDeadlineExceeded:
+                    full_text = None
+                    hydration_degraded = True
+                    self._stamp_document_hydration_degraded(raw)
                 if full_text:
                     doc_flag = bool(raw.get("instruction_like")) or bool(
                         is_instruction_like(full_text)
@@ -4544,7 +4686,7 @@ class RetrievalEngine:
                             self.config, "instruction_body_perturbation_enabled", True
                         ),
                     )
-                else:
+                elif not hydration_degraded:
                     raw["full_document_text"] = full_text
 
             # S7: self-labeling recall package — primary (rank 1) vs related (2..N).
@@ -4553,7 +4695,7 @@ class RetrievalEngine:
             raw["match_kind"] = "primary" if _result_rank == 1 else "related"
             raw["related_rank"] = None if _result_rank == 1 else _result_rank - 1
 
-            projected = self._apply_depth(raw, depth)
+            projected = self._project_depth(raw, depth)
             projected["match_kind"] = raw["match_kind"]
             projected["related_rank"] = raw["related_rank"]
             projected["query_variants"] = query_variants
@@ -4729,7 +4871,10 @@ class RetrievalEngine:
         }
 
         if depth == "document":
-            raw["full_document_text"] = self._fetch_full_document(row["doc_id"])
+            try:
+                raw["full_document_text"] = self._fetch_full_document(row["doc_id"])
+            except RequestDeadlineExceeded:
+                self._stamp_document_hydration_degraded(raw)
 
         if update_access:
             with self.db.cursor() as c:
@@ -4800,7 +4945,7 @@ class RetrievalEngine:
             if "full_document_text" in raw:
                 raw["full_document_text"] = raw["evidence_envelope"]
 
-        return self._apply_depth(raw, depth)
+        return self._project_depth(raw, depth)
 
     #: Event types that exist for observability, not as recallable memory.
     #: `recall` rows are the durable recall trace (minnid_runtime.recall writes
@@ -4954,39 +5099,49 @@ class RetrievalEngine:
         # where it crashed on a missing learning_id key).
         if results and update_access:
             now = time.time()
-            with self.db.cursor() as c:
-                for result in results[:limit]:
-                    c.execute(
-                        """UPDATE learnings
-                           SET access_count = access_count + 1, last_accessed = ?
-                           WHERE learning_id = ?""",
-                        (now, result["learning_id"]),
-                    )
-                    try:
-                        # OR IGNORE: two searches in the same clock tick
-                        # collide on the (learning_id, agent_id, read_at) PK;
-                        # the read is already recorded for that instant, so
-                        # the duplicate is dropped instead of raising an
-                        # IntegrityError that the except below would swallow
-                        # as silently dropped tracking.
+            from minni.request_deadline import RequestDeadlineExceeded
+
+            try:
+                with self.db.cursor() as c:
+                    for result in results[:limit]:
                         c.execute(
-                            """INSERT OR IGNORE INTO learning_reads
-                               (learning_id, agent_id, read_at, source)
-                               VALUES (?, ?, ?, ?)""",
-                            (
-                                result["learning_id"],
-                                agent_id or "unknown",
-                                now,
-                                source,
-                            ),
+                            """UPDATE learnings
+                               SET access_count = access_count + 1, last_accessed = ?
+                               WHERE learning_id = ?""",
+                            (now, result["learning_id"]),
                         )
-                    except Exception as exc:
-                        # hooks-PL-5: never silently drop read tracking — a
-                        # missing row here is exactly what makes stale_beliefs
-                        # fire events:[] forever.
-                        logger.warning(
-                            "learning_reads insert failed for learning #%s: %s",
-                            result.get("learning_id"), exc,
-                        )
+                        try:
+                            # OR IGNORE: two searches in the same clock tick
+                            # collide on the (learning_id, agent_id, read_at) PK;
+                            # the read is already recorded for that instant, so
+                            # the duplicate is dropped instead of raising an
+                            # IntegrityError that the except below would swallow
+                            # as silently dropped tracking.
+                            c.execute(
+                                """INSERT OR IGNORE INTO learning_reads
+                                   (learning_id, agent_id, read_at, source)
+                                   VALUES (?, ?, ?, ?)""",
+                                (
+                                    result["learning_id"],
+                                    agent_id or "unknown",
+                                    now,
+                                    source,
+                                ),
+                            )
+                        except RequestDeadlineExceeded:
+                            raise
+                        except Exception as exc:
+                            # hooks-PL-5: never silently drop read tracking — a
+                            # missing row here is exactly what makes stale_beliefs
+                            # fire events:[] forever.
+                            logger.warning(
+                                "learning_reads insert failed for learning #%s: %s",
+                                result.get("learning_id"), exc,
+                            )
+
+            except RequestDeadlineExceeded:
+                # cursor() rolled back the whole tracking transaction. The
+                # completed read is still useful; the RPC reports expiration.
+                pass
 
         return results
