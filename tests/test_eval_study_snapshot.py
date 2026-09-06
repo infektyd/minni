@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import stat
 import time
 from pathlib import Path
@@ -913,3 +914,110 @@ def test_draft_records_excluded_from_default_snapshot_search(tmp_path):
     materialize_snapshot_db(dest)
     results = SnapshotSearcher(dest).search("alpha", limit=5)
     assert [r["source"].split("vault/")[-1] for r in results] == ["project-a/launch.md"]
+
+
+def test_ineligible_top_row_does_not_starve_eligible_row(tmp_path):
+    """Eligibility filters BEFORE the output limit (limit=1 must serve doc2)."""
+    from minni.eval.retrievers import SnapshotSearcher
+
+    dest = tmp_path / "snapshot"
+    blocked = _record("doc-top", "store-a", "project-a/top.md", "alpha note")
+    blocked.update(agent="mallory", privacy_level="blocked")
+    blocked["content_sha256"] = hashlib.sha256(blocked["text"].encode()).hexdigest()
+    prepare_snapshot(_packet([
+        blocked,
+        _record("doc-2", "store-b", "project-b/launch.md",
+                "alpha launch notes for the spring release planning session"),
+    ]), dest)
+    materialize_snapshot_db(dest)
+
+    searcher = SnapshotSearcher(dest)
+    assert searcher._principal.agent_id == "hans"
+    one = searcher.search("alpha", limit=1)
+    assert [r["source"].split("vault/")[-1] for r in one] == ["project-b/launch.md"]
+    assert one[0]["provenance"]["snapshot_id"] == searcher.snapshot_id
+
+
+def test_or_fallback_fires_on_eligible_exhaustion_not_raw_hits(tmp_path):
+    """Strict hits that are all ineligible must not suppress the OR fallback."""
+    from minni.eval.retrievers import SnapshotSearcher
+
+    dest = tmp_path / "snapshot"
+    blocked = _record("doc-both", "store-a", "project-a/both.md", "alpha beta note")
+    blocked.update(agent="mallory", privacy_level="blocked")
+    blocked["content_sha256"] = hashlib.sha256(blocked["text"].encode()).hexdigest()
+    prepare_snapshot(_packet([
+        blocked,
+        _record("doc-a", "store-b", "project-b/launch.md", "alpha launch notes here"),
+    ]), dest)
+    materialize_snapshot_db(dest)
+
+    # Strict "alpha beta" matches only the blocked row; the OR fallback must
+    # still surface the eligible "alpha" row.
+    results = SnapshotSearcher(dest).search("alpha beta", limit=5)
+    assert [r["source"].split("vault/")[-1] for r in results] == ["project-b/launch.md"]
+
+
+def test_valid_replacement_generation_fails_closed(tmp_path):
+    """A valid snapshot B at A's path is refused under A's pinned identity."""
+    from minni.eval.retrievers import SnapshotSearcher
+
+    home = tmp_path / "a"
+    prepare_snapshot(_packet([
+        _record("doc-a1", "store-a", "project-a/launch.md", "alpha launch notes"),
+    ]), home)
+    materialize_snapshot_db(home)
+
+    searcher = SnapshotSearcher(home)
+    old_id = searcher.snapshot_id
+    assert old_id.startswith("study-")
+    assert searcher.search("alpha", limit=5)[0]["provenance"]["snapshot_id"] == old_id
+
+    # Replacement generation B is built fresh AT the same path (wipe, prepare,
+    # materialize), so every B artifact is internally consistent — including
+    # absolute DB paths, which is why a raw directory copy is not used here.
+    # Materialization runs in a FRESH PROCESS: SovereignDB keeps process-wide
+    # per-path schema state, so an in-process rebuild at a reused path would
+    # skip schema init — exactly the schema-cache hazard a real replacement
+    # (separate process/generation) never hits.
+    import os
+    import subprocess
+    import sys
+
+    b_packet = _packet([
+        _record("doc-b1", "store-b", "project-b/memo.md", "newword quarterly memo"),
+        _record("doc-b2", "store-b", "project-b/old.md", "stale draft copy",
+                expected_eligible=False),
+    ])
+    (tmp_path / "packet_b.json").write_text(json.dumps(b_packet))
+    driver = tmp_path / "materialize_b.py"
+    driver.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from minni.eval.study_snapshot import prepare_snapshot, materialize_snapshot_db\n"
+        "packet = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\n"
+        "dest = Path(sys.argv[2])\n"
+        "prepare_snapshot(packet, dest)\n"
+        "info = materialize_snapshot_db(dest)\n"
+        "print(info['snapshot_id'])\n"
+    )
+    shutil.rmtree(home)
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(tmp_path / "packet_b.json"), str(home)],
+        capture_output=True, text=True, timeout=120,
+        cwd=Path(__file__).resolve().parent.parent,
+        env={**os.environ, "PYTHONPATH": "src"},
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+
+    # The replacement is internally valid, but the old searcher must fail
+    # closed on both the old word and the new word — never label B's rows
+    # with A's study ID.
+    with pytest.raises(StudySnapshotError, match="changed since searcher initialization"):
+        searcher.search("alpha", limit=5)
+    with pytest.raises(StudySnapshotError, match="changed since searcher initialization"):
+        searcher.search("newword", limit=5)
+
+    fresh = SnapshotSearcher(home)
+    assert fresh.snapshot_id != old_id
+    assert fresh.search("newword", limit=5)[0]["provenance"]["snapshot_id"] == fresh.snapshot_id
