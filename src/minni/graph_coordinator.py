@@ -1,21 +1,27 @@
 """P1.3 prepare/commit coordinator core (addendum §4.3, spec §§2.1–2.2).
 
-Substantive core for ``commit_learning_with_graph()``: model/shortlist
-prepare runs OUTSIDE the write lock; one ``BEGIN IMMEDIATE`` transaction
-writes learning + canonical document + join + FTS/chunks + typed edges, with
-in-transaction revalidation of candidate identity, privacy, and content
-hashes. Any failure before commit rolls back to zero durable writes
-(fail-loud new promotion). Standing repair preserves durable truth and
-defers edges instead of failing.
+Split API so expensive Phase A never holds the write lock:
+
+- ``prepare_learning_with_graph``: embed/shortlist/classify, return a frozen
+  payload. Model callbacks refuse to run while ``connection.in_transaction``.
+- ``commit_prepared_learning(cursor, payload)``: Phase B on the CALLER's
+  open SQLite transaction. Does not commit, rollback, or refresh FAISS.
+  Returned chunk vectors are uncommitted until the outer txn commits
+  (status ``staged``, never ``ok``).
+- ``commit_learning_with_graph``: compatible wrapper (prepare + local
+  ``BEGIN IMMEDIATE``). Returns ``ok`` only after that wrapper txn commits.
+
+Fail-loud new promotion: prepare errors yield no payload; Phase B refusal
+raises ``GraphCommitAborted`` so the caller rolls back to zero durable
+writes. Standing repair preserves durable truth and defers edges instead
+of failing.
 
 Scope boundaries (explicit non-goals):
 - No entrypoint/activation/config/schema changes: production
   (``resolve_candidate``, ``handle_learn``, AFM) does NOT invoke this yet.
   Exact next integration is listed in ``NEXT_INTEGRATION`` below.
-- No FAISS access inside the coordinator and never before commit: prepare
-  takes injected ``search_chunks``/``classify``/``embed`` callables, and the
-  result returns new chunk ids + vectors for the CALLER's post-commit
-  refresh (Phase C).
+- No FAISS access inside this module: Phase C belongs in the callsite
+  AFTER the outer txn commits, using returned chunk ids + vectors.
 - No auto-supersession (P2.1), no contradiction surfacing beyond the
   ``contradiction_log`` persist row (P2.2), no traversal (P1.4).
 - ``graph_enabled`` defaults True (local runtime default) but enables
@@ -30,7 +36,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from minni.durable_projection import (
@@ -63,13 +69,17 @@ TYPED_LINK_TYPES = frozenset(PERSIST_CONFIDENCE)
 INFERENCE_METHOD = "local_classifier"
 
 NEXT_INTEGRATION = (
-    "Unify callsites WITHOUT changing their behavior until the quality gate: "
-    "governance.store path (minnid_runtime/governance.py:274) for "
-    "resolve_candidate accept, handle_learn force path, and AFM consolidation "
-    "each replace their store_learning + index_durable fragments with "
-    "commit_learning_with_graph, passing the daemon RetrievalEngine-backed "
-    "search/classify closures. Phase C (post-commit FAISS refresh) belongs in "
-    "those callsites, never in this module."
+    "Callsites own the outer write transaction; this module does not wire "
+    "them. governance.store (resolve_candidate accept), handle_learn force, "
+    "and AFM consolidation each: (1) prepare_learning_with_graph OUTSIDE the "
+    "lock with RetrievalEngine-backed search/classify/embed closures; "
+    "(2) BEGIN IMMEDIATE; terminalize the candidate_packets row and any "
+    "review-fence updates on that same cursor; commit_prepared_learning("
+    "cursor, payload, db=, principal=); (3) COMMIT or ROLLBACK "
+    "themselves — Phase B refusal is GraphCommitAborted; (4) Phase C FAISS "
+    "refresh ONLY after COMMIT, using returned chunk ids/vectors. Never pass "
+    "an index callback into this module. Muse owns governance/AFM "
+    "canonical-missing separately."
 )
 
 
@@ -83,7 +93,9 @@ class CommittedEdge:
 
 @dataclass(frozen=True)
 class CommitResult:
-    status: str  # "ok" | "error"
+    status: str  # "ok" | "staged" | "error"
+    # "staged" = Phase B wrote on the caller's cursor; durable only after
+    # the outer transaction commits. Wrapper maps staged -> ok after THAT.
     learning_id: Optional[int] = None
     doc_id: Optional[int] = None
     edges: Tuple[CommittedEdge, ...] = ()
@@ -110,12 +122,71 @@ class RepairResult:
     error: Optional[str] = None
 
 
-class _Abort(Exception):
-    """Internal rollback signal: zero durable writes, error envelope out."""
+@dataclass(frozen=True)
+class LearningFields:
+    """Optional learnings-row columns. None means omit (wrapper default).
+
+    Any field that is set is written at commit or the commit aborts — never
+    silently dropped. ``supersedes`` updates another row in the same cursor.
+    """
+
+    source_query: Optional[str] = None
+    source_doc_ids: Any = None
+    evidence_doc_ids: Any = None
+    confidence: Optional[float] = None
+    assertion: Optional[str] = None
+    applies_when: Optional[str] = None
+    contradicts_id: Optional[int] = None
+    supersedes: Optional[int] = None
+    content_hash: Optional[str] = None
+    status: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PreparedLearningCommit:
+    """Detached Phase A snapshot; the digest rejects changed snapshot fields."""
+
+    digest: str
+    store_id: str
+    principal: EffectivePrincipal
+    workspace: str
+    content: str
+    content_sha256: str
+    category: str
+    vault_path: str
+    embedding_model: str
+    graph_enabled: bool
+    learning_vector: Optional[bytes]
+    chunks: Tuple[Tuple[str, bytes], ...]
+    path: str
+    sigil: str
+    layer: str
+    shortlist_no_pairs: bool
+    validated: Tuple[Tuple[CandidateDescriptor, str, str, float], ...]
+    classifier_info: Tuple[Tuple[str, str], ...]
+    meta_snapshots: Tuple[Tuple[int, str], ...]
+    learning_fields: LearningFields
+    prepared_at: float
+
+
+@dataclass(frozen=True)
+class PrepareResult:
+    status: str  # "ok" | "error"
+    payload: Optional[PreparedLearningCommit] = None
+    error_code: Optional[str] = None
+    error: Optional[str] = None
+
+
+class GraphCommitAborted(Exception):
+    """Phase B refused: caller must roll back the open write transaction."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+class _Abort(GraphCommitAborted):
+    """Internal alias so existing raise sites stay short."""
 
 
 def _sha256_text(text: str) -> str:
@@ -148,31 +219,81 @@ def _embed_all(
     return [bytes(v) for v in vectors]
 
 
-def _bound_store_id(db: Any, store_id: str) -> None:
+def _canonical_store_id(conn: Any) -> str:
+    """On-disk identity of the opened main database (PRAGMA, not config)."""
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    file = None
+    for row in rows:
+        try:
+            name, path = row["name"], row["file"]
+        except (TypeError, KeyError, IndexError):
+            name, path = row[1], row[2]
+        if str(name) == "main":
+            file = path
+            break
+    if not file:
+        raise _Abort("store_binding_mismatch",
+                     "expected a real on-disk main database")
+    return os.path.realpath(str(file))
+
+
+def _bound_store_id(db: Any, store_id: str, conn: Any = None) -> str:
     """Bind the supplied store_id to the ACTUAL database identity.
 
-    No schema change and no caller-supplied alias map: the canonical
-    identity is the realpath of the db file, and ``store_id`` must BE that
-    path. An alias dict cannot make a foreign store claim "verified" — there
-    is no verified registry yet, so only the canonical path is accepted.
-    Anything else aborts: prepare-time evidence from one store must never
-    commit into another, even when doc ids collide. Callsites pass
-    ``realpath(db.config.db_path)``; a future registered binding replaces
-    this function, not its callers' trust assumptions.
+    Canonical identity is ``PRAGMA database_list`` main ``file`` realpath
+    (the opened connection), not the mutable ``config.db_path`` label.
+    ``store_id`` must BE that path. Prepare-time evidence from one store
+    must never commit into another, even when doc ids collide — including
+    a cursor whose connection is a different file than ``db``.
     """
     if not isinstance(store_id, str) or not store_id.strip():
         raise _Abort("store_binding_invalid", "store_id must be non-empty")
-    try:
-        actual = os.path.realpath(
-            os.path.abspath(str(db.config.db_path)))
-    except Exception as exc:
-        raise _Abort("store_binding_mismatch",
-                     f"database identity unreadable: {exc}")
-    if os.path.realpath(os.path.abspath(store_id)) != actual:
+    if conn is None:
+        getter = getattr(db, "_get_conn", None)
+        if callable(getter):
+            try:
+                conn = getter()
+            except Exception:
+                conn = None
+    if conn is not None:
+        actual = _canonical_store_id(conn)
+    else:
+        try:
+            actual = os.path.realpath(
+                os.path.abspath(str(db.config.db_path)))
+        except Exception as exc:
+            raise _Abort("store_binding_mismatch",
+                         f"database identity unreadable: {exc}")
+    supplied = os.path.realpath(os.path.abspath(store_id))
+    if supplied != actual:
         raise _Abort(
             "store_binding_mismatch",
             f"store_id {store_id!r} does not identify this database",
         )
+    return actual
+
+
+def _snapshot_principal(principal: EffectivePrincipal) -> EffectivePrincipal:
+    """Copy identity so later mutation of the caller's lists cannot relabel."""
+    return _dc_replace(
+        principal,
+        capabilities=list(principal.capabilities),
+        allowed_vault_roots=list(principal.allowed_vault_roots),
+    )
+
+
+def _require_same_authority(
+    prepared: PreparedLearningCommit, principal: EffectivePrincipal
+) -> None:
+    if principal.agent_id != prepared.principal.agent_id:
+        raise _Abort("principal_mismatch",
+                     "commit principal does not match prepare")
+    if principal.workspace_id != prepared.principal.workspace_id:
+        raise _Abort("principal_mismatch",
+                     "commit workspace does not match prepare")
+    if principal.workspace_id != prepared.workspace:
+        raise _Abort("principal_mismatch",
+                     "commit workspace does not match prepared workspace")
 
 
 def _classify_validated(
@@ -579,6 +700,107 @@ def _revalidate_target(
             )
 
 
+def _json_or_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    raise _Abort("learning_field_invalid", f"cannot encode {type(value).__name__}")
+
+
+def _freeze_json_value(value: Any) -> Any:
+    """Copy JSON-able field values so the caller's lists cannot relabel."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    encoded = _json_or_text(value)
+    if encoded is None:
+        return None
+    loaded = json.loads(encoded)
+    if isinstance(loaded, list):
+        return tuple(loaded)
+    return loaded
+
+
+def _freeze_fields(fields: LearningFields) -> LearningFields:
+    return _dc_replace(
+        fields,
+        source_doc_ids=_freeze_json_value(fields.source_doc_ids),
+        evidence_doc_ids=_freeze_json_value(fields.evidence_doc_ids),
+    )
+
+
+def _assert_unlocked(db: Any, label: str) -> None:
+    getter = getattr(db, "_get_conn", None)
+    if not callable(getter):
+        return
+    conn = getter()
+    if getattr(conn, "in_transaction", False):
+        raise _Abort(
+            "model_in_transaction",
+            f"{label} must not run while a write transaction is open",
+        )
+
+
+def _guard_model(db: Any, label: str, fn: Callable) -> Callable:
+    """Fail-loud if a model/search callback runs under the write lock."""
+
+    def wrapped(*args, **kwargs):
+        _assert_unlocked(db, label)
+        return fn(*args, **kwargs)
+
+    return wrapped
+
+
+def _payload_digest(payload: PreparedLearningCommit) -> str:
+    body = {
+        "store_id": payload.store_id,
+        "agent": payload.principal.agent_id,
+        "workspace": payload.workspace,
+        "caps": list(payload.principal.capabilities),
+        "roots": list(payload.principal.allowed_vault_roots),
+        "content_sha256": payload.content_sha256,
+        "category": payload.category,
+        "vault_path": payload.vault_path,
+        "embedding_model": payload.embedding_model,
+        "graph_enabled": payload.graph_enabled,
+        "learning_vector": None if payload.learning_vector is None
+        else hashlib.sha256(payload.learning_vector).hexdigest(),
+        "chunks": [
+            (text, hashlib.sha256(vector).hexdigest())
+            for text, vector in payload.chunks
+        ],
+        "path": payload.path,
+        "sigil": payload.sigil,
+        "layer": payload.layer,
+        "shortlist_no_pairs": payload.shortlist_no_pairs,
+        "validated": [
+            (d.pair_id, d.doc_id, d.store_id, d.content_sha256, d.metadata_sha256,
+             label, direction, confidence)
+            for d, label, direction, confidence in payload.validated
+        ],
+        "classifier_info": list(payload.classifier_info),
+        "meta_snapshots": list(payload.meta_snapshots),
+        "fields": {
+            "source_query": payload.learning_fields.source_query,
+            "source_doc_ids": _json_or_text(payload.learning_fields.source_doc_ids),
+            "evidence_doc_ids": _json_or_text(payload.learning_fields.evidence_doc_ids),
+            "confidence": payload.learning_fields.confidence,
+            "assertion": payload.learning_fields.assertion,
+            "applies_when": payload.learning_fields.applies_when,
+            "contradicts_id": payload.learning_fields.contradicts_id,
+            "supersedes": payload.learning_fields.supersedes,
+            "content_hash": payload.learning_fields.content_hash,
+            "status": payload.learning_fields.status,
+        },
+        "prepared_at": payload.prepared_at,
+    }
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
 def _insert_learning(
     c: Any,
     *,
@@ -587,19 +809,50 @@ def _insert_learning(
     content: str,
     embedding: Optional[bytes],
     now: float,
+    fields: LearningFields,
 ) -> int:
-    """Production learning-row shape (mirrors writeback.store_learning)."""
+    """Learnings INSERT: wrapper columns plus any provided optional fields."""
     from minni.writeback import CATEGORIES
 
     if category not in CATEGORIES:
         category = "general"
-    c.execute(
-        """INSERT INTO learnings
-           (agent_id, category, content, confidence, embedding, created_at)
-           VALUES (?, ?, ?, 1.0, ?, ?)""",
-        (agent_id, category, content, embedding, now),
+    confidence = 1.0 if fields.confidence is None else float(fields.confidence)
+    if not math.isfinite(confidence):
+        raise _Abort("learning_field_invalid", "confidence must be finite")
+    cols = ["agent_id", "category", "content", "confidence", "embedding", "created_at"]
+    vals: List[Any] = [agent_id, category, content, confidence, embedding, now]
+    present = {str(r[1]) for r in c.execute("PRAGMA table_info(learnings)").fetchall()}
+    optional = (
+        ("source_query", fields.source_query),
+        ("source_doc_ids", _json_or_text(fields.source_doc_ids)),
+        ("evidence_doc_ids", _json_or_text(fields.evidence_doc_ids)),
+        ("assertion", fields.assertion),
+        ("applies_when", fields.applies_when),
+        ("contradicts_id", fields.contradicts_id),
+        ("content_hash", fields.content_hash),
+        ("status", fields.status),
     )
-    return int(c.lastrowid)
+    for name, value in optional:
+        if value is None:
+            continue
+        if name not in present:
+            raise _Abort(
+                "learning_field_unavailable",
+                f"learnings.{name} was provided but is not in this schema",
+            )
+        cols.append(name)
+        vals.append(value)
+    c.execute(
+        f"INSERT INTO learnings ({', '.join(cols)}) VALUES ({', '.join('?' * len(vals))})",
+        vals,
+    )
+    learning_id = int(c.lastrowid)
+    if fields.supersedes is not None:
+        c.execute(
+            "UPDATE learnings SET superseded_by = ? WHERE learning_id = ?",
+            (learning_id, fields.supersedes),
+        )
+    return learning_id
 
 
 def _fill_projection(
@@ -658,7 +911,7 @@ def _run_id(model_id: str, prompt_version: str, evidence_hash: str) -> str:
     ).hexdigest()[:16]
 
 
-def commit_learning_with_graph(
+def prepare_learning_with_graph(
     *,
     db: Any,
     store_id: str,
@@ -675,43 +928,63 @@ def commit_learning_with_graph(
     classify: Callable[[Dict[str, Any], List[Dict[str, Any]]], Any],
     graph_enabled: bool = True,
     workspace: str = "default",
-) -> CommitResult:
-    """Prepare outside the write lock, then atomically commit one learning
-    with its canonical node, projection, and typed edges.
+    learning_fields: Optional[LearningFields] = None,
+) -> PrepareResult:
+    """Phase A: embed/shortlist/classify OUTSIDE any write transaction.
 
-    Phase A (no lock): embed + chunk the new content, FAISS snapshot,
-    shortlist, batched classification. Phase B (``BEGIN IMMEDIATE``): insert
-    the learning, revalidate every edge target, stamp the canonical node +
-    join, fill FTS/chunks, upsert edges. Any abort before commit leaves zero
-    durable writes. New chunk ids + vectors return for the caller's
-    post-commit FAISS refresh — this module never touches a live index.
+    Returns a detached, digest-checked payload. Model callbacks must not run while
+    ``db`` is in a write transaction. Fail-loud: any prepare error yields
+    ``status='error'`` and no payload (new promotion stays uncommitted).
     """
     if not isinstance(principal, EffectivePrincipal):
-        return CommitResult(status="error", error_code="bad_principal",
-                            error="principal must be EffectivePrincipal")
+        return PrepareResult(status="error", error_code="bad_principal",
+                             error="principal must be EffectivePrincipal")
+    if workspace != principal.workspace_id:
+        return PrepareResult(
+            status="error", error_code="workspace_mismatch",
+            error="workspace does not match principal.workspace_id",
+        )
     try:
         _bound_store_id(db, store_id)
+        _assert_unlocked(db, "prepare")
     except _Abort as abort:
-        return CommitResult(status="error", error_code=abort.code,
-                            error=str(abort))
+        return PrepareResult(status="error", error_code=abort.code,
+                             error=str(abort))
+    principal = _snapshot_principal(principal)
     agent_id = principal.agent_id
     if not isinstance(content, str) or not content.strip():
-        return CommitResult(status="error", error_code="empty_content",
-                            error="content must be non-empty text")
+        return PrepareResult(status="error", error_code="empty_content",
+                             error="content must be non-empty text")
     now = time.time()
     meta = durable_metadata(content)
     path = durable_doc_path(agent_id, "", vault_path, content)
-
-    def _fail(code: str, message: str) -> CommitResult:
-        logger.warning("graph coordinator: commit aborted (%s): %s", code, message)
-        return CommitResult(status="error", error_code=code, error=message)
-
-    # Phase A1: vectors outside the lock. Graph-on promotion is fail-loud on
-    # any model failure; the disabled baseline tolerates missing vectors.
     try:
+        fields = _freeze_fields(
+            learning_fields if learning_fields is not None else LearningFields()
+        )
+    except _Abort as abort:
+        return PrepareResult(status="error", error_code=abort.code,
+                             error=str(abort))
+    embed_text = _guard_model(db, "embed", embed_text)
+    chunk_texts = _guard_model(db, "chunk", chunk_texts)
+    search_chunks = _guard_model(db, "search", search_chunks)
+    classify = _guard_model(db, "classify", classify)
+
+    def _fail(code: str, message: str) -> PrepareResult:
+        logger.warning("graph coordinator: prepare aborted (%s): %s", code, message)
+        return PrepareResult(status="error", error_code=code, error=message)
+
+    try:
+        _assert_unlocked(db, "chunk")
         raw_chunks = list(chunk_texts(content)) or [content.strip()]
+    except _Abort as abort:
+        return _fail(abort.code, str(abort))
     except Exception as exc:
         return _fail("chunk_failed", f"chunker failed: {exc}")
+    try:
+        _assert_unlocked(db, "embed")
+    except _Abort as abort:
+        return _fail(abort.code, str(abort))
     vectors = _embed_all(embed_text, [content, *raw_chunks])
     if vectors is None:
         if graph_enabled:
@@ -719,7 +992,7 @@ def commit_learning_with_graph(
         learning_vector, chunk_vectors = None, []
     else:
         learning_vector, chunk_vectors = vectors[0], vectors[1:]
-    chunks = list(zip(raw_chunks, chunk_vectors)) if chunk_vectors else []
+    chunks = tuple(zip(raw_chunks, chunk_vectors)) if chunk_vectors else ()
 
     shortlist = None
     validated: List[Tuple[CandidateDescriptor, str, str, float]] = []
@@ -731,7 +1004,10 @@ def commit_learning_with_graph(
             return _fail("edge_inference_schema_missing",
                          "graph schema not ready; promotion stays uncommitted")
         try:
+            _assert_unlocked(db, "search")
             hits = list(search_chunks(learning_vector or b"", MAX_CHUNK_HITS))
+        except _Abort as abort:
+            return _fail(abort.code, str(abort))
         except Exception as exc:
             return _fail("search_failed", f"chunk search failed: {exc}")
         try:
@@ -746,8 +1022,6 @@ def commit_learning_with_graph(
             return _fail(abort.code, str(abort))
         except ValueError as exc:
             return _fail("shortlist_rejected", str(exc))
-        # Self-exclusion binds post-commit in _bind_edges: re-promotion
-        # shares the canonical node, and a self-edge must never persist.
         pairs = list(shortlist.pairs)
         if pairs:
             source = {
@@ -767,94 +1041,220 @@ def commit_learning_with_graph(
                 for p in pairs
             ]
             try:
+                _assert_unlocked(db, "classify")
                 validated, classifier_info = _classify_validated(
                     source, candidates, classify, descriptors)
             except _Abort as abort:
                 return _fail(abort.code, str(abort))
 
-    # Phase B: one BEGIN IMMEDIATE transaction. _Abort or any DB error rolls
-    # back everything; the caller sees an error envelope, never partial rows.
+    snapshot_rows = tuple(
+        (int(doc_id), json.dumps(snapshot, sort_keys=True, separators=(",", ":")))
+        for doc_id, snapshot in sorted(meta_snapshots.items())
+    )
+    info_rows = tuple(sorted((str(k), str(v)) for k, v in classifier_info.items()))
+    draft = PreparedLearningCommit(
+        digest="",
+        store_id=store_id,
+        principal=principal,
+        workspace=workspace,
+        content=content,
+        content_sha256=_sha256_text(content),
+        category=category,
+        vault_path=vault_path,
+        embedding_model=embedding_model,
+        graph_enabled=bool(graph_enabled),
+        learning_vector=None if learning_vector is None else bytes(learning_vector),
+        chunks=tuple((str(t), bytes(v)) for t, v in chunks),
+        path=path,
+        sigil=str(meta["sigil"]),
+        layer=str(meta["layer"]),
+        shortlist_no_pairs=bool(graph_enabled and shortlist is not None
+                                and not shortlist.pairs),
+        validated=tuple(validated),
+        classifier_info=info_rows,
+        meta_snapshots=snapshot_rows,
+        learning_fields=fields,
+        prepared_at=now,
+    )
+    payload = _dc_replace(draft, digest=_payload_digest(draft))
+    return PrepareResult(status="ok", payload=payload)
+
+
+def _require_open_transaction(cursor: Any) -> None:
+    conn = getattr(cursor, "connection", None)
+    if conn is None or not getattr(conn, "in_transaction", False):
+        raise _Abort(
+            "write_requires_transaction",
+            "commit_prepared_learning requires the caller's open write transaction",
+        )
+
+
+def commit_prepared_learning(
+    cursor: Any,
+    prepared: PreparedLearningCommit,
+    *,
+    db: Any,
+    principal: EffectivePrincipal,
+) -> CommitResult:
+    """Phase B on the CALLER's cursor. Does not commit, rollback, or refresh FAISS.
+
+    The governed caller revalidates and terminalizes its candidate and review
+    fence on this same cursor. This helper never authorizes a candidate.
+    Writes are durable only after the outer transaction commits. Returned
+    ``new_chunk_vectors`` are for the caller's Phase C after that commit —
+    this function never invokes an index callback. On refusal it raises
+    ``GraphCommitAborted`` so the caller can roll back.
+    """
+    if not isinstance(prepared, PreparedLearningCommit):
+        raise _Abort("bad_payload", "prepared must be PreparedLearningCommit")
+    if not isinstance(principal, EffectivePrincipal):
+        raise _Abort("bad_principal", "principal must be EffectivePrincipal")
+    if _payload_digest(prepared) != prepared.digest:
+        raise _Abort("payload_tampered", "prepared digest does not match contents")
+    if _sha256_text(prepared.content) != prepared.content_sha256:
+        raise _Abort("payload_tampered", "content does not match snapshot hash")
+    _require_same_authority(prepared, principal)
+    _require_open_transaction(cursor)
+    conn = getattr(cursor, "connection", None)
+    _bound_store_id(db, prepared.store_id)
+    _bound_store_id(db, prepared.store_id, conn=conn)
+    if _payload_digest(prepared) != prepared.digest:
+        raise _Abort("payload_tampered", "prepared digest mutated before write")
+    snapshots = {
+        doc_id: json.loads(blob) for doc_id, blob in prepared.meta_snapshots
+    }
+    info = dict(prepared.classifier_info)
+    c = cursor
+    prior = c.execute(
+        "SELECT page_status, privacy_level FROM documents"
+        " WHERE path = ?",
+        (prepared.path,),
+    ).fetchone()
+    if prior is not None and projection_row_closed(
+        prior["page_status"], prior["privacy_level"]
+    ):
+        raise _Abort("canonical_restricted",
+                     "canonical node is lifecycle-closed/restricted")
+    learning_id = _insert_learning(
+        c, agent_id=prepared.principal.agent_id, category=prepared.category,
+        content=prepared.content, embedding=prepared.learning_vector,
+        now=prepared.prepared_at, fields=prepared.learning_fields,
+    )
+    doc_id = ensure_canonical_learning_node(
+        c, learning_id=learning_id, agent_id=prepared.principal.agent_id,
+        content=prepared.content, vault_path=prepared.vault_path,
+        created_at=prepared.prepared_at,
+    )
+    if doc_id is None:
+        raise _Abort("canonical_failed", "canonical node commit refused")
+    bound: List[Tuple[int, int, str, float]] = []
+    if prepared.graph_enabled and prepared.validated:
+        targets = {}
+        for descriptor, _label, _direction, _conf in prepared.validated:
+            targets[descriptor.doc_id] = descriptor
+        for descriptor in targets.values():
+            _revalidate_target(
+                c, descriptor, principal=principal,
+                workspace=prepared.workspace, store_id=prepared.store_id,
+                metadata_snapshot=_require_snapshot(snapshots, descriptor.doc_id),
+            )
+        bound = _bind_edges(prepared.validated, int(doc_id))
+    new_chunk_ids: Tuple[int, ...] = ()
+    new_vectors: Tuple[bytes, ...] = ()
+    chunks = list(prepared.chunks)
+    if chunks or prepared.graph_enabled:
+        _, new_chunk_ids = _fill_projection(
+            c, doc_id=doc_id, path=prepared.path,
+            agent_id=prepared.principal.agent_id, sigil=prepared.sigil,
+            content=prepared.content, chunks=chunks,
+            embedding_model=prepared.embedding_model, layer=prepared.layer,
+            now=prepared.prepared_at,
+        )
+        if new_chunk_ids:
+            new_vectors = tuple(v for _, v in chunks)
+    elif not prepared.graph_enabled:
+        present = c.execute(
+            "SELECT 1 FROM vault_fts WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if present is None:
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (doc_id, prepared.path, prepared.content,
+                 prepared.principal.agent_id, prepared.sigil),
+            )
+    committed: Tuple[CommittedEdge, ...] = ()
+    contradiction_logged = False
+    if bound:
+        run = _run_id(info["model_id"], info["prompt_version"], info["evidence_hash"])
+        committed, contradiction_logged = _write_edges(
+            c, bound, run_id=run, model_id=info["model_id"],
+            prompt_version=info["prompt_version"],
+            evidence={"evidence_hash": info["evidence_hash"]},
+            now=prepared.prepared_at, new_learning_id=learning_id,
+        )
+    return CommitResult(
+        status="staged", learning_id=learning_id, doc_id=doc_id,
+        edges=committed,
+        no_candidates=prepared.shortlist_no_pairs,
+        edges_deferred=None if prepared.graph_enabled else "disabled",
+        new_chunk_ids=new_chunk_ids, new_chunk_vectors=new_vectors,
+        contradiction_logged=contradiction_logged,
+    )
+
+
+def commit_learning_with_graph(
+    *,
+    db: Any,
+    store_id: str,
+    principal: EffectivePrincipal,
+    content: str,
+    category: str = "general",
+    vault_path: str,
+    embedding_model: str,
+    embed_text: Callable[[str], bytes],
+    chunk_texts: Callable[[str], Sequence[str]],
+    search_chunks: Callable[[bytes, int], Sequence[Dict[str, Any]]],
+    get_metadata: Callable[[str, int], Optional[Dict[str, Any]]],
+    get_content: Callable[[str, int], Optional[Dict[str, Any]]],
+    classify: Callable[[Dict[str, Any], List[Dict[str, Any]]], Any],
+    graph_enabled: bool = True,
+    workspace: str = "default",
+    learning_fields: Optional[LearningFields] = None,
+) -> CommitResult:
+    """Compatible wrapper: Phase A then caller-local ``BEGIN IMMEDIATE``.
+
+    Phase C (FAISS) is still the caller's job after this returns. The
+    wrapper only returns ``ok`` after the outer transaction commits.
+    """
+    prepared = prepare_learning_with_graph(
+        db=db, store_id=store_id, principal=principal, content=content,
+        category=category, vault_path=vault_path,
+        embedding_model=embedding_model, embed_text=embed_text,
+        chunk_texts=chunk_texts, search_chunks=search_chunks,
+        get_metadata=get_metadata, get_content=get_content,
+        classify=classify, graph_enabled=graph_enabled,
+        workspace=workspace, learning_fields=learning_fields,
+    )
+    if prepared.status != "ok" or prepared.payload is None:
+        return CommitResult(
+            status="error", error_code=prepared.error_code,
+            error=prepared.error,
+        )
+
+    def _fail(code: str, message: str) -> CommitResult:
+        logger.warning("graph coordinator: commit aborted (%s): %s", code, message)
+        return CommitResult(status="error", error_code=code, error=message)
+
     try:
         with db.transaction() as c:
-            # A pre-existing closed/restricted node at this path must not be
-            # resurrected by a new promotion sharing its content.
-            prior = c.execute(
-                "SELECT page_status, privacy_level FROM documents"
-                " WHERE path = ?",
-                (path,),
-            ).fetchone()
-            if prior is not None and projection_row_closed(
-                prior["page_status"], prior["privacy_level"]
-            ):
-                raise _Abort("canonical_restricted",
-                             "canonical node is lifecycle-closed/restricted")
-            learning_id = _insert_learning(
-                c, agent_id=agent_id, category=category, content=content,
-                embedding=learning_vector, now=now,
+            staged = commit_prepared_learning(
+                c, prepared.payload, db=db, principal=principal,
             )
-            doc_id = ensure_canonical_learning_node(
-                c, learning_id=learning_id, agent_id=agent_id,
-                content=content, vault_path=vault_path, created_at=now,
-            )
-            if doc_id is None:
-                raise _Abort("canonical_failed",
-                             "canonical node commit refused")
-            bound: List[Tuple[int, int, str, float]] = []
-            if graph_enabled and validated:
-                targets = {}
-                for descriptor, _label, _direction, _conf in validated:
-                    targets[descriptor.doc_id] = descriptor
-                for descriptor in targets.values():
-                    _revalidate_target(
-                        c, descriptor, principal=principal,
-                        workspace=workspace, store_id=store_id,
-                        metadata_snapshot=_require_snapshot(
-                            meta_snapshots, descriptor.doc_id))
-                bound = _bind_edges(validated, int(doc_id))
-            new_chunk_ids: Tuple[int, ...] = ()
-            new_vectors: Tuple[bytes, ...] = ()
-            if chunks or graph_enabled:
-                _, new_chunk_ids = _fill_projection(
-                    c, doc_id=doc_id, path=path, agent_id=agent_id,
-                    sigil=meta["sigil"], content=content, chunks=chunks,
-                    embedding_model=embedding_model, layer=meta["layer"],
-                    now=now,
-                )
-                if new_chunk_ids:
-                    new_vectors = tuple(v for _, v in chunks)
-            elif not graph_enabled:
-                # Disabled baseline with no vectors still lands lexical FTS.
-                present = c.execute(
-                    "SELECT 1 FROM vault_fts WHERE doc_id = ?", (doc_id,)
-                ).fetchone()
-                if present is None:
-                    c.execute(
-                        "INSERT INTO vault_fts (doc_id, path, content, agent, sigil)"
-                        " VALUES (?, ?, ?, ?, ?)",
-                        (doc_id, path, content, agent_id, meta["sigil"]),
-                    )
-            committed: Tuple[CommittedEdge, ...] = ()
-            contradiction_logged = False
-            if bound:
-                run = _run_id(classifier_info["model_id"],
-                              classifier_info["prompt_version"],
-                              classifier_info["evidence_hash"])
-                committed, contradiction_logged = _write_edges(
-                    c, bound, run_id=run, model_id=classifier_info["model_id"],
-                    prompt_version=classifier_info["prompt_version"],
-                    evidence={"evidence_hash": classifier_info["evidence_hash"]},
-                    now=now, new_learning_id=learning_id,
-                )
-            return CommitResult(
-                status="ok", learning_id=learning_id, doc_id=doc_id,
-                edges=committed,
-                no_candidates=bool(graph_enabled and shortlist is not None
-                                   and not shortlist.pairs),
-                edges_deferred=None if graph_enabled else "disabled",
-                new_chunk_ids=new_chunk_ids, new_chunk_vectors=new_vectors,
-                contradiction_logged=contradiction_logged,
-            )
-    except _Abort as abort:
+        if staged.status == "staged":
+            return _dc_replace(staged, status="ok")
+        return staged
+    except GraphCommitAborted as abort:
         return _fail(abort.code, str(abort))
     except Exception as exc:
         logger.exception("graph coordinator: commit transaction failed")
