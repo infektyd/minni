@@ -80,6 +80,7 @@ where = ["src"]
 minni = [
     "afm_prompts/*.md",
     "afm_passes/*.md",
+    "prompts/*",
     "principal_templates/*",
     "migrations/*",
     "data/*",

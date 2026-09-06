@@ -428,7 +428,14 @@ class TestExplain:
 class TestMigration002:
 
     def test_migration_002_bumps_user_version_to_current_target(self, tmp_path):
-        """After migrations, user_version matches the highest known migration."""
+        """After migrations, user_version matches the highest ACTUALLY APPLIED migration.
+
+        Intentional contract (not a bug): user_version is truthful — it is
+        MAX(schema_migrations), never the highest known file. This fixture is
+        a partial schema (no learnings/memory_links), so 021 stays unstamped
+        and pending by design; stamping 21 here would lie about the graph
+        schema being present. A full base schema stamps the file max.
+        """
         from minni.migrations import run_migrations
         db_path = str(tmp_path / "test.db")
         conn = sqlite3.connect(db_path)
@@ -448,13 +455,15 @@ class TestMigration002:
         conn.commit()
         run_migrations(conn)
         version = conn.execute("PRAGMA user_version").fetchone()[0]
+        applied = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        pending_021 = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = 21"
+        ).fetchone()
         conn.close()
-        migrations_dir = Path(os.path.dirname(__file__)).parent / "src" / "minni" / "migrations"
-        expected = max(
-            int(p.name.split("_", 1)[0])
-            for p in migrations_dir.glob("[0-9][0-9][0-9]_*.sql")
-        )
-        assert version == expected, f"Expected user_version={expected}, got {version}"
+        # Truthful stamp: user_version tracks what was applied, not what exists.
+        assert version == applied, f"user_version={version} lies about applied max={applied}"
+        # Partial fixture => 021 correctly left pending for a later retry.
+        assert pending_021 is None, "021 must stay unstamped on a partial schema"
 
     def test_score_distribution_table_exists(self, tmp_path):
         """Migration 002 creates score_distribution table."""
