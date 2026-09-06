@@ -600,17 +600,38 @@ created: {dt.isoformat()}
         # (rows preserved; resolution_id wired on resolve_candidate)
         try:
             now = time.time()
+            # Probe once per invocation: baseline 009 lacks resolution_status
+            # (021 unavailable is non-fatal), so use the legacy column shape
+            # there instead of dropping every audit row under the catch below.
+            with self.db.cursor() as probe:
+                log_cols = {
+                    row[1]
+                    for row in probe.execute(
+                        "PRAGMA table_info(contradiction_log)"
+                    ).fetchall()
+                }
+            typed_log = "resolution_status" in log_cols
             for cand in candidates:
                 with self.db.cursor() as c:
-                    c.execute(
-                        """
-                        INSERT INTO contradiction_log
-                        (memory_a_id, memory_b_id, detected_at, detection_method,
-                         resolution_status)
-                        VALUES (?, ?, ?, ?, 'legacy_unclassified')
-                        """,
-                        (cand.get("id"), None, now, "cosine"),
-                    )
+                    if typed_log:
+                        c.execute(
+                            """
+                            INSERT INTO contradiction_log
+                            (memory_a_id, memory_b_id, detected_at, detection_method,
+                             resolution_status)
+                            VALUES (?, ?, ?, ?, 'legacy_unclassified')
+                            """,
+                            (cand.get("id"), None, now, "cosine"),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO contradiction_log
+                            (memory_a_id, memory_b_id, detected_at, detection_method)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (cand.get("id"), None, now, "cosine"),
+                        )
         except Exception as exc:
             logger.debug("contradiction_log insert skipped (non-fatal): %s", exc)
 
