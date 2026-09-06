@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -163,20 +162,39 @@ class VendorMemorySearcher(SearcherProtocol):
         return []
 
 
-class SnapshotSearcher(SearcherProtocol):
-    """Governed retrieval over a prepared study snapshot directory only.
+def _sanitize_snapshot_query(query: str) -> str:
+    """FTS5-safe query terms; mirrors RetrievalEngine._sanitize_fts_query.
 
-    Opens the disposable database/index/vault inside ``snapshot_dir`` (see
-    ``eval/study_snapshot.py``) under a least-privilege principal scoped to
-    the snapshot vault. Never instantiates the live ``DEFAULT_CONFIG``.
-    Normal governed search applies; access/trace effects are the engine's
-    own and no zero-write forensic claim is made.
+    A contract test pins parity so snapshot lexical semantics cannot drift
+    from the engine's FTS leg. Local copy (not an engine call) keeps the
+    snapshot search path free of model-adjacent imports.
+    """
+    import re as _re
+
+    words = _re.sub(r"[^\w\s]", " ", query).split()
+    return " ".join(words)
+
+
+class SnapshotSearcher(SearcherProtocol):
+    """Governed lexical retrieval over a prepared study snapshot directory.
+
+    Explicit offline lexical implementation over the disposable study
+    database: FTS5 MATCH (strict AND, OR fallback) with the engine's default
+    lifecycle exclusions and the central ``can_read_document`` gate under a
+    least-privilege principal scoped to the snapshot vault. No retrieval
+    engine is instantiated, no model is loaded, no network is touched, and
+    NO deadline is passed anywhere in this path — so present and future
+    whole-request expiry semantics cannot degrade it to empty. Never touches
+    the live ``DEFAULT_CONFIG`` database. Read-only: access counters are
+    never updated and no zero-write forensic claim is made beyond that.
     """
 
     backend = "snapshot"
 
     def __init__(self, snapshot_dir: Path) -> None:
-        from .study_snapshot import check_materialized, verify_snapshot
+        from minni.principal import EffectivePrincipal
+
+        from .study_snapshot import check_materialized, snapshot_config_paths, verify_snapshot
 
         root = Path(snapshot_dir).resolve()
         try:
@@ -198,68 +216,106 @@ class SnapshotSearcher(SearcherProtocol):
             if record.get("expected_eligible") is False:
                 self.forbidden_doc_ids.add(materialized["document_ids"].get(study_id))
         self.forbidden_doc_ids.discard(None)
-        self._engine = None
-        self._principal = None
-
-    def _ensure_engine(self):  # lazy so import never touches a database
-        if self._engine is not None:
-            return self._engine
-        from minni.config import SovereignConfig
-        from minni.db import SovereignDB
-        from minni.principal import EffectivePrincipal
-        from minni.retrieval import RetrievalEngine
-        from .study_snapshot import check_materialized, snapshot_config_paths, verify_snapshot
-
-        root = self.snapshot_dir
-        # Re-validate frozen files, metadata, and materialized outputs before
-        # opening the disposable backend: symlinks, tampered bytes,
-        # inconsistent mappings, and stale-output mixing all fail here.
-        verify_snapshot(root)
-        materialized = check_materialized(root)
         paths = snapshot_config_paths(root)
-        config = SovereignConfig(
-            db_path=paths["db_path"],
-            vault_path=paths["vault_path"],
-            faiss_index_path=paths["faiss_index_path"],
-            graph_export_dir=paths["graph_export_dir"],
-            writeback_path=paths["writeback_path"],
-            writeback_enabled=False,
-            reranker_enabled=False,
-            hyde_enabled=False,
-        )
-        db = SovereignDB(config)
-        self._engine = RetrievalEngine(db, config)
         self._principal = EffectivePrincipal(
             agent_id=self._agent_id,
             capabilities=["search", "read"],
             allowed_vault_roots=[paths["vault_path"]],
         )
-        self._materialized = materialized
-        return self._engine
 
     def search(self, query: str, **kwargs) -> List[Dict[str, Any]]:
-        from .study_snapshot import check_materialized, verify_snapshot
+        from minni.principal import can_read_document
+
+        from .study_snapshot import (
+            DEFAULT_EXCLUDED_STATUSES,
+            StudySnapshotError,
+            check_materialized,
+            verify_snapshot,
+        )
 
         if kwargs.get("expand") not in (None, False, "off") or kwargs.get("use_hyde"):
             raise ValueError("snapshot retrieval supports lexical-only baseline configuration")
         # Frozen state is re-validated before every search, not just at open.
         verify_snapshot(self.snapshot_dir)
         check_materialized(self.snapshot_dir)
-        engine = self._ensure_engine()
-        search_kwargs = {
-            "limit": kwargs.get("limit", 10),
-            "update_access": False,
-            "expand": False,
-            "use_hyde": False,
-            "budget_tokens": kwargs.get("budget_tokens", True),
-            "principal": self._principal,
-            "deadline_monotonic": time.monotonic() - 1,
-        }
-        if kwargs.get("deadline_monotonic") is not None:
-            search_kwargs["deadline_monotonic"] = min(
-                search_kwargs["deadline_monotonic"], kwargs["deadline_monotonic"]
-            )
-        return engine.retrieve(query, **search_kwargs)
+        # Deadline-free by construction: any caller-supplied deadline is
+        # ignored, never forwarded, so expiry semantics cannot empty results.
+        limit = max(1, int(kwargs.get("limit", 10)))
+        if not isinstance(query, str) or not query.strip():
+            return []
+        safe_query = _sanitize_snapshot_query(query)
+        if not safe_query:
+            return []
+        terms = safe_query.split()
+        match_exprs = [safe_query]
+        if len(terms) > 1:
+            match_exprs.append(" OR ".join(term.lower() for term in terms))
+
+        import sqlite3
+        from urllib.parse import quote as _quote
+
+        db_path = self.snapshot_dir / "study.db"
+        uri = "file:" + _quote(str(db_path), safe="/:") + "?mode=ro"
+        skip = sorted(DEFAULT_EXCLUDED_STATUSES)
+        placeholders = ",".join("?" * len(skip))
+        rows: List[Dict[str, Any]] = []
+        try:
+            handle = sqlite3.connect(uri, uri=True)
+            try:
+                handle.execute("PRAGMA query_only = ON")
+                for match_expr in match_exprs:
+                    for row in handle.execute(
+                        "SELECT f.doc_id, d.path, d.agent, d.page_status,"
+                        " d.privacy_level, d.page_type, f.content, f.rank AS bm25_rank"
+                        " FROM vault_fts f JOIN documents d ON d.doc_id = f.doc_id"
+                        " WHERE vault_fts MATCH ?"
+                        f" AND COALESCE(d.page_status, 'candidate') NOT IN ({placeholders})"
+                        " ORDER BY rank LIMIT ?",
+                        [match_expr, *skip, limit * 3],
+                    ).fetchall():
+                        rows.append({
+                            "doc_id": row[0], "path": row[1], "agent": row[2],
+                            "page_status": row[3] or "candidate",
+                            "privacy_level": row[4], "page_type": row[5],
+                            "content": row[6],
+                        })
+                    if rows:
+                        break
+            finally:
+                handle.close()
+        except Exception as exc:  # noqa: BLE001 - a DB failure is an integrity failure
+            raise StudySnapshotError(
+                f"snapshot lexical search failed: {type(exc).__name__}"
+            ) from exc
+
+        results = []
+        for rank, row in enumerate(rows[:limit], start=1):
+            metadata = {
+                "path": row["path"], "agent": row["agent"],
+                "page_type": row["page_type"], "privacy_level": row["privacy_level"],
+            }
+            if not can_read_document(self._principal, "default", metadata):
+                continue
+            text = row["content"] or ""
+            results.append({
+                "doc_id": row["doc_id"],
+                "source": row["path"],
+                "filename": Path(row["path"]).name,
+                "text": text,
+                "score": round(1.0 / rank, 4),
+                "token_count": max(1, len(text) // 4),
+                "agent": row["agent"],
+                "privacy_level": row["privacy_level"],
+                "page_status": row["page_status"],
+                "retriever": "snapshot",
+                "provenance": {
+                    "doc_id": row["doc_id"],
+                    "backend": "snapshot",
+                    "snapshot_id": self.snapshot_id,
+                    "lexical_only": True,
+                },
+            })
+        return results
 
 
 class MockSearcher(SearcherProtocol):

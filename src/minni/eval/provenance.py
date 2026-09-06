@@ -267,13 +267,14 @@ def principal_provenance(
 
 
 def corpus_provenance(*, is_mock: bool, retriever_name: str = "",
-                      snapshot_id: str | None = None,
-                      manifest_digest: str | None = None) -> Dict[str, Any]:
+                      snapshot_id: Optional[str] = None,
+                      manifest_digest: Optional[str] = None) -> Dict[str, Any]:
     """Corpus/database identity per backend: only what is verifiably available.
 
     Only the live-engine backends touch a database at all. File baselines
     and placeholders get their own honest labels instead of inheriting the
-    live-database description.
+    live-database description. The snapshot backend fails closed: without a
+    verified snapshot ID it is unknown, never frozen.
     """
     key = retriever_name.strip().lower()
     if is_mock or key == "mock":
@@ -306,8 +307,16 @@ def corpus_provenance(*, is_mock: bool, retriever_name: str = "",
                     "results; no corpus identity applies.",
         }
     if key in {"snapshot", "study-snapshot", "study_snapshot"}:
+        if not snapshot_id or snapshot_id == "unknown":
+            return {
+                "snapshot": "unknown",
+                "frozen": False,
+                "note": "Snapshot backend without a verified snapshot ID: "
+                        "no frozen claim is made. A verified prepared "
+                        "snapshot reports its manifest-derived ID instead.",
+            }
         return {
-            "snapshot": snapshot_id or "study-frozen",
+            "snapshot": snapshot_id,
             "manifest_digest": manifest_digest,
             "frozen": True,
             "note": "Disposable study snapshot: all DB/index/vault paths live "

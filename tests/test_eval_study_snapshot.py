@@ -320,7 +320,7 @@ def test_deterministic_remapping_is_stable_and_opaque():
         assert row["source_provenance"]["agent"] == "hans"
         assert row["source_provenance"]["privacy_level"] == "private"
         assert row["source_provenance"]["origin"] == "day-to-day cross-project memory"
-        assert row["source_provenance"]["page_status"] == "active"
+        assert row["source_provenance"]["page_status"] == "candidate"
         assert row["expected_eligible"] is True  # flat mirror matches judgment
 
 
@@ -465,7 +465,7 @@ def test_materialize_preserves_original_lifecycle_and_refuses_rerun(tmp_path, mo
         "SELECT agent, privacy_level, page_status, page_type FROM documents ORDER BY doc_id"
     ).fetchall()
     assert rows[0] == ("hans", "private", "superseded", "decision")
-    assert rows[1] == ("hans", "shared", "active", "note")
+    assert rows[1] == ("hans", "shared", "candidate", "unknown")
 
     materialized = check_materialized(dest)
     assert materialized["manifest_digest"] == result["manifest_digest"]
@@ -473,42 +473,45 @@ def test_materialize_preserves_original_lifecycle_and_refuses_rerun(tmp_path, mo
         materialize_snapshot_db(dest)
 
 
-def test_snapshot_searcher_never_uses_live_default_config(tmp_path, monkeypatch):
-    from minni import config as config_mod
+def test_snapshot_search_constructs_no_engine_db_or_model(tmp_path, monkeypatch):
     from minni import db as db_mod
     from minni import retrieval as retrieval_mod
     from minni.eval.retrievers import SnapshotSearcher, make_searcher
 
+    def no_database(_self, *_args, **_kwargs):
+        pytest.fail("snapshot search must not construct a database")
+
+    def no_engine(_self, *_args, **_kwargs):
+        pytest.fail("snapshot search must not construct a retrieval engine")
+
+    def no_model(_self):
+        pytest.fail("snapshot search must not load a model")
+
     dest = tmp_path / "snapshot"
     prepare_snapshot(_two_record_packet(), dest)
+    # Materialization legitimately builds the disposable isolated DB; the
+    # fail-closed guards below cover searcher construction and search only.
     materialize_snapshot_db(dest)
-
-    live_config = config_mod.DEFAULT_CONFIG
-    seen = []
-
-    def fake_db_init(self, config):
-        seen.append(("db", config))
-
-    def fake_engine_init(self, db, config=None, **kwargs):
-        seen.append(("engine", config))
-        self.db, self.config = db, config
-
-    monkeypatch.setattr(db_mod.SovereignDB, "__init__", fake_db_init)
-    monkeypatch.setattr(retrieval_mod.RetrievalEngine, "__init__", fake_engine_init)
+    monkeypatch.setattr(db_mod.SovereignDB, "__init__", no_database)
+    monkeypatch.setattr(retrieval_mod.RetrievalEngine, "__init__", no_engine)
+    monkeypatch.setattr(retrieval_mod.RetrievalEngine, "model", property(no_model))
 
     searcher = make_searcher("snapshot", root=dest)
     assert isinstance(searcher, SnapshotSearcher)
-    object.__new__(SnapshotSearcher)  # device under test supports pure-mock setup
-    searcher._ensure_engine()
-    assert seen, "expected isolated constructors to be recorded"
-    for _kind, config in seen:
-        assert config is not live_config
-        for attr in ("db_path", "vault_path", "faiss_index_path", "graph_export_dir"):
-            assert str(Path(getattr(config, attr)).resolve()).startswith(str(dest.resolve())), attr
+    assert searcher.snapshot_id.startswith("study-")
+    # Known relevant rows come back with no engine, DB handle, or model.
+    results = searcher.search("alpha launch", limit=5)
+    assert [r["source"].split("vault/")[-1] for r in results] == ["project-a/launch.md"]
+    assert results[0]["provenance"]["snapshot_id"] == searcher.snapshot_id
+    assert results[0]["provenance"]["lexical_only"] is True
+    # Caller deadlines are ignored, never forwarded: expiry semantics,
+    # present or future, cannot empty snapshot results.
+    expired = searcher.search("alpha launch", limit=5, deadline_monotonic=0.0)
+    assert [r["doc_id"] for r in expired] == [r["doc_id"] for r in results]
+    assert searcher._principal.allowed_vault_roots == [str(dest / "vault")]
 
     with pytest.raises(ValueError, match="prepared snapshot directory"):
         make_searcher("snapshot")
-
 
 def test_snapshot_searcher_revalidates_before_every_search(tmp_path, monkeypatch):
     import sqlite3
@@ -550,12 +553,31 @@ def test_snapshot_searcher_revalidates_before_every_search(tmp_path, monkeypatch
 def test_snapshot_provenance_labels_are_honest():
     from minni.eval.provenance import corpus_provenance, principal_provenance
 
-    corpus = corpus_provenance(is_mock=False, retriever_name="snapshot")
-    assert corpus["snapshot"] == "study-frozen" and corpus["frozen"] is True
-    assert "never" in corpus["note"] and "live corpus" in corpus["note"]
-    principal = principal_provenance("snapshot", is_mock=False)
+    # Fail closed: no verified snapshot ID means unknown, never frozen.
+    missing = corpus_provenance(is_mock=False, retriever_name="snapshot")
+    assert missing["snapshot"] == "unknown" and missing["frozen"] is False
+    unknown = corpus_provenance(is_mock=False, retriever_name="snapshot", snapshot_id="unknown")
+    assert unknown["snapshot"] == "unknown" and unknown["frozen"] is False
+    corpus = corpus_provenance(
+        is_mock=False, retriever_name="snapshot", snapshot_id="study-abc123",
+        manifest_digest="digest-abc123")
+    assert corpus["snapshot"] == "study-abc123" and corpus["frozen"] is True
+    assert corpus["manifest_digest"] == "digest-abc123"
+    assert "live corpus" in corpus["note"]
+    from minni.principal import EffectivePrincipal
+
+    uninitialized = principal_provenance("snapshot", is_mock=False)
+    assert uninitialized["supplied"] is True
+    assert "not initialized" in uninitialized["note"]
+    principal = principal_provenance(
+        "snapshot", is_mock=False,
+        principal=EffectivePrincipal(
+            agent_id="hans", capabilities=["search", "read"],
+            allowed_vault_roots=["/private/snap/study-01/vault"]),
+    )
     assert principal["supplied"] is True
-    assert "not independently verified" in principal["note"]
+    assert principal["agent_id"] == "hans"
+    assert principal["allowed_vault_roots"] == ["/private/snap/study-01/vault"]
 
     assert "live" in study_snapshot.__doc__.lower()
 
@@ -845,3 +867,49 @@ def test_prepare_preflights_nonempty_destination(tmp_path):
     after = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
     assert after == before
     assert verify_snapshot(dest)["manifest"]["manifest_digest"] == first["manifest"]["manifest_digest"]
+
+
+def test_page_status_uses_genuine_engine_vocabulary():
+    from minni.eval.study_snapshot import DEFAULT_PAGE_STATUS, PAGE_STATUSES
+
+    assert DEFAULT_PAGE_STATUS == "candidate"
+    assert "draft" in PAGE_STATUSES and "active" not in PAGE_STATUSES
+    packet = _two_record_packet()
+    packet["records"][0]["page_status"] = "active"
+    with pytest.raises(StudySnapshotError, match="page_status"):
+        validate_export_packet(packet)
+    allowed = _packet([
+        _record("doc-a1", "store-a", "project-a/a.md", "text one here", page_status="draft"),
+    ])
+    assert validate_export_packet(allowed)[0]["page_status"] == "draft"
+
+
+def test_page_status_vocabulary_matches_engine():
+    from minni.eval.study_snapshot import PAGE_STATUSES
+    from minni.wiki_indexer import WikiFrontmatter
+
+    assert PAGE_STATUSES == set(WikiFrontmatter.VALID_STATUSES)
+
+
+def test_snapshot_sanitize_matches_engine_fts():
+    from minni.eval.retrievers import _sanitize_snapshot_query
+    from minni.retrieval import RetrievalEngine
+
+    for query in ["alpha launch", "cross-project recall!", "  spaced   out  ",
+                  "c++ and c#", "well-known fact"]:
+        assert _sanitize_snapshot_query(query) == RetrievalEngine._sanitize_fts_query(query)
+
+
+def test_draft_records_excluded_from_default_snapshot_search(tmp_path):
+    from minni.eval.retrievers import SnapshotSearcher
+
+    dest = tmp_path / "snapshot"
+    prepare_snapshot(_packet([
+        _record("doc-a1", "store-a", "project-a/launch.md", "alpha launch notes",
+                page_status="accepted"),
+        _record("doc-b1", "store-b", "project-b/draft.md", "alpha draft notes",
+                page_status="draft"),
+    ]), dest)
+    materialize_snapshot_db(dest)
+    results = SnapshotSearcher(dest).search("alpha", limit=5)
+    assert [r["source"].split("vault/")[-1] for r in results] == ["project-a/launch.md"]

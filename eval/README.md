@@ -353,10 +353,15 @@ PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
 
 The snapshot retriever requires `--snapshot-dir`, opens only that directory
 under a least-privilege principal scoped to the snapshot vault, and never
-instantiates the live `DEFAULT_CONFIG`. Provenance labels it `study-frozen`
+instantiates the live `DEFAULT_CONFIG`, a retrieval engine, or a model.
+Retrieval is an explicit offline lexical baseline (FTS5 MATCH with the
+engine's default lifecycle exclusions plus the central read gate) — not a
+full-engine quality comparison — and takes no deadline, so expiry semantics
+cannot empty its results. Provenance labels the verified snapshot ID plus its manifest digest
+(failing closed to `unknown`/unfrozen without a verified ID)
 with supplied (not verified) authorization; the snapshot backend is excluded
-from quality-gate config comparisons. Normal governed search/drill
-access/trace effects apply — no zero-write forensic claim is made.
+from quality-gate config comparisons. The search path is fully read-only;
+no zero-write forensic claim is made beyond that.
 `sm_export_pack` stays what it is (shared snippets under an export
 capability, not a corpus snapshot) and no capability is bypassed.
 

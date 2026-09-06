@@ -77,10 +77,25 @@ MAX_CLAIMED_CHARS = 512
 MAX_SOURCE_DOC_ID_CHARS = 256
 MAX_AGENT_CHARS = 128
 MAX_PRIVACY_CHARS = 64
-MAX_LIFECYCLE_CHARS = 64
 MAX_LOCATOR_CHARS = 512
 MAX_ARTIFACT_PATH_CHARS = 512
 MAX_TOTAL_ARTIFACT_PATH_CHARS = 256_000
+
+# Genuine engine lifecycle vocabulary (WikiFrontmatter.VALID_STATUSES; the DB
+# column and frontmatter defaults are "candidate"). Snapshot packets must use
+# these exact statuses — never invented ones like "active" — so frozen rows
+# behave identically under the engine's lifecycle filters. In particular the
+# default must stay retrievable under default retrieval: "draft" is excluded
+# unless include_drafts is passed, so defaulting to it would silently return
+# no retrieval. A contract test pins this set to the engine vocabulary.
+PAGE_STATUSES = frozenset({"draft", "candidate", "accepted", "superseded", "rejected", "expired"})
+DEFAULT_PAGE_STATUS = "candidate"
+# Statuses excluded by default retrieval (retrieve() with all include_* False,
+# plus the never-recallable "complete" terminal state).
+DEFAULT_EXCLUDED_STATUSES = frozenset({"draft", "superseded", "rejected", "expired", "complete"})
+PAGE_TYPES = frozenset({"entity", "concept", "decision", "procedure", "session",
+                        "artifact", "handoff", "synthesis", "unknown"})
+DEFAULT_PAGE_TYPE = "unknown"
 # Frozen-file read caps: no unbounded read happens before a size preflight.
 MAX_VAULT_FILE_BYTES = MAX_TEXT_BYTES + 1_024
 MAX_METADATA_BYTES = 4_000_000
@@ -284,8 +299,8 @@ def _canonical_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "expected_eligible": record["expected_eligible"],
         "human_reviewed": record["human_reviewed"],
         "origin": record["origin"],
-        "page_status": record.get("page_status", "active"),
-        "page_type": record.get("page_type", "note"),
+        "page_status": record.get("page_status", DEFAULT_PAGE_STATUS),
+        "page_type": record.get("page_type", DEFAULT_PAGE_TYPE),
         "privacy_level": record["privacy_level"],
         "review_state": record["review_state"],
         "source_detail": record.get("source_detail"),
@@ -438,13 +453,18 @@ def validate_export_packet(packet: Any) -> List[Dict[str, Any]]:
                 f"{label}: expected_eligible must be an explicit boolean "
                 "(cross-project eligibility is annotated, never inferred)"
             )
-        page_status = _require_bounded_str(
-            row.get("page_status", "active"), f"{label} page_status", MAX_LIFECYCLE_CHARS)
-        if page_status not in {"active", "draft", "candidate", "accepted", "superseded",
-                               "rejected", "expired", "complete"}:
-            raise StudySnapshotError(f"{label}: page_status is not a recognized lifecycle status")
-        page_type = _require_bounded_str(
-            row.get("page_type", "note"), f"{label} page_type", MAX_LIFECYCLE_CHARS)
+        page_status = row.get("page_status", DEFAULT_PAGE_STATUS)
+        if page_status not in PAGE_STATUSES:
+            raise StudySnapshotError(
+                f"{label}: page_status must be one of {sorted(PAGE_STATUSES)} "
+                "(genuine engine lifecycle statuses only)"
+            )
+        page_type = row.get("page_type", DEFAULT_PAGE_TYPE)
+        if page_type not in PAGE_TYPES:
+            raise StudySnapshotError(
+                f"{label}: page_type must be one of {sorted(PAGE_TYPES)} "
+                "(genuine engine page types only)"
+            )
         if source_locator is not None and len(source_locator) > MAX_LOCATOR_CHARS:
             raise StudySnapshotError(
                 f"{label}: source_locator exceeds {MAX_LOCATOR_CHARS} chars")
@@ -992,8 +1012,8 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
                     " VALUES(?,?,?,?,?,?)",
                     (str(target), provenance.get("agent", row.get("agent")),
                      provenance.get("privacy_level", row.get("privacy_level")),
-                     provenance.get("page_status", "active"),
-                     provenance.get("page_type", "note"), "T"),
+                     provenance.get("page_status", DEFAULT_PAGE_STATUS),
+                     provenance.get("page_type", DEFAULT_PAGE_TYPE), "T"),
                 )
                 doc_id = cursor.lastrowid
                 cursor.execute(
@@ -1174,8 +1194,8 @@ def check_materialized(snapshot_dir: Path) -> Dict[str, Any]:
         fts_path, fts_content, fts_agent = actual["fts"]
         if (actual["agent"] != expected_agent
                 or actual["privacy_level"] != provenance.get("privacy_level", row.get("privacy_level"))
-                or actual["page_status"] != provenance.get("page_status", "active")
-                or actual["page_type"] != provenance.get("page_type", "note")
+                or actual["page_status"] != provenance.get("page_status", DEFAULT_PAGE_STATUS)
+                or actual["page_type"] != provenance.get("page_type", DEFAULT_PAGE_TYPE)
                 or actual["decay_score"] != 1.0
                 or actual["sigil"] != "T"
                 or fts_path != expected_path
