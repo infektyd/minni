@@ -13,6 +13,35 @@ from .dataset import repo_root
 logger = logging.getLogger("sovereign.eval")
 
 
+_BACKEND_ALIASES = {
+    "minnid": "minnid",
+    "sovrd": "sovrd",
+    "baseline": "baseline",
+    "ripgrep": "ripgrep",
+    "rg": "ripgrep",
+    "raw-context": "raw-context",
+    "raw_context": "raw-context",
+    "raw": "raw-context",
+    "vendor": "vendor",
+    "vendor-memory": "vendor-memory",
+    "vendor_memory": "vendor-memory",
+    "mock": "mock",
+    "snapshot": "snapshot",
+    "study-snapshot": "snapshot",
+    "study_snapshot": "snapshot",
+}
+
+
+def canonical_backend_name(name: str) -> str:
+    """Single normalization point for retriever names.
+
+    Unknown names pass through stripped and lowercased so callers fail on
+    the original spelling instead of an invented canonical form.
+    """
+    key = name.strip().lower()
+    return _BACKEND_ALIASES.get(key, key)
+
+
 class SearcherProtocol:
     """
     Abstract protocol for the object used by the harness.
@@ -354,18 +383,18 @@ def make_searcher(
     root: Optional[Path] = None,
 ) -> SearcherProtocol:
     """Build a named retriever for adversarial baseline comparisons."""
-    key = name.strip().lower()
+    key = canonical_backend_name(name)
     explicit_root = root
     search_root = root or repo_root()
-    if key in {"mock"}:
+    if key == "mock":
         return MockSearcher(queries)
     if key in {"minnid", "sovrd", "baseline"}:
         return RealSearcher()
-    if key in {"ripgrep", "rg"}:
+    if key == "ripgrep":
         return RipgrepSearcher(search_root)
-    if key in {"raw-context", "raw_context", "raw"}:
+    if key == "raw-context":
         return RawContextSearcher(search_root)
-    if key in {"vendor", "vendor-memory", "vendor_memory"}:
+    if key in {"vendor", "vendor-memory"}:
         return VendorMemorySearcher()
     if key in {"snapshot", "study-snapshot", "study_snapshot"}:
         if explicit_root is None:

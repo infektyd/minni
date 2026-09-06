@@ -398,3 +398,36 @@ def test_wire_cli_happy_path(monkeypatch, capsys):
     assert captured["platform"] == "claude-code"
     assert captured["dry_run"] is True
     assert captured["verify_payload"] is True
+
+
+@pytest.mark.parametrize("operation", ["connect", "sendall", "recv"])
+def test_rpc_converts_socket_timeout(monkeypatch, tmp_path, operation):
+    timeout_error = minni_cli.socket.timeout("transport stalled")
+    observed = {}
+
+    class TimeoutSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            observed["closed"] = True
+
+        def settimeout(self, value):
+            observed["timeout"] = value
+
+        def connect(self, path):
+            if operation == "connect":
+                raise timeout_error
+
+        def sendall(self, data):
+            if operation == "sendall":
+                raise timeout_error
+
+        def recv(self, size):
+            raise timeout_error
+
+    monkeypatch.setattr(minni_cli.socket, "socket", lambda *args: TimeoutSocket())
+    with pytest.raises(minni_cli.RpcTimeoutError, match="timed out after 120s") as caught:
+        minni_cli._rpc(tmp_path / "daemon.sock", "search", timeout=120.0)
+    assert caught.value.__cause__ is timeout_error
+    assert observed == {"timeout": 120.0, "closed": True}

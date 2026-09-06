@@ -437,7 +437,7 @@ def test_materialize_preserves_original_lifecycle_and_refuses_rerun(tmp_path, mo
         _record("doc-a1", "store-a", "project-a/launch.md", "alpha launch notes",
                 page_status="superseded", page_type="decision"),
         _record("doc-b1", "store-b", "project-b/launch.md", "beta launch notes",
-                privacy_level="shared"),
+                privacy_level="safe"),
     ])
     prepare_snapshot(packet, dest)
 
@@ -465,7 +465,7 @@ def test_materialize_preserves_original_lifecycle_and_refuses_rerun(tmp_path, mo
         "SELECT agent, privacy_level, page_status, page_type FROM documents ORDER BY doc_id"
     ).fetchall()
     assert rows[0] == ("hans", "private", "superseded", "decision")
-    assert rows[1] == ("hans", "shared", "candidate", "unknown")
+    assert rows[1] == ("hans", "safe", "candidate", "unknown")
 
     materialized = check_materialized(dest)
     assert materialized["manifest_digest"] == result["manifest_digest"]

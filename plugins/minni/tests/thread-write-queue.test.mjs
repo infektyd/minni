@@ -268,14 +268,24 @@ async function journalTimeoutDiagnostics({ last, startFail = [], completeFail = 
   };
 }
 
-async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false, startFail = [], completeFail = [] }, timeoutMs = 20_000) {
-  const begin = Date.now();
+async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false, startFail = [], completeFail = [] }, timeoutMs = 20_000, options = {}) {
+  const {
+    stallMs = timeoutMs, clock = Date.now, readState = journalState,
+    readQueue = () => listQueuedWorkerWrites(fixture.vaultPath, fixture.planId),
+    kick = () => kickWorkerWriteDrain({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId }),
+    pause = () => new Promise(resolve => setTimeout(resolve, 25)),
+  } = options;
+  const begin = clock();
+  let progressedAt = begin;
+  let progress = 0;
   let last;
   let leftover;
-  while (Date.now() - begin < timeoutMs) {
-    last = await journalState(fixture);
+  while (clock() - begin < timeoutMs && clock() - progressedAt < stallMs) {
+    last = await readState(fixture);
+    const count = last.started.length + last.completed.length;
+    if (count > progress) { progress = count; progressedAt = clock(); }
     leftover = queueEmpty
-      ? await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)
+      ? await readQueue()
       : undefined;
     if (
       last.started.length >= started &&
@@ -284,16 +294,12 @@ async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty 
     ) {
       return last;
     }
-    kickWorkerWriteDrain({
-      vaultPath: fixture.vaultPath,
-      notePath: fixture.notePath,
-      planId: fixture.planId,
-    });
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    kick();
+    await pause();
   }
   const diagnostic = await journalTimeoutDiagnostics({ last, startFail, completeFail },
-    () => listQueuedWorkerWrites(fixture.vaultPath, fixture.planId));
-  throw new Error(`timeout waiting for ${started} starts / ${completed} completes; got ${JSON.stringify(diagnostic)}`);
+    readQueue);
+  throw new Error(`timeout waiting for ${started} starts / ${completed} completes; elapsed=${clock() - begin}ms stalled=${clock() - progressedAt}ms; got ${JSON.stringify(diagnostic)}`);
 }
 
 async function runWetBurst(t, n) {
@@ -305,7 +311,9 @@ async function runWetBurst(t, n) {
   const completes = await completeBurst(fixture, claims);
   const completeBusy = completes.filter((result) => result.code === "THREAD_BUSY");
   const completeFail = completes.filter((result) => !result.ok);
-  const journal = await waitForJournal(fixture, { started: n, completed: n, startFail, completeFail });
+  // A correctness burst may exceed 20s under filesystem contention. Keep a
+  // 20s no-progress failure and a 50s total cap inside the 60s test deadline.
+  const journal = await waitForJournal(fixture, { started: n, completed: n, startFail, completeFail }, 50_000, { stallMs: 20_000 });
   return {
     n,
     startOk: starts.filter((result) => result.ok).length,
@@ -977,6 +985,50 @@ test("claimed pending complete without start/stamp/ticket cannot persist done", 
     }),
     /complete cannot persist done without start/,
   );
+
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "pending");
+  assert.notEqual(plan.slices[0].status, "done");
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 0);
+  assert.equal(journal.completed.length, 0);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  const leftover = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(leftover.length, 0);
+});
+
+test("busy claimed pending complete is refused without queuing an undrainable ticket", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const queued = await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId);
+  assert.equal(queued.length, 0, "GO case has no start ticket");
+  const stamp = await readStartAcceptedStamp(fixture, claim);
+  assert.equal(stamp, undefined, "GO case has no start-accepted stamp");
+  const planBefore = await rehydratePlan(fixture.notePath);
+  assert.equal(planBefore.slices[0].status, "pending");
+  assert.ok(planBefore.slices[0].claim);
+
+  await withThreadLock(fixture.vaultPath, fixture.planId, "hold-pending-complete", async () => {
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-pending-no-start",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-pending-no-start",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /complete cannot persist done without start/,
+  );
+
+  assert.deepEqual(await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId), []);
+  });
 
   const plan = await rehydratePlan(fixture.notePath);
   assert.equal(plan.slices[0].status, "pending");
@@ -3042,3 +3094,27 @@ test("idle ordinary kick does not contend for the persist lock", async (t) => {
   }
   assert.equal(lockAttempts, 0, "empty drain must not force another worker into accepted-only behavior");
 });
+
+// Virtual time distinguishes useful progress from a parked queue without a
+// machine-speed assertion. These exercise the same waiter the wet burst uses.
+for (const scenario of ["progress", "stalled", "never-finishes"]) {
+  test(`journal waiter budget: ${scenario}`, async () => {
+    let elapsed = 0;
+    const options = {
+      stallMs: 20_000, clock: () => elapsed, kick: () => {},
+      pause: async () => { elapsed += 10_000; }, readQueue: async () => [],
+      readState: async () => ({
+        started: Array.from({ length: scenario === "stalled" ? 0 : elapsed / 10_000 }),
+        completed: [], completesWithoutStarts: [],
+      }),
+    };
+    if (scenario === "progress") {
+      const result = await waitForJournal({}, { started: 3 }, 50_000, options);
+      assert.equal(result.started.length, 3);
+      assert.equal(elapsed, 30_000);
+    } else {
+      await assert.rejects(waitForJournal({}, { started: 99 }, 50_000, options), /timeout waiting/);
+      assert.equal(elapsed, scenario === "stalled" ? 20_000 : 50_000);
+    }
+  });
+}
