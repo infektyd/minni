@@ -217,6 +217,28 @@ class OperationPolicy:
     local_only: bool = False
 
 
+def _is_loopback_request_url(url: Optional[str]) -> bool:
+    """True when a model-target URL addresses the local loopback interface.
+
+    Single source of truth for the host set is minni.config._LOOPBACK_HOSTS
+    (mirror of afm.ts checkModelTarget); only the hostname is compared here —
+    an operator-allowlisted remote HTTPS endpoint is NOT loopback even though
+    check_model_target() would allow it for ordinary non-local requests.
+    """
+    from minni.config import _LOOPBACK_HOSTS
+    from urllib.parse import urlparse as _urlparse
+
+    if not url:
+        return False
+    try:
+        host = (_urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return host in _LOOPBACK_HOSTS or host.endswith(".localhost")
+
+
 def _sanitize_chain_result(result: ProviderResult) -> ProviderResult:
     """SEC (P3): secret hygiene is structural, not per-call-site.
 
@@ -258,7 +280,32 @@ class ProviderChain:
             eligible.append(provider)
         return eligible
 
+    def requires_loopback(self, operation: OperationClass) -> bool:
+        """True when an operation's requests must target the loopback interface.
+
+        Mirrors the providers_for structural override: edge_inference is always
+        local-only; other operations follow their configured policy.
+        """
+        if operation == "edge_inference":
+            return True
+        policy = self.operations.get(operation) or OperationPolicy()
+        return policy.local_only
+
     def chat(self, request: ChatRequest, client: Optional[BridgeClient] = None) -> ProviderResult:
+        if self.requires_loopback(request.operation):
+            # Actual-request enforcement, not tier trust: even a provider that
+            # claims tier "local" must not receive a local-only request aimed
+            # at an allowlisted remote HTTPS endpoint. Ordinary non-local
+            # requests skip this check and keep allowlist compatibility.
+            url = request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL
+            if not _is_loopback_request_url(url):
+                return ProviderResult(
+                    ok=False,
+                    data={},
+                    provider="none",
+                    status="target_denied",
+                    error="afm_target_denied: local-only operation requires a loopback model target",
+                )
         eligible = self.providers_for(request.operation)
         if not eligible:
             return ProviderResult(

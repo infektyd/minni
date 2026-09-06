@@ -11,6 +11,7 @@ Verifies:
 import json
 import os
 import sys
+from unittest import mock
 
 import pytest
 
@@ -20,6 +21,8 @@ from minni.edge_inference import (
     AFM_INPUT_BUDGET_TOKENS,
     MAX_CANDIDATE_PAIRS,
     MAX_EXCERPT_TOKENS,
+    UNTRUSTED_BEGIN,
+    UNTRUSTED_END,
     VALID_DIRECTIONS,
     VALID_EDGE_LABELS,
     count_tokens,
@@ -408,7 +411,115 @@ def test_validate_label_direction_compatibility(label, direction, compatible):
 
 @pytest.mark.parametrize("length,valid", [(200, True), (201, False)])
 def test_rationale_matches_prompt_limit(length, valid):
-    result, _, error = validate_edge_inference_response([_valid_item(rationale="x" * length)], ["pair_1"])
+    result, _, error = validate_edge_inference_response(
+        [_valid_item(rationale="x" * length)],
+        ["pair_1"],
+        line_counts_per_pair={"pair_1": 3},
+    )
     assert result is valid
     if not valid:
         assert "rationale_too_long" in error
+
+
+def _fat_candidate(pair_id, words=350):
+    return {
+        "pair_id": pair_id,
+        "doc_id": f"doc_{pair_id}",
+        "body": f"Candidate {pair_id}: " + " ".join([f"content_{pair_id}"] * words),
+    }
+
+
+def test_render_enforces_total_budget_with_oversized_title():
+    """A 16k-char title must be metadata-capped, not returned over budget."""
+    source = {
+        "learning_id": 7,
+        "title": "T" * 16000,
+        "body": " ".join(["src_token"] * 200),
+    }
+    candidates = [_fat_candidate(f"pair_{i}") for i in range(1, 9)]
+    result = render_edge_inference_prompt(source, candidates)
+    assert result.budget_exceeded is False
+    assert result.total_tokens <= AFM_INPUT_BUDGET_TOKENS
+    assert len(result.pair_ids) == 8
+    assert result.excluded_pair_ids == []
+
+
+def test_render_drops_pairs_to_fit_budget_and_reports_excluded():
+    """Over-budget renders drop last pairs (re-batchable) instead of flag-only."""
+    source = {"learning_id": 1, "body": " ".join(["src_token"] * 200)}
+    candidates = [_fat_candidate(f"pair_{i}") for i in range(1, 9)]
+    result = render_edge_inference_prompt(source, candidates, budget_limit=1200)
+    assert result.budget_exceeded is False
+    assert result.total_tokens <= 1200
+    assert len(result.pair_ids) < 8
+    assert result.pair_ids + result.excluded_pair_ids == [f"pair_{i}" for i in range(1, 9)]
+    assert set(result.line_counts_per_pair) == set(result.pair_ids)
+
+
+def test_numbered_excerpt_keeps_complete_raw_lines():
+    """Fallback truncation must not leave a dangling prefix or numbered raw_lines."""
+    with mock.patch.dict(sys.modules, {"tiktoken": None}):
+        formatted, raw_lines, _, measured = format_numbered_excerpt(
+            "alpha\nbeta\ngamma", max_tokens=3
+        )
+    assert measured is False
+    assert raw_lines == ["alpha", "beta"]
+    assert formatted == "[1] alpha\n[2] beta"
+    assert all("[" not in line for line in raw_lines)
+
+    with mock.patch.dict(sys.modules, {"tiktoken": None}):
+        formatted, raw_lines, _, _ = format_numbered_excerpt("abcdefghij", max_tokens=1)
+    assert raw_lines == ["abcd"]
+    assert formatted == "[1] abcd"
+
+
+def test_metadata_inside_untrusted_boundary():
+    """Source and candidate metadata must sit inside untrusted-evidence markers."""
+    source = {"learning_id": 1, "title": "Secret Title", "body": "hello world"}
+    candidates = [{"pair_id": "p1", "body": "candidate body here"}]
+    result = render_edge_inference_prompt(source, candidates)
+    text = result.prompt_text
+    assert UNTRUSTED_BEGIN in text and UNTRUSTED_END in text
+    first_begin = text.index(UNTRUSTED_BEGIN)
+    last_end = text.rindex(UNTRUSTED_END)
+    assert first_begin < text.index("Secret Title") < last_end
+    assert first_begin < text.index("Candidate Pair: p1") < last_end
+
+
+def test_strict_parser_rejects_trailing_text_and_preamble():
+    """Fragments around the array fail closed; a whole-text fence still parses."""
+    good = json.dumps([_valid_item()])
+    counts = {"pair_1": 3}
+    is_valid, _, err = validate_edge_inference_response(
+        good + " trailing junk", ["pair_1"], line_counts_per_pair=counts
+    )
+    assert is_valid is False and "json_decode_error" in err
+    is_valid, _, err = validate_edge_inference_response(
+        "note: classify this " + good, ["pair_1"], line_counts_per_pair=counts
+    )
+    assert is_valid is False and "json_decode_error" in err
+    is_valid, edges, err = validate_edge_inference_response(
+        "```json\n" + good + "\n```", ["pair_1"], line_counts_per_pair=counts
+    )
+    assert is_valid is True, err
+    assert edges is not None and len(edges) == 1
+
+
+def test_missing_malformed_line_counts_rejected():
+    """Absent, incomplete, or non-positive line-count maps fail the batch."""
+    good = json.dumps([_valid_item()])
+    is_valid, _, err = validate_edge_inference_response(good, ["pair_1"])
+    assert is_valid is False and "missing_line_counts" in (err or "")
+    is_valid, _, err = validate_edge_inference_response(
+        good, ["pair_1"], line_counts_per_pair={"other": 3}
+    )
+    assert is_valid is False and "incomplete_line_counts" in (err or "")
+    for bad_counts, code in (
+        ({"pair_1": 0}, "invalid_line_counts"),
+        ({"pair_1": True}, "invalid_line_counts"),
+        ({"pair_1": "3"}, "invalid_line_counts"),
+    ):
+        is_valid, _, err = validate_edge_inference_response(
+            good, ["pair_1"], line_counts_per_pair=bad_counts
+        )
+        assert is_valid is False and code in (err or "")

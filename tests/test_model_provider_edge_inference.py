@@ -122,6 +122,54 @@ def test_structural_immutability_even_if_chain_manually_initialized_with_false()
     assert [p.name for p in eligible] == ["local_afm"]
 
 
+def _edge_request(url=None):
+    req = _chat_request("edge_inference")
+    if url is not None:
+        from minni.model_provider import ChatRequest as _CR
+
+        req = _CR(payload=req.payload, operation=req.operation, url=url)
+    return req
+
+
+def test_local_only_denies_allowlisted_remote_url_without_invocation():
+    """A local-only request aimed at a remote endpoint is denied pre-provider."""
+    local_p = MockProvider("local_afm", tier="local")
+    for operations in (
+        {"edge_inference": OperationPolicy(local_only=True)},
+        {},  # structural override applies even without configured policy
+        {"edge_inference": OperationPolicy(local_only=False)},  # hostile config
+    ):
+        chain = ProviderChain(providers=[local_p], operations=operations)
+        result = chain.chat(_edge_request("https://afm.internal/v1/chat/completions"))
+        assert result.ok is False
+        assert result.status == "target_denied"
+        assert "loopback" in (result.error or "")
+    assert local_p.calls == []
+
+
+def test_local_only_default_url_proceeds_and_nonlocal_remote_stays_compatible():
+    """Loopback default proceeds; ordinary non-local remote requests are untouched."""
+    local_p = MockProvider("local_afm", tier="local")
+    chain = ProviderChain(providers=[local_p], operations={})
+    result = chain.chat(_edge_request())
+    assert result.ok is True
+    assert len(local_p.calls) == 1
+
+    remote_chain = ProviderChain(
+        providers=[local_p],
+        operations={"retrieval": OperationPolicy(local_only=False)},
+    )
+    result = remote_chain.chat(
+        ChatRequest(
+            payload={"messages": []},
+            operation="retrieval",  # type: ignore[arg-type]
+            url="https://afm.internal/v1/chat/completions",
+        )
+    )
+    assert result.ok is True
+    assert len(local_p.calls) == 2
+
+
 def test_edge_inference_fails_loud_when_no_local_provider_available():
     """When only cloud providers exist, edge_inference yields no_provider error and never calls cloud."""
     cloud_p = MockProvider("cloud_openai", tier="cloud", result_ok=True)

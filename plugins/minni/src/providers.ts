@@ -118,6 +118,22 @@ export interface OperationPolicy {
   localOnly?: boolean;
 }
 
+// Loopback hosts mirrored from afm.ts checkModelTarget / engine config.
+// An operator-allowlisted remote HTTPS endpoint is NOT loopback even though
+// checkModelTarget() allows it for ordinary non-local requests.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "0.0.0.0"]);
+
+export function isLoopbackModelTarget(targetUrl: string | undefined): boolean {
+  if (!targetUrl) return false;
+  try {
+    const h = (new URL(targetUrl).hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+    if (!h) return false;
+    return LOOPBACK_HOSTS.has(h) || h.endsWith(".localhost");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * SEC (P3): secret hygiene is structural, not per-call-site. Every non-ok
  * result leaving the chain has its error passed through safeError so future
@@ -148,7 +164,28 @@ export class ProviderChain {
     );
   }
 
+  requiresLoopback(operation: OperationClass): boolean {
+    // Mirrors the providersFor structural override: edge_inference is always
+    // local-only; other operations follow their configured policy.
+    if (operation === "edge_inference") return true;
+    return this.operations[operation]?.localOnly ?? false;
+  }
+
   async chat(request: ChatRequest): Promise<ProviderChatResult> {
+    if (this.requiresLoopback(request.operation)) {
+      // Actual-request enforcement, not tier trust: even a provider that
+      // claims a local tier must not receive a local-only request aimed at
+      // an allowlisted remote HTTPS endpoint. Ordinary non-local requests
+      // skip this check and keep allowlist compatibility.
+      const url = request.url ?? AFM_PREPARE_TASK_URL;
+      if (!isLoopbackModelTarget(url)) {
+        return {
+          ok: false,
+          provider: "none",
+          error: "afm_target_denied: local-only operation requires a loopback model target",
+        };
+      }
+    }
     const eligible = this.providersFor(request.operation);
     if (eligible.length === 0) {
       return {
