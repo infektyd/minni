@@ -48,6 +48,7 @@ import json
 import math
 import os
 import stat
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -549,6 +550,57 @@ def _reject_live_destination(dest: Path) -> Path:
     return resolved
 
 
+def _enclosing_git_checkout(path: Path):
+    """Nearest ancestor (or the path itself) holding a Git checkout marker.
+
+    A `.git` directory marks a normal checkout; a `.git` file marks a linked
+    worktree. Either means the destination would land inside version control.
+    Returns the checkout top, or None when the path sits outside any checkout.
+    """
+    for candidate in (path, *path.parents):
+        marker = candidate / ".git"
+        try:
+            if marker.is_dir() or marker.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _require_gitignored_destination(resolved: Path) -> Path:
+    """Refuse snapshot destinations inside a Git checkout unless gitignored.
+
+    Snapshots are private study material and must never be committed by
+    accident: a destination inside a checkout is accepted only when
+    ``git check-ignore`` verifiably reports it ignored (the user-approved
+    ``_private/`` tree is ignored, so it keeps working). The plumbing query
+    is read-only and also covers not-yet-created descendant paths. When a
+    checkout marker exists but no usable git binary can confirm ignore
+    status, verification is impossible and the destination fails closed.
+    Runs before any write.
+    """
+    top = _enclosing_git_checkout(resolved)
+    if top is None:
+        return resolved
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(top), "check-ignore", "-q", "--", str(resolved)],
+            capture_output=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise StudySnapshotError(
+            f"snapshot destination {resolved} sits inside git checkout {top} "
+            "but ignore status is unverifiable (no usable git); refusing"
+        ) from exc
+    if completed.returncode != 0:
+        raise StudySnapshotError(
+            f"snapshot destination {resolved} sits inside git checkout {top} "
+            "and is not gitignored; snapshots must live in a verifiably "
+            "gitignored private destination or outside the checkout"
+        )
+    return resolved
+
+
 def _ensure_private_dir(path: Path) -> None:
     """Create or verify a user-owned 0700 directory (mirrors harness handling)."""
     if path.exists():
@@ -796,6 +848,17 @@ def verify_snapshot(snapshot_dir: Path) -> Dict[str, Any]:
         raise StudySnapshotError("snapshot.json version mismatch; re-prepare the snapshot")
     if manifest.get("human_reviewed") is not False:
         raise StudySnapshotError("snapshot manifest must keep human_reviewed=false")
+    if manifest.get("review_state") != MACHINE_PROPOSED:
+        raise StudySnapshotError(
+            "snapshot manifest must keep review_state machine_proposed; "
+            "machine judgments are never human-reviewed"
+        )
+    principal = manifest.get("principal")
+    if not isinstance(principal, dict) or principal.get("provenance_note") != _AUTHORIZATION_NOTE:
+        raise StudySnapshotError(
+            "snapshot manifest principal must keep the supplied-claim provenance "
+            "note; supplied packet claims are never authentication proof"
+        )
     if not isinstance(envelope, dict) or not isinstance(envelope.get("records"), dict):
         raise StudySnapshotError("mapping.json must hold a records object with the manifest digest")
     if envelope.get("snapshot_version") != SNAPSHOT_VERSION:
@@ -891,6 +954,7 @@ def prepare_snapshot(packet: Any, dest: Path) -> Dict[str, Any]:
     records = validate_export_packet(packet)
     identity = canonical_identity(packet)
     dest = _reject_live_destination(Path(dest))
+    _require_gitignored_destination(dest)
     _ensure_private_dir(dest)
     try:
         preexisting = list(dest.iterdir())
@@ -1145,6 +1209,11 @@ def check_materialized(snapshot_dir: Path) -> Dict[str, Any]:
     materialized = _read_json_strict(root / "materialized.json", root, "materialized outputs")
     if not isinstance(materialized, dict):
         raise StudySnapshotError("materialized outputs must be an object")
+    if materialized.get("snapshot_version") != SNAPSHOT_VERSION:
+        raise StudySnapshotError(
+            "materialized outputs version is absent or stale; re-materialize "
+            "the snapshot instead of interpreting a foreign version"
+        )
     if materialized.get("manifest_digest") != manifest["manifest_digest"]:
         raise StudySnapshotError(
             "materialized outputs do not belong to this snapshot; never mix "

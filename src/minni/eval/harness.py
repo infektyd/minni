@@ -459,6 +459,38 @@ def _preflight_quality_gate(
         sys.exit(2)
 
 
+def _require_snapshot_query_binding(searcher: Any, queries: Any) -> None:
+    """Refuse to score bound judgments against a non-matching snapshot.
+
+    Numeric ``expected_doc_ids`` are only meaningful for the corpus they were
+    judged against. Every query must declare that corpus with ``snapshot_id`` plus
+    ``manifest_digest``; every declared pair must equal the searcher's pinned
+    identity or scoring aborts before any comparison. Missing and partial
+    bindings fail closed, including negative judgments with no expected hits.
+    """
+    bound_id = getattr(searcher, "snapshot_id", None)
+    bound_digest = getattr(searcher, "manifest_digest", None)
+    offenders = []
+    for position, item in enumerate(queries or []):
+        if not isinstance(item, dict):
+            continue
+        declared_id = item.get("snapshot_id")
+        declared_digest = item.get("manifest_digest")
+        if (not bound_id or not bound_digest or not declared_id or not declared_digest
+                or declared_id != bound_id or declared_digest != bound_digest):
+            offenders.append(str(item.get("query_id", item.get("query", position))))
+    if offenders:
+        raise ValueError(
+            f"query corpus binding mismatch on {len(offenders)} quer"
+            f"{'y' if len(offenders) == 1 else 'ies'} "
+            f"({', '.join(offenders[:5])}"
+            f"{'...' if len(offenders) > 5 else ''}); searcher pins "
+            f"snapshot_id={bound_id!r} manifest_digest={bound_digest!r}, "
+            "so these judgments belong to a different snapshot — "
+            "no comparison accepted"
+        )
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Run evaluation for one or more configs and write reports."""
     config_names = [c.strip() for c in args.config.split(",")]
@@ -552,6 +584,12 @@ def cmd_run(args: argparse.Namespace) -> None:
             logger.error("Could not initialise retriever %r: %s", retriever_name, exc)
             sys.exit(1)
         is_mock = bool(getattr(args, "mock", False)) or retriever_name.strip().lower() == "mock"
+        if isinstance(searcher, SnapshotSearcher):
+            try:
+                _require_snapshot_query_binding(searcher, queries)
+            except ValueError as exc:
+                logger.error("Snapshot query-corpus binding failed: %s", exc)
+                sys.exit(3)
 
         for config_name in config_names:
             config_kwargs = CONFIGS[config_name]

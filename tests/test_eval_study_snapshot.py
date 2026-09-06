@@ -1021,3 +1021,99 @@ def test_valid_replacement_generation_fails_closed(tmp_path):
     fresh = SnapshotSearcher(home)
     assert fresh.snapshot_id != old_id
     assert fresh.search("newword", limit=5)[0]["provenance"]["snapshot_id"] == fresh.snapshot_id
+
+
+def _prepared_materialized(tmp_path):
+    dest = tmp_path / "snapshot"
+    prepare_snapshot(_two_record_packet(), dest)
+    materialize_snapshot_db(dest)
+    return dest
+
+
+def test_check_materialized_rejects_absent_and_stale_version(tmp_path):
+    dest = _prepared_materialized(tmp_path)
+    assert check_materialized(dest)["manifest_digest"]
+    raw = json.loads((dest / "materialized.json").read_text())
+    stale = dict(raw, snapshot_version="minni-study-snapshot-v0")
+    (dest / "materialized.json").write_text(json.dumps(stale))
+    with pytest.raises(StudySnapshotError, match="version is absent or stale"):
+        check_materialized(dest)
+    missing = dict(raw)
+    del missing["snapshot_version"]
+    (dest / "materialized.json").write_text(json.dumps(missing))
+    with pytest.raises(StudySnapshotError, match="version is absent or stale"):
+        check_materialized(dest)
+
+
+def test_verify_rejects_false_review_labels(tmp_path):
+    dest = tmp_path / "snapshot"
+    manifest = prepare_snapshot(_two_record_packet(), dest)
+    assert verify_snapshot(dest)["manifest"]["review_state"] == "machine_proposed"
+    assert manifest["snapshot_id"]
+    snap_path = dest / "snapshot.json"
+    raw = json.loads(snap_path.read_text())
+    raw["review_state"] = "human_reviewed"
+    snap_path.write_text(json.dumps(raw))
+    with pytest.raises(StudySnapshotError, match="machine_proposed"):
+        verify_snapshot(dest)
+    raw["review_state"] = "machine_proposed"
+    raw["principal"]["provenance_note"] = "human verified this export"
+    snap_path.write_text(json.dumps(raw))
+    with pytest.raises(StudySnapshotError, match="supplied-claim"):
+        verify_snapshot(dest)
+
+
+def _git_init(repo: Path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(repo)], check=True,
+                   capture_output=True, timeout=30)
+
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None,
+                               reason="git binary required for ignore-rule checks")
+
+
+@needs_git
+def test_prepare_refuses_nonignored_git_destination(tmp_path):
+    _git_init(tmp_path)
+    with pytest.raises(StudySnapshotError, match="not gitignored"):
+        prepare_snapshot(_two_record_packet(), tmp_path / "snap")
+
+
+@needs_git
+def test_prepare_accepts_gitignored_private_destination_with_new_descendants(tmp_path):
+    _git_init(tmp_path)
+    (tmp_path / ".gitignore").write_text("_private/\n")
+    dest = tmp_path / "_private" / "campaign-x" / "deep" / "snap"
+    manifest = prepare_snapshot(_two_record_packet(), dest)
+    assert verify_snapshot(dest)["manifest"]["snapshot_id"] == manifest["snapshot_id"]
+
+
+def test_prepare_refuses_worktree_dotgit_file_marker(tmp_path):
+    (tmp_path / ".git").write_text("gitdir: /elsewhere/worktrees/study\n")
+    with pytest.raises(StudySnapshotError, match="git checkout"):
+        prepare_snapshot(_two_record_packet(), tmp_path / "snap")
+
+
+def test_snapshot_query_binding_accepts_matching_and_rejects_stale(tmp_path):
+    from minni.eval.harness import _require_snapshot_query_binding, make_searcher
+
+    dest = _prepared_materialized(tmp_path)
+    manifest = json.loads((dest / "snapshot.json").read_text())
+    searcher = make_searcher("snapshot", [], root=dest)
+    bound = [{
+        "query": "alpha launch",
+        "expected_doc_ids": [1],
+        "snapshot_id": manifest["snapshot_id"],
+        "manifest_digest": manifest["manifest_digest"],
+    }]
+    # The valid matching packet scores: the gate passes silently.
+    _require_snapshot_query_binding(searcher, bound)
+    stale = [dict(bound[0], snapshot_id="study-f" + "0" * 59)]
+    with pytest.raises(ValueError, match="binding mismatch"):
+        _require_snapshot_query_binding(searcher, stale)
+    half = [dict(bound[0])]
+    del half[0]["manifest_digest"]
+    with pytest.raises(ValueError, match="binding mismatch"):
+        _require_snapshot_query_binding(searcher, half)

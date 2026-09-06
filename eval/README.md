@@ -217,6 +217,23 @@ separately authorized collection step can run it without improvising.
   retrieval runs, not derived from retrieval output.
 - Keep the snapshot and all study reports **outside version control**
   (e.g. under Minni's private data dir or `/tmp`), never in `eval/`.
+  `prepare_snapshot` enforces this: a destination inside a Git checkout is
+  refused unless `git check-ignore` verifiably reports it ignored (the
+  user-approved `_private/` tree is ignored, so it keeps working; worktree
+  `.git` files count as checkout markers, and not-yet-created descendants
+  of ignored directories are accepted). No usable git binary means no
+  verification, which fails closed.
+- Numeric `expected_doc_ids` are corpus-relative. Every snapshot query must
+  bind its judgments to the corpus with `snapshot_id` plus `manifest_digest`.
+  The harness refuses missing, partial or mismatched bindings before scoring,
+  including negative judgments with no expected hits. No generic frozen
+  identity is assumed.
+- Verification pins the machine labels: the manifest must keep
+  `review_state: machine_proposed` and the supplied-claim provenance note;
+  a `human_reviewed` label on the manifest is rejected just like one on a
+  mapping entry. `check_materialized` likewise rejects
+  `materialized.json` with an absent or stale `snapshot_version` before
+  interpreting it.
 - Refreshing the corpus means a new snapshot with a new identity and new
   review; never silently swap files under a recorded digest.
 
