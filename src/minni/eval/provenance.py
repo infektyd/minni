@@ -33,6 +33,59 @@ from typing import Any, Dict, Iterable, List, Optional
 LIVE_BACKENDS = {"minnid", "sovrd", "baseline"}
 FILE_BACKENDS = {"ripgrep", "rg", "raw-context", "raw_context", "raw"}
 
+# Retrieval kwargs the named adapter swallows without effect. The harness
+# passes every known kwarg to every backend, so without this map a ripgrep
+# or mock report would claim an `expand` difference that never existed.
+# Keys are canonical backend names; aliases resolve through
+# ``retrievers.canonical_backend_name`` so no alias set is repeated here.
+# Live engine backends honour the known kwargs; file/mock/vendor adapters
+# honour only what their search() signature actually consumes.
+_BACKEND_SWALLOWED = {
+    "ripgrep": frozenset({"expand", "use_hyde", "agent_id", "update_access",
+                           "budget_tokens", "depth", "include_superseded",
+                           "include_rejected", "include_drafts",
+                           "include_expired"}),
+    "mock": frozenset({"expand", "use_hyde", "agent_id", "update_access",
+                        "budget_tokens", "depth", "include_superseded",
+                        "include_rejected", "include_drafts",
+                        "include_expired"}),
+    "raw-context": frozenset({"expand", "use_hyde", "agent_id",
+                               "update_access", "depth",
+                               "include_superseded", "include_rejected",
+                               "include_drafts", "include_expired"}),
+    "vendor": frozenset({"expand", "use_hyde", "agent_id", "update_access",
+                          "budget_tokens", "depth", "include_superseded",
+                          "include_rejected", "include_drafts",
+                          "include_expired"}),
+    "vendor-memory": frozenset({"expand", "use_hyde", "agent_id",
+                                 "update_access", "budget_tokens", "depth",
+                                 "include_superseded", "include_rejected",
+                                 "include_drafts", "include_expired"}),
+}
+
+# Harness envelope defaults (limit / update_access) each adapter consumes.
+# Anything the adapter does not consume is omitted from `effective`: e.g.
+# only the live engine honours update_access, so reporting it as effective
+# for ripgrep would invent a compared difference that never existed.
+_BACKEND_ENVELOPE = {
+    "ripgrep": frozenset({"limit"}),
+    "mock": frozenset({"limit"}),
+    "raw-context": frozenset({"limit", "budget_tokens"}),
+    "vendor": frozenset(),
+    "vendor-memory": frozenset(),
+}
+
+def _canonical_backend(retriever_name: str) -> str:
+    from .retrievers import canonical_backend_name
+
+    return canonical_backend_name(retriever_name)
+
+
+def backend_ignored_options(retriever_name: str) -> frozenset:
+    """Known kwargs the named backend swallows without effect (may be empty)."""
+    return _BACKEND_SWALLOWED.get(_canonical_backend(retriever_name), frozenset())
+
+
 RUN_CAVEATS = (
     "Reports run sequentially in-process in run_order; the first report may "
     "benefit from or pay for process-level caches, but searcher construction "
@@ -133,25 +186,62 @@ def code_provenance(root: Optional[Path] = None) -> Dict[str, Any]:
     return {"revision": revision, "dirty": dirty, "method": "git rev-parse HEAD"}
 
 
+def backend_envelope_options(retriever_name: str, limit: int = 10) -> Dict[str, Any]:
+    """Harness envelope defaults the named backend actually consumes.
+
+    Live engine backends consume both limit and update_access; anything
+    unlisted for an adapter is omitted from the reported `effective`
+    options instead of being repeated as a default the backend never saw.
+    """
+    honored = _BACKEND_ENVELOPE.get(_canonical_backend(retriever_name))
+    if honored is None:
+        return {"limit": limit, "update_access": False}
+    envelope: Dict[str, Any] = {}
+    if "limit" in honored:
+        envelope["limit"] = limit
+    if "update_access" in honored:
+        envelope["update_access"] = False
+    return envelope
+
+
 def retrieval_options_provenance(
     config_name: str,
     config_kwargs: Dict[str, Any],
     known_kwargs: Iterable[str],
     limit: int = 10,
+    backend_ignored: Iterable[str] = (),
+    backend_envelope: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Record requested config kwargs vs the effective kwargs sent to search()."""
+    """Record requested config kwargs vs the effective kwargs sent to search().
+
+    ``backend_ignored`` names known kwargs the constructed adapter swallows
+    without effect (e.g. ``expand`` for ripgrep/mock). Those move out of
+    ``effective`` into ``ignored_by_backend`` so a report cannot claim a
+    compared difference that never existed. ``backend_envelope`` is the
+    harness envelope the backend actually consumes (see
+    ``backend_envelope_options``); when omitted the legacy limit plus
+    update_access default applies, so envelope-agnostic callers are unchanged.
+    """
     known = set(known_kwargs)
+    swallowed = set(backend_ignored)
     requested = dict(config_kwargs)
-    effective: Dict[str, Any] = {"limit": limit, "update_access": False}
+    effective: Dict[str, Any] = (
+        dict(backend_envelope) if backend_envelope is not None
+        else {"limit": limit, "update_access": False}
+    )
     ignored = sorted(key for key in requested if key not in known)
+    ignored_by_backend = sorted(
+        key for key in requested if key in known and key in swallowed
+    )
     for key, value in requested.items():
-        if key in known:
+        if key in known and key not in swallowed:
             effective[key] = value
     return {
         "config": config_name,
         "requested": requested,
         "effective": effective,
         "ignored_unknown": ignored,
+        "ignored_by_backend": ignored_by_backend,
         "expand_default_note": (
             "When 'expand' is unset the engine default applies "
             "(config.query_expand_default); an unset flag is not evidence "
@@ -316,4 +406,49 @@ def build_report_provenance(
         "human_review": "not-established",
         "certification": "none: provenance describes how a report was produced; "
                          "it is not a passing certification.",
+    }
+
+
+def build_gate_provenance(
+    *,
+    kind: str,
+    query: Dict[str, Any],
+    code: Dict[str, Any],
+    baseline: str,
+    candidate: Optional[str],
+    decision: Dict[str, Any],
+    corpus_snapshot: str,
+    mock: bool,
+    live_backend_present: bool,
+    started_iso: str,
+) -> Dict[str, Any]:
+    """Provenance for a gate artifact, which is derived evidence, not a search.
+
+    Carries the same query digest / code revision / corpus identity as the
+    per-report blocks plus the gate inputs and the recorded decision, so a
+    retained ``*-gate.json`` identifies its query digest, revision, corpus
+    state, and effective settings when copied independently.
+    """
+    return {
+        "kind": kind,
+        "query_file": query,
+        "code": code,
+        "baseline": baseline,
+        "candidate": candidate,
+        "metric": decision.get("metric"),
+        "min_relative_improvement": decision.get("min_relative_improvement"),
+        "decision": {
+            "ok": decision.get("ok"),
+            "reason": decision.get("reason"),
+            "baseline_score": decision.get("baseline_score"),
+            "candidate_score": decision.get("candidate_score"),
+            "comparable_queries": decision.get("comparable_queries"),
+        },
+        "corpus_snapshot": corpus_snapshot,
+        "mock": bool(mock),
+        "live_backend_present": bool(live_backend_present),
+        "run_started_iso": started_iso,
+        "human_review": "not-established",
+        "certification": "none: provenance describes how an artifact was "
+                         "produced; it is not a passing certification.",
     }

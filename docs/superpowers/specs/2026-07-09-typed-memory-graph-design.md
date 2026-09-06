@@ -134,7 +134,7 @@ UPDATE memory_links SET
         WHEN 'wikilink' THEN 'explicit_wikilink'
         WHEN 'derived_from' THEN 'writeback_evidence'
         ELSE 'legacy' END)
-    WHERE confidence IS NULL;
+    WHERE confidence IS NULL OR inference_method IS NULL;
 ```
 
 **Deferred (Grok F8):** the `memory_link_inference_runs` ledger table moves to Phase 2/3;

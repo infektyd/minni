@@ -588,6 +588,54 @@ def test_expand_deadline_keeps_truncation_and_stamps_only_ran_variants(
     assert rows[0]["query_variants"] == ["sockets"]
 
 
+def test_expand_deadline_does_not_propagate_unused_later_variant_raise(
+    tmp_path, monkeypatch
+):
+    """P1: deadline truncation must keep the first ranking if a later unused
+    variant would raise. Eager pool.map started that child and aborted the
+    retrieve; serial (and deadline-aware) never starts it.
+    """
+    import minni.retrieval as retrieval_mod
+
+    engine = _engine(tmp_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(retrieval_mod.time, "monotonic", lambda: clock["now"])
+
+    def fake_variants(self, q, expand):
+        if expand in (False, None, "off"):
+            return [q]
+        return ["sockets", "later-raises"]
+
+    orig_fts = RetrievalEngine._fts_search
+    fts_calls = {"n": 0, "queries": []}
+
+    def counting_fts(self, query, *args, **kwargs):
+        fts_calls["n"] += 1
+        fts_calls["queries"].append(query)
+        if query == "later-raises":
+            raise RuntimeError("unused later variant")
+        rows = orig_fts(self, query, *args, **kwargs)
+        clock["now"] = 1_010.0
+        return rows
+
+    monkeypatch.setattr(RetrievalEngine, "_resolve_query_variants", fake_variants)
+    monkeypatch.setattr(RetrievalEngine, "_semantic_search", lambda *a, **k: [])
+    monkeypatch.setattr(RetrievalEngine, "_fts_search", counting_fts)
+
+    rows = engine.retrieve(
+        "sockets",
+        limit=5,
+        budget_tokens=False,
+        expand=True,
+        deadline_monotonic=1_005.0,
+        update_access=False,
+    )
+    assert rows
+    assert fts_calls["n"] == 1, fts_calls
+    assert fts_calls["queries"] == ["sockets"]
+    assert "truncated" in str(engine.last_query_expand_degraded).lower()
+
+
 def test_deadline_fts_does_not_bump_access_count(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     monkeypatch.setattr(RetrievalEngine, "_semantic_search", lambda *a, **k: [])

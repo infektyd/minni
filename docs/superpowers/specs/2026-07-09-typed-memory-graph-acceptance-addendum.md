@@ -270,7 +270,7 @@ UPDATE memory_links SET
         WHEN 'wikilink' THEN 'explicit_wikilink'
         WHEN 'derived_from' THEN 'writeback_evidence'
         ELSE 'legacy' END)
-    WHERE confidence IS NULL;
+    WHERE confidence IS NULL OR inference_method IS NULL;
 ```
 
 ### 5.2 Interaction with `migrations.py` and `_execute_tolerant`

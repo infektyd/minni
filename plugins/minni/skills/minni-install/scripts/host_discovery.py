@@ -15,7 +15,8 @@ import tomllib
 # Desktop chat applications are not interchangeable with their agent runtimes.
 _SPECS = {
     "codex": (("codex",), ("Codex.app",), (".codex/config.toml",)),
-    "claude-code": (("claude",), (), (".claude.json",)),
+    "claude-code": (("claude",), (), (".claude.json", ".claude/plugins/installed_plugins.json",
+                                     ".claude/settings.json")),
     "kilocode": (("kilo", "kilocode"), (), (".config/kilo/kilo.json",)),
     "gemini": (("gemini",), (), (".gemini/settings.json", ".gemini/extensions/minni/gemini-extension.json")),
     "antigravity": (("agy", "antigravity"), ("Antigravity.app", "Antigravity IDE.app"),
@@ -79,6 +80,62 @@ def _binding(config: dict) -> tuple[bool, bool]:
     return present, disabled
 
 
+# Upper bound for a single host config read. ~/.claude.json accumulates
+# per-project prompt history in normal use and routinely passes the old 4 MiB
+# cut-off; 64 MiB still bounds memory while accepting established installs.
+# Anything larger stays a fail-closed config error, never a silent skip.
+_MAX_CONFIG_BYTES = 64 * 1024 * 1024
+
+
+def _claude_registry_binding(config: dict) -> tuple[bool, bool]:
+    """Active `minni@minni` user-scope registration in installed_plugins.json.
+
+    The registry carries no enabled flag: a user-scope entry with an
+    installPath IS the active binding (that is exactly what wire writes and
+    what Claude Code reads hooks/skills/commands from). Entries without an
+    installPath, non-user scopes, and malformed shapes do not count — an
+    unrecognized shape raises so discovery fails closed instead of guessing.
+    """
+    plugins = config.get("plugins")
+    if not isinstance(plugins, dict):
+        raise ValueError("plugin registry must be an object")
+    entries = plugins.get("minni@minni")
+    if entries is None:
+        return False, False
+    if not isinstance(entries, list):
+        raise ValueError("plugin registration must be a list")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("scope", "user") != "user":
+            continue
+        if entry.get("installPath"):
+            return True, False
+    return False, False
+
+
+def _claude_settings_disabled(config: dict) -> bool:
+    """Explicit operator disable of `minni@minni` in ~/.claude/settings.json.
+
+    Installed is not active: Claude Code records per-plugin enablement under
+    `enabledPlugins`. An explicit `false` means the operator turned Minni off,
+    and bulk discovery must preserve that intent rather than reactivate it.
+    Absent key (or absent file) means no recorded disable. Anything else
+    raises so discovery fails closed instead of guessing.
+    """
+    plugins = config.get("enabledPlugins")
+    if plugins is None:
+        return False
+    if not isinstance(plugins, dict):
+        raise ValueError("enabledPlugins must be an object")
+    if "minni@minni" not in plugins:
+        return False
+    value = plugins["minni@minni"]
+    if not isinstance(value, bool):
+        raise ValueError("enabledPlugins entry must be a boolean")
+    return value is False
+
+
 def discover_host(platform: str, *, home: Path | None = None, path: str | None = None,
                   app_roots: tuple[Path, ...] | None = None,
                   launcher_roots: tuple[Path, ...] | None = None) -> HostPresence:
@@ -127,13 +184,18 @@ def discover_host(platform: str, *, home: Path | None = None, path: str | None =
         present = True
         try:
             # Configuration errors may contain credentials; report category only.
-            if target.stat().st_size > 4 * 1024 * 1024:
+            if target.stat().st_size > _MAX_CONFIG_BYTES:
                 raise ValueError("oversized config")
             text = target.read_text(encoding="utf-8")
             config = tomllib.loads(text) if target.suffix == ".toml" else json.loads(text)
             if not isinstance(config, dict):
                 raise ValueError("config must be object")
-            found, disabled = _binding(config)
+            if target.name == "installed_plugins.json":
+                found, disabled = _claude_registry_binding(config)
+            elif platform == "claude-code" and relative == ".claude/settings.json":
+                found, disabled = False, _claude_settings_disabled(config)
+            else:
+                found, disabled = _binding(config)
             configured = configured or found
             binding_disabled = binding_disabled or disabled
         except (OSError, ValueError, UnicodeError) as exc:

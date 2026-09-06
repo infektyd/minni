@@ -162,18 +162,43 @@ The legacy `--gate` Minni-versus-ripgrep loss-rate check is separate and keeps i
 20% rule. Ungated runs remain available for smaller exploratory datasets.
 
 Quality comparisons require one document-ID retriever and two distinct configs.
-Both configs set `use_hyde=False`, so HyDE stays constant. `no-expand` disables
-query expansion; `with-expand` sets `expand=True`, which uses the engine’s
-`query_expand_default` mode (rule or AFM; unsupported defaults fall back to rule).
+Both configs must set `use_hyde=False` explicitly — HyDE on either side
+(including the `with-hyde` config) is rejected before any retrieval work, so a
+two-dimension change can never certify as expansion evidence. `no-expand`
+disables query expansion; `with-expand` sets `expand=True`, which uses the
+engine’s `query_expand_default` mode (rule or AFM; unsupported defaults fall
+back to rule).
 It does not force AFM expansion or guarantee extra variants for every query. The legacy
 `baseline` config retains its existing defaults. Report names resolve by complete
-config identity, so `baseline` never aliases `fp32-baseline`.
+config identity, so `baseline` never aliases `fp32-baseline`. Report names must
+also be unique case-insensitively (`minnid,MINNID` share one backend and one
+report file on case-insensitive filesystems) and must not collide with the
+`gate` / `quality-gate` artifact names.
 
 Quality mode rejects malformed JSONL, missing or blank query-class labels,
-retrieval exceptions, and unsupported config options. It cannot be combined with
+retrieval exceptions, and unsupported config options. An absent or null
+`expected_doc_ids` field is malformed evidence, never an empty judgment: only
+an explicitly present `[]` marks an unevaluable probe. It cannot be combined with
 the legacy `--gate`. These
 checks validate the comparison inputs; passing synthetic tests is not evidence
 of improved real retrieval quality.
+
+Real acceptance requires a positively recorded frozen snapshot with the
+same explicit identity on both sides. Absent provenance, a missing or
+`"unknown"` snapshot, frozen-without-identity, a snapshot mismatch, or mixed
+evidence kinds all fail — nothing is inferred from absence, so a bare report
+without provenance fails rather than passing as synthetic. Positively labeled
+mock evidence keeps the numeric comparison but never certifies: the decision
+is forced to fail with a synthetic-plumbing reason and evidence label (exit
+3). Matching snapshot strings are packet identity, not authenticated proof of
+a frozen corpus. Rerun both configs against a frozen snapshot with a recorded
+identity (snapshot support lands separately) before gating; this gate invents
+no frozen proof.
+
+Gate artifacts (`*-gate.json`, `*-quality-gate.json`) carry their own
+`provenance` block — query digest, code revision, corpus snapshot, gate inputs,
+and the recorded decision — so a retained artifact identifies its evidence
+when copied independently.
 
 ## Private-study preparation runbook (no corpus collected yet)
 
@@ -236,16 +261,23 @@ PYTHONPATH=src .venv/bin/python -m minni.eval.harness run \
 ```
 
 `--output-dir` defaults to `eval/reports`, preserving existing behavior; pass
-an outside-the-repo directory for anything private. A new explicit directory
-is created with mode `0700`; an existing directory must already be owned by
-you and private. Shared directories such as `/tmp` itself are rejected; use
-a dedicated child directory. JSON and Markdown reports are written with mode
-`0600`. Repeated config/retriever combinations are rejected before a run starts.
+an outside-the-repo directory for anything private. A new directory (explicit
+or default) is created with mode `0700`; a pre-existing group/other-writable
+directory fails fast with exit 2 before any retrieval work, instead of running
+the study and then writing zero reports. An existing explicit directory must
+already be owned by you and private. Shared report directories such as `/tmp`
+itself are rejected; use a dedicated child directory. JSON and Markdown
+reports are written with mode `0600`. Repeated config/retriever combinations
+(including case-insensitive collisions) are rejected before a run starts.
 Every JSON report carries
 a `provenance` block: a digest of the exact parsed queries scored
 (`loaded_queries_digest`), the separately observed query-file bytes with
 explicitly unverified correspondence, code revision/dirty state,
-requested/effective retrieval settings, config/dependency metadata when
+requested/effective retrieval settings (options an adapter swallows without
+effect are listed under `ignored_by_backend`, never claimed as compared;
+harness envelope defaults such as `update_access` appear as effective only
+for backends that actually consume them — the live engine alone),
+config/dependency metadata when
 importable (model names are configured defaults, not observed inference),
 principal availability, run order and timing caveats (searcher construction
 happens before, and outside, the measured per-query timing), and
@@ -255,6 +287,13 @@ comparison adds a short Run Provenance section derived from the actually
 constructed backends, not from CLI flags alone. Provenance describes how a
 report was produced; it is not a passing certification, and `unknown` means
 unverifiable, not safe.
+
+`fixture --output` writes a single `0600` file, so the documented
+`/tmp/minni-fixture.json` paths keep working: a sticky shared parent such as
+`/tmp` is accepted for one private file (the sticky bit stops other users
+renaming or replacing it), while a non-sticky shared parent is rejected. The
+destination is preflighted before the fixture runs, so an unusable path exits
+2 instead of discarding a completed evaluation.
 
 `fp32-baseline`, `int8-quantized`, and `with-semantic-merge` are placeholder
 ablations without implemented option changes and are rejected in quality mode.

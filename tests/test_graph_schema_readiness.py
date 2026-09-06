@@ -298,6 +298,69 @@ def test_memory_links_rejects_restrictive_edge_status_check():
     assert any("prevents edge_status='stale'" in error for error in report.errors)
 
 
+def test_memory_links_rejects_nested_restrictive_edge_status_check():
+    """A nested CHECK(edge_status IN ('active')) must also fail the lifecycle."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+
+    conn.executescript(
+        """
+        DROP TABLE memory_links;
+        CREATE TABLE memory_links (
+            source_doc_id INTEGER NOT NULL,
+            target_doc_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL,
+            weight REAL DEFAULT 1.0,
+            created_at REAL,
+            confidence REAL,
+            inference_method TEXT,
+            model_id TEXT,
+            prompt_version TEXT,
+            inference_run_id TEXT,
+            evidence_json TEXT,
+            inferred_at REAL,
+            edge_status TEXT NOT NULL DEFAULT 'active' CHECK(edge_status IN ('active')),
+            PRIMARY KEY(source_doc_id, target_doc_id, link_type)
+        );
+        CREATE INDEX idx_memory_links_target_active
+            ON memory_links(target_doc_id, edge_status, link_type, source_doc_id);
+        CREATE INDEX idx_memory_links_source_active
+            ON memory_links(source_doc_id, edge_status, link_type, target_doc_id);
+        """
+    )
+
+    report = verify_graph_schema(conn)
+    assert report.status == "schema_drifted"
+    assert any("prevents edge_status='stale'" in error for error in report.errors)
+    conn.close()
+
+
+def test_omitted_fk_target_resolves_to_parent_pk():
+    """FOREIGN KEY (doc_id) REFERENCES documents (no column) means the PK."""
+    conn = sqlite3.connect(":memory:")
+    _create_baseline_schema(conn)
+    _apply_migration_021_sql(conn)
+    assert verify_graph_schema(conn).ready is True
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("DROP TABLE learning_documents")
+    conn.execute(
+        """CREATE TABLE learning_documents (
+            learning_id INTEGER NOT NULL REFERENCES learnings(learning_id),
+            doc_id INTEGER NOT NULL,
+            created_at REAL,
+            PRIMARY KEY (learning_id, doc_id),
+            FOREIGN KEY (doc_id) REFERENCES documents ON DELETE CASCADE)"""
+    )
+    conn.execute("CREATE INDEX idx_learning_documents_doc_id ON learning_documents(doc_id)")
+    conn.commit()
+
+    report = verify_graph_schema(conn)
+    assert report.ready is True, report.errors
+    conn.close()
+
+
 def test_tc_ready_declared_type_drift():
     """A required column with the wrong declared type flags schema drift."""
     conn = sqlite3.connect(":memory:")

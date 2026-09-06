@@ -185,6 +185,59 @@ def _normalize_sql(sql: str) -> str:
     return re.sub(r"\s+", " ", sql).strip().lower()
 
 
+def _iter_check_bodies(ddl: str):
+    """Yield inner text of top-level CHECK(...) constraints, nesting-aware.
+
+    A flat ``[^()]*`` match misses the valid SQLite form
+    ``CHECK(edge_status IN ('active'))`` whose IN-list carries its own
+    parens, letting a restrictive lifecycle pass. Depth counting handles one
+    or more nested levels; parens inside quoted literals are out of scope.
+    """
+    for match in re.finditer(r"\bCHECK\s*\(", ddl, re.IGNORECASE):
+        depth = 0
+        start = match.end()
+        pos = start
+        while pos < len(ddl):
+            char = ddl[pos]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    yield ddl[start:pos]
+                    break
+                depth -= 1
+            pos += 1
+
+
+def _single_pk_column(conn: sqlite3.Connection, table: str) -> str | None:
+    """Name the single-column PK of *table*, or None when not exactly one."""
+    try:
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return None
+    pks = [row for row in info if row[5] > 0]
+    if len(pks) != 1:
+        return None
+    return str(pks[0][1])
+
+
+def memory_links_typed_columns_present(conn: Any) -> bool:
+    """True when memory_links carries the 021 typed-edge columns writers set.
+
+    Accepts a connection or cursor (both expose ``.execute``). Explicit-link
+    writers (writeback, wiki_indexer, vault_ingest) consult this to fall back
+    to the legacy 5-column insert when 021 is unavailable — db.py treats a
+    failed migrations run as non-fatal, so the columns can genuinely be
+    absent at write time.
+    """
+    try:
+        rows = conn.execute("PRAGMA table_info(memory_links)").fetchall()
+    except (sqlite3.Error, AttributeError):
+        return False
+    present = {row[1] for row in rows}
+    return "confidence" in present and "inference_method" in present
+
+
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     try:
         row = conn.execute(
@@ -353,7 +406,7 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_links'"
         ).fetchone()
         ddl = str(ddl_row[0] or "") if ddl_row else ""
-        for check_body in re.findall(r"\bCHECK\s*\(([^()]*)\)", ddl, re.IGNORECASE):
+        for check_body in _iter_check_bodies(ddl):
             if "edge_status" not in check_body.lower():
                 continue
             allowed_match = re.search(
@@ -422,7 +475,19 @@ def verify_graph_schema(conn: sqlite3.Connection) -> SchemaVerificationReport:
             for from_col, target_tbl, target_col, _ in fks
         } | ALLOWED_EXTRA_FOREIGN_KEYS.get(tbl, set())
         for row in fk_list:
-            signature = (str(row[3]).lower(), str(row[2]).lower(), str(row[4]).lower())
+            # An omitted FK target (REFERENCES parent with no column) is valid
+            # SQLite meaning the parent's PK: resolve it to the actual single
+            # PK column so semantic matching below judges it, instead of
+            # rejecting a NULL target here. Unresolvable targets stay None and
+            # are still flagged — strictness is preserved, not broadened.
+            to_col = row[4]
+            if to_col is None:
+                to_col = _single_pk_column(conn, str(row[2]))
+            signature = (
+                str(row[3]).lower(),
+                str(row[2]).lower(),
+                str(to_col).lower() if to_col is not None else None,
+            )
             if row[1] != 0 or signature not in expected_signatures:
                 errors.append(
                     f"table '{tbl}' contains unexpected foreign key: "

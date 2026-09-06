@@ -29,6 +29,9 @@ from .dataset import (
 )
 from .provenance import (
     LIVE_BACKENDS,
+    backend_envelope_options,
+    backend_ignored_options,
+    build_gate_provenance,
     build_report_provenance,
     code_provenance,
     corpus_provenance,
@@ -89,8 +92,23 @@ def _queries_path() -> Path:
 
 
 def _reports_dir() -> Path:
+    # Fresh directories are created private (0700 has no group/other bits, so
+    # no umask can broaden them). A pre-existing group/other-writable
+    # directory fails here — before any retrieval work — instead of running
+    # the whole study and then writing zero reports.
     d = repo_root() / "eval" / "reports"
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError(
+                "Default report directory must be owned by this user and not "
+                "writable by others; fix its mode or rerun with --output-dir "
+                "pointing at a private directory"
+            )
+    finally:
+        os.close(fd)
     return d
 
 
@@ -153,6 +171,75 @@ def _write_private_report(path: Path, text: str) -> None:
 def _write_json_report(report: Dict[str, Any], path: Path) -> None:
     _write_private_report(path, json.dumps(report, indent=2))
     logger.info("JSON report written to %s", path)
+
+
+def _check_single_file_destination(directory_fd: int, name: str) -> None:
+    """Reject a symlink, directory, hardlinked, or foreign-owned destination."""
+    try:
+        existing = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+        raise ValueError("Output destination must be a regular, unlinked file")
+    if existing.st_uid != os.getuid():
+        raise ValueError("Output destination is owned by another user")
+
+
+def _open_single_file_parent(path: Path) -> int:
+    """Open the output parent for a direct-file write such as fixture output.
+
+    The parent symlink is followed once (macOS `/tmp` itself is a symlink),
+    then the opened directory must be private or a sticky shared directory:
+    a single 0600 file in a sticky directory is private by its own mode,
+    while a non-sticky group/other-writable parent lets another user swap
+    the destination. Callers must ``os.close`` the returned fd.
+    """
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    except OSError:
+        os.close(fd)
+        raise
+    if mode & 0o022 and not mode & stat.S_ISVTX:
+        os.close(fd)
+        raise ValueError(
+            "Output directory is writable by others without a sticky bit; "
+            "use a private directory"
+        )
+    return fd
+
+
+def _preflight_single_file(path: Path) -> None:
+    """Fail fast (ValueError) when a direct-file destination is unusable."""
+    if not path.parent.exists() or not path.parent.is_dir():
+        raise ValueError(f"Output parent {path.parent} is not a directory")
+    directory = _open_single_file_parent(path)
+    try:
+        _check_single_file_destination(directory, path.name)
+    finally:
+        os.close(directory)
+
+
+def _write_private_single_file(path: Path, text: str) -> None:
+    """Write one 0600 file, allowing a sticky shared parent such as /tmp."""
+    directory = _open_single_file_parent(path)
+    temporary = f".minni-report-{uuid.uuid4().hex}.tmp"
+    created = False
+    try:
+        _check_single_file_destination(directory, path.name)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        created = True
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+    finally:
+        if created:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        os.close(directory)
 
 
 def _write_markdown_comparison(
@@ -358,6 +445,17 @@ def _preflight_quality_gate(
     if baseline_options == candidate_options:
         logger.error("Quality gate requires different effective retrieval options, not only labels")
         sys.exit(2)
+    hyde_values = [
+        CONFIGS[configs_by_key[key]].get("use_hyde")
+        for key in (baseline_key, candidate_key)
+    ]
+    if any(value is not False for value in hyde_values):
+        logger.error(
+            "Quality gate requires HyDE constant and off (use_hyde=False) on "
+            "both configs; got baseline=%r candidate=%r",
+            hyde_values[0], hyde_values[1],
+        )
+        sys.exit(2)
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -380,9 +478,16 @@ def cmd_run(args: argparse.Namespace) -> None:
     reserved = ({"gate"} if getattr(args, "gate", False) else set()) | (
         {"quality-gate"} if getattr(args, "quality_gate", False) else set()
     )
+    folded = [name.casefold() for name in run_order]
     if (not run_order or len(set(run_order)) != len(run_order)
-            or reserved.intersection(run_order)):
-        logger.error("Each evaluation must have a unique report name; remove repeated configs/retrievers")
+            or len(set(folded)) != len(folded)
+            or reserved.intersection(run_order)
+            or {name.casefold() for name in reserved}.intersection(folded)):
+        logger.error(
+            "Each evaluation must have a unique report name; remove repeated "
+            "configs/retrievers (names compare case-insensitively: shared "
+            "backends and report files collide on case-insensitive filesystems)"
+        )
         sys.exit(2)
     if any(Path(name).name != name or name in (".", "..") for name in run_order):
         logger.error("Report names must be plain filenames")
@@ -413,7 +518,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     run_started_iso = datetime.now(timezone.utc).isoformat()
     reports: Dict[str, Dict[str, Any]] = {}
     ks = (1, 3, 5, 10)
-    reports_dir = _resolve_reports_dir(getattr(args, "output_dir", ""))
+    try:
+        reports_dir = _resolve_reports_dir(getattr(args, "output_dir", ""))
+    except (ValueError, OSError) as exc:
+        logger.error("Invalid report directory: %s", exc)
+        sys.exit(2)
 
     effective_query_path = query_path or _queries_path()
     query_prov = query_file_provenance(query_path, effective_query_path, queries)
@@ -452,7 +561,9 @@ def cmd_run(args: argparse.Namespace) -> None:
                 query=query_prov,
                 code=code_prov,
                 retrieval=retrieval_options_provenance(
-                    config_name, config_kwargs, KNOWN_RETRIEVE_KWARGS
+                    config_name, config_kwargs, KNOWN_RETRIEVE_KWARGS,
+                    backend_ignored=backend_ignored_options(retriever_name),
+                    backend_envelope=backend_envelope_options(retriever_name),
                 ),
                 principal=principal_provenance(retriever_name, is_mock=is_mock),
                 corpus=corpus_provenance(is_mock=is_mock, retriever_name=retriever_name),
@@ -495,6 +606,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     gate_report = None
     if getattr(args, "gate", False):
         gate_report = evaluate_gate(reports)
+        gate_report["provenance"] = build_gate_provenance(
+            kind="legacy-loss-rate",
+            query=query_prov,
+            code=code_prov,
+            baseline="ripgrep",
+            candidate="minnid",
+            decision=gate_report,
+            corpus_snapshot=run_prov_summary["corpus_snapshot"],
+            mock=run_prov_summary["mock"],
+            live_backend_present=run_prov_summary["live_backend_present"],
+            started_iso=run_started_iso,
+        )
         gate_path = reports_dir / f"{timestamp}-gate.json"
         _write_json_report(gate_report, gate_path)
         if not gate_report["ok"]:
@@ -517,6 +640,18 @@ def cmd_run(args: argparse.Namespace) -> None:
             min_relative_improvement=getattr(
                 args, "min_improvement", QUALITY_GATE_DEFAULT_MIN_IMPROVEMENT
             ),
+        )
+        quality_report["provenance"] = build_gate_provenance(
+            kind="quality",
+            query=query_prov,
+            code=code_prov,
+            baseline=baseline_key,
+            candidate=candidate_key,
+            decision=quality_report,
+            corpus_snapshot=run_prov_summary["corpus_snapshot"],
+            mock=run_prov_summary["mock"],
+            live_backend_present=run_prov_summary["live_backend_present"],
+            started_iso=run_started_iso,
         )
         quality_path = reports_dir / f"{timestamp}-quality-gate.json"
         _write_json_report(quality_report, quality_path)
@@ -702,8 +837,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         cmd_harvest(args)
     elif args.command == "fixture":
         from .fixture import run_fixture
+        out_path = Path(args.output)
+        try:
+            _preflight_single_file(out_path)
+        except (ValueError, OSError) as exc:
+            logger.error("Invalid fixture output: %s", exc)
+            sys.exit(2)
         report = run_fixture(path=args.corpus, profile=args.profile, repeats=args.repeats)
-        _write_json_report(report, Path(args.output))
+        try:
+            _write_private_single_file(out_path, json.dumps(report, indent=2))
+        except (ValueError, OSError) as exc:
+            logger.error("Could not write fixture report: %s", exc)
+            sys.exit(1)
+        logger.info("JSON report written to %s", out_path)
         print(json.dumps(report["summary"], indent=2))
         if not report["summary"]["ok"]:
             sys.exit(3)
@@ -737,6 +883,8 @@ __all__ = [
     "_token_budget_recall_at_k",
     "_write_json_report",
     "_write_markdown_comparison",
+    "_preflight_single_file",
+    "_write_private_single_file",
     "cmd_harvest",
     "cmd_record",
     "cmd_run",

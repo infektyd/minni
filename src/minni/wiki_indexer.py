@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.graph_readiness import memory_links_typed_columns_present
 from minni.chunker import MarkdownChunker
 from minni.faiss_index import FAISSIndex
 from minni.indexer import VaultIndexer
@@ -697,36 +698,35 @@ class WikiIndexer:
             for target_doc_id in keep_ids
         ]
 
-        # Phase 4: Batch insert with fallback
-        try:
-            if insert_data:
-                cursor.executemany(
-                    """INSERT INTO memory_links
+        # Phase 4: Batch insert with fallback. When 021 is unavailable the
+        # typed columns are absent — use the legacy 5-column shape instead of
+        # silently writing nothing.
+        if memory_links_typed_columns_present(cursor):
+            batch_sql = """INSERT INTO memory_links
                        (source_doc_id, target_doc_id, link_type, weight, created_at,
                         confidence, inference_method)
                        VALUES (?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(source_doc_id, target_doc_id, link_type)
                        DO UPDATE SET weight=excluded.weight,
                                      confidence=excluded.confidence,
-                                     inference_method=excluded.inference_method""",
-                    insert_data,
-                )
-                link_count += len(insert_data)
+                                     inference_method=excluded.inference_method"""
+            row_data = insert_data
+        else:
+            batch_sql = """INSERT INTO memory_links
+                       (source_doc_id, target_doc_id, link_type, weight, created_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                       DO UPDATE SET weight=excluded.weight"""
+            row_data = [row[:5] for row in insert_data]
+        try:
+            if row_data:
+                cursor.executemany(batch_sql, row_data)
+                link_count += len(row_data)
         except Exception:
             # Fallback to row-by-row if batch fails (e.g., FK constraint on specific rows)
-            for data in insert_data:
+            for data in row_data:
                 try:
-                    cursor.execute(
-                        """INSERT INTO memory_links
-                           (source_doc_id, target_doc_id, link_type, weight, created_at,
-                            confidence, inference_method)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)
-                           ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                           DO UPDATE SET weight=excluded.weight,
-                                         confidence=excluded.confidence,
-                                         inference_method=excluded.inference_method""",
-                        data,
-                    )
+                    cursor.execute(batch_sql, data)
                     link_count += 1
                 except Exception:
                     pass

@@ -26,6 +26,7 @@ from datetime import datetime
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.graph_readiness import memory_links_typed_columns_present
 from minni.timestamps import coerce_epoch
 
 logger = logging.getLogger("sovereign.writeback")
@@ -243,19 +244,35 @@ class WriteBackMemory:
                 )
                 existing = [row["doc_id"] for row in c.fetchall()]
                 for evidence_doc_id in existing:
-                    c.execute(
-                        """
-                        INSERT INTO memory_links
-                        (source_doc_id, target_doc_id, link_type, weight, created_at,
-                         confidence, inference_method)
-                        VALUES (?, ?, 'derived_from', 1.0, ?, 1.0, 'writeback_evidence')
-                        ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                        DO UPDATE SET weight=excluded.weight,
-                                      confidence=excluded.confidence,
-                                      inference_method=excluded.inference_method
-                        """,
-                        (learning_doc_id, evidence_doc_id, now),
-                    )
+                    # Baseline fallback: when 021 is unavailable (db.py treats
+                    # a failed migrations run as non-fatal) the typed columns
+                    # are absent — write the legacy 5-column edge instead of
+                    # failing the whole writeback.
+                    if memory_links_typed_columns_present(c):
+                        c.execute(
+                            """
+                            INSERT INTO memory_links
+                            (source_doc_id, target_doc_id, link_type, weight, created_at,
+                             confidence, inference_method)
+                            VALUES (?, ?, 'derived_from', 1.0, ?, 1.0, 'writeback_evidence')
+                            ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                            DO UPDATE SET weight=excluded.weight,
+                                          confidence=excluded.confidence,
+                                          inference_method=excluded.inference_method
+                            """,
+                            (learning_doc_id, evidence_doc_id, now),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO memory_links
+                            (source_doc_id, target_doc_id, link_type, weight, created_at)
+                            VALUES (?, ?, 'derived_from', 1.0, ?)
+                            ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                            DO UPDATE SET weight=excluded.weight
+                            """,
+                            (learning_doc_id, evidence_doc_id, now),
+                        )
                 return learning_doc_id
         except Exception as exc:
             logger.warning("Failed to add derived_from provenance edges: %s", exc)
