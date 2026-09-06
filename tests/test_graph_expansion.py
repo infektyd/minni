@@ -116,7 +116,7 @@ def _seed(db, doc_id, score=1.0, store_id=None):
     return tagged
 
 
-def _expand(db, tmp_path, seeds, *, agent="codex", deadline=None, principal=None, store_id=None):
+def _expand(db, tmp_path, seeds, *, agent="codex", deadline=None, principal=None, store_id=None, depth=1):
     if deadline is None:
         deadline = time.monotonic() + 30
     if principal is None:
@@ -131,6 +131,7 @@ def _expand(db, tmp_path, seeds, *, agent="codex", deadline=None, principal=None
             principal=principal,
             workspace="default",
             deadline_monotonic=deadline,
+            max_depth=depth,
         )
 
 
@@ -584,3 +585,372 @@ def test_cleanup_does_not_allow_general_sql_after_expiry(db, monkeypatch):
             conn.execute("SELECT 1")
     assert conn.in_transaction
     conn.rollback()
+
+
+# --- P3.1 bounded two-hop traversal --------------------------------------
+# Disposable SQLite only: no models, providers, live memory, or network.
+# Covers allowed typed paths with decay math, excluded relation types,
+# blocked/closed/denied intermediates and far nodes, cycles, reverse
+# direction, direct-vs-two-hop winners without duplicate support,
+# per-seed/total caps with determinism, mid-walk deadline degradation,
+# nested-snapshot sharing, and one-hop backward compatibility.
+
+
+def _by_id(result):
+    return {row["doc_id"]: row for row in result.neighbors}
+
+
+def test_two_hop_allowed_path_scores_with_decay(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID-BODY")
+    far = _insert_doc(db, tmp_path, name="far", body="FAR-BODY")
+    _link(db, seed, mid, "updates", confidence=1.0)
+    _link(db, mid, far, "extends", confidence=0.9)
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert result.graph_status == "ok"
+    found = _by_id(result)
+    assert found[mid]["graph_depth"] == 1
+    assert found[mid]["graph_score"] == pytest.approx(1.0)
+    assert found[far]["graph_depth"] == 2
+    # seed 1.0 x updates 1.00 x extends 0.85 x conf 0.9 x decay 0.65.
+    assert found[far]["graph_score"] == pytest.approx(1.0 * 0.85 * 0.9 * 0.65)
+    assert found[far]["chunk_text"] == "FAR-BODY"
+    paths = found[far]["graph_paths"]
+    assert len(paths) == 2
+    assert (paths[0]["from_doc_id"], paths[0]["to_doc_id"],
+            paths[0]["link_type"]) == (seed, mid, "updates")
+    assert (paths[1]["from_doc_id"], paths[1]["to_doc_id"],
+            paths[1]["link_type"]) == (mid, far, "extends")
+    assert found[far]["link_type"] == "extends"
+    assert found[far]["seed_doc_id"] == seed
+
+
+def test_two_hop_excluded_types_do_not_traverse(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    via_relates = _insert_doc(db, tmp_path, name="via-relates", body="R")
+    via_contradicts = _insert_doc(db, tmp_path, name="via-contra", body="C")
+    via_updates = _insert_doc(db, tmp_path, name="via-updates", body="U")
+    _link(db, seed, mid, "updates")
+    _link(db, mid, via_relates, "relates")
+    _link(db, mid, via_contradicts, "contradicts")
+    _link(db, mid, via_updates, "updates")
+    # Parallel excluded edge to the same far node must not shadow the win.
+    _link(db, mid, via_updates, "relates")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    ids = _by_id(result)
+    assert via_relates not in ids
+    assert via_contradicts not in ids
+    assert ids[via_updates]["graph_depth"] == 2
+    assert ids[via_updates]["link_type"] == "updates"
+
+
+def test_two_hop_blocked_or_closed_intermediate_hides_subtree(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    direct = _insert_doc(db, tmp_path, name="direct", body="DIRECT")
+    blocked = _insert_doc(db, tmp_path, name="blocked", privacy="blocked")
+    expired = _insert_doc(db, tmp_path, name="expired", status="expired")
+    far_blocked = _insert_doc(db, tmp_path, name="far-blocked", body="FB")
+    far_expired = _insert_doc(db, tmp_path, name="far-expired", body="FE")
+    _link(db, seed, direct, "extends")
+    _link(db, seed, blocked, "updates")
+    _link(db, seed, expired, "updates")
+    _link(db, blocked, far_blocked, "updates")
+    _link(db, expired, far_expired, "updates")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    ids = set(_by_id(result))
+    # Denied/closed intermediates are not admitted and never traversed,
+    # even though their far neighbors are readable.
+    assert ids == {direct}
+    assert result.graph_status == "ok"
+
+
+def test_two_hop_denied_far_node_leaks_nothing(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    secret = _insert_doc(
+        db, tmp_path, name="secret", agent="foreign", privacy="private",
+        body="FAR-SECRET-TEXT",
+    )
+    _link(db, seed, mid, "updates")
+    _link(db, mid, secret, "updates")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    ids = _by_id(result)
+    assert mid in ids and secret not in ids
+    blob = repr(result)
+    assert "FAR-SECRET-TEXT" not in blob
+    assert all("withheld" not in row for row in result.neighbors)
+
+
+def test_two_hop_cycle_terminates_without_seed_echo(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    far = _insert_doc(db, tmp_path, name="far", body="FAR")
+    _link(db, seed, mid, "updates")
+    _link(db, mid, seed, "updates")
+    _link(db, mid, far, "updates")
+    _link(db, far, mid, "extends")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert result.graph_status == "ok"
+    assert sorted(_by_id(result)) == sorted((mid, far))
+
+
+def test_two_hop_closed_far_node_excluded(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    old = _insert_doc(db, tmp_path, name="old", status="superseded",
+                      body="OLD")
+    _link(db, seed, mid, "updates")
+    _link(db, mid, old, "updates")
+    _link(db, old, mid, "extends")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    # The closed far node is excluded, and the closed node is never
+    # traversed back through either.
+    assert sorted(_by_id(result)) == [mid]
+
+
+def test_two_hop_incoming_chain(db, tmp_path):
+    succ = _insert_doc(db, tmp_path, name="succ", body="SUCC")
+    seed = _insert_doc(db, tmp_path, name="seed", body="SEED")
+    far = _insert_doc(db, tmp_path, name="far", body="FAR2")
+    _link(db, succ, seed, "updates")
+    _link(db, far, succ, "extends")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    ids = _by_id(result)
+    assert ids[succ]["graph_depth"] == 1
+    assert ids[succ]["graph_paths"][0]["direction"] == "incoming"
+    assert ids[far]["graph_depth"] == 2
+    hops = ids[far]["graph_paths"]
+    assert [h["direction"] for h in hops] == ["incoming", "incoming"]
+    assert [h["link_type"] for h in hops] == ["updates", "extends"]
+
+
+def test_direct_vs_two_hop_winner_keeps_single_path(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    wins_far = _insert_doc(db, tmp_path, name="wins-far", body="WF")
+    wins_direct = _insert_doc(db, tmp_path, name="wins-direct", body="WD")
+    # Two-hop outscores the weak direct relates edge: single depth-2 entry.
+    _link(db, seed, mid, "updates", confidence=1.0)
+    _link(db, mid, wins_far, "updates", confidence=1.0)
+    _link(db, seed, wins_far, "relates", confidence=0.5)
+    # Strong direct updates edge beats the decayed two-hop path.
+    _link(db, seed, wins_direct, "updates", confidence=1.0)
+    _link(db, mid, wins_direct, "updates", confidence=0.1)
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    ids = _by_id(result)
+    assert ids[wins_far]["graph_depth"] == 2
+    assert len(ids[wins_far]["graph_paths"]) == 2
+    assert ids[wins_far]["graph_score"] == pytest.approx(0.65)
+    assert ids[wins_direct]["graph_depth"] == 1
+    assert len(ids[wins_direct]["graph_paths"]) == 1
+    assert ids[wins_direct]["graph_score"] == pytest.approx(1.0)
+    assert sorted(ids) == sorted((mid, wins_far, wins_direct))
+
+
+def test_two_hop_caps_and_deterministic_order(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    _link(db, seed, mid, "updates")
+    for i in range(MAX_NEIGHBORS_PER_SEED + 4):
+        far = _insert_doc(db, tmp_path, name=f"far-{i:02d}", body=f"F{i}")
+        _link(db, mid, far, "updates", confidence=0.99 - i * 0.01)
+    first = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert first.graph_status == "ok"
+    # One intermediate plus its top far nodes: the per-seed cap binds.
+    assert len(first.neighbors) <= MAX_NEIGHBORS_PER_SEED
+    assert len(first.neighbors) == MAX_NEIGHBORS_PER_SEED
+    second = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert [(r["doc_id"], r["graph_score"]) for r in second.neighbors] == [
+        (r["doc_id"], r["graph_score"]) for r in first.neighbors
+    ]
+
+
+def test_two_hop_total_cap_across_seeds(db, tmp_path):
+    from minni.graph_expansion import MAX_GRAPH_CANDIDATES
+    seeds = []
+    for s in range(3):
+        seed = _insert_doc(db, tmp_path, name=f"seed-{s}")
+        seeds.append(_seed(db, seed, 1.0 - s * 0.1))
+        mid = _insert_doc(db, tmp_path, name=f"mid-{s}", body=f"M{s}")
+        _link(db, seed, mid, "updates")
+        for i in range(5):
+            far = _insert_doc(db, tmp_path, name=f"far-{s}-{i}", body="F")
+            _link(db, mid, far, "updates")
+    result = _expand(db, tmp_path, seeds, depth=2)
+    assert result.graph_status == "ok"
+    assert len(result.neighbors) <= MAX_GRAPH_CANDIDATES
+    assert len({r["doc_id"] for r in result.neighbors}) == len(result.neighbors)
+
+
+def test_two_hop_mid_walk_deadline_degrades_without_leak(db, tmp_path, monkeypatch):
+    from minni.request_deadline import RequestDeadlineExceeded
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    far = _insert_doc(db, tmp_path, name="far", body="FAR")
+    _link(db, seed, mid, "updates")
+    _link(db, mid, far, "updates")
+    calls = [0]
+    original = graph_expansion.check_deadline
+
+    def expiring():
+        calls[0] += 1
+        if calls[0] > 12:
+            raise RequestDeadlineExceeded("synthetic mid-walk expiry")
+        return original()
+
+    monkeypatch.setattr(graph_expansion, "check_deadline", expiring)
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert result.graph_status == "degraded"
+    assert "FAR" not in repr(result)
+    conn = db._get_conn()
+    assert not conn.in_transaction
+
+
+def test_two_hop_nested_snapshot_shares_caller_transaction(db, tmp_path):
+    conn = db._get_conn()
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    far = _insert_doc(db, tmp_path, name="far", body="FAR")
+    _link(db, seed, mid, "updates")
+    _link(db, mid, far, "extends")
+    conn.execute("CREATE TEMP TABLE caller_pending(value INTEGER)")
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO caller_pending VALUES (11)")
+    try:
+        result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    finally:
+        pending = conn.execute("SELECT value FROM caller_pending").fetchone()[0]
+        conn.rollback()
+    assert result.graph_status == "ok"
+    assert {r["doc_id"] for r in result.neighbors} == {mid, far}
+    assert pending == 11
+    assert conn.execute("SELECT COUNT(*) FROM caller_pending").fetchone()[0] == 0
+
+
+def test_default_depth_is_one_hop_and_invalid_depth_rejected(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    mid = _insert_doc(db, tmp_path, name="mid", body="MID")
+    far = _insert_doc(db, tmp_path, name="far", body="FAR")
+    _link(db, seed, mid, "updates")
+    _link(db, mid, far, "updates")
+    default = _expand(db, tmp_path, [_seed(db, seed)])
+    explicit = expand_typed_graph(
+        db=db,
+        store_id=_store(db),
+        seeds=[_seed(db, seed)],
+        principal=_principal(tmp_path),
+        workspace="default",
+        deadline_monotonic=time.monotonic() + 30,
+        max_depth=1,
+    )
+    assert {r["doc_id"] for r in default.neighbors} == {mid}
+    assert [(r["doc_id"], r["graph_score"], r["graph_depth"])
+            for r in default.neighbors] == [
+        (r["doc_id"], r["graph_score"], r["graph_depth"])
+        for r in explicit.neighbors
+    ]
+    assert all(r["graph_depth"] == 1 for r in default.neighbors)
+    deep = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert far in {r["doc_id"] for r in deep.neighbors}
+    for bad in (0, 3, -1):
+        with pytest.raises(ValueError, match="max_depth"):
+            expand_typed_graph(
+                db=db,
+                store_id=_store(db),
+                seeds=[_seed(db, seed)],
+                principal=_principal(tmp_path),
+                workspace="default",
+                deadline_monotonic=time.monotonic() + 30,
+                max_depth=bad,
+            )
+
+
+def test_two_hop_excluded_first_edge_stops_at_depth1(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    via_relates = _insert_doc(db, tmp_path, name="via-relates", body="MR")
+    via_contra = _insert_doc(db, tmp_path, name="via-contra", body="MC")
+    via_updates = _insert_doc(db, tmp_path, name="via-updates", body="MU")
+    far_r = _insert_doc(db, tmp_path, name="far-r", body="FR")
+    far_c = _insert_doc(db, tmp_path, name="far-c", body="FC")
+    far_u = _insert_doc(db, tmp_path, name="far-u", body="FU")
+    _link(db, seed, via_relates, "relates")
+    _link(db, seed, via_contra, "contradicts")
+    _link(db, seed, via_updates, "updates")
+    _link(db, via_relates, far_r, "updates")
+    _link(db, via_contra, far_c, "updates")
+    _link(db, via_updates, far_u, "updates")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert result.graph_status == "ok"
+    ids = _by_id(result)
+    # Excluded first edges stop at depth 1; their direct entries survive.
+    assert ids[via_relates]["graph_depth"] == 1
+    assert ids[via_contra]["graph_depth"] == 1
+    assert far_r not in ids
+    assert far_c not in ids
+    # Allowed first edge traverses normally.
+    assert ids[far_u]["graph_depth"] == 2
+    assert [h["link_type"] for h in ids[far_u]["graph_paths"]] == [
+        "updates", "updates",
+    ]
+
+
+def test_two_hop_frontier_uses_ranked_cap_not_backfill(db, tmp_path):
+    seed = _insert_doc(db, tmp_path, name="seed")
+    scored = []
+    for i in range(4):
+        node = _insert_doc(db, tmp_path, name=f"a-{i}", body=f"A{i}")
+        _link(db, seed, node, "updates", confidence=1.0)
+        scored.append(node)
+    rel = _insert_doc(db, tmp_path, name="rel", body="REL")
+    _link(db, seed, rel, "relates", confidence=1.0)  # 0.55, rank 5
+    mid6 = _insert_doc(db, tmp_path, name="mid6", body="M6")
+    _link(db, seed, mid6, "updates", confidence=0.5)  # 0.50, rank 6
+    cut = _insert_doc(db, tmp_path, name="cut", body="CUT")
+    _link(db, seed, cut, "updates", confidence=0.4)  # 0.40, rank 7: cut
+    far_top = _insert_doc(db, tmp_path, name="far-top", body="FT")
+    far_rel = _insert_doc(db, tmp_path, name="far-rel", body="FR")
+    far_cut = _insert_doc(db, tmp_path, name="far-cut", body="FC")
+    _link(db, scored[0], far_top, "extends", confidence=1.0)  # 0.5525
+    _link(db, rel, far_rel, "updates")
+    _link(db, cut, far_cut, "updates")
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert result.graph_status == "ok"
+    ids = _by_id(result)
+    # Output top 6 (4 x 1.0, far-top 0.5525, relates 0.55; mid6 0.50 cut);
+    # the rank-7 updates node never entered the traversal frontier.
+    assert sorted(ids) == sorted([*scored, rel, far_top])
+    assert ids[far_top]["graph_depth"] == 2
+    assert ids[rel]["graph_depth"] == 1
+    # Neither the excluded-type frontier member nor the capped-out node
+    # was traversed, although both far nodes are readable.
+    assert far_rel not in ids
+    assert far_cut not in ids
+    again = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert [r["doc_id"] for r in again.neighbors] == [
+        r["doc_id"] for r in result.neighbors
+    ]
+
+
+def test_two_hop_intermediate_expansions_bounded_by_cap(db, tmp_path, monkeypatch):
+    from minni.graph_expansion import MAX_NEIGHBORS_PER_SEED
+    seed = _insert_doc(db, tmp_path, name="seed")
+    for i in range(9):
+        mid = _insert_doc(db, tmp_path, name=f"mid-{i:02d}", body=f"M{i}")
+        _link(db, seed, mid, "updates", confidence=1.0)
+        far = _insert_doc(db, tmp_path, name=f"far-{i:02d}", body=f"F{i}")
+        _link(db, mid, far, "updates", confidence=1.0)
+    calls = [0]
+    original = graph_expansion._second_hop_for_parent
+
+    def counting(*args, **kwargs):
+        calls[0] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(graph_expansion, "_second_hop_for_parent", counting)
+    result = _expand(db, tmp_path, [_seed(db, seed)], depth=2)
+    assert result.graph_status == "ok"
+    # Nine eligible intermediates, six output slots: the ranked frontier
+    # cap binds expansion itself, not just the output list.
+    assert calls[0] == MAX_NEIGHBORS_PER_SEED
+    assert len(result.neighbors) == MAX_NEIGHBORS_PER_SEED
