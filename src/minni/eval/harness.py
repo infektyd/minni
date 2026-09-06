@@ -74,6 +74,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 CONFIGS: Dict[str, Dict[str, Any]] = {
     "baseline": {"use_hyde": False},
     "no-expand": {"use_hyde": False, "expand": False},
+    "semantic": {"use_hyde": False, "expand": False},
     "with-expand": {"use_hyde": False, "expand": True},
     "with-hyde": {"use_hyde": True},
     "fp32-baseline": {},
@@ -570,7 +571,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         try:
             if args.mock:
                 searcher = _MockSearcher(queries)
-            elif retriever_name.strip().lower() in {"snapshot", "study-snapshot", "study_snapshot"}:
+            elif retriever_name.strip().lower() in {
+                "snapshot", "study-snapshot", "study_snapshot",
+                "snapshot-semantic", "snapshot_semantic",
+            }:
                 snapshot_dir = getattr(args, "snapshot_dir", "")
                 if not snapshot_dir:
                     logger.error("The snapshot retriever requires --snapshot-dir <prepared-snapshot-dir>")
@@ -584,6 +588,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             logger.error("Could not initialise retriever %r: %s", retriever_name, exc)
             sys.exit(1)
         is_mock = bool(getattr(args, "mock", False)) or retriever_name.strip().lower() == "mock"
+        # SnapshotSemanticSearcher subclasses SnapshotSearcher, so the
+        # mandatory snapshot+manifest binding covers the semantic backend too.
         if isinstance(searcher, SnapshotSearcher):
             try:
                 _require_snapshot_query_binding(searcher, queries)
@@ -627,6 +633,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                     retriever_name=retriever_name,
                     snapshot_id=getattr(searcher, "snapshot_id", None),
                     manifest_digest=getattr(searcher, "manifest_digest", None),
+                    model=getattr(searcher, "embedding_provenance", None),
                 ),
                 environment=env_prov,
                 retriever_name=retriever_name,

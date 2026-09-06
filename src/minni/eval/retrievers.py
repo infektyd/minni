@@ -29,6 +29,8 @@ _BACKEND_ALIASES = {
     "snapshot": "snapshot",
     "study-snapshot": "snapshot",
     "study_snapshot": "snapshot",
+    "snapshot-semantic": "snapshot-semantic",
+    "snapshot_semantic": "snapshot-semantic",
 }
 
 
@@ -487,9 +489,19 @@ def make_searcher(
                 "(see eval/study_snapshot.py); pass root=<snapshot-dir>"
             )
         return SnapshotSearcher(Path(explicit_root))
+    if key == "snapshot-semantic":
+        if explicit_root is None:
+            raise ValueError(
+                "The snapshot-semantic retriever needs a prepared snapshot "
+                "directory (see eval/semantic_snapshot.py); pass "
+                "root=<snapshot-dir>"
+            )
+        from .semantic_snapshot import SnapshotSemanticSearcher
+
+        return SnapshotSemanticSearcher(Path(explicit_root))
     raise ValueError(
         "Unknown retriever {!r}. Available: minnid, ripgrep, raw-context, "
-        "vendor-memory, mock, snapshot".format(name)
+        "vendor-memory, mock, snapshot, snapshot-semantic".format(name)
     )
 
 

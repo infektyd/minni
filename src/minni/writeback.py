@@ -26,6 +26,7 @@ from datetime import datetime
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.graph_commit import ensure_canonical_learning_node
 from minni.graph_readiness import memory_links_typed_columns_present
 from minni.timestamps import coerce_epoch
 
@@ -126,6 +127,10 @@ class WriteBackMemory:
                 emb = self.model.encode(content, show_progress_bar=False).astype(np.float32)
             emb_bytes = emb.tobytes()
 
+        # Coordinated atomic commit: learning row + supersede marker +
+        # canonical graph node + explicit edges share one cursor block, so any
+        # failure rolls everything back (no partial durable state). Model
+        # encoding stays outside the transaction, per the write-path contract.
         with self.db.cursor() as c:
             c.execute("""
                 INSERT INTO learnings
@@ -145,14 +150,25 @@ class WriteBackMemory:
                     (learning_id, supersedes),
                 )
 
-        self.add_derived_from_edges(
-            learning_id=learning_id,
-            agent_id=agent_id,
-            category=category,
-            content=content,
-            evidence_doc_ids=evidence_doc_ids or source_doc_ids,
-            created_at=now,
-        )
+            canonical_doc_id = ensure_canonical_learning_node(
+                c,
+                learning_id=learning_id,
+                agent_id=agent_id,
+                content=content,
+                vault_path=self.config.vault_path,
+                created_at=now,
+            )
+
+            self.add_derived_from_edges(
+                learning_id=learning_id,
+                agent_id=agent_id,
+                category=category,
+                content=content,
+                evidence_doc_ids=evidence_doc_ids or source_doc_ids,
+                created_at=now,
+                _cursor=c,
+                canonical_doc_id=canonical_doc_id,
+            )
 
         logger.info(
             "Stored learning #%d [%s/%s]: %.60s...",
@@ -173,6 +189,8 @@ class WriteBackMemory:
         content: str,
         evidence_doc_ids: Optional[List[int]],
         created_at: Optional[float] = None,
+        _cursor=None,
+        canonical_doc_id: Optional[int] = None,
     ) -> Optional[int]:
         """
         Represent an evidence-backed learning as a graph document and link it
@@ -182,6 +200,15 @@ class WriteBackMemory:
         ``learning://<id>`` document node only when evidence is supplied. This
         keeps the schema additive and lets graph_export surface the edge
         without a migration.
+
+        When ``_cursor`` is supplied (coordinated commit from
+        ``store_learning``), the writes join its transaction and failures
+        propagate for full rollback. Otherwise a private cursor is used and
+        failures stay lenient (warning + None), as before.
+
+        When ``canonical_doc_id`` is supplied, edges source from that
+        canonical node and no ``learning://`` alias is created (no orphan
+        duplicate representations). Otherwise the legacy alias path runs.
         """
         if not evidence_doc_ids:
             return None
@@ -208,75 +235,100 @@ class WriteBackMemory:
         if not valid_ids:
             return None
 
-        path = f"learning://{learning_id}"
+        if _cursor is not None:
+            # Coordinated commit: run inside the caller's cursor so the edges
+            # share its transaction; failures propagate for full rollback.
+            return self._insert_derived_edges(
+                _cursor, learning_id, agent_id, valid_ids, now,
+                canonical_doc_id=canonical_doc_id,
+            )
         try:
             with self.db.cursor() as c:
-                c.execute("SELECT doc_id FROM documents WHERE path = ?", (path,))
-                row = c.fetchone()
-                if row:
-                    learning_doc_id = row["doc_id"]
-                else:
-                    c.execute(
-                        """
-                        INSERT INTO documents
-                        (path, agent, sigil, last_modified, indexed_at, access_count,
-                         decay_score, whole_document, page_status, privacy_level,
-                         page_type, evidence_refs)
-                        VALUES (?, ?, ?, ?, ?, 0, 1.0, 0, 'accepted', 'safe',
-                                'learning', ?)
-                        """,
-                        (
-                            path,
-                            f"learning:{agent_id}",
-                            "L",
-                            now,
-                            now,
-                            json.dumps(valid_ids),
-                        ),
-                    )
-                    learning_doc_id = c.lastrowid
-
-                c.execute(
-                    "SELECT doc_id FROM documents WHERE doc_id IN ({})".format(
-                        ",".join("?" for _ in valid_ids)
-                    ),
-                    valid_ids,
+                return self._insert_derived_edges(
+                    c, learning_id, agent_id, valid_ids, now,
+                    canonical_doc_id=canonical_doc_id,
                 )
-                existing = [row["doc_id"] for row in c.fetchall()]
-                for evidence_doc_id in existing:
-                    # Baseline fallback: when 021 is unavailable (db.py treats
-                    # a failed migrations run as non-fatal) the typed columns
-                    # are absent — write the legacy 5-column edge instead of
-                    # failing the whole writeback.
-                    if memory_links_typed_columns_present(c):
-                        c.execute(
-                            """
-                            INSERT INTO memory_links
-                            (source_doc_id, target_doc_id, link_type, weight, created_at,
-                             confidence, inference_method)
-                            VALUES (?, ?, 'derived_from', 1.0, ?, 1.0, 'writeback_evidence')
-                            ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                            DO UPDATE SET weight=excluded.weight,
-                                          confidence=excluded.confidence,
-                                          inference_method=excluded.inference_method
-                            """,
-                            (learning_doc_id, evidence_doc_id, now),
-                        )
-                    else:
-                        c.execute(
-                            """
-                            INSERT INTO memory_links
-                            (source_doc_id, target_doc_id, link_type, weight, created_at)
-                            VALUES (?, ?, 'derived_from', 1.0, ?)
-                            ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                            DO UPDATE SET weight=excluded.weight
-                            """,
-                            (learning_doc_id, evidence_doc_id, now),
-                        )
-                return learning_doc_id
         except Exception as exc:
             logger.warning("Failed to add derived_from provenance edges: %s", exc)
             return None
+
+    def _insert_derived_edges(
+        self, c, learning_id, agent_id, valid_ids, now, canonical_doc_id=None
+    ):
+        """Derived_from edges on an already-open cursor.
+
+        With a canonical source the edges attach to the canonical node and no
+        alias document is created. Otherwise the legacy ``learning://`` alias
+        node is created (or reused) as the edge source. Raises on DB errors;
+        the caller owns the failure policy.
+        """
+        if canonical_doc_id is not None:
+            learning_doc_id = int(canonical_doc_id)
+        else:
+            path = f"learning://{learning_id}"
+            c.execute("SELECT doc_id FROM documents WHERE path = ?", (path,))
+            row = c.fetchone()
+            if row:
+                learning_doc_id = row["doc_id"]
+            else:
+                c.execute(
+                    """
+                    INSERT INTO documents
+                    (path, agent, sigil, last_modified, indexed_at, access_count,
+                     decay_score, whole_document, page_status, privacy_level,
+                     page_type, evidence_refs)
+                    VALUES (?, ?, ?, ?, ?, 0, 1.0, 0, 'accepted', 'safe',
+                            'learning', ?)
+                    """,
+                    (
+                        path,
+                        f"learning:{agent_id}",
+                        "L",
+                        now,
+                        now,
+                        json.dumps(valid_ids),
+                    ),
+                )
+                learning_doc_id = c.lastrowid
+
+        c.execute(
+            "SELECT doc_id FROM documents WHERE doc_id IN ({})".format(
+                ",".join("?" for _ in valid_ids)
+            ),
+            valid_ids,
+        )
+        existing = [row["doc_id"] for row in c.fetchall()]
+        for evidence_doc_id in existing:
+            # Baseline fallback: when 021 is unavailable (db.py treats
+            # a failed migrations run as non-fatal) the typed columns
+            # are absent — write the legacy 5-column edge instead of
+            # failing the whole writeback.
+            if memory_links_typed_columns_present(c):
+                c.execute(
+                    """
+                    INSERT INTO memory_links
+                    (source_doc_id, target_doc_id, link_type, weight, created_at,
+                     confidence, inference_method)
+                    VALUES (?, ?, 'derived_from', 1.0, ?, 1.0, 'writeback_evidence')
+                    ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                    DO UPDATE SET weight=excluded.weight,
+                                  confidence=excluded.confidence,
+                                  inference_method=excluded.inference_method
+                    """,
+                    (learning_doc_id, evidence_doc_id, now),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO memory_links
+                    (source_doc_id, target_doc_id, link_type, weight, created_at)
+                    VALUES (?, ?, 'derived_from', 1.0, ?)
+                    ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                    DO UPDATE SET weight=excluded.weight
+                    """,
+                    (learning_doc_id, evidence_doc_id, now),
+                )
+        return learning_doc_id
 
     def recall_learnings(
         self,

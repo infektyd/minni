@@ -5,6 +5,21 @@ import os
 ACTIVE_LEARNING_SQL = """superseded_by IS NULL AND
     (status IS NULL OR status NOT IN ('rejected', 'expired', 'superseded'))"""
 
+# A STORED documents row with one of these page_status values (or blocked
+# privacy) is lifecycle-closed/restricted. Repair and purge must treat it as
+# authoritative: never resurrect it from content defaults, never fill vectors
+# for it. Mirrors the content-derived eligibility set used by the learning
+# projection repair.
+CLOSED_PROJECTION_STATUSES = frozenset({"draft", "expired", "rejected", "superseded"})
+
+
+def projection_row_closed(page_status, privacy_level) -> bool:
+    """True when a stored projection row is closed or restricted.
+
+    Only the row's own stored values count — never content-derived defaults.
+    """
+    return privacy_level == "blocked" or (page_status or "") in CLOSED_PROJECTION_STATUSES
+
 
 def durable_doc_path(agent_id, key, vault_path, content=None):
     seed = content if content is not None else key
