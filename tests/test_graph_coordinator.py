@@ -17,8 +17,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from dataclasses import replace
+
 from minni.graph_coordinator import (
+    GraphCommitAborted,
+    LearningFields,
     commit_learning_with_graph,
+    commit_prepared_learning,
+    prepare_learning_with_graph,
     repair_learning_projection,
 )
 from minni.principal import EffectivePrincipal
@@ -218,6 +224,30 @@ def store(tmp_path):
 
 def _principal():
     return EffectivePrincipal(agent_id="codex", capabilities=["learn"])
+
+
+def _prepare(db, config, content, fakes, **over):
+    params = dict(
+        db=db, store_id=fakes.store_id, principal=_principal(),
+        content=content,
+        vault_path=config.vault_path, embedding_model="test-model",
+        embed_text=fakes.embed_text, chunk_texts=fakes.chunk_texts,
+        search_chunks=fakes.search_chunks, get_metadata=fakes.get_metadata,
+        get_content=fakes.get_content, classify=fakes.classify,
+    )
+    params.update(over)
+    return prepare_learning_with_graph(**params)
+
+
+def _seed_candidate(db, content, principal="codex", workspace="default"):
+    with db.cursor() as c:
+        c.execute(
+            "INSERT INTO candidate_packets"
+            " (principal, workspace_id, content, status, proposed_at)"
+            " VALUES (?, ?, ?, 'proposed', 0.0)",
+            (principal, workspace, content),
+        )
+        return int(c.lastrowid)
 
 
 def _commit(db, config, content, fakes, **over):
@@ -804,3 +834,304 @@ def test_pair_cap_is_allowed_but_missing_content_before_eight_valid_pairs_is_not
         assert result.no_candidates is False
         assert len(reads) == 8 and classified == [8]
     assert all(hit["doc_id"] not in reads for hit in hits[9:])
+
+
+class _Rollback(Exception):
+    """Caller-owned abort used to roll back an outer SQLite transaction."""
+
+
+def test_outer_rollback_after_phase_b_leaves_zero_durable_rows(store):
+    db, config = store
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    prepared = _prepare(db, config, CONTENT_A, fakes)
+    assert prepared.status == "ok" and prepared.payload is not None
+    try:
+        with db.transaction() as c:
+            staged = commit_prepared_learning(
+                c, prepared.payload, db=db, principal=_principal(),
+            )
+            assert staged.status == "staged"
+            assert staged.learning_id is not None
+            assert c.execute("SELECT COUNT(*) FROM learnings").fetchone()[0] == 1
+            raise _Rollback()
+    except _Rollback:
+        pass
+    assert _counts(db) == {
+        "learnings": 0, "documents": 0, "learning_documents": 0,
+        "vault_fts": 0, "chunk_embeddings": 0, "memory_links": 0,
+        "contradiction_log": 0,
+    }
+
+
+def test_candidate_accept_is_atomic_with_learning_and_projection(store):
+    db, config = store
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    cid = _seed_candidate(db, CONTENT_A)
+    prepared = _prepare(db, config, CONTENT_A, fakes)
+    assert prepared.status == "ok" and prepared.payload is not None
+    try:
+        with db.transaction() as c:
+            c.execute("UPDATE candidate_packets SET status='accepted' WHERE candidate_id=?", (cid,))
+            commit_prepared_learning(
+                c, prepared.payload, db=db, principal=_principal(),
+            )
+            raise _Rollback()
+    except _Rollback:
+        pass
+    assert _counts(db)["learnings"] == 0
+    assert _counts(db)["documents"] == 0
+    status = _rows(db, "SELECT status FROM candidate_packets WHERE candidate_id=?",
+                   (cid,))
+    assert status == [("proposed",)]
+
+    with db.transaction() as c:
+        c.execute("UPDATE candidate_packets SET status='accepted', resolved_by='codex', resolution_reason='accepted' WHERE candidate_id=?", (cid,))
+        staged = commit_prepared_learning(
+            c, prepared.payload, db=db, principal=_principal(),
+        )
+    assert staged.status == "staged"
+    assert staged.learning_id is not None and staged.doc_id is not None
+    packet = _rows(db, "SELECT status, resolved_by, resolution_reason"
+                       " FROM candidate_packets WHERE candidate_id=?", (cid,))
+    assert packet == [("accepted", "codex", "accepted")]
+    assert _counts(db)["learnings"] == 1
+    assert _counts(db)["documents"] == 1
+    assert _counts(db)["learning_documents"] == 1
+    assert _counts(db)["vault_fts"] == 1
+    assert _counts(db)["chunk_embeddings"] == 1
+    join = _rows(db, "SELECT learning_id, doc_id FROM learning_documents")
+    assert join == [(staged.learning_id, staged.doc_id)]
+
+
+def test_embed_and_classify_assert_not_in_transaction(store):
+    db, config = store
+    seed = _Fakes(db, classifier=_ok_classifier())
+    assert _commit(db, config, CONTENT_A, seed).status == "ok"
+    seen = []
+    canned = _ok_classifier((0, "extends", "forward", 0.85))
+    fakes = _Fakes(db, classifier=canned)
+    real_embed = fakes.embed_text
+
+    def embed(text):
+        seen.append(("embed", bool(db._get_conn().in_transaction)))
+        return real_embed(text)
+
+    def classify(source, candidates):
+        seen.append(("classify", bool(db._get_conn().in_transaction)))
+        return canned(source, candidates)
+
+    result = _commit(db, config, CONTENT_B, fakes,
+                     embed_text=embed, classify=classify)
+    assert result.status == "ok", result.error
+    assert ("embed", False) in seen
+    assert ("classify", False) in seen
+    assert all(locked is False for _, locked in seen)
+
+
+def test_prepare_rejects_open_write_transaction(store):
+    db, config = store
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    with db.transaction() as _c:
+        prepared = _prepare(db, config, CONTENT_A, fakes)
+    assert prepared.status == "error"
+    assert prepared.error_code == "model_in_transaction"
+    assert prepared.payload is None
+    assert _counts(db)["learnings"] == 0
+
+
+def test_commit_prepared_does_not_invoke_phase_c_or_models(store):
+    db, config = store
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    calls = []
+    real_embed, real_search = fakes.embed_text, fakes.search_chunks
+    canned = fakes.classifier
+
+    def embed(text):
+        calls.append("embed")
+        return real_embed(text)
+
+    def search(vector, top_k):
+        calls.append("search")
+        return real_search(vector, top_k)
+
+    def classify(source, candidates):
+        calls.append("classify")
+        return canned(source, candidates)
+
+    fakes.embed_text, fakes.search_chunks, fakes.classifier = (
+        embed, search, classify)
+    prepared = _prepare(db, config, CONTENT_A, fakes)
+    assert prepared.status == "ok"
+    assert "embed" in calls
+    before = list(calls)
+    with db.transaction() as c:
+        assert c.connection.in_transaction
+        staged = commit_prepared_learning(
+            c, prepared.payload, db=db, principal=_principal(),
+        )
+        assert c.connection.in_transaction
+        assert calls == before
+    assert staged.status == "staged"
+    assert staged.new_chunk_ids != ()
+    assert len(staged.new_chunk_ids) == len(staged.new_chunk_vectors)
+    assert calls == before
+
+
+def test_commit_prepared_requires_open_transaction(store):
+    db, config = store
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    prepared = _prepare(db, config, CONTENT_A, fakes)
+    assert prepared.status == "ok"
+    with db.cursor() as c:
+        with pytest.raises(GraphCommitAborted) as caught:
+            commit_prepared_learning(
+                c, prepared.payload, db=db, principal=_principal(),
+            )
+    assert caught.value.code == "write_requires_transaction"
+    assert _counts(db)["learnings"] == 0
+
+
+def test_prepared_payload_rejects_relabel_and_digest_tamper(store):
+    db, config = store
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    prepared = _prepare(db, config, CONTENT_A, fakes)
+    payload = prepared.payload
+    foreign = EffectivePrincipal(agent_id="intruder", capabilities=["learn"])
+    cases = [
+        replace(payload, store_id="/tmp/other-store.db"),
+        replace(payload, content=CONTENT_B, content_sha256=payload.content_sha256),
+        replace(payload, principal=foreign),
+        replace(payload, digest="0" * 64),
+    ]
+    for tampered in cases:
+        with pytest.raises(GraphCommitAborted) as caught:
+            with db.transaction() as c:
+                commit_prepared_learning(
+                    c, tampered, db=db, principal=_principal(),
+                )
+        assert caught.value.code == "payload_tampered"
+    assert _counts(db)["learnings"] == 0
+
+    mutated = _prepare(db, config, CONTENT_A, fakes).payload
+    mutated.principal.capabilities.append("steal")
+    with pytest.raises(GraphCommitAborted) as caught:
+        with db.transaction() as c:
+            commit_prepared_learning(
+                c, mutated, db=db, principal=_principal(),
+            )
+    assert caught.value.code == "payload_tampered"
+
+
+def test_commit_rejects_cross_store_cursor_and_principal(store, tmp_path):
+    from minni.config import SovereignConfig
+    from minni.db import SovereignDB
+    from minni.migrations import run_migrations
+
+    db_a, config_a = store
+    fakes_a = _Fakes(db_a, classifier=_ok_classifier())
+    prepared = _prepare(db_a, config_a, CONTENT_A, fakes_a)
+    assert prepared.status == "ok"
+
+    other = EffectivePrincipal(agent_id="intruder", capabilities=["learn"])
+    with pytest.raises(GraphCommitAborted) as caught:
+        with db_a.transaction() as c:
+            commit_prepared_learning(
+                c, prepared.payload, db=db_a, principal=other,
+            )
+    assert caught.value.code == "principal_mismatch"
+    assert _counts(db_a)["learnings"] == 0
+
+    config_b = SovereignConfig(
+        db_path=str(tmp_path / "other.db"),
+        vault_path=str(tmp_path / "vault_b"),
+        writeback_path=str(tmp_path / "notes_b"),
+        faiss_index_path=str(tmp_path / "index_b.faiss"),
+        reranker_enabled=False, attribution_enabled=False,
+    )
+    db_b = SovereignDB(config_b)
+    try:
+        run_migrations(db_b._get_conn())
+        with pytest.raises(GraphCommitAborted) as caught:
+            with db_b.transaction() as c:
+                commit_prepared_learning(
+                    c, prepared.payload, db=db_a, principal=_principal(),
+                )
+        assert caught.value.code == "store_binding_mismatch"
+        assert _counts(db_a)["learnings"] == 0
+        assert _counts(db_b)["learnings"] == 0
+        with pytest.raises(GraphCommitAborted) as caught:
+            with db_a.transaction() as c:
+                commit_prepared_learning(
+                    c, prepared.payload, db=db_b, principal=_principal(),
+                )
+        assert caught.value.code == "store_binding_mismatch"
+        assert _counts(db_a)["learnings"] == 0
+        assert _counts(db_b)["learnings"] == 0
+    finally:
+        db_b.close()
+
+
+def test_learning_fields_persist_and_content_hash_is_fail_loud(store):
+    db, config = store
+    prior = _seed_raw_learning(db, "An older learning about staging.")
+    fields = LearningFields(
+        source_query="how do we ship staging?",
+        source_doc_ids=[11, 2],
+        evidence_doc_ids=[7],
+        confidence=0.7,
+        assertion="signed checklist",
+        applies_when="staging deploys",
+        contradicts_id=prior,
+        supersedes=prior,
+        status="active",
+    )
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    result = _commit(db, config, CONTENT_A, fakes, learning_fields=fields)
+    assert result.status == "ok", result.error
+    row = _rows(
+        db,
+        "SELECT source_query, source_doc_ids, evidence_doc_ids, confidence,"
+        " assertion, applies_when, contradicts_id, status, superseded_by"
+        " FROM learnings WHERE learning_id=?",
+        (result.learning_id,),
+    )[0]
+    assert row[0] == "how do we ship staging?"
+    assert "11" in row[1] and "2" in row[1]
+    assert "7" in row[2]
+    assert row[3] == 0.7
+    assert row[4] == "signed checklist"
+    assert row[5] == "staging deploys"
+    assert row[6] == prior
+    assert row[7] == "active"
+    superseded = _rows(db, "SELECT superseded_by FROM learnings WHERE learning_id=?",
+                       (prior,))[0][0]
+    assert superseded == result.learning_id
+
+    hashed = _prepare(
+        db, config, CONTENT_B, _Fakes(db, classifier=_ok_classifier()),
+        learning_fields=LearningFields(content_hash="abc123"),
+        graph_enabled=False,
+    )
+    assert hashed.status == "ok" and hashed.payload is not None
+    present = {
+        str(r[1]) for r in db._get_conn().execute(
+            "PRAGMA table_info(learnings)").fetchall()
+    }
+    assert "content_hash" not in present
+    before = _counts(db)
+    with pytest.raises(GraphCommitAborted) as caught:
+        with db.transaction() as c:
+            commit_prepared_learning(
+                c, hashed.payload, db=db, principal=_principal(),
+            )
+    assert caught.value.code == "learning_field_unavailable"
+    assert _counts(db) == before
+
+
+def test_wrapper_maps_staged_to_ok_only_after_commit(store):
+    db, config = store
+    fakes = _Fakes(db, classifier=_ok_classifier())
+    result = _commit(db, config, CONTENT_A, fakes)
+    assert result.status == "ok"
+    assert result.learning_id is not None
+    assert _counts(db)["learnings"] == 1
