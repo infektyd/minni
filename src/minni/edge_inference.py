@@ -63,8 +63,14 @@ class InferredEdge:
     label: EdgeLabel
     direction: EdgeDirection
     confidence: float
-    supporting_evidence_indices: List[int]
+    supporting_evidence_indices: Tuple[int, ...]
     rationale: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.supporting_evidence_indices, tuple):
+            object.__setattr__(
+                self, "supporting_evidence_indices", tuple(self.supporting_evidence_indices)
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
