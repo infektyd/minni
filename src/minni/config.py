@@ -100,6 +100,12 @@ class SovereignConfig:
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranker_top_k: int = 20              # Re-rank top-K candidates from first pass
     reranker_final_k: int = 5             # Return top-K after re-ranking
+    # Pinned-CPU CrossEncoder.predict batch cap only. ST defaults to 32;
+    # mixed-length CPU batches pad to the longest pair, so a smaller cap
+    # cuts padding waste without dropping or truncating candidates.
+    # Applied solely when cross_encoder_unlocked_predict_safe() is true.
+    # <1 disables the cap (library default). >8 is clamped to 8.
+    reranker_cpu_predict_batch_size: int = 8
 
     # Local NLI attribution scoring for claim/evidence support checks.
     attribution_enabled: bool = True

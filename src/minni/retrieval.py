@@ -1964,6 +1964,26 @@ class RetrievalEngine:
         self._apply_correction_rerank_boost(candidates)
         self._apply_decay_rerank_attenuation(candidates)
 
+    _CPU_PREDICT_BATCH_CAP = 8
+
+    def _pinned_cpu_cross_encoder_predict_kwargs(self) -> dict:
+        """Kwargs for CrossEncoder.predict on the verified pinned-CPU path.
+
+        Smaller batches reduce mixed-length padding inside ST's length-sorted
+        predict. Other devices and the locked fallback keep the historical
+        ``predict(pairs, show_progress_bar=False)`` call. Does not truncate
+        tokens, skip candidates, or change cache/deadline boundaries.
+        """
+        kwargs = {"show_progress_bar": False}
+        raw = getattr(self.config, "reranker_cpu_predict_batch_size", 8)
+        if type(raw) is not int:
+            return kwargs
+        batch = raw
+        if batch < 1:
+            return kwargs
+        kwargs["batch_size"] = min(batch, self._CPU_PREDICT_BATCH_CAP)
+        return kwargs
+
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
         """
         Re-rank candidates using a cross-encoder.
@@ -2039,7 +2059,9 @@ class RetrievalEngine:
                 self.last_rerank_degraded = "search deadline; skipped rerank"
                 return candidates
             if cross_encoder_unlocked_predict_safe():
-                scores = reranker.predict(pairs, show_progress_bar=False)
+                scores = reranker.predict(
+                    pairs, **self._pinned_cpu_cross_encoder_predict_kwargs()
+                )
                 if past_search_deadline(self._current_deadline(), min_remaining=0):
                     self.last_rerank_degraded = (
                         "search deadline exceeded during nonpreemptible rerank"
