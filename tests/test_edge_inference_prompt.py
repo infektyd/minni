@@ -242,7 +242,7 @@ def test_validate_edge_inference_response_success():
     assert edges[0].pair_id == "pair_1"
     assert edges[0].label == "updates"
     assert edges[0].confidence == 0.95
-    assert edges[0].supporting_evidence_indices == [1, 2]
+    assert edges[0].supporting_evidence_indices == (1, 2)
 
 
 @pytest.mark.parametrize(
