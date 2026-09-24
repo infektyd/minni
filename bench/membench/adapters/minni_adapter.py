@@ -265,13 +265,6 @@ def _durable_digest(agent_id: str, content: str) -> str:
 _LIVE_HOME = Path.home() / ".minni"
 _LIVE_SOCKET = _LIVE_HOME / "run" / "minnid.sock"
 _LIVE_DB = _LIVE_HOME / "minni.db"
-# The engine's dual-write flat-file lives at a HARDCODED real-home path
-# (minnid.py: _OPENCLAW_DIR = Path.home() / ".openclaw") that ignores MINNI_HOME.
-# It is only written when minnid is launched with --dual-write — which the
-# throwaway daemon command below MUST NEVER pass (see _spawn_daemon). We still
-# include it in the live-path guard so the guard's "any live path aborts"
-# assurance is HONEST and uniform, not silently scoped to ~/.minni (finding #4).
-_LIVE_OPENCLAW = Path.home() / ".openclaw"
 
 # Path to the engine's minnid entrypoint and its venv python. The adapter
 # *launches* these as a subprocess (a public process boundary), it does not
@@ -474,12 +467,10 @@ class MinniAdapter:
         # uniform for every path: anything equal to _LIVE_HOME or under it aborts
         # — not just the one exact live socket file. (A temp socket like
         # ~/.minni/run/bench.sock must abort too.)
-        # Guard against BOTH live roots: ~/.minni (db/socket/vault) AND ~/.openclaw
-        # (the hardcoded dual-write flat-file root, finding #4). Any candidate path
-        # equal to or under either aborts.
+        # Guard against the live root ~/.minni (db/socket/vault). Any candidate
+        # path equal to or under it aborts.
         live_roots = [
             Path(os.path.realpath(_LIVE_HOME)),
-            Path(os.path.realpath(_LIVE_OPENCLAW)),
         ]
         for p, label in ((tmp_home, "home"), (sock, "socket")):
             real = Path(os.path.realpath(p))
@@ -511,8 +502,7 @@ class MinniAdapter:
         env = {k: os.environ[k] for k in _PASSTHROUGH if k in os.environ}
         # HOME is NOT passed through from the operator's environment (review
         # finding #3): the engine computes some paths relative to HOME at module
-        # load and IGNORES MINNI_HOME for them (e.g. _OPENCLAW_DIR = Path.home() /
-        # ".openclaw"). If the throwaway daemon inherited the real HOME, any such
+        # load and IGNORES MINNI_HOME for them. If the throwaway daemon inherited the real HOME, any such
         # home-rooted path would land in the operator's real home. We pin HOME to
         # the temp home so every home-rooted path the daemon derives stays under
         # the throwaway dir, not ~. (The data-safety guard above has already
@@ -555,12 +545,6 @@ class MinniAdapter:
         # explicitly, never inherited wholesale.
         env["PYTHONPATH"] = str(_ENGINE_DIR)
 
-        # NEVER add --dual-write to this command: the engine's dual-write target
-        # (~/.openclaw/MEMORY.md) is a HARDCODED real-home path that ignores
-        # MINNI_HOME, so enabling it would write fixture content into the
-        # operator's live flat-file. Absent --dual-write, _dual_write_enabled stays
-        # False and _flatfile_append is never reached (finding #4).
-        #
         # stdout+stderr go to a FILE, not a pipe. With a PIPE that nobody drains,
         # a daemon that logs heavily while ingesting hundreds of docs fills the
         # ~64 KiB OS pipe buffer and BLOCKS on its next write — the daemon then

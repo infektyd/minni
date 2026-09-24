@@ -71,39 +71,6 @@ def test_spawn_daemon_refuses_path_inside_live_home(monkeypatch):
         adapter.teardown()
 
 
-def test_spawn_daemon_refuses_path_inside_openclaw(monkeypatch):
-    """The data-safety guard MUST fire if mkdtemp lands inside ~/.openclaw.
-
-    Finding #4 added ~/.openclaw as a second live root (the engine's hardcoded
-    dual-write flat-file dir). This mirrors the ~/.minni guard test for that root
-    so a typo that skips the openclaw root cannot pass the suite while leaving the
-    operator's ~/.openclaw unprotected (review finding #5).
-    """
-    injected = str(Path.home() / ".openclaw" / "injected-membench")
-
-    import membench.adapters.minni_adapter as mod
-
-    monkeypatch.setattr(mod.tempfile, "mkdtemp", lambda *a, **k: injected)
-
-    def _boom(*a, **k):  # pragma: no cover - only hit on guard regression
-        raise AssertionError("subprocess launched despite live-openclaw path")
-
-    monkeypatch.setattr(mod.subprocess, "Popen", _boom)
-
-    adapter = MinniAdapter()
-    try:
-        with pytest.raises(MinniStandupError):
-            adapter._spawn_daemon()
-        # The guard must abort BEFORE any filesystem mutation under tmp_home.
-        assert not Path(injected).exists(), (
-            "guard must abort before creating any directory under ~/.openclaw"
-        )
-        assert not (Path(injected) / "run").exists()
-    finally:
-        adapter._tmp_home = None
-        adapter.teardown()
-
-
 def test_rpc_rejects_non_dict_json_response(monkeypatch, tmp_path):
     """A valid-JSON but non-dict JSON-RPC reply (e.g. a list) must raise a
     redacted MinniStandupError, NOT a raw AttributeError/TypeError (finding #4)."""
@@ -335,7 +302,7 @@ def test_spawn_daemon_env_pythonpath_is_engine_only(monkeypatch):
 def test_spawn_daemon_env_home_is_temp_not_real(monkeypatch):
     """The throwaway daemon's HOME must be PINNED to the temp home, never the
     operator's real ~ (review finding #3). The engine derives some paths from HOME
-    and IGNORES MINNI_HOME for them (e.g. ~/.openclaw); inheriting the real HOME
+    and IGNORES MINNI_HOME for them; inheriting the real HOME
     would let a home-rooted path land in the operator's real home. Assert HOME ==
     tmp_home == MINNI_HOME and that the real home is not what was passed."""
     import membench.adapters.minni_adapter as mod

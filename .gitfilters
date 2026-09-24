@@ -70,8 +70,6 @@ plugins/*/node_modules/**
 plugins/*/dist/**
 plugins/*/output/**
 plugins/*/.playwright-cli/**
-openclaw-extension/node_modules/**
-openclaw-extension/dist/**
 engine/venv/**
 __pycache__/**
 .pytest_cache/**
