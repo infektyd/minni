@@ -12,6 +12,7 @@ from typing import Iterator
 from minni.wire.claude_plugin import (
     ClaudePluginError,
     claude_adopt_pending,
+    ensure_claude_marketplace,
     follow_claude_desktop,
     register_claude_plugin,
 )
@@ -586,6 +587,12 @@ def run_wire(args) -> int:
                         extras["claude_plugin"] = register_claude_plugin(
                             install_root, version,
                             git_sha=manifest.git_sha, dry_run=dry_run,
+                        )
+                        # Claude Code >= 2.1.282 refuses to load minni@minni
+                        # when the `minni` marketplace cannot be resolved, so
+                        # the registration is only half the job.
+                        extras["claude_marketplace"] = ensure_claude_marketplace(
+                            install_root, version, dry_run=dry_run,
                         )
                     except ClaudePluginError as exc:
                         # The MCP config and wired.json already moved above, so

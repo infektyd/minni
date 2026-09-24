@@ -17,6 +17,9 @@ from minni.wire.claude_plugin import (
     ClaudePluginError,
     adopt_claude_code,
     claude_adopt_pending,
+    claude_settings_path,
+    ensure_claude_marketplace,
+    local_marketplace_root,
     follow_claude_desktop,
     installed_plugins_path,
     known_marketplaces_path,
@@ -705,6 +708,9 @@ def test_adopt_dry_run_writes_nothing(home):
     assert result["steps"]["register"]["changed"] is True
     assert not installed_plugins_path().exists()
     assert (legacy_cache_root() / "minni" / "0.3.0").is_dir()
+    assert result["steps"]["local_marketplace"]["settings"]["changed"] is True
+    assert not local_marketplace_root().exists()
+    assert not claude_settings_path().exists()
 
 
 def test_adopt_apply_performs_every_step(home):
@@ -841,3 +847,186 @@ def test_dry_run_wired_bookkeeping_writes_nothing(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir()), (
         "dry-run wired bookkeeping wrote into HOME"
     )
+
+
+# --- local stub marketplace (Claude Code >= 2.1.282) ------------------------
+
+
+def _settings(home: Path) -> dict:
+    return json.loads(claude_settings_path().read_text(encoding="utf-8"))
+
+
+def _stub_manifest() -> dict:
+    path = local_marketplace_root() / ".claude-plugin" / "marketplace.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_marketplace_fresh_install_creates_stub_and_settings(home):
+    root = _install_tree(home, "0.4.0")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    stub = local_marketplace_root()
+    assert stub == home / ".claude" / "local-marketplaces" / "minni"
+    assert _stub_manifest() == {
+        "name": "minni",
+        "owner": {"name": "Minni"},
+        "plugins": [{"name": "minni", "version": "0.4.0", "source": "./plugins/minni-0.4.0"}],
+    }
+    payload = stub / "plugins" / "minni-0.4.0"
+    assert payload.is_dir() and not payload.is_symlink()
+    assert (payload / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8") == (
+        root / ".claude-plugin" / "plugin.json"
+    ).read_text(encoding="utf-8")
+    assert _settings(home)["extraKnownMarketplaces"]["minni"]["source"] == {
+        "source": "directory", "path": str(stub),
+    }
+    assert result["settings"]["changed"] is True
+    assert result["settings"]["backup"] is None  # nothing existed to back up
+    # installPath is not the stub's business: registration keeps the wire tree.
+    assert not installed_plugins_path().exists()
+
+
+def test_marketplace_repairs_a_stale_settings_path_and_keeps_other_keys(home):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    original = {
+        "model": "opus",
+        "permissions": {"allow": ["Bash(ls:*)"]},
+        "enabledPlugins": {"minni@minni": True, "other@elsewhere": True},
+        "extraKnownMarketplaces": {
+            "minni": {
+                "source": {"source": "directory", "path": str(home / "deleted" / "worktree")},
+                "autoUpdate": False,
+            },
+            "other": {"source": {"source": "github", "repo": "example/other"}},
+        },
+    }
+    settings.write_text(json.dumps(original), encoding="utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    data = _settings(home)
+    assert data["extraKnownMarketplaces"]["minni"] == {
+        "source": {"source": "directory", "path": str(local_marketplace_root())},
+        "autoUpdate": False,
+    }
+    assert data["extraKnownMarketplaces"]["other"] == original["extraKnownMarketplaces"]["other"]
+    for key in ("model", "permissions", "enabledPlugins"):
+        assert data[key] == original[key]
+    backup = Path(result["settings"]["backup"])
+    assert backup.parent == settings.parent
+    assert backup.name.startswith("settings.json.minni-backup-")
+    assert json.loads(backup.read_text(encoding="utf-8")) == original
+
+
+def test_marketplace_rerun_is_idempotent(home):
+    root = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(root, "0.4.0")
+    settings_before = claude_settings_path().read_bytes()
+    manifest = local_marketplace_root() / ".claude-plugin" / "marketplace.json"
+    manifest_mtime = manifest.stat().st_mtime_ns
+
+    second = ensure_claude_marketplace(root, "0.4.0")
+
+    assert second["local_marketplace"]["changed"] is False
+    assert second["settings"]["changed"] is False
+    assert claude_settings_path().read_bytes() == settings_before
+    assert manifest.stat().st_mtime_ns == manifest_mtime
+    backups = list(claude_settings_path().parent.glob("settings.json.minni-backup-*"))
+    assert backups == []
+
+
+def test_marketplace_new_version_replaces_and_prunes_old_copies(home):
+    old = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(old, "0.4.0")
+    new = _install_tree(home, "0.4.1")
+
+    result = ensure_claude_marketplace(new, "0.4.1")
+
+    plugins = local_marketplace_root() / "plugins"
+    assert sorted(p.name for p in plugins.iterdir()) == ["minni-0.4.1"]
+    assert result["local_marketplace"]["pruned"] == [str(plugins / "minni-0.4.0")]
+    assert _stub_manifest()["plugins"][0]["source"] == "./plugins/minni-0.4.1"
+    # Settings already named the stub; a version bump does not rewrite them.
+    assert result["settings"]["changed"] is False
+
+
+def test_marketplace_refreshes_a_copy_that_drifted_from_the_payload(home):
+    root = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(root, "0.4.0")
+    copy = local_marketplace_root() / "plugins" / "minni-0.4.0" / "dist" / "server.js"
+    copy.write_text("// tampered\n", encoding="utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    assert result["local_marketplace"]["copied"] is True
+    assert copy.read_text(encoding="utf-8") == "// stub\n"
+
+
+def test_marketplace_dry_run_writes_nothing(home):
+    root = _install_tree(home, "0.4.0")
+
+    result = ensure_claude_marketplace(root, "0.4.0", dry_run=True)
+
+    assert result["local_marketplace"]["changed"] is True
+    assert result["settings"]["changed"] is True
+    assert not local_marketplace_root().exists()
+    assert not claude_settings_path().exists()
+
+
+def test_marketplace_refuses_a_symlinked_stub(home, tmp_path):
+    root = _install_tree(home, "0.4.0")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    local_marketplace_root().parent.mkdir(parents=True)
+    local_marketplace_root().symlink_to(elsewhere)
+
+    with pytest.raises(ClaudePluginError):
+        ensure_claude_marketplace(root, "0.4.0")
+    assert not any(elsewhere.iterdir())
+
+
+def test_marketplace_refuses_corrupt_settings(home):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError):
+        ensure_claude_marketplace(root, "0.4.0")
+    assert settings.read_text(encoding="utf-8") == "{not json"
+
+
+def test_stub_marketplace_entry_is_not_retired_or_pending(home):
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    adopt_claude_code(apply=True)
+    # Claude Code records the directory marketplace it resolved.
+    marketplaces = known_marketplaces_path()
+    marketplaces.write_text(json.dumps({
+        "minni": {
+            "source": {"source": "directory", "path": str(local_marketplace_root())},
+            "installLocation": str(local_marketplace_root()),
+        },
+    }), encoding="utf-8")
+
+    assert claude_adopt_pending() is False
+    assert retire_claude_marketplace()["changed"] is False
+    assert "minni" in json.loads(marketplaces.read_text(encoding="utf-8"))
+
+
+def test_adopt_apply_sets_up_the_stub_marketplace(home):
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+
+    result = adopt_claude_code(apply=True)
+
+    step = result["steps"]["local_marketplace"]
+    assert step["local_marketplace"]["changed"] is True
+    assert (local_marketplace_root() / "plugins" / "minni-0.4.0").is_dir()
+    assert _settings(home)["extraKnownMarketplaces"]["minni"]["source"]["path"] == str(
+        local_marketplace_root()
+    )
+    assert _registry(home)["plugins"]["minni@minni"][0]["installPath"] == str(root)
