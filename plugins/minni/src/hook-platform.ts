@@ -326,12 +326,11 @@ export function renderIntent(wire: PlatformWire, intent: HookIntent): RenderedIn
 }
 
 /**
- * Hosts without a vendor hook contract (Hermes/OpenClaw, Muse, future ids).
+ * Hosts without a vendor hook contract (Muse, future ids).
  *
  * Historical failure: unknown ids fell through to claudeCodeWire, so inject
  * "succeeded" in our audit log while the host discarded Claude's envelope
- * (same scar as cursor before it had a profile). Hermes wrote 1075 daemon
- * learnings with an empty vault and no WIRES entry. Refuse inject; keep the
+ * (same scar as cursor before it had a profile). Refuse inject; keep the
  * requested id so the drop reason is attributable.
  */
 export function unprofiledWire(id: string): PlatformWire {
@@ -344,9 +343,6 @@ export function unprofiledWire(id: string): PlatformWire {
   };
 }
 
-/** Documented in docs/contracts/VAULT.md; no vendor hook profile. */
-export const hermesWire: PlatformWire = unprofiledWire("hermes");
-
 const WIRES: ReadonlyArray<PlatformWire> = [
   claudeCodeWire,
   codexWire,
@@ -354,7 +350,6 @@ const WIRES: ReadonlyArray<PlatformWire> = [
   kilocodeWire,
   geminiWire,
   cursorWire,
-  hermesWire,
 ];
 
 /**

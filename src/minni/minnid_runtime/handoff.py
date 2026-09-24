@@ -38,8 +38,6 @@ def default_agent_vault(agent_id: str) -> Path:
         "claude-code": "claudecode",
         "claudecode": "claudecode",
         "codex": "codex",
-        "hermes": "hermes",
-        "openclaw": "openclaw",
         # Preserve hyphenated canonical slugs; the Grok overlay polls these vault names.
         # Any hyphenated id whose vault dir keeps the hyphen MUST be listed here --
         # the fallback below strips non-alphanumerics, so an unlisted `foo-bar`

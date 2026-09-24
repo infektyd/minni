@@ -1008,8 +1008,6 @@ export function getAgentIdFromVaultPath(vaultPath: string): string {
   if (absPath === path.join(homedir, ".minni", "codex-vault")) return "codex";
   if (absPath === path.join(homedir, ".minni", "claudecode-vault")) return "claude-code";
   if (absPath === path.join(homedir, ".minni", "kilocode-vault")) return "kilocode";
-  if (absPath === path.join(homedir, ".minni", "hermes-vault")) return "hermes";
-  if (absPath === path.join(homedir, ".minni", "openclaw-vault")) return "openclaw";
 
   const base = path.basename(absPath);
   if (base.endsWith("-vault")) {

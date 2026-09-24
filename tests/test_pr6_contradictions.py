@@ -963,22 +963,22 @@ class TestHandleResolveContradiction:
                 VALUES (?, 'codex', ?, 'unit-test')
             """, (codex_learning_id, now))
 
-            # A DIFFERENT agent ("hermes") has its own unrelated read+superseded
+            # A DIFFERENT agent ("peer") has its own unrelated read+superseded
             # learning -- codex must never see or be counted against this.
             c.execute("""
                 INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
-                VALUES ('test', 'fact', 'hermes-relevant learning', 1.0, ?, 'active')
+                VALUES ('test', 'fact', 'peer-relevant learning', 1.0, ?, 'active')
             """, (now,))
-            hermes_learning_id = c.lastrowid
+            peer_learning_id = c.lastrowid
             c.execute("""
                 INSERT INTO learning_reads (learning_id, agent_id, read_at, source)
-                VALUES (?, 'hermes', ?, 'unit-test')
-            """, (hermes_learning_id, now))
+                VALUES (?, 'peer', ?, 'unit-test')
+            """, (peer_learning_id, now))
 
         import minni.writeback as wb_mod
         wb_mod.WriteBackMemory.model = property(lambda self: None)
         try:
-            for lid in (codex_learning_id, hermes_learning_id):
+            for lid in (codex_learning_id, peer_learning_id):
                 resp = self._dispatch("resolve_contradiction", {
                     "new_content": f"resolution for learning {lid}",
                     "supersede_ids": [lid],
@@ -1008,9 +1008,9 @@ class TestHandleResolveContradiction:
         assert checked["contradiction_events_for_agent_reads"] == 1
         assert checked["learning_reads_for_agent"] == 1
 
-        # And the events list itself must never include hermes's event.
+        # And the events list itself must never include peer's event.
         superseded_ids = {e["superseded_learning_id"] for e in subscribed["result"]["events"]}
-        assert hermes_learning_id not in superseded_ids
+        assert peer_learning_id not in superseded_ids
         assert superseded_ids == {codex_learning_id}
 
     def test_resolve_new_content_required(self, tmp_path, monkeypatch):

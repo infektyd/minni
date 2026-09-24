@@ -70,10 +70,10 @@ test("ensureVault does not wipe a raced log.md seed", async () => {
   }
 });
 
-test("ensureVault refuses hermes-vault dir symlink into shop-restore", async () => {
+test("ensureVault refuses peer-vault dir symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-shop-"));
   const shop = path.join(tmp, "shop-restore");
-  const vault = path.join(tmp, "hermes-vault");
+  const vault = path.join(tmp, "peer-vault");
   try {
     await mkdir(shop);
     await writeFile(path.join(shop, "keep.md"), "restore\n", "utf8");
@@ -93,7 +93,7 @@ test("ensureVault refuses hermes-vault dir symlink into shop-restore", async () 
 test("ensureVault refuses wiki symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-wiki-shop-"));
   const shop = path.join(tmp, "shop-restore");
-  const vault = path.join(tmp, "hermes-vault");
+  const vault = path.join(tmp, "peer-vault");
   try {
     await mkdir(shop);
     await mkdir(vault);
@@ -111,7 +111,7 @@ test("ensureVault refuses wiki symlink into shop-restore", async () => {
 test("ensureVault refuses inbox symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-inbox-shop-"));
   const shop = path.join(tmp, "shop-restore");
-  const vault = path.join(tmp, "hermes-vault");
+  const vault = path.join(tmp, "peer-vault");
   try {
     await mkdir(shop);
     await mkdir(vault);
@@ -222,7 +222,7 @@ test("appendIndex uses appendFileWithFsync (O_APPEND|O_NOFOLLOW), never appendFi
 test("writeVaultPage does not follow raced index.md symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-index-shop-"));
   const shop = path.join(tmp, "shop-restore");
-  const vault = path.join(tmp, "hermes-vault");
+  const vault = path.join(tmp, "peer-vault");
   try {
     await mkdir(shop);
     await mkdir(vault);
@@ -264,7 +264,7 @@ test("appendFileWithFsync uses O_APPEND|O_NOFOLLOW, never open(path, \"a\")", as
 test("appendFileWithFsync does not follow raced log.md symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-append-race-shop-"));
   const shop = path.join(tmp, "shop-restore");
-  const vault = path.join(tmp, "hermes-vault");
+  const vault = path.join(tmp, "peer-vault");
   try {
     await mkdir(shop);
     await mkdir(vault);
@@ -288,7 +288,7 @@ test("appendFileWithFsync does not follow raced log.md symlink into shop-restore
 test("recordAudit refuses log.md symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-audit-log-shop-"));
   const shop = path.join(tmp, "shop-restore");
-  const vault = path.join(tmp, "hermes-vault");
+  const vault = path.join(tmp, "peer-vault");
   try {
     await mkdir(shop);
     await mkdir(vault);
@@ -308,7 +308,7 @@ test("recordAudit refuses log.md symlink into shop-restore", async () => {
 test("recordAudit refuses daily log.md symlink into shop-restore", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "sm-audit-daily-shop-"));
   const shop = path.join(tmp, "shop-restore");
-  const vault = path.join(tmp, "hermes-vault");
+  const vault = path.join(tmp, "peer-vault");
   try {
     await mkdir(shop);
     await mkdir(vault);

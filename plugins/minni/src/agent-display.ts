@@ -2,7 +2,7 @@
 const RUNTIME_NAMES: Record<string, string> = {
   codex: "Codex", cursor: "Cursor", "claude-code": "Claude Code",
   "claude-desktop": "Claude Desktop", gemini: "Gemini", antigravity: "Antigravity",
-  "grok-build": "Grok", grok: "Grok", hermes: "Hermes", openclaw: "OpenClaw",
+  "grok-build": "Grok", grok: "Grok",
   kilocode: "Kilo Code", devin: "Devin", main: "Operator",
 };
 

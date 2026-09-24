@@ -233,7 +233,7 @@ def main():
     sp.add_argument("--agent", "-a")
 
     sp = sub.add_parser("read", help="Agent startup context")
-    sp.add_argument("--agent", "-a", default="hermes")
+    sp.add_argument("--agent", "-a")
     sp.add_argument("--limit", type=int, default=5)
 
     sp = sub.add_parser("learn", help="Store a learning")

@@ -1,18 +1,17 @@
-"""Hermes vault/wire slice (usage-audit R2).
+"""Agent vault seed / wire slice (usage-audit R2).
 
-Live machine: 1075 learnings with agent_id=hermes (2026-04-13..2026-05-17)
-live in shared ``~/.minni/learnings`` and AFM wiki ``~/.minni/vault``, not
-hermes-vault wiki. hermes-vault being `.index`-only is a missing
-inbox/identity layout (wiki dirs, log.md, index.md). Principal JSON names
-the vault; docs/contracts/VAULT.md documents it. hook-platform.wireFor
-used to silently render the Claude Code shape for hermes; it now keeps
-the id and refuses inject/note.
+Daemon learnings live in shared ``~/.minni/learnings`` and the AFM wiki
+``~/.minni/vault``, not in a per-agent vault wiki. An agent vault that is
+`.index`-only is a missing inbox/identity layout (wiki dirs, log.md,
+index.md). Principal JSON names the vault. hook-platform.wireFor used to
+silently render the Claude Code shape for unprofiled ids; it now keeps the
+id and refuses inject/note. ``peer`` below is an arbitrary fixture id.
 
 This slice:
 - seeds inbox/identity contract files when a principal's vault root
   already exists as a directory
 - does not invent a vault from nothing
-- does not route learnings into hermes-vault
+- does not route learnings into an agent vault
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ def _isolate_minni_home(tmp_path, monkeypatch) -> Path:
 
 
 def test_ensure_agent_vault_seeds_empty_index_only_dir(tmp_path):
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / ".index").mkdir()
     created = ensure_agent_vault(vault)
@@ -69,25 +68,25 @@ def test_ensure_agent_vault_does_not_create_missing_root(tmp_path):
 
 def test_principal_load_seeds_existing_vault_root(tmp_path, monkeypatch):
     minni_home = _isolate_minni_home(tmp_path, monkeypatch)
-    vault = minni_home / "hermes-vault"
+    vault = minni_home / "peer-vault"
     vault.mkdir()
     principals = tmp_path / "principals"
     _write_principal(
         principals,
-        "hermes",
+        "peer",
         {
-            "agent_id": "hermes",
-            "workspace_id": "workspace-hermes",
+            "agent_id": "peer",
+            "workspace_id": "workspace-peer",
             "capabilities": ["search", "learn"],
             "allowed_vault_roots": [str(vault)],
         },
     )
     p = resolve_effective_principal(
-        supplied_agent_id="hermes",
+        supplied_agent_id="peer",
         transport="uds",
         principals_dir=principals,
     )
-    assert p.agent_id == "hermes"
+    assert p.agent_id == "peer"
     assert (vault / "log.md").is_file()
     assert (vault / "wiki").is_dir()
 
@@ -157,7 +156,7 @@ def test_principal_load_does_not_seed_broad_home_acl_root(tmp_path, monkeypatch)
 
 
 def test_ensure_agent_vault_raises_on_log_md_directory(tmp_path):
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / "log.md").mkdir()
     with pytest.raises(OSError):
@@ -166,7 +165,7 @@ def test_ensure_agent_vault_raises_on_log_md_directory(tmp_path):
 
 
 def test_ensure_agent_vault_raises_on_wiki_file(tmp_path):
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / "wiki").write_text("not a directory\n", encoding="utf-8")
     with pytest.raises(OSError):
@@ -175,14 +174,14 @@ def test_ensure_agent_vault_raises_on_wiki_file(tmp_path):
 
 def test_principal_load_does_not_swallow_vault_seed_failure(tmp_path, monkeypatch):
     minni_home = _isolate_minni_home(tmp_path, monkeypatch)
-    vault = minni_home / "hermes-vault"
+    vault = minni_home / "peer-vault"
     vault.mkdir()
     (vault / "wiki").write_text("not a directory\n", encoding="utf-8")
     principals = tmp_path / "principals"
-    _write_principal(principals, "hermes", _acl_principal("hermes", [vault]))
+    _write_principal(principals, "peer", _acl_principal("peer", [vault]))
     with pytest.raises(OSError):
         resolve_effective_principal(
-            supplied_agent_id="hermes",
+            supplied_agent_id="peer",
             transport="uds",
             principals_dir=principals,
         )
@@ -194,7 +193,7 @@ def test_vault_dirname_for_uses_canonical_agent_vault_dirs():
     assert vault_dirname_for("claude-code") == "claudecode-vault"
     assert vault_dirname_for("grok-build") == "grok-build-vault"
     assert vault_dirname_for("grok-build") != "grokbuild-vault"
-    assert vault_dirname_for("hermes") == "hermes-vault"
+    assert vault_dirname_for("peer") == "peer-vault"
     for agent_id, vault_dir in AGENT_VAULT_DIRS.items():
         assert vault_dirname_for(agent_id) == vault_dir
 
@@ -231,14 +230,14 @@ def test_principal_resolve_seeds_canonical_grok_build_vault_not_dashless_alias(
 
 
 def test_principal_from_raw_does_not_seed_on_construction(tmp_path):
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     p = _principal_from_raw(
-        _acl_principal("hermes", [vault]),
+        _acl_principal("peer", [vault]),
         transport="uds",
         principals_dir=tmp_path,
     )
-    assert p.agent_id == "hermes"
+    assert p.agent_id == "peer"
     assert not (vault / "log.md").exists()
     assert not (vault / "wiki").exists()
     assert not (vault / "inbox").exists()
@@ -308,8 +307,8 @@ def test_resolve_search_only_operator_does_not_seed_own_vault(tmp_path):
 
 def test_resolve_platform_agent_does_not_seed_operator_vault(tmp_path, monkeypatch):
     minni_home = tmp_path / "minni-home"
-    hermes = minni_home / "hermes-vault"
-    hermes.mkdir(parents=True)
+    peer = minni_home / "peer-vault"
+    peer.mkdir(parents=True)
     operator_vault = tmp_path / "claudecode-vault"
     operator_vault.mkdir()
     monkeypatch.setenv("MINNI_HOME", str(minni_home))
@@ -321,28 +320,28 @@ def test_resolve_platform_agent_does_not_seed_operator_vault(tmp_path, monkeypat
             "agent_id": "claude-code",
             "capabilities": ["*"],
             "allowed_vault_roots": [str(operator_vault)],
-            "platform_agent_ids": ["hermes"],
-            "platform_agent_capabilities": {"hermes": ["search", "learn"]},
+            "platform_agent_ids": ["peer"],
+            "platform_agent_capabilities": {"peer": ["search", "learn"]},
         },
     )
     p = resolve_effective_principal(
-        supplied_agent_id="hermes",
+        supplied_agent_id="peer",
         transport="uds",
         principals_dir=principals,
     )
-    assert p.agent_id == "hermes"
+    assert p.agent_id == "peer"
     assert not (operator_vault / "log.md").exists()
     assert not (operator_vault / "wiki").exists()
     assert not (operator_vault / "inbox").exists()
 
 
-def test_platform_agent_resolve_seeds_canonical_hermes_vault(tmp_path, monkeypatch):
+def test_platform_agent_resolve_seeds_canonical_peer_vault(tmp_path, monkeypatch):
     minni_home = tmp_path / "minni-home"
-    hermes = minni_home / "hermes-vault"
+    peer = minni_home / "peer-vault"
     dashless = minni_home / "grokbuild-vault"
-    hermes.mkdir(parents=True)
+    peer.mkdir(parents=True)
     dashless.mkdir()
-    (hermes / ".index").mkdir()
+    (peer / ".index").mkdir()
     operator_vault = tmp_path / "operator-vault"
     operator_vault.mkdir()
     monkeypatch.setenv("MINNI_HOME", str(minni_home))
@@ -354,19 +353,19 @@ def test_platform_agent_resolve_seeds_canonical_hermes_vault(tmp_path, monkeypat
             "agent_id": "main",
             "capabilities": ["*"],
             "allowed_vault_roots": [str(operator_vault)],
-            "platform_agent_ids": ["hermes"],
-            "platform_agent_capabilities": {"hermes": ["search", "learn"]},
+            "platform_agent_ids": ["peer"],
+            "platform_agent_capabilities": {"peer": ["search", "learn"]},
         },
     )
     p = resolve_effective_principal(
-        supplied_agent_id="hermes",
+        supplied_agent_id="peer",
         transport="uds",
         principals_dir=principals,
     )
-    assert p.agent_id == "hermes"
-    assert (hermes / "log.md").is_file()
-    assert (hermes / "index.md").is_file()
-    assert (hermes / "wiki" / "sessions").is_dir()
+    assert p.agent_id == "peer"
+    assert (peer / "log.md").is_file()
+    assert (peer / "index.md").is_file()
+    assert (peer / "wiki" / "sessions").is_dir()
     assert not (operator_vault / "log.md").exists()
     assert not (dashless / "log.md").exists()
 
@@ -404,7 +403,7 @@ def test_platform_agent_resolve_does_not_seed_dashless_grokbuild_alias(
 
 
 def test_ensure_agent_vault_raises_on_file_at_root(tmp_path):
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.write_text("not a directory\n", encoding="utf-8")
     with pytest.raises(NotADirectoryError):
         ensure_agent_vault(vault)
@@ -414,7 +413,7 @@ def test_ensure_agent_vault_raises_on_file_at_root(tmp_path):
 def test_ensure_agent_vault_raises_on_symlink_to_file_at_root(tmp_path):
     target = tmp_path / "payload"
     target.write_text("not a directory\n", encoding="utf-8")
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.symlink_to(target)
     with pytest.raises(OSError):
         ensure_agent_vault(vault)
@@ -424,7 +423,7 @@ def test_ensure_agent_vault_refuses_dir_symlink_root_into_shop_restore(tmp_path)
     shop = tmp_path / "shop-restore"
     shop.mkdir()
     (shop / "keep.md").write_text("restore\n", encoding="utf-8")
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.symlink_to(shop)
     with pytest.raises(OSError):
         ensure_agent_vault(vault)
@@ -441,13 +440,13 @@ def test_principal_resolve_refuses_vault_root_dir_symlink_into_shop(
     shop = tmp_path / "shop-restore"
     shop.mkdir()
     (shop / "keep.md").write_text("restore\n", encoding="utf-8")
-    vault = minni_home / "hermes-vault"
+    vault = minni_home / "peer-vault"
     vault.symlink_to(shop)
     principals = tmp_path / "principals"
-    _write_principal(principals, "hermes", _acl_principal("hermes", [vault]))
+    _write_principal(principals, "peer", _acl_principal("peer", [vault]))
     with pytest.raises(OSError):
         resolve_effective_principal(
-            supplied_agent_id="hermes",
+            supplied_agent_id="peer",
             transport="uds",
             principals_dir=principals,
         )
@@ -459,13 +458,13 @@ def test_principal_resolve_refuses_vault_root_dir_symlink_into_shop(
 
 def test_principal_resolve_fail_closed_on_file_at_vault_root(tmp_path, monkeypatch):
     minni_home = _isolate_minni_home(tmp_path, monkeypatch)
-    vault = minni_home / "hermes-vault"
+    vault = minni_home / "peer-vault"
     vault.write_text("not a directory\n", encoding="utf-8")
     principals = tmp_path / "principals"
-    _write_principal(principals, "hermes", _acl_principal("hermes", [vault]))
+    _write_principal(principals, "peer", _acl_principal("peer", [vault]))
     with pytest.raises(NotADirectoryError):
         resolve_effective_principal(
-            supplied_agent_id="hermes",
+            supplied_agent_id="peer",
             transport="uds",
             principals_dir=principals,
         )
@@ -473,18 +472,18 @@ def test_principal_resolve_fail_closed_on_file_at_vault_root(tmp_path, monkeypat
 
 def test_principal_resolve_expands_user_vault_root_and_seeds(tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
-    vault = fake_home / ".minni" / "hermes-vault"
+    vault = fake_home / ".minni" / "peer-vault"
     vault.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("MINNI_HOME", str(fake_home / ".minni"))
     principals = tmp_path / "principals"
     _write_principal(
         principals,
-        "hermes",
-        _acl_principal("hermes", ["~/.minni/hermes-vault"]),
+        "peer",
+        _acl_principal("peer", ["~/.minni/peer-vault"]),
     )
     p = resolve_effective_principal(
-        supplied_agent_id="hermes",
+        supplied_agent_id="peer",
         transport="uds",
         principals_dir=principals,
     )
@@ -496,24 +495,24 @@ def test_principal_resolve_expands_user_vault_root_and_seeds(tmp_path, monkeypat
 def test_seed_canonical_live_path_not_first_acl_basename(tmp_path, monkeypatch):
     """allowed_vault_roots is a read ACL. Seed MINNI_HOME / authored vault.
 
-    A backup (or extra ACL entry) also named hermes-vault must not receive
+    A backup (or extra ACL entry) also named peer-vault must not receive
     inbox/wiki/log.md even when it is the first basename match.
     """
     minni_home = tmp_path / "minni-home"
-    live = minni_home / "hermes-vault"
-    backup = tmp_path / "backup" / "hermes-vault"
+    live = minni_home / "peer-vault"
+    backup = tmp_path / "backup" / "peer-vault"
     live.mkdir(parents=True)
     backup.mkdir(parents=True)
     (live / ".index").mkdir()
     monkeypatch.setenv("MINNI_HOME", str(minni_home))
     principals = tmp_path / "principals"
-    _write_principal(principals, "hermes", _acl_principal("hermes", [backup]))
+    _write_principal(principals, "peer", _acl_principal("peer", [backup]))
     p = resolve_effective_principal(
-        supplied_agent_id="hermes",
+        supplied_agent_id="peer",
         transport="uds",
         principals_dir=principals,
     )
-    assert p.agent_id == "hermes"
+    assert p.agent_id == "peer"
     assert (live / "log.md").is_file()
     assert (live / "wiki" / "sessions").is_dir()
     assert (live / "inbox").is_dir()
@@ -527,17 +526,17 @@ def test_seed_skips_missing_first_acl_basename_and_seeds_live_path(
 ):
     """A missing first basename match must not skip a later live vault."""
     minni_home = tmp_path / "minni-home"
-    live = minni_home / "hermes-vault"
-    missing = tmp_path / "stale" / "hermes-vault"
+    live = minni_home / "peer-vault"
+    missing = tmp_path / "stale" / "peer-vault"
     live.mkdir(parents=True)
     monkeypatch.setenv("MINNI_HOME", str(minni_home))
     principals = tmp_path / "principals"
     _write_principal(
-        principals, "hermes", _acl_principal("hermes", [missing, live])
+        principals, "peer", _acl_principal("peer", [missing, live])
     )
     assert not missing.exists()
     resolve_effective_principal(
-        supplied_agent_id="hermes",
+        supplied_agent_id="peer",
         transport="uds",
         principals_dir=principals,
     )
@@ -634,7 +633,7 @@ def test_locked_out_platform_malformed_roots_do_not_seed_live_vault(
     tmp_path, monkeypatch
 ):
     minni_home = tmp_path / "minni-home"
-    live = minni_home / "hermes-vault"
+    live = minni_home / "peer-vault"
     live.mkdir(parents=True)
     monkeypatch.setenv("MINNI_HOME", str(minni_home))
     principals = tmp_path / "principals"
@@ -644,17 +643,17 @@ def test_locked_out_platform_malformed_roots_do_not_seed_live_vault(
         {
             "agent_id": "main",
             "capabilities": ["*"],
-            "platform_agent_ids": ["hermes"],
-            "platform_agent_capabilities": {"hermes": ["search", "learn"]},
-            "platform_agent_vault_roots": {"hermes": ""},
+            "platform_agent_ids": ["peer"],
+            "platform_agent_capabilities": {"peer": ["search", "learn"]},
+            "platform_agent_vault_roots": {"peer": ""},
         },
     )
     p = resolve_effective_principal(
-        supplied_agent_id="hermes",
+        supplied_agent_id="peer",
         transport="uds",
         principals_dir=principals,
     )
-    assert p.agent_id == "hermes"
+    assert p.agent_id == "peer"
     assert p.can("learn")
     assert not p.allows_vault_root(live)
     assert not (live / "log.md").exists()
