@@ -42,7 +42,7 @@ def _positive_int_env(name: str, default: int) -> int:
 class SovereignConfig:
     """All configuration in one place, overridable via env vars or constructor."""
 
-    # Paths — G02 unified canonical (prefer ~/.minni over legacy ~/.openclaw)
+    # Paths — G02 unified canonical home (~/.minni, overridable via MINNI_HOME)
     vault_path: str = os.environ.get(
         "MINNI_VAULT_PATH",
         os.path.join(CANONICAL_SOVEREIGN_HOME, "vault/")
@@ -304,7 +304,6 @@ class SovereignConfig:
         "recon": "#6B5BFF",
         "heartbeat_router": "#FF00FF",
         "syntra": "#00FF88",
-        "hermes": "#FF8800",
         "unknown": "#808080",
     })
 

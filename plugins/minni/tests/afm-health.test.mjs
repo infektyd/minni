@@ -655,7 +655,7 @@ test("afmHealth still fails on HTTP errors", async () => {
 });
 
 test("native mode: dead bridge /health must not veto a working native helper", async () => {
-  // The flaky-bridge scenario: hermes /health is down, but the native helper
+  // The flaky-bridge scenario: the AFM bridge /health is down, but the native helper
   // generates fine. buildStatusReport must probe the helper directly instead
   // of short-circuiting on the bridge health result.
   await withProbeHelper({ ok: true, data: { answer: "y" } }, async (helper) => {

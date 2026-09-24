@@ -106,8 +106,6 @@ export function agentIdToVaultSlug(agentId: string): string {
     "claude-code": "claudecode",
     claudecode: "claudecode",
     codex: "codex",
-    hermes: "hermes",
-    openclaw: "openclaw",
     kilocode: "kilocode",
     // Preserve hyphenated canonical slugs (the strip-punctuation fallback would
     // write grok-build -> grokbuild-vault, which the Grok overlay never polls).

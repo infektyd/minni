@@ -36,13 +36,13 @@ import minni.minnid as minnid  # type: ignore  # for the _handle_* entry points
 
 def test_effective_principal_dataclass_fields():
     p = EffectivePrincipal(
-        agent_id="hermes",
+        agent_id="peer",
         workspace_id="ws-42",
         transport="uds",
         capabilities=["search", "learn"],
         allowed_vault_roots=["/tmp/vault"],
     )
-    assert p.agent_id == "hermes"
+    assert p.agent_id == "peer"
     assert p.workspace_id == "ws-42"
     assert p.can("search")
     assert p.can("foo") is False
@@ -95,7 +95,7 @@ def test_resolve_strict_rejects_mismatch(tmp_path: Path):
                 "workspace_id": "prod",
                 "capabilities": ["*"],
                 "allowed_vault_roots": [str(tmp_path)],
-                "legacy_agent_ids": ["main", "hermes"],
+                "legacy_agent_ids": ["main", "peer"],
             }
         ),
         encoding="utf-8",
@@ -104,7 +104,7 @@ def test_resolve_strict_rejects_mismatch(tmp_path: Path):
 
     # Good supplied via legacy alias -> stamped wins (no raise)
     p = resolve_effective_principal(
-        supplied_agent_id="hermes", transport="uds", principals_dir=principals
+        supplied_agent_id="peer", transport="uds", principals_dir=principals
     )
     assert p.agent_id == "operator-prime"
     assert p.workspace_id == "prod"
