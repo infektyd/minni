@@ -10,4 +10,4 @@ Pass these arguments:
 - `includeVault`: `true`
 - `limit`: `8`
 
-Read the returned context. If a result has `agent_origin` other than `kilocode`, note that another agent (Claude Code / Codex / Hermes / OpenClaw) wrote it — consider whether to follow up with a recall scoped to that agent.
+Read the returned context. If a result has `agent_origin` other than `kilocode`, note that another agent (Claude Code / Codex / Gemini / Grok Build) wrote it — consider whether to follow up with a recall scoped to that agent.

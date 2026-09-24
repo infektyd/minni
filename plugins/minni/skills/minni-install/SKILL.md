@@ -71,7 +71,7 @@ Use this when the user asks to:
 - update or repair the Minni plugin/MCP install for a platform
 - repair hydration, recall, daemon read, socket, per-agent vault, plugin cache, or MCP drift
 - make Codex/Claude/Gemini/Grok beta/Grok Build/Antigravity use Minni more smoothly via their native session hook surfaces
-- seed Hermes/OpenClaw/local-worker identity or soul files
+- seed local-worker identity or soul files
 
 Do not use this for ordinary recall-only context lookup — use the `minni`
 skill for that. For diagnosing an existing install ("what is wrong?"), start
@@ -83,7 +83,7 @@ Classify before writing anything:
 
 | Agent type | Examples | Layer 1 content |
 | --- | --- | --- |
-| Owned/Minni-authored | Hermes, OpenClaw variants, local workers, AFM-backed agents | `SOUL.md` / `IDENTITY.md` soul and identity |
+| Owned/Minni-authored | local workers, AFM-backed agents | `SOUL.md` / `IDENTITY.md` soul and identity |
 | Hosted/runtime-authored | Codex, Claude Code, Gemini, Antigravity | hosted-agent envelope/map, never a replacement personality |
 
 Hosted-agent envelopes must say they are subordinate to the host runtime,
@@ -134,7 +134,7 @@ system/developer instructions, safety policy, and active user request.
    - Confirm daemon socket: `~/.minni/run/minnid.sock`.
    - Confirm the active DB: `~/.minni/minni.db`.
      The source repo must not be treated as the vault or database root.
-   - Do not assume large external directories (e.g. `~/.openclaw`) are available locally. Some users keep them in off-machine or cryo storage.
+   - Do not assume large external directories are available locally. Some users keep them in off-machine or cryo storage.
 
 3. **Write recallable vault pages**
    - Use vault API/CLI, not raw manual edits, so `index.md` and `log.md` update.
@@ -347,7 +347,7 @@ claim.
   every platform must be explicitly stamped with its own agent id and vault.
 - Giving hosted agents a soul/personality override.
 - Trusting a stale MCP transport after cache or daemon changes.
-- Treating a missing local `~/.openclaw` as data loss; check cryo storage first.
+- Treating a missing large external directory as data loss; check cryo storage first.
 - Writing vault pages by hand and bypassing audit/index propagation.
 - Calling Layer 1 fixed before testing both `agent_api.py --identity` and daemon
   `read`.

@@ -11,4 +11,4 @@ Pass these arguments:
 
 (Agent identity is stamped server-side as `DEFAULT_AGENT_ID`; the tool no longer accepts a client-supplied `agentId`, to prevent identity spoofing.)
 
-Read the returned context. If a result has `agent_origin` other than `claude-code`, note that another agent (Codex / Hermes / OpenClaw) wrote it — consider whether to follow up with a recall scoped to that agent.
+Read the returned context. If a result has `agent_origin` other than `claude-code`, note that another agent (Codex / Gemini / Grok Build / Kilo Code) wrote it — consider whether to follow up with a recall scoped to that agent.

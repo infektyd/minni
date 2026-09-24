@@ -5,7 +5,7 @@
 
 This document is the canonical operating contract for all Minni vaults.
 It governs how agents read, write, and maintain vault pages. All agents — Claude
-Code, Codex, Hermes, OpenClaw, and any future peer — are bound by this contract.
+Code, Codex, and any future peer — are bound by this contract.
 
 ---
 
@@ -61,8 +61,6 @@ variable, with a documented default:
 |-------|--------------------|-----------------|
 | Claude Code | `~/.minni/claudecode-vault` | `MINNI_VAULT_PATH` |
 | Codex | `~/.minni/codex-vault` | `MINNI_VAULT_PATH` |
-| Hermes | `~/.minni/hermes-vault` | `MINNI_VAULT_PATH` |
-| OpenClaw | `~/.minni/openclaw-vault` | `MINNI_VAULT_PATH` |
 
 Additional env vars:
 
