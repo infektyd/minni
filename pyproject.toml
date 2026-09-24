@@ -87,7 +87,6 @@ minni = [
     "launchd/*.example",
     "native_afm_helper",
     "native_afm_helper.swift",
-    "openclaw-tool.sh",
     "plugin_payload/*",
     # setuptools' `*` does not match a leading dot — dotFILES need explicit
     # entries or they silently drop from the wheel (caught by the release

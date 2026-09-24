@@ -7,7 +7,7 @@ it red. Covers:
   GA4-2   decay reaches the DEFAULT (reranker) ordering, not just final_score
   #225-R1 the episodic layer is reachable from the search RPC
   GA6-1   vault_ingest infers the layer instead of hardcoding 'knowledge'
-  GA7-2   seed_identity / wiki_indexer stamp layer on their INSERTs
+  GA7-2   wiki_indexer stamps layer on its INSERTs
   GA1-1   learnings with a NULL embedding are backfillable and counted
   #225-R6 the document/vector coverage ratio is surfaced in health
   GA4-1   score calibration is fed by the retrieval path (record_score wired)
@@ -1355,41 +1355,6 @@ class TestLayerStamping:
             "frontmatter must never be able to self-assign the identity layer"
         )
         db_obj.close()
-
-    def test_seed_identity_stamps_the_identity_layer(self):
-        """STRUCTURAL, deliberately — and the reason is worth stating rather
-        than leaving as an unexplained weaker test. seed_identity.seed_identity()
-        is a top-level script bound to a module-level DB_PATH under the real
-        ~/.openclaw, and it reads each agent's SOUL.md/IDENTITY.md from live
-        home directories. Driving it behaviorally would write to live machine
-        state, which this campaign forbids.
-
-        So this asserts the two SQL statements carry the layer, and the
-        migration test below covers the stored-row half behaviorally — an
-        envelope that reaches the DB with layer NULL is repaired there.
-        """
-        import ast
-        import inspect
-
-        import minni.seed_identity as si
-
-        src = inspect.getsource(si.seed_identity)
-        # Parse rather than substring-match, so a stray 'identity' in a comment
-        # or log line cannot make this pass over an unstamped INSERT.
-        statements = [
-            node.value
-            for node in ast.walk(ast.parse(src.strip()))
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        ]
-        doc_insert = [s for s in statements if "INSERT INTO documents" in s]
-        chunk_insert = [s for s in statements if "INSERT INTO chunk_embeddings" in s]
-        assert doc_insert and chunk_insert, "both INSERTs must still be present"
-        assert all("layer" in s for s in doc_insert), (
-            "identity envelopes left layer NULL and read back as KNOWLEDGE — "
-            "the one layer they must never be"
-        )
-        assert all("layer" in s for s in chunk_insert)
-        assert all("'identity'" in s for s in doc_insert)
 
     def test_artifact_layer_recall_returns_repaired_rows_end_to_end(
         self, tmp_path, monkeypatch, hermetic_principals
