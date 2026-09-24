@@ -69,19 +69,48 @@ opaque string (`playwright@claude-plugins-official` currently reads `"unknown"`)
 ## Q2 — How does `minni wire claude-code` register, and is a marketplace needed?
 
 **Decision: registration is a normal step of `minni wire claude-code`, performed
-*after* verification passes; no marketplace entry is created or required.**
+*after* verification passes. Wire also keeps a local stub marketplace so the
+`@minni` marketplace name resolves.**
 
-### No marketplace
+### Marketplace: a wire-owned local stub
 
-Claude Code loads a plugin's hooks/skills/commands from `installPath` alone. The
-`@marketplace` suffix in the `minni@minni` key is a namespacing convention, not
-a lookup — the marketplace source is consulted only during install/update. The
-live machine already proves this: `minni@minni` loads from a cache path while
-its marketplace source points at an unrelated worktree.
+Claude Code loads a plugin's hooks/skills/commands from `installPath`. This
+document originally went further and treated the `@marketplace` suffix in the
+`minni@minni` key as a pure namespacing convention, consulted only during
+install/update, and so concluded that no marketplace was needed. **That no
+longer holds.** Claude Code 2.1.282 validates the marketplace when it loads a
+plugin: with the `minni` marketplace gone from `known_marketplaces.json` and
+`settings.json` `extraKnownMarketplaces.minni` still naming a deleted worktree,
+`claude plugin list` reported `minni@minni ✘ failed to load — Marketplace minni
+not found`, even though `installPath` was correct.
 
-Registering a marketplace would therefore buy nothing and re-arm the
-`/plugin update` foot-gun. Wire creates no marketplace entry, and the cutover
-removes the stale one.
+So wire (on `minni wire claude-code` and on `minni wire-adopt claude-code`)
+maintains a stub directory marketplace and points Claude Code at it:
+
+- `~/.claude/local-marketplaces/minni/.claude-plugin/marketplace.json` =
+  `{"name":"minni","owner":{"name":"Minni"},"plugins":[{"name":"minni","version":"<V>","source":"./plugins/minni-<V>"}]}`;
+- `~/.claude/local-marketplaces/minni/plugins/minni-<V>/` is a **copy** (never a
+  symlink) of the wired payload `~/.minni/plugin/<V>`; older `minni-*` copies
+  are pruned so only the current version remains;
+- `~/.claude/settings.json` `extraKnownMarketplaces.minni.source` =
+  `{"source":"directory","path":"<home>/.claude/local-marketplaces/minni"}`. Any
+  other value (stale or nonexistent path, other source type) is replaced; every
+  other settings key, other marketplaces and extra fields on the `minni` entry
+  are preserved. The file is written atomically and, when it changes, the
+  previous bytes are kept beside it as `settings.json.minni-backup-*` (the same
+  convention as the custom MCP refresh);
+- `installed_plugins.json` `minni@minni` `installPath` still names
+  `~/.minni/plugin/<V>`. Wire owns that registration and never shells out to
+  `claude plugin install/update`.
+
+Every step is idempotent: an up-to-date copy (compared by content digest), an
+unchanged `marketplace.json` and a settings entry already naming the stub are
+not rewritten. A `known_marketplaces.json` `minni` entry that resolves to the
+stub is Claude Code's own record of it; the cutover keeps it and
+`claude_adopt_pending()` does not count it as stale. Residual risk, accepted:
+`/plugin update` can now reinstall from the stub, moving `installPath` into the
+plugin cache; the content is the same payload, and the next `minni wire`
+re-registers the wire tree.
 
 Note the distinction: this retires the **machine-side** `known_marketplaces.json`
 entry. It does **not** delete the repo's `.claude-plugin/marketplace.json`, which
@@ -130,24 +159,26 @@ not ride along with ordinary wiring.
 1. **Register** the plugin against the currently wired claude-code install root
    (read from `wired.json`), if not already registered there.
 2. **Repoint Claude Desktop.** `~/Library/Application Support/Claude/claude_desktop_config.json`
-   currently launches `mcpServers.minni` from the 0.3.0 cache. Step 4 deletes
+   currently launches `mcpServers.minni` from the 0.3.0 cache. Step 5 deletes
    that dir, so the repoint is not optional — skipping it would knowingly break
    a live surface. Merge-only: other servers and unrelated top-level keys are
    preserved. The rewrite targets *the argument that points into the legacy
    cache*, not `args[0]`, so an entry like `["--inspect", "<cache>/server.js"]`
    keeps its flag; when no argument points into the cache the step is a no-op
-   and step 4's scan decides whether deletion is still safe. A `command` living
+   and step 5's scan decides whether deletion is still safe. A `command` living
    inside the cache aborts the cutover rather than being guessed at.
-3. **Retire the stale marketplace entry** (`minni` →
-   `~/Projects/minni-worktrees/cursor-hooks`) from `known_marketplaces.json`.
-4. **Remove the legacy cache tree** `~/.claude/plugins/cache/minni/minni`
+3. **Create the local stub marketplace and point settings at it** (see Q2).
+   A dry run reports what would change and writes nothing.
+4. **Retire the stale marketplace entry** (`minni` → a since-deleted worktree)
+   from `known_marketplaces.json`; an entry that resolves to the stub is kept.
+5. **Remove the legacy cache tree** `~/.claude/plugins/cache/minni/minni`
    (skippable with `--keep-legacy-cache`).
 
 Each step reports `changed: true|false` and is individually idempotent, so a
 re-run after a partial failure completes the remainder rather than compounding.
 **This PR ships the code; it is not executed against the live machine.**
 
-#### What step 4 guarantees
+#### What step 5 guarantees
 
 The deletion is an `rmtree` on a live machine, so it carries two explicit
 properties rather than relying on the earlier steps having done their job:
@@ -159,7 +190,7 @@ properties rather than relying on the earlier steps having done their job:
   aborts the cutover and names the offending file and field. A config that
   cannot be parsed counts as a hit: an unreadable file is not evidence that
   nothing references the tree. `known_marketplaces.json` is deliberately not
-  scanned — its `minni` entry is the one reference step 3 retires itself.
+  scanned — its `minni` entry is the one reference step 4 retires itself.
 
   The check is two-layer, applied to each string leaf. Structured matching
   (`Path.relative_to`) recognises a string that *is* a lexically-normal absolute
