@@ -2145,7 +2145,7 @@ instructions, and to the user's current request.
 
 Minni gives owned agents a soul. It gives hosted agents a map plus an agent-authored persona slot.
 
-Owned agents such as Hermes agents, OpenClaw variants, local workers, and future
+Owned agents such as local workers and future
 Minni-authored agents may receive Layer 1 soul or identity material.
 Hosted agents such as Codex, Claude Code, Gemini, and Antigravity receive a
 workspace envelope instead.

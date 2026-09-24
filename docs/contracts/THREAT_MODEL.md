@@ -12,9 +12,8 @@ four-section layout optimized for diff review prompts).
 
 **Code anchors:** engine `src/minni/minnid.py` and `src/minni/*`; plugin
 `plugins/minni`; home `$MINNI_HOME` / `~/.minni`; socket
-`~/.minni/run/minnid.sock`. `openclaw-extension/` is not on `main` — treat any
-still-installed copy as a separate legacy surface. `src/minni/openclaw-tool.sh`
-remains an in-tree helper.
+`~/.minni/run/minnid.sock`. Legacy bridge extensions that are not on `main`
+are out of scope; treat any still-installed copy as a separate legacy surface.
 
 ## 1. Overview
 
@@ -172,7 +171,7 @@ evidence/citation never system/developer/user instruction.
 | Daemon socket / cross-uid RPC | Unexpected JSON-RPC as wildcard operator. | Intended 0600/0700 under `~/.minni/run`; UDS 1 MiB body cap. | No `getpeereid`; chmod warn-and-continue; TOCTOU on mkdir/bind. |
 | Optional HTTP fallback | Unauth operator RPC remotely or cross-uid. | Default `--port=0` (off). | No auth, unbounded body, stamped as local/UDS operator — Critical when enabled. |
 | Zero-config principal binding | Any UDS peer is wildcard `main` with `*`. | Strict mode via `principals/*.json`. | Empty `allowed_vault_roots` makes path gates vacuous; `MINNI_LOCAL_OPERATOR` re-opens wildcard. |
-| Vault path traversal | Read/write outside configured vault. | Daemon vault-root guard + TS `assertUnder` / realpath. | Vacuous under zero-config empty roots; symlink/race; legacy OpenClaw installs. |
+| Vault path traversal | Read/write outside configured vault. | Daemon vault-root guard + TS `assertUnder` / realpath. | Vacuous under zero-config empty roots; symlink/race; legacy bridge installs. |
 | AFM provider / SSRF | Context to nonlocal endpoint; confused summaries. | Allowlist + HTTPS for non-loopback; draft/review oriented. | `0.0.0.0` loopback quirk; consolidation auto-accept when loop on. |
 | Vector / learnings leakage | Private/blocked via semantic or learning search. | Retrieval filters `privacy_level`/`lifecycle`; FAISS post-filters via SQLite. | Missing privacy → `safe`; `handle_read` hardcodes safe meta; `search_learnings` has no privacy dimension; frontmatter `page_type`/`agent` substring cross-share. |
 | Console / Deep Research | Local browser or process drives privileged actions; vault→cloud. | Loopback bind, Host/Origin/Sec-Fetch, bearer by default; Deep Research opt-in. | Token-in-URL leak; `/api/health` unauth; `NO_AUTH=1`; Deep Research egress/exec when enabled. |

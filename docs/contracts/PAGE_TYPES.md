@@ -461,7 +461,7 @@ Sovereign Memory system as of 2026-04-26.
 ## System layers
 
 ```
-Agent (Claude Code, Codex, Hermes, OpenClaw)
+Agent (Claude Code, Codex, ...)
     ↓  JSON-RPC over Unix socket
 Sovereign Memory Daemon (sovrd)
     ↓  Python API

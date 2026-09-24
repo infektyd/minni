@@ -26,8 +26,7 @@ flowchart LR
     subgraph Surfaces["Agent and human surfaces"]
         Codex["Codex"]
         Claude["Claude Code"]
-        Hermes["Hermes"]
-        OpenClaw["OpenClaw"]
+        Others["Other agents (Gemini, Grok Build, Kilo Code)"]
         Console["Local console"]
     end
 
@@ -61,8 +60,7 @@ flowchart LR
 
     Codex --> MCP
     Claude --> Hooks
-    Hermes --> Adapters
-    OpenClaw --> Adapters
+    Others --> Adapters
     Console --> MCP
 
     MCP --> Sovrd
@@ -430,14 +428,14 @@ the indexed recall pool.
 flowchart LR
     CodexVault["Codex vault"]
     ClaudeVault["Claude Code vault"]
-    HermesVault["Hermes vault"]
+    OtherVaults["Other agent vaults"]
     Daemon["Shared daemon"]
     Pool["Shared recall pool"]
     Result["Recall result with agent_origin and provenance"]
 
     CodexVault --> Daemon
     ClaudeVault --> Daemon
-    HermesVault --> Daemon
+    OtherVaults --> Daemon
     Daemon --> Pool --> Result
 ```
 

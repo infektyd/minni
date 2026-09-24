@@ -9,7 +9,7 @@ compatibility: Requires minni MCP server running (node dist/server.js) and the M
 
 # Minni for KiloCode
 
-Use this skill to operate KiloCode's local Minni bridge and the KiloCode-owned Obsidian vault. Minni is shared across multiple agents (KiloCode, Claude Code, Codex, Hermes, OpenClaw) — each has its own vault, but they all talk to the same daemon and can recall each other's notes, tagged with `agent_origin`.
+Use this skill to operate KiloCode's local Minni bridge and the KiloCode-owned Obsidian vault. Minni is shared across multiple agents (KiloCode, Claude Code, Codex, Gemini, Grok Build) — each has its own vault, but they all talk to the same daemon and can recall each other's notes, tagged with `agent_origin`.
 
 ## KiloCode Spine Integration
 

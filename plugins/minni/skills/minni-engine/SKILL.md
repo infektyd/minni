@@ -1,7 +1,7 @@
 ---
 name: minni-engine
 description: Development reference for the Minni engine (v3.1/v3.2). Use when modifying the memory system's extraction, reranking, consolidation, or retrieval pipelines.
-tags: [openclaw, memory, llm, faiss, sqlite]
+tags: [memory, llm, faiss, sqlite]
 ---
 
 # Minni Engine — Development Reference
@@ -66,18 +66,6 @@ To swap to a different reranker API:
 - Change `config.reranker_model` and the API URL/headers in `_rerank()`
 - Keep the same signature: `_rerank(query, candidates) → candidates`
 - Always add `rerank_score` key to each candidate dict
-
-### Swapping Extraction LLM (V3.2 pattern)
-Extraction uses the OpenClaw gateway (OpenAI-compatible /v1/chat/completions):
-
-1. **Config** (`config.py`): `extraction_model`, `openclaw_gateway_url`
-2. **Method** (`_call_gateway`): HTTP POST to `/v1/chat/completions`
-3. **Availability** (`is_available`): HTTP GET to `/v1/models`
-
-To swap to a different LLM backend:
-- Change `config.extraction_model` and the URL in `_call_gateway()`
-- Keep the same prompt, JSON parsing (3 strategies), and confidence filtering
-- Keep `get_extractor()` singleton pattern
 
 ### Adding a New Endpoint (app.py)
 1. Add Pydantic request/response models

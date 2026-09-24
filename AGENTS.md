@@ -21,7 +21,7 @@ When you (the agent) hear the user talk about:
 - The engine + daemon (the stuff actually running right now)
 - The core skill + all the supporting skills (hydration, consolidation, wiki stuff, health checks, etc.)
 - The big multi-host plugin
-- The thin overlays (Grok one in `~/.grok`, plus whatever exists for Claude, Codex, Hermes, OpenClaw, etc.)
+- The thin overlays (Grok one in `~/.grok`, plus whatever exists for Claude, Codex, Gemini, Kilo Code, etc.)
 - Hooks, console, propagation paths, and anything else that was previously installed from this tree
 
 That's the system. Not just the folder with the longest name.
