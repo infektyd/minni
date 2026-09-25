@@ -266,11 +266,17 @@ async function journalTimeoutDiagnostics({ last, startFail = [], completeFail = 
   };
 }
 
-async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false, startFail = [], completeFail = [] }, timeoutMs = 20_000) {
+async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty = false, startFail = [], completeFail = [] }, timeoutMs = 20_000, overallMs = 50_000) {
+  // Stall-gated wait: fail on 20s without journal progress (real stranded
+  // work), not on a fixed wall clock (slow-disk contention). The overall cap
+  // stays inside the caller's test timeout. End-state assertions are
+  // unchanged — this only distinguishes stall from slowness.
   const begin = Date.now();
   let last;
   let leftover;
-  while (Date.now() - begin < timeoutMs) {
+  let progressedAt = begin;
+  let progressCount = -1;
+  while (Date.now() - begin < overallMs && Date.now() - progressedAt < timeoutMs) {
     last = await journalState(fixture);
     leftover = queueEmpty
       ? await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)
@@ -281,6 +287,11 @@ async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty 
       (!queueEmpty || leftover.length === 0)
     ) {
       return last;
+    }
+    const count = last.started.length + last.completed.length;
+    if (count > progressCount) {
+      progressCount = count;
+      progressedAt = Date.now();
     }
     kickWorkerWriteDrain({
       vaultPath: fixture.vaultPath,
@@ -712,6 +723,172 @@ test("wet N=20 starts+completes still hold", { timeout: 45_000 }, async (t) => {
   assert.equal(result.completeOk, 20, JSON.stringify(result.completeFail));
   assert.deepEqual(result.journal.completesWithoutStarts, []);
   assert.equal(result.journal.dense, true);
+});
+
+test("drain snapshot fast path falls back when the picked ticket vanished", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  await enqueueWorkerWrite({
+    ...fixture, sliceId: "s0", workerAgentId: "worker-0", token: claim.token,
+    idempotencyKey: "start-0", action: { action: "start" },
+    generation: claim.generation, applyNow: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  // Simulate a concurrent drain removing the picked ticket between the
+  // loop-top snapshot and the in-lock confirm: the second read of the ticket
+  // file reports ENOENT once. Fallback must still apply it, not park it.
+  const originalRead = fs.promises.readFile;
+  const reads = new Map();
+  fs.promises.readFile = async (file, ...args) => {
+    if (typeof file === "string" && file.includes(".q") && file.endsWith(".json") && !file.endsWith("progress.json")) {
+      const count = (reads.get(file) ?? 0) + 1;
+      reads.set(file, count);
+      if (count === 2) throw Object.assign(new Error("simulated concurrent removal"), { code: "ENOENT" });
+    }
+    return originalRead(file, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await drainWorkerWrites({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId });
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual((await journalState(fixture)).started, ["s0"]);
+  assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0);
+});
+
+test("drain snapshot fast path falls back on ticketId mismatch", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  await enqueueWorkerWrite({
+    ...fixture, sliceId: "s0", workerAgentId: "worker-0", token: claim.token,
+    idempotencyKey: "start-0", action: { action: "start" },
+    generation: claim.generation, applyNow: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  // Simulate a replaced ticket file on the confirm read only: the fallback
+  // scan sees the real file and applies the real ticket. Raw file untouched.
+  const originalRead = fs.promises.readFile;
+  const reads = new Map();
+  fs.promises.readFile = async (file, ...args) => {
+    const text = await originalRead(file, ...args);
+    if (typeof file === "string" && file.includes(".q") && file.endsWith(".json") && !file.endsWith("progress.json")) {
+      const count = (reads.get(file) ?? 0) + 1;
+      reads.set(file, count);
+      if (count === 2) {
+        const parsed = JSON.parse(text);
+        return JSON.stringify({ ...parsed, ticketId: "00000000-0000-0000-0000-000000000000" });
+      }
+    }
+    return text;
+  };
+  syncBuiltinESMExports();
+  try {
+    await drainWorkerWrites({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId });
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual((await journalState(fixture)).started, ["s0"]);
+  assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0);
+  const raw = await readRawQTickets(fixture.vaultPath, fixture.planId).catch(() => []);
+  assert.equal(raw.length, 0);
+});
+
+test("stale snapshot cannot apply complete before its start; later drain recovers", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const completeInput = {
+    ...fixture, sliceId: "s0", workerAgentId: "worker-0", token: claim.token,
+    idempotencyKey: "complete-0",
+    action: { action: "complete", evidence: "Verification: slice s0 done via test ID T-0" },
+    generation: claim.generation,
+  };
+  await enqueueWorkerWrite(completeInput);
+  await enqueueWorkerWrite({
+    ...fixture, sliceId: "s0", workerAgentId: "worker-0", token: claim.token,
+    idempotencyKey: "start-0", action: { action: "start" },
+    generation: claim.generation, applyNow: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  // Hide the start ticket from the first queue readdir only, so the
+  // loop-top snapshot picks the complete while the start is on disk.
+  const dir = workerWriteQueueDir(fixture.vaultPath, fixture.planId);
+  let startName;
+  for (const name of await readdir(dir)) {
+    if (!name.endsWith(".json") || name === "progress.json") continue;
+    const item = JSON.parse(await readFile(path.join(dir, name), "utf8"));
+    if (item.action?.action === "start") startName = name;
+  }
+  assert.ok(startName, "start ticket must be on disk for the stale-snapshot probe");
+  const hidden = startName;
+  let hideOnce = true;
+  const originalReaddir = fs.promises.readdir;
+  fs.promises.readdir = async (p, ...args) => {
+    const entries = await originalReaddir(p, ...args);
+    if (hideOnce && p === dir) {
+      hideOnce = false;
+      return entries.filter((entry) => entry !== hidden);
+    }
+    return entries;
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      drainWorkerWrites({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId }),
+      /start must apply before complete/,
+    );
+  } finally {
+    fs.promises.readdir = originalReaddir;
+    syncBuiltinESMExports();
+  }
+  assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 2, "stale pick must park both tickets, not drop or invert");
+  assert.deepEqual((await journalState(fixture)).started, []);
+  assert.deepEqual((await journalState(fixture)).completed, []);
+  await drainWorkerWrites({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId });
+  assert.deepEqual((await journalState(fixture)).started, ["s0"]);
+  assert.deepEqual((await journalState(fixture)).completed, ["s0"]);
+  assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0);
+});
+
+test("drain snapshot fast path bounds queue ticket-file reads", async (t) => {
+  const fixture = await burstFixture(t, 3);
+  const claims = await assignAndClaimAll(fixture);
+  for (let index = 0; index < 3; index += 1) {
+    await enqueueWorkerWrite({
+      ...fixture, sliceId: `s${index}`, workerAgentId: `worker-${index}`, token: claims[index].token,
+      idempotencyKey: `start-${index}`, action: { action: "start" }, generation: claims[index].generation,
+    });
+    await enqueueWorkerWrite({
+      ...fixture, sliceId: `s${index}`, workerAgentId: `worker-${index}`, token: claims[index].token,
+      idempotencyKey: `complete-${index}`,
+      action: { action: "complete", evidence: `Verification: slice s${index} done via test ID T-${index}` },
+      generation: claims[index].generation,
+    });
+  }
+  // Exact budget for 6 tickets, no arrivals: loop-top 6+5+..+1=21, single-
+  // file confirms 6, post-remove progress 5+..+0=15 → 42. Pre-fix code paid
+  // an extra full scan per item (21 more → 63). Bound 48 separates them
+  // deterministically: file-read counts, never wall-clock time.
+  let ticketReads = 0;
+  const originalRead = fs.promises.readFile;
+  fs.promises.readFile = async (file, ...args) => {
+    if (typeof file === "string" && file.includes(".q") && file.endsWith(".json") && !file.endsWith("progress.json")) {
+      ticketReads += 1;
+    }
+    return originalRead(file, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await drainWorkerWrites({ vaultPath: fixture.vaultPath, notePath: fixture.notePath, planId: fixture.planId });
+  } finally {
+    fs.promises.readFile = originalRead;
+    syncBuiltinESMExports();
+  }
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 3);
+  assert.equal(journal.completed.length, 3);
+  assert.deepEqual(journal.completesWithoutStarts, []);
+  assert.equal((await listQueuedWorkerWrites(fixture.vaultPath, fixture.planId)).length, 0);
+  assert.ok(ticketReads <= 48, `snapshot fast path must bound ticket reads; got ${ticketReads}`);
 });
 
 test("replan during an N=40 start burst stays exclusive and is not a Q item", { timeout: 60_000 }, async (t) => {

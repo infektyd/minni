@@ -2292,7 +2292,7 @@ export async function drainWorkerWrites(
               !(await queuedWriteIsLiveWork(input.notePath, head))
             ) {
               // Dead leftover after supersede: drop now. Not a live apply.
-              await drainOneQueuedWorkerWrite(input, deps);
+              await drainOneQueuedWorkerWrite(input, deps, items);
               return;
             }
             // Live accepted start: yield once. Do not journal slice.started
@@ -2300,7 +2300,7 @@ export async function drainWorkerWrites(
             oneShotYieldedLive = true;
             return;
           }
-          await drainOneQueuedWorkerWrite(input, deps);
+          await drainOneQueuedWorkerWrite(input, deps, remaining);
         },
         { waitMs: 0 },
       );
@@ -2493,9 +2493,34 @@ async function claimTokenFromExistingStore(
 async function drainOneQueuedWorkerWrite(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps,
+  snapshot?: QueuedWorkerWrite[],
 ): Promise<void> {
-  const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
-  const item = pickNextQueuedWorkerWrite(items);
+  // Fast path: the caller already holds a fresh queue snapshot from the top
+  // of this drain iteration. Confirm just that picked ticket with one file
+  // read instead of re-scanning every ticket (O(n) reads per item, O(n^2)
+  // per burst — the wet N=40 cloud timeout). ticketId mismatch or a missing
+  // file means a concurrent drain removed it: fall back to a fresh scan.
+  // Fail-closed either way: a stale pick can only retry, never corrupt.
+  let item: QueuedWorkerWrite | undefined;
+  if (snapshot !== undefined) {
+    const candidate = pickNextQueuedWorkerWrite(snapshot);
+    if (candidate !== undefined) {
+      const live = await findQueuedWorkerWrite(
+        input.vaultPath,
+        input.planId,
+        candidate.idempotencyKey,
+      );
+      item =
+        live !== undefined && live.ticketId === candidate.ticketId
+          ? live
+          : pickNextQueuedWorkerWrite(
+              await listQueuedWorkerWrites(input.vaultPath, input.planId),
+            );
+    }
+  } else {
+    const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
+    item = pickNextQueuedWorkerWrite(items);
+  }
   if (item === undefined) return;
   if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
     // Yield: keep the ticket. Exclusive replan owns persist. Do not
