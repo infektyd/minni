@@ -309,17 +309,21 @@ def sync_local_marketplace(
     )
 
     manifest_current = False
-    if manifest_path.is_file():
-        try:
-            manifest_current = json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
-        except (OSError, json.JSONDecodeError):
-            manifest_current = False
-
-    stale = sorted(
-        p for p in plugins_dir.iterdir()
-        if p.name != payload_name
-        and (p.name.startswith(_STUB_PAYLOAD_PREFIX) or p.name.startswith(_STUB_TMP_PREFIX))
-    ) if plugins_dir.is_dir() else []
+    try:
+        if manifest_path.is_file():
+            try:
+                manifest_current = (
+                    json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                manifest_current = False
+        stale = sorted(
+            p for p in plugins_dir.iterdir()
+            if p.name != payload_name
+            and (p.name.startswith(_STUB_PAYLOAD_PREFIX) or p.name.startswith(_STUB_TMP_PREFIX))
+        ) if plugins_dir.is_dir() else []
+    except OSError as exc:
+        raise ClaudePluginError(f"cannot inspect local marketplace {stub}: {exc}") from exc
 
     result: dict[str, object] = {
         "path": str(stub),

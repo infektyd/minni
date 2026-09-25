@@ -1054,6 +1054,35 @@ def test_marketplace_dry_run_writes_nothing(home):
     assert not claude_settings_path().exists()
 
 
+def test_marketplace_scan_of_an_unreadable_plugins_dir_is_a_claude_error(home, monkeypatch):
+    root = _install_tree(home, "0.4.0")
+    plugins_dir = local_marketplace_root() / "plugins"
+    plugins_dir.mkdir(parents=True)
+    real_iterdir = Path.iterdir
+
+    def denied(path):
+        if path == plugins_dir:
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied)
+
+    with pytest.raises(ClaudePluginError, match="cannot inspect local marketplace"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+
+def test_marketplace_rewrites_a_non_utf8_manifest(home):
+    root = _install_tree(home, "0.4.0")
+    manifest = local_marketplace_root() / ".claude-plugin" / "marketplace.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b"\xff\xfe\x00 not utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    assert result["local_marketplace"]["manifest_written"] is True
+    assert _stub_manifest()["plugins"][0]["source"] == "./plugins/minni-0.4.0"
+
+
 def test_marketplace_refuses_a_symlinked_stub(home, tmp_path):
     root = _install_tree(home, "0.4.0")
     elsewhere = tmp_path / "elsewhere"
