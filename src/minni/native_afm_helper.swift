@@ -279,6 +279,109 @@ struct DistilledLearningResult {
     var category: String
 }
 
+@Generable
+enum EdgeLabel: String, Encodable {
+    case updates
+    case extends
+    case contradicts
+    case relates
+    case none
+}
+
+@Generable
+enum EdgeDirection: String, Encodable {
+    case forward
+    case backward
+    case mutual
+    case none
+}
+
+@Generable
+struct NativeInferredEdge {
+    @Guide(description: "Exact candidate pair identifier from input, e.g. pair_1")
+    var pairId: String
+
+    var label: EdgeLabel
+
+    var direction: EdgeDirection
+
+    @Guide(description: "Confidence score between 0.0 and 1.0")
+    var confidence: Double
+
+    @Guide(description: "1-based line numbers of supporting evidence from excerpts, empty if none")
+    var supportingEvidenceIndices: [Int]
+
+    @Guide(description: "Concise technical rationale in at most 200 characters")
+    var rationale: String
+}
+
+@Generable
+struct NativeEdgeInferenceBatchResult {
+    @Guide(description: "Classified edges for candidate pairs, at most 8")
+    var edges: [NativeInferredEdge]
+}
+
+@Generable
+enum CompactRelation: String, Encodable {
+    case updates_forward
+    case updates_backward
+    case extends_forward
+    case extends_backward
+    case contradicts_mutual
+    case contradicts_forward
+    case contradicts_backward
+    case relates_mutual
+    case none
+}
+
+extension CompactRelation {
+    var labelAndDirection: (label: String, direction: String) {
+        switch self {
+        case .updates_forward:
+            return ("updates", "forward")
+        case .updates_backward:
+            return ("updates", "backward")
+        case .extends_forward:
+            return ("extends", "forward")
+        case .extends_backward:
+            return ("extends", "backward")
+        case .contradicts_mutual:
+            return ("contradicts", "mutual")
+        case .contradicts_forward:
+            return ("contradicts", "forward")
+        case .contradicts_backward:
+            return ("contradicts", "backward")
+        case .relates_mutual:
+            return ("relates", "mutual")
+        case .none:
+            return ("none", "none")
+        }
+    }
+}
+
+@Generable
+struct CompactInferredEdge {
+    @Guide(description: "1-based candidate pair index from input: 1 for first pair, 2 for second pair, up to N")
+    var pairIndex: Int
+
+    var relation: CompactRelation
+
+    @Guide(description: "Confidence score between 0.0 and 1.0")
+    var confidence: Double
+
+    @Guide(description: "1-based line numbers of supporting evidence from excerpts, empty if none")
+    var supportingEvidenceIndices: [Int]
+
+    @Guide(description: "Concise technical rationale at most 8 words")
+    var rationale: String
+}
+
+@Generable
+struct CompactEdgeInferenceBatchResult {
+    @Guide(description: "Classified edges for candidate pairs, at most 8")
+    var edges: [CompactInferredEdge]
+}
+
 // Tool-backed triage: the model orchestrates, the tool decides deterministically.
 // Pure-guided triage was prompt-fragile (resample flipped reject->accept); the
 // tool pins the decision (verified reliable in fm-boundary tool harness).
@@ -533,6 +636,464 @@ func runFoundationModels(_ request: AFMRequest) async {
                     "assertion": .string(response.content.assertion),
                     "appliesWhen": .string(response.content.appliesWhen),
                     "category": .string(response.content.category),
+                ]
+            ))
+        case "edge_inference":
+            var prompt = inputString(request, "prompt")
+            if prompt.isEmpty {
+                if let payload = request.input?["payload"]?.objectValue,
+                   let messages = payload["messages"]?.arrayValue {
+                    for msg in messages {
+                        guard let mo = msg.objectValue else { continue }
+                        let content = mo["content"]?.stringValue ?? ""
+                        if !content.isEmpty {
+                            prompt += (prompt.isEmpty ? "" : "\n") + content
+                        }
+                    }
+                }
+            }
+            guard !prompt.isEmpty else {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "invalid_input",
+                    ],
+                    errorKind: "invalid_input",
+                    error: "missing_prompt: prompt is required and non-empty"
+                ))
+                return
+            }
+
+            let expectedPairIds = request.input?["expected_pair_ids"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+            if !expectedPairIds.isEmpty {
+                if expectedPairIds.count > 8 {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "batch_size_exceeded",
+                        ],
+                        errorKind: "batch_size_exceeded",
+                        error: "batch_size_exceeded: candidate pairs (\(expectedPairIds.count)) exceed maximum allowed of 8"
+                    ))
+                    return
+                }
+                if Set(expectedPairIds).count != expectedPairIds.count {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "duplicate_pair_ids",
+                        ],
+                        errorKind: "duplicate_pair_ids",
+                        error: "duplicate_pair_ids: expected_pair_ids contains duplicates"
+                    ))
+                    return
+                }
+            }
+
+            // Prompt is self-contained; avoid adding extra unbudgeted system message.
+            let session = LanguageModelSession()
+            let response = try await session.respond(
+                to: prompt,
+                generating: NativeEdgeInferenceBatchResult.self
+            )
+
+            let generatedEdges = response.content.edges
+            if generatedEdges.count > 8 {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "too_many_edges",
+                    ],
+                    errorKind: "too_many_edges",
+                    error: "too_many_edges: model generated \(generatedEdges.count) edges, exceeding maximum allowed of 8"
+                ))
+                return
+            }
+
+            if !expectedPairIds.isEmpty {
+                let generatedPairIds = generatedEdges.map { $0.pairId }
+                if generatedPairIds != expectedPairIds {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "pair_id_mismatch",
+                        ],
+                        errorKind: "pair_id_mismatch",
+                        error: "pair_id_mismatch: generated pair IDs \(generatedPairIds) do not match expected \(expectedPairIds)"
+                    ))
+                    return
+                }
+            }
+
+            struct EdgeRecord {
+                let pairId: String
+                let label: String
+                let direction: String
+                let confidence: Double
+                let supportingEvidenceIndices: [Int]
+                let rationale: String
+            }
+
+            var validatedRecords: [EdgeRecord] = []
+            for edge in generatedEdges {
+                guard edge.confidence.isFinite && edge.confidence >= 0.0 && edge.confidence <= 1.0 else {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "invalid_confidence",
+                        ],
+                        errorKind: "invalid_confidence",
+                        error: "invalid_confidence: confidence \(edge.confidence) must be finite in 0.0...1.0"
+                    ))
+                    return
+                }
+
+                let lbl = edge.label.rawValue
+                let dir = edge.direction.rawValue
+                let compatible: Bool
+                switch edge.label {
+                case .updates, .extends:
+                    compatible = (edge.direction == .forward || edge.direction == .backward)
+                case .contradicts:
+                    compatible = (edge.direction == .mutual || edge.direction == .forward || edge.direction == .backward)
+                case .relates:
+                    compatible = (edge.direction == .mutual)
+                case .none:
+                    compatible = (edge.direction == .none)
+                }
+                guard compatible else {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "incompatible_label_direction",
+                        ],
+                        errorKind: "incompatible_label_direction",
+                        error: "incompatible_label_direction: label '\(lbl)' incompatible with direction '\(dir)'"
+                    ))
+                    return
+                }
+
+                for idx in edge.supportingEvidenceIndices {
+                    guard idx >= 0 else {
+                        emit(AFMEnvelope(
+                            ok: false,
+                            availability: "available",
+                            data: [
+                                "status": "error",
+                                "backend": "apple-foundation-models",
+                                "error_kind": "invalid_evidence_index",
+                            ],
+                            errorKind: "invalid_evidence_index",
+                            error: "invalid_evidence_index: negative evidence index \(idx)"
+                        ))
+                        return
+                    }
+                }
+
+                let boundedRationale = edge.rationale.count > 200
+                    ? String(edge.rationale.prefix(200))
+                    : edge.rationale
+
+                validatedRecords.append(EdgeRecord(
+                    pairId: edge.pairId,
+                    label: lbl,
+                    direction: dir,
+                    confidence: edge.confidence,
+                    supportingEvidenceIndices: edge.supportingEvidenceIndices,
+                    rationale: boundedRationale
+                ))
+            }
+
+            let rawDicts: [[String: Any]] = validatedRecords.map { r in
+                [
+                    "pair_id": r.pairId,
+                    "label": r.label,
+                    "direction": r.direction,
+                    "confidence": r.confidence,
+                    "supporting_evidence_indices": r.supportingEvidenceIndices,
+                    "rationale": r.rationale,
+                ]
+            }
+            let jsonString = (try? JSONSerialization.data(withJSONObject: rawDicts, options: []))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+
+            emit(AFMEnvelope(
+                ok: true,
+                availability: "available",
+                data: [
+                    "choices": [
+                        [
+                            "index": 0,
+                            "message": ["role": "assistant", "content": .string(jsonString)],
+                            "finish_reason": "stop",
+                        ],
+                    ],
+                    "edges": .array(validatedRecords.map { r in
+                        JSONValue.object([
+                            "pair_id": .string(r.pairId),
+                            "label": .string(r.label),
+                            "direction": .string(r.direction),
+                            "confidence": .number(r.confidence),
+                            "supporting_evidence_indices": .array(r.supportingEvidenceIndices.map { .number(Double($0)) }),
+                            "rationale": .string(r.rationale),
+                        ])
+                    }),
+                ]
+            ))
+        case "edge_inference_compact":
+            let prompt = inputString(request, "prompt")
+            guard !prompt.isEmpty else {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "missing_prompt",
+                    ],
+                    errorKind: "missing_prompt",
+                    error: "missing_prompt: prompt is required and non-empty"
+                ))
+                return
+            }
+
+            guard let rawPairArray = request.input?["expected_pair_ids"]?.arrayValue else {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "missing_expected_pair_ids",
+                    ],
+                    errorKind: "missing_expected_pair_ids",
+                    error: "missing_expected_pair_ids: expected_pair_ids array is required"
+                ))
+                return
+            }
+
+            guard rawPairArray.count >= 1 && rawPairArray.count <= 8 else {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "invalid_pair_count",
+                    ],
+                    errorKind: "invalid_pair_count",
+                    error: "invalid_pair_count: expected_pair_ids must contain between 1 and 8 items, got \(rawPairArray.count)"
+                ))
+                return
+            }
+
+            var expectedPairIds: [String] = []
+            for (idx, item) in rawPairArray.enumerated() {
+                guard case .string(let s) = item, !s.isEmpty else {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "malformed_pair_id",
+                        ],
+                        errorKind: "malformed_pair_id",
+                        error: "malformed_pair_id: item at index \(idx) is not a non-empty string"
+                    ))
+                    return
+                }
+                expectedPairIds.append(s)
+            }
+
+            if Set(expectedPairIds).count != expectedPairIds.count {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "duplicate_pair_ids",
+                    ],
+                    errorKind: "duplicate_pair_ids",
+                    error: "duplicate_pair_ids: expected_pair_ids contains duplicates"
+                ))
+                return
+            }
+
+            // Prompt is already self-contained; avoid adding extra unbudgeted system message.
+            let session = LanguageModelSession()
+            let response = try await session.respond(
+                to: prompt,
+                generating: CompactEdgeInferenceBatchResult.self
+            )
+
+            let generatedEdges = response.content.edges
+            let expectedCount = expectedPairIds.count
+
+            // Require exactly 1..N unique complete pair indices (do not implicitly assign IDs by output position)
+            guard generatedEdges.count == expectedCount else {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "edge_count_mismatch",
+                    ],
+                    errorKind: "edge_count_mismatch",
+                    error: "edge_count_mismatch: model generated \(generatedEdges.count) edges, expected exactly \(expectedCount)"
+                ))
+                return
+            }
+
+            let generatedIndices = generatedEdges.map { $0.pairIndex }
+            let expectedIndexSet = Set(1...expectedCount)
+            let generatedIndexSet = Set(generatedIndices)
+
+            guard generatedIndexSet == expectedIndexSet && generatedIndices.count == expectedCount else {
+                emit(AFMEnvelope(
+                    ok: false,
+                    availability: "available",
+                    data: [
+                        "status": "error",
+                        "backend": "apple-foundation-models",
+                        "error_kind": "invalid_pair_indices",
+                    ],
+                    errorKind: "invalid_pair_indices",
+                    error: "invalid_pair_indices: model pair indices \(generatedIndices) do not form a complete 1..\(expectedCount) permutation"
+                ))
+                return
+            }
+
+            // Bounded post-validation
+            for edge in generatedEdges {
+                guard edge.confidence.isFinite && edge.confidence >= 0.0 && edge.confidence <= 1.0 else {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "invalid_confidence",
+                        ],
+                        errorKind: "invalid_confidence",
+                        error: "invalid_confidence: confidence \(edge.confidence) must be finite in 0.0...1.0"
+                    ))
+                    return
+                }
+
+                for idx in edge.supportingEvidenceIndices {
+                    guard idx >= 1 else {
+                        emit(AFMEnvelope(
+                            ok: false,
+                            availability: "available",
+                            data: [
+                                "status": "error",
+                                "backend": "apple-foundation-models",
+                                "error_kind": "invalid_evidence_index",
+                            ],
+                            errorKind: "invalid_evidence_index",
+                            error: "invalid_evidence_index: evidence line index must be positive (>= 1), got \(idx)"
+                        ))
+                        return
+                    }
+                }
+
+                guard !edge.rationale.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "empty_rationale",
+                        ],
+                        errorKind: "empty_rationale",
+                        error: "empty_rationale: rationale must not be empty"
+                    ))
+                    return
+                }
+
+                guard edge.rationale.count <= 200 else {
+                    emit(AFMEnvelope(
+                        ok: false,
+                        availability: "available",
+                        data: [
+                            "status": "error",
+                            "backend": "apple-foundation-models",
+                            "error_kind": "rationale_too_long",
+                        ],
+                        errorKind: "rationale_too_long",
+                        error: "rationale_too_long: rationale length (\(edge.rationale.count)) exceeds 200 characters; truncation forbidden"
+                    ))
+                    return
+                }
+            }
+
+            // Map pair index (1..N) to exact supplied expected_pair_ids, sorted by pair index 1..N
+            let sortedEdges = generatedEdges.sorted(by: { $0.pairIndex < $1.pairIndex })
+            var mappedEdgesDicts: [[String: Any]] = []
+            for edge in sortedEdges {
+                let pairId = expectedPairIds[edge.pairIndex - 1]
+                let (lbl, dir) = edge.relation.labelAndDirection
+                mappedEdgesDicts.append([
+                    "pair_id": pairId,
+                    "label": lbl,
+                    "direction": dir,
+                    "confidence": edge.confidence,
+                    "supporting_evidence_indices": edge.supportingEvidenceIndices,
+                    "rationale": edge.rationale,
+                ])
+            }
+
+            let serializedData = (try? JSONSerialization.data(withJSONObject: mappedEdgesDicts, options: [])) ?? Data("[]".utf8)
+            let jsonContent = String(data: serializedData, encoding: .utf8) ?? "[]"
+
+            emit(AFMEnvelope(
+                ok: true,
+                availability: "available",
+                data: [
+                    "choices": [
+                        [
+                            "index": 0,
+                            "message": ["role": "assistant", "content": .string(jsonContent)],
+                            "finish_reason": "stop",
+                        ],
+                    ],
+                    "edges": .array(sortedEdges.map { edge in
+                        let (lbl, dir) = edge.relation.labelAndDirection
+                        let pairId = expectedPairIds[edge.pairIndex - 1]
+                        return JSONValue.object([
+                            "pair_id": .string(pairId),
+                            "label": .string(lbl),
+                            "direction": .string(dir),
+                            "confidence": .number(edge.confidence),
+                            "supporting_evidence_indices": .array(edge.supportingEvidenceIndices.map { .number(Double($0)) }),
+                            "rationale": .string(edge.rationale),
+                        ])
+                    }),
                 ]
             ))
         default:
