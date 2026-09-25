@@ -2228,6 +2228,13 @@ type DrainKickEntry = {
 };
 
 const drainKicks = new Map<string, DrainKickEntry>();
+// Observational state only; never consulted by the drain.
+const drainOperations = new Map<string, { operation: string; since: number }>();
+function recordDrainOperation(input: ThreadPlanTarget, operation: string): void {
+  if (!queueStallDiagnosticsEnabled()) return;
+  const key = drainKickKey(input.vaultPath, input.planId);
+  if (drainKicks.has(key)) drainOperations.set(key, { operation, since: Date.now() });
+}
 
 /**
  * Owned in-flight kick promises, keyed like drainKicks. Test-support join
@@ -2236,6 +2243,110 @@ const drainKicks = new Map<string, DrainKickEntry>();
  * (including any follow-up re-kick registration) completes.
  */
 const drainTasks = new Map<string, Promise<boolean>>();
+
+/**
+ * Opt-in stall diagnostics (measure-before-fix). Recording is gated on
+ * MINNI_QUEUE_DIAG=1 and never changes drain behavior or timers: it only
+ * retains error identity (name/code, never messages, tokens, or paths) from
+ * drain failures the fire-and-forget kick path otherwise swallows, plus the
+ * last per-key yield outcome. The accessors below are read-only views for
+ * the test probe and never select, authorize, or steer work.
+ */
+const MAX_RETAINED_DRAIN_DIAGNOSTICS = 20;
+
+interface SwallowedDrainError {
+  name: string;
+  code: string | null;
+  at: string;
+}
+
+interface RetainedDrainOutcome {
+  planId: string;
+  yieldedLive: boolean;
+  at: string;
+}
+
+const swallowedDrainErrors: SwallowedDrainError[] = [];
+const retainedDrainOutcomes = new Map<string, RetainedDrainOutcome>();
+
+export function queueStallDiagnosticsEnabled(): boolean {
+  return process.env.MINNI_QUEUE_DIAG === "1";
+}
+
+function errorCodeOf(error: unknown): string | null {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : null;
+}
+
+function recordSwallowedDrainError(error: unknown): void {
+  if (!queueStallDiagnosticsEnabled()) return;
+  swallowedDrainErrors.push({
+    name: error instanceof Error ? error.name : typeof error,
+    code: errorCodeOf(error),
+    at: new Date().toISOString(),
+  });
+  if (swallowedDrainErrors.length > MAX_RETAINED_DRAIN_DIAGNOSTICS) {
+    swallowedDrainErrors.splice(
+      0,
+      swallowedDrainErrors.length - MAX_RETAINED_DRAIN_DIAGNOSTICS,
+    );
+  }
+}
+
+function recordRetainedDrainOutcome(key: string, yieldedLive: boolean): void {
+  if (!queueStallDiagnosticsEnabled()) return;
+  retainedDrainOutcomes.delete(key);
+  retainedDrainOutcomes.set(key, {
+    planId: key.split("\0").at(-1) ?? key,
+    yieldedLive,
+    at: new Date().toISOString(),
+  });
+  while (retainedDrainOutcomes.size > MAX_RETAINED_DRAIN_DIAGNOSTICS) {
+    const oldest = retainedDrainOutcomes.keys().next();
+    if (oldest.done) break;
+    retainedDrainOutcomes.delete(oldest.value);
+  }
+}
+
+export interface WorkerWriteDrainDiagnostic {
+  planId: string;
+  oneShot: boolean;
+  followUpFull: boolean;
+  taskPending: boolean;
+  lastYieldedLive: boolean | null;
+  operation: string | null;
+  operationElapsedMs: number | null;
+}
+
+/** Read-only view of owned in-process kick drains. Diagnostic only. */
+export function describeWorkerWriteDrains(
+  vaultPath: string,
+  planId?: string,
+): WorkerWriteDrainDiagnostic[] {
+  const prefix = `${path.resolve(vaultPath)}\0`;
+  const out: WorkerWriteDrainDiagnostic[] = [];
+  for (const [key, entry] of drainKicks) {
+    if (!key.startsWith(prefix)) continue;
+    const keyPlanId = key.slice(prefix.length);
+    if (planId !== undefined && keyPlanId !== planId) continue;
+    out.push({
+      planId: keyPlanId,
+      oneShot: entry.oneShot,
+      followUpFull: entry.followUpFull,
+      taskPending: drainTasks.has(key),
+      lastYieldedLive: retainedDrainOutcomes.get(key)?.yieldedLive ?? null,
+      operation: drainOperations.get(key)?.operation ?? null,
+      operationElapsedMs: drainOperations.has(key)
+        ? Math.max(0, Date.now() - drainOperations.get(key)!.since) : null,
+    });
+  }
+  return out;
+}
+
+/** Retained drain-chain failure identities. Diagnostic only. */
+export function readSwallowedDrainErrors(): SwallowedDrainError[] {
+  return [...swallowedDrainErrors];
+}
 
 function drainKickKey(vaultPath: string, planId: string): string {
   return `${path.resolve(vaultPath)}\0${planId}`;
@@ -2285,6 +2396,7 @@ export async function drainWorkerWrites(
   let oneShotPending = runOptions.oneShotYield === true;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
+    recordDrainOperation(input, "queue-scan");
     // Ordinary drains only check names before the authoritative locked read.
     // Standing drains still need the pre-lock head for acceptor deferral.
     if (runOptions.standingDefer !== true &&
@@ -2293,6 +2405,7 @@ export async function drainWorkerWrites(
       ? await listQueuedWorkerWrites(input.vaultPath, input.planId)
       : undefined;
     if (remaining?.length === 0) return false;
+    recordDrainOperation(input, "reservation-check");
     if (await exclusiveReplanReservationIsLive(input.vaultPath, input.planId)) {
       // Preserve the empty/malformed/error verdict even when a reservation
       // prevents reaching the locked read. No snapshot survives this retry.
@@ -2312,11 +2425,14 @@ export async function drainWorkerWrites(
     try {
       let oneShotYieldedLive = false;
       let queueEmpty = false;
+      recordDrainOperation(input, "lock-acquire");
       await withThreadLock(
         input.vaultPath,
         input.planId,
         `worker-queue-drain:${randomUUID()}`,
         async () => {
+          try {
+          recordDrainOperation(input, "locked-selection");
           if (oneShotPending) {
             oneShotPending = false;
             const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
@@ -2338,6 +2454,7 @@ export async function drainWorkerWrites(
             return;
           }
           queueEmpty = await drainOneQueuedWorkerWrite(input, deps);
+          } finally { recordDrainOperation(input, "lock-release"); }
         },
         { waitMs: 0 },
       );
@@ -2345,6 +2462,7 @@ export async function drainWorkerWrites(
       if (oneShotYieldedLive) return true;
     } catch (error) {
       if (error instanceof ThreadBusyError) {
+        recordDrainOperation(input, "lock-busy-retry");
         if ((await listQueuedWorkerWrites(input.vaultPath, input.planId)).length === 0) return false;
         await new Promise((resolve) => setTimeout(resolve, 25));
         continue;
@@ -2408,13 +2526,17 @@ export function kickWorkerWriteDrain(
   const task = drainWorkerWrites(input, deps, {
     oneShotYield: options.oneShotYield === true,
   })
-    .catch(() => {
+    .catch((error) => {
       // Apply throw is parked, not dropped: drainOne keeps the ticket and
       // the start-accepted receipt. Swallow only the unhandled rejection.
+      // Opt-in stall diagnostics retain the error identity (name/code only).
+      recordSwallowedDrainError(error);
       return false;
     })
     .then((yieldedLive) => {
+      recordRetainedDrainOutcome(key, yieldedLive === true);
       drainKicks.delete(key);
+      drainOperations.delete(key);
       drainTasks.delete(key);
       // One-shot yielded a live start: do not apply it here. Orch may still
       // reserve. Standing drain must not apply a live start in that window
@@ -2484,8 +2606,10 @@ export async function drainPendingWorkerWritesForVault(
         standingDefer: true,
       });
       drained.push(planId);
-    } catch {
+    } catch (error) {
       // Apply throw is parked. Ticket + stamp stay for the next later drain.
+      // Opt-in stall diagnostics retain the error identity (name/code only).
+      recordSwallowedDrainError(error);
     }
   }
   return { planIds: drained };
@@ -2566,6 +2690,7 @@ async function drainOneQueuedWorkerWrite(
   input: ThreadPlanTarget & { now?: Date | (() => Date) },
   deps: ThreadWorkerDeps,
 ): Promise<boolean> {
+  recordDrainOperation(input, "locked-selection");
   const items = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const item = pickNextQueuedWorkerWrite(items);
   if (item === undefined) return true;
@@ -2576,6 +2701,7 @@ async function drainOneQueuedWorkerWrite(
   }
   // Reuse this strict snapshot only inside this one lock acquisition. Token
   // lookup must refer to the same generation we just checked for liveness.
+  recordDrainOperation(input, "authority-read");
   const lockedPlan = await rehydrateAuthority(input);
   if (!(await queuedWriteIsLiveWork(input.notePath, item, lockedPlan))) {
     // Leftover Q after generation advance / supersede is not live work.
@@ -2608,6 +2734,8 @@ async function drainOneQueuedWorkerWrite(
   // Fail-closed: apply throw must not reach removeQueuedWorkerWrite.
   // Dropping the ticket lets a later complete persist done with no start.
   await withClaimFsScope(async () => {
+    try {
+    recordDrainOperation(input, "claim-authentication");
     const token = await claimTokenFromExistingStore(
       input.vaultPath,
       lockedPlan,
@@ -2626,8 +2754,12 @@ async function drainOneQueuedWorkerWrite(
         (typeof item.applyNow === "string" ? new Date(item.applyNow) : undefined) ??
         input.now,
     };
-    await applyClaimedSliceOnLockedPlan(mapped, deps);
+    recordDrainOperation(input, "ticket-apply");
+    await applyClaimedSliceOnLockedPlan(mapped, deps,
+      operation => recordDrainOperation(input, operation));
+    } finally { recordDrainOperation(input, "claim-helper-stop"); }
   });
+  recordDrainOperation(input, "ticket-removal-and-progress");
   await removeQueuedWorkerWrite(input.vaultPath, input.planId, item.idempotencyKey);
   const leftover = await listQueuedWorkerWrites(input.vaultPath, input.planId);
   const next = leftover[0];
@@ -2642,13 +2774,15 @@ async function drainOneQueuedWorkerWrite(
 async function applyClaimedSliceOnLockedPlan(
   input: UpdateClaimedSliceInput,
   deps: ThreadWorkerDeps = {},
+  diagnostic?: (operation: string) => void,
 ): Promise<ThreadMutationResult> {
-  return withClaimFsScope(() => applyClaimedSliceWithClaimFs(input, deps));
+  return withClaimFsScope(() => applyClaimedSliceWithClaimFs(input, deps, diagnostic));
 }
 
 async function applyClaimedSliceWithClaimFs(
   input: UpdateClaimedSliceInput,
   deps: ThreadWorkerDeps = {},
+  diagnostic?: (operation: string) => void,
 ): Promise<ThreadMutationResult> {
   const planId = requireNonEmpty(input.planId, "plan id");
   const sliceId = requireNonEmpty(input.sliceId, "slice id");
@@ -2865,10 +2999,12 @@ async function applyClaimedSliceWithClaimFs(
       });
 
       try {
+        diagnostic?.("plan-persist");
         await persist(next, {
           vaultPath: input.vaultPath,
           notePath: input.notePath,
         });
+        diagnostic?.("post-persist-receipts-and-journal");
       } catch (error) {
         let committed = error instanceof PlanHistoryAppendError;
         if (!committed) {

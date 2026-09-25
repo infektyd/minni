@@ -79,9 +79,15 @@ function assertQTicketHasNoRawToken(ticket, rawToken) {
 }
 
 
+const burstFixturePaths = new Set();
+const retainedBurstFixtures = new Set();
+
 async function burstFixture(t, n) {
   const vaultPath = await mkdtemp(path.join(tmpdir(), `minni-thread-lock-q-${n}-`));
+  burstFixturePaths.add(vaultPath);
   t.after(async () => {
+    burstFixturePaths.delete(vaultPath);
+    if (retainedBurstFixtures.delete(vaultPath)) return;
     for (let attempt = 0; attempt < 30; attempt += 1) {
       try {
         await rm(vaultPath, { recursive: true, force: true });
@@ -280,6 +286,10 @@ async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty 
   let progress = 0;
   let last;
   let leftover;
+  // Opt-in stall diagnostics (MINNI_QUEUE_DIAG=1, measure-before-fix): one
+  // observational snapshot after 5s of no journal progress. No drains
+  // started, no timers changed.
+  let stallDiagTaken = false;
   while (clock() - begin < timeoutMs && clock() - progressedAt < stallMs) {
     last = await readState(fixture);
     const count = last.started.length + last.completed.length;
@@ -294,8 +304,42 @@ async function waitForJournal(fixture, { started = 0, completed = 0, queueEmpty 
     ) {
       return last;
     }
+    if (
+      !stallDiagTaken &&
+      clock() - progressedAt > 5_000 &&
+      process.env.MINNI_QUEUE_DIAG === "1"
+    ) {
+      stallDiagTaken = true;
+      try {
+        const { captureQueueStallDiagnostics } = await import("./queue-stall-diag.mjs");
+        process.stderr.write(`${await captureQueueStallDiagnostics(fixture, readQueue, last)}\n`);
+      } catch { /* diagnostics never fail the test */ }
+    }
     kick();
     await pause();
+  }
+  if (process.env.MINNI_QUEUE_DIAG === "1") {
+    // Only disposable burst fixtures can survive teardown. No paths or
+    // claim-store contents are emitted. Observe before the original throw.
+    const retained = burstFixturePaths.has(fixture.vaultPath);
+    if (retained) retainedBurstFixtures.add(fixture.vaultPath);
+    const bounded = async (promise, fallback) => {
+      let timer;
+      try { return await Promise.race([promise,
+        new Promise(resolve => { timer = setTimeout(() => resolve(fallback), 1000); })]); }
+      finally { clearTimeout(timer); }
+    };
+    try {
+      const snapshot = await bounded(
+        import("./queue-stall-diag.mjs").then(({ captureQueueStallDiagnostics }) =>
+          captureQueueStallDiagnostics(fixture, readQueue, last)),
+        "STALL_DIAG snapshot=unavailable");
+      const line = `TERMINAL_${snapshot} fixtureRetained=${retained}`;
+      (options.emitDiagnostic ?? (value => process.stderr.write(`${value}\n`)))(line);
+      if (retained) await bounded(writeFile(
+        path.join(fixture.vaultPath, ".queue-terminal-diagnostic.txt"),
+        `${line}\n`, { mode: 0o600 }), undefined);
+    } catch { /* retention and the original failure survive diagnostic errors */ }
   }
   const diagnostic = await journalTimeoutDiagnostics({ last, startFail, completeFail },
     readQueue);
@@ -3118,3 +3162,46 @@ for (const scenario of ["progress", "stalled", "never-finishes"]) {
     }
   });
 }
+
+
+// Virtual no-progress injection with the real fixture teardown: no wet burst.
+test("terminal queue diagnostics retain only opted-in stalled fixtures", async () => {
+  const previous = process.env.MINNI_QUEUE_DIAG;
+  try {
+    for (const enabled of [false, true]) {
+      if (enabled) process.env.MINNI_QUEUE_DIAG = "1";
+      else delete process.env.MINNI_QUEUE_DIAG;
+      const cleanups = [];
+      const fixture = await burstFixture({ after: callback => cleanups.push(callback) }, 1);
+      const lines = [];
+      let elapsed = 0;
+      try {
+        await assert.rejects(waitForJournal(fixture, { started: 1 }, 20_000, {
+          clock: () => elapsed, kick: () => {},
+          pause: async () => { elapsed += 20_000; },
+          readState: async () => ({ started: [], completed: [], completesWithoutStarts: [] }),
+          readQueue: async () => [], emitDiagnostic: line => lines.push(line),
+        }), /timeout waiting/);
+        for (const cleanup of cleanups) await cleanup();
+        if (enabled) {
+          assert.equal(lines.length, 1, "terminal capture occurs without the early snapshot");
+          assert.match(lines[0], /^TERMINAL_STALL_DIAG drains=/);
+          assert.match(lines[0], /errors=\[.*lock=.*reserv=.*childProcs=.*fixtureRetained=true/);
+          assert.equal(lines[0].includes(fixture.vaultPath), false);
+          assert.equal(lines[0].includes(fixture.planId), false);
+          assert.equal(await readFile(path.join(fixture.vaultPath, ".queue-terminal-diagnostic.txt"), "utf8"), `${lines[0]}\n`);
+        } else {
+          assert.deepEqual(lines, []);
+          await assert.rejects(readdir(fixture.vaultPath), { code: "ENOENT" });
+        }
+      } finally {
+        retainedBurstFixtures.delete(fixture.vaultPath);
+        burstFixturePaths.delete(fixture.vaultPath);
+        await rm(fixture.vaultPath, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.MINNI_QUEUE_DIAG;
+    else process.env.MINNI_QUEUE_DIAG = previous;
+  }
+});
