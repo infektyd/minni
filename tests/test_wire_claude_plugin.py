@@ -948,6 +948,34 @@ def test_marketplace_concurrent_settings_edit_leaves_no_backup(home, monkeypatch
     assert list(settings.parent.glob("settings.json.minni-backup-*")) == []
 
 
+def test_marketplace_settings_edit_after_parse_uses_parsed_bytes_as_baseline(home, monkeypatch):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"extraKnownMarketplaces": {"minni": {"source": "old"}}}))
+    concurrent_edit = b'{"operator_edit": true}'
+    original_read_bytes = Path.read_bytes
+    original_write_bytes = Path.write_bytes
+    replaced_after_parse = False
+
+    def read_bytes(path):
+        nonlocal replaced_after_parse
+        data = original_read_bytes(path)
+        if path == settings and not replaced_after_parse:
+            replaced_after_parse = True
+            original_write_bytes(path, concurrent_edit)
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    with pytest.raises(ClaudePluginError, match="changed while it was being updated"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert replaced_after_parse is True
+    assert original_read_bytes(settings) == concurrent_edit
+    assert list(settings.parent.glob("settings.json.minni-backup-*")) == []
+
+
 def test_marketplace_rerun_is_idempotent(home):
     root = _install_tree(home, "0.4.0")
     ensure_claude_marketplace(root, "0.4.0")

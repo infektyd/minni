@@ -83,21 +83,22 @@ def _now_iso_ms() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
-def _load_json_doc(path: Path, default: dict) -> dict:
-    """Read a live Claude config, or `default` when it is absent or empty.
+def _load_json_doc_with_bytes(path: Path, default: dict) -> tuple[dict, bytes | None]:
+    """Read a live Claude config and return the bytes it was parsed from.
 
     A corrupt file raises. These documents hold other plugins' registrations and
     other MCP servers; recovering our own entry by overwriting theirs is not a
     trade this code gets to make on the user's behalf.
     """
     if not path.exists():
-        return dict(default)
+        return dict(default), None
     try:
-        text = path.read_text(encoding="utf-8")
+        original = path.read_bytes()
     except OSError as exc:
         raise ClaudePluginError(f"cannot read {path}: {exc}") from exc
+    text = original.decode("utf-8")
     if not text.strip():
-        return dict(default)
+        return dict(default), original
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -106,7 +107,12 @@ def _load_json_doc(path: Path, default: dict) -> dict:
         ) from exc
     if not isinstance(data, dict):
         raise ClaudePluginError(f"{path} is not a JSON object; refusing to overwrite it")
-    return data
+    return data, original
+
+
+def _load_json_doc(path: Path, default: dict) -> dict:
+    """Read a live Claude config, or `default` when it is absent or empty."""
+    return _load_json_doc_with_bytes(path, default)[0]
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -352,7 +358,7 @@ def sync_local_marketplace(
     return result
 
 
-def _write_with_backup(path: Path, doc: dict) -> str | None:
+def _write_with_backup(path: Path, doc: dict, original: bytes | None) -> str | None:
     """Back up the current bytes beside `path`, then replace it atomically.
 
     Same convention as the custom MCP refresh: a `<name>.minni-backup-*` file
@@ -360,15 +366,17 @@ def _write_with_backup(path: Path, doc: dict) -> str | None:
     change.
     """
     backup_name = None
-    if path.exists():
-        original = path.read_bytes()
+    if original is not None:
         fd, backup_name = tempfile.mkstemp(prefix=path.name + ".minni-backup-", dir=str(path.parent))
         with os.fdopen(fd, "wb") as backup:
             backup.write(original)
         os.chmod(backup_name, path.stat().st_mode & 0o777)
-        if path.read_bytes() != original:
+    if path.exists() != (original is not None) or (
+        original is not None and path.read_bytes() != original
+    ):
+        if backup_name is not None:
             Path(backup_name).unlink(missing_ok=True)
-            raise ClaudePluginError(f"{path} changed while it was being updated; refusing to overwrite it")
+        raise ClaudePluginError(f"{path} changed while it was being updated; refusing to overwrite it")
     _atomic_write_json(path, doc)
     return backup_name
 
@@ -384,7 +392,7 @@ def point_settings_at_local_marketplace(
     already naming the stub is not rewritten.
     """
     path = claude_settings_path()
-    doc = _load_json_doc(path, {})
+    doc, original = _load_json_doc_with_bytes(path, {})
     extra = doc.get("extraKnownMarketplaces")
     if extra is not None and not isinstance(extra, dict):
         raise ClaudePluginError(f"{path}: 'extraKnownMarketplaces' is not an object")
@@ -410,7 +418,7 @@ def point_settings_at_local_marketplace(
     backup = None
     if not dry_run:
         try:
-            backup = _write_with_backup(path, doc)
+            backup = _write_with_backup(path, doc, original)
         except OSError as exc:
             raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     if pending is not None:
