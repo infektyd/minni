@@ -367,7 +367,8 @@ def _write_with_backup(path: Path, doc: dict) -> str | None:
             backup.write(original)
         os.chmod(backup_name, path.stat().st_mode & 0o777)
         if path.read_bytes() != original:
-            raise ClaudePluginError(f"{path} changed while it was being updated; backup kept at {backup_name}")
+            Path(backup_name).unlink(missing_ok=True)
+            raise ClaudePluginError(f"{path} changed while it was being updated; refusing to overwrite it")
     _atomic_write_json(path, doc)
     return backup_name
 
