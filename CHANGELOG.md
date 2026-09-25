@@ -35,7 +35,7 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 - `privacy=review` candidate packets are AFM-examinable: learn-only `stage_candidate`
   clamps non-operator proposals to `privacy=review`. Consolidation now treats
   `privacy=review` as examinable (`_EXAMINABLE_PRIVACY`) so multi-agent candidate queues
-  (Claude, Grok, Gemini, Hermes, Cursor) re-enter the consolidation drain rather than
+  (Claude, Grok, Gemini, Cursor) re-enter the consolidation drain rather than
   permanently parking behind the `afm_review` fence (`examined=0`). Rows passing quality,
   deduplication, and non-instruction checks are triaged; durable promotion into active
   memory still strictly requires operator resolution or `auto_accept_own`, and unset/NULL
