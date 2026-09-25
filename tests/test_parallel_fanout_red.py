@@ -333,7 +333,7 @@ def test_rerank_holds_lock_unless_gate(monkeypatch, tmp_path):
     engine, _db = parity._make_engine(tmp_path)
 
     class _FakeReranker:
-        def predict(self, pairs, show_progress_bar=False):
+        def predict(self, pairs, **kwargs):
             return [0.25] * len(pairs)
 
     engine._reranker = _FakeReranker()
