@@ -366,18 +366,23 @@ def _write_with_backup(path: Path, doc: dict, original: bytes | None) -> str | N
     change.
     """
     backup_name = None
-    if original is not None:
-        fd, backup_name = tempfile.mkstemp(prefix=path.name + ".minni-backup-", dir=str(path.parent))
-        with os.fdopen(fd, "wb") as backup:
-            backup.write(original)
-        os.chmod(backup_name, path.stat().st_mode & 0o777)
-    if path.exists() != (original is not None) or (
-        original is not None and path.read_bytes() != original
-    ):
+    try:
+        if original is not None:
+            fd, backup_name = tempfile.mkstemp(prefix=path.name + ".minni-backup-", dir=str(path.parent))
+            with os.fdopen(fd, "wb") as backup:
+                backup.write(original)
+            os.chmod(backup_name, path.stat().st_mode & 0o777)
+        if path.exists() != (original is not None) or (
+            original is not None and path.read_bytes() != original
+        ):
+            raise ClaudePluginError(f"{path} changed while it was being updated; refusing to overwrite it")
+        _atomic_write_json(path, doc)
+    except (OSError, ClaudePluginError):
+        # The file was not updated; a backup of its live bytes is litter, not
+        # recovery material. Never strand one on a failed write.
         if backup_name is not None:
             Path(backup_name).unlink(missing_ok=True)
-        raise ClaudePluginError(f"{path} changed while it was being updated; refusing to overwrite it")
-    _atomic_write_json(path, doc)
+        raise
     return backup_name
 
 

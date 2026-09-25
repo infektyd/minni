@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from minni.wire import claude_plugin
 from minni.wire.claude_plugin import (
     ClaudePluginError,
     adopt_claude_code,
@@ -973,6 +974,28 @@ def test_marketplace_settings_edit_after_parse_uses_parsed_bytes_as_baseline(hom
 
     assert replaced_after_parse is True
     assert original_read_bytes(settings) == concurrent_edit
+    assert list(settings.parent.glob("settings.json.minni-backup-*")) == []
+
+
+def test_marketplace_failed_settings_write_leaves_no_backup(home, monkeypatch):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    original = {"extraKnownMarketplaces": {"minni": {"source": "old"}}}
+    settings.write_text(json.dumps(original), encoding="utf-8")
+    real_write = claude_plugin._atomic_write_json
+
+    def fail_settings_write(path, data):
+        if path == settings:
+            raise OSError("simulated write failure")
+        real_write(path, data)
+
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", fail_settings_write)
+
+    with pytest.raises(ClaudePluginError):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert json.loads(settings.read_text(encoding="utf-8")) == original
     assert list(settings.parent.glob("settings.json.minni-backup-*")) == []
 
 
