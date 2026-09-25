@@ -1120,7 +1120,7 @@ def test_marketplace_refuses_corrupt_settings(home):
 
 def test_marketplace_writes_through_a_symlinked_settings(home, tmp_path):
     root = _install_tree(home, "0.4.0")
-    target = tmp_path / "dotfiles" / "settings.json"
+    target = home / "dotfiles" / "settings.json"
     target.parent.mkdir(parents=True)
     target.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
     settings = claude_settings_path()
@@ -1138,6 +1138,34 @@ def test_marketplace_writes_through_a_symlinked_settings(home, tmp_path):
     backup = Path(result["settings"]["backup"])
     assert backup.parent == target.parent
     assert json.loads(backup.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+def test_marketplace_refuses_a_looping_settings_symlink(home):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True)
+    settings.symlink_to(settings.name)
+
+    with pytest.raises(ClaudePluginError, match="unresolvable symlink"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert settings.is_symlink()
+
+
+def test_marketplace_refuses_a_settings_symlink_outside_home(home, tmp_path):
+    root = _install_tree(home, "0.4.0")
+    outside = tmp_path / "elsewhere" / "settings.json"
+    outside.parent.mkdir(parents=True)
+    outside.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True)
+    settings.symlink_to(outside)
+
+    with pytest.raises(ClaudePluginError, match="outside the home directory"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert settings.is_symlink()
+    assert json.loads(outside.read_text(encoding="utf-8")) == {"model": "opus"}
 
 
 def test_stub_marketplace_entry_is_not_retired_or_pending(home):

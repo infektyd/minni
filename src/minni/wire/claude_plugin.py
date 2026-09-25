@@ -404,10 +404,20 @@ def point_settings_at_local_marketplace(
     # settings.json is a common dotfiles symlink; an atomic rename would swap
     # the link for a regular file and leave the user's real copy stale.
     if path.is_symlink():
+        # strict: a loop or dangling link must raise, not resolve to itself and
+        # get replaced. Write through only to a regular file inside $HOME, the
+        # same boundary the stub marketplace enforces.
         try:
-            path = path.resolve()
+            target = path.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise ClaudePluginError(f"{path} is an unresolvable symlink: {exc}") from exc
+        if not target.is_file():
+            raise ClaudePluginError(f"{path} links to {target}, which is not a regular file")
+        if not target.is_relative_to(user_home().resolve()):
+            raise ClaudePluginError(
+                f"{path} links outside the home directory ({target}); refusing to write through it"
+            )
+        path = target
     doc, original = _load_json_doc_with_bytes(path, {})
     extra = doc.get("extraKnownMarketplaces")
     if extra is not None and not isinstance(extra, dict):
