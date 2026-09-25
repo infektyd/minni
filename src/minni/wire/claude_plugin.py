@@ -392,6 +392,13 @@ def point_settings_at_local_marketplace(
     already naming the stub is not rewritten.
     """
     path = claude_settings_path()
+    # settings.json is a common dotfiles symlink; an atomic rename would swap
+    # the link for a regular file and leave the user's real copy stale.
+    if path.is_symlink():
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ClaudePluginError(f"{path} is an unresolvable symlink: {exc}") from exc
     doc, original = _load_json_doc_with_bytes(path, {})
     extra = doc.get("extraKnownMarketplaces")
     if extra is not None and not isinstance(extra, dict):

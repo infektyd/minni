@@ -1054,6 +1054,28 @@ def test_marketplace_refuses_corrupt_settings(home):
     assert settings.read_text(encoding="utf-8") == "{not json"
 
 
+def test_marketplace_writes_through_a_symlinked_settings(home, tmp_path):
+    root = _install_tree(home, "0.4.0")
+    target = tmp_path / "dotfiles" / "settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True)
+    settings.symlink_to(target)
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    assert settings.is_symlink()
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["extraKnownMarketplaces"]["minni"]["source"] == {
+        "source": "directory", "path": str(local_marketplace_root()),
+    }
+    assert data["model"] == "opus"
+    backup = Path(result["settings"]["backup"])
+    assert backup.parent == target.parent
+    assert json.loads(backup.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
 def test_stub_marketplace_entry_is_not_retired_or_pending(home):
     root = _install_tree(home, "0.4.0")
     _write_wired(home, root, "0.4.0")
