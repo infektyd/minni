@@ -1043,6 +1043,18 @@ def test_marketplace_refreshes_a_copy_that_drifted_from_the_payload(home):
     assert copy.read_text(encoding="utf-8") == "// stub\n"
 
 
+def test_marketplace_refreshes_a_copy_when_the_source_tree_drifted(home):
+    root = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(root, "0.4.0")
+    (root / "dist" / "server.js").write_text("// rebuilt\n", encoding="utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    copy = local_marketplace_root() / "plugins" / "minni-0.4.0" / "dist" / "server.js"
+    assert result["local_marketplace"]["copied"] is True
+    assert copy.read_text(encoding="utf-8") == "// rebuilt\n"
+
+
 def test_marketplace_dry_run_writes_nothing(home):
     root = _install_tree(home, "0.4.0")
 
