@@ -583,11 +583,13 @@ def run_wire(args) -> int:
                 # never on a path that would leave a live registration behind for
                 # a payload we could not verify.
                 if spec.platform == "claude-code":
+                    plugin_registered = False
                     try:
                         extras["claude_plugin"] = register_claude_plugin(
                             install_root, version,
                             git_sha=manifest.git_sha, dry_run=dry_run,
                         )
+                        plugin_registered = True
                         # Claude Code >= 2.1.282 refuses to load minni@minni
                         # when the `minni` marketplace cannot be resolved, so
                         # the registration is only half the job.
@@ -599,7 +601,12 @@ def run_wire(args) -> int:
                         # `failed` alone would tell an operator (or automation
                         # keying on it) that nothing changed. Say which half
                         # landed.
-                        extras["wired_but_plugin_unregistered"] = not dry_run
+                        if plugin_registered:
+                            extras["wired_but_marketplace_unconfigured"] = not dry_run
+                            failure = "marketplace setup failed"
+                        else:
+                            extras["wired_but_plugin_unregistered"] = not dry_run
+                            failure = "plugin registration failed"
                         out.results.append(PlatformResult(
                             platform, "failed",
                             config_path=str(config_path) if config_path else None,
@@ -608,7 +615,7 @@ def run_wire(args) -> int:
                             workspace=str(workspace) if workspace else None,
                             verify=verify,
                             reason=(
-                                f"plugin registration failed: {exc} "
+                                f"{failure}: {exc} "
                                 "(the MCP server and wired.json were already updated; "
                                 "re-run `minni wire claude-code` once resolved)"
                             ),

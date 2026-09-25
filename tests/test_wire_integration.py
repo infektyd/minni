@@ -192,6 +192,27 @@ def test_wire_real_install_idempotent(wire_env, monkeypatch, capsys):
     assert rc2 == 0
 
 
+def test_wire_marketplace_failure_is_not_reported_as_registration_failure(
+    wire_env, monkeypatch, capsys,
+):
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{not json", encoding="utf-8")
+
+    rc = run_wire(_args("claude-code", home))
+
+    assert rc == 1
+    result = json.loads(capsys.readouterr().out)["results"][0]
+    assert result["status"] == "failed"
+    assert result["reason"].startswith("marketplace setup failed:")
+    assert result["extra"]["wired_but_marketplace_unconfigured"] is True
+    assert "wired_but_plugin_unregistered" not in result["extra"]
+    registry = json.loads((home / ".claude" / "plugins" / "installed_plugins.json").read_text())
+    assert "minni@minni" in registry["plugins"]
+
+
 def test_wire_version_mismatch(wire_env, monkeypatch, capsys):
     home, payload_root, manifest = wire_env
     monkeypatch.setattr("minni.wire.flow.package_version", lambda: "9.9.9")
