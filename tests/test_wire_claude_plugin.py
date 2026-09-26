@@ -778,6 +778,40 @@ def test_adopt_dry_run_tolerates_the_registration_it_will_rewrite(home):
     assert not (legacy_cache_root() / "minni").exists()
 
 
+def test_adopt_dry_run_scans_a_symlinked_settings_as_rewritten(home):
+    """pending[] is keyed on the scanned path, not the resolved target.
+
+    With ~/.claude/settings.json symlinked into dotfiles, keying the override
+    on the resolved target leaves legacy_cache_referrers reading the stale
+    on-disk doc: the dry run refuses "still referenced by" while --apply
+    writes first and proceeds.
+    """
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    target = home / "dotfiles" / "settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({
+        "extraKnownMarketplaces": {
+            "minni": {
+                "source": {"source": "directory", "path": str(legacy_cache_root())},
+            },
+        },
+    }), encoding="utf-8")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.symlink_to(target)
+
+    result = adopt_claude_code()
+
+    assert result["steps"]["legacy_cache"]["changed"] is True
+    assert (legacy_cache_root() / "minni").is_dir()
+    applied = adopt_claude_code(apply=True)
+    assert applied["applied"] is True
+    assert settings.is_symlink()
+    assert not (legacy_cache_root() / "minni").exists()
+
+
 def test_adopt_refuses_when_a_foreign_scope_still_points_into_the_cache(home):
     root = _install_tree(home, "0.4.0")
     _write_wired(home, root, "0.4.0")

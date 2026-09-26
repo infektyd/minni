@@ -406,6 +406,11 @@ def point_settings_at_local_marketplace(
     already naming the stub is not rewritten.
     """
     path = claude_settings_path()
+    # pending[] is looked up by the paths legacy_scan_paths() enumerates --
+    # the symlink itself, not its target. Keying the override on the resolved
+    # path would leave a dry run scanning the stale on-disk doc that --apply
+    # rewrote before the scan, and the two runs would disagree.
+    pending_key = str(path)
     # settings.json is a common dotfiles symlink; an atomic rename would swap
     # the link for a regular file and leave the user's real copy stale.
     if path.is_symlink():
@@ -438,7 +443,7 @@ def point_settings_at_local_marketplace(
 
     if previous == desired:
         if pending is not None:
-            pending[str(path)] = doc
+            pending[pending_key] = doc
         return {"path": str(path), "changed": False, "source": desired}
 
     entry = dict(current) if isinstance(current, dict) else {}
@@ -453,7 +458,7 @@ def point_settings_at_local_marketplace(
         except OSError as exc:
             raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     if pending is not None:
-        pending[str(path)] = doc
+        pending[pending_key] = doc
     return {
         "path": str(path),
         "changed": True,
