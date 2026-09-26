@@ -217,7 +217,7 @@ The Claude Code surface adds:
 
 Disable hooks without uninstalling: `export MINNI_CLAUDECODE_HOOKS=off`.
 
-The Codex plugin (`.codex-plugin/`), Gemini extension (`.gemini-plugin/`), and other integrations (Hermes, OpenClaw, Grok Build) are unaffected — they share the daemon, not the vault.
+The Codex plugin (`.codex-plugin/`), Gemini extension (`.gemini-plugin/`), and other integrations (Grok Build, Kilo Code) are unaffected — they share the daemon, not the vault.
 
 Automatic behavior should remain recall-only. `minni_route` can recommend recall/status/audit automatically, but learning and vault writes stay manual and vault-first. `minni_learn` returns a quality report and blocks weak memories by default (`requireQuality` defaults to `true`; pass `requireQuality: false` to store a weak note deliberately).
 
@@ -274,7 +274,7 @@ The KiloCode surface adds:
 
 Disable hooks without uninstalling: `export MINNI_KILOCODE_HOOKS=off`.
 
-The Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gemini extension (`.gemini-plugin/`), and other integrations (Hermes, OpenClaw, Grok Build) are unaffected — they share the daemon, not the vault.
+The Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gemini extension (`.gemini-plugin/`), and other integrations (Grok Build, Kilo Code) are unaffected — they share the daemon, not the vault.
 
 ## Local Console
 

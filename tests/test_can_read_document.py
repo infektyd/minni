@@ -62,7 +62,7 @@ def test_shared_wiki_authorized():
 
 
 def test_private_shared_wiki_denied_for_foreign_non_operator():
-    p = _p("hermes", caps=["search", "recall"])
+    p = _p("peer", caps=["search", "recall"])
     meta = {
         "agent": "wiki:meta",
         "page_type": "wiki",
@@ -75,7 +75,7 @@ def test_private_shared_wiki_denied_for_foreign_non_operator():
 
 def test_foreign_private_denied():
     # Non-operator limited principal (no * cap, not main/operator id) must be denied foreign private
-    p = _p("hermes", caps=["search", "recall"])
+    p = _p("peer", caps=["search", "recall"])
     meta = {
         "agent": "other-agent",
         "privacy_level": "private",
@@ -86,7 +86,7 @@ def test_foreign_private_denied():
 
 
 def test_private_local_only_denied_for_foreign():
-    p = _p("hermes", caps=["search", "recall"])
+    p = _p("peer", caps=["search", "recall"])
     meta = {"agent": "other", "privacy_level": "local-only", "path": "/tmp/test-vault/other/local.md"}
     assert can_read_document(p, "default", meta) is False
 

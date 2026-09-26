@@ -1,6 +1,6 @@
 ---
 name: minni
-description: Use when the user asks the agent to recall, learn, write, audit, or operate through Minni, when a task likely benefits from prior local memory, or when the user asks what Minni is or how to work with it. Works across Claude Code, Codex, Gemini, Grok, KiloCode, Hermes, and OpenClaw. Default automatic behavior is recall-only; do not learn unless explicitly requested.
+description: Use when the user asks the agent to recall, learn, write, audit, or operate through Minni, when a task likely benefits from prior local memory, or when the user asks what Minni is or how to work with it. Works across Claude Code, Codex, Gemini, Grok, and KiloCode. Default automatic behavior is recall-only; do not learn unless explicitly requested.
 ---
 
 # Minni — Portable Delivery Layer
@@ -174,7 +174,7 @@ See `~/.agents/artifacts/minni-distill-ritual-v1/notes/agnostic-vs-grok-specific
 
 ## Spine Integration (Claude Code)
 
-Use this skill to operate the local Minni bridge and the agent's Obsidian vault. Minni is shared across multiple agents (Claude Code, Codex, Hermes, OpenClaw) — each has its own vault, but they all talk to the same daemon and can recall each other's notes, tagged with `agent_origin`.
+Use this skill to operate the local Minni bridge and the agent's Obsidian vault. Minni is shared across multiple agents (Claude Code, Codex, Gemini, Grok Build, KiloCode) — each has its own vault, but they all talk to the same daemon and can recall each other's notes, tagged with `agent_origin`.
 
 When loaded as a Claude Code plugin, Minni wires four hooks into the session
 (each platform — Claude Code, Codex, Grok, KiloCode — has its own compiled hook;
@@ -201,7 +201,7 @@ The Claude Code vault lives at `~/.minni/claudecode-vault` (override: `MINNI_CLA
 
 Use this workflow when the user asks for "Sovereign Team Mode", "parallel Sovereign agents", "temporary agents", "use 4-5 agents", "compress wall-clock time", or asks to split a non-trivial task across helper agents.
 
-Core rule: Minni owns the team substrate; Codex CLI, Codex Desktop, Claude Code, Hermes, OpenClaw, and local workers are host adapters. Do not tie the workflow to one host surface.
+Core rule: Minni owns the team substrate; Codex CLI, Codex Desktop, Claude Code, and local workers are host adapters. Do not tie the workflow to one host surface.
 
 1. Check health and context.
    - Call `minni_status`.
@@ -314,7 +314,7 @@ When a recalled snippet has `agent_origin` other than your own (e.g., Claude Cod
   (`propagate.py update-plugin --platform grok`, agent id `grok-build`).
 - All rich portable behaviors come from this canonical SKILL + the ritual package `~/.agents/artifacts/minni-distill-ritual-v1/`
 
-### (Future sections for Claude Code, Codex, Gemini/Antigravity, Hermes/OpenClaw, etc. — thin notes only)
+### (Future sections for Claude Code, Codex, Gemini/Antigravity, etc. — thin notes only)
 
 ---
 

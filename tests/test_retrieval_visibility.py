@@ -39,7 +39,7 @@ def test_retrieve_accepts_principal_param():
 
 def test_shared_wiki_result_visible_under_gate():
     """Shared wiki (page_type=wiki, any agent) visible to non-matching principal if gate allows."""
-    p = _mk_principal("hermes", caps=["search"])  # limited principal: wiki shared allowed, foreign private denied
+    p = _mk_principal("peer", caps=["search"])  # limited principal: wiki shared allowed, foreign private denied
     fake_results = [
         {"doc_id": 1, "agent": "wiki-bot", "page_type": "wiki", "privacy_level": "safe", "path": "/tmp/v/wiki/s.md", "chunk_text": "shared"},
         {"doc_id": 2, "agent": "other", "page_type": "knowledge", "privacy_level": "private", "path": "/tmp/v/other/p.md", "chunk_text": "secret"},
@@ -52,7 +52,7 @@ def test_shared_wiki_result_visible_under_gate():
 
 
 def test_foreign_private_result_denied_under_gate(monkeypatch):
-    p = _mk_principal("hermes", caps=["search"])  # limited non-main/non-operator id
+    p = _mk_principal("peer", caps=["search"])  # limited non-main/non-operator id
     fake = [{"doc_id": 99, "agent": "foreign", "privacy_level": "private", "path": "/tmp/v/secret.md", "chunk_text": "x"}]
     filtered = [r for r in fake if can_read_document(p, "default", r)]
     assert len(filtered) == 0

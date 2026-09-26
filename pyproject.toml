@@ -87,7 +87,6 @@ minni = [
     "launchd/*.example",
     "native_afm_helper",
     "native_afm_helper.swift",
-    "openclaw-tool.sh",
     "plugin_payload/*",
     # setuptools' `*` does not match a leading dot — dotFILES need explicit
     # entries or they silently drop from the wheel (caught by the release
@@ -109,11 +108,8 @@ minni = [
     "plugin_payload/.kilocode-plugin/skills/sovereign-memory/*",
     "plugin_payload/commands/*",
     "plugin_payload/skills/minni/*",
-    "plugin_payload/skills/minni-consolidation/*",
-    "plugin_payload/skills/minni-consolidation/scripts/*",
     "plugin_payload/skills/minni-doctor/*",
     "plugin_payload/skills/minni-engine/*",
-    "plugin_payload/skills/minni-health-check/*",
     "plugin_payload/skills/minni-ingestion/*",
     "plugin_payload/skills/minni-install/*",
     "plugin_payload/skills/minni-install/references/*",

@@ -32,22 +32,22 @@ async function withConfigEnv(env, fn) {
   }
 }
 
-test("generic MINNI env overrides Codex-specific defaults for Hermes", async () => {
+test("generic MINNI env overrides Codex-specific defaults for a peer agent", async () => {
   await withConfigEnv(
     {
-      MINNI_VAULT_PATH: "/tmp/hermes-vault",
+      MINNI_VAULT_PATH: "/tmp/peer-vault",
       MINNI_CODEX_VAULT_PATH: "/tmp/codex-vault",
-      MINNI_SOCKET_PATH: "/tmp/hermes-sovereign.sock",
-      MINNI_AGENT_ID: "hermes",
+      MINNI_SOCKET_PATH: "/tmp/peer-sovereign.sock",
+      MINNI_AGENT_ID: "peer",
       MINNI_CODEX_AGENT_ID: "codex",
-      MINNI_WORKSPACE_ID: "/tmp/hermes-workspace",
+      MINNI_WORKSPACE_ID: "/tmp/peer-workspace",
       MINNI_CODEX_WORKSPACE_ID: "/tmp/codex-workspace",
     },
     (config) => {
-      assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/hermes-vault");
-      assert.equal(config.SOCKET_PATH, "/tmp/hermes-sovereign.sock");
-      assert.equal(config.DEFAULT_AGENT_ID, "hermes");
-      assert.equal(config.DEFAULT_WORKSPACE_ID, "workspace-hermes-workspace");
+      assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/peer-vault");
+      assert.equal(config.SOCKET_PATH, "/tmp/peer-sovereign.sock");
+      assert.equal(config.DEFAULT_AGENT_ID, "peer");
+      assert.equal(config.DEFAULT_WORKSPACE_ID, "workspace-peer-workspace");
     },
   );
 });

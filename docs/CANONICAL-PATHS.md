@@ -9,7 +9,7 @@ It is also the canonical Git working tree for
 runtime integrations use `src/minni/` and
 `plugins/minni/` directly.
 
-Use this page to avoid guessing between older root-level, OpenClaw, Hermes, and
+Use this page to avoid guessing between older root-level, legacy, and
 downloaded paths.
 
 Older notes may still spell this path using retired home-root or temp-main
@@ -38,13 +38,13 @@ Codex's vault and do not bootstrap a new agent by copying another agent's
 
 - `docs/plans/` - planning documents and prompt plans.
 - `docs/research/` - related research notes.
-- `logs/openclaw/` - preserved OpenClaw audit logs.
+- `logs/` - preserved legacy audit logs (local only, not tracked).
 - `archives/downloads/` - old downloaded bundles and one-off prototypes.
 - `_archive/` - previous repo/workspace archives.
 
 ## Retired Legacy Roots
 
-Legacy home-root copies, repo-local vault copies, `.openclaw` state, and old
+Legacy home-root copies, repo-local vault copies, legacy platform state, and old
 archives belong in private offsite/cryo storage, outside the public repository.
 
 Do not recreate compatibility symlinks for those paths unless the user
@@ -56,7 +56,7 @@ Do not casually move these folders wholesale. They are live application state
 for other systems and may contain secrets, sessions, local databases, or runtime
 locks:
 
-- Agent-host runtime roots such as Hermes/OpenClaw state.
+- Runtime roots of other agent platforms installed on the machine.
 - Private AFM training, adapter, or model artifact storage.
 
 If they need cleanup later, move only specific non-runtime artifacts and leave

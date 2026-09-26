@@ -1,8 +1,7 @@
 """Slice E security regressions: DoS/misc (R7, R9).
 
 R10 (unscoped contradiction count) is covered by updated assertions in
-test_correction_reinjection.py; X7 (sovrd lru_cache) is covered by
-openclaw-extension/tests/test_content_hash_no_cache.py.
+test_correction_reinjection.py.
 """
 
 from __future__ import annotations

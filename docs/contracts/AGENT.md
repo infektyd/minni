@@ -26,8 +26,6 @@ It scopes reads, writes, episodic events, and learnings. Well-known values:
 | `grok-build`   | Grok Build (xAI CLI)               |
 | `kilocode`     | Kilo Code                          |
 | `claude-science` | Claude Science (research workbench; vault-only, no hook surface) |
-| `hermes`       | Hermes orchestration agent         |
-| `openclaw`     | OpenClaw tool harness              |
 | `main`         | Default / anonymous agent          |
 
 The wired-platform ids above are the actual principal ids shipped in
@@ -59,10 +57,10 @@ First-class persisted document workspace isolation remains planned (G11 / PR-3).
 
 Documents stored with `agent = 'identity:<agent_id>'` are that agent's identity
 anchor. They are loaded first on session start and never decay.
-`src/minni/seed_identity.py` writes one identity document per agent into the
-`documents` table with the reserved `identity:` prefix (it currently targets a
-fixed OpenClaw agent set, not an arbitrary `--agent`; a general per-`agent_id`
-bootstrap has not shipped). These documents survive decay passes and are always
+The installer (`plugins/minni/skills/minni-install/scripts/propagate.py`)
+writes a hosted agent's identity envelope into the `documents` table with the
+reserved `identity:` prefix, embedding it via `src/minni/seed_identity.py`'s
+`get_embedding`. These documents survive decay passes and are always
 included in the `read()` startup context. The day-to-day identity bootstrap for
 a wired runtime is the principal file at `~/.minni/principals/<agent_id>.json`,
 rendered by `python -m minni.tools.author_principals --apply` from

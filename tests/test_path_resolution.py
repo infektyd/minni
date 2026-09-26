@@ -18,7 +18,6 @@ from minni.config import SovereignConfig, CANONICAL_SOVEREIGN_HOME, resolve_cano
 def test_canonical_home_prefers_minni():
     home = CANONICAL_SOVEREIGN_HOME
     assert ".minni" in home or "minni" in home.lower()
-    assert "openclaw" not in home  # legacy not the default
 
 
 def test_engine_config_derives_from_canonical_home():

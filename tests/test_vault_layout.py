@@ -15,7 +15,7 @@ _PLUGIN_INDEX = "# Minni Index\n\n- [[wiki/entities/peer]]\n"
 
 
 def test_ensure_agent_vault_preserves_existing_log_and_index(tmp_path):
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
     (vault / "index.md").write_text(_PLUGIN_INDEX, encoding="utf-8")
@@ -37,7 +37,7 @@ def test_ensure_agent_vault_exclusive_create_does_not_clobber_raced_append(
     check, a stub header wipes the audit. Exclusive create (mode 'x') must
     merge-not-wipe.
     """
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     orig_exists = Path.exists
 
@@ -72,7 +72,7 @@ def test_ensure_agent_vault_does_not_clobber_append_after_exclusive_create(
     header write. Writing the header at offset 0 would overwrite the start of
     the audit entry. Treat a non-empty exclusive fd as already owned.
     """
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     orig_os_open = os.open
     orig_path_open = Path.open
@@ -117,7 +117,7 @@ def test_ensure_agent_vault_does_not_clobber_append_after_exclusive_create(
 
 def test_ensure_agent_vault_created_paths_are_owner_only(tmp_path):
     """Seeded wiki/inbox/log.md must be 0700/0600; umask is not the boundary."""
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     old_umask = os.umask(0)
     try:
@@ -134,7 +134,7 @@ def test_ensure_agent_vault_created_paths_are_owner_only(tmp_path):
 
 def test_ensure_agent_vault_refuses_symlink_wiki_into_shop_restore(tmp_path):
     """Contract-dir mkdir must not follow wiki → shop/backup/peer trees."""
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -148,7 +148,7 @@ def test_ensure_agent_vault_refuses_symlink_wiki_into_shop_restore(tmp_path):
 
 
 def test_ensure_agent_vault_refuses_symlink_inbox_into_peer_vault(tmp_path):
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     peer = tmp_path / "codex-vault"
     vault.mkdir()
     peer.mkdir()
@@ -159,11 +159,11 @@ def test_ensure_agent_vault_refuses_symlink_inbox_into_peer_vault(tmp_path):
 
 
 def test_ensure_agent_vault_refuses_symlink_root_into_shop_restore(tmp_path):
-    """hermes-vault → shop-restore must not plant wiki/inbox in the target."""
+    """peer-vault → shop-restore must not plant wiki/inbox in the target."""
     shop = tmp_path / "shop-restore"
     shop.mkdir()
     (shop / "keep.md").write_text("restore\n", encoding="utf-8")
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.symlink_to(shop)
     with pytest.raises(OSError):
         ensure_agent_vault(vault)
@@ -191,7 +191,7 @@ def test_afm_ensure_vault_does_not_wipe_raced_log_md(tmp_path, monkeypatch):
     """Peer AFM seeder must not exists()+write_text over a raced stamp."""
     from minni.afm_writer import _ensure_vault
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     monkeypatch.setattr(Path, "exists", _plant_stamp_then_claim_missing(Path.exists, vault))
     _ensure_vault(vault)
@@ -203,7 +203,7 @@ def test_handoff_ensure_vault_does_not_wipe_raced_log_md(tmp_path, monkeypatch):
     """Peer handoff seeder must not exists()+write_text over a raced stamp."""
     from minni.minnid_runtime.handoff import ensure_handoff_vault
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     monkeypatch.setattr(Path, "exists", _plant_stamp_then_claim_missing(Path.exists, vault))
     ensure_handoff_vault(vault)
@@ -217,7 +217,7 @@ def test_afm_ensure_vault_does_not_clobber_append_after_exclusive_create(
     """Peer AFM seeder must skip a non-empty exclusive fd, not write at 0."""
     from minni.afm_writer import _ensure_vault
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     orig_os_open = os.open
 
@@ -253,7 +253,7 @@ def _shop_restore_symlink_root(tmp_path: Path) -> tuple[Path, Path]:
     shop = tmp_path / "shop-restore"
     shop.mkdir()
     (shop / "keep.md").write_text("restore\n", encoding="utf-8")
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.symlink_to(shop)
     return vault, shop
 
@@ -268,7 +268,7 @@ def _assert_shop_unplanted(shop: Path) -> None:
 
 
 def test_afm_ensure_vault_refuses_symlink_root_into_shop_restore(tmp_path):
-    """Peer AFM mkdir must not follow hermes-vault → shop-restore."""
+    """Peer AFM mkdir must not follow peer-vault → shop-restore."""
     from minni.afm_writer import _ensure_vault
 
     vault, shop = _shop_restore_symlink_root(tmp_path)
@@ -278,7 +278,7 @@ def test_afm_ensure_vault_refuses_symlink_root_into_shop_restore(tmp_path):
 
 
 def test_handoff_ensure_vault_refuses_symlink_root_into_shop_restore(tmp_path):
-    """Peer handoff mkdir must not follow hermes-vault → shop-restore."""
+    """Peer handoff mkdir must not follow peer-vault → shop-restore."""
     from minni.minnid_runtime.handoff import ensure_handoff_vault
 
     vault, shop = _shop_restore_symlink_root(tmp_path)
@@ -300,7 +300,7 @@ def test_afm_append_audit_does_not_truncate_when_exists_lies(tmp_path, monkeypat
     """Leftover exists()+write_text after exclusive ensure must not wipe log.md."""
     from minni.afm_writer import _append_audit
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
     orig_exists = Path.exists
@@ -321,7 +321,7 @@ def test_handoff_append_audit_does_not_truncate_when_exists_lies(tmp_path, monke
     """Leftover exists()+write_text after exclusive ensure must not wipe log.md."""
     from minni.minnid_runtime.handoff import append_handoff_audit
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
     orig_exists = Path.exists
@@ -342,11 +342,11 @@ def test_wire_bootstrap_vault_preserves_existing_log_and_index(tmp_path, monkeyp
     from minni.wire.writers import bootstrap_vault
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    vault = tmp_path / ".minni" / "hermes-vault"
+    vault = tmp_path / ".minni" / "peer-vault"
     vault.mkdir(parents=True)
     (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
     (vault / "index.md").write_text(_PLUGIN_INDEX, encoding="utf-8")
-    bootstrap_vault("hermes")
+    bootstrap_vault("peer")
     assert (vault / "log.md").read_text(encoding="utf-8") == _PLUGIN_LOG
     assert (vault / "index.md").read_text(encoding="utf-8") == _PLUGIN_INDEX
 
@@ -357,7 +357,7 @@ def test_wire_bootstrap_vault_does_not_clobber_append_after_exclusive_create(
     from minni.wire.writers import bootstrap_vault
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    vault = tmp_path / ".minni" / "hermes-vault"
+    vault = tmp_path / ".minni" / "peer-vault"
     vault.mkdir(parents=True)
     orig_os_open = os.open
 
@@ -382,7 +382,7 @@ def test_wire_bootstrap_vault_does_not_clobber_append_after_exclusive_create(
         return fd
 
     monkeypatch.setattr(os, "open", racing_os_open)
-    bootstrap_vault("hermes")
+    bootstrap_vault("peer")
     log_text = (vault / "log.md").read_text(encoding="utf-8")
     index_text = (vault / "index.md").read_text(encoding="utf-8")
     assert _RACE_AUDIT in log_text
@@ -390,7 +390,7 @@ def test_wire_bootstrap_vault_does_not_clobber_append_after_exclusive_create(
 
 
 def _wiki_symlink_to_shop(tmp_path: Path) -> tuple[Path, Path]:
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -400,7 +400,7 @@ def _wiki_symlink_to_shop(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _inbox_symlink_to_shop(tmp_path: Path) -> tuple[Path, Path]:
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -410,7 +410,7 @@ def _inbox_symlink_to_shop(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _file_symlink_to_shop(tmp_path: Path, rel: str) -> tuple[Path, Path]:
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -549,7 +549,7 @@ def _afm_draft(*, section: str, kind: str = "concept") -> dict:
 
 
 def _wiki_section_symlink_to_shop(tmp_path: Path, section: str) -> tuple[Path, Path]:
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -608,7 +608,7 @@ def test_afm_write_batch_merges_inbox_runs_after_exclusive_seed(tmp_path):
 
     from minni.afm_writer import _write_batch
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     job = {"vault_path": str(vault), "pass_name": "probe", "drafts": []}
     first = _write_batch(job)
@@ -633,7 +633,7 @@ def test_afm_write_batch_crash_between_ledger_commit_and_landing_leaves_no_phant
     import minni.afm_writer as afm_writer
     from minni.afm_writer import _write_batch
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     real_write_one = afm_writer._write_one
 
@@ -673,7 +673,7 @@ def test_afm_write_batch_ledger_flips_pending_to_landed_after_landing(tmp_path):
 
     from minni.afm_writer import _write_batch
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     result = _write_batch(
         {
@@ -699,7 +699,7 @@ def test_afm_write_batch_does_not_plant_inbox_drafts_tmp_sidecar_symlink(tmp_pat
     from minni.afm_writer import _write_batch
 
     day = time.strftime("%Y-%m-%d", time.gmtime())
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -732,7 +732,7 @@ def test_afm_write_one_does_not_plant_wiki_page_tmp_sidecar_symlink(tmp_path):
 
     from minni.afm_writer import _slugify, _write_one
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -764,7 +764,7 @@ def test_atomic_write_text_refuses_unique_tmp_symlink_into_shop(tmp_path, monkey
 
     monkeypatch.setattr(os, "getpid", lambda: 4242)
     monkeypatch.setattr(os, "urandom", lambda n: b"\xab" * n)
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -795,7 +795,7 @@ def test_persist_pending_lifecycle_does_not_plant_pid_sidecar_symlink(
     from minni.afm_writer import _persist_pending_lifecycle
 
     monkeypatch.setattr(os, "getpid", lambda: 4242)
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -873,7 +873,7 @@ def test_persist_exception_restart_hydrate_refuses_wet_enqueue(
     """Persist Exception with a missing sidecar must not hydrate-empty into a remint."""
     import minni.afm_writer as afm_writer
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / "inbox").mkdir()
 
@@ -906,7 +906,7 @@ def test_persist_fail_sibling_sidecar_restart_refuses_wet_enqueue(
 
     import minni.afm_writer as afm_writer
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     inbox = vault / "inbox"
     inbox.mkdir()
@@ -993,7 +993,7 @@ def test_read_pending_lifecycle_file_raises_on_torn_sidecar(tmp_path):
     """Parse/IO errors are not empty — empty would let RMW wipe sibling passes."""
     from minni.afm_writer import _read_pending_lifecycle_file
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     _torn_pending_sidecar(vault)
     with pytest.raises(OSError, match="unreadable pending-lifecycle"):
@@ -1004,7 +1004,7 @@ def test_clear_pending_lifecycle_keeps_torn_sidecar(tmp_path):
     """Unreadable sidecar must not be treated as “no other passes” and unlinked."""
     from minni.afm_writer import _clear_persisted_pending_lifecycle
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     path = _torn_pending_sidecar(vault)
     _clear_persisted_pending_lifecycle("consolidation", str(vault))
@@ -1016,7 +1016,7 @@ def test_persist_pending_lifecycle_does_not_replace_torn_sidecar(tmp_path):
     """RMW must not rewrite a torn sidecar as only the current pass."""
     from minni.afm_writer import _persist_pending_lifecycle
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     path = _torn_pending_sidecar(vault)
     _persist_pending_lifecycle("consolidation", _pending_lifecycle(), str(vault))
@@ -1031,7 +1031,7 @@ def test_hydrate_pending_lifecycle_from_torn_sidecar_is_noop(tmp_path):
     )
 
     reset_pass_counters()
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     path = _torn_pending_sidecar(vault)
     assert _hydrate_pending_lifecycle_from_vault(str(vault)) is False
@@ -1051,7 +1051,7 @@ def test_submit_drafts_refuses_wet_enqueue_on_torn_pending_sidecar(
     monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
     monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     path = _torn_pending_sidecar(vault)
     put_calls = []
@@ -1085,7 +1085,7 @@ def test_writer_status_torn_sticky_is_not_ok(tmp_path, monkeypatch):
 
     afm_writer.reset_pass_counters()
     monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     path = _torn_pending_sidecar(vault)
     state = afm_writer.writer_status(
@@ -1107,7 +1107,7 @@ def test_afm_write_batch_does_not_wipe_runs_on_truncated_inbox(tmp_path):
 
     from minni.afm_writer import _write_batch
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     job = {"vault_path": str(vault), "pass_name": "probe", "drafts": []}
     first = _write_batch(job)
@@ -1127,7 +1127,7 @@ def test_afm_write_batch_does_not_wipe_runs_on_truncated_inbox(tmp_path):
 def test_afm_write_batch_does_not_wipe_runs_on_non_object_inbox(tmp_path):
     from minni.afm_writer import _write_batch
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     job = {"vault_path": str(vault), "pass_name": "probe", "drafts": []}
     first = _write_batch(job)
@@ -1144,7 +1144,7 @@ def test_afm_write_batch_does_not_mint_wiki_when_inbox_torn(tmp_path):
 
     from minni.afm_writer import _write_batch
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     first_draft = _afm_draft(section="concepts")
     first = _write_batch(
@@ -1188,7 +1188,7 @@ def test_afm_write_batch_inbox_commit_fail_does_not_dual_mint_wiki(
     """
     from minni import afm_writer
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     orig = afm_writer._atomic_write_text
 
@@ -1247,7 +1247,7 @@ def test_compile_handoff_page_refuses_dest_symlink_into_shop(tmp_path):
         compile_handoff_page,
     )
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -1258,7 +1258,7 @@ def test_compile_handoff_page_refuses_dest_symlink_into_shop(tmp_path):
     packet = {
         "kind": "handoff",
         "task": "task",
-        "from_agent": "hermes",
+        "from_agent": "peer",
         "to_agent": "grok",
         "trace_id": "trace-1",
         "lease_id": "handoff-lease1",
@@ -1279,13 +1279,13 @@ def test_compile_handoff_page_keeps_same_day_packets(tmp_path):
     """Date+slug alone would atomically replace the first same-day handoff."""
     from minni.minnid_runtime.handoff import compile_handoff_page
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     (vault / "wiki" / "handoffs").mkdir(parents=True)
     stamp = "20260901T000000Z"
     first = {
         "kind": "handoff",
         "task": "task",
-        "from_agent": "hermes",
+        "from_agent": "peer",
         "to_agent": "grok",
         "trace_id": "trace-aaa",
         "lease_id": "handoff-lease-aaa",
@@ -1314,13 +1314,13 @@ def test_compile_handoff_page_lease_id_case_collision(tmp_path):
     """slugify lowercases; handoff-AAA and handoff-aaa must not share a page."""
     from minni.minnid_runtime.handoff import compile_handoff_page
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     (vault / "wiki" / "handoffs").mkdir(parents=True)
     stamp = "20260901T000000Z"
     upper = {
         "kind": "handoff",
         "task": "task",
-        "from_agent": "hermes",
+        "from_agent": "peer",
         "to_agent": "grok",
         "trace_id": "trace-upper",
         "lease_id": "handoff-AAA",
@@ -1389,7 +1389,7 @@ def test_pruning_write_inbox_does_not_wipe_runs_on_truncated_inbox(tmp_path):
 
     from minni.afm_passes.pruning import _write_inbox
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     first = _write_inbox(str(vault), "trace-prune-1", [_pruning_proposal("trace-prune-1")])
     inbox = vault / first["path"]
@@ -1425,7 +1425,7 @@ def test_pruning_append_audit_does_not_truncate_when_exists_lies(
     """exists()+write_text after a peer stamp must not wipe log.md."""
     from minni.afm_passes.pruning import _append_audit
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     (vault / "log.md").write_text(_PLUGIN_LOG, encoding="utf-8")
     orig_exists = Path.exists
@@ -1448,7 +1448,7 @@ def test_pruning_append_audit_does_not_clobber_append_after_exclusive_create(
     """O_EXCL seed must not write the header at offset 0 after a raced stamp."""
     from minni.afm_passes.pruning import _append_audit
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     vault.mkdir()
     orig_os_open = os.open
 
@@ -1508,7 +1508,7 @@ def test_afm_append_audit_does_not_follow_raced_log_md_symlink_into_shop(
 ):
     from minni.afm_writer import _append_audit
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -1526,7 +1526,7 @@ def test_handoff_append_audit_does_not_follow_raced_log_md_symlink_into_shop(
 ):
     from minni.minnid_runtime.handoff import append_handoff_audit
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -1554,7 +1554,7 @@ def test_pruning_append_audit_does_not_follow_raced_log_md_symlink_into_shop(
 ):
     from minni.afm_passes.pruning import _append_audit
 
-    vault = tmp_path / "hermes-vault"
+    vault = tmp_path / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir()
     shop.mkdir()
@@ -1607,7 +1607,7 @@ def test_wire_bootstrap_vault_refuses_schema_agents_symlink_into_shop(
     from minni.wire.writers import bootstrap_vault
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    vault = tmp_path / ".minni" / "hermes-vault"
+    vault = tmp_path / ".minni" / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir(parents=True)
     shop.mkdir()
@@ -1615,7 +1615,7 @@ def test_wire_bootstrap_vault_refuses_schema_agents_symlink_into_shop(
     (vault / "schema").mkdir()
     (vault / "schema" / "AGENTS.md").symlink_to(shop / "keep.md")
     with pytest.raises(OSError):
-        bootstrap_vault("hermes")
+        bootstrap_vault("peer")
     assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
     assert list(shop.iterdir()) == [shop / "keep.md"]
 
@@ -1626,14 +1626,14 @@ def test_wire_bootstrap_vault_refuses_schema_dir_symlink_into_shop(
     from minni.wire.writers import bootstrap_vault
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    vault = tmp_path / ".minni" / "hermes-vault"
+    vault = tmp_path / ".minni" / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir(parents=True)
     shop.mkdir()
     (shop / "keep.md").write_text("restore\n", encoding="utf-8")
     (vault / "schema").symlink_to(shop)
     with pytest.raises(OSError):
-        bootstrap_vault("hermes")
+        bootstrap_vault("peer")
     assert not (shop / "AGENTS.md").exists()
     assert (shop / "keep.md").read_text(encoding="utf-8") == "restore\n"
 
@@ -1644,14 +1644,14 @@ def test_wire_bootstrap_vault_refuses_symlink_wiki_into_shop_restore(
     from minni.wire.writers import bootstrap_vault
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    vault = tmp_path / ".minni" / "hermes-vault"
+    vault = tmp_path / ".minni" / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir(parents=True)
     shop.mkdir()
     (shop / "keep.md").write_text("restore\n", encoding="utf-8")
     (vault / "wiki").symlink_to(shop)
     with pytest.raises(OSError):
-        bootstrap_vault("hermes")
+        bootstrap_vault("peer")
     _assert_shop_identity_unplanted(shop)
 
 
@@ -1661,12 +1661,12 @@ def test_wire_bootstrap_vault_refuses_symlink_inbox_into_shop_restore(
     from minni.wire.writers import bootstrap_vault
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    vault = tmp_path / ".minni" / "hermes-vault"
+    vault = tmp_path / ".minni" / "peer-vault"
     shop = tmp_path / "shop-restore"
     vault.mkdir(parents=True)
     shop.mkdir()
     (shop / "keep.md").write_text("restore\n", encoding="utf-8")
     (vault / "inbox").symlink_to(shop)
     with pytest.raises(OSError):
-        bootstrap_vault("hermes")
+        bootstrap_vault("peer")
     assert list(shop.iterdir()) == [shop / "keep.md"]

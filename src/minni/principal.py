@@ -30,7 +30,7 @@ EffectivePrincipal object and G12+ read-policy / candidate pipeline are out of s
 See CANONICAL_PRINCIPAL_NAMES for the authoritative file-name list.
 
 Fields (per spec):
-    agent_id: str                 — canonical stamped identity ("main", "hermes", ...)
+    agent_id: str                 — canonical stamped identity ("main", "codex", ...)
     workspace_id: str             — scoping domain (default "default")
     session_id: Optional[str]     — per-session nonce for correlation
     transport: str                — "uds" | "stdio" | "http" | ...
@@ -273,7 +273,7 @@ def _seed_own_vault(principal: EffectivePrincipal) -> None:
 
     ``allowed_vault_roots`` is a read ACL. Seed the live path
     ``MINNI_HOME / vault_dirname_for(agent_id)``, never the first ACL
-    entry whose basename matches (a backup also named hermes-vault, or a
+    entry whose basename matches (a backup also named codex-vault, or a
     missing first hit that would skip a later live dir).
     Do not seed when the ACL uniquely forbade the store (sentinel /
     empty platform_agent_vault_roots). ``ensure_agent_vault`` already
