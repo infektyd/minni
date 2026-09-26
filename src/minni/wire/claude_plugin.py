@@ -897,9 +897,12 @@ def adopt_claude_code(
     manifest_path = install_root / "payload-manifest.json"
     if manifest_path.is_file():
         try:
-            git_sha = str(json.loads(manifest_path.read_text(encoding="utf-8")).get("git_sha") or "")
+            payload_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ClaudePluginError(f"cannot read {manifest_path}: {exc}") from exc
+        if not isinstance(payload_manifest, dict):
+            raise ClaudePluginError(f"{manifest_path} is not a JSON object")
+        git_sha = str(payload_manifest.get("git_sha") or "")
 
     dry_run = not apply
     # The cache scan must see the configs as they will be *after* the steps

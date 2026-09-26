@@ -1206,6 +1206,16 @@ def test_adopt_refuses_a_non_utf8_payload_manifest(home):
         adopt_claude_code()
 
 
+def test_adopt_refuses_a_non_object_payload_manifest(home):
+    """Valid JSON that is not an object must refuse, not AttributeError."""
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    (root / "payload-manifest.json").write_text("[1, 2]", encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="not a JSON object"):
+        adopt_claude_code()
+
+
 def test_marketplace_writes_through_a_symlinked_settings(home, tmp_path):
     root = _install_tree(home, "0.4.0")
     target = home / "dotfiles" / "settings.json"
