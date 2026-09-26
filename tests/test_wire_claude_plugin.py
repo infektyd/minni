@@ -7,6 +7,7 @@ refuses to delete a tree anything still points into.
 
 from __future__ import annotations
 
+import errno
 import json
 import unicodedata
 from pathlib import Path
@@ -81,6 +82,10 @@ def _write_wired(home: Path, install_root: Path, version: str) -> None:
 
 def _registry(home: Path) -> dict:
     return json.loads(installed_plugins_path().read_text(encoding="utf-8"))
+
+
+def _raise_enospc(path, data):
+    raise OSError(errno.ENOSPC, "No space left on device")
 
 
 # --- registration -----------------------------------------------------------
@@ -169,6 +174,15 @@ def test_register_dry_run_writes_nothing(home):
     assert not installed_plugins_path().exists()
 
 
+def test_register_write_failure_is_a_claude_plugin_error(home, monkeypatch):
+    """Callers catch only ClaudePluginError; a raw OSError is a traceback."""
+    root = _install_tree(home, "0.4.0")
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", _raise_enospc)
+
+    with pytest.raises(ClaudePluginError, match="cannot update"):
+        register_claude_plugin(root, "0.4.0")
+
+
 # --- GC reference tracking --------------------------------------------------
 
 
@@ -216,6 +230,16 @@ def test_retire_marketplace_is_idempotent(home):
     path.write_text(json.dumps({"other": {}}), encoding="utf-8")
 
     assert retire_claude_marketplace()["changed"] is False
+
+
+def test_retire_marketplace_write_failure_is_a_claude_plugin_error(home, monkeypatch):
+    path = known_marketplaces_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"minni": {"installLocation": "/stale"}}), encoding="utf-8")
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", _raise_enospc)
+
+    with pytest.raises(ClaudePluginError, match="cannot update"):
+        retire_claude_marketplace()
 
 
 def _legacy_server(version: str = "0.3.0") -> str:
@@ -369,6 +393,15 @@ def test_repoint_desktop_refuses_a_command_inside_the_cache(home):
     root = _install_tree(home, "0.4.0")
 
     with pytest.raises(ClaudePluginError, match="points into"):
+        repoint_claude_desktop(root)
+
+
+def test_repoint_desktop_write_failure_is_a_claude_plugin_error(home, monkeypatch):
+    _write_desktop(home, {"command": "node", "args": [_legacy_server()]})
+    root = _install_tree(home, "0.4.0")
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", _raise_enospc)
+
+    with pytest.raises(ClaudePluginError, match="cannot update"):
         repoint_claude_desktop(root)
 
 

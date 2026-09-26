@@ -217,7 +217,10 @@ def register_claude_plugin(
     doc["plugins"] = plugins
 
     if not dry_run:
-        _atomic_write_json(path, doc)
+        try:
+            _atomic_write_json(path, doc)
+        except OSError as exc:
+            raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     if pending is not None:
         pending[str(path)] = doc
 
@@ -514,7 +517,10 @@ def retire_claude_marketplace(*, dry_run: bool = False) -> dict[str, object]:
     if isinstance(removed, dict):
         source = str(removed.get("installLocation") or removed.get("source", ""))
     if not dry_run:
-        _atomic_write_json(path, doc)
+        try:
+            _atomic_write_json(path, doc)
+        except OSError as exc:
+            raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     return {"path": str(path), "changed": True, "removed_source": source}
 
 
@@ -623,7 +629,10 @@ def _move_desktop_arg(
     servers["minni"] = entry
     doc["mcpServers"] = servers
     if not dry_run:
-        _atomic_write_json(path, doc)
+        try:
+            _atomic_write_json(path, doc)
+        except OSError as exc:
+            raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     if pending is not None:
         pending[str(path)] = doc
     return {
