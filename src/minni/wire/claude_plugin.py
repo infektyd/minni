@@ -1,11 +1,18 @@
 """Claude Code plugin-surface registration against the wire-managed tree.
 
 Claude Code loads a plugin's hooks, skills and commands from the `installPath`
-recorded in ~/.claude/plugins/installed_plugins.json. Nothing else is consulted:
-the `@marketplace` suffix in the `minni@minni` key is a namespacing convention,
-and the marketplace source matters only during an install/update flow. So wire
-can serve the whole plugin surface from ~/.minni/plugin/<version> — the tree it
-already installs, hashes and verifies — by owning that one registration.
+recorded in ~/.claude/plugins/installed_plugins.json. So wire can serve the
+whole plugin surface from ~/.minni/plugin/<version> — the tree it already
+installs, hashes and verifies — by owning that registration.
+
+The `@minni` marketplace in the `minni@minni` key is not free, though. Since
+Claude Code 2.1.282 a plugin whose marketplace cannot be resolved fails to load
+("Marketplace minni not found"), whatever its installPath says. Wire therefore
+also keeps a small local directory marketplace at
+~/.claude/local-marketplaces/minni (a marketplace.json plus a *copy* of the
+current payload) and points settings.json `extraKnownMarketplaces.minni` at it.
+installPath still names the wire tree; the stub exists only so the marketplace
+lookup succeeds.
 
 The path recorded is the *versioned* install root, never ~/.minni/plugin/current:
 `current` is a deliberately release-only pointer (see the gate in install.py and
@@ -19,6 +26,7 @@ See docs/design/DESIGN-wire-claude-plugin-adoption.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -28,7 +36,7 @@ import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minni.wire.paths import plugin_base, user_home
+from minni.wire.paths import is_safe_version_segment, plugin_base, user_home
 from minni.wire.wired import wired_record
 
 PLUGIN_KEY = "minni@minni"
@@ -46,6 +54,15 @@ def installed_plugins_path() -> Path:
 
 def known_marketplaces_path() -> Path:
     return user_home() / ".claude" / "plugins" / "known_marketplaces.json"
+
+
+def claude_settings_path() -> Path:
+    return user_home() / ".claude" / "settings.json"
+
+
+def local_marketplace_root() -> Path:
+    """The stub directory marketplace wire owns: ~/.claude/local-marketplaces/minni."""
+    return user_home() / ".claude" / "local-marketplaces" / MARKETPLACE_NAME
 
 
 def legacy_cache_root() -> Path:
@@ -66,21 +83,27 @@ def _now_iso_ms() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
-def _load_json_doc(path: Path, default: dict) -> dict:
-    """Read a live Claude config, or `default` when it is absent or empty.
+def _load_json_doc_with_bytes(path: Path, default: dict) -> tuple[dict, bytes | None]:
+    """Read a live Claude config and return the bytes it was parsed from.
 
     A corrupt file raises. These documents hold other plugins' registrations and
     other MCP servers; recovering our own entry by overwriting theirs is not a
     trade this code gets to make on the user's behalf.
     """
     if not path.exists():
-        return dict(default)
+        return dict(default), None
     try:
-        text = path.read_text(encoding="utf-8")
+        original = path.read_bytes()
     except OSError as exc:
         raise ClaudePluginError(f"cannot read {path}: {exc}") from exc
+    try:
+        text = original.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ClaudePluginError(
+            f"{path} is not valid UTF-8 ({exc}); refusing to overwrite it",
+        ) from exc
     if not text.strip():
-        return dict(default)
+        return dict(default), original
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -89,7 +112,12 @@ def _load_json_doc(path: Path, default: dict) -> dict:
         ) from exc
     if not isinstance(data, dict):
         raise ClaudePluginError(f"{path} is not a JSON object; refusing to overwrite it")
-    return data
+    return data, original
+
+
+def _load_json_doc(path: Path, default: dict) -> dict:
+    """Read a live Claude config, or `default` when it is absent or empty."""
+    return _load_json_doc_with_bytes(path, default)[0]
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -189,7 +217,10 @@ def register_claude_plugin(
     doc["plugins"] = plugins
 
     if not dry_run:
-        _atomic_write_json(path, doc)
+        try:
+            _atomic_write_json(path, doc)
+        except OSError as exc:
+            raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     if pending is not None:
         pending[str(path)] = doc
 
@@ -202,12 +233,276 @@ def register_claude_plugin(
     }
 
 
-def retire_claude_marketplace(*, dry_run: bool = False) -> dict[str, object]:
-    """Drop the `minni` marketplace entry from known_marketplaces.json.
+_STUB_PAYLOAD_PREFIX = f"{MARKETPLACE_NAME}-"
+_STUB_TMP_PREFIX = f".{MARKETPLACE_NAME}-staging-"
 
-    Wire needs no marketplace to register a plugin, and leaving one behind keeps
-    `/plugin update` armed to re-copy whatever directory it points at over the
-    tree wire manages.
+
+def _tree_digest(root: Path) -> str:
+    """Content digest of a payload tree: relative paths plus file bytes.
+
+    Symlinks are followed, matching what the copy below materialises, so a copy
+    and its source compare equal exactly when the copy is current.
+    """
+    digest = hashlib.sha256()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = Path(dirpath) / name
+            rel = full.relative_to(root).as_posix()
+            digest.update(rel.encode("utf-8") + b"\0")
+            try:
+                digest.update(full.read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _checked_stub_root() -> Path:
+    """The stub marketplace root, refusing layouts wire must not write through."""
+    stub = local_marketplace_root()
+    expected_parent = user_home() / ".claude" / "local-marketplaces"
+    for p in (expected_parent, stub, stub / "plugins", stub / ".claude-plugin"):
+        if p.is_symlink():
+            raise ClaudePluginError(f"{p} is a symlink; refusing to write through it")
+        if p.exists() and not p.is_dir():
+            raise ClaudePluginError(f"{p} exists and is not a directory")
+    return stub
+
+
+def sync_local_marketplace(
+    install_root: Path, version: str, *, dry_run: bool = False,
+) -> dict[str, object]:
+    """Create or refresh the stub marketplace for `version`. Idempotent.
+
+    Layout, relative to ~/.claude/local-marketplaces/minni:
+
+    * `.claude-plugin/marketplace.json` naming one plugin, `minni`, at
+      `./plugins/minni-<version>`;
+    * `plugins/minni-<version>/`, a real copy of `install_root` (never a
+      symlink: the marketplace must not reach into a tree GC may prune);
+    * no other `minni-*` payload copies — older ones are pruned.
+
+    A copy already matching `install_root` byte for byte is left alone, and
+    marketplace.json is rewritten only when its content changes, so a re-run
+    for an unchanged version writes nothing.
+    """
+    if not is_safe_version_segment(version):
+        raise ClaudePluginError(f"unsafe plugin version for a directory name: {version!r}")
+    # A dry-run wire has not installed the payload yet; report the copy it
+    # would make rather than refusing over a tree that only the apply creates.
+    if not install_root.is_dir() and not dry_run:
+        raise ClaudePluginError(f"wired install root does not exist: {install_root}")
+    stub = _checked_stub_root()
+    plugins_dir = stub / "plugins"
+    payload_name = f"{_STUB_PAYLOAD_PREFIX}{version}"
+    target = plugins_dir / payload_name
+    manifest_path = stub / ".claude-plugin" / "marketplace.json"
+    manifest = {
+        "name": MARKETPLACE_NAME,
+        "owner": {"name": "Minni"},
+        "plugins": [{
+            "name": MARKETPLACE_NAME,
+            "version": version,
+            "source": f"./plugins/{payload_name}",
+        }],
+    }
+
+    if target.is_symlink():
+        raise ClaudePluginError(f"{target} is a symlink; refusing to replace it")
+    copy_current = (
+        install_root.is_dir()
+        and target.is_dir()
+        and _tree_digest(target) == _tree_digest(install_root)
+    )
+
+    manifest_current = False
+    try:
+        if manifest_path.is_file():
+            try:
+                manifest_current = (
+                    json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                manifest_current = False
+        stale = sorted(
+            p for p in plugins_dir.iterdir()
+            if p.name != payload_name
+            and (p.name.startswith(_STUB_PAYLOAD_PREFIX) or p.name.startswith(_STUB_TMP_PREFIX))
+        ) if plugins_dir.is_dir() else []
+    except OSError as exc:
+        raise ClaudePluginError(f"cannot inspect local marketplace {stub}: {exc}") from exc
+
+    result: dict[str, object] = {
+        "path": str(stub),
+        "payload": str(target),
+        "copied": not copy_current,
+        "manifest_written": not manifest_current,
+        "pruned": [str(p) for p in stale],
+    }
+    result["changed"] = bool(result["copied"] or result["manifest_written"] or stale)
+    if dry_run or not result["changed"]:
+        return result
+
+    try:
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        if not copy_current:
+            staging = Path(tempfile.mkdtemp(prefix=_STUB_TMP_PREFIX, dir=str(plugins_dir)))
+            try:
+                staged = staging / payload_name
+                shutil.copytree(
+                    install_root, staged, symlinks=False, ignore_dangling_symlinks=True,
+                )
+                if target.exists():
+                    shutil.rmtree(target)
+                os.replace(staged, target)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+        if not manifest_current:
+            _atomic_write_json(manifest_path, manifest)
+        for old in stale:
+            if old.is_symlink() or old.is_file():
+                old.unlink()
+            else:
+                shutil.rmtree(old)
+    except OSError as exc:
+        raise ClaudePluginError(f"cannot refresh local marketplace {stub}: {exc}") from exc
+    return result
+
+
+def _write_with_backup(path: Path, doc: dict, original: bytes | None) -> str | None:
+    """Back up the current bytes beside `path`, then replace it atomically.
+
+    Same convention as the custom MCP refresh: a `<name>.minni-backup-*` file
+    in the same directory, written only when an existing file is about to
+    change.
+    """
+    backup_name = None
+    try:
+        if original is not None:
+            fd, backup_name = tempfile.mkstemp(prefix=path.name + ".minni-backup-", dir=str(path.parent))
+            with os.fdopen(fd, "wb") as backup:
+                backup.write(original)
+            os.chmod(backup_name, path.stat().st_mode & 0o777)
+        if path.exists() != (original is not None) or (
+            original is not None and path.read_bytes() != original
+        ):
+            raise ClaudePluginError(f"{path} changed while it was being updated; refusing to overwrite it")
+        _atomic_write_json(path, doc)
+    except (OSError, ClaudePluginError):
+        # The file was not updated; a backup of its live bytes is litter, not
+        # recovery material. Never strand one on a failed write.
+        if backup_name is not None:
+            Path(backup_name).unlink(missing_ok=True)
+        raise
+    return backup_name
+
+
+def point_settings_at_local_marketplace(
+    *, dry_run: bool = False, pending: dict[str, dict] | None = None,
+) -> dict[str, object]:
+    """Set settings.json `extraKnownMarketplaces.minni` to the stub marketplace.
+
+    Any other value — a deleted worktree, a stale directory, a GitHub source —
+    is replaced. Every other settings key, every other marketplace, and any
+    extra fields on the minni entry itself are preserved. Idempotent: an entry
+    already naming the stub is not rewritten.
+    """
+    path = claude_settings_path()
+    # pending[] is looked up by the paths legacy_scan_paths() enumerates --
+    # the symlink itself, not its target. Keying the override on the resolved
+    # path would leave a dry run scanning the stale on-disk doc that --apply
+    # rewrote before the scan, and the two runs would disagree.
+    pending_key = str(path)
+    # settings.json is a common dotfiles symlink; an atomic rename would swap
+    # the link for a regular file and leave the user's real copy stale.
+    if path.is_symlink():
+        # strict: a loop or dangling link must raise, not resolve to itself and
+        # get replaced. Write through only to a regular file inside $HOME, the
+        # same boundary the stub marketplace enforces.
+        try:
+            target = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ClaudePluginError(f"{path} is an unresolvable symlink: {exc}") from exc
+        if not target.is_file():
+            raise ClaudePluginError(f"{path} links to {target}, which is not a regular file")
+        if not target.is_relative_to(user_home().resolve()):
+            raise ClaudePluginError(
+                f"{path} links outside the home directory ({target}); refusing to write through it"
+            )
+        path = target
+    doc, original = _load_json_doc_with_bytes(path, {})
+    extra = doc.get("extraKnownMarketplaces")
+    if extra is not None and not isinstance(extra, dict):
+        raise ClaudePluginError(f"{path}: 'extraKnownMarketplaces' is not an object")
+    extra = dict(extra or {})
+    current = extra.get(MARKETPLACE_NAME)
+    if current is not None and not isinstance(current, dict):
+        raise ClaudePluginError(
+            f"{path}: extraKnownMarketplaces['{MARKETPLACE_NAME}'] is not an object",
+        )
+    desired = {"source": "directory", "path": str(local_marketplace_root())}
+    previous = current.get("source") if isinstance(current, dict) else None
+
+    if previous == desired:
+        if pending is not None:
+            pending[pending_key] = doc
+        return {"path": str(path), "changed": False, "source": desired}
+
+    entry = dict(current) if isinstance(current, dict) else {}
+    entry["source"] = desired
+    extra[MARKETPLACE_NAME] = entry
+    doc["extraKnownMarketplaces"] = extra
+
+    backup = None
+    if not dry_run:
+        try:
+            backup = _write_with_backup(path, doc, original)
+        except OSError as exc:
+            raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
+    if pending is not None:
+        pending[pending_key] = doc
+    return {
+        "path": str(path),
+        "changed": True,
+        "source": desired,
+        "previous_source": previous,
+        "backup": backup,
+    }
+
+
+def ensure_claude_marketplace(
+    install_root: Path,
+    version: str,
+    *,
+    dry_run: bool = False,
+    pending: dict[str, dict] | None = None,
+) -> dict[str, object]:
+    """Make the `@minni` marketplace resolvable for the current wired version.
+
+    The stub is refreshed first, so settings never name a directory that does
+    not hold a valid marketplace. Wire does not run `claude plugin
+    install/update`: installPath stays the wire tree via register_claude_plugin.
+    """
+    return {
+        "local_marketplace": sync_local_marketplace(install_root, version, dry_run=dry_run),
+        "settings": point_settings_at_local_marketplace(dry_run=dry_run, pending=pending),
+    }
+
+
+def _names_local_marketplace(entry: object) -> bool:
+    """True when a known_marketplaces entry resolves to the stub marketplace."""
+    stub = local_marketplace_root()
+    return any(_is_under(value, stub) for _trail, value in _iter_json_strings(entry))
+
+
+def retire_claude_marketplace(*, dry_run: bool = False) -> dict[str, object]:
+    """Drop a stale `minni` marketplace entry from known_marketplaces.json.
+
+    A leftover entry pointing at a worktree or cache keeps `/plugin update`
+    armed to re-copy that directory over the tree wire manages. An entry that
+    Claude Code recorded for the wire-owned stub marketplace is kept: it is the
+    marketplace the plugin key now resolves through.
     """
     path = known_marketplaces_path()
     if not path.exists():
@@ -215,12 +510,17 @@ def retire_claude_marketplace(*, dry_run: bool = False) -> dict[str, object]:
     doc = _load_json_doc(path, {})
     if MARKETPLACE_NAME not in doc:
         return {"path": str(path), "changed": False, "reason": "no minni marketplace entry"}
+    if _names_local_marketplace(doc[MARKETPLACE_NAME]):
+        return {"path": str(path), "changed": False, "reason": "entry is the local stub marketplace"}
     removed = doc.pop(MARKETPLACE_NAME)
     source = ""
     if isinstance(removed, dict):
         source = str(removed.get("installLocation") or removed.get("source", ""))
     if not dry_run:
-        _atomic_write_json(path, doc)
+        try:
+            _atomic_write_json(path, doc)
+        except OSError as exc:
+            raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     return {"path": str(path), "changed": True, "removed_source": source}
 
 
@@ -329,7 +629,10 @@ def _move_desktop_arg(
     servers["minni"] = entry
     doc["mcpServers"] = servers
     if not dry_run:
-        _atomic_write_json(path, doc)
+        try:
+            _atomic_write_json(path, doc)
+        except OSError as exc:
+            raise ClaudePluginError(f"cannot update {path}: {exc}") from exc
     if pending is not None:
         pending[str(path)] = doc
     return {
@@ -350,7 +653,11 @@ def claude_adopt_pending() -> bool:
     except ClaudePluginError:
         # Unreadable is not "clean"; surfacing the nudge is the safe direction.
         return True
-    return MARKETPLACE_NAME in marketplaces or (legacy_cache_root() / MARKETPLACE_NAME).is_dir()
+    stale_entry = (
+        MARKETPLACE_NAME in marketplaces
+        and not _names_local_marketplace(marketplaces[MARKETPLACE_NAME])
+    )
+    return stale_entry or (legacy_cache_root() / MARKETPLACE_NAME).is_dir()
 
 
 def legacy_scan_paths() -> list[Path]:
@@ -590,9 +897,12 @@ def adopt_claude_code(
     manifest_path = install_root / "payload-manifest.json"
     if manifest_path.is_file():
         try:
-            git_sha = str(json.loads(manifest_path.read_text(encoding="utf-8")).get("git_sha") or "")
-        except (OSError, json.JSONDecodeError) as exc:
+            payload_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ClaudePluginError(f"cannot read {manifest_path}: {exc}") from exc
+        if not isinstance(payload_manifest, dict):
+            raise ClaudePluginError(f"{manifest_path} is not a JSON object")
+        git_sha = str(payload_manifest.get("git_sha") or "")
 
     dry_run = not apply
     # The cache scan must see the configs as they will be *after* the steps
@@ -602,6 +912,9 @@ def adopt_claude_code(
     steps: dict[str, object] = {
         "register": register_claude_plugin(
             install_root, version, git_sha=git_sha, dry_run=dry_run, pending=overrides,
+        ),
+        "local_marketplace": ensure_claude_marketplace(
+            install_root, version, dry_run=dry_run, pending=overrides,
         ),
         "claude_desktop": repoint_claude_desktop(
             install_root, dry_run=dry_run, pending=overrides,

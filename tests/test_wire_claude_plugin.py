@@ -7,16 +7,21 @@ refuses to delete a tree anything still points into.
 
 from __future__ import annotations
 
+import errno
 import json
 import unicodedata
 from pathlib import Path
 
 import pytest
 
+from minni.wire import claude_plugin
 from minni.wire.claude_plugin import (
     ClaudePluginError,
     adopt_claude_code,
     claude_adopt_pending,
+    claude_settings_path,
+    ensure_claude_marketplace,
+    local_marketplace_root,
     follow_claude_desktop,
     installed_plugins_path,
     known_marketplaces_path,
@@ -77,6 +82,10 @@ def _write_wired(home: Path, install_root: Path, version: str) -> None:
 
 def _registry(home: Path) -> dict:
     return json.loads(installed_plugins_path().read_text(encoding="utf-8"))
+
+
+def _raise_enospc(path, data):
+    raise OSError(errno.ENOSPC, "No space left on device")
 
 
 # --- registration -----------------------------------------------------------
@@ -165,6 +174,15 @@ def test_register_dry_run_writes_nothing(home):
     assert not installed_plugins_path().exists()
 
 
+def test_register_write_failure_is_a_claude_plugin_error(home, monkeypatch):
+    """Callers catch only ClaudePluginError; a raw OSError is a traceback."""
+    root = _install_tree(home, "0.4.0")
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", _raise_enospc)
+
+    with pytest.raises(ClaudePluginError, match="cannot update"):
+        register_claude_plugin(root, "0.4.0")
+
+
 # --- GC reference tracking --------------------------------------------------
 
 
@@ -212,6 +230,16 @@ def test_retire_marketplace_is_idempotent(home):
     path.write_text(json.dumps({"other": {}}), encoding="utf-8")
 
     assert retire_claude_marketplace()["changed"] is False
+
+
+def test_retire_marketplace_write_failure_is_a_claude_plugin_error(home, monkeypatch):
+    path = known_marketplaces_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"minni": {"installLocation": "/stale"}}), encoding="utf-8")
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", _raise_enospc)
+
+    with pytest.raises(ClaudePluginError, match="cannot update"):
+        retire_claude_marketplace()
 
 
 def _legacy_server(version: str = "0.3.0") -> str:
@@ -365,6 +393,15 @@ def test_repoint_desktop_refuses_a_command_inside_the_cache(home):
     root = _install_tree(home, "0.4.0")
 
     with pytest.raises(ClaudePluginError, match="points into"):
+        repoint_claude_desktop(root)
+
+
+def test_repoint_desktop_write_failure_is_a_claude_plugin_error(home, monkeypatch):
+    _write_desktop(home, {"command": "node", "args": [_legacy_server()]})
+    root = _install_tree(home, "0.4.0")
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", _raise_enospc)
+
+    with pytest.raises(ClaudePluginError, match="cannot update"):
         repoint_claude_desktop(root)
 
 
@@ -705,6 +742,9 @@ def test_adopt_dry_run_writes_nothing(home):
     assert result["steps"]["register"]["changed"] is True
     assert not installed_plugins_path().exists()
     assert (legacy_cache_root() / "minni" / "0.3.0").is_dir()
+    assert result["steps"]["local_marketplace"]["settings"]["changed"] is True
+    assert not local_marketplace_root().exists()
+    assert not claude_settings_path().exists()
 
 
 def test_adopt_apply_performs_every_step(home):
@@ -768,6 +808,40 @@ def test_adopt_dry_run_tolerates_the_registration_it_will_rewrite(home):
     assert result["steps"]["legacy_cache"]["changed"] is True
     assert (legacy_cache_root() / "minni" / "0.3.0").is_dir()
     assert adopt_claude_code(apply=True)["applied"] is True
+    assert not (legacy_cache_root() / "minni").exists()
+
+
+def test_adopt_dry_run_scans_a_symlinked_settings_as_rewritten(home):
+    """pending[] is keyed on the scanned path, not the resolved target.
+
+    With ~/.claude/settings.json symlinked into dotfiles, keying the override
+    on the resolved target leaves legacy_cache_referrers reading the stale
+    on-disk doc: the dry run refuses "still referenced by" while --apply
+    writes first and proceeds.
+    """
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    target = home / "dotfiles" / "settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({
+        "extraKnownMarketplaces": {
+            "minni": {
+                "source": {"source": "directory", "path": str(legacy_cache_root())},
+            },
+        },
+    }), encoding="utf-8")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.symlink_to(target)
+
+    result = adopt_claude_code()
+
+    assert result["steps"]["legacy_cache"]["changed"] is True
+    assert (legacy_cache_root() / "minni").is_dir()
+    applied = adopt_claude_code(apply=True)
+    assert applied["applied"] is True
+    assert settings.is_symlink()
     assert not (legacy_cache_root() / "minni").exists()
 
 
@@ -841,3 +915,385 @@ def test_dry_run_wired_bookkeeping_writes_nothing(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir()), (
         "dry-run wired bookkeeping wrote into HOME"
     )
+
+
+# --- local stub marketplace (Claude Code >= 2.1.282) ------------------------
+
+
+def _settings(home: Path) -> dict:
+    return json.loads(claude_settings_path().read_text(encoding="utf-8"))
+
+
+def _stub_manifest() -> dict:
+    path = local_marketplace_root() / ".claude-plugin" / "marketplace.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_marketplace_fresh_install_creates_stub_and_settings(home):
+    root = _install_tree(home, "0.4.0")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    stub = local_marketplace_root()
+    assert stub == home / ".claude" / "local-marketplaces" / "minni"
+    assert _stub_manifest() == {
+        "name": "minni",
+        "owner": {"name": "Minni"},
+        "plugins": [{"name": "minni", "version": "0.4.0", "source": "./plugins/minni-0.4.0"}],
+    }
+    payload = stub / "plugins" / "minni-0.4.0"
+    assert payload.is_dir() and not payload.is_symlink()
+    assert (payload / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8") == (
+        root / ".claude-plugin" / "plugin.json"
+    ).read_text(encoding="utf-8")
+    assert _settings(home)["extraKnownMarketplaces"]["minni"]["source"] == {
+        "source": "directory", "path": str(stub),
+    }
+    assert result["settings"]["changed"] is True
+    assert result["settings"]["backup"] is None  # nothing existed to back up
+    # installPath is not the stub's business: registration keeps the wire tree.
+    assert not installed_plugins_path().exists()
+
+
+def test_marketplace_repairs_a_stale_settings_path_and_keeps_other_keys(home):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    original = {
+        "model": "opus",
+        "permissions": {"allow": ["Bash(ls:*)"]},
+        "enabledPlugins": {"minni@minni": True, "other@elsewhere": True},
+        "extraKnownMarketplaces": {
+            "minni": {
+                "source": {"source": "directory", "path": str(home / "deleted" / "worktree")},
+                "autoUpdate": False,
+            },
+            "other": {"source": {"source": "github", "repo": "example/other"}},
+        },
+    }
+    settings.write_text(json.dumps(original), encoding="utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    data = _settings(home)
+    assert data["extraKnownMarketplaces"]["minni"] == {
+        "source": {"source": "directory", "path": str(local_marketplace_root())},
+        "autoUpdate": False,
+    }
+    assert data["extraKnownMarketplaces"]["other"] == original["extraKnownMarketplaces"]["other"]
+    for key in ("model", "permissions", "enabledPlugins"):
+        assert data[key] == original[key]
+    backup = Path(result["settings"]["backup"])
+    assert backup.parent == settings.parent
+    assert backup.name.startswith("settings.json.minni-backup-")
+    assert json.loads(backup.read_text(encoding="utf-8")) == original
+
+
+def test_marketplace_concurrent_settings_edit_leaves_no_backup(home, monkeypatch):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"extraKnownMarketplaces": {"minni": {"source": "old"}}}))
+    concurrent_edit = b'{"operator_edit": true}'
+    original_read_bytes = Path.read_bytes
+    original_write_bytes = Path.write_bytes
+    settings_reads = 0
+
+    def read_bytes(path):
+        nonlocal settings_reads
+        if path == settings:
+            settings_reads += 1
+            if settings_reads == 2:
+                original_write_bytes(path, concurrent_edit)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    with pytest.raises(ClaudePluginError, match="changed while it was being updated"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert settings.read_bytes() == concurrent_edit
+    assert list(settings.parent.glob("settings.json.minni-backup-*")) == []
+
+
+def test_marketplace_settings_edit_after_parse_uses_parsed_bytes_as_baseline(home, monkeypatch):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"extraKnownMarketplaces": {"minni": {"source": "old"}}}))
+    concurrent_edit = b'{"operator_edit": true}'
+    original_read_bytes = Path.read_bytes
+    original_write_bytes = Path.write_bytes
+    replaced_after_parse = False
+
+    def read_bytes(path):
+        nonlocal replaced_after_parse
+        data = original_read_bytes(path)
+        if path == settings and not replaced_after_parse:
+            replaced_after_parse = True
+            original_write_bytes(path, concurrent_edit)
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    with pytest.raises(ClaudePluginError, match="changed while it was being updated"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert replaced_after_parse is True
+    assert original_read_bytes(settings) == concurrent_edit
+    assert list(settings.parent.glob("settings.json.minni-backup-*")) == []
+
+
+def test_marketplace_failed_settings_write_leaves_no_backup(home, monkeypatch):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    original = {"extraKnownMarketplaces": {"minni": {"source": "old"}}}
+    settings.write_text(json.dumps(original), encoding="utf-8")
+    real_write = claude_plugin._atomic_write_json
+
+    def fail_settings_write(path, data):
+        if path == settings:
+            raise OSError("simulated write failure")
+        real_write(path, data)
+
+    monkeypatch.setattr(claude_plugin, "_atomic_write_json", fail_settings_write)
+
+    with pytest.raises(ClaudePluginError):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert json.loads(settings.read_text(encoding="utf-8")) == original
+    assert list(settings.parent.glob("settings.json.minni-backup-*")) == []
+
+
+def test_marketplace_rerun_is_idempotent(home):
+    root = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(root, "0.4.0")
+    settings_before = claude_settings_path().read_bytes()
+    manifest = local_marketplace_root() / ".claude-plugin" / "marketplace.json"
+    manifest_mtime = manifest.stat().st_mtime_ns
+
+    second = ensure_claude_marketplace(root, "0.4.0")
+
+    assert second["local_marketplace"]["changed"] is False
+    assert second["settings"]["changed"] is False
+    assert claude_settings_path().read_bytes() == settings_before
+    assert manifest.stat().st_mtime_ns == manifest_mtime
+    backups = list(claude_settings_path().parent.glob("settings.json.minni-backup-*"))
+    assert backups == []
+
+
+def test_marketplace_new_version_replaces_and_prunes_old_copies(home):
+    old = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(old, "0.4.0")
+    new = _install_tree(home, "0.4.1")
+
+    result = ensure_claude_marketplace(new, "0.4.1")
+
+    plugins = local_marketplace_root() / "plugins"
+    assert sorted(p.name for p in plugins.iterdir()) == ["minni-0.4.1"]
+    assert result["local_marketplace"]["pruned"] == [str(plugins / "minni-0.4.0")]
+    assert _stub_manifest()["plugins"][0]["source"] == "./plugins/minni-0.4.1"
+    # Settings already named the stub; a version bump does not rewrite them.
+    assert result["settings"]["changed"] is False
+
+
+def test_marketplace_refreshes_a_copy_that_drifted_from_the_payload(home):
+    root = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(root, "0.4.0")
+    copy = local_marketplace_root() / "plugins" / "minni-0.4.0" / "dist" / "server.js"
+    copy.write_text("// tampered\n", encoding="utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    assert result["local_marketplace"]["copied"] is True
+    assert copy.read_text(encoding="utf-8") == "// stub\n"
+
+
+def test_marketplace_refreshes_a_copy_when_the_source_tree_drifted(home):
+    root = _install_tree(home, "0.4.0")
+    ensure_claude_marketplace(root, "0.4.0")
+    (root / "dist" / "server.js").write_text("// rebuilt\n", encoding="utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    copy = local_marketplace_root() / "plugins" / "minni-0.4.0" / "dist" / "server.js"
+    assert result["local_marketplace"]["copied"] is True
+    assert copy.read_text(encoding="utf-8") == "// rebuilt\n"
+
+
+def test_marketplace_dry_run_writes_nothing(home):
+    root = _install_tree(home, "0.4.0")
+
+    result = ensure_claude_marketplace(root, "0.4.0", dry_run=True)
+
+    assert result["local_marketplace"]["changed"] is True
+    assert result["settings"]["changed"] is True
+    assert not local_marketplace_root().exists()
+    assert not claude_settings_path().exists()
+
+
+def test_marketplace_scan_of_an_unreadable_plugins_dir_is_a_claude_error(home, monkeypatch):
+    root = _install_tree(home, "0.4.0")
+    plugins_dir = local_marketplace_root() / "plugins"
+    plugins_dir.mkdir(parents=True)
+    real_iterdir = Path.iterdir
+
+    def denied(path):
+        if path == plugins_dir:
+            raise PermissionError(13, "Permission denied")
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", denied)
+
+    with pytest.raises(ClaudePluginError, match="cannot inspect local marketplace"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+
+def test_marketplace_rewrites_a_non_utf8_manifest(home):
+    root = _install_tree(home, "0.4.0")
+    manifest = local_marketplace_root() / ".claude-plugin" / "marketplace.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b"\xff\xfe\x00 not utf-8")
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    assert result["local_marketplace"]["manifest_written"] is True
+    assert _stub_manifest()["plugins"][0]["source"] == "./plugins/minni-0.4.0"
+
+
+def test_marketplace_refuses_a_symlinked_stub(home, tmp_path):
+    root = _install_tree(home, "0.4.0")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    local_marketplace_root().parent.mkdir(parents=True)
+    local_marketplace_root().symlink_to(elsewhere)
+
+    with pytest.raises(ClaudePluginError):
+        ensure_claude_marketplace(root, "0.4.0")
+    assert not any(elsewhere.iterdir())
+
+
+def test_marketplace_refuses_corrupt_settings(home):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError):
+        ensure_claude_marketplace(root, "0.4.0")
+    assert settings.read_text(encoding="utf-8") == "{not json"
+
+
+def test_marketplace_refuses_non_utf8_settings(home):
+    """Invalid UTF-8 is the same refusal as corrupt JSON, not a traceback."""
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_bytes(b'\xff\xfe"broken"')
+
+    with pytest.raises(ClaudePluginError, match="not valid UTF-8"):
+        ensure_claude_marketplace(root, "0.4.0")
+    assert settings.read_bytes() == b'\xff\xfe"broken"'
+
+
+def test_adopt_refuses_a_non_utf8_payload_manifest(home):
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    (root / "payload-manifest.json").write_bytes(b"\xff\xfe not utf-8")
+
+    with pytest.raises(ClaudePluginError, match="cannot read"):
+        adopt_claude_code()
+
+
+def test_adopt_refuses_a_non_object_payload_manifest(home):
+    """Valid JSON that is not an object must refuse, not AttributeError."""
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    (root / "payload-manifest.json").write_text("[1, 2]", encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="not a JSON object"):
+        adopt_claude_code()
+
+
+def test_marketplace_writes_through_a_symlinked_settings(home, tmp_path):
+    root = _install_tree(home, "0.4.0")
+    target = home / "dotfiles" / "settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True)
+    settings.symlink_to(target)
+
+    result = ensure_claude_marketplace(root, "0.4.0")
+
+    assert settings.is_symlink()
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert data["extraKnownMarketplaces"]["minni"]["source"] == {
+        "source": "directory", "path": str(local_marketplace_root()),
+    }
+    assert data["model"] == "opus"
+    backup = Path(result["settings"]["backup"])
+    assert backup.parent == target.parent
+    assert json.loads(backup.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+def test_marketplace_refuses_a_looping_settings_symlink(home):
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True)
+    settings.symlink_to(settings.name)
+
+    with pytest.raises(ClaudePluginError, match="unresolvable symlink"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert settings.is_symlink()
+
+
+def test_marketplace_refuses_a_settings_symlink_outside_home(home, tmp_path):
+    root = _install_tree(home, "0.4.0")
+    outside = tmp_path / "elsewhere" / "settings.json"
+    outside.parent.mkdir(parents=True)
+    outside.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True)
+    settings.symlink_to(outside)
+
+    with pytest.raises(ClaudePluginError, match="outside the home directory"):
+        ensure_claude_marketplace(root, "0.4.0")
+
+    assert settings.is_symlink()
+    assert json.loads(outside.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+def test_stub_marketplace_entry_is_not_retired_or_pending(home):
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    adopt_claude_code(apply=True)
+    # Claude Code records the directory marketplace it resolved.
+    marketplaces = known_marketplaces_path()
+    marketplaces.write_text(json.dumps({
+        "minni": {
+            "source": {"source": "directory", "path": str(local_marketplace_root())},
+            "installLocation": str(local_marketplace_root()),
+        },
+    }), encoding="utf-8")
+
+    assert claude_adopt_pending() is False
+    assert retire_claude_marketplace()["changed"] is False
+    assert "minni" in json.loads(marketplaces.read_text(encoding="utf-8"))
+
+
+def test_adopt_apply_sets_up_the_stub_marketplace(home):
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+
+    result = adopt_claude_code(apply=True)
+
+    step = result["steps"]["local_marketplace"]
+    assert step["local_marketplace"]["changed"] is True
+    assert (local_marketplace_root() / "plugins" / "minni-0.4.0").is_dir()
+    assert _settings(home)["extraKnownMarketplaces"]["minni"]["source"]["path"] == str(
+        local_marketplace_root()
+    )
+    assert _registry(home)["plugins"]["minni@minni"][0]["installPath"] == str(root)

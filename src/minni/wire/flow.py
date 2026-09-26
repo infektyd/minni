@@ -12,6 +12,7 @@ from typing import Iterator
 from minni.wire.claude_plugin import (
     ClaudePluginError,
     claude_adopt_pending,
+    ensure_claude_marketplace,
     follow_claude_desktop,
     register_claude_plugin,
 )
@@ -582,17 +583,30 @@ def run_wire(args) -> int:
                 # never on a path that would leave a live registration behind for
                 # a payload we could not verify.
                 if spec.platform == "claude-code":
+                    plugin_registered = False
                     try:
                         extras["claude_plugin"] = register_claude_plugin(
                             install_root, version,
                             git_sha=manifest.git_sha, dry_run=dry_run,
+                        )
+                        plugin_registered = True
+                        # Claude Code >= 2.1.282 refuses to load minni@minni
+                        # when the `minni` marketplace cannot be resolved, so
+                        # the registration is only half the job.
+                        extras["claude_marketplace"] = ensure_claude_marketplace(
+                            install_root, version, dry_run=dry_run,
                         )
                     except ClaudePluginError as exc:
                         # The MCP config and wired.json already moved above, so
                         # `failed` alone would tell an operator (or automation
                         # keying on it) that nothing changed. Say which half
                         # landed.
-                        extras["wired_but_plugin_unregistered"] = not dry_run
+                        if plugin_registered:
+                            extras["wired_but_marketplace_unconfigured"] = not dry_run
+                            failure = "marketplace setup failed"
+                        else:
+                            extras["wired_but_plugin_unregistered"] = not dry_run
+                            failure = "plugin registration failed"
                         out.results.append(PlatformResult(
                             platform, "failed",
                             config_path=str(config_path) if config_path else None,
@@ -601,7 +615,7 @@ def run_wire(args) -> int:
                             workspace=str(workspace) if workspace else None,
                             verify=verify,
                             reason=(
-                                f"plugin registration failed: {exc} "
+                                f"{failure}: {exc} "
                                 "(the MCP server and wired.json were already updated; "
                                 "re-run `minni wire claude-code` once resolved)"
                             ),
@@ -627,10 +641,11 @@ def run_wire(args) -> int:
                             install_root, dry_run=dry_run,
                         )
                     except (ClaudePluginError, OSError) as exc:
-                        # OSError too: the config dir can be unwritable or the
-                        # file mid-write, and _atomic_write_json surfaces that
-                        # raw. Letting it escape would abort the whole run with
-                        # a traceback and no JSON at all — strictly worse than
+                        # OSError too: _move_desktop_arg wraps its own write
+                        # now, but path probing (resolve/stat edges) can still
+                        # raise one, and this block is the last line of defence.
+                        # Letting it escape would abort the whole run with a
+                        # traceback and no JSON at all — strictly worse than
                         # the `failed` result this block exists to avoid.
                         extras["claude_desktop"] = {
                             "changed": False, "reason": f"skipped: {exc}",

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import minni.wire.flow as flow_mod
+
 from minni.wire.flow import run_wire
 from minni.wire.manifest import PayloadManifest, sha256_file
 from minni.wire.output import WireOutput
@@ -190,6 +192,31 @@ def test_wire_real_install_idempotent(wire_env, monkeypatch, capsys):
     assert (home / ".minni" / "plugin" / "current").is_symlink()
     rc2 = run_wire(_args("claude-code", home))
     assert rc2 == 0
+
+
+def test_wire_marketplace_failure_is_not_reported_as_registration_failure(
+    wire_env, monkeypatch, capsys,
+):
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+
+    def _marketplace_fails(*_args, **_kwargs):
+        raise flow_mod.ClaudePluginError("marketplace unavailable for test")
+
+    # Fail the marketplace step itself; a corrupt settings.json is rejected by
+    # the host-config preflight before registration ever runs.
+    monkeypatch.setattr(flow_mod, "ensure_claude_marketplace", _marketplace_fails)
+
+    rc = run_wire(_args("claude-code", home))
+
+    assert rc == 1
+    result = json.loads(capsys.readouterr().out)["results"][0]
+    assert result["status"] == "failed"
+    assert result["reason"].startswith("marketplace setup failed:")
+    assert result["wired_but_marketplace_unconfigured"] is True
+    assert "wired_but_plugin_unregistered" not in result
+    registry = json.loads((home / ".claude" / "plugins" / "installed_plugins.json").read_text())
+    assert "minni@minni" in registry["plugins"]
 
 
 def test_wire_version_mismatch(wire_env, monkeypatch, capsys):
