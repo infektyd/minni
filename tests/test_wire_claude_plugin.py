@@ -1118,6 +1118,27 @@ def test_marketplace_refuses_corrupt_settings(home):
     assert settings.read_text(encoding="utf-8") == "{not json"
 
 
+def test_marketplace_refuses_non_utf8_settings(home):
+    """Invalid UTF-8 is the same refusal as corrupt JSON, not a traceback."""
+    root = _install_tree(home, "0.4.0")
+    settings = claude_settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_bytes(b'\xff\xfe"broken"')
+
+    with pytest.raises(ClaudePluginError, match="not valid UTF-8"):
+        ensure_claude_marketplace(root, "0.4.0")
+    assert settings.read_bytes() == b'\xff\xfe"broken"'
+
+
+def test_adopt_refuses_a_non_utf8_payload_manifest(home):
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    (root / "payload-manifest.json").write_bytes(b"\xff\xfe not utf-8")
+
+    with pytest.raises(ClaudePluginError, match="cannot read"):
+        adopt_claude_code()
+
+
 def test_marketplace_writes_through_a_symlinked_settings(home, tmp_path):
     root = _install_tree(home, "0.4.0")
     target = home / "dotfiles" / "settings.json"

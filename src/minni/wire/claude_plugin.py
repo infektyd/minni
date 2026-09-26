@@ -96,7 +96,12 @@ def _load_json_doc_with_bytes(path: Path, default: dict) -> tuple[dict, bytes | 
         original = path.read_bytes()
     except OSError as exc:
         raise ClaudePluginError(f"cannot read {path}: {exc}") from exc
-    text = original.decode("utf-8")
+    try:
+        text = original.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ClaudePluginError(
+            f"{path} is not valid UTF-8 ({exc}); refusing to overwrite it",
+        ) from exc
     if not text.strip():
         return dict(default), original
     try:
@@ -879,7 +884,7 @@ def adopt_claude_code(
     if manifest_path.is_file():
         try:
             git_sha = str(json.loads(manifest_path.read_text(encoding="utf-8")).get("git_sha") or "")
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ClaudePluginError(f"cannot read {manifest_path}: {exc}") from exc
 
     dry_run = not apply
