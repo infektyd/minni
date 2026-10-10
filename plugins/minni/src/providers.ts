@@ -21,7 +21,7 @@ import {
   type ProviderHealth,
 } from "./afm.js";
 import { AFM_PREPARE_TASK_URL, loadProvidersConfig, type ProvidersConfig } from "./config.js";
-import type { JsonResult } from "./sovereign.js";
+import type { JsonResult } from "./daemon_transport.js";
 
 export type OperationClass = "retrieval" | "prepare" | "extraction" | "edge_inference";
 export type ProviderTier = "local" | "cloud";

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Exploration: how AFM behaves on the kinds of extraction/summarization jobs
-// sovereign memory actually does. Hits the AFM bridge over OpenAI-compat HTTP.
+// minni memory actually does. Hits the AFM bridge over OpenAI-compat HTTP.
 //
-//   node scripts/afm-sovereign-scenarios.mjs
-//   AFM_URL=http://127.0.0.1:11437/v1/chat/completions node scripts/afm-sovereign-scenarios.mjs
+//   node scripts/afm-minni-scenarios.mjs
+//   AFM_URL=http://127.0.0.1:11437/v1/chat/completions node scripts/afm-minni-scenarios.mjs
 
 const URL = process.env.AFM_URL ?? "http://127.0.0.1:11437/v1/chat/completions";
 const MODEL = process.env.AFM_MODEL ?? "apple-foundation-models";

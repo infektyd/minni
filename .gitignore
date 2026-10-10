@@ -1,4 +1,4 @@
-# Sovereign Memory public boundary
+# Minni public boundary
 
 # Private working notes — human-only scratch for audits, RC prep, drafts
 _private/
@@ -57,7 +57,7 @@ claudecode-vault/wiki/sessions/
 # FAISS index artifacts (regenerable from corpus)
 faiss/
 
-# Sovereign Memory runtime audit log + index at workspace root (contain local paths)
+# Minni runtime audit log + index at workspace root (contain local paths)
 /log.md
 /index.md
 

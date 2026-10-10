@@ -1,10 +1,10 @@
-# Sovereign Memory Explainer
+# Minni Explainer
 
 Status: draft explainer
 Audience: humans and agents trying to understand the system shape
 Last updated: 2026-05-10
 
-Sovereign Memory is a local-first memory spine for AI agents. Its job is to
+Minni is a local-first memory spine for AI agents. Its job is to
 make memory durable, inspectable, attributable, and useful across sessions
 without turning it into a hidden black box.
 
@@ -31,7 +31,7 @@ flowchart LR
     end
 
     subgraph PluginLayer["Plugin and adapter layer"]
-        MCP["Sovereign Memory MCP tools"]
+        MCP["Minni MCP tools"]
         Hooks["Session hooks and context envelopes"]
         Adapters["Host adapters"]
     end
@@ -86,7 +86,7 @@ flowchart LR
     Vaults --> Logs
 ```
 
-Sovereign Memory deliberately separates the visible memory surface from the
+Minni deliberately separates the visible memory surface from the
 fast recall machinery.
 
 The vault is where people and agents can inspect memory. SQLite, FTS5, and
@@ -103,7 +103,7 @@ Most agent memory systems have one of two failure modes:
 - They are too blunt. A full history or giant note gets dumped into context,
   making the agent slow, noisy, or overconfident.
 
-Sovereign Memory aims for a third shape: memory as a local, inspectable wiki
+Minni aims for a third shape: memory as a local, inspectable wiki
 backed by retrieval infrastructure.
 
 The design choices follow from that:
@@ -122,7 +122,7 @@ The design choices follow from that:
 
 ## The Two-Layer System
 
-Sovereign Memory separates agent hydration into two layers.
+Minni separates agent hydration into two layers.
 
 Layer 1 is identity and orientation. It is loaded as whole documents.
 
@@ -329,7 +329,7 @@ chunks are for the retrieval engine.
 Chunking is how large Markdown documents become retrievable without dumping
 the whole file into context.
 
-Sovereign Memory uses Markdown-aware chunking rather than blind character
+Minni uses Markdown-aware chunking rather than blind character
 splitting. It tries to preserve headings, paragraphs, lists, and code blocks as
 meaningful units. The default target is about 512 tokens with overlap, and
 chunks carry heading breadcrumbs so a recalled passage still knows where it
@@ -420,7 +420,7 @@ linked, corrected, superseded, or rejected.
 
 ## Cross-Agent Memory
 
-Sovereign Memory supports multiple agents using the same local recall spine.
+Minni supports multiple agents using the same local recall spine.
 The agents do not have to share a vault directory. They share the daemon and
 the indexed recall pool.
 
@@ -553,7 +553,7 @@ This flow is intentionally asymmetric:
 
 ## What Counts As Truth
 
-Sovereign Memory has several kinds of truth, and they should not be confused.
+Minni has several kinds of truth, and they should not be confused.
 
 | Surface | Role |
 | --- | --- |
@@ -573,7 +573,7 @@ wiki knowledge.
 
 ## The Design In One Sentence
 
-Sovereign Memory is a local, inspectable LLM wiki with a shared recall daemon:
+Minni is a local, inspectable LLM wiki with a shared recall daemon:
 Layer 1 gives an agent stable orientation, Layer 2 retrieves task-specific
 knowledge, the vault keeps memory visible, chunking keeps recall precise, and
 AFM backend agents help organize drafts without silently becoming authority.

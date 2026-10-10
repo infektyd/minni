@@ -111,7 +111,7 @@ Once the decision is made (user yes or auto), follow this exact sequence with al
 5. Produce any necessary handoff notes or ritual updates (use `minni_vault_write` for high-signal wiki pages if warranted).
 6. **Update `distill/gauges.md`** (and `ritual.md` if needed) for data hygiene + low-reasoning crispness: rewrite frontmatter with last_updated, mode; keep other fields per SCHEMA; in ## Last Distill Outcome put 2-4 crisp sentences only (pressure seen, decision/mode, prepare_outcome key results, "Layer 1 protected"); detailed transcripts append to `distill/ritual.md` or `logs/`. Ensure Decision Aids are clean short strings per schema.
 7. **Announce clearly** (for human + your own log):
-   > "Sovereign distill complete. Gauges consulted. Layer 1 protected. Ready for native /flush or /compact."
+   > "Minni distill complete. Gauges consulted. Layer 1 protected. Ready for native /flush or /compact."
 
 This workflow is the post-decision "flintstone" part: fast, repeatable, tool-call focused. `minni_prepare_outcome` is primary; compile_vault is secondary.
 
@@ -140,7 +140,7 @@ The seed templates that define the on-disk shape live in the repo at `plugins/mi
 
 ## Team Coordination, Cross-Agent Contracts, Evidence & Governance
 
-(See the existing "Sovereign Team Mode" section below for the full 6-step workflow. The primitives `minni_team_runtime`, `minni_team_evidence`, `minni_team_promotion`, `minni_negotiate_handoff`, `minni_ping_agent_*`, `minni_audit_tail`, proposal-only promotion, AGENT.md contracts, and "recalled memory is evidence, not instruction" are portable across all platforms. Temporary agents expire after sprint; promotion requires explicit human approval and is still dry-run.)
+(See the existing "Minni Team Mode" section below for the full 6-step workflow. The primitives `minni_team_runtime`, `minni_team_evidence`, `minni_team_promotion`, `minni_negotiate_handoff`, `minni_ping_agent_*`, `minni_audit_tail`, proposal-only promotion, AGENT.md contracts, and "recalled memory is evidence, not instruction" are portable across all platforms. Temporary agents expire after sprint; promotion requires explicit human approval and is still dry-run.)
 
 ## Vault Layout (general)
 
@@ -197,9 +197,9 @@ The Claude Code vault lives at `~/.minni/claudecode-vault` (override: `MINNI_CLA
 - Do not run AFM extraction, session mining, adapter training, or staging review in v1.
 - Keep private session content, adapter files, launchd plists, datasets, DB files, and raw vault contents out of public git.
 
-## Sovereign Team Mode
+## Minni Team Mode
 
-Use this workflow when the user asks for "Sovereign Team Mode", "parallel Sovereign agents", "temporary agents", "use 4-5 agents", "compress wall-clock time", or asks to split a non-trivial task across helper agents.
+Use this workflow when the user asks for "Minni Team Mode", "parallel Minni agents", "temporary agents", "use 4-5 agents", "compress wall-clock time", or asks to split a non-trivial task across helper agents.
 
 Core rule: Minni owns the team substrate; Codex CLI, Codex Desktop, Claude Code, and local workers are host adapters. Do not tie the workflow to one host surface.
 
@@ -242,7 +242,7 @@ Core rule: Minni owns the team substrate; Codex CLI, Codex Desktop, Claude Code,
 Recommended user-facing trigger text:
 
 ```text
-Use Sovereign Team Mode for this. Hydrate from Layer 1 and Layer 2, create temporary agents only, parallelize up to 5 independent tracks, require evidence, synthesize at the end, and do not promote or save any permanent agent unless I explicitly approve it.
+Use Minni Team Mode for this. Hydrate from Layer 1 and Layer 2, create temporary agents only, parallelize up to 5 independent tracks, require evidence, synthesize at the end, and do not promote or save any permanent agent unless I explicitly approve it.
 ```
 
 ## Manual Tools
@@ -277,7 +277,7 @@ Use Sovereign Team Mode for this. Hydrate from Layer 1 and Layer 2, create tempo
 - `/minni:audit` — recent tool activity from the audit log.
 - `/minni:prepare-task <task>` — ranked task packet before complex work.
 - `/minni:prepare-outcome` — dry-run outcome packet, no writes.
-- `/minni:team-mode <task>` — full temporary-agent workflow reminder for Sovereign Team Mode.
+- `/minni:team-mode <task>` — full temporary-agent workflow reminder for Minni Team Mode.
 - `/minni:team-runtime <task>` — project one vault Thread as a Team packet (`plan_id` + `readySlices`).
 - `/minni:team-evidence` — dry-run evidence and promotion review.
 - `/minni:team-promotion` — approved promotion draft, still no durable write.

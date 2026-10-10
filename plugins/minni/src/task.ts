@@ -11,8 +11,8 @@ import { resolveAfmProvider, resolvedNativeHelperPath, type AfmProvider, type Af
 import { defaultProviderChain, type ProviderChain } from "./providers.js";
 import { callNativeOpChunked, reduceViaSameOp, type NativeOpResult } from "./afm-chunking.js";
 import { EVIDENCE_AUTHORITY_SENTENCE } from "./agent_envelope.js";
-import { afmHealth, recallMemory, formatDegradation } from "./sovereign.js";
-import type { JsonResult, RecallResponse } from "./sovereign.js";
+import { afmHealth, recallMemory, formatDegradation } from "./daemon_transport.js";
+import type { JsonResult, RecallResponse } from "./daemon_transport.js";
 import { isInstructionLike } from "./safety.js";
 import { recordAudit, searchVaultNotes } from "./vault.js";
 import type { PrivacyLevel, VaultSearchResult } from "./vault.js";

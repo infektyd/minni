@@ -1,4 +1,4 @@
-# Sovereign Memory Page Types — Example Pages
+# Minni Page Types — Example Pages
 
 **Contract version:** 1.0.0
 **Last updated:** 2026-04-26
@@ -34,7 +34,7 @@ trace_id: t8f2a1b3
 
 ```markdown
 ---
-title: "Sovereign Memory Daemon (sovrd)"
+title: "Minni Daemon (sovrd)"
 type: entity
 status: accepted
 privacy: safe
@@ -50,10 +50,10 @@ tags: [daemon, ipc, json-rpc, sovereign-memory]
 trace_id: t1a2b3c4
 ---
 
-# Sovereign Memory Daemon (sovrd)
+# Minni Daemon (sovrd)
 
-The Sovereign Memory Daemon (`sovrd`) is a long-running Python process that
-exposes the Sovereign Memory engine over a Unix domain socket using JSON-RPC 2.0.
+The Minni Daemon (`sovrd`) is a long-running Python process that
+exposes the Minni engine over a Unix domain socket using JSON-RPC 2.0.
 It manages FAISS + SQLite hybrid retrieval, deduplicates embedding model loads
 across requests, and maintains per-agent recall context.
 
@@ -96,7 +96,7 @@ trace_id: t2b3c4d5
 
 # Hybrid Retrieval (FTS5 + FAISS + RRF)
 
-Sovereign Memory uses a three-stage retrieval pipeline:
+Minni uses a three-stage retrieval pipeline:
 
 1. **FTS5 keyword search** — SQLite's full-text search with BM25 ranking. Fast,
    no model required. Returns top-K document-level matches.
@@ -146,7 +146,7 @@ trace_id: t3c4d5e6
 
 ## Decision
 
-The Sovereign Memory daemon communicates with clients via a Unix domain socket
+The Minni daemon communicates with clients via a Unix domain socket
 (`~/.minni/run/minnid.sock`) using JSON-RPC 2.0 over a line-delimited protocol.
 
 ## Rationale
@@ -179,7 +179,7 @@ Windows WSL2 edge cases).
 
 ```markdown
 ---
-title: "Index a New Vault into Sovereign Memory"
+title: "Index a New Vault into Minni"
 type: procedure
 status: accepted
 privacy: safe
@@ -195,7 +195,7 @@ tags: [procedure, indexing, vault, onboarding]
 trace_id: t4d5e6f7
 ---
 
-# Procedure: Index a New Vault into Sovereign Memory
+# Procedure: Index a New Vault into Minni
 
 Use this procedure when adding a new agent vault or a new document collection
 to the shared recall pool.
@@ -435,7 +435,7 @@ human sessions.
 
 ```markdown
 ---
-title: "Sovereign Memory Architecture Overview"
+title: "Minni Architecture Overview"
 type: synthesis
 status: accepted
 privacy: safe
@@ -453,17 +453,17 @@ tags: [synthesis, architecture, overview, sovereign-memory]
 trace_id: t8b9c0d1
 ---
 
-# Sovereign Memory Architecture Overview
+# Minni Architecture Overview
 
 This synthesis compiles the key architectural decisions and components of the
-Sovereign Memory system as of 2026-04-26.
+Minni system as of 2026-04-26.
 
 ## System layers
 
 ```
 Agent (Claude Code, Codex, ...)
     ↓  JSON-RPC over Unix socket
-Sovereign Memory Daemon (sovrd)
+Minni Daemon (sovrd)
     ↓  Python API
 Engine (retrieval.py, faiss_index.py, writeback.py, episodic.py)
     ↓  SQL + binary

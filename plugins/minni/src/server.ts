@@ -31,7 +31,7 @@ import {
   shouldPrescanVault,
   statusAndAudit,
   subscribeContradictions,
-} from "./sovereign.js";
+} from "./daemon_transport.js";
 import {
   buildHandoffPacket,
   extractScarTissue,
@@ -877,7 +877,7 @@ server.registerTool(
     // Schema pins status to z.enum(["proposed"]), so drainStatus is always
     // "proposed" here — no hidden-status branch (it could never fire).
     // Non-proposed rows are still filtered inside modelListCandidatesPayload.
-    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
     const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
       status: drainStatus,
       ...(limit != null ? { limit } : {}),

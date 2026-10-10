@@ -1,10 +1,10 @@
-# Sovereign Memory Agent Contract
+# Minni Agent Contract
 
 **Contract version:** 1.0.0
 **Last updated:** 2026-07-31
 
 This document is the canonical contract governing how AI agents interact with
-Sovereign Memory. Every agent that consumes recall results or writes vault pages
+Minni. Every agent that consumes recall results or writes vault pages
 is bound by this contract. If this document and any code diverge, this document
 defines the intended behavior.
 

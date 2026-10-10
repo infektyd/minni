@@ -106,7 +106,7 @@ import {
   recallMemory,
   stashPrecompactReassert,
   subscribeContradictions,
-} from "./sovereign.js";
+} from "./daemon_transport.js";
 import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
 import {
   auditTail,

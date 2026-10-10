@@ -16,7 +16,7 @@ import type {
   InconclusiveCredentialVerdict,
   InconclusiveHighRiskAssignment,
 } from "./policy.js";
-import type { JsonResult } from "./sovereign.js";
+import type { JsonResult } from "./daemon_transport.js";
 
 const AFM_TIMEOUT_MS = 8_000;
 

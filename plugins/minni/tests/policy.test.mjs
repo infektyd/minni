@@ -5,12 +5,12 @@ import { assessLearningQuality, routeMemoryIntent } from "../dist/policy.js";
 import { lifecycleNudgeMode } from "../dist/agent_envelope.js";
 
 test("routeMemoryIntent allows automatic recall but not learning", () => {
-  const recall = routeMemoryIntent("continue testing the Sovereign Memory plugin from prior context");
+  const recall = routeMemoryIntent("continue testing the Minni plugin from prior context");
   assert.equal(recall.action, "recall");
   assert.equal(recall.automaticAllowed, true);
   assert.equal(recall.suggestedTool, "minni_recall");
 
-  const learn = routeMemoryIntent("remember this decision in Sovereign Memory");
+  const learn = routeMemoryIntent("remember this decision in Minni");
   assert.equal(learn.action, "learn");
   assert.equal(learn.automaticAllowed, false);
   assert.equal(learn.suggestedTool, "minni_learn");
