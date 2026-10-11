@@ -236,7 +236,7 @@ def test_minnid_read_includes_layer_1_identity_before_context(tmp_path, monkeypa
             """,
             (
                 identity_doc_id,
-                "Sovereign Memory gives owned agents a soul. It gives hosted agents a map.",
+                "Minni gives owned agents a soul. It gives hosted agents a map.",
                 b"0" * 1536,
                 now,
             ),

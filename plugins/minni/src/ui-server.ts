@@ -8,7 +8,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT, minniHome } from "./config.js";
-import { buildStatusReport } from "./sovereign.js";
+import { buildStatusReport } from "./daemon_transport.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
 import { auditTail, getAgentIdFromVaultPath, listSessions, type SessionSummary } from "./vault.js";
 import { readRecallState } from "./recall-state.js";
@@ -1068,7 +1068,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const daemonRpc =
     options.daemonRpc ??
     (async (method: string, params: Record<string, unknown>) => {
-      const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+      const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
       return jsonRpcSocketRequestWithFallback(method, params);
     });
   const recallStateReader =

@@ -1,4 +1,4 @@
-# Sovereign Memory public-boundary denylist.
+# Minni public-boundary denylist.
 #
 # These patterns are intentionally stricter than normal source filtering. The
 # pre-commit hook in .githooks/pre-commit reads this file and blocks staged

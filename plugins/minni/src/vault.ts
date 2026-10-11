@@ -116,6 +116,9 @@ export interface LearnInput {
    * fail-open write path is the one that previously stayed audit-dark.
    */
   quality?: LearningQualityReport;
+  annotation?: string;
+  trigger_kind?: string;
+  sessionId?: string;
 }
 
 export interface VaultWriteResult {
@@ -1428,6 +1431,9 @@ export async function vaultFirstLearn(
       category: input.category ?? "general",
       source: input.source,
       storeResult: input.storeResult,
+      ...(input.sessionId ? { session_id: input.sessionId } : {}),
+      ...(input.annotation ? { annotation: input.annotation } : {}),
+      ...(input.trigger_kind ? { trigger_kind: input.trigger_kind } : {}),
       // Match quality-blocked audits: full report (ok/score/warnings/semanticTier).
       ...(input.quality ? { quality: input.quality } : {}),
     },
@@ -1506,6 +1512,8 @@ export interface SessionReceipt {
   learns: number;
   vault_writes: number;
   candidates_drafted: number;
+  jev_learns?: number;
+  jev_annotation?: string;
 }
 
 /**
@@ -1701,7 +1709,21 @@ function tallyWindow(
         receipt.guard_allowed += 1;
       }
     }
-    if (item.tool === "minni_learn") receipt.learns += 1;
+    if (item.tool === "minni_learn") {
+      receipt.learns += 1;
+      const details = item.details as Record<string, unknown> | undefined;
+      if (details && details.source === "jev_harvest") {
+        receipt.jev_learns = (receipt.jev_learns ?? 0) + 1;
+        const ann =
+          (details.annotation as string) ||
+          (details.trigger_kind
+            ? `${details.trigger_kind}: ${item.summary}`
+            : item.summary);
+        if (!receipt.jev_annotation && ann) {
+          receipt.jev_annotation = ann;
+        }
+      }
+    }
     if (item.tool === "minni_vault_write" || item.tool === "vault_write") {
       receipt.vault_writes += 1;
     }
@@ -1785,12 +1807,16 @@ export async function sessionReceipt(
  */
 export function formatSessionReceiptLine(receipt: SessionReceipt): string {
   const recalls = receipt.recalls_strong + receipt.recalls_weak;
+  const jevSuffix =
+    receipt.jev_learns && receipt.jev_learns > 0
+      ? ` (${receipt.jev_annotation ?? "jev"}) [jev]`
+      : "";
   // `learns` (committed minni_learn rows) and `candidates_drafted` are
   // distinct tallies — naming only one hid the other from the proof line.
   const parts = [
     `${recalls} recall${recalls === 1 ? "" : "s"} (${receipt.recalls_strong} strong)`,
     `${receipt.guard_denied} guard nudge${receipt.guard_denied === 1 ? "" : "s"}`,
-    `${receipt.learns} learn${receipt.learns === 1 ? "" : "s"} committed`,
+    `${receipt.learns} learn${receipt.learns === 1 ? "" : "s"} committed${jevSuffix}`,
     `${receipt.candidates_drafted} candidate${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
   ];
   return `Minni session receipt: ${parts.join(", ")}.`;

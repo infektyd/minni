@@ -1,0 +1,1519 @@
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { existsSync } from "node:fs";
+import { stat, readdir } from "node:fs/promises";
+import net from "node:net";
+import path from "node:path";
+import { URL } from "node:url";
+import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
+import {
+  daemonAfmToProviderHealth,
+  daemonEffectiveAfmProvider,
+  getAfmProviderHealth,
+  GENERATION_PROBE_TTL_MS,
+  resolveAfmProvider,
+  resolvedNativeHelperPath,
+  sanitizeAfmHealth,
+  type AfmProviderMode,
+  type AfmProviderResolution,
+  type ProviderHealth,
+} from "./afm.js";
+import { auditTail, ensureVault, recordAudit, vaultExists, writeInbox } from "./vault.js";
+import type { VaultSearchResult } from "./vault.js";
+
+export interface JsonResult<T = unknown> {
+  ok: boolean;
+  data?: T;
+  error?: string;
+}
+
+export interface RecallResponse {
+  results?: string | unknown[];
+  agent_id?: string;
+  layer?: string;
+  workspace_id?: string;
+  backend?: string;
+  backend_badge?: string;
+  /** W5: the daemon's own hit count (recall.py response_payload, always paired
+   *  with `results`) — the preferred, wire-shape signal for "answered but
+   *  empty", ahead of inspecting `results` itself. */
+  count?: number;
+  /** P0-A diagnostic: present (non-empty) when the daemon's read gate
+   *  filtered a non-empty candidate set to zero — a scoped ANSWER, not a
+   *  miss. isDaemonResultEmpty must treat it as non-empty. */
+  auth_suppression?: unknown[];
+  /** R4/R5 (#226): one entry per corpus this recall touched, always present on
+   *  a daemon reply (recall.py response_payload). Declared here because a
+   *  field the renderer never reads is a field the AGENT never sees: an
+   *  FTS-only or half-failed recall arrived looking exactly like a healthy
+   *  hybrid one. formatRecall/formatRecallLean render it. */
+  degradation?: unknown[];
+  /** Roll-up of `degradation[].degraded` — the daemon's own verdict. */
+  degraded?: boolean;
+  /** Learnings surface separately from document `results`/`count`; a
+   *  learnings-only reply is still a live scoped answer. */
+  learnings?: unknown[];
+  /** Audit #225-R1: episodic events live in episodic_events, never in
+   *  `documents`, so they can only arrive as their own array — document
+   *  `results`/`count` structurally cannot carry them. An episodic-only reply
+   *  is a live scoped answer, exactly like a learnings-only one. */
+  episodic?: unknown[];
+  episodic_count?: number;
+}
+
+export interface ReadContextResponse {
+  agent_id?: string;
+  context?: string;
+  backend?: string;
+  backend_badge?: string;
+}
+
+export interface ExtractorStatus {
+  provider: string;
+  tier: "local" | "cloud";
+  generationVerified: boolean;
+  probeAgeMs: number;
+  /** Which leg produced this verdict — see StatusReport.afm's doc comment. */
+  source: "daemon" | "plugin-probe";
+}
+
+export interface StatusReport {
+  vault: {
+    path: string;
+    exists: boolean;
+  };
+  socket: JsonResult;
+  /**
+   * afm.ok is generationVerified (honest health), not mere /health
+   * reachability. Single-authority (punch-list §3): when the daemon socket
+   * carries a fresh, matching-mode probe (socket.data.afm), this field is
+   * DERIVED from that same daemon data rather than an independent plugin
+   * probe, so it can never disagree with socket.data.afm in content — only
+   * fall back to the plugin's own probe when the daemon leg is unreachable,
+   * stale, mode-mismatched, or malformed. afm.data.source records which leg
+   * produced the verdict ("daemon" | "plugin-probe").
+   */
+  afm: JsonResult;
+  afmProvider: AfmProviderResolution;
+  extractor: ExtractorStatus;
+  audit: {
+    /**
+     * Count of `## ` audit entries in the active rolling log file
+     * (`logs/YYYY-MM-DD.md` or fallback `log.md`) — not a presence bit.
+     * Soft-capped at the last 10_000 headers of that file (status path only).
+     */
+    entries: number;
+    /**
+     * Headline line only (`## [ts] tool | summary`). Never the full multi-line
+     * audit entry body (paths, details JSON, stack). Full bodies: `minni_audit_tail`
+     * or `auditReport({ includeLatest: true })` on the opt-in path.
+     */
+    latest?: string;
+    volume: number;
+  };
+}
+
+export function parseSovrdJson<T = unknown>(raw: string): JsonResult<T> {
+  try {
+    return { ok: true, data: JSON.parse(raw) as T };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// NOTE: the old socketRequest() (HTTP-over-unix-socket) was removed. The daemon
+// speaks JSON-RPC only, so that fallback could never succeed and instead masked
+// real daemon errors (e.g. identity_mismatch) as "Parse Error: Expected HTTP/".
+// All daemon calls now go through jsonRpcSocketRequest and surface real errors.
+
+/**
+ * Honest /health body inspection. The old behavior treated any HTTP<400
+ * parseable-JSON body as ok without ever reading availability/status values,
+ * so a bridge reporting status=error still counted as healthy.
+ */
+function afmHealthBodyProblem(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  // Only definitive negatives veto the downstream generation probe. Unknown
+  // status strings (a bridge update adding e.g. "initializing" or
+  // "degraded-but-serving") must NOT hard-fail health: the probe runs and
+  // decides. The previous closed allowlist {ok,ready,healthy,available,bridge}
+  // kept afm_ok=false even with working generation.
+  const badHealthStatuses = new Set(["error", "fail", "failed", "down", "dead", "stopped", "unavailable"]);
+  if (typeof record.status === "string" && badHealthStatuses.has(record.status.toLowerCase())) {
+    return `afm health degraded: status=${record.status.slice(0, 40)}`;
+  }
+  if (typeof record.availability === "string" && record.availability.toLowerCase() !== "available") {
+    return `afm health degraded: availability=${record.availability.slice(0, 40)}`;
+  }
+  if (record.available === false) return "afm health degraded: available=false";
+  if (record.ok === false) return "afm health degraded: ok=false";
+  return undefined;
+}
+
+export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
+  return new Promise((resolve) => {
+    const parsedUrl = new URL(url);
+    const client = parsedUrl.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = client(parsedUrl, { method: "GET", timeout: 2000 }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        const parsed = parseSovrdJson(data);
+        if (res.statusCode && res.statusCode >= 400) {
+          resolve({ ok: false, data: parsed.data, error: `HTTP ${res.statusCode}` });
+          return;
+        }
+        if (!parsed.ok) {
+          resolve(parsed);
+          return;
+        }
+        const problem = afmHealthBodyProblem(parsed.data);
+        if (problem) {
+          resolve({ ok: false, data: parsed.data, error: problem });
+          return;
+        }
+        resolve(parsed);
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy(new Error("AFM health request timed out"));
+    });
+    req.on("error", (error) => resolve({ ok: false, error: error.message }));
+    req.end();
+  });
+}
+
+export async function socketHealth(timeoutMs?: number): Promise<JsonResult> {
+  // Daemon speaks JSON-RPC only; return its real result (including structured
+  // errors) rather than masking them behind a dead HTTP-over-socket fallback.
+  //
+  // `timeoutMs` is the load-bearing deadline for a budgeted caller: it DESTROYS
+  // the socket. Racing this promise instead (withBudget) only abandons it — the
+  // in-flight handle keeps the event loop alive for the full 30s default, long
+  // past a hook budget, and a host that kills the hook discards its output even
+  // though it was already written.
+  return jsonRpcSocketRequestWithFallback(
+    "status",
+    {},
+    timeoutMs !== undefined ? { timeoutMs } : {},
+  );
+}
+
+/**
+ * Layer policy (recall-F1/recall-F6): the two recall surfaces are deliberately
+ * complementary, not contradictory —
+ *  - BOOT (SessionStart) queries BOOT_RECALL_LAYERS: the identity shelf PLUS
+ *    the correction/decision-bearing layers (knowledge, episodic). The old
+ *    identity-only whitelist dropped knowledge-layer corrections before rerank,
+ *    which is how an already-corrected belief survived a 3-hour loop.
+ *  - PER-TURN (UserPromptSubmit) recalls all layers but formatRecallLean drops
+ *    identity-shelf hits, because the shelf was already injected at boot and
+ *    never changes mid-session.
+ * Boot = identity + fresh corrections; per-turn = query-relevant non-identity.
+ */
+export const BOOT_RECALL_LAYERS: ReadonlyArray<string> = ["identity", "knowledge", "episodic"];
+
+/**
+ * SessionStart boot envelope slice for a successful daemon recall.
+ *
+ * #225-R1: BOOT_RECALL_LAYERS includes episodic, and the daemon returns
+ * episodic hits on their own channel (`episodic` / `episodic_count`), never
+ * inside document `results`. Forwarding only `results` dropped the channel
+ * this surface asked for — the same "advertised but dead" class the RPC
+ * wire already closed. Keep the document fields AND the episodic channel.
+ *
+ * F1 review round 1: the whitelist dropped `degradation`/`degraded` for
+ * exactly the same reason it once dropped episodic — boot is the AUTOMATIC
+ * recall surface, so a session hydrated from a half-failed or auth-blacked-out
+ * corpus opened looking perfectly healthy, and no one chose to ignore the
+ * warning because no one was shown one. Carried as rendered lines rather than
+ * the raw array, and only when something is actually wrong: the boot envelope
+ * is context-budgeted, and a healthy report is per-corpus noise nobody reads.
+ */
+export function buildBootRecallSlice(
+  data: RecallResponse,
+  agentFallback: string,
+): {
+  ok: true;
+  results: RecallResponse["results"];
+  episodic: unknown[];
+  episodic_count: number;
+  agent_origin: string;
+  layer: RecallResponse["layer"];
+  layers: ReadonlyArray<string>;
+  degraded?: true;
+  degradation_notes?: string[];
+} {
+  const episodic = Array.isArray(data.episodic) ? data.episodic : [];
+  const episodic_count =
+    typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
+  const notes = formatDegradation(data);
+  return {
+    ok: true,
+    results: data.results,
+    episodic,
+    episodic_count,
+    agent_origin: data.agent_id ?? agentFallback,
+    layer: data.layer,
+    layers: BOOT_RECALL_LAYERS,
+    ...(notes ? { degraded: true as const, degradation_notes: notes.split("\n") } : {}),
+  };
+}
+
+export async function recallMemory(input: {
+  query: string;
+  agentId?: string;
+  layer?: string;
+  layers?: ReadonlyArray<string>;
+  workspaceId?: string;
+  limit?: number;
+  scope?: "personal" | "combined" | "both";
+  crossAgent?: boolean;
+  cross_agent?: boolean;
+  sessionId?: string;
+  /**
+   * TOTAL deadline for the recall RPC. Prompt-time hooks pass their remaining
+   * budget so a cold daemon (lazy embedder/cross-encoder/FAISS load) degrades to
+   * a fail-open turn instead of being killed by the harness with its output
+   * discarded. Omitted elsewhere → the 30s default.
+   */
+  timeoutMs?: number;
+}, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
+  // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
+  // directly instead of masking it behind a dead HTTP-over-socket fallback.
+  // M-2 fix: explicitly pass depth="snippet" so agents receive evidence text
+  // (~120 tokens/result) rather than headline-only (wikilink + score, no text).
+  // The daemon's previous default was "headline" despite the docstring claiming
+  // "snippet". Both the daemon default and this call-site now agree on "snippet".
+  const timeoutMs = input.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
+  return jsonRpcSocketRequestWithFallbackRequester("search", {
+    query: input.query,
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    layers: input.layers ?? (input.layer ? [input.layer] : undefined),
+    limit: input.limit,
+    scope: input.scope,
+    cross_agent: input.crossAgent ?? input.cross_agent,
+    depth: "snippet",
+    // Daemon search is to_thread and uncancellable; pass the same budget so
+    // retrieve() can stop FAISS/expand/CE before this client kills the socket.
+    timeout_ms: timeoutMs,
+    // Session receipts: the daemon records a durable episodic recall-trace event
+    // (thread_id=session_id) when this is present. Omit it entirely when the
+    // caller has no session context so the daemon param stays absent, not null.
+    ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
+  }, requester, { timeoutMs }) as Promise<
+    JsonResult<RecallResponse>
+  >;
+}
+
+export async function learnMemory(input: {
+  content: string;
+  category?: string;
+  agentId?: string;
+  workspaceId?: string;
+}): Promise<JsonResult> {
+  const body = {
+    content: input.content,
+    category: input.category ?? "general",
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
+  };
+  // JSON-RPC only; return the daemon's real result/error (no masking HTTP fallback).
+  return jsonRpcSocketRequestWithFallback("learn", body);
+}
+
+export async function readAgentContext(input: {
+  agentId?: string;
+  limit?: number;
+  /** Boot-budget deadline: destroys the socket, which is what lets a hook
+   * process EXIT (see the SessionStart budget in hook-handlers.ts). */
+  timeoutMs?: number;
+} = {}): Promise<JsonResult<ReadContextResponse>> {
+  return jsonRpcSocketRequestWithFallback(
+    "read",
+    {
+      agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+      limit: input.limit ?? 8,
+    },
+    input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {},
+  ) as Promise<JsonResult<ReadContextResponse>>;
+}
+
+/**
+ * recall-F1 / hooks-PL-2: the daemon 'read' context is identity-shelf heavy;
+ * boot hooks only need its recency-ordered "## Learnings" slice (where fresh
+ * corrections land as new active learnings). Extract just that section so the
+ * read round-trip (which also records learning_reads) stays cheap to inject.
+ */
+export function extractLearningsSection(context: string | undefined): string | undefined {
+  if (!context) return undefined;
+  const match = context.match(/^## Learnings[^\n]*$/m);
+  if (!match || match.index === undefined) return undefined;
+  const rest = context.slice(match.index);
+  const next = rest.slice(match[0].length).search(/^## /m);
+  const section = next >= 0 ? rest.slice(0, match[0].length + next) : rest;
+  return section.trim() || undefined;
+}
+
+/**
+ * Boot identity delivery: the daemon `read` context leads with the whole-
+ * document Layer 1 identity block (## Agent Identity …) before Prior Context /
+ * Learnings. Extract that slice so SessionStart can rank it in the envelope as
+ * `identity_body` instead of stripping it via extractLearningsSection().
+ *
+ * H5: the block is only trusted when it (a) sits at the LEADING position of the
+ * context — an unanchored match anywhere in the body lets a learning/prior-
+ * context entry smuggle a `## Agent Identity:` header that would be injected as
+ * Layer 1 — and (b) names the stamped agent, when one is supplied. A header for
+ * a different agent (or one buried mid-context) is rejected.
+ */
+export function extractIdentityBody(
+  context: string | undefined,
+  stampedAgent?: string,
+): string | undefined {
+  if (!context) return undefined;
+  // Anchor to the leading position: allow only leading whitespace before the
+  // identity header. A header found anywhere else is untrusted smuggled content.
+  const lead = context.match(/^\s*(## Agent Identity[^\n]*)$/m);
+  if (!lead || lead.index === undefined) return undefined;
+  if (context.slice(0, lead.index).trim() !== "") return undefined;
+  const headerLine = lead[1];
+  // Validate the named agent against the server-stamped identity when provided.
+  if (stampedAgent !== undefined) {
+    const named = headerLine.replace(/^## Agent Identity:?\s*/, "").trim();
+    if (named !== stampedAgent) return undefined;
+  }
+  const headerStart = lead.index + lead[0].indexOf(headerLine);
+  const rest = context.slice(headerStart);
+  const afterHeader = rest.slice(headerLine.length);
+  const next = afterHeader.search(/^## (?:Prior Context|Learnings|Recent Activity)/m);
+  const section = next >= 0 ? rest.slice(0, headerLine.length + next) : rest;
+  return section.trim() || undefined;
+}
+
+/** Rough token→char budget (4 chars/token) for Layer-1 envelope gating. */
+export function truncateToTokenCharBudget(text: string, tokenBudget: number): string {
+  if (tokenBudget <= 0) return "";
+  const maxChars = tokenBudget * 4;
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+/** Default JSON-RPC deadline for non-hook callers (MCP tools, CLI). */
+export const DEFAULT_JSON_RPC_TIMEOUT_MS = 30000;
+
+/** The exact error text callers match on to detect a transport deadline. */
+export const JSON_RPC_TIMEOUT_ERROR = "JSON-RPC request timed out";
+
+export interface JsonRpcRequestOptions {
+  /**
+   * TOTAL deadline for the call in ms — across every socket candidate, not per
+   * candidate. The candidate loop is sequential, so a per-candidate deadline
+   * multiplies: with the old fixed 30s-per-candidate and no total, a prompt-time
+   * hook could block for N×30s while Claude Code's own 30s limit killed it and
+   * discarded the output. Callers under a harness deadline MUST pass this.
+   */
+  timeoutMs?: number;
+}
+
+export type JsonRpcRequester = (
+  socketPath: string,
+  method: string,
+  params: Record<string, unknown>,
+  options?: JsonRpcRequestOptions,
+) => Promise<JsonResult>;
+
+function jsonRpcSocketCandidates(): string[] {
+  return [SOCKET_PATH];
+}
+
+/**
+ * Extract the daemon's structured identity-recovery route from an RPC payload
+ * (#121 / PR #132 P1). Handles both wire shapes:
+ *  - a success-wrapped recovery envelope (`result.status === "recovery_required"`,
+ *    e.g. gate.shared), and
+ *  - a JSON-RPC error whose `error.data` carries the machine route (gated
+ *    method capability denials).
+ * Returns the route object, or undefined when the payload is not a recovery.
+ */
+export function recoveryRouteFrom(payload: unknown): Record<string, unknown> | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const record = payload as Record<string, unknown>;
+  if (record.status === "recovery_required") return record;
+  const error = record.error;
+  if (!error || typeof error !== "object") return undefined;
+  const data = (error as Record<string, unknown>).data;
+  if (data && typeof data === "object" && (data as Record<string, unknown>).status === "recovery_required") {
+    return data as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function recoveryErrorMessage(route: Record<string, unknown>): string {
+  const reason = typeof route.reason === "string" ? route.reason : "recovery_required";
+  const remediation = Array.isArray(route.remediation) ? route.remediation.join(" ") : "";
+  return `recovery_required (${reason}): ${remediation}`.trim();
+}
+
+/**
+ * Extract a live identity/authz denial from a JSON-RPC error envelope
+ * (#132 P2). A -32004 (capability_denied / reserved_agent_id / recovery)
+ * means the daemon ANSWERED and refused the caller's identity — a
+ * misconfiguration, not an outage — so callers must not fall back to
+ * offline framing. Transport failures carry no JSON-RPC error envelope
+ * and return undefined, keeping the offline fallback intact.
+ */
+export function identityDenialFrom(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const error = (payload as Record<string, unknown>).error;
+  if (!error || typeof error !== "object") return undefined;
+  const record = error as Record<string, unknown>;
+  if (record.code !== -32004) return undefined;
+  return typeof record.message === "string" && record.message
+    ? record.message
+    : "capability_denied";
+}
+
+/**
+ * Convert a JSON-RPC success `result` into a JsonResult. A success-wrapped
+ * recovery envelope means identity is unresolved and the call did NOT do what
+ * was asked — it must read as a FAILED RPC (surfacing the remediation route),
+ * never as ok (#132 P1: minni_recall rendered it as "No recall results" and
+ * minni_learn as "learned"). The route stays on `data` for shape-aware
+ * callers (e.g. requireSharedGate).
+ */
+function jsonRpcResultToJsonResult(result: unknown): JsonResult {
+  const route = recoveryRouteFrom(result);
+  if (route) {
+    return { ok: false, data: result, error: recoveryErrorMessage(route) };
+  }
+  return { ok: true, data: result };
+}
+
+export function jsonRpcSocketRequest(
+  socketPath: string,
+  method: string,
+  params: Record<string, unknown>,
+  options: JsonRpcRequestOptions = {},
+): Promise<JsonResult> {
+  return new Promise((resolve) => {
+    if (!existsSync(socketPath)) {
+      resolve({ ok: false, error: `Socket not found: ${socketPath}` });
+      return;
+    }
+    const timeoutMs = options.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
+    if (timeoutMs <= 0) {
+      resolve({ ok: false, error: JSON_RPC_TIMEOUT_ERROR });
+      return;
+    }
+    const client = net.createConnection(socketPath);
+    let data = "";
+    let settled = false;
+    // HARD deadline, not socket.setTimeout. setTimeout is an IDLE timer: it
+    // resets on every byte, so a daemon that dribbles output — or one still
+    // loading models while the connection sits accepted — can hold the caller
+    // indefinitely without ever tripping it. A hook whose own budget has expired
+    // needs the handle GONE (finish() destroys it) or the node process will not
+    // exit even once the caller has stopped awaiting this promise.
+    const deadline = setTimeout(() => finish({ ok: false, error: JSON_RPC_TIMEOUT_ERROR }), timeoutMs);
+    function finish(result: JsonResult): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      client.destroy();
+      resolve(result);
+    }
+    client.on("connect", () => {
+      client.write(`${JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params })}\n`);
+    });
+    client.on("data", (chunk) => {
+      data += chunk.toString("utf8");
+      if (!data.includes("\n")) return;
+      const line = data.split("\n")[0];
+      const parsed = parseSovrdJson<{ result?: unknown; error?: { message?: string } }>(line);
+      if (!parsed.ok) {
+        finish(parsed);
+        return;
+      }
+      if (parsed.data?.error) {
+        finish({ ok: false, data: parsed.data, error: parsed.data.error.message ?? "JSON-RPC error" });
+        return;
+      }
+      finish(jsonRpcResultToJsonResult(parsed.data?.result));
+    });
+    client.on("error", (error) => finish({ ok: false, error: error.message }));
+    client.on("end", () => {
+      if (!settled && data.trim()) {
+        const parsed = parseSovrdJson<{ result?: unknown }>(data.trim());
+        finish(parsed.ok ? jsonRpcResultToJsonResult(parsed.data?.result) : parsed);
+      }
+    });
+  });
+}
+
+export async function handoffMemory(input: {
+  fromAgent: string;
+  toAgent: string;
+  packet: Record<string, unknown>;
+}): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallback("daemon.handoff", {
+    from_agent: input.fromAgent,
+    to_agent: input.toAgent,
+    packet: input.packet,
+  });
+}
+
+export async function gateSharedOperation(
+  input: {
+    operation: string;
+    agentId?: string;
+    workspaceId?: string;
+    details?: Record<string, unknown>;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("gate.shared", {
+    operation: input.operation,
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
+    details: input.details,
+  }, requester);
+}
+
+export function isSharedGateUnavailable(error: string | undefined): boolean {
+  const message = error ?? "";
+  if (message.includes("Method not found: gate.shared")) return true;
+  if (message.startsWith("Socket not found:")) return true;
+  if (message === "JSON-RPC request timed out") return true;
+  // Anchor transport error codes to the START of the message (the shape Node
+  // surfaces them in: "connect ECONNREFUSED ...", "ENOENT: no such file ...").
+  // Matching them anywhere would let an IDENTITY/authz rejection whose reason
+  // text merely *mentions* a code (e.g. "...path ENOENT...") be misclassified
+  // as an availability degrade — inverting fail-loud-on-identity into
+  // fail-open. Availability degrades; identity must stay loud.
+  return /^(?:Error:\s*)?(?:connect\s+)?(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
+}
+
+export async function drillMemory(
+  input: {
+    resultIds?: number[];
+    chunkIds?: number[];
+    references?: Array<Record<string, unknown> | string>;
+    depth?: "snippet" | "chunk" | "document";
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sm_drill", {
+    result_ids: input.resultIds,
+    chunk_ids: input.chunkIds,
+    references: input.references,
+    depth: input.depth ?? "snippet",
+  }, requester);
+}
+
+export async function exportContextPack(
+  input: {
+    query: string;
+    budgetTokens: number;
+    cacheKey: string;
+    agentId?: string;
+    workspaceId?: string;
+    timeoutMs?: number;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  const timeoutMs = input.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
+  return jsonRpcSocketRequestWithFallbackRequester("sm_export_pack", {
+    query: input.query,
+    budget_tokens: input.budgetTokens,
+    cache_key: input.cacheKey,
+    agent_id: input.agentId,
+    workspace_id: input.workspaceId,
+    timeout_ms: timeoutMs,
+  }, requester, { timeoutMs });
+}
+
+export async function ackHandoff(
+  input: {
+    leaseId: string;
+    status: "accepted" | "rejected_stale" | "rejected_contradicts" | "rejected_scope";
+    contradictsId?: number;
+    /**
+     * A3 authz: the daemon now requires the stamped caller principal to match
+     * the lease's to_agent — pass the agent identity (server-side config,
+     * never model-supplied) so the daemon can stamp the platform principal,
+     * mirroring listPendingHandoffs.
+     */
+    agentId?: string;
+    /** Boot-budget deadline: this is one RPC PER LEASE, so it is the boot's
+     * most unbounded call and the one most able to blow the deadline. */
+    timeoutMs?: number;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_ack_handoff", {
+    lease_id: input.leaseId,
+    status: input.status,
+    contradicts_id: input.contradictsId,
+    agent_id: input.agentId,
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
+}
+
+export async function listPendingHandoffs(
+  input: { agentId: string; timeoutMs?: number },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_list_pending_handoffs", {
+    agent_id: input.agentId,
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
+}
+
+export async function awaitHandoff(
+  input: { leaseId: string; timeoutMs?: number },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_await_handoff", {
+    lease_id: input.leaseId,
+    timeout_ms: input.timeoutMs,
+  }, requester);
+}
+
+export async function subscribeContradictions(
+  input: { agentId: string; sinceTs?: number; timeoutMs?: number },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_subscribe_contradictions", {
+    agent_id: input.agentId,
+    since_ts: input.sinceTs,
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 1: fetch the current stale-belief /
+ * contradiction events for an agent. Shared by all four hook binaries so the
+ * extraction logic cannot drift one-sided (the repo's #1 bug class).
+ */
+export async function fetchStaleBeliefEvents(
+  agentId: string,
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<{ ok: boolean; events: unknown[]; error?: string }> {
+  const contradictions = await subscribeContradictions({ agentId }, requester);
+  const events =
+    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
+      ? ((contradictions.data as any).events as unknown[])
+      : [];
+  return { ok: contradictions.ok, events, error: contradictions.error };
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 2 (Claude Code / kilocode): stash
+ * non-empty stale-belief events durably in the vault inbox as a dedicated
+ * "precompact_reassert" entry so the post-compaction boot re-asserts them
+ * (corrections_reassert) even if the daemon is down at next boot. Returns the
+ * inbox path, or undefined when there was nothing to stash. (codex/grok carry
+ * the same stale_belief_events field on their precompact handoff payloads.)
+ */
+export async function stashPrecompactReassert(input: {
+  vaultPath: string;
+  sessionId: string;
+  agentId: string;
+  staleBeliefEvents: unknown[];
+  trigger?: string;
+}): Promise<string | undefined> {
+  if (input.staleBeliefEvents.length === 0) return undefined;
+  const entry = await writeInbox(input.vaultPath, input.sessionId, {
+    kind: "precompact_reassert",
+    agent_id: input.agentId,
+    stale_belief_events: input.staleBeliefEvents,
+    compaction_trigger: input.trigger || "compaction in progress",
+  });
+  return entry.filePath;
+}
+
+export async function jsonRpcSocketRequestWithFallback(
+  method: string,
+  params: Record<string, unknown>,
+  options: JsonRpcRequestOptions = {},
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester(method, params, jsonRpcSocketRequest, options);
+}
+
+async function jsonRpcSocketRequestWithFallbackRequester(
+  method: string,
+  params: Record<string, unknown>,
+  requester: JsonRpcRequester,
+  options: JsonRpcRequestOptions = {},
+): Promise<JsonResult> {
+  let last: JsonResult = { ok: false, error: "No socket attempted" };
+  // An ABSOLUTE deadline shared by every candidate: the budget belongs to the
+  // whole call, so N candidates cannot each spend it in turn.
+  const deadline =
+    options.timeoutMs !== undefined ? Date.now() + options.timeoutMs : undefined;
+  for (const socketPath of jsonRpcSocketCandidates()) {
+    if (deadline !== undefined) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { ok: false, error: JSON_RPC_TIMEOUT_ERROR };
+      last = await requester(socketPath, method, params, { timeoutMs: remaining });
+    } else {
+      last = await requester(socketPath, method, params);
+    }
+    if (last.ok) return last;
+  }
+  return last;
+}
+
+export async function compileVault(
+  input: {
+    passName?: string;
+    vaultPath?: string;
+    dryRun?: boolean;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  const socketCandidates = jsonRpcSocketCandidates();
+  let last: JsonResult = { ok: false, error: "No socket attempted" };
+  for (const socketPath of socketCandidates) {
+    last = await requester(socketPath, "daemon.compile", {
+      pass_name: input.passName ?? "session_distillation",
+      vault_path: input.vaultPath,
+      dry_run: input.dryRun ?? true,
+    });
+    if (last.ok) return last;
+  }
+  return last;
+}
+
+function firstLine(text: string): string {
+  return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
+}
+
+function compactDaemonResults(results: string | unknown[] | undefined): string {
+  if (Array.isArray(results)) return JSON.stringify(results, null, 2);
+  if (!results) return "No daemon recall results.";
+  return results;
+}
+
+function formatVaultContext(results: VaultSearchResult[], agentId?: string): string {
+  if (results.length === 0) {
+    const label = agentId ? `${agentId} ` : "";
+    return `No ${label}vault wiki matches.`;
+  }
+  return results
+    .map((result, index) => {
+      const snippet = result.snippet.replace(/\s+/g, " ");
+      return `${index + 1}. ${result.wikilink} (vault score=${result.score})\n   ${snippet}`;
+    })
+    .join("\n");
+}
+
+/**
+ * #225-R1: render the episodic channel. Episodic events are not documents —
+ * they carry event_id/event_type/content, never a wikilink — so they get their
+ * own section rather than being merged into "Daemon Results" where every
+ * consumer assumes a document shape.
+ */
+export function formatEpisodic(response: RecallResponse, limit = 5): string | undefined {
+  const events = Array.isArray(response.episodic) ? response.episodic : [];
+  if (events.length === 0) return undefined;
+  const lean = events.slice(0, limit).map((e) => {
+    const r = (e ?? {}) as Record<string, unknown>;
+    const content = typeof r.content === "string" ? r.content.replace(/\s+/g, " ").slice(0, 200) : "";
+    return {
+      event_id: r.event_id,
+      event_type: r.event_type,
+      thread_id: r.thread_id ?? undefined,
+      content,
+    };
+  });
+  const omitted = events.length - lean.length;
+  return (
+    "## Episodic Events\n" +
+    JSON.stringify(lean, null, 2) +
+    (omitted > 0 ? `\n(${omitted} further episodic hit(s) omitted.)` : "")
+  );
+}
+
+/**
+ * The degrade kinds recall.py can put on a `degradation` entry, in the order
+ * they are rendered. Named explicitly rather than "every extra key" so a new
+ * daemon-side field cannot start leaking into the agent's context unreviewed.
+ */
+const DEGRADE_KINDS = [
+  "vector_degraded",
+  "rerank_degraded",
+  "query_expand_degraded",
+  "hyde_degraded",
+  "personal_index_failed",
+  "shared_index_failed",
+  "combined_index_failed",
+] as const;
+
+/**
+ * Render the daemon's per-corpus degrade report (#226 R4/R5).
+ *
+ * The daemon has written `degradation` on every search response since R8, but
+ * nothing on this side read it — so a lexical-only answer, a dead personal
+ * vault, or a failed HyDE leg reached the agent formatted exactly like a
+ * healthy hybrid recall. One line per degraded corpus, no line at all when
+ * everything is healthy (the daemon reports healthy corpora too, and echoing
+ * "all fine" every turn is pure context tax).
+ *
+ * `auth_suppression` gets the same treatment for the same reason: it was
+ * declared here only to keep isDaemonResultEmpty honest, never rendered, so a
+ * corpus blacked out by the read gate looked to the agent like a corpus that
+ * simply had nothing.
+ */
+/**
+ * Render one degrade detail as inert, quoted text.
+ *
+ * These strings are `str(exc)` from THIRD-PARTY provider calls (the rerank,
+ * query-expand and HyDE legs), and this change is what carries them into the
+ * agent's context — including the SessionStart boot envelope, the
+ * highest-trust surface there is. The daemon redacts secrets and paths out of
+ * them; it does not neutralize instructions. Collapse the whitespace so the
+ * line cannot fake a section break, strip backticks so it cannot escape its
+ * own code span, and cap it: a degrade detail is a diagnostic, not a document.
+ */
+function safeLabel(value: string): string {
+  return value.replace(/[`\r\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+function safeDetail(value: string): string {
+  return "`" + value.replace(/[`\r\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120) + "`";
+}
+
+export function formatDegradation(response: RecallResponse): string | undefined {
+  const lines: string[] = [];
+  const entries = Array.isArray(response.degradation) ? response.degradation : [];
+  for (const raw of entries) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    // Truthy, not `=== true`: the daemon rolls this up with Python's `any()`,
+    // so a strict compare here would silently drop an entry that reached the
+    // wire as 1 or a non-empty string and report the corpus as healthy.
+    const kindsPresent = DEGRADE_KINDS.some((kind) => Boolean(entry[kind]));
+    if (!entry.degraded && !kindsPresent) continue;
+    // Name WHICH vault when combined scope fanned out over several: without it
+    // N degraded vaults render as N identical lines and the reader cannot tell
+    // a fleet outage from a duplicated report.
+    const src = typeof entry.src === "string" ? entry.src : "?";
+    const agent = typeof entry.source_agent === "string" ? entry.source_agent : undefined;
+    // Sanitized for the same reason the detail is: a newline in either field
+    // forges a whole extra ⚠ line, and buildBootRecallSlice splits on "\n", so
+    // the forgery becomes its own top-level note in the boot envelope. Both
+    // fields are daemon-controlled and charset-validated today; this line is
+    // what stops that from being load-bearing.
+    const label = safeLabel(agent ? `${src}/${agent}` : src);
+    const kinds = DEGRADE_KINDS.filter((kind) => Boolean(entry[kind])).map((kind) => {
+      const value = entry[kind];
+      // Booleans carry no detail beyond the kind name; the failure strings do,
+      // and it is the detail that tells the agent whether to retry or re-scope.
+      if (typeof value !== "string") return kind;
+      return `${kind} (${safeDetail(value)})`;
+    });
+    lines.push(`⚠ degraded: ${label}: ${kinds.length ? kinds.join("; ") : "unspecified"}`);
+  }
+  const suppressions = Array.isArray(response.auth_suppression) ? response.auth_suppression : [];
+  for (const raw of suppressions) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    const src = safeLabel(typeof entry.src === "string" ? entry.src : "?");
+    const suppressed = typeof entry.suppressed === "number" ? entry.suppressed : undefined;
+    lines.push(
+      `⚠ auth-suppressed: ${src}: ${suppressed ?? "some"} candidate(s) withheld by the read gate`,
+    );
+  }
+  if (lines.length === 0) {
+    // The daemon's own roll-up, honored even when the per-corpus array is
+    // absent or was stripped by an intermediate whitelist. Without this, a
+    // report that loses its detail silently loses the verdict too — which is
+    // the exact failure mode this whole change exists to close.
+    // Truthy here too, for the same reason the per-entry check is.
+    return response.degraded
+      ? "⚠ degraded: the daemon reported a degraded recall with no per-corpus detail"
+      : undefined;
+  }
+  return lines.join("\n");
+}
+
+export function formatRecall(query: string, response: RecallResponse, vaultResults: VaultSearchResult[] = []): string {
+  const backendBadge = response.backend ?? response.backend_badge;
+  const results = Array.isArray(response.results)
+    ? JSON.stringify(response.results, null, 2)
+    : response.results ?? "No recall results.";
+  const provenance = [
+    response.agent_id ? `agent=${response.agent_id}` : undefined,
+    response.layer ? `layer=${response.layer}` : undefined,
+    response.workspace_id ? `workspace=${response.workspace_id}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const daemonLead = firstLine(compactDaemonResults(response.results));
+  const sections = [
+    "# Minni Recall",
+    `Query: ${query}${backendBadge ? ` [${backendBadge}]` : ""}`,
+    provenance ? `Provenance: ${provenance}` : undefined,
+    // Above the results, not below: a caller who stops reading at the first
+    // hit must still have been told the corpus it came from was degraded.
+    formatDegradation(response),
+    "## AI Context Pack",
+    formatVaultContext(vaultResults, response.agent_id),
+    daemonLead ? `Daemon lead: ${daemonLead}` : undefined,
+    "## Daemon Results",
+    results,
+    formatEpisodic(response),
+  ].filter(Boolean);
+  return sections.join("\n\n");
+}
+
+/**
+ * X5 / W5: decide whether to run the local `searchVaultNotes` pre-scan for a
+ * recall.
+ *
+ * The local pre-scan reads Markdown straight off disk and is NOT subject to the
+ * daemon's workspace scoping / read-privacy policy. When the daemon recall
+ * succeeds WITH HITS, its (properly scoped) results are authoritative and the
+ * unscoped local snippets must not be injected alongside them.
+ *
+ * W5 (punch-list #1, recall vs prepare_task asymmetry): the daemon's `search`
+ * RPC returns JSON-RPC SUCCESS even when it has zero hits (results: [],
+ * count: 0) — that is a live, scoped, empty answer, not an outage. The
+ * original 2-arg gate (`includeVault && !daemonOk`) suppressed the pre-scan on
+ * that daemon-empty case exactly like it does on a genuine outage, which made
+ * minni_recall blinder than prepare_task's markdown/AFM path (which has no
+ * such gate at all). `daemonEmpty` widens the trigger to cover "daemon
+ * answered but empty" alongside "daemon unreachable" — the pre-scan is still
+ * an OFFLINE/DEGRADED fallback, never injected alongside a nonempty daemon
+ * answer, and the accepted tradeoff (unscoped local snippets can now surface
+ * on a workspace-scoped-empty query, not only on a hard outage) is the punch
+ * list's explicit ask. This must NOT be OR'd with an identity denial — a
+ * denial is a refusal, not an empty, and callers must keep gating this
+ * function on `!identityDenied` (see recallResponseText / server.ts's
+ * minni_recall handler; recovery-denial.test.mjs's reserved_agent_id case
+ * pins that invariant).
+ */
+export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean, daemonEmpty: boolean = false): boolean {
+  return includeVault && (!daemonOk || daemonEmpty);
+}
+
+/**
+ * W5: detect "the daemon answered but has nothing" from the wire shape, not
+ * from English prose. Prefers `count` (recall.py response_payload always
+ * pairs it with `results`) over inspecting `results` itself; falls back to
+ * array length, then to a known empty-results sentinel string for the rare
+ * caller-synthesized RecallResponse that has neither `count` nor an array.
+ */
+export function isDaemonResultEmpty(response: RecallResponse | undefined): boolean {
+  if (!response) return true;
+  // Review r1 (P1): `count` covers document results only. A reply whose
+  // documents were removed by the auth_suppression read gate, or that matched
+  // only the separate `learnings` array, is a live SCOPED answer — treating
+  // it as empty would trigger the workspace-unscoped vault pre-scan and bury
+  // the suppression diagnostic under local markdown snippets.
+  if (Array.isArray(response.auth_suppression) && response.auth_suppression.length > 0) return false;
+  if (Array.isArray(response.learnings) && response.learnings.length > 0) return false;
+  // #225-R1: same argument as learnings — `count` covers documents only, and
+  // episodic hits can never appear there. An episodic-only answer that reported
+  // "empty" would trigger the workspace-unscoped vault pre-scan and bury it.
+  if (Array.isArray(response.episodic) && response.episodic.length > 0) return false;
+  if (typeof response.count === "number") return response.count === 0;
+  const { results } = response;
+  if (Array.isArray(results)) return results.length === 0;
+  if (typeof results === "string") return results.trim().length === 0 || results.trim() === "No recall results.";
+  return results === undefined;
+}
+
+/**
+ * Decide the minni_recall response text for a daemon recall result (#132 P1).
+ * An identity-recovery denial is neither a recall miss nor a daemon outage:
+ * it must surface the remediation route verbatim — never "No recall results"
+ * (fake success) and never the "Daemon unavailable" offline-fallback framing
+ * (the daemon answered; the caller's identity is unprovisioned).
+ */
+export function recallResponseText(
+  query: string,
+  result: JsonResult<RecallResponse>,
+  vaultResults: VaultSearchResult[],
+): string {
+  // W5: pass vaultResults through — a daemon-empty answer is still `result.ok`,
+  // and shouldPrescanVault (server.ts) may now have populated vaultResults for
+  // exactly that case (punch-list #1). Discarding them here would silently
+  // defeat the daemon-empty pre-scan fix by rendering "No Codex vault wiki
+  // matches." even when the local scan found something.
+  if (result.ok && result.data) return formatRecall(query, result.data, vaultResults);
+  const recovery = recoveryRouteFrom(result.data);
+  if (recovery) {
+    return [
+      "Recall denied — Minni identity recovery required (not a recall miss).",
+      JSON.stringify(recovery, null, 2),
+    ].join("\n");
+  }
+  // #132 P2: a routeless -32004 (e.g. reserved_agent_id, capability_denied)
+  // is still a live daemon answer — surface its diagnostic, never the
+  // "Daemon unavailable" offline framing or the unscoped local fallback.
+  const denial = identityDenialFrom(result.data);
+  if (denial) {
+    // W5 (punch-list #4): cross_agent's default-deny (principal.py:798-803,
+    // allows_cross_agent_recall) is correct-by-design policy, not an identity
+    // misconfiguration — say so, name the capability, give the remedy. Every
+    // OTHER -32004 (reserved_agent_id, other capability_denied methods) keeps
+    // the original "misconfiguration, not an outage" framing: those really
+    // are unprovisioned/misrouted identities (recovery-denial.test.mjs's
+    // reserved_agent_id case pins this — do not regress).
+    if (isCrossAgentCapabilityDenial(denial)) {
+      return crossAgentDenialText(denial);
+    }
+    return `Recall denied by the daemon (identity/authz misconfiguration, not an outage): ${denial}`;
+  }
+  if (vaultResults.length) {
+    return formatRecall(
+      query,
+      { results: "Daemon unavailable — offline vault fallback (workspace-unscoped)." },
+      vaultResults,
+    );
+  }
+  return `Recall failed: ${result.error}`;
+}
+
+/**
+ * W5 (punch-list #4): match ONLY the exact cross_agent capability_denied
+ * message shape emitted by principal.py:806-822 (`make_capability_denied_error`,
+ * called from recall.py:165 for `cross_agent` specifically). The SAME helper
+ * stamps -32004s for other capabilities (provenance.py:117,
+ * enforce_method_capability) and for reserved_agent_id/unknown_identity
+ * (provenance.py:98-116) with a similarly-shaped message — this regex must
+ * leave those on the existing "not-an-outage, no-fallback" path untouched.
+ *
+ * Known coupling risk: this keys off Python-owned prose (principal.py:814).
+ * If that message wording changes, this silently stops matching and
+ * cross_agent denials fall back to the generic (still-correct, just less
+ * ergonomic) framing above — fails safe, no crash. FOLLOW-UP (out of scope
+ * for this package): stamp `error.data = {capability, method}` server-side
+ * (JSON-RPC 2.0's `data` field is exactly for this, and the identity-recovery
+ * path already does it — see recoveryRouteFrom) so the TS side can switch to
+ * a structural check instead of parsing English.
+ */
+export function isCrossAgentCapabilityDenial(denialMessage: string): boolean {
+  return /^capability_denied: 'cross_agent'/.test(denialMessage);
+}
+
+/** W5: the reworded cross_agent denial text — names the capability and the
+ *  remedy, and deliberately never says "misconfiguration" (that word implies
+ *  something is broken; a default-deny capability gate is working as designed). */
+export function crossAgentDenialText(denial: string): string {
+  return (
+    "Cross-agent search denied by the daemon: this is a default-deny policy " +
+    "(capability 'cross_agent' is off by default for this principal) — grant it " +
+    "via the operator principal config, or omit cross_agent to search personal " +
+    `scope. (${denial})`
+  );
+}
+
+/**
+ * W5 (punch-list #4c): pure formatter for the cross_agent graceful-degrade
+ * path. Mirrors formatRecall's shape (so it reads identically to a normal
+ * recall) but leads with an explicit note that cross-agent was denied and
+ * these are personal-scope results instead — per graceful-degradation best
+ * practice, the substitution must be visible, never silent. Independently
+ * unit-testable without a fake daemon: callers pass the ALREADY-RESOLVED
+ * personal-scope RecallResponse (the retry itself is an async RPC call and
+ * lives in recallCrossAgentDegrade, keeping this function pure).
+ */
+export function formatCrossAgentDegrade(
+  query: string,
+  personalResponse: RecallResponse,
+  vaultResults: VaultSearchResult[] = [],
+): string {
+  const note =
+    "Note: cross-agent search was denied by design default (capability 'cross_agent' " +
+    "is off for this principal) — showing personal-scope results instead.";
+  return [note, "", formatRecall(query, personalResponse, vaultResults)].join("\n");
+}
+
+/**
+ * W5 (punch-list #4c): on a cross_agent capability denial, gracefully degrade
+ * IN-BAND to a personal-scope retry of the same query rather than returning
+ * only an error. The retry is strictly narrower/safer than the denied
+ * cross_agent call (personal scope is a subset), so it cannot fail for a NEW
+ * reason the original call didn't already risk.
+ *
+ * Guarded two ways (belt-and-suspenders against a misfiring classifier or an
+ * already-personal-scope call retrying itself into a loop):
+ *  1. `denial` must match isCrossAgentCapabilityDenial exactly.
+ *  2. `crossAgentRequested` must be the ORIGINAL request's own cross_agent
+ *     flag (=== true), not inferred from the denial text alone.
+ *
+ * Returns undefined when the degrade path does not apply, or when the
+ * personal-scope retry itself fails/comes back empty — callers should then
+ * fall back to recallResponseText's plain (reworded) denial text.
+ */
+export async function recallCrossAgentDegrade(
+  input: {
+    query: string;
+    layer?: string;
+    limit?: number;
+    workspaceId?: string;
+    agentId?: string;
+  },
+  crossAgentRequested: boolean,
+  denial: string | undefined,
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<string | undefined> {
+  if (!denial || !isCrossAgentCapabilityDenial(denial) || crossAgentRequested !== true) {
+    return undefined;
+  }
+  // Review r4 (P2): the personal-scope retry runs through recallMemory, which
+  // does not (and, for an authenticated principal, cannot) rescope the daemon
+  // search to a caller-requested workspace — daemon `search` scopes documents
+  // from the STAMPED principal's workspace (recall.py:880 uses
+  // principal.workspace_id, ignoring any per-request workspace_id), while
+  // recallMemory never even serializes workspaceId onto the wire. So when a
+  // NON-DEFAULT workspace was explicitly requested, the retry would surface
+  // stamped/default-workspace personal hits while the degrade note claims
+  // "personal-scope results", hiding the requested workspace's real denial/
+  // empty answer. Skip the degrade when the workspace cannot be honored; the
+  // caller then falls through to recallResponseText's denial/remedy text.
+  if (input.workspaceId !== undefined && input.workspaceId !== DEFAULT_WORKSPACE_ID) {
+    return undefined;
+  }
+  const personalRetry = await recallMemory(
+    {
+      query: input.query,
+      layer: input.layer,
+      limit: input.limit,
+      workspaceId: input.workspaceId,
+      agentId: input.agentId,
+      scope: "personal",
+      crossAgent: false,
+    },
+    requester,
+  );
+  if (!personalRetry.ok || !personalRetry.data) return undefined;
+  // Review r2 (P2): an EMPTY personal retry must fall through exactly like a
+  // failed one — formatting the degrade here would report crossAgentDegraded
+  // ("showing personal results instead") with nothing to show, hiding the
+  // denial/remedy text the docstring promises for empty retries.
+  if (isDaemonResultEmpty(personalRetry.data)) return undefined;
+  return formatCrossAgentDegrade(input.query, personalRetry.data, []);
+}
+
+/**
+ * Per-turn lean recall (UserPromptSubmit). Two reductions vs formatRecall:
+ *  1. Drops the verbose per-result provenance (score ranks, decay_factor,
+ *     query_variants, rrf/cross_encoder, trace_id, source path) — keeps only
+ *     wikilink + rounded score + a short headline/snippet.
+ *  2. Omits identity-layer "shelf" hits (boot agent-envelopes): those are loaded
+ *     once at SessionStart and never change, so re-injecting them every turn is
+ *     pure redundancy.
+ * Together this roughly halves the per-turn recall payload.
+ *
+ * STALE CLAIM, corrected in review round 1 of the F1 fix: this describes an
+ * intent, not the wiring. The formatter has no production caller today — the
+ * live UserPromptSubmit path builds a recall pointer (hook-handlers.ts) and
+ * SessionStart uses buildBootRecallSlice, not a formatter. Left in place
+ * because it is exported and tested, but do not read its comments as a
+ * description of what the per-turn surface actually renders.
+ */
+export function formatRecallLean(
+  query: string,
+  response: RecallResponse,
+  vaultResults: VaultSearchResult[] = [],
+  limit = 5,
+): string {
+  const arr = Array.isArray(response.results) ? response.results : [];
+  const lean = arr
+    .map((r) => (r ?? {}) as Record<string, unknown>)
+    .filter((r) => String(r.layer ?? "") !== "identity")
+    .slice(0, limit)
+    .map((r) => {
+      const wikilink =
+        typeof r.wikilink === "string"
+          ? r.wikilink
+          : typeof r.filename === "string"
+            ? r.filename
+            : "[[?]]";
+      const score =
+        typeof r.score === "number" ? Number((r.score as number).toFixed(2)) : undefined;
+      const src = typeof r.src === "string" ? r.src : undefined;
+      const headRaw = (r.headline ?? r.snippet ?? "") as unknown;
+      const headline =
+        typeof headRaw === "string" && headRaw.trim()
+          ? headRaw.replace(/\s+/g, " ").slice(0, 140)
+          : undefined;
+      return { wikilink, src, score, headline };
+    });
+  const omitted = arr.length - lean.length;
+  const sections = [
+    "# Recall (lean)",
+    `Query: ${query}`,
+    // Lean drops provenance, never health. NOTE (review round 1): this
+    // formatter currently has no production caller — the live UserPromptSubmit
+    // path builds a recall pointer instead (hook-handlers.ts), and boot uses
+    // buildBootRecallSlice. Rendering it here keeps the formatter honest for
+    // whoever picks it up; it does NOT mean the per-turn surface shows
+    // degradation today. See the PR's residuals.
+    formatDegradation(response),
+    "## AI Context Pack",
+    formatVaultContext(vaultResults, response.agent_id),
+    lean.length
+      ? "## Daemon Results (wikilink + headline; full provenance and identity-shelf hits omitted to save context — pull via minni_recall if needed)\n" +
+        JSON.stringify(lean, null, 2)
+      : "No non-identity daemon recall results.",
+    // BOOT_RECALL_LAYERS asks for episodic, so the boot path must be able to
+    // render what it asked for — otherwise the layer is still dead here.
+    formatEpisodic(response, limit),
+    omitted > 0
+      ? `(${omitted} identity-shelf/extra hit(s) omitted; identity shelf is loaded at SessionStart.)`
+      : undefined,
+  ].filter(Boolean);
+  return sections.join("\n\n");
+}
+
+export async function buildStatusReport(input?: {
+  vaultPath?: string;
+  socket?: JsonResult;
+  afm?: JsonResult;
+  afmProviderMode?: AfmProviderMode;
+  /** Test seam: pre-computed verified-generation health (skips the live probe). */
+  afmGeneration?: ProviderHealth;
+  /** Test seam: transport for the 1-token generation probe. */
+  afmGenerationTransport?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult>;
+  afmGenerationTtlMs?: number;
+  /**
+   * Total time (ms) this report may spend on the network, for callers under a
+   * hook budget. Threaded into the daemon socket call and the AFM probe so they
+   * DESTROY their handles rather than merely being abandoned — an abandoned
+   * handle outlives the budget and keeps the process alive past the harness
+   * kill.
+   *
+   * It is a budget for the WHOLE report, not per leg. The legs run in sequence
+   * (socket status, then the AFM probe), so handing each the same figure would
+   * let the wall time reach ~2x it — and the caller's own outer race would then
+   * abandon a report that a shared deadline would have completed in time.
+   */
+  timeoutMs?: number;
+}): Promise<StatusReport> {
+  // One absolute deadline, shared by every network leg below.
+  const networkDeadline =
+    input?.timeoutMs !== undefined ? Date.now() + input.timeoutMs : undefined;
+  const networkRemainingMs = (): number | undefined =>
+    networkDeadline === undefined ? undefined : Math.max(0, networkDeadline - Date.now());
+  const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
+  await ensureVault(vaultPath);
+  // One wide tail: entry *count* needs more than limit=1 (that was a 0|1 lie),
+  // and auditTail already readFile+splits the whole active log — don't pay it
+  // twice on this hot path. Headline comes from the last entry in the same window.
+  const countedTail = await auditTail(vaultPath, 10_000);
+
+  // Fetch the daemon socket status BEFORE computing our own AFM verdict: when
+  // the daemon is reachable it has ALREADY run afm_runtime_status() with its
+  // own real (matching) probe budget (afm_provider.py:376-421, embedded here
+  // as socket.data.afm by health.py:156-189). Reordered so the reuse check
+  // below (daemonAfmToProviderHealth) can skip a second, independently-timed
+  // generation probe entirely when that fresh result is usable.
+  const socket = input?.socket ?? (await socketHealth(networkRemainingMs()));
+
+  let volume = 0;
+  const logFiles = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
+  for (const name of logFiles) {
+    try {
+      const st = await stat(path.join(vaultPath, name));
+      volume += st.size;
+    } catch {}
+  }
+  const logsDir = path.join(vaultPath, "logs");
+  try {
+    const dailyNames = await readdir(logsDir);
+    for (const name of dailyNames) {
+      if (name.endsWith(".md")) {
+        const st = await stat(path.join(logsDir, name));
+        volume += st.size;
+      }
+    }
+  } catch {}
+
+  // Review r3 (P2): decide daemon-verdict reuse BEFORE paying the local
+  // afmHealth() call — in native/auto installs with the bridge health endpoint
+  // down or slow, that probe costs its full timeout on every
+  // Status/SessionStart even when the daemon has already supplied the
+  // authoritative AFM verdict. The reuse decision does not need bridge
+  // /health: in explicit modes resolveAfmProvider's provider IS the mode
+  // (health only refines status/availability detail), and in auto mode
+  // daemonAfmToProviderHealth treats the daemon as the authority regardless of
+  // the local guess. So resolve provisionally without health, and only await
+  // afmHealth() when the daemon verdict is unusable (the fallback plugin probe
+  // and auto-resolution genuinely need it).
+  const configuredAfmMode = input?.afmProviderMode ?? AFM_PROVIDER_MODE;
+  let rawAfm = input?.afm;
+  let afmProvider = resolveAfmProvider(configuredAfmMode, {
+    nativeHelperPath: resolvedNativeHelperPath(),
+    health: rawAfm,
+  });
+
+  // Single-authority AFM verdict (punch-list §3): reuse the daemon's own
+  // fresh, matching-mode probe when it's usable instead of spawning a second,
+  // independently-timed generation probe (no cold native-helper subprocess,
+  // no redundant bridge chat-completion call). daemonAfmToProviderHealth
+  // returns undefined — falling through to the plugin's own probe below —
+  // whenever the socket is unreachable, the daemon payload has no `afm`
+  // block at all (back-compat: identical to "socket unreachable"), the
+  // payload shape doesn't match (untrusted input), the provider mode doesn't
+  // match this process's resolved provider, or the probe is stale.
+  const ttlMs = input?.afmGenerationTtlMs ?? GENERATION_PROBE_TTL_MS;
+  const daemonAfmData = socket.ok ? (socket.data as Record<string, unknown> | undefined)?.afm : undefined;
+  // Review r2 (P2): pass the CONFIGURED mode too — in auto mode the daemon's
+  // effective-provider verdict wins over the plugin's local guess (helper
+  // presence alone can resolve "native" here while the daemon already fell
+  // back to bridge after a real FoundationModels check).
+  // #195 (env-context split): only pass a configured mode when THIS process
+  // actually has one. MINNI_AFM_PROVIDER_MODE reaches a process via the
+  // daemon's launchd plist or an installer-written MCP env block
+  // (native_afm_env() in plugins/minni/skills/minni-install/scripts/
+  // propagate.py); a hook/MCP/shell context with neither source falls
+  // through to "bridge" as a default, not an operator decision, and must
+  // not out-vote the daemon's verified verdict. Passing undefined makes the
+  // daemon the single source of truth for those unconfigured contexts.
+  const afmModeIsConfigured = input?.afmProviderMode !== undefined || afmProviderModeConfigured();
+  const daemonGeneration = daemonAfmToProviderHealth(
+    daemonAfmData,
+    afmProvider.provider,
+    ttlMs,
+    Date.now,
+    afmModeIsConfigured ? afmProvider.mode : undefined,
+  );
+
+  // Local /health probe (r3): skipped entirely when the daemon verdict is
+  // being reused — the report's afm block then carries the daemon-sourced
+  // reachable/generationVerified plus source:"daemon", and the bridge-health
+  // string fields are simply absent. When we DO need it (no usable daemon
+  // verdict, or a test seam supplied input.afm), re-resolve the provider with
+  // health so the fallback path behaves exactly as before.
+  const reusingDaemonVerdict = !input?.afmGeneration && daemonGeneration !== undefined;
+  if (rawAfm === undefined && !reusingDaemonVerdict) {
+    rawAfm = await afmHealth();
+    afmProvider = resolveAfmProvider(configuredAfmMode, {
+      nativeHelperPath: resolvedNativeHelperPath(),
+      health: rawAfm,
+    });
+  }
+  const resolvedRawAfm: JsonResult =
+    rawAfm ?? { ok: false, data: undefined, error: undefined };
+
+  let generation: ProviderHealth;
+  let source: "daemon" | "plugin-probe";
+  if (input?.afmGeneration) {
+    generation = input.afmGeneration;
+    source = "plugin-probe";
+  } else if (daemonGeneration) {
+    generation = daemonGeneration;
+    source = "daemon";
+    // #195: when an unconfigured process adopts the daemon's verdict, the
+    // report's provider block must be re-stated from the daemon too. Leaving
+    // the local guess ("bridge", available:false, "ECONNREFUSED 11437") next to
+    // afm.ok:true would just relocate the contradiction this fix removes.
+    const daemonProvider = daemonEffectiveAfmProvider(daemonAfmData);
+    if (daemonProvider && daemonProvider !== afmProvider.provider) {
+      afmProvider = {
+        mode: afmProvider.mode,
+        provider: daemonProvider,
+        status:
+          daemonProvider === "off"
+            ? "off"
+            : daemonProvider === "bridge"
+              ? "bridge"
+              : generation.generationVerified
+                ? "native_available"
+                : "native_unavailable",
+        available: generation.generationVerified,
+        adapterConfigured: afmProvider.adapterConfigured,
+        reason: "provider reported by the daemon (this process has no configured AFM mode)",
+      };
+    }
+  } else {
+    generation = await getAfmProviderHealth({
+      mode: afmProvider.provider,
+      // The HTTP /health result gates the generation probe only for the bridge
+      // provider; in native mode a dead bridge must not veto the probe — the
+      // native helper is exercised directly (mirror of afm_runtime_status).
+      health: afmProvider.provider === "bridge" ? resolvedRawAfm : undefined,
+      transport: input?.afmGenerationTransport,
+      ttlMs: input?.afmGenerationTtlMs,
+      nativeHelperPath: resolvedNativeHelperPath(),
+      // Budgeted callers cap the probe too: its 10s bridge / 45s native-helper
+      // defaults both outlive a hook budget, and the in-flight handle would
+      // keep the process alive past the deadline that kills it. What is left of
+      // the SHARED deadline, not a fresh copy of it — the socket leg above has
+      // already spent part of it.
+      ...(networkRemainingMs() !== undefined ? { timeoutMs: networkRemainingMs() } : {}),
+    });
+    source = "plugin-probe";
+  }
+  const sanitizedAfm = sanitizeAfmHealth(resolvedRawAfm);
+  const generationError =
+    generation.generationVerified
+      ? undefined
+      : generation.detail ?? (afmProvider.provider === "bridge" ? sanitizedAfm.error : undefined);
+  // afm_ok is redefined as generationVerified (field name kept for envelope compat):
+  // a verified 1-token completion within the probe TTL, not mere /health reachability.
+  const afm: JsonResult<Record<string, unknown>> = {
+    ok: generation.generationVerified,
+    data: {
+      ...sanitizedAfm.data,
+      reachable: generation.reachable,
+      generationVerified: generation.generationVerified,
+      // Authority tag (punch-list §3c): which leg produced this verdict, so a
+      // consumer never has to diff socket.data.afm against this field to spot
+      // a contradiction — when source is "daemon" the two are, by construction,
+      // the same probe.
+      source,
+    },
+    error: generationError,
+  };
+
+  return {
+    vault: {
+      path: vaultPath,
+      exists: await vaultExists(vaultPath),
+    },
+    socket,
+    afm,
+    afmProvider,
+    extractor: {
+      provider: afmProvider.provider,
+      tier: "local",
+      source,
+      generationVerified: generation.generationVerified,
+      probeAgeMs: generation.probeAgeMs,
+    },
+    audit: {
+      entries: countedTail.entries.length,
+      // X10: never return the full last audit body on status (paths/metadata
+      // in free-form markdown). Headline line only — same posture as hooks.
+      latest: (() => {
+        const last = countedTail.entries.at(-1);
+        if (!last) return undefined;
+        const headline = last.split("\n")[0]?.trim() ?? "";
+        return headline.length > 0 ? headline : undefined;
+      })(),
+      volume,
+    },
+  };
+}
+
+export async function statusAndAudit(vaultPath = DEFAULT_VAULT_PATH): Promise<StatusReport> {
+  const report = await buildStatusReport({ vaultPath });
+  // Do not dump the full StatusReport into audit details — that re-introduces
+  // vault paths and nested payloads into the full-body audit_tail channel (X10).
+  await recordAudit(vaultPath, {
+    tool: "minni_status",
+    summary: `socket=${report.socket.ok ? "ok" : "error"} afm=${report.afm.ok ? "ok" : "error"}`,
+    details: {
+      socket_ok: report.socket.ok,
+      afm_ok: report.afm.ok,
+      audit_entries: report.audit.entries,
+      audit_volume: report.audit.volume,
+      audit_latest_headline: report.audit.latest,
+    },
+  });
+  return report;
+}

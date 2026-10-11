@@ -21,7 +21,7 @@
 import path from "node:path";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 
-import type { RecallResponse } from "./sovereign.js";
+import type { RecallResponse } from "./daemon_transport.js";
 import type { VaultSearchResult } from "./vault.js";
 import { assertWriteTargetUnder } from "./vault.js";
 

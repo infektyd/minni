@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 
-import type { JsonResult } from "./sovereign.js";
+import type { JsonResult } from "./daemon_transport.js";
 // G13: single source for allowlist (fixes duplication noted in review)
 import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL, minniHome, modelAllowedTargets } from "./config.js";
 

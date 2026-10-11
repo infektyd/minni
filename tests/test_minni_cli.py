@@ -431,3 +431,24 @@ def test_rpc_converts_socket_timeout(monkeypatch, tmp_path, operation):
         minni_cli._rpc(tmp_path / "daemon.sock", "search", timeout=120.0)
     assert caught.value.__cause__ is timeout_error
     assert observed == {"timeout": 120.0, "closed": True}
+
+
+def test_rpc_connection_refused_kickstart_hint(monkeypatch, tmp_path):
+    class RefusedSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, value):
+            pass
+
+        def connect(self, path):
+            raise ConnectionRefusedError("Connection refused")
+
+    monkeypatch.setattr(minni_cli.socket, "socket", lambda *args: RefusedSocket())
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(minni_cli.RpcError, match="launchctl kickstart"):
+        minni_cli._rpc(tmp_path / "daemon.sock", "ping")
+

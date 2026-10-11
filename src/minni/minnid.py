@@ -59,6 +59,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import sys
 import time
 import threading
@@ -1684,6 +1685,49 @@ async def _footprint_watchdog_runner(
             raise
 
 
+async def _socket_watchdog_runner(
+    sock_path: Path,
+    expected_inode: int,
+    *,
+    interval: Optional[float] = None,
+    shutdown_tasks=None,
+):
+    """Periodic socket inode self-check. Trips → graceful shutdown for launchd/supervisor restart."""
+    wait = interval if interval is not None else 2.0
+    logger.info("Socket watchdog enabled: path=%s expected_inode=%d interval=%.1fs", sock_path, expected_inode, wait)
+
+    while True:
+        try:
+            await asyncio.sleep(wait)
+            current_stat = sock_path.stat()
+            if current_stat.st_ino != expected_inode:
+                logger.critical(
+                    "Socket watchdog: inode drift detected on %s (expected %d, found %d) — shutting down for supervisor restart",
+                    sock_path, expected_inode, current_stat.st_ino,
+                )
+                _initiate_graceful_shutdown(
+                    f"Socket watchdog: inode drift on {sock_path} ({expected_inode} != {current_stat.st_ino})",
+                    tasks=shutdown_tasks() if callable(shutdown_tasks) else shutdown_tasks,
+                    level="warning",
+                )
+                return
+        except FileNotFoundError:
+            logger.critical(
+                "Socket watchdog: socket file %s unlinked — shutting down for supervisor restart",
+                sock_path,
+            )
+            _initiate_graceful_shutdown(
+                f"Socket watchdog: socket {sock_path} unlinked",
+                tasks=shutdown_tasks() if callable(shutdown_tasks) else shutdown_tasks,
+                level="warning",
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Socket watchdog pass failed")
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1891,9 +1935,12 @@ async def _handle_client(reader: asyncio.StreamReader,
             pass
 
 
+_bound_socket_inode: Optional[int] = None
+
+
 async def _serve_unix_socket(path: Path):
     """Start the Unix socket server."""
-    global _server, _running
+    global _server, _running, _bound_socket_inode
 
     # SEC-001: ensure parent run/ dir is 0700 (owner-only) before bind
     run_dir = path.parent
@@ -1903,9 +1950,21 @@ async def _serve_unix_socket(path: Path):
     except OSError as e:
         logger.warning("Failed to chmod run dir %s to 0o700 (OSError: %s) — socket may be accessible to other users (SEC-001)", run_dir, e)
 
-    # Remove stale socket
+    # Check for active listener before touching stale socket
     if path.exists():
-        path.unlink()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                probe.connect(str(path))
+                logger.error("Active minnid is already listening on %s. Refusing to overwrite active socket.", path)
+                raise RuntimeError(f"Active minnid is already listening on {path}. Refusing to overwrite active socket.")
+        except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError) as e:
+            if isinstance(e, RuntimeError):
+                raise
+            try:
+                path.unlink()
+            except OSError as unlink_err:
+                logger.warning("Failed to unlink stale socket %s: %s", path, unlink_err)
 
     # SEC-015: cap StreamReader buffer at 1 MiB so readuntil raises
     # LimitOverrunError instead of growing unbounded.
@@ -1915,14 +1974,25 @@ async def _serve_unix_socket(path: Path):
         limit=_SOCKET_BODY_LIMIT,
     )
 
+    try:
+        _bound_socket_inode = path.stat().st_ino
+    except OSError:
+        _bound_socket_inode = None
+
     # Set socket permissions (owner read/write only)
     try:
         os.chmod(str(path), 0o600)
     except OSError as e:
         logger.warning("Failed to chmod socket %s to 0o600 (OSError: %s) — socket may be accessible to other users (SEC-001)", path, e)
 
-    logger.info("Listening on %s", path)
+    logger.info("Listening on %s (inode=%s)", path, _bound_socket_inode)
     _running = True
+
+    watchdog_task = None
+    if _bound_socket_inode is not None:
+        watchdog_task = asyncio.create_task(
+            _socket_watchdog_runner(path, _bound_socket_inode)
+        )
 
     try:
         async with _server:
@@ -1931,6 +2001,8 @@ async def _serve_unix_socket(path: Path):
     except asyncio.CancelledError:
         pass
     finally:
+        if watchdog_task is not None and not watchdog_task.done():
+            watchdog_task.cancel()
         if _server is not None:
             _server.close()
             await _server.wait_closed()
@@ -2305,9 +2377,21 @@ def main():
         logger.info("Shutting down…")
     finally:
         _running = False
-        # Clean up socket
-        if _unix_socket_path.exists():
-            _unix_socket_path.unlink()
+        # Clean up socket only if we still own the inode on disk (#socket-resilience)
+        try:
+            if _unix_socket_path.exists():
+                stat_ino = _unix_socket_path.stat().st_ino
+                if _bound_socket_inode is None or stat_ino == _bound_socket_inode:
+                    _unix_socket_path.unlink()
+                else:
+                    logger.warning(
+                        "Exit cleanup skipped unlinking %s: inode mismatch (bound %s vs disk %s)",
+                        _unix_socket_path,
+                        _bound_socket_inode,
+                        stat_ino,
+                    )
+        except OSError as e:
+            logger.warning("Exit cleanup could not inspect or unlink %s: %s", _unix_socket_path, e)
         loop.close()
         logger.info("minnid stopped.")
 
