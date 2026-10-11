@@ -528,7 +528,7 @@ function deterministicPacket(input: {
   const currentState = [
     relevantSources.length > 0
       ? `Vault context available from ${relevantSources.length} ranked note${relevantSources.length === 1 ? "" : "s"}.`
-      : "No matching Codex vault notes were found for this task.",
+      : "No matching vault notes were found for this task.",
     input.recallResult.ok ? "Daemon recall responded." : `Daemon recall unavailable: ${input.recallResult.error ?? "unknown error"}.`,
   ];
   if (daemonLead) currentState.push(`Daemon lead: ${daemonLead}`);
@@ -538,7 +538,7 @@ function deterministicPacket(input: {
     "Run focused tests first, then the plugin build/test suite before handoff.",
   ];
   const risks = [
-    "Older broad semantic recall can outrank fresher Codex vault notes unless source ranking is explicit.",
+    "Older broad semantic recall can outrank fresher vault notes unless source ranking is explicit.",
     "Private local memory material can accidentally leak if public-safety scans are skipped.",
   ];
   // SEC-010: model-facing context only ever carries snippets inside the

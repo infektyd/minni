@@ -795,8 +795,11 @@ function compactDaemonResults(results: string | unknown[] | undefined): string {
   return results;
 }
 
-function formatVaultContext(results: VaultSearchResult[]): string {
-  if (results.length === 0) return "No Codex vault wiki matches.";
+function formatVaultContext(results: VaultSearchResult[], agentId?: string): string {
+  if (results.length === 0) {
+    const label = agentId ? `${agentId} ` : "";
+    return `No ${label}vault wiki matches.`;
+  }
   return results
     .map((result, index) => {
       const snippet = result.snippet.replace(/\s+/g, " ");
@@ -954,7 +957,7 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     // hit must still have been told the corpus it came from was degraded.
     formatDegradation(response),
     "## AI Context Pack",
-    formatVaultContext(vaultResults),
+    formatVaultContext(vaultResults, response.agent_id),
     daemonLead ? `Daemon lead: ${daemonLead}` : undefined,
     "## Daemon Results",
     results,
@@ -1251,7 +1254,7 @@ export function formatRecallLean(
     // degradation today. See the PR's residuals.
     formatDegradation(response),
     "## AI Context Pack",
-    formatVaultContext(vaultResults),
+    formatVaultContext(vaultResults, response.agent_id),
     lean.length
       ? "## Daemon Results (wikilink + headline; full provenance and identity-shelf hits omitted to save context — pull via minni_recall if needed)\n" +
         JSON.stringify(lean, null, 2)

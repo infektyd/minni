@@ -273,7 +273,7 @@ server.registerTool(
   {
     title: "Minni Prepare Task",
     description:
-      "Build a compact Codex task packet from vault notes, daemon recall, constraints, and optional AFM distillation.",
+      "Build a compact task packet from vault notes, daemon recall, constraints, and optional AFM distillation.",
     inputSchema: {
       task: z.string().min(1),
       budgetTokens: z.number().int().min(1000).max(32000).optional(),
@@ -616,7 +616,7 @@ server.registerTool(
   {
     title: "Minni Recall",
     description:
-      "Recall Minni context and log the lookup in the Codex vault.",
+      "Recall Minni context and log the lookup in the vault.",
     inputSchema: {
       query: z.string().min(1),
       layer: z
@@ -768,7 +768,7 @@ server.registerTool(
   {
     title: "Minni Learn",
     description:
-      "Write a Codex vault note first, then store the learning through Minni.",
+      "Write a vault note first, then store the learning through Minni.",
     inputSchema: {
       title: z.string().min(1),
       content: z.string().min(1),
@@ -956,7 +956,7 @@ server.registerTool(
   {
     title: "Minni Vault Write",
     description:
-      "Write a structured Codex Obsidian vault page without storing it as a durable learning.",
+      "Write a structured Obsidian vault page without storing it as a durable learning.",
     inputSchema: {
       title: z.string().min(1),
       content: z.string().min(1),
@@ -1040,7 +1040,7 @@ server.registerTool(
   {
     title: "Minni Audit Tail",
     description:
-      "Show recent Minni audit entries from the Codex vault.",
+      "Show recent Minni audit entries from the vault.",
     inputSchema: {
       limit: z.number().int().min(1).max(100).optional(),
     },

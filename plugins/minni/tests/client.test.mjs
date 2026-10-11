@@ -58,6 +58,17 @@ test("formatRecall includes backend badge when recall reports backend provenance
   assert.match(formatted, /\[faiss-disk\+qdrant\]/);
 });
 
+test("formatRecall respects agent_id for empty vault matches and avoids hardcoded Codex", () => {
+  const geminiRecall = formatRecall("test", { results: [], agent_id: "gemini" }, []);
+  assert.match(geminiRecall, /No gemini vault wiki matches\./);
+  assert.doesNotMatch(geminiRecall, /No Codex vault wiki matches/);
+
+  const bareRecall = formatRecall("test", { results: [] }, []);
+  assert.match(bareRecall, /No vault wiki matches\./);
+  assert.doesNotMatch(bareRecall, /Codex/);
+});
+
+
 test("buildStatusReport includes vault, socket, AFM, and audit state", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-status-"));
   try {
