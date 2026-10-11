@@ -1,0 +1,2 @@
+{"source":"TOOL","type":"TOOL_RESULT","tool_name":"run_command","timestamp":"2026-10-11T12:02:00.000Z","content":"swift build --flag-legacy\nerror: unknown flag: --flag-legacy; use --enable-legacy-driver"}
+{"source":"TOOL","type":"TOOL_RESULT","tool_name":"run_command","timestamp":"2026-10-11T12:02:15.000Z","content":"swift build --enable-legacy-driver\nBuild complete! [2/2] Compiling target"}
