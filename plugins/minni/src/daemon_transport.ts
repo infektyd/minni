@@ -936,11 +936,117 @@ export function formatDegradation(response: RecallResponse): string | undefined 
   return lines.join("\n");
 }
 
-export function formatRecall(query: string, response: RecallResponse, vaultResults: VaultSearchResult[] = []): string {
+function formatAgentName(agentId?: string): string {
+  if (!agentId) return "Codex";
+  const normalized = agentId.toLowerCase();
+  const names: Record<string, string> = {
+    codex: "Codex",
+    cursor: "Cursor",
+    "claude-code": "Claude Code",
+    claudecode: "Claude Code",
+    "claude-desktop": "Claude Desktop",
+    gemini: "Gemini",
+    antigravity: "Antigravity",
+    "grok-build": "Grok",
+    grok: "Grok",
+    hermes: "Hermes",
+    openclaw: "OpenClaw",
+    kilocode: "Kilo Code",
+    devin: "Devin",
+    main: "Operator",
+  };
+  if (names[normalized]) return names[normalized];
+  return agentId.charAt(0).toUpperCase() + agentId.slice(1);
+}
+
+export function extractDaemonLead(results: string | unknown[] | undefined): string | undefined {
+  if (Array.isArray(results)) {
+    if (results.length === 0) return undefined;
+    const first = results[0];
+    if (typeof first === "object" && first !== null) {
+      const r = first as Record<string, unknown>;
+      const text =
+        (typeof r.heading === "string" && r.heading.trim()) ||
+        (typeof r.title === "string" && r.title.trim()) ||
+        (typeof r.headline === "string" && r.headline.trim()) ||
+        (typeof r.snippet === "string" && r.snippet.trim() ? firstLine(r.snippet) : "") ||
+        "";
+      if (text && !text.startsWith("[") && !text.startsWith("{")) return text;
+      return undefined;
+    }
+    if (typeof first === "string" && first.trim()) {
+      const line = firstLine(first);
+      if (line && !line.startsWith("[") && !line.startsWith("{")) return line;
+    }
+    return undefined;
+  }
+  if (typeof results === "string" && results.trim()) {
+    const trimmed = results.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) return undefined;
+    return firstLine(trimmed);
+  }
+  return undefined;
+}
+
+function formatDaemonCard(r: Record<string, unknown>, index: number): string {
+  const wikilink =
+    typeof r.wikilink === "string" && r.wikilink.trim()
+      ? r.wikilink.trim()
+      : typeof r.filename === "string" && r.filename.trim()
+        ? (r.filename.trim().startsWith("[[") ? r.filename.trim() : `[[${r.filename.trim()}]]`)
+        : "[[?]]";
+  const title =
+    (typeof r.heading === "string" && r.heading.trim()) ||
+    (typeof r.title === "string" && r.title.trim()) ||
+    (typeof r.headline === "string" && r.headline.trim()) ||
+    undefined;
+  const score =
+    typeof r.score === "number"
+      ? Number(r.score.toFixed(2))
+      : (typeof r.score === "string" && r.score.trim() ? r.score.trim() : undefined);
+  const rawSnippet = r.snippet ?? r.content ?? r.text ?? r.headline;
+  const snippet =
+    typeof rawSnippet === "string" && rawSnippet.trim()
+      ? rawSnippet.replace(/\s+/g, " ").trim()
+      : undefined;
+
+  let card = `${index + 1}. ${wikilink}`;
+  if (title && title !== wikilink && title !== wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "")) {
+    card += ` — ${title}`;
+  }
+  if (score !== undefined) {
+    card += ` (score=${score})`;
+  }
+  if (snippet) {
+    card += `\n   ${snippet}`;
+  }
+  return card;
+}
+
+function formatVaultCard(r: VaultSearchResult, index: number): string {
+  const snippet = r.snippet ? r.snippet.replace(/\s+/g, " ").trim() : "";
+  let card = `${index + 1}. ${r.wikilink}`;
+  if (r.title && r.title !== r.wikilink && r.title !== r.wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "")) {
+    card += ` — ${r.title}`;
+  }
+  card += ` (vault score=${r.score})`;
+  if (snippet) {
+    card += `\n   ${snippet}`;
+  }
+  return card;
+}
+
+export interface FormatRecallOptions {
+  debug?: boolean;
+}
+
+export function formatRecall(
+  query: string,
+  response: RecallResponse,
+  vaultResults: VaultSearchResult[] = [],
+  options?: FormatRecallOptions | boolean,
+): string {
   const backendBadge = response.backend ?? response.backend_badge;
-  const results = Array.isArray(response.results)
-    ? JSON.stringify(response.results, null, 2)
-    : response.results ?? "No recall results.";
   const provenance = [
     response.agent_id ? `agent=${response.agent_id}` : undefined,
     response.layer ? `layer=${response.layer}` : undefined,
@@ -948,7 +1054,70 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
   ]
     .filter(Boolean)
     .join(", ");
-  const daemonLead = firstLine(compactDaemonResults(response.results));
+
+  const isDebug = Boolean(
+    options === true ||
+      (typeof options === "object" && options !== null && options.debug) ||
+      process.env.MINNI_DEBUG_RECALL === "true",
+  );
+
+  const agentName = formatAgentName(response.agent_id);
+
+  // Check daemon results
+  const rawResults = response.results;
+  const isArrayResults = Array.isArray(rawResults);
+  const daemonHits: unknown[] = isArrayResults ? rawResults : [];
+  const hasDaemonArrayHits = isArrayResults && daemonHits.length > 0;
+  const stringResults = typeof rawResults === "string" ? rawResults.trim() : undefined;
+  const isStringResults = typeof stringResults === "string" && stringResults.length > 0;
+  const isStringSentinel =
+    isStringResults &&
+    (stringResults === "No recall results." ||
+      stringResults.startsWith("Daemon unavailable"));
+  const hasDaemonStringHits = isStringResults && !isStringSentinel;
+  const hasDaemonHits = (hasDaemonArrayHits || hasDaemonStringHits) && response.count !== 0;
+  const hasVaultHits = vaultResults.length > 0;
+
+  // Build AI Context Pack
+  let contextPackContent: string;
+  if (!hasDaemonHits && !hasVaultHits) {
+    contextPackContent = `No ${agentName} vault wiki matches.`;
+  } else {
+    const cards: string[] = [];
+    let cardIndex = 0;
+    if (hasDaemonArrayHits) {
+      for (const item of daemonHits) {
+        if (typeof item === "object" && item !== null) {
+          cards.push(formatDaemonCard(item as Record<string, unknown>, cardIndex++));
+        } else if (typeof item === "string" && item.trim()) {
+          cards.push(`${cardIndex + 1}. ${item.trim()}`);
+          cardIndex++;
+        }
+      }
+    } else if (hasDaemonStringHits && !hasVaultHits) {
+      cards.push(stringResults!);
+    }
+
+    if (hasVaultHits) {
+      for (const item of vaultResults) {
+        cards.push(formatVaultCard(item, cardIndex++));
+      }
+    }
+    contextPackContent = cards.join("\n");
+  }
+
+  // Determine ## Daemon Results
+  let daemonResultsContent: string | undefined;
+  if (isDebug) {
+    daemonResultsContent = isArrayResults
+      ? JSON.stringify(rawResults, null, 2)
+      : stringResults ?? (rawResults ? String(rawResults) : "No recall results.");
+  } else if (hasDaemonStringHits && hasVaultHits) {
+    daemonResultsContent = stringResults;
+  } else if (!hasDaemonHits && isStringResults && stringResults.startsWith("Daemon unavailable")) {
+    daemonResultsContent = stringResults;
+  }
+
   const sections = [
     "# Minni Recall",
     `Query: ${query}${backendBadge ? ` [${backendBadge}]` : ""}`,
@@ -957,10 +1126,8 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     // hit must still have been told the corpus it came from was degraded.
     formatDegradation(response),
     "## AI Context Pack",
-    formatVaultContext(vaultResults, response.agent_id),
-    daemonLead ? `Daemon lead: ${daemonLead}` : undefined,
-    "## Daemon Results",
-    results,
+    contextPackContent,
+    ...(daemonResultsContent ? ["## Daemon Results", daemonResultsContent] : []),
     formatEpisodic(response),
   ].filter(Boolean);
   return sections.join("\n\n");
