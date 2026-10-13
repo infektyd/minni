@@ -221,6 +221,12 @@ class SovereignConfig:
                 "interval_seconds": 15 * 60,
                 "max_per_run": 50,
                 "max_batches_per_tick": 40,  # up to 40*50=2000 candidates/tick
+                "judge_mode": os.environ.get("MINNI_JUDGE_MODE", "enforce"),
+                "max_model_calls_per_batch": 8,
+                "debounce_window_seconds": 20.0,
+                "burst_threshold": 2,
+                "min_debounce_gap_seconds": 5.0,
+                "allow_jev_egress": False,
                 # Before draining, ingest inbox stop-candidate files
                 # (<vault>/inbox/*.json — kind 'stop_candidates', legacy
                 # 'codex_stop_candidates', or kind-less stop-candidate shape)
