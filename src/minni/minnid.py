@@ -799,6 +799,14 @@ def _increment_governance_request_count() -> None:
     _request_count += 1
 
 
+_consolidation_trigger: Optional[Any] = None
+
+
+def _notify_consolidation_trigger() -> None:
+    if _consolidation_trigger is not None:
+        _consolidation_trigger.notify()
+
+
 def _governance_context() -> GovernanceContext:
     return GovernanceContext(
         make_error=_make_error,
@@ -812,6 +820,7 @@ def _governance_context() -> GovernanceContext:
         maybe_archive_inbox_source=_maybe_archive_inbox_source,
         increment_request_count=_increment_governance_request_count,
         sovereign_db=SovereignDB,
+        notify_candidate_staged=_notify_consolidation_trigger,
         logger=logger,
     )
 
@@ -2309,9 +2318,51 @@ def main():
         http_task = loop.create_task(_serve_http(args.host, args.port))
 
     # Opt-in AFM loop runner (gated by MINNI_AFM_LOOP). Dormant unless enabled.
+    global _consolidation_trigger
     afm_task = None
+    consolidation_trigger_task = None
     if _afm_loop_enabled(DEFAULT_CONFIG):
         afm_task = loop.create_task(_afm_loop_runner())
+        from minni.minnid_runtime.afm import ConsolidationTrigger, drain_consolidation
+        schedule = getattr(DEFAULT_CONFIG, "afm_loop_schedule", {}) or {}
+        pass_cfg = (schedule.get("passes") or {}).get("consolidation", {})
+        window = float(pass_cfg.get("debounce_window_seconds", 20.0))
+        burst = int(pass_cfg.get("burst_threshold", 2))
+        min_gap = float(pass_cfg.get("min_debounce_gap_seconds", 5.0))
+
+        async def _drain_fn():
+            return await drain_consolidation(_afm_context(), pass_cfg, source="trigger")
+
+        _consolidation_trigger = ConsolidationTrigger(
+            loop=loop,
+            drain_fn=_drain_fn,
+            window=window,
+            burst=burst,
+            min_gap=min_gap,
+            logger=logger,
+        )
+        consolidation_trigger_task = loop.create_task(_consolidation_trigger.run())
+
+        try:
+            wb = _lazy_writeback()
+            with wb.db.cursor() as c:
+                c.execute(
+                    """
+                    SELECT COUNT(*) AS n FROM candidate_packets cp
+                    WHERE cp.status = 'proposed'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM consolidation_actions ca
+                          WHERE ca.action_type IN ('afm_review', 'afm_judge_reject', 'afm_judge_redact')
+                            AND ca.claim = CAST(cp.candidate_id AS TEXT)
+                            AND COALESCE(ca.status, '') != 'superseded'
+                      )
+                    """
+                )
+                if int(c.fetchone()["n"]) > 0:
+                    _consolidation_trigger.trigger_now()
+        except Exception as exc:
+            logger.warning("Consolidation boot probe failed: %s", exc)
+
 
     # Vault watch runner. On by default (MINNI_VAULT_WATCH=off to disable):
     # unlike the AFM loop this is not an enhancement, it is what keeps recall
@@ -2349,7 +2400,7 @@ def main():
     # rather than silently eating the machine. On by default.
     footprint_task = None
     background_tasks = lambda: [
-        main_task, http_task, afm_task, vault_watch_task,
+        main_task, http_task, afm_task, consolidation_trigger_task, vault_watch_task,
         decay_task, backfill_task, worker_write_drain_task,
         warmup_task, footprint_task,
     ]

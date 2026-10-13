@@ -49,6 +49,7 @@ class GovernanceContext:
     purge_durable_learning: Callable[..., None] = lambda *a, **k: None
     increment_request_count: Callable[[], None] | None = None
     sovereign_db: Callable[..., Any] = SovereignDB
+    notify_candidate_staged: Optional[Callable[[], None]] = None
     logger: logging.Logger = logger
 
 
@@ -91,6 +92,7 @@ AUTO_ACCEPT_PARAM_KEYS = ("auto_accept_own", "learn.auto_accept_own")
 # One request must not be able to hold the daemon's write lock open writing an
 # event row per entry. See handle_resolve_contradiction.
 MAX_SUPERSEDE_IDS = 64
+MAX_PENDING_CANDIDATES_PER_PRINCIPAL = 2000
 
 
 def reject_wire_supplied_auto_accept(
@@ -893,6 +895,23 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     if err:
         return err
 
+    try:
+        wb = context.lazy_writeback()
+        with wb.db.cursor() as c:
+            c.execute(
+                "SELECT COUNT(*) AS n FROM candidate_packets WHERE principal=? AND status='proposed'",
+                (principal.agent_id,),
+            )
+            pending_count = int(c.fetchone()["n"])
+            if pending_count >= MAX_PENDING_CANDIDATES_PER_PRINCIPAL:
+                return context.make_error(
+                    -32005,
+                    f"Backpressure: pending candidate queue limit reached ({pending_count} >= {MAX_PENDING_CANDIDATES_PER_PRINCIPAL}) for principal {principal.agent_id}",
+                    request_id,
+                )
+    except Exception as exc:
+        context.logger.warning("stage_candidate: backpressure check failed (%s); proceeding", exc)
+
     content = (params.get("content") or params.get("text") or "").strip()
     if not content:
         return context.make_error(-32602, "content is required", request_id)
@@ -1022,25 +1041,49 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 withheld = list(withheld) + ["durable-write preparation failed"]
 
         def _stage_proposal(c):
-            c.execute(
-                """
-                INSERT INTO candidate_packets
-                (principal, workspace_id, layer, privacy_level, content,
-                 evidence_refs, derived_from, instruction_like, status, proposed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                """,
-                (
-                    principal.agent_id,
-                    ws,
-                    params.get("layer"),
-                    stored_privacy,
-                    stored_content,
-                    ev,
-                    df,
-                    instr,
-                    now,
-                ),
-            )
+            pragma = c.execute("PRAGMA table_info(candidate_packets)").fetchall()
+            cols = {row["name"] if isinstance(row, dict) else row[1] for row in pragma}
+            if "requested_privacy" in cols:
+                c.execute(
+                    """
+                    INSERT INTO candidate_packets
+                    (principal, workspace_id, layer, privacy_level, requested_privacy, content,
+                     evidence_refs, derived_from, instruction_like, status, proposed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                    """,
+                    (
+                        principal.agent_id,
+                        ws,
+                        params.get("layer"),
+                        stored_privacy,
+                        requested_privacy,
+                        stored_content,
+                        ev,
+                        df,
+                        instr,
+                        now,
+                    ),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO candidate_packets
+                    (principal, workspace_id, layer, privacy_level, content,
+                     evidence_refs, derived_from, instruction_like, status, proposed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                    """,
+                    (
+                        principal.agent_id,
+                        ws,
+                        params.get("layer"),
+                        stored_privacy,
+                        stored_content,
+                        ev,
+                        df,
+                        instr,
+                        now,
+                    ),
+                )
             return c.lastrowid
 
         try:
@@ -1155,6 +1198,11 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 "G16 stage_candidate #%d principal=%s privacy=%s (proposal-first, no durable learn yet)",
                 cid, principal.agent_id, stored_privacy,
             )
+            if context.notify_candidate_staged is not None:
+                try:
+                    context.notify_candidate_staged()
+                except Exception as exc:
+                    context.logger.warning("notify_candidate_staged failed: %s", exc)
 
         result = {
             "status": "accepted" if lid is not None else "proposed",

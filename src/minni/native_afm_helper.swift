@@ -254,6 +254,14 @@ struct TriageResult {
 }
 
 @Generable
+struct JudgeResult {
+    @Guide(description: "Decision for durable memory: accept, reject, or redact")
+    var decision: String
+    @Guide(description: "Concise justification referencing the rubric")
+    var reason: String
+}
+
+@Generable
 struct ExtractedEntity {
     @Guide(description: "Entity name")
     var name: String
@@ -507,6 +515,33 @@ func runFoundationModels(_ request: AFMRequest) async {
                 ok: true,
                 availability: "available",
                 data: ["decision": .string(decision), "reason": .string(response.content), "tool_used": .bool(TriageState.shared.lastDecision != nil)]
+            ))
+        case "judge":
+            let session = LanguageModelSession(
+                instructions: """
+                You are an authoritative evaluator for durable software engineering knowledge in a shared developer memory vault.
+                Rubric:
+                - accept: durable, self-contained, domain-specific technical facts, system conventions, API behaviors, architectural decisions, or bug root causes.
+                - reject: transient conversational chatter, session-specific instructions (e.g. 'do this next', 'run tests'), vague fragments, or unsubstantiated opinions.
+                - redact: contains sensitive authentication keys, private credentials, passwords, or personal secrets.
+                Output exactly one of: accept, reject, redact, with a concise justification.
+                """
+            )
+            let candidate = inputString(request, "candidate")
+            let response = try await session.respond(
+                to: candidate,
+                generating: JudgeResult.self
+            )
+            let rawDec = response.content.decision.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let dec = (rawDec == "accept" || rawDec == "reject" || rawDec == "redact") ? rawDec : "reject"
+            emit(AFMEnvelope(
+                ok: true,
+                availability: "available",
+                data: [
+                    "decision": .string(dec),
+                    "reason": .string(response.content.reason),
+                    "model": .string("afm-native-judge")
+                ]
             ))
         case "entity_extract":
             let session = LanguageModelSession(instructions: "Extract the key entities and their types. Use only entities present in the text.")

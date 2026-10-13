@@ -126,6 +126,8 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
     if version == 21:
         from minni.graph_readiness import verify_graph_schema
         return verify_graph_schema(conn).ready
+    if version == 22:
+        return _column_exists(conn, "candidate_packets", "requested_privacy")
     return True
 
 
