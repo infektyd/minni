@@ -91,8 +91,8 @@ class SovereignConfig:
     hnsw_ef_search: int = 128              # HNSW query-time search width
 
     # Retrieval
-    fts_weight: float = 0.35              # RRF constant for FTS5 rank
-    semantic_weight: float = 0.65         # RRF constant for semantic rank
+    fts_weight: float = 0.60              # RRF constant for FTS5 rank
+    semantic_weight: float = 0.40         # RRF constant for semantic rank
     rrf_k: int = 60                       # Reciprocal Rank Fusion constant
 
     # Cross-encoder re-ranking

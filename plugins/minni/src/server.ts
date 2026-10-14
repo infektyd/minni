@@ -832,6 +832,25 @@ server.registerTool(
       // SEC-G6: successful learn audit must carry semanticTier (fail-open path).
       quality,
     });
+    // Phase 3: index the session note into the daemon immediately via vault_index_doc
+    // so the note is recallable in the same session even while the learning candidate
+    // is still status='proposed'. Fail-open if the daemon is unreachable.
+    try {
+      const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+      const fullContent = `---\ntitle: ${title}\nsection: sessions\nstatus: candidate\nprivacy: safe\ncategory: ${category ?? "general"}\n---\n# ${title}\n\n${content}`;
+      await jsonRpcSocketRequestWithFallback("vault_index_doc", {
+        content: fullContent,
+        path: note.relativePath,
+        agent_id: DEFAULT_AGENT_ID,
+        agent: DEFAULT_AGENT_ID,
+        sigil: "📄",
+        privacy_level: "safe",
+        page_status: "candidate",
+        layer: "knowledge",
+      });
+    } catch {
+      // Fail-open: vault note is on disk and will be indexed on next pass
+    }
     // #132 P1: an identity-recovery denial must never read as "learned" —
     // name it distinctly so the remediation route (in store.data) is acted on.
     const storeRecovery = recoveryRouteFrom(store.data);

@@ -97,7 +97,10 @@ def raw_confidence(
         rrf_norm = min(1.0, rrf * 20.0)  # RRF scores are typically ~0.01-0.05
         raw = 0.6 * ce_prob + 0.4 * rrf_norm
     else:
-        raw = min(1.0, rrf * 20.0)
+        # Un-reranked / fast-mode FTS-only RRF uses k=60 (Rank-1 FTS = 0.60/61 ≈ 0.009836,
+        # Rank-1 FTS+Sem = 1.0/61 ≈ 0.01639). Normalizing by (rrf_k + 1) = 61.0 maps
+        # Rank-1 FTS-only hits to 0.60 and Rank-1 dual hits to 1.0 instead of capping at 0.197.
+        raw = min(1.0, rrf * 61.0)
 
     # Apply decay
     return raw * max(0.0, min(1.0, decay))

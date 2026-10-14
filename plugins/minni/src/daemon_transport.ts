@@ -250,7 +250,7 @@ export function buildBootRecallSlice(
   const episodic = Array.isArray(data.episodic) ? data.episodic : [];
   const episodic_count =
     typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
-  const notes = formatDegradation(data);
+  const notes = formatDegradation({ ...data, auth_suppression: [] });
   return {
     ok: true,
     results: data.results,
@@ -917,6 +917,7 @@ export function formatDegradation(response: RecallResponse): string | undefined 
   const suppressions = Array.isArray(response.auth_suppression) ? response.auth_suppression : [];
   for (const raw of suppressions) {
     const entry = (raw ?? {}) as Record<string, unknown>;
+    if (isRoutineForeignScopeSuppression(entry)) continue;
     const src = safeLabel(typeof entry.src === "string" ? entry.src : "?");
     const suppressed = typeof entry.suppressed === "number" ? entry.suppressed : undefined;
     lines.push(
@@ -1081,7 +1082,12 @@ export function formatRecall(
   // Build AI Context Pack
   let contextPackContent: string;
   if (!hasDaemonHits && !hasVaultHits) {
-    contextPackContent = `No ${agentName} vault wiki matches.`;
+    const label = !response.agent_id
+      ? ""
+      : response.count === undefined
+        ? `${response.agent_id} `
+        : `${agentName} `;
+    contextPackContent = `No ${label}vault wiki matches.`;
   } else {
     const cards: string[] = [];
     let cardIndex = 0;
@@ -1163,6 +1169,18 @@ export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean, dae
   return includeVault && (!daemonOk || daemonEmpty);
 }
 
+function isRoutineForeignScopeSuppression(
+  entry: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!entry) return false;
+  if (entry.scope_blackout === true) return true;
+  return (
+    entry.src === "c" &&
+    typeof entry.reason === "string" &&
+    entry.reason.includes("suppressed by scope")
+  );
+}
+
 /**
  * W5: detect "the daemon answered but has nothing" from the wire shape, not
  * from English prose. Prefers `count` (recall.py response_payload always
@@ -1176,15 +1194,34 @@ export function isDaemonResultEmpty(response: RecallResponse | undefined): boole
   // documents were removed by the auth_suppression read gate, or that matched
   // only the separate `learnings` array, is a live SCOPED answer — treating
   // it as empty would trigger the workspace-unscoped vault pre-scan and bury
-  // the suppression diagnostic under local markdown snippets.
-  if (Array.isArray(response.auth_suppression) && response.auth_suppression.length > 0) return false;
+  // the suppression diagnostic under local markdown snippets. Foreign vault
+  // scope_blackout entries are normal multi-agent isolation and do not count
+  // as a non-empty answer when results are empty.
+  const meaningfulSuppression = Array.isArray(response.auth_suppression)
+    ? response.auth_suppression.filter(
+        (entry) => !isRoutineForeignScopeSuppression(entry as Record<string, unknown> | null),
+      )
+    : [];
+  if (meaningfulSuppression.length > 0) return false;
   if (Array.isArray(response.learnings) && response.learnings.length > 0) return false;
   // #225-R1: same argument as learnings — `count` covers documents only, and
   // episodic hits can never appear there. An episodic-only answer that reported
   // "empty" would trigger the workspace-unscoped vault pre-scan and bury it.
   if (Array.isArray(response.episodic) && response.episodic.length > 0) return false;
-  if (typeof response.count === "number") return response.count === 0;
   const { results } = response;
+  if (Array.isArray(results) && results.length > 0) {
+    const confidences = results
+      .map((item) =>
+        item && typeof item === "object"
+          ? (item as Record<string, unknown>).confidence
+          : undefined,
+      )
+      .filter((c): c is number => typeof c === "number" && Number.isFinite(c));
+    if (confidences.length === results.length && Math.max(...confidences) < 0.25) {
+      return true;
+    }
+  }
+  if (typeof response.count === "number") return response.count === 0;
   if (Array.isArray(results)) return results.length === 0;
   if (typeof results === "string") return results.trim().length === 0 || results.trim() === "No recall results.";
   return results === undefined;

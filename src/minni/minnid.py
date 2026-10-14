@@ -2296,6 +2296,12 @@ def main():
         logger.exception("Eager database initialization failed")
 
     _raise_fd_ceiling()
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            ctypes.CDLL("/usr/lib/libSystem.B.dylib").setpriority(4, 0, 0)
+        except Exception:
+            pass
 
     loop = asyncio.new_event_loop()
     # Bound the pool that asyncio.to_thread dispatches sync RPC handlers onto.

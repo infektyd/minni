@@ -386,6 +386,10 @@ def promote_candidate_durable(
             # effects, and the review fence stays pending.
             if not _row_matches_snapshot(c, candidate_id, prepared):
                 return None
+            from minni.writeback import CATEGORIES
+
+            raw_cat = str(cand.get("category") or "general").strip().lower()
+            cand_category = raw_cat if raw_cat in CATEGORIES else "general"
             c.execute(
                 """
                 INSERT INTO learnings
@@ -393,10 +397,10 @@ def promote_candidate_durable(
                  confidence, embedding, created_at,
                  assertion, applies_when, evidence_doc_ids, contradicts_id, status,
                  content_hash)
-                VALUES (?, 'general', ?, NULL, 'afm-consolidation',
+                VALUES (?, ?, ?, NULL, 'afm-consolidation',
                         ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
                 """,
-                (agent_id, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
+                (agent_id, cand_category, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
             )
             lid = c.lastrowid
             # Atomic canonical identity: the node + join share this cursor.
@@ -1515,16 +1519,32 @@ async def drain_consolidation(
                 (res.get("error") or {}).get("message")
                 if failure == "rpc_error"
                 else payload.get("reason")
+                or (
+                    f"drafts_deferred={payload.get('drafts_deferred')}"
+                    if failure == "lifecycle_recovered"
+                    else None
+                )
             )
             context.logger.warning(
                 "Consolidation drain (%s) batch %d returned %s: %s",
                 source, batches + 1, failure, detail,
             )
+            if failure == "lifecycle_recovered":
+                last_summ = payload.get("summary") if isinstance(payload, dict) else None
+                batches += 1
+                examined = (last_summ or {}).get("examined", 0)
+                total_examined += examined
+                if examined == 0:
+                    break
+                await asyncio.sleep(0)
+                continue
             break
 
         result_obj = (res.get("result") or {}) if isinstance(res, dict) else {}
         summary = result_obj.get("summary") if isinstance(result_obj, dict) else None
         last_summ = summary
+        tick_failed = False
+        tick_failure = None
 
         batches += 1
         examined = (summary or {}).get("examined", 0)

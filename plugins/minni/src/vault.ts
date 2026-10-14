@@ -655,16 +655,155 @@ function wordRegex(term: string, inflect: boolean): RegExp | undefined {
   return regex;
 }
 
-function countWordOccurrences(
+function isAsciiLowerWordChar(code: number): boolean {
+  return (code >= 97 && code <= 122) || (code >= 48 && code <= 57);
+}
+
+function isAsciiLowerEdgeChar(code: number): boolean {
+  return isAsciiLowerWordChar(code) || code === 95;
+}
+
+function isPureLowerAscii(str: string): boolean {
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c >= 128 || (c >= 65 && c <= 90)) return false;
+  }
+  return true;
+}
+
+function hasAsciiWordChar(str: string): boolean {
+  for (let i = 0; i < str.length; i++) {
+    if (isAsciiLowerWordChar(str.charCodeAt(i))) return true;
+  }
+  return false;
+}
+
+function countWordOccurrencesRegex(
   text: string,
   term: string,
-  inflect = true,
+  inflect: boolean,
 ): number {
-  if (!term) return 0;
   const regex = wordRegex(term, inflect);
   if (!regex) return 0;
   const matches = text.match(regex);
   return matches ? matches.length : 0;
+}
+
+function countWordOccurrences(
+  text: string,
+  term: string,
+  inflect = true,
+  maxCount = 5,
+): number {
+  if (!term) return 0;
+  if (!isPureLowerAscii(term)) {
+    return countWordOccurrencesRegex(text, term, inflect);
+  }
+  let idx = text.indexOf(term);
+  if (idx === -1) return 0;
+
+  const termLen = term.length;
+  const firstCode = term.charCodeAt(0);
+  const lastCode = term.charCodeAt(termLen - 1);
+  const leadRequired = isAsciiLowerEdgeChar(firstCode);
+  const tailRequired = isAsciiLowerEdgeChar(lastCode);
+  if (!leadRequired && !tailRequired && !hasAsciiWordChar(term)) {
+    return 0;
+  }
+  const allowSuffix =
+    inflect &&
+    termLen >= MIN_MORPHOLOGICAL_LENGTH &&
+    lastCode >= 97 &&
+    lastCode <= 122;
+
+  const textLen = text.length;
+  let count = 0;
+  while (idx !== -1) {
+    if (leadRequired && idx > 0) {
+      const prevCode = text.charCodeAt(idx - 1);
+      if (prevCode >= 128) {
+        return countWordOccurrencesRegex(text, term, inflect);
+      }
+      if (isAsciiLowerWordChar(prevCode)) {
+        idx = text.indexOf(term, idx + 1);
+        continue;
+      }
+    }
+
+    const afterIdx = idx + termLen;
+    if (!tailRequired) {
+      count++;
+      if (count >= maxCount) return count;
+      idx = text.indexOf(term, afterIdx);
+      continue;
+    }
+
+    // Check trailing boundary and optional morphological suffix: (?:s|es|ing|ed)?
+    let advance = -1;
+    if (afterIdx >= textLen) {
+      advance = afterIdx;
+    } else {
+      const c0 = text.charCodeAt(afterIdx);
+      if (c0 >= 128) {
+        return countWordOccurrencesRegex(text, term, inflect);
+      }
+      if (!isAsciiLowerWordChar(c0)) {
+        advance = afterIdx;
+      } else if (allowSuffix) {
+        if (c0 === 115) {
+          // 's'
+          const p = afterIdx + 1;
+          if (p >= textLen) {
+            advance = p;
+          } else {
+            const cp = text.charCodeAt(p);
+            if (cp >= 128) return countWordOccurrencesRegex(text, term, inflect);
+            if (!isAsciiLowerWordChar(cp)) advance = p;
+          }
+        } else if (c0 === 101 && afterIdx + 1 < textLen) {
+          // 'es' or 'ed'
+          const c1 = text.charCodeAt(afterIdx + 1);
+          if (c1 >= 128) return countWordOccurrencesRegex(text, term, inflect);
+          if (c1 === 115 || c1 === 100) {
+            const p = afterIdx + 2;
+            if (p >= textLen) {
+              advance = p;
+            } else {
+              const cp = text.charCodeAt(p);
+              if (cp >= 128) return countWordOccurrencesRegex(text, term, inflect);
+              if (!isAsciiLowerWordChar(cp)) advance = p;
+            }
+          }
+        } else if (c0 === 105 && afterIdx + 2 < textLen) {
+          // 'ing'
+          const c1 = text.charCodeAt(afterIdx + 1);
+          const c2 = text.charCodeAt(afterIdx + 2);
+          if (c1 >= 128 || c2 >= 128) {
+            return countWordOccurrencesRegex(text, term, inflect);
+          }
+          if (c1 === 110 && c2 === 103) {
+            const p = afterIdx + 3;
+            if (p >= textLen) {
+              advance = p;
+            } else {
+              const cp = text.charCodeAt(p);
+              if (cp >= 128) return countWordOccurrencesRegex(text, term, inflect);
+              if (!isAsciiLowerWordChar(cp)) advance = p;
+            }
+          }
+        }
+      }
+    }
+
+    if (advance !== -1) {
+      count++;
+      if (count >= maxCount) return count;
+      idx = text.indexOf(term, advance);
+    } else {
+      idx = text.indexOf(term, idx + 1);
+    }
+  }
+  return count;
 }
 
 // Recall queries are natural language and routinely carry terminal punctuation
@@ -1396,6 +1535,7 @@ export async function writeVaultPage(
   // caller.
   const doWriteAtomic = deps.writeFileAtomic ?? writeFileAtomic;
   await doWriteAtomic(notePath, body);
+  updateVaultSearchCacheOnWrite(input.vaultPath, notePath, relativePath, input.title, body);
 
   await appendIndex(input.vaultPath, input.title, relativePath, input.content);
   await recordAudit(input.vaultPath, {
@@ -1899,62 +2039,287 @@ export async function listSessions(
   return summaries.reverse().slice(0, limit);
 }
 
+interface CachedVaultNoteEntry {
+  notePath: string;
+  relativePath: string;
+  wikilink: string;
+  title: string;
+  markdown: string;
+  privacy: PrivacyLevel | undefined;
+  status: PageStatus | undefined;
+  skipByStatus: boolean;
+  haystackLower: string;
+  titleLower: string;
+  isSessionNote: boolean;
+  isMinniLearning: boolean;
+  hasCorrectionBoost: boolean;
+  wordCounts: Map<string, number>;
+}
+
+interface VaultSearchCacheEntry {
+  builtAtMs: number;
+  notes: Map<string, CachedVaultNoteEntry>;
+  tokenMap: Map<string, Set<string>>;
+}
+
+const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
+
+function buildCachedVaultNoteEntry(
+  notePath: string,
+  relativePath: string,
+  title: string,
+  markdown: string,
+  privacy: PrivacyLevel | undefined,
+): CachedVaultNoteEntry {
+  const status = statusFromMarkdown(markdown);
+  const rawStatus = frontmatterField(markdown, "status")?.toLowerCase();
+  const skipByStatus =
+    rawStatus === "superseded" ||
+    rawStatus === "rejected" ||
+    rawStatus === "expired" ||
+    rawStatus === "draft" ||
+    Boolean(frontmatterField(markdown, "superseded_by"));
+  const pageType = frontmatterField(markdown, "type")?.toLowerCase();
+  return {
+    notePath,
+    relativePath,
+    wikilink: wikilinkFor(relativePath),
+    title,
+    markdown,
+    privacy,
+    status,
+    skipByStatus,
+    haystackLower: `${title}\n${relativePath}\n${markdown}`.toLowerCase(),
+    titleLower: title.toLowerCase(),
+    isSessionNote: relativePath.startsWith("wiki/sessions/"),
+    isMinniLearning: /minni_learning:\s*true/i.test(markdown),
+    hasCorrectionBoost: Boolean(pageType && CORRECTION_CLASS_TYPES.has(pageType)),
+    wordCounts: new Map<string, number>(),
+  };
+}
+
+function scoreVaultNoteCached(
+  phrases: string[],
+  terms: string[],
+  entry: CachedVaultNoteEntry,
+): number {
+  if (entry.skipByStatus) return 0;
+  const { haystackLower, titleLower, wordCounts } = entry;
+  let termScore = 0;
+  for (const phrase of phrases) {
+    if (countWordOccurrences(haystackLower, phrase, false, 1) > 0) {
+      termScore += 50;
+      break;
+    }
+  }
+  for (const term of terms) {
+    let contrib = wordCounts.get(term);
+    if (contrib === undefined) {
+      const count = countWordOccurrences(haystackLower, term, true, 5);
+      contrib =
+        count > 0
+          ? Math.min(count, 5) +
+            (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
+          : 0;
+      if (wordCounts.size < 256) {
+        wordCounts.set(term, contrib);
+      }
+    }
+    termScore += contrib;
+  }
+  if (termScore < MIN_TERM_SCORE) return 0;
+
+  let score = termScore;
+  if (entry.isSessionNote) score += 1;
+  if (entry.isMinniLearning) score += 2;
+  if (entry.hasCorrectionBoost) {
+    score *= 1 + CORRECTION_SALIENCE_BOOST;
+  }
+  return score;
+}
+
+function indexNoteTokensIntoMap(
+  tokenMap: Map<string, Set<string>>,
+  notePath: string,
+  haystackLower: string,
+): void {
+  const rawMatches = haystackLower.match(/[a-z0-9_]{2,}/g) ?? [];
+  const keys = new Set<string>();
+  const addTokenKeys = (tok: string): void => {
+    keys.add(tok);
+    if (tok.length > 3 && tok.endsWith("s")) {
+      keys.add(tok.slice(0, -1));
+    }
+    if (tok.length >= 6 && (tok.endsWith("es") || tok.endsWith("ed"))) {
+      keys.add(tok.slice(0, -2));
+    }
+    if (tok.length >= 7 && tok.endsWith("ing")) {
+      keys.add(tok.slice(0, -3));
+    }
+    const maxPrefix = Math.min(tok.length - 1, 10);
+    for (let len = 3; len <= maxPrefix; len++) {
+      keys.add(tok.slice(0, len));
+    }
+  };
+  for (const tok of rawMatches) {
+    addTokenKeys(tok);
+    if (tok.includes("_")) {
+      for (const sub of tok.split("_")) {
+        if (sub.length >= 2) addTokenKeys(sub);
+      }
+    }
+  }
+  for (const key of keys) {
+    let bucket = tokenMap.get(key);
+    if (!bucket) {
+      bucket = new Set<string>();
+      tokenMap.set(key, bucket);
+    }
+    bucket.add(notePath);
+  }
+}
+
+function updateVaultSearchCacheOnWrite(
+  vaultPath: string,
+  notePath: string,
+  relativePath: string,
+  title: string,
+  markdown: string,
+): void {
+  const cached = _vaultSearchCache.get(vaultPath);
+  if (!cached) return;
+  const privacy = privacyFromMarkdown(markdown);
+  if (privacy === "blocked") {
+    cached.notes.delete(notePath);
+    return;
+  }
+  const resolvedTitle = title || titleFromMarkdown(relativePath, markdown);
+  const entry = buildCachedVaultNoteEntry(
+    notePath,
+    relativePath,
+    resolvedTitle,
+    markdown,
+    privacy,
+  );
+  cached.notes.set(notePath, entry);
+  if (!entry.skipByStatus) {
+    indexNoteTokensIntoMap(cached.tokenMap, notePath, entry.haystackLower);
+  }
+  cached.builtAtMs = Date.now();
+}
+
 export async function searchVaultNotes(
   vaultPath: string,
   query: string,
   limit = 5,
 ): Promise<VaultSearchResult[]> {
-  await ensureVault(vaultPath);
-  const wikiRoot = path.join(vaultPath, "wiki");
   const terms = queryTerms(query);
+  const phrases = phraseForms(query);
   // Only bail when there is nothing to match on at all. Bailing on an empty
   // term list alone threw away the exact-phrase bonus, which is the strongest
   // signal in the scorer and needs no tokens — but phraseForms yields nothing
   // for a query with no phrase of substance, so `-` or `--` (no tokens, no
   // usable phrase) stops here instead of reaching the scorer with terms = [].
-  if (terms.length === 0 && phraseForms(query).length === 0) return [];
+  let cache = _vaultSearchCache.get(vaultPath);
+  const now = Date.now();
+  const hasWarmCache = Boolean(
+    cache && cache.notes.size >= 20 && now - cache.builtAtMs <= 30_000,
+  );
+  if (!hasWarmCache) {
+    await ensureVault(vaultPath);
+  }
+  if (terms.length === 0 && phrases.length === 0) return [];
 
-  let files: string[] = [];
-  try {
-    files = await listMarkdownFiles(wikiRoot);
-  } catch {
-    return [];
+  const wikiRoot = path.join(vaultPath, "wiki");
+  if (!hasWarmCache || !cache) {
+    let files: string[] = [];
+    try {
+      files = await listMarkdownFiles(wikiRoot);
+    } catch {
+      return [];
+    }
+    const notes = new Map<string, CachedVaultNoteEntry>();
+    const tokenMap = new Map<string, Set<string>>();
+    await Promise.all(
+      files.map(async (notePath) => {
+        const markdown = await readFile(notePath, "utf8");
+        const privacy = privacyFromMarkdown(markdown);
+        if (privacy === "blocked") return;
+        const relativePath = path.relative(vaultPath, notePath);
+        const title = titleFromMarkdown(relativePath, markdown);
+        const entry = buildCachedVaultNoteEntry(
+          notePath,
+          relativePath,
+          title,
+          markdown,
+          privacy,
+        );
+        notes.set(notePath, entry);
+        if (!entry.skipByStatus) {
+          indexNoteTokensIntoMap(tokenMap, notePath, entry.haystackLower);
+        }
+      }),
+    );
+    cache = { builtAtMs: now, notes, tokenMap };
+    _vaultSearchCache.set(vaultPath, cache);
   }
 
-  const scored = await Promise.all(
-    files.map(async (notePath): Promise<VaultSearchResult | undefined> => {
-      const markdown = await readFile(notePath, "utf8");
-      // SEC-006: frontmatter privacy is authoritative. Blocked notes never
-      // leave the search layer (mirrors the daemon's _ALWAYS_EXCLUDED gate);
-      // everything else carries its authored privacy so consumers gate on it.
-      const privacy = privacyFromMarkdown(markdown);
-      if (privacy === "blocked") return undefined;
-      const relativePath = path.relative(vaultPath, notePath);
-      const title = titleFromMarkdown(relativePath, markdown);
-      const score = scoreVaultNote(query, terms, relativePath, title, markdown);
-      return {
-        notePath,
-        relativePath,
-        wikilink: wikilinkFor(relativePath),
-        title,
-        snippet: snippetFor(markdown, terms),
-        score,
-        privacy,
-        status: statusFromMarkdown(markdown),
-      };
-    }),
+  let candidateEntries: Iterable<CachedVaultNoteEntry> = cache.notes.values();
+  const lowerTerms = terms.map((t) => t.toLowerCase());
+  const lookupSubtokens = lowerTerms.map((t) =>
+    /^[a-z0-9_][a-z0-9_/-]*[a-z0-9_]$/.test(t)
+      ? (t.match(/[a-z0-9_]{2,}/g) ?? [])
+      : [],
+  );
+  const allIndexableTokens =
+    lookupSubtokens.length > 0 && lookupSubtokens.every((subs) => subs.length > 0);
+  if (allIndexableTokens && cache.notes.size >= 20) {
+    const matchedPaths = new Set<string>();
+    for (const subs of lookupSubtokens) {
+      const tok = subs[0];
+      const exactSet = cache.tokenMap.get(tok);
+      if (exactSet) {
+        for (const p of exactSet) matchedPaths.add(p);
+      }
+      if (tok.length > 3 && tok.endsWith("s")) {
+        const stemSet = cache.tokenMap.get(tok.slice(0, -1));
+        if (stemSet) {
+          for (const p of stemSet) matchedPaths.add(p);
+        }
+      }
+    }
+    const subset: CachedVaultNoteEntry[] = [];
+    for (const p of matchedPaths) {
+      const entry = cache.notes.get(p);
+      if (entry && !entry.skipByStatus) subset.push(entry);
+    }
+    candidateEntries = subset;
+  }
+
+  const scored: Array<{ entry: CachedVaultNoteEntry; score: number }> = [];
+  for (const entry of candidateEntries) {
+    const score = scoreVaultNoteCached(phrases, terms, entry);
+    if (score > 0) {
+      scored.push({ entry, score });
+    }
+  }
+
+  scored.sort(
+    (a, b) =>
+      b.score - a.score ||
+      a.entry.relativePath.localeCompare(b.entry.relativePath),
   );
 
-  return scored
-    .filter(
-      (result): result is VaultSearchResult =>
-        result !== undefined && result.score > 0,
-    )
-    .sort(
-      (a, b) =>
-        b.score - a.score || a.relativePath.localeCompare(b.relativePath),
-    )
-    .slice(0, limit);
+  return scored.slice(0, limit).map(({ entry, score }) => ({
+    notePath: entry.notePath,
+    relativePath: entry.relativePath,
+    wikilink: entry.wikilink,
+    title: entry.title,
+    snippet: snippetFor(entry.markdown, terms),
+    score,
+    privacy: entry.privacy,
+    status: entry.status,
+  }));
 }
 
 export interface InboxEntry {

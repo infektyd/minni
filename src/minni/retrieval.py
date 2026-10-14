@@ -1103,22 +1103,32 @@ class RetrievalEngine:
                 # vtable race can also fire while stepping the SELECT.
                 # Prefer the first embedded chunk when the doc has one; fall
                 # back to vault_fts content for deliberately unembedded rows
-                # (draft/expired). The hollow-hit fix used f.content alone,
-                # which made FTS-only (encoder down) attach multi-KB YAML-led
-                # files as chunk_text and exhaust the default budget after a
-                # couple of hits. Body-only post-strip is applied below.
+                # (draft/expired). Defer the correlated chunk_embeddings lookup
+                # to the outer SELECT so SQLite only evaluates it on the bounded
+                # LIMIT window rather than every FTS row scanned during sorting.
                 return _fts_execute_with_retry(c, f"""
-                    SELECT f.doc_id, d.path, d.agent, d.sigil,
-                           rank AS bm25_rank, d.decay_score,
-                           d.page_status, d.privacy_level, d.page_type,
-                           d.evidence_refs, d.indexed_at, d.layer,
-                           {_FTS_CHUNK_TEXT_EXPR} AS chunk_text
-                    FROM vault_fts f
-                    JOIN documents d ON d.doc_id = f.doc_id
-                    WHERE vault_fts MATCH ?
-                    {agent_clause}
-                    ORDER BY rank
-                    LIMIT ?
+                    SELECT m.doc_id, m.path, m.agent, m.sigil,
+                           m.bm25_rank, m.decay_score,
+                           m.page_status, m.privacy_level, m.page_type,
+                           m.evidence_refs, m.indexed_at, m.layer,
+                           COALESCE(
+                               (SELECT ce.chunk_text FROM chunk_embeddings ce
+                                WHERE ce.doc_id = m.doc_id
+                                ORDER BY ce.chunk_index LIMIT 1),
+                               m.content
+                           ) AS chunk_text
+                    FROM (
+                        SELECT f.doc_id, f.content, d.path, d.agent, d.sigil,
+                               rank AS bm25_rank, d.decay_score,
+                               d.page_status, d.privacy_level, d.page_type,
+                               d.evidence_refs, d.indexed_at, d.layer
+                        FROM vault_fts f
+                        JOIN documents d ON d.doc_id = f.doc_id
+                        WHERE vault_fts MATCH ?
+                        {agent_clause}
+                        ORDER BY rank
+                        LIMIT ?
+                    ) m
                 """, [match_expr, *scope_params, limit * 3])
 
             # Strict pass first: FTS5 space-joined terms are implicit AND —
@@ -1128,13 +1138,23 @@ class RetrievalEngine:
             # OR semantics: bm25 still ranks the document matching the most /
             # rarest terms first, restoring recall without diluting queries the
             # strict pass already answers (same contract as learnings_fts).
-            rows = _match(safe_query)
             terms = safe_query.split()
+            lowered = [t.lower() for t in terms]
+            selective = self._selective_or_terms(lowered) if len(terms) > 1 else lowered
+            strict_q = (
+                " ".join(selective)
+                if (selective and len(selective) < len(lowered) and self._is_large_corpus())
+                else safe_query
+            )
+            rows = _match(strict_q)
             if not rows and len(terms) > 1:
                 # Lowercase the operands: FTS5 matching is case-insensitive,
                 # but a literal uppercase "OR"/"AND"/"NOT" token from the query
                 # would be parsed as an operator and corrupt the expression.
-                rows = _match(" OR ".join(t.lower() for t in terms))
+                if selective and len(selective) < len(lowered):
+                    rows = _match(" OR ".join(selective))
+                if not rows:
+                    rows = _match(" OR ".join(lowered))
 
             for row in rows:
                 results.append({
@@ -1679,6 +1699,24 @@ class RetrievalEngine:
             self._refresh_live_faiss(new_chunk_ids, new_vectors)
             if on_vectors is not None and new_chunk_ids:
                 on_vectors(new_chunk_ids, new_vectors)
+            self._index_doc_in_trie(
+                doc_id=doc_id,
+                path=path,
+                agent=agent,
+                sigil=sigil,
+                decay_score=1.0,
+                chunk_text=content,
+                heading_context=prepared_chunks[0][0].heading_path if prepared_chunks else "",
+                page_status=page_status,
+                privacy_level=privacy_level,
+                page_type=page_type,
+                evidence_refs=None,
+                indexed_at=now,
+                layer=layer,
+            )
+            elig_cache = getattr(self, "_foreign_vault_elig_cache", None)
+            if isinstance(elig_cache, dict):
+                elig_cache.clear()
 
             return {
                 "status": "ok",
@@ -2369,6 +2407,8 @@ class RetrievalEngine:
             doc_scores[did]["rrf_score"] += self.config.semantic_weight / (k + rank)
             if doc_scores[did]["sem_rank"] is None:
                 doc_scores[did]["sem_rank"] = rank
+            if r.get("similarity") is not None and doc_scores[did].get("similarity") is None:
+                doc_scores[did]["similarity"] = r["similarity"]
             # Prefer the semantic chunk over FTS full-page content: FTS now
             # carries the whole file (frontmatter first) as a fallback body,
             # which must not shadow the matching passage on dual hits.
@@ -2395,7 +2435,47 @@ class RetrievalEngine:
             self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
-        return ranked[:limit]
+        return self._reserve_top_fts_slots(ranked, fts_results, doc_scores, limit)
+
+    def _reserve_top_fts_slots(
+        self,
+        ranked: List[Dict],
+        fts_results: List[Dict],
+        doc_scores: Dict[int, Dict],
+        limit: int,
+    ) -> List[Dict]:
+        """Reserve up to min(10, len(fts_results), limit) slots in the top-limit
+        window for top FTS5 BM25 hits so unembedded candidate notes and exact
+        Rank-1 lexical matches are never evicted by semantic-only neighbors."""
+        top_window = ranked[:limit]
+        if not fts_results or limit <= 0:
+            return top_window
+        fts_quota = min(10, len(fts_results), limit)
+        present_ids = {r["doc_id"] for r in top_window}
+        missing_fts: List[Dict] = []
+        seen_missing: set[int] = set()
+        for r in fts_results[:fts_quota]:
+            did = r.get("doc_id")
+            if did in doc_scores and did not in present_ids and did not in seen_missing:
+                missing_fts.append(doc_scores[did])
+                seen_missing.add(did)
+        if not missing_fts:
+            return top_window
+        keep_count = max(0, limit - len(missing_fts))
+        kept = [
+            r for r in top_window
+            if r.get("fts_rank") is not None and r["fts_rank"] <= fts_quota
+        ]
+        for r in top_window:
+            if len(kept) >= keep_count:
+                break
+            if r not in kept:
+                kept.append(r)
+        return sorted(
+            kept + missing_fts,
+            key=lambda x: x["final_score"],
+            reverse=True,
+        )[:limit]
 
     # ── Context Window Budgeting ──────────────────────────────
 
@@ -2466,6 +2546,8 @@ class RetrievalEngine:
             }
             if result.get("full_provenance") is not None:
                 fields["full_provenance"] = result.get("full_provenance")
+            if result.get("evidence_envelope") is not None:
+                fields["evidence_envelope"] = result.get("evidence_envelope")
             # Only include provenance if not already in existing dict
             if existing is None or "provenance" not in existing:
                 fields["provenance"] = result.get("provenance")
@@ -2503,9 +2585,45 @@ class RetrievalEngine:
             return out
 
         if depth == "snippet":
-            text = result.get("chunk_text", "")
-            if len(text) > _SNIPPET_MAX_CHARS:
-                text = text[:_SNIPPET_MAX_CHARS] + "…"
+            raw_body = result.get("raw_chunk_text")
+            if isinstance(raw_body, str):
+                snippet_body = (
+                    raw_body[:_SNIPPET_MAX_CHARS] + "…"
+                    if len(raw_body) > _SNIPPET_MAX_CHARS
+                    else raw_body
+                )
+                text = build_evidence_envelope(
+                    source=result.get("source") or result.get("path") or result.get("filename") or "?",
+                    agent=result.get("agent", "?"),
+                    status=result.get("review_state") or result.get("page_status") or "?",
+                    privacy=result.get("privacy_level", "?"),
+                    score=float(result.get("score") or 0),
+                    instruction_like=bool(result.get("instruction_like")),
+                    visibility=result.get("visibility", "authorized"),
+                    text=snippet_body,
+                    attribution=result.get("attribution"),
+                    perturbation_enabled=getattr(
+                        getattr(self, "config", None),
+                        "instruction_body_perturbation_enabled",
+                        True,
+                    ),
+                )
+            else:
+                text = result.get("chunk_text", "")
+                if (
+                    text.startswith("<EVIDENCE ")
+                    and text.endswith("</EVIDENCE>")
+                    and ">" in text
+                ):
+                    open_end = text.find(">")
+                    open_tag = text[: open_end + 1]
+                    close_tag = "</EVIDENCE>"
+                    inner = text[open_end + 1 : -len(close_tag)]
+                    if len(inner) > _SNIPPET_MAX_CHARS:
+                        inner = inner[:_SNIPPET_MAX_CHARS] + "…"
+                    text = f"{open_tag}{inner}{close_tag}"
+                elif len(text) > _SNIPPET_MAX_CHARS:
+                    text = text[:_SNIPPET_MAX_CHARS] + "…"
             out = {
                 "text": text,
                 "source": result.get("source", ""),
@@ -3022,7 +3140,294 @@ class RetrievalEngine:
             self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
-        return ranked[:limit]
+        return self._reserve_top_fts_slots(ranked, fts_results, doc_scores, limit)
+
+    # ── Tier 1 Reflex: In-Memory Inverted Prefix/Token Trie (< 0.5 ms) ────────
+
+    @staticmethod
+    def _strip_frontmatter(text: str) -> str:
+        if not text:
+            return ""
+        if text.startswith("---"):
+            end = text.find("\n---", 3)
+            if end != -1:
+                nl = text.find("\n", end + 4)
+                return text[nl + 1 :].lstrip() if nl != -1 else ""
+        return text
+
+    @staticmethod
+    def _tokenize_trie_text(text: str) -> List[str]:
+        if not text:
+            return []
+        return [tok for tok in re.findall(r"[a-z0-9_]{2,}", text.lower()) if len(tok) >= 2]
+
+    def _index_doc_in_trie(
+        self,
+        *,
+        doc_id: int,
+        path: str,
+        agent: str,
+        sigil: str,
+        decay_score: float,
+        chunk_text: str,
+        heading_context: str,
+        page_status: str,
+        privacy_level: str,
+        page_type: Optional[str],
+        evidence_refs: Any,
+        indexed_at: Any,
+        layer: str,
+    ) -> None:
+        if getattr(self, "_trie_docs", None) is None:
+            return
+        lock = getattr(self, "_trie_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._trie_lock = lock
+        with lock:
+            entry = {
+                "doc_id": doc_id,
+                "path": path or "",
+                "agent": agent or "",
+                "sigil": sigil or "❓",
+                "decay_score": float(decay_score if decay_score is not None else 1.0),
+                "chunk_text": self._strip_frontmatter(chunk_text or "")[:1200],
+                "heading_context": heading_context or "",
+                "page_status": page_status or "candidate",
+                "privacy_level": privacy_level or "safe",
+                "page_type": page_type,
+                "evidence_refs": evidence_refs,
+                "indexed_at": indexed_at,
+                "layer": layer or "knowledge",
+            }
+            self._trie_docs[doc_id] = entry
+            header_text = f"{path or ''} {heading_context or ''} {(chunk_text or '')[:600]}"
+            tokens = set(self._tokenize_trie_text(header_text))
+            for tok in tokens:
+                self._trie_token_map.setdefault(tok, set()).add(doc_id)
+                max_pref = min(len(tok), 12)
+                for plen in range(3, max_pref + 1):
+                    self._trie_prefix_map.setdefault(tok[:plen], set()).add(doc_id)
+            if indexed_at is not None:
+                try:
+                    self._trie_max_doc_id = max(int(getattr(self, "_trie_max_doc_id", 0) or 0), int(doc_id))
+                    self._trie_checked_at = time.monotonic()
+                except Exception:
+                    pass
+
+    _OR_FALLBACK_STOPWORDS = frozenset({
+        "minni", "sovereign", "the", "and", "for", "with", "from", "this",
+        "that", "what", "how", "why", "when", "where", "are", "was", "were",
+        "is", "in", "on", "to", "of", "by", "at", "as", "or", "not",
+    })
+
+    def _selective_or_terms(self, lowered_terms: Sequence[str]) -> List[str]:
+        token_map = getattr(self, "_trie_token_map", None) or {}
+        selective = [
+            t for t in lowered_terms
+            if t not in self._OR_FALLBACK_STOPWORDS
+            and len(token_map.get(t, ())) <= 500
+        ]
+        return selective
+
+    def _ensure_trie_loaded(self) -> None:
+        if getattr(self, "db", None) is None:
+            return
+        now_mono = time.monotonic()
+        if (
+            getattr(self, "_trie_docs", None) is not None
+            and (now_mono - float(getattr(self, "_trie_checked_at", 0.0) or 0.0)) < 30.0
+        ):
+            return
+        lock = getattr(self, "_trie_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._trie_lock = lock
+        with lock:
+            now_mono = time.monotonic()
+            if (
+                getattr(self, "_trie_docs", None) is not None
+                and (now_mono - float(getattr(self, "_trie_checked_at", 0.0) or 0.0)) < 30.0
+            ):
+                return
+            try:
+                with self.db.cursor() as c:
+                    c.execute("SELECT COUNT(*), COALESCE(MAX(doc_id), 0) FROM documents")
+                    meta = c.fetchone()
+                    doc_count = int(meta[0] or 0) if meta else 0
+                    max_doc_id = int(meta[1] or 0) if meta else 0
+                    prev_max = int(getattr(self, "_trie_max_doc_id", -1))
+                    prev_count = int(getattr(self, "_trie_doc_count", -1))
+                    self._trie_checked_at = now_mono
+                    if (
+                        getattr(self, "_trie_docs", None) is not None
+                        and max_doc_id == prev_max
+                        and doc_count == prev_count
+                    ):
+                        return
+                    incremental = (
+                        getattr(self, "_trie_docs", None) is not None
+                        and prev_max >= 0
+                        and doc_count >= prev_count
+                        and max_doc_id >= prev_max
+                    )
+                    if not incremental:
+                        self._trie_docs = {}
+                        self._trie_token_map = {}
+                        self._trie_prefix_map = {}
+                        prev_max = 0
+                    self._trie_max_doc_id = max_doc_id
+                    self._trie_doc_count = doc_count
+                    if doc_count == 0:
+                        return
+                    if doc_count < 50:
+                        c.execute(
+                            """
+                            SELECT d.doc_id, d.path, d.agent, d.sigil, d.decay_score,
+                                   d.page_status, d.privacy_level, d.page_type,
+                                   d.evidence_refs, d.indexed_at, d.layer,
+                                   COALESCE(
+                                       (SELECT ce.chunk_text FROM chunk_embeddings ce
+                                        WHERE ce.doc_id = d.doc_id
+                                        ORDER BY ce.chunk_index ASC LIMIT 1),
+                                       (SELECT substr(vf.content, 1, 1200) FROM vault_fts vf
+                                        WHERE vf.doc_id = d.doc_id LIMIT 1),
+                                       ''
+                                   ) AS chunk_text,
+                                   COALESCE(
+                                       (SELECT ce.heading_context FROM chunk_embeddings ce
+                                        WHERE ce.doc_id = d.doc_id
+                                        ORDER BY ce.chunk_index ASC LIMIT 1),
+                                       ''
+                                   ) AS heading_context
+                            FROM documents d
+                            WHERE d.doc_id > ?
+                              AND COALESCE(d.privacy_level, 'safe') != 'blocked'
+                            """,
+                            (prev_max,),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            SELECT d.doc_id, d.path, d.agent, d.sigil, d.decay_score,
+                                   d.page_status, d.privacy_level, d.page_type,
+                                   d.evidence_refs, d.indexed_at, d.layer,
+                                   COALESCE(ce.chunk_text, '') AS chunk_text,
+                                   COALESCE(ce.heading_context, '') AS heading_context
+                            FROM documents d
+                            LEFT JOIN chunk_embeddings ce
+                              ON ce.doc_id = d.doc_id AND ce.chunk_index = 0
+                            WHERE d.doc_id > ?
+                              AND COALESCE(d.privacy_level, 'safe') != 'blocked'
+                            """,
+                            (prev_max,),
+                        )
+                    rows = c.fetchall()
+            except Exception:
+                return
+            for r in rows:
+                did = r["doc_id"]
+                raw_text = r["chunk_text"] or ""
+                clean_text = self._strip_frontmatter(raw_text)[:1200]
+                path_str = r["path"] or ""
+                heading_str = r["heading_context"] or ""
+                self._trie_docs[did] = {
+                    "doc_id": did,
+                    "path": path_str,
+                    "path_lower": path_str.lower(),
+                    "agent": r["agent"] or "",
+                    "sigil": r["sigil"] or "❓",
+                    "decay_score": float(r["decay_score"] if r["decay_score"] is not None else 1.0),
+                    "chunk_text": clean_text,
+                    "heading_context": heading_str,
+                    "page_status": r["page_status"] or "candidate",
+                    "privacy_level": r["privacy_level"] or "safe",
+                    "page_type": r["page_type"],
+                    "evidence_refs": r["evidence_refs"],
+                    "indexed_at": r["indexed_at"],
+                    "layer": r["layer"] or "knowledge",
+                }
+                header_text = f"{path_str} {heading_str} {clean_text[:300]}"
+                tokens = set(self._tokenize_trie_text(header_text))
+                for tok in tokens:
+                    self._trie_token_map.setdefault(tok, set()).add(did)
+                    max_pref = min(len(tok), 10)
+                    for plen in range(3, max_pref + 1):
+                        self._trie_prefix_map.setdefault(tok[:plen], set()).add(did)
+
+    def trie_search(
+        self,
+        query: str,
+        limit: int = 10,
+        agent_filter: Optional[Sequence[str]] = None,
+        exclude_statuses: Optional[Sequence[str]] = None,
+    ) -> List[Dict]:
+        """Sub-millisecond Tier 1 in-memory Prefix/Token Trie lookup."""
+        self._ensure_trie_loaded()
+        trie_docs = getattr(self, "_trie_docs", None)
+        if not trie_docs:
+            return []
+        q_tokens = self._tokenize_trie_text(query)
+        if not q_tokens:
+            return []
+        excluded = set(exclude_statuses or ())
+        agent_set = self._normalize_agent_filter(agent_filter) if agent_filter else None
+        scores: Dict[int, float] = {}
+        token_map = getattr(self, "_trie_token_map", {})
+        prefix_map = getattr(self, "_trie_prefix_map", {})
+        selective_tokens = self._selective_or_terms(q_tokens) if len(q_tokens) > 1 else q_tokens
+        primary_tokens = selective_tokens if selective_tokens else q_tokens
+        ubiquitous_tokens = [tok for tok in q_tokens if tok not in primary_tokens] if selective_tokens else []
+        for tok in primary_tokens:
+            for did in token_map.get(tok, ()):
+                scores[did] = scores.get(did, 0.0) + 3.0
+            if len(tok) >= 3:
+                pref = tok[:10]
+                p_matches = prefix_map.get(pref, ())
+                if len(p_matches) <= 500 or not selective_tokens:
+                    for did in p_matches:
+                        scores[did] = scores.get(did, 0.0) + 1.0
+        if not scores and ubiquitous_tokens:
+            for tok in ubiquitous_tokens:
+                for did in token_map.get(tok, ()):
+                    scores[did] = scores.get(did, 0.0) + 3.0
+        elif scores and ubiquitous_tokens:
+            for tok in ubiquitous_tokens:
+                t_set = token_map.get(tok, ())
+                if t_set:
+                    for did in list(scores.keys()):
+                        if did in t_set:
+                            scores[did] += 3.0
+        if not scores:
+            return []
+        q_lower = query.strip().lower()
+        scored_ids: List[Tuple[float, int]] = []
+        for did, sc in scores.items():
+            doc = trie_docs.get(did)
+            if doc is None:
+                continue
+            if (doc.get("page_status") or "candidate") in excluded:
+                continue
+            if (doc.get("privacy_level") or "safe") == "blocked":
+                continue
+            if agent_set and doc.get("agent") not in agent_set:
+                continue
+            path_lower = doc.get("path_lower") or (doc.get("path") or "").lower()
+            if q_lower and q_lower in path_lower:
+                sc += 4.0
+            else:
+                for tok in q_tokens:
+                    if tok in path_lower:
+                        sc += 1.5
+            scored_ids.append((sc, did))
+        scored_ids.sort(key=lambda item: item[0], reverse=True)
+        out: List[Dict] = []
+        for sc, did in scored_ids[:limit]:
+            row_copy = dict(trie_docs[did])
+            row_copy.pop("path_lower", None)
+            row_copy["bm25_rank"] = -sc
+            out.append(row_copy)
+        return out
 
     def _normalize_layers(self, layers: Optional[Sequence[str]]) -> Optional[set]:
         """None → no filter. grok-review round 5 (finding 2): a bare string is
@@ -3465,6 +3870,7 @@ class RetrievalEngine:
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
         deadline_monotonic: Optional[float] = None,
+        mode: Optional[str] = None,
         # perf/parallel-fanout (#388, YELLOW-3a): private per-call state for
         # variant pool workers. Public callers never pass it. The signature
         # is explicit — NOT *args — because G20 introspects it; it mirrors
@@ -3513,11 +3919,26 @@ class RetrievalEngine:
                 principal=principal,
                 workspace=workspace,
                 deadline_monotonic=deadline_monotonic,
+                mode=mode,
             )
         finally:
             self._pop_call_state()
             if outer:
                 self._publish_call_state(state)
+
+    def _is_large_corpus(self) -> bool:
+        cached = getattr(self, "_cached_large_corpus", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            with self.db.cursor() as c:
+                row = c.execute("SELECT COUNT(*) AS n FROM documents").fetchone()
+                n = int(row["n"] if isinstance(row, dict) else row[0])
+                is_large = n >= 50
+                self._cached_large_corpus = is_large
+                return is_large
+        except Exception:
+            return False
 
     def _retrieve_body(
         self,
@@ -3546,6 +3967,7 @@ class RetrievalEngine:
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
         deadline_monotonic: Optional[float] = None,
+        mode: Optional[str] = None,
     ) -> List[Dict]:
         """
         Hybrid retrieval: FTS5 + FAISS semantic, RRF fusion, cross-encoder re-rank,
@@ -3593,6 +4015,27 @@ class RetrievalEngine:
         With backend=None (default), results are bit-identical to pre-PR-3.
         """
         claim_text = str(claim or "").strip()
+        effective_fast = mode == "fast" or (
+            mode is None
+            and backend is None
+            and not claim_text
+            and sort != "chronological"
+            and self._is_large_corpus()
+        )
+        if (
+            effective_fast
+            and document_agent_filter is None
+            and principal is not None
+            and getattr(principal, "agent_id", None) not in ("main", "operator")
+            and "*" not in (getattr(principal, "capabilities", None) or ())
+            and bool(getattr(principal, "allowed_vault_roots", None))
+            and getattr(self.config, "vault_path", None)
+            and not principal.allows_vault_root(self.config.vault_path)
+        ):
+            document_agent_filter = [
+                principal.agent_id,
+                f"identity:{principal.agent_id}",
+            ]
         # R5 (#226) / AFM-6 (#230): cleared per-retrieve so a stale flag from an
         # earlier call never reports this one as degraded. The multi-variant
         # branch below RECURSES, and each recursive call clears these again on
@@ -3611,7 +4054,9 @@ class RetrievalEngine:
         state.document_hydration_degraded = None
         self._reset_encode_ms()
         self._set_current_deadline(deadline_monotonic)
-        if past_search_deadline(deadline_monotonic):
+        if effective_fast:
+            query_variants = [query]
+        elif past_search_deadline(deadline_monotonic):
             query_variants = [query]
             if expand not in (False, None, "off"):
                 state.query_expand_degraded = "search deadline; skipped query expand"
@@ -3672,6 +4117,7 @@ class RetrievalEngine:
                     principal=principal,
                     workspace=workspace,
                     deadline_monotonic=deadline_monotonic,
+                    mode=mode,
                     _state=variant_states[index],
                 )
 
@@ -4039,7 +4485,7 @@ class RetrievalEngine:
             # At that ceiling a trace records incomplete candidate coverage;
             # no result is admitted merely to fill the requested count.
             window = max(1, wanted)
-            ceiling = max(window, 512)
+            ceiling = window if effective_fast else max(window, 512)
             last_rows: List[Dict] = []
             with self._query_encoding_scope():
                 while True:
@@ -4066,7 +4512,11 @@ class RetrievalEngine:
                         return rows
                     window = min(ceiling, window * 2)
 
-        rerank_k = max(limit, self.config.reranker_top_k if self.config.reranker_enabled else limit)
+        rerank_k = (
+            limit
+            if effective_fast
+            else max(limit, self.config.reranker_top_k if self.config.reranker_enabled else limit)
+        )
 
         lexical_searched = False
 
@@ -4142,7 +4592,20 @@ class RetrievalEngine:
             # _semantic_search path is taken — bit-identical to pre-PR-3.
             extra_backend_results: List[List[Dict]] = []
             semantic_t0 = time.perf_counter()
-            if past_search_deadline(deadline_monotonic):
+            if effective_fast:
+                try:
+                    semantic_results = _eligible(
+                        self.trie_search(
+                            query,
+                            limit=rerank_k,
+                            agent_filter=document_agent_filter,
+                            exclude_statuses=skip_list,
+                        )
+                    )
+                except Exception:
+                    semantic_results = []
+                trace["backends"] = ["trie-fast"]
+            elif past_search_deadline(deadline_monotonic):
                 semantic_results = []
                 trace["backends"] = ["fts-deadline"]
                 if lexical_searched:
@@ -4236,7 +4699,9 @@ class RetrievalEngine:
             # Step 4: Cross-encoder re-rank.
             # Deadline before `self.reranker`: that property lazily calls
             # get_cross_encoder() / CrossEncoder() and can outlive the client.
-            if merged and self.config.reranker_enabled:
+            if effective_fast:
+                merged = merged[:limit]
+            elif merged and self.config.reranker_enabled:
                 if past_search_deadline(deadline_monotonic):
                     self.last_rerank_degraded = "search deadline; skipped rerank"
                     merged = merged[:limit]
@@ -4247,6 +4712,25 @@ class RetrievalEngine:
                     trace["cross_encoder_scores"] = [
                         {"doc_id": r.get("doc_id"), "score": r.get("rerank_score")}
                         for r in merged
+                    ]
+                    # Filter semantic-only noise when Cross-Encoder logit and cosine
+                    # similarity are below the relevance floor (-1.0 when FTS had 0 hits,
+                    # -4.0 unconditional gibberish floor).
+                    ce_floor = -1.0 if not fts_results else -4.0
+                    merged = [
+                        r
+                        for r in merged
+                        if not (
+                            r.get("fts_rank") is None
+                            and r.get("raw_rerank_score") is not None
+                            and (
+                                float(r["raw_rerank_score"]) < -4.0
+                                or (
+                                    float(r["raw_rerank_score"]) < ce_floor
+                                    and float(r.get("similarity") or 0.0) < 0.35
+                                )
+                            )
+                        )
                     ]
                     # S-1 fix: respect the caller's limit. reranker_final_k is a
                     # precision-tuning floor (controls how many cross-encoder scores
@@ -4263,7 +4747,11 @@ class RetrievalEngine:
 
             # PR-8: HyDE cold-query second pass. This runs at most once and
             # gracefully returns the original pass if AFM is unavailable.
-            hyde_enabled = self.config.hyde_enabled if use_hyde is None else bool(use_hyde)
+            hyde_enabled = (
+                False
+                if effective_fast
+                else (self.config.hyde_enabled if use_hyde is None else bool(use_hyde))
+            )
             if hyde_enabled and past_search_deadline(deadline_monotonic):
                 self.last_hyde_degraded = "search deadline; skipped hyde"
                 hyde_enabled = False
@@ -4279,14 +4767,20 @@ class RetrievalEngine:
                     probe_results = []
                     for r in merged[:limit]:
                         probe = dict(r)
+                        ce_probe = r.get(
+                            "raw_rerank_score", r.get("rerank_score")
+                        )
+                        rrf_probe = r.get("rrf_score")
+                        if ce_probe is None and rrf_probe is not None:
+                            # hyde_confidence_floor (0.4) is tuned against the
+                            # legacy 20x RRF probe scale when un-reranked.
+                            rrf_probe = float(rrf_probe) * (20.0 / 61.0)
                         probe["confidence"] = compute_confidence(
-                            rrf_score=r.get("rrf_score"),
+                            rrf_score=rrf_probe,
                             # grok-review round 2: the raw logit — rerank_score
                             # is already decay-attenuated and decay_factor is
                             # passed separately below.
-                            cross_encoder_score=r.get(
-                                "raw_rerank_score", r.get("rerank_score")
-                            ),
+                            cross_encoder_score=ce_probe,
                             # round 5 (finding 3): the effective decay ranking
                             # used (correction floor + clamp), not the raw one.
                             decay_factor=r.get(
@@ -4504,6 +4998,7 @@ class RetrievalEngine:
         # Model-facing content is always wrapped; raw executable instructions never treated as policy.
         for r in merged:
             txt = str(r.get("chunk_text") or r.get("full_document_text") or r.get("content") or "")
+            r["raw_chunk_text"] = txt
             r["instruction_like"] = bool(is_instruction_like(txt))
             attribution = (
                 self._score_attribution(claim_text, txt)
@@ -4520,28 +5015,6 @@ class RetrievalEngine:
                 vis = "shared-wiki-authorized"
             r["visibility"] = vis
             r["reasoning"] = f"can_read_document(principal={pid or 'n/a'}, ws={ws}) passed"
-            # Safe wrapper: attribute + body escaping lives in
-            # build_evidence_envelope (SEC-010 — untrusted paths/snippets must
-            # not be able to forge attributes or a second EVIDENCE tag).
-            src = r.get("path") or r.get("source") or r.get("filename") or "?"
-            ag = r.get("agent", "?")
-            st = r.get("page_status", "?")
-            pr = r.get("privacy_level", "?")
-            sc = float(r.get("score") or 0)
-            r["evidence_envelope"] = build_evidence_envelope(
-                source=src,
-                agent=ag,
-                status=st,
-                privacy=pr,
-                score=sc,
-                instruction_like=r["instruction_like"],
-                visibility=vis,
-                text=txt,
-                attribution=r.get("attribution"),
-                perturbation_enabled=getattr(
-                    self.config, "instruction_body_perturbation_enabled", True
-                ),
-            )
             if r["instruction_like"] or r.get("attribution_score") is not None:
                 existing_full = r.get("full_provenance")
                 if not isinstance(existing_full, dict):
@@ -4560,11 +5033,8 @@ class RetrievalEngine:
                         "attribution_score": r.get("attribution_score"),
                         "attribution_model": r.get("attribution_model"),
                     })
-            # Primary text field becomes the envelope so downstream (sovrd JSON, agent_api, formatRecall) sees tagged evidence
-            if "chunk_text" in r:
-                r["chunk_text"] = r["evidence_envelope"]
 
-        # Step 5: Context budgeting
+        # Step 5: Context budgeting (uses raw chunk_text, not XML envelope overhead)
         if budget_tokens:
             merged = self._budget_results(merged, query)
 
@@ -4589,6 +5059,28 @@ class RetrievalEngine:
                 ),
                 4,
             )
+            r["score"] = score
+            src = r.get("path") or r.get("source") or r.get("filename") or "?"
+            ag = r.get("agent", "?")
+            st = r.get("page_status", "?")
+            pr = r.get("privacy_level", "?")
+            raw_txt = str(r.get("raw_chunk_text") or r.get("chunk_text") or "")
+            r["evidence_envelope"] = build_evidence_envelope(
+                source=src,
+                agent=ag,
+                status=st,
+                privacy=pr,
+                score=float(score or 0),
+                instruction_like=bool(r.get("instruction_like")),
+                visibility=r.get("visibility", "authorized"),
+                text=raw_txt,
+                attribution=r.get("attribution"),
+                perturbation_enabled=getattr(
+                    self.config, "instruction_body_perturbation_enabled", True
+                ),
+            )
+            if "chunk_text" in r:
+                r["chunk_text"] = r["evidence_envelope"]
 
             # Compute age_days from indexed_at. Audit R0: parse-or-report, so a
             # TEXT indexed_at costs this one row its age instead of raising
@@ -4629,17 +5121,6 @@ class RetrievalEngine:
                     rrf_score=r.get("rrf_score"),
                     cross_encoder_score=ce_for_confidence,
                     decay_factor=decay_for_confidence,
-                    # GA4-1 / grok-review rounds 4-5 (finding 1): formatting
-                    # neither records NOR calibrates. Production search is
-                    # multi-call AND multi-engine — scope=both fans out
-                    # personal (vault db) + combined (vaults + shared) — so
-                    # per-engine calibration made one response mix percentile
-                    # ranks (shared window) with raw blends (vault windows,
-                    # never fed), and per-call recording padded the window
-                    # with duplicate/discarded scores. The RPC boundary
-                    # (recall.handle_search) records confidence_raw into the
-                    # SHARED window and rewrites confidence onto that single
-                    # basis for the whole payload.
                     db=None,
                     record=False,
                 )
@@ -4731,6 +5212,9 @@ class RetrievalEngine:
                 "decay_applied": r.get("decay_applied"),
                 "layer": r.get("layer", "knowledge"),
                 "chunk_text": chunk_text,
+                "raw_chunk_text": r.get("raw_chunk_text", ""),
+                "evidence_envelope": r.get("evidence_envelope"),
+                "visibility": r.get("visibility", "authorized"),
                 "heading_context": r.get("heading_context", ""),
                 "token_count": r.get("token_count", 0),
                 # PR-2 envelope fields
@@ -5219,13 +5703,23 @@ class RetrievalEngine:
         # OR semantics: bm25 rank still puts the learning matching the most /
         # rarest terms first, restoring recall without diluting queries the
         # strict pass already answers.
-        results = _match(safe_q)
         terms = safe_q.split()
+        lowered = [t.lower() for t in terms]
+        selective = self._selective_or_terms(lowered) if len(terms) > 1 else lowered
+        strict_q = (
+            " ".join(selective)
+            if (selective and len(selective) < len(lowered) and self._is_large_corpus())
+            else safe_q
+        )
+        results = _match(strict_q)
         if not results and len(terms) > 1:
             # Lowercase the operands: FTS5 matching is case-insensitive, but a
             # literal uppercase "OR"/"AND"/"NOT" token from the query would be
             # parsed as an operator and corrupt the joined expression.
-            results = _match(" OR ".join(t.lower() for t in terms))
+            if selective and len(selective) < len(lowered):
+                results = _match(" OR ".join(selective))
+            if not results:
+                results = _match(" OR ".join(lowered))
 
         # hooks-PL-2 leg (a): searching learnings IS reading them. Record
         # access + a learning_reads row so subscribe_contradictions can later

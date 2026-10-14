@@ -41,13 +41,15 @@ def _numpy():
 
 # Categories for learnings
 CATEGORIES = {
-    "pattern":    "Recurring patterns discovered in code, behavior, or data",
-    "fix":        "Bug fixes, workarounds, solutions to known problems",
-    "decision":   "Decisions made and their rationale",
-    "preference": "User or agent preferences learned over time",
-    "fact":       "Facts discovered about the codebase, infrastructure, or domain",
-    "procedure":  "Step-by-step procedures that worked",
-    "general":    "Uncategorized learning",
+    "pattern":      "Recurring patterns discovered in code, behavior, or data",
+    "fix":          "Bug fixes, workarounds, solutions to known problems",
+    "decision":     "Decisions made and their rationale",
+    "preference":   "User or agent preferences learned over time",
+    "fact":         "Facts discovered about the codebase, infrastructure, or domain",
+    "procedure":    "Step-by-step procedures that worked",
+    "architecture": "Architectural invariants, boundaries, and structural decisions",
+    "codebase":     "Codebase structure, file locations, and module layouts",
+    "general":      "Uncategorized learning",
 }
 
 
@@ -111,6 +113,7 @@ class WriteBackMemory:
         Returns:
             learning_id
         """
+        category = str(category or "general").strip().lower()
         if category not in CATEGORIES:
             category = "general"
 

@@ -265,6 +265,19 @@ export async function readTranscriptDelta(
 const DIRECTIVE_PATTERN =
   /\b(?:from now on|always|never|don't|do not|remember to|stop doing|make sure to|ensure that|prefer|must not|only use)\b/i;
 
+/**
+ * Fast-path guard rejecting raw operator slash-dispatch prompts (/boost, /apex),
+ * multi-section # DIRECTIVE: task briefs, subagent delegation boilerplate, or
+ * multi-command terminal transcript dumps from being harvested as candidate learnings.
+ */
+const PROMPT_DISPATCH_BLOCK_PATTERN =
+  /(?:^\s*(?:\*\*Task\*\*:\s*)?\/(?:boost|apex)\b|^#+\s*DIRECTIVE:|\b#+\s*DIRECTIVE:\s+[^\n]{5,}|Executing the \*\*Delegation Routine\*\*|\bRan command:\s+[^\n]+\n\s*Ran command:)/im;
+
+export function isPromptDispatchBlock(text: string): boolean {
+  if (!text) return false;
+  return PROMPT_DISPATCH_BLOCK_PATTERN.test(text);
+}
+
 const TEST_FAIL_PATTERN =
   /\b(?:FAIL|failed|AssertionError|AssertionFailure|failures:|\d+\s+failed)\b/i;
 const TEST_PASS_PATTERN =
@@ -283,11 +296,16 @@ export function screenTranscriptChunk(entries: TranscriptEntry[]): JevTrigger[] 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
 
-    // 1. Operator Directives (strictly human input)
+    // 1. Operator Directives (strictly human input, excluding raw /boost, /apex, or # DIRECTIVE: task briefs)
     if (isHumanTypedInput(entry)) {
       const rawText = extractEntryText(entry);
       const cleaned = maskTelemetry(rawText);
-      if (cleaned.length >= 10 && DIRECTIVE_PATTERN.test(cleaned)) {
+      if (
+        cleaned.length >= 10 &&
+        cleaned.length <= 2000 &&
+        !isPromptDispatchBlock(cleaned) &&
+        DIRECTIVE_PATTERN.test(cleaned)
+      ) {
         triggers.push({
           kind: "operator_directive",
           triggerText: cleaned,
@@ -369,11 +387,57 @@ export function screenTranscriptChunk(entries: TranscriptEntry[]): JevTrigger[] 
 // Jev Extraction Pass (typesafe_extract)
 // ---------------------------------------------------------------------------
 
+const CANONICAL_JEV_CATEGORIES = new Set([
+  "procedure",
+  "decision",
+  "fix",
+  "pattern",
+  "preference",
+  "fact",
+  "architecture",
+  "codebase",
+  "general",
+]);
+
+const LEGACY_JEV_CATEGORY_MAP: Record<string, string> = {
+  operational: "procedure",
+  design: "decision",
+  debugging: "fix",
+  testing: "pattern",
+  convention: "preference",
+};
+
+function defaultCategoryForTrigger(kind?: string): string {
+  switch (kind) {
+    case "operator_directive":
+      return "preference";
+    case "test_insight":
+      return "pattern";
+    case "scar":
+      return "fix";
+    default:
+      return "general";
+  }
+}
+
+export function normalizeJevCategory(raw: unknown, triggerKind?: string): string {
+  if (typeof raw === "string") {
+    const cleaned = raw.trim().toLowerCase();
+    if (CANONICAL_JEV_CATEGORIES.has(cleaned)) return cleaned;
+    if (LEGACY_JEV_CATEGORY_MAP[cleaned]) return LEGACY_JEV_CATEGORY_MAP[cleaned];
+  }
+  return defaultCategoryForTrigger(triggerKind);
+}
+
 export async function extractJevLearning(
   trigger: JevTrigger,
   extractor?: (trigger: JevTrigger, contextText: string) => Promise<JevLearnPayload | undefined>,
 ): Promise<JevLearnPayload | undefined> {
   const contextText = trigger.contextWindow.join("\n---\n");
+
+  if (isPromptDispatchBlock(trigger.triggerText) || isPromptDispatchBlock(contextText)) {
+    return undefined;
+  }
 
   if (extractor) {
     return extractor(trigger, contextText);
@@ -387,7 +451,7 @@ export async function extractJevLearning(
     const want = {
       title: "Short concise title under 8 words",
       content: "The rule, finding, or recovery instruction",
-      category: "One of: operational, design, debugging, testing, convention",
+      category: "One of: procedure, decision, fix, pattern, preference, fact, architecture, codebase, general",
     };
     const req = JSON.stringify({
       text: contextText.slice(0, 2000),
@@ -399,9 +463,13 @@ export async function extractJevLearning(
     });
     const parsed = JSON.parse(stdout);
     if (parsed.status === "ok" && parsed.values) {
-      const title = parsed.values.title?.value || trigger.triggerText.slice(0, 60);
+      const rawTitle = String(parsed.values.title?.value || trigger.triggerText.slice(0, 60));
+      const title = rawTitle.replace(/\s+/g, " ").trim();
       const content = parsed.values.content?.value || trigger.triggerText;
-      const category = parsed.values.category?.value || "operational";
+      if (isPromptDispatchBlock(title) || isPromptDispatchBlock(String(content))) {
+        return undefined;
+      }
+      const category = normalizeJevCategory(parsed.values.category?.value, trigger.kind);
       return {
         title,
         content,
@@ -418,23 +486,23 @@ export async function extractJevLearning(
   // Deterministic structural extraction fallback
   let title = "";
   let content = "";
-  let category = "operational";
+  let category = defaultCategoryForTrigger(trigger.kind);
 
   switch (trigger.kind) {
     case "operator_directive":
-      title = trigger.triggerText.split(/[.\n]/)[0].slice(0, 60).trim();
+      title = trigger.triggerText.split(/[.\n]/)[0].replace(/\s+/g, " ").slice(0, 60).trim();
       content = trigger.triggerText;
-      category = "operational";
+      category = "preference";
       break;
     case "test_insight":
       title = "Test fix insight";
       content = trigger.contextWindow.join("\n");
-      category = "testing";
+      category = "pattern";
       break;
     case "scar":
       title = "Tool error recovery";
       content = trigger.contextWindow.join("\n");
-      category = "debugging";
+      category = "fix";
       break;
   }
 
@@ -466,7 +534,8 @@ export async function executeLearnPipeline(input: {
   store?: JsonResult;
 }> {
   const { vaultPath, workspaceId, agentId, sessionId, payload } = input;
-  const { title, content, category, source } = payload;
+  const { title, content, source } = payload;
+  const category = normalizeJevCategory(payload.category, payload.triggerKind);
 
   // 1. Credential & secret scan (flagsSensitiveMaterial)
   const quality = await assessLearningQualityAsync({ title, content, category, source });
@@ -502,6 +571,23 @@ export async function executeLearnPipeline(input: {
     trigger_kind: payload.triggerKind,
     sessionId,
   });
+
+  try {
+    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const fullContent = `---\ntitle: ${title}\nsection: sessions\nstatus: candidate\nprivacy: safe\ncategory: ${category}\n---\n# ${title}\n\n${content}`;
+    await jsonRpcSocketRequestWithFallback("vault_index_doc", {
+      content: fullContent,
+      path: note.relativePath,
+      agent_id: effectivePrincipal,
+      agent: effectivePrincipal,
+      sigil: "📄",
+      privacy_level: "safe",
+      page_status: "candidate",
+      layer: "knowledge",
+    });
+  } catch {
+    // Fail-open: vault note is on disk and will be indexed on next pass
+  }
 
   return { ok: true, status: "learned", quality, note, store };
 }
