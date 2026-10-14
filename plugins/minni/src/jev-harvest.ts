@@ -295,28 +295,28 @@ export function screenTranscriptChunk(entries: TranscriptEntry[]): JevTrigger[] 
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
+    const entryText = maskTelemetry(extractEntryText(entry));
+    if (isPromptDispatchBlock(entryText)) {
+      continue;
+    }
 
     // 1. Operator Directives (strictly human input, excluding raw /boost, /apex, or # DIRECTIVE: task briefs)
     if (isHumanTypedInput(entry)) {
-      const rawText = extractEntryText(entry);
-      const cleaned = maskTelemetry(rawText);
       if (
-        cleaned.length >= 10 &&
-        cleaned.length <= 2000 &&
-        !isPromptDispatchBlock(cleaned) &&
-        DIRECTIVE_PATTERN.test(cleaned)
+        entryText.length >= 10 &&
+        entryText.length <= 2000 &&
+        DIRECTIVE_PATTERN.test(entryText)
       ) {
         triggers.push({
           kind: "operator_directive",
-          triggerText: cleaned,
-          contextWindow: [cleaned],
+          triggerText: entryText,
+          contextWindow: [entryText],
           timestamp: asString(entry.timestamp) || new Date().toISOString(),
         });
       }
     }
 
     // 2. Test Insight (test red -> edit -> test green)
-    const entryText = maskTelemetry(extractEntryText(entry));
     if (
       TEST_FAIL_PATTERN.test(entryText) &&
       (TEST_COMMAND_PATTERN.test(entryText) || entry.tool_name === "run_command" || entry.type === "TOOL_RESULT")
@@ -573,7 +573,7 @@ export async function executeLearnPipeline(input: {
   });
 
   try {
-    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
     const fullContent = `---\ntitle: ${title}\nsection: sessions\nstatus: candidate\nprivacy: safe\ncategory: ${category}\n---\n# ${title}\n\n${content}`;
     await jsonRpcSocketRequestWithFallback("vault_index_doc", {
       content: fullContent,

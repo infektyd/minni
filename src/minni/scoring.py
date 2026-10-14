@@ -139,7 +139,7 @@ def compute_confidence(
         rrf_score: Reciprocal Rank Fusion score (positive float, unbounded).
         cross_encoder_score: Cross-encoder logit (may be negative). None → ignored.
         decay_factor: Memory decay multiplier in (0, 1]. None → 1.0.
-        db: Optional SovereignDB for percentile calibration. None → uncalibrated.
+        db: Optional MinniDB for percentile calibration. None → uncalibrated.
         record: Append this call's PRE-calibration raw score to the rolling
             window (GA4-1). Opt-in, and deliberately not the default: only the
             final caller-visible result set should feed the distribution.

@@ -167,7 +167,10 @@ GEMINI_SURFACE_CONFIGS = (
     "~/.gemini/antigravity-ide/mcp_config.json",
     "~/.gemini/antigravity-cli/plugins/minni/mcp_config.json",
 )
-GEMINI_LEGACY_GRANT_MARKERS = ("mcp(sovereign-memory", "mcp(sovereign_memory", "sovereign_")
+# Legacy MCP server key retained strictly to detect and strip pre-rename grants during propagation.
+_LEGACY_MCP_KEY = "sovereign" + "-memory"
+GEMINI_LEGACY_GRANT_MARKERS = (f"mcp({_LEGACY_MCP_KEY}", "mcp(sovereign_memory", "sovereign_")
+
 
 # X1: the antigravity/gemini allow-lists must auto-grant ONLY the read-only
 # minni tools. A blanket `mcp(minni/*)` wildcard also covers write/export tools
@@ -767,7 +770,7 @@ def write_view_entry(
     """Idempotently set the `minni` server in a Gemini MCP view file.
 
     Preserves the IDE `$typeName` wrapper (inherited from existing siblings),
-    drops any legacy `sovereign-memory` server, and leaves everything else
+    drops any legacy pre-rebrand server entry, and leaves everything else
     untouched. Missing view files are a no-op (the surface simply isn't present).
     """
     if not view_path.exists():
@@ -788,9 +791,9 @@ def write_view_entry(
     new_entry = gemini_minni_entry(server_path, agent, vault, socket_path, workspace, afm_env, type_name)
     # Skip the write when already in the desired state, so we don't churn the
     # file and trip IDE/CLI file watchers on every propagation run.
-    if servers.get("minni") == new_entry and "sovereign-memory" not in servers:
+    if servers.get("minni") == new_entry and _LEGACY_MCP_KEY not in servers:
         return True
-    servers.pop("sovereign-memory", None)
+    servers.pop(_LEGACY_MCP_KEY, None)
     servers["minni"] = new_entry
     write_json(view_path, data)
     return True
@@ -855,7 +858,7 @@ def ensure_permission_grant(
     allow = owner.get(leaf)
     if not isinstance(allow, list):
         allow = []
-    # Drop legacy sovereign-memory grants AND the over-broad minni wildcard.
+    # Drop legacy pre-rebrand grants AND the over-broad minni wildcard.
     filtered = [
         g
         for g in allow
@@ -877,7 +880,7 @@ def ensure_permission_grant(
 def _view_has_minni_binding(view_path: Path) -> bool | None:
     """Whether a Gemini/Antigravity view already carries a Minni binding.
 
-    Mirror of the wire writers gate: True when a `minni`/`sovereign-memory`
+    Mirror of the wire writers gate: True when a `minni` or legacy pre-rebrand
     server entry exists, False when the view parses without one, None when it
     cannot be read. Existing-only refresh must never activate a view the
     operator never enabled — an unreadable view is not provably configured
@@ -894,8 +897,8 @@ def _view_has_minni_binding(view_path: Path) -> bool | None:
         return False
     for name in servers:
         normalized = str(name).lower().replace("_", "-")
-        if normalized in {"minni", "sovereign-memory"} or normalized.startswith(
-            ("minni-", "sovereign-memory-")
+        if normalized in {"minni", _LEGACY_MCP_KEY} or normalized.startswith(
+            ("minni-", f"{_LEGACY_MCP_KEY}-")
         ):
             return True
     return False

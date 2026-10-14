@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from minni.config import DEFAULT_CONFIG
-from minni.db import SovereignDB, _BudgetConnection
+from minni.db import MinniDB, _BudgetConnection
 from minni.request_deadline import RequestDeadlineExceeded, current_deadline, request_deadline
 
 
@@ -34,7 +34,7 @@ def test_nonfinite_rpc_budget_uses_default():
 @pytest.fixture
 def db(tmp_path):
     config = dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'test.db'), vault_path=str(tmp_path / 'vault'))
-    database = SovereignDB(config)
+    database = MinniDB(config)
     database._get_conn()
     yield database
     database.close()
@@ -188,18 +188,18 @@ def test_insert_returning_expired_cursor_does_not_false_succeed(db, monkeypatch)
 
 def test_first_eligibility_fetch_deadline_raises_instead_of_empty(tmp_path, monkeypatch):
     """A deadline on the first FTS fetch must not look like a quiet miss."""
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / 'elig.db'),
         vault_path=str(tmp_path / 'vault'),
         reranker_enabled=False,
         hyde_enabled=False,
         query_expand_default='off',
     )
-    engine = RetrievalEngine(SovereignDB(cfg), cfg)
+    engine = RetrievalEngine(MinniDB(cfg), cfg)
 
     def boom(*args, **kwargs):
         raise RequestDeadlineExceeded('first fetch')
@@ -216,28 +216,6 @@ def test_first_eligibility_fetch_deadline_raises_instead_of_empty(tmp_path, monk
         )
 
 
-def test_multi_backend_search_does_not_swallow_deadline():
-    import numpy as np
-    from minni.backends.multi import MultiBackend
-    from minni.vector_backend import VectorHit
-
-    class Boom:
-        name = 'boom'
-        dim = 8
-        def search(self, *args, **kwargs):
-            raise RequestDeadlineExceeded('copied context deadline')
-
-    class Ok:
-        name = 'ok'
-        dim = 8
-        def search(self, *args, **kwargs):
-            return [VectorHit(chunk_id=1, doc_id=1, score=1.0, backend='ok')]
-
-    multi = MultiBackend([Boom(), Ok()])
-    with pytest.raises(RequestDeadlineExceeded, match='copied context deadline'):
-        multi.search(np.zeros(8, dtype=np.float32), k=3)
-
-
 def test_document_depth_hydration_timeout_preserves_chunk_and_reports_degradation(
     tmp_path, monkeypatch,
 ):
@@ -246,12 +224,12 @@ def test_document_depth_hydration_timeout_preserves_chunk_and_reports_degradatio
     FAISS disk-cache load is a different surface. This drives retrieve(depth=
     document) through the ranked-result hydration path.
     """
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.minnid_runtime.recall import _degradation_for
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / 'doc-hydrate.db'),
         faiss_index_path=str(tmp_path / 'doc-hydrate.faiss'),
         vault_path=str(tmp_path / 'vault'),
@@ -260,7 +238,7 @@ def test_document_depth_hydration_timeout_preserves_chunk_and_reports_degradatio
         feedback_enabled=False,
         query_expand_default='off',
     )
-    engine = RetrievalEngine(SovereignDB(cfg), cfg)
+    engine = RetrievalEngine(MinniDB(cfg), cfg)
     engine.index_durable_document(
         content='# Deadline slice\n\nFTS must still find this paragraph about sockets.\n',
         path='wiki/concepts/deadline-slice.md',
@@ -306,17 +284,17 @@ def test_document_depth_hydration_timeout_preserves_chunk_and_reports_degradatio
 
 def test_faiss_hydration_timeout_sets_vector_degraded(tmp_path, monkeypatch):
     """Disk-cache hydration timeout must degrade, not look like a healthy miss."""
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / 'hydrate.db'),
         vault_path=str(tmp_path / 'vault'),
         reranker_enabled=False,
         hyde_enabled=False,
     )
-    engine = RetrievalEngine(SovereignDB(cfg), cfg)
+    engine = RetrievalEngine(MinniDB(cfg), cfg)
 
     def boom(*args, **kwargs):
         raise RequestDeadlineExceeded('hydrate timeout')
@@ -353,7 +331,7 @@ def test_faiss_disk_postfilter_does_not_swallow_deadline():
 
 
 def test_expired_scope_does_not_open_connection(tmp_path):
-    database = SovereignDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'cold.db'), vault_path=str(tmp_path / 'vault')))
+    database = MinniDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'cold.db'), vault_path=str(tmp_path / 'vault')))
     with request_deadline(time.monotonic() - 1), pytest.raises(RequestDeadlineExceeded):
         database._get_conn()
     assert not hasattr(database._local, 'conn')
@@ -523,7 +501,7 @@ def test_bulk_scores_stop_and_keep_consistent_response_when_budget_expires(db, m
 
 
 def test_request_budget_covers_multiple_connections_and_resets(db, tmp_path):
-    second = SovereignDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'second.db'), vault_path=str(tmp_path / 'second-vault')))
+    second = MinniDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'second.db'), vault_path=str(tmp_path / 'second-vault')))
     second._get_conn()
     try:
         with request_deadline(time.monotonic() - 1):
@@ -548,7 +526,7 @@ def test_schema_lock_wait_is_bounded_and_next_request_can_open(tmp_path):
     worker = threading.Thread(target=holder)
     worker.start()
     assert held.wait(1)
-    database = SovereignDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'blocked.db'), vault_path=str(tmp_path / 'vault')))
+    database = MinniDB(dataclasses.replace(DEFAULT_CONFIG, db_path=str(tmp_path / 'blocked.db'), vault_path=str(tmp_path / 'vault')))
     started = time.monotonic()
     try:
         with request_deadline(started + .02), pytest.raises(RequestDeadlineExceeded):

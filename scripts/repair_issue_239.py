@@ -126,8 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.repair_dual_candidates import run_full_repair
 
     db_path = os.path.expanduser(args.db)
@@ -135,9 +135,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: database not found: {db_path}", file=sys.stderr)
         return 2
 
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
     vault_roots = _discover_vault_roots(cfg, args.vault)
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     try:
         result = run_full_repair(
             db,

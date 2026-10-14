@@ -8,9 +8,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def _make_db(tmp_path, *, reorg_horizon_days=30):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -29,7 +29,7 @@ def _make_db(tmp_path, *, reorg_horizon_days=30):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -265,7 +265,7 @@ def test_daemon_compile_routes_reorg_and_pruning_with_traces(tmp_path, monkeypat
     }
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
     monkeypatch.setattr(minnid, "_writeback", None)
-    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda config=None: db_obj)
 
     reorg_resp = minnid._dispatch_sync({
         "jsonrpc": "2.0",

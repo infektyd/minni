@@ -49,9 +49,9 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         vector_backends=["faiss-disk"],
@@ -63,7 +63,7 @@ def _make_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

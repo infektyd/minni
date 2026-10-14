@@ -397,7 +397,7 @@ def test_resolve_degrades_dns_log_only_on_pre_015_schema(tmp_path, monkeypatch):
     old_db = cfg_mod.DEFAULT_CONFIG.db_path
     cfg_mod.DEFAULT_CONFIG.db_path = db_path
     monkeypatch.setattr(minnid, "_writeback", None)
-    # Mark the path already-migrated so SovereignDB does not re-run migrations
+    # Mark the path already-migrated so MinniDB does not re-run migrations
     # and silently re-expand the CHECK — the daemon is serving as-is.
     db_mod._migrations_run = True
     db_mod._migrated_paths.add(os.path.abspath(db_path))

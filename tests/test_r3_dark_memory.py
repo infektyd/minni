@@ -40,9 +40,9 @@ def _install_fake_embedder(monkeypatch):
 
 
 def _make_cfg(tmp_path):
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    return SovereignConfig(
+    return MinniConfig(
         db_path=str(tmp_path / "shared" / "minni.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -500,10 +500,10 @@ def _write_page(path: Path, status: str, body: str) -> None:
 
 
 def _engine(cfg):
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    return RetrievalEngine(SovereignDB(cfg), cfg)
+    return RetrievalEngine(MinniDB(cfg), cfg)
 
 
 def test_drafts_cannot_crowd_the_fts_window(tmp_path, monkeypatch):
@@ -1148,10 +1148,10 @@ def test_faiss_invalidate_is_atomic_against_concurrent_search(tmp_path, monkeypa
     import threading
 
     import numpy as np
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.faiss_index import FAISSIndex
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
         writeback_enabled=False,
@@ -1312,10 +1312,10 @@ def test_faiss_disk_reload_is_atomic_against_concurrent_search(tmp_path):
     import threading
 
     import numpy as np
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.faiss_index import FAISSIndex
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
         writeback_enabled=False,
@@ -1454,10 +1454,10 @@ def test_save_to_disk_records_the_callers_checksum(tmp_path):
     import json
 
     import numpy as np
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.faiss_index import FAISSIndex
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
         writeback_enabled=False,
@@ -1635,16 +1635,16 @@ def test_durable_refresh_survives_an_ensure_that_missed_its_rows(tmp_path, monke
     import threading
 
     import numpy as np
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
         writeback_enabled=False,
     )
-    eng = RetrievalEngine(SovereignDB(cfg), cfg)
+    eng = RetrievalEngine(MinniDB(cfg), cfg)
     try:
         dim = cfg.embedding_dim
         ids = list(range(1, 51))

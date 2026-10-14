@@ -113,7 +113,7 @@ export interface StatusReport {
   };
 }
 
-export function parseSovrdJson<T = unknown>(raw: string): JsonResult<T> {
+export function parseMinnidJson<T = unknown>(raw: string): JsonResult<T> {
   try {
     return { ok: true, data: JSON.parse(raw) as T };
   } catch (error) {
@@ -161,7 +161,7 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
         data += chunk;
       });
       res.on("end", () => {
-        const parsed = parseSovrdJson(data);
+        const parsed = parseMinnidJson(data);
         if (res.statusCode && res.statusCode >= 400) {
           resolve({ ok: false, data: parsed.data, error: `HTTP ${res.statusCode}` });
           return;
@@ -532,7 +532,7 @@ export function jsonRpcSocketRequest(
       data += chunk.toString("utf8");
       if (!data.includes("\n")) return;
       const line = data.split("\n")[0];
-      const parsed = parseSovrdJson<{ result?: unknown; error?: { message?: string } }>(line);
+      const parsed = parseMinnidJson<{ result?: unknown; error?: { message?: string } }>(line);
       if (!parsed.ok) {
         finish(parsed);
         return;
@@ -546,7 +546,7 @@ export function jsonRpcSocketRequest(
     client.on("error", (error) => finish({ ok: false, error: error.message }));
     client.on("end", () => {
       if (!settled && data.trim()) {
-        const parsed = parseSovrdJson<{ result?: unknown }>(data.trim());
+        const parsed = parseMinnidJson<{ result?: unknown }>(data.trim());
         finish(parsed.ok ? jsonRpcResultToJsonResult(parsed.data?.result) : parsed);
       }
     });

@@ -11,7 +11,7 @@ from typing import Any, Callable, Optional
 import minni.obs as obs
 from minni.afm_review_markers import supersede_afm_review
 from minni.config import DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.principal import (
     OPERATOR_RESERVED_AGENT_IDS,
@@ -42,7 +42,7 @@ class AFMContext:
     index_durable_learning: Callable[..., bool | None] | None = None
     increment_request_count: Callable[[], None] | None = None
     writeback_ref: Callable[[], Any] = lambda: None
-    sovereign_db: Callable[..., Any] = SovereignDB
+    sovereign_db: Callable[..., Any] = MinniDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     is_running: Callable[[], bool] = lambda: False
     logger: logging.Logger = logger
@@ -1119,7 +1119,7 @@ async def afm_loop_runner(context: AFMContext):
                         _skips: dict = {}
                         try:
                             from minni.afm_passes.inbox_ingest import ingest as _ingest_inbox
-                            # Reuse the daemon's shared handle: SovereignDB
+                            # Reuse the daemon's shared handle: MinniDB
                             # connections are thread-local and only released
                             # by close(), so a fresh instance per tick leaks
                             # one connection per tick in this loop.

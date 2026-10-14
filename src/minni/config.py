@@ -39,7 +39,7 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 @dataclass
-class SovereignConfig:
+class MinniConfig:
     """All configuration in one place, overridable via env vars or constructor."""
 
     # Paths — G02 unified canonical home (~/.minni, overridable via MINNI_HOME)
@@ -334,7 +334,7 @@ def correction_class_page_types(config) -> set:
 
 
 # Global default config — importable everywhere
-DEFAULT_CONFIG = SovereignConfig()
+DEFAULT_CONFIG = MinniConfig()
 
 
 # --- Model provider chain config (P3) ----------------------------------------

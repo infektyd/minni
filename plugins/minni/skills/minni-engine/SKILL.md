@@ -75,12 +75,12 @@ To swap to a different reranker API:
 
 ## Config (config.py)
 
-All settings are fields on the `SovereignConfig` dataclass. Env var overrides:
+All settings are fields on the `MinniConfig` dataclass. Env var overrides:
 - `MINNI_HOME`, `MINNI_VAULT_PATH`, `MINNI_DB_PATH`, `MINNI_FAISS_PATH`
 - `MINNI_AFM_PROVIDER_MODE`, `MINNI_AFM_MODE`, `MINNI_AFM_ALLOWED_TARGETS`
 - `MINNI_PROVIDERS_CONFIG` and provider-specific secret references
 
-The global `DEFAULT_CONFIG = SovereignConfig()` is imported everywhere.
+The global `DEFAULT_CONFIG = MinniConfig()` is imported everywhere.
 
 ## Testing Changes
 

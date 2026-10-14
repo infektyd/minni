@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from minni.config import DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.timestamps import parse_epoch_or_report
 from minni.principal import (
     allows_cross_agent_recall,
@@ -117,7 +117,7 @@ class RecallContext:
     record_latency: Callable[[str, float], None]
     increment_request_count: Callable[[], None] | None = None
     lazy_episodic: Callable[[], Any] | None = None
-    sovereign_db: Callable[..., Any] = SovereignDB
+    sovereign_db: Callable[..., Any] = MinniDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     can_read_document: Callable[[Any, str, Any], bool] = can_read_document
     allows_cross_agent_recall: Callable[[Any], bool] = allows_cross_agent_recall
@@ -1057,7 +1057,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 if principal is None or not source_agent or source_agent == principal.agent_id:
                     return True
                 if not isinstance(
-                    getattr(vault_engine, "db", None), SovereignDB
+                    getattr(vault_engine, "db", None), MinniDB
                 ) or "retrieve" in getattr(
                     vault_engine, "__dict__", {}
                 ):

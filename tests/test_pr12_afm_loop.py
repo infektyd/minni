@@ -11,9 +11,9 @@ from minni.principal import EffectivePrincipal  # type: ignore
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -27,7 +27,7 @@ def _make_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -131,7 +131,7 @@ def test_daemon_compile_wet_run_writes_draft_inbox_and_trace(tmp_path, monkeypat
     _seed_event(db_obj)
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
     monkeypatch.setattr(minnid, "_writeback", None)
-    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda config=None: db_obj)
 
     resp = minnid._dispatch_sync(
         {
@@ -177,7 +177,7 @@ def test_daemon_compile_wet_run_requires_operator_principal(tmp_path, monkeypatc
     _seed_event(db_obj)
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
     monkeypatch.setattr(minnid, "_writeback", None)
-    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda config=None: db_obj)
 
     read_only = EffectivePrincipal(agent_id="codex", capabilities=["read"])
     monkeypatch.setattr(
@@ -211,7 +211,7 @@ def test_daemon_compile_dry_run_allowed_for_read_only_principal(tmp_path, monkey
     _seed_event(db_obj)
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
     monkeypatch.setattr(minnid, "_writeback", None)
-    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda config=None: db_obj)
 
     read_only = EffectivePrincipal(agent_id="codex", capabilities=["read"])
     monkeypatch.setattr(
@@ -237,7 +237,7 @@ def test_daemon_endorse_accepts_draft_and_audits(tmp_path, monkeypatch):
     db_obj, cfg = _make_db(tmp_path)
     _seed_event(db_obj)
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda config=None: db_obj)
     compile_resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
@@ -270,7 +270,7 @@ def test_compile_skips_cleanly_when_afm_loop_disabled(tmp_path, monkeypatch):
     cfg.afm_loop_schedule["enabled"] = False
     _seed_event(db_obj)
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda config=None: db_obj)
 
     resp = minnid._dispatch_sync(
         {
@@ -290,7 +290,7 @@ def test_health_report_includes_afm_loop(tmp_path, monkeypatch):
 
     db_obj, cfg = _make_db(tmp_path)
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda config=None: db_obj)
 
     resp = minnid._dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "health_report", "params": {}})
     assert "error" not in resp
@@ -300,10 +300,10 @@ def test_health_report_includes_afm_loop(tmp_path, monkeypatch):
 
 def test_scheduler_runs_most_overdue_pass_only_when_idle(tmp_path):
     from minni.afm_scheduler import AFMScheduler
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     calls = []
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         afm_loop_schedule={
             "enabled": True,

@@ -8,7 +8,7 @@ import {
   buildBootRecallSlice,
   formatDegradation,
   isDaemonResultEmpty,
-} from "../dist/sovereign.js";
+} from "../dist/daemon_transport.js";
 import {
   markRecallConsumed,
   readRecallState,
@@ -350,6 +350,111 @@ test("Step 1: screenTranscriptChunk and extractJevLearning reject raw /boost, /a
     undefined,
     "extractJevLearning must return undefined for raw /boost or # DIRECTIVE: prompt blocks",
   );
+
+  // Prompt-dispatch blocks containing test failure or tool error keywords must also
+  // not trigger test_insight or scar in screenTranscriptChunk
+  const noisyPromptEntries = [
+    {
+      role: "user",
+      type: "TOOL_RESULT",
+      is_error: true,
+      content:
+        "# DIRECTIVE: Fix pytest failure\nerror: command failed when running pytest on recall.py.",
+    },
+    {
+      role: "assistant",
+      tool_name: "replace_file_content",
+      content: "Applied fix to recall.py",
+    },
+    {
+      role: "user",
+      type: "TOOL_RESULT",
+      content: "12 passed in 0.40s",
+    },
+  ];
+  assert.equal(
+    screenTranscriptChunk(noisyPromptEntries).length,
+    0,
+    "screenTranscriptChunk must not trigger test_insight or scar on # DIRECTIVE: prompt blocks",
+  );
 });
+
+test("Phase 4: ui-server removes foreign deep_research routes, queries list_candidates across all principals on /api/candidates, and surfaces review_status / review_action_type", async () => {
+  if (!process.env.MINNI_CONSOLE_TOKEN) {
+    process.env.MINNI_CONSOLE_TOKEN = "test-token";
+  }
+  const { createUiServer } = await import("../dist/ui-server.js");
+  const transportMod = await import("../dist/daemon_transport.js");
+  assert.equal(
+    typeof transportMod.parseMinnidJson,
+    "function",
+    "daemon_transport.js must export parseMinnidJson",
+  );
+
+  let seenListCandidatesParams = null;
+  const app = createUiServer({
+    host: "127.0.0.1",
+    port: 0,
+    daemonRpc: async (method, params) => {
+      if (method === "list_candidates") {
+        seenListCandidatesParams = params;
+        return {
+          ok: true,
+          data: {
+            candidates: [
+              {
+                candidate_id: 42,
+                principal: "cursor",
+                category: "architecture",
+                content: "Verify Trie cache coherence",
+                status: "proposed",
+                review_status: "superseded",
+                review_action_type: "afm_review",
+              },
+            ],
+            principal: "main",
+            count: 1,
+          },
+        };
+      }
+      return { ok: true, data: {} };
+    },
+  });
+  await app.start();
+  try {
+    const base = `http://127.0.0.1:${app.server.address().port}`;
+    const headers = { Authorization: `Bearer ${process.env.MINNI_CONSOLE_TOKEN || "test-token"}` };
+
+    const health = await fetch(`${base}/api/health`).then((r) => r.json());
+    assert.equal(
+      health.tools.some((t) => String(t).startsWith("deep_research_")),
+      false,
+      "Foreign deep_research_* tools must be removed from /api/health",
+    );
+
+    const deepRoute = await fetch(`${base}/api/deep-research/paths`, { headers });
+    assert.equal(
+      deepRoute.status,
+      404,
+      "Foreign /api/deep-research/* routes must be removed (404)",
+    );
+
+    const candRes = await fetch(`${base}/api/candidates`, { headers });
+    assert.equal(candRes.status, 200);
+    assert.equal(
+      seenListCandidatesParams?.agent_id,
+      undefined,
+      `Expected /api/candidates without ?agent_id= to query across all principals (agent_id=undefined), got ${seenListCandidatesParams?.agent_id}`,
+    );
+    const candJson = await candRes.json();
+    const rows = candJson.data?.candidates ?? candJson.candidates;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].review_status, "superseded");
+    assert.equal(rows[0].review_action_type, "afm_review");
+  } finally {
+    await app.close();
+  }
+});
+
 
 

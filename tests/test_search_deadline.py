@@ -24,8 +24,8 @@ import time
 
 import numpy as np
 
-from minni.config import DEFAULT_CONFIG, SovereignConfig
-from minni.db import SovereignDB
+from minni.config import DEFAULT_CONFIG, MinniConfig
+from minni.db import MinniDB
 from minni.minnid_runtime.recall import (
     DEFAULT_SEARCH_BUDGET_MS,
     RecallContext,
@@ -53,8 +53,8 @@ def _engine(tmp_path, **cfg_overrides) -> RetrievalEngine:
         query_expand_default="off",
     )
     cfg_kwargs.update(cfg_overrides)
-    cfg = SovereignConfig(**cfg_kwargs)
-    db = SovereignDB(cfg)
+    cfg = MinniConfig(**cfg_kwargs)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     engine.index_durable_document(
         content="# Deadline slice\n\nFTS must still find this paragraph about sockets.\n",
@@ -94,7 +94,7 @@ def test_retrieve_skips_semantic_when_deadline_already_past(tmp_path, monkeypatc
 def test_retrieve_skips_reranker_load_when_deadline_already_past(tmp_path, monkeypatch):
     # Production default is reranker_enabled=True. The shared fixture disables
     # it, which short-circuits `self.reranker` and hides the lazy CE load.
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         faiss_index_path=str(tmp_path / "test.faiss"),
         vault_path=str(tmp_path / "vault/"),
@@ -105,7 +105,7 @@ def test_retrieve_skips_reranker_load_when_deadline_already_past(tmp_path, monke
         feedback_enabled=False,
         query_expand_default="off",
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     engine.index_durable_document(
         content="# Deadline slice\n\nFTS must still find this paragraph about sockets.\n",
@@ -1572,7 +1572,7 @@ def test_handle_search_poisoned_only_ranking_does_not_qty_learnings_after_empty_
     must fail-closed on learnings qty, calibration, and shared document qty.
     """
     shared = _engine(tmp_path / "shared")
-    vault_cfg = SovereignConfig(
+    vault_cfg = MinniConfig(
         db_path=str(tmp_path / "personal" / "test.db"),
         faiss_index_path=str(tmp_path / "personal" / "test.faiss"),
         vault_path=str(tmp_path / "personal" / "vault/"),
@@ -1583,7 +1583,7 @@ def test_handle_search_poisoned_only_ranking_does_not_qty_learnings_after_empty_
         feedback_enabled=False,
         query_expand_default="off",
     )
-    vault = RetrievalEngine(SovereignDB(vault_cfg), vault_cfg)
+    vault = RetrievalEngine(MinniDB(vault_cfg), vault_cfg)
 
     now = time.time()
     with shared.db.cursor() as c:
@@ -2158,7 +2158,7 @@ def test_handle_search_personal_vault_deadline_fts_miss_does_not_bump_learnings(
     search_learnings still qty-delta'd the shared learnings row.
     """
     shared = _engine(tmp_path / "shared")
-    vault_cfg = SovereignConfig(
+    vault_cfg = MinniConfig(
         db_path=str(tmp_path / "personal" / "test.db"),
         faiss_index_path=str(tmp_path / "personal" / "test.faiss"),
         vault_path=str(tmp_path / "personal" / "vault/"),
@@ -2169,7 +2169,7 @@ def test_handle_search_personal_vault_deadline_fts_miss_does_not_bump_learnings(
         feedback_enabled=False,
         query_expand_default="off",
     )
-    vault = RetrievalEngine(SovereignDB(vault_cfg), vault_cfg)
+    vault = RetrievalEngine(MinniDB(vault_cfg), vault_cfg)
 
     now = time.time()
     with shared.db.cursor() as c:

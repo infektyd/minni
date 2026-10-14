@@ -85,47 +85,6 @@ async function startTestServer(overrides = {}) {
         contextMarkdown: "# Outcome",
       };
     },
-    deepResearch: {
-      paths: async () => ({
-        root: "/Users/alice/deep-research-agent",
-        cli: "/Users/alice/deep-research-agent/.venv/bin/deep-research",
-        local_docs: "/Users/alice/deep-research-agent/local-docs",
-        runs: "/Users/alice/deep-research-agent/runs",
-      }),
-      listRuns: async () => [
-        {
-          run_id: "20260429T000000Z-abc12345",
-          created_at: "2026-04-29T00:00:00Z",
-          prompt: "Research local console UX.",
-          mode: "web",
-          interaction_id: "v1_test",
-          status: "completed",
-          has_result: true,
-          has_report: true,
-        },
-      ],
-      getRun: async (runId) => ({
-        metadata: { run_id: runId, status: "completed", interaction_id: "v1_test" },
-        result: { id: "v1_test", status: "completed", outputs: [{ type: "text", text: "report" }] },
-        report: "Deep Research report from /Users/alice/private/run.",
-        events: [],
-      }),
-      localDocsManifest: async () => ({ root: "/Users/alice/deep-research-agent/local-docs", files: [] }),
-      listFileStores: async () => ({ fileStores: [{ name: "fileSearchStores/test" }] }),
-      createFileStore: async (displayName) => ({ name: "fileSearchStores/test", displayName }),
-      deleteFileStore: async (name) => ({ deleted: name }),
-      plan: async (input) => {
-        calls.push(["deepPlan", input]);
-        return { id: "v1_plan", status: "completed", outputs: [{ type: "text", text: "plan" }] };
-      },
-      refinePlan: async (input) => ({ id: input.previousInteractionId, status: "completed" }),
-      approvePlan: async (input) => ({ id: input.previousInteractionId, status: "created" }),
-      run: async (input) => {
-        calls.push(["deepRun", input]);
-        return { run_id: "20260429T000000Z-abc12345", interaction_id: "v1_run" };
-      },
-      status: async (input) => ({ id: input.interactionId, status: "completed" }),
-    },
     ...overrides,
   });
   await server.start();
@@ -173,23 +132,10 @@ test("UI server exposes local status, prepare, outcome, audit, and static assets
     const audit = await fetch(`${server.baseUrl}/api/audit-tail?limit=5`, { headers: authHeaders() }).then((response) => response.json());
     assert.equal(audit.entries.length, 1);
 
-    const deepPaths = await fetch(`${server.baseUrl}/api/deep-research/paths`, { headers: authHeaders() }).then((response) => response.json());
-    assert.equal(deepPaths.root, "[local-path]");
-
-    const deepRuns = await fetch(`${server.baseUrl}/api/deep-research/runs`, { headers: authHeaders() }).then((response) => response.json());
-    assert.equal(deepRuns[0].run_id, "20260429T000000Z-abc12345");
-
-    const deepPlan = await fetch(`${server.baseUrl}/api/deep-research/plan`, {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ prompt: "research the console", mode: "web", enabledTools: ["google_search"] }),
-    }).then((response) => response.json());
-    assert.equal(deepPlan.id, "v1_plan");
-
     const indexHtml = await fetch(`${server.baseUrl}/`, { headers: authHeaders() }).then((response) => response.text());
     assert.match(indexHtml, /Minni Memory Console/);
 
-    assert.deepEqual(server.calls.map(([name]) => name), ["prepareTask", "prepareOutcome", "deepPlan"]);
+    assert.deepEqual(server.calls.map(([name]) => name), ["prepareTask", "prepareOutcome"]);
   } finally {
     await server.close();
   }

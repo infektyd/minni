@@ -15,7 +15,7 @@ import {
   formatDegradation,
   formatRecall,
   formatRecallLean,
-} from "../dist/sovereign.js";
+} from "../dist/daemon_transport.js";
 
 /** The shape recall.py's response_payload puts on the wire (recall.py). */
 const degradedResponse = {

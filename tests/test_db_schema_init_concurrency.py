@@ -10,11 +10,11 @@ from contextlib import contextmanager
 import pytest
 
 from minni import db as db_mod
-from minni.config import SovereignConfig
+from minni.config import MinniConfig
 
 
 def _make_cfg(tmp_path):
-    return SovereignConfig(
+    return MinniConfig(
         db_path=str(tmp_path / "minni.db"),
         faiss_index_path=str(tmp_path / "minni.faiss"),
         vault_path=str(tmp_path / "vault"),
@@ -24,21 +24,21 @@ def _make_cfg(tmp_path):
 
 def _make_db(tmp_path):
     cfg = _make_cfg(tmp_path)
-    db_obj = db_mod.SovereignDB(cfg)
+    db_obj = db_mod.MinniDB(cfg)
     db_obj._get_conn()
     return db_obj, cfg
 
 
 def test_schema_initialization_is_serialized_across_db_instances(tmp_path, monkeypatch):
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "minni.db"),
         faiss_index_path=str(tmp_path / "minni.faiss"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
     )
-    first = db_mod.SovereignDB(cfg)
-    second = db_mod.SovereignDB(cfg)
-    original = db_mod.SovereignDB._init_schema
+    first = db_mod.MinniDB(cfg)
+    second = db_mod.MinniDB(cfg)
+    original = db_mod.MinniDB._init_schema
     active = 0
     max_active = 0
     counter_lock = threading.Lock()
@@ -55,7 +55,7 @@ def test_schema_initialization_is_serialized_across_db_instances(tmp_path, monke
             with counter_lock:
                 active -= 1
 
-    monkeypatch.setattr(db_mod.SovereignDB, "_init_schema", observed_init)
+    monkeypatch.setattr(db_mod.MinniDB, "_init_schema", observed_init)
     errors = []
 
     def open_and_query(db):
@@ -82,12 +82,12 @@ def test_schema_initialization_is_serialized_across_db_instances(tmp_path, monke
 
 # ---------------------------------------------------------------------------
 # Punch-list §2 fix (a): process-wide _schema_ready_paths — schema DDL runs
-# once per db-path per process, not once per SovereignDB instance.
+# once per db-path per process, not once per MinniDB instance.
 # ---------------------------------------------------------------------------
 
 
 def test_schema_ddl_runs_once_per_process_per_path(tmp_path, monkeypatch):
-    """A second SovereignDB opened on the same db-path must NOT re-run
+    """A second MinniDB opened on the same db-path must NOT re-run
     _init_schema. Before the fix, the per-instance ``self._schema_initialized``
     flag let every fresh instance re-run the trigger DDL against the shared
     file, bumping the SQLite schema cookie under concurrent vault_fts readers
@@ -101,16 +101,16 @@ def test_schema_ddl_runs_once_per_process_per_path(tmp_path, monkeypatch):
     db_mod._schema_ready_paths.discard(os.path.abspath(cfg.db_path))
 
     calls = []
-    original = db_mod.SovereignDB._init_schema
+    original = db_mod.MinniDB._init_schema
 
     def counting_init(self, conn):
         calls.append(os.path.abspath(self.config.db_path))
         return original(self, conn)
 
-    monkeypatch.setattr(db_mod.SovereignDB, "_init_schema", counting_init)
+    monkeypatch.setattr(db_mod.MinniDB, "_init_schema", counting_init)
 
-    first = db_mod.SovereignDB(cfg)
-    second = db_mod.SovereignDB(cfg)
+    first = db_mod.MinniDB(cfg)
+    second = db_mod.MinniDB(cfg)
     first._get_conn()
     second._get_conn()
 
@@ -131,21 +131,21 @@ def test_schema_ready_path_not_recorded_when_init_fails(tmp_path, monkeypatch):
     abs_path = os.path.abspath(cfg.db_path)
     db_mod._schema_ready_paths.discard(abs_path)
 
-    boom = db_mod.SovereignDB._init_schema
+    boom = db_mod.MinniDB._init_schema
 
     def failing_init(self, conn):
         raise RuntimeError("simulated schema init failure")
 
-    monkeypatch.setattr(db_mod.SovereignDB, "_init_schema", failing_init)
-    first = db_mod.SovereignDB(cfg)
+    monkeypatch.setattr(db_mod.MinniDB, "_init_schema", failing_init)
+    first = db_mod.MinniDB(cfg)
     with pytest.raises(RuntimeError):
         first._get_conn()
     assert abs_path not in db_mod._schema_ready_paths
 
     # Restore the real init; a fresh instance must now succeed (path was not
     # poisoned into the ready set by the failure).
-    monkeypatch.setattr(db_mod.SovereignDB, "_init_schema", boom)
-    second = db_mod.SovereignDB(cfg)
+    monkeypatch.setattr(db_mod.MinniDB, "_init_schema", boom)
+    second = db_mod.MinniDB(cfg)
     second._get_conn()
     assert abs_path in db_mod._schema_ready_paths
 
@@ -161,7 +161,7 @@ def test_migration_failure_does_not_poison_schema_ready_gate(tmp_path, monkeypat
     run is retried on the next open of this path. _init_schema then returns
     normally. If _schema_ready_paths were keyed off 'did _init_schema return'
     rather than 'did migrations succeed', that swallowed failure would poison
-    the gate: every later SovereignDB the daemon/AFM loop constructs would skip
+    the gate: every later MinniDB the daemon/AFM loop constructs would skip
     _init_schema entirely and migrations would NEVER be retried this process
     ('no such table'-class errors). This is the exact path
     ``test_schema_ready_path_not_recorded_when_init_fails`` does NOT cover — it
@@ -189,7 +189,7 @@ def test_migration_failure_does_not_poison_schema_ready_gate(tmp_path, monkeypat
 
     # First instance: migrations raise, _init_schema swallows it non-fatally and
     # returns. The gate must NOT record the path (migrations did not succeed).
-    first = db_mod.SovereignDB(cfg)
+    first = db_mod.MinniDB(cfg)
     first._get_conn()
     assert calls["n"] == 1, "run_migrations must have been attempted exactly once"
     assert abs_path not in db_mod._migrated_paths, (
@@ -203,10 +203,10 @@ def test_migration_failure_does_not_poison_schema_ready_gate(tmp_path, monkeypat
     # Second instance on the same path: must re-enter _init_schema and RETRY
     # migrations (now succeeding), then mark the path ready. Before the fix the
     # gate skipped _init_schema here and calls["n"] stayed at 1.
-    second = db_mod.SovereignDB(cfg)
+    second = db_mod.MinniDB(cfg)
     second._get_conn()
     assert calls["n"] == 2, (
-        "the second SovereignDB instance must retry migrations; the gate wrongly "
+        "the second MinniDB instance must retry migrations; the gate wrongly "
         "skipped _init_schema if run_migrations was not attempted again"
     )
     assert abs_path in db_mod._migrated_paths
@@ -220,7 +220,7 @@ def test_migration_failure_does_not_poison_schema_ready_gate(tmp_path, monkeypat
 
 
 def test_trigger_ddl_is_idempotent_no_drop_trigger():
-    src = inspect.getsource(db_mod.SovereignDB._init_schema)
+    src = inspect.getsource(db_mod.MinniDB._init_schema)
     assert "DROP TRIGGER" not in src, (
         "trigger DDL still uses DROP TRIGGER; convert to CREATE TRIGGER IF NOT "
         "EXISTS — DROP+CREATE bumps the schema cookie on every init"

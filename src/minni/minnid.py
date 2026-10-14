@@ -84,7 +84,7 @@ if str(_ENGINE_DIR) not in sys.path:
 
 import minni.obs as obs                                                  # noqa: E402  # centralized logging + metrics counters
 from minni.config import DEFAULT_CONFIG          # noqa: E402
-from minni.db import SovereignDB                                  # noqa: E402
+from minni.db import MinniDB                                  # noqa: E402
 from minni.principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
     agent_scope_for,
@@ -255,7 +255,7 @@ def _lazy_retrieval():
     global _retrieval
     if _retrieval is None:
         from minni.retrieval import RetrievalEngine
-        _retrieval = RetrievalEngine(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _retrieval = RetrievalEngine(MinniDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _retrieval
 
 
@@ -303,7 +303,7 @@ def _lazy_vault_retrieval(vault_path: Path):
     from minni.vault_index import build_vault_index_config
 
     cfg = build_vault_index_config(vault, base_config=DEFAULT_CONFIG)
-    db = SovereignDB.shared(cfg)
+    db = MinniDB.shared(cfg)
     engine = RetrievalEngine(db, cfg, faiss_index=FAISSIndex(cfg))
     cached = (engine, agent_id, cfg.db_path)
     _vault_retrieval_cache[key] = cached
@@ -335,7 +335,7 @@ def _lazy_writeback():
     global _writeback
     if _writeback is None:
         from minni.writeback import WriteBackMemory
-        _writeback = WriteBackMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _writeback = WriteBackMemory(MinniDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _writeback
 
 
@@ -512,7 +512,7 @@ def _lazy_episodic():
     global _episodic
     if _episodic is None:
         from minni.episodic import EpisodicMemory
-        _episodic = EpisodicMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _episodic = EpisodicMemory(MinniDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _episodic
 
 
@@ -757,7 +757,7 @@ def _recall_context() -> RecallContext:
         record_latency=_record_latency,
         increment_request_count=_increment_recall_request_count,
         lazy_episodic=_lazy_episodic,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
         logger=logger,
     )
 
@@ -819,7 +819,7 @@ def _governance_context() -> GovernanceContext:
         purge_durable_learning=_purge_durable_learning,
         maybe_archive_inbox_source=_maybe_archive_inbox_source,
         increment_request_count=_increment_governance_request_count,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
         notify_candidate_staged=_notify_consolidation_trigger,
         logger=logger,
     )
@@ -869,7 +869,7 @@ def _health_context() -> HealthContext:
         request_count=lambda: _request_count,
         start_time=lambda: _start_time,
         version=VERSION,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
         default_config=DEFAULT_CONFIG,
         logger=logger,
         retrieval_engine=_lazy_retrieval,
@@ -901,7 +901,7 @@ def _afm_context() -> AFMContext:
         index_durable_learning=_index_durable_learning,
         increment_request_count=_increment_ops_request_count,
         writeback_ref=lambda: _writeback,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
         default_config=DEFAULT_CONFIG,
         is_running=lambda: _running,
         logger=logger,
@@ -1078,7 +1078,7 @@ def _ensure_vault_engines_unbounded() -> None:
 def _invalidate_shared_faiss() -> None:
     """Make chunks the sweep just wrote visible to the live engine's semantic leg.
 
-    index_shared_vault writes through its OWN short-lived SovereignDB and
+    index_shared_vault writes through its OWN short-lived MinniDB and
     VaultIndexer, so its FAISS rebuild lands on a throwaway instance. The
     daemon's process-wide RetrievalEngine keeps the in-memory index it built at
     startup. Invalidating drops that snapshot; reload it here on the vault-watch
@@ -1399,10 +1399,10 @@ def _backfill_sweep_once() -> dict:
     # backfill would report success while recall still found nothing) and
     # holding a write lock that blocks every other daemon writer.
     try:
-        from minni.db import SovereignDB
+        from minni.db import MinniDB
         from minni.episodic import reconcile_episodic_fts
 
-        _conn = SovereignDB.shared(DEFAULT_CONFIG)._get_conn()
+        _conn = MinniDB.shared(DEFAULT_CONFIG)._get_conn()
         try:
             episodic = reconcile_episodic_fts(_conn)
             _conn.commit()
@@ -2288,8 +2288,8 @@ def main():
 
     # Eagerly initialize/migrate database on startup (RCM-028 Phase 0 exit)
     try:
-        from minni.db import SovereignDB
-        db = SovereignDB.shared(DEFAULT_CONFIG)
+        from minni.db import MinniDB
+        db = MinniDB.shared(DEFAULT_CONFIG)
         db._get_conn()
         logger.info("Database initialized/migrated on startup.")
     except Exception:

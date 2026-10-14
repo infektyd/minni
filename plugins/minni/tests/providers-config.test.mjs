@@ -18,7 +18,7 @@ import {
   providersConfigPath,
   resolveCloudApiKey,
 } from "../dist/config.js";
-import { buildStatusReport } from "../dist/sovereign.js";
+import { buildStatusReport } from "../dist/daemon_transport.js";
 
 const SECRET_KEY = "sk-test-vErYsEcReT-cLoUdKeY-12345";
 

@@ -24,8 +24,8 @@ from datetime import datetime
 
 # G09: SEC-018 frontmatter forgery guard helpers (repo-grounded, smallest addition)
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.graph_readiness import memory_links_typed_columns_present
 from minni.timestamps import coerce_epoch
@@ -73,8 +73,8 @@ class WriteBackMemory:
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
     ):
         self.db = db
         self.config = config

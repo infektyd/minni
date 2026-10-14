@@ -19,8 +19,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import yaml  # G21: safe YAML parser for frontmatter (adversarial body-forge resistance)
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 from minni.chunker import MarkdownChunker
 from minni.faiss_index import FAISSIndex
 from minni.timestamps import parse_epoch_or_report
@@ -47,8 +47,8 @@ class VaultIndexer:
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
     ):
         self.db = db
         self.config = config

@@ -107,20 +107,20 @@ class TestDepthTiers:
 
     def _engine(self, tmp_path):
         """Create a RetrievalEngine with a minimal test DB."""
-        from minni.config import SovereignConfig
-        from minni.db import SovereignDB
+        from minni.config import MinniConfig
+        from minni.db import MinniDB
         from minni.faiss_index import FAISSIndex
         from minni.retrieval import RetrievalEngine
 
         db_path = str(tmp_path / "test.db")
-        cfg = SovereignConfig(db_path=db_path)
+        cfg = MinniConfig(db_path=db_path)
 
         # Reset migrations flag so we can use a fresh DB
         import minni.db as db_mod
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
-            db = SovereignDB(cfg)
+            db = MinniDB(cfg)
         finally:
             db_mod._migrations_run = old_flag
 

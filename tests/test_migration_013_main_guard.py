@@ -37,7 +37,7 @@ def _fresh_undermigrated_db(tmp_path, seed_main_rows=True):
     all_versions = [v for v, _ in _load_migration_files()]
     assert 13 in all_versions
 
-    cfg = cfg_mod.SovereignConfig(
+    cfg = cfg_mod.MinniConfig(
         db_path=str(tmp_path / "fresh.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -45,7 +45,7 @@ def _fresh_undermigrated_db(tmp_path, seed_main_rows=True):
         writeback_enabled=False,
     )
 
-    # Run migrations normally (via SovereignDB init) up through 012 by
+    # Run migrations normally (via MinniDB init) up through 012 by
     # temporarily hiding 013 from the loader, so the schema is fully
     # up-to-date except for the 013 rewrite under test.
     import minni.migrations as mig_mod
@@ -56,7 +56,7 @@ def _fresh_undermigrated_db(tmp_path, seed_main_rows=True):
         mig_mod._load_migration_files = lambda: [
             (v, p) for v, p in real_loader() if v != 13
         ]
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         conn = db_obj._get_conn()
     finally:
         mig_mod._load_migration_files = real_loader

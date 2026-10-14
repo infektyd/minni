@@ -285,14 +285,14 @@ def test_handle_read_recent_activity_excludes_recall_traces(tmp_path, monkeypatc
     import time
 
     import minni.minnid as minnid
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     import minni.db as db_mod
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "obs.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "obs.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -314,7 +314,7 @@ def test_handle_read_recent_activity_excludes_recall_traces(tmp_path, monkeypatc
             " VALUES ('codex', 'message', 'the real agent message', ?)",
             (now - 100,),
         )
-    monkeypatch.setattr(minnid, "SovereignDB", lambda: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda: db_obj)
 
     context = minnid._handle_read({"agent_id": "codex", "limit": 5}, 1)["result"]["context"]
     assert "the real agent message" in context

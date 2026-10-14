@@ -1,4 +1,4 @@
-// API types mirror plugins/minni/src/{task.ts,sovereign.ts,vault.ts}.
+// API types mirror plugins/minni/src/{task.ts,daemon_transport.ts,vault.ts}.
 // Kept here as a structural copy so the bundle is self-contained.
 
 export type TaskProfile = "compact" | "standard" | "deep";

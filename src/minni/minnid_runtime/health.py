@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from minni.config import DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.timestamps import (
     malformed_timestamp_report,
     parse_epoch_or_report,
@@ -103,7 +103,7 @@ class HealthContext:
     request_count: Callable[[], int] = lambda: 0
     start_time: Callable[[], float] = lambda: time.time()
     version: str = "unknown"
-    sovereign_db: Callable[..., Any] = SovereignDB
+    sovereign_db: Callable[..., Any] = MinniDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     logger: logging.Logger = logger
     # P0-B (2026-07-19 blackout): lets status surface the live engine's
@@ -706,7 +706,7 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             )
 
             # `db` is already open in this scope (line ~383) and closed in
-            # the finally below — opening a second SovereignDB here re-ran
+            # the finally below — opening a second MinniDB here re-ran
             # PRAGMA journal_mode=WAL on every health call for nothing.
             with db.cursor() as c:
                 lifecycle["afm_review_orphans"] = count_orphaned_afm_review(c)

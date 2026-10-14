@@ -51,13 +51,13 @@ POISON_ISO_OFFSET_EPOCH_SECONDS = 1785585600.0
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "ts.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "ts.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -572,14 +572,14 @@ def test_health_stale_docs_falls_back_to_last_modified_when_indexed_at_is_bad(tm
         def close(self):
             pass
 
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.timestamps import reset_malformed_timestamps
 
     reset_malformed_timestamps()
     # Hermetic: point vault_path at an empty tmp dir so the inbox_quarantine
     # scan (which reads context.default_config.vault_path) never touches a
     # real machine vault.
-    hermetic_cfg = SovereignConfig(
+    hermetic_cfg = MinniConfig(
         db_path=str(tmp_path / "unused.db"), vault_path=str(tmp_path),
     )
     context = HealthContext(

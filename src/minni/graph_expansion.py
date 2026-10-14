@@ -158,7 +158,7 @@ def expand_typed_graph(
     Seed authorization, neighbor authorization, and text hydration share
     one read snapshot (``BEGIN DEFERRED`` or a SAVEPOINT). That snapshot
     is rolled back or released — never committed — so this helper cannot
-    commit caller writes. ``SovereignDB.cursor()`` is not used: its
+    commit caller writes. ``MinniDB.cursor()`` is not used: its
     success path commits, and SELECT alone does not open a transaction.
     WAL readers keep the snapshot if another connection commits mid-walk.
     """
@@ -259,7 +259,7 @@ def _bound_store_id(conn: Any) -> str:
 def _read_snapshot(conn):
     """Read-only snapshot for auth + hydration. Never commits.
 
-    Production ``SovereignDB.cursor()`` commits on success and SELECT does
+    Production ``MinniDB.cursor()`` commits on success and SELECT does
     not begin a transaction (isolation ``""``). This helper opens
     ``BEGIN DEFERRED`` when the connection is idle, or a SAVEPOINT when
     the caller already has a transaction, then ROLLBACK/RELEASE. DEFERRED
@@ -321,7 +321,7 @@ def _connection(db: Any):
         return getter()
     if hasattr(db, "execute"):
         return db
-    raise TypeError("db must be a SovereignDB or sqlite3 connection")
+    raise TypeError("db must be a MinniDB or sqlite3 connection")
 
 
 def _is_doc_id(value: Any) -> bool:

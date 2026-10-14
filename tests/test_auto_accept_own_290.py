@@ -37,12 +37,12 @@ from minni.principal import EffectivePrincipal
 @pytest.fixture
 def db_path(tmp_path, monkeypatch):
     import minni.config as cfg
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
     path = str(tmp_path / "auto_accept.db")
     monkeypatch.setattr(cfg.DEFAULT_CONFIG, "db_path", path, raising=False)
-    db = SovereignDB()
+    db = MinniDB()
     run_migrations(db._get_conn())
     return path
 
@@ -61,7 +61,7 @@ def _principal(agent_id="claude-code", *, auto_accept_own=False, capabilities=No
 def _context(principal, db_path):
     """A GovernanceContext wired to the real DB with a fixed stamped principal."""
     import minni.config as cfg
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.writeback import WriteBackMemory
 
     def handler_principal(params, request_id, **kwargs):
@@ -82,8 +82,8 @@ def _context(principal, db_path):
 
     return governance.GovernanceContext(
         handler_principal=handler_principal,
-        lazy_writeback=lambda: WriteBackMemory(SovereignDB(), cfg.DEFAULT_CONFIG),
-        sovereign_db=SovereignDB,
+        lazy_writeback=lambda: WriteBackMemory(MinniDB(), cfg.DEFAULT_CONFIG),
+        sovereign_db=MinniDB,
         make_response=make_response,
         make_error=make_error,
         logger=_Logger(),
@@ -782,7 +782,7 @@ def test_a_committed_learning_is_not_reported_as_a_failure(db_path):
     returned -32000 for a learn that had in fact succeeded — so the caller
     retried and staged a duplicate while the first copy sat durable and
     unindexed, which is the state the indexing exists to prevent."""
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.writeback import WriteBackMemory
     import minni.config as cfg
 
@@ -798,8 +798,8 @@ def test_a_committed_learning_is_not_reported_as_a_failure(db_path):
 
     context = governance.GovernanceContext(
         handler_principal=handler_principal,
-        lazy_writeback=lambda: WriteBackMemory(SovereignDB(), cfg.DEFAULT_CONFIG),
-        sovereign_db=SovereignDB,
+        lazy_writeback=lambda: WriteBackMemory(MinniDB(), cfg.DEFAULT_CONFIG),
+        sovereign_db=MinniDB,
         make_response=lambda r, i: {"result": r},
         make_error=lambda c, m, i: {"error": {"code": c, "message": m}},
         logger=_Logger(),
@@ -1037,7 +1037,7 @@ def test_auto_and_manual_acceptance_have_identical_side_effects(db_path, monkeyp
 
     def make(route, principal):
         route_now["name"] = route
-        from minni.db import SovereignDB
+        from minni.db import MinniDB
         from minni.writeback import WriteBackMemory
         import minni.config as cfg
 
@@ -1047,8 +1047,8 @@ def test_auto_and_manual_acceptance_have_identical_side_effects(db_path, monkeyp
 
         return governance.GovernanceContext(
             handler_principal=lambda p, r, **k: (principal, None),
-            lazy_writeback=lambda: WriteBackMemory(SovereignDB(), cfg.DEFAULT_CONFIG),
-            sovereign_db=SovereignDB,
+            lazy_writeback=lambda: WriteBackMemory(MinniDB(), cfg.DEFAULT_CONFIG),
+            sovereign_db=MinniDB,
             make_response=lambda res, i: {"result": res},
             make_error=lambda c, m, i: {"error": {"code": c, "message": m}},
             logger=_Logger(),

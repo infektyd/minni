@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 
 const configUrl = new URL("../dist/config.js", import.meta.url).href;
-const sovereignUrl = new URL("../dist/sovereign.js", import.meta.url).href;
+const sovereignUrl = new URL("../dist/daemon_transport.js", import.meta.url).href;
 const script = `
 import { DEFAULT_WORKSPACE_ID, CODEX_WORKSPACE_ID } from ${JSON.stringify(configUrl)};
 import { recallMemory } from ${JSON.stringify(sovereignUrl)};

@@ -2,7 +2,7 @@
 
 Exercises the full daemon path (minnid._dispatch_sync -> dispatch_request ->
 enforce_method_capability -> minnid._METHODS["list_events"]) against a real
-SovereignDB, mirroring the style of tests/test_rpc_capability_enforcement.py.
+MinniDB, mirroring the style of tests/test_rpc_capability_enforcement.py.
 Verifies cursor pagination, param validation, capability gating (the "read"
 capability, same enforcement path as other read methods), filters, and a
 round-trip against a recall-trace row written the same way
@@ -28,18 +28,18 @@ from minni.principal import EffectivePrincipal
 
 def _patch_db(monkeypatch, tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "events.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "events.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
     monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
-    monkeypatch.setattr(minnid, "SovereignDB", lambda *a, **k: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda *a, **k: db_obj)
     return db_obj
 
 

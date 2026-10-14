@@ -13,7 +13,7 @@ import {
   formatRecall,
   formatRecallLean,
   isDaemonResultEmpty,
-} from "../dist/sovereign.js";
+} from "../dist/daemon_transport.js";
 
 const EVENT = {
   event_id: 7,

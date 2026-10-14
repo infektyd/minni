@@ -19,7 +19,7 @@ import {
   recallMemory,
   recallResponseText,
   recoveryRouteFrom,
-} from "../dist/sovereign.js";
+} from "../dist/daemon_transport.js";
 
 const RECOVERY_ROUTE = {
   ok: false,

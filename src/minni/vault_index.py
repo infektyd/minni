@@ -11,8 +11,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Tuple
 
-from minni.config import DEFAULT_CONFIG, SovereignConfig
-from minni.db import SovereignDB
+from minni.config import DEFAULT_CONFIG, MinniConfig
+from minni.db import MinniDB
 from minni.indexer import VaultIndexer
 
 INDEX_DIRNAME = ".index"
@@ -43,9 +43,9 @@ def vault_index_paths(vault_path: str | Path) -> VaultIndexPaths:
 def build_vault_index_config(
     vault_path: str | Path,
     *,
-    base_config: Optional[SovereignConfig] = None,
-) -> SovereignConfig:
-    """Return a SovereignConfig pointed at ``<vault>/.index`` only."""
+    base_config: Optional[MinniConfig] = None,
+) -> MinniConfig:
+    """Return a MinniConfig pointed at ``<vault>/.index`` only."""
     base = base_config or DEFAULT_CONFIG
     paths = vault_index_paths(vault_path)
     return replace(
@@ -63,9 +63,9 @@ def build_vault_index_config(
 def open_vault_index(
     vault_path: str | Path,
     *,
-    base_config: Optional[SovereignConfig] = None,
-) -> Tuple[SovereignDB, VaultIndexer]:
+    base_config: Optional[MinniConfig] = None,
+) -> Tuple[MinniDB, VaultIndexer]:
     """Open the vault-local DB and indexer for ``vault_path``."""
     cfg = build_vault_index_config(vault_path, base_config=base_config)
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     return db, VaultIndexer(db, cfg)

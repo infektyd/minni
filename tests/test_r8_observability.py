@@ -804,7 +804,7 @@ def _compile_consolidation_with_write_status(monkeypatch, tmp_path, write_result
     import minni.afm_writer as afm_writer
     import minni.db as db_mod
     import minni.minnid_runtime.afm as afm_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.principal import EffectivePrincipal
 
     def _run(db, config, **kwargs):
@@ -830,7 +830,7 @@ def _compile_consolidation_with_write_status(monkeypatch, tmp_path, write_result
             captured.update(payload)
         return {"result": payload}
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "afm.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -3163,7 +3163,7 @@ def test_consolidation_ingest_status_does_not_latch_on_old_failures(tmp_path, mo
     from minni.minnid_runtime.health import CONSOLIDATION_FAILURE_RECENT_SECONDS
     from minni.principal import EffectivePrincipal
 
-    monkeypatch.setattr(minnid, "SovereignDB", _HealthFakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _HealthFakeDB)
     monkeypatch.setattr(
         cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
     )
@@ -3237,10 +3237,10 @@ def _engine_without_model(tmp_path, monkeypatch):
     import minni.db as db_mod
     import minni.models as models_mod
     import minni.retrieval as retrieval_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -3273,7 +3273,7 @@ def _run_one_afm_loop_tick(tmp_path, monkeypatch, *, failing: str):
     import minni.afm_passes.inbox_ingest as ingest_mod
     import minni.afm_passes.inbox_quarantine as quarantine_mod
     import minni.minnid_runtime.afm as afm_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     def _boom(name):
         def _raise(*args, **kwargs):
@@ -3317,7 +3317,7 @@ def _run_one_afm_loop_tick(tmp_path, monkeypatch, *, failing: str):
         lambda params, request_id, context: {"result": {"summary": {"examined": 0}}},
     )
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "loop.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -3358,10 +3358,10 @@ def _hyde_engine(tmp_path, monkeypatch):
     import minni.db as db_mod
     import minni.models as models_mod
     import minni.retrieval as retrieval_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "hyde.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -3404,7 +3404,7 @@ def _fresh_db(db_mod, cfg):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -3413,9 +3413,9 @@ def _fresh_db(db_mod, cfg):
 
 def _distill_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "distill.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -3430,7 +3430,7 @@ def _compile_with_pass_error(monkeypatch, tmp_path, error):
     import minni.afm_passes.consolidation as consolidation_mod
     import minni.db as db_mod
     import minni.minnid_runtime.afm as afm_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.principal import EffectivePrincipal
 
     def _explode(db, config, **kwargs):
@@ -3445,7 +3445,7 @@ def _compile_with_pass_error(monkeypatch, tmp_path, error):
             captured.update(payload)
         return {"result": payload}
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "afm.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),

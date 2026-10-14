@@ -16,7 +16,7 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
+from minni.config import MinniConfig, DEFAULT_CONFIG
 from minni.request_deadline import (
     RequestDeadlineExceeded,
     budgeted_lock,
@@ -26,7 +26,7 @@ from minni.request_deadline import (
     remaining_seconds,
 )
 
-# Module-level flag: True once any SovereignDB has run migrations this process.
+# Module-level flag: True once any MinniDB has run migrations this process.
 # Kept as a bool for backward-compatibility with test code that manipulates it
 # directly (e.g. ``db_mod._migrations_run = False`` to force a re-run).
 _migrations_run = False
@@ -38,7 +38,7 @@ _migrations_run = False
 _migrated_paths: set = set()
 _migrations_lock = threading.Lock()
 # Schema creation includes DROP/CREATE trigger pairs and FTS5 virtual-table
-# initialization.  Different SovereignDB instances can be constructed by the
+# initialization.  Different MinniDB instances can be constructed by the
 # daemon's background loops at the same time, so an instance-local lock is not
 # sufficient: their schema transactions can interleave and leave one
 # connection unable to construct vault_fts.  Serialize schema initialization
@@ -47,7 +47,7 @@ _schema_init_lock = threading.RLock()
 # Per-path tracking of which db files have had their non-migration schema DDL
 # (FTS5 vtable init + trigger creation) run this process. Mirrors the
 # _migrated_paths idiom above. Without it, _init_schema was gated only by the
-# per-instance ``self._schema_initialized`` flag, so every fresh SovereignDB the
+# per-instance ``self._schema_initialized`` flag, so every fresh MinniDB the
 # daemon/AFM passes construct re-ran the trigger DDL against the shared on-disk
 # file — each re-run bumping the SQLite schema cookie under concurrent vault_fts
 # readers and surfacing "vtable constructor failed: vault_fts". Gating the DDL
@@ -160,13 +160,13 @@ class _BudgetConnection(sqlite3.Connection):
             return super().commit()
 
 
-class SovereignDB:
+class MinniDB:
     """
     Thread-safe SQLite connection manager.
     WAL mode allows concurrent readers + one writer without blocking.
     """
 
-    def __init__(self, config: SovereignConfig = DEFAULT_CONFIG):
+    def __init__(self, config: MinniConfig = DEFAULT_CONFIG):
         self.config = config
         self.config.ensure_dirs()
         self._local = threading.local()
@@ -174,7 +174,7 @@ class SovereignDB:
         self._lock = threading.Lock()
 
     # Per-path shared instances. Connections are cached per (instance, thread),
-    # so when several long-lived subsystems each construct their own SovereignDB
+    # so when several long-lived subsystems each construct their own MinniDB
     # on the same file — the daemon's retrieval/writeback/episodic singletons all
     # do — every executor thread ends up holding one connection PER INSTANCE to
     # the same database. Under a loaded thread pool that multiplies to
@@ -184,10 +184,10 @@ class SovereignDB:
     _shared_lock = threading.Lock()
 
     @classmethod
-    def shared(cls, config: SovereignConfig = DEFAULT_CONFIG) -> "SovereignDB":
+    def shared(cls, config: MinniConfig = DEFAULT_CONFIG) -> "MinniDB":
         """Return the process-wide instance for ``config.db_path``.
 
-        Safe because SovereignDB reads nothing from config beyond db_path
+        Safe because MinniDB reads nothing from config beyond db_path
         (and ensure_dirs at construction); callers keep their own configs.
         """
         key = os.path.abspath(config.db_path)
@@ -252,7 +252,7 @@ class SovereignDB:
                 if not self._schema_initialized:
                     # Process-wide gate: schema DDL (FTS5 vtable init + trigger
                     # creation) only needs to run once per db-path per process.
-                    # A second SovereignDB instance opened on the same file — the
+                    # A second MinniDB instance opened on the same file — the
                     # daemon + AFM passes construct many — must skip _init_schema
                     # on its FIRST call too, not re-run the trigger DDL and bump
                     # the schema cookie under concurrent vault_fts readers.
@@ -272,7 +272,7 @@ class SovereignDB:
                         # (see the migrations block in _init_schema). If we added
                         # to _schema_ready_paths unconditionally, that swallowed
                         # failure would still poison the gate: every later
-                        # SovereignDB the daemon/AFM loop constructs would skip
+                        # MinniDB the daemon/AFM loop constructs would skip
                         # _init_schema entirely and migrations would NEVER be
                         # retried for the life of the process. Keying this gate off
                         # _migrated_paths preserves the retry-on-failure contract:
@@ -711,16 +711,16 @@ class SovereignDB:
             self._local.conn = None
 
 
-def connect(config: SovereignConfig = DEFAULT_CONFIG) -> SovereignDB:
+def connect(config: MinniConfig = DEFAULT_CONFIG) -> MinniDB:
     """
-    Create and return a SovereignDB instance with the schema initialized and
+    Create and return a MinniDB instance with the schema initialized and
     migrations applied. This is the canonical entry point for callers that
     just need a connected database handle.
 
     The migrations runner is guarded by a module-level flag and runs at most
     once per process, even if connect() is called multiple times.
     """
-    db = SovereignDB(config)
+    db = MinniDB(config)
     # Trigger schema init + migrations by acquiring a connection
     db._get_conn()
     return db

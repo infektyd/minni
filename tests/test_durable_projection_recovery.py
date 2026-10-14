@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 
 from minni.backfill import backfill_learning_projections, run_backfill
-from minni.config import SovereignConfig
-from minni.db import SovereignDB
+from minni.config import MinniConfig
+from minni.db import MinniDB
 from minni.durable_projection import durable_doc_path
 from minni.retrieval import RetrievalEngine
 
@@ -29,14 +29,14 @@ class Encoder:
 def store(tmp_path, monkeypatch):
     from minni import models
 
-    config = SovereignConfig(
+    config = MinniConfig(
         db_path=str(tmp_path / "memory.db"), vault_path=str(tmp_path / "vault"),
         writeback_path=str(tmp_path / "notes"), faiss_index_path=str(tmp_path / "index.faiss"),
         reranker_enabled=False, attribution_enabled=False,
     )
     model = Encoder(config.embedding_dim)
     monkeypatch.setattr(models, "get_embedder", lambda: model)
-    db = SovereignDB(config)
+    db = MinniDB(config)
     yield db, config, model
     db.close()
 
@@ -103,7 +103,7 @@ def test_publication_rechecks_after_concurrent_lifecycle_change(store, mutation)
     lid = learning(db)
     def change():
         # Independent connection commits while encode runs outside the publish lock.
-        other = SovereignDB(config)
+        other = MinniDB(config)
         try:
             with other.cursor() as c:
                 if mutation == "supersede":
@@ -191,7 +191,7 @@ def test_governed_accept_failure_then_real_scheduled_sweep(store, monkeypatch):
     # default config was imported before the fixture existed.
     from dataclasses import replace
     from minni.writeback import WriteBackMemory
-    context = replace(daemon._governance_context(), sovereign_db=lambda: SovereignDB(config),
+    context = replace(daemon._governance_context(), sovereign_db=lambda: MinniDB(config),
                       lazy_writeback=lambda: WriteBackMemory(db, config),
                       maybe_archive_inbox_source=lambda *args: None)
     monkeypatch.setattr(daemon, "_governance_context", lambda: context)
@@ -511,7 +511,7 @@ def test_placeholder_repair_rechecks_restriction_changed_during_encoding(store, 
     db, config, model = store
     _, doc_id = _placeholder(store, "Concurrent restricted repair specimen")
     def restrict():
-        other = SovereignDB(config)
+        other = MinniDB(config)
         try:
             with other.cursor() as c:
                 c.execute("UPDATE documents SET privacy_level=?, page_status=? WHERE doc_id=?",

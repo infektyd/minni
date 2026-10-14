@@ -18,20 +18,20 @@ def corpus_path(tmp_path):
 
 def test_real_lexical_retrieval_has_ids_scope_and_honest_degradation(monkeypatch):
     from minni.retrieval import RetrievalEngine
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
 
     def no_model(_self):
         pytest.fail('lexical profile must not load a model')
 
     monkeypatch.setattr(RetrievalEngine, 'model', property(no_model))
-    original = SovereignDB.__init__
+    original = MinniDB.__init__
     opened = []
 
     def track_database(self, config):
         opened.append(Path(config.db_path))
         original(self, config)
 
-    monkeypatch.setattr(SovereignDB, '__init__', track_database)
+    monkeypatch.setattr(MinniDB, '__init__', track_database)
     report = run_fixture(repeats=2)
     assert report['summary']['ok']
     assert report['human_reviewed'] is False

@@ -12,12 +12,12 @@ link_type='wikilink' so other edge types survive), then upsert the rest.
 from __future__ import annotations
 
 import minni.db as db_mod
-from minni.config import SovereignConfig
+from minni.config import MinniConfig
 
 
 def _make_db(tmp_path):
-    cfg = SovereignConfig(db_path=str(tmp_path / "links.db"))
-    return db_mod.SovereignDB(cfg)
+    cfg = MinniConfig(db_path=str(tmp_path / "links.db"))
+    return db_mod.MinniDB(cfg)
 
 
 def _add_doc(c, path: str) -> int:

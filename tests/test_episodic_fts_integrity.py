@@ -24,15 +24,15 @@ import pytest
 
 
 def _make_db(tmp_path, **cfg_overrides):
-    """(SovereignDB, SovereignConfig) over a temporary SQLite file."""
+    """(MinniDB, MinniConfig) over a temporary SQLite file."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "test.db"), **cfg_overrides)
+    cfg = MinniConfig(db_path=str(tmp_path / "test.db"), **cfg_overrides)
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -458,7 +458,7 @@ class TestFreshSchemaCarriesTheTriggers:
 
     Both install these triggers, by the same belt-and-braces pattern learnings
     uses (base schema + migration 011). That redundancy means a test driving a
-    normal SovereignDB cannot tell which source installed them: deleting them
+    normal MinniDB cannot tell which source installed them: deleting them
     from _init_schema leaves the suite green because the migration re-adds them.
     Verified — both such mutants survived the full suite. So the fresh-schema
     path is asserted here directly, against a connection that has had
@@ -470,15 +470,15 @@ class TestFreshSchemaCarriesTheTriggers:
         nothing but the base schema can supply the triggers under test."""
         import minni.db as db_mod
         import minni.migrations as migrations_mod
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
 
         monkeypatch.setattr(migrations_mod, "run_migrations", lambda conn: None)
 
-        cfg = SovereignConfig(db_path=str(tmp_path / "bare.db"))
+        cfg = MinniConfig(db_path=str(tmp_path / "bare.db"))
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
-            db_obj = db_mod.SovereignDB(cfg)
+            db_obj = db_mod.MinniDB(cfg)
             conn = db_obj._get_conn()
         finally:
             db_mod._migrations_run = old_flag

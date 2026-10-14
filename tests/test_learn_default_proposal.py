@@ -16,8 +16,8 @@ def test_learn_default_is_proposal_not_durable(tmp_path, monkeypatch):
     cfg.DEFAULT_CONFIG.db_path = str(tmp_path / "proposal.db")
     try:
         from minni.migrations import run_migrations
-        from minni.db import SovereignDB
-        db = SovereignDB()
+        from minni.db import MinniDB
+        db = MinniDB()
         run_migrations(db._get_conn())
 
         resp = _handle_learn({"content": "Proposal default test G16", "agent_id": "main"}, 42)

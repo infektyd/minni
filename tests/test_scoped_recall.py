@@ -23,8 +23,8 @@ def _make_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, aliases=No
     import minni.minnid as minnid
     import minni.principal as principal_mod
     import minni.retrieval as retrieval_mod
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
     principals = tmp_path / "principals"
@@ -44,12 +44,12 @@ def _make_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, aliases=No
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        cfg = SovereignConfig(
+        cfg = MinniConfig(
             db_path=str(tmp_path / "test.db"),
             reranker_enabled=False,
             hyde_enabled=False,
         )
-        db_obj = SovereignDB(cfg)
+        db_obj = MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

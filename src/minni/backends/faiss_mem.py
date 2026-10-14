@@ -30,7 +30,7 @@ class FaissMemBackend:
     def __init__(self, config=None):
         """
         Args:
-            config : SovereignConfig (uses DEFAULT_CONFIG if None).
+            config : MinniConfig (uses DEFAULT_CONFIG if None).
         """
         from minni.config import DEFAULT_CONFIG
         from minni.faiss_index import FAISSIndex

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from minni.afm_review_markers import supersede_afm_review
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
@@ -48,7 +48,7 @@ class GovernanceContext:
     # existing constructions/tests working without threading a real purger.
     purge_durable_learning: Callable[..., None] = lambda *a, **k: None
     increment_request_count: Callable[[], None] | None = None
-    sovereign_db: Callable[..., Any] = SovereignDB
+    sovereign_db: Callable[..., Any] = MinniDB
     notify_candidate_staged: Optional[Callable[[], None]] = None
     logger: logging.Logger = logger
 
@@ -464,7 +464,7 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
 
         # Hoisted ABOVE the transaction on purpose. This helper opens a cursor,
-        # and SovereignDB.cursor() commits on exit on the same thread-local
+        # and MinniDB.cursor() commits on exit on the same thread-local
         # connection — calling it inside `with db.transaction()` ended the
         # enclosing BEGIN IMMEDIATE, so the ownership checks committed early and
         # the INSERT/UPDATE/event block silently ran in a separate deferred
@@ -1299,7 +1299,10 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
                 "WHERE ca.claim = CAST(cp.candidate_id AS TEXT) "
                 "ORDER BY ca.created_at DESC, ca.action_id DESC LIMIT 1) AS review_action_type "
             )
-            if principal.agent_id in ("main", "operator"):
+            explicit_agent_filter = bool(
+                isinstance(params, dict) and str(params.get("agent_id") or "").strip()
+            )
+            if principal.agent_id in ("main", "operator") and not explicit_agent_filter:
                 c.execute(
                     f"SELECT {review_cols} FROM candidate_packets cp "
                     "WHERE cp.status=? "

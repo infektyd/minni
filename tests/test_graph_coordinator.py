@@ -205,18 +205,18 @@ def _fail_classifier(status="provider_unavailable", error="offline"):
 
 @pytest.fixture
 def store(tmp_path):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
-    config = SovereignConfig(
+    config = MinniConfig(
         db_path=str(tmp_path / "graph.db"),
         vault_path=str(tmp_path / "vault"),
         writeback_path=str(tmp_path / "notes"),
         faiss_index_path=str(tmp_path / "index.faiss"),
         reranker_enabled=False, attribution_enabled=False,
     )
-    db = SovereignDB(config)
+    db = MinniDB(config)
     run_migrations(db._get_conn())
     yield db, config
     db.close()
@@ -617,19 +617,19 @@ def test_repair_preserves_restricted_canonical(store):
 def test_cross_store_prepare_never_commits(store, tmp_path):
     """R4: evidence prepared against store B cannot commit into store A,
     even with colliding doc ids — store_id must be the canonical db path."""
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
     db_a, config_a = store
-    config_b = SovereignConfig(
+    config_b = MinniConfig(
         db_path=str(tmp_path / "other.db"),
         vault_path=str(tmp_path / "vault_b"),
         writeback_path=str(tmp_path / "notes_b"),
         faiss_index_path=str(tmp_path / "index_b.faiss"),
         reranker_enabled=False, attribution_enabled=False,
     )
-    db_b = SovereignDB(config_b)
+    db_b = MinniDB(config_b)
     try:
         run_migrations(db_b._get_conn())
         seed_b = _Fakes(db_b, classifier=_ok_classifier())
@@ -1023,8 +1023,8 @@ def test_prepared_payload_rejects_relabel_and_digest_tamper(store):
 
 
 def test_commit_rejects_cross_store_cursor_and_principal(store, tmp_path):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
     db_a, config_a = store
@@ -1041,14 +1041,14 @@ def test_commit_rejects_cross_store_cursor_and_principal(store, tmp_path):
     assert caught.value.code == "principal_mismatch"
     assert _counts(db_a)["learnings"] == 0
 
-    config_b = SovereignConfig(
+    config_b = MinniConfig(
         db_path=str(tmp_path / "other.db"),
         vault_path=str(tmp_path / "vault_b"),
         writeback_path=str(tmp_path / "notes_b"),
         faiss_index_path=str(tmp_path / "index_b.faiss"),
         reranker_enabled=False, attribution_enabled=False,
     )
-    db_b = SovereignDB(config_b)
+    db_b = MinniDB(config_b)
     try:
         run_migrations(db_b._get_conn())
         with pytest.raises(GraphCommitAborted) as caught:

@@ -351,7 +351,7 @@ def _afm_context(db_obj):
 
 
 def _db_with_fenced_candidate(tmp_path, cid: int = 1):
-    """Real SovereignDB with one fenced, proposed candidate.
+    """Real MinniDB with one fenced, proposed candidate.
 
     Reuses the AFM loop suite's fixture so the schema is exactly what those
     code paths run against — the learnings table in particular.

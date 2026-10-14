@@ -10,13 +10,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "test.db"), vector_backends=["faiss-disk"])
+    cfg = MinniConfig(db_path=str(tmp_path / "test.db"), vector_backends=["faiss-disk"])
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -46,35 +46,15 @@ class FakeBackend:
         return {"name": self.name, "dim": self.dim, "vector_count": len(self.items)}
 
 
-def test_protocol_dataclasses_and_multi_backend_rrf():
-    from minni.backends.multi import MultiBackend
+def test_protocol_dataclasses():
     from minni.vector_backend import VectorHit, VectorItem
 
     vec = np.ones(384, dtype=np.float32)
     item = VectorItem(chunk_id=1, doc_id=10, vector=vec, metadata={"agent": "codex"})
     assert item.metadata["agent"] == "codex"
+    hit = VectorHit(chunk_id=1, doc_id=10, score=0.9, backend="faiss-disk")
+    assert hit.backend == "faiss-disk"
 
-    class BackendA(FakeBackend):
-        name = "a"
-
-        def search(self, query_vec, k, filter=None):
-            return [
-                VectorHit(chunk_id=1, doc_id=10, score=0.9, backend=self.name),
-                VectorHit(chunk_id=2, doc_id=20, score=0.8, backend=self.name),
-            ]
-
-    class BackendB(FakeBackend):
-        name = "b"
-
-        def search(self, query_vec, k, filter=None):
-            return [
-                VectorHit(chunk_id=2, doc_id=20, score=0.95, backend=self.name),
-                VectorHit(chunk_id=3, doc_id=30, score=0.7, backend=self.name),
-            ]
-
-    merged = MultiBackend([BackendA(), BackendB()]).search(vec, k=3)
-    assert [hit.chunk_id for hit in merged] == [2, 1, 3]
-    assert merged[0].backend in {"a", "b"}
 
 
 def test_migration_003_creates_vector_backends_table(tmp_path):
@@ -164,11 +144,11 @@ def test_vector_sync_removes_deleted_chunks_when_dirty(tmp_path):
 
 
 def test_backend_resolver_preserves_default_bit_identical_path():
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.minnid import _resolve_backend
 
-    assert _resolve_backend("auto", SovereignConfig(vector_backends=["faiss-disk"])) is None
-    assert _resolve_backend(None, SovereignConfig(vector_backends=["faiss-disk"])) is None
+    assert _resolve_backend("auto", MinniConfig(vector_backends=["faiss-disk"])) is None
+    assert _resolve_backend(None, MinniConfig(vector_backends=["faiss-disk"])) is None
     # R4(c) (#226): this used to assert the bare string was passed through
     # unchanged. That WAS the defect — a bare string reached the "explicit
     # backend object" branch in retrieve() and had `.search` called on a `str`,
@@ -176,20 +156,20 @@ def test_backend_resolver_preserves_default_bit_identical_path():
     # is a perfectly documented parameter value. A named backend is now
     # normalized to the validated single-element list form.
     # The default paths asserted above are unchanged and still bit-identical.
-    assert _resolve_backend("faiss-mem", SovereignConfig()) == ["faiss-mem"]
-    assert _resolve_backend("auto", SovereignConfig(vector_backends=["faiss-disk", "faiss-mem"])) == [
+    assert _resolve_backend("faiss-mem", MinniConfig()) == ["faiss-mem"]
+    assert _resolve_backend("auto", MinniConfig(vector_backends=["faiss-disk", "faiss-mem"])) == [
         "faiss-disk",
         "faiss-mem",
     ]
 
 
 def _fresh_engine(tmp_path, name):
-    from minni.db import SovereignDB
-    from minni.config import SovereignConfig
+    from minni.db import MinniDB
+    from minni.config import MinniConfig
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(db_path=str(tmp_path / name))
-    return RetrievalEngine(SovereignDB(cfg), cfg)
+    cfg = MinniConfig(db_path=str(tmp_path / name))
+    return RetrievalEngine(MinniDB(cfg), cfg)
 
 
 def test_normalize_backend_names_dedups_and_preserves_order(tmp_path):
@@ -211,18 +191,18 @@ def test_normalize_backend_names_caps_length(tmp_path):
     from minni.retrieval import RetrievalEngine
 
     engine = _fresh_engine(tmp_path, "t2.db")
-    assert engine._MAX_BACKENDS == 4
+    assert engine._MAX_BACKENDS == 2
 
-    # Exactly at the cap (the 4 known backends): allowed.
-    engine._normalize_backend_names(["faiss-disk", "faiss-mem", "qdrant", "lance"])
+    # Exactly at the cap (the 2 known backends): allowed.
+    engine._normalize_backend_names(["faiss-disk", "faiss-mem"])
 
     # One more DISTINCT known name pushes past the cap -> must raise.
     original_known = RetrievalEngine._KNOWN_BACKENDS
-    RetrievalEngine._KNOWN_BACKENDS = original_known + ("fifth-backend",)
+    RetrievalEngine._KNOWN_BACKENDS = original_known + ("third-backend",)
     try:
         try:
             engine._normalize_backend_names(
-                ["faiss-disk", "faiss-mem", "qdrant", "lance", "fifth-backend"]
+                ["faiss-disk", "faiss-mem", "third-backend"]
             )
             raised = None
         except ValueError as exc:

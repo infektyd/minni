@@ -25,7 +25,7 @@ import {
   resolveAfmProvider,
 } from "../dist/afm.js";
 import { utimesSync, writeFileSync, existsSync as fsExistsSync } from "node:fs";
-import { afmHealth, buildStatusReport } from "../dist/sovereign.js";
+import { afmHealth, buildStatusReport } from "../dist/daemon_transport.js";
 
 const HEALTH_UP = { ok: true, data: { status: "ok", adapter: null } };
 const GENERATION_ALIVE = { ok: true, data: { choices: [{ message: { content: "y" } }] } };

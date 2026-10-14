@@ -34,12 +34,12 @@ class _FakeModel:
 def env(tmp_path, monkeypatch):
     import minni.config as cfg
     import minni.writeback as wb_mod
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
     path = str(tmp_path / "gaps.db")
     monkeypatch.setattr(cfg.DEFAULT_CONFIG, "db_path", path, raising=False)
-    db = SovereignDB()
+    db = MinniDB()
     run_migrations(db._get_conn())
     monkeypatch.setattr(
         wb_mod.WriteBackMemory, "model", property(lambda self: _FakeModel()))
@@ -54,7 +54,7 @@ def _principal(**over):
 
 def _gov_context(principal, db, indexed=None, archived=None):
     import minni.config as cfg
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.writeback import WriteBackMemory
 
     calls = indexed if indexed is not None else []
@@ -70,8 +70,8 @@ def _gov_context(principal, db, indexed=None, archived=None):
 
     return governance.GovernanceContext(
         handler_principal=lambda params, rid, **k: (principal, None),
-        lazy_writeback=lambda: WriteBackMemory(SovereignDB(), cfg.DEFAULT_CONFIG),
-        sovereign_db=SovereignDB,
+        lazy_writeback=lambda: WriteBackMemory(MinniDB(), cfg.DEFAULT_CONFIG),
+        sovereign_db=MinniDB,
         make_response=lambda result, rid: {"result": result},
         make_error=lambda code, message, rid: {
             "error": {"code": code, "message": message}},
@@ -146,12 +146,12 @@ def _stub_model(monkeypatch):
 
 
 def _afm_env(tmp_path):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
     from minni.minnid_runtime.governance import ensure_content_hash_column
 
-    config = SovereignConfig(
+    config = MinniConfig(
         db_path=str(tmp_path / "afm.db"),
         vault_path=str(tmp_path / "vault"),
         writeback_path=str(tmp_path / "notes"),
@@ -159,7 +159,7 @@ def _afm_env(tmp_path):
         writeback_enabled=False,
         reranker_enabled=False, attribution_enabled=False,
     )
-    db = SovereignDB(config)
+    db = MinniDB(config)
     run_migrations(db._get_conn())
     # Production contract (not a migration): the learn path ensures
     # learnings.content_hash, which promote_candidate_durable's INSERT names.

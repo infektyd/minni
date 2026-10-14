@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
+from minni.config import MinniConfig, DEFAULT_CONFIG
 from minni.tokens import count_tokens
 
 
@@ -57,7 +57,7 @@ class MarkdownChunker:
     6. Heading breadcrumbs are attached to every chunk
     """
 
-    def __init__(self, config: SovereignConfig = DEFAULT_CONFIG):
+    def __init__(self, config: MinniConfig = DEFAULT_CONFIG):
         self.chunk_size = config.chunk_size          # 512
         self.chunk_overlap = config.chunk_overlap    # 128
         self.strategy = config.chunk_strategy

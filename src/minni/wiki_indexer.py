@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 from minni.graph_readiness import memory_links_typed_columns_present
 from minni.chunker import MarkdownChunker
 from minni.faiss_index import FAISSIndex
@@ -234,8 +234,8 @@ class WikiIndexer:
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
     ):
         self.db = db
         self.config = config
@@ -820,8 +820,8 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
 
-    config = SovereignConfig()
-    db = SovereignDB(config)
+    config = MinniConfig()
+    db = MinniDB(config)
     indexer = WikiIndexer(db, config)
 
     wiki_path = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/wiki")

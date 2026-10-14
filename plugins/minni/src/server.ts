@@ -836,7 +836,7 @@ server.registerTool(
     // so the note is recallable in the same session even while the learning candidate
     // is still status='proposed'. Fail-open if the daemon is unreachable.
     try {
-      const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+      const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
       const fullContent = `---\ntitle: ${title}\nsection: sessions\nstatus: candidate\nprivacy: safe\ncategory: ${category ?? "general"}\n---\n# ${title}\n\n${content}`;
       await jsonRpcSocketRequestWithFallback("vault_index_doc", {
         content: fullContent,
@@ -932,7 +932,7 @@ server.registerTool(
     const gated = await requireSharedGate("candidates.resolve", { candidate_id, decision });
     if (gated) return gated;
     // Delegate to daemon RPC (owner-or-explicit-operator inside the transaction)
-    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
     const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
       candidate_id,
       decision,
@@ -1008,7 +1008,7 @@ server.registerTool(
     // the write still succeeds (the page is on disk; recall degrades to lexical
     // until the next VaultIndexer run).
     try {
-      const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+      const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
       const fullContent = `---\ntitle: ${title}\nsection: ${section}\nstatus: candidate\nprivacy: safe\n---\n# ${title}\n\n${content}`;
       const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
         content: fullContent,

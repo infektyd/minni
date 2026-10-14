@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isDaemonResultEmpty, shouldPrescanVault } from "../dist/sovereign.js";
+import { isDaemonResultEmpty, shouldPrescanVault } from "../dist/daemon_transport.js";
 
 // X5: the local vault pre-scan (searchVaultNotes) is workspace-unscoped and
 // bypasses the daemon read/privacy policy. It must only run as an OFFLINE

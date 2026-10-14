@@ -34,8 +34,8 @@ from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG, correction_class_page_types
+from minni.db import MinniDB
 from minni.episodic import NON_MEMORY_EVENT_TYPES as _NON_MEMORY_EVENT_TYPES
 from minni.faiss_index import FAISSIndex
 from minni.query_expand import expand as expand_query
@@ -181,7 +181,7 @@ _TYPE_TO_AUTHORITY = {
 
 # --- vault_fts vtable DDL race (punch-list §2, fix (c)) --------------------
 # The vault_fts virtual table is reconstructed via its FTS5 xConnect callback
-# whenever a concurrent schema-cookie bump (another SovereignDB instance/process
+# whenever a concurrent schema-cookie bump (another MinniDB instance/process
 # running schema init) moves the schema version mid-flight. A read racing that
 # reconstruction can surface a transient "vtable constructor failed: vault_fts"
 # (or "database schema has changed"). Retry the read a bounded number of times
@@ -606,8 +606,8 @@ class RetrievalEngine:
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
         faiss_index: Optional[FAISSIndex] = None,
     ):
         self.db = db
@@ -2329,7 +2329,7 @@ class RetrievalEngine:
         page_type = str(d.get("page_type") or "").lower()
         if page_type in self._correction_types:
             # Direct field access: correction_salience_boost / _decay_floor are
-            # SovereignConfig dataclass fields with defaults (config.py); only
+            # MinniConfig dataclass fields with defaults (config.py); only
             # correction_class_page_types() tolerates duck-typed configs.
             boost = float(self.config.correction_salience_boost)
             floor = float(self.config.correction_decay_floor)
@@ -2746,8 +2746,8 @@ class RetrievalEngine:
     # build N disk-loading backends; dedup and cap the list, and reject unknown
     # members loudly instead of silently skipping (a silent skip hid typos and
     # let an attacker probe backend names).
-    _KNOWN_BACKENDS = ("faiss-disk", "faiss-mem", "qdrant", "lance")
-    _MAX_BACKENDS = 4
+    _KNOWN_BACKENDS = ("faiss-disk", "faiss-mem")
+    _MAX_BACKENDS = 2
 
     def _note_vector_model_down(self) -> None:
         """Raise the P0-B degradation flag, logging once per outage."""
@@ -2917,7 +2917,6 @@ class RetrievalEngine:
         Resolve a list of backend name strings to VectorBackend instances.
 
         Currently supports: "faiss-disk", "faiss-mem".
-        Stubs ("qdrant", "lance") raise ImportError at construction.
 
         R9: the input list is deduped, capped, and validated first; an unknown
         or over-long member is rejected loudly.
@@ -2931,14 +2930,6 @@ class RetrievalEngine:
             elif name == "faiss-mem":
                 from minni.backends.faiss_mem import FaissMemBackend
                 b = FaissMemBackend(self.config)
-                resolved.append(b)
-            elif name == "qdrant":
-                from minni.backends.qdrant import QdrantBackend
-                b = QdrantBackend(self.config)  # raises ImportError if not installed
-                resolved.append(b)
-            elif name == "lance":
-                from minni.backends.lance import LanceBackend
-                b = LanceBackend(self.config)  # raises ImportError if not installed
                 resolved.append(b)
         return resolved
 
@@ -4627,23 +4618,25 @@ class RetrievalEngine:
                         self.last_vector_degraded = "search deadline; lexical (FTS) only"
                 trace["backends"] = ["faiss-disk"]
             elif isinstance(backend, list):
-                # Fan-out: build a MultiBackend from the list of backend names/objects
-                from minni.backends.multi import MultiBackend
                 resolved = self._resolve_backends(backend)
+                query_emb = self._encode_query(query)
                 if len(resolved) == 1:
-                    query_emb = self._encode_query(query)
                     semantic_results = _collect_eligible(lambda window: self._backend_search(
                         query_emb, window, resolved[0],
                     ), rerank_k)
                 else:
-                    multi = MultiBackend(resolved)
-                    query_emb = self._encode_query(query)
-                    # Same encoder-down guard as _backend_search (round 3,
-                    # PR #260): degrade to FTS-only instead of raising.
-                    semantic_results = _collect_eligible(lambda window: self._hits_to_dicts(
-                        [] if query_emb.size == 0 else multi.search(query_emb, k=window),
-                        query_emb,
-                    ), rerank_k)
+                    def _fanout_backends(window: int) -> List[Dict]:
+                        combined: List[Dict] = []
+                        seen_docs: set = set()
+                        for b in resolved:
+                            for hit in self._backend_search(query_emb, window, b):
+                                did = hit.get("doc_id")
+                                if did not in seen_docs:
+                                    seen_docs.add(did)
+                                    combined.append(hit)
+                        return combined
+
+                    semantic_results = _collect_eligible(_fanout_backends, rerank_k)
                 trace["backends"] = [getattr(b, "name", str(b)) for b in resolved]
             else:
                 # Single explicit backend object

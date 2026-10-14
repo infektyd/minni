@@ -22,11 +22,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def test_vault_write_content_is_immediately_recall_able(tmp_path):
     """After index_durable_document, the page must appear in retrieve() results."""
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         faiss_index_path=str(tmp_path / "test.faiss"),
         vault_path=str(tmp_path / "vault/"),
@@ -36,7 +36,7 @@ def test_vault_write_content_is_immediately_recall_able(tmp_path):
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
 
     # Simulate what vault_write produces: a markdown page with frontmatter
@@ -93,11 +93,11 @@ without a daemon restart. Set MINNI_DUAL_WRITE=1 in the environment.
 def test_vault_write_chunks_zero_still_findable_via_fts(tmp_path):
     """Very short pages that produce 0 semantic chunks should still be found
     via FTS5 (lexical fallback), not silently dropped."""
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test2.db"),
         faiss_index_path=str(tmp_path / "test2.faiss"),
         vault_path=str(tmp_path / "vault2/"),
@@ -107,7 +107,7 @@ def test_vault_write_chunks_zero_still_findable_via_fts(tmp_path):
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
 
     # Very short page — likely produces 0 chunks (below min_tokens=64)

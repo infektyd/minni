@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from minni.config import SovereignConfig
-from minni.db import SovereignDB
+from minni.config import MinniConfig
+from minni.db import MinniDB
 from minni.request_deadline import current_deadline, request_deadline
 from minni.migrations import run_migrations
 from minni.minnid_runtime import recall as recall_mod
@@ -56,7 +56,7 @@ def test_phase1_rrf_weights_and_fts_slot_reservation_prevent_lexical_eviction(tm
     """Config defaults must be fts_weight=0.60, semantic_weight=0.40, and _rrf_merge
     must reserve slots for top FTS5 hits so an unembedded status='candidate' Rank-1
     lexical hit is never evicted by 20 status='accepted' semantic-only hits."""
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "rrf.db"),
         faiss_index_path=str(tmp_path / "rrf.faiss"),
         vault_path=str(tmp_path / "vault"),
@@ -68,7 +68,7 @@ def test_phase1_rrf_weights_and_fts_slot_reservation_prevent_lexical_eviction(tm
     assert cfg.fts_weight == pytest.approx(0.60)
     assert cfg.semantic_weight == pytest.approx(0.40)
 
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     try:
         fts_results = [
@@ -116,7 +116,7 @@ def test_phase1_snippet_depth_never_truncates_inside_evidence_tag_and_stamps_rea
     """At depth='snippet', _SNIPPET_MAX_CHARS truncation must slice the note prose
     BEFORE wrapping in <EVIDENCE ...>...</EVIDENCE>, and score attribute must match
     the result's actual score rather than '0.000'."""
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "snip.db"),
         faiss_index_path=str(tmp_path / "snip.faiss"),
         vault_path=str(tmp_path / "vault"),
@@ -126,7 +126,7 @@ def test_phase1_snippet_depth_never_truncates_inside_evidence_tag_and_stamps_rea
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     try:
         long_prose = (
@@ -179,7 +179,7 @@ def test_phase2_in_memory_trie_and_fast_recall_under_10ms(tmp_path):
     """RetrievalEngine must maintain an in-memory inverted prefix/token Trie
     updated on index_durable_document and support mode='fast' (Tier 1 Trie +
     Tier 2 FTS5 BM25) in under 10 ms without touching FAISS or Cross-Encoder."""
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "fast.db"),
         faiss_index_path=str(tmp_path / "fast.faiss"),
         vault_path=str(tmp_path / "vault"),
@@ -188,7 +188,7 @@ def test_phase2_in_memory_trie_and_fast_recall_under_10ms(tmp_path):
         reranker_enabled=True,
         hyde_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     try:
         engine.index_durable_document(
@@ -231,14 +231,14 @@ def test_phase3_migration_023_unblocks_legacy_proposed_candidates(tmp_path):
     rows in consolidation_actions so _proposed_candidates returns them."""
     from minni.afm_passes.consolidation import _proposed_candidates
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "mig023.db"),
         faiss_index_path=str(tmp_path / "mig023.faiss"),
         vault_path=str(tmp_path / "vault"),
         writeback_path=str(tmp_path / "learnings"),
         graph_export_dir=str(tmp_path / "graphs"),
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     try:
         with db.transaction() as c:
             c.execute(
@@ -295,11 +295,11 @@ def test_phase3_resolve_and_list_candidates_preserve_author_category_and_operato
     import minni.minnid_runtime.provenance as provenance
     from minni.principal import EffectivePrincipal
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "authz.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "authz.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -324,10 +324,21 @@ def test_phase3_resolve_and_list_candidates_preserve_author_category_and_operato
     )
     cid = staged["result"]["candidate_id"]
 
-    # Operator ('main') lists candidates without agent_id filter -> sees cursor's candidate
+    # Operator ('main') lists candidates with explicit agent_id='main' filter -> scopes to main only
     _stamp_principal(
         "main", capabilities=["*", "learn", "govern", "resolve_candidate"]
     )
+    scoped_main = minnid._list_candidates(
+        {"status": "proposed", "agent_id": "main"}, 2
+    )
+    assert all(
+        c["candidate_id"] != cid for c in scoped_main["result"]["candidates"]
+    ), (
+        "Explicit agent_id='main' filter must scope list_candidates to main's family, "
+        f"not return foreign principal rows: {scoped_main['result']['candidates']}"
+    )
+
+    # Operator ('main') lists candidates without agent_id filter -> sees cursor's candidate
     listed = minnid._list_candidates({"status": "proposed"}, 2)
     candidates = listed["result"]["candidates"]
     matching = [c for c in candidates if c["candidate_id"] == cid]
@@ -388,7 +399,7 @@ def test_fast_mode_fts_rank1_confidence_and_token_budgeting_before_envelope(tmp_
 
     # 2. _budget_results sees raw note text (not <EVIDENCE> XML overhead), and
     #    -5.47 gibberish semantic-only hit is dropped by post-rerank floor
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "budget.db"),
         faiss_index_path=str(tmp_path / "budget.faiss"),
         vault_path=str(tmp_path / "vault/"),
@@ -399,7 +410,7 @@ def test_fast_mode_fts_rank1_confidence_and_token_budgeting_before_envelope(tmp_
         feedback_enabled=False,
         context_budget_tokens=15,  # Fits two 5-token raw notes, but NOT two <EVIDENCE>-wrapped notes
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     try:
         for idx in (1, 2):
@@ -489,11 +500,11 @@ def test_list_candidates_joins_consolidation_actions_and_afm_promote_preserves_c
     from minni.minnid_runtime.afm import mark_candidate_review, promote_candidate_durable
     from minni.principal import EffectivePrincipal
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "afm_cat.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "afm_cat.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -622,7 +633,7 @@ def test_foreign_vault_elig_cache_invalidates_on_index_durable_document(tmp_path
     from types import SimpleNamespace
     from minni.principal import EffectivePrincipal
 
-    own_cfg = SovereignConfig(
+    own_cfg = MinniConfig(
         db_path=str(tmp_path / "own.db"),
         faiss_index_path=str(tmp_path / "own.faiss"),
         vault_path=str(tmp_path / "own-vault"),
@@ -631,7 +642,7 @@ def test_foreign_vault_elig_cache_invalidates_on_index_durable_document(tmp_path
         reranker_enabled=False,
         hyde_enabled=False,
     )
-    foreign_cfg = SovereignConfig(
+    foreign_cfg = MinniConfig(
         db_path=str(tmp_path / "foreign.db"),
         faiss_index_path=str(tmp_path / "foreign.faiss"),
         vault_path=str(tmp_path / "foreign-vault"),
@@ -640,8 +651,8 @@ def test_foreign_vault_elig_cache_invalidates_on_index_durable_document(tmp_path
         reranker_enabled=False,
         hyde_enabled=False,
     )
-    own_db = SovereignDB(own_cfg)
-    foreign_db = SovereignDB(foreign_cfg)
+    own_db = MinniDB(own_cfg)
+    foreign_db = MinniDB(foreign_cfg)
     own_eng = RetrievalEngine(own_db, own_cfg)
     foreign_eng = RetrievalEngine(foreign_db, foreign_cfg)
     try:
@@ -723,11 +734,11 @@ def test_stage_candidate_and_resolve_preserve_architecture_and_codebase_categori
     import minni.minnid_runtime.provenance as provenance
     from minni.principal import EffectivePrincipal
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "arch_cat.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "arch_cat.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -762,4 +773,26 @@ def test_stage_candidate_and_resolve_preserve_architecture_and_codebase_categori
             c.execute("SELECT category FROM learnings WHERE learning_id = ?", (lid,))
             row = dict(c.fetchone())
             assert row["category"] == cat
+
+
+def test_phase4_minni_db_config_and_legacy_shim_extinction(tmp_path):
+    """Phase 4: MinniDB and MinniConfig are the canonical symbols in minni.db and
+    minni.config, and legacy shims/stub backends (sovereign_memory.py, sovereign.ts,
+    qdrant.py, lance.py, multi.py) are removed."""
+    import minni.config as cfg_mod
+    import minni.db as db_mod
+
+    assert hasattr(cfg_mod, "MinniConfig"), "minni.config must define MinniConfig"
+    assert hasattr(db_mod, "MinniDB"), "minni.db must define MinniDB"
+
+    repo_root = Path(__file__).resolve().parent.parent
+    for rel in (
+        "src/minni/sovereign_memory.py",
+        "plugins/minni/src/sovereign.ts",
+        "src/minni/backends/qdrant.py",
+        "src/minni/backends/lance.py",
+        "src/minni/backends/multi.py",
+    ):
+        assert not (repo_root / rel).exists(), f"Legacy shim/backend must be deleted: {rel}"
+
 

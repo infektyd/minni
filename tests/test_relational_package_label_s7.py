@@ -19,11 +19,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 
 def _make_engine(tmp_path, db_suffix=""):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / f"test{db_suffix}.db"),
         faiss_index_path=str(tmp_path / f"test{db_suffix}.faiss"),
         vault_path=str(tmp_path / "vault/"),
@@ -33,7 +33,7 @@ def _make_engine(tmp_path, db_suffix=""):
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     return RetrievalEngine(db, cfg)
 
 

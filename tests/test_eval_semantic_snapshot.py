@@ -227,7 +227,7 @@ def test_generation_replacement_fails_closed(tmp_path):
     assert searcher.search("alpha", limit=5)
 
     # Replacement generation B is built fresh AT the same path in a FRESH
-    # PROCESS: SovereignDB keeps process-wide per-path schema state, so an
+    # PROCESS: MinniDB keeps process-wide per-path schema state, so an
     # in-process rebuild at a reused path would skip schema init — a
     # schema-cache hazard a real replacement never hits.
     b_packet = _packet([
@@ -273,7 +273,7 @@ def test_no_live_db_engine_or_model_on_search(tmp_path, monkeypatch):
         pytest.fail("injected embedder must not trigger the default loader")
 
     dest = _prepared(tmp_path)
-    monkeypatch.setattr(db_mod.SovereignDB, "__init__", no_database)
+    monkeypatch.setattr(db_mod.MinniDB, "__init__", no_database)
     monkeypatch.setattr(retrieval_mod.RetrievalEngine, "__init__", no_engine)
     monkeypatch.setattr(semantic_snapshot, "_default_embedder", no_default_loader)
     searcher = SnapshotSemanticSearcher(dest, embedder=WordBinEmbedder(),

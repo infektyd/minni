@@ -27,15 +27,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 
 def _make_db(tmp_path, **cfg_overrides):
-    """(SovereignDB, SovereignConfig) over a temporary SQLite file."""
+    """(MinniDB, MinniConfig) over a temporary SQLite file."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "test.db"), **cfg_overrides)
+    cfg = MinniConfig(db_path=str(tmp_path / "test.db"), **cfg_overrides)
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -145,7 +145,7 @@ def _run_main_with_stub_loop(monkeypatch, tmp_path):
     shutdown path can be invoked directly and its cancellations observed.
 
     Everything that would touch the operator's machine is stubbed: the eager
-    SovereignDB.shared() startup migration (which would open the real
+    MinniDB.shared() startup migration (which would open the real
     ~/.minni/minni.db), the fd-ceiling raise, logging reconfiguration, the
     deploy-state git probe, and signal registration.
     """
@@ -154,7 +154,7 @@ def _run_main_with_stub_loop(monkeypatch, tmp_path):
 
     import minni.minnid as minnid
     import minni.minnid_runtime.deploy_honesty as deploy_honesty
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
 
     loop = _StubLoop()
     handlers = {}
@@ -178,7 +178,7 @@ def _run_main_with_stub_loop(monkeypatch, tmp_path):
         loop.live_db_attempts.append(True)
         raise RuntimeError("test: refusing to open the live database")
 
-    monkeypatch.setattr(SovereignDB, "shared", staticmethod(_no_live_db))
+    monkeypatch.setattr(MinniDB, "shared", staticmethod(_no_live_db))
 
     minnid.main()
     return minnid, loop, handlers
@@ -1101,10 +1101,10 @@ class TestFaissWarmStartRebuild:
     a silent no-op and chunks removed since the snapshot stayed searchable."""
 
     def _index(self, tmp_path):
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
         from minni.faiss_index import FAISSIndex
 
-        cfg = SovereignConfig(db_path=str(tmp_path / "f.db"))
+        cfg = MinniConfig(db_path=str(tmp_path / "f.db"))
         return FAISSIndex(cfg)
 
     def _vecs(self, n, dim):
@@ -1179,7 +1179,7 @@ class TestLayerStamping:
         import minni.models as models
         from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
         from minni.afm_passes.vault_ingest import run as run_vault_ingest
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
         from minni.vault_index import vault_index_paths
 
         class _FakeEmbedder:
@@ -1210,7 +1210,7 @@ class TestLayerStamping:
         _page("art.md", "artifact")
         _page("note.md", "concept")
 
-        cfg = SovereignConfig(
+        cfg = MinniConfig(
             db_path=str(tmp_path / "shared" / "minni.db"),
             vault_path=str(tmp_path / "shared-vault"),
             writeback_enabled=False,
@@ -1218,7 +1218,7 @@ class TestLayerStamping:
         old = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
-            shared = db_mod.SovereignDB(cfg)
+            shared = db_mod.MinniDB(cfg)
             shared._get_conn()
         finally:
             db_mod._migrations_run = old
@@ -1522,7 +1522,7 @@ class TestDecayIsScheduled:
         )
 
     def test_the_harness_never_reaches_the_live_database(self, monkeypatch, tmp_path):
-        """main()'s eager startup migration opens SovereignDB.shared inside a
+        """main()'s eager startup migration opens MinniDB.shared inside a
         bare `except Exception`. The stub that intercepts it is the only thing
         keeping this suite off the operator's real ~/.minni/minni.db, and a
         stub that silently stopped being called would look identical."""
@@ -1530,7 +1530,7 @@ class TestDecayIsScheduled:
 
         assert loop.live_db_attempts, (
             "main() no longer routes its startup DB open through "
-            "SovereignDB.shared — the live-database guard is not holding"
+            "MinniDB.shared — the live-database guard is not holding"
         )
 
     def test_decay_is_not_scheduled_when_disabled(self, monkeypatch, tmp_path):
@@ -3291,7 +3291,7 @@ class TestEpisodicFtsBackfill:
                     " VALUES ('codex', ?, ?, ?)",
                     (event_type, content, now),
                 )
-        monkeypatch.setattr(minnid, "SovereignDB", lambda: db_obj)
+        monkeypatch.setattr(minnid, "MinniDB", lambda: db_obj)
 
         context = minnid._handle_read({"agent_id": "codex", "limit": 5}, 1)
         context = context["result"]["context"]
@@ -3573,20 +3573,20 @@ class TestEpisodicFtsBackfill:
             )
             raise sqlite3.OperationalError("disk I/O error mid-backfill")
 
-        from minni.db import SovereignDB
+        from minni.db import MinniDB
 
         monkey_cfg = minnid.DEFAULT_CONFIG
-        shared_original = SovereignDB.shared
+        shared_original = MinniDB.shared
         episodic_original = episodic_mod.reconcile_episodic_fts
         minnid.DEFAULT_CONFIG = cfg
         episodic_mod.reconcile_episodic_fts = _write_then_fail
-        SovereignDB.shared = staticmethod(lambda *a, **k: db_obj)
+        MinniDB.shared = staticmethod(lambda *a, **k: db_obj)
         try:
             # The sweep records the failure rather than propagating it.
             results = minnid._backfill_sweep_once()
         finally:
             episodic_mod.reconcile_episodic_fts = episodic_original
-            SovereignDB.shared = shared_original
+            MinniDB.shared = shared_original
             minnid.DEFAULT_CONFIG = monkey_cfg
 
         assert "error" in results["episodic_fts"], "the failure must be reported"
@@ -3703,14 +3703,14 @@ class TestEpisodicFtsBackfill:
         monkey_cfg = minnid.DEFAULT_CONFIG
         minnid.DEFAULT_CONFIG = cfg
         try:
-            from minni.db import SovereignDB
+            from minni.db import MinniDB
 
-            original = SovereignDB.shared
-            SovereignDB.shared = staticmethod(lambda *a, **k: db_obj)
+            original = MinniDB.shared
+            MinniDB.shared = staticmethod(lambda *a, **k: db_obj)
             try:
                 minnid._backfill_sweep_once()
             finally:
-                SovereignDB.shared = original
+                MinniDB.shared = original
         finally:
             minnid.DEFAULT_CONFIG = monkey_cfg
 

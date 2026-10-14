@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { recordAudit, ensureVault, vaultFirstLearn } from "../dist/vault.js";
-import { buildStatusReport } from "../dist/sovereign.js";
+import { buildStatusReport } from "../dist/daemon_transport.js";
 
 test("RCM-008: hook rate-limiting drops duplicate hook audit entries without failing", async () => {
   // Use a folder ending in -vault so the agent ID is mapped cleanly to the basename

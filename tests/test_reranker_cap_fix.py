@@ -59,11 +59,11 @@ def _make_fake_merged(n: int) -> List[Dict]:
 
 def test_reranker_final_k_does_not_cap_below_limit(tmp_path):
     """A limit=10 retrieve call must return up to 10 results, not 5 (final_k)."""
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         faiss_index_path=str(tmp_path / "test.faiss"),
         vault_path=str(tmp_path / "vault/"),
@@ -74,7 +74,7 @@ def test_reranker_final_k_does_not_cap_below_limit(tmp_path):
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
 
     # Build 20 fake pre-merge candidates so the reranker has plenty to truncate.
@@ -122,11 +122,11 @@ def test_reranker_final_k_still_caps_when_larger_than_limit(tmp_path):
     max(20, 5) = 20 is applied (not a tighter limit=5 cap that would strip
     docs the reranker intentionally kept).
     """
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test2.db"),
         faiss_index_path=str(tmp_path / "test2.faiss"),
         vault_path=str(tmp_path / "vault2/"),
@@ -137,7 +137,7 @@ def test_reranker_final_k_still_caps_when_larger_than_limit(tmp_path):
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
 
     fake_candidates = _make_fake_merged(20)
@@ -174,11 +174,11 @@ def test_reranker_final_k_still_caps_when_larger_than_limit(tmp_path):
 
 def test_reranker_disabled_returns_limit_results(tmp_path):
     """When reranker is disabled, the else-branch [:limit] must still work."""
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test3.db"),
         faiss_index_path=str(tmp_path / "test3.faiss"),
         vault_path=str(tmp_path / "vault3/"),
@@ -188,7 +188,7 @@ def test_reranker_disabled_returns_limit_results(tmp_path):
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
 
     fake_candidates = _make_fake_merged(20)

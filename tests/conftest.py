@@ -3,7 +3,7 @@
 Three isolation guarantees are established here:
 
 1. MINNI_HOME isolation (PR92-4). ``config.py`` freezes ``CANONICAL_SOVEREIGN_HOME``
-   and the ``SovereignConfig`` field defaults (``db_path`` / ``vault_path`` /
+   and the ``MinniConfig`` field defaults (``db_path`` / ``vault_path`` /
    ``faiss_*``) at IMPORT time from the ``MINNI_HOME`` env var. Isolation must
    therefore be established BEFORE any engine module is imported — i.e. at
    conftest module load, not inside a fixture (a per-test ``monkeypatch.setenv``
@@ -191,7 +191,7 @@ def _isolated_engine_state(tmp_path, monkeypatch):
         # Same reasoning for the per-path shared-instance registry: a tmp db
         # path reused across tests would hand a later test the earlier test's
         # instance (and its already-open connections to the deleted file).
-        _db.SovereignDB._shared_instances.clear()
+        _db.MinniDB._shared_instances.clear()
     except Exception:
         pass
 

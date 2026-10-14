@@ -14,12 +14,12 @@ import {
   exportContextPack,
   formatRecall,
   listPendingHandoffs,
-  parseSovrdJson,
+  parseMinnidJson,
   subscribeContradictions,
-} from "../dist/sovereign.js";
+} from "../dist/daemon_transport.js";
 
-test("parseSovrdJson accepts healthy JSON responses", () => {
-  assert.deepEqual(parseSovrdJson('{"status":"ok","agent":"shared-daemon"}'), {
+test("parseMinnidJson accepts healthy JSON responses", () => {
+  assert.deepEqual(parseMinnidJson('{"status":"ok","agent":"shared-daemon"}'), {
     ok: true,
     data: { status: "ok", agent: "shared-daemon" },
   });

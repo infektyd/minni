@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { extractDaemonLead, formatRecall } from "../dist/sovereign.js";
+import { extractDaemonLead, formatRecall } from "../dist/daemon_transport.js";
 
 test("The Bracket Bug is dead: formatRecall does not output 'Daemon lead: ['", () => {
   const response = {

@@ -30,8 +30,8 @@ import logging
 import time
 from typing import Dict, Optional, Tuple
 
-from minni.config import DEFAULT_CONFIG, SovereignConfig
-from minni.db import SovereignDB
+from minni.config import DEFAULT_CONFIG, MinniConfig
+from minni.db import MinniDB
 # Share the indexer's deliberate no-embed contract — do not fork the set.
 # draft/expired pages are written to documents + vault_fts without vectors so
 # they cannot occupy the fixed FAISS top-k window; retrieve drops them only
@@ -98,7 +98,7 @@ def _cursor_batch(c, sql: str, key: Tuple[str, str], limit: int):
     return rows
 
 
-def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
+def embedding_coverage(db: MinniDB) -> Dict[str, object]:
     """Document- and learning-level vector coverage, plus episodic FTS coverage.
 
     Counts only — no paths, no learning text — so this is safe to expose in the
@@ -193,7 +193,7 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
     return coverage
 
 
-def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
+def episodic_index_coverage(db: MinniDB) -> Dict[str, object]:
     """Episodic events versus what episodic_fts can actually find.
 
     Slice R7: embedding_coverage compared documents against vectors and
@@ -314,7 +314,7 @@ def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
 
 def vault_embedding_coverage(
     minni_home=None,
-    base_config: SovereignConfig = DEFAULT_CONFIG,
+    base_config: MinniConfig = DEFAULT_CONFIG,
 ) -> Dict[str, Dict]:
     """Per-vault embedding_coverage, keyed by vault name.
 
@@ -332,7 +332,7 @@ def vault_embedding_coverage(
         vault_db = None
         try:
             vault_config = build_vault_index_config(vault, base_config=base_config)
-            vault_db = SovereignDB(vault_config)
+            vault_db = MinniDB(vault_config)
             out[vault.name] = embedding_coverage(vault_db)
         except Exception as exc:
             out[vault.name] = {"error": str(exc)}
@@ -346,8 +346,8 @@ def vault_embedding_coverage(
 
 
 def backfill_learning_embeddings(
-    db: SovereignDB,
-    config: SovereignConfig = DEFAULT_CONFIG,
+    db: MinniDB,
+    config: MinniConfig = DEFAULT_CONFIG,
     *,
     limit: int = DEFAULT_BATCH,
 ) -> Dict[str, int]:
@@ -436,8 +436,8 @@ def backfill_learning_embeddings(
 
 
 def backfill_document_vectors(
-    db: SovereignDB,
-    config: SovereignConfig = DEFAULT_CONFIG,
+    db: MinniDB,
+    config: MinniConfig = DEFAULT_CONFIG,
     *,
     limit: int = DEFAULT_BATCH,
     on_vectors=None,
@@ -611,8 +611,8 @@ def backfill_document_vectors(
 
 
 def backfill_learning_projections(
-    db: SovereignDB,
-    config: SovereignConfig = DEFAULT_CONFIG,
+    db: MinniDB,
+    config: MinniConfig = DEFAULT_CONFIG,
     *,
     limit: int = DEFAULT_BATCH,
     on_vectors=None,
@@ -704,8 +704,8 @@ def backfill_learning_projections(
 
 
 def run_backfill(
-    db: SovereignDB,
-    config: SovereignConfig = DEFAULT_CONFIG,
+    db: MinniDB,
+    config: MinniConfig = DEFAULT_CONFIG,
     *,
     limit: int = DEFAULT_BATCH,
     on_vectors=None,
@@ -724,7 +724,7 @@ def run_backfill(
 
 
 def run_backfill_all_indexes(
-    config: SovereignConfig = DEFAULT_CONFIG,
+    config: MinniConfig = DEFAULT_CONFIG,
     *,
     limit: int = DEFAULT_BATCH,
     minni_home=None,
@@ -752,7 +752,7 @@ def run_backfill_all_indexes(
 
     results: Dict[str, Dict] = {}
 
-    db = SovereignDB(config)
+    db = MinniDB(config)
     try:
         results["shared"] = run_backfill(
             db, config, limit=limit, on_vectors=on_vectors
@@ -768,7 +768,7 @@ def run_backfill_all_indexes(
         vault_db = None
         try:
             vault_config = build_vault_index_config(vault, base_config=config)
-            vault_db = SovereignDB(vault_config)
+            vault_db = MinniDB(vault_config)
             results[name] = run_backfill(vault_db, vault_config, limit=limit)
         except Exception as exc:
             logger.warning("Backfill failed for vault %s: %s", name, exc)

@@ -69,7 +69,7 @@ class RealSearcher(SearcherProtocol):
         from minni.retrieval import RetrievalEngine
 
         self._engine = RetrievalEngine(
-            db=db_mod.SovereignDB(DEFAULT_CONFIG),
+            db=db_mod.MinniDB(DEFAULT_CONFIG),
             config=DEFAULT_CONFIG,
             faiss_index=FAISSIndex(DEFAULT_CONFIG),
         )

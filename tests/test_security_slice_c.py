@@ -13,14 +13,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "slicec.db"), reranker_enabled=False)
+    cfg = MinniConfig(db_path=str(tmp_path / "slicec.db"), reranker_enabled=False)
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = SovereignDB(cfg)
+        db_obj = MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

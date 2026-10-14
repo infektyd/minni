@@ -17,8 +17,8 @@ from minni.afm_passes.judge import (
     judge_candidate,
     scan_for_secrets,
 )
-from minni.config import SovereignConfig
-from minni.db import SovereignDB
+from minni.config import MinniConfig
+from minni.db import MinniDB
 
 
 def test_deterministic_shield_secrets():
@@ -118,14 +118,14 @@ def test_judge_candidate_mocked():
 def _make_test_db(tmp_path):
     from minni.migrations import run_migrations
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
         faiss_index_path=str(tmp_path / "faiss.index"),
         writeback_enabled=False,
     )
-    db_obj = SovereignDB(cfg)
+    db_obj = MinniDB(cfg)
     conn = db_obj._get_conn()
     run_migrations(conn)
     return db_obj, cfg

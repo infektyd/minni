@@ -46,13 +46,13 @@ PLATFORM_TEMPLATE_CAPS = (
 def _patch_db(monkeypatch, tmp_path):
     import minni.db as db_mod
     import minni.config as cfg_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "cursor-candidates.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "cursor-candidates.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -323,7 +323,7 @@ def _around_page_select(monkeypatch, hook, when="before"):
     """
     import minni.db as db_mod
 
-    orig = db_mod.SovereignDB.cursor
+    orig = db_mod.MinniDB.cursor
     hooked = []
 
     @contextmanager
@@ -333,7 +333,7 @@ def _around_page_select(monkeypatch, hook, when="before"):
             hooked.append(proxy)
             yield proxy
 
-    monkeypatch.setattr(db_mod.SovereignDB, "cursor", wrapped)
+    monkeypatch.setattr(db_mod.MinniDB, "cursor", wrapped)
     return hooked
 
 
@@ -601,7 +601,7 @@ def test_list_candidates_rpc_error_redacts_db_paths(monkeypatch, tmp_path):
         raise sqlite3.OperationalError(f"unable to open database file: {leak}")
         yield  # pragma: no cover
 
-    monkeypatch.setattr(db_mod.SovereignDB, "cursor", boom)
+    monkeypatch.setattr(db_mod.MinniDB, "cursor", boom)
     listed = minnid._list_candidates({"status": "proposed"}, 30)
     blob = str(listed)
     assert leak not in blob, listed
@@ -631,7 +631,7 @@ def test_resolve_candidate_rpc_error_redacts_private_paths(monkeypatch, tmp_path
         raise sqlite3.OperationalError(f"unable to open database file: {leak}")
         yield  # pragma: no cover
 
-    monkeypatch.setattr(db_mod.SovereignDB, "transaction", boom)
+    monkeypatch.setattr(db_mod.MinniDB, "transaction", boom)
     resolved = minnid._resolve_candidate(
         {"candidate_id": cid, "decision": "reject", "reason": "drain"},
         31,

@@ -13,8 +13,8 @@ import math
 import logging
 from typing import Dict
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG, correction_class_page_types
+from minni.db import MinniDB
 from minni.timestamps import parse_epoch_or_report
 
 logger = logging.getLogger("sovereign.decay")
@@ -25,8 +25,8 @@ class MemoryDecay:
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
     ):
         self.db = db
         self.config = config
@@ -43,7 +43,7 @@ class MemoryDecay:
         # beliefs whose decay saturates at 1.0 via access reinforcement.
         # Shared helper (config.py) — same set retrieval.py boosts on.
         correction_types = correction_class_page_types(self.config)
-        # Direct field access: these are SovereignConfig dataclass fields with
+        # Direct field access: these are MinniConfig dataclass fields with
         # defaults (config.py); only correction_class_page_types() tolerates
         # duck-typed configs.
         grace_sec = float(self.config.correction_decay_grace_days) * 86400
@@ -187,7 +187,7 @@ class MemoryDecay:
 
 
 def run_decay_all_indexes(
-    config: SovereignConfig = DEFAULT_CONFIG,
+    config: MinniConfig = DEFAULT_CONFIG,
     *,
     minni_home=None,
 ) -> Dict[str, Dict]:
@@ -207,7 +207,7 @@ def run_decay_all_indexes(
 
     results: Dict[str, Dict] = {}
 
-    db = SovereignDB(config)
+    db = MinniDB(config)
     try:
         results["shared"] = MemoryDecay(db, config).run_decay()
     except Exception as exc:
@@ -224,7 +224,7 @@ def run_decay_all_indexes(
             # fail on its own, and that failure must be isolated to this vault
             # exactly like a failed pass is.
             vault_config = build_vault_index_config(vault, base_config=config)
-            vault_db = SovereignDB(vault_config)
+            vault_db = MinniDB(vault_config)
             results[name] = MemoryDecay(vault_db, vault_config).run_decay()
         except Exception as exc:
             logger.warning("Decay pass failed for vault %s: %s", name, exc)
@@ -241,7 +241,7 @@ def run_decay_all_indexes(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    db = SovereignDB()
+    db = MinniDB()
     decay = MemoryDecay(db)
     stats = decay.run_decay()
     print(f"Decay stats: {stats}")

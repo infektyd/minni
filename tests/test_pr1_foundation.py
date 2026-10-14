@@ -84,7 +84,7 @@ class TestMigrationsRunner:
             os.environ["MINNI_DB_PATH"] = db_path
             # Re-import config so db_path env var is picked up
             import minni.config as config
-            cfg = config.SovereignConfig(db_path=db_path)
+            cfg = config.MinniConfig(db_path=db_path)
             db_obj = db_mod.connect(cfg)
             db_obj.close()
             conn = sqlite3.connect(db_path)
@@ -124,8 +124,8 @@ class TestMigrationsRunner:
 
             # Create a DB at the same path — migrations should NOT run because
             # the path is already in _migrated_paths.
-            cfg = __import__("config").SovereignConfig(db_path=db_path)
-            d = db_mod.SovereignDB(cfg)
+            cfg = __import__("config").MinniConfig(db_path=db_path)
+            d = db_mod.MinniDB(cfg)
             d._get_conn()
             d.close()
 

@@ -27,7 +27,7 @@ const SUMMARY_TEXT = [
   "1. Primary Request and Intent:",
   "   User asked to fix the daemon fd leak and deploy the fix to all platforms.",
   "2. Key Technical Concepts:",
-  "   SovereignDB caches one sqlite connection per thread; the RPC pool multiplies open fds past the launchd soft limit.",
+  "   MinniDB caches one sqlite connection per thread; the RPC pool multiplies open fds past the launchd soft limit.",
   "3. Errors and fixes:",
   "   launchctl bootstrap error 5 right after bootout is a teardown race; sleeping two seconds and retrying succeeds.",
   "",

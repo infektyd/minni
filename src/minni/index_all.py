@@ -19,8 +19,8 @@ import logging
 from pathlib import Path
 from typing import Dict
 
-from minni.config import CANONICAL_SOVEREIGN_HOME, SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import CANONICAL_SOVEREIGN_HOME, MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 from minni.indexer import VaultIndexer
 from minni.wiki_indexer import WikiIndexer
 
@@ -28,7 +28,7 @@ logger = logging.getLogger("sovereign.index_all")
 
 
 def index_all(
-    config: SovereignConfig = None,
+    config: MinniConfig = None,
     vault: bool = True,
     wiki: bool = True,
     verbose: bool = False,
@@ -39,7 +39,7 @@ def index_all(
     Returns combined stats dict.
     """
     config = config or DEFAULT_CONFIG
-    db = SovereignDB(config)
+    db = MinniDB(config)
 
     combined_stats = {}
 
@@ -115,7 +115,7 @@ def discover_agent_vaults(minni_home: str | Path | None = None) -> list[Path]:
     )
 
 
-def index_shared_vault(config: SovereignConfig = None) -> Dict[str, Dict]:
+def index_shared_vault(config: MinniConfig = None) -> Dict[str, Dict]:
     """Incrementally index the shared vault (``config.vault_path``) into the shared DB.
 
     ``discover_agent_vaults`` cannot cover this one (see its docstring), and
@@ -130,7 +130,7 @@ def index_shared_vault(config: SovereignConfig = None) -> Dict[str, Dict]:
     """
     config = config or DEFAULT_CONFIG
     vault = str(config.vault_path)
-    db = SovereignDB(config)
+    db = MinniDB(config)
     try:
         stats = VaultIndexer(db, config).index_vault(verbose=False)
     finally:
@@ -141,7 +141,7 @@ def index_shared_vault(config: SovereignConfig = None) -> Dict[str, Dict]:
 
 
 def index_agent_vaults(
-    config: SovereignConfig = None,
+    config: MinniConfig = None,
     *,
     minni_home: str | Path | None = None,
     dry_run: bool = False,
@@ -149,7 +149,7 @@ def index_agent_vaults(
 ) -> Dict[str, Dict]:
     """Run vault_ingest across every discovered agent vault."""
     config = config or DEFAULT_CONFIG
-    db = SovereignDB(config)
+    db = MinniDB(config)
     from minni.afm_passes.vault_ingest import run as run_vault_ingest
 
     combined: Dict[str, Dict] = {}
