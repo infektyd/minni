@@ -1,14 +1,4 @@
-"""R8 observability slice — every degrade path must be visible at the call site.
-
-Issues #226 (recall observability), #230 (AFM pass honesty and durability), and
-the gap-audit findings folded into them (GA4-3, GA6-2, GA2-1).
-
-The shared contract these tests enforce: a degraded result must never be
-indistinguishable from a healthy one. Each test below fails against the
-pre-R8 behavior — that is the point of it. Where a test pins a NEW field, the
-old code omitted the field entirely; where it pins a value, the old code
-reported the opposite.
-"""
+"""R8 observability slice — every degrade path must be visible at the call site."""
 
 import queue
 import time
@@ -16,13 +6,8 @@ import time
 import pytest
 
 
-# ── #226 R3: partial auth suppression must be visible ────────────────────────
-
-
 def test_auth_suppression_reported_even_when_other_legs_returned_hits():
-    """R3: `auth_suppression` was gated on `if not results` — a vault entirely
-    blacked out by authorization read as normal whenever ANY other leg had
-    hits. Fails pre-R8: the key is absent from a non-empty response."""
+    """R3: `auth_suppression` was gated on `if not results` — a vault entirely"""
     from minni.minnid_runtime import recall as recall_mod
 
     captured = {}
@@ -50,12 +35,8 @@ def test_auth_suppression_reported_even_when_other_legs_returned_hits():
     assert payload["auth_suppression"][0]["suppressed"] == 4
 
 
-# ── #226 R4(a): the response must carry a vector-degradation field ───────────
-
-
 def test_search_response_always_carries_vector_model_and_degraded():
-    """R4(a): the response carried no `vector_model` or `degraded` field at
-    all. Fails pre-R8: both keys are absent."""
+    """R4(a): the response carried no `vector_model` or `degraded` field at"""
     from minni.minnid_runtime import recall as recall_mod
 
     captured = {}
@@ -66,8 +47,6 @@ def test_search_response_always_carries_vector_model_and_degraded():
     class _Engine:
         config = _Config()
         vector_model_down = True  # semantic leg is DOWN
-        # Round 2 (PR #260): the response reads the per-request thread-local,
-        # not the racy process-global bool. A real engine sets both.
         last_vector_degraded = "embedding model unavailable; lexical (FTS) only"
         last_rerank_degraded = None
         last_query_expand_degraded = None
@@ -116,27 +95,18 @@ def test_healthy_search_reports_degradation_field_as_false_not_absent():
 
 
 def test_vector_degradation_is_read_per_request_not_from_the_global():
-    """Review round 2 (PR #260): one process-wide engine serves concurrent
-    search workers, so the plain `vector_model_down` bool could be flipped by
-    a racing request between this request's retrieve() and the handler's read
-    — reporting a lexical-only answer as healthy, or a healthy one as
-    degraded. The response must be driven by the per-request thread-local
-    verdict, with the global left to the health surface."""
+    """Review round 2 (PR #260): one process-wide engine serves concurrent"""
     from minni.minnid_runtime import recall as recall_mod
 
     class _Config:
         embedding_model = "all-MiniLM-L6-v2"
 
     class _StaleGlobal:
-        # A concurrent request left the global raised; THIS request's semantic
-        # leg was fine.
         config = _Config()
         vector_model_down = True
         last_vector_degraded = None
 
     class _StaleClear:
-        # The inverse race: a concurrent success cleared the global after THIS
-        # request degraded to lexical-only.
         config = _Config()
         vector_model_down = False
         last_vector_degraded = "embedding model unavailable; lexical (FTS) only"
@@ -150,15 +120,8 @@ def test_vector_degradation_is_read_per_request_not_from_the_global():
     assert degraded["degraded"] is True
 
 
-# ── #226 R4(b): explicit-backend branches must not bypass the P0-B flag ──────
-
-
 def test_encode_query_raises_the_degradation_flag_when_encoder_down(tmp_path, monkeypatch):
-    """R4(b): the explicit-backend branches inlined
-    `self.model.encode(q) if self.model else np.array([])`, feeding an EMPTY
-    query vector into search with no log line and no flag. Fails pre-R8:
-    `_encode_query` does not exist, and the inline expression it replaces left
-    vector_model_down False."""
+    """R4(b): the explicit-backend branches inlined"""
     engine = _engine_without_model(tmp_path, monkeypatch)
 
     assert engine.vector_model_down is False
@@ -176,8 +139,7 @@ def test_encode_query_raises_the_degradation_flag_when_encoder_down(tmp_path, mo
 
 
 class _LiveIndexBackend:
-    """Stands in for a populated FAISS index: a real one raises a dimension
-    mismatch when handed the (1, 0) reshape of an empty query vector."""
+    """Stands in for a populated FAISS index: a real one raises a dimension"""
 
     name = "faiss-disk"
 
@@ -186,20 +148,13 @@ class _LiveIndexBackend:
 
 
 def test_encoder_down_with_explicit_backend_degrades_instead_of_erroring(tmp_path, monkeypatch):
-    """Review round 3 (PR #260): with the encoder down, the default `auto`
-    path degrades to FTS-only cleanly, but the explicit-backend path fed the
-    empty query vector into the live index — a dim-mismatch raise that
-    surfaced as -32000 with no degradation envelope. Same outage, two honesty
-    outcomes. Fails pre-round-3: _backend_search called backend.search with
-    the empty vector."""
+    """Review round 3 (PR #260): with the encoder down, the default `auto`"""
     engine = _engine_without_model(tmp_path, monkeypatch)
 
     results = engine._backend_search(engine._encode_query("some query"), 5, _LiveIndexBackend())
     assert results == [], "the semantic leg is down; the leg's contribution is empty"
     assert engine.last_vector_degraded is not None
 
-    # End to end through retrieve() on the explicit-backend path: a success
-    # payload with the degrade flag raised, not an internal error.
     out = engine.retrieve("some query", limit=3, backend=_LiveIndexBackend(), expand=False)
     assert isinstance(out, list)
     assert engine.last_vector_degraded is not None, (
@@ -208,33 +163,26 @@ def test_encoder_down_with_explicit_backend_degrades_instead_of_erroring(tmp_pat
 
 
 def test_explicit_backend_branches_use_the_flagging_encoder():
-    """Regression pin on the call sites themselves: no branch may re-introduce
-    the unflagged inline encode. Fails pre-R8 — all three lines matched."""
+    """Regression pin on the call sites themselves: no branch may re-introduce"""
+    import inspect
     from pathlib import Path
 
     import minni.retrieval as retrieval_mod
+    from minni.retrieval import RetrievalEngine
 
     source = Path(retrieval_mod.__file__).read_text(encoding="utf-8")
     assert "self.model.encode(query).astype(np.float32) if self.model else" not in source, (
         "an explicit-backend branch is bypassing _encode_query and therefore "
         "the P0-B degradation flag"
     )
-    # Round 7: the DEFAULT semantic path must go through the same encoder —
-    # an encode-side degrade fixed only in _encode_query would otherwise
-    # miss the default path.
-    sem = source.index("def _semantic_search")
-    assert "_encode_query" in source[sem:sem + 1500], (
+    sem_source = inspect.getsource(RetrievalEngine._semantic_search)
+    assert "_encode_query" in sem_source, (
         "the default FAISS path must route through _encode_query too"
     )
 
 
-# ── #226 R4(c): a bad backend value is -32602, not -32000 ────────────────────
-
-
 def test_unknown_backend_value_is_invalid_params_not_internal_error():
-    """R4(c): an unknown backend raised AttributeError on a str and surfaced as
-    -32000 (internal error) — a caller mistake reported as a server fault.
-    Fails pre-R8: resolve_backend returned the bad string unchanged."""
+    """R4(c): an unknown backend raised AttributeError on a str and surfaced as"""
     from minni.minnid_runtime.recall import resolve_backend
 
     with pytest.raises(ValueError) as excinfo:
@@ -245,19 +193,14 @@ def test_unknown_backend_value_is_invalid_params_not_internal_error():
 
 
 def test_documented_faiss_disk_backend_value_resolves_instead_of_crashing():
-    """The documented `backend: "faiss-disk"` form must reach the validated
-    list path. Fails pre-R8: it was passed through as a bare str."""
+    """The documented `backend: 'faiss-disk'` form must reach the validated"""
     from minni.minnid_runtime.recall import resolve_backend
 
     assert resolve_backend("faiss-disk") == ["faiss-disk"]
 
 
 def test_unknown_backend_in_list_form_is_invalid_params_not_internal_error():
-    """Review round 4 (PR #260): R4(c) validated only the bare-string form.
-    The equally documented LIST form passed through unchecked, raised inside
-    retrieve(), and surfaced as -32000 — the same caller mistake answered
-    with two different codes ("nope" -> -32602, ["nope"] -> -32000). Fails
-    pre-round-4: resolve_backend returned the list unchanged."""
+    """Review round 4 (PR #260): R4(c) validated only the bare-string form."""
     from minni.minnid_runtime.recall import resolve_backend
 
     for bad in (["faiss-dsk"], ["faiss-disk", "nope"]):
@@ -268,22 +211,15 @@ def test_unknown_backend_in_list_form_is_invalid_params_not_internal_error():
 
     with pytest.raises(ValueError):
         resolve_backend([])
-    # A wire value that is neither string nor list is a caller mistake too.
     with pytest.raises(ValueError):
         resolve_backend(42)
 
-    # The valid list form still resolves.
     assert resolve_backend(["faiss-mem"]) == ["faiss-mem"]
     assert resolve_backend(["faiss-disk", "faiss-mem"]) == ["faiss-disk", "faiss-mem"]
 
 
-# ── #226 R5: a per-engine rerank failure must be reported ────────────────────
-
-
 def test_rerank_failure_is_recorded_not_swallowed(tmp_path, monkeypatch):
-    """R5: a rerank failure left candidates with no rerank_score, dropping that
-    corpus to raw RRF magnitude in a cross-corpus merge. Fails pre-R8: the
-    attribute does not exist and the failure left no trace."""
+    """R5: a rerank failure left candidates with no rerank_score, dropping that"""
     engine = _engine_without_model(tmp_path, monkeypatch)
 
     class _ExplodingReranker:
@@ -302,12 +238,8 @@ def test_rerank_failure_is_recorded_not_swallowed(tmp_path, monkeypatch):
     assert "reranker died" in engine.last_rerank_degraded
 
 
-# ── #230 AFM-4: the probe cache must evict ───────────────────────────────────
-
-
 def test_probe_cache_is_bounded():
-    """AFM-4: the cache had no eviction policy — measured live at 22 entries,
-    21 of them stale test residue. Fails pre-R8: it grew without limit."""
+    """AFM-4: the cache had no eviction policy — measured live at 22 entries,"""
     from minni import afm_provider
 
     entries = {
@@ -322,15 +254,12 @@ def test_probe_cache_is_bounded():
     afm_provider._evict_probe_entries(entries, "probed_at")
 
     assert len(entries) == afm_provider.PROBE_CACHE_MAX_ENTRIES
-    # Oldest probes go first: the surviving set is the newest N.
     survivors = sorted(entry["probed_at"] for entry in entries.values())
     assert survivors[0] > 1000.0, "eviction must drop the OLDEST probe, not an arbitrary one"
 
 
 def test_probe_cache_write_is_serialized(tmp_path, monkeypatch):
-    """AFM-4: the persistent cache was a read-modify-write with no mutual
-    exclusion, so concurrent probes lost entries. Fails pre-R8 under
-    contention; here we pin that the lock exists and the RMW holds it."""
+    """AFM-4: the persistent cache was a read-modify-write with no mutual"""
     import threading
 
     from minni import afm_provider
@@ -362,28 +291,14 @@ def test_probe_cache_write_is_serialized(tmp_path, monkeypatch):
     assert len(persisted) == 16, "a concurrent probe must not lose another's entry"
 
 
-# ── #230 AFM-6: a failed HyDE leg must not read as triggered-and-fine ────────
-
-
 def test_hyde_afm_unavailable_reaches_the_search_degradation_envelope(
     tmp_path, monkeypatch
 ):
-    """AFM-6, driven end to end: a HyDE leg that TRIGGERED and then got nothing
-    back from AFM must reach the caller as a degraded response.
-
-    Replaces three source-grep assertions (F2/H5): they matched the text of
-    retrieval.py, so deleting the `last_hyde_degraded` setter that carries the
-    verdict out of the engine left them all green. This drives the real
-    retrieve() HyDE branch with AFM returning no hypothetical and reads the
-    RPC response, which is where the signal actually has to land.
-    """
+    """AFM-6, driven end to end: a HyDE leg that TRIGGERED and then got nothing"""
     import minni.hyde as hyde_mod
     from minni.minnid_runtime import recall as recall_mod
 
     engine = _hyde_engine(tmp_path, monkeypatch)
-    # The AFM-unavailable condition itself: the provider answers with nothing.
-    # generate_hypothetical_answer is imported inside retrieve(), so patching
-    # the module attribute is what the production call site resolves.
     monkeypatch.setattr(hyde_mod, "generate_hypothetical_answer", lambda *a, **k: None)
 
     captured = {}
@@ -402,16 +317,11 @@ def test_hyde_afm_unavailable_reaches_the_search_degradation_envelope(
 
 
 def test_hyde_that_completes_is_not_reported_as_degraded(tmp_path, monkeypatch):
-    """The other half of triggered-vs-completed: a leg that actually ran must
-    not be flagged. Without this, `last_hyde_degraded = "afm_unavailable"`
-    hoisted out of its else-branch would still satisfy the test above."""
+    """The other half of triggered-vs-completed: a leg that actually ran must"""
     import minni.hyde as hyde_mod
     from minni.minnid_runtime import recall as recall_mod
 
     engine = _hyde_engine(tmp_path, monkeypatch)
-    # Positive control: without this, "no hyde_degraded entry" would also be
-    # satisfied by a HyDE leg that never ran at all, and the test would keep
-    # passing against a broken trigger.
     calls = []
 
     def _answer(*args, **kwargs):
@@ -471,8 +381,7 @@ def test_hyde_failure_surfaces_on_search_degradation_envelope():
 
 
 def test_query_expansion_failure_is_reachable_from_the_call_site(tmp_path, monkeypatch):
-    """AFM-6: query-expansion degrade was a log line only, unreachable from the
-    caller. Fails pre-R8: the attribute does not exist."""
+    """AFM-6: query-expansion degrade was a log line only, unreachable from the"""
     import minni.retrieval as retrieval_mod
 
     engine = _engine_without_model(tmp_path, monkeypatch)
@@ -480,8 +389,6 @@ def test_query_expansion_failure_is_reachable_from_the_call_site(tmp_path, monke
     def _explode(query, mode="rule"):
         raise RuntimeError("expansion died")
 
-    # Round 23: retrieval uses expand_with_status; hard failures still surface
-    # via the exception path on that entry point.
     monkeypatch.setattr(retrieval_mod, "expand_query_with_status", _explode)
     monkeypatch.setattr(retrieval_mod, "expand_query", _explode)
     engine.last_query_expand_degraded = None
@@ -493,9 +400,6 @@ def test_query_expansion_failure_is_reachable_from_the_call_site(tmp_path, monke
     )
 
 
-# ── #230 AFM-8: writer queue bound, drop policy, honest write failure ────────
-
-
 def test_writer_queue_is_bounded():
     """AFM-8: the queue was unbounded. Fails pre-R8: maxsize was 0 (infinite)."""
     from minni import afm_writer
@@ -505,9 +409,7 @@ def test_writer_queue_is_bounded():
 
 
 def test_full_queue_rejects_loudly_and_counts_the_drop(monkeypatch):
-    """AFM-8 drop policy: a submission past the bound is REJECTED and counted,
-    not silently accepted into a queue that will never drain. Fails pre-R8:
-    the unbounded queue accepted it and reported status 'queued'."""
+    """AFM-8 drop policy: a submission past the bound is REJECTED and counted,"""
     from minni import afm_writer
 
     afm_writer.reset_pass_counters()
@@ -523,9 +425,7 @@ def test_full_queue_rejects_loudly_and_counts_the_drop(monkeypatch):
 
 
 def test_write_failure_is_its_own_error_type_not_a_bare_runtime_error(monkeypatch):
-    """AFM-8: a write failure raised a bare RuntimeError, which the daemon's
-    blanket handler reported as `afm_unavailable` — blaming the model provider
-    for a durable-storage fault. Fails pre-R8: DraftWriteError did not exist."""
+    """AFM-8: a write failure raised a bare RuntimeError, which the daemon's"""
     from minni import afm_writer
 
     monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
@@ -542,9 +442,7 @@ def test_write_failure_is_its_own_error_type_not_a_bare_runtime_error(monkeypatc
 
 
 def test_daemon_compile_reports_write_failure_as_write_failed(monkeypatch, tmp_path):
-    """AFM-8, end to end: a storage fault must not be reported as
-    `afm_unavailable`. Fails pre-R8: the blanket handler returned
-    'afm_unavailable' for every exception including write failures."""
+    """AFM-8, end to end: a storage fault must not be reported as"""
     from minni import afm_writer
 
     captured = _compile_with_pass_error(
@@ -564,8 +462,7 @@ def test_daemon_compile_still_reports_provider_faults_as_afm_unavailable(monkeyp
 
 
 def test_writer_timeout_does_not_claim_the_drafts_landed(monkeypatch):
-    """AFM-8: the timeout path returned status 'queued', so an unobserved batch
-    read as a completed one. Fails pre-R8: status was 'queued'."""
+    """AFM-8: the timeout path returned status 'queued', so an unobserved batch"""
     from minni import afm_writer
 
     monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
@@ -579,13 +476,8 @@ def test_writer_timeout_does_not_claim_the_drafts_landed(monkeypatch):
     assert result["drafts_in_flight"] == 2
 
 
-# ── GA4-3: a pass that raises must record the attempt AND the failure ────────
-
-
 def test_pass_exception_records_attempt_and_failure(monkeypatch, tmp_path):
-    """GA4-3: an exception skipped record_pass_attempt, so a pass raising every
-    tick read as 'never invoked' or went stale — and NO failure counter existed
-    anywhere. Fails pre-R8 on both assertions."""
+    """GA4-3: an exception skipped record_pass_attempt, so a pass raising every"""
     from minni import afm_writer
 
     afm_writer.reset_pass_counters()
@@ -600,9 +492,7 @@ def test_pass_exception_records_attempt_and_failure(monkeypatch, tmp_path):
 
 
 def test_failing_pass_reads_as_failing_not_ok():
-    """GA4-3: the health verdict must distinguish a failing pass from an idle
-    one. Fails pre-R8: 'failing' was not a status derive_loop_status could
-    return, and a pass that ran (attempt recorded) read 'ok'."""
+    """GA4-3: the health verdict must distinguish a failing pass from an idle"""
     from minni.afm_writer import derive_loop_status
 
     now = 1_000_000.0
@@ -618,12 +508,7 @@ def test_failing_pass_reads_as_failing_not_ok():
 
 
 def test_failing_clears_when_the_pass_recovers():
-    """Review round 2 (PR #260): the failure counter is cumulative and nothing
-    clears it, so `failing` was latched for the process lifetime — one
-    transient fault and 500 clean ticks later the primary health surface still
-    screamed. Failure must be CURRENT: the recorders stamp the attempt first
-    and the failure second, so a later successful attempt (attempt_at past the
-    last fail_at) means the pass recovered."""
+    """Review round 2 (PR #260): the failure counter is cumulative and nothing"""
     from minni.afm_writer import derive_loop_status
 
     now = 1_000_000.0
@@ -640,8 +525,6 @@ def test_failing_clears_when_the_pass_recovers():
     )
     assert not any("raising" in reason for reason in reasons)
 
-    # The counterpart: the last outcome WAS the fault — still failing, and the
-    # cumulative count stays visible in the reason.
     still_failing = {
         "last_attempt_per_pass": {"consolidation": now - 60},
         "failures_per_pass": {"consolidation": 3},
@@ -666,13 +549,8 @@ def test_healthy_pass_still_reads_ok():
     assert status == "ok"
 
 
-# ── GA2-1: queue_depth must be consulted, not orphaned ───────────────────────
-
-
 def test_queue_depth_is_consulted_by_the_status_derivation():
-    """GA2-1: queue_depth was recorded in writer_status and never read by
-    derive_loop_status — an orphaned metric reads as coverage that is not
-    there. Fails pre-R8: the status was 'ok' at any queue depth."""
+    """GA2-1: queue_depth was recorded in writer_status and never read by"""
     from minni.afm_writer import WRITER_QUEUE_BACKLOG, derive_loop_status
 
     now = 1_000_000.0
@@ -704,10 +582,7 @@ def test_dropped_writes_reach_the_status_verdict():
 
 
 def test_an_old_drop_does_not_latch_backlogged_forever():
-    """Review round 2 (PR #260): writes_dropped is cumulative, so any drop —
-    ever — held the verdict at `backlogged` until daemon restart. A recent
-    drop is a live condition; an old one is history, kept visible as the
-    counter but no longer the status."""
+    """Review round 2 (PR #260): writes_dropped is cumulative, so any drop —"""
     from minni.afm_writer import WRITES_DROPPED_RECENT_SECONDS, derive_loop_status
 
     now = 1_000_000.0
@@ -729,16 +604,11 @@ def test_an_old_drop_does_not_latch_backlogged_forever():
     status, reasons = derive_loop_status(recent_drop, schedule=schedule, now=now)
     assert status == "backlogged"
     assert any("REJECTED" in reason for reason in reasons)
-    # Round 4: the reason must present the lifetime count AS a lifetime count,
-    # not as the size of the current incident.
     assert any("lifetime" in reason for reason in reasons)
 
 
 def test_write_timeout_is_counted_and_stamped(monkeypatch):
-    """Review round 3 (PR #260): a slow-but-alive writer returns write_timeout
-    on every wet compile while every other signal stays green — attempts
-    fresh, no failures, queue one deep. Without a counter the condition never
-    reaches any surface."""
+    """Review round 3 (PR #260): a slow-but-alive writer returns write_timeout"""
     from minni import afm_writer
 
     afm_writer.reset_pass_counters()
@@ -755,11 +625,7 @@ def test_write_timeout_is_counted_and_stamped(monkeypatch):
 
 
 def test_resubmit_while_prior_job_in_flight_is_refused_not_duplicated(monkeypatch):
-    """Round 5: a write_timeout response means the job is STILL queued and
-    will land when the writer drains. Re-submitting the pass before then used
-    to enqueue a second generation of the same batch — new trace_id, new
-    page_ids, duplicate wiki files once the queue drained, and a bounded
-    queue filling 288x faster. The writer must refuse, not duplicate."""
+    """Round 5: a write_timeout response means the job is STILL queued and"""
     from minni import afm_writer
 
     afm_writer.reset_pass_counters()
@@ -781,13 +647,11 @@ def test_resubmit_while_prior_job_in_flight_is_refused_not_duplicated(monkeypatc
         "the duplicate batch must be REFUSED, not enqueued behind the stuck one"
     )
 
-    # Another pass is not blocked by this pass's stall.
     other = afm_writer.submit_drafts(
         {"pass_name": "q", "drafts": [{"title": "t3"}]}, timeout=0.01
     )
     assert other["status"] == "write_timeout"
 
-    # Once the prior job lands (its Event sets), the pass may submit again.
     afm_writer._IN_FLIGHT_PER_PASS["p"].set()
     third = afm_writer.submit_drafts(
         {"pass_name": "p", "drafts": [{"title": "t4"}]}, timeout=0.01
@@ -797,9 +661,7 @@ def test_resubmit_while_prior_job_in_flight_is_refused_not_duplicated(monkeypatc
 
 
 def _compile_consolidation_with_write_status(monkeypatch, tmp_path, write_result):
-    """Drive handle_daemon_compile wet through a consolidation run that
-    produces review candidates + drafts, with submit_drafts stubbed to return
-    ``write_result``. Returns (captured_response, applied_spy)."""
+    """Drive handle_daemon_compile wet through a consolidation run that"""
     import minni.afm_passes.consolidation as consolidation_mod
     import minni.afm_writer as afm_writer
     import minni.db as db_mod
@@ -866,11 +728,7 @@ def _compile_consolidation_with_write_status(monkeypatch, tmp_path, write_result
 
 
 def test_refused_drafts_do_not_apply_lifecycle_mutations(monkeypatch, tmp_path):
-    """Round 8: write_in_flight returns WITHOUT raising and the drafts were
-    never enqueued — but apply_consolidation_result ran unconditionally, so
-    candidates were promoted/marked-reviewed while the review drafts that
-    explain those mutations will never exist. The raising failures already
-    skip apply via the except path; the non-raising refusal must too."""
+    """Round 8: write_in_flight returns WITHOUT raising and the drafts were"""
     captured, applied = _compile_consolidation_with_write_status(
         monkeypatch,
         tmp_path,
@@ -894,10 +752,7 @@ def test_accepted_writes_still_apply_lifecycle_mutations(monkeypatch, tmp_path):
 
 
 def test_write_timeout_does_not_apply_lifecycle_mutations(monkeypatch, tmp_path):
-    """Round 9: write_timeout used to apply lifecycle optimistically. A late
-    worker failure then left candidates terminal with no review drafts, and
-    the recency-windowed failure counter aged status back to ok. Treat
-    timeout like write_in_flight — skip apply until drafts are observed."""
+    """Round 9: write_timeout used to apply lifecycle optimistically. A late"""
     captured, applied = _compile_consolidation_with_write_status(
         monkeypatch,
         tmp_path,
@@ -913,10 +768,7 @@ def test_write_timeout_does_not_apply_lifecycle_mutations(monkeypatch, tmp_path)
 def test_lifecycle_recovered_does_not_apply_outer_lifecycle_mutations(
     monkeypatch, tmp_path
 ):
-    """Round 16: lifecycle_recovered re-applies a PRIOR deferred decision set
-    inside the writer and deliberately does not enqueue THIS batch's drafts.
-    The outer compile gate must not apply the NEW result's promote/dedup/
-    review ids (AFM-8 class: terminal candidates with no review drafts)."""
+    """Round 16: lifecycle_recovered re-applies a PRIOR deferred decision set"""
     captured, applied = _compile_consolidation_with_write_status(
         monkeypatch,
         tmp_path,
@@ -935,10 +787,7 @@ def test_lifecycle_recovered_does_not_apply_outer_lifecycle_mutations(
 
 
 def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
-    """Round 8: a batch failing AFTER its submitter timed out had no observer
-    at all — no DraftWriteError (waiter gone), no pass failure, no counter.
-    The worker itself now counts every batch failure.
-    Round 9/13: unrecovered stamps only when the waiter already left."""
+    """Round 8: a batch failing AFTER its submitter timed out had no observer"""
     import threading
 
     from minni import afm_writer
@@ -951,7 +800,6 @@ def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
     monkeypatch.setattr(afm_writer, "_write_batch", _explode)
     done = threading.Event()
     out: dict = {}
-    # Observed failure (waiter still present): write_failures++, no unrecovered.
     afm_writer._process_job({"pass_name": "p", "drafts": [{"title": "t"}]}, done, out)
     assert done.is_set(), "the Event must settle so in-flight state clears"
     assert "error" in out
@@ -962,7 +810,6 @@ def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
         "waiter-gone only"
     )
 
-    # Unobserved failure (waiter_timed_out — waiter already left): unrecovered.
     done2 = threading.Event()
     out2: dict = {}
     afm_writer._process_job(
@@ -980,8 +827,7 @@ def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
 
 
 def test_recent_write_failures_reach_the_status_verdict():
-    """The late failure must reach the verdict like timeouts do — and age out
-    the same way instead of latching (unless unrecovered residue is set)."""
+    """The late failure must reach the verdict like timeouts do — and age out"""
     from minni.afm_writer import WRITE_FAILURES_RECENT_SECONDS, derive_loop_status
 
     now = 1_000_000.0
@@ -1005,8 +851,7 @@ def test_recent_write_failures_reach_the_status_verdict():
 
 
 def test_unrecovered_write_failures_never_age_into_ok():
-    """Round 9: recency-windowed write_failures alone aged into ok over a
-    permanently broken vault. unrecovered_write_failures has no window."""
+    """Round 9: recency-windowed write_failures alone aged into ok over a"""
     from minni.afm_writer import WRITE_FAILURES_RECENT_SECONDS, derive_loop_status
 
     now = 1_000_000.0
@@ -1023,8 +868,7 @@ def test_unrecovered_write_failures_never_age_into_ok():
 
 
 def test_observed_write_failure_does_not_latch_unrecovered_backlogged(monkeypatch):
-    """Round 13: observed DraftWriteError must not stamp unrecovered — a later
-    successful write leaves status free of unrecovered-backlogged."""
+    """Round 13: observed DraftWriteError must not stamp unrecovered — a later"""
     import threading
 
     from minni import afm_writer
@@ -1038,7 +882,6 @@ def test_observed_write_failure_does_not_latch_unrecovered_backlogged(monkeypatc
     monkeypatch.setattr(afm_writer, "_write_batch", _explode)
     done = threading.Event()
     out: dict = {}
-    # Waiter still present — observed failure path.
     afm_writer._process_job(
         {"pass_name": "consolidation", "drafts": [{"title": "t"}]}, done, out
     )
@@ -1046,7 +889,6 @@ def test_observed_write_failure_does_not_latch_unrecovered_backlogged(monkeypatc
     assert afm_writer._UNRECOVERED_WRITE_FAILURES == 0
 
     now = 1_000_000.0
-    # Age the recency-windowed write_failures out; unrecovered must stay 0.
     status, reasons = derive_loop_status(
         {
             "last_attempt_per_pass": {"consolidation": now - 60},
@@ -1088,7 +930,6 @@ def test_personal_vault_index_failure_is_in_degradation():
     shared = _Shared()
     personal = _PersonalBoom()
     context = _make_context(shared, captured)
-    # principal required for personal scope
     principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
     object.__setattr__(
         context,
@@ -1115,8 +956,6 @@ def test_personal_vault_index_failure_is_in_degradation():
     ]
     assert personal_entries, f"expected personal degradation, got {payload['degradation']!r}"
     assert personal_entries[0].get("degraded") is True
-    # Round 14: vector_model from vault engine config / default_config — not
-    # the missing context.config attribute (always null before this fix).
     assert personal_entries[0].get("vector_model") == "m", (
         f"expected embedding model on personal degrade, got {personal_entries[0]!r}"
     )
@@ -1128,13 +967,7 @@ def test_personal_vault_index_failure_is_in_degradation():
 
 
 def test_personal_and_shared_dual_failure_keeps_degradation():
-    """Round 22 Medium: personal boom + hard shared fallback both raised →
-    outer handle_search −32000 dropped the Round 13 personal_index_failed
-    entry. Dual-corpus total failure is exactly when that signal matters.
-
-    Pin: scope personal, both engines raise → 200 body (not error), empty
-    hits, degraded true, personal + shared failure entries present.
-    """
+    """Round 22 Medium: personal boom + hard shared fallback both raised →"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -1199,10 +1032,7 @@ def test_personal_and_shared_dual_failure_keeps_degradation():
 
 
 def test_combined_vault_index_failure_returns_partial_and_degraded():
-    """Round 16: one agent vault throw in retrieve_combined hard-failed the
-    whole search with JSON-RPC −32000. Mirror personal: per-engine try/except,
-    degradation entry, continue — response returns, degraded true, other hits
-    present."""
+    """Round 16: one agent vault throw in retrieve_combined hard-failed the"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -1284,8 +1114,7 @@ def test_combined_vault_index_failure_returns_partial_and_degraded():
 
 
 def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):
-    """Round 10: timeout skips apply in compile, but a late successful write
-    must apply lifecycle once (not mint a second draft set on re-run)."""
+    """Round 10: timeout skips apply in compile, but a late successful write"""
     import threading
 
     from minni import afm_writer
@@ -1303,7 +1132,6 @@ def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):
 
     monkeypatch.setattr(afm_writer, "_write_batch", _slow_write)
     monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
-    # Drive _process_job on a side thread like the real worker.
     done = threading.Event()
     out: dict = {}
     job = {
@@ -1323,7 +1151,6 @@ def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):
     t = threading.Thread(target=_worker)
     t.start()
     assert started.wait(2), "worker must enter the write"
-    # Simulate submit_drafts timeout path: transfer ownership, then release write.
     job["defer_lifecycle_to_worker"] = True
     release.set()
     t.join(timeout=5)
@@ -1333,7 +1160,6 @@ def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):
     assert applied[0]["promote_candidate_ids"] == [1]
     assert applied[0]["review_candidate_ids"] == [2]
     assert job.get("lifecycle_applied") is True
-    # Second call must be a no-op (idempotent).
     afm_writer._maybe_apply_deferred_lifecycle(job)
     assert len(applied) == 1
     afm_writer.reset_pass_counters()
@@ -1359,15 +1185,13 @@ def test_write_finishes_before_defer_flag_still_applies_or_returns_result(monkey
     afm_writer._maybe_apply_deferred_lifecycle(job)
     assert len(applied) == 1
     assert applied[0]["promote_candidate_ids"] == [3]
-    # Claim-before-invoke: second call is a no-op.
     afm_writer._maybe_apply_deferred_lifecycle(job)
     assert len(applied) == 1
     afm_writer.reset_pass_counters()
 
 
 def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
-    """Round 12: in-flight must not clear before deferred lifecycle finishes,
-    or a concurrent resubmit mints a second draft set for the same candidates."""
+    """Round 12: in-flight must not clear before deferred lifecycle finishes,"""
     import threading
     import queue as queue_mod
 
@@ -1404,7 +1228,6 @@ def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
         "lifecycle_handler": _slow_handler,
         "defer_lifecycle_to_worker": True,
     }
-    # Manually register in-flight the way submit_drafts does.
     with afm_writer._IN_FLIGHT_LOCK:
         afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
 
@@ -1417,7 +1240,6 @@ def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
     assert not done.is_set(), (
         "in-flight Event must stay unset while deferred lifecycle runs"
     )
-    # Concurrent resubmit must still be refused.
     second = afm_writer.submit_drafts(
         {"pass_name": "consolidation", "drafts": [{"title": "dup"}]},
         timeout=0.05,
@@ -1433,9 +1255,7 @@ def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
 
 
 def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
-    """Round 13: deferred apply raises after drafts land → sticky refuse + status.
-    Round 14: a later submit re-applies without a second write, then accepts.
-    Round 22: re-apply that terminalizes (applied non-zero) still discards wet batch."""
+    """Round 13: deferred apply raises after drafts land → sticky refuse + status."""
     import threading
     import queue as queue_mod
 
@@ -1458,8 +1278,6 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("db blip during lifecycle")
-        # Round 22: production apply_consolidation_result always writes applied;
-        # non-zero = terminalized candidates → anti-duplicate discard.
         life["applied"] = {"promoted": 1, "deduped": 0, "reviewed": 0}
         calls["applied"].append(dict(life))
 
@@ -1485,7 +1303,6 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     assert "consolidation" in afm_writer._PENDING_LIFECYCLE
     assert writes == ["consolidation"]
 
-    # Round 15: re-apply succeeds and MUST NOT enqueue a second draft batch.
     put_calls = []
     real_put = afm_writer._WORK_QUEUE.put_nowait
 
@@ -1511,7 +1328,6 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     assert put_calls == [], "re-apply must not enqueue a second draft job"
     assert done.is_set(), "re-apply must clear the sticky in-flight Event"
 
-    # A later submit (after recovery) may enqueue normally.
     third = afm_writer.submit_drafts(
         {
             "pass_name": "consolidation",
@@ -1526,7 +1342,6 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     )
     assert len(put_calls) == 1, f"third submit should enqueue once: {put_calls!r}"
 
-    # Synthetic status surface still names deferred lifecycle when counters say so.
     status, reasons = afm_writer.derive_loop_status(
         {
             "last_attempt_per_pass": {"consolidation": 1_000_000.0},
@@ -1542,13 +1357,7 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
 
 
 def test_stale_sticky_noop_reapply_enqueues_wet_batch(monkeypatch):
-    """Round 22 Medium: sticky re-apply that terminalizes nothing (applied
-    all-zero) must NOT discard a wet batch for a new decision set.
-
-    Live sticky (applied non-zero) still returns lifecycle_recovered without
-    enqueue — covered by test_deferred_lifecycle_failure_refuses_resubmit.
-    This arm pins the stale-sticky path: clear + put_nowait.
-    """
+    """Round 22 Medium: sticky re-apply that terminalizes nothing (applied"""
     import threading
     import queue as queue_mod
 
@@ -1569,8 +1378,6 @@ def test_stale_sticky_noop_reapply_enqueues_wet_batch(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("db blip during lifecycle")
-        # Candidates already terminal (operator resolved / apply landed but
-        # sidecar clear failed) → pure no-op.
         life["applied"] = {"promoted": 0, "deduped": 0, "reviewed": 0}
 
     done = threading.Event()
@@ -1624,14 +1431,7 @@ def test_stale_sticky_noop_reapply_enqueues_wet_batch(monkeypatch):
 def test_sticky_deferred_lifecycle_survives_process_restart_simulation(
     tmp_path, monkeypatch
 ):
-    """Round 18: sticky pending was process-memory only. After drafts land and
-    deferred apply fails, a daemon restart cleared _PENDING_LIFECYCLE → next
-    tick re-triaged proposed candidates and minted a second draft set.
-
-    Pin: write OK → apply fails → clear in-memory state (restart) → next
-    submit hydrates from the vault sidecar, re-applies, and does NOT enqueue
-    a second draft batch.
-    """
+    """Round 18: sticky pending was process-memory only. After drafts land and"""
     import threading
     import queue as queue_mod
 
@@ -1655,7 +1455,6 @@ def test_sticky_deferred_lifecycle_survives_process_restart_simulation(
 
     def _handler(life):
         calls["n"] += 1
-        # First apply (pre-restart) fails; post-restart re-apply succeeds.
         if calls["n"] == 1:
             raise RuntimeError("db blip during lifecycle")
         calls["applied"].append(dict(life))
@@ -1687,7 +1486,6 @@ def test_sticky_deferred_lifecycle_survives_process_restart_simulation(
     assert on_disk["consolidation"]["review_candidate_ids"] == [1, 2]
     assert writes == [[1, 2]]
 
-    # Simulate process restart: memory gone, durable file remains.
     with afm_writer._IN_FLIGHT_LOCK:
         afm_writer._PENDING_LIFECYCLE.clear()
         afm_writer._IN_FLIGHT_PER_PASS.clear()
@@ -1702,7 +1500,6 @@ def test_sticky_deferred_lifecycle_survives_process_restart_simulation(
 
     monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
 
-    # Post-restart submit: new drafts (new page_ids / new trace) must NOT land.
     second = afm_writer.submit_drafts(
         {
             "pass_name": "consolidation",
@@ -1730,14 +1527,7 @@ def test_sticky_deferred_lifecycle_survives_process_restart_simulation(
 def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
     tmp_path, monkeypatch
 ):
-    """Round 19: fail deferred apply → set memory under lock → persist was
-    outside the lock. Concurrent submit_drafts re-applied + cleared, then the
-    worker's stale persist rewrote the sidecar → phantom sticky after restart
-    (drops wet drafts on recovery).
-
-    Pin: fail apply → block inside persist RMW → concurrent re-apply clears →
-    release gate → sidecar stays empty; following submit enqueues.
-    """
+    """Round 19: fail deferred apply → set memory under lock → persist was"""
     import threading
     import queue as queue_mod
 
@@ -1757,10 +1547,6 @@ def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
 
     def _gated_persist(pass_name, lifecycle, vault_path):
         entered_persist.set()
-        # Hold the critical section if the implementation keeps persist under
-        # the same lock as the memory set (the fix). A concurrent re-apply
-        # must then wait until we finish, then clear — never interleave a
-        # clear between set and a late write that resurrects the file.
         assert persist_gate.wait(timeout=5.0), "persist gate timed out"
         return real_persist(pass_name, lifecycle, vault_path)
 
@@ -1775,7 +1561,6 @@ def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
 
     def _handler(life):
         calls["n"] += 1
-        # Worker deferred apply fails once; re-apply succeeds.
         if calls["n"] == 1:
             raise RuntimeError("db blip during lifecycle")
         calls["applied"].append(dict(life))
@@ -1808,7 +1593,6 @@ def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
     t = threading.Thread(target=_run_worker, name="sticky-race-worker")
     t.start()
     assert entered_persist.wait(timeout=5.0), "worker never entered persist"
-    # Concurrent re-apply while worker is mid-persist (or mid set+persist CS).
     reapply_result: dict = {}
 
     def _run_reapply():
@@ -1824,8 +1608,6 @@ def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
 
     re_t = threading.Thread(target=_run_reapply, name="sticky-race-reapply")
     re_t.start()
-    # Give re-apply a moment to either block on the lock (fix) or race past
-    # a released lock (bug). Either way release the gate so progress continues.
     time.sleep(0.05)
     persist_gate.set()
     t.join(timeout=5.0)
@@ -1853,7 +1635,6 @@ def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
         return real_put(item)
 
     monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
-    # Following submit (post-recovery) must enqueue — not hit phantom sticky.
     follow = afm_writer.submit_drafts(
         {
             "pass_name": "consolidation",
@@ -1875,14 +1656,7 @@ def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
 def test_sticky_reapply_does_not_hold_inflight_lock_across_handler(
     tmp_path, monkeypatch
 ):
-    """Round 20 High: submit_drafts re-applied sticky lifecycle while holding
-    _IN_FLIGHT_LOCK across handler(payload) (DB/embed work). Concurrent
-    submit_drafts for a *different* pass blocked on the lock for the whole
-    re-apply, freezing writer coordination.
-
-    Pin: slow re-apply handler for consolidation; concurrent synthesis submit
-    must enqueue within a short deadline (not wait on the slow handler).
-    """
+    """Round 20 High: submit_drafts re-applied sticky lifecycle while holding"""
     import threading
     import queue as queue_mod
 
@@ -1936,8 +1710,6 @@ def test_sticky_reapply_does_not_hold_inflight_lock_across_handler(
     re_t.start()
     assert entered_handler.wait(timeout=2.0), "re-apply never entered handler"
 
-    # While consolidation re-apply is mid-handler (outside the lock), a
-    # different pass must still be able to enqueue.
     other = afm_writer.submit_drafts(
         {
             "pass_name": "synthesis",
@@ -1971,13 +1743,7 @@ def test_sticky_reapply_does_not_hold_inflight_lock_across_handler(
 
 
 def test_writer_status_hydrates_durable_sticky_after_restart(tmp_path, monkeypatch):
-    """Round 20 Medium: durable sticky lived in the vault sidecar, but
-    writer_status only read process memory. After restart, health reported
-    pending_lifecycle_passes=0 / ok until the next wet submit hydrated.
-
-    Pin: clear memory, leave sidecar, writer_status must report pending >= 1
-    and a non-ok status naming deferred lifecycle.
-    """
+    """Round 20 Medium: durable sticky lived in the vault sidecar, but"""
     from minni import afm_writer
 
     afm_writer.reset_pass_counters()
@@ -1994,7 +1760,6 @@ def test_writer_status_hydrates_durable_sticky_after_restart(tmp_path, monkeypat
     with afm_writer._IN_FLIGHT_LOCK:
         afm_writer._PENDING_LIFECYCLE["consolidation"] = life
         afm_writer._persist_pending_lifecycle("consolidation", life, str(vault))
-        # Simulate cold start: memory gone, durable file remains.
         afm_writer._PENDING_LIFECYCLE.clear()
 
     assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
@@ -2011,16 +1776,12 @@ def test_writer_status_hydrates_durable_sticky_after_restart(tmp_path, monkeypat
     assert any(
         "deferred lifecycle" in r for r in (state.get("status_reasons") or [])
     ), state
-    # Hydrate is read-only from status — sticky must remain until re-apply.
     assert "consolidation" in afm_writer._PENDING_LIFECYCLE
     afm_writer.reset_pass_counters()
 
 
 def test_shared_index_failure_returns_partial_and_degraded():
-    """Round 18: shared engine throw after agent-vault hits hard-failed the
-    whole search with −32000. Soft-fail shared like combined agent legs —
-    partial hits + degradation, not total loss.
-    """
+    """Round 18: shared engine throw after agent-vault hits hard-failed the"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2083,13 +1844,7 @@ def test_shared_index_failure_returns_partial_and_degraded():
 
 
 def test_both_scope_soft_fails_personal_shared_fallback():
-    """Round 19: scope 'both' ran retrieve_personal() first; personal vault
-    boom fell through to hard retrieve_shared(), which −32000'd before
-    retrieve_combined() could return other agent-vault hits.
-
-    Pin: personal boom + shared boom + healthy combined vault → response
-    returns combined hits, degraded, no JSON-RPC error.
-    """
+    """Round 19: scope 'both' ran retrieve_personal() first; personal vault"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2161,10 +1916,7 @@ def test_both_scope_soft_fails_personal_shared_fallback():
 
 
 def test_both_scope_reports_one_shared_failure_once():
-    """F4: scope 'both' runs the shared engine through two legs — the personal
-    leg's soft shared fallback and retrieve_combined's shared tail — so ONE
-    shared-index outage appended two byte-identical `{"src": "c"}` entries. A
-    caller counting broken corpora read one outage as two."""
+    """F4: scope 'both' runs the shared engine through two legs — the personal"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2184,8 +1936,6 @@ def test_both_scope_reports_one_shared_failure_once():
         "handler_principal",
         lambda params, request_id: (principal, None),
     )
-    # No agent vault and no other vaults: the shared engine is the ONLY corpus,
-    # reached twice. Any duplicate here is pure double-reporting.
     recall_mod.handle_search(
         {"query": "anything", "scope": "both"},
         request_id=1,
@@ -2206,15 +1956,7 @@ def test_both_scope_reports_one_shared_failure_once():
 
 
 def test_a_shared_leg_that_degrades_only_on_the_second_pass_is_still_reported():
-    """Review round 2: the first attempt at the F4 fix let the FIRST shared leg
-    claim the report and silenced the second unconditionally. On scope "both"
-    the shared engine runs twice, so leg one succeeding and leg two throwing
-    produced a response with `degraded: false` — a shared index that failed
-    mid-request, rendered to the agent as a healthy hybrid recall.
-
-    Suppressing a differing second outcome is a health overstatement, which is
-    strictly worse than the over-count it was fixing. Dedupe is by identity, so
-    a second report that DIFFERS is news and must land."""
+    """Review round 2: the first attempt at the F4 fix let the FIRST shared leg"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2222,9 +1964,7 @@ def test_a_shared_leg_that_degrades_only_on_the_second_pass_is_still_reported():
     captured = {}
 
     class _HealthyThenBoom:
-        """Leg one answers; leg two — the same engine, later in the request —
-        throws. This is a real shape: an index can be evicted, locked, or
-        rotated between two passes of one search."""
+        """Leg one answers; leg two — the same engine, later in the request —"""
 
         config = SimpleNamespace(embedding_model="m")
         last_vector_degraded = None
@@ -2263,10 +2003,7 @@ def test_a_shared_leg_that_degrades_only_on_the_second_pass_is_still_reported():
 
 
 def test_one_shared_blackout_is_announced_to_the_agent_once():
-    """Review round 2: `auth_suppression` had the identical double-report on
-    the identical two-leg shared path, and this change is what makes it
-    visible — the plugin renders one line per entry, so one blackout of one
-    corpus was about to be announced to the agent twice."""
+    """Review round 2: `auth_suppression` had the identical double-report on"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2300,15 +2037,7 @@ def test_one_shared_blackout_is_announced_to_the_agent_once():
 
 
 def test_two_distinct_degraded_vaults_are_reported_separately():
-    """The inverse of the F4 fix, and the reason it is scoped to the shared leg
-    instead of deduping the whole report by content (review round 1).
-
-    retrieve_combined's per-vault entries are all src "c" and carry no vault
-    identity, so a content-level dedupe collapses N genuinely-degraded vaults
-    into one whenever they fail alike — and a dead embedder is process-wide, so
-    failing alike is the COMMON case. Under-reporting a fleet-wide outage as a
-    single corpus is the same class of lie as double-reporting one.
-    """
+    """The inverse of the F4 fix, and the reason it is scoped to the shared leg"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2316,8 +2045,6 @@ def test_two_distinct_degraded_vaults_are_reported_separately():
     captured = {}
 
     def _vault():
-        # Byte-identical reports from two genuinely different corpora: same
-        # model, same process-wide encoder outage, no distinguishing field.
         return SimpleNamespace(
             config=SimpleNamespace(embedding_model="m"),
             last_vector_degraded="embedding model unavailable",
@@ -2360,23 +2087,13 @@ def test_two_distinct_degraded_vaults_are_reported_separately():
         "two degraded corpora must be reported as two, not collapsed into one: "
         f"{payload['degradation']!r}"
     )
-    # Review round 3: without this the daemon-side `source_agent` stamp was
-    # deletable with zero failures across the whole suite — the plugin's
-    # attribution test builds its own fixture, so the two halves of the fix
-    # were tested independently and the wire contract between them was not
-    # pinned at all. Two entries that cannot be told apart are not two reports.
     assert {d.get("source_agent") for d in degraded_entries} == {"agent-b", "agent-c"}, (
         "each vault's report must name the vault: " f"{degraded_entries!r}"
     )
 
 
 def test_provider_leg_degrade_details_are_redacted_too():
-    """Review round 1: `_degrade_detail` covered only the three index-failure
-    strings, while `_degradation_for` copied the rerank/query-expand/HyDE flags
-    onto the wire raw — and retrieval.py sets two of them from an UNTRUNCATED
-    `str(exc)`. Those are the provider-calling legs, so their exception text is
-    the likeliest to carry an echoed credential, and the plugin now renders it
-    into agent context."""
+    """Review round 1: `_degrade_detail` covered only the three index-failure"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2388,7 +2105,6 @@ def test_provider_leg_degrade_details_are_redacted_too():
         config = SimpleNamespace(embedding_model="m")
         last_vector_degraded = None
         last_auth_suppression = None
-        # All three provider legs failed with provider-echoed text.
         last_rerank_degraded = leak
         last_query_expand_degraded = leak
         last_hyde_degraded = leak
@@ -2404,16 +2120,12 @@ def test_provider_leg_degrade_details_are_redacted_too():
         assert "sk-live-abc123" not in str(entry[key]), f"{key} leaked a secret: {entry!r}"
         assert "/Users/operator" not in str(entry[key]), f"{key} leaked a path: {entry!r}"
         assert "[REDACTED]" in str(entry[key]) and "[REDACTED_PATH]" in str(entry[key])
-    # The two unbounded flags are also capped now — an exception can be huge.
     long_engine = _Engine()
     long_engine.last_rerank_degraded = "x" * 5000
     context = _make_context(long_engine, captured)
     recall_mod.handle_search({"query": "anything"}, request_id=1, context=context)
     assert len(captured["response"]["degradation"][0]["rerank_degraded"]) <= 400
 
-    # Review round 3: scrubbing must not TYPE-cast. A bare True routed through
-    # str() ships as the string "True", which the renderer then prints as a
-    # failure detail — "rerank_degraded (True)" reads like an error message.
     bool_engine = _Engine()
     bool_engine.last_rerank_degraded = True
     bool_engine.last_query_expand_degraded = None
@@ -2426,10 +2138,7 @@ def test_provider_leg_degrade_details_are_redacted_too():
 
 
 def test_degrade_details_are_redacted_before_they_leave_the_daemon():
-    """F5: the three index-failure details embedded raw `str(exc)`, bypassing
-    the redaction this module already applies to the trace surface and the
-    durable recall trace. Retrieval exceptions routinely carry the failing
-    index path — and whatever a provider echoed back with it."""
+    """F5: the three index-failure details embedded raw `str(exc)`, bypassing"""
     from types import SimpleNamespace
 
     from minni.minnid_runtime import recall as recall_mod
@@ -2478,8 +2187,6 @@ def test_degrade_details_are_redacted_before_they_leave_the_daemon():
     assert "[REDACTED]" in rendered and "[REDACTED_PATH]" in rendered, (
         f"the detail must still say WHAT failed, redacted: {rendered}"
     )
-    # All three details go through the same helper — pin that every leg's
-    # entry was scrubbed, not just the first one seen.
     failures = [
         d
         for d in payload.get("degradation") or []
@@ -2493,10 +2200,7 @@ def test_degrade_details_are_redacted_before_they_leave_the_daemon():
 def test_encode_query_encode_raise_keeps_vector_down_and_empty_vector(
     tmp_path, monkeypatch
 ):
-    """Round 18: encode() raise after optimistic vector_model_down=False left
-    health reading encoder-up and hard-failed. Must keep down flag and return
-    empty vector for FTS-only degrade.
-    """
+    """Round 18: encode() raise after optimistic vector_model_down=False left"""
     import minni.models as models_mod
     import minni.retrieval as retrieval_mod
 
@@ -2505,13 +2209,11 @@ def test_encode_query_encode_raise_keeps_vector_down_and_empty_vector(
             raise RuntimeError("OOM during encode")
 
     boom = _BoomModel()
-    # model property always goes through get_embedder — plant a present-but-broken encoder.
     monkeypatch.setattr(models_mod, "get_embedder", lambda: boom)
     if hasattr(retrieval_mod, "get_embedder"):
         monkeypatch.setattr(retrieval_mod, "get_embedder", lambda: boom)
 
     engine = _engine_without_model(tmp_path, monkeypatch)
-    # Re-plant after helper (helper sets get_embedder → None).
     monkeypatch.setattr(models_mod, "get_embedder", lambda: boom)
     if hasattr(retrieval_mod, "get_embedder"):
         monkeypatch.setattr(retrieval_mod, "get_embedder", lambda: boom)
@@ -2532,8 +2234,7 @@ def test_encode_query_encode_raise_keeps_vector_down_and_empty_vector(
 
 
 def test_timeout_counter_not_bumped_when_result_present_under_lock(monkeypatch):
-    """Round 12: if out already has a result when the wait times out, do not
-    stamp write_timeouts (phantom backlogged on a landed write)."""
+    """Round 12: if out already has a result when the wait times out, do not"""
     import threading
     import queue as queue_mod
 
@@ -2543,24 +2244,18 @@ def test_timeout_counter_not_bumped_when_result_present_under_lock(monkeypatch):
     monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
     monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
 
-    # Publish result into out immediately; never set done until after submit
-    # would have timed out — but out has the result so the lock path returns it.
     hold = threading.Event()
 
     def _write_publish_then_hold(job):
-        # The real worker path is not used; we inject via a custom process.
         return {"drafts_written": [{"page_id": "late"}], "inbox_path": "x"}
 
     monkeypatch.setattr(afm_writer, "_write_batch", _write_publish_then_hold)
 
-    # Drive submit_drafts with a fake worker that fills out before wait ends.
     original_put = afm_writer._WORK_QUEUE.put_nowait
 
     def _put_and_prefill(item):
         job, done, out = item
         out["result"] = {"drafts_written": [{"page_id": "prefilled"}]}
-        # Do not set done — waiter times out, but result is under lock.
-        # Leave done unset so wait() returns False.
         original_put(item)
 
     monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _put_and_prefill)
@@ -2600,7 +2295,6 @@ def test_stale_probe_cache_lock_is_reclaimed(tmp_path, monkeypatch):
     lock = tmp_path / "afm-probe-cache.json.lock"
     monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", str(cache))
     lock.write_text("orphan", encoding="utf-8")
-    # Backdate mtime past the stale threshold.
     old = time_mod.time() - afm_provider.PROBE_CACHE_LOCK_STALE_SECONDS - 5
     os.utime(lock, (old, old))
     assert afm_provider._reclaim_stale_probe_cache_lock() is True
@@ -2608,8 +2302,7 @@ def test_stale_probe_cache_lock_is_reclaimed(tmp_path, monkeypatch):
 
 
 def test_recent_write_timeouts_reach_the_status_verdict():
-    """The chronic-timeout writer must not read `ok`; an old timeout must not
-    latch `backlogged` (same recency discipline as drops)."""
+    """The chronic-timeout writer must not read `ok`; an old timeout must not"""
     from minni.afm_writer import WRITE_TIMEOUTS_RECENT_SECONDS, derive_loop_status
 
     now = 1_000_000.0
@@ -2622,7 +2315,6 @@ def test_recent_write_timeouts_reach_the_status_verdict():
     status, reasons = derive_loop_status(recent, schedule=schedule, now=now)
     assert status == "backlogged"
     assert any("timed out" in reason for reason in reasons)
-    # Round 4: lifetime count labeled as lifetime, recency named explicitly.
     assert any("lifetime" in reason for reason in reasons)
 
     old = {
@@ -2636,11 +2328,7 @@ def test_recent_write_timeouts_reach_the_status_verdict():
 
 
 def test_a_hung_in_flight_job_never_ages_off_the_status_surface(monkeypatch):
-    """Round 6: a worker hung MID-JOB has queue_depth 0 (already dequeued),
-    and later ticks return write_in_flight without refreshing the timeout
-    stamp — so after WRITE_TIMEOUTS_RECENT_SECONDS the surface read `ok`
-    while every submit was still refused. A job in flight NOW is current
-    truth: no recency window."""
+    """Round 6: a worker hung MID-JOB has queue_depth 0 (already dequeued),"""
     import time as time_mod
 
     from minni import afm_writer
@@ -2653,7 +2341,6 @@ def test_a_hung_in_flight_job_never_ages_off_the_status_surface(monkeypatch):
         {"pass_name": "p", "drafts": [{"title": "t"}]}, timeout=0.01
     )
     assert first["status"] == "write_timeout", "precondition: the job is hung"
-    # The worker dequeues the job it is hung inside of; depth goes to 0.
     afm_writer._WORK_QUEUE.get_nowait()
 
     later = time_mod.time() + afm_writer.WRITE_TIMEOUTS_RECENT_SECONDS + 60
@@ -2667,7 +2354,6 @@ def test_a_hung_in_flight_job_never_ages_off_the_status_surface(monkeypatch):
     assert state["status"] == "backlogged"
     assert any("in flight" in r for r in state["status_reasons"])
 
-    # The moment the job lands, the same aged state reads ok again.
     afm_writer._IN_FLIGHT_PER_PASS["p"].set()
     state = afm_writer.writer_status(schedule={"passes": {}}, now=later)
     assert state["jobs_in_flight"] == 0
@@ -2697,9 +2383,6 @@ def test_writer_status_exposes_the_fields_the_verdict_reads():
         assert key in state, f"writer_status must report {key}"
 
 
-# ── GA6-2: consolidation sub-op failures must be counted ─────────────────────
-
-
 @pytest.mark.parametrize(
     "sub_op,counter",
     [
@@ -2712,16 +2395,7 @@ def test_writer_status_exposes_the_fields_the_verdict_reads():
 def test_a_failing_consolidation_sub_op_is_counted_and_attributed(
     sub_op, counter, tmp_path, monkeypatch
 ):
-    """GA6-2, driven end to end: a consolidation sub-op that raises on every
-    tick must climb its own counter and land in the error ring.
-
-    Replaces two source-grep assertions (F2/H5): they matched `obs.incr(...)`
-    and `obs.record_error(...)` in afm.py's text, so wrapping both calls in
-    `if False:` left the whole suite green while the counter stayed flat
-    forever — exactly the invisible-failure shape GA6-2 exists to prevent.
-    This runs one real AFM loop tick with that sub-op raising and reads the
-    counter and the ring afterwards.
-    """
+    """GA6-2, driven end to end: a consolidation sub-op that raises on every"""
     import minni.obs as obs
 
     before = obs.metrics_snapshot().get(counter, 0)
@@ -2739,19 +2413,8 @@ def test_a_failing_consolidation_sub_op_is_counted_and_attributed(
     )
 
 
-# ── AFM-8 (loop level): last_run must not consume the interval on failure ────
-
-
 def test_failed_tick_does_not_consume_the_full_retry_window():
-    """AFM-8: `last_run[name] = time.time()` sat OUTSIDE the try, so a run that
-    accomplished nothing consumed the whole 24h window — a failing pass looked
-    exactly like one that ran and had nothing to do.
-
-    Behavioral, not a source grep. Review round 1 on PR #260 caught that the
-    first version of this fix put the backoff in the loop's `except`, which
-    handle_daemon_compile never reaches because it swallows the exception and
-    RETURNS — so the line was dead and a grep-based test passed anyway.
-    """
+    """AFM-8: `last_run[name] = time.time()` sat OUTSIDE the try, so a run that"""
     from minni.minnid_runtime.afm import _FAILURE_RETRY_SECONDS, next_last_run
 
     interval = 24 * 60 * 60
@@ -2770,44 +2433,26 @@ def test_failed_tick_does_not_consume_the_full_retry_window():
 
 
 def test_a_returned_failure_status_counts_as_a_failed_tick():
-    """The load-bearing half of the fix: handle_daemon_compile does NOT raise,
-    it RETURNS a failure status. If the loop does not read the response, the
-    backoff above never fires and the original defect is still live."""
+    """The load-bearing half of the fix: handle_daemon_compile does NOT raise,"""
     from minni.minnid_runtime.afm import compile_failure_status
 
     assert compile_failure_status({"result": {"status": "afm_unavailable"}}) == "afm_unavailable"
     assert compile_failure_status({"result": {"status": "write_failed"}}) == "write_failed"
-    # Round 2 (PR #260): a hung writer does not raise — submit_drafts waits
-    # out its timeout and RETURNS write_timeout, which handle_daemon_compile
-    # merges into a non-exception response. Missing it here scheduled the next
-    # attempt a full interval later: the same AFM-8 hole, one status name over.
     assert compile_failure_status({"result": {"status": "write_timeout"}}) == "write_timeout"
-    # Round 5: the writer refusing a duplicate submit while the previous batch
-    # is still queued is a failed tick too.
     assert compile_failure_status({"result": {"status": "write_in_flight"}}) == "write_in_flight"
-    # Round 17: lifecycle_recovered re-applied a prior deferred lifecycle and
-    # did NOT enqueue this batch's drafts — soft failure for scheduling so
-    # max_batches=1 cannot burn a full interval after discarded wet work.
     assert compile_failure_status(
         {"result": {"status": "lifecycle_recovered", "drafts_deferred": 2}}
     ) == "lifecycle_recovered"
-    # Round 5: handle_daemon_compile's make_error paths (unsupported
-    # pass_name, vault-guard denial) return a top-level `error` with no
-    # `result` — reading only result.status made those SUCCESSFUL ticks.
     assert compile_failure_status(
         {"jsonrpc": "2.0", "id": None, "error": {"code": -32602, "message": "unsupported pass_name: nope"}}
     ) == "rpc_error"
-    # A successful compile must not be mistaken for a failure.
     assert compile_failure_status({"result": {"status": "ok", "summary": {}}}) is None
     assert compile_failure_status({"result": {"summary": {"examined": 3}}}) is None
     assert compile_failure_status(None) is None
 
 
 def test_an_rpc_error_records_attempt_and_failure():
-    """Round 5: a make_error response returns BEFORE handle_daemon_compile's
-    try body, so neither record_pass_attempt nor record_pass_failure ran — a
-    misconfigured pass failing its argument checks on every tick left the
-    GA4-3 counters silent. The loop records both through record_rpc_error."""
+    """Round 5: a make_error response returns BEFORE handle_daemon_compile's"""
     from minni import afm_writer
     from minni.minnid_runtime.afm import record_rpc_error
 
@@ -2823,12 +2468,7 @@ def test_an_rpc_error_records_attempt_and_failure():
 
 
 def test_a_write_stall_backs_off_longer_than_a_recoverable_fault():
-    """Round 5: write_timeout/write_in_flight mean the previous batch is
-    STILL QUEUED and may yet land — not the nothing-durable-in-flight failure
-    modes the 300s retry was built for. Re-firing the whole pass every 300s
-    against a blocked writer burned LLM compute 288x faster than the old
-    schedule; the writer's in-flight guard stops the duplicates, and this
-    dedicated backoff stops the compute storm."""
+    """Round 5: write_timeout/write_in_flight mean the previous batch is"""
     from minni.minnid_runtime.afm import (
         _FAILURE_RETRY_SECONDS,
         _WRITE_STALL_RETRY_SECONDS,
@@ -2845,13 +2485,11 @@ def test_a_write_stall_backs_off_longer_than_a_recoverable_fault():
 
     stalled = next_last_run(interval, now, True, retry_seconds=_WRITE_STALL_RETRY_SECONDS)
     assert stalled + interval - now == _WRITE_STALL_RETRY_SECONDS
-    # The default (recoverable-fault) backoff is unchanged.
     assert next_last_run(interval, now, True) + interval - now == _FAILURE_RETRY_SECONDS
 
 
 def test_loop_consults_the_returned_status_not_only_exceptions():
-    """Pins the wiring itself: a tick's last_run decision must be reachable
-    from a RETURNED failure, which is the route real pass failures take."""
+    """Pins the wiring itself: a tick's last_run decision must be reachable"""
     from pathlib import Path
 
     import minni.minnid_runtime.afm as afm_mod
@@ -2862,26 +2500,15 @@ def test_loop_consults_the_returned_status_not_only_exceptions():
         "is dead code for the failure mode AFM-8 is about"
     )
     assert "tick_failed" in source and "next_last_run(" in source
-    # Round 5: the backoff class must depend on WHICH failure came back —
-    # a write stall (previous batch still queued) backs off longer.
     assert "tick_failure in _WRITE_STALL_STATUSES" in source
-    # Round 5: rpc_error responses skip handle_daemon_compile's recording,
-    # so the loop itself must record the attempt and the failure.
     assert "record_rpc_error(name, res)" in source
-    # Round 7: an rpc_error's message lives in the top-level `error`, not
-    # result.reason — reading only the latter logged "rpc_error: None".
     assert '(res.get("error") or {}).get("message")' in source
-    # Round 17: lifecycle_recovered is a soft failure — short backoff, but
-    # multi-batch consolidation continues so review pages can still land.
     assert "lifecycle_recovered" in source
     assert 'failure == "lifecycle_recovered"' in source
 
 
 def test_lifecycle_recovered_is_soft_failure_not_full_interval():
-    """Round 17: a tick that only re-applied a prior deferred lifecycle and
-    discarded this batch's drafts must not consume the full pass interval —
-    especially under max_batches_per_tick == 1 where multi-batch drain cannot
-    mask the honesty gap."""
+    """Round 17: a tick that only re-applied a prior deferred lifecycle and"""
     from minni.minnid_runtime.afm import (
         _FAILURE_RETRY_SECONDS,
         _WRITE_STALL_STATUSES,
@@ -2899,7 +2526,6 @@ def test_lifecycle_recovered_is_soft_failure_not_full_interval():
         }
     )
     assert status == "lifecycle_recovered"
-    # Soft failure uses the recoverable backoff, not the write-stall class.
     assert status not in _WRITE_STALL_STATUSES
 
     interval = 24 * 60 * 60
@@ -2908,13 +2534,8 @@ def test_lifecycle_recovered_is_soft_failure_not_full_interval():
     assert stamped + interval - now == _FAILURE_RETRY_SECONDS
 
 
-# ── #230 AFM-9: dropped distillation groups must be counted ──────────────────
-
-
 def test_unreadable_distillation_file_is_counted_and_logged(tmp_path, caplog, monkeypatch):
-    """AFM-9: the malformed-payload branch dropped the group with no counter
-    and no log line, so how much input was discarded was unanswerable from any
-    surface. Fails pre-R8: `_unreadable` was never counted."""
+    """AFM-9: the malformed-payload branch dropped the group with no counter"""
     import logging
 
     import minni.afm_passes.compact_distillation as mod
@@ -2935,10 +2556,7 @@ def test_unreadable_distillation_file_is_counted_and_logged(tmp_path, caplog, mo
 
 
 def test_over_candidate_cap_counts_only_candidate_eligible_sections():
-    """Round 6: the cap-break count was `len(sections) - i - 1`, which swept
-    in personal and skip-titled sections that were never distillation input —
-    overstating how much SHARED input the cap threw away, the exact number
-    AFM-9 exists to answer."""
+    """Round 6: the cap-break count was `len(sections) - i - 1`, which swept"""
     import minni.afm_passes.compact_distillation as mod
 
     filler = "durable transferable learning content, well past the floor."
@@ -2962,8 +2580,7 @@ def test_over_candidate_cap_counts_only_candidate_eligible_sections():
 
 
 def test_distillation_reports_dropped_sections(tmp_path, monkeypatch):
-    """AFM-9: sections dropped mid-distillation vanished on a bare `continue`.
-    Fails pre-R8: `dropped_sections` did not exist in the result."""
+    """AFM-9: sections dropped mid-distillation vanished on a bare `continue`."""
     import minni.afm_passes.compact_distillation as mod
 
     monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
@@ -2975,12 +2592,8 @@ def test_distillation_reports_dropped_sections(tmp_path, monkeypatch):
     assert "dropped_sections" in res
 
 
-# ── GA6-2: health must carry an ingest-failure and inbox-backlog field ───────
-
-
 def test_health_report_declares_consolidation_ingest_fields():
-    """GA6-2: health had no ingest-failure field and no inbox-backlog field at
-    all. Fails pre-R8: the key does not exist in the report."""
+    """GA6-2: health had no ingest-failure field and no inbox-backlog field at"""
     from pathlib import Path
 
     import minni.minnid_runtime.health as health_mod
@@ -2990,16 +2603,8 @@ def test_health_report_declares_consolidation_ingest_fields():
     assert '"inbox_backlog"' in source
 
 
-# ── Review round 1 (PR #260): the degrade flags must be thread-safe ─────────
-
-
 def test_degrade_flags_are_thread_local_like_auth_suppression(tmp_path, monkeypatch):
-    """The daemon hands every `search` RPC the SAME process-wide engine on its
-    own worker thread. A plain instance attribute lets a concurrent request
-    clear this one's flag between retrieve() returning and the handler reading
-    it — reporting a degraded search as healthy, or pinning one caller's
-    failure on another. last_auth_suppression already solved this; the new
-    flags must use the same pattern."""
+    """The daemon hands every `search` RPC the SAME process-wide engine on its"""
     import threading
 
     engine = _engine_without_model(tmp_path, monkeypatch)
@@ -3010,7 +2615,6 @@ def test_degrade_flags_are_thread_local_like_auth_suppression(tmp_path, monkeypa
     seen = {}
 
     def _other_thread():
-        # A concurrent request clearing its own flags, as retrieve() does on entry.
         engine.last_rerank_degraded = None
         engine.last_query_expand_degraded = None
         engine.last_vector_degraded = None
@@ -3030,8 +2634,7 @@ def test_degrade_flags_are_thread_local_like_auth_suppression(tmp_path, monkeypa
 
 
 def test_degrade_flags_work_on_instances_that_bypass_init():
-    """Test fakes built via object.__new__ must still get a working store —
-    the same lazy-init guarantee the auth-suppression setter makes."""
+    """Test fakes built via object.__new__ must still get a working store —"""
     from minni.retrieval import RetrievalEngine
 
     engine = object.__new__(RetrievalEngine)
@@ -3040,20 +2643,11 @@ def test_degrade_flags_work_on_instances_that_bypass_init():
     assert engine.last_rerank_degraded == "boom"
 
 
-# ── Review round 1: a degrade in ANY query variant degrades the merge ───────
-
-
 def test_rerank_degrade_survives_a_later_healthy_variant(tmp_path, monkeypatch):
-    """Each recursive retrieve() clears the flags on entry, so an early
-    variant's failure was wiped by a later healthy one and the merged response
-    reported a clean cross-corpus ordering it did not have. Auth suppressions
-    were already aggregated for exactly this reason; these were not."""
+    """Each recursive retrieve() clears the flags on entry, so an early"""
     import minni.retrieval as retrieval_mod
 
     engine = _engine_without_model(tmp_path, monkeypatch)
-    # Round 23: retrieval expands via expand_query_with_status; patching the
-    # legacy expand_query alone leaves the real rule expander (often 1 variant
-    # for short queries) and this test never exercises multi-variant merge.
     monkeypatch.setattr(
         retrieval_mod,
         "expand_query_with_status",
@@ -3063,9 +2657,6 @@ def test_rerank_degrade_survives_a_later_healthy_variant(tmp_path, monkeypatch):
         retrieval_mod, "expand_query", lambda query, mode="rule": ["v1", "v2"]
     )
 
-    # _filter_candidates runs once per variant on the single-variant path, so
-    # it is a reliable place to stand in for "this variant degraded" without
-    # needing a live reranker configured.
     calls = {"n": 0}
     real_filter = engine._filter_candidates
 
@@ -3087,14 +2678,8 @@ def test_rerank_degrade_survives_a_later_healthy_variant(tmp_path, monkeypatch):
     assert "v1" in engine.last_rerank_degraded
 
 
-# ── Review round 1: the ingest health field must stay ingest-scoped ─────────
-
-
 def test_consolidation_ingest_failures_exclude_other_subsystems():
-    """A bare `_failures_total` suffix filter also swept in
-    afm_pass_failures_total and afm_loop_tick_failures_total, so a synthesis
-    pass fault flipped the INGEST field to failing — one subsystem's problem
-    reported as another's."""
+    """A bare `_failures_total` suffix filter also swept in"""
     from minni.minnid_runtime.health import CONSOLIDATION_FAILURE_COUNTERS
 
     assert "afm_pass_failures_total" not in CONSOLIDATION_FAILURE_COUNTERS
@@ -3105,9 +2690,6 @@ def test_consolidation_ingest_failures_exclude_other_subsystems():
         "inbox_archive_failures_total",
         "compact_distillation_failures_total",
     }
-
-
-# ── Review round 3: the ingest verdict must not latch on lifetime totals ─────
 
 
 def test_counters_stamp_recency():
@@ -3151,12 +2733,7 @@ class _HealthFakeDB:
 
 
 def test_consolidation_ingest_status_does_not_latch_on_old_failures(tmp_path, monkeypatch):
-    """Review round 3 (PR #260): the ingest status was derived from cumulative
-    totals, which nothing ages out — a counter bumped once at boot read
-    `failing` until daemon restart, the same one-way latch round 2 removed
-    from derive_loop_status. Historical failure + no recent activity must be
-    `ok` (with the totals still reported as data); a recent failure must
-    still be `failing`."""
+    """Review round 3 (PR #260): the ingest status was derived from cumulative"""
     import minni.config as cfg_mod
     import minni.minnid as minnid
     from minni import obs
@@ -3172,14 +2749,12 @@ def test_consolidation_ingest_status_does_not_latch_on_old_failures(tmp_path, mo
         obs.incr("inbox_ingest_failures_total")
         op = EffectivePrincipal(agent_id="main", capabilities=["*"])
 
-        # Fresh failure: still failing, totals and recency agree.
         rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
         ingest = rep["consolidation_ingest"]
         assert ingest["status"] == "failing"
         assert ingest["failures"] == {"inbox_ingest_failures_total": 1}
         assert ingest["recent_failures"] == {"inbox_ingest_failures_total": 1}
 
-        # Same counter, aged past the window: history, not a live condition.
         monkeypatch.setattr(
             obs,
             "metrics_last_incremented_at",
@@ -3196,9 +2771,6 @@ def test_consolidation_ingest_status_does_not_latch_on_old_failures(tmp_path, mo
         assert ingest["recent_failures"] == {}
     finally:
         obs.METRICS.reset()
-
-
-# ── helpers ──────────────────────────────────────────────────────────────────
 
 
 def _make_context(engine, captured):
@@ -3228,12 +2800,7 @@ def _make_context(engine, captured):
 
 
 def _engine_without_model(tmp_path, monkeypatch):
-    """A RetrievalEngine whose embedding model never loads.
-
-    ``model`` is a lazy property that re-resolves through models.get_embedder,
-    so the patch has to stay in place for the life of the test — clearing
-    ``_model`` alone just triggers a real (network) model load.
-    """
+    """A RetrievalEngine whose embedding model never loads."""
     import minni.db as db_mod
     import minni.models as models_mod
     import minni.retrieval as retrieval_mod
@@ -3258,13 +2825,7 @@ def _engine_without_model(tmp_path, monkeypatch):
 
 
 def _run_one_afm_loop_tick(tmp_path, monkeypatch, *, failing: str):
-    """Run exactly one consolidation tick of the real AFM loop.
-
-    Every sub-op is stubbed to a benign success except ``failing``, which
-    raises — so whatever the tick then reports about the failure came from
-    afm.py's own handling of it, not from the stub. The consolidation drain
-    itself returns examined=0 so the tick ends after one batch.
-    """
+    """Run exactly one consolidation tick of the real AFM loop."""
     import asyncio
     from types import SimpleNamespace
 
@@ -3282,8 +2843,6 @@ def _run_one_afm_loop_tick(tmp_path, monkeypatch, *, failing: str):
         return _raise
 
     stubs = {
-        # A non-empty _agent_mismatch skip set is what makes the loop attempt
-        # the quarantine sweep at all.
         "inbox_ingest": (
             ingest_mod,
             "ingest",
@@ -3310,7 +2869,6 @@ def _run_one_afm_loop_tick(tmp_path, monkeypatch, *, failing: str):
     for name, (module, attr, ok) in stubs.items():
         monkeypatch.setattr(module, attr, _boom(name) if name == failing else ok)
 
-    # The drain is not under test: one batch, nothing examined, clean status.
     monkeypatch.setattr(
         afm_mod,
         "handle_daemon_compile",
@@ -3345,14 +2903,7 @@ def _run_one_afm_loop_tick(tmp_path, monkeypatch, *, failing: str):
 
 
 def _hyde_engine(tmp_path, monkeypatch):
-    """A RetrievalEngine whose HyDE leg is guaranteed to TRIGGER.
-
-    HyDE fires only when every top hit scores below `hyde_confidence_floor`, so
-    the trigger is arranged with the real config knob (floor 1.0 — every
-    confidence is below it) over one indexed document, not by stubbing
-    should_trigger_hyde. That keeps the decision path under test and leaves
-    only the AFM call itself to the caller's patch.
-    """
+    """A RetrievalEngine whose HyDE leg is guaranteed to TRIGGER."""
     import time
 
     import minni.db as db_mod
@@ -3385,17 +2936,11 @@ def _hyde_engine(tmp_path, monkeypatch):
             "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) VALUES (?, ?, ?, ?, ?)",
             (doc_id, "wiki/aetherkernel.md", "aetherkernel xHCI window notes", "unknown", "?"),
         )
-    # Semantic leg off: this test is about the HyDE leg's honesty, and a real
-    # embedder here would be a network load.
     monkeypatch.setattr(models_mod, "get_embedder", lambda: None)
     if hasattr(retrieval_mod, "get_embedder"):
         monkeypatch.setattr(retrieval_mod, "get_embedder", lambda: None)
     engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
     engine._model = None
-    # Explicitly disable this unrelated leg. An uncached get_embedder stub
-    # alone looks like a cold model to the deadline guard, which correctly
-    # reports a skipped vector/HyDE pass rather than the completed HyDE this
-    # fixture is intended to exercise.
     monkeypatch.setattr(engine, "_semantic_search", lambda *_args, **_kwargs: [])
     return engine
 
@@ -3485,16 +3030,10 @@ class _NullRing:
         return None
 
 
-# ── Round 23: tip App RC on #260 — sticky missing-handler + AFM expand soft-fail ──
-
-
 def test_deferred_lifecycle_missing_handler_records_sticky_and_is_recoverable(
     tmp_path, monkeypatch,
 ):
-    """Medium #1 (PR #260 tip RC): deferred lifecycle with no handler used to
-    hold the pass forever without sticky — log claimed 'later pass' recovery
-    but re-apply never armed. Sticky + next submit with a handler must clear.
-    """
+    """Medium #1 (PR #260 tip RC): deferred lifecycle with no handler used to"""
     import queue as queue_mod
     import threading
 
@@ -3524,7 +3063,6 @@ def test_deferred_lifecycle_missing_handler_records_sticky_and_is_recoverable(
             "dedup_candidate_ids": [],
             "review_candidate_ids": [],
         },
-        # Intentionally absent / non-callable — the defect surface.
         "lifecycle_handler": None,
         "defer_lifecycle_to_worker": True,
     }
@@ -3565,16 +3103,12 @@ def test_deferred_lifecycle_missing_handler_records_sticky_and_is_recoverable(
 
 
 def test_afm_query_expand_soft_fail_sets_degraded_flag(tmp_path, monkeypatch):
-    """Low #3 (PR #260 tip RC): mode=afm with empty AFM used to fall back to
-    rules with degraded=false. Must surface afm_unavailable on the engine flag
-    (parity with HyDE)."""
+    """Low #3 (PR #260 tip RC): mode=afm with empty AFM used to fall back to"""
     import minni.retrieval as retrieval_mod
     import minni.query_expand as qe
 
     engine = _engine_without_model(tmp_path, monkeypatch)
     monkeypatch.setattr(qe, "_afm_expand", lambda query: [])
-    # expand_with_status is bound at import on retrieval; patch the retrieval
-    # module's reference so _resolve_query_variants sees the soft-fail path.
     monkeypatch.setattr(
         retrieval_mod,
         "expand_query_with_status",
@@ -3600,9 +3134,7 @@ def test_expand_with_status_rule_mode_never_degrades():
 
 
 def test_deferred_worker_soft_partial_keeps_sticky_and_hold(monkeypatch):
-    """High (PR #260 tip RC): first deferred apply soft-partial must sticky-hold
-    the same way as re-apply — not only after a raising first apply.
-    """
+    """High (PR #260 tip RC): first deferred apply soft-partial must sticky-hold"""
     import queue as queue_mod
     import threading
 
@@ -3618,7 +3150,6 @@ def test_deferred_worker_soft_partial_keeps_sticky_and_hold(monkeypatch):
     )
 
     def _soft_partial(life):
-        # No raise — remaining_proposed proves incompleteness.
         life["applied"] = {
             "promoted": 1,
             "deduped": 0,
@@ -3671,9 +3202,7 @@ def test_deferred_worker_soft_partial_keeps_sticky_and_hold(monkeypatch):
 
 
 def test_partial_sticky_reapply_keeps_hold_and_refuses_wet(monkeypatch):
-    """High #1 (PR #260 tip RC): sticky re-apply that terminalizes only a
-    subset of deferred IDs must NOT clear sticky or dual-mint the rest.
-    """
+    """High #1 (PR #260 tip RC): sticky re-apply that terminalizes only a"""
     import queue as queue_mod
     import threading
 
@@ -3689,7 +3218,6 @@ def test_partial_sticky_reapply_keeps_hold_and_refuses_wet(monkeypatch):
     )
 
     def _handler(life):
-        # Partial: 1 of 3 promotes — remaining_proposed proves incompleteness.
         life["applied"] = {
             "promoted": 1,
             "deduped": 0,
@@ -3746,8 +3274,7 @@ def test_partial_sticky_reapply_keeps_hold_and_refuses_wet(monkeypatch):
 
 
 def test_legacy_partial_applied_without_remaining_keeps_sticky(monkeypatch):
-    """Legacy handlers that only set promoted=1 of N (no remaining_proposed)
-    must still be treated as incomplete — any() was the High reopen."""
+    """Legacy handlers that only set promoted=1 of N (no remaining_proposed)"""
     import queue as queue_mod
     import threading
 
@@ -3854,12 +3381,10 @@ def test_lifecycle_recovered_counts_discarded_wet_drafts(monkeypatch):
     assert afm_writer._LIFECYCLE_RECOVERED_DRAFTS_DROPPED == 2
     status = afm_writer.writer_status()
     assert status["lifecycle_recovered_drafts_dropped"] == 2
-    # Round 25: counter must drive the verdict (not an orphaned metric).
     assert status["status"] != "ok", status
     assert any("discarded" in r or "lifecycle recovery" in r for r in status["status_reasons"]), (
         status["status_reasons"]
     )
-    # Aged stamp may return to ok when otherwise healthy.
     aged = {
         "lifecycle_recovered_drafts_dropped": 2,
         "last_lifecycle_recovered_drop_at": time_mod.time()
@@ -3883,15 +3408,12 @@ def test_lifecycle_recovered_counts_discarded_wet_drafts(monkeypatch):
 
 
 def test_afm_expand_soft_fail_survives_multi_variant_retrieve(tmp_path, monkeypatch):
-    """High (PR #260 tip RC): parent last_query_expand_degraded must survive
-    multi-variant recursion that clears flags on each child entry.
-    """
+    """High (PR #260 tip RC): parent last_query_expand_degraded must survive"""
     import minni.retrieval as retrieval_mod
     import minni.query_expand as qe
 
     engine = _engine_without_model(tmp_path, monkeypatch)
     monkeypatch.setattr(qe, "_afm_expand", lambda query: [])
-    # Force multi-variant rule fallback so the recursive path runs.
     monkeypatch.setattr(
         retrieval_mod,
         "expand_query_with_status",

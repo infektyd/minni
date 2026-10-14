@@ -1,19 +1,4 @@
-"""Search must yield under the client JSON-RPC kill (audit slice).
-
-Live: search p50 ~202s vs plugin DEFAULT_JSON_RPC_TIMEOUT_MS = 30s. The
-handler runs in asyncio.to_thread (uncancellable). If retrieve() never
-checks a deadline, FTS+FAISS+expand+CE burn the worker after the client
-has already destroyed the socket.
-
-These tests require:
-1. retrieve() skips the semantic/CE legs when deadline_monotonic is already past
-   and still returns FTS hits, marked degraded.
-2. handle_search threads a deadline into retrieve (from timeout_ms, else a
-   default under 30s).
-3. A deadline still in the future does not start encode/FAISS/HyDE/CE when the
-   leftover budget is below the stage floor, after the embedder lock, or after
-   HyDE AFM. Deadline FTS-only hits must not calibrate or qty-delta access_count.
-"""
+"""Search must yield under the client JSON-RPC kill (audit slice)."""
 
 from __future__ import annotations
 
@@ -92,8 +77,6 @@ def test_retrieve_skips_semantic_when_deadline_already_past(tmp_path, monkeypatc
 
 
 def test_retrieve_skips_reranker_load_when_deadline_already_past(tmp_path, monkeypatch):
-    # Production default is reranker_enabled=True. The shared fixture disables
-    # it, which short-circuits `self.reranker` and hides the lazy CE load.
     cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         faiss_index_path=str(tmp_path / "test.faiss"),
@@ -212,7 +195,6 @@ def test_handle_search_passes_deadline_from_timeout_ms():
     assert engine.retrieve_kwargs, "handle_search must call retrieve"
     deadline = engine.retrieve_kwargs[0].get("deadline_monotonic")
     assert deadline is not None
-    # 90% of 8000ms = 7.2s of work budget
     assert before < deadline <= after + 7.2 + 0.5
 
 
@@ -488,11 +470,7 @@ def test_handle_search_records_scores_when_hybrid_completes(tmp_path, monkeypatc
 def test_handle_search_skips_score_record_when_rerank_deadline_degraded(
     tmp_path, monkeypatch
 ):
-    """FAISS finished, CE skipped for deadline: RRF-without-CE must not feed
-    the hybrid window. skip_score_record used to key only off last_vector_degraded
-    containing "search deadline", so this path recorded kind=combined and the
-    next search calibrated against a poisoned window.
-    """
+    """FAISS finished, CE skipped for deadline: RRF-without-CE must not feed"""
     import minni.minnid_runtime.recall as recall_mod
     import minni.retrieval as retrieval_mod
     from minni.scoring import record_score
@@ -591,10 +569,7 @@ def test_expand_deadline_keeps_truncation_and_stamps_only_ran_variants(
 def test_expand_deadline_does_not_propagate_unused_later_variant_raise(
     tmp_path, monkeypatch
 ):
-    """P1: deadline truncation must keep the first ranking if a later unused
-    variant would raise. Eager pool.map started that child and aborted the
-    retrieve; serial (and deadline-aware) never starts it.
-    """
+    """P1: deadline truncation must keep the first ranking if a later unused"""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path)
@@ -687,12 +662,7 @@ def _assert_qty_once_on_winner(engine, before, *, winner="deadline-slice", skipp
 def test_hyde_skips_cross_encoder_property_after_second_pass_deadline(
     tmp_path, monkeypatch
 ):
-    """HyDE must not evaluate self.reranker after AFM/second-FAISS burns the budget.
-
-    The first-pass CE path checks past_search_deadline before the lazy
-    property. The HyDE branch used to do `reranker_enabled and self.reranker`
-    first, which calls get_cross_encoder() on an already-dead client.
-    """
+    """HyDE must not evaluate self.reranker after AFM/second-FAISS burns the budget."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path, hyde_enabled=True, reranker_enabled=True)
@@ -703,8 +673,6 @@ def test_hyde_skips_cross_encoder_property_after_second_pass_deadline(
     def counting_reranker(self):
         loads["ce"] += 1
         if not loads["allow"]:
-            # Do not raise: HyDE's except Exception would swallow it and stamp
-            # last_hyde_degraded from the message, hiding the lazy load.
             loads["hyde_ce"] += 1
         return object()
 
@@ -826,11 +794,7 @@ def test_rerank_skips_predict_after_ce_lock_if_deadline_elapsed(tmp_path, monkey
 def test_hyde_rerank_skips_merge_after_ce_lock_if_deadline_elapsed(
     tmp_path, monkeypatch
 ):
-    """HyDE mirror of test_rerank_skips_predict_after_ce_lock_if_deadline_elapsed.
-
-    First-pass CE must finish; HyDE `_rerank` waits on the lock, deadline
-    elapses, predict is skipped, and unscored HyDE hits must not merge.
-    """
+    """HyDE mirror of test_rerank_skips_predict_after_ce_lock_if_deadline_elapsed."""
     import minni.models as models
     import minni.retrieval as retrieval_mod
     import minni.rerank_cache as rerank_cache
@@ -1068,8 +1032,6 @@ def test_handle_search_records_scores_when_hyde_deadline_skipped_after_hybrid(
     assert n >= 1, (
         "skipped HyDE enrichment must not withhold calibration from a completed hybrid fill"
     )
-    # Whole-request budgeting preserves accounting for the completed document
-    # ranking, but does not start a new learning search after expiry.
     assert int(access["access_count"] or 0) == 0
     assert any(d.get("stage") == "learnings" for d in resp["result"]["degradation"])
     _assert_qty_once_on_winner(engine, before)
@@ -1144,11 +1106,7 @@ def test_expand_merge_skips_neighborhood_afm_when_deadline_elapsed(
 
 
 def test_neighborhood_afm_stops_mid_loop_when_deadline_elapses(tmp_path, monkeypatch):
-    """Mid-loop expire must stop remaining summarize_with_afm calls.
-
-    Does not mock `_add_neighborhood_summaries` away — the helper itself
-    re-checks the deadline before each AFM call.
-    """
+    """Mid-loop expire must stop remaining summarize_with_afm calls."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path)
@@ -1266,12 +1224,7 @@ def _assert_no_hyde_wipe(rows):
 
 
 def test_hyde_in_lock_ce_deadline_does_not_merge_and_restores_rerank(tmp_path, monkeypatch):
-    """HyDE CE can abort after the lock while hyde_apply is still True.
-
-    merge_hyde_results is keyed by doc_id; injecting HyDE-FTS docs would
-    overwrite the first-pass ranking (banana-pudding wipe). First-pass CE
-    completed, so qty still applies and last_rerank_degraded must be restored.
-    """
+    """HyDE CE can abort after the lock while hyde_apply is still True."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path, hyde_enabled=True, reranker_enabled=True)
@@ -1317,12 +1270,7 @@ def test_hyde_in_lock_ce_deadline_does_not_merge_and_restores_rerank(tmp_path, m
 
 
 def test_deadline_skipped_rerank_does_not_bump_access_count(tmp_path, monkeypatch):
-    """FAISS finished, CE skipped for deadline: qty must not treat RRF as a fill.
-
-    Production default is reranker_enabled=True and hyde_enabled=False.
-    skip_score_record already keys off last_rerank_degraded; access_count
-    UPDATE used to key only last_vector_degraded / last_hyde_degraded.
-    """
+    """FAISS finished, CE skipped for deadline: qty must not treat RRF as a fill."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path, reranker_enabled=True, hyde_enabled=False)
@@ -1359,11 +1307,7 @@ def test_deadline_skipped_rerank_does_not_bump_access_count(tmp_path, monkeypatc
 
 
 def test_hyde_inner_semantic_deadline_does_not_merge(tmp_path, monkeypatch):
-    """Deadline skip inside HyDE FAISS/encode must not merge HyDE-FTS docs.
-
-    The pre-stage check can pass, then _semantic_search sets last_vector_degraded
-    and returns [] while hyde_apply stays True.
-    """
+    """Deadline skip inside HyDE FAISS/encode must not merge HyDE-FTS docs."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path, hyde_enabled=True, reranker_enabled=False)
@@ -1558,8 +1502,6 @@ def test_handle_search_mixed_legs_keeps_calibration_after_healthy_then_deadline(
     assert n >= 1, (
         "healthy first-pass hybrid scores must still enter the calibration window"
     )
-    # Whole-request budgeting preserves accounting for the completed document
-    # ranking, but does not start a new learning search after expiry.
     assert int(access["access_count"] or 0) == 0
     assert any(d.get("stage") == "learnings" for d in resp["result"]["degradation"])
     assert _access_count(engine) == before + 1
@@ -1568,9 +1510,7 @@ def test_handle_search_mixed_legs_keeps_calibration_after_healthy_then_deadline(
 def test_handle_search_poisoned_only_ranking_does_not_qty_learnings_after_empty_personal_miss(
     tmp_path, monkeypatch
 ):
-    """Empty personal miss is not a healthy fill. Poisoned-only merged ranking
-    must fail-closed on learnings qty, calibration, and shared document qty.
-    """
+    """Empty personal miss is not a healthy fill. Poisoned-only merged ranking"""
     shared = _engine(tmp_path / "shared")
     vault_cfg = MinniConfig(
         db_path=str(tmp_path / "personal" / "test.db"),
@@ -1651,14 +1591,7 @@ def test_handle_search_poisoned_only_ranking_does_not_qty_learnings_after_empty_
 def test_expand_in_flight_deadline_variant_does_not_merge_or_withhold_qty(
     tmp_path, monkeypatch
 ):
-    """In-flight variant-2 FTS/CE-skip must not RRF-merge into first-pass hybrid.
-
-    Existing truncation tests expire the clock on variant-1 FTS so variant 2
-    never starts. This pin lets the second retrieve run, skip CE, and still
-    drop its FTS-only banana-pudding hits before _merge_expanded_results.
-    Qty/calibration follow the completed first-pass ranking, not a sticky
-    any-variant last_vector_degraded / last_rerank_degraded join.
-    """
+    """In-flight variant-2 FTS/CE-skip must not RRF-merge into first-pass hybrid."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path, reranker_enabled=True, hyde_enabled=False)
@@ -1787,8 +1720,6 @@ def test_handle_search_expand_deadline_variant_still_records_hybrid_qty(
     assert n >= 1, (
         "expand deadline variant must not withhold calibration from a completed hybrid fill"
     )
-    # Whole-request budgeting preserves accounting for the completed document
-    # ranking, but does not start a new learning search after expiry.
     assert int(access["access_count"] or 0) == 0
     assert any(d.get("stage") == "learnings" for d in resp["result"]["degradation"])
     _assert_qty_once_on_winner(engine, before)
@@ -1797,12 +1728,7 @@ def test_handle_search_expand_deadline_variant_still_records_hybrid_qty(
 def test_expand_in_flight_deadline_variant_keeps_degraded_fill_after_first_pass_miss(
     tmp_path, monkeypatch
 ):
-    """Original-query miss must not drop in-flight variant-2 FTS/CE-skip hits.
-
-    per_variant == [[]] is list-of-lists nonempty, so the expand drop used to
-    discard banana-pudding FTS before _merge_expanded_results and return
-    empty under default expand=True. Keep the degraded later fill.
-    """
+    """Original-query miss must not drop in-flight variant-2 FTS/CE-skip hits."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path, reranker_enabled=True, hyde_enabled=False)
@@ -1939,13 +1865,7 @@ def test_handle_search_expand_deadline_after_miss_returns_degraded_fill(
 def test_expand_deadline_between_variants_keeps_degraded_fill_after_original_miss(
     tmp_path, monkeypatch
 ):
-    """Loop gate must not treat per_variant == [[]] as a completed ranking.
-
-    The existing in-flight pin expires the clock *inside* variant-2 semantic,
-    so the loop-gate hole stays green. Expire after the original-query child
-    returns empty: variant 2 must still start, and cheap FTS after the
-    deadline must be kept (post-child drop already keys off any(per_variant)).
-    """
+    """Loop gate must not treat per_variant == [[]] as a completed ranking."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path, reranker_enabled=True, hyde_enabled=False)
@@ -2105,11 +2025,7 @@ def test_handle_search_expand_deadline_between_variants_returns_degraded_fill(
 def test_handle_search_deadline_fts_miss_does_not_bump_learnings_access_count(
     tmp_path,
 ):
-    """Empty deadline document ranking is an aborted search: learnings stay 0.
-
-    _caller_visible_deadline_poisoned([]) is False, so skip_score_record used
-    to fail-open and search_learnings still bumped access_count.
-    """
+    """Empty deadline document ranking is an aborted search: learnings stay 0."""
     engine = _engine(tmp_path)
     now = time.time()
     with engine.db.cursor() as c:
@@ -2151,12 +2067,7 @@ def test_handle_search_deadline_fts_miss_does_not_bump_learnings_access_count(
 def test_handle_search_personal_vault_deadline_fts_miss_does_not_bump_learnings(
     tmp_path, monkeypatch
 ):
-    """scope=personal vault empty deadline miss must not key skip off shared.
-
-    retrieve_from(vault) returns [] after a deadline FTS miss and never
-    touches shared, so skip_score_record used to stay False while
-    search_learnings still qty-delta'd the shared learnings row.
-    """
+    """scope=personal vault empty deadline miss must not key skip off shared."""
     shared = _engine(tmp_path / "shared")
     vault_cfg = MinniConfig(
         db_path=str(tmp_path / "personal" / "test.db"),
@@ -2227,11 +2138,7 @@ def test_handle_search_personal_vault_deadline_fts_miss_does_not_bump_learnings(
 
 
 def test_merge_document_results_does_not_replace_hybrid_with_poisoned_twin():
-    """scope=both identity merge must not let a later FTS-only twin win.
-
-    Negative CE logit vs RRF>0 used to replace a completed hybrid row with
-    a deadline-poisoned later-scope copy of the same identity.
-    """
+    """scope=both identity merge must not let a later FTS-only twin win."""
     hybrid = {
         "doc_id": 1,
         "chunk_id": 10,
@@ -2254,11 +2161,7 @@ def test_merge_document_results_does_not_replace_hybrid_with_poisoned_twin():
 
 
 def test_merge_document_results_poisoned_fts_does_not_evict_hybrid_at_limit():
-    """Unmatched deadline FTS (RRF>0) must not take every [:limit] slot.
-
-    Negative CE logits sort below FTS RRF, so extra poisoned identities used
-    to wipe a completed hybrid fill after identity-dedupe of twins only.
-    """
+    """Unmatched deadline FTS (RRF>0) must not take every [:limit] slot."""
     hybrid = [
         {
             "doc_id": i,
@@ -2388,8 +2291,7 @@ def test_semantic_search_skips_cold_faiss_rebuild_with_twenty_s_leftover(
 def test_semantic_search_skips_cold_faiss_rebuild_with_default_handle_search_leftover(
     tmp_path, monkeypatch
 ):
-    """Default handle_search leftover is 22.5s (25s * 0.9). Disk restore must
-    still run; a disk-miss rebuild must not start."""
+    """Default handle_search leftover is 22.5s (25s * 0.9). Disk restore must"""
     leftover_s = (DEFAULT_SEARCH_BUDGET_MS / 1000.0) * SEARCH_BUDGET_CLIENT_FRACTION
     assert leftover_s == 22.5
     _assert_cold_faiss_rebuild_skipped(tmp_path, monkeypatch, leftover_s=22.5)
@@ -2407,8 +2309,7 @@ def test_semantic_search_skips_cold_faiss_rebuild_with_recall_memory_leftover(
 def test_semantic_search_disk_hit_warms_faiss_with_default_handle_search_leftover(
     tmp_path, monkeypatch
 ):
-    """Default leftover 22.5s is <= the 27s rebuild floor; a disk hit must
-    still make FAISS ready instead of skipping _ensure_faiss_loaded entirely."""
+    """Default leftover 22.5s is <= the 27s rebuild floor; a disk hit must"""
     leftover_s = (DEFAULT_SEARCH_BUDGET_MS / 1000.0) * SEARCH_BUDGET_CLIENT_FRACTION
     assert leftover_s == 22.5
     _assert_leftover_disk_hit_becomes_ready(tmp_path, monkeypatch, leftover_s=22.5)
@@ -2423,9 +2324,7 @@ def test_semantic_search_disk_hit_warms_faiss_with_recall_memory_leftover(
 
 
 def test_faiss_load_lock_timeout_is_surplus_above_rebuild_floor(monkeypatch):
-    """Default leftover (22.5s / 27s) must not wait on a held rebuild lock.
-    Remaining above SEARCH_FAISS_REBUILD_MIN_REMAINING_S may wait the surplus.
-    Unbounded (no deadline) blocks."""
+    """Default leftover (22.5s / 27s) must not wait on a held rebuild lock."""
     import minni.retrieval as retrieval_mod
 
     fn = getattr(retrieval_mod, "faiss_load_lock_timeout", None)
@@ -2446,10 +2345,7 @@ def test_faiss_load_lock_timeout_is_surplus_above_rebuild_floor(monkeypatch):
 
 
 def test_invalidate_shared_faiss_reloads_unbounded(tmp_path, monkeypatch):
-    """Vault-watch invalidate used to leave FAISS cold for 'the next search'.
-    Default leftover is <=27s, so that next search now skips in-request
-    rebuild. Reload off the RPC, even if this thread has a stale leftover
-    deadline and disk misses."""
+    """Vault-watch invalidate used to leave FAISS cold for 'the next search'."""
     import minni.minnid as minnid
 
     engine = _engine(tmp_path)
@@ -2469,11 +2365,7 @@ def test_invalidate_shared_faiss_reloads_unbounded(tmp_path, monkeypatch):
 
 
 def test_refresh_live_faiss_exception_reloads_unbounded(tmp_path, monkeypatch):
-    """`_refresh_live_faiss` on exception invalidate()s so 'next search
-    reloads from DB', but default leftover now skips that rebuild. Disk
-    restore also misses because generation/checksum moved. Unbounded
-    reload after invalidate, even if this thread holds a leftover
-    deadline."""
+    """`_refresh_live_faiss` on exception invalidate()s so 'next search"""
     engine = _engine(tmp_path)
     _ensure_chunk_embeddings(engine)
     engine._ensure_faiss_loaded()
@@ -2601,13 +2493,7 @@ def _assert_cold_faiss_rebuild_skipped(tmp_path, monkeypatch, leftover_s: float)
 def test_semantic_search_lock_wait_leftover_skip_sets_vector_degraded(
     tmp_path, monkeypatch
 ):
-    """27.1s leftover is above SEARCH_STAGE_MIN_REMAINING_S so ensure runs.
-    After lock-wait, leftover in (2, 27] and FAISS still cold must not look
-    like a genuine miss.
-
-    Boom-mocking _ensure_faiss_loaded hid this: the caller only re-checked
-    past_search_deadline (2s floor) and returned [] with no last_vector_degraded.
-    """
+    """27.1s leftover is above SEARCH_STAGE_MIN_REMAINING_S so ensure runs."""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path)
@@ -2682,11 +2568,7 @@ def test_semantic_search_lock_wait_leftover_skip_sets_vector_degraded(
 def test_semantic_search_skips_held_faiss_lock_without_waiting_out_rebuild(
     tmp_path, monkeypatch
 ):
-    """Default leftover still took `_faiss_load_lock` blocking *before*
-    `should_skip_faiss_rebuild`. Warmup/vault-watch hold that lock for the
-    whole SELECT+build; a 25s/30s worker then outlives DEFAULT_JSON_RPC
-    kill. Pin: lock held → leftover skip without waiting out the rebuild.
-    """
+    """Default leftover still took `_faiss_load_lock` blocking *before*"""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path)
@@ -2751,12 +2633,7 @@ def test_semantic_search_skips_held_faiss_lock_without_waiting_out_rebuild(
 def test_handle_search_faiss_leftover_skip_keeps_hybrid_sibling_at_limit(
     tmp_path, monkeypatch
 ):
-    """Inner leftover skip must stamp poison so mixed-scope merge keeps hybrid.
-
-    27.1s leftover enters real _ensure_faiss_loaded; disk-miss clock drop to
-    leftover 17.1s skips rebuild and leaves FAISS cold. Unstamped FTS RRF>0
-    otherwise occupies [:limit] ahead of a completed hybrid (negative CE logit).
-    """
+    """Inner leftover skip must stamp poison so mixed-scope merge keeps hybrid."""
     import minni.minnid_runtime.recall as recall_mod
     import minni.retrieval as retrieval_mod
 
@@ -2884,7 +2761,6 @@ def test_handle_sm_export_pack_passes_deadline_from_timeout_ms():
     assert engine.retrieve_kwargs, "handle_sm_export_pack must call retrieve"
     deadline = engine.retrieve_kwargs[0].get("deadline_monotonic")
     assert deadline is not None
-    # 90% of 8000ms = 7.2s of work budget
     assert before < deadline <= after + 7.2 + 0.5
 
 
@@ -2905,8 +2781,7 @@ def test_handle_sm_export_pack_default_budget_is_under_jsonrpc_30s():
 def test_encode_skips_cold_embedder_load_with_default_leftover(
     tmp_path, monkeypatch
 ):
-    """Default leftover (~22.5s) is above the 8s cold-load floor and still
-    cannot finish HuggingFace/SentenceTransformer() before JSON-RPC kill."""
+    """Default leftover (~22.5s) is above the 8s cold-load floor and still"""
     import minni.retrieval as retrieval_mod
 
     engine = _engine(tmp_path)
@@ -3096,11 +2971,7 @@ def test_dispatch_stamps_accepted_monotonic_before_to_thread_dequeue(monkeypatch
 
 
 def test_backfill_clear_rewarms_vault_engines_unbounded(tmp_path, monkeypatch):
-    """Backfill cleared the per-vault cache with no ensure: the replacements
-    were cold FAISSIndex, and default leftover never rebuilds in-request — so
-    the next personal search degraded to FTS-only. The sweep must
-    unbounded-ensure after the clear (mirroring the vault watch), so an
-    immediate personal search is semantic, not FTS-only."""
+    """Backfill cleared the per-vault cache with no ensure: the replacements"""
     import minni.backfill as backfill_mod
     import minni.minnid as minnid
 
@@ -3132,7 +3003,6 @@ def test_backfill_clear_rewarms_vault_engines_unbounded(tmp_path, monkeypatch):
         "default leftover never rebuilds a cold index in-request"
     )
 
-    # Immediate personal search on a default leftover: semantic, no fallback.
     rows = engine.retrieve(
         "sockets",
         limit=5,
@@ -3148,10 +3018,7 @@ def test_backfill_clear_rewarms_vault_engines_unbounded(tmp_path, monkeypatch):
 
 
 def test_sighup_clear_rewarms_vault_engines_unbounded(tmp_path, monkeypatch):
-    """_reload_runtime_config cleared the per-vault cache with no ensure —
-    the same cold-strand class as backfill. Signal handlers are plain
-    functions, so the real path is directly testable: after SIGHUP the vault
-    engines must be warm despite a stale leftover deadline on this thread."""
+    """_reload_runtime_config cleared the per-vault cache with no ensure —"""
     import minni.minnid as minnid
 
     engine = _engine(tmp_path)
