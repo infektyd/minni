@@ -40,22 +40,29 @@ def _strip_leading_frontmatter(text: str) -> str:
 
 
 def _fts_execute_with_retry(
-    cursor, sql, params, *, attempts: int = _FTS_RETRY_ATTEMPTS
+    cursor, sql, params, *, attempts: Optional[int] = None
 ):
     """Execute a vault_fts MATCH select and fetch its rows with bounded retry
     on transient schema-cookie / vtable-reconnect races."""
+    import minni.retrieval as _ret
+
+    effective_attempts = (
+        int(_ret._FTS_RETRY_ATTEMPTS) if attempts is None else int(attempts)
+    )
+    markers = getattr(_ret, "_FTS_TRANSIENT_MARKERS", _FTS_TRANSIENT_MARKERS)
+    backoffs = getattr(_ret, "_FTS_RETRY_BACKOFFS", _FTS_RETRY_BACKOFFS)
     last_exc: Optional[sqlite3.OperationalError] = None
-    for attempt in range(attempts):
+    for attempt in range(effective_attempts):
         try:
             cursor.execute(sql, params)
             return cursor.fetchall()
         except sqlite3.OperationalError as exc:
-            if not any(m in str(exc).lower() for m in _FTS_TRANSIENT_MARKERS):
+            if not any(m in str(exc).lower() for m in markers):
                 raise
             last_exc = exc
-            if attempt + 1 >= attempts:
+            if attempt + 1 >= effective_attempts:
                 break
-            time.sleep(_FTS_RETRY_BACKOFFS[min(attempt, len(_FTS_RETRY_BACKOFFS) - 1)])
+            _ret.time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
     assert last_exc is not None
     raise last_exc
 
@@ -181,7 +188,7 @@ class FtsSearchMixin:
                     "evidence_refs": row["evidence_refs"],
                     "indexed_at": row["indexed_at"],
                     "layer": row["layer"] or "knowledge",
-                    "chunk_text": _strip_leading_frontmatter(row["chunk_text"] or ""),
+                    "chunk_text": _ret._strip_leading_frontmatter(row["chunk_text"] or ""),
                 })
 
         return results
@@ -388,7 +395,7 @@ class FtsSearchMixin:
                 "rrf_score": None,
                 "fts_rank": None,
                 "sem_rank": None,
-                "chunk_text": _strip_leading_frontmatter(row["chunk_text"] or ""),
+                "chunk_text": _ret._strip_leading_frontmatter(row["chunk_text"] or ""),
                 "heading_context": row["heading_context"] or "",
                 "decay_score": row["decay_score"] or 1.0,
                 "page_status": row["page_status"] or "candidate",

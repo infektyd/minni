@@ -21,6 +21,19 @@ class _FakeEmbedder:
         return vec
 
 
+class _WarmEngine:
+    count = 5
+
+    def __init__(self):
+        self.faiss_index = self
+        self.invalidated = False
+        _WarmEngine.invalidated = False
+
+    def invalidate(self):
+        self.invalidated = True
+        _WarmEngine.invalidated = True
+
+
 def _install_fake_embedder(monkeypatch):
     import minni.models as models
 
@@ -318,16 +331,6 @@ def test_sweep_invalidates_the_live_engine_faiss(tmp_path, monkeypatch):
     _install_fake_embedder(monkeypatch)
     cfg = _make_cfg(tmp_path)
     monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
-
-    class _WarmEngine:
-        def __init__(self):
-            self.faiss_index = self
-
-        count = 5
-        invalidated = False
-
-        def invalidate(self):
-            type(self).invalidated = True
 
     engine = _WarmEngine()
     monkeypatch.setattr(minnid, "_retrieval", engine)
@@ -832,16 +835,6 @@ def test_purge_only_sweep_invalidates_the_live_faiss(tmp_path, monkeypatch):
         conn.commit()
     finally:
         conn.close()
-
-    class _WarmEngine:
-        def __init__(self):
-            self.faiss_index = self
-
-        count = 5
-        invalidated = False
-
-        def invalidate(self):
-            type(self).invalidated = True
 
     monkeypatch.setattr(minnid, "_retrieval", _WarmEngine())
 

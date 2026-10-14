@@ -1853,18 +1853,24 @@ def test_all_proposed_superseded_fence_does_not_prefer(tmp_path):
     assert groups[0]["loser_ids"] == [high]
 
 
+class _OperationalErrorCursor:
+    def __init__(self, msg: str):
+        self._msg = msg
+
+    def execute(self, *args, **kwargs):
+        import sqlite3
+
+        raise sqlite3.OperationalError(self._msg)
+
+
 def test_fence_query_lock_is_not_laundered_into_empty_set():
     """High: a broken fence SELECT must raise, not look like nobody is fenced."""
     import sqlite3
 
     from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
 
-    class BoomCursor:
-        def execute(self, *args, **kwargs):
-            raise sqlite3.OperationalError("database is locked")
-
     with pytest.raises(sqlite3.OperationalError, match="locked"):
-        _active_afm_review_ids_on_cursor(BoomCursor())
+        _active_afm_review_ids_on_cursor(_OperationalErrorCursor("database is locked"))
 
 
 def test_fence_query_unexpected_schema_is_not_laundered_into_empty_set():
@@ -1873,25 +1879,20 @@ def test_fence_query_unexpected_schema_is_not_laundered_into_empty_set():
 
     from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
 
-    class BoomCursor:
-        def execute(self, *args, **kwargs):
-            raise sqlite3.OperationalError("no such column: claim")
-
     with pytest.raises(sqlite3.OperationalError, match="no such column"):
-        _active_afm_review_ids_on_cursor(BoomCursor())
+        _active_afm_review_ids_on_cursor(_OperationalErrorCursor("no such column: claim"))
 
 
 def test_fence_query_missing_table_returns_empty_set():
     """Pre-014 installs lack consolidation_actions — that is not a fault."""
-    import sqlite3
-
     from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
 
-    class MissingTableCursor:
-        def execute(self, *args, **kwargs):
-            raise sqlite3.OperationalError("no such table: consolidation_actions")
-
-    assert _active_afm_review_ids_on_cursor(MissingTableCursor()) == set()
+    assert (
+        _active_afm_review_ids_on_cursor(
+            _OperationalErrorCursor("no such table: consolidation_actions")
+        )
+        == set()
+    )
 
 
 class _FenceSelectLockCursor:

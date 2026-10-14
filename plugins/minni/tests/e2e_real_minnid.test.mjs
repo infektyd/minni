@@ -32,7 +32,7 @@ async function waitForDaemonReady(sockPath, proc, timeoutMs = 15000) {
 test("Real minnid E2E over Unix socket: ping -> learn -> list_candidates -> resolve_candidate -> fast search (<15ms)", async (t) => {
   // Keep socket path well under the 104-byte macOS AF_UNIX sun_path limit
   const tmpRoot = await mkdtemp("/tmp/mn-e2e-");
-  const sockPath = path.join(tmpRoot, "m.sock");
+  const sockPath = path.join(tmpRoot, "minnid.sock");
   const principalsDir = path.join(tmpRoot, "principals");
   const claudeVault = path.join(tmpRoot, "claudecode-vault");
   const sharedVault = path.join(tmpRoot, "shared");
@@ -171,37 +171,34 @@ test("Real minnid E2E over Unix socket: ping -> learn -> list_candidates -> reso
   assert.equal(resolveRes.data.new_status, "accepted");
   assert.equal(typeof resolveRes.data.learning_id, "number");
 
-  // 5. Warm + timed `search` in `mode: "fast"` as `claude-code`
-  await jsonRpcSocketRequest(
-    sockPath,
-    "search",
-    {
-      query: `${uniqueToken} sub-15ms fast search`,
-      mode: "fast",
-      agent_id: "claude-code",
-      workspace_id: "default",
-    },
-    { timeoutMs: 5000 },
-  );
+  // 5. Warm + timed `search` in `mode: "fast"` as `claude-code` (< 15 ms warm latency)
+  const searchParams = {
+    query: `${uniqueToken} sub-15ms fast search`,
+    mode: "fast",
+    agent_id: "claude-code",
+    workspace_id: "default",
+  };
+  await jsonRpcSocketRequest(sockPath, "search", searchParams, { timeoutMs: 5000 });
+  await jsonRpcSocketRequest(sockPath, "search", searchParams, { timeoutMs: 5000 });
 
-  const t0 = performance.now();
-  const searchRes = await jsonRpcSocketRequest(
-    sockPath,
-    "search",
-    {
-      query: `${uniqueToken} sub-15ms fast search`,
-      mode: "fast",
-      agent_id: "claude-code",
-      workspace_id: "default",
-    },
-    { timeoutMs: 5000 },
-  );
-  const elapsedMs = performance.now() - t0;
+  let searchRes = null;
+  let elapsedMs = Infinity;
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    const res = await jsonRpcSocketRequest(sockPath, "search", searchParams, {
+      timeoutMs: 5000,
+    });
+    const dt = performance.now() - t0;
+    if (dt < elapsedMs) {
+      elapsedMs = dt;
+    }
+    searchRes = res;
+  }
   assert.equal(searchRes.ok, true, `search failed: ${JSON.stringify(searchRes)}`);
   assert.equal(searchRes.data.degraded, false);
   assert.ok(
-    elapsedMs < 25,
-    `Expected warm fast search over Unix socket < 25ms (engine < 15ms), got ${elapsedMs.toFixed(2)}ms`,
+    elapsedMs < 15,
+    `Expected warm fast search over Unix socket < 15ms, got ${elapsedMs.toFixed(2)}ms`,
   );
   assert.equal(
     formatDegradation(searchRes.data),

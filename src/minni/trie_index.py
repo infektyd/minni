@@ -6,6 +6,23 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
+def _strip_frontmatter(text: str) -> str:
+    if not text:
+        return ""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            nl = text.find("\n", end + 4)
+            return text[nl + 1 :].lstrip() if nl != -1 else ""
+    return text
+
+
+def _tokenize_trie_text(text: str) -> List[str]:
+    if not text:
+        return []
+    return [tok for tok in re.findall(r"[a-z0-9_]{2,}", text.lower()) if len(tok) >= 2]
+
+
 class TrieIndexMixin:
     """Tier 1 Reflex: in-memory inverted prefix/token Trie (< 0.5 ms)."""
 
@@ -15,22 +32,8 @@ class TrieIndexMixin:
         "is", "in", "on", "to", "of", "by", "at", "as", "or", "not",
     })
 
-    @staticmethod
-    def _strip_frontmatter(text: str) -> str:
-        if not text:
-            return ""
-        if text.startswith("---"):
-            end = text.find("\n---", 3)
-            if end != -1:
-                nl = text.find("\n", end + 4)
-                return text[nl + 1 :].lstrip() if nl != -1 else ""
-        return text
-
-    @staticmethod
-    def _tokenize_trie_text(text: str) -> List[str]:
-        if not text:
-            return []
-        return [tok for tok in re.findall(r"[a-z0-9_]{2,}", text.lower()) if len(tok) >= 2]
+    _strip_frontmatter = staticmethod(_strip_frontmatter)
+    _tokenize_trie_text = staticmethod(_tokenize_trie_text)
 
     def _index_doc_in_trie(
         self,
@@ -49,6 +52,8 @@ class TrieIndexMixin:
         indexed_at: Any,
         layer: str,
     ) -> None:
+        import minni.retrieval as _ret
+
         if getattr(self, "_trie_docs", None) is None:
             return
         lock = getattr(self, "_trie_lock", None)
@@ -84,7 +89,7 @@ class TrieIndexMixin:
                     self._trie_max_doc_id = max(
                         int(getattr(self, "_trie_max_doc_id", 0) or 0), int(doc_id)
                     )
-                    self._trie_checked_at = time.monotonic()
+                    self._trie_checked_at = _ret.time.monotonic()
                 except Exception:
                     pass
 
@@ -97,9 +102,11 @@ class TrieIndexMixin:
         ]
 
     def _ensure_trie_loaded(self) -> None:
+        import minni.retrieval as _ret
+
         if getattr(self, "db", None) is None:
             return
-        now_mono = time.monotonic()
+        now_mono = _ret.time.monotonic()
         if (
             getattr(self, "_trie_docs", None) is not None
             and (now_mono - float(getattr(self, "_trie_checked_at", 0.0) or 0.0)) < 30.0
@@ -110,7 +117,7 @@ class TrieIndexMixin:
             lock = threading.Lock()
             self._trie_lock = lock
         with lock:
-            now_mono = time.monotonic()
+            now_mono = _ret.time.monotonic()
             if (
                 getattr(self, "_trie_docs", None) is not None
                 and (now_mono - float(getattr(self, "_trie_checked_at", 0.0) or 0.0)) < 30.0

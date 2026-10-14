@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -53,7 +54,7 @@ from minni.request_deadline import (
 from minni.safety import is_instruction_like
 from minni.semantic_rerank import SemanticRerankMixin
 from minni.timestamps import parse_epoch_or_report
-from minni.trie_index import TrieIndexMixin
+from minni.trie_index import TrieIndexMixin, _strip_frontmatter, _tokenize_trie_text
 from minni.wiki_indexer import WikiFrontmatter
 
 logger = logging.getLogger("sovereign.retrieval")
@@ -1748,240 +1749,37 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
 
         parent_expand_degraded = state.query_expand_degraded
         if len(query_variants) > 1:
-            total_t0 = time.perf_counter()
-            variant_suppressions: List[Dict] = []
-            variant_rerank_degraded: List[str] = []
-            variant_expand_degraded: List[str] = []
-            variant_vector_degraded: List[str] = []
-            variant_hyde_degraded: List[str] = []
-            variant_document_hydration_degraded: List[str] = []
-            variant_states = [RetrievalCallState() for _ in query_variants]
-            truncated_expand = None
-
-            def _run_variant(index: int) -> List[Dict]:
-                return self.retrieve(
-                    query=query_variants[index],
-                    limit=limit,
-                    agent_id=agent_id,
-                    update_access=False,
-                    budget_tokens=budget_tokens,
-                    depth=depth,
-                    include_superseded=include_superseded,
-                    include_rejected=include_rejected,
-                    include_drafts=include_drafts,
-                    include_expired=include_expired,
-                    backend=backend,
-                    layers=layers,
-                    sort=sort,
-                    start_date=start_date,
-                    end_date=end_date,
-                    expand=False,
-                    summarize_neighborhood=False,
-                    use_hyde=use_hyde,
-                    cross_agent=cross_agent,
-                    claim=claim,
-                    document_agent_filter=document_agent_filter,
-                    principal=principal,
-                    workspace=workspace,
-                    deadline_monotonic=deadline_monotonic,
-                    mode=mode,
-                    _state=variant_states[index],
-                )
-
-            def _child_deadline_poisoned(child: RetrievalCallState) -> bool:
-                return any(
-                    flag and "search deadline" in str(flag).lower()
-                    for flag in (child.vector_degraded, child.rerank_degraded)
-                )
-
-            def _record_kept_child(variant: str, child: RetrievalCallState) -> None:
-                if child.auth_suppression:
-                    variant_suppressions.append(
-                        {**child.auth_suppression, "variant": variant}
-                    )
-                if child.rerank_degraded:
-                    variant_rerank_degraded.append(
-                        f"{variant}: {child.rerank_degraded}"
-                    )
-                if child.query_expand_degraded:
-                    variant_expand_degraded.append(
-                        f"{variant}: {child.query_expand_degraded}"
-                    )
-                if child.vector_degraded:
-                    variant_vector_degraded.append(
-                        f"{variant}: {child.vector_degraded}"
-                    )
-                if child.hyde_degraded:
-                    variant_hyde_degraded.append(
-                        f"{variant}: {child.hyde_degraded}"
-                    )
-                if child.document_hydration_degraded:
-                    variant_document_hydration_degraded.append(
-                        f"{variant}: {child.document_hydration_degraded}"
-                    )
-
-            def _should_drop_deadline_child(
-                child: RetrievalCallState, kept_rows: List[List[Dict]]
-            ) -> bool:
-                prior_ranking = any(kept_rows)
-                prior_deadline_poisoned = any(
-                    "search deadline" in str(flag).lower()
-                    for flag in (
-                        *variant_vector_degraded,
-                        *variant_rerank_degraded,
-                    )
-                )
-                return (
-                    prior_ranking
-                    and _child_deadline_poisoned(child)
-                    and not prior_deadline_poisoned
-                )
-
-            per_variant: List[List[Dict]] = []
-            ran_variants: List[str] = []
-            use_variant_pool = (
-                RETRIEVAL_VARIANT_PARALLEL and deadline_monotonic is None
+            return self._retrieve_expanded_variants(
+                query=query,
+                query_variants=query_variants,
+                parent_expand_degraded=parent_expand_degraded,
+                state=state,
+                limit=limit,
+                agent_id=agent_id,
+                update_access=update_access,
+                budget_tokens=budget_tokens,
+                depth=depth,
+                include_superseded=include_superseded,
+                include_rejected=include_rejected,
+                include_drafts=include_drafts,
+                include_expired=include_expired,
+                backend=backend,
+                layers=layers,
+                sort=sort,
+                start_date=start_date,
+                end_date=end_date,
+                expand=expand,
+                summarize_neighborhood=summarize_neighborhood,
+                use_hyde=use_hyde,
+                cross_agent=cross_agent,
+                claim=claim,
+                claim_text=claim_text,
+                document_agent_filter=document_agent_filter,
+                principal=principal,
+                workspace=workspace,
+                deadline_monotonic=deadline_monotonic,
+                mode=mode,
             )
-            if use_variant_pool:
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(_MAX_VARIANT_WORKERS, len(query_variants)),
-                    thread_name_prefix="minni-variant",
-                ) as _variant_pool:
-                    bound = [
-                        bind_copied_deadline(_run_variant, index)
-                        for index in range(len(query_variants))
-                    ]
-                    raw_rows = list(_variant_pool.map(run_bound, bound))
-                for variant, rows, child in zip(
-                    query_variants, raw_rows, variant_states
-                ):
-                    if _should_drop_deadline_child(child, per_variant):
-                        truncated_expand = "search deadline; truncated query expand"
-                        break
-                    per_variant.append(rows)
-                    ran_variants.append(variant)
-                    _record_kept_child(variant, child)
-            else:
-                for index, variant in enumerate(query_variants):
-                    if any(per_variant) and past_search_deadline(deadline_monotonic):
-                        truncated_expand = "search deadline; truncated query expand"
-                        break
-                    try:
-                        rows = _run_variant(index)
-                    except RequestDeadlineExceeded:
-                        truncated_expand = "search deadline; truncated query expand"
-                        break
-                    child = variant_states[index]
-                    if _should_drop_deadline_child(child, per_variant):
-                        truncated_expand = "search deadline; truncated query expand"
-                        break
-                    per_variant.append(rows)
-                    ran_variants.append(variant)
-                    _record_kept_child(variant, child)
-
-            results = self._merge_expanded_results(per_variant, ran_variants, limit)
-            state.rerank_degraded = (
-                "; ".join(variant_rerank_degraded) if variant_rerank_degraded else None
-            )
-            child_expand = (
-                "; ".join(variant_expand_degraded) if variant_expand_degraded else None
-            )
-            if parent_expand_degraded and child_expand:
-                merged_expand = f"{parent_expand_degraded}; {child_expand}"
-            else:
-                merged_expand = parent_expand_degraded or child_expand
-            if truncated_expand:
-                state.query_expand_degraded = (
-                    f"{merged_expand}; {truncated_expand}"
-                    if merged_expand
-                    else truncated_expand
-                )
-            else:
-                state.query_expand_degraded = merged_expand
-            state.vector_degraded = (
-                "; ".join(variant_vector_degraded) if variant_vector_degraded else None
-            )
-            state.hyde_degraded = (
-                "; ".join(variant_hyde_degraded) if variant_hyde_degraded else None
-            )
-            state.document_hydration_degraded = (
-                "; ".join(variant_document_hydration_degraded)
-                if variant_document_hydration_degraded
-                else None
-            )
-            if variant_suppressions:
-                total_pre = sum(s.get("pre_gate", 0) for s in variant_suppressions)
-                state.auth_suppression = {
-                    "pre_gate": total_pre,
-                    "suppressed": total_pre,
-                    "reason": "; ".join(
-                        str(s.get("reason", "")) for s in variant_suppressions
-                    ),
-                    "variants": [s.get("variant") for s in variant_suppressions],
-                }
-            else:
-                state.auth_suppression = None
-            if summarize_neighborhood and not past_search_deadline(deadline_monotonic):
-                results = self._add_neighborhood_summaries(
-                    results,
-                    principal=principal,
-                    workspace=workspace,
-                    deadline_monotonic=deadline_monotonic,
-                )
-            if update_access and not self._deadline_skipped_vector():
-                with self.db.cursor() as c:
-                    for result in results:
-                        if result.get("doc_id") is None:
-                            continue
-                        c.execute(
-                            """UPDATE documents
-                               SET access_count = access_count + 1, last_accessed = ?
-                               WHERE doc_id = ?""",
-                            (time.time(), result["doc_id"]),
-                        )
-            try:
-                expanded_trace = {
-                    "query": query,
-                    "variants": ran_variants,
-                    "expansion": {"mode": expand, "variant_count": len(ran_variants)},
-                    "final_ordering": [
-                        {
-                            "doc_id": r.get("doc_id"),
-                            "score": r.get("score"),
-                            "matched_query_variants": r.get(
-                                "matched_query_variants", []
-                            ),
-                        }
-                        for r in results
-                    ],
-                    "timing": {
-                        "total_ms": round(
-                            (time.perf_counter() - total_t0) * 1000, 3
-                        ),
-                    },
-                }
-                if claim_text:
-                    expanded_trace["claim"] = claim_text
-                    expanded_trace["attribution_scores"] = [
-                        {
-                            "doc_id": r.get("doc_id"),
-                            "chunk_id": r.get("chunk_id"),
-                            "attribution": r.get("attribution"),
-                            "score": r.get("attribution_score"),
-                        }
-                        for r in results
-                        if r.get("attribution_score") is not None
-                    ]
-                expanded_trace_id = _trace_ring().add(
-                    expanded_trace, owner=getattr(principal, "agent_id", None)
-                )
-                self.last_trace_id = expanded_trace_id
-                for result in results:
-                    result["trace_id"] = expanded_trace_id
-            except Exception as exc:
-                logger.debug("expanded trace capture failed: %s", exc)
-                self.last_trace_id = None
-            return results
 
         total_t0 = time.perf_counter()
         timing = {
@@ -2282,23 +2080,9 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                         {"doc_id": r.get("doc_id"), "score": r.get("rerank_score")}
                         for r in merged
                     ]
-                    ce_floor = -1.0 if not fts_results else -4.0
-                    merged = [
-                        r
-                        for r in merged
-                        if not (
-                            r.get("fts_rank") is None
-                            and r.get("raw_rerank_score") is not None
-                            and (
-                                float(r["raw_rerank_score"]) < -4.0
-                                or (
-                                    float(r["raw_rerank_score"]) < ce_floor
-                                    and float(r.get("similarity") or 0.0) < 0.35
-                                )
-                            )
-                        )
-                    ]
-                    merged = merged[: max(self.config.reranker_final_k, limit)]
+                    merged = self._apply_post_rerank_confidence_floor(
+                        merged, fts_results, limit
+                    )
                 else:
                     merged = merged[:limit]
             else:
@@ -2313,188 +2097,18 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 self.last_hyde_degraded = "search deadline; skipped hyde"
                 hyde_enabled = False
             if hyde_enabled:
-                try:
-                    from minni.hyde import (
-                        generate_hypothetical_answer,
-                        merge_hyde_results,
-                        should_trigger_hyde,
-                    )
-                    from minni.scoring import compute_confidence
-
-                    probe_results = []
-                    for r in merged[:limit]:
-                        probe = dict(r)
-                        ce_probe = r.get("raw_rerank_score", r.get("rerank_score"))
-                        rrf_probe = r.get("rrf_score")
-                        if ce_probe is None and rrf_probe is not None:
-                            rrf_probe = float(rrf_probe) * (20.0 / 61.0)
-                        probe["confidence"] = compute_confidence(
-                            rrf_score=rrf_probe,
-                            cross_encoder_score=ce_probe,
-                            decay_factor=r.get("decay_applied", r.get("decay_score")),
-                            db=None,
-                        )
-                        probe_results.append(probe)
-
-                    if should_trigger_hyde(
-                        probe_results,
-                        enabled=True,
-                        floor=self.config.hyde_confidence_floor,
-                    ):
-                        trace["hyde"]["triggered"] = True
-                        trace["hyde"]["confidence_floor"] = (
-                            self.config.hyde_confidence_floor
-                        )
-                        if past_search_deadline(deadline_monotonic) or past_search_deadline(
-                            deadline_monotonic, min_remaining=2.0
-                        ):
-                            self.last_hyde_degraded = "search deadline; skipped hyde"
-                            trace["hyde"]["completed"] = False
-                            trace["hyde"]["skipped"] = "deadline"
-                        else:
-                            hypothetical = generate_hypothetical_answer(
-                                query, config=self.config
-                            )
-                            if not hypothetical:
-                                trace["hyde"]["completed"] = False
-                                trace["hyde"]["skipped"] = "afm_unavailable"
-                                self.last_hyde_degraded = "afm_unavailable"
-                                logger.warning(
-                                    "HyDE leg degraded: AFM produced no hypothetical "
-                                    "answer — results are the un-enriched first pass"
-                                )
-                            elif past_search_deadline(deadline_monotonic):
-                                self.last_hyde_degraded = "search deadline; skipped hyde"
-                                trace["hyde"]["completed"] = False
-                                trace["hyde"]["skipped"] = "deadline"
-                            else:
-                                trace["hyde"]["hypothetical_chars"] = len(hypothetical)
-                                if document_agent_filter is None:
-                                    hyde_fts = _collect_eligible(
-                                        lambda window: self._fts_search(
-                                            hypothetical,
-                                            window,
-                                            exclude_statuses=skip_list,
-                                        ),
-                                        rerank_k,
-                                        sql_window=True,
-                                    )
-                                else:
-                                    hyde_fts = _collect_eligible(
-                                        lambda window: self._fts_search(
-                                            hypothetical,
-                                            window,
-                                            agent_filter=document_agent_filter,
-                                            exclude_statuses=skip_list,
-                                        ),
-                                        rerank_k,
-                                        sql_window=True,
-                                    )
-                                first_pass_vector = self.last_vector_degraded
-                                first_pass_rerank = self.last_rerank_degraded
-                                hyde_apply = True
-                                hyde_merged_applied = False
-                                try:
-                                    if past_search_deadline(deadline_monotonic):
-                                        hyde_semantic = []
-                                        self.last_hyde_degraded = (
-                                            "search deadline; skipped hyde"
-                                        )
-                                        trace["hyde"]["completed"] = False
-                                        trace["hyde"]["skipped"] = "deadline"
-                                        hyde_apply = False
-                                    else:
-                                        hyde_semantic = _collect_eligible(
-                                            lambda window: self._semantic_search(
-                                                hypothetical, window
-                                            ),
-                                            rerank_k,
-                                        )
-                                    vector_flag = self.last_vector_degraded
-                                    if (
-                                        hyde_apply
-                                        and vector_flag
-                                        and "search deadline" in str(vector_flag).lower()
-                                    ):
-                                        self.last_hyde_degraded = (
-                                            "search deadline; skipped hyde"
-                                        )
-                                        trace["hyde"]["completed"] = False
-                                        trace["hyde"]["skipped"] = "deadline"
-                                        hyde_apply = False
-                                    if hyde_apply:
-                                        hyde_semantic = _eligible(hyde_semantic)
-                                        hyde_merged = self._rrf_merge(
-                                            hyde_fts, hyde_semantic, rerank_k
-                                        )
-                                        hyde_merged = _eligible(hyde_merged)
-                                        if self.config.reranker_enabled:
-                                            if past_search_deadline(deadline_monotonic):
-                                                self.last_hyde_degraded = (
-                                                    "search deadline; skipped hyde"
-                                                )
-                                                trace["hyde"]["completed"] = False
-                                                trace["hyde"]["skipped"] = "deadline"
-                                                hyde_apply = False
-                                            elif self.reranker:
-                                                hyde_merged = self._rerank(
-                                                    query, hyde_merged
-                                                )
-                                                rerank_flag = self.last_rerank_degraded
-                                                if (
-                                                    rerank_flag
-                                                    and "search deadline"
-                                                    in str(rerank_flag).lower()
-                                                ):
-                                                    self.last_hyde_degraded = (
-                                                        "search deadline; skipped hyde"
-                                                    )
-                                                    trace["hyde"]["completed"] = False
-                                                    trace["hyde"]["skipped"] = "deadline"
-                                                    hyde_apply = False
-                                                else:
-                                                    hyde_merged = hyde_merged[
-                                                        : max(
-                                                            self.config.reranker_final_k,
-                                                            limit,
-                                                        )
-                                                    ]
-                                            else:
-                                                hyde_merged = hyde_merged[:limit]
-                                        else:
-                                            hyde_merged = hyde_merged[:limit]
-                                    if hyde_apply and (
-                                        past_search_deadline(deadline_monotonic)
-                                        or self._deadline_skipped_vector()
-                                    ):
-                                        hyde_apply = False
-                                        self.last_hyde_degraded = (
-                                            "search deadline; skipped hyde"
-                                        )
-                                        trace["hyde"]["completed"] = False
-                                        trace["hyde"]["skipped"] = "deadline"
-                                    if hyde_apply:
-                                        merged = merge_hyde_results(
-                                            merged,
-                                            hyde_merged,
-                                            limit=rerank_k,
-                                            rrf_k=self.config.rrf_k,
-                                        )[:limit]
-                                        hyde_merged_applied = True
-                                        trace["hyde"]["result_doc_ids"] = [
-                                            r.get("doc_id") for r in hyde_merged
-                                        ]
-                                finally:
-                                    if not hyde_merged_applied:
-                                        self.last_vector_degraded = first_pass_vector
-                                        self.last_rerank_degraded = first_pass_rerank
-                        trace["hyde"].setdefault("completed", True)
-                except Exception as exc:
-                    logger.warning("HyDE leg failed after retrieval pass: %s", exc)
-                    trace["hyde"]["completed"] = False
-                    trace["hyde"]["skipped"] = "error"
-                    trace["hyde"]["error"] = str(exc)
-                    self._current_state().hyde_degraded = str(exc)[:400]
+                merged = self._run_hyde_enrichment(
+                    query=query,
+                    merged=merged,
+                    limit=limit,
+                    rerank_k=rerank_k,
+                    skip_list=skip_list,
+                    document_agent_filter=document_agent_filter,
+                    deadline_monotonic=deadline_monotonic,
+                    trace=trace,
+                    eligible_fn=_eligible,
+                    collect_eligible_fn=_collect_eligible,
+                )
 
         merged = self._apply_feedback_demotions(merged, query, agent_id)
 
@@ -2571,6 +2185,543 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             logger.warning("Unknown depth=%r, falling back to 'snippet'", depth)
             depth = "snippet"
 
+        results = self._format_retrieved_results(
+            merged=merged,
+            depth=depth,
+            claim_text=claim_text,
+            query_variants=query_variants,
+            update_access=update_access,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+        trace["decay_factors"] = [
+            {"doc_id": r.get("doc_id"), "decay_factor": r.get("decay_score")}
+            for r in merged
+        ]
+        trace["final_ordering"] = [
+            {
+                "doc_id": r.get("doc_id"),
+                "chunk_id": r.get("chunk_id"),
+                "score": r.get("rerank_score", r.get("final_score", 0.0)),
+                "feedback_demote": r.get("feedback_demote", 0.0),
+                "adjusted_score": r.get("feedback_adjusted_score"),
+            }
+            for r in merged
+        ]
+        if claim_text:
+            trace["claim"] = claim_text
+            trace["attribution_scores"] = [
+                {
+                    "doc_id": r.get("doc_id"),
+                    "chunk_id": r.get("chunk_id"),
+                    "attribution": r.get("attribution"),
+                    "score": r.get("attribution_score"),
+                }
+                for r in merged
+                if r.get("attribution_score") is not None
+            ]
+        timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
+        timing["embedding_ms"] = round(self._take_encode_ms(), 3)
+        try:
+            single_trace_id = _trace_ring().add(
+                trace, owner=getattr(principal, "agent_id", None)
+            )
+            self.last_trace_id = single_trace_id
+            for result in results:
+                result["trace_id"] = single_trace_id
+        except Exception as exc:
+            logger.debug("trace capture failed: %s", exc)
+            self.last_trace_id = None
+
+        if summarize_neighborhood and not past_search_deadline(deadline_monotonic):
+            results = self._add_neighborhood_summaries(
+                results,
+                principal=principal,
+                workspace=workspace,
+                deadline_monotonic=deadline_monotonic,
+            )
+
+        return results
+
+    def _retrieve_expanded_variants(
+        self,
+        *,
+        query: str,
+        query_variants: List[str],
+        parent_expand_degraded: Optional[str],
+        state: RetrievalCallState,
+        limit: int,
+        agent_id: Optional[str],
+        update_access: bool,
+        budget_tokens: bool,
+        depth: str,
+        include_superseded: bool,
+        include_rejected: bool,
+        include_drafts: bool,
+        include_expired: bool,
+        backend,
+        layers: Optional[Sequence[str]],
+        sort: Literal["semantic", "chronological"],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        expand,
+        summarize_neighborhood: bool,
+        use_hyde: Optional[bool],
+        cross_agent: bool,
+        claim: Optional[str],
+        claim_text: str,
+        document_agent_filter: Optional[Sequence[str]],
+        principal: Optional[EffectivePrincipal],
+        workspace: str,
+        deadline_monotonic: Optional[float],
+        mode: Optional[str],
+    ) -> List[Dict]:
+        """Fan out expanded query variants, merge results, and record expanded trace."""
+        total_t0 = time.perf_counter()
+        variant_suppressions: List[Dict] = []
+        variant_rerank_degraded: List[str] = []
+        variant_expand_degraded: List[str] = []
+        variant_vector_degraded: List[str] = []
+        variant_hyde_degraded: List[str] = []
+        variant_document_hydration_degraded: List[str] = []
+        variant_states = [RetrievalCallState() for _ in query_variants]
+        truncated_expand = None
+
+        def _run_variant(index: int) -> List[Dict]:
+            return self.retrieve(
+                query=query_variants[index],
+                limit=limit,
+                agent_id=agent_id,
+                update_access=False,
+                budget_tokens=budget_tokens,
+                depth=depth,
+                include_superseded=include_superseded,
+                include_rejected=include_rejected,
+                include_drafts=include_drafts,
+                include_expired=include_expired,
+                backend=backend,
+                layers=layers,
+                sort=sort,
+                start_date=start_date,
+                end_date=end_date,
+                expand=False,
+                summarize_neighborhood=False,
+                use_hyde=use_hyde,
+                cross_agent=cross_agent,
+                claim=claim,
+                document_agent_filter=document_agent_filter,
+                principal=principal,
+                workspace=workspace,
+                deadline_monotonic=deadline_monotonic,
+                mode=mode,
+                _state=variant_states[index],
+            )
+
+        def _child_deadline_poisoned(child: RetrievalCallState) -> bool:
+            return any(
+                flag and "search deadline" in str(flag).lower()
+                for flag in (child.vector_degraded, child.rerank_degraded)
+            )
+
+        def _record_kept_child(variant: str, child: RetrievalCallState) -> None:
+            if child.auth_suppression:
+                variant_suppressions.append(
+                    {**child.auth_suppression, "variant": variant}
+                )
+            if child.rerank_degraded:
+                variant_rerank_degraded.append(
+                    f"{variant}: {child.rerank_degraded}"
+                )
+            if child.query_expand_degraded:
+                variant_expand_degraded.append(
+                    f"{variant}: {child.query_expand_degraded}"
+                )
+            if child.vector_degraded:
+                variant_vector_degraded.append(
+                    f"{variant}: {child.vector_degraded}"
+                )
+            if child.hyde_degraded:
+                variant_hyde_degraded.append(
+                    f"{variant}: {child.hyde_degraded}"
+                )
+            if child.document_hydration_degraded:
+                variant_document_hydration_degraded.append(
+                    f"{variant}: {child.document_hydration_degraded}"
+                )
+
+        def _should_drop_deadline_child(
+            child: RetrievalCallState, kept_rows: List[List[Dict]]
+        ) -> bool:
+            prior_ranking = any(kept_rows)
+            prior_deadline_poisoned = any(
+                "search deadline" in str(flag).lower()
+                for flag in (
+                    *variant_vector_degraded,
+                    *variant_rerank_degraded,
+                )
+            )
+            return (
+                prior_ranking
+                and _child_deadline_poisoned(child)
+                and not prior_deadline_poisoned
+            )
+
+        per_variant: List[List[Dict]] = []
+        ran_variants: List[str] = []
+        use_variant_pool = (
+            RETRIEVAL_VARIANT_PARALLEL and deadline_monotonic is None
+        )
+        if use_variant_pool:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(_MAX_VARIANT_WORKERS, len(query_variants)),
+                thread_name_prefix="minni-variant",
+            ) as _variant_pool:
+                bound = [
+                    bind_copied_deadline(_run_variant, index)
+                    for index in range(len(query_variants))
+                ]
+                raw_rows = list(_variant_pool.map(run_bound, bound))
+            for variant, rows, child in zip(
+                query_variants, raw_rows, variant_states
+            ):
+                if _should_drop_deadline_child(child, per_variant):
+                    truncated_expand = "search deadline; truncated query expand"
+                    break
+                per_variant.append(rows)
+                ran_variants.append(variant)
+                _record_kept_child(variant, child)
+        else:
+            for index, variant in enumerate(query_variants):
+                if any(per_variant) and past_search_deadline(deadline_monotonic):
+                    truncated_expand = "search deadline; truncated query expand"
+                    break
+                try:
+                    rows = _run_variant(index)
+                except RequestDeadlineExceeded:
+                    truncated_expand = "search deadline; truncated query expand"
+                    break
+                child = variant_states[index]
+                if _should_drop_deadline_child(child, per_variant):
+                    truncated_expand = "search deadline; truncated query expand"
+                    break
+                per_variant.append(rows)
+                ran_variants.append(variant)
+                _record_kept_child(variant, child)
+
+        results = self._merge_expanded_results(per_variant, ran_variants, limit)
+        state.rerank_degraded = (
+            "; ".join(variant_rerank_degraded) if variant_rerank_degraded else None
+        )
+        child_expand = (
+            "; ".join(variant_expand_degraded) if variant_expand_degraded else None
+        )
+        if parent_expand_degraded and child_expand:
+            merged_expand = f"{parent_expand_degraded}; {child_expand}"
+        else:
+            merged_expand = parent_expand_degraded or child_expand
+        if truncated_expand:
+            state.query_expand_degraded = (
+                f"{merged_expand}; {truncated_expand}"
+                if merged_expand
+                else truncated_expand
+            )
+        else:
+            state.query_expand_degraded = merged_expand
+        state.vector_degraded = (
+            "; ".join(variant_vector_degraded) if variant_vector_degraded else None
+        )
+        state.hyde_degraded = (
+            "; ".join(variant_hyde_degraded) if variant_hyde_degraded else None
+        )
+        state.document_hydration_degraded = (
+            "; ".join(variant_document_hydration_degraded)
+            if variant_document_hydration_degraded
+            else None
+        )
+        if variant_suppressions:
+            total_pre = sum(s.get("pre_gate", 0) for s in variant_suppressions)
+            state.auth_suppression = {
+                "pre_gate": total_pre,
+                "suppressed": total_pre,
+                "reason": "; ".join(
+                    str(s.get("reason", "")) for s in variant_suppressions
+                ),
+                "variants": [s.get("variant") for s in variant_suppressions],
+            }
+        else:
+            state.auth_suppression = None
+        if summarize_neighborhood and not past_search_deadline(deadline_monotonic):
+            results = self._add_neighborhood_summaries(
+                results,
+                principal=principal,
+                workspace=workspace,
+                deadline_monotonic=deadline_monotonic,
+            )
+        if update_access and not self._deadline_skipped_vector():
+            with self.db.cursor() as c:
+                for result in results:
+                    if result.get("doc_id") is None:
+                        continue
+                    c.execute(
+                        """UPDATE documents
+                           SET access_count = access_count + 1, last_accessed = ?
+                           WHERE doc_id = ?""",
+                        (time.time(), result["doc_id"]),
+                    )
+        try:
+            expanded_trace = {
+                "query": query,
+                "variants": ran_variants,
+                "expansion": {"mode": expand, "variant_count": len(ran_variants)},
+                "final_ordering": [
+                    {
+                        "doc_id": r.get("doc_id"),
+                        "score": r.get("score"),
+                        "matched_query_variants": r.get(
+                            "matched_query_variants", []
+                        ),
+                    }
+                    for r in results
+                ],
+                "timing": {
+                    "total_ms": round(
+                        (time.perf_counter() - total_t0) * 1000, 3
+                    ),
+                },
+            }
+            if claim_text:
+                expanded_trace["claim"] = claim_text
+                expanded_trace["attribution_scores"] = [
+                    {
+                        "doc_id": r.get("doc_id"),
+                        "chunk_id": r.get("chunk_id"),
+                        "attribution": r.get("attribution"),
+                        "score": r.get("attribution_score"),
+                    }
+                    for r in results
+                    if r.get("attribution_score") is not None
+                ]
+            expanded_trace_id = _trace_ring().add(
+                expanded_trace, owner=getattr(principal, "agent_id", None)
+            )
+            self.last_trace_id = expanded_trace_id
+            for result in results:
+                result["trace_id"] = expanded_trace_id
+        except Exception as exc:
+            logger.debug("expanded trace capture failed: %s", exc)
+            self.last_trace_id = None
+        return results
+
+    def _run_hyde_enrichment(
+        self,
+        *,
+        query: str,
+        merged: List[Dict],
+        limit: int,
+        rerank_k: int,
+        skip_list: List[str],
+        document_agent_filter: Optional[Sequence[str]],
+        deadline_monotonic: Optional[float],
+        trace: Dict,
+        eligible_fn,
+        collect_eligible_fn,
+    ) -> List[Dict]:
+        """Execute HyDE hypothetical document generation and second-pass merge."""
+        try:
+            from minni.hyde import (
+                generate_hypothetical_answer,
+                merge_hyde_results,
+                should_trigger_hyde,
+            )
+            from minni.scoring import compute_confidence
+
+            probe_results = []
+            for r in merged[:limit]:
+                probe = dict(r)
+                ce_probe = r.get("raw_rerank_score", r.get("rerank_score"))
+                rrf_probe = r.get("rrf_score")
+                if ce_probe is None and rrf_probe is not None:
+                    rrf_probe = float(rrf_probe) * (20.0 / 61.0)
+                probe["confidence"] = compute_confidence(
+                    rrf_score=rrf_probe,
+                    cross_encoder_score=ce_probe,
+                    decay_factor=r.get("decay_applied", r.get("decay_score")),
+                    db=None,
+                )
+                probe_results.append(probe)
+
+            if should_trigger_hyde(
+                probe_results,
+                enabled=True,
+                floor=self.config.hyde_confidence_floor,
+            ):
+                trace["hyde"]["triggered"] = True
+                trace["hyde"]["confidence_floor"] = (
+                    self.config.hyde_confidence_floor
+                )
+                if past_search_deadline(deadline_monotonic) or past_search_deadline(
+                    deadline_monotonic, min_remaining=2.0
+                ):
+                    self.last_hyde_degraded = "search deadline; skipped hyde"
+                    trace["hyde"]["completed"] = False
+                    trace["hyde"]["skipped"] = "deadline"
+                else:
+                    hypothetical = generate_hypothetical_answer(
+                        query, config=self.config
+                    )
+                    if not hypothetical:
+                        trace["hyde"]["completed"] = False
+                        trace["hyde"]["skipped"] = "afm_unavailable"
+                        self.last_hyde_degraded = "afm_unavailable"
+                        logger.warning(
+                            "HyDE leg degraded: AFM produced no hypothetical "
+                            "answer — results are the un-enriched first pass"
+                        )
+                    elif past_search_deadline(deadline_monotonic):
+                        self.last_hyde_degraded = "search deadline; skipped hyde"
+                        trace["hyde"]["completed"] = False
+                        trace["hyde"]["skipped"] = "deadline"
+                    else:
+                        trace["hyde"]["hypothetical_chars"] = len(hypothetical)
+                        if document_agent_filter is None:
+                            hyde_fts = collect_eligible_fn(
+                                lambda window: self._fts_search(
+                                    hypothetical,
+                                    window,
+                                    exclude_statuses=skip_list,
+                                ),
+                                rerank_k,
+                                sql_window=True,
+                            )
+                        else:
+                            hyde_fts = collect_eligible_fn(
+                                lambda window: self._fts_search(
+                                    hypothetical,
+                                    window,
+                                    agent_filter=document_agent_filter,
+                                    exclude_statuses=skip_list,
+                                ),
+                                rerank_k,
+                                sql_window=True,
+                            )
+                        first_pass_vector = self.last_vector_degraded
+                        first_pass_rerank = self.last_rerank_degraded
+                        hyde_apply = True
+                        hyde_merged_applied = False
+                        try:
+                            if past_search_deadline(deadline_monotonic):
+                                hyde_semantic = []
+                                self.last_hyde_degraded = (
+                                    "search deadline; skipped hyde"
+                                )
+                                trace["hyde"]["completed"] = False
+                                trace["hyde"]["skipped"] = "deadline"
+                                hyde_apply = False
+                            else:
+                                hyde_semantic = collect_eligible_fn(
+                                    lambda window: self._semantic_search(
+                                        hypothetical, window
+                                    ),
+                                    rerank_k,
+                                )
+                            vector_flag = self.last_vector_degraded
+                            if (
+                                hyde_apply
+                                and vector_flag
+                                and "search deadline" in str(vector_flag).lower()
+                            ):
+                                self.last_hyde_degraded = (
+                                    "search deadline; skipped hyde"
+                                )
+                                trace["hyde"]["completed"] = False
+                                trace["hyde"]["skipped"] = "deadline"
+                                hyde_apply = False
+                            if hyde_apply:
+                                hyde_semantic = eligible_fn(hyde_semantic)
+                                hyde_merged = self._rrf_merge(
+                                    hyde_fts, hyde_semantic, rerank_k
+                                )
+                                hyde_merged = eligible_fn(hyde_merged)
+                                if self.config.reranker_enabled:
+                                    if past_search_deadline(deadline_monotonic):
+                                        self.last_hyde_degraded = (
+                                            "search deadline; skipped hyde"
+                                        )
+                                        trace["hyde"]["completed"] = False
+                                        trace["hyde"]["skipped"] = "deadline"
+                                        hyde_apply = False
+                                    elif self.reranker:
+                                        hyde_merged = self._rerank(
+                                            query, hyde_merged
+                                        )
+                                        rerank_flag = self.last_rerank_degraded
+                                        if (
+                                            rerank_flag
+                                            and "search deadline"
+                                            in str(rerank_flag).lower()
+                                        ):
+                                            self.last_hyde_degraded = (
+                                                "search deadline; skipped hyde"
+                                            )
+                                            trace["hyde"]["completed"] = False
+                                            trace["hyde"]["skipped"] = "deadline"
+                                            hyde_apply = False
+                                        else:
+                                            hyde_merged = hyde_merged[
+                                                : max(
+                                                    self.config.reranker_final_k,
+                                                    limit,
+                                                )
+                                            ]
+                                    else:
+                                        hyde_merged = hyde_merged[:limit]
+                                else:
+                                    hyde_merged = hyde_merged[:limit]
+                            if hyde_apply and (
+                                past_search_deadline(deadline_monotonic)
+                                or self._deadline_skipped_vector()
+                            ):
+                                hyde_apply = False
+                                self.last_hyde_degraded = (
+                                    "search deadline; skipped hyde"
+                                )
+                                trace["hyde"]["completed"] = False
+                                trace["hyde"]["skipped"] = "deadline"
+                            if hyde_apply:
+                                merged = merge_hyde_results(
+                                    merged,
+                                    hyde_merged,
+                                    limit=rerank_k,
+                                    rrf_k=self.config.rrf_k,
+                                )[:limit]
+                                hyde_merged_applied = True
+                                trace["hyde"]["result_doc_ids"] = [
+                                    r.get("doc_id") for r in hyde_merged
+                                ]
+                        finally:
+                            if not hyde_merged_applied:
+                                self.last_vector_degraded = first_pass_vector
+                                self.last_rerank_degraded = first_pass_rerank
+                trace["hyde"].setdefault("completed", True)
+        except Exception as exc:
+            logger.warning("HyDE leg failed after retrieval pass: %s", exc)
+            trace["hyde"]["completed"] = False
+            trace["hyde"]["skipped"] = "error"
+            trace["hyde"]["error"] = str(exc)
+            self._current_state().hyde_degraded = str(exc)[:400]
+        return merged
+
+    def _format_retrieved_results(
+        self,
+        *,
+        merged: List[Dict],
+        depth: str,
+        claim_text: str,
+        query_variants: List[str],
+        update_access: bool,
+        deadline_monotonic: Optional[float],
+    ) -> List[Dict]:
+        """Format merged candidates with envelopes, confidence, provenance, and depth projection."""
         from minni.rationale import explain
         from minni.scoring import compute_confidence, raw_confidence
 
@@ -2800,54 +2951,6 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                            WHERE doc_id = ?""",
                         (time.time(), r["doc_id"]),
                     )
-
-        trace["decay_factors"] = [
-            {"doc_id": r.get("doc_id"), "decay_factor": r.get("decay_score")}
-            for r in merged
-        ]
-        trace["final_ordering"] = [
-            {
-                "doc_id": r.get("doc_id"),
-                "chunk_id": r.get("chunk_id"),
-                "score": r.get("rerank_score", r.get("final_score", 0.0)),
-                "feedback_demote": r.get("feedback_demote", 0.0),
-                "adjusted_score": r.get("feedback_adjusted_score"),
-            }
-            for r in merged
-        ]
-        if claim_text:
-            trace["claim"] = claim_text
-            trace["attribution_scores"] = [
-                {
-                    "doc_id": r.get("doc_id"),
-                    "chunk_id": r.get("chunk_id"),
-                    "attribution": r.get("attribution"),
-                    "score": r.get("attribution_score"),
-                }
-                for r in merged
-                if r.get("attribution_score") is not None
-            ]
-        timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
-        timing["embedding_ms"] = round(self._take_encode_ms(), 3)
-        try:
-            single_trace_id = _trace_ring().add(
-                trace, owner=getattr(principal, "agent_id", None)
-            )
-            self.last_trace_id = single_trace_id
-            for result in results:
-                result["trace_id"] = single_trace_id
-        except Exception as exc:
-            logger.debug("trace capture failed: %s", exc)
-            self.last_trace_id = None
-
-        if summarize_neighborhood and not past_search_deadline(deadline_monotonic):
-            results = self._add_neighborhood_summaries(
-                results,
-                principal=principal,
-                workspace=workspace,
-                deadline_monotonic=deadline_monotonic,
-            )
-
         return results
 
     def search(self, *args, **kwargs) -> List[Dict]:

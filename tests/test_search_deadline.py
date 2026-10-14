@@ -169,6 +169,52 @@ class _RecordingEngine:
         return []
 
 
+class _CountingCrossEncoder:
+    def __init__(self, predict_calls: dict[str, int], score: float = 0.1):
+        self._predict_calls = predict_calls
+        self._score = score
+
+    def predict(self, pairs, show_progress_bar=False):
+        self._predict_calls["n"] += 1
+        return [self._score] * len(pairs)
+
+
+class _GateLock:
+    def __init__(self, real_lock, waiting: threading.Event, passthrough_first: bool = False):
+        self._real_lock = real_lock
+        self._waiting = waiting
+        self._passthrough_first = passthrough_first
+        self.acquires = 0
+        self._need_real_release = False
+
+    def acquire(self, blocking=True, timeout=-1):
+        self.acquires += 1
+        if self._passthrough_first and self.acquires == 1:
+            return True
+        self._waiting.set()
+        ok = self._real_lock.acquire(blocking, timeout)
+        self._need_real_release = bool(ok)
+        return ok
+
+    def release(self):
+        if self._passthrough_first:
+            if self._need_real_release:
+                self._need_real_release = False
+                return self._real_lock.release()
+            return None
+        return self._real_lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def locked(self):
+        return self._real_lock.locked()
+
+
 def test_handle_search_passes_deadline_from_timeout_ms():
     engine = _RecordingEngine()
     principal = EffectivePrincipal(
@@ -372,27 +418,9 @@ def test_encode_skips_after_embedder_lock_if_deadline_elapsed(tmp_path, monkeypa
             encode_calls["n"] += 1
             return np.zeros(384, dtype=np.float32)
 
-    class _GateLock:
-        def acquire(self, blocking=True, timeout=-1):
-            waiting.set()
-            return real_lock.acquire(blocking, timeout)
-
-        def release(self):
-            return real_lock.release()
-
-        def __enter__(self):
-            self.acquire()
-            return self
-
-        def __exit__(self, *exc):
-            self.release()
-
-        def locked(self):
-            return real_lock.locked()
-
     monkeypatch.setattr(retrieval_mod.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: _FakeModel()))
-    monkeypatch.setattr(models, "get_embedder_lock", lambda: _GateLock())
+    monkeypatch.setattr(models, "get_embedder_lock", lambda: _GateLock(real_lock, waiting))
 
     seen = {}
     released = False
@@ -730,33 +758,16 @@ def test_rerank_skips_predict_after_ce_lock_if_deadline_elapsed(tmp_path, monkey
     waiting = threading.Event()
     real_lock = models.get_cross_encoder_lock()
 
-    class _DummyCE:
-        def predict(self, pairs, show_progress_bar=False):
-            predict_calls["n"] += 1
-            return [0.1] * len(pairs)
-
-    class _GateLock:
-        def acquire(self, blocking=True, timeout=-1):
-            waiting.set()
-            return real_lock.acquire(blocking, timeout)
-
-        def release(self):
-            return real_lock.release()
-
-        def __enter__(self):
-            self.acquire()
-            return self
-
-        def __exit__(self, *exc):
-            self.release()
-
-        def locked(self):
-            return real_lock.locked()
-
     monkeypatch.setattr(retrieval_mod.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(RetrievalEngine, "reranker", property(lambda self: _DummyCE()))
+    monkeypatch.setattr(
+        RetrievalEngine,
+        "reranker",
+        property(lambda self: _CountingCrossEncoder(predict_calls)),
+    )
     monkeypatch.setattr(RetrievalEngine, "_semantic_search", lambda *a, **k: [])
-    monkeypatch.setattr(models, "get_cross_encoder_lock", lambda: _GateLock())
+    monkeypatch.setattr(
+        models, "get_cross_encoder_lock", lambda: _GateLock(real_lock, waiting)
+    )
     monkeypatch.setattr(rerank_cache, "GLOBAL_RERANK_CACHE", None)
 
     seen = {}
@@ -814,43 +825,13 @@ def test_hyde_rerank_skips_merge_after_ce_lock_if_deadline_elapsed(
     waiting = threading.Event()
     real_lock = models.get_cross_encoder_lock()
 
-    class _DummyCE:
-        def predict(self, pairs, show_progress_bar=False):
-            predict_calls["n"] += 1
-            return [0.1] * len(pairs)
-
-    class _GateLock:
-        def __init__(self):
-            self.acquires = 0
-            self._need_real_release = False
-
-        def acquire(self, blocking=True, timeout=-1):
-            self.acquires += 1
-            if self.acquires == 1:
-                return True
-            waiting.set()
-            ok = real_lock.acquire(blocking, timeout)
-            self._need_real_release = bool(ok)
-            return ok
-
-        def release(self):
-            if self._need_real_release:
-                self._need_real_release = False
-                return real_lock.release()
-
-        def __enter__(self):
-            self.acquire()
-            return self
-
-        def __exit__(self, *exc):
-            self.release()
-
-        def locked(self):
-            return real_lock.locked()
-
-    gate = _GateLock()
+    gate = _GateLock(real_lock, waiting, passthrough_first=True)
     monkeypatch.setattr(retrieval_mod.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(RetrievalEngine, "reranker", property(lambda self: _DummyCE()))
+    monkeypatch.setattr(
+        RetrievalEngine,
+        "reranker",
+        property(lambda self: _CountingCrossEncoder(predict_calls)),
+    )
     monkeypatch.setattr(RetrievalEngine, "_semantic_search", lambda *a, **k: [])
     monkeypatch.setattr(models, "get_cross_encoder_lock", lambda: gate)
     monkeypatch.setattr(rerank_cache, "GLOBAL_RERANK_CACHE", None)
@@ -2508,26 +2489,7 @@ def test_semantic_search_lock_wait_leftover_skip_sets_vector_degraded(
 
     waiting = threading.Event()
     real_lock = engine._faiss_load_lock
-
-    class _GateLock:
-        def acquire(self, blocking=True, timeout=-1):
-            waiting.set()
-            return real_lock.acquire(blocking, timeout)
-
-        def release(self):
-            return real_lock.release()
-
-        def __enter__(self):
-            self.acquire()
-            return self
-
-        def __exit__(self, *exc):
-            self.release()
-
-        def locked(self):
-            return real_lock.locked()
-
-    engine._faiss_load_lock = _GateLock()
+    engine._faiss_load_lock = _GateLock(real_lock, waiting)
     seen = {}
     released = False
     real_lock.acquire()

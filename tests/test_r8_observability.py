@@ -6,23 +6,37 @@ import time
 import pytest
 
 
+class _StubConfig:
+    embedding_model = "all-MiniLM-L6-v2"
+
+
+def _stub_retrieve_engine(**attrs):
+    class _Engine:
+        config = _StubConfig()
+        vector_model_down = False
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 1, "path": "wiki/a.md"}]
+
+    for k, v in attrs.items():
+        setattr(_Engine, k, v)
+    return _Engine()
+
+
 def test_auth_suppression_reported_even_when_other_legs_returned_hits():
     """R3: `auth_suppression` was gated on `if not results` — a vault entirely"""
     from minni.minnid_runtime import recall as recall_mod
 
     captured = {}
-
-    class _Engine:
-        config = None
-        vector_model_down = False
-        last_rerank_degraded = None
-        last_query_expand_degraded = None
-        last_auth_suppression = {"pre_gate": 4, "suppressed": 4}
-
-        def retrieve(self, **kwargs):
-            return [{"doc_id": 1, "path": "wiki/a.md"}]
-
-    context = _make_context(_Engine(), captured)
+    engine = _stub_retrieve_engine(
+        config=None,
+        last_auth_suppression={"pre_gate": 4, "suppressed": 4},
+    )
+    context = _make_context(engine, captured)
     recall_mod.handle_search({"query": "anything"}, request_id=1, context=context)
 
     payload = captured["response"]
@@ -40,22 +54,11 @@ def test_search_response_always_carries_vector_model_and_degraded():
     from minni.minnid_runtime import recall as recall_mod
 
     captured = {}
-
-    class _Config:
-        embedding_model = "all-MiniLM-L6-v2"
-
-    class _Engine:
-        config = _Config()
-        vector_model_down = True  # semantic leg is DOWN
-        last_vector_degraded = "embedding model unavailable; lexical (FTS) only"
-        last_rerank_degraded = None
-        last_query_expand_degraded = None
-        last_auth_suppression = None
-
-        def retrieve(self, **kwargs):
-            return [{"doc_id": 1, "path": "wiki/a.md"}]
-
-    context = _make_context(_Engine(), captured)
+    engine = _stub_retrieve_engine(
+        vector_model_down=True,
+        last_vector_degraded="embedding model unavailable; lexical (FTS) only",
+    )
+    context = _make_context(engine, captured)
     recall_mod.handle_search({"query": "anything"}, request_id=1, context=context)
 
     payload = captured["response"]
@@ -72,21 +75,7 @@ def test_healthy_search_reports_degradation_field_as_false_not_absent():
     from minni.minnid_runtime import recall as recall_mod
 
     captured = {}
-
-    class _Config:
-        embedding_model = "all-MiniLM-L6-v2"
-
-    class _Engine:
-        config = _Config()
-        vector_model_down = False
-        last_rerank_degraded = None
-        last_query_expand_degraded = None
-        last_auth_suppression = None
-
-        def retrieve(self, **kwargs):
-            return [{"doc_id": 1, "path": "wiki/a.md"}]
-
-    context = _make_context(_Engine(), captured)
+    context = _make_context(_stub_retrieve_engine(), captured)
     recall_mod.handle_search({"query": "anything"}, request_id=1, context=context)
 
     payload = captured["response"]
@@ -98,24 +87,20 @@ def test_vector_degradation_is_read_per_request_not_from_the_global():
     """Review round 2 (PR #260): one process-wide engine serves concurrent"""
     from minni.minnid_runtime import recall as recall_mod
 
-    class _Config:
-        embedding_model = "all-MiniLM-L6-v2"
-
-    class _StaleGlobal:
-        config = _Config()
-        vector_model_down = True
-        last_vector_degraded = None
-
-    class _StaleClear:
-        config = _Config()
-        vector_model_down = False
-        last_vector_degraded = "embedding model unavailable; lexical (FTS) only"
-
-    healthy = recall_mod._degradation_for(_StaleGlobal(), "vault")
+    healthy = recall_mod._degradation_for(
+        _stub_retrieve_engine(vector_model_down=True, last_vector_degraded=None),
+        "vault",
+    )
     assert healthy["vector_degraded"] is False
     assert healthy["degraded"] is False
 
-    degraded = recall_mod._degradation_for(_StaleClear(), "vault")
+    degraded = recall_mod._degradation_for(
+        _stub_retrieve_engine(
+            vector_model_down=False,
+            last_vector_degraded="embedding model unavailable; lexical (FTS) only",
+        ),
+        "vault",
+    )
     assert degraded["vector_degraded"] is True
     assert degraded["degraded"] is True
 
@@ -168,13 +153,15 @@ def test_explicit_backend_branches_use_the_flagging_encoder():
     from pathlib import Path
 
     import minni.retrieval as retrieval_mod
+    import minni.semantic_rerank as semantic_rerank_mod
     from minni.retrieval import RetrievalEngine
 
-    source = Path(retrieval_mod.__file__).read_text(encoding="utf-8")
-    assert "self.model.encode(query).astype(np.float32) if self.model else" not in source, (
-        "an explicit-backend branch is bypassing _encode_query and therefore "
-        "the P0-B degradation flag"
-    )
+    for mod in (retrieval_mod, semantic_rerank_mod):
+        source = Path(mod.__file__).read_text(encoding="utf-8")
+        assert "self.model.encode(query).astype(np.float32) if self.model else" not in source, (
+            "an explicit-backend branch is bypassing _encode_query and therefore "
+            "the P0-B degradation flag"
+        )
     sem_source = inspect.getsource(RetrievalEngine._semantic_search)
     assert "_encode_query" in sem_source, (
         "the default FAISS path must route through _encode_query too"

@@ -451,8 +451,16 @@ class _StubEmbedder:
         import numpy as np
 
         vec = np.zeros(384, dtype="float32")
-        vec[len(text) % 384] = 1.0
+        vec[sum(str(text).encode("utf-8")) % 384] = 1.0
         return vec
+
+
+class _ConstantStubReranker:
+    def __init__(self, score: float = 1.0):
+        self._score = float(score)
+
+    def predict(self, pairs, **kwargs):
+        return [self._score] * len(pairs)
 
 
 class TestEmbeddingBackfillAndCoverage:
@@ -1026,15 +1034,7 @@ class TestLayerStamping:
         from minni.config import MinniConfig
         from minni.vault_index import vault_index_paths
 
-        class _FakeEmbedder:
-            def encode(self, text, **kwargs):
-                import numpy as np
-
-                vec = np.zeros(384, dtype="float32")
-                vec[sum(text.encode("utf-8")) % 384] = 1.0
-                return vec
-
-        monkeypatch.setattr(models, "get_embedder", lambda: _FakeEmbedder())
+        monkeypatch.setattr(models, "get_embedder", lambda: _StubEmbedder())
 
         slug = next(iter(_VAULT_SLUG_TO_AGENT_ID))
         vault = tmp_path / f"{slug}-vault"
@@ -1114,15 +1114,7 @@ class TestLayerStamping:
         import minni.models as models
         from minni.wiki_indexer import WikiIndexer
 
-        class _FakeEmbedder:
-            def encode(self, text, **kwargs):
-                import numpy as np
-
-                vec = np.zeros(384, dtype="float32")
-                vec[sum(text.encode("utf-8")) % 384] = 1.0
-                return vec
-
-        monkeypatch.setattr(models, "get_embedder", lambda: _FakeEmbedder())
+        monkeypatch.setattr(models, "get_embedder", lambda: _StubEmbedder())
         db_obj, cfg = _make_db(tmp_path)
 
         wiki_dir = tmp_path / "wiki" / "pages"
@@ -1163,15 +1155,7 @@ class TestLayerStamping:
         import minni.models as models
         from minni.wiki_indexer import WikiIndexer
 
-        class _FakeEmbedder:
-            def encode(self, text, **kwargs):
-                import numpy as np
-
-                vec = np.zeros(384, dtype="float32")
-                vec[sum(text.encode("utf-8")) % 384] = 1.0
-                return vec
-
-        monkeypatch.setattr(models, "get_embedder", lambda: _FakeEmbedder())
+        monkeypatch.setattr(models, "get_embedder", lambda: _StubEmbedder())
         db_obj, cfg = _make_db(tmp_path)
 
         wiki_dir = tmp_path / "wiki" / "pages"
@@ -1513,12 +1497,7 @@ class TestDecayRerankParity:
     def test_rerank_public_path_orders_by_decay(self, tmp_path):
         """Name-independent proof: drive _rerank itself with a stub"""
         engine, _db, _cfg = _make_engine(tmp_path)
-
-        class _StubReranker:
-            def predict(self, pairs, **kwargs):
-                return [1.0] * len(pairs)
-
-        engine._reranker = _StubReranker()
+        engine._reranker = _ConstantStubReranker(1.0)
         candidates = [
             {"doc_id": 1, "chunk_id": None, "chunk_text": "alpha",
              "rerank_score": None, "decay_score": 0.05, "page_type": "note"},
@@ -1560,12 +1539,7 @@ class TestDecayIsAppliedOnce:
 
     def test_rerank_public_path_carries_the_raw_logit(self, tmp_path):
         engine, _db, _cfg = _make_engine(tmp_path)
-
-        class _StubReranker:
-            def predict(self, pairs, **kwargs):
-                return [2.0] * len(pairs)
-
-        engine._reranker = _StubReranker()
+        engine._reranker = _ConstantStubReranker(2.0)
         candidates = [
             {"doc_id": 1, "chunk_id": None, "chunk_text": "alpha",
              "rerank_score": None, "decay_score": 0.5, "page_type": "note"},
@@ -1618,12 +1592,7 @@ class TestDecayIsAppliedOnce:
         engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
         monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: None))
         monkeypatch.setattr(minnid, "_retrieval", engine)
-
-        class _StubReranker:
-            def predict(self, pairs, **kwargs):
-                return [2.0] * len(pairs)
-
-        engine._reranker = _StubReranker()
+        engine._reranker = _ConstantStubReranker(2.0)
 
         body = "the deployment rollback procedure is documented here. " * 20
         with db_obj.cursor() as c:
@@ -3467,3 +3436,71 @@ def test_calibration_distinguishes_unavailable_encoder_from_deadline_skip(
         recorded = c.execute("SELECT COUNT(*) AS n FROM score_distribution").fetchone()["n"]
     assert recorded == (0 if cold else len(results))
     assert all("confidence_raw" not in row for row in results)
+
+
+def test_phase5_mixin_reexports_and_monkeypatch_seams(tmp_path, monkeypatch):
+    """Phase 5 seam parity: module-level re-exports and dynamic _ret.* lookups."""
+    from types import SimpleNamespace
+    import minni.retrieval as retrieval_mod
+    from minni.retrieval import RetrievalEngine
+
+    assert callable(getattr(retrieval_mod, "_strip_frontmatter", None))
+    assert callable(getattr(retrieval_mod, "_tokenize_trie_text", None))
+    assert hasattr(retrieval_mod, "sqlite3")
+    assert callable(getattr(RetrievalEngine, "_apply_post_rerank_confidence_floor", None))
+
+    engine, db_obj, _ = _make_engine(tmp_path)
+    with db_obj.cursor() as c:
+        c.execute(
+            "INSERT INTO documents (path, agent, sigil, layer) "
+            "VALUES ('seam.md', 'codex', 'vault', 'knowledge')"
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+            "VALUES (?, 'seam.md', '---\ntitle: Seam\n---\nseam_token_alpha', 'codex', 'vault')",
+            (doc_id,),
+        )
+
+    monotonic_calls = []
+    perf_calls = []
+    strip_calls = []
+
+    fake_time = SimpleNamespace(
+        monotonic=lambda: (monotonic_calls.append(1), 500.0)[1],
+        perf_counter=lambda: (perf_calls.append(1), float(len(perf_calls)))[1],
+        time=lambda: 1700000000.0,
+        sleep=lambda _s: None,
+    )
+    monkeypatch.setattr(retrieval_mod, "time", fake_time)
+    orig_strip = retrieval_mod._strip_leading_frontmatter
+    monkeypatch.setattr(
+        retrieval_mod,
+        "_strip_leading_frontmatter",
+        lambda text: (strip_calls.append(text), orig_strip(text))[1],
+    )
+
+    engine._ensure_trie_loaded()
+    assert monotonic_calls, "TrieIndexMixin._ensure_trie_loaded must resolve time via minni.retrieval"
+
+    fts_hits = engine._fts_search("seam_token_alpha", limit=5)
+    assert fts_hits and strip_calls, "FtsSearchMixin._fts_search must resolve _strip_leading_frontmatter via minni.retrieval"
+
+    monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: _StubEmbedder()))
+    monkeypatch.setattr(retrieval_mod, "should_skip_cold_model_load", lambda *_a: False)
+    vec = engine._encode_query("seam_token_alpha")
+    assert vec.size == 384 and len(perf_calls) >= 2, (
+        "SemanticRerankMixin._encode_query must resolve time.perf_counter via minni.retrieval"
+    )
+
+    kept = engine._apply_post_rerank_confidence_floor(
+        [
+            {"doc_id": 1, "fts_rank": 1, "raw_rerank_score": -5.0, "similarity": 0.1},
+            {"doc_id": 2, "fts_rank": None, "raw_rerank_score": -5.0, "similarity": 0.9},
+        ],
+        fts_results=[{"doc_id": 1}],
+        limit=5,
+    )
+    assert [r["doc_id"] for r in kept] == [1]
+    db_obj.close()
+

@@ -415,6 +415,31 @@ class SemanticRerankMixin:
 
         return candidates
 
+    def _apply_post_rerank_confidence_floor(
+        self,
+        merged: List[Dict],
+        fts_results: List[Dict],
+        limit: int,
+    ) -> List[Dict]:
+        """Drop low-logit semantic-only noise before truncating to reranker_final_k."""
+        ce_floor = -1.0 if not fts_results else -4.0
+        filtered = [
+            r
+            for r in merged
+            if not (
+                r.get("fts_rank") is None
+                and r.get("raw_rerank_score") is not None
+                and (
+                    float(r["raw_rerank_score"]) < -4.0
+                    or (
+                        float(r["raw_rerank_score"]) < ce_floor
+                        and float(r.get("similarity") or 0.0) < 0.35
+                    )
+                )
+            )
+        ]
+        return filtered[: max(self.config.reranker_final_k, limit)]
+
     def _rerank_corpus(self) -> str:
         db_path = getattr(self.config, "db_path", None)
         if not db_path or str(db_path) == ":memory:":
@@ -649,13 +674,13 @@ class SemanticRerankMixin:
                 if not self.model:
                     self._note_vector_model_down()
                     return np.array([], dtype=np.float32)
-                started = time.perf_counter()
+                started = _ret.time.perf_counter()
                 try:
                     vec = self.model.encode(
                         query, show_progress_bar=False
                     ).astype(np.float32)
                 finally:
-                    self._add_encode_ms((time.perf_counter() - started) * 1000)
+                    self._add_encode_ms((_ret.time.perf_counter() - started) * 1000)
                 if _ret.past_search_deadline(deadline_monotonic, min_remaining=0):
                     self.last_vector_degraded = (
                         "search deadline exceeded during nonpreemptible encode"
