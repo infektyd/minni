@@ -147,33 +147,29 @@ find_fresh_receipt() {
   check_not_symlink
   [ -f "$receipt_file" ] || return 1
 
-  local matched_line=""
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    set -- $line
-    local r_tree="${1:-}"
+  local matched_tree="" matched_commit="" matched_ts="" matched_gate=""
+  while IFS=' ' read -r r_tree r_commit r_ts r_gate _rest; do
+    [ -n "${r_tree:-}" ] || continue
     if [ "$r_tree" = "$target_tree" ]; then
-      matched_line="$line"
+      matched_tree="$r_tree"
+      matched_commit="${r_commit:-}"
+      matched_ts="${r_ts:-}"
+      matched_gate="${r_gate:-gate}"
     fi
   done < "$receipt_file"
 
-  [ -n "$matched_line" ] || return 1
-  set -- $matched_line
-  local r_tree="${1:-}"
-  local r_commit="${2:-}"
-  local r_ts="${3:-}"
-  local r_gate="${4:-gate}"
+  [ -n "$matched_tree" ] || return 1
 
-  if ! [[ "$r_ts" =~ ^[0-9]+$ ]]; then
+  if ! [[ "$matched_ts" =~ ^[0-9]+$ ]]; then
     return 1
   fi
 
-  local age=$(( now_ts - r_ts ))
+  local age=$(( now_ts - matched_ts ))
   if [ "$age" -lt 0 ] || [ "$age" -ge "$PROVEN_TTL_SECONDS" ]; then
     return 1
   fi
 
-  printf '%s %s %s %s %s\n' "$r_tree" "$r_commit" "$r_ts" "$r_gate" "$age"
+  printf '%s %s %s %s %s\n' "$matched_tree" "$matched_commit" "$matched_ts" "$matched_gate" "$age"
   return 0
 }
 
@@ -308,12 +304,7 @@ if [ "$MODE" = "check-receipt" ]; then
 
   target_tree="${TARGET_TREE:-$(git rev-parse "HEAD^{tree}")}"
   if receipt_info="$(find_fresh_receipt "$target_tree")"; then
-    set -- $receipt_info
-    r_tree="$1"
-    r_commit="$2"
-    r_ts="$3"
-    r_gate="$4"
-    r_age="$5"
+    IFS=' ' read -r r_tree r_commit r_ts r_gate r_age <<< "$receipt_info"
     echo "[promote-proven] Fresh rootside receipt verified for tree ${r_tree} (commit ${r_commit:0:8}, age ${r_age}s, gate=${r_gate})."
     exit 0
   else
@@ -334,12 +325,7 @@ commit_sha="$(git rev-parse HEAD)"
 short_sha="$(git rev-parse --short HEAD)"
 
 if [ "$FORCE_GATE" -eq 0 ] && receipt_info="$(find_fresh_receipt "$tree_sha")"; then
-  set -- $receipt_info
-  r_tree="$1"
-  r_commit="$2"
-  r_ts="$3"
-  r_gate="$4"
-  r_age="$5"
+  IFS=' ' read -r r_tree r_commit r_ts r_gate r_age <<< "$receipt_info"
   echo "[promote-proven] Step (a): Fresh rootside receipt verified for tree ${r_tree} (commit ${r_commit:0:8}, age ${r_age}s, gate=${r_gate})."
 else
   LAST_GATE_LABEL="gate"

@@ -17,61 +17,54 @@ tags: [memory, llm, faiss, sqlite]
 ├── tests/                 # pytest suite
 ├── src/minni/             # Minni Python package
 │   ├── config.py          # Centralized config (dataclass, MINNI_* overrides)
-│   ├── db.py              # SQLite + FTS5 schema
+│   ├── db.py              # SQLite + FTS5 schema and migrations
 │   ├── minnid.py          # JSON-RPC daemon over Unix socket
-│   ├── retrieval.py       # Hybrid FTS5 + FAISS + RRF pipeline
+│   ├── retrieval.py       # Hybrid RetrievalEngine orchestrator
+│   ├── trie_index.py      # Tier 1 in-memory prefix/token Trie (TrieIndexMixin, <0.5ms)
+│   ├── fts_search.py      # Tier 2 SQLite FTS5 BM25 lexical search (FtsSearchMixin, <10ms fast mode)
+│   ├── semantic_rerank.py # Tier 3 FAISS + RRF (0.60/0.40) + Cross-Encoder rerank (SemanticRerankMixin)
 │   ├── writeback.py       # Write-back memory and learning lifecycle
-│   ├── faiss_index.py     # FAISS index manager
+│   ├── faiss_index.py     # FAISS index manager (faiss-disk / faiss-mem)
 │   ├── episodic.py        # Episodic event logging
-│   └── indexer.py         # Vault indexing pipeline
+│   └── indexer.py         # Vault indexing pipeline (including synchronous index_single_file)
 └── plugins/minni/         # Multi-host TypeScript plugin
 ```
 
 ## Key Interfaces (don't break these)
 
-### Extraction (extraction.py)
+### Extraction (`src/minni/extraction.py`)
 ```python
-from extraction import get_extractor
+from minni.extraction import get_extractor
 extractor = get_extractor()
 facts = extractor.extract_facts(messages)  # List[Dict] with type/content/confidence
 available = extractor.is_available()       # bool
 ```
 
-### Retrieval (retrieval.py)
+### Retrieval (`src/minni/retrieval.py` + `trie_index.py`, `fts_search.py`, `semantic_rerank.py`)
 ```python
-from retrieval import RetrievalEngine
+from minni.retrieval import RetrievalEngine
 engine = RetrievalEngine(db, config)
-results = engine.retrieve(query, limit=5, agent_id=None)  # List[Dict]
+results = engine.retrieve(query, limit=5, agent_id=None, mode="fast")  # List[Dict]
 ```
 
-### Writeback (writeback.py)
+### Writeback (`src/minni/writeback.py`)
 ```python
-from writeback import WriteBackMemory
+from minni.writeback import WriteBackMemory, CATEGORIES
+# CATEGORIES: pattern, fix, decision, preference, fact, procedure, architecture, codebase, general
 wb = WriteBackMemory(db, config)
-learning_id = wb.store_learning(agent_id, content, category="fix", confidence=0.9)
+learning_id = wb.store_learning(agent_id, content, category="architecture", confidence=0.9)
 wb.detect_contradiction(agent_id, learning_id, content)
 ```
 
 ## Model Backend Patterns
 
-### Swapping Reranker (V3.2 pattern)
-The reranker is an HTTP API call, not a local model:
+### Reranking & Reciprocal Rank Fusion (`src/minni/semantic_rerank.py` & `src/minni/config.py`)
+Retrieval fuses lexical and semantic candidates via weighted RRF (`0.60` FTS / `0.40` semantic), reserves the top-10 FTS BM25 slots before Cross-Encoder reranking, and applies a `>= 0.35` post-rerank confidence floor:
 
-1. **Config** (`config.py`): `reranker_model`, `openrouter_api_key`, `openrouter_base_url`
-2. **Property** (`retrieval.py`): `reranker` returns `True`/`None` (availability flag)
-3. **Method** (`_rerank`): HTTP POST to `/v1/rank`, parse `{results: [{index, relevance_score}]}`
-4. **Fallback**: on any error, log warning and return candidates unsorted (RRF scores preserved)
-
-To swap to a different reranker API:
-- Change `config.reranker_model` and the API URL/headers in `_rerank()`
-- Keep the same signature: `_rerank(query, candidates) → candidates`
-- Always add `rerank_score` key to each candidate dict
-
-### Adding a New Endpoint (app.py)
-1. Add Pydantic request/response models
-2. Add `@app.post("/your_endpoint")` handler
-3. For background work: use `asyncio.create_task()` — never block the response
-4. Use `_make_agent(agent_id)` for writeback operations
+1. **Config** (`src/minni/config.py`): `reranker_model`, `rrf_fts_weight` (`0.60`), `rrf_semantic_weight` (`0.40`)
+2. **Mixin** (`src/minni/semantic_rerank.py`): `SemanticRerankMixin` handles vector search, weighted RRF, Cross-Encoder reranking, and NLI attribution
+3. **Fast Path** (`mode="fast"`): `TrieIndexMixin` (`src/minni/trie_index.py`) + `FtsSearchMixin` (`src/minni/fts_search.py`) return lexical hits in `< 10 ms` without loading neural models
+4. **Fallback**: on any reranker error or deadline expiry, return deterministic RRF/FTS candidates
 
 ## Config (config.py)
 
@@ -103,12 +96,12 @@ make daemon
 
 ## Related Skills
 
-- `minni-wiki-ingestion` — Ingest LLM Wiki pages with frontmatter enrichment, wikilink graph extraction, and agent-optimized chunking
+- `minni-ingestion` — Ingest LLM Wiki pages with frontmatter enrichment, wikilink graph extraction, and agent-optimized chunking
 
 ## Pitfalls
 
-- **Don't remove `SentenceTransformer`** from retrieval.py — it's the embedding model for FAISS, NOT the reranker
-- **Don't inline extraction** in request paths — always use `asyncio.create_task()` (see `_run_extraction` in app.py)
+- **Keep retrieval mixins cohesive** — `RetrievalEngine` (`src/minni/retrieval.py`) inherits from `TrieIndexMixin` (`src/minni/trie_index.py`), `FtsSearchMixin` (`src/minni/fts_search.py`), and `SemanticRerankMixin` (`src/minni/semantic_rerank.py`)
+- **Preserve synchronous single-file indexing** — `minni_learn` and `resolve_candidate(accept)` call `index_single_file` / `vault_index_doc` so newly written notes are recallable immediately
 - **Don't change response formats** — downstream agents depend on exact JSON shapes
-- **FTS5 queries** must be sanitized (no special chars) — use `_sanitize_fts_query()` in retrieval.py
+- **FTS5 queries** must be sanitized (no special chars) — use `_sanitize_fts_query()` in `src/minni/fts_search.py` (re-exported on `RetrievalEngine`)
 - **Config changes** require updating both the dataclass field AND any code that reads it

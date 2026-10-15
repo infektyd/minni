@@ -10,4 +10,4 @@ Summarize for the user in one paragraph:
 - Vault path and whether it exists.
 - Latest audit entry, if any.
 
-If the daemon socket is missing, suggest checking that `engine/minnid.py` is running.
+If the daemon socket is missing, suggest starting the daemon with `minni up` (`src/minni/minnid.py`).

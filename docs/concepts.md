@@ -4,9 +4,9 @@
 
 | Verb | What happens | Surface |
 |---|---|---|
-| **Recall** | Cited, provenance-tagged retrieval across the personal and shared legs | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
-| **Learn** | Normally stages a persistent `candidate_packets` row with status `proposed`; the MCP tool also writes a personal vault note. Neither is the same as an accepted shared learning | `minni_learn`, `minni_learning_quality` |
-| **Approve** | A later resolution decision — accept / reject / redact / log-only / merge / supersede / do-not-store. Accepting decisions commit the shared learning; indexing follows and may report `indexed=false`. Existing personal notes and staged packets already persist | `minni_list_candidates`, `minni_resolve_candidate` |
+| **Recall** | Cited, provenance-tagged retrieval across the personal and shared legs (`mode="fast"` `< 10 ms` lexical Trie + FTS5 BM25, or full hybrid with FAISS + weighted RRF + Cross-Encoder reranking) | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
+| **Learn** | Normally stages a persistent `candidate_packets` row with status `proposed` and category (`pattern`, `fix`, `decision`, `preference`, `fact`, `procedure`, `architecture`, `codebase`, `general`); the MCP tool also writes a personal vault note and synchronously indexes it (`index_single_file` / `vault_index_doc`). Neither is the same as an accepted shared learning | `minni_learn`, `minni_learning_quality` |
+| **Approve** | A later resolution decision — accept / reject / redact / log-only / merge / supersede / do-not-store. Accepting decisions commit the shared learning (preserving original author `principal` and `category`, with resolver in `resolved_by`) and synchronously index the note; if follow-up indexing fails it reports `indexed=false`. Existing personal notes and staged packets already persist | `minni_list_candidates`, `minni_resolve_candidate` |
 | **Handoff** | Explicit cross-agent transfer under a lease; the receiver acks before the sender releases | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_await_handoff`, `minni_list_pending_handoffs` |
 
 One explicit operator override is `force=true` on `learn`
@@ -14,10 +14,9 @@ writes a durable learning directly, **only** for an operator principal, and is
 audit-stamped `FORCE_DURABLE_LEARN`. A non-operator force attempt is denied
 with an `operator_only` error. Operator-configured `auto_accept_own` and the optional consolidation path are separate approval mechanisms described below; they are not implied by ordinary tool access.
 
-Three success states need different follow-up: a **personal note** can be indexed
-and recalled by its owner before shared approval; a **staged candidate** awaits a
-governance decision; an **accepted shared learning** is durable even if follow-up
-indexing fails. Check the response's indexing result. If `indexed=false`, repair
+Three success states need different follow-up: a **personal note** is synchronously indexed (`index_single_file` / `vault_index_doc`) and recallable immediately by its owner before shared approval; a **staged candidate** awaits a
+governance decision; an **accepted shared learning** is durable and synchronously indexed upon acceptance (even if follow-up
+indexing fails, it remains durable in SQLite). Check the response's indexing result. If `indexed=false`, repair
 or reindex the accepted record rather than resubmitting it as a new learning.
 
 ## Delegating approval
@@ -37,8 +36,9 @@ because the human was AFK. Proposal-first is what makes this a reasonable
 grant: nothing enters the shared durable tier without approval. Know exactly
 what you are allowing, though — `minni_learn` does two things per call. It
 stages the `proposed` candidate, and it also writes a Markdown note into the
-agent's **own vault** immediately (audit-logged, and indexed into that
-agent's personal tier by `vault_ingest`). The quality gate blocks weak
+agent's **own vault** immediately (audit-logged, and synchronously indexed into
+that agent's personal tier via `vault_index_doc` / `index_single_file`, with
+`vault_ingest` sweeping in the background). The quality gate blocks weak
 content by default (`requireQuality` defaults to `true`; a caller must pass
 `requireQuality: false` to store a weak note deliberately). Allowlisting the tool
 therefore means trusting the agent to write its own vault notes unprompted —
@@ -147,7 +147,8 @@ same audit trail:
 
    One consequence worth knowing before you opt an agent in: this is the first
    path that lets a `learn`-only agent OWN a durable learning without a human
-   (a manual accept records the resolver as owner, not the proposer). Owning one
+   (a manual accept preserves the proposer as `learnings.agent_id` and records
+   the resolver in `resolved_by`). Owning one
    is the precondition for `resolve_contradiction`, so that handler now applies
    the same floor to non-operators rather than being an unguarded way around it.
    Counts land in `health_report` under
@@ -211,14 +212,16 @@ nothing recalled speaks with the operator's voice.
 ## Two-tier storage
 
 - **Personal tier** — each agent's vault wiki (`<agent>-vault/wiki/**/*.md`) is
-  indexed by the `vault_ingest` pass into that vault's own
+  indexed synchronously on write (`vault_index_doc` / `index_single_file`) and
+  by the background `vault_ingest` pass into that vault's own
   `.index/vault.db` + `vault.faiss` + `vault.manifest.json`.
 - **Shared tier** — `~/.minni/minni.db` (SQLite, FTS5, WAL) holds durable
   learnings, candidates, episodic/contradiction events, handoff leases, and
   the pooled document layer, with a shared FAISS index for vectors.
 
 Recall merges the tiers by `scope`: `personal` (caller's index, falling back
-to shared), `combined` (all per-vault indexes plus shared), or `both` (the
+to shared), `combined` (all per-vault indexes plus shared, pre-filtering foreign
+vaults via `_should_query_foreign_vault`), or `both` (the
 default — personal and combined merged, deduplicating the caller's own hits).
 Learnings always come from the shared DB. Full provenance — owning agent,
 source vault, score components, `indexed_at` — is available via `minni_drill`.
@@ -230,11 +233,23 @@ contracts instead of scraping another agent's private vault directly.
 
 ## Retrieval
 
-The retrieval stack is a hybrid pipeline: lexical search (SQLite FTS5/BM25) +
-vector search (FAISS) fused with reciprocal-rank fusion, cross-encoder
-reranking, optional NLI claim-attribution scoring, MMR-diverse token-budgeted
-packing, and progressive depth tiers (`headline` / `snippet` / `chunk` /
-`document`) — merged across the personal and shared legs by recall scope.
+The retrieval stack (`src/minni/retrieval.py` + `trie_index.py`, `fts_search.py`,
+`semantic_rerank.py`) is a tiered hybrid pipeline:
+
+- **Tier 1 (in-memory prefix/token Trie, `< 0.5 ms`)**: exact/prefix lexical
+  lookup (`TrieIndexMixin` in the daemon and `searchVaultNotes` Trie in
+  `plugins/minni/src/vault.ts`), invalidated on `(vault_path, mtime_ns)`.
+- **Tier 2 (SQLite FTS5/BM25, `< 10 ms` `mode="fast"`)**: deterministic lexical
+  recall (`FtsSearchMixin`) paired with Tier 1 Trie boosts for sub-10 ms hook
+  and fast-mode queries without invoking neural inference.
+- **Tier 3 (hybrid vector + RRF + Cross-Encoder reranking)**: FAISS vector
+  search (`faiss-disk` / `faiss-mem`) fused with FTS5 via weighted Reciprocal
+  Rank Fusion (`0.60` FTS / `0.40` semantic), reserving the top-10 FTS BM25
+  slots prior to Cross-Encoder reranking (`SemanticRerankMixin`) and enforcing a
+  `>= 0.35` post-rerank confidence floor, optional NLI claim-attribution
+  scoring, MMR-diverse token-budgeted packing, and progressive depth tiers
+  (`headline` / `snippet` / `chunk` / `document`) — merged across the personal
+  and shared legs by recall scope.
 
 ## The AFM pass pipeline
 

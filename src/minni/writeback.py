@@ -10,7 +10,7 @@ a decision rationale, a learned preference), it can store that as a
 Learnings are:
 - Indexed in FTS5 for keyword search
 - Embedded for semantic search
-- Categorized (pattern, fix, decision, preference, fact)
+- Categorized (pattern, fix, decision, preference, fact, procedure, architecture, codebase, general)
 - Versioned: new learnings can supersede old ones
 - Optionally written to disk as markdown files (for Obsidian integration)
 """

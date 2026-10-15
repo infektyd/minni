@@ -74,7 +74,6 @@ flowchart TB
   end
   subgraph layer5 [Layer5_Console]
     UI["loopback UI + bearer"]
-    DR["Deep Research opt-in"]
   end
   subgraph layer6 [Layer6_Optional_HTTP]
     HTTP["--port unauth operator RPC"]
@@ -123,13 +122,7 @@ flowchart TB
    caller `privacy_level` to `review` so it cannot self-mark auto-promotable.
    Content-semantic gate is primarily `is_instruction_like` (regex floor),
    plus privacy/quality/dedup filters — not a human endorsement.
-8. **Deep Research (console, opt-in)** — `MINNI_CONSOLE_DEEP_RESEARCH=1` +
-   bearer + local bind. Can exec external CLI/Python and egress to the internet
-   (`google_search`, `url_context`, `code_execution`); `local-docs`/`hybrid` can
-   ship vault material to cloud. Contradicts “no internet clients” unless this
-   gate stays off. Rate **High** if token leaks; otherwise **Medium** gated
-   residual.
-9. **Recall / privacy** — Evidence envelopes + `instruction_like`. `blocked`
+8. **Recall / privacy** — Evidence envelopes + `instruction_like`. `blocked`
    always dropped. Missing privacy → **`safe` (fail-open)** in code, schema, and
    this document. Fail-closed behavior requires an explicit `private`,
    `local-only`, or `blocked` stamp.
@@ -145,11 +138,11 @@ token still required); same-uid direct FS access to DB/vault (bypasses all of
 the above).
 
 **Operator-controlled:** `MINNI_*` / legacy `SOVEREIGN_*` env; principal files;
-allowed vault roots; launchd/socket config; console token / `NO_AUTH` / Deep
-Research enable; AFM allowlists and loop enable; manual candidate/AFM
+allowed vault roots; launchd/socket config; console token / `NO_AUTH`;
+AFM allowlists and loop enable; manual candidate/AFM
 endorsement. Deliberately pointing vault/DB/AFM at unsafe locations remains
-configuration risk — **except** enabling HTTP fallback or Deep Research, which
-create new Critical/High technical surfaces and must be treated as such.
+configuration risk — **except** enabling HTTP fallback, which
+creates a Critical technical surface and must be treated as such.
 
 **Developer-controlled:** tests, fixtures, migrations, CLI (`agent_api`, graph
 export). These become security-relevant if wired to a model/UI/network without
@@ -159,7 +152,7 @@ surfaces.
 
 **Assumptions:** OS FS permissions protect the home directory *when chmod
 succeeds*; single-user local software; no untrusted internet clients **unless
-Deep Research or non-loopback AFM/HTTP is enabled**; recalled memory is
+non-loopback AFM/HTTP is enabled**; recalled memory is
 evidence/citation never system/developer/user instruction.
 
 ## 4. Threats, mitigations, and residual stories
@@ -174,7 +167,7 @@ evidence/citation never system/developer/user instruction.
 | Vault path traversal | Read/write outside configured vault. | Daemon vault-root guard + TS `assertUnder` / realpath. | Vacuous under zero-config empty roots; symlink/race; legacy bridge installs. |
 | AFM provider / SSRF | Context to nonlocal endpoint; confused summaries. | Allowlist + HTTPS for non-loopback; draft/review oriented. | `0.0.0.0` loopback quirk; consolidation auto-accept when loop on. |
 | Vector / learnings leakage | Private/blocked via semantic or learning search. | Retrieval filters `privacy_level`/`lifecycle`; FAISS post-filters via SQLite. | Missing privacy → `safe`; `handle_read` hardcodes safe meta; `search_learnings` has no privacy dimension; frontmatter `page_type`/`agent` substring cross-share. |
-| Console / Deep Research | Local browser or process drives privileged actions; vault→cloud. | Loopback bind, Host/Origin/Sec-Fetch, bearer by default; Deep Research opt-in. | Token-in-URL leak; `/api/health` unauth; `NO_AUTH=1`; Deep Research egress/exec when enabled. |
+| Console | Local browser or process drives privileged actions. | Loopback bind, Host/Origin/Sec-Fetch, bearer by default (`deep_research_agent` routes removed in v0.6.0). | Token-in-URL leak; `/api/health` unauth; `NO_AUTH=1`. |
 | Plugin-local vault writes | Durable notes without daemon gate. | Schema-pinned vault path (SEC-003/G12). | `gate.shared` attribution only; proceeds when daemon down. |
 | Secret redaction gaps | Tokens leave process in audit/status/ping/DR output. | Label-oriented + common bare prefixes (`sk-`, `ghp_`, `github_pat_`, `AKIA`, Slack `xox*`) + PEM + common absolute paths. | Unknown-prefix high-entropy blobs still missed — incomplete Medium control. |
 
@@ -205,7 +198,7 @@ succeed; plugin vault writes without gate. Credit the strong control:
 resolve.
 
 **Availability:** caps on UDS/learn/UI; HTTP body uncapped when enabled;
-embedding/AFM/Deep Research remain local DoS/egress targets.
+embedding/AFM remain local DoS/egress targets.
 
 ## 5. Criticality calibration
 
@@ -217,7 +210,7 @@ embedding/AFM/Deep Research remain local DoS/egress targets.
   (inherent; accepted residual of the architecture)
 - Identity/principal bypass that commits durable memory as another agent (HTTP
   stamp, or wildcard main abused for force/learn where gates allow)
-- Path traversal / helper / Deep Research / AFM misconfig that reads secrets or
+- Path traversal / helper / AFM misconfig that reads secrets or
   ships them off-box without operator intent
 - Prompt injection / inbox poisoning that causes **automatic durable writes**
   (AFM loop on), shell execution, or secret export
@@ -232,8 +225,6 @@ embedding/AFM/Deep Research remain local DoS/egress targets.
   (zero-config roots are already open)
 - AFM SSRF to non-allowlisted endpoint, or allowlisted nonlocal endpoint
   receiving private context
-- Deep Research enabled + console token available → vault→cloud exfil /
-  external exec
 - Oversized HTTP/AFM payload exhaustion when those surfaces are on (DoS axis of
   the same Critical HTTP surface)
 
@@ -246,7 +237,6 @@ embedding/AFM/Deep Research remain local DoS/egress targets.
 - Incorrect lifecycle handling; contract/doc drift
 - Supply-chain / broad dependency ranges; graph/FAISS exports leaking metadata
   when shared
-- Deep Research feature existing behind opt-in (document even when off)
 
 **Low**
 
@@ -297,7 +287,7 @@ retrieval, ingest, and the schema default all fall back to `safe`, not
 - New vault write paths.
 - New vector backend adapters.
 - New AFM provider, extraction, synthesis, or consolidation auto-promote paths.
-- Enabling or changing HTTP fallback, console auth, Deep Research, or
+- Enabling or changing HTTP fallback, console auth, or
   `MINNI_AFM_LOOP` defaults.
 - Any default flip based on eval harness results.
 - Changes to principal synthesis, `can_read_document`, or peer-credential /

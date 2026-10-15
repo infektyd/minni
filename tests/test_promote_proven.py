@@ -153,6 +153,13 @@ def test_receipt_stamping_via_stamp_only_and_attest(temp_git_repo: Path) -> None
     assert parts2[1] == expected_commit
     assert parts2[3] == "custom-verify-cmd"
 
+    # 4. --stamp-only and --check-receipt do not pathname-expand glob characters in gate_label
+    glob_res = _run_script(temp_git_repo, "--stamp-only", "gate*?[a-z]")
+    assert glob_res.returncode == 0, glob_res.stderr
+    check_glob = _run_script(temp_git_repo, "--check-receipt")
+    assert check_glob.returncode == 0, check_glob.stderr
+    assert "gate=gate*?[a-z]" in check_glob.stdout
+
 
 def test_check_receipt_happy_path_and_rejection_cases(temp_git_repo: Path) -> None:
     """--check-receipt exits 0 on fresh matching tree SHA and non-zero on missing/stale/changed/dirty/symlink."""

@@ -81,7 +81,7 @@ audit writes do not cross this boundary; see
 |---|---|
 | `src/minni/minnid.py` | JSON-RPC daemon, dispatch, policy, storage, status |
 | `src/minni/principal.py` | Identity resolution, vault roots, capabilities, read authorization |
-| `src/minni/retrieval.py` | FTS/FAISS/RRF/rerank retrieval path, personal/shared leg merge |
+| `src/minni/retrieval.py` (`trie_index.py`, `fts_search.py`, `semantic_rerank.py`) | Hybrid Tier 1 Trie + Tier 2 FTS5 BM25 (`mode="fast"`) + FAISS/RRF/Cross-Encoder rerank retrieval path, personal/shared leg merge |
 | `src/minni/db.py` | Shared SQLite schema and migrations |
 | `src/minni/afm_passes/` | Background curation passes (see [concepts](concepts.md#the-afm-pass-pipeline)) |
 | `src/minni/minni_cli.py` | Newcomer lifecycle CLI: `up` / `down` / `status` / `doctor` |

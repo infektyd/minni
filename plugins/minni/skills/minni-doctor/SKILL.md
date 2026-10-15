@@ -138,8 +138,8 @@ bash scripts/repro-smoke.sh                   # hermetic daemon smoke
 ```
 
 The VectorBackend conformance suite
-(`tests/test_pr3_storage_abstraction.py`) certifies any vector backend —
-FAISS today; any future Lance/Qdrant adapter must pass the same file.
+(`tests/test_pr3_storage_abstraction.py`) certifies the active vector backends
+(`faiss-disk` and `faiss-mem`; legacy Lance/Qdrant/multi stubs were removed in v0.6.0).
 
 ## Reporting discipline
 
