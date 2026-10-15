@@ -1967,9 +1967,12 @@ async def _serve_unix_socket(path: Path):
                 probe.connect(str(path))
                 logger.error("Active minnid is already listening on %s. Refusing to overwrite active socket.", path)
                 raise RuntimeError(f"Active minnid is already listening on {path}. Refusing to overwrite active socket.")
-        except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError) as e:
-            if isinstance(e, RuntimeError):
-                raise
+        except socket.timeout as e:
+            # A listener exists but did not accept in time (e.g. saturated backlog):
+            # not stale. Refuse to start rather than unlink a live socket.
+            logger.error("Socket %s did not accept within probe timeout (%s); refusing to overwrite.", path, e)
+            raise RuntimeError(f"Active minnid socket at {path} did not accept within probe timeout. Refusing to overwrite active socket.") from e
+        except (ConnectionRefusedError, FileNotFoundError):
             try:
                 path.unlink()
             except OSError as unlink_err:

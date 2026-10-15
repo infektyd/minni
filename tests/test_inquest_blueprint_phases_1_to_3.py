@@ -226,9 +226,10 @@ def test_phase2_in_memory_trie_and_fast_recall_under_10ms(tmp_path):
 
 
 def test_phase3_migration_023_unblocks_legacy_proposed_candidates(tmp_path):
-    """Migration 023 must add candidate_packets.category, backfill NULL
-    requested_privacy on proposed rows to 'safe', and supersede stale afm_review
-    rows in consolidation_actions so _proposed_candidates returns them."""
+    """Migration 023 must add candidate_packets.category, leave NULL
+    requested_privacy on proposed rows NULL (no asserted 'safe' intent), and
+    supersede stale automated privacy fences in consolidation_actions so
+    _proposed_candidates returns them."""
     from minni.afm_passes.consolidation import _proposed_candidates
 
     cfg = MinniConfig(
@@ -256,7 +257,7 @@ def test_phase3_migration_023_unblocks_legacy_proposed_candidates(tmp_path):
                 """
                 INSERT INTO consolidation_actions
                 (action_type, claim, status, detail, created_at)
-                VALUES ('afm_review', ?, 'pending', 'privacy_level=review', ?)
+                VALUES ('afm_review', ?, 'pending', 'afm-consolidation: privacy=review', ?)
                 """,
                 (str(cid), time.time() - 3500),
             )
@@ -275,7 +276,7 @@ def test_phase3_migration_023_unblocks_legacy_proposed_candidates(tmp_path):
             f"Expected legacy proposed candidate {cid} to be unblocked by migration 023, got {unblocked_ids}"
         )
         row = next(r for r in unblocked if r["candidate_id"] == cid)
-        assert row["requested_privacy"] == "safe"
+        assert row["requested_privacy"] is None
     finally:
         db.close()
 

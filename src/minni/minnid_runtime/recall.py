@@ -17,6 +17,7 @@ from minni.timestamps import parse_epoch_or_report
 from minni.principal import (
     allows_cross_agent_recall,
     can_read_document,
+    is_operator_principal,
     make_capability_denied_error,
 )
 
@@ -1104,8 +1105,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                             "WHERE agent = ? OR sigil = ? OR agent = 'unknown' "
                             "OR LOWER(COALESCE(page_type, '')) IN ('wiki', 'handoff', 'synthesis', 'decision') "
                             "OR LOWER(COALESCE(agent, '')) LIKE '%wiki%' "
-                            "OR LOWER(COALESCE(agent, '')) LIKE '%handoff%' "
-                            "LIMIT 25",
+                            "OR LOWER(COALESCE(agent, '')) LIKE '%handoff%'",
                             (principal.agent_id, principal.agent_id),
                         )
                         rows = c.fetchall()
@@ -1604,9 +1604,11 @@ def handle_trace(params: dict, request_id: Any, context: RecallContext) -> dict:
         # R8: bind the read to the requesting principal — a trace_id is not an
         # authorization token, so another authenticated principal cannot read a
         # trace it did not create (owner-bound entries deny a non-owner).
-        # Top-level operator ('main' / 'operator') may inspect any trace.
+        # Operator (is_operator_principal: 'main'/'operator' WITH capabilities)
+        # may inspect any trace. Bare agent_id 'main' is not enough: co-located
+        # subagents are stamped 'main' on the shared UDS surface.
         req_agent = getattr(principal, "agent_id", None)
-        effective_requester = None if req_agent in ("main", "operator") else req_agent
+        effective_requester = None if is_operator_principal(principal) else req_agent
         trace = context.trace_ring().get(
             str(trace_id), requester=effective_requester
         )
