@@ -651,7 +651,12 @@ export async function harvestTranscriptDelta(
   let blockedReason: string | undefined;
 
   for (const trigger of triggers) {
-    const triggerHash = createHash("sha1").update(trigger.triggerText).digest("hex");
+    // Key on the full context window too: test_insight triggerText only carries
+    // the passing output, so a generic "all tests passed" would otherwise
+    // suppress the learning for a different failure/edit pair.
+    const triggerHash = createHash("sha1")
+      .update(JSON.stringify([trigger.triggerText, trigger.contextWindow]))
+      .digest("hex");
     if (state.harvested[triggerHash]) {
       continue;
     }

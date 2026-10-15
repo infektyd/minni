@@ -76,6 +76,13 @@ class TrieIndexMixin:
                 "indexed_at": indexed_at,
                 "layer": layer or "knowledge",
             }
+            if doc_id in self._trie_docs:
+                # Reindex of an existing doc_id: drop its old token/prefix
+                # memberships so terms it no longer contains stop matching.
+                for members in self._trie_token_map.values():
+                    members.discard(doc_id)
+                for members in self._trie_prefix_map.values():
+                    members.discard(doc_id)
             self._trie_docs[doc_id] = entry
             header_text = f"{path or ''} {heading_context or ''} {(chunk_text or '')[:600]}"
             tokens = set(self._tokenize_trie_text(header_text))

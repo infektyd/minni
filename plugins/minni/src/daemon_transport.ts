@@ -1018,9 +1018,11 @@ function formatDaemonCard(r: Record<string, unknown>, index: number): string {
       ? rawSnippet.replace(/\s+/g, " ").trim()
       : undefined;
 
-  let card = `${index + 1}. ${wikilink}`;
+  // Title/wikilink come from note content: collapse newlines so a crafted title
+  // cannot open its own Markdown section in the model-facing recall.
+  let card = `${index + 1}. ${wikilink.replace(/\s+/g, " ").trim()}`;
   if (title && title !== wikilink && title !== wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "")) {
-    card += ` — ${title}`;
+    card += ` — ${title.replace(/\s+/g, " ").trim()}`;
   }
   if (score !== undefined) {
     card += ` (score=${score})`;
@@ -1033,9 +1035,10 @@ function formatDaemonCard(r: Record<string, unknown>, index: number): string {
 
 function formatVaultCard(r: VaultSearchResult, index: number): string {
   const snippet = r.snippet ? r.snippet.replace(/\s+/g, " ").trim() : "";
-  let card = `${index + 1}. ${r.wikilink}`;
+  // Same escaping as formatDaemonCard: note titles/wikilinks are untrusted.
+  let card = `${index + 1}. ${r.wikilink.replace(/\s+/g, " ").trim()}`;
   if (r.title && r.title !== r.wikilink && r.title !== r.wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "")) {
-    card += ` — ${r.title}`;
+    card += ` — ${r.title.replace(/\s+/g, " ").trim()}`;
   }
   card += ` (vault score=${r.score})`;
   if (snippet) {

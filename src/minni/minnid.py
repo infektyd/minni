@@ -1947,7 +1947,7 @@ async def _handle_client(reader: asyncio.StreamReader,
 _bound_socket_inode: Optional[int] = None
 
 
-async def _serve_unix_socket(path: Path):
+async def _serve_unix_socket(path: Path, shutdown_tasks=None):
     """Start the Unix socket server."""
     global _server, _running, _bound_socket_inode
 
@@ -2003,7 +2003,7 @@ async def _serve_unix_socket(path: Path):
     watchdog_task = None
     if _bound_socket_inode is not None:
         watchdog_task = asyncio.create_task(
-            _socket_watchdog_runner(path, _bound_socket_inode)
+            _socket_watchdog_runner(path, _bound_socket_inode, shutdown_tasks=shutdown_tasks)
         )
 
     try:
@@ -2320,7 +2320,9 @@ def main():
             max_workers=workers, thread_name_prefix="minnid-rpc"
         )
     )
-    main_task = loop.create_task(_serve_unix_socket(_unix_socket_path))
+    main_task = loop.create_task(
+        _serve_unix_socket(_unix_socket_path, shutdown_tasks=lambda: background_tasks())
+    )
 
     http_task = None
     if args.port:
