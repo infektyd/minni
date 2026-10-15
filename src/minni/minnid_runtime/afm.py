@@ -491,7 +491,7 @@ def promote_candidate_durable(
 
     try:
         if wb_config is not None and wb_config.writeback_enabled:
-            wb._write_to_disk(lid, agent_id, "general", content, now)
+            wb._write_to_disk(lid, agent_id, cand_category, content, now)
     except Exception as exc:
         context.logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
 
@@ -676,7 +676,9 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
     review_ids = [int(cid) for cid in (result.get("review_candidate_ids") or [])]
     reject_ids = [int(cid) for cid in (result.get("reject_candidate_ids") or [])]
     redact_ids = [int(cid) for cid in (result.get("redact_candidate_ids") or [])]
-    judge_verdicts = result.get("judge_verdicts") or {}
+    # Deferred lifecycle carries verdicts under the in-process "_judge_verdicts"
+    # key (dropped by the sidecar serializer, since Verdict is not JSON-safe).
+    judge_verdicts = result.get("judge_verdicts") or result.get("_judge_verdicts") or {}
 
     for cid in promote_ids:
         try:
@@ -795,19 +797,6 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
     dry_run = bool(params.get("dry_run", True))
     vault_path = str(params.get("vault_path") or context.default_config.vault_path)
 
-    lock_acquired = False
-    if pass_name == "consolidation" and not dry_run:
-        if not _CONSOLIDATION_LOCK.acquire(blocking=False):
-            return context.make_response({
-                "status": "busy",
-                "reason": "consolidation_in_progress",
-                "pass_name": pass_name,
-                "dry_run": dry_run,
-                "drafts": [],
-                "drafts_written": [],
-            }, request_id)
-        lock_acquired = True
-
     # P1: dry_run=false runs submit_drafts/apply_consolidation_result, promoting
     # candidates to durable learnings — a write op. The method-capability table
     # only requires 'read' (so read principals may still dry-run/preview). Gate
@@ -840,6 +829,21 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             "drafts": [],
             "drafts_written": [],
         }, request_id)
+
+    # Acquire only after every preflight return above, so no early exit can
+    # leave the single-flight lock held; the finally below releases it.
+    lock_acquired = False
+    if pass_name == "consolidation" and not dry_run:
+        if not _CONSOLIDATION_LOCK.acquire(blocking=False):
+            return context.make_response({
+                "status": "busy",
+                "reason": "consolidation_in_progress",
+                "pass_name": pass_name,
+                "dry_run": dry_run,
+                "drafts": [],
+                "drafts_written": [],
+            }, request_id)
+        lock_acquired = True
 
     db = None
     try:
@@ -923,6 +927,13 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
                 "review_candidate_ids": list(
                     result.get("review_candidate_ids") or []
                 ),
+                "reject_candidate_ids": list(
+                    result.get("reject_candidate_ids") or []
+                ),
+                "redact_candidate_ids": list(
+                    result.get("redact_candidate_ids") or []
+                ),
+                "_judge_verdicts": result.get("judge_verdicts") or {},
             }
             write_result = submit_drafts({
                 "pass_name": pass_name,
@@ -969,6 +980,8 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             result.get("promote_candidate_ids")
             or result.get("dedup_candidate_ids")
             or result.get("review_candidate_ids")
+            or result.get("reject_candidate_ids")
+            or result.get("redact_candidate_ids")
         ):
             if write_refused:
                 if write_status == "write_timeout":

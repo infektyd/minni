@@ -1538,6 +1538,8 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
         lifecycle.get("promote_candidate_ids")
         or lifecycle.get("dedup_candidate_ids")
         or lifecycle.get("review_candidate_ids")
+        or lifecycle.get("reject_candidate_ids")
+        or lifecycle.get("redact_candidate_ids")
     )
     if not has_ops:
         return True

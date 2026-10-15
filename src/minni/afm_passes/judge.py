@@ -125,11 +125,11 @@ _GLOBAL_BREAKER = CircuitBreaker(failure_threshold=3, cooldown_seconds=300.0)
 
 def scan_for_secrets(text: str) -> Optional[str]:
     """Scan candidate text for credential and key patterns."""
-    for pat in _SECRET_PATTERNS:
-        m = pat.search(text)
-        if m:
-            matched_snippet = m.group(0)[:30]
-            return f"secret pattern matched: {matched_snippet}..."
+    # Report only the pattern index: the matched text is the credential itself
+    # and must not reach verdict reasons, DB rows, or logs.
+    for idx, pat in enumerate(_SECRET_PATTERNS):
+        if pat.search(text):
+            return f"secret pattern matched: pattern #{idx}"
     return None
 
 

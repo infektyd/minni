@@ -1708,10 +1708,16 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
     ) -> List[Dict]:
         """Hybrid retrieval pipeline: FTS5 + FAISS/Trie + RRF + Cross-Encoder + Depth projection."""
         claim_text = str(claim or "").strip()
+        hyde_requested = (
+            self.config.hyde_enabled if use_hyde is None else bool(use_hyde)
+        )
         effective_fast = mode == "fast" or (
             mode is None
             and backend is None
             and not claim_text
+            and not expand
+            and not summarize_neighborhood
+            and not hyde_requested
             and sort != "chronological"
             and self._is_large_corpus()
         )

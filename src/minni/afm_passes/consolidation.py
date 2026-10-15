@@ -444,12 +444,12 @@ def run(db, config, vault_path: Optional[str] = None,
 
             judge_verdicts[cand["candidate_id"]] = verdict
 
-            if verdict.decision == "accept":
-                if judge_mode == "enforce":
-                    promote_candidate_ids.append(cand["candidate_id"])
-                    seen_this_run.add(batch_key)
-                else:  # shadow mode: log verdict, route to review
-                    _review(cand, f"afm_judge_shadow: accept ({verdict.reason})")
+            if judge_mode != "enforce":
+                # shadow: observe only; every verdict routes to review, never terminal
+                _review(cand, f"afm_judge_shadow: {verdict.decision} ({verdict.reason})")
+            elif verdict.decision == "accept":
+                promote_candidate_ids.append(cand["candidate_id"])
+                seen_this_run.add(batch_key)
             elif verdict.decision == "reject":
                 reject_candidate_ids.append(cand["candidate_id"])
             elif verdict.decision == "redact":

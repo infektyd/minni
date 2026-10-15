@@ -202,12 +202,17 @@ export function extractEntryText(entry: TranscriptEntry): string {
 // Cursor Safety & Delta Harvester (Invariant 3: Read up to last complete newline)
 // ---------------------------------------------------------------------------
 
+/** Per-pass read cap so the Stop/PreCompact hook never allocates a whole large transcript. */
+const MAX_TRANSCRIPT_DELTA_BYTES = 4 * 1024 * 1024;
+
 export async function readTranscriptDelta(
   transcriptPath: string,
   fromOffset = 0,
 ): Promise<{ entries: TranscriptEntry[]; newOffset: number }> {
   try {
     const info = await stat(transcriptPath);
+    // Truncated or rotated transcript: the stored offset is past EOF, restart from the top.
+    if (info.size < fromOffset) fromOffset = 0;
     if (!info.isFile() || info.size <= fromOffset) {
       return { entries: [], newOffset: fromOffset };
     }
@@ -215,8 +220,9 @@ export async function readTranscriptDelta(
     const handle = await open(transcriptPath, "r");
     let buffer: Buffer;
     let bytesRead = 0;
+    let length = 0;
     try {
-      const length = info.size - fromOffset;
+      length = Math.min(info.size - fromOffset, MAX_TRANSCRIPT_DELTA_BYTES);
       buffer = Buffer.alloc(length);
       const res = await handle.read(buffer, 0, length, fromOffset);
       bytesRead = res.bytesRead;
@@ -231,7 +237,9 @@ export async function readTranscriptDelta(
     // Invariant 3: Strictly up to the last complete newline (\n), never to raw EOF
     const lastNewline = buffer.subarray(0, bytesRead).lastIndexOf(0x0a);
     if (lastNewline === -1) {
-      return { entries: [], newOffset: fromOffset };
+      // A full window with no newline holds one line longer than the cap; skip it so the cursor advances.
+      const skipped = length === MAX_TRANSCRIPT_DELTA_BYTES ? fromOffset + bytesRead : fromOffset;
+      return { entries: [], newOffset: skipped };
     }
 
     const validChunk = buffer.subarray(0, lastNewline + 1).toString("utf8");
@@ -635,6 +643,11 @@ export async function harvestTranscriptDelta(
 
   const { entries, newOffset } = await readTranscriptDelta(transcriptPath, currentOffset);
   if (entries.length === 0) {
+    // Persist offset moves that yielded no entries (truncation reset, oversized-line skip).
+    if (newOffset !== currentOffset) {
+      state.cursors[transcriptPath] = newOffset;
+      await writeJevHarvestState(config.vaultPath, state);
+    }
     return { harvested: false, learnings: [], reason: "no_new_entries" };
   }
 
