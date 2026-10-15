@@ -11,7 +11,9 @@
 #   make build   - build the plugin (tsc + vite)
 #   make test    - full engine pytest + plugin test suite (heavy)
 #   make check   - fast validation gate (lint + typecheck + plugin build/test
-#                  + scoped engine pytest); this is what CI/pre-push should run
+#                  + scoped engine pytest); stamps .git/.proven-shas for pre-push
+#   make attest  - full rootside attestation (check + smoke + check-versions + public boundary)
+#   make promote - verify proven tree-SHA receipt, push main to origin, and sync-root
 #   make smoke   - hermetic engine repro smoke (scripts/repro-smoke.sh)
 #   make daemon  - run the minnid daemon on the default socket
 #   make help    - list targets
@@ -50,6 +52,8 @@ help:
 	@echo "  test       full engine pytest + plugin test (heavy)"
 	@echo "  test-engine  full engine pytest suite (override ENGINE_PYTEST)"
 	@echo "  check      fast gate: lint + typecheck + plugin build/test + scoped engine pytest"
+	@echo "  attest     full rootside attestation (scripts/promote-proven.sh --attest)"
+	@echo "  promote    promote proven local main to origin and sync-root (scripts/promote-proven.sh)"
 	@echo "  coverage   plugin (node) + engine (pytest-cov) coverage with floors"
 	@echo "  smoke      hermetic engine repro smoke"
 	@echo "  daemon     run the minnid daemon (SOCKET=$(SOCKET))"

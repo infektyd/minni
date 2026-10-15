@@ -24,9 +24,11 @@ do and the `MINNI_SKIP_HOOKS` escape hatch.
 ## The commands you'll actually run
 
 ```bash
-make check   # fast gate: lint + typecheck + plugin build/test + scoped engine pytest
-make test    # full suites (engine pytest + plugin test) — heavier, loads embedding/FAISS models
-make smoke   # hermetic daemon smoke (scripts/repro-smoke.sh), isolated MINNI_HOME
+make check    # fast gate: lint + typecheck + plugin build/test + scoped engine pytest (stamps .git/.proven-shas)
+make attest   # full rootside attestation: make check + make smoke + check-versions --repo-only + check-public-boundary.sh
+make promote  # verify HEAD's tree-SHA in .git/.proven-shas, push main to origin, and sync-root
+make test     # full suites (engine pytest + plugin test, including e2e_real_minnid.test.mjs) — heavier, loads embedding/FAISS models
+make smoke    # hermetic daemon smoke (scripts/repro-smoke.sh), isolated MINNI_HOME
 ```
 
 Prefer the Make targets above: they set `PYTHONPATH=src` so a git worktree
@@ -34,13 +36,20 @@ does not silently import `minni` from another checkout's editable install
 (#258). If you run bare pytest, use `PYTHONPATH=src .venv/bin/python -m pytest …`
 from the repo root (scoped agent runs included).
 
-`make check` is what the pre-push hook runs, and it's the fast gate CI expects
-to pass before review. Run it before you push. `make test` runs the full
-engine and plugin suites and is slower. `make smoke` runs the daemon in an
-isolated `MINNI_HOME` and asserts no pollution of your real `~/.minni`.
+`make check` is the fast validation gate and stamps `HEAD`'s tree-SHA into
+`.git/.proven-shas` via `scripts/promote-proven.sh`. The `.githooks/pre-push`
+hook verifies that receipt before pushing `main` (and runs `make check`
+automatically on cache miss). `make attest` runs the full local verification
+suite (`make check` + `make smoke` + `check_versions.py --repo-only` +
+`scripts/check-public-boundary.sh`) and stamps a `full-attest` receipt;
+`make promote` verifies that receipt, pushes `main` to `origin`, and runs
+`make sync-root`. `make test` runs the full engine and plugin suites (including
+the zero-mock Unix socket E2E gate `plugins/minni/tests/e2e_real_minnid.test.mjs`)
+and is slower. `make smoke` runs the daemon in an isolated `MINNI_HOME` and
+asserts no pollution of your real `~/.minni`.
 
 See the Makefile (`make help`) for the full target list, including `lint`,
-`typecheck`, `build`, `coverage`, and `daemon`.
+`typecheck`, `build`, `coverage`, `attest`, `promote`, and `daemon`.
 
 ## Dogfooding the live machine
 
@@ -88,7 +97,9 @@ maintainer discussion **before** you write code. Open an issue describing the
 problem and proposed approach first. That surface spans both languages:
 
 - **Engine (`src/minni/`)** — anything that affects how memories are written,
-  ranked, retrieved, or authorized: `src/minni/db.py`, `src/minni/retrieval.py`,
+  ranked, retrieved, or authorized: `src/minni/db.py`, `src/minni/retrieval.py`
+  (`src/minni/trie_index.py`, `src/minni/fts_search.py`,
+  `src/minni/semantic_rerank.py`), `src/minni/writeback.py`,
   `src/minni/principal.py`, the AFM passes, the candidate/learning lifecycle.
 - **Plugin security paths (`plugins/minni/src/`)** — the recall/privacy and
   model-facing-context gates enforced plugin-side: privacy gating and evidence

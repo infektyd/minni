@@ -32,25 +32,30 @@ Each wiki page gets: frontmatter metadata baked into chunk heading context,
   └── (meta files)     → wiki:meta
 
 src/minni/  (in a Minni checkout)
-  ├── wiki_indexer.py   ← NEW: wiki-aware indexer
-  ├── index_all.py      ← NEW: unified vault+wiki indexer
-  ├── config.py         ← MODIFIED: wiki_paths field
-  ├── retrieval.py      ← MODIFIED: FTS5 hyphen fix
-  └── db.py             ← Schema: memory_links FK → documents
+  ├── wiki_indexer.py    ← wiki-aware indexer
+  ├── index_all.py       ← unified vault+wiki indexer
+  ├── indexer.py         ← vault indexer (including synchronous index_single_file)
+  ├── config.py          ← wiki_paths field
+  ├── retrieval.py       ← RetrievalEngine orchestrator
+  ├── trie_index.py      ← Tier 1 in-memory prefix/token Trie
+  ├── fts_search.py      ← Tier 2 FTS5 BM25 & _sanitize_fts_query hyphen handling
+  ├── semantic_rerank.py ← Tier 3 FAISS + RRF + Cross-Encoder reranking
+  ├── writeback.py       ← CATEGORIES (pattern, fix, decision, preference, fact, procedure, architecture, codebase, general)
+  └── db.py              ← Schema: memory_links FK → documents
 ```
 
 ### Key Files
 
-#### wiki_indexer.py
+#### `src/minni/wiki_indexer.py`
 - `WikiPageParser` — parses frontmatter (YAML) + extracts `[[wikilinks]]`
 - `WikiIndexer` — two-phase indexing:
   - Phase 1: Index all pages (content + chunks + FTS), queue wikilinks
   - Phase 2: Resolve wikilinks into `memory_links` (all pages are in DB)
 - Enriched heading context: `[wiki:concept | tags: architecture, cognitive | Cognitive Architecture (Tri-Brain)]`
 
-#### index_all.py
+#### `src/minni/index_all.py`
 - `index_all(vault=True, wiki=True, verbose=False)` — runs VaultIndexer + WikiIndexer, then rebuilds FAISS
-- CLI: `python index_all.py [--vault-only|--wiki-only|--verbose]`
+- CLI: `python -m minni.index_all [--vault-only|--wiki-only|--verbose]`
 
 ### Usage
 
@@ -150,7 +155,7 @@ Solution: Phase 1 queues `(doc_id, wikilinks)`, Phase 2 resolves after all pages
 
 #### FTS5 Hyphen Handling
 FTS5 treats `-` as a NOT operator. `multi-agent` becomes `multi NOT agent` → syntax error.
-Fix in `retrieval.py` `_sanitize_fts_query`: replace ALL non-word chars including hyphens with spaces:
+Fix in `src/minni/fts_search.py` (`FtsSearchMixin._sanitize_fts_query`, mixed into `RetrievalEngine` in `src/minni/retrieval.py`): replace ALL non-word chars including hyphens with spaces:
 ```python
 cleaned = re.sub(r'[^\w\s]', ' ', query)  # removes hyphens
 ```

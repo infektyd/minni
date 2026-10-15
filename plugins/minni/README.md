@@ -128,9 +128,10 @@ rejected outright and disables the cloud provider.
 - `minni_export_pack`
 - `minni_learning_quality`
 - `minni_learn`
-- `minni_list_candidates` — list this runtime principal's staged candidates
-  (own rows only; defaults to `status=proposed`; redacted/rejected content
-  is not returned to the model)
+- `minni_list_candidates` — list staged candidates (platform principals see
+  their own rows only; operator principals `main`/`operator` without an explicit
+  `agent_id` filter list across all principals; defaults to `status=proposed`;
+  redacted/rejected content is not returned to the model)
 - `minni_resolve_candidate` — owner-or-explicit-operator candidate resolution
   for staged learning candidates. Accept into durable memory still requires
   operator/govern; a platform host may reject/redact its own rows without that
@@ -150,8 +151,7 @@ rejected outright and disables the cloud provider.
 - `minni_ping_agent_request` / `minni_ping_agent_inbox` / `minni_ping_agent_decide` / `minni_ping_agent_status`
 - `minni_subscribe_contradictions`
 
-Compatibility aliases for older `sovereign_*` workflows may still resolve to
-these tools, but new integrations should use the `minni_*` names above.
+Only canonical `minni_*` tool names are registered (legacy `sovereign_*` aliases were removed in v0.6.0).
 
 For a complete claim/start/complete sequence and queued-response handling, see
 [Run a Thread](../../docs/thread-workflow.md). A lease token can authorize several
@@ -213,7 +213,7 @@ The Claude Code surface adds:
   - `Stop` — drafts candidate learnings to vault inbox; never auto-writes.
 - **Slash commands** (namespaced as `/minni:*`): `recall`, `learn`, `status`, `audit`, `prepare-task`, `prepare-outcome`.
 - **Team runtime commands**: `team-runtime`, `team-evidence`, and `team-promotion` help coordinate temporary helper agents without automatic learning or promotion.
-- **Agent-first envelope**: hook output is wrapped as `<sovereign:context version="1" event="..." agent="claude-code" tokens="...">` containing deterministic JSON for prompt-cache stability.
+- **Agent-first envelope**: hook output is wrapped as `<minni:context version="1" event="..." agent="claude-code" tokens="...">` containing deterministic JSON for prompt-cache stability.
 
 Disable hooks without uninstalling: `export MINNI_CLAUDECODE_HOOKS=off`.
 
@@ -270,7 +270,7 @@ The KiloCode surface adds:
   - `PreCompact` — captures scar tissue (failed paths, dead ends) so post-compaction KiloCode doesn't repeat them.
   - `Stop` — drafts candidate learnings to vault inbox; never auto-writes.
 - **Slash commands** (namespaced as `/minni:*`): `recall`, `learn`, `status`, `audit`, `prepare-task`, `prepare-outcome`.
-- **Agent-first envelope**: hook output is wrapped as `<sovereign:context version="1" event="..." agent="kilocode" tokens="...">` containing deterministic JSON for prompt-cache stability.
+- **Agent-first envelope**: hook output is wrapped as `<minni:context version="1" event="..." agent="kilocode" tokens="...">` containing deterministic JSON for prompt-cache stability.
 
 Disable hooks without uninstalling: `export MINNI_KILOCODE_HOOKS=off`.
 

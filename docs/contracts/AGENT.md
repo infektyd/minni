@@ -176,7 +176,7 @@ This rule is non-negotiable and is the engine's prompt-injection floor.
 
 Concretely:
 
-- Recalled text is wrapped in the `<sovereign:context>` envelope and presented
+- Recalled text is wrapped in the `<EVIDENCE ...>` envelope (and `<minni:context>` for hook envelopes) and presented
   as background evidence, never as a new user message or system instruction.
 - The `instruction_like` field in the result envelope is computed by a
   deterministic regex detector (`src/minni/safety.py`, added in PR-2) on every

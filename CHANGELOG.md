@@ -8,11 +8,27 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-14
+
+Close of the 5-Phase Architectural Inquest & Rootside Promotion campaign. This release extinguishes legacy `sovereign_*` shims and dead vector stubs, decomposes `RetrievalEngine` into focused lexical/semantic mixins with a `< 0.5 ms` Tier 1 Trie + `< 10 ms` Tier 2 FTS5 BM25 fast path, adds synchronous single-file indexing on `minni_learn` and candidate acceptance, unblocks legacy `afm_review`-fenced candidates via migration `023`, and enforces a rootside-first `.git/.proven-shas` attestation and promotion pipeline. **Minor** version per the pre-1.0 convention: it contains breaking shim removals.
+
+### Removed
+
+- Extinguished legacy `sovereign_memory.py` and `plugins/minni/src/sovereign.ts` compatibility shims (`SovereignDB`, `SovereignConfig`, `parseSovrdJson`, `sovereign_*` MCP tool aliases, and `<sovereign:context>` hook tags). All runtime, MCP, and hook surfaces speak canonical `minni` (`MinniDB`, `MinniConfig`, `parseMinnidJson`, `minni_*` tools, `<minni:context>` envelopes).
+- Removed dead vector backend stubs (`src/minni/storage/vector/qdrant.py`, `lance.py`, `multi.py`), restricting `RetrievalEngine` vector backends to `("faiss-disk", "faiss-mem")`.
+- Removed foreign `deep_research_agent` (`Deep Research`) routes and handlers from `plugins/minni/src/ui-server.ts`.
+
 ### Added
 
+- Tier 1 in-memory inverted prefix/token Trie index (`src/minni/trie_index.py`, `TrieIndexMixin` + `searchVaultNotes` Trie in `plugins/minni/src/vault.ts`) with `(vault_path, mtime_ns)` invalidation for `< 0.5 ms` lexical lookup, paired with Tier 2 SQLite FTS5 BM25 (`src/minni/fts_search.py`, `FtsSearchMixin`) to power the `< 10 ms` `mode="fast"` recall path.
+- Migration `023_unblock_legacy_proposed_candidates.sql`: adds `category TEXT NOT NULL DEFAULT 'general'` to `candidate_packets` and supersedes stale automated `afm_review` privacy fences (`detail LIKE '%: privacy=%'`) while preserving operator holds and leaving `NULL` `requested_privacy` unasserted.
+- Added `"architecture"` and `"codebase"` to `writeback.CATEGORIES` (`src/minni/writeback.py`) with full wire passthrough from `minni_learn` → `stage_candidate` → `resolve_candidate`.
+- Real-daemon Unix socket E2E gate (`plugins/minni/tests/e2e_real_minnid.test.mjs`) verifying `learn` → `list_candidates` → `resolve_candidate` → `search` (`< 15 ms` warm fast path) → `status` against a live `minni.minnid` process with zero mocks.
+- Rootside-first promotion pipeline (`scripts/promote-proven.sh`, `.githooks/pre-push`, `make attest`, `make promote`, `tests/test_promote_proven.py`) with `.git/.proven-shas` tree-SHA receipts and automatic relay approval fallback (`gh auth token`).
 - MCP `minni_list_candidates` — hosts (Cursor included) can list their own
   staged `candidate_packets` and pair that with existing
-  `minni_resolve_candidate`. List is this-principal only. Owner reject/redact
+  `minni_resolve_candidate`, while operator principals (`main` / `operator`)
+  omitting `agent_id` inspect the cross-principal candidate queue. Owner reject/redact
   stays; accept into durable memory still requires operator/govern; a platform
   template does not gain the cross-principal `resolve_candidate` grant.
   Drain-queue list defaults to `status=proposed`, redacts POLICY §2 secrets
@@ -32,6 +48,9 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Changed
 
+- Decomposed `src/minni/retrieval.py` into `RetrievalEngine` + `TrieIndexMixin` (`src/minni/trie_index.py`), `FtsSearchMixin` (`src/minni/fts_search.py`), and `SemanticRerankMixin` (`src/minni/semantic_rerank.py`).
+- Tuned Reciprocal Rank Fusion weights to `0.60` FTS / `0.40` semantic (`src/minni/config.py`) with top-10 FTS BM25 slot reservation prior to Cross-Encoder reranking and a `>= 0.35` post-rerank confidence floor.
+- Synchronous single-file indexing (`index_single_file` / `vault_index_doc`) on `minni_learn` and candidate acceptance so newly written notes are recallable immediately with zero post-learn blind window.
 - `privacy=review` candidate packets are AFM-examinable: learn-only `stage_candidate`
   clamps non-operator proposals to `privacy=review`. Consolidation now treats
   `privacy=review` as examinable (`_EXAMINABLE_PRIVACY`) so multi-agent candidate queues
@@ -70,7 +89,6 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   In-process kick yields to exclusive replan: exclusive replan reserves before the persist lock, and kick/drain does not apply an accepted start while that reservation is live. Accept-path kick also one-shot yields once under lock when reservation is not yet live — so kick cannot apply after accept returns and before orch reserves, without holding the persist lock across accept→replan. Complete-behind-start is the same yield (start still unapplied); a follow-up full drain after that live yield does not apply the start. A live accepting process can stay up; journal has no `slice.started` on a parent that exclusive split then supersedes. After supersede, leftover Q still drops (later drain / post-replan kick). Kick still drains when no exclusive replan is in flight. `THREAD_BUSY` stays overflow, not the default. No SIGKILL required. No new MCP tool.
   Standing drain (`minnidStandingDrainTick` / `drainPendingWorkerWritesForVault`) yields a live queued start while the accepting process is still alive and the ticket is younger than `DEFAULT_WAIT_MS`, so minnid tick cannot journal `slice.started` in the accept→orch-reserve window. Dead/stale acceptor still applies. Kick/`drainWorkerWrites` without standing-defer still applies when no exclusive replan is in flight. Legacy tickets without acceptor pid apply as today. Q still stores token digest only.
   Orch can remount `depends_on` on named live slice(s) via existing `minni_thread_replan` (`set_depends_on`) without a full-set `new_slices` rewrite. Unnamed live slices stay. Journal `depends_on_changed`. No claim token. Remount fails closed if a `depends_on` target is missing or superseded, or is the remounted slice itself (do not persist, do not journal that dangling edge); mixed self+valid rejects the whole remount; honest remount onto pending/in_progress/done still lands. `new_slices`/`add_slices` fail closed if a slice's `depends_on` includes its own id (do not persist, do not journal that self-edge), and also fail closed if a `depends_on` target is missing or superseded (do not persist, do not journal that dangling edge), including a same-call exclusive split (drop + add) that must not persist a written `depends_on` onto the dead parent.
-
 - `docs-accuracy-converge.rhai` now binds `risk_acceptance`/`re_check_issue`
   into both loom gap arrays and emits a `Re-checks required` report section
   (filed refs marked apart from PROPOSED titles) (#354) — superseding the
@@ -79,6 +97,12 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Fixed
 
+- Unblocked parallel `ThreadPoolExecutor` recall legs when `deadline_monotonic` is set (`bind_copied_deadline`) and pre-filtered foreign vaults (`_should_query_foreign_vault`) to eliminate wasted foreign-vault scans and routine `scope_blackout` noise.
+- Fixed `<EVIDENCE>` envelope mid-tag truncation on `depth="snippet"` by keeping `chunk_text` as raw note content before slicing and computing `evidence_envelope` after final score assignment.
+- Broke the Antigravity `PreInvocation` infinite `PreToolUse` denial loop by preserving `consumed` in `writeRecallState` when `task_signature` is unchanged.
+- Preserved original candidate author `principal` and `category` on `resolve_candidate(accept)` (recording resolver in `resolved_by` instead of overwriting `learnings.agent_id`).
+- Added directive-header and prompt-dispatch guard (`isPromptDispatchBlock` in `plugins/minni/src/jev-harvest.ts`) so prompt-coach dispatch blocks are never harvested as memory notes.
+- Fixed Linux `ext4` inode reuse flake in `tests/test_socket_resilience.py` (`test_socket_watchdog_detects_inode_drift`) and refused to unlink active sockets on probe `socket.timeout` in `src/minni/minnid.py`.
 - Monotonic search deadline enforcement before JSON-RPC timeout: retrieval operations
   (`retrieve()`) now check a cooperative deadline budget (`deadline_monotonic`, defaulting to 25s
   / 90% of client `timeout_ms`). When the budget expires, query expansion, FAISS semantic
@@ -565,7 +589,8 @@ commit.
   model-download notices, contributor/security hygiene files, and a rewritten
   README with a `docs/` tree.
 
-[Unreleased]: https://github.com/infektyd/minni/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/infektyd/minni/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/infektyd/minni/releases/tag/v0.6.0
 [0.5.0]: https://github.com/infektyd/minni/releases/tag/v0.5.0
 [0.4.2]: https://github.com/infektyd/minni/releases/tag/v0.4.2
 [0.4.1]: https://github.com/infektyd/minni/releases/tag/v0.4.1

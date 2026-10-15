@@ -20,7 +20,7 @@ When loaded as a KiloCode plugin, Minni wires four hooks into the session:
 - **PreCompact** — captures scar tissue (failed paths, dead ends) so post-compaction doesn't re-walk them.
 - **Stop** — drafts candidate learnings into the vault inbox (never auto-writes); next session reviews them.
 
-All hook output is wrapped in `<sovereign:context version="1" event="..." agent="kilocode" tokens="...">` envelopes containing JSON. Parse the JSON; don't reformat the envelope. Disable with `MINNI_KILOCODE_HOOKS=off`.
+All hook output is wrapped in `<minni:context version="1" event="..." agent="kilocode" tokens="...">` envelopes containing JSON. Parse the JSON; don't reformat the envelope. Disable with `MINNI_KILOCODE_HOOKS=off`.
 
 The KiloCode vault lives at `~/.minni/kilocode-vault` (override: `MINNI_KILOCODE_VAULT_PATH`). The Claude Code vault at `~/.minni/claudecode-vault` is a peer, not a parent — they share a daemon, not a directory.
 
