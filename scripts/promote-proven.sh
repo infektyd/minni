@@ -400,6 +400,9 @@ relay_token="${RELAY_APPROVE_TOKEN:-}"
 if [ -z "$relay_token" ] && command -v security >/dev/null 2>&1; then
   relay_token="$(security find-generic-password -s "minni-relay-approve-token" -w 2>/dev/null || true)"
 fi
+if [ -z "$relay_token" ]; then
+  relay_token="$(gh auth token -u "${RELAY_APPROVE_USER:-infektydrelay-bit}" 2>/dev/null || true)"
+fi
 if [ -n "$relay_token" ]; then
   echo "[promote-proven] Submitting relay approval on PR #${pr_num}..."
   GH_TOKEN="$relay_token" gh pr review "$pr_num" --approve || echo "[promote-proven] WARN: relay approval returned non-zero; continuing..." >&2
