@@ -1,6 +1,6 @@
 import { DEFAULT_VAULT_PATH } from "./config.js";
 import { assessLearningQualityAsync, flagsSensitiveMaterial, routeMemoryIntent } from "./policy.js";
-import { readAgentContext, statusAndAudit } from "./sovereign.js";
+import { readAgentContext, statusAndAudit } from "./daemon_transport.js";
 import { prepareOutcome, prepareTask } from "./task.js";
 import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "./team.js";
 import { auditReport, auditTail, ensureVault, vaultFirstLearn, writeVaultPage } from "./vault.js";

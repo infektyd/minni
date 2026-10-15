@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from minni.config import DEFAULT_CONFIG, SovereignConfig
+from minni.config import DEFAULT_CONFIG, MinniConfig
 from minni.rerank_cache import RerankCache
 from minni.retrieval import RetrievalEngine
 import minni.models as models
@@ -45,7 +45,7 @@ def _candidates(n=20):
 
 def test_default_config_cpu_predict_batch_size_is_eight():
     assert DEFAULT_CONFIG.reranker_cpu_predict_batch_size == 8
-    assert SovereignConfig().reranker_cpu_predict_batch_size == 8
+    assert MinniConfig().reranker_cpu_predict_batch_size == 8
 
 
 def test_pinned_cpu_path_passes_capped_batch_size(monkeypatch):

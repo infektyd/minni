@@ -11,15 +11,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = str(tmp_path / "test.db")
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
 
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -66,7 +66,7 @@ def test_handle_read_concatenates_identity_docs_in_path_order(tmp_path, monkeypa
     _seed_identity_doc(conn, envelope_path, "envelope body")
     _seed_identity_doc(conn, shelf_path, "shelf body")
 
-    monkeypatch.setattr(minnid, "SovereignDB", lambda: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda: db_obj)
     monkeypatch.setattr(
         minnid,
         "resolve_effective_principal",

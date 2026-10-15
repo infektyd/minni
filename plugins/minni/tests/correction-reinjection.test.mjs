@@ -8,7 +8,7 @@ import {
   BOOT_RECALL_LAYERS,
   extractLearningsSection,
   recallMemory,
-} from "../dist/sovereign.js";
+} from "../dist/daemon_transport.js";
 import {
   CORRECTION_CLASS_TYPES,
   CORRECTION_SALIENCE_BOOST,

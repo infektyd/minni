@@ -6,14 +6,14 @@ ENGINE_DIR = str(Path(__file__).resolve().parent)
 if ENGINE_DIR not in sys.path:
     sys.path.insert(0, ENGINE_DIR)
 
-from minni.db import SovereignDB, connect
+from minni.db import MinniDB, connect
 from minni.ax_memory import AXMemory
 from minni.config import DEFAULT_CONFIG
 
 def main():
     # Use an in-memory DB for test isolation if preferred, or test DB
     import sqlite3
-    db = SovereignDB(DEFAULT_CONFIG)
+    db = MinniDB(DEFAULT_CONFIG)
     # Ensure schema is loaded
     db._get_conn()
     

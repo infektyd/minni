@@ -1,11 +1,11 @@
-# DESIGN: Sovereign Memory Delivery Layer (Portable SSoT + Thin Adapter Contract)
+# DESIGN: Minni Delivery Layer (Portable SSoT + Thin Adapter Contract)
 
 **Status**: Phase 1 final (post canonical SKILL merge)  
 **Date**: 2026-05-20  
 **Governed by**: The single approved canonical generalization plan (phase1-planned-diff-approach-for-signoff-2026-05-20.md + phase1-remainder-merge-map-2026-05-20.md) and the strict boundary in `~/.agents/artifacts/sovereign-distill-ritual-v1/notes/agnostic-vs-grok-specific.md`  
 **Reference**: ritual package `~/.agents/artifacts/sovereign-distill-ritual-v1/`, canonical `~/.agents/skills/sovereign-memory/SKILL.md`, Grok Build V1 thin reference at `~/.grok/plugins/grok-sovereign-memory/`
 
-This is the single authoritative spec for the Sovereign Memory Delivery Layer. It formalizes the portable vs. platform-specific boundary, the adapter contract that every thin surface must satisfy, the verification matrix, and Grok Build as the first fully-worked thin reference implementation.
+This is the single authoritative spec for the Minni Delivery Layer. It formalizes the portable vs. platform-specific boundary, the adapter contract that every thin surface must satisfy, the verification matrix, and Grok Build as the first fully-worked thin reference implementation.
 
 ---
 

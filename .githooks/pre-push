@@ -13,8 +13,16 @@
 # (fail-open: contributors without ~/.config/git/hooks are unaffected).
 # Repos that set core.hooksPath otherwise shadow global hooks entirely —
 # that shadowing let content leaks bypass the guard (see PR #204 history).
+# Capture stdin once so both the chained global git-guard hook and our
+# tree-receipt inspection below can read the pushed ref lines.
+stdin_payload="$(cat)"
+
 if [ -x "$HOME/.config/git/hooks/pre-push" ]; then
-  "$HOME/.config/git/hooks/pre-push" "$@" || exit 1
+  if [ -n "$stdin_payload" ]; then
+    printf '%s\n' "$stdin_payload" | "$HOME/.config/git/hooks/pre-push" "$@" || exit 1
+  else
+    "$HOME/.config/git/hooks/pre-push" "$@" </dev/null || exit 1
+  fi
 fi
 
 set -euo pipefail
@@ -26,6 +34,81 @@ fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
+
+# Fast rootside boundary and migration checks (~0.08s total) always run on push.
+if [ -f "scripts/check-public-boundary.sh" ]; then
+  bash scripts/check-public-boundary.sh
+fi
+if [ -f "scripts/check-migrations.sh" ]; then
+  bash scripts/check-migrations.sh
+fi
+
+git_dir="$(git rev-parse --git-dir)"
+receipt_file="${git_dir}/.proven-shas"
+ttl="${PROVEN_TTL_SECONDS:-3600}"
+z40="0000000000000000000000000000000000000000"
+
+if [ -L "$receipt_file" ]; then
+  echo "[pre-push] ERROR: receipt file '$receipt_file' is a symlink (rejected)." >&2
+  exit 1
+fi
+
+check_tree_receipt_age() {
+  local target_tree="$1"
+  [ -f "$receipt_file" ] || return 1
+  [ ! -L "$receipt_file" ] || return 1
+  local now_ts matched_ts=""
+  now_ts="$(date +%s)"
+  while IFS=' ' read -r r_tree _r_commit r_ts _r_gate _rest; do
+    [ -n "${r_tree:-}" ] || continue
+    if [ "$r_tree" = "$target_tree" ]; then
+      matched_ts="${r_ts:-}"
+    fi
+  done < "$receipt_file"
+  [[ "$matched_ts" =~ ^[0-9]+$ ]] || return 1
+  local age=$(( now_ts - matched_ts ))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then
+    printf '%s\n' "$age"
+    return 0
+  fi
+  return 1
+}
+
+pushed_shas=()
+if [ -n "$stdin_payload" ]; then
+  while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    [ -n "${local_sha:-}" ] || continue
+    [ "$local_sha" = "$z40" ] && continue
+    pushed_shas+=("$local_sha")
+  done <<< "$stdin_payload"
+else
+  pushed_shas+=("HEAD")
+fi
+
+if [ "${#pushed_shas[@]}" -gt 0 ]; then
+  all_fresh=1
+  last_tree=""
+  last_age=""
+  for sha in "${pushed_shas[@]}"; do
+    tree_sha="$(git rev-parse "${sha}^{tree}" 2>/dev/null || true)"
+    if [ -z "$tree_sha" ]; then
+      all_fresh=0
+      break
+    fi
+    if age="$(check_tree_receipt_age "$tree_sha")"; then
+      last_tree="$tree_sha"
+      last_age="$age"
+    else
+      all_fresh=0
+      break
+    fi
+  done
+
+  if [ "$all_fresh" -eq 1 ] && [ -n "$last_tree" ]; then
+    echo "[pre-push] Fresh rootside receipt verified for tree ${last_tree} (age ${last_age}s) — skipping duplicate 'make check'." >&2
+    exit 0
+  fi
+fi
 
 if ! command -v make >/dev/null 2>&1; then
   echo "[pre-push] make not found — cannot run validation gate; skipping." >&2
@@ -43,4 +126,7 @@ echo "[pre-push] running 'make check'…" >&2
   done < <(git rev-parse --local-env-vars)
   make check
 )
+if [ -f "scripts/promote-proven.sh" ] && git diff --quiet && git diff --cached --quiet; then
+  bash scripts/promote-proven.sh --stamp-only pre-push >/dev/null 2>&1 || true
+fi
 echo "[pre-push] OK" >&2

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatRecallLean } from "../dist/sovereign.js";
+import { formatRecallLean } from "../dist/daemon_transport.js";
 
 const sampleResponse = {
   backend: "faiss-disk",

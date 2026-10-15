@@ -18,8 +18,8 @@ import sys
 import time
 from typing import Optional
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 from minni.retrieval import RetrievalEngine
 from minni.episodic import EpisodicMemory
 from minni.writeback import WriteBackMemory
@@ -42,12 +42,12 @@ class SovereignAgent:
     def __init__(
         self,
         agent_id: str,
-        config: SovereignConfig = DEFAULT_CONFIG,
-        db: Optional[SovereignDB] = None,
+        config: MinniConfig = DEFAULT_CONFIG,
+        db: Optional[MinniDB] = None,
     ):
         self.agent_id = agent_id
         self.config = config
-        self.db = db or SovereignDB(config)
+        self.db = db or MinniDB(config)
         self.retrieval = RetrievalEngine(self.db, config)
         self.episodic = EpisodicMemory(self.db, config)
         self.writeback = WriteBackMemory(self.db, config)

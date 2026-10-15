@@ -24,18 +24,18 @@ from minni.minnid_runtime.health import (
 
 @pytest.fixture
 def store(tmp_path):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
-    config = SovereignConfig(
+    config = MinniConfig(
         db_path=str(tmp_path / "alias.db"),
         vault_path=str(tmp_path / "vault"),
         writeback_path=str(tmp_path / "notes"),
         faiss_index_path=str(tmp_path / "index.faiss"),
         reranker_enabled=False, attribution_enabled=False,
     )
-    db = SovereignDB(config)
+    db = MinniDB(config)
     run_migrations(db._get_conn())
     yield db
     db.close()

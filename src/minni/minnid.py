@@ -59,6 +59,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import sys
 import time
 import threading
@@ -83,7 +84,7 @@ if str(_ENGINE_DIR) not in sys.path:
 
 import minni.obs as obs                                                  # noqa: E402  # centralized logging + metrics counters
 from minni.config import DEFAULT_CONFIG          # noqa: E402
-from minni.db import SovereignDB                                  # noqa: E402
+from minni.db import MinniDB                                  # noqa: E402
 from minni.principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
     agent_scope_for,
@@ -254,7 +255,7 @@ def _lazy_retrieval():
     global _retrieval
     if _retrieval is None:
         from minni.retrieval import RetrievalEngine
-        _retrieval = RetrievalEngine(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _retrieval = RetrievalEngine(MinniDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _retrieval
 
 
@@ -302,7 +303,7 @@ def _lazy_vault_retrieval(vault_path: Path):
     from minni.vault_index import build_vault_index_config
 
     cfg = build_vault_index_config(vault, base_config=DEFAULT_CONFIG)
-    db = SovereignDB.shared(cfg)
+    db = MinniDB.shared(cfg)
     engine = RetrievalEngine(db, cfg, faiss_index=FAISSIndex(cfg))
     cached = (engine, agent_id, cfg.db_path)
     _vault_retrieval_cache[key] = cached
@@ -334,7 +335,7 @@ def _lazy_writeback():
     global _writeback
     if _writeback is None:
         from minni.writeback import WriteBackMemory
-        _writeback = WriteBackMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _writeback = WriteBackMemory(MinniDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _writeback
 
 
@@ -511,7 +512,7 @@ def _lazy_episodic():
     global _episodic
     if _episodic is None:
         from minni.episodic import EpisodicMemory
-        _episodic = EpisodicMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _episodic = EpisodicMemory(MinniDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _episodic
 
 
@@ -756,7 +757,7 @@ def _recall_context() -> RecallContext:
         record_latency=_record_latency,
         increment_request_count=_increment_recall_request_count,
         lazy_episodic=_lazy_episodic,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
         logger=logger,
     )
 
@@ -798,6 +799,14 @@ def _increment_governance_request_count() -> None:
     _request_count += 1
 
 
+_consolidation_trigger: Optional[Any] = None
+
+
+def _notify_consolidation_trigger() -> None:
+    if _consolidation_trigger is not None:
+        _consolidation_trigger.notify()
+
+
 def _governance_context() -> GovernanceContext:
     return GovernanceContext(
         make_error=_make_error,
@@ -810,7 +819,8 @@ def _governance_context() -> GovernanceContext:
         purge_durable_learning=_purge_durable_learning,
         maybe_archive_inbox_source=_maybe_archive_inbox_source,
         increment_request_count=_increment_governance_request_count,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
+        notify_candidate_staged=_notify_consolidation_trigger,
         logger=logger,
     )
 
@@ -859,7 +869,7 @@ def _health_context() -> HealthContext:
         request_count=lambda: _request_count,
         start_time=lambda: _start_time,
         version=VERSION,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
         default_config=DEFAULT_CONFIG,
         logger=logger,
         retrieval_engine=_lazy_retrieval,
@@ -891,7 +901,7 @@ def _afm_context() -> AFMContext:
         index_durable_learning=_index_durable_learning,
         increment_request_count=_increment_ops_request_count,
         writeback_ref=lambda: _writeback,
-        sovereign_db=SovereignDB,
+        sovereign_db=MinniDB,
         default_config=DEFAULT_CONFIG,
         is_running=lambda: _running,
         logger=logger,
@@ -1068,7 +1078,7 @@ def _ensure_vault_engines_unbounded() -> None:
 def _invalidate_shared_faiss() -> None:
     """Make chunks the sweep just wrote visible to the live engine's semantic leg.
 
-    index_shared_vault writes through its OWN short-lived SovereignDB and
+    index_shared_vault writes through its OWN short-lived MinniDB and
     VaultIndexer, so its FAISS rebuild lands on a throwaway instance. The
     daemon's process-wide RetrievalEngine keeps the in-memory index it built at
     startup. Invalidating drops that snapshot; reload it here on the vault-watch
@@ -1389,10 +1399,10 @@ def _backfill_sweep_once() -> dict:
     # backfill would report success while recall still found nothing) and
     # holding a write lock that blocks every other daemon writer.
     try:
-        from minni.db import SovereignDB
+        from minni.db import MinniDB
         from minni.episodic import reconcile_episodic_fts
 
-        _conn = SovereignDB.shared(DEFAULT_CONFIG)._get_conn()
+        _conn = MinniDB.shared(DEFAULT_CONFIG)._get_conn()
         try:
             episodic = reconcile_episodic_fts(_conn)
             _conn.commit()
@@ -1684,6 +1694,49 @@ async def _footprint_watchdog_runner(
             raise
 
 
+async def _socket_watchdog_runner(
+    sock_path: Path,
+    expected_inode: int,
+    *,
+    interval: Optional[float] = None,
+    shutdown_tasks=None,
+):
+    """Periodic socket inode self-check. Trips → graceful shutdown for launchd/supervisor restart."""
+    wait = interval if interval is not None else 2.0
+    logger.info("Socket watchdog enabled: path=%s expected_inode=%d interval=%.1fs", sock_path, expected_inode, wait)
+
+    while True:
+        try:
+            await asyncio.sleep(wait)
+            current_stat = sock_path.stat()
+            if current_stat.st_ino != expected_inode:
+                logger.critical(
+                    "Socket watchdog: inode drift detected on %s (expected %d, found %d) — shutting down for supervisor restart",
+                    sock_path, expected_inode, current_stat.st_ino,
+                )
+                _initiate_graceful_shutdown(
+                    f"Socket watchdog: inode drift on {sock_path} ({expected_inode} != {current_stat.st_ino})",
+                    tasks=shutdown_tasks() if callable(shutdown_tasks) else shutdown_tasks,
+                    level="warning",
+                )
+                return
+        except FileNotFoundError:
+            logger.critical(
+                "Socket watchdog: socket file %s unlinked — shutting down for supervisor restart",
+                sock_path,
+            )
+            _initiate_graceful_shutdown(
+                f"Socket watchdog: socket {sock_path} unlinked",
+                tasks=shutdown_tasks() if callable(shutdown_tasks) else shutdown_tasks,
+                level="warning",
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Socket watchdog pass failed")
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1891,9 +1944,12 @@ async def _handle_client(reader: asyncio.StreamReader,
             pass
 
 
+_bound_socket_inode: Optional[int] = None
+
+
 async def _serve_unix_socket(path: Path):
     """Start the Unix socket server."""
-    global _server, _running
+    global _server, _running, _bound_socket_inode
 
     # SEC-001: ensure parent run/ dir is 0700 (owner-only) before bind
     run_dir = path.parent
@@ -1903,9 +1959,24 @@ async def _serve_unix_socket(path: Path):
     except OSError as e:
         logger.warning("Failed to chmod run dir %s to 0o700 (OSError: %s) — socket may be accessible to other users (SEC-001)", run_dir, e)
 
-    # Remove stale socket
+    # Check for active listener before touching stale socket
     if path.exists():
-        path.unlink()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                probe.connect(str(path))
+                logger.error("Active minnid is already listening on %s. Refusing to overwrite active socket.", path)
+                raise RuntimeError(f"Active minnid is already listening on {path}. Refusing to overwrite active socket.")
+        except socket.timeout as e:
+            # A listener exists but did not accept in time (e.g. saturated backlog):
+            # not stale. Refuse to start rather than unlink a live socket.
+            logger.error("Socket %s did not accept within probe timeout (%s); refusing to overwrite.", path, e)
+            raise RuntimeError(f"Active minnid socket at {path} did not accept within probe timeout. Refusing to overwrite active socket.") from e
+        except (ConnectionRefusedError, FileNotFoundError):
+            try:
+                path.unlink()
+            except OSError as unlink_err:
+                logger.warning("Failed to unlink stale socket %s: %s", path, unlink_err)
 
     # SEC-015: cap StreamReader buffer at 1 MiB so readuntil raises
     # LimitOverrunError instead of growing unbounded.
@@ -1915,14 +1986,25 @@ async def _serve_unix_socket(path: Path):
         limit=_SOCKET_BODY_LIMIT,
     )
 
+    try:
+        _bound_socket_inode = path.stat().st_ino
+    except OSError:
+        _bound_socket_inode = None
+
     # Set socket permissions (owner read/write only)
     try:
         os.chmod(str(path), 0o600)
     except OSError as e:
         logger.warning("Failed to chmod socket %s to 0o600 (OSError: %s) — socket may be accessible to other users (SEC-001)", path, e)
 
-    logger.info("Listening on %s", path)
+    logger.info("Listening on %s (inode=%s)", path, _bound_socket_inode)
     _running = True
+
+    watchdog_task = None
+    if _bound_socket_inode is not None:
+        watchdog_task = asyncio.create_task(
+            _socket_watchdog_runner(path, _bound_socket_inode)
+        )
 
     try:
         async with _server:
@@ -1931,6 +2013,8 @@ async def _serve_unix_socket(path: Path):
     except asyncio.CancelledError:
         pass
     finally:
+        if watchdog_task is not None and not watchdog_task.done():
+            watchdog_task.cancel()
         if _server is not None:
             _server.close()
             await _server.wait_closed()
@@ -2207,14 +2291,20 @@ def main():
 
     # Eagerly initialize/migrate database on startup (RCM-028 Phase 0 exit)
     try:
-        from minni.db import SovereignDB
-        db = SovereignDB.shared(DEFAULT_CONFIG)
+        from minni.db import MinniDB
+        db = MinniDB.shared(DEFAULT_CONFIG)
         db._get_conn()
         logger.info("Database initialized/migrated on startup.")
     except Exception:
         logger.exception("Eager database initialization failed")
 
     _raise_fd_ceiling()
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            ctypes.CDLL("/usr/lib/libSystem.B.dylib").setpriority(4, 0, 0)
+        except Exception:
+            pass
 
     loop = asyncio.new_event_loop()
     # Bound the pool that asyncio.to_thread dispatches sync RPC handlers onto.
@@ -2237,9 +2327,51 @@ def main():
         http_task = loop.create_task(_serve_http(args.host, args.port))
 
     # Opt-in AFM loop runner (gated by MINNI_AFM_LOOP). Dormant unless enabled.
+    global _consolidation_trigger
     afm_task = None
+    consolidation_trigger_task = None
     if _afm_loop_enabled(DEFAULT_CONFIG):
         afm_task = loop.create_task(_afm_loop_runner())
+        from minni.minnid_runtime.afm import ConsolidationTrigger, drain_consolidation
+        schedule = getattr(DEFAULT_CONFIG, "afm_loop_schedule", {}) or {}
+        pass_cfg = (schedule.get("passes") or {}).get("consolidation", {})
+        window = float(pass_cfg.get("debounce_window_seconds", 20.0))
+        burst = int(pass_cfg.get("burst_threshold", 2))
+        min_gap = float(pass_cfg.get("min_debounce_gap_seconds", 5.0))
+
+        async def _drain_fn():
+            return await drain_consolidation(_afm_context(), pass_cfg, source="trigger")
+
+        _consolidation_trigger = ConsolidationTrigger(
+            loop=loop,
+            drain_fn=_drain_fn,
+            window=window,
+            burst=burst,
+            min_gap=min_gap,
+            logger=logger,
+        )
+        consolidation_trigger_task = loop.create_task(_consolidation_trigger.run())
+
+        try:
+            wb = _lazy_writeback()
+            with wb.db.cursor() as c:
+                c.execute(
+                    """
+                    SELECT COUNT(*) AS n FROM candidate_packets cp
+                    WHERE cp.status = 'proposed'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM consolidation_actions ca
+                          WHERE ca.action_type IN ('afm_review', 'afm_judge_reject', 'afm_judge_redact')
+                            AND ca.claim = CAST(cp.candidate_id AS TEXT)
+                            AND COALESCE(ca.status, '') != 'superseded'
+                      )
+                    """
+                )
+                if int(c.fetchone()["n"]) > 0:
+                    _consolidation_trigger.trigger_now()
+        except Exception as exc:
+            logger.warning("Consolidation boot probe failed: %s", exc)
+
 
     # Vault watch runner. On by default (MINNI_VAULT_WATCH=off to disable):
     # unlike the AFM loop this is not an enhancement, it is what keeps recall
@@ -2277,7 +2409,7 @@ def main():
     # rather than silently eating the machine. On by default.
     footprint_task = None
     background_tasks = lambda: [
-        main_task, http_task, afm_task, vault_watch_task,
+        main_task, http_task, afm_task, consolidation_trigger_task, vault_watch_task,
         decay_task, backfill_task, worker_write_drain_task,
         warmup_task, footprint_task,
     ]
@@ -2305,9 +2437,21 @@ def main():
         logger.info("Shutting down…")
     finally:
         _running = False
-        # Clean up socket
-        if _unix_socket_path.exists():
-            _unix_socket_path.unlink()
+        # Clean up socket only if we still own the inode on disk (#socket-resilience)
+        try:
+            if _unix_socket_path.exists():
+                stat_ino = _unix_socket_path.stat().st_ino
+                if _bound_socket_inode is None or stat_ino == _bound_socket_inode:
+                    _unix_socket_path.unlink()
+                else:
+                    logger.warning(
+                        "Exit cleanup skipped unlinking %s: inode mismatch (bound %s vs disk %s)",
+                        _unix_socket_path,
+                        _bound_socket_inode,
+                        stat_ino,
+                    )
+        except OSError as e:
+            logger.warning("Exit cleanup could not inspect or unlink %s: %s", _unix_socket_path, e)
         loop.close()
         logger.info("minnid stopped.")
 

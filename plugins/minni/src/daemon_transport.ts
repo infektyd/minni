@@ -113,7 +113,7 @@ export interface StatusReport {
   };
 }
 
-export function parseSovrdJson<T = unknown>(raw: string): JsonResult<T> {
+export function parseMinnidJson<T = unknown>(raw: string): JsonResult<T> {
   try {
     return { ok: true, data: JSON.parse(raw) as T };
   } catch (error) {
@@ -161,7 +161,7 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
         data += chunk;
       });
       res.on("end", () => {
-        const parsed = parseSovrdJson(data);
+        const parsed = parseMinnidJson(data);
         if (res.statusCode && res.statusCode >= 400) {
           resolve({ ok: false, data: parsed.data, error: `HTTP ${res.statusCode}` });
           return;
@@ -250,7 +250,14 @@ export function buildBootRecallSlice(
   const episodic = Array.isArray(data.episodic) ? data.episodic : [];
   const episodic_count =
     typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
-  const notes = formatDegradation(data);
+  // Only routine foreign-scope blackouts are dropped; a non-routine read-gate
+  // suppression must reach the boot envelope the same way formatRecall renders it.
+  const notes = formatDegradation({
+    ...data,
+    auth_suppression: (Array.isArray(data.auth_suppression) ? data.auth_suppression : []).filter(
+      (entry) => !isRoutineForeignScopeSuppression((entry ?? {}) as Record<string, unknown>),
+    ),
+  });
   return {
     ok: true,
     results: data.results,
@@ -532,7 +539,7 @@ export function jsonRpcSocketRequest(
       data += chunk.toString("utf8");
       if (!data.includes("\n")) return;
       const line = data.split("\n")[0];
-      const parsed = parseSovrdJson<{ result?: unknown; error?: { message?: string } }>(line);
+      const parsed = parseMinnidJson<{ result?: unknown; error?: { message?: string } }>(line);
       if (!parsed.ok) {
         finish(parsed);
         return;
@@ -546,7 +553,7 @@ export function jsonRpcSocketRequest(
     client.on("error", (error) => finish({ ok: false, error: error.message }));
     client.on("end", () => {
       if (!settled && data.trim()) {
-        const parsed = parseSovrdJson<{ result?: unknown }>(data.trim());
+        const parsed = parseMinnidJson<{ result?: unknown }>(data.trim());
         finish(parsed.ok ? jsonRpcResultToJsonResult(parsed.data?.result) : parsed);
       }
     });
@@ -795,8 +802,11 @@ function compactDaemonResults(results: string | unknown[] | undefined): string {
   return results;
 }
 
-function formatVaultContext(results: VaultSearchResult[]): string {
-  if (results.length === 0) return "No Codex vault wiki matches.";
+function formatVaultContext(results: VaultSearchResult[], agentId?: string): string {
+  if (results.length === 0) {
+    const label = agentId ? `${agentId} ` : "";
+    return `No ${label}vault wiki matches.`;
+  }
   return results
     .map((result, index) => {
       const snippet = result.snippet.replace(/\s+/g, " ");
@@ -914,6 +924,7 @@ export function formatDegradation(response: RecallResponse): string | undefined 
   const suppressions = Array.isArray(response.auth_suppression) ? response.auth_suppression : [];
   for (const raw of suppressions) {
     const entry = (raw ?? {}) as Record<string, unknown>;
+    if (isRoutineForeignScopeSuppression(entry)) continue;
     const src = safeLabel(typeof entry.src === "string" ? entry.src : "?");
     const suppressed = typeof entry.suppressed === "number" ? entry.suppressed : undefined;
     lines.push(
@@ -933,11 +944,117 @@ export function formatDegradation(response: RecallResponse): string | undefined 
   return lines.join("\n");
 }
 
-export function formatRecall(query: string, response: RecallResponse, vaultResults: VaultSearchResult[] = []): string {
+function formatAgentName(agentId?: string): string {
+  if (!agentId) return "Codex";
+  const normalized = agentId.toLowerCase();
+  const names: Record<string, string> = {
+    codex: "Codex",
+    cursor: "Cursor",
+    "claude-code": "Claude Code",
+    claudecode: "Claude Code",
+    "claude-desktop": "Claude Desktop",
+    gemini: "Gemini",
+    antigravity: "Antigravity",
+    "grok-build": "Grok",
+    grok: "Grok",
+    hermes: "Hermes",
+    openclaw: "OpenClaw",
+    kilocode: "Kilo Code",
+    devin: "Devin",
+    main: "Operator",
+  };
+  if (names[normalized]) return names[normalized];
+  return agentId.charAt(0).toUpperCase() + agentId.slice(1);
+}
+
+export function extractDaemonLead(results: string | unknown[] | undefined): string | undefined {
+  if (Array.isArray(results)) {
+    if (results.length === 0) return undefined;
+    const first = results[0];
+    if (typeof first === "object" && first !== null) {
+      const r = first as Record<string, unknown>;
+      const text =
+        (typeof r.heading === "string" && r.heading.trim()) ||
+        (typeof r.title === "string" && r.title.trim()) ||
+        (typeof r.headline === "string" && r.headline.trim()) ||
+        (typeof r.snippet === "string" && r.snippet.trim() ? firstLine(r.snippet) : "") ||
+        "";
+      if (text && !text.startsWith("[") && !text.startsWith("{")) return text;
+      return undefined;
+    }
+    if (typeof first === "string" && first.trim()) {
+      const line = firstLine(first);
+      if (line && !line.startsWith("[") && !line.startsWith("{")) return line;
+    }
+    return undefined;
+  }
+  if (typeof results === "string" && results.trim()) {
+    const trimmed = results.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) return undefined;
+    return firstLine(trimmed);
+  }
+  return undefined;
+}
+
+function formatDaemonCard(r: Record<string, unknown>, index: number): string {
+  const wikilink =
+    typeof r.wikilink === "string" && r.wikilink.trim()
+      ? r.wikilink.trim()
+      : typeof r.filename === "string" && r.filename.trim()
+        ? (r.filename.trim().startsWith("[[") ? r.filename.trim() : `[[${r.filename.trim()}]]`)
+        : "[[?]]";
+  const title =
+    (typeof r.heading === "string" && r.heading.trim()) ||
+    (typeof r.title === "string" && r.title.trim()) ||
+    (typeof r.headline === "string" && r.headline.trim()) ||
+    undefined;
+  const score =
+    typeof r.score === "number"
+      ? Number(r.score.toFixed(2))
+      : (typeof r.score === "string" && r.score.trim() ? r.score.trim() : undefined);
+  const rawSnippet = r.snippet ?? r.content ?? r.text ?? r.headline;
+  const snippet =
+    typeof rawSnippet === "string" && rawSnippet.trim()
+      ? rawSnippet.replace(/\s+/g, " ").trim()
+      : undefined;
+
+  let card = `${index + 1}. ${wikilink}`;
+  if (title && title !== wikilink && title !== wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "")) {
+    card += ` — ${title}`;
+  }
+  if (score !== undefined) {
+    card += ` (score=${score})`;
+  }
+  if (snippet) {
+    card += `\n   ${snippet}`;
+  }
+  return card;
+}
+
+function formatVaultCard(r: VaultSearchResult, index: number): string {
+  const snippet = r.snippet ? r.snippet.replace(/\s+/g, " ").trim() : "";
+  let card = `${index + 1}. ${r.wikilink}`;
+  if (r.title && r.title !== r.wikilink && r.title !== r.wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "")) {
+    card += ` — ${r.title}`;
+  }
+  card += ` (vault score=${r.score})`;
+  if (snippet) {
+    card += `\n   ${snippet}`;
+  }
+  return card;
+}
+
+export interface FormatRecallOptions {
+  debug?: boolean;
+}
+
+export function formatRecall(
+  query: string,
+  response: RecallResponse,
+  vaultResults: VaultSearchResult[] = [],
+  options?: FormatRecallOptions | boolean,
+): string {
   const backendBadge = response.backend ?? response.backend_badge;
-  const results = Array.isArray(response.results)
-    ? JSON.stringify(response.results, null, 2)
-    : response.results ?? "No recall results.";
   const provenance = [
     response.agent_id ? `agent=${response.agent_id}` : undefined,
     response.layer ? `layer=${response.layer}` : undefined,
@@ -945,7 +1062,75 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
   ]
     .filter(Boolean)
     .join(", ");
-  const daemonLead = firstLine(compactDaemonResults(response.results));
+
+  const isDebug = Boolean(
+    options === true ||
+      (typeof options === "object" && options !== null && options.debug) ||
+      process.env.MINNI_DEBUG_RECALL === "true",
+  );
+
+  const agentName = formatAgentName(response.agent_id);
+
+  // Check daemon results
+  const rawResults = response.results;
+  const isArrayResults = Array.isArray(rawResults);
+  const daemonHits: unknown[] = isArrayResults ? rawResults : [];
+  const hasDaemonArrayHits = isArrayResults && daemonHits.length > 0;
+  const stringResults = typeof rawResults === "string" ? rawResults.trim() : undefined;
+  const isStringResults = typeof stringResults === "string" && stringResults.length > 0;
+  const isStringSentinel =
+    isStringResults &&
+    (stringResults === "No recall results." ||
+      stringResults.startsWith("Daemon unavailable"));
+  const hasDaemonStringHits = isStringResults && !isStringSentinel;
+  const hasDaemonHits = (hasDaemonArrayHits || hasDaemonStringHits) && response.count !== 0;
+  const hasVaultHits = vaultResults.length > 0;
+
+  // Build AI Context Pack
+  let contextPackContent: string;
+  if (!hasDaemonHits && !hasVaultHits) {
+    const label = !response.agent_id
+      ? ""
+      : response.count === undefined
+        ? `${response.agent_id} `
+        : `${agentName} `;
+    contextPackContent = `No ${label}vault wiki matches.`;
+  } else {
+    const cards: string[] = [];
+    let cardIndex = 0;
+    if (hasDaemonArrayHits) {
+      for (const item of daemonHits) {
+        if (typeof item === "object" && item !== null) {
+          cards.push(formatDaemonCard(item as Record<string, unknown>, cardIndex++));
+        } else if (typeof item === "string" && item.trim()) {
+          cards.push(`${cardIndex + 1}. ${item.trim()}`);
+          cardIndex++;
+        }
+      }
+    } else if (hasDaemonStringHits && !hasVaultHits) {
+      cards.push(stringResults!);
+    }
+
+    if (hasVaultHits) {
+      for (const item of vaultResults) {
+        cards.push(formatVaultCard(item, cardIndex++));
+      }
+    }
+    contextPackContent = cards.join("\n");
+  }
+
+  // Determine ## Daemon Results
+  let daemonResultsContent: string | undefined;
+  if (isDebug) {
+    daemonResultsContent = isArrayResults
+      ? JSON.stringify(rawResults, null, 2)
+      : stringResults ?? (rawResults ? String(rawResults) : "No recall results.");
+  } else if (hasDaemonStringHits && hasVaultHits) {
+    daemonResultsContent = stringResults;
+  } else if (!hasDaemonHits && isStringResults && stringResults.startsWith("Daemon unavailable")) {
+    daemonResultsContent = stringResults;
+  }
+
   const sections = [
     "# Minni Recall",
     `Query: ${query}${backendBadge ? ` [${backendBadge}]` : ""}`,
@@ -954,10 +1139,8 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     // hit must still have been told the corpus it came from was degraded.
     formatDegradation(response),
     "## AI Context Pack",
-    formatVaultContext(vaultResults),
-    daemonLead ? `Daemon lead: ${daemonLead}` : undefined,
-    "## Daemon Results",
-    results,
+    contextPackContent,
+    ...(daemonResultsContent ? ["## Daemon Results", daemonResultsContent] : []),
     formatEpisodic(response),
   ].filter(Boolean);
   return sections.join("\n\n");
@@ -993,6 +1176,18 @@ export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean, dae
   return includeVault && (!daemonOk || daemonEmpty);
 }
 
+function isRoutineForeignScopeSuppression(
+  entry: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!entry) return false;
+  if (entry.scope_blackout === true) return true;
+  return (
+    entry.src === "c" &&
+    typeof entry.reason === "string" &&
+    entry.reason.includes("suppressed by scope")
+  );
+}
+
 /**
  * W5: detect "the daemon answered but has nothing" from the wire shape, not
  * from English prose. Prefers `count` (recall.py response_payload always
@@ -1006,15 +1201,34 @@ export function isDaemonResultEmpty(response: RecallResponse | undefined): boole
   // documents were removed by the auth_suppression read gate, or that matched
   // only the separate `learnings` array, is a live SCOPED answer — treating
   // it as empty would trigger the workspace-unscoped vault pre-scan and bury
-  // the suppression diagnostic under local markdown snippets.
-  if (Array.isArray(response.auth_suppression) && response.auth_suppression.length > 0) return false;
+  // the suppression diagnostic under local markdown snippets. Foreign vault
+  // scope_blackout entries are normal multi-agent isolation and do not count
+  // as a non-empty answer when results are empty.
+  const meaningfulSuppression = Array.isArray(response.auth_suppression)
+    ? response.auth_suppression.filter(
+        (entry) => !isRoutineForeignScopeSuppression(entry as Record<string, unknown> | null),
+      )
+    : [];
+  if (meaningfulSuppression.length > 0) return false;
   if (Array.isArray(response.learnings) && response.learnings.length > 0) return false;
   // #225-R1: same argument as learnings — `count` covers documents only, and
   // episodic hits can never appear there. An episodic-only answer that reported
   // "empty" would trigger the workspace-unscoped vault pre-scan and bury it.
   if (Array.isArray(response.episodic) && response.episodic.length > 0) return false;
-  if (typeof response.count === "number") return response.count === 0;
   const { results } = response;
+  if (Array.isArray(results) && results.length > 0) {
+    const confidences = results
+      .map((item) =>
+        item && typeof item === "object"
+          ? (item as Record<string, unknown>).confidence
+          : undefined,
+      )
+      .filter((c): c is number => typeof c === "number" && Number.isFinite(c));
+    if (confidences.length === results.length && Math.max(...confidences) < 0.25) {
+      return true;
+    }
+  }
+  if (typeof response.count === "number") return response.count === 0;
   if (Array.isArray(results)) return results.length === 0;
   if (typeof results === "string") return results.trim().length === 0 || results.trim() === "No recall results.";
   return results === undefined;
@@ -1251,7 +1465,7 @@ export function formatRecallLean(
     // degradation today. See the PR's residuals.
     formatDegradation(response),
     "## AI Context Pack",
-    formatVaultContext(vaultResults),
+    formatVaultContext(vaultResults, response.agent_id),
     lean.length
       ? "## Daemon Results (wikilink + headline; full provenance and identity-shelf hits omitted to save context — pull via minni_recall if needed)\n" +
         JSON.stringify(lean, null, 2)

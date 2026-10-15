@@ -57,9 +57,9 @@ def _write_page(path: Path, title: str, marker: str, privacy: str = "safe") -> N
 
 def _make_cfg(tmp_path: Path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "shared" / "minni.db"),
         vault_path=str(tmp_path / "shared-vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -72,7 +72,7 @@ def _make_cfg(tmp_path: Path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

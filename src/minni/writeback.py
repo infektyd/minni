@@ -24,8 +24,8 @@ from datetime import datetime
 
 # G09: SEC-018 frontmatter forgery guard helpers (repo-grounded, smallest addition)
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.graph_readiness import memory_links_typed_columns_present
 from minni.timestamps import coerce_epoch
@@ -41,13 +41,15 @@ def _numpy():
 
 # Categories for learnings
 CATEGORIES = {
-    "pattern":    "Recurring patterns discovered in code, behavior, or data",
-    "fix":        "Bug fixes, workarounds, solutions to known problems",
-    "decision":   "Decisions made and their rationale",
-    "preference": "User or agent preferences learned over time",
-    "fact":       "Facts discovered about the codebase, infrastructure, or domain",
-    "procedure":  "Step-by-step procedures that worked",
-    "general":    "Uncategorized learning",
+    "pattern":      "Recurring patterns discovered in code, behavior, or data",
+    "fix":          "Bug fixes, workarounds, solutions to known problems",
+    "decision":     "Decisions made and their rationale",
+    "preference":   "User or agent preferences learned over time",
+    "fact":         "Facts discovered about the codebase, infrastructure, or domain",
+    "procedure":    "Step-by-step procedures that worked",
+    "architecture": "Architectural invariants, boundaries, and structural decisions",
+    "codebase":     "Codebase structure, file locations, and module layouts",
+    "general":      "Uncategorized learning",
 }
 
 
@@ -71,8 +73,8 @@ class WriteBackMemory:
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
     ):
         self.db = db
         self.config = config
@@ -111,6 +113,7 @@ class WriteBackMemory:
         Returns:
             learning_id
         """
+        category = str(category or "general").strip().lower()
         if category not in CATEGORIES:
             category = "general"
 

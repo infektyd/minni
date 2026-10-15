@@ -26,7 +26,7 @@ import {
   writeRecallState,
 } from "../dist/recall-state.js";
 import { buildGuardDenyReason } from "../dist/recall-guard.js";
-import { extractIdentityBody } from "../dist/sovereign.js";
+import { extractIdentityBody } from "../dist/daemon_transport.js";
 import {
   collectCorrectionsReassert,
   readReassertPending,

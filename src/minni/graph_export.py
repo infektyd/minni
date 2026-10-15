@@ -14,8 +14,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 
 logger = logging.getLogger("sovereign.graph")
 
@@ -25,8 +25,8 @@ class GraphExporter:
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
     ):
         self.db = db
         self.config = config
@@ -274,7 +274,7 @@ class GraphExporter:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    db = SovereignDB()
+    db = MinniDB()
     exporter = GraphExporter(db)
     path = exporter.export_to_file()
     print(f"Exported: {path}")

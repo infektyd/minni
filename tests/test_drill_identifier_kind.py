@@ -10,7 +10,7 @@ Fix: ``expand_result(..., id_kind=...)`` restricts the namespace ("doc" for
 source/path/wikilink and explicit doc_id references, "chunk" for explicit
 chunk_id, legacy "auto" chunk-first fallback for bare result_id).
 
-All cases run against a REAL SQLite fixture (SovereignDB + RetrievalEngine):
+All cases run against a REAL SQLite fixture (MinniDB + RetrievalEngine):
 no live vault, no network, no model calls.
 
 Limitation kept explicit: indexed chunks are retrieval excerpts, NOT
@@ -24,8 +24,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from minni.config import SovereignConfig
-from minni.db import SovereignDB
+from minni.config import MinniConfig
+from minni.db import MinniDB
 from minni.principal import EffectivePrincipal
 from minni.retrieval import RetrievalEngine
 from minni.minnid_runtime import recall as recall_mod
@@ -35,11 +35,11 @@ def _make_db(tmp_path, name):
     import minni.db as db_mod
 
     db_path = str(tmp_path / name)
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

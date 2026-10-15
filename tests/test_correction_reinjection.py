@@ -77,17 +77,17 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _make_db(tmp_path, **cfg_overrides):
-    """Return (SovereignDB, SovereignConfig) backed by a temporary SQLite file."""
+    """Return (MinniDB, MinniConfig) backed by a temporary SQLite file."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = str(tmp_path / "test.db")
-    cfg = SovereignConfig(db_path=db_path, **cfg_overrides)
+    cfg = MinniConfig(db_path=db_path, **cfg_overrides)
 
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -1046,8 +1046,8 @@ class TestRetrieveIntegration:
 
         # Control: with the salience boost zeroed the saturated habitual hit
         # wins — proving the boost (not FTS tie-break order) flips the result.
-        from minni.config import SovereignConfig
-        cfg_off = SovereignConfig(
+        from minni.config import MinniConfig
+        cfg_off = MinniConfig(
             db_path=cfg.db_path, reranker_enabled=False, hyde_enabled=False,
             correction_salience_boost=0.0,
         )

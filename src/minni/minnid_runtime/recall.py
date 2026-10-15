@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from minni.config import DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.timestamps import parse_epoch_or_report
 from minni.principal import (
     allows_cross_agent_recall,
     can_read_document,
+    is_operator_principal,
     make_capability_denied_error,
 )
 
@@ -117,7 +118,7 @@ class RecallContext:
     record_latency: Callable[[str, float], None]
     increment_request_count: Callable[[], None] | None = None
     lazy_episodic: Callable[[], Any] | None = None
-    sovereign_db: Callable[..., Any] = SovereignDB
+    sovereign_db: Callable[..., Any] = MinniDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     can_read_document: Callable[[Any, str, Any], bool] = can_read_document
     allows_cross_agent_recall: Callable[[Any], bool] = allows_cross_agent_recall
@@ -263,7 +264,6 @@ def _gather_leg_results(callables: list, deadline_monotonic) -> list:
     use_leg_pool = (
         RECALL_LEG_PARALLEL
         and len(callables) > 1
-        and deadline_monotonic is None
     )
     if use_leg_pool:
         bound = [bind_copied_deadline(fn) for fn in callables]
@@ -589,6 +589,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
     expand = params.get("expand", True)
     summarize_neighborhood = bool(params.get("summarize_neighborhood", False))
     claim = str(params.get("claim", "")).strip() or None
+    mode = str(params.get("mode") or "").strip().lower() or None
 
     if depth == "auto":
         depth = "snippet"
@@ -734,7 +735,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 previous_trace_id = getattr(retrieval_engine, "last_trace_id", None)
                 deadline_interrupted = False
                 try:
-                    rows = retrieval_engine.retrieve(
+                    retrieve_kwargs = dict(
                         query=query,
                         agent_id=agent_id,
                         limit=limit,
@@ -757,6 +758,18 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                         deadline_monotonic=deadline_monotonic,
                         update_access=False,
                     )
+                    if mode is not None:
+                        retrieve_kwargs["mode"] = mode
+                    elif (
+                        resolved_backend is None
+                        and not expand
+                        and not claim
+                        and not summarize_neighborhood
+                        and bool(getattr(engine, "_is_large_corpus", lambda: False)())
+                        and "retrieve" not in getattr(retrieval_engine, "__dict__", {})
+                    ):
+                        retrieve_kwargs["mode"] = "fast"
+                    rows = retrieval_engine.retrieve(**retrieve_kwargs)
                 except RequestDeadlineExceeded:
                     # A database deadline is request degradation, not an index
                     # failure. In particular, do not claim an FTS-only result
@@ -800,6 +813,13 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 # plugin now RENDERS it — one blackout of one corpus was
                 # about to be announced to the agent twice.
                 entry = {"src": src, **suppression}
+                if (
+                    source_agent
+                    and principal_for_documents is not None
+                    and source_agent != principal_for_documents.agent_id
+                ):
+                    entry["source_agent"] = source_agent
+                    entry["scope_blackout"] = True
                 ops.append(("auth", entry, shared))
             if reused:
                 degradation = dict(degradation)
@@ -1034,8 +1054,73 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                         None,
                     )
 
+            def _should_query_foreign_vault(vault_engine, source_agent) -> bool:
+                if principal is None or not source_agent or source_agent == principal.agent_id:
+                    return True
+                if not isinstance(
+                    getattr(vault_engine, "db", None), MinniDB
+                ) or "retrieve" in getattr(
+                    vault_engine, "__dict__", {}
+                ):
+                    return True
+                try:
+                    ws = getattr(principal, "workspace_id", "default") or "default"
+                    vault_cfg = getattr(vault_engine, "config", None)
+                    vault_root = getattr(vault_cfg, "vault_path", None)
+                    has_explicit_roots = bool(getattr(principal, "allowed_vault_roots", None))
+                    root_allowed = (
+                        principal.allows_vault_root(vault_root)
+                        if (has_explicit_roots and vault_root)
+                        else True
+                    )
+                    cache_key = (principal.agent_id, ws, bool(root_allowed), bool(context.allows_cross_agent_recall(principal)))
+                    cache_map = getattr(vault_engine, "_foreign_vault_elig_cache", None)
+                    now_m = time.monotonic()
+                    if isinstance(cache_map, dict):
+                        cached_entry = cache_map.get(cache_key)
+                        if cached_entry is not None and (now_m - cached_entry[0]) < 10.0:
+                            return bool(cached_entry[1])
+                    else:
+                        cache_map = {}
+                        setattr(vault_engine, "_foreign_vault_elig_cache", cache_map)
+                    with vault_engine.db.cursor() as c:
+                        if not root_allowed:
+                            c.execute(
+                                "SELECT path, agent, sigil, page_type, privacy_level "
+                                "FROM documents WHERE agent = ? LIMIT 1",
+                                (principal.agent_id,),
+                            )
+                            row = c.fetchone()
+                            res_bool = bool(row is not None and can_read_document(principal, ws, dict(row)))
+                            cache_map[cache_key] = (now_m, res_bool)
+                            return res_bool
+                        if context.allows_cross_agent_recall(principal):
+                            c.execute("SELECT 1 FROM documents LIMIT 1")
+                            res_bool = c.fetchone() is not None
+                            cache_map[cache_key] = (now_m, res_bool)
+                            return res_bool
+                        c.execute(
+                            "SELECT path, agent, sigil, page_type, privacy_level "
+                            "FROM documents "
+                            "WHERE agent = ? OR sigil = ? OR agent = 'unknown' "
+                            "OR LOWER(COALESCE(page_type, '')) IN ('wiki', 'handoff', 'synthesis', 'decision') "
+                            "OR LOWER(COALESCE(agent, '')) LIKE '%wiki%' "
+                            "OR LOWER(COALESCE(agent, '')) LIKE '%handoff%'",
+                            (principal.agent_id, principal.agent_id),
+                        )
+                        rows = c.fetchall()
+                        res_bool = any(
+                            can_read_document(principal, ws, dict(r)) for r in rows
+                        )
+                        cache_map[cache_key] = (now_m, res_bool)
+                        return res_bool
+                except Exception:
+                    return True
+
             leg_fns = []
             for vault_engine, source_agent, _source_db_path in vault_legs:
+                if not _should_query_foreign_vault(vault_engine, source_agent):
+                    continue
                 leg_fns.append(
                     lambda _ve=vault_engine, _sa=source_agent: _vault_leg(_ve, _sa)
                 )
@@ -1288,7 +1373,14 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     row.update(prior)
                 stage_open("score_calibration")
 
-        if skip_score_record:
+        is_fast_reflex = (mode == "fast") or (
+            mode is None and bool(getattr(engine, "_is_large_corpus", lambda: False)())
+        )
+        if is_fast_reflex:
+            for r in results:
+                if isinstance(r, dict):
+                    r.pop("confidence_raw", None)
+        elif skip_score_record:
             if stage_open("document_access"):
                 run_document_access()
             if stage_open("score_calibration"):
@@ -1313,7 +1405,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     cross_agent=learnings_cross_agent,
                     limit=limit,
                     source="minnid.search",
-                    update_access=not skip_score_record,
+                    update_access=not (skip_score_record or is_fast_reflex),
                 )
             except Exception as exc:
                 context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
@@ -1347,7 +1439,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         # too, not just plugin-mediated ones. Best-effort — a trace failure
         # must never fail the search itself.
         if (
-            principal is not None
+            not is_fast_reflex
+            and principal is not None
             and context.lazy_episodic is not None
             and getattr(context.default_config, "recall_trace", False)
             and stage_open("recall_trace")
@@ -1511,8 +1604,13 @@ def handle_trace(params: dict, request_id: Any, context: RecallContext) -> dict:
         # R8: bind the read to the requesting principal — a trace_id is not an
         # authorization token, so another authenticated principal cannot read a
         # trace it did not create (owner-bound entries deny a non-owner).
+        # Operator (is_operator_principal: 'main'/'operator' WITH capabilities)
+        # may inspect any trace. Bare agent_id 'main' is not enough: co-located
+        # subagents are stamped 'main' on the shared UDS surface.
+        req_agent = getattr(principal, "agent_id", None)
+        effective_requester = None if is_operator_principal(principal) else req_agent
         trace = context.trace_ring().get(
-            str(trace_id), requester=getattr(principal, "agent_id", None)
+            str(trace_id), requester=effective_requester
         )
         if trace is None:
             return context.make_response({

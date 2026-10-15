@@ -67,6 +67,8 @@ def _binding(config: dict) -> tuple[bool, bool]:
             raise ValueError("MCP server table must be an object")
         for name, entry in servers.items():
             normalized = str(name).lower().replace("_", "-")
+            # Intentional migration literal: recognize pre-rename MCP server keys so
+            # minni sync can upgrade or preserve disabled state on legacy configs.
             if not (normalized in {"minni", "sovereign-memory"}
                     or normalized.startswith(("minni-", "sovereign-memory-"))):
                 continue

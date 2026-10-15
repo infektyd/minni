@@ -182,11 +182,11 @@ def _fail_classifier():
 
 @pytest.fixture
 def store(tmp_path):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
-    config = SovereignConfig(
+    config = MinniConfig(
         db_path=str(tmp_path / "graph.db"),
         vault_path=str(tmp_path / "vault"),
         writeback_path=str(tmp_path / "notes"),
@@ -195,7 +195,7 @@ def store(tmp_path):
         embedding_model="test-model",
         reranker_enabled=False, attribution_enabled=False,
     )
-    db = SovereignDB(config)
+    db = MinniDB(config)
     run_migrations(db._get_conn())
     yield db, config
     db.close()
@@ -621,8 +621,8 @@ def test_loader_failure_aborts_prepare_and_degrades_repair(store):
 
 
 def test_engine_db_swap_fails_bound_store_on_every_public_call(store, tmp_path):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.migrations import run_migrations
 
     db, config = store
@@ -630,7 +630,7 @@ def test_engine_db_swap_fails_bound_store_on_every_public_call(store, tmp_path):
     staged, delivered = _promote(adapter, db, CONTENT_A)
     assert delivered.status == "ok"
 
-    config_b = SovereignConfig(
+    config_b = MinniConfig(
         db_path=str(tmp_path / "other.db"),
         vault_path=str(tmp_path / "vault_b"),
         writeback_path=str(tmp_path / "notes_b"),
@@ -639,7 +639,7 @@ def test_engine_db_swap_fails_bound_store_on_every_public_call(store, tmp_path):
         embedding_model="test-model",
         reranker_enabled=False, attribution_enabled=False,
     )
-    db_b = SovereignDB(config_b)
+    db_b = MinniDB(config_b)
     try:
         run_migrations(db_b._get_conn())
         engine.db = db_b

@@ -23,11 +23,11 @@ def test_search_depth_defaults_to_snippet(tmp_path, monkeypatch):
     # The daemon's _handle_search line now reads:
     #   depth = str(params.get("depth", "snippet"))
     # This test verifies the downstream retrieve() at depth="snippet" returns text.
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         faiss_index_path=str(tmp_path / "test.faiss"),
         vault_path=str(tmp_path / "vault/"),
@@ -37,7 +37,7 @@ def test_search_depth_defaults_to_snippet(tmp_path, monkeypatch):
         hyde_enabled=False,
         feedback_enabled=False,
     )
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
 
     content = """# Minni Token Budget

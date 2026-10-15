@@ -51,6 +51,8 @@ import {
   markOutputDropped,
 } from "./hook-delivery.js";
 import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
+import { harvestTranscriptDelta } from "./jev-harvest.js";
+import type { JevTrigger, JevLearnPayload } from "./jev-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
 import { canInject, renderIntent, wireFor } from "./hook-platform.js";
@@ -106,7 +108,7 @@ import {
   recallMemory,
   stashPrecompactReassert,
   subscribeContradictions,
-} from "./sovereign.js";
+} from "./daemon_transport.js";
 import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
 import {
   auditTail,
@@ -307,6 +309,8 @@ export interface AgentHookConfig {
    * actually show the recipient the content.
    */
   ackPendingHandoffsAtBoot?: boolean;
+  /** Optional Jev extractor override for testing and inline learning extraction. */
+  jevExtractor?: (trigger: JevTrigger, contextText: string) => Promise<JevLearnPayload | undefined>;
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -327,6 +331,8 @@ export interface StopCoreConfig {
   stopCommitHint?: string;
   /** Platform wire for last-task text; optional so tests can omit it. */
   wire?: PlatformWire;
+  /** Optional Jev extractor override for testing and inline learning extraction. */
+  jevExtractor?: (trigger: JevTrigger, contextText: string) => Promise<JevLearnPayload | undefined>;
 }
 
 /**
@@ -391,10 +397,26 @@ export async function handleStopCore(
   // NOTE: this is a governance-posture change — it needs operator sign-off
   // before the plugin is re-propagated.
   //
-  // Session receipts (PR #166 slice): every Stop path still emits a proof-of-use
-  // tally. The stop MARKER summary stays exactly `stop <id>` so sessionReceipt /
-  // listSessions can close the boot→stop window; breadcrumb reasons live in
-  // details, not the summary.
+  // Jev Inline Learning: harvest high-signal discoveries off hot-path at Stop.
+  const transcriptPath =
+    asString(payload.transcript_path) || asString(payload.transcriptPath);
+  if (transcriptPath) {
+    await harvestTranscriptDelta(
+      {
+        vaultPath: config.vaultPath,
+        workspaceId,
+        agentId: config.agentId,
+        auditPrefix: config.auditPrefix,
+        extractor: config.jevExtractor,
+      },
+      {
+        transcriptPath,
+        sessionId,
+        event: "Stop",
+      },
+    ).catch(() => undefined);
+  }
+
   const changedFiles = stringArray(payload.changedFiles ?? payload.changed_files);
   const outcomeSummary = asString(payload.summary).trim();
   const hasDraftableSignal = changedFiles.length > 0 || outcomeSummary.length > 0;
@@ -1596,6 +1618,29 @@ export function createHookHandlers(
     const { ok: staleBeliefsOk, events: staleBeliefEvents } =
       await fetchStaleBeliefEvents(config.agentId);
 
+    const transcriptPath =
+      asString(payload.transcript_path) || asString(payload.transcriptPath);
+    let durableLearningCommitted = false;
+    if (transcriptPath) {
+      const jevResult = await harvestTranscriptDelta(
+        {
+          vaultPath: config.vaultPath,
+          workspaceId,
+          agentId: config.agentId,
+          auditPrefix: config.auditPrefix,
+          extractor: config.jevExtractor,
+        },
+        {
+          transcriptPath,
+          sessionId,
+          event: "PreCompact",
+        },
+      ).catch(() => undefined);
+      if (jevResult?.harvested && jevResult.learnings.length > 0) {
+        durableLearningCommitted = true;
+      }
+    }
+
     // Agents WITH a precompactKind persist a durable inbox handoff (which
     // carries the stale-belief stash); agents without one (kilocode) carry
     // the scar tissue in the envelope only and stash non-empty stale-belief
@@ -1609,7 +1654,7 @@ export function createHookHandlers(
           stale_belief_events: staleBeliefEvents,
           audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
           compaction_trigger: transcript || "compaction in progress",
-          durable_learning_committed: false,
+          durable_learning_committed: durableLearningCommitted,
         })
       : undefined;
     const reassertInboxPath = config.precompactKind
@@ -1635,7 +1680,7 @@ export function createHookHandlers(
         audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
         compaction_trigger: transcript || "compaction in progress",
         ...(inbox
-          ? { inbox_path: inbox.filePath, durable_learning_committed: false }
+          ? { inbox_path: inbox.filePath, durable_learning_committed: durableLearningCommitted }
           : {}),
       },
     });

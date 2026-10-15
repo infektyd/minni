@@ -45,9 +45,9 @@ def _write_page(path: Path, marker: str) -> None:
 
 
 def _make_cfg(tmp_path):
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    return SovereignConfig(
+    return MinniConfig(
         db_path=str(tmp_path / "shared" / "minni.db"),
         vault_path=str(tmp_path / "shared-vault"),
         graph_export_dir=str(tmp_path / "graphs"),

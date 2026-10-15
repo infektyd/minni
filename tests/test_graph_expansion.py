@@ -10,7 +10,7 @@ import pytest
 import minni.graph_expansion as graph_expansion
 
 from minni.config import DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.graph_expansion import (
     MAX_GRAPH_CANDIDATES,
     MAX_NEIGHBORS_PER_SEED,
@@ -33,7 +33,7 @@ def db(tmp_path):
         db_path=str(tmp_path / "graph.db"),
         vault_path=str(vault),
     )
-    database = SovereignDB(cfg)
+    database = MinniDB(cfg)
     database._get_conn()
     yield database
     database.close()

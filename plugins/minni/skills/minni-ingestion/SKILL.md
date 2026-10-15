@@ -55,20 +55,20 @@ src/minni/  (in a Minni checkout)
 ### Usage
 
 ```bash
-cd <minni-checkout>/src/minni
-source ../../.venv/bin/activate
+cd <minni-checkout>
+source .venv/bin/activate
 
 # Index everything
-python sovereign_memory.py index
+python -m minni.index_all
 
 # Index only wiki
-python sovereign_memory.py index --wiki-only
+python -m minni.index_all --wiki-only
 
-# Query (searches both vault + wiki)
-python sovereign_memory.py query "syntra cognitive architecture" --limit 5
+# Query (searches both vault + wiki via daemon)
+python -m minni.minnid_client search "syntra cognitive architecture" --limit 5
 
 # Agent context
-python agent_api.py <agent_id> --context
+python -m minni.agent_api <agent_id> --context
 ```
 
 ### Agent-Optimized Features
@@ -106,16 +106,16 @@ wiki_paths: list = field(default_factory=lambda: [
 ### Testing
 
 ```bash
-cd <minni-checkout>/src/minni
-source ../../.venv/bin/activate
+cd <minni-checkout>
+source .venv/bin/activate
 
 # Full re-index
-python index_all.py --verbose
+python -m minni.index_all --verbose
 
 # Verify wikilinks resolved
 python -c "
-from db import SovereignDB
-db = SovereignDB()
+from minni.db import MinniDB
+db = MinniDB()
 with db.cursor() as c:
     c.execute('SELECT COUNT(*) FROM memory_links WHERE link_type = \"wikilink\"')
     print(f'Wikilinks: {c.fetchone()[0]}')
@@ -124,7 +124,7 @@ with db.cursor() as c:
 "
 
 # Test recall
-python sovereign_memory.py query "syntra cognitive architecture" --limit 3
+python -m minni.minnid_client search "syntra cognitive architecture" --limit 3
 ```
 
 ---

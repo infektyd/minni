@@ -1,4 +1,4 @@
-# Sovereign Memory — JSON-RPC Capabilities Matrix
+# Minni — JSON-RPC Capabilities Matrix
 
 **Contract version:** 1.1.0
 **Last updated:** 2026-06-15

@@ -342,7 +342,7 @@ def test_preparation_calls_no_model_or_live_database(tmp_path, monkeypatch):
     def no_model(_self):
         pytest.fail("preparation must not load a model")
 
-    monkeypatch.setattr(db_mod.SovereignDB, "__init__", no_database)
+    monkeypatch.setattr(db_mod.MinniDB, "__init__", no_database)
     monkeypatch.setattr(retrieval_mod.RetrievalEngine, "model", property(no_model))
 
     dest = tmp_path / "snapshot"
@@ -445,13 +445,13 @@ def test_materialize_preserves_original_lifecycle_and_refuses_rerun(tmp_path, mo
 
     live_config = config_mod.DEFAULT_CONFIG
     opened = []
-    original = db_mod.SovereignDB.__init__
+    original = db_mod.MinniDB.__init__
 
     def track_database(self, config):
         opened.append(config)
         original(self, config)
 
-    monkeypatch.setattr(db_mod.SovereignDB, "__init__", track_database)
+    monkeypatch.setattr(db_mod.MinniDB, "__init__", track_database)
 
     result = materialize_snapshot_db(dest)
     assert len(opened) == 1
@@ -494,7 +494,7 @@ def test_snapshot_search_constructs_no_engine_db_or_model(tmp_path, monkeypatch)
     # Materialization legitimately builds the disposable isolated DB; the
     # fail-closed guards below cover searcher construction and search only.
     materialize_snapshot_db(dest)
-    monkeypatch.setattr(db_mod.SovereignDB, "__init__", no_database)
+    monkeypatch.setattr(db_mod.MinniDB, "__init__", no_database)
     monkeypatch.setattr(retrieval_mod.RetrievalEngine, "__init__", no_engine)
     monkeypatch.setattr(retrieval_mod.RetrievalEngine, "model", property(no_model))
 
@@ -977,7 +977,7 @@ def test_valid_replacement_generation_fails_closed(tmp_path):
     # Replacement generation B is built fresh AT the same path (wipe, prepare,
     # materialize), so every B artifact is internally consistent — including
     # absolute DB paths, which is why a raw directory copy is not used here.
-    # Materialization runs in a FRESH PROCESS: SovereignDB keeps process-wide
+    # Materialization runs in a FRESH PROCESS: MinniDB keeps process-wide
     # per-path schema state, so an in-process rebuild at a reused path would
     # skip schema init — exactly the schema-cache hazard a real replacement
     # (separate process/generation) never hits.

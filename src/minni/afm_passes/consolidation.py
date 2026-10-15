@@ -45,6 +45,7 @@ logger = logging.getLogger("sovereign.afm.consolidation")
 # privacy is NOT the same as "known safe" and must never auto-promote to durable
 # learnings without a review pass (I1/I2 security fix).
 _SAFE_PRIVACY = {"safe", "public", "low"}
+_STRICT_PRIVATE = {"private", "local-only", "secret", "blocked"}
 # Learn-only stage_candidate clamps non-operator rows to privacy=review.
 # That label means "AFM must filter", not "park forever behind afm_review"
 # and not "auto-promote into learnings/writeback as safe". Unset/NULL
@@ -52,6 +53,18 @@ _SAFE_PRIVACY = {"safe", "public", "low"}
 _EXAMINABLE_PRIVACY = _SAFE_PRIVACY | {"review"}
 _MIN_CONTENT_LEN = 12
 _DEFAULT_MAX_PER_RUN = 50
+
+
+def is_judge_eligible(privacy_level: Optional[str], requested_privacy: Optional[str]) -> bool:
+    """Return True if candidate is eligible for AFM Model Judge evaluation.
+
+    Candidate must have privacy_level == 'review' (clamped non-operator author)
+    AND requested_privacy in _SAFE_PRIVACY (author explicitly intended to share).
+    Explicit private/local-only, explicit review, and legacy NULL rows are NOT judge-eligible.
+    """
+    p = (privacy_level or "").strip().lower()
+    r = (requested_privacy or "").strip().lower()
+    return p == "review" and r in _SAFE_PRIVACY
 
 
 def _normalize(text: str) -> str:
@@ -139,15 +152,19 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
     # the schema CHECK forbids new statuses — but an 'afm_review' marker keeps
     # them from being re-examined/re-drafted, so the drain loop makes progress).
     with db.cursor() as c:
+        pragma = c.execute("PRAGMA table_info(candidate_packets)").fetchall()
+        cols = {row["name"] if isinstance(row, dict) else row[1] for row in pragma}
+        req_col = "requested_privacy, " if "requested_privacy" in cols else "NULL AS requested_privacy, "
         c.execute(
-            """
+            f"""
             SELECT candidate_id, principal, workspace_id, layer, privacy_level,
+                   {req_col}
                    content, instruction_like, proposed_at
             FROM candidate_packets cp
             WHERE cp.status = 'proposed'
               AND NOT EXISTS (
                   SELECT 1 FROM consolidation_actions ca
-                  WHERE ca.action_type = 'afm_review'
+                  WHERE ca.action_type IN ('afm_review', 'afm_judge_reject', 'afm_judge_redact')
                     AND ca.claim = CAST(cp.candidate_id AS TEXT)
                     AND COALESCE(ca.status, '') != 'superseded'
               )
@@ -335,7 +352,22 @@ def run(db, config, vault_path: Optional[str] = None,
     promote_candidate_ids: List[int] = []
     dedup_candidate_ids: List[int] = []
     review_candidate_ids: List[int] = []
+    reject_candidate_ids: List[int] = []
+    redact_candidate_ids: List[int] = []
+    judge_verdicts: Dict[int, Any] = {}
     drafts: List[Dict[str, Any]] = []
+
+    judge_mode = str(
+        pass_cfg.get("judge_mode")
+        or getattr(config, "judge_mode", None)
+        or os.environ.get("MINNI_JUDGE_MODE", "enforce")
+    ).strip().lower()
+    max_model_calls = int(pass_cfg.get("max_model_calls_per_batch", 8))
+    model_timeout = float(pass_cfg.get("model_timeout", 15.0))
+    allow_jev_egress = bool(pass_cfg.get("allow_jev_egress", False))
+
+    model_calls_made = 0
+    deferred_budget = 0
 
     def _review(cand, reason):
         review_candidate_ids.append(cand["candidate_id"])
@@ -374,12 +406,59 @@ def run(db, config, vault_path: Optional[str] = None,
             _review(cand, "low quality: " + "; ".join(blockers))
             continue
 
-        # Examinable ≠ auto-promotable. Learn-only review packets must
-        # stay parked for resolve_candidate; promote_candidate_durable
-        # has no privacy column and writeback/indexer default to safe.
+        # If privacy is review, evaluate via authoritative model judge if eligible
         if privacy not in _SAFE_PRIVACY:
-            _review(cand, f"privacy={privacy or 'unset'}")
+            if judge_mode == "off":
+                _review(cand, f"privacy={privacy or 'unset'}")
+                continue
+
+            req_priv = cand.get("requested_privacy")
+            if not is_judge_eligible(privacy, req_priv):
+                # Author intent was not public/safe, or legacy unknown
+                r_clean = (req_priv or "").strip().lower()
+                if r_clean in _STRICT_PRIVATE:
+                    _review(cand, f"requested_privacy={r_clean}")
+                elif r_clean == "review":
+                    _review(cand, "requested_privacy=review")
+                elif not r_clean:
+                    _review(cand, "legacy_unknown")
+                else:
+                    _review(cand, f"requested_privacy={r_clean}")
+                continue
+
+            if model_calls_made >= max_model_calls:
+                # Swarm influx protection: defer excess to next batch to avoid model starvation
+                deferred_budget += 1
+                continue
+
+            from minni.afm_passes.judge import judge_candidate
+
+            verdict = judge_candidate(
+                content=content,
+                trace_id=trace_id,
+                timeout=model_timeout,
+                allow_jev_egress=allow_jev_egress,
+            )
+            if not verdict.cached:
+                model_calls_made += 1
+
+            judge_verdicts[cand["candidate_id"]] = verdict
+
+            if verdict.decision == "accept":
+                if judge_mode == "enforce":
+                    promote_candidate_ids.append(cand["candidate_id"])
+                    seen_this_run.add(batch_key)
+                else:  # shadow mode: log verdict, route to review
+                    _review(cand, f"afm_judge_shadow: accept ({verdict.reason})")
+            elif verdict.decision == "reject":
+                reject_candidate_ids.append(cand["candidate_id"])
+            elif verdict.decision == "redact":
+                redact_candidate_ids.append(cand["candidate_id"])
+            else:  # inconclusive / timeout / circuit open
+                _review(cand, f"afm_judge_inconclusive: {verdict.reason}")
             continue
+
+
 
         promote_candidate_ids.append(cand["candidate_id"])
         seen_this_run.add(batch_key)
@@ -388,9 +467,14 @@ def run(db, config, vault_path: Optional[str] = None,
         "total_proposed": total,
         "examined": len(candidates),
         "deferred": max(0, total - len(candidates)),
+        "deferred_budget": deferred_budget,
         "to_promote": len(promote_candidate_ids),
         "to_dedup": len(dedup_candidate_ids),
         "to_review": len(review_candidate_ids),
+        "to_reject": len(reject_candidate_ids),
+        "to_redact": len(redact_candidate_ids),
+        "model_calls": model_calls_made,
+        "judge_mode": judge_mode,
         "dry_run": dry_run,
     }
 
@@ -404,7 +488,10 @@ def run(db, config, vault_path: Optional[str] = None,
         "promote_candidate_ids": promote_candidate_ids,
         "dedup_candidate_ids": dedup_candidate_ids,
         "review_candidate_ids": review_candidate_ids,
+        "reject_candidate_ids": reject_candidate_ids,
+        "redact_candidate_ids": redact_candidate_ids,
+        "judge_verdicts": judge_verdicts,
         "drafts": drafts,
         "triage_advisory": triage_advisory,
-        "prompt_version": "consolidation-v1-deterministic",
+        "prompt_version": "consolidation-v2-model-judge",
     }

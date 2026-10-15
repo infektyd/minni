@@ -31,7 +31,7 @@ import {
   shouldPrescanVault,
   statusAndAudit,
   subscribeContradictions,
-} from "./sovereign.js";
+} from "./daemon_transport.js";
 import {
   buildHandoffPacket,
   extractScarTissue,
@@ -273,7 +273,7 @@ server.registerTool(
   {
     title: "Minni Prepare Task",
     description:
-      "Build a compact Codex task packet from vault notes, daemon recall, constraints, and optional AFM distillation.",
+      "Build a compact task packet from vault notes, daemon recall, constraints, and optional AFM distillation.",
     inputSchema: {
       task: z.string().min(1),
       budgetTokens: z.number().int().min(1000).max(32000).optional(),
@@ -616,7 +616,7 @@ server.registerTool(
   {
     title: "Minni Recall",
     description:
-      "Recall Minni context and log the lookup in the Codex vault.",
+      "Recall Minni context and log the lookup in the vault.",
     inputSchema: {
       query: z.string().min(1),
       layer: z
@@ -768,7 +768,7 @@ server.registerTool(
   {
     title: "Minni Learn",
     description:
-      "Write a Codex vault note first, then store the learning through Minni.",
+      "Write a vault note first, then store the learning through Minni.",
     inputSchema: {
       title: z.string().min(1),
       content: z.string().min(1),
@@ -832,6 +832,25 @@ server.registerTool(
       // SEC-G6: successful learn audit must carry semanticTier (fail-open path).
       quality,
     });
+    // Phase 3: index the session note into the daemon immediately via vault_index_doc
+    // so the note is recallable in the same session even while the learning candidate
+    // is still status='proposed'. Fail-open if the daemon is unreachable.
+    try {
+      const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
+      const fullContent = `---\ntitle: ${title}\nsection: sessions\nstatus: candidate\nprivacy: safe\ncategory: ${category ?? "general"}\n---\n# ${title}\n\n${content}`;
+      await jsonRpcSocketRequestWithFallback("vault_index_doc", {
+        content: fullContent,
+        path: note.relativePath,
+        agent_id: DEFAULT_AGENT_ID,
+        agent: DEFAULT_AGENT_ID,
+        sigil: "📄",
+        privacy_level: "safe",
+        page_status: "candidate",
+        layer: "knowledge",
+      });
+    } catch {
+      // Fail-open: vault note is on disk and will be indexed on next pass
+    }
     // #132 P1: an identity-recovery denial must never read as "learned" —
     // name it distinctly so the remediation route (in store.data) is acted on.
     const storeRecovery = recoveryRouteFrom(store.data);
@@ -877,7 +896,7 @@ server.registerTool(
     // Schema pins status to z.enum(["proposed"]), so drainStatus is always
     // "proposed" here — no hidden-status branch (it could never fire).
     // Non-proposed rows are still filtered inside modelListCandidatesPayload.
-    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
     const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
       status: drainStatus,
       ...(limit != null ? { limit } : {}),
@@ -913,7 +932,7 @@ server.registerTool(
     const gated = await requireSharedGate("candidates.resolve", { candidate_id, decision });
     if (gated) return gated;
     // Delegate to daemon RPC (owner-or-explicit-operator inside the transaction)
-    const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
     const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
       candidate_id,
       decision,
@@ -956,7 +975,7 @@ server.registerTool(
   {
     title: "Minni Vault Write",
     description:
-      "Write a structured Codex Obsidian vault page without storing it as a durable learning.",
+      "Write a structured Obsidian vault page without storing it as a durable learning.",
     inputSchema: {
       title: z.string().min(1),
       content: z.string().min(1),
@@ -989,7 +1008,7 @@ server.registerTool(
     // the write still succeeds (the page is on disk; recall degrades to lexical
     // until the next VaultIndexer run).
     try {
-      const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+      const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
       const fullContent = `---\ntitle: ${title}\nsection: ${section}\nstatus: candidate\nprivacy: safe\n---\n# ${title}\n\n${content}`;
       const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
         content: fullContent,
@@ -1040,7 +1059,7 @@ server.registerTool(
   {
     title: "Minni Audit Tail",
     description:
-      "Show recent Minni audit entries from the Codex vault.",
+      "Show recent Minni audit entries from the vault.",
     inputSchema: {
       limit: z.number().int().min(1).max(100).optional(),
     },

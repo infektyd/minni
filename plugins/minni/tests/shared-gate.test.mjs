@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { gateSharedOperation, isSharedGateUnavailable } from "../dist/sovereign.js";
+import { gateSharedOperation, isSharedGateUnavailable } from "../dist/daemon_transport.js";
 
 test("gateSharedOperation routes shared plugin work through minnid gate", async () => {
   const calls = [];

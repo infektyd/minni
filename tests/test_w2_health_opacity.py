@@ -11,7 +11,7 @@ Covers the five additively-composable sub-fixes:
       ring buffer, exposed in health_report behind the same operator gate that
       already redacts stale_docs/never_recalled/contradicting_learnings.
 
-Hermetic: SovereignDB is stubbed and no real ~/.minni is opened.
+Hermetic: MinniDB is stubbed and no real ~/.minni is opened.
 """
 
 from __future__ import annotations
@@ -192,7 +192,7 @@ class _FakeDB:
 
 
 def test_health_report_recent_errors_hidden_from_non_operator(monkeypatch):
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     obs.ERRORS.reset()
     obs.record_error("search", ValueError("/Users/x/secret-path leaked in message"))
 
@@ -207,7 +207,7 @@ def test_health_report_recent_errors_hidden_from_non_operator(monkeypatch):
 def test_health_report_recent_errors_visible_to_operator(monkeypatch):
     from minni.principal import EffectivePrincipal
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     obs.ERRORS.reset()
     obs.record_error("search", ValueError("boom-attributable"))
 

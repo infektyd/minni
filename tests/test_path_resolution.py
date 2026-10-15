@@ -12,7 +12,7 @@ import pytest
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from minni.config import SovereignConfig, CANONICAL_SOVEREIGN_HOME, resolve_canonical_path
+from minni.config import MinniConfig, CANONICAL_SOVEREIGN_HOME, resolve_canonical_path
 
 
 def test_canonical_home_prefers_minni():
@@ -21,7 +21,7 @@ def test_canonical_home_prefers_minni():
 
 
 def test_engine_config_derives_from_canonical_home():
-    cfg = SovereignConfig()  # uses env or default
+    cfg = MinniConfig()  # uses env or default
     for p in (cfg.db_path, cfg.faiss_index_path, cfg.graph_export_dir, cfg.writeback_path):
         assert CANONICAL_SOVEREIGN_HOME in p or p.startswith(CANONICAL_SOVEREIGN_HOME), f"{p} not under canonical home"
 

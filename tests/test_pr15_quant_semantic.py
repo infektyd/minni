@@ -7,9 +7,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 
 def test_pr15_config_defaults_preserve_existing_behavior():
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig()
+    cfg = MinniConfig()
 
     assert cfg.embedding_quantization == "fp32"
     assert cfg.chunking_semantic_merge is False
@@ -18,11 +18,11 @@ def test_pr15_config_defaults_preserve_existing_behavior():
 def test_semantic_merge_is_opt_in_and_merges_adjacent_same_heading(monkeypatch):
     import minni.chunker as chunker_mod
     from minni.chunker import MarkdownChunker
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     text = "# Topic\nalpha beta gamma delta.\n\nalpha beta gamma epsilon."
 
-    base_cfg = SovereignConfig(chunk_size=5, chunk_overlap=0, min_tokens=1)
+    base_cfg = MinniConfig(chunk_size=5, chunk_overlap=0, min_tokens=1)
     base_chunks = MarkdownChunker(base_cfg).chunk_document(text)
     assert len(base_chunks) == 2
 
@@ -34,7 +34,7 @@ def test_semantic_merge_is_opt_in_and_merges_adjacent_same_heading(monkeypatch):
 
     monkeypatch.setattr(chunker_mod, "get_embedder", lambda: FakeEmbedder(), raising=False)
 
-    merge_cfg = SovereignConfig(
+    merge_cfg = MinniConfig(
         chunk_size=5,
         chunk_overlap=0,
         min_tokens=1,
@@ -52,7 +52,7 @@ def test_semantic_merge_is_opt_in_and_merges_adjacent_same_heading(monkeypatch):
 def test_semantic_merge_respects_max_tokens(monkeypatch):
     import minni.chunker as chunker_mod
     from minni.chunker import MarkdownChunker
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     class FakeEmbedder:
         def encode(self, value, **kwargs):
@@ -60,7 +60,7 @@ def test_semantic_merge_respects_max_tokens(monkeypatch):
 
     monkeypatch.setattr(chunker_mod, "get_embedder", lambda: FakeEmbedder(), raising=False)
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         chunk_size=5,
         chunk_overlap=0,
         min_tokens=1,
@@ -75,7 +75,7 @@ def test_semantic_merge_respects_max_tokens(monkeypatch):
 
 
 def test_int8_quantization_uses_scalar_quantized_faiss_when_available():
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.faiss_index import FAISSIndex
 
     class FakeHnsw:
@@ -105,7 +105,7 @@ def test_int8_quantization_uses_scalar_quantized_faiss_when_available():
         METRIC_INNER_PRODUCT = "ip"
         IndexHNSWSQ = FakeQuantizedIndex
 
-    cfg = SovereignConfig(embedding_dim=4, embedding_quantization="int8")
+    cfg = MinniConfig(embedding_dim=4, embedding_quantization="int8")
     idx = FAISSIndex(cfg)
     idx._faiss = FakeFaiss
     idx.build_from_vectors([42], np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32))
@@ -142,19 +142,3 @@ def test_quantization_setting_is_part_of_faiss_manifest(tmp_path):
         expected_quantization="fp32",
     ) is not None
 
-
-def test_index_cli_semantic_merge_flag_is_opt_in(monkeypatch, capsys):
-    import minni.sovereign_memory as sovereign_memory
-
-    calls = []
-
-    def fake_index_all(config=None, vault=True, wiki=True, verbose=False):
-        calls.append((config.chunking_semantic_merge, vault, wiki, verbose))
-        return {"ok": True}
-
-    monkeypatch.setattr("minni.index_all.index_all", fake_index_all)
-
-    sovereign_memory.cmd_index(["--semantic-merge", "--vault-only", "--verbose"])
-
-    assert calls == [(True, True, False, True)]
-    assert '"ok": true' in capsys.readouterr().out

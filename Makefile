@@ -36,7 +36,7 @@ SOCKET ?= $(HOME)/.minni/run/minnid.sock
 # Scoped engine pytest for `make check`: a fast, model-free core that exercises
 # daemon import, dispatch, status, learn/read, and the observability surface.
 # Override to widen, e.g. `make check CHECK_PYTEST="tests -q"` for the full suite.
-CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py tests/test_worktree_import_resolution.py -q
+CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py tests/test_worktree_import_resolution.py tests/test_promote_proven.py -q
 
 .DEFAULT_GOAL := help
 
@@ -148,6 +148,14 @@ coverage-engine:
 check: lint typecheck build
 	cd $(PLUGIN_DIR) && npm test
 	PYTHONPATH=src:$$PYTHONPATH $(VENV_PY) -m pytest $(CHECK_PYTEST)
+	@bash scripts/promote-proven.sh --stamp-only make-check
+
+.PHONY: attest promote
+attest:
+	@bash scripts/promote-proven.sh --attest
+
+promote:
+	@bash scripts/promote-proven.sh
 
 # ── Engine runtime ─────────────────────────────────────────────────────────
 .PHONY: smoke

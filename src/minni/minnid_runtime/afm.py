@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ from typing import Any, Callable, Optional
 import minni.obs as obs
 from minni.afm_review_markers import supersede_afm_review
 from minni.config import DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.principal import (
     OPERATOR_RESERVED_AGENT_IDS,
@@ -41,7 +42,7 @@ class AFMContext:
     index_durable_learning: Callable[..., bool | None] | None = None
     increment_request_count: Callable[[], None] | None = None
     writeback_ref: Callable[[], Any] = lambda: None
-    sovereign_db: Callable[..., Any] = SovereignDB
+    sovereign_db: Callable[..., Any] = MinniDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     is_running: Callable[[], bool] = lambda: False
     logger: logging.Logger = logger
@@ -101,8 +102,10 @@ _COMPILE_FAILURE_STATUSES = frozenset(
         "write_timeout",
         "write_in_flight",
         "lifecycle_recovered",
+        "busy",
     }
 )
+
 
 # Review round 5 on PR #260: write_timeout / write_in_flight are NOT the same
 # failure mode as afm_unavailable / write_failed. The latter mean nothing
@@ -249,7 +252,12 @@ def _row_matches_snapshot(c, candidate_id: int, snap: dict) -> bool:
     return all(current[key] == snap[key] for key in current)
 
 
-def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContext):
+def promote_candidate_durable(
+    candidate_id: int,
+    reason: str,
+    context: AFMContext,
+    judge_verdict: Optional[Any] = None,
+):
     """Promote one proposed candidate into a durable, embedded learning.
 
     Returns the new learning_id, or None if the candidate is missing or no longer
@@ -302,38 +310,46 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
             candidate_id,
         )
         return None
-    from minni.afm_passes.consolidation import _SAFE_PRIVACY, content_hash as _content_hash
+    from minni.afm_passes.consolidation import _SAFE_PRIVACY, is_judge_eligible, content_hash as _content_hash
     from minni.afm_passes.inbox_ingest import _canonical_principal
 
     privacy = (cand.get("privacy_level") or "").strip().lower()
     if privacy not in _SAFE_PRIVACY:
-        now = time.time()
-        with wb.db.transaction() as c:
-            if not _row_matches_snapshot(c, candidate_id, prepared):
-                # Same staleness bar as the instruction branch: no fence for
-                # replacement content decided under different privacy.
-                return None
-            c.execute(
-                """SELECT 1 FROM consolidation_actions
-                   WHERE action_type='afm_review' AND claim=?
-                     AND COALESCE(status, '') != 'superseded' LIMIT 1""",
-                (str(candidate_id),),
-            )
-            if not c.fetchone():
-                c.execute(
-                    """
-                    INSERT INTO consolidation_actions
-                    (action_type, claim, category, status, detail, created_at)
-                    VALUES ('afm_review', ?, 'general', 'pending', ?, ?)
-                    """,
-                    (str(candidate_id), f"{reason[:450]}: privacy={privacy or 'unset'}", now),
-                )
-        context.logger.warning(
-            "AFM consolidation refused auto-promote of candidate #%d privacy=%s",
-            candidate_id,
-            privacy or "unset",
+        judge_accepted = (
+            judge_verdict is not None
+            and getattr(judge_verdict, "decision", None) == "accept"
         )
-        return None
+        req_privacy = cand.get("requested_privacy")
+        eligible = is_judge_eligible(privacy, req_privacy)
+
+        if not (judge_accepted and eligible):
+            now = time.time()
+            with wb.db.transaction() as c:
+                if not _row_matches_snapshot(c, candidate_id, prepared):
+                    # Same staleness bar as the instruction branch: no fence for
+                    # replacement content decided under different privacy.
+                    return None
+                c.execute(
+                    """SELECT 1 FROM consolidation_actions
+                       WHERE action_type='afm_review' AND claim=?
+                         AND COALESCE(status, '') != 'superseded' LIMIT 1""",
+                    (str(candidate_id),),
+                )
+                if not c.fetchone():
+                    c.execute(
+                        """
+                        INSERT INTO consolidation_actions
+                        (action_type, claim, category, status, detail, created_at)
+                        VALUES ('afm_review', ?, 'general', 'pending', ?, ?)
+                        """,
+                        (str(candidate_id), f"{reason[:450]}: privacy={privacy or 'unset'}", now),
+                    )
+            context.logger.warning(
+                "AFM consolidation refused auto-promote of candidate #%d privacy=%s",
+                candidate_id,
+                privacy or "unset",
+            )
+            return None
     agent_id = _canonical_principal(cand.get("principal") or "afm-loop")
     try:
         validate_agent_id(agent_id)
@@ -345,6 +361,8 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
         )
         return None
 
+    from minni.afm_passes.consolidation import _ensure_dedup_index
+    _ensure_dedup_index(wb.db)
     chash = _content_hash(content)
 
     emb_bytes = None
@@ -368,6 +386,10 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
             # effects, and the review fence stays pending.
             if not _row_matches_snapshot(c, candidate_id, prepared):
                 return None
+            from minni.writeback import CATEGORIES
+
+            raw_cat = str(cand.get("category") or "general").strip().lower()
+            cand_category = raw_cat if raw_cat in CATEGORIES else "general"
             c.execute(
                 """
                 INSERT INTO learnings
@@ -375,10 +397,10 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
                  confidence, embedding, created_at,
                  assertion, applies_when, evidence_doc_ids, contradicts_id, status,
                  content_hash)
-                VALUES (?, 'general', ?, NULL, 'afm-consolidation',
+                VALUES (?, ?, ?, NULL, 'afm-consolidation',
                         ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
                 """,
-                (agent_id, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
+                (agent_id, cand_category, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
             )
             lid = c.lastrowid
             # Atomic canonical identity: the node + join share this cursor.
@@ -405,14 +427,19 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
                     vault_path=vault_path,
                     created_at=now,
                 )
+            resolved_by = (
+                f"afm-judge({getattr(judge_verdict, 'model', 'native')})"
+                if judge_verdict is not None
+                else "afm-consolidation"
+            )
             c.execute(
                 """
                 UPDATE candidate_packets
-                SET status='accepted', resolved_at=?, resolved_by='afm-consolidation',
+                SET status='accepted', resolved_at=?, resolved_by=?,
                     resolution_reason=?
                 WHERE candidate_id=?
                 """,
-                (now, reason[:500], candidate_id),
+                (now, resolved_by, reason[:500], candidate_id),
             )
             # M5: retire the review fence with the candidate it fenced.
             supersede_afm_review(c, candidate_id)
@@ -518,6 +545,78 @@ def reject_candidate_dedup(candidate_id: int, context: AFMContext) -> bool:
     return True
 
 
+def reject_candidate_judge(candidate_id: int, verdict: Any, context: AFMContext) -> bool:
+    wb = context.lazy_writeback()
+    now = time.time()
+    reason = getattr(verdict, "reason", "rejected by model judge")
+    model_name = getattr(verdict, "model", "afm-judge")
+    with wb.db.transaction() as c:
+        c.execute(
+            "SELECT status FROM candidate_packets WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        row = c.fetchone()
+        if not row or row["status"] != "proposed":
+            return False
+        c.execute(
+            """
+            UPDATE candidate_packets
+            SET status='rejected', resolved_at=?, resolved_by=?,
+                resolution_reason=?
+            WHERE candidate_id=?
+            """,
+            (now, f"afm-judge({model_name})", reason[:500], candidate_id),
+        )
+        supersede_afm_review(c, candidate_id)
+        c.execute(
+            """
+            INSERT INTO consolidation_actions
+            (action_type, claim, category, status, detail, created_at)
+            VALUES ('afm_judge_reject', ?, 'general', 'applied', ?, ?)
+            """,
+            (str(candidate_id), reason[:500], now),
+        )
+    context.logger.info("AFM judge rejected candidate #%d: %s", candidate_id, reason)
+    context.maybe_archive_inbox_source(wb.db, candidate_id)
+    return True
+
+
+def redact_candidate_judge(candidate_id: int, verdict: Any, context: AFMContext) -> bool:
+    wb = context.lazy_writeback()
+    now = time.time()
+    reason = getattr(verdict, "reason", "redacted by model judge")
+    model_name = getattr(verdict, "model", "afm-judge")
+    with wb.db.transaction() as c:
+        c.execute(
+            "SELECT status FROM candidate_packets WHERE candidate_id=?",
+            (candidate_id,),
+        )
+        row = c.fetchone()
+        if not row or row["status"] != "proposed":
+            return False
+        c.execute(
+            """
+            UPDATE candidate_packets
+            SET status='redacted', resolved_at=?, resolved_by=?,
+                resolution_reason=?
+            WHERE candidate_id=?
+            """,
+            (now, f"afm-judge({model_name})", reason[:500], candidate_id),
+        )
+        supersede_afm_review(c, candidate_id)
+        c.execute(
+            """
+            INSERT INTO consolidation_actions
+            (action_type, claim, category, status, detail, created_at)
+            VALUES ('afm_judge_redact', ?, 'general', 'applied', ?, ?)
+            """,
+            (str(candidate_id), reason[:500], now),
+        )
+    context.logger.info("AFM judge redacted candidate #%d: %s", candidate_id, reason)
+    context.maybe_archive_inbox_source(wb.db, candidate_id)
+    return True
+
+
 def mark_candidate_review(candidate_id: int, reason: str, context: AFMContext) -> bool:
     """Flag a proposed candidate for operator review without changing status.
 
@@ -570,14 +669,20 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
     Clearing sticky after terminalizing only a subset reopens AFM-8 dual-mint
     for the candidates that stayed ``proposed``.
     """
-    promoted = deduped = reviewed = 0
+    promoted = deduped = reviewed = rejected = redacted = 0
     errors = 0
     promote_ids = [int(cid) for cid in (result.get("promote_candidate_ids") or [])]
     dedup_ids = [int(cid) for cid in (result.get("dedup_candidate_ids") or [])]
     review_ids = [int(cid) for cid in (result.get("review_candidate_ids") or [])]
+    reject_ids = [int(cid) for cid in (result.get("reject_candidate_ids") or [])]
+    redact_ids = [int(cid) for cid in (result.get("redact_candidate_ids") or [])]
+    judge_verdicts = result.get("judge_verdicts") or {}
+
     for cid in promote_ids:
         try:
-            if promote_candidate_durable(cid, "afm-consolidation", context):
+            verdict = judge_verdicts.get(cid)
+            reason = getattr(verdict, "reason", "afm-consolidation")
+            if promote_candidate_durable(cid, reason, context, judge_verdict=verdict):
                 promoted += 1
         except Exception:
             errors += 1
@@ -589,6 +694,22 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
         except Exception:
             errors += 1
             context.logger.exception("consolidation: dedup candidate %s failed", cid)
+    for cid in reject_ids:
+        try:
+            verdict = judge_verdicts.get(cid)
+            if reject_candidate_judge(cid, verdict, context):
+                rejected += 1
+        except Exception:
+            errors += 1
+            context.logger.exception("consolidation: reject candidate %s failed", cid)
+    for cid in redact_ids:
+        try:
+            verdict = judge_verdicts.get(cid)
+            if redact_candidate_judge(cid, verdict, context):
+                redacted += 1
+        except Exception:
+            errors += 1
+            context.logger.exception("consolidation: redact candidate %s failed", cid)
     for cid in review_ids:
         try:
             if mark_candidate_review(cid, "afm-consolidation review", context):
@@ -601,10 +722,10 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
     try:
         wb = context.lazy_writeback()
         with wb.db.cursor() as c:
-            # Promote/dedup targets must leave "proposed". Review routing is
+            # Promote/dedup/reject/redact targets must leave "proposed". Review routing is
             # intentional leave-proposed + fence; incomplete only when the
             # review mark did not land (counted via reviewed vs requested).
-            for cid in promote_ids + dedup_ids:
+            for cid in promote_ids + dedup_ids + reject_ids + redact_ids:
                 c.execute(
                     "SELECT status FROM candidate_packets WHERE candidate_id=?",
                     (cid,),
@@ -637,13 +758,13 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
         context.logger.exception(
             "consolidation: remaining-proposed probe failed after apply"
         )
-        remaining_proposed = list(dict.fromkeys(promote_ids + dedup_ids + review_ids))
+        remaining_proposed = list(dict.fromkeys(promote_ids + dedup_ids + reject_ids + redact_ids + review_ids))
 
-    if promoted or deduped or reviewed:
+    if promoted or deduped or reviewed or rejected or redacted:
         context.logger.info(
             "AFM consolidation applied: promoted=%d deduped=%d reviewed=%d "
-            "errors=%d remaining_proposed=%d",
-            promoted, deduped, reviewed, errors, len(remaining_proposed),
+            "rejected=%d redacted=%d errors=%d remaining_proposed=%d",
+            promoted, deduped, reviewed, rejected, redacted, errors, len(remaining_proposed),
         )
     result["applied"] = {
         "promoted": promoted,
@@ -659,6 +780,9 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
     }
 
 
+_CONSOLIDATION_LOCK = threading.Lock()
+
+
 def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) -> dict:
     """Run an AFM compile pass. Defaults to dry-run and never auto-accepts."""
     if context.increment_request_count is not None:
@@ -670,6 +794,19 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
         return context.make_error(-32602, "pass_name is required", request_id)
     dry_run = bool(params.get("dry_run", True))
     vault_path = str(params.get("vault_path") or context.default_config.vault_path)
+
+    lock_acquired = False
+    if pass_name == "consolidation" and not dry_run:
+        if not _CONSOLIDATION_LOCK.acquire(blocking=False):
+            return context.make_response({
+                "status": "busy",
+                "reason": "consolidation_in_progress",
+                "pass_name": pass_name,
+                "dry_run": dry_run,
+                "drafts": [],
+                "drafts_written": [],
+            }, request_id)
+        lock_acquired = True
 
     # P1: dry_run=false runs submit_drafts/apply_consolidation_result, promoting
     # candidates to durable learnings — a write op. The method-capability table
@@ -907,12 +1044,15 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             "drafts_written": [],
         }, request_id)
     finally:
+        if lock_acquired:
+            _CONSOLIDATION_LOCK.release()
         if db is not None and hasattr(db, "close"):
             try:
                 db.close()
             except Exception:
                 pass
         context.record_latency("afm", time.perf_counter() - started_at)
+
 
 
 async def afm_loop_runner(context: AFMContext):
@@ -979,7 +1119,7 @@ async def afm_loop_runner(context: AFMContext):
                         _skips: dict = {}
                         try:
                             from minni.afm_passes.inbox_ingest import ingest as _ingest_inbox
-                            # Reuse the daemon's shared handle: SovereignDB
+                            # Reuse the daemon's shared handle: MinniDB
                             # connections are thread-local and only released
                             # by close(), so a fresh instance per tick leaks
                             # one connection per tick in this loop.
@@ -1253,67 +1393,11 @@ async def afm_loop_runner(context: AFMContext):
                             )
                             obs.incr("compact_distillation_failures_total")
                             obs.record_error("afm_loop.compact_distillation", exc)
-                    max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
-                    batches = total_examined = 0
-                    last_summ = None
-                    while batches < max_batches:
-                        res = handle_daemon_compile(params, request_id=None, context=context)
-                        failure = compile_failure_status(res)
-                        if failure:
-                            tick_failed = True
-                            tick_failure = failure
-                            if failure == "rpc_error":
-                                record_rpc_error(name, res)
-                            # Round 7: an rpc_error carries its message in the
-                            # top-level `error`, not result.reason — reading
-                            # only the latter logged "rpc_error: None".
-                            # Round 17: lifecycle_recovered surfaces via status
-                            # (no reason); log drafts_deferred for honesty.
-                            payload = (res.get("result") or {}) if isinstance(res, dict) else {}
-                            detail = (
-                                (res.get("error") or {}).get("message")
-                                if failure == "rpc_error"
-                                else payload.get("reason")
-                                or (
-                                    f"drafts_deferred={payload.get('drafts_deferred')}"
-                                    if failure == "lifecycle_recovered"
-                                    else None
-                                )
-                            )
-                            context.logger.warning(
-                                "AFM loop: consolidation batch %d returned %s: %s",
-                                batches + 1, failure, detail,
-                            )
-                            # Soft: sticky lifecycle was cleared; keep draining
-                            # so this tick can still produce review pages.
-                            if failure == "lifecycle_recovered":
-                                last_summ = payload.get("summary") if isinstance(payload, dict) else None
-                                batches += 1
-                                examined = (last_summ or {}).get("examined", 0)
-                                total_examined += examined
-                                if examined == 0:
-                                    break
-                                await asyncio.sleep(0)
-                                continue
-                            break
-                        last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
-                        # Round 26: a mid-tick lifecycle_recovered soft-fail must
-                        # not latch tick_failed across later successful batches —
-                        # that forced a 300s re-fire after a productive drain.
-                        tick_failed = False
-                        tick_failure = None
-                        batches += 1
-                        examined = (last_summ or {}).get("examined", 0)
-                        total_examined += examined
-                        if examined == 0:
-                            break
-                        await asyncio.sleep(0)  # yield to the server task between batches
-                    context.logger.info(
-                        "AFM loop: consolidation drained %d batch(es), %d candidate(s); last=%s",
-                        batches,
-                        total_examined,
-                        last_summ,
-                    )
+                    drain_res = await drain_consolidation(context, cfg, source="afm_loop")
+                    if drain_res.get("failed"):
+                        tick_failed = True
+                        tick_failure = drain_res.get("failure")
+
                 else:
                     res = handle_daemon_compile(params, request_id=None, context=context)
                     failure = compile_failure_status(res)
@@ -1388,3 +1472,211 @@ def handle_daemon_endorse(params: dict, request_id: Any, context: AFMContext) ->
     except Exception as exc:
         context.logger.warning("daemon.endorse failed: %s", exc)
         return context.make_error(-32000, f"Endorse error: {exc}", request_id)
+
+
+async def drain_consolidation(
+    context: AFMContext,
+    cfg: Optional[dict] = None,
+    *,
+    source: str = "loop",
+) -> dict:
+    """Drain consolidation batches until empty, budget exhausted, or failure.
+
+    Shared by afm_loop_runner (periodic) and ConsolidationTrigger (event-driven).
+    """
+    schedule = getattr(context.default_config, "afm_loop_schedule", {}) or {}
+    pass_cfg = cfg or (schedule.get("passes") or {}).get("consolidation", {}) or {}
+    max_batches = int(pass_cfg.get("max_batches_per_tick", 40))
+
+    params = {
+        "pass_name": "consolidation",
+        "dry_run": False,
+        "vault_path": context.default_config.vault_path,
+        "_principal": loop_principal(),
+    }
+
+    batches = 0
+    total_examined = 0
+    total_resolved = 0
+    last_summ = None
+    tick_failed = False
+    tick_failure = None
+    budget_exhausted = False
+
+    while batches < max_batches:
+        res = await asyncio.to_thread(handle_daemon_compile, params, request_id=None, context=context)
+        failure = compile_failure_status(res)
+        if failure:
+            if failure == "busy":
+                context.logger.info("Consolidation drain (%s): already running (busy); stopping", source)
+                break
+            tick_failed = True
+            tick_failure = failure
+            if failure == "rpc_error":
+                record_rpc_error("consolidation", res)
+            payload = (res.get("result") or {}) if isinstance(res, dict) else {}
+            detail = (
+                (res.get("error") or {}).get("message")
+                if failure == "rpc_error"
+                else payload.get("reason")
+                or (
+                    f"drafts_deferred={payload.get('drafts_deferred')}"
+                    if failure == "lifecycle_recovered"
+                    else None
+                )
+            )
+            context.logger.warning(
+                "Consolidation drain (%s) batch %d returned %s: %s",
+                source, batches + 1, failure, detail,
+            )
+            if failure == "lifecycle_recovered":
+                last_summ = payload.get("summary") if isinstance(payload, dict) else None
+                batches += 1
+                examined = (last_summ or {}).get("examined", 0)
+                total_examined += examined
+                if examined == 0:
+                    break
+                await asyncio.sleep(0)
+                continue
+            break
+
+        result_obj = (res.get("result") or {}) if isinstance(res, dict) else {}
+        summary = result_obj.get("summary") if isinstance(result_obj, dict) else None
+        last_summ = summary
+        tick_failed = False
+        tick_failure = None
+
+        batches += 1
+        examined = (summary or {}).get("examined", 0)
+        deferred_budget = (summary or {}).get("deferred_budget", 0)
+        resolved = examined - deferred_budget
+        total_examined += examined
+        total_resolved += resolved
+
+        if deferred_budget > 0:
+            budget_exhausted = True
+
+        # Stop if no progress made or all proposed candidates drained
+        if resolved == 0 or (summary and summary.get("deferred", 0) == 0 and deferred_budget == 0):
+            break
+
+        # If model budget was exhausted in this batch, break and return to let caller pace/reschedule
+        if budget_exhausted:
+            break
+
+        await asyncio.sleep(0)
+
+    context.logger.info(
+        "Consolidation drain (%s) completed: %d batch(es), %d candidate(s) examined, %d resolved; last=%s",
+        source, batches, total_examined, total_resolved, last_summ,
+    )
+    return {
+        "batches": batches,
+        "total_examined": total_examined,
+        "total_resolved": total_resolved,
+        "last_summary": last_summ,
+        "budget_exhausted": budget_exhausted,
+        "failed": tick_failed,
+        "failure": tick_failure,
+    }
+
+
+class ConsolidationTrigger:
+    """Fixed-window debounce with burst coalescing and event-loop decoupling.
+
+    Notified by handle_learn/stage_candidate across worker threads:
+    - 1st learn arms a fixed-window timer (default 20s).
+    - Burst threshold (default >= 2) promotes evaluation deadline to NOW.
+    - Drains in a background thread under a single-flight lock (_drain_lock).
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        drain_fn: Callable[[], Any],
+        window: float = 20.0,
+        burst: int = 2,
+        min_gap: float = 5.0,
+        logger: Optional[logging.Logger] = None,
+    ):
+        self._loop = loop
+        self._drain_fn = drain_fn
+        self._window = window
+        self._burst = burst
+        self._min_gap = min_gap
+        self._logger = logger or logging.getLogger("minnid.afm.trigger")
+        self._pending = 0
+        self._timer: Optional[asyncio.TimerHandle] = None
+        self._wake = asyncio.Event()
+        self._drain_lock = asyncio.Lock()
+        self._last_done = 0.0
+        self._running = True
+
+    def notify(self) -> None:
+        """O(1) thread-safe notification called from any worker thread."""
+        if not self._running:
+            return
+        self._loop.call_soon_threadsafe(self._on_learn)
+
+    def _on_learn(self) -> None:
+        """Runs strictly on the event loop thread."""
+        self._pending += 1
+        now = self._loop.time()
+        if self._pending >= self._burst:
+            self._logger.info(
+                "Consolidation trigger: burst threshold reached (%d >= %d); accelerating drain to NOW",
+                self._pending,
+                self._burst,
+            )
+            self._arm(now)
+        elif self._timer is None:
+            self._logger.info(
+                "Consolidation trigger: candidate staged; debouncing for %.1fs",
+                self._window,
+            )
+            self._arm(now + self._window)
+
+    def _arm(self, when: float) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        target = max(when, self._last_done + self._min_gap)
+        self._timer = self._loop.call_at(target, self._wake.set)
+
+    def trigger_now(self) -> None:
+        """Manually trigger immediate consolidation."""
+        if not self._running:
+            return
+        self._loop.call_soon_threadsafe(lambda: self._arm(self._loop.time()))
+
+    async def run(self) -> None:
+        self._logger.info("Consolidation trigger worker started")
+        while self._running:
+            await self._wake.wait()
+            self._wake.clear()
+            self._timer = None
+            self._pending = 0
+            drain_res = None
+            async with self._drain_lock:
+                try:
+                    if inspect.iscoroutinefunction(self._drain_fn):
+                        drain_res = await self._drain_fn()
+                    else:
+                        drain_res = await asyncio.to_thread(self._drain_fn)
+                except Exception as exc:
+                    self._logger.exception("Consolidation trigger drain failed: %s", exc)
+            self._last_done = self._loop.time()
+            if isinstance(drain_res, dict) and drain_res.get("budget_exhausted") and not drain_res.get("failed"):
+                self._logger.info(
+                    "Consolidation trigger: model budget exhausted with remaining candidates; re-arming in %.1fs",
+                    self._min_gap,
+                )
+                self._arm(self._last_done + self._min_gap)
+
+
+    def stop(self) -> None:
+        self._running = False
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        self._wake.set()

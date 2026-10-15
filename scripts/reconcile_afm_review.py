@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no such database: {args.db}", file=sys.stderr)
         return 2
 
-    # 30s to match SovereignDB: the default --db IS the live database, so
+    # 30s to match MinniDB: the default --db IS the live database, so
     # contending with minnid is the expected case, not an exception.
     try:
         conn = sqlite3.connect(args.db, timeout=30.0)

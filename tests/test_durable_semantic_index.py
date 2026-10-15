@@ -94,8 +94,8 @@ def temp_engine(tmp_path, monkeypatch):
     # Base schema first (_init_schema), THEN migrations ALTER it (the PR-6
     # learnings columns like `assertion`/`status` are ADDed by migration 005 on
     # top of the baseline table — same setup order the force-learn tests use).
-    from minni.db import SovereignDB
-    _seed_db = SovereignDB()
+    from minni.db import MinniDB
+    _seed_db = MinniDB()
     run_migrations(_seed_db._get_conn())
 
     yield db_path, tmp_path
@@ -224,8 +224,8 @@ def test_learn_force_ignores_model_supplied_wiki_page_type(temp_engine):
     )
     assert resp["result"]["status"] == "ok"
 
-    from minni.db import SovereignDB
-    db_obj = SovereignDB()
+    from minni.db import MinniDB
+    db_obj = MinniDB()
     with db_obj.cursor() as c:
         c.execute(
             "SELECT page_type FROM documents WHERE path LIKE '%_durable%' "
@@ -376,8 +376,8 @@ def test_divergent_db_writes_to_store_db_not_default(tmp_path, monkeypatch):
     supplied store db differs from DEFAULT_CONFIG.db_path, the semantic index
     MUST land in the store's DB and the live DEFAULT_CONFIG DB must be untouched.
     """
-    from minni.db import SovereignDB
-    from minni.config import SovereignConfig
+    from minni.db import MinniDB
+    from minni.config import MinniConfig
 
     db_a = str(tmp_path / "live_default.db")   # DEFAULT_CONFIG points here
     db_b = str(tmp_path / "store_target.db")   # explicit db= points here
@@ -390,11 +390,11 @@ def test_divergent_db_writes_to_store_db_not_default(tmp_path, monkeypatch):
 
     # Seed BOTH databases with the full schema.
     for path in (db_a, db_b):
-        seed = SovereignDB(SovereignConfig(db_path=path))
+        seed = MinniDB(MinniConfig(db_path=path))
         run_migrations(seed._get_conn())
         seed.close()
 
-    store_db = SovereignDB(SovereignConfig(db_path=db_b))
+    store_db = MinniDB(MinniConfig(db_path=db_b))
     try:
         minnid._index_durable_learning(
             "main", _DOC_PHOTO, key="learning:42", db=store_db

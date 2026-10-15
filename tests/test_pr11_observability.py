@@ -47,9 +47,9 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -59,7 +59,7 @@ def _make_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -236,14 +236,14 @@ def test_minnid_read_includes_layer_1_identity_before_context(tmp_path, monkeypa
             """,
             (
                 identity_doc_id,
-                "Sovereign Memory gives owned agents a soul. It gives hosted agents a map.",
+                "Minni gives owned agents a soul. It gives hosted agents a map.",
                 b"0" * 1536,
                 now,
             ),
         )
         _seed_doc(db_obj, path="/wiki/context.md", agent="codex")
 
-    monkeypatch.setattr(minnid, "SovereignDB", lambda: db_obj)
+    monkeypatch.setattr(minnid, "MinniDB", lambda: db_obj)
 
     resp = minnid._handle_read({"agent_id": "codex", "limit": 5}, 1)
     context = resp["result"]["context"]
@@ -256,7 +256,7 @@ def test_minnid_read_includes_layer_1_identity_before_context(tmp_path, monkeypa
 
 def test_status_accepts_persisted_faiss_npz_cache(tmp_path, monkeypatch):
     import minni.minnid as minnid
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = tmp_path / "minni.db"
     faiss_dir = tmp_path / "faiss"
@@ -267,7 +267,7 @@ def test_status_accepts_persisted_faiss_npz_cache(tmp_path, monkeypatch):
     )
     (faiss_dir / "index.faiss.npz").write_bytes(b"npz-cache")
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(db_path),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),

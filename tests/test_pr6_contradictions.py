@@ -102,18 +102,18 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _make_db(tmp_path):
-    """Return (SovereignDB, SovereignConfig) backed by a temporary SQLite file."""
+    """Return (MinniDB, MinniConfig) backed by a temporary SQLite file."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = str(tmp_path / "test.db")
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
 
     # Reset the module-level guard so migrations run freshly for each test DB.
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -271,11 +271,11 @@ class TestDetectContradictions:
     def test_high_cosine_match_returned(self, tmp_path):
         """A seeded learning with nearly identical embedding appears in candidates."""
         from minni.writeback import WriteBackMemory
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
         import minni.db as db_mod
 
         db_obj, cfg = _make_db(tmp_path)
-        cfg = SovereignConfig(db_path=cfg.db_path, contradiction_threshold=0.85)
+        cfg = MinniConfig(db_path=cfg.db_path, contradiction_threshold=0.85)
         wb = WriteBackMemory(db_obj, cfg)
 
         base_emb = _fixed_embedding("The auth system uses JWT tokens")
@@ -304,10 +304,10 @@ class TestDetectContradictions:
     def test_low_cosine_match_excluded(self, tmp_path):
         """A seeded learning with orthogonal embedding is NOT returned."""
         from minni.writeback import WriteBackMemory
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
 
         db_obj, cfg = _make_db(tmp_path)
-        cfg = SovereignConfig(db_path=cfg.db_path, contradiction_threshold=0.85)
+        cfg = MinniConfig(db_path=cfg.db_path, contradiction_threshold=0.85)
         wb = WriteBackMemory(db_obj, cfg)
 
         base_emb = _fixed_embedding("Completely unrelated topic A")
@@ -401,10 +401,10 @@ class TestDetectContradictions:
     def test_candidates_sorted_by_score_descending(self, tmp_path):
         """Candidates list is sorted by score descending."""
         from minni.writeback import WriteBackMemory
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
 
         db_obj, cfg = _make_db(tmp_path)
-        cfg = SovereignConfig(db_path=cfg.db_path, contradiction_threshold=0.50)
+        cfg = MinniConfig(db_path=cfg.db_path, contradiction_threshold=0.50)
         wb = WriteBackMemory(db_obj, cfg)
 
         emb_a = _fixed_embedding("topic A")
@@ -1115,13 +1115,13 @@ class TestHandleResolveContradiction:
 class TestConfig:
 
     def test_default_threshold_is_0_85(self):
-        from minni.config import SovereignConfig
-        cfg = SovereignConfig()
+        from minni.config import MinniConfig
+        cfg = MinniConfig()
         assert cfg.contradiction_threshold == 0.85
 
     def test_threshold_overridable(self):
-        from minni.config import SovereignConfig
-        cfg = SovereignConfig(contradiction_threshold=0.70)
+        from minni.config import MinniConfig
+        cfg = MinniConfig(contradiction_threshold=0.70)
         assert cfg.contradiction_threshold == 0.70
 
     def test_default_config_has_threshold(self):

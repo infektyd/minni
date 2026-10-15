@@ -126,6 +126,10 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
     if version == 21:
         from minni.graph_readiness import verify_graph_schema
         return verify_graph_schema(conn).ready
+    if version == 22:
+        return _column_exists(conn, "candidate_packets", "requested_privacy")
+    if version == 23:
+        return _column_exists(conn, "candidate_packets", "category")
     return True
 
 
@@ -208,20 +212,21 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             conn.execute("BEGIN IMMEDIATE")
             for version, filepath in items:
                 logger.info("  Applying migration %03d: %s", version, os.path.basename(filepath))
-                if version == 21 and not _migration_021_base_tables_present(conn):
+                if version >= 21 and not _migration_021_base_tables_present(conn):
                     # Non-destructive partial-schema guard: 021's ALTERs would
                     # otherwise succeed against a base table that exists
                     # (contradiction_log) while stamping a REFERENCES clause to
                     # a parent that does not (documents). SQLite defers that
                     # check to enforcement time, so every later INSERT with
                     # foreign_keys=ON fails with "no such table:
-                    # main.documents". Skip the statements entirely — 021
-                    # stays unstamped and retries on a later run once the base
+                    # main.documents". Skip the statements entirely — 021+
+                    # stay unstamped and retry on a later run once the base
                     # schema (db._init_schema) has supplied the tables.
                     logger.warning(
-                        "Migration 021: base tables incomplete — skipping 021 "
-                        "statements (non-destructive); 021 stays pending and "
-                        "will retry once the base schema is supplied"
+                        "Migration %03d: base tables incomplete — skipping "
+                        "statements (non-destructive); migration stays pending and "
+                        "will retry once the base schema is supplied",
+                        version,
                     )
                     continue
                 with open(filepath, "r", encoding="utf-8") as fh:
@@ -338,8 +343,22 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
         conn.execute("BEGIN IMMEDIATE")
+        existing_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(candidate_packets)").fetchall()
+        }
+        extra_col_defs = []
+        extra_col_names = []
+        if "requested_privacy" in existing_cols:
+            extra_col_defs.append("requested_privacy TEXT")
+            extra_col_names.append("requested_privacy")
+        if "category" in existing_cols:
+            extra_col_defs.append("category TEXT DEFAULT 'general'")
+            extra_col_names.append("category")
+        extra_ddl = (",\n                " + ",\n                ".join(extra_col_defs)) if extra_col_defs else ""
+        extra_select = (", " + ", ".join(extra_col_names)) if extra_col_names else ""
         conn.execute(
-            """
+            f"""
             CREATE TABLE candidate_packets_015 (
                 candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 principal TEXT NOT NULL,
@@ -358,21 +377,21 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
                 proposed_at REAL NOT NULL,
                 resolved_at REAL,
                 resolved_by TEXT,
-                resolution_reason TEXT
+                resolution_reason TEXT{extra_ddl}
             )
             """
         )
         conn.execute(
-            """
+            f"""
             INSERT INTO candidate_packets_015 (
                 candidate_id, principal, workspace_id, layer, privacy_level, content,
                 evidence_refs, derived_from, instruction_like, status, proposed_at,
-                resolved_at, resolved_by, resolution_reason
+                resolved_at, resolved_by, resolution_reason{extra_select}
             )
             SELECT
                 candidate_id, principal, workspace_id, layer, privacy_level, content,
                 evidence_refs, derived_from, instruction_like, status, proposed_at,
-                resolved_at, resolved_by, resolution_reason
+                resolved_at, resolved_by, resolution_reason{extra_select}
             FROM candidate_packets
             """
         )

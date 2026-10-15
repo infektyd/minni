@@ -1,6 +1,6 @@
 """#288 — every raw _get_conn() call site must leave the connection clean.
 
-`SovereignDB.cursor()` is the auto-commit contract: it commits on success and
+`MinniDB.cursor()` is the auto-commit contract: it commits on success and
 rolls back on exception. `_get_conn()` hands out the raw connection and opts out
 of that contract *silently*. PR #279 shipped a defect of exactly this shape — a
 repair that wrote through `_get_conn()` and never committed, leaving the write
@@ -60,13 +60,13 @@ import pytest
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "contract.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "contract.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -120,7 +120,7 @@ def _fails_if_a_write_is_pending_when_a_cursor_opens(db_obj, label):
     import minni.db as db_mod
 
     originals = {
-        name: getattr(db_mod.SovereignDB, name) for name in ("cursor", "transaction")
+        name: getattr(db_mod.MinniDB, name) for name in ("cursor", "transaction")
     }
     laundered = []
 
@@ -128,7 +128,7 @@ def _fails_if_a_write_is_pending_when_a_cursor_opens(db_obj, label):
         @contextmanager
         def wrapper(self, *args, **kwargs):
             # self._get_conn(), not a connection captured up front: audited code
-            # may route through a different SovereignDB (e.g. shared()) or a
+            # may route through a different MinniDB (e.g. shared()) or a
             # worker thread, and a captured handle would silently pass.
             if self._get_conn().in_transaction:
                 laundered.append(True)
@@ -138,12 +138,12 @@ def _fails_if_a_write_is_pending_when_a_cursor_opens(db_obj, label):
         return wrapper
 
     for name, original in originals.items():
-        setattr(db_mod.SovereignDB, name, _wrap(original))
+        setattr(db_mod.MinniDB, name, _wrap(original))
     try:
         yield
     finally:
         for name, original in originals.items():
-            setattr(db_mod.SovereignDB, name, original)
+            setattr(db_mod.MinniDB, name, original)
 
     assert not laundered, (
         f"{label} left a write pending when a later cursor() opened — that "
@@ -217,10 +217,10 @@ class TestDbModuleContracts:
         """db.py:529 — connect() acquires a connection purely to trigger schema
         init and migrations. Both write; both must commit."""
         import minni.db as db_mod
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
         from minni.db import connect
 
-        cfg = SovereignConfig(db_path=str(tmp_path / "connect.db"))
+        cfg = MinniConfig(db_path=str(tmp_path / "connect.db"))
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
@@ -508,16 +508,16 @@ class TestTheSweepWriteSite:
 
     def _run_sweep(self, db_obj, cfg):
         import minni.minnid as minnid
-        from minni.db import SovereignDB
+        from minni.db import MinniDB
 
         original_cfg = minnid.DEFAULT_CONFIG
-        original_shared = SovereignDB.shared
+        original_shared = MinniDB.shared
         minnid.DEFAULT_CONFIG = cfg
-        SovereignDB.shared = staticmethod(lambda *a, **k: db_obj)
+        MinniDB.shared = staticmethod(lambda *a, **k: db_obj)
         try:
             return minnid._backfill_sweep_once()
         finally:
-            SovereignDB.shared = original_shared
+            MinniDB.shared = original_shared
             minnid.DEFAULT_CONFIG = original_cfg
 
     def test_the_sweep_commits_and_releases(self, tmp_path):
@@ -714,29 +714,11 @@ class TestTheRemainingCallSitesRunTheirOwnCode:
         _assert_connection_is_clean(conn, cfg, "vault_ingest._save_faiss")
         db_obj.close()
 
-    def test_sovereign_memory_faiss_rebuild(self, tmp_path, monkeypatch, capsys):
-        """sovereign_memory.py:292, via cmd_faiss('--rebuild')."""
-        import minni.sovereign_memory as sm
-
-        db_obj, cfg = _make_db(tmp_path)
-        _seed_embeddings(db_obj, cfg)
-        conn = db_obj._get_conn()
-
-        monkeypatch.setattr(sm, "SovereignDB", lambda *a, **k: db_obj)
-        monkeypatch.setattr(db_obj, "close", lambda: None)
-        sm.cmd_faiss(["--rebuild"])
-
-        assert "rebuilt" in capsys.readouterr().out, (
-            "precondition: the rebuild branch must have run"
-        )
-        _assert_connection_is_clean(conn, cfg, "sovereign_memory.cmd_faiss")
-        db_obj.close()
-
     def test_eager_startup_init_leaves_no_transaction(self, tmp_path):
         """minnid.py:2094-2095 — the daemon's eager startup init, driven
-        through SovereignDB.shared() as production does.
+        through MinniDB.shared() as production does.
 
-        An earlier version constructed SovereignDB directly, which mirrors
+        An earlier version constructed MinniDB directly, which mirrors
         db.connect() rather than the call site it claimed to cover. shared()
         goes through a process-wide registry keyed by absolute db_path, so the
         path under test is genuinely different code — and an overstated
@@ -745,17 +727,17 @@ class TestTheRemainingCallSitesRunTheirOwnCode:
         import os
 
         import minni.db as db_mod
-        from minni.config import SovereignConfig
-        from minni.db import SovereignDB
+        from minni.config import MinniConfig
+        from minni.db import MinniDB
 
-        cfg = SovereignConfig(db_path=str(tmp_path / "eager.db"))
+        cfg = MinniConfig(db_path=str(tmp_path / "eager.db"))
         key = os.path.abspath(cfg.db_path)
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         db = None
         try:
             # Verbatim shape of minnid.py:2094-2095.
-            db = SovereignDB.shared(cfg)
+            db = MinniDB.shared(cfg)
             db._get_conn()
 
             _assert_connection_is_clean(db._get_conn(), cfg, "eager startup init")
@@ -771,8 +753,8 @@ class TestTheRemainingCallSitesRunTheirOwnCode:
             db_mod._migrations_run = old_flag
             if db is not None:
                 db.close()
-            with SovereignDB._shared_lock:
-                SovereignDB._shared_instances.pop(key, None)
+            with MinniDB._shared_lock:
+                MinniDB._shared_instances.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -908,7 +890,7 @@ class TestACrossThreadLeakIsOnlyVisibleToTheLockProbe:
 
 
 class TestReadOnlyConnectSitesCannotWrite:
-    """Three sites bypass SovereignDB entirely and open sqlite3 directly.
+    """Three sites bypass MinniDB entirely and open sqlite3 directly.
 
     Two of them (watch.py's EpisodicPoller, vault_ingest._read_index_state)
     do it through a `file:...?mode=ro` URI, which is a stronger guarantee than
@@ -978,21 +960,3 @@ class TestReadOnlyConnectSitesCannotWrite:
             _make_db(tmp_path)[0]._get_conn(), cfg, "_read_index_state"
         )
 
-    def test_faiss_status_checksum_read_leaves_nothing_open(self, tmp_path, capsys):
-        """sovereign_memory.py:328 — cmd_faiss('--status'). Read-only in
-        practice rather than by URI, so this pins the outcome, not the
-        mechanism."""
-        import minni.sovereign_memory as sm
-
-        db_obj, cfg = _make_db(tmp_path)
-
-        original = sm.DEFAULT_CONFIG
-        sm.DEFAULT_CONFIG = cfg
-        try:
-            sm.cmd_faiss(["--status"])
-        finally:
-            sm.DEFAULT_CONFIG = original
-
-        assert capsys.readouterr().out.strip(), "precondition: --status must report"
-        _assert_connection_is_clean(db_obj._get_conn(), cfg, "cmd_faiss --status")
-        db_obj.close()

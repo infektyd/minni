@@ -93,14 +93,14 @@ def _seed_expand_doc(conn, path, agent, privacy_level, page_type="session"):
 
 def _make_expand_db(tmp_path, name):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = str(tmp_path / name)
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -116,7 +116,7 @@ def test_expand_result_select_populates_fields_so_shared_wiki_type_is_read(tmp_p
     fell through can_read_document's default-deny -- a foreign agent's
     explicitly shared, safe wiki page was wrongly hidden on the direct-expand
     (chunk_id/doc_id) path. This drives expand_result against a REAL
-    SovereignDB row (not a mocked dict) so the actual SELECT is exercised, and
+    MinniDB row (not a mocked dict) so the actual SELECT is exercised, and
     proves the now-populated privacy_level/page_type let the legitimate
     shared-wiki grant fire.
     """
@@ -192,9 +192,9 @@ def test_retrieve_legacy_no_principal_no_unbound_and_g22_envelope_present():
     Also asserts the evidence keys are attached (G22 contract on retrieve).
     """
     from minni.retrieval import RetrievalEngine
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.config import DEFAULT_CONFIG
-    eng = RetrievalEngine(SovereignDB(), DEFAULT_CONFIG)
+    eng = RetrievalEngine(MinniDB(), DEFAULT_CONFIG)
     # limit=0 or empty query is safe; real hits would now carry envelope without crash
     try:
         res = eng.retrieve("sov test query", limit=0)

@@ -18,7 +18,7 @@ SUMMARY_BODY = (
     "1. Primary Request and Intent:\n"
     "   User asked to fix the daemon fd leak and deploy the fix everywhere.\n"
     "2. Key Technical Concepts:\n"
-    "   SovereignDB caches one sqlite connection per thread; the RPC pool\n"
+    "   MinniDB caches one sqlite connection per thread; the RPC pool\n"
     "   multiplies open fds past the launchd soft limit.\n"
     "3. Errors and fixes:\n"
     "   launchctl bootstrap error 5 right after bootout is a teardown race;\n"
@@ -33,9 +33,9 @@ SUMMARY_BODY = (
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -46,7 +46,7 @@ def _make_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -109,7 +109,7 @@ def test_deterministic_distill_proposes_shared_sections_only(tmp_path, monkeypat
     assert len(rows) == 2
     joined = "\n".join(r["content"] for r in rows)
     assert "teardown race" in joined
-    assert "SovereignDB caches one sqlite connection" in joined
+    assert "MinniDB caches one sqlite connection" in joined
     assert "All user messages" not in joined
     assert "Pending Tasks" not in joined
     # Raw local paths never reach the proposal queue.
@@ -327,7 +327,7 @@ def test_distill_in_txn_canonicalizes_alias_wanted_against_leftover_gemini(
 
 THREE_SHARED_BODY = (
     "1. Key Technical Concepts:\n"
-    "   SovereignDB caches one sqlite connection per thread so the RPC pool\n"
+    "   MinniDB caches one sqlite connection per thread so the RPC pool\n"
     "   multiplies open fds past the launchd soft limit.\n"
     "2. Errors and fixes:\n"
     "   launchctl bootstrap error 5 right after bootout is a teardown race;\n"
@@ -383,7 +383,7 @@ def test_leftover_alias_index0_does_not_archive_compact_without_extra_fills(
 
     res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
     # Occupied leftover 0 is not compact section 0: missing=[1,2] still
-    # extras-at-next-idx the divergent qty (SovereignDB…) so it is not
+    # extras-at-next-idx the divergent qty (MinniDB…) so it is not
     # archived unmerged. expected_keys must not treat leftover 0 as the fill.
     assert res["inserted"] == 3, res
     with db_obj.cursor() as c:
@@ -398,7 +398,7 @@ def test_leftover_alias_index0_does_not_archive_compact_without_extra_fills(
     assert sorted(by_idx) == [0, 1, 2, 3], by_idx
     assert leftover in by_idx[0]["content"]
     assert by_idx[0]["principal"] == "agy"
-    qty = [r for r in rows if "SovereignDB caches" in r["content"]]
+    qty = [r for r in rows if "MinniDB caches" in r["content"]]
     assert qty, [r["content"] for r in rows]
     qty_idx = json.loads(qty[0]["derived_from"]).get("candidate_index")
     assert qty_idx not in {0}, qty_idx
@@ -487,7 +487,7 @@ def test_unique_skip_does_not_archive_compact_file_before_insert(
     }
     assert sorted(by_idx) == [0, 1, 2, 3], by_idx
     assert leftover in by_idx[0]["content"]
-    qty = [r for r in rows if "SovereignDB caches" in r["content"]]
+    qty = [r for r in rows if "MinniDB caches" in r["content"]]
     assert qty, [r["content"] for r in rows]
     qty_idx = json.loads(qty[0]["derived_from"]).get("candidate_index")
     assert qty_idx not in {0}, qty_idx

@@ -33,17 +33,17 @@ def test_vault_index_config_points_inside_vault_dot_index(tmp_path):
 
 
 def test_open_vault_index_initializes_isolated_schema_without_touching_shared_db(tmp_path):
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.vault_index import open_vault_index, vault_index_paths
 
-    shared_cfg = SovereignConfig(
+    shared_cfg = MinniConfig(
         db_path=str(tmp_path / "shared" / "minni.db"),
         vault_path=str(tmp_path / "shared-vault"),
         graph_export_dir=str(tmp_path / "graphs"),
         writeback_enabled=False,
     )
-    shared_db = SovereignDB(shared_cfg)
+    shared_db = MinniDB(shared_cfg)
     shared_db._get_conn()
 
     vault = tmp_path / "codex-vault"

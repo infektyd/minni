@@ -210,6 +210,18 @@ def _announce_download_once(model_name: str, role: str) -> None:
         pass  # visibility must never block a load
 
 
+def _load_local_first(cls, model_name: str, role: str, **kwargs):
+    """Attempt offline load (local_files_only=True) before hitting HuggingFace Hub."""
+    try:
+        return cls(model_name, local_files_only=True, **kwargs)
+    except TypeError:
+        _announce_download_once(model_name, role)
+        return cls(model_name, **kwargs)
+    except Exception:
+        _announce_download_once(model_name, role)
+        return cls(model_name, **kwargs)
+
+
 @functools.cache
 def get_embedder():
     """
@@ -224,13 +236,14 @@ def get_embedder():
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     try:
         from sentence_transformers import SentenceTransformer
-        _announce_download_once(DEFAULT_CONFIG.embedding_model, "embedding")
         device = _resolve_model_device()
         _pin_torch_threads_for_cpu_once(device)
         kwargs = {}
         if device is not None:
             kwargs["device"] = device
-        model = SentenceTransformer(DEFAULT_CONFIG.embedding_model, **kwargs)
+        model = _load_local_first(
+            SentenceTransformer, DEFAULT_CONFIG.embedding_model, "embedding", **kwargs
+        )
         logger.info(
             "Embedding model loaded (singleton): %s device=%s",
             DEFAULT_CONFIG.embedding_model,
@@ -260,13 +273,14 @@ def get_cross_encoder():
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     try:
         from sentence_transformers import CrossEncoder
-        _announce_download_once(DEFAULT_CONFIG.reranker_model, "reranker")
         device = _resolve_model_device()
         _pin_torch_threads_for_cpu_once(device)
         kwargs = {}
         if device is not None:
             kwargs["device"] = device
-        model = CrossEncoder(DEFAULT_CONFIG.reranker_model, **kwargs)
+        model = _load_local_first(
+            CrossEncoder, DEFAULT_CONFIG.reranker_model, "reranker", **kwargs
+        )
         global _CROSS_ENCODER_CONSTRUCTION_DEVICE
         _CROSS_ENCODER_CONSTRUCTION_DEVICE = device if device is not None else "auto"
         logger.info(
@@ -298,13 +312,14 @@ def get_attribution_cross_encoder():
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     try:
         from sentence_transformers import CrossEncoder
-        _announce_download_once(DEFAULT_CONFIG.attribution_model, "attribution")
         device = _resolve_model_device()
         _pin_torch_threads_for_cpu_once(device)
         kwargs = {}
         if device is not None:
             kwargs["device"] = device
-        model = CrossEncoder(DEFAULT_CONFIG.attribution_model, **kwargs)
+        model = _load_local_first(
+            CrossEncoder, DEFAULT_CONFIG.attribution_model, "attribution", **kwargs
+        )
         logger.info(
             "Attribution cross-encoder loaded (singleton): %s device=%s",
             DEFAULT_CONFIG.attribution_model,

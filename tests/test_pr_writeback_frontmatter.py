@@ -14,13 +14,13 @@ import pytest
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from minni.writeback import WriteBackMemory
-from minni.config import SovereignConfig
+from minni.config import MinniConfig
 
 
 def _make_writeback(tmp_path: Path) -> WriteBackMemory:
     wb_dir = tmp_path / "learnings"
     wb_dir.mkdir()
-    cfg = SovereignConfig(writeback_path=str(wb_dir), writeback_enabled=True)
+    cfg = MinniConfig(writeback_path=str(wb_dir), writeback_enabled=True)
     # minimal: no model, no db needed for the disk guard path
     wb = WriteBackMemory(cfg)
     # patch out the DB parts that would fail without full setup

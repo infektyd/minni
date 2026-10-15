@@ -11,7 +11,7 @@ import { envelopeBudgetFor } from "../dist/agent_envelope.js";
 import {
   extractIdentityBody,
   truncateToTokenCharBudget,
-} from "../dist/sovereign.js";
+} from "../dist/daemon_transport.js";
 
 const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 

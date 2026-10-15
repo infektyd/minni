@@ -228,8 +228,8 @@ make sync-root                               # preferred full operator path
 > Minni from a public marketplace.
 
 The `propagate.py update-plugin` flow refreshes an *existing* install in place.
-When the plugin's marketplace/plugin **name** changes (e.g. the
-`sovereign-memory@sovereign-memory` → `minni@minni` rebrand), `update-plugin` is
+When the plugin's marketplace/plugin **name** changes (e.g. a legacy marketplace
+identity → `minni@minni` rebrand), `update-plugin` is
 not enough — the install identity `<plugin>@<marketplace>` must be swapped via
 the native `claude plugin` CLI (uninstall old → remove stale marketplace → add
 marketplace from the canonical repo path → install new identity), then verified

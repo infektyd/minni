@@ -46,15 +46,15 @@ def _usable_faiss_or_skip():
 def _make_db(tmp_path):
     """Create a minimal sovereign DB for testing."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = str(tmp_path / "test.db")
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
 
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()  # triggers schema + migrations
     finally:
         db_mod._migrations_run = old_flag
@@ -170,17 +170,17 @@ class TestFAISSPersistence:
         _usable_faiss_or_skip()
 
         from minni.faiss_index import FAISSIndex
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
         import minni.db as db_mod
 
         db_path = str(tmp_path / "test.db")
-        cfg = SovereignConfig(db_path=db_path)
+        cfg = MinniConfig(db_path=db_path)
 
         # Fresh DB so migrations run cleanly
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
-            db_obj = db_mod.SovereignDB(cfg)
+            db_obj = db_mod.MinniDB(cfg)
             conn = db_obj._get_conn()
         finally:
             db_mod._migrations_run = old_flag
@@ -204,9 +204,9 @@ class TestFAISSPersistence:
         monkeypatch.setitem(sys.modules, "faiss", types.SimpleNamespace(__file__=None))
 
         from minni.faiss_index import FAISSIndex
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
 
-        cfg = SovereignConfig(db_path=str(tmp_path / "test.db"), embedding_dim=4)
+        cfg = MinniConfig(db_path=str(tmp_path / "test.db"), embedding_dim=4)
         idx = FAISSIndex(cfg)
         vecs = np.eye(4, dtype=np.float32)
 
@@ -736,7 +736,7 @@ class TestWikiIndexerFrontmatter:
         """WikiIndexer excludes pages with invalid frontmatter."""
         import minni.db as db_mod
         from minni.wiki_indexer import WikiIndexer
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
 
         # Create a wiki dir with one invalid page
         wiki_dir = tmp_path / "wiki"
@@ -748,12 +748,12 @@ class TestWikiIndexerFrontmatter:
         )
 
         db_path = str(tmp_path / "test.db")
-        cfg = SovereignConfig(db_path=db_path)
+        cfg = MinniConfig(db_path=db_path)
 
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
-            db_obj = db_mod.SovereignDB(cfg)
+            db_obj = db_mod.MinniDB(cfg)
             db_obj._get_conn()
         finally:
             db_mod._migrations_run = old_flag
@@ -770,7 +770,7 @@ class TestWikiIndexerFrontmatter:
         """WikiIndexer skips pages with privacy: blocked."""
         import minni.db as db_mod
         from minni.wiki_indexer import WikiIndexer
-        from minni.config import SovereignConfig
+        from minni.config import MinniConfig
 
         wiki_dir = tmp_path / "wiki"
         wiki_dir.mkdir()
@@ -781,12 +781,12 @@ class TestWikiIndexerFrontmatter:
         )
 
         db_path = str(tmp_path / "test.db")
-        cfg = SovereignConfig(db_path=db_path)
+        cfg = MinniConfig(db_path=db_path)
 
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False
         try:
-            db_obj = db_mod.SovereignDB(cfg)
+            db_obj = db_mod.MinniDB(cfg)
             db_obj._get_conn()
         finally:
             db_mod._migrations_run = old_flag

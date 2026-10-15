@@ -114,6 +114,16 @@ async function main(): Promise<void> {
     // PreInvocation carries no prompt text; mine the transcript or the
     // shared handler returns noIntent and the per-turn recall pointer dies.
     payload = await enrichAgyPromptPayload(payload).catch(() => payload);
+    const promptText = asString(payload.prompt).trim();
+    if (promptText) {
+      const { readRecallState } = await import("./recall-state.js");
+      const { hashTaskSignature } = await import("./agent_envelope.js");
+      const existingState = await readRecallState(CONFIG.vaultPath).catch(() => null);
+      if (existingState && existingState.task_signature === hashTaskSignature(promptText)) {
+        emit({ continue: true });
+        return;
+      }
+    }
   }
   if (event === "Stop") {
     // Best-effort: pull the real last user message from agy's transcript so

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import shutil
 
-from minni.config import SovereignConfig
+from minni.config import MinniConfig
 import minni.db as db_mod
 
 # Try to import from minnid. Under TDD, this should fail initially since the feature is not yet built.
@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skip(reason="unbuilt feature: minnid._extract_recent_se
 
 
 def _make_db(tmp_path):
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -39,7 +39,7 @@ def _make_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -121,7 +121,7 @@ def test_extract_recent_sessions_lifecycle(tmp_path, monkeypatch):
     time.sleep(2.1)
     
     # Run the extraction pass
-    monkeypatch.setattr("minni.minnid.SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr("minni.minnid.MinniDB", lambda config=None: db_obj)
     
     _extract_recent_sessions(cfg)
     

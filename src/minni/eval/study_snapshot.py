@@ -1035,15 +1035,15 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
 
     Re-validates frozen files and metadata first (rejecting symlinks,
     tampered bytes, inconsistent mappings, and stale-output mixing), then
-    mirrors ``eval/fixture.py`` isolated construction: a ``SovereignConfig``
+    mirrors ``eval/fixture.py`` isolated construction: a ``MinniConfig``
     with DB, vault, FAISS index, graph, and writeback paths ALL inside the
     snapshot directory, writeback disabled, and original ownership/lifecycle/
     privacy metadata preserved per record. No model is loaded; rows are
     lexical (documents + vault_fts with sigil ``"T"``), exactly like the
     fixture's lexical profile. Never touches the live ``DEFAULT_CONFIG``.
     """
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
 
     snapshot_dir = _reject_live_destination(Path(snapshot_dir))
     verified = verify_snapshot(snapshot_dir)
@@ -1060,7 +1060,7 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
             "prepared directory so stale records can never mix with new ones"
         )
 
-    config = SovereignConfig(
+    config = MinniConfig(
         db_path=str(snapshot_dir / "study.db"),
         vault_path=str(vault_root),
         faiss_index_path=str(snapshot_dir / "study.faiss"),
@@ -1072,7 +1072,7 @@ def materialize_snapshot_db(snapshot_dir: Path) -> Dict[str, Any]:
     )
     previous_umask = os.umask(0o077)
     try:
-        db = SovereignDB(config)
+        db = MinniDB(config)
     finally:
         os.umask(previous_umask)
     try:

@@ -39,7 +39,7 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 @dataclass
-class SovereignConfig:
+class MinniConfig:
     """All configuration in one place, overridable via env vars or constructor."""
 
     # Paths — G02 unified canonical home (~/.minni, overridable via MINNI_HOME)
@@ -91,8 +91,8 @@ class SovereignConfig:
     hnsw_ef_search: int = 128              # HNSW query-time search width
 
     # Retrieval
-    fts_weight: float = 0.35              # RRF constant for FTS5 rank
-    semantic_weight: float = 0.65         # RRF constant for semantic rank
+    fts_weight: float = 0.60              # RRF constant for FTS5 rank
+    semantic_weight: float = 0.40         # RRF constant for semantic rank
     rrf_k: int = 60                       # Reciprocal Rank Fusion constant
 
     # Cross-encoder re-ranking
@@ -221,6 +221,12 @@ class SovereignConfig:
                 "interval_seconds": 15 * 60,
                 "max_per_run": 50,
                 "max_batches_per_tick": 40,  # up to 40*50=2000 candidates/tick
+                "judge_mode": os.environ.get("MINNI_JUDGE_MODE", "enforce"),
+                "max_model_calls_per_batch": 8,
+                "debounce_window_seconds": 20.0,
+                "burst_threshold": 2,
+                "min_debounce_gap_seconds": 5.0,
+                "allow_jev_egress": False,
                 # Before draining, ingest inbox stop-candidate files
                 # (<vault>/inbox/*.json — kind 'stop_candidates', legacy
                 # 'codex_stop_candidates', or kind-less stop-candidate shape)
@@ -328,7 +334,7 @@ def correction_class_page_types(config) -> set:
 
 
 # Global default config — importable everywhere
-DEFAULT_CONFIG = SovereignConfig()
+DEFAULT_CONFIG = MinniConfig()
 
 
 # --- Model provider chain config (P3) ----------------------------------------

@@ -21,7 +21,7 @@
 import path from "node:path";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 
-import type { RecallResponse } from "./sovereign.js";
+import type { RecallResponse } from "./daemon_transport.js";
 import type { VaultSearchResult } from "./vault.js";
 import { assertWriteTargetUnder } from "./vault.js";
 
@@ -226,12 +226,17 @@ export async function writeRecallState(
   // <vault>/.runtime (or the target file itself) outside the vault could
   // redirect this write. Reject any symlink escape before writing.
   assertWriteTargetUnder(filePath, vaultPath);
+  const existing = await readRecallState(vaultPath).catch(() => null);
+  const preserveConsumed =
+    existing !== null &&
+    existing.task_signature === state.task_signature &&
+    existing.consumed === true;
   const payload: RecallState = {
     task_signature: state.task_signature,
     intent: state.intent,
     top_hits: state.top_hits,
     top_score: state.top_score,
-    consumed: false,
+    consumed: preserveConsumed,
     ts: state.ts ?? new Date().toISOString(),
   };
   await writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");

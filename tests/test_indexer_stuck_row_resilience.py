@@ -25,15 +25,15 @@ POISON_GARBAGE = "not a timestamp"
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = str(tmp_path / "test.db")
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
 
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -54,7 +54,7 @@ def _poison_last_modified(conn, path: str) -> None:
 
 
 def test_vault_indexer_reindexes_instead_of_sticking_on_poisoned_last_modified(tmp_path):
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.indexer import VaultIndexer
 
     vault_dir = tmp_path / "vault"
@@ -66,7 +66,7 @@ def test_vault_indexer_reindexes_instead_of_sticking_on_poisoned_last_modified(t
     conn = db_obj._get_conn()
     _poison_last_modified(conn, str(doc_path.resolve()))
 
-    cfg2 = SovereignConfig(db_path=cfg.db_path, vault_path=str(vault_dir))
+    cfg2 = MinniConfig(db_path=cfg.db_path, vault_path=str(vault_dir))
     indexer = VaultIndexer(db=db_obj, config=cfg2)
     stats = indexer.index_vault()
 
@@ -82,7 +82,7 @@ def test_vault_indexer_reindexes_instead_of_sticking_on_poisoned_last_modified(t
 
 def test_wiki_indexer_reindexes_instead_of_sticking_on_poisoned_last_modified(tmp_path):
     from minni.wiki_indexer import WikiIndexer
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     wiki_dir = tmp_path / "wiki" / "auto-indexed"
     wiki_dir.mkdir(parents=True)

@@ -289,13 +289,13 @@ def test_provisioned_caller_missing_grant_keeps_bare_capability_denied(monkeypat
 
 def _patch_db(monkeypatch, tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "issue121.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "issue121.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

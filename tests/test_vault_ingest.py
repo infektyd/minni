@@ -33,9 +33,9 @@ def _install_fake_embedder(monkeypatch):
 
 def _make_shared_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "shared" / "minni.db"),
         vault_path=str(tmp_path / "shared-vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -46,7 +46,7 @@ def _make_shared_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -323,7 +323,7 @@ def test_vault_ingest_unknown_vault_slug_skips_without_index_store(tmp_path, mon
 def test_daemon_compile_registers_vault_ingest_dry_run(tmp_path, monkeypatch):
     import minni.minnid as minnid
     import minni.principal as principal_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     _install_fake_embedder(monkeypatch)
     vault = tmp_path / "codex-vault"
@@ -345,7 +345,7 @@ def test_daemon_compile_registers_vault_ingest_dry_run(tmp_path, monkeypatch):
     os.chmod(principal_file, 0o600)
     monkeypatch.setattr(principal_mod, "PRINCIPALS_DIR", principals)
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "shared" / "minni.db"),
         vault_path=str(vault),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -833,9 +833,9 @@ def test_excluded_page_does_not_read_as_a_repairable_vector_gap(tmp_path, monkey
     run(shared_db, cfg, vault_path=str(vault), dry_run=False)
 
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    index_cfg = SovereignConfig(
+    index_cfg = MinniConfig(
         db_path=first["index_db_path"],
         vault_path=str(vault),
         graph_export_dir=str(tmp_path / "g"),
@@ -845,7 +845,7 @@ def test_excluded_page_does_not_read_as_a_repairable_vector_gap(tmp_path, monkey
     old = db_mod._migrations_run
     db_mod._migrations_run = True
     try:
-        idx_db = db_mod.SovereignDB(index_cfg)
+        idx_db = db_mod.MinniDB(index_cfg)
         cov = embedding_coverage(idx_db)
     finally:
         db_mod._migrations_run = old

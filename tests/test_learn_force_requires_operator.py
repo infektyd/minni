@@ -29,8 +29,8 @@ def test_force_learn_operator_gate(tmp_path, monkeypatch):
     pr_mod.PRINCIPALS_DIR = pdir
     try:
         from minni.migrations import run_migrations
-        from minni.db import SovereignDB
-        db = SovereignDB()
+        from minni.db import MinniDB
+        db = MinniDB()
         run_migrations(db._get_conn())
 
         # Call as non-operator (stamped "local" with limited caps)

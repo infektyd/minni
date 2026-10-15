@@ -7,7 +7,7 @@ invoke it before a principal is verified. These tests pin the redaction:
   - the handler redacts when the trusted `_recovery` flag is set, and returns
     full detail when it is not.
 
-Hermetic: the handler tests stub SovereignDB so no real ~/.minni DB is opened.
+Hermetic: the handler tests stub MinniDB so no real ~/.minni DB is opened.
 """
 
 import json
@@ -126,7 +126,7 @@ class _FakeDB:
 def test_handle_health_report_redacts_when_recovery(monkeypatch):
     import minni.minnid as minnid
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     resp = minnid._handle_health_report({"_recovery": True}, 1)
     rep = resp["result"]
 
@@ -141,7 +141,7 @@ def test_handle_health_report_full_detail_when_operator(monkeypatch):
     import minni.minnid as minnid
     from minni.principal import EffectivePrincipal
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     op = EffectivePrincipal(agent_id="main", capabilities=["*"])
     resp = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)
     rep = resp["result"]
@@ -157,7 +157,7 @@ def test_handle_health_report_redacts_identified_non_operator(monkeypatch):
     import minni.minnid as minnid
     from minni.principal import EffectivePrincipal
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     limited = EffectivePrincipal(agent_id="codex", capabilities=["read", "search"])
     resp = minnid._handle_health_report({"_recovery": False, "_principal": limited}, 1)
     rep = resp["result"]
@@ -172,7 +172,7 @@ def test_handle_health_report_redacts_by_default_when_flag_absent(monkeypatch):
     """Fail-closed: if the trusted _recovery flag is missing, redact."""
     import minni.minnid as minnid
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     resp = minnid._handle_health_report({}, 1)
     rep = resp["result"]
 

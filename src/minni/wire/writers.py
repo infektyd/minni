@@ -21,6 +21,7 @@ GEMINI_SURFACE_CONFIGS = (
     "~/.gemini/antigravity-ide/mcp_config.json",
     "~/.gemini/antigravity-cli/plugins/minni/mcp_config.json",
 )
+# Intentional migration literal: strip pre-rename MCP permission grants during sync.
 GEMINI_LEGACY_GRANT_MARKERS = ("mcp(sovereign-memory", "mcp(sovereign_memory", "sovereign_")
 MINNI_READONLY_TOOLS = (
     "minni_recall", "minni_drill", "minni_status", "minni_audit_tail",
@@ -396,6 +397,7 @@ def write_view_entry(
         server_path, agent, vault, socket_path, workspace, afm_env, type_name,
         launcher_fallback=launcher_fallback,
     )
+    # Intentional migration literal: evict legacy pre-rename MCP server entry when writing 'minni'.
     if servers.get("minni") == new_entry and "sovereign-memory" not in servers:
         return True
     servers.pop("sovereign-memory", None)

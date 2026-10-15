@@ -5,7 +5,7 @@ PR-3 default backend. Wraps engine/faiss_index.py (FAISSIndex) and
 engine/faiss_persist.py (PR-2 save/load with manifest + db_checksum).
 
 Behaviour:
-  - On construction, if a SovereignDB connection is passed, attempts to
+  - On construction, if a MinniDB connection is passed, attempts to
     load the FAISS index from disk cache (cold-start <500ms).
   - upsert() adds vectors to the live index and schedules a save.
   - remove() marks vectors for exclusion (HNSW doesn't support true delete;
@@ -42,8 +42,8 @@ class FaissDiskBackend:
     def __init__(self, config=None, db=None):
         """
         Args:
-            config : SovereignConfig (uses DEFAULT_CONFIG if None).
-            db     : SovereignDB (used for disk-cache checksum and post-filter).
+            config : MinniConfig (uses DEFAULT_CONFIG if None).
+            db     : MinniDB (used for disk-cache checksum and post-filter).
                      May be None — search() will skip SQLite post-filter on chunk_ids.
         """
         from minni.config import DEFAULT_CONFIG

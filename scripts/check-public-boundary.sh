@@ -15,13 +15,21 @@ boundary_out="$(mktemp)"
 sensitive_out="$(mktemp)"
 trap 'rm -f "$boundary_out" "$sensitive_out"' EXIT
 
-if git ls-files | rg '(^|/)node_modules/|\.log$|\.db$|\.sqlite$|\.sqlite3$|\.faiss$|\.npz$|\.fmadapter$|(^|/)\.DS_Store$|^\.claude/|^codex-vault/|^claudecode-vault/|^logs/|^inbox/|^outbox/|^raw/|^wiki/|^session-extracts/' >"$boundary_out"; then
+match_regex() {
+  if command -v rg >/dev/null 2>&1; then
+    rg "$1"
+  else
+    grep -E "$1"
+  fi
+}
+
+if git ls-files | match_regex '(^|/)node_modules/|\.log$|\.db$|\.sqlite$|\.sqlite3$|\.faiss$|\.npz$|\.fmadapter$|(^|/)\.DS_Store$|^\.claude/|^codex-vault/|^claudecode-vault/|^logs/|^inbox/|^outbox/|^raw/|^wiki/|^session-extracts/' >"$boundary_out"; then
   echo "Public-boundary check failed. These tracked files look private, generated, or runtime-only:" >&2
   cat "$boundary_out" >&2
   exit 1
 fi
 
-if git ls-files | rg '(^|/)session-export-[0-9]+\.zip$|\.fmadapter$|adapter.*\.json$|hook.*dump|sovereign_memory\.db' >"$sensitive_out"; then
+if git ls-files | match_regex '(^|/)session-export-[0-9]+\.zip$|\.fmadapter$|adapter.*\.json$|hook.*dump|sovereign_memory\.db' >"$sensitive_out"; then
   echo "Sensitive-artifact check failed. These tracked files should not ship in the public repo:" >&2
   cat "$sensitive_out" >&2
   exit 1

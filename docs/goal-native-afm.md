@@ -1,6 +1,6 @@
 # Native AFM Wiring
 
-Sovereign Memory no longer treats AFM only as an optional
+Minni no longer treats AFM only as an optional
 OpenAI-compatible localhost bridge. The repo now has a native-provider
 architecture with bridge compatibility, explicit opt-out, and graceful
 downgrade.

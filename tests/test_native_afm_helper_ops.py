@@ -18,9 +18,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -38,7 +38,7 @@ def _make_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -327,7 +327,7 @@ def test_error_kind_logged_distinctly_on_native_failure(tmp_path, monkeypatch, c
 
 def _ensure_candidate_tables(db_obj):
     """candidate_packets lives in the numbered migrations (007); the lightweight
-    SovereignDB bootstrap skips them. consolidation_actions is created lazily by
+    MinniDB bootstrap skips them. consolidation_actions is created lazily by
     the daemon at runtime, so create it here (DDL mirrors test_inbox_archive)."""
     from minni.migrations import run_migrations
 

@@ -127,9 +127,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         os.environ["MINNI_DB_PATH"] = os.path.expanduser(args.db)
 
     from minni.config import DEFAULT_CONFIG
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
 
-    db = SovereignDB(DEFAULT_CONFIG)
+    db = MinniDB(DEFAULT_CONFIG)
     try:
         result = run(db, DEFAULT_CONFIG, dry_run=not args.apply)
     finally:

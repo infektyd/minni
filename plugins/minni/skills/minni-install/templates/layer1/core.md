@@ -1,6 +1,6 @@
 # Layer 1 — {{agent}} core orientation
 
-- **Agent id**: {{agent}} (sovereign `identity:{{agent}}`)
+- **Agent id**: {{agent}} (minni `identity:{{agent}}`)
 - **Vault**: {{vault}}
 - **Primary workspace**: {{workspace}}
 - **Daemon socket**: {{socket}}

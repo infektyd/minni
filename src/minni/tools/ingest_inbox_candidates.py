@@ -36,7 +36,7 @@ def main(argv=None) -> int:
         os.environ["MINNI_DB_PATH"] = os.path.expanduser(args.db)
 
     from minni.config import DEFAULT_CONFIG
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.afm_passes.inbox_ingest import ingest
 
     dry_run = not args.live
@@ -45,7 +45,7 @@ def main(argv=None) -> int:
         print(f"ERROR: inbox not found: {inbox}", file=sys.stderr)
         return 2
 
-    db = SovereignDB(DEFAULT_CONFIG)
+    db = MinniDB(DEFAULT_CONFIG)
     res = ingest(db, DEFAULT_CONFIG, inboxes=[inbox],
                  fallback_principal=args.principal, dry_run=dry_run)
 

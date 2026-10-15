@@ -100,7 +100,10 @@ def _rpc(socket_path: Path, method: str, params: dict | None = None,
     except FileNotFoundError as exc:
         raise RpcError(f"socket {socket_path} does not exist") from exc
     except ConnectionRefusedError as exc:
-        raise RpcError("connection refused — daemon not listening") from exc
+        msg = "connection refused — daemon not listening"
+        if sys.platform == "darwin":
+            msg += " (if managed by launchd, try: launchctl kickstart -k gui/$(id -u)/com.minni.minnid)"
+        raise RpcError(msg) from exc
     except socket.timeout as exc:
         raise RpcTimeoutError(
             f"request timed out after {timeout:.0f}s") from exc
@@ -253,8 +256,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         result = _rpc(sock, "status")
     except RpcError as exc:
-        print(f"minnid is not reachable: {exc}\nStart it with: minni up",
-              file=sys.stderr)
+        msg = f"minnid is not reachable: {exc}\nStart it with: minni up"
+        if sys.platform == "darwin" and "launchctl kickstart" not in str(exc):
+            msg += "\nIf managed by launchd, try: launchctl kickstart -k gui/$(id -u)/com.minni.minnid"
+        print(msg, file=sys.stderr)
         return 1
     daemon = result.get("daemon", {})
     engine = result.get("engine", {})

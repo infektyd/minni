@@ -120,7 +120,7 @@ def test_writeback_store_learning_passes_show_progress_bar_false(tmp_path):
     from dataclasses import replace
 
     from minni.config import DEFAULT_CONFIG
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.writeback import WriteBackMemory
 
     cfg = replace(
@@ -131,7 +131,7 @@ def test_writeback_store_learning_passes_show_progress_bar_false(tmp_path):
     )
     (tmp_path / "vault").mkdir()
     (tmp_path / "learnings").mkdir()
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     model = _RecordingEncodeModel(sleep_s=0.0)
 
     class _WB(WriteBackMemory):
@@ -149,7 +149,7 @@ def test_retrieval_score_attribution_passes_show_progress_bar(tmp_path):
     from dataclasses import replace
 
     from minni.config import DEFAULT_CONFIG
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
     cfg = replace(
@@ -159,7 +159,7 @@ def test_retrieval_score_attribution_passes_show_progress_bar(tmp_path):
         attribution_enabled=True,
     )
     (tmp_path / "vault").mkdir()
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     pred = _RecordingPredictModel()
     engine._attribution_model = pred
@@ -173,7 +173,7 @@ def test_retrieval_rerank_passes_show_progress_bar(tmp_path):
     from dataclasses import replace
 
     from minni.config import DEFAULT_CONFIG
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
     cfg = replace(
@@ -183,7 +183,7 @@ def test_retrieval_rerank_passes_show_progress_bar(tmp_path):
         reranker_enabled=True,
     )
     (tmp_path / "vault").mkdir()
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     engine = RetrievalEngine(db, cfg)
     pred = _RecordingPredictModel()
     engine._reranker = pred
@@ -201,7 +201,7 @@ def test_retrieval_encode_query_passes_show_progress_bar(tmp_path):
     from dataclasses import replace
 
     from minni.config import DEFAULT_CONFIG
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
     cfg = replace(
@@ -210,7 +210,7 @@ def test_retrieval_encode_query_passes_show_progress_bar(tmp_path):
         vault_path=str(tmp_path / "vault"),
     )
     (tmp_path / "vault").mkdir()
-    db = SovereignDB(cfg)
+    db = MinniDB(cfg)
     model = _RecordingEncodeModel(sleep_s=0.0)
 
     class _Eng(RetrievalEngine):
@@ -442,6 +442,6 @@ def test_resolve_model_device_respects_env(monkeypatch):
 
 
 def test_model_device_config_field_exists():
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    assert "model_device" in SovereignConfig.__dataclass_fields__
+    assert "model_device" in MinniConfig.__dataclass_fields__

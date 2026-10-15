@@ -115,8 +115,8 @@ def run_fixture(path: Path | None = None, *, profile: str = "lexical-deadline", 
     still runs; the engine's own deadline branch bypasses models and reports
     degradation. It is not a proxy for healthy hybrid search performance.
     """
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.principal import EffectivePrincipal
     from minni.retrieval import RetrievalEngine, _trace_ring
 
@@ -139,12 +139,12 @@ def run_fixture(path: Path | None = None, *, profile: str = "lexical-deadline", 
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="minni-eval-") as temporary:
         root = Path(temporary)
-        config = SovereignConfig(
+        config = MinniConfig(
             db_path=str(root / "eval.db"), vault_path=str(root / "vault"),
             faiss_index_path=str(root / "index.faiss"), graph_export_dir=str(root / "graphs"),
             writeback_enabled=False, reranker_enabled=profile == "hybrid", hyde_enabled=False,
         )
-        db = SovereignDB(config)
+        db = MinniDB(config)
         try:
             engine = RetrievalEngine(db, config)
             mapping = {}

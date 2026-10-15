@@ -14,7 +14,7 @@ Sync strategy:
 Triggers:
   1. After indexer pass: VaultIndexer / WikiIndexer call sync_backend() when done.
   2. Daemon idle hook: every 30s if any backend has status='dirty'.
-  3. CLI: python -m engine.sovereign_memory vectors --sync
+  3. CLI: minni vectors --sync
 
 Entry points:
   sync_backend(backend, db, config)       — sync one backend
@@ -119,8 +119,8 @@ def sync_backend(
 
     Args:
         backend       : A VectorBackend instance.
-        db            : SovereignDB instance.
-        config        : SovereignConfig (for embedding_dim fallback).
+        db            : MinniDB instance.
+        config        : MinniConfig (for embedding_dim fallback).
         batch_size    : Rows to process per call.
         embedding_dim : Expected vector dim (auto-detected from backend.dim).
         full_rebuild  : If True, ignore last_synced_chunk_rowid and re-sync all.
@@ -283,8 +283,8 @@ def sync_all(
 
     Args:
         backends     : List of VectorBackend instances.
-        db           : SovereignDB instance.
-        config       : SovereignConfig.
+        db           : MinniDB instance.
+        config       : MinniConfig.
         batch_size   : Rows per backend per call.
         full_rebuild : If True, re-sync all rows.
 

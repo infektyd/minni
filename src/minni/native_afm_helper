@@ -3,7 +3,8 @@ set -euo pipefail
 
 source_file="${0}.swift"
 uid="$(id -u)"
-base_cache_dir="${TMPDIR:-/tmp}/sovereign-memory-afm-${uid}"
+base_cache_dir="${TMPDIR:-/tmp}/minni-afm-${uid}"
+
 
 umask 077
 if ! mkdir "${base_cache_dir}" 2>/dev/null; then

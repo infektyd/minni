@@ -20,9 +20,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 def test_hyde_disabled_by_default():
     """R7: hyde_enabled must default to False so the recall query is not posted
     to the unauthenticated loopback AFM endpoint unless explicitly opted in."""
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    assert SovereignConfig().hyde_enabled is False
+    assert MinniConfig().hyde_enabled is False
 
 
 def test_afm_bridge_client_caps_response_bytes(monkeypatch):
@@ -58,16 +58,16 @@ def test_afm_bridge_client_caps_response_bytes(monkeypatch):
 
 def _engine(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.faiss_index import FAISSIndex
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "e.db"), reranker_enabled=False)
+    cfg = MinniConfig(db_path=str(tmp_path / "e.db"), reranker_enabled=False)
     old = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = SovereignDB(cfg)
+        db_obj = MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old

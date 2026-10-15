@@ -102,17 +102,17 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _make_db(tmp_path: Path):
-    """Return (SovereignDB, SovereignConfig) backed by a temporary SQLite file."""
+    """Return (MinniDB, MinniConfig) backed by a temporary SQLite file."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     db_path = str(tmp_path / "test.db")
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = MinniConfig(db_path=db_path)
 
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

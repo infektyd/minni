@@ -1,4 +1,4 @@
-# Sovereign Memory Workflows
+# Minni Workflows
 
 These workflows describe the repeatable operating loops for v4. They are meant
 for agents first and humans second: each step leaves provenance and review state

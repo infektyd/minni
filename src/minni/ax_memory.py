@@ -4,7 +4,7 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 
-from minni.db import SovereignDB
+from minni.db import MinniDB
 
 logger = logging.getLogger("sovereign.ax")
 
@@ -13,7 +13,7 @@ class AXMemory:
     AX Snapshots memory: UI accessibility trees and screenshots.
     """
 
-    def __init__(self, db: SovereignDB):
+    def __init__(self, db: MinniDB):
         self.db = db
 
     def add_snapshot(

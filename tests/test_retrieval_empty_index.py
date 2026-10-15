@@ -6,16 +6,16 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 def test_empty_document_index_returns_without_loading_embedder(tmp_path, monkeypatch):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "empty.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "empty.db"))
     old_flag = db_mod._migrations_run
     old_paths = db_mod._migrated_paths.copy()
     db_mod._migrations_run = False
     db_mod._migrated_paths = set()
     try:
-        db = db_mod.SovereignDB(cfg)
+        db = db_mod.MinniDB(cfg)
         db._get_conn()
     finally:
         db_mod._migrations_run = old_flag

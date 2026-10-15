@@ -277,7 +277,18 @@ def test_migration_015_survives_contradiction_log_fk(tmp_path):
         """
     )
     conn.execute(
-        "INSERT INTO candidate_packets_old SELECT * FROM candidate_packets"
+        """
+        INSERT INTO candidate_packets_old (
+            candidate_id, principal, workspace_id, layer, privacy_level, content,
+            evidence_refs, derived_from, instruction_like, status, proposed_at,
+            resolved_at, resolved_by, resolution_reason
+        )
+        SELECT
+            candidate_id, principal, workspace_id, layer, privacy_level, content,
+            evidence_refs, derived_from, instruction_like, status, proposed_at,
+            resolved_at, resolved_by, resolution_reason
+        FROM candidate_packets
+        """
     )
     conn.execute("DROP TABLE candidate_packets")
     conn.execute("ALTER TABLE candidate_packets_old RENAME TO candidate_packets")
@@ -342,7 +353,20 @@ def _rebuild_candidate_packets_pre_015(db_path):
         )
         """
     )
-    conn.execute("INSERT INTO candidate_packets_old SELECT * FROM candidate_packets")
+    conn.execute(
+        """
+        INSERT INTO candidate_packets_old (
+            candidate_id, principal, workspace_id, layer, privacy_level, content,
+            evidence_refs, derived_from, instruction_like, status, proposed_at,
+            resolved_at, resolved_by, resolution_reason
+        )
+        SELECT
+            candidate_id, principal, workspace_id, layer, privacy_level, content,
+            evidence_refs, derived_from, instruction_like, status, proposed_at,
+            resolved_at, resolved_by, resolution_reason
+        FROM candidate_packets
+        """
+    )
     conn.execute("DROP TABLE candidate_packets")
     conn.execute("ALTER TABLE candidate_packets_old RENAME TO candidate_packets")
     conn.commit()
@@ -373,7 +397,7 @@ def test_resolve_degrades_dns_log_only_on_pre_015_schema(tmp_path, monkeypatch):
     old_db = cfg_mod.DEFAULT_CONFIG.db_path
     cfg_mod.DEFAULT_CONFIG.db_path = db_path
     monkeypatch.setattr(minnid, "_writeback", None)
-    # Mark the path already-migrated so SovereignDB does not re-run migrations
+    # Mark the path already-migrated so MinniDB does not re-run migrations
     # and silently re-expand the CHECK — the daemon is serving as-is.
     db_mod._migrations_run = True
     db_mod._migrated_paths.add(os.path.abspath(db_path))

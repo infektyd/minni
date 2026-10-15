@@ -57,19 +57,6 @@ def test_blank_env_agent_falls_back_to_unknown(monkeypatch):
     assert seen["events_agent"] == "unknown"
 
 
-def test_cli_compile_propagates_agent_to_env(monkeypatch):
-    """sovereign_memory.py compile --agent X exports MINNI_AGENT_ID before the
-    pass runs (verified even when the AFM loop is disabled and it returns early)."""
-    import minni.sovereign_memory as sovereign_memory
-
-    monkeypatch.delenv("MINNI_AGENT_ID", raising=False)
-    # Force the AFM loop "disabled" path so cmd_compile prints the unavailable
-    # summary and returns AFTER parsing+propagating the agent — no heavy pass run.
-    monkeypatch.setattr(sovereign_memory.DEFAULT_CONFIG, "afm_loop_schedule", {}, raising=False)
-    sovereign_memory.cmd_compile(["--pass", "session_distillation", "--agent", "codex", "--dry-run"])
-    assert os.environ.get("MINNI_AGENT_ID") == "codex"
-
-
 def test_agent_id_kwarg_binds_ahead_of_env(monkeypatch):
     monkeypatch.setenv("MINNI_AGENT_ID", "env-agent")
     seen = _capture_agent(monkeypatch)
@@ -82,14 +69,14 @@ def test_agent_id_kwarg_binds_ahead_of_env(monkeypatch):
 def test_session_distill_inputs_redact_event_content(tmp_path, monkeypatch):
     """Finding 9: MCP/model-visible inputs must not include episodic event bodies."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
     monkeypatch.delenv("MINNI_AGENT_ID", raising=False)
-    cfg = SovereignConfig(db_path=str(tmp_path / "sd.db"), afm_loop_schedule={})
+    cfg = MinniConfig(db_path=str(tmp_path / "sd.db"), afm_loop_schedule={})
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -118,13 +105,13 @@ def test_session_distill_inputs_redact_event_content(tmp_path, monkeypatch):
 def test_recent_raw_docs_does_not_return_foreign_agent_raw_paths(tmp_path):
     """Finding 9: bound raw-doc query must not OR-match other agents' rows."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "raw.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "raw.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -156,13 +143,13 @@ def test_raw_docs_include_own_vault_unknown_but_not_foreign(tmp_path):
     they must stay visible to their own vault's distillation (vault-path
     containment) without re-opening other vaults' unattributed raw docs."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "raw.db"), afm_loop_schedule={})
+    cfg = MinniConfig(db_path=str(tmp_path / "raw.db"), afm_loop_schedule={})
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

@@ -1,23 +1,23 @@
-"""fd-ceiling defenses: per-path shared SovereignDB + RLIMIT_NOFILE raise.
+"""fd-ceiling defenses: per-path shared MinniDB + RLIMIT_NOFILE raise.
 
-The daemon's sync RPC handlers run on a thread pool, and SovereignDB caches
+The daemon's sync RPC handlers run on a thread pool, and MinniDB caches
 one never-closed sqlite connection per (instance, thread). Multiple daemon
 subsystems constructing their own instance on the same file therefore
 multiplied open fds to instances x threads x (db + wal) — enough to breach
 the default soft fd limit under sustained multi-agent load, after which
 accept() fails with EMFILE and every client sees EPIPE while launchd still
-reports the job running. SovereignDB.shared() collapses instances per db
+reports the job running. MinniDB.shared() collapses instances per db
 file; minnid._raise_fd_ceiling() lifts the soft limit toward the hard one.
 """
 
 import os
 import resource
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 
 
-def _cfg(tmp_path, name: str) -> SovereignConfig:
+def _cfg(tmp_path, name: str) -> MinniConfig:
     from dataclasses import replace
 
     return replace(
@@ -29,18 +29,18 @@ def _cfg(tmp_path, name: str) -> SovereignConfig:
 
 def test_shared_returns_same_instance_for_same_path(tmp_path):
     cfg = _cfg(tmp_path, "a.db")
-    assert SovereignDB.shared(cfg) is SovereignDB.shared(cfg)
+    assert MinniDB.shared(cfg) is MinniDB.shared(cfg)
 
 
 def test_shared_keys_on_path_not_config_object(tmp_path):
     # Two distinct config objects pointing at the same file share one instance.
-    assert SovereignDB.shared(_cfg(tmp_path, "a.db")) is SovereignDB.shared(
+    assert MinniDB.shared(_cfg(tmp_path, "a.db")) is MinniDB.shared(
         _cfg(tmp_path, "a.db")
     )
 
 
 def test_shared_distinct_paths_get_distinct_instances(tmp_path):
-    assert SovereignDB.shared(_cfg(tmp_path, "a.db")) is not SovereignDB.shared(
+    assert MinniDB.shared(_cfg(tmp_path, "a.db")) is not MinniDB.shared(
         _cfg(tmp_path, "b.db")
     )
 
@@ -51,11 +51,11 @@ def test_shared_normalizes_path_spellings(tmp_path, monkeypatch):
 
     absolute = _cfg(tmp_path, "a.db")
     relative = replace(absolute, db_path="a.db")
-    assert SovereignDB.shared(absolute) is SovereignDB.shared(relative)
+    assert MinniDB.shared(absolute) is MinniDB.shared(relative)
 
 
 def test_shared_instance_is_usable(tmp_path):
-    db = SovereignDB.shared(_cfg(tmp_path, "a.db"))
+    db = MinniDB.shared(_cfg(tmp_path, "a.db"))
     conn = db._get_conn()
     assert conn.execute("SELECT 1").fetchone()[0] == 1
 
@@ -63,8 +63,8 @@ def test_shared_instance_is_usable(tmp_path):
 def test_plain_constructor_is_untouched(tmp_path):
     # Non-daemon callers (CLI one-shots, tests) keep per-instance semantics.
     cfg = _cfg(tmp_path, "a.db")
-    assert SovereignDB(cfg) is not SovereignDB(cfg)
-    assert SovereignDB(cfg) is not SovereignDB.shared(cfg)
+    assert MinniDB(cfg) is not MinniDB(cfg)
+    assert MinniDB(cfg) is not MinniDB.shared(cfg)
 
 
 def test_raise_fd_ceiling_never_lowers_and_respects_hard_limit():
@@ -105,7 +105,7 @@ def test_shared_pins_relative_db_path_to_absolute(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     from dataclasses import replace
 
-    inst = SovereignDB.shared(replace(_cfg(tmp_path, "a.db"), db_path="a.db"))
+    inst = MinniDB.shared(replace(_cfg(tmp_path, "a.db"), db_path="a.db"))
     assert os.path.isabs(inst.config.db_path)
     other = tmp_path / "elsewhere"
     other.mkdir()
@@ -129,7 +129,7 @@ def test_failed_migration_is_retried_on_next_use(tmp_path, monkeypatch):
     monkeypatch.setattr(migrations_mod, "run_migrations", boom)
 
     cfg = _cfg(tmp_path, "a.db")
-    inst = SovereignDB.shared(cfg)
+    inst = MinniDB.shared(cfg)
     inst._get_conn()
     key = os.path.abspath(cfg.db_path)
     assert key not in db_mod._migrated_paths
@@ -137,7 +137,7 @@ def test_failed_migration_is_retried_on_next_use(tmp_path, monkeypatch):
 
     monkeypatch.undo()
     monkeypatch.setattr(db_mod, "_migrations_run", False, raising=False)
-    assert inst is SovereignDB.shared(cfg)
+    assert inst is MinniDB.shared(cfg)
     inst._get_conn()
     assert key in db_mod._migrated_paths
     assert inst._schema_initialized is True

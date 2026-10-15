@@ -145,7 +145,8 @@ def test_eligible_result_refills_bounded_windows(monkeypatch, branch):
     windows = []
 
     def fetch(_query, limit, *args, **kwargs):
-        windows.append(limit)
+        if limit not in windows:
+            windows.append(limit)
         return [dict(r) for r in candidates[:limit]]
 
     engine._fts_search = fetch if branch == "fts" else lambda *_a, **_k: []
@@ -154,10 +155,6 @@ def test_eligible_result_refills_bounded_windows(monkeypatch, branch):
     engine._backend_search = fetch
     engine._resolve_backends = lambda _names: [SimpleNamespace(name="first", dim=1)] + (
         [SimpleNamespace(name="second", dim=1)] if branch == "multi-backend" else [])
-    if branch == "multi-backend":
-        from minni.backends.multi import MultiBackend
-        monkeypatch.setattr(MultiBackend, "search", lambda _self, query, k: fetch(query, k))
-        engine._hits_to_dicts = lambda hits, _emb: hits
     options = {"sort": "chronological"} if branch == "chronological" else {}
     if branch == "explicit":
         options["backend"] = SimpleNamespace(name="custom")

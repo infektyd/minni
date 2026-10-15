@@ -59,9 +59,9 @@ def temp_engine(tmp_path, monkeypatch):
     monkeypatch.setattr(minnid, "_writeback", None, raising=False)
     monkeypatch.setattr(minnid, "_episodic", None, raising=False)
 
-    from minni.db import SovereignDB
+    from minni.db import MinniDB
 
-    _seed_db = SovereignDB()
+    _seed_db = MinniDB()
     run_migrations(_seed_db._get_conn())
 
     yield db_path, tmp_path

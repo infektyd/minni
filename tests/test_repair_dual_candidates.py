@@ -13,9 +13,9 @@ import pytest
 
 def _make_db(tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -25,7 +25,7 @@ def _make_db(tmp_path):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -199,7 +199,6 @@ def test_repair_keeps_accepted_deletes_rejected_twin_leaves_learnings(tmp_path):
     accepted_id = _insert_candidate(db, content=content, status="accepted")
     rejected_id = _insert_candidate(db, content=content, status="rejected")
 
-    # Learning that the accepted twin produced — must survive repair.
     with db.transaction() as c:
         c.execute(
             """
@@ -237,7 +236,6 @@ def test_repair_keeps_accepted_deletes_rejected_twin_leaves_learnings(tmp_path):
     assert learnings[0]["learning_id"] == learning_id
     assert learnings[0]["content"] == content
 
-    # Idempotent
     again = repair_duplicate_candidate_pairs(db, dry_run=False)
     assert again["groups_found"] == 0
     assert again["deleted"] == 0
@@ -269,11 +267,9 @@ def test_ensure_inbox_dedup_index_blocks_reinsert(tmp_path):
     exists = ensure_inbox_dedup_index(db)
     assert exists["status"] == "exists"
 
-    # Second insert with same inbox key must fail the unique index.
     with pytest.raises(sqlite3.IntegrityError):
         _insert_candidate(db, content=content, status="proposed")
 
-    # Same (file, index) with a *different* content_sha1 is also blocked.
     with pytest.raises(sqlite3.IntegrityError):
         _insert_candidate(
             db,
@@ -284,11 +280,7 @@ def test_ensure_inbox_dedup_index_blocks_reinsert(tmp_path):
 
 
 def test_ensure_inbox_dedup_index_blocks_divergent_app_key(tmp_path):
-    """Medium #1: app-key peers with different content_sha1 block unique index.
-
-    Dual repair leaves divergent peers alone; ensure must still return
-    blocked_by_duplicates (not fall through to CREATE UNIQUE IntegrityError).
-    """
+    """Medium #1: app-key peers with different content_sha1 block unique index."""
     from minni.repair_dual_candidates import (
         ensure_inbox_dedup_index,
         find_app_key_collisions,
@@ -312,7 +304,6 @@ def test_ensure_inbox_dedup_index_blocks_divergent_app_key(tmp_path):
         candidate_index=0,
     )
 
-    # No byte-identical duals — repair is a no-op.
     assert find_duplicate_candidate_groups(db) == []
     repair_duplicate_candidate_pairs(db, dry_run=False)
     collisions = find_app_key_collisions(db)
@@ -325,7 +316,6 @@ def test_ensure_inbox_dedup_index_blocks_divergent_app_key(tmp_path):
     assert blocked.get("divergent_groups", 0) >= 1
     assert blocked.get("sample")
     assert blocked["sample"][0]["key"]["inbox_file"] == "div.json"
-    # Must not have created the index.
     assert blocked["status"] != "created"
     with db.cursor() as c:
         c.execute(
@@ -384,7 +374,6 @@ def test_cli_exits_nonzero_when_apply_index_blocked(tmp_path):
     spec.loader.exec_module(mod)
 
     db, cfg = _make_db(tmp_path)
-    # Divergent app-key peers: dual repair is a no-op; index stays blocked.
     _insert_candidate(
         db, content="body alpha", status="accepted", inbox_file="div.json"
     )
@@ -403,7 +392,6 @@ def test_cli_exits_nonzero_when_apply_index_blocked(tmp_path):
     rc = mod.main(["--db", cfg.db_path, "--apply"])
     assert rc == 3
 
-    # --no-index: dual repair alone may succeed with exit 0.
     rc_skip = mod.main(["--db", cfg.db_path, "--apply", "--no-index"])
     assert rc_skip == 0
 
@@ -441,7 +429,6 @@ def test_virtual_durable_not_flagged_missing_when_fts_present(tmp_path):
             (doc_id, virtual_path),
         )
 
-    # Default finder excludes virtual durable (not a real file requirement).
     assert find_missing_document_rows(db) == []
     assert find_orphan_virtual_durable(db) == []
 
@@ -524,11 +511,8 @@ def test_relative_path_with_fts_not_pruned_wrong_cwd(tmp_path, monkeypatch):
             (doc_id, rel_path),
         )
 
-    # Resolve works when vault roots are provided.
     assert resolve_document_path(rel_path, [cfg.vault_path]) == str(real_file)
 
-    # Simulate operator running from an unrelated CWD with no vault roots:
-    # bare isfile(rel) is false, but FTS-backed relative must not be missing.
     other = tmp_path / "other-cwd"
     other.mkdir()
     monkeypatch.chdir(other)
@@ -563,9 +547,7 @@ def test_relative_path_without_fts_prunable_when_vault_checked(tmp_path):
             """,
             (rel_path,),
         )
-    # No vault roots → refuse to classify as missing (cannot prove absence).
     assert find_missing_document_rows(db, vault_roots=None) == []
-    # With vault roots, resolved absolute is missing and no FTS → missing.
     missing = find_missing_document_rows(db, vault_roots=[cfg.vault_path])
     assert len(missing) == 1
     assert missing[0]["path"] == rel_path
@@ -648,12 +630,7 @@ def test_repair_dual_does_not_commit_via_cursor_mid_txn(tmp_path, monkeypatch):
 
 
 def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
-    """Medium #4: compact_distillation mirrors ingest UNIQUE / in-txn recheck.
-
-    Keys are sha-scoped: only a same-sha key hit skips. The seed must carry
-    the ACTUAL distilled body (a divergent body extras-at-next-idx instead —
-    see the next test).
-    """
+    """Medium #4: compact_distillation mirrors ingest UNIQUE / in-txn recheck."""
     from minni.afm_passes import compact_distillation as cd
 
     db, cfg = _make_db(tmp_path)
@@ -662,7 +639,6 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
         "race on bootout after launchctl error 5"
     )
 
-    # Pre-seed a twin key as if another process already inserted.
     _insert_candidate(
         db,
         content=content,
@@ -693,13 +669,9 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    # Force no AFM so deterministic fallback is used.
     monkeypatch.setattr(cd, "resolve_afm_mode", lambda: "off")
     monkeypatch.setattr(cd, "default_provider_chain", lambda: None)
 
-    # Bypass file-level short-circuit by clearing pre-scan occupancy for
-    # this file. Exercise the in-txn recheck path by emptying occupancy so
-    # the insert path runs, then the sha-compare recheck must skip.
     monkeypatch.setattr(cd, "_existing_keys", lambda db, principals=None: set())
     monkeypatch.setattr(cd, "_fills_for_file", lambda db, principal, inbox_file: [])
 
@@ -708,7 +680,6 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
     with db.cursor() as c:
         c.execute("SELECT COUNT(*) AS n FROM candidate_packets")
         assert dict(c.fetchone())["n"] == 1
-    # The distilled sha is durably present, so the file retires.
     assert res["archived_with_shared"] == 1
     assert not (inbox / "compact-1.json").exists()
     assert (inbox / ".archive" / "compact-1.json").is_file()
@@ -717,12 +688,10 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
 def test_distill_in_txn_recheck_extras_divergent_body_at_next_idx(
     tmp_path, monkeypatch
 ):
-    """Sha-scoped keys: a leftover (file, index) key with a DIVERGENT body
-    must not swallow the distilled section — it extras-at-next-idx."""
+    """Sha-scoped keys: a leftover (file, index) key with a DIVERGENT body"""
     from minni.afm_passes import compact_distillation as cd
 
     db, cfg = _make_db(tmp_path)
-    # Leftover occupies (compact-1.json, 0) with a different body.
     _insert_candidate(
         db,
         content="Compaction summary — Key technical concepts: race on bootout",
@@ -753,11 +722,9 @@ def test_distill_in_txn_recheck_extras_divergent_body_at_next_idx(
         encoding="utf-8",
     )
 
-    # Force no AFM so deterministic fallback is used.
     monkeypatch.setattr(cd, "resolve_afm_mode", lambda: "off")
     monkeypatch.setattr(cd, "default_provider_chain", lambda: None)
 
-    # Same empty pre-scan as the skip test so the in-txn recheck path runs.
     monkeypatch.setattr(cd, "_existing_keys", lambda db, principals=None: set())
     monkeypatch.setattr(cd, "_fills_for_file", lambda db, principal, inbox_file: [])
 
@@ -777,19 +744,13 @@ def test_distill_in_txn_recheck_extras_divergent_body_at_next_idx(
     ]
     assert len(extra) == 1
     assert json.loads(extra[0]["derived_from"]).get("candidate_index") == 1
-    # Once the extra fill lands, the file retires — same lifecycle as the
-    # leftover-alias merge case in test_compact_distillation.py.
     assert res["archived_with_shared"] == 1
     assert not (inbox / "compact-1.json").exists()
     assert (inbox / ".archive" / "compact-1.json").is_file()
 
 
 def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
-    """agy/gemini (and xai/grok-build) are one agent: same file+index is a dual.
-
-    Slug aliases remap the vault-derived principal, so leftover agy/xai rows
-    plus a remapped gemini/grok-build insert share one fill and must collapse.
-    """
+    """agy/gemini (and xai/grok-build) are one agent: same file+index is a dual."""
     from minni.repair_dual_candidates import (
         find_app_key_collisions,
         find_duplicate_candidate_groups,
@@ -831,11 +792,7 @@ def test_slug_alias_principals_are_same_inbox_app_key(tmp_path):
 def test_prefer_unfenced_collapse_stamps_deleted_leftover_source_principal(
     tmp_path,
 ):
-    """all_proposed_prefer_unfenced keeps the canonical twin; leftover alias
-    is deleted. Stamp source_principal from that deleted leftover even when
-    the winner is already gemini/grok-build, or accept archives the leftover
-    vault as the only drain of the remapped fill.
-    """
+    """all_proposed_prefer_unfenced keeps the canonical twin; leftover alias"""
     from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
 
     cases = (
@@ -872,15 +829,7 @@ def test_prefer_unfenced_collapse_stamps_deleted_leftover_source_principal(
 def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(
     tmp_path, monkeypatch
 ):
-    """SQL UNIQUE must key the canonical fill, not the raw leftover principal.
-
-    Failing input: leftover candidate_packets principal='agy' (or 'xai') for
-    session.json index 0; repair keeps that row (no twin to collapse, and
-    collapse keeps min(candidate_id) without rewriting principal); operator
-    index is created. A later INSERT principal='gemini' (or 'grok-build') for
-    the same inbox_file+index must collide so inbox_ingest's IntegrityError
-    swallow is a #239 backstop, not a silent dual PK.
-    """
+    """SQL UNIQUE must key the canonical fill, not the raw leftover principal."""
     import sqlite3
 
     from minni.afm_passes import inbox_ingest as ii
@@ -952,15 +901,7 @@ def test_ensure_inbox_dedup_index_blocks_canonical_alias_twin_insert(
 
 
 def test_dry_run_stale_raw_principal_unique_is_not_exists(tmp_path):
-    """Stale UNIQUE on raw principal must not report dry-run status=exists.
-
-    ``"principal" in sql.lower()`` is true for both the leftover raw-column
-    index and the CASE canonical fill. Dry-run has to reuse
-    ``_inbox_dedup_index_sql_is_current`` so a named-but-stale index falls
-    through to collision preflight (would_create / would_block), then
-    ``ensure_inbox_dedup_index`` recreates the CASE index and leftover
-    ``agy``/``xai`` rows collide with ``gemini``/``grok-build`` inserts.
-    """
+    """Stale UNIQUE on raw principal must not report dry-run status=exists."""
     import sqlite3
 
     from minni.repair_dual_candidates import (
@@ -1045,12 +986,7 @@ def test_dry_run_stale_raw_principal_unique_is_not_exists(tmp_path):
 
 
 def test_ingest_allows_same_basename_under_other_principal(tmp_path):
-    """Principal-scoped key: multi-vault same basename is legitimate.
-
-    Issue #239 duals are double-ingest *within* one agent vault. A global
-    (file, index) key starved cross-vault peers and failed public smoke
-    (test_cross_vault_live_sibling…). Same principal must still be idempotent.
-    """
+    """Principal-scoped key: multi-vault same basename is legitimate."""
     from minni.afm_passes.inbox_ingest import ingest
 
     db, cfg = _make_db(tmp_path)
@@ -1063,7 +999,6 @@ def test_ingest_allows_same_basename_under_other_principal(tmp_path):
         principal="claude-code",
     )
 
-    # Different principal (codex-vault → codex): must insert.
     inbox_other = tmp_path / "codex-vault" / "inbox"
     inbox_other.mkdir(parents=True)
     (inbox_other / "shared.json").write_text(
@@ -1086,7 +1021,6 @@ def test_ingest_allows_same_basename_under_other_principal(tmp_path):
     res_other = ingest(db, cfg, inboxes=[inbox_other], dry_run=False)
     assert res_other["inserted"] == 1
 
-    # Same principal re-ingest: still a no-op.
     inbox_same = tmp_path / "claudecode-vault" / "inbox"
     inbox_same.mkdir(parents=True)
     (inbox_same / "shared.json").write_text(
@@ -1145,8 +1079,6 @@ def test_learning_uri_survives_prune_index(tmp_path):
             (learning_path,),
         )
         learning_doc_id = c.lastrowid
-        # memory_links off the learning identity (writeback graph edges).
-        # Evidence path is on-disk so only learning:// is the prune subject.
         c.execute(
             """
             INSERT INTO documents
@@ -1165,7 +1097,6 @@ def test_learning_uri_survives_prune_index(tmp_path):
             (learning_doc_id, evidence_id),
         )
 
-    # No FTS by design for learning:// graph nodes — still must not be missing.
     assert find_missing_document_rows(db, vault_roots=[cfg.vault_path]) == []
 
     result = repair_index_disk_divergence(
@@ -1201,7 +1132,6 @@ def test_absolute_fts_backed_path_survives_missing_file(tmp_path):
     )
 
     db, cfg = _make_db(tmp_path)
-    # Absolute path that never existed on disk (simulates moved home prefix).
     abs_path = str(tmp_path / "old-home" / ".minni" / "codex-vault" / "wiki" / "foo.md")
     assert not os.path.isfile(abs_path)
 
@@ -1235,7 +1165,6 @@ def test_absolute_fts_backed_path_survives_missing_file(tmp_path):
         c.execute("SELECT COUNT(*) AS n FROM vault_fts")
         assert dict(c.fetchone())["n"] == 1
 
-    # Explicit force may prune recallable rows when the operator insists.
     forced_missing = find_missing_document_rows(
         db, vault_roots=[cfg.vault_path], force_prune_indexed=True
     )
@@ -1288,7 +1217,6 @@ def test_ingest_mid_batch_unique_still_commits_later(tmp_path, monkeypatch):
     db, cfg = _make_db(tmp_path)
     ensure_inbox_dedup_index(db)
 
-    # Pre-seed key (file=a.json, index=0) so the first insert hits UNIQUE.
     _insert_candidate(
         db,
         content="pre-existing twin",
@@ -1298,10 +1226,8 @@ def test_ingest_mid_batch_unique_still_commits_later(tmp_path, monkeypatch):
         principal="codex",
     )
 
-    # Force the insert path to attempt both keys (bypass pre-txn existing set).
     monkeypatch.setattr(ii, "_existing_keys", lambda db, principals=None: set())
 
-    # Craft to_insert-equivalent via a synthetic scan: two candidates in one file.
     inbox = tmp_path / "codex-vault" / "inbox"
     inbox.mkdir(parents=True)
     (inbox / "a.json").write_text(
@@ -1334,7 +1260,6 @@ def test_ingest_mid_batch_unique_still_commits_later(tmp_path, monkeypatch):
     assert "brand new second lesson" in contents
     assert len(contents) == 2
 
-    # Sanity: IntegrityError is the type raised by the unique index itself.
     with pytest.raises(sqlite3.IntegrityError):
         _insert_candidate(
             db,
@@ -1348,12 +1273,7 @@ def test_ingest_mid_batch_unique_still_commits_later(tmp_path, monkeypatch):
 def test_in_txn_revalidate_keeps_accepted_promoted_under_stale_plan(
     tmp_path, monkeypatch
 ):
-    """High #1: concurrent accept of planned 'loser' must not be deleted.
-
-    Plan outside txn sees both proposed → keep lowest id. Between plan and
-    apply, consolidation promotes the higher id to accepted. Apply must
-    re-choose under BEGIN IMMEDIATE and keep the accepted twin.
-    """
+    """High #1: concurrent accept of planned 'loser' must not be deleted."""
     from minni import repair_dual_candidates as mod
 
     db, _cfg = _make_db(tmp_path)
@@ -1362,7 +1282,6 @@ def test_in_txn_revalidate_keeps_accepted_promoted_under_stale_plan(
     high_id = _insert_candidate(db, content=content, status="proposed")
     assert low_id < high_id
 
-    # Capture the pre-txn plan shape (lowest id wins while both proposed).
     groups = mod.find_duplicate_candidate_groups(db)
     assert len(groups) == 1
     assert groups[0]["winner_id"] == low_id
@@ -1372,8 +1291,6 @@ def test_in_txn_revalidate_keeps_accepted_promoted_under_stale_plan(
 
     def find_then_promote(db_arg):
         groups_out = real_find(db_arg)
-        # Simulate concurrent consolidation AFTER plan, BEFORE write txn:
-        # promote the planned loser (high_id) and reject the planned winner.
         with db_arg.transaction() as c:
             c.execute(
                 """
@@ -1411,11 +1328,7 @@ def test_in_txn_revalidate_keeps_accepted_promoted_under_stale_plan(
 
 
 def test_never_deletes_accepted_when_two_accepted(tmp_path):
-    """Hard guard: status=accepted is never hard-deleted as a loser.
-
-    Medium pin: dual accepted is needs_operator (not collapsible); still never
-    deletes either accepted twin.
-    """
+    """Hard guard: status=accepted is never hard-deleted as a loser."""
     from minni.repair_dual_candidates import (
         find_duplicate_candidate_groups,
         find_needs_operator_groups,
@@ -1428,7 +1341,6 @@ def test_never_deletes_accepted_when_two_accepted(tmp_path):
     b = _insert_candidate(db, content=content, status="accepted")
     assert a < b
 
-    # Dual accepted → not collapsible; surfaces as needs_operator.
     assert find_duplicate_candidate_groups(db) == []
     needs = find_needs_operator_groups(db)
     assert len(needs) == 1
@@ -1472,7 +1384,6 @@ def test_rejected_plus_proposed_needs_operator_no_delete(tmp_path):
     prop = _insert_candidate(db, content=content, status="proposed")
     assert rej < prop
 
-    # Not a collapsible dual — must surface as needs-operator.
     assert find_duplicate_candidate_groups(db) == []
     needs = find_needs_operator_groups(db)
     assert len(needs) == 1
@@ -1524,7 +1435,6 @@ def test_divergent_content_same_app_key_not_deleted(tmp_path):
         candidate_index=0,
     )
 
-    # Not a byte-identical dual group.
     assert find_duplicate_candidate_groups(db) == []
     divergent = find_divergent_content_groups(db)
     assert len(divergent) == 1
@@ -1628,12 +1538,7 @@ def test_is_unique_integrity_error_narrow():
 
 
 def test_missing_sha_different_bodies_not_collapsed(tmp_path):
-    """Medium #2: absent content_sha1 digests from content; different bodies stay.
-
-    Legacy / non-ingest writers may omit derived_from.content_sha1. Collapse
-    must derive the digest from the content column so distinct bodies are
-    reported divergent and never hard-deleted.
-    """
+    """Medium #2: absent content_sha1 digests from content; different bodies stay."""
     from minni.repair_dual_candidates import (
         find_divergent_content_groups,
         find_duplicate_candidate_groups,
@@ -1662,7 +1567,6 @@ def test_missing_sha_different_bodies_not_collapsed(tmp_path):
     divergent = find_divergent_content_groups(db)
     assert len(divergent) == 1
     assert set(divergent[0]["candidate_ids"]) == {id_a, id_b}
-    # Digests derived from content are distinct non-empty strings.
     shas = [s for s in divergent[0]["content_sha1s"] if s]
     assert len(shas) == 2
 
@@ -1706,7 +1610,6 @@ def test_missing_sha_identical_bodies_still_collapsed(tmp_path):
     assert len(groups) == 1
     assert groups[0]["winner_id"] == keep
     assert lose in groups[0]["loser_ids"]
-    # Collapse key digest is non-None (derived from content).
     assert groups[0]["key"]["content_sha1"]
 
     result = repair_duplicate_candidate_pairs(db, dry_run=False)
@@ -1728,7 +1631,6 @@ def test_stale_stored_sha_divergent_bodies_not_collapsed(tmp_path):
     )
 
     db, _cfg = _make_db(tmp_path)
-    # Same stale/copied metadata sha for two different bodies.
     fake_sha = hashlib.sha1(b"unrelated body").hexdigest()
     id_a = _insert_candidate(
         db,
@@ -1825,7 +1727,6 @@ def test_prune_document_rows_invalidates_faiss_and_rerank(tmp_path):
     faiss = _FakeFaiss()
     path = str(tmp_path / "vault" / "wiki" / "orphan.md")
     now = time.time()
-    # 384 float32 zeros without importing numpy (env may have a broken numpy).
     empty_emb = b"\x00" * (384 * 4)
     with db.transaction() as c:
         c.execute(
@@ -1857,7 +1758,6 @@ def test_prune_document_rows_invalidates_faiss_and_rerank(tmp_path):
     faiss.add(chunk_id)
     assert chunk_id in faiss._reverse_map
 
-    # Seed rerank cache so we can observe invalidation.
     try:
         if hasattr(GLOBAL_RERANK_CACHE, "_by_chunk"):
             GLOBAL_RERANK_CACHE._by_chunk[int(chunk_id)] = object()
@@ -1877,7 +1777,6 @@ def test_prune_document_rows_invalidates_faiss_and_rerank(tmp_path):
     assert chunk_id not in faiss._reverse_map
     assert chunk_id in faiss.removed
 
-    # invalidate_chunks is the same path purge_durable_document uses.
     assert callable(invalidate_chunks)
 
     with db.cursor() as c:
@@ -1954,18 +1853,24 @@ def test_all_proposed_superseded_fence_does_not_prefer(tmp_path):
     assert groups[0]["loser_ids"] == [high]
 
 
+class _OperationalErrorCursor:
+    def __init__(self, msg: str):
+        self._msg = msg
+
+    def execute(self, *args, **kwargs):
+        import sqlite3
+
+        raise sqlite3.OperationalError(self._msg)
+
+
 def test_fence_query_lock_is_not_laundered_into_empty_set():
     """High: a broken fence SELECT must raise, not look like nobody is fenced."""
     import sqlite3
 
     from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
 
-    class BoomCursor:
-        def execute(self, *args, **kwargs):
-            raise sqlite3.OperationalError("database is locked")
-
     with pytest.raises(sqlite3.OperationalError, match="locked"):
-        _active_afm_review_ids_on_cursor(BoomCursor())
+        _active_afm_review_ids_on_cursor(_OperationalErrorCursor("database is locked"))
 
 
 def test_fence_query_unexpected_schema_is_not_laundered_into_empty_set():
@@ -1974,25 +1879,20 @@ def test_fence_query_unexpected_schema_is_not_laundered_into_empty_set():
 
     from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
 
-    class BoomCursor:
-        def execute(self, *args, **kwargs):
-            raise sqlite3.OperationalError("no such column: claim")
-
     with pytest.raises(sqlite3.OperationalError, match="no such column"):
-        _active_afm_review_ids_on_cursor(BoomCursor())
+        _active_afm_review_ids_on_cursor(_OperationalErrorCursor("no such column: claim"))
 
 
 def test_fence_query_missing_table_returns_empty_set():
     """Pre-014 installs lack consolidation_actions — that is not a fault."""
-    import sqlite3
-
     from minni.repair_dual_candidates import _active_afm_review_ids_on_cursor
 
-    class MissingTableCursor:
-        def execute(self, *args, **kwargs):
-            raise sqlite3.OperationalError("no such table: consolidation_actions")
-
-    assert _active_afm_review_ids_on_cursor(MissingTableCursor()) == set()
+    assert (
+        _active_afm_review_ids_on_cursor(
+            _OperationalErrorCursor("no such table: consolidation_actions")
+        )
+        == set()
+    )
 
 
 class _FenceSelectLockCursor:
@@ -2014,13 +1914,7 @@ class _FenceSelectLockCursor:
 
 
 def test_apply_fence_select_error_does_not_delete_unfenced_twin(tmp_path):
-    """High: lock/schema error on apply fence SELECT must not DELETE the fill.
-
-    Two proposed alias twins (agy fenced, gemini unfenced). Swallowing the
-    SELECT into fenced={} keeps lowest id and deletes the unfenced gemini
-    row; the leftover agy packet stays behind afm_review and examinable
-    fills go 1→0. The error must raise and both rows must survive.
-    """
+    """High: lock/schema error on apply fence SELECT must not DELETE the fill."""
     import sqlite3
 
     from minni import repair_dual_candidates as mod
@@ -2081,7 +1975,6 @@ def test_cli_warns_on_dual_accepted_groups(tmp_path, capsys):
         except Exception:
             pass
 
-    # Dry-run should still warn; --apply with index stays exit 3 (blocked).
     rc_dry = mod.main(["--db", cfg.db_path])
     captured = capsys.readouterr()
     assert rc_dry == 0
@@ -2105,10 +1998,8 @@ def test_empty_principal_reload_does_not_delete_other_principal(tmp_path):
 
     db, cfg = _make_db(tmp_path)
     content = "same body X"
-    # Empty-principal twins (byte-identical dual).
     a = _insert_candidate(db, content=content, status="accepted", inbox_file="a.json", principal="")
     b = _insert_candidate(db, content=content, status="rejected", inbox_file="a.json", principal="")
-    # Other principal same basename — must survive apply.
     c = _insert_candidate(db, content=content, status="proposed", inbox_file="a.json", principal="codex")
 
     res = repair_duplicate_candidate_pairs(db, dry_run=False)

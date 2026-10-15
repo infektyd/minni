@@ -751,10 +751,11 @@ def test_leg_gather_slow_first_leg_delays_fast_raise(monkeypatch):
 
 
 def test_leg_gather_deadline_guard_skips_pool(monkeypatch):
-    """Any supplied deadline (what every RPC carries) forces the serial
-    loop even with the parallel flag on: a later leg never starts past an
-    earlier raise. Deadline-free callers still get the pool."""
+    """A supplied deadline engages the parallel pool for multi-leg batches and
+    propagates the deadline via bind_copied_deadline, while still surfacing
+    the first failing leg's exception in submission order."""
     import concurrent.futures
+    from minni.request_deadline import request_deadline
 
     created: list = []
     real_pool = concurrent.futures.ThreadPoolExecutor
@@ -766,16 +767,18 @@ def test_leg_gather_deadline_guard_skips_pool(monkeypatch):
 
     monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _SpyPool)
     monkeypatch.setattr(recall_mod, "RECALL_LEG_PARALLEL", True)
-    # Supplied deadline: serial loop, no pool, later leg never starts.
+    # Supplied deadline: pool engages and raises the first failing leg's exception.
     serial_marks: list = []
-    with pytest.raises(RuntimeError, match="boom-leg fast"):
-        recall_mod._gather_leg_results(
-            [_leg_boom("fast"), _leg_ok(serial_marks, "slow")],
-            time.monotonic() + 25.0,
-        )
-    assert serial_marks == []
-    assert created == [], "a supplied deadline must not engage the pool"
+    target_deadline = time.monotonic() + 25.0
+    with request_deadline(target_deadline):
+        with pytest.raises(RuntimeError, match="boom-leg fast"):
+            recall_mod._gather_leg_results(
+                [_leg_boom("fast"), _leg_ok(serial_marks, "slow", delay=0.05)],
+                target_deadline,
+            )
+    assert len(created) >= 1, "a supplied deadline must engage the pool for multi-leg batches"
     # Deadline-free: the pool engages for multi-leg batches.
+    created.clear()
     assert recall_mod._gather_leg_results(
         [lambda: "a", lambda: "b"], None
     ) == ["a", "b"]

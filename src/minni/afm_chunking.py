@@ -42,7 +42,7 @@ _SENTENCE_SNAP_LOOKAHEAD_WORDS = 20
 def resolve_afm_input_budget_tokens() -> int:
     """Resolve the proactive chunk-trigger budget at call time:
     MINNI_AFM_INPUT_BUDGET_TOKENS env override, then the config field
-    (SovereignConfig.afm_input_budget_tokens, mirroring how
+    (MinniConfig.afm_input_budget_tokens, mirroring how
     context_budget_tokens is config-driven), then the module fallback."""
     raw = os.environ.get("MINNI_AFM_INPUT_BUDGET_TOKENS", "").strip()
     if raw:

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from minni.afm_review_markers import supersede_afm_review
-from minni.db import SovereignDB
+from minni.db import MinniDB
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
@@ -48,7 +48,8 @@ class GovernanceContext:
     # existing constructions/tests working without threading a real purger.
     purge_durable_learning: Callable[..., None] = lambda *a, **k: None
     increment_request_count: Callable[[], None] | None = None
-    sovereign_db: Callable[..., Any] = SovereignDB
+    sovereign_db: Callable[..., Any] = MinniDB
+    notify_candidate_staged: Optional[Callable[[], None]] = None
     logger: logging.Logger = logger
 
 
@@ -91,6 +92,7 @@ AUTO_ACCEPT_PARAM_KEYS = ("auto_accept_own", "learn.auto_accept_own")
 # One request must not be able to hold the daemon's write lock open writing an
 # event row per entry. See handle_resolve_contradiction.
 MAX_SUPERSEDE_IDS = 64
+MAX_PENDING_CANDIDATES_PER_PRINCIPAL = 2000
 
 
 def reject_wire_supplied_auto_accept(
@@ -180,7 +182,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         validate_agent_id(agent_id)
     except ValueError as exc:
         return context.make_error(-32602, str(exc), request_id)
-    category = params.get("category", "general")
+    category = str(params.get("category") or "general").strip().lower()
     force = bool(params.get("force", False))
 
     assertion = params.get("assertion")
@@ -444,7 +446,7 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
             request_id,
         )
 
-    category = params.get("category", "general")
+    category = str(params.get("category") or "general").strip().lower()
     assertion = params.get("assertion")
     applies_when = params.get("applies_when")
     evidence_doc_ids = params.get("evidence_doc_ids")
@@ -462,7 +464,7 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
 
         # Hoisted ABOVE the transaction on purpose. This helper opens a cursor,
-        # and SovereignDB.cursor() commits on exit on the same thread-local
+        # and MinniDB.cursor() commits on exit on the same thread-local
         # connection — calling it inside `with db.transaction()` ended the
         # enclosing BEGIN IMMEDIATE, so the ownership checks committed early and
         # the INSERT/UPDATE/event block silently ran in a separate deferred
@@ -893,6 +895,23 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     if err:
         return err
 
+    try:
+        wb = context.lazy_writeback()
+        with wb.db.cursor() as c:
+            c.execute(
+                "SELECT COUNT(*) AS n FROM candidate_packets WHERE principal=? AND status='proposed'",
+                (principal.agent_id,),
+            )
+            pending_count = int(c.fetchone()["n"])
+            if pending_count >= MAX_PENDING_CANDIDATES_PER_PRINCIPAL:
+                return context.make_error(
+                    -32005,
+                    f"Backpressure: pending candidate queue limit reached ({pending_count} >= {MAX_PENDING_CANDIDATES_PER_PRINCIPAL}) for principal {principal.agent_id}",
+                    request_id,
+                )
+    except Exception as exc:
+        context.logger.warning("stage_candidate: backpressure check failed (%s); proceeding", exc)
+
     content = (params.get("content") or params.get("text") or "").strip()
     if not content:
         return context.make_error(-32602, "content is required", request_id)
@@ -903,6 +922,10 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     ev = json.dumps(params.get("evidence_refs") or params.get("evidence_doc_ids") or [])
     df = json.dumps(params.get("derived_from") or {})
     instr = 1 if (params.get("instruction_like") or is_instruction_like(stored_content)) else 0
+    from minni.writeback import CATEGORIES
+
+    raw_category = str(params.get("category") or "general").strip().lower()
+    category = raw_category if raw_category in CATEGORIES else "general"
 
     # The governed proposal writer makes privacy explicit. Preserve a caller's
     # explicit privacy_level; otherwise reuse the M-3 frontmatter bridge used by
@@ -1022,25 +1045,71 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 withheld = list(withheld) + ["durable-write preparation failed"]
 
         def _stage_proposal(c):
-            c.execute(
-                """
-                INSERT INTO candidate_packets
-                (principal, workspace_id, layer, privacy_level, content,
-                 evidence_refs, derived_from, instruction_like, status, proposed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                """,
-                (
-                    principal.agent_id,
-                    ws,
-                    params.get("layer"),
-                    stored_privacy,
-                    stored_content,
-                    ev,
-                    df,
-                    instr,
-                    now,
-                ),
-            )
+            pragma = c.execute("PRAGMA table_info(candidate_packets)").fetchall()
+            cols = {row["name"] if isinstance(row, dict) else row[1] for row in pragma}
+            if "category" in cols and "requested_privacy" in cols:
+                c.execute(
+                    """
+                    INSERT INTO candidate_packets
+                    (principal, workspace_id, layer, privacy_level, requested_privacy, category, content,
+                     evidence_refs, derived_from, instruction_like, status, proposed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                    """,
+                    (
+                        principal.agent_id,
+                        ws,
+                        params.get("layer"),
+                        stored_privacy,
+                        requested_privacy,
+                        category,
+                        stored_content,
+                        ev,
+                        df,
+                        instr,
+                        now,
+                    ),
+                )
+            elif "requested_privacy" in cols:
+                c.execute(
+                    """
+                    INSERT INTO candidate_packets
+                    (principal, workspace_id, layer, privacy_level, requested_privacy, content,
+                     evidence_refs, derived_from, instruction_like, status, proposed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                    """,
+                    (
+                        principal.agent_id,
+                        ws,
+                        params.get("layer"),
+                        stored_privacy,
+                        requested_privacy,
+                        stored_content,
+                        ev,
+                        df,
+                        instr,
+                        now,
+                    ),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO candidate_packets
+                    (principal, workspace_id, layer, privacy_level, content,
+                     evidence_refs, derived_from, instruction_like, status, proposed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                    """,
+                    (
+                        principal.agent_id,
+                        ws,
+                        params.get("layer"),
+                        stored_privacy,
+                        stored_content,
+                        ev,
+                        df,
+                        instr,
+                        now,
+                    ),
+                )
             return c.lastrowid
 
         try:
@@ -1062,25 +1131,15 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         auto_accept = False
                         withheld = ["duplicate of an existing learning"]
                 if auto_accept:
-                    # 'general' matches both resolve_candidate and afm.py's
-                    # promote, so the category cannot diverge by acceptance route.
-                    #
-                    # The OWNER does diverge, and it is worth being exact: a manual
-                    # accept records the RESOLVER as agent_id, so a human accepting
-                    # agent X's candidate produces a learning owned by the operator.
-                    # This path records X. That is the intended reading of "the
-                    # learnings are the agent's own" — and it is also why X can now
-                    # own a learning at all, which is what made resolve_contradiction
-                    # reachable and gave it the floor above.
                     c.execute(
                         """
                         INSERT INTO learnings
                         (agent_id, category, content, created_at, embedding,
                          content_hash, status)
-                        VALUES (?, 'general', ?, ?, ?, ?, 'active')
+                        VALUES (?, ?, ?, ?, ?, ?, 'active')
                         """,
                         (
-                            principal.agent_id, stored_content, now,
+                            principal.agent_id, category, stored_content, now,
                             emb_bytes, chash,
                         ),
                     )
@@ -1155,6 +1214,11 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 "G16 stage_candidate #%d principal=%s privacy=%s (proposal-first, no durable learn yet)",
                 cid, principal.agent_id, stored_privacy,
             )
+            if context.notify_candidate_staged is not None:
+                try:
+                    context.notify_candidate_staged()
+                except Exception as exc:
+                    context.logger.warning("notify_candidate_staged failed: %s", exc)
 
         result = {
             "status": "accepted" if lid is not None else "proposed",
@@ -1162,6 +1226,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             "principal": principal.agent_id,
             "workspace_id": ws,
             "privacy_level": stored_privacy,
+            "category": category,
         }
         if lid is not None:
             result["learning_id"] = lid
@@ -1220,14 +1285,37 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
             # would fill LIMIT and still report has_more false.
             # Family-scoped (#44): co-located sessions share a principal
             # family, so scope by family, not the single stamped agent_id.
-            # status_f is always truthy here (defaults to "proposed"), so no
-            # unfiltered branch: omitting status must not SELECT every status.
-            c.execute(
-                "SELECT * FROM candidate_packets "
-                f"WHERE principal IN ({placeholders}) AND status=? "
-                "ORDER BY proposed_at DESC LIMIT ?",
-                (*family, status_f, limit + 1),
+            # Top-level operator ('main' / 'operator') without an explicit
+            # principal filter inspects the full drain queue across principals.
+            review_cols = (
+                "cp.*, "
+                "(SELECT ca.status FROM consolidation_actions ca "
+                "WHERE ca.claim = CAST(cp.candidate_id AS TEXT) "
+                "ORDER BY ca.created_at DESC, ca.action_id DESC LIMIT 1) AS review_status, "
+                "(SELECT ca.detail FROM consolidation_actions ca "
+                "WHERE ca.claim = CAST(cp.candidate_id AS TEXT) "
+                "ORDER BY ca.created_at DESC, ca.action_id DESC LIMIT 1) AS review_detail, "
+                "(SELECT ca.action_type FROM consolidation_actions ca "
+                "WHERE ca.claim = CAST(cp.candidate_id AS TEXT) "
+                "ORDER BY ca.created_at DESC, ca.action_id DESC LIMIT 1) AS review_action_type "
             )
+            explicit_agent_filter = bool(
+                isinstance(params, dict) and str(params.get("agent_id") or "").strip()
+            )
+            if is_operator_principal(principal) and not explicit_agent_filter:
+                c.execute(
+                    f"SELECT {review_cols} FROM candidate_packets cp "
+                    "WHERE cp.status=? "
+                    "ORDER BY cp.proposed_at DESC LIMIT ?",
+                    (status_f, limit + 1),
+                )
+            else:
+                c.execute(
+                    f"SELECT {review_cols} FROM candidate_packets cp "
+                    f"WHERE cp.principal IN ({placeholders}) AND cp.status=? "
+                    "ORDER BY cp.proposed_at DESC LIMIT ?",
+                    (*family, status_f, limit + 1),
+                )
             rows = []
             for row in c.fetchall():
                 item = dict(row)
@@ -1383,6 +1471,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
     try:
         db = context.sovereign_db()
         lid = None
+        author_agent = principal.agent_id
         with db.transaction() as c:
             c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
             row = c.fetchone()
@@ -1392,6 +1481,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 )
             rowd = dict(row)
             owner = str(rowd.get("principal") or "")
+            author_agent = owner or principal.agent_id
             from minni.afm_passes.inbox_ingest import _canonical_principal
 
             if (
@@ -1461,13 +1551,17 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 ))
 
             if new_status == "accepted":
+                from minni.writeback import CATEGORIES
+
+                raw_cat = str(rowd.get("category") or params.get("category") or "general").strip().lower()
+                cat = raw_cat if raw_cat in CATEGORIES else "general"
                 c.execute(
                     """
                     INSERT INTO learnings
                     (agent_id, category, content, created_at)
-                    VALUES (?, 'general', ?, ?)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (principal.agent_id, content, now),
+                    (author_agent, cat, content, now),
                 )
                 lid = c.lastrowid
                 # Coordinated canonical commit: the join row lands in the same
@@ -1477,7 +1571,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 ensure_canonical_learning_node(
                     c,
                     learning_id=lid,
-                    agent_id=principal.agent_id,
+                    agent_id=author_agent,
                     content=content,
                     vault_path=db.config.vault_path,
                     created_at=now,
@@ -1514,7 +1608,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         indexed_ok = True
         if lid is not None:
             indexed_ok = settle_accepted_candidate(
-                context, db, cid, principal.agent_id,
+                context, db, cid, author_agent,
                 str(rowd.get("content") or ""), lid,
             )
         else:

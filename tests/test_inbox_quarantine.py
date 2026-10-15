@@ -352,7 +352,7 @@ def test_health_report_surfaces_quarantine_counts(tmp_path, monkeypatch):
     from minni.afm_passes.inbox_quarantine import quarantine_inbox_file
     from minni.principal import EffectivePrincipal
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     monkeypatch.setattr(
         cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
     )
@@ -387,7 +387,7 @@ def test_health_report_quarantine_block_survives_recovery_redaction(tmp_path, mo
     import minni.minnid as minnid
     from minni.afm_passes.inbox_quarantine import quarantine_inbox_file
 
-    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    monkeypatch.setattr(minnid, "MinniDB", _FakeDB)
     monkeypatch.setattr(
         cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
     )
@@ -620,12 +620,12 @@ def _real_lifecycle_db(tmp_path, monkeypatch):
     import minni.db as db_mod
     import minni.minnid as minnid
 
-    # Build via SovereignDB, not raw run_migrations: health_report reads
+    # Build via MinniDB, not raw run_migrations: health_report reads
     # columns the full initializer creates (contradicts_id and friends), so a
     # migrations-only fixture degrades the whole report and hides the block
     # under test.
     db_path = tmp_path / "health.db"
-    cfg = cfg_mod.SovereignConfig(
+    cfg = cfg_mod.MinniConfig(
         db_path=str(db_path),
         vault_path=str(tmp_path / "vault"),
         graph_export_dir=str(tmp_path / "graphs"),
@@ -635,7 +635,7 @@ def _real_lifecycle_db(tmp_path, monkeypatch):
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        seed = db_mod.SovereignDB(cfg)
+        seed = db_mod.MinniDB(cfg)
         seed._get_conn()
     finally:
         db_mod._migrations_run = old_flag
@@ -672,7 +672,7 @@ def _real_lifecycle_db(tmp_path, monkeypatch):
         cfg_mod.DEFAULT_CONFIG, "vault_path", str(tmp_path / "vault"), raising=False
     )
     monkeypatch.setattr(db_mod, "_migrations_run", False, raising=False)
-    monkeypatch.setattr(minnid, "SovereignDB", db_mod.SovereignDB)
+    monkeypatch.setattr(minnid, "MinniDB", db_mod.MinniDB)
     return db_path
 
 

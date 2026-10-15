@@ -31,16 +31,16 @@ from minni.principal import EffectivePrincipal
 
 
 def _make_db(tmp_path: Path):
-    """Real SovereignDB on a throwaway path, migrations forced (same idiom as
+    """Real MinniDB on a throwaway path, migrations forced (same idiom as
     test_rpc_capability_enforcement._patch_db)."""
     import minni.db as db_mod
-    from minni.config import SovereignConfig
+    from minni.config import MinniConfig
 
-    cfg = SovereignConfig(db_path=str(tmp_path / "log-event.db"))
+    cfg = MinniConfig(db_path=str(tmp_path / "log-event.db"))
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = db_mod.SovereignDB(cfg)
+        db_obj = db_mod.MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

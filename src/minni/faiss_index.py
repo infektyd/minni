@@ -21,7 +21,7 @@ import threading
 
 import numpy as np
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
+from minni.config import MinniConfig, DEFAULT_CONFIG
 
 logger = logging.getLogger("sovereign.faiss")
 
@@ -37,7 +37,7 @@ class FAISSIndex:
         # results: [(chunk_id, distance), ...]
     """
 
-    def __init__(self, config: SovereignConfig = DEFAULT_CONFIG):
+    def __init__(self, config: MinniConfig = DEFAULT_CONFIG):
         self.config = config
         self.dim = config.embedding_dim
         self._index = None

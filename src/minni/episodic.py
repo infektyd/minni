@@ -18,8 +18,8 @@ from datetime import datetime
 
 import numpy as np
 
-from minni.config import SovereignConfig, DEFAULT_CONFIG
-from minni.db import SovereignDB
+from minni.config import MinniConfig, DEFAULT_CONFIG
+from minni.db import MinniDB
 
 logger = logging.getLogger("sovereign.episodic")
 
@@ -158,13 +158,13 @@ def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
 class EpisodicMemory:
     """
     Episodic memory: agent events, task lifecycles, thread management.
-    All writes go through the shared SovereignDB.
+    All writes go through the shared MinniDB.
     """
 
     def __init__(
         self,
-        db: SovereignDB,
-        config: SovereignConfig = DEFAULT_CONFIG,
+        db: MinniDB,
+        config: MinniConfig = DEFAULT_CONFIG,
     ):
         self.db = db
         self.config = config

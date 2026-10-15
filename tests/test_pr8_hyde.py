@@ -111,11 +111,11 @@ def test_rrf_merge_marks_hyde_contributed_results():
 
 def test_retrieve_runs_one_hyde_pass_for_low_confidence_results(monkeypatch, tmp_path):
     import minni.db as db_mod
-    from minni.config import SovereignConfig
-    from minni.db import SovereignDB
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
     from minni.retrieval import RetrievalEngine
 
-    cfg = SovereignConfig(
+    cfg = MinniConfig(
         db_path=str(tmp_path / "test.db"),
         reranker_enabled=False,
         context_budget_tokens=0,
@@ -125,7 +125,7 @@ def test_retrieve_runs_one_hyde_pass_for_low_confidence_results(monkeypatch, tmp
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:
-        db_obj = SovereignDB(cfg)
+        db_obj = MinniDB(cfg)
         db_obj._get_conn()
     finally:
         db_mod._migrations_run = old_flag

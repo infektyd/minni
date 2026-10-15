@@ -304,7 +304,7 @@ test("X10: auditReport omits the full 'latest' entry by default (automatic path)
 });
 
 test("X10: buildStatusReport audit.latest is headline-only (no body paths)", async () => {
-  const { buildStatusReport } = await import("../dist/sovereign.js");
+  const { buildStatusReport } = await import("../dist/daemon_transport.js");
   const root = await mkdtemp(path.join(tmpdir(), "slice-g-x10-status-"));
   try {
     await ensureVault(root);
@@ -331,7 +331,7 @@ test("X10: buildStatusReport audit.latest is headline-only (no body paths)", asy
 });
 
 test("X10: status.audit.entries is a real count (not 0|1 from limit=1)", async () => {
-  const { buildStatusReport } = await import("../dist/sovereign.js");
+  const { buildStatusReport } = await import("../dist/daemon_transport.js");
   const root = await mkdtemp(path.join(tmpdir(), "slice-g-x10-count-"));
   try {
     await ensureVault(root);
@@ -350,7 +350,7 @@ test("X10: status.audit.entries is a real count (not 0|1 from limit=1)", async (
 });
 
 test("X10: statusAndAudit details are scalar allowlist only", async () => {
-  const { statusAndAudit } = await import("../dist/sovereign.js");
+  const { statusAndAudit } = await import("../dist/daemon_transport.js");
   const { auditTail } = await import("../dist/vault.js");
   const root = await mkdtemp(path.join(tmpdir(), "slice-g-x10-saudit-"));
   try {
