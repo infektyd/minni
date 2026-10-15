@@ -197,6 +197,11 @@ class TrieIndexMixin:
                         )
                     rows = c.fetchall()
             except Exception:
+                # Watermarks were advanced before the SELECT; reset them so the
+                # next load (after the 30s throttle) does a full rebuild instead
+                # of treating the empty/partial index as current.
+                self._trie_max_doc_id = -1
+                self._trie_doc_count = -1
                 return
             for r in rows:
                 did = r["doc_id"]

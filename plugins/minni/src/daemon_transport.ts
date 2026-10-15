@@ -250,7 +250,14 @@ export function buildBootRecallSlice(
   const episodic = Array.isArray(data.episodic) ? data.episodic : [];
   const episodic_count =
     typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
-  const notes = formatDegradation({ ...data, auth_suppression: [] });
+  // Only routine foreign-scope blackouts are dropped; a non-routine read-gate
+  // suppression must reach the boot envelope the same way formatRecall renders it.
+  const notes = formatDegradation({
+    ...data,
+    auth_suppression: (Array.isArray(data.auth_suppression) ? data.auth_suppression : []).filter(
+      (entry) => !isRoutineForeignScopeSuppression((entry ?? {}) as Record<string, unknown>),
+    ),
+  });
   return {
     ok: true,
     results: data.results,

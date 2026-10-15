@@ -1302,7 +1302,7 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
             explicit_agent_filter = bool(
                 isinstance(params, dict) and str(params.get("agent_id") or "").strip()
             )
-            if principal.agent_id in ("main", "operator") and not explicit_agent_filter:
+            if is_operator_principal(principal) and not explicit_agent_filter:
                 c.execute(
                     f"SELECT {review_cols} FROM candidate_packets cp "
                     "WHERE cp.status=? "

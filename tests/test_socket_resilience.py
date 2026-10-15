@@ -98,9 +98,11 @@ def test_socket_watchdog_detects_inode_drift(tmp_path):
             await asyncio.sleep(0.08)
             assert not shutdown_mock.called
 
-            # Recreate the file to produce a new inode
-            sock_path.unlink()
-            sock_path.touch()
+            # Recreate the file to produce a new inode (allocate before replacing
+            # so Linux ext4 does not reuse the just-unlinked inode number)
+            replacement_path = tmp_path / "minnid.sock.replacement"
+            replacement_path.touch()
+            replacement_path.replace(sock_path)
             new_inode = sock_path.stat().st_ino
             assert new_inode != original_inode
 

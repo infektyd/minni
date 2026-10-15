@@ -132,6 +132,11 @@ jobs:
 
           echo "✓ No forbidden files in PR diff."
 
+      - name: Public boundary & migration guard
+        run: |
+          bash scripts/check-public-boundary.sh
+          bash scripts/check-migrations.sh
+
       - name: Require the content gate verdict
         # Deliberately NOT a duplicate of the content job: it re-publishes that
         # job's conclusion through the context branch protection actually
