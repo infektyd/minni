@@ -199,7 +199,7 @@ The Claude Code vault lives at `~/.minni/claudecode-vault` (override: `MINNI_CLA
 
 ## Minni Team Mode
 
-Use this workflow when the user asks for "Minni Team Mode", "parallel Minni agents", "temporary agents", "use 4-5 agents", "compress wall-clock time", or asks to split a non-trivial task across helper agents.
+Use this workflow when the user asks for "Minni Team Mode", "parallel Minni agents", "temporary agents", "use 4-5 agents", "compress wall-clock time", or asks to split a non-trivial task across helper agents. Legacy aliases "Sovereign Team Mode" and "parallel Sovereign agents" also activate this workflow.
 
 Core rule: Minni owns the team substrate; Codex CLI, Codex Desktop, Claude Code, and local workers are host adapters. Do not tie the workflow to one host surface.
 
@@ -249,11 +249,11 @@ Use Minni Team Mode for this. Hydrate from Layer 1 and Layer 2, create temporary
 
 - `minni_route`: Classify whether a task should recall, learn, write a note, show audit, check status, or do nothing.
 - `minni_status`: Check daemon, AFM bridge, vault path, and recent audit state.
-- `minni_prepare_task`: Build a compact Codex task packet with ranked context, source reasons, privacy metadata, and optional AFM distillation.
+- `minni_prepare_task`: Build a compact task packet with ranked context, source reasons, privacy metadata, and optional AFM distillation.
 - `minni_prepare_outcome`: Build a dry-run post-task outcome packet without writing durable memory.
-- `minni_recall`: Search existing Minni, prepend a Codex vault context pack, and log the lookup.
+- `minni_recall`: Search existing Minni, prepend a vault context pack, and log the lookup.
 - `minni_learning_quality`: Review a potential memory before writing it.
-- `minni_learn`: Write a Codex vault note first, quality-report it, then store the learning through Minni.
+- `minni_learn`: Write a vault note first, quality-report it, then store the learning through Minni.
 - `minni_vault_write`: Write a structured Obsidian note without durable learning.
 - `minni_audit_report`: Summarize recent memory tool activity.
 - `minni_audit_tail`: Show recent memory audit entries.

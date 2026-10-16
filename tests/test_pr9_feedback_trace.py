@@ -58,20 +58,25 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
                 principals_dir=target_dir,
             )
 
+        op_ctx = operator_context or target_agent in principal.OPERATOR_RESERVED_AGENT_IDS
+        caps = (
+            ["*"]
+            if op_ctx
+            else ["search", "read", "learn", "feedback", "log_event", "handoff", "export"]
+        )
         f = target_dir / f"{target_agent}.json"
         f.write_text(
             json.dumps(
                 {
                     "agent_id": target_agent,
                     "workspace_id": "default",
-                    "capabilities": ["*"],
+                    "capabilities": caps,
                 }
             ),
             encoding="utf-8",
         )
         os.chmod(f, 0o600)
 
-        op_ctx = operator_context or target_agent in principal.OPERATOR_RESERVED_AGENT_IDS
         return original_resolve(
             supplied_agent_id=supplied_agent_id,
             transport=transport,

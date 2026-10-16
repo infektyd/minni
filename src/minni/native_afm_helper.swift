@@ -397,7 +397,7 @@ func runFoundationModels(_ request: AFMRequest) async {
                 data: ["answer": .string(response.content.answer)]
             ))
         case "prepare_task":
-            let session = LanguageModelSession(instructions: "Prepare a compact Codex task packet for Minni software work. Interpret wiring/config/providers as software integration, never physical or electrical wiring. Do not include secrets, raw private logs, local paths, adapter paths, or durable-write instructions.")
+            let session = LanguageModelSession(instructions: "Prepare a compact task packet for Minni software work. Interpret wiring/config/providers as software integration, never physical or electrical wiring. Do not include secrets, raw private logs, local paths, adapter paths, or durable-write instructions.")
             let response = try await session.respond(
                 to: compactJSONString(request.input ?? [:]),
                 generating: PrepareTaskResult.self

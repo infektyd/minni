@@ -353,7 +353,7 @@ export async function handleStopCore(
   payload: Record<string, unknown>,
   prepareOutcomeFn: typeof prepareOutcome = prepareOutcome,
 ): Promise<HookOutput> {
-  await ensureVault(config.vaultPath);
+  await ensureVault(config.vaultPath, { agentId: config.agentId });
   // Stop keeps the defaulted "session" fallback (inbox filename, marker text,
   // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime that
   // never labeled any turn with a real session_id still gets a best-effort
@@ -670,7 +670,7 @@ export function createHookHandlers(
     const deadline = Date.now() + budgetMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
     const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
-    await ensureVault(config.vaultPath);
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
 
     // Compaction-summary harvest backstop (P3 / #227). Claude Code's primary
     // path is PostCompact in hook.ts; Kilo delivers via CompactSummary (its
@@ -1210,10 +1210,26 @@ export function createHookHandlers(
   }
 
   async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput> {
+    // BUDGET (parity with the claude-code hook): every host kills a prompt-time
+    // hook and DISCARDS its output, so an overrun costs the whole turn's
+    // injection silently. The budget is clamped to this platform's manifest
+    // timeout (`promptHookTimeoutMs`) so it always finishes inside the deadline
+    // that will actually kill it — gemini's 10s PreInvocation is the tightest.
+    // The clock starts at handler ENTRY so vault setup below counts against it.
+    const budgetMs = effectiveHookBudgetMs(config.promptHookTimeoutMs);
+    const deadline = Date.now() + budgetMs;
+    const remainingMs = (): number => Math.max(0, deadline - Date.now());
+
     const prompt = asString(payload.prompt) || asString(payload.user_prompt);
     if (!prompt.trim()) {
       return render(noIntent);
     }
+
+    await withBudget(
+      ensureVault(config.vaultPath, { agentId: config.agentId }),
+      remainingMs(),
+      undefined,
+    );
 
     const workspaceId = workspaceFor(payload);
     // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
@@ -1284,14 +1300,6 @@ export function createHookHandlers(
     }
 
     const threshold = recallPointerThreshold();
-    // BUDGET (parity with the claude-code hook): every host kills a prompt-time
-    // hook and DISCARDS its output, so an overrun costs the whole turn's
-    // injection silently. The budget is clamped to this platform's manifest
-    // timeout (`promptHookTimeoutMs`) so it always finishes inside the deadline
-    // that will actually kill it — gemini's 10s PreInvocation is the tightest.
-    const budgetMs = effectiveHookBudgetMs(config.promptHookTimeoutMs);
-    const deadline = Date.now() + budgetMs;
-    const remainingMs = (): number => Math.max(0, deadline - Date.now());
     // #313: searchVaultNotes scores and ranks across the WHOLE vault, then
     // slices to `limit` before privacy is ever considered (it only drops
     // `blocked` notes internally; `private`/`local-only` ride along, see
@@ -1319,7 +1327,11 @@ export function createHookHandlers(
     const VAULT_RESULT_LIMIT = 6;
     const VAULT_SEARCH_OVERFETCH = 18;
     const [vaultResultsRaw, recall] = await Promise.all([
-      withBudget(searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH), remainingMs(), []),
+      withBudget(
+        searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH, config.agentId),
+        remainingMs(),
+        [],
+      ),
       withBudget(
         recallMemory({
           query: prompt,
@@ -1603,7 +1615,7 @@ export function createHookHandlers(
   }
 
   async function handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput> {
-    await ensureVault(config.vaultPath);
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
     const tail = await auditTail(config.vaultPath, 60);
     const scarTissue = extractScarTissue(tail.entries);
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
@@ -1713,7 +1725,7 @@ export function createHookHandlers(
   // compact_distillation pass reviews/organizes it into governance-gated
   // candidates. Injects nothing — there is no model turn to inject into.
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
-    await ensureVault(config.vaultPath);
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     // Same provenance stamp as SessionStart harvest — dual delivery paths
     // must not disagree on `platform` when runtime and agentId differ.
@@ -1749,7 +1761,7 @@ export function createHookHandlers(
   // inject into. Raw storage only; the daemon's compact_distillation pass
   // does the AFM review on its own timer.
   async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
-    await ensureVault(config.vaultPath);
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     await harvestSummaryText(
       {
