@@ -63,7 +63,8 @@ for the AFM adapter vars). `MINNI_HOME` overrides the home directory for every
 - AFM prepare-task URL: `MINNI_AFM_PREPARE_TASK_URL` if set, otherwise `http://127.0.0.1:11437/v1/chat/completions`.
 - AFM prepare-task model: `MINNI_AFM_PREPARE_TASK_MODEL` if set, otherwise `apple-foundation-models`.
 - AFM provider mode: `bridge` by default; set `MINNI_AFM_PROVIDER_MODE=native`, `auto`, or `off` to change opt-in AFM calls.
-- Codex vault: `MINNI_VAULT_PATH` (or legacy fallback `MINNI_CODEX_VAULT_PATH`), otherwise `~/.minni/unknown-vault`. The Codex surface normally sets `MINNI_VAULT_PATH=~/.minni/codex-vault` in its manifest env.
+- MCP vault: `MINNI_VAULT_PATH` (or legacy fallback `MINNI_CODEX_VAULT_PATH`), otherwise `~/.minni/unknown-vault`. This is the vault the MCP server and console use.
+- Hook vaults are platform-scoped and do not read `MINNI_VAULT_PATH`: each hook entrypoint uses its own constant (e.g. Gemini `MINNI_GEMINI_VAULT_PATH`, Cursor `MINNI_CURSOR_VAULT_PATH`, Codex `MINNI_CODEX_VAULT_PATH`). Host manifests may still set `MINNI_VAULT_PATH` for the MCP side, so set the platform override too if you want MCP and hooks on the same vault.
 - Claude Code vault: `MINNI_CLAUDECODE_VAULT_PATH`, otherwise `~/.minni/claudecode-vault`.
 - KiloCode vault: `MINNI_KILOCODE_VAULT_PATH`, otherwise `~/.minni/kilocode-vault`.
 - Grok Build vault: `MINNI_GROK_VAULT_PATH`, otherwise `~/.minni/grok-build-vault`.
@@ -72,10 +73,12 @@ Override with:
 
 ```bash
 export MINNI_HOME=~/.minni
-export MINNI_VAULT_PATH=/path/to/codex-vault
+export MINNI_VAULT_PATH=/path/to/vault
 export MINNI_CLAUDECODE_VAULT_PATH=/path/to/claudecode-vault
 export MINNI_KILOCODE_VAULT_PATH=/path/to/kilocode-vault
+export MINNI_GEMINI_VAULT_PATH=/path/to/gemini-vault
 export MINNI_GROK_VAULT_PATH=/path/to/grok-build-vault
+export MINNI_CURSOR_VAULT_PATH=/path/to/cursor-vault
 export MINNI_SOCKET_PATH=~/.minni/run/minnid.sock
 export MINNI_AFM_HEALTH_URL=http://127.0.0.1:11437/health
 export MINNI_AFM_PREPARE_TASK_URL=http://127.0.0.1:11437/v1/chat/completions
@@ -295,7 +298,7 @@ The console exposes only local HTTP endpoints:
 
 The server binds to `127.0.0.1`, refuses non-local bind hosts, rejects non-local host/origin/fetch-metadata requests, requires JSON POST bodies, caps JSON request bodies, redacts machine-local paths in browser-facing status/audit/candidate responses, and does not expose learn or vault-write endpoints. Browser requests cannot override the server-owned vault path or AFM target. `prepare-task` keeps its existing audit behavior; `prepare-outcome` remains dry-run only.
 
-The bridge defaults to the Codex vault resolved from `MINNI_VAULT_PATH` (or `MINNI_CODEX_VAULT_PATH`). Override with `MINNI_VAULT_PATH=~/.minni/claudecode-vault npm run console` to point Recall at a different vault.
+The bridge defaults to the active vault resolved from `MINNI_VAULT_PATH` (or legacy fallback `MINNI_CODEX_VAULT_PATH`). Override with `MINNI_VAULT_PATH=~/.minni/claudecode-vault npm run console` to point Recall at a different vault.
 
 ## Development
 

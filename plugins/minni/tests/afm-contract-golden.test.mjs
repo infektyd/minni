@@ -145,7 +145,7 @@ test("golden: buildAfmChatPayload freezes the task-purpose chat body", () => {
         {
           role: "user",
           content: [
-            "Return compact JSON only for Codex task prep.",
+            "Return compact JSON only for task prep.",
             "Keys: brief, recommendedNextActions, risks.",
             "Interpret wiring/config/providers as Minni software integration work, never physical or electrical wiring.",
             "No secrets, no raw private logs.",
@@ -190,7 +190,7 @@ test("golden: buildAfmChatPayload freezes the outcome-purpose chat body", () => 
         {
           role: "user",
           content: [
-            "Return compact JSON only for Codex outcome prep.",
+            "Return compact JSON only for outcome prep.",
             "Keys: outcomeDraft with learnCandidates, logOnly, expires, doNotStore.",
             "Buckets must be mutually exclusive; put uncertain or sensitive items in the most restrictive applicable bucket.",
             "No secrets, no raw private logs, no local absolute paths.",

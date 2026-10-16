@@ -11,8 +11,11 @@ import {
   ensureVault,
   formatSessionReceiptLine,
   listSessions,
+  isUsableAgentId,
+  normalizeAgentId,
   recordAudit,
   resolveInboxHandoffContext,
+  resolveVaultAgent,
   searchVaultNotes,
   sessionReceipt,
   vaultFirstLearn,
@@ -32,7 +35,7 @@ process.env.MINNI_HOME = await mkdtemp(path.join(tmpdir(), "sm-test-home-"));
 // unaffected by this flag).
 process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
 
-test("ensureVault creates the Codex LLM wiki structure and schema", async () => {
+test("ensureVault creates the LLM wiki structure and schema with generic fallback", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-vault-"));
   try {
     const result = await ensureVault(root);
@@ -46,8 +49,129 @@ test("ensureVault creates the Codex LLM wiki structure and schema", async () => 
       path.join(root, "schema", "AGENTS.md"),
       "utf8",
     );
-    assert.match(schema, /Codex Minni Vault/);
+    assert.match(schema, /# Minni Vault/);
     assert.match(schema, /raw sources/i);
+
+    const index = await readFile(path.join(root, "index.md"), "utf8");
+    assert.match(index, /# Minni Index/);
+    assert.match(index, /maintained by the Minni plugin/);
+
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(log, /# Minni Log/);
+    assert.match(log, /Append-only audit of memory operations/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault seeds dynamic agent-specific headers when agentId is provided", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-vault-gemini-"));
+  try {
+    const result = await ensureVault(root, "gemini");
+
+    assert.equal(result.vaultPath, root);
+    const schema = await readFile(
+      path.join(root, "schema", "AGENTS.md"),
+      "utf8",
+    );
+    assert.match(schema, /# gemini Minni Vault/);
+
+    const index = await readFile(path.join(root, "index.md"), "utf8");
+    assert.match(index, /# gemini Minni Index/);
+    assert.match(index, /maintained by the Minni gemini plugin/);
+
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(log, /# gemini Minni Log/);
+    assert.match(log, /audit of gemini memory operations/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault filters unknown-agent sentinel and falls back to generic headers", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-vault-sentinel-"));
+  try {
+    const result = await ensureVault(root, { agentId: "unknown-agent" });
+    assert.equal(result.vaultPath, root);
+    const schema = await readFile(path.join(root, "schema", "AGENTS.md"), "utf8");
+    assert.match(schema, /# Minni Vault/);
+    assert.doesNotMatch(schema, /unknown-agent/);
+
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(log, /# Minni Log/);
+    assert.doesNotMatch(log, /unknown-agent/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveVaultAgent preserves explicit platform env overrides and MINNI_AGENT_VAULTS verbatim while normalizing heuristic basenames", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-vault-alias-"));
+  const claudeRoot = path.join(tmp, "custom-claude-dir");
+  const grokRoot = path.join(tmp, "custom-grok-dir");
+  const mappedRoot = path.join(tmp, "mapped-grok-dir");
+  const prevClaudeVault = process.env.MINNI_CLAUDECODE_VAULT_PATH;
+  const prevClaudeAgent = process.env.MINNI_CLAUDECODE_AGENT_ID;
+  const prevGrokVault = process.env.MINNI_GROK_VAULT_PATH;
+  const prevGrokAgent = process.env.MINNI_GROK_AGENT_ID;
+  const prevAgentVaults = process.env.MINNI_AGENT_VAULTS;
+  try {
+    process.env.MINNI_CLAUDECODE_VAULT_PATH = claudeRoot;
+    process.env.MINNI_CLAUDECODE_AGENT_ID = "claude";
+    assert.equal(resolveVaultAgent(claudeRoot), "claude");
+
+    process.env.MINNI_CLAUDECODE_AGENT_ID = "   ";
+    assert.equal(resolveVaultAgent(claudeRoot), "claude-code");
+
+    process.env.MINNI_GROK_VAULT_PATH = grokRoot;
+    process.env.MINNI_GROK_AGENT_ID = "grok";
+    assert.equal(resolveVaultAgent(grokRoot), "grok");
+
+    process.env.MINNI_AGENT_VAULTS = JSON.stringify({ grok: mappedRoot });
+    assert.equal(resolveVaultAgent(mappedRoot), "grok");
+
+    assert.equal(resolveVaultAgent(path.join(tmp, "claudecode-vault")), "claude-code");
+    assert.equal(resolveVaultAgent(path.join(tmp, "grok-vault")), "grok-build");
+    assert.equal(normalizeAgentId("claudecode"), "claude-code");
+    assert.equal(normalizeAgentId("grok"), "grok-build");
+  } finally {
+    if (prevClaudeVault !== undefined) process.env.MINNI_CLAUDECODE_VAULT_PATH = prevClaudeVault;
+    else delete process.env.MINNI_CLAUDECODE_VAULT_PATH;
+    if (prevClaudeAgent !== undefined) process.env.MINNI_CLAUDECODE_AGENT_ID = prevClaudeAgent;
+    else delete process.env.MINNI_CLAUDECODE_AGENT_ID;
+    if (prevGrokVault !== undefined) process.env.MINNI_GROK_VAULT_PATH = prevGrokVault;
+    else delete process.env.MINNI_GROK_VAULT_PATH;
+    if (prevGrokAgent !== undefined) process.env.MINNI_GROK_AGENT_ID = prevGrokAgent;
+    else delete process.env.MINNI_GROK_AGENT_ID;
+    if (prevAgentVaults !== undefined) process.env.MINNI_AGENT_VAULTS = prevAgentVaults;
+    else delete process.env.MINNI_AGENT_VAULTS;
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("ensureVault promotes untouched generic daemon seeds to agent-specific headers without clobbering appended files", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-vault-promote-"));
+  try {
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "log.md"), "# Minni Log\n\n", "utf8");
+    await writeFile(path.join(root, "index.md"), "# Minni Index\n\n", "utf8");
+
+    await ensureVault(root, { agentId: "gemini" });
+
+    const promotedLog = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(promotedLog, /^# gemini Minni Log/);
+    assert.match(promotedLog, /audit of gemini memory operations/);
+
+    const promotedIndex = await readFile(path.join(root, "index.md"), "utf8");
+    assert.match(promotedIndex, /^# gemini Minni Index/);
+    assert.match(promotedIndex, /maintained by the Minni gemini plugin/);
+
+    // Once entries are appended, ensureVault with another agentId must NOT overwrite them.
+    const appendedLog = `${promotedLog}## [2026-10-15T00:00:00.000Z] minni_status | ok\n\n`;
+    await writeFile(path.join(root, "log.md"), appendedLog, "utf8");
+    await ensureVault(root, { agentId: "cursor" });
+    const afterSecondEnsure = await readFile(path.join(root, "log.md"), "utf8");
+    assert.equal(afterSecondEnsure, appendedLog);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -184,7 +308,7 @@ test("recordAudit rotation does not wipe a second-tap exclusive seed", async () 
         if (existsSync(rotated)) {
           try {
             const fd = openSync(logPath, "wx", 0o600);
-            writeSync(fd, `# Minni Codex Log\n\n${raced}`);
+            writeSync(fd, `# Minni Log\n\n${raced}`);
             closeSync(fd);
             planted = true;
             return;
@@ -204,6 +328,40 @@ test("recordAudit rotation does not wipe a second-tap exclusive seed", async () 
     const text = await readFile(logPath, "utf8");
     assert.match(text, /second-tap-do-not-clobber/);
     assert.match(text, /rotate-tap/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recordAudit rotation preserves tenant attribution and legacy Codex log headers", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-rotate-header-"));
+  try {
+    await ensureVault(root, { agentId: "gemini" });
+    const logPath = path.join(root, "log.md");
+    await writeFile(
+      logPath,
+      `# gemini Minni Log\n\n${"a".repeat(5 * 1024 * 1024)}`,
+      "utf8",
+    );
+    await recordAudit(root, {
+      tool: "test_tool",
+      summary: "after-gemini-rotate",
+    });
+    const geminiRotated = await readFile(logPath, "utf8");
+    assert.match(geminiRotated, /^# gemini Minni Log/);
+
+    // Legacy `# Minni Codex Log` header is also preserved on rotation as codex.
+    await writeFile(
+      logPath,
+      `# Minni Codex Log\n\n${"b".repeat(5 * 1024 * 1024)}`,
+      "utf8",
+    );
+    await recordAudit(root, {
+      tool: "test_tool",
+      summary: "after-legacy-codex-rotate",
+    });
+    const codexRotated = await readFile(logPath, "utf8");
+    assert.match(codexRotated, /^# codex Minni Log/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -668,6 +826,144 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
     assert.match(log, /Socket daemon health check/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("vaultFirstLearn infers agent attribution from vault path when agentId is omitted", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-learn-attr-"));
+  const root = path.join(tmp, "gemini-vault");
+  try {
+    await ensureVault(root);
+    const result = await vaultFirstLearn({
+      vaultPath: root,
+      title: "Dynamic agent attribution test",
+      content: "Minni learning attributes to gemini from the vault path.",
+      category: "fact",
+      source: "unit-test",
+      storeResult: { ok: true, detail: "learned" },
+    });
+
+    const note = await readFile(result.notePath, "utf8");
+    assert.match(note, /agent: gemini/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("vaultFirstLearn prefers tenant vault principal over process-wide default agent", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-learn-tenant-pref-"));
+  const root = path.join(tmp, "claudecode-vault");
+  try {
+    await ensureVault(root);
+    const result = await vaultFirstLearn({
+      vaultPath: root,
+      title: "Tenant preference test",
+      content: "Minni learning must attribute to claude-code rather than default codex.",
+      category: "fact",
+      source: "unit-test",
+      storeResult: { ok: true, detail: "learned" },
+    });
+
+    const note = await readFile(result.notePath, "utf8");
+    assert.match(note, /agent: claude-code/);
+    assert.doesNotMatch(note, /agent: codex/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("configured default principal wins over *-vault basename inference for MINNI_VAULT_PATH", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-default-priority-"));
+  const researchVault = path.join(tmp, "research-vault");
+  const prevVaultPath = process.env.MINNI_VAULT_PATH;
+  const prevAgentId = process.env.MINNI_AGENT_ID;
+  try {
+    process.env.MINNI_VAULT_PATH = researchVault;
+    process.env.MINNI_AGENT_ID = "codex";
+
+    await ensureVault(researchVault);
+    const schema = await readFile(path.join(researchVault, "schema", "AGENTS.md"), "utf8");
+    assert.match(schema, /# codex Minni Vault/);
+
+    const result = await vaultFirstLearn({
+      vaultPath: researchVault,
+      title: "Configured default vault learn",
+      content: "Configured default agent wins over research-vault basename.",
+      category: "fact",
+      source: "unit-test",
+      storeResult: { ok: true, detail: "learned" },
+    });
+    const note = await readFile(result.notePath, "utf8");
+    assert.match(note, /agent: codex/);
+  } finally {
+    if (prevVaultPath !== undefined) process.env.MINNI_VAULT_PATH = prevVaultPath;
+    else delete process.env.MINNI_VAULT_PATH;
+    if (prevAgentId !== undefined) process.env.MINNI_AGENT_ID = prevAgentId;
+    else delete process.env.MINNI_AGENT_ID;
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("explicit team/shared/default principals are preserved while heuristic *-vault path sentinels are filtered", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-sentinel-split-"));
+  const teamVault = path.join(tmp, "team-vault");
+  const explicitTeamVault = path.join(tmp, "explicit-team");
+  try {
+    assert.equal(isUsableAgentId("team"), true);
+    assert.equal(isUsableAgentId("shared"), true);
+    assert.equal(isUsableAgentId("default"), true);
+    assert.equal(resolveVaultAgent(teamVault), undefined);
+
+    await ensureVault(teamVault);
+    const genericSchema = await readFile(path.join(teamVault, "schema", "AGENTS.md"), "utf8");
+    assert.match(genericSchema, /^# Minni Vault/);
+
+    await ensureVault(explicitTeamVault, { agentId: "team" });
+    const teamSchema = await readFile(path.join(explicitTeamVault, "schema", "AGENTS.md"), "utf8");
+    assert.match(teamSchema, /^# team Minni Vault/);
+
+    const learned = await vaultFirstLearn({
+      vaultPath: explicitTeamVault,
+      title: "Explicit team principal learn",
+      content: "Legitimate principal named team is preserved.",
+      category: "fact",
+      source: "unit-test",
+      agentId: "team",
+      storeResult: { ok: true, detail: "learned" },
+    });
+    const note = await readFile(learned.notePath, "utf8");
+    assert.match(note, /agent: team/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("searchVaultNotes and UserPromptSubmit seed brand-new vault with agentId", async () => {
+  const { createHookHandlers } = await import("../dist/hook-handlers.js");
+  const tmp = await mkdtemp(path.join(tmpdir(), "sm-prompt-seed-"));
+  const searchVault = path.join(tmp, "custom-search");
+  const hookVault = path.join(tmp, "custom-hook");
+  try {
+    await searchVaultNotes(searchVault, "nonexistent query", 5, "gemini");
+    const searchSchema = await readFile(path.join(searchVault, "schema", "AGENTS.md"), "utf8");
+    assert.match(searchSchema, /^# gemini Minni Vault/);
+
+    const handlers = createHookHandlers(
+      {
+        vaultPath: hookVault,
+        agentId: "cursor",
+        auditPrefix: "hook_cursor",
+        stopDraftSource: "cursor-stop-hook",
+      },
+      (intent) => ({ continue: true, intent }),
+    );
+    // Write-intent prompt takes the early-return path before searchVaultNotes
+    // and still seeds the vault with config.agentId.
+    await handlers.handleUserPromptSubmit({ prompt: "remember this fact for later" });
+    const hookSchema = await readFile(path.join(hookVault, "schema", "AGENTS.md"), "utf8");
+    assert.match(hookSchema, /^# cursor Minni Vault/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
@@ -2668,3 +2964,23 @@ test("an orphaned cycle is still cut at the foreign boot when it never stops", a
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("ensureVault generic-header promotion serializes with concurrent recordAudit appends", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-concurrent-promote-"));
+  try {
+    await ensureVault(root);
+    await writeFile(path.join(root, "log.md"), "# Minni Log\n\n", "utf8");
+    await Promise.all([
+      ensureVault(root, { agentId: "gemini" }),
+      recordAudit(root, {
+        tool: "minni_learn",
+        summary: "concurrent audit must survive promotion",
+      }),
+    ]);
+    const logText = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(logText, /concurrent audit must survive promotion/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+

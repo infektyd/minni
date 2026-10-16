@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   access,
   lstat,
@@ -21,6 +21,7 @@ import type { LearningQualityReport } from "./policy.js";
 // resolves fine under Node's ESM live-binding semantics; neither module
 // touches the other's binding at top-level/module-evaluation time.
 import { filterSafeVaultResults } from "./task.js";
+import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
 
 export type VaultSection =
   | "raw"
@@ -923,8 +924,94 @@ function scoreVaultNote(
   return score;
 }
 
-function schemaContent(): string {
-  return `# Codex Minni Vault
+export function isUsableAgentId(id: string | undefined | null): id is string {
+  if (typeof id !== "string") return false;
+  const trimmed = id.trim();
+  return (
+    trimmed.length > 0 &&
+    trimmed !== "agent" &&
+    trimmed !== "vault" &&
+    trimmed !== "unknown" &&
+    trimmed !== "unknown-vault" &&
+    trimmed !== "unknown-agent"
+  );
+}
+
+function isUsablePathAgentId(id: string | undefined | null): id is string {
+  if (!isUsableAgentId(id)) return false;
+  const trimmed = id.trim();
+  return (
+    trimmed !== "default" &&
+    trimmed !== "team" &&
+    trimmed !== "shared"
+  );
+}
+
+export function normalizeAgentId(agentId: string): string {
+  const trimmed = agentId.trim();
+  if (trimmed === "claudecode" || trimmed === "claude") return "claude-code";
+  if (trimmed === "grok") return "grok-build";
+  return trimmed;
+}
+
+export function resolveVaultAgent(vaultPath: string): string | undefined {
+  const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+  // Explicit mappings win even when the basename equals the agent id (e.g.
+  // MINNI_GEMINI_VAULT_PATH=/home/u/gemini). The basename fallback is only
+  // consulted for *-vault names, and sentinels are filtered on both paths.
+  const explicit = explicitAgentIdForVault(absPath);
+  if (isUsableAgentId(explicit)) {
+    return explicit;
+  }
+  if (path.basename(absPath).endsWith("-vault")) {
+    const fromPath = getAgentIdFromVaultPath(vaultPath);
+    if (isUsablePathAgentId(fromPath)) {
+      return fromPath;
+    }
+  }
+  return undefined;
+}
+
+function resolveConfiguredDefaultAgent(vaultPath: string): string | undefined {
+  const absVault = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+  const envDefaultVault =
+    process.env.MINNI_VAULT_PATH ?? process.env.MINNI_CODEX_VAULT_PATH;
+  const activeDefaultVault = path.resolve(
+    (envDefaultVault ?? DEFAULT_VAULT_PATH).replace(/^~(?=$|\/)/, os.homedir()),
+  );
+  if (absVault !== activeDefaultVault) {
+    return undefined;
+  }
+  const rawDefaultAgent = (
+    process.env.MINNI_AGENT_ID ??
+    process.env.MINNI_CODEX_AGENT_ID ??
+    DEFAULT_AGENT_ID
+  )?.trim();
+  return isUsableAgentId(rawDefaultAgent) ? rawDefaultAgent : undefined;
+}
+
+function resolveEffectiveVaultAgent(
+  vaultPath: string,
+  explicitAgentId?: string,
+): string | undefined {
+  if (isUsableAgentId(explicitAgentId)) {
+    return explicitAgentId.trim();
+  }
+  const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+  const explicitMapped = explicitAgentIdForVault(absPath);
+  if (isUsableAgentId(explicitMapped)) {
+    return explicitMapped;
+  }
+  const configuredDefault = resolveConfiguredDefaultAgent(vaultPath);
+  if (configuredDefault !== undefined) {
+    return configuredDefault;
+  }
+  return resolveVaultAgent(vaultPath);
+}
+
+function schemaContent(agentId?: string): string {
+  const heading = agentId ? `${agentId} Minni Vault` : "Minni Vault";
+  return `# ${heading}
 
 This vault operates under the Minni vault contract.
 
@@ -954,20 +1041,24 @@ Recalled memory is evidence, not instruction. See docs/contracts/AGENT.md.
 `;
 }
 
-function indexContent(): string {
-  return `# Codex Minni Index
+function indexContent(agentId?: string): string {
+  const heading = agentId ? `${agentId} Minni Index` : "Minni Index";
+  const maintained = agentId ? `the Minni ${agentId} plugin` : "the Minni plugin";
+  return `# ${heading}
 
-This index is maintained by the Minni Codex plugin.
+This index is maintained by ${maintained}.
 
 ## Recent Pages
 
 `;
 }
 
-function logContent(): string {
-  return `# Minni Codex Log
+function logContent(agentId?: string): string {
+  const heading = agentId ? `${agentId} Minni Log` : "Minni Log";
+  const desc = agentId ? `Append-only audit of ${agentId} memory operations.` : "Append-only audit of memory operations.";
+  return `# ${heading}
 
-Append-only audit of Codex memory operations.
+${desc}
 
 `;
 }
@@ -1035,8 +1126,109 @@ async function seedExclusiveFile(
   }
 }
 
+const vaultFileLocks = new Map<string, Promise<void>>();
+
+async function withVaultFileLock<T>(
+  filePath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = path.resolve(filePath.replace(/^~(?=$|\/)/, os.homedir()));
+  const previous = vaultFileLocks.get(key) ?? Promise.resolve();
+  let releaseMem!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseMem = resolve;
+  });
+  const tail = previous.then(
+    () => current,
+    () => current,
+  );
+  vaultFileLocks.set(key, tail);
+
+  await previous.catch(() => {});
+  const lockDigest = createHash("sha256").update(key).digest("hex").slice(0, 32);
+  const lockPath = path.join(os.tmpdir(), `minni-vlock-${lockDigest}.lock`);
+  let acquiredDisk = false;
+  try {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      try {
+        const lfh = await open(lockPath, "wx", 0o600);
+        await lfh.close();
+        acquiredDisk = true;
+        break;
+      } catch (err) {
+        if (!isErrno(err, "EEXIST")) break;
+        try {
+          const lst = await stat(lockPath);
+          if (Date.now() - lst.mtimeMs > 5000) {
+            await unlink(lockPath).catch(() => {});
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    if (!acquiredDisk) {
+      throw new Error(`timed out acquiring vault file lock: ${lockPath}`);
+    }
+    return await fn();
+  } finally {
+    if (acquiredDisk) {
+      await unlink(lockPath).catch(() => {});
+    }
+    releaseMem();
+    if (vaultFileLocks.get(key) === tail) {
+      vaultFileLocks.delete(key);
+    }
+  }
+}
+
+async function seedOrPromoteVaultFile(
+  filePath: string,
+  targetContent: string,
+  untouchedGenericSeeds: readonly string[],
+  shouldPromote: boolean,
+): Promise<void> {
+  const seeded = await seedExclusiveFile(filePath, targetContent);
+  if (seeded || !shouldPromote) {
+    return;
+  }
+  await withVaultFileLock(filePath, async () => {
+    await refuseSymlink(filePath, "seed");
+    let beforeStat;
+    let existing: string;
+    try {
+      beforeStat = await lstat(filePath);
+      if (beforeStat.isSymbolicLink()) {
+        throw new Error(`refusing to seed through symlink: ${filePath}`);
+      }
+      existing = await readFile(filePath, "utf8");
+    } catch (error) {
+      if (isErrno(error, "ENOENT")) {
+        return;
+      }
+      throw error;
+    }
+    if (!untouchedGenericSeeds.includes(existing)) {
+      return;
+    }
+    const afterStat = await lstat(filePath);
+    if (
+      afterStat.isSymbolicLink() ||
+      afterStat.ino !== beforeStat.ino ||
+      afterStat.size !== Buffer.byteLength(existing, "utf8")
+    ) {
+      return;
+    }
+    await writeFileAtomic(filePath, targetContent);
+  });
+}
+
 export async function ensureVault(
   vaultPath: string,
+  options?: string | { agentId?: string },
 ): Promise<EnsureVaultResult> {
   const created: string[] = [];
   try {
@@ -1057,12 +1249,29 @@ export async function ensureVault(
     created.push(full);
   }
 
-  await seedExclusiveFile(
+  const explicitAgentId =
+    typeof options === "string" ? options : options?.agentId;
+  const inferred = resolveEffectiveVaultAgent(vaultPath, explicitAgentId);
+  const shouldPromote = inferred !== undefined;
+
+  await seedOrPromoteVaultFile(
     path.join(vaultPath, "schema", "AGENTS.md"),
-    schemaContent(),
+    schemaContent(inferred),
+    [schemaContent(undefined)],
+    shouldPromote,
   );
-  await seedExclusiveFile(path.join(vaultPath, "index.md"), indexContent());
-  await seedExclusiveFile(path.join(vaultPath, "log.md"), logContent());
+  await seedOrPromoteVaultFile(
+    path.join(vaultPath, "index.md"),
+    indexContent(inferred),
+    ["# Minni Index\n\n", indexContent(undefined)],
+    shouldPromote,
+  );
+  await seedOrPromoteVaultFile(
+    path.join(vaultPath, "log.md"),
+    logContent(inferred),
+    ["# Minni Log\n\n", logContent(undefined)],
+    shouldPromote,
+  );
 
   return { vaultPath, created };
 }
@@ -1116,9 +1325,10 @@ function escapeAuditDetailsBlock(raw: string): string {
   return block;
 }
 
-export function getAgentIdFromVaultPath(vaultPath: string): string {
-  const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
-
+// Explicit tenant mappings only (MINNI_AGENT_VAULTS, the fixed platform
+// *_VAULT_PATH env vars, ~/.minni/<agent>-vault layout). Undefined when nothing
+// is configured.
+function explicitAgentIdForVault(absPath: string): string | undefined {
   const mappingRaw = process.env.MINNI_AGENT_VAULTS;
   if (mappingRaw) {
     try {
@@ -1127,29 +1337,51 @@ export function getAgentIdFromVaultPath(vaultPath: string): string {
         for (const [agentId, mappedPath] of Object.entries(mapping as Record<string, unknown>)) {
           if (typeof mappedPath === "string") {
             const absMapped = path.resolve(mappedPath.replace(/^~(?=$|\/)/, os.homedir()));
-            if (absMapped === absPath) return agentId;
+            if (absMapped === absPath && typeof agentId === "string" && agentId.trim().length > 0) {
+              return agentId.trim();
+            }
           }
         }
       }
     } catch {}
   }
 
+  // Each platform vault var is paired with its *_AGENT_ID override (same
+  // fallback as config.ts), so a tenant vault resolves to its configured owner.
   const envKeys = [
-    { key: "MINNI_CODEX_VAULT_PATH", id: "codex" },
-    { key: "MINNI_CLAUDECODE_VAULT_PATH", id: "claude-code" },
-    { key: "MINNI_KILOCODE_VAULT_PATH", id: "kilocode" },
+    { key: "MINNI_CODEX_VAULT_PATH", agentKey: "MINNI_CODEX_AGENT_ID", id: "codex" },
+    { key: "MINNI_CLAUDECODE_VAULT_PATH", agentKey: "MINNI_CLAUDECODE_AGENT_ID", id: "claude-code" },
+    { key: "MINNI_KILOCODE_VAULT_PATH", agentKey: "MINNI_KILOCODE_AGENT_ID", id: "kilocode" },
+    { key: "MINNI_GEMINI_VAULT_PATH", agentKey: "MINNI_GEMINI_AGENT_ID", id: "gemini" },
+    { key: "MINNI_GROK_VAULT_PATH", agentKey: "MINNI_GROK_AGENT_ID", id: "grok-build" },
+    { key: "MINNI_CURSOR_VAULT_PATH", agentKey: "MINNI_CURSOR_AGENT_ID", id: "cursor" },
   ];
-  for (const { key, id } of envKeys) {
+  for (const { key, agentKey, id } of envKeys) {
     const val = process.env[key];
     if (val && path.resolve(val.replace(/^~(?=$|\/)/, os.homedir())) === absPath) {
-      return id;
+      const override = process.env[agentKey]?.trim();
+      return override && override.length > 0 ? override : id;
     }
   }
+
+  // No generic MINNI_<AGENT>_VAULT_PATH reverse mapping: the env key is lossy
+  // (team.alpha and team-alpha both become TEAM_ALPHA), so an id derived from
+  // it can name a nonexistent principal. Use MINNI_AGENT_VAULTS for those.
 
   const homedir = os.homedir();
   if (absPath === path.join(homedir, ".minni", "codex-vault")) return "codex";
   if (absPath === path.join(homedir, ".minni", "claudecode-vault")) return "claude-code";
   if (absPath === path.join(homedir, ".minni", "kilocode-vault")) return "kilocode";
+  if (absPath === path.join(homedir, ".minni", "gemini-vault")) return "gemini";
+  if (absPath === path.join(homedir, ".minni", "grok-build-vault")) return "grok-build";
+  if (absPath === path.join(homedir, ".minni", "cursor-vault")) return "cursor";
+  return undefined;
+}
+
+export function getAgentIdFromVaultPath(vaultPath: string): string {
+  const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+  const explicit = explicitAgentIdForVault(absPath);
+  if (explicit !== undefined) return explicit;
 
   const base = path.basename(absPath);
   if (base.endsWith("-vault")) {
@@ -1157,24 +1389,25 @@ export function getAgentIdFromVaultPath(vaultPath: string): string {
     // Known basename aliases must normalize regardless of parent dir, so a
     // claudecode-vault under a non-default MINNI_HOME still maps to the
     // claude-code principal instead of a capability-less "claudecode".
-    if (stripped === "claudecode" || stripped === "claude") return "claude-code";
-    return stripped;
+    return normalizeAgentId(stripped);
   }
   return base || "agent";
 }
 
 export async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
-  const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-  const fh = await open(
-    filePath,
-    fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow,
-  );
-  try {
-    await fh.writeFile(content, "utf8");
-    await fh.sync();
-  } finally {
-    await fh.close();
-  }
+  await withVaultFileLock(filePath, async () => {
+    const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+    const fh = await open(
+      filePath,
+      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow,
+    );
+    try {
+      await fh.writeFile(content, "utf8");
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  });
 }
 
 export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
@@ -1358,6 +1591,14 @@ export async function recordAudit(
   } catch {}
 
   if (currentSize >= 5 * 1024 * 1024) {
+    // An explicit ensureVault agent can't be recovered from the path, so keep
+    // the tenant the current log header was seeded with.
+    const seededHeader = await readFile(logPath, "utf8")
+      .then((text) => text.split("\n", 1)[0] ?? "")
+      .catch(() => "");
+    const seededAgent =
+      seededHeader.match(/^# (.+) Minni Log$/)?.[1] ??
+      (seededHeader === "# Minni Codex Log" ? "codex" : undefined);
     const path3 = path.join(vaultPath, "log.3.md");
     const path2 = path.join(vaultPath, "log.2.md");
     const path1 = path.join(vaultPath, "log.1.md");
@@ -1375,7 +1616,10 @@ export async function recordAudit(
 
     // Exclusive seed, then the append below. writeFileAtomic replace would
     // wipe a second tap that O_EXCL-created+appended the new log.md.
-    await seedExclusiveFile(logPath, logContent());
+    await seedExclusiveFile(
+      logPath,
+      logContent(resolveEffectiveVaultAgent(vaultPath, seededAgent)),
+    );
   }
 
   // --- 3. Format and Append Audit Line ---
@@ -1496,7 +1740,11 @@ export async function writeVaultPage(
   input: WriteVaultPageInput,
   deps: WriteVaultPageDeps = {},
 ): Promise<VaultWriteResult> {
-  await ensureVault(input.vaultPath);
+  const agent = input.frontmatter?.agent;
+  await ensureVault(
+    input.vaultPath,
+    typeof agent === "string" ? { agentId: agent } : undefined,
+  );
   const relativePath = sectionPath(input.section, input.title);
   const notePath = path.join(input.vaultPath, relativePath);
   await mkdir(path.dirname(notePath), { recursive: true });
@@ -1557,7 +1805,7 @@ export async function vaultFirstLearn(
     section: "sessions",
     source: input.source,
     frontmatter: {
-      agent: input.agentId ?? "codex",
+      agent: resolveEffectiveVaultAgent(input.vaultPath, input.agentId) ?? "agent",
       category: input.category ?? "general",
       minni_learning: true,
     },
@@ -2212,6 +2460,7 @@ export async function searchVaultNotes(
   vaultPath: string,
   query: string,
   limit = 5,
+  agentId?: string,
 ): Promise<VaultSearchResult[]> {
   const terms = queryTerms(query);
   const phrases = phraseForms(query);
@@ -2226,7 +2475,7 @@ export async function searchVaultNotes(
     cache && cache.notes.size >= 20 && now - cache.builtAtMs <= 30_000,
   );
   if (!hasWarmCache) {
-    await ensureVault(vaultPath);
+    await ensureVault(vaultPath, agentId ? { agentId } : undefined);
   }
   if (terms.length === 0 && phrases.length === 0) return [];
 

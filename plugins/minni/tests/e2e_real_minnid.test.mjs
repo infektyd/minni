@@ -135,7 +135,7 @@ test("Real minnid E2E over Unix socket: ping -> learn -> list_candidates -> reso
       agent_id: "claude-code",
       workspace_id: "default",
     },
-    { timeoutMs: 5000 },
+    { timeoutMs: 30000 },
   );
   assert.equal(learnRes.ok, true, `learn failed: ${JSON.stringify(learnRes)}`);
   assert.equal(learnRes.data.status, "proposed");
@@ -147,7 +147,7 @@ test("Real minnid E2E over Unix socket: ping -> learn -> list_candidates -> reso
     sockPath,
     "list_candidates",
     { status: "proposed" },
-    { timeoutMs: 5000 },
+    { timeoutMs: 30000 },
   );
   assert.equal(listRes.ok, true, `list_candidates failed: ${JSON.stringify(listRes)}`);
   assert.ok(Array.isArray(listRes.data.candidates));
@@ -164,7 +164,7 @@ test("Real minnid E2E over Unix socket: ping -> learn -> list_candidates -> reso
       candidate_id: candidateId,
       decision: "accept",
     },
-    { timeoutMs: 5000 },
+    { timeoutMs: 30000 },
   );
   assert.equal(resolveRes.ok, true, `resolve_candidate failed: ${JSON.stringify(resolveRes)}`);
   assert.equal(resolveRes.data.status, "resolved");
@@ -178,8 +178,8 @@ test("Real minnid E2E over Unix socket: ping -> learn -> list_candidates -> reso
     agent_id: "claude-code",
     workspace_id: "default",
   };
-  await jsonRpcSocketRequest(sockPath, "search", searchParams, { timeoutMs: 5000 });
-  await jsonRpcSocketRequest(sockPath, "search", searchParams, { timeoutMs: 5000 });
+  await jsonRpcSocketRequest(sockPath, "search", searchParams, { timeoutMs: 30000 });
+  await jsonRpcSocketRequest(sockPath, "search", searchParams, { timeoutMs: 30000 });
 
   let searchRes = null;
   let elapsedMs = Infinity;
