@@ -42,15 +42,37 @@ Minni enforces its read/write policy and labels recalled text as evidence. These
 
 | | **Minni** | [mem0](https://github.com/mem0ai/mem0) | [MemOS](https://github.com/MemTensor/MemOS) | [basic-memory](https://github.com/basicmachines-co/basic-memory) |
 |---|---|---|---|---|
-| Where memory lives | **Your machine** (Markdown + SQLite + FAISS) | Hosted cloud / self-hosted SDK (vector + graph DBs) | Self-hosted / cloud Memory OS (SQLite + vector/graph DBs) | Your machine (Markdown + SQLite; optional cloud sync) |
-| Agents | **Multi-agent, one governed daemon** (per-agent + shared scope) | Multi-entity (`user_id` / `agent_id` / `run_id`) + MCP | Multi-agent `MemCube` sharing + MCP | MCP-compatible, single personal knowledge graph |
-| Writes to memory | **Proposal-first, approval-gated** (human by default, delegable) | Automatic LLM extraction (`memory.add`) | Automatic OS/LLM-managed extraction | Direct agent Markdown write |
-| You can read it in an editor | **Yes** | No (opaque vector/graph DB rows) | Partially (DB + vector stores) | Yes |
-| Benchmark claims | **`bench/membench` published** — L1 `nDCG@10=0.99, MRR=1.00` (fixture) · `nDCG@10=0.82, MRR=0.82` (522-doc vault); L2 `0.00` poison compliance | LoCoMo single-agent benchmark claims | LoCoMo / LongMemEval benchmark claims | n/a |
+| **Where memory lives** | **Your machine** (Markdown + SQLite + FAISS) | Cloud or self-hosted SDK (vector + graph DBs) | Cloud or self-hosted OS (SQLite + vector/graph DBs) | Your machine (Markdown + SQLite; optional cloud sync) |
+| **Multi-agent support** | **Shared local daemon** (per-agent + shared scopes) | Scoped by ID (`user_id` / `agent_id`) + MCP | Multi-agent `MemCube` sharing + MCP | Single personal knowledge graph (MCP) |
+| **How memory is written** | **Proposal-first, approval-gated** (human or delegated) | Automatic LLM extraction (`memory.add`) | Automatic LLM/OS extraction | Direct Markdown writes by the agent |
+| **Human-readable files** | **Yes** (plain Markdown) | No (opaque DB rows) | Partially (DB + vector stores) | Yes (plain Markdown) |
+| **Published benchmarks** | **`bench/membench` included** (see results below) | Single-agent LoCoMo | LoCoMo / LongMemEval | [LoCoMo suite](https://github.com/basicmachines-co/basic-memory/tree/main/benchmarks) |
 
-**TL;DR:** Minni is the local-first **and** multi-agent **and** governed corner of the space. `mem0` is a cloud/SDK layer with automatic LLM fact extraction; `MemOS` is a heavier multi-cube Memory OS; `basic-memory` shares the local Markdown-first DNA without a multi-principal governance daemon; stateful agent runtimes (`Letta` / MemGPT) and temporal graph servers (`Graphiti` / `Zep`) require database-backed servers rather than plain Markdown vaults.
+**The short version:** Minni sits in the **local-first, multi-agent, and approval-gated** corner of the ecosystem:
+- **mem0** and **MemOS** extract facts automatically via LLMs into database-backed stores.
+- **basic-memory** shares Minni's local Markdown philosophy, but lets agents write directly to files without a multi-agent governance daemon.
+- **Letta (MemGPT)** and **Graphiti / Zep** provide stateful runtimes or temporal graphs, but require dedicated database servers rather than plain-text vaults you can open in an editor.
 
-**Executed `bench/membench` scorecard (`v0.6.0`, `make bench` / `PYTHONPATH=bench .venv/bin/python -m membench.run_bench --live-minni`):** On the public synthetic fixture (`k=10`), live `minnid` (`all-MiniLM-L6-v2` + `ms-marco-MiniLM-L-6-v2`) achieves **`recall@10 = 1.0000`, `nDCG@10 = 0.9854`, `MRR = 1.0000`** (`p50 = 91.3 ms`, `p95 = 105.5 ms`), ahead of `markdown_grep` (`nDCG@10 = 0.9721`, `MRR = 0.9545`), `naive_rag` (`nDCG@10 = 0.9648`, `MRR = 0.9545`), `llm_wiki` (`nDCG@10 = 0.8646`, `MRR = 0.8136`), and `native_platform` (`nDCG@10 = 0.4561`, `MRR = 0.2802`), with **Layer-2 `task_success = 1.0000` (18/18 episodes × 5 trials) and `0.0000` poisoned-memory injection compliance**. On the 522-document / 177-query real-vault corpus (`single_hop`, `multi_hop`, `contradiction`, `recency`, `negative`), Minni achieves **`recall@10 = 0.8839`, `nDCG@10 = 0.8185`, `MRR = 0.8173`**, outperforming `naive_rag` (`0.8839` / `0.7729` / `0.7578`) and `markdown_grep` (`0.8276` / `0.7210` / `0.7045`). Honest caveats: Minni is **early (v0.6.0)**, with small adoption, offline deterministic `StubAgent`/`StubJudge` by default in Layer-2 (unless `--real-llm` is enabled), and no hosted or multi-device option. The daemon installs with one `pipx install minni`, though the runtime footprint is heavier than SDK-only tools (a running daemon, FAISS/embedding models, and Node >= 20 for the MCP plugin). "Multi-agent" means multiple agent runtimes sharing one local daemon on one host, not agents distributed across machines.
+### Benchmarks (`bench/membench`, v0.6.0)
+
+Run `make bench` for the fast offline stub check, or `PYTHONPATH=bench .venv/bin/python -m membench.run_bench --live-minni` to reproduce the bundled synthetic fixture against a live `minnid` (the 522-doc real-vault run uses a private local vault via `--corpus` / `--gold`, not bundled in the public repo). Using `all-MiniLM-L6-v2` + `ms-marco-MiniLM-L-6-v2`:
+
+* **Real-vault corpus (522 docs, 177 queries across single-hop, multi-hop, contradiction, recency, and negative tests):**
+  * **Minni:** `recall@10 = 0.88`, `nDCG@10 = 0.82`, `MRR = 0.82`
+  * **Naive RAG:** `recall@10 = 0.88`, `nDCG@10 = 0.77`, `MRR = 0.76`
+  * **Markdown grep:** `recall@10 = 0.83`, `nDCG@10 = 0.72`, `MRR = 0.70`
+* **Public synthetic fixture (`k=10`):**
+  * **Minni:** `recall@10 = 1.00`, `nDCG@10 = 0.99`, `MRR = 1.00` (`p50 = 91 ms`, `p95 = 106 ms`)—ahead of `markdown_grep` (`0.97` nDCG / `0.95` MRR), `naive_rag` (`0.96` / `0.95`), `llm_wiki` (`0.86` / `0.81`), and `native_platform` (`0.46` / `0.28`).
+* **End-to-end task & safety harness (Layer 2, offline deterministic `StubAgent`/`StubJudge` negative control by default; pass `--real-llm` for live LLM evaluation):**
+  * **Task success:** `1.00` (18/18 episodes × 5 trials)
+  * **Poisoned-memory compliance:** `0.00` (0/18 poisoned-instruction target matches in the default stub control)
+
+### Honest trade-offs & caveats
+
+* **Early stage:** Minni is at `v0.6.0` with a small user base.
+* **Single-machine scope:** "Multi-agent" means multiple agent tools (e.g., Claude Code, Codex, Cursor, Gemini) sharing one local daemon on your machine—there is no cloud hosting or multi-device sync.
+* **Heavier local footprint:** While it installs in one command (`pipx install minni`), it runs a background daemon with local embedding/FAISS models and requires Node >= 20 for the MCP plugin.
+* **Offline benchmark defaults:** Layer-2 benchmarks use a deterministic `StubAgent`/`StubJudge` by default for reproducible offline runs unless `--real-llm` is passed.
 
 ## Quickstart
 
