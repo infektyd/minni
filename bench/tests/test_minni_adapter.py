@@ -1715,3 +1715,28 @@ def test_spawn_daemon_writes_accept_flagged_principal(monkeypatch):
         assert captured["env"]["MINNI_AGENT_ID"] == "main"
     finally:
         adapter.teardown()
+
+
+def test_query_passes_timeout_ms_above_faiss_rebuild_floor(monkeypatch, corpus, budget, tmp_path):
+    """MinniAdapter.query() must pass timeout_ms=60000 in search RPC params so
+    the daemon's cooperative budget (0.9 * timeout_ms = 54s) exceeds
+    SEARCH_FAISS_REBUILD_MIN_REMAINING_S (27s) and warms the FAISS index after
+    fresh ingest instead of degrading to lexical FTS-only."""
+    import membench.adapters.minni_adapter as mod
+
+    adapter = MinniAdapter()
+    _prime_adapter_for_query(adapter, corpus, tmp_path)
+    captured_params: dict = {}
+
+    def _fake_rpc(sock, method, params, **k):
+        captured_params.update(params)
+        return {"results": [], "learnings": []}
+
+    monkeypatch.setattr(mod, "_rpc", _fake_rpc)
+    try:
+        adapter.query("solstice backup shelf", budget)
+        assert captured_params.get("timeout_ms") == 60000
+    finally:
+        adapter._corpus = None
+        adapter.teardown()
+

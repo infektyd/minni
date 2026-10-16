@@ -19,7 +19,7 @@ A single local **daemon** (`minnid`) over a Unix socket, a typed **MCP surface**
 
 Four verbs cover the lifecycle:
 
-- **Recall** — cited, provenance-tagged retrieval across the personal and shared legs, pairing a `< 0.5 ms` Tier 1 in-memory prefix/token Trie and `< 10 ms` Tier 2 SQLite FTS5 BM25 (`mode="fast"`) with FAISS vector search, weighted Reciprocal Rank Fusion (`0.60` FTS / `0.40` semantic), top-10 FTS slot reservation, Cross-Encoder reranking (`>= 0.35` floor), and MMR packing.
+- **Recall** — cited, provenance-tagged retrieval across the personal and shared legs, pairing a `< 0.5 ms` Tier 1 in-memory prefix/token Trie (`0.27 ms` p50) and `< 10 ms` Tier 2 SQLite FTS5 BM25 + Trie RRF (`mode="fast"`, `2.29 ms` p50; auto-selected on corpora `>= 50` docs when `backend`/`expand`/`claim`/`summarize_neighborhood` are unset) with FAISS vector search (`all-MiniLM-L6-v2`), weighted Reciprocal Rank Fusion (`0.60` FTS / `0.40` semantic, `rrf_k=60`), top-10 FTS slot reservation, Cross-Encoder reranking (`ms-marco-MiniLM-L-6-v2`; semantic-only confidence floor `>= -4.0` logit, or `>= -1.0` logit / `>= 0.35` cosine similarity when FTS is empty), and token-budgeted MMR packing (`budget_tokens`).
 - **Learn** — normally stage a shared-learning candidate (`pattern`, `fix`, `decision`, `preference`, `fact`, `procedure`, `architecture`, `codebase`, `general`). The MCP tool also persists a personal vault note and synchronously indexes it (`index_single_file` / `vault_index_doc`) so the note is recallable immediately with zero post-learn blind window; operator-configured approval paths are described in [Concepts](docs/concepts.md#delegating-approval).
 - **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Acceptance commits the shared learning (preserving the original proposing principal and category while recording the resolver in `resolved_by`) and triggers synchronous single-file indexing; if follow-up indexing reports `indexed=false`, it can be repaired without resubmitting. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent, including the background AFM auto-consolidation pass (functional since [#119](https://github.com/infektyd/minni/issues/119) closed) — every path lands in the same audited gate.
 - **Handoff** — explicit cross-agent transfers with leases, so work and context move between runtimes deliberately.
@@ -42,15 +42,15 @@ Minni enforces its read/write policy and labels recalled text as evidence. These
 
 | | **Minni** | [mem0](https://github.com/mem0ai/mem0) | [MemOS](https://github.com/MemTensor/MemOS) | [basic-memory](https://github.com/basicmachines-co/basic-memory) |
 |---|---|---|---|---|
-| Where memory lives | **Your machine** (Markdown + SQLite) | Hosted service / SDK | Research memory-OS | Your machine (Markdown) |
-| Agents | **Multi-agent, one governed daemon** | Single-agent focus | Research multi-memory | Single personal vault |
-| Writes to memory | **Proposal-first, approval-gated** (human by default, delegable) | Automatic extraction | Managed by the OS | Direct |
-| You can read it in an editor | **Yes** | No | Partially | Yes |
-| Benchmark claims | **None published** | Benchmark-optimized | Research benchmarks | n/a |
+| Where memory lives | **Your machine** (Markdown + SQLite + FAISS) | Hosted cloud / self-hosted SDK (vector + graph DBs) | Self-hosted / cloud Memory OS (SQLite + vector/graph DBs) | Your machine (Markdown + SQLite; optional cloud sync) |
+| Agents | **Multi-agent, one governed daemon** (per-agent + shared scope) | Multi-entity (`user_id` / `agent_id` / `run_id`) + MCP | Multi-agent `MemCube` sharing + MCP | MCP-compatible, single personal knowledge graph |
+| Writes to memory | **Proposal-first, approval-gated** (human by default, delegable) | Automatic LLM extraction (`memory.add`) | Automatic OS/LLM-managed extraction | Direct agent Markdown write |
+| You can read it in an editor | **Yes** | No (opaque vector/graph DB rows) | Partially (DB + vector stores) | Yes |
+| Benchmark claims | **`bench/membench` published** — L1 `nDCG@10=0.99, MRR=1.00` (fixture) · `nDCG@10=0.82, MRR=0.82` (522-doc vault); L2 `0.00` poison compliance | LoCoMo single-agent benchmark claims | LoCoMo / LongMemEval benchmark claims | n/a |
 
-**TL;DR:** Minni is the local-first **and** multi-agent **and** governed corner of the space. mem0 is the mature hosted layer optimizing single-agent recall benchmarks; MemOS is a heavier research memory-OS; basic-memory shares the Markdown-first DNA but is one personal knowledge graph without a governing daemon on top.
+**TL;DR:** Minni is the local-first **and** multi-agent **and** governed corner of the space. `mem0` is a cloud/SDK layer with automatic LLM fact extraction; `MemOS` is a heavier multi-cube Memory OS; `basic-memory` shares the local Markdown-first DNA without a multi-principal governance daemon; stateful agent runtimes (`Letta` / MemGPT) and temporal graph servers (`Graphiti` / `Zep`) require database-backed servers rather than plain Markdown vaults.
 
-Honest caveats: Minni is **early (v0.6)**, with tiny adoption, no published benchmarks, and no hosted or multi-device option. The daemon installs with one `pipx install minni`, but the runtime footprint is still heavier than SDK-style tools (a running daemon, FAISS/embedding models, and Node >= 20 on the machine for the MCP plugin). "Multi-agent" means multiple agent runtimes sharing one local daemon on one host, not agents distributed across machines.
+**Executed `bench/membench` scorecard (`v0.6.0`, `make bench` / `PYTHONPATH=bench .venv/bin/python -m membench.run_bench --live-minni`):** On the public synthetic fixture (`k=10`), live `minnid` (`all-MiniLM-L6-v2` + `ms-marco-MiniLM-L-6-v2`) achieves **`recall@10 = 1.0000`, `nDCG@10 = 0.9854`, `MRR = 1.0000`** (`p50 = 91.3 ms`, `p95 = 105.5 ms`), ahead of `markdown_grep` (`nDCG@10 = 0.9721`, `MRR = 0.9545`), `naive_rag` (`nDCG@10 = 0.9648`, `MRR = 0.9545`), `llm_wiki` (`nDCG@10 = 0.8646`, `MRR = 0.8136`), and `native_platform` (`nDCG@10 = 0.4561`, `MRR = 0.2802`), with **Layer-2 `task_success = 1.0000` (18/18 episodes × 5 trials) and `0.0000` poisoned-memory injection compliance**. On the 522-document / 177-query real-vault corpus (`single_hop`, `multi_hop`, `contradiction`, `recency`, `negative`), Minni achieves **`recall@10 = 0.8839`, `nDCG@10 = 0.8185`, `MRR = 0.8173`**, outperforming `naive_rag` (`0.8839` / `0.7729` / `0.7578`) and `markdown_grep` (`0.8276` / `0.7210` / `0.7045`). Honest caveats: Minni is **early (v0.6.0)**, with small adoption, offline deterministic `StubAgent`/`StubJudge` by default in Layer-2 (unless `--real-llm` is enabled), and no hosted or multi-device option. The daemon installs with one `pipx install minni`, though the runtime footprint is heavier than SDK-only tools (a running daemon, FAISS/embedding models, and Node >= 20 for the MCP plugin). "Multi-agent" means multiple agent runtimes sharing one local daemon on one host, not agents distributed across machines.
 
 ## Quickstart
 
@@ -66,7 +66,7 @@ minni up       # start the daemon in the background
 minni doctor   # verify the install end to end
 ```
 
-`doctor` checks the local install subset: interpreter floor, socket presence/permissions, daemon `status` shape, a recall round-trip, and model-cache presence. It does **not** run wire verify probes (MCP handshake, hook dry-run, config readback — those belong to `minni wire` re-run) and does **not** assert the CI hermetic smoke's throwaway-`MINNI_HOME` isolation. `minni down` stops the daemon.
+`doctor` checks the 6-part local install subset: interpreter floor, socket presence/permissions, daemon `status` shape, a recall round-trip, model-cache presence, and `fleet` deploy lag (`plugin/daemon not reporting deploy lag`). It does **not** run wire verify probes (MCP handshake, hook dry-run, config readback — those belong to `minni wire` re-run) and does **not** assert the CI hermetic smoke's throwaway-`MINNI_HOME` isolation. `minni down` stops the daemon.
 
 ### 2. Wire your agents
 
@@ -95,7 +95,7 @@ Swap the platform for any of these:
 | `gemini` | provisional | `wire all` skips it with a warning — see [docs/runtimes/gemini.md](docs/runtimes/gemini.md) |
 | `cursor` | fleet-known, skip | in `VALID_PLATFORMS` but wire expands to skip; install via `propagate.py` / `make sync-root` — [docs/runtimes/cursor.md](docs/runtimes/cursor.md) |
 
-Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback. Re-run `minni wire <platform>` to repeat those probes; `minni doctor` is interpreter/socket/status/recall/models only and never substitutes for wire verify. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
+Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback. Re-run `minni wire <platform>` to repeat those probes; `minni doctor` is interpreter/socket/status/recall/models/fleet only and never substitutes for wire verify. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
 
 ### Poke at it
 
@@ -124,12 +124,12 @@ Want proof agents are actually using memory? `minni watch` tails every recall, l
 
 **Keep hosts current:** after `pipx upgrade minni` or a `git pull` on a dogfood checkout, run **`minni sync`** so every wired agent (Claude / Codex / Grok / Kilo + cursor/antigravity) reloads the plugin payload — otherwise the daemon can move while hosts still run last week's `server.js`. See [docs/install.md](docs/install.md#keep-every-agent-host-current-minni-sync).
 
-If you run Minni from a source checkout (editable engine + wire-managed plugin tree), **`minni sync --full`** (or **`make sync-root`**) is the full refresh path: fast-forward to `origin/main`, reinstall, rebuild the plugin, redeploy with the D7 fleet partition, then **restart when launchd is loaded** (`launchctl kickstart`); without launchd it only probes the socket — bounce minnid yourself (`minni down && minni up` / systemd) if `deploy.stale` stays true. Watch `minni status` for the `deploy` block — top-level `deploy.stale` includes nested `plugin_dist.stale`. **`minni wire all` ≠ `propagate --platform all`**: wire covers codex/claude-code/kilocode/grok; propagate's `all` is only antigravity + cursor (and post-wire propagate of codex/kilo/grok rewrites MCP onto legacy trees). Full story: [deploy/README.md](deploy/README.md).
+If you run Minni from a source checkout (editable engine + wire-managed plugin tree), **`minni sync --full`** (or **`make sync-root`**) is the full refresh path: fast-forward to `origin/main`, reinstall, rebuild the plugin, redeploy with the D7 fleet partition, then **restart when launchd is loaded** (`launchctl kickstart`); without launchd it only probes the socket — bounce minnid yourself (`minni down && minni up` / systemd) if `deploy.stale` stays true. For local-first trunk development, **`make promote`** (`scripts/promote-proven.sh`, or `make promote-dry`) verifies that `HEAD`'s tree SHA is stamped in `.git/.proven-shas` by the local rootside gate before pushing to `origin/main` and running `make sync-root`. Watch `minni status` for the `deploy` block — top-level `deploy.stale` includes nested `plugin_dist.stale`. **`minni wire all` ≠ `propagate --platform all`**: wire covers codex/claude-code/kilocode/grok; propagate's `all` is only antigravity + cursor (and post-wire propagate of codex/kilo/grok rewrites MCP onto legacy trees). Full story: [deploy/README.md](deploy/README.md).
 
 ## Architecture at a glance
 
 ```mermaid
-%% Budget: 18 nodes / 16 edges. Dashed = host-fired; solid = someone calls.
+%% Budget: 12/18 nodes, 16 edges. Dashed = host-fired; solid = someone calls.
 %% Tool names re-verified 2026-08-04: the thread surface ships as minni_thread_*;
 %% the pre-rename minni_plan_* aliases are removed.
 flowchart TD
@@ -172,7 +172,7 @@ Two things reach the daemon that are not the same thing. **Agents call** MCP too
 
 ## Status
 
-Minni is pre-1.0. Version **0.5.0 is published on PyPI** ([release](https://pypi.org/project/minni/0.5.0/)); the daemon and CLI install with `pipx install minni`. The [changelog](CHANGELOG.md) records release history, while `main` can carry subsequent fixes under the same version string.
+Minni is pre-1.0. Version **0.6.0** is the current release on `main` ([PyPI project](https://pypi.org/project/minni/), with **0.5.0** previously published at [0.5.0](https://pypi.org/project/minni/0.5.0/) and `.github/workflows/release.yml` publishing the **0.6.0** wheel + bundled npm tarball on `v0.6.0` tag push); the daemon and CLI install with `pipx install minni`. The [changelog](CHANGELOG.md) records release history, while `main` can carry subsequent fixes under the same version string.
 
 | Surface | What identifies the content |
 |---|---|
@@ -182,7 +182,7 @@ Minni is pre-1.0. Version **0.5.0 is published on PyPI** ([release](https://pypi
 
 Runtime integrations cover Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code, with host-specific activation requirements described in [runtime setup](docs/runtimes/). A payload or MCP initialization check does not certify every native hook event. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
 
-What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation under a throwaway `MINNI_HOME` on every push. Locally, `minni doctor` covers a related subset (interpreter, socket, status, recall, models) without the home-isolation assert. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
+What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation under a throwaway `MINNI_HOME` on every push. Locally, `minni doctor` covers a related 6-check subset (`interpreter`, `socket`, `status`, `recall`, `models`, `fleet`) without the home-isolation assert. The benchmark harness (`bench/membench`, byte-reproducible Layer-1 scorecards via `make bench` or `PYTHONPATH=bench .venv/bin/python -m membench.run_bench --live-minni`) is executed against the real `v0.6.0` daemon + cached embedding/Cross-Encoder models (`recall@10 = 1.0000`, `nDCG@10 = 0.9854`, `MRR = 1.0000` on the synthetic fixture; `recall@10 = 0.8839`, `nDCG@10 = 0.8185`, `MRR = 0.8173` on the 522-doc / 177-query vault corpus; `0.0000` poisoned-memory injection compliance). In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 
 ## Documentation
 

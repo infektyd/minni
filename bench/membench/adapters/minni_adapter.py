@@ -270,9 +270,9 @@ _LIVE_DB = _LIVE_HOME / "minni.db"
 # *launches* these as a subprocess (a public process boundary), it does not
 # import them — so isolation (§7.5) holds.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_ENGINE_DIR = _REPO_ROOT / "engine"
-_MINNID_PY = _ENGINE_DIR / "minnid.py"
-_VENV_PYTHON = _ENGINE_DIR / ".venv" / "bin" / "python"
+_ENGINE_DIR = _REPO_ROOT / "src"
+_MINNID_PY = _ENGINE_DIR / "minni" / "minnid.py"
+_VENV_PYTHON = _REPO_ROOT / ".venv" / "bin" / "python"
 
 
 class MinniStandupError(RuntimeError):
@@ -507,6 +507,14 @@ class MinniAdapter:
         # the temp home so every home-rooted path the daemon derives stays under
         # the throwaway dir, not ~. (The data-safety guard above has already
         # proven tmp_home is outside every live root.)
+        real_hf_hub = Path(
+            os.environ.get("HUGGINGFACE_HUB_CACHE")
+            or (Path.home() / ".cache" / "huggingface" / "hub")
+        )
+        if real_hf_hub.is_dir():
+            env["HUGGINGFACE_HUB_CACHE"] = str(real_hf_hub)
+            env["HF_HUB_OFFLINE"] = "1"
+            env["TRANSFORMERS_OFFLINE"] = "1"
         env["HOME"] = str(tmp_home)
         env["MINNI_HOME"] = str(tmp_home)
         env["MINNI_VAULT_PATH"] = str(tmp_home / "vault")
@@ -827,7 +835,12 @@ class MinniAdapter:
         result = _rpc(
             self._socket_path,
             "search",
-            {"query": q, "limit": budget.max_docs, "depth": "chunk"},
+            {
+                "query": q,
+                "limit": budget.max_docs,
+                "depth": "chunk",
+                "timeout_ms": 60000,
+            },
             timeout=60.0,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
