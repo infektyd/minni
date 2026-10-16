@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 _BENCH_DIR = Path(__file__).resolve().parents[1]
-_FORBIDDEN_ROOTS = ("engine", "plugins")
+_FORBIDDEN_ROOTS = ("engine", "minni", "plugins")
 
 
 def _python_files():
