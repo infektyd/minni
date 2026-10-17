@@ -302,6 +302,19 @@ class SemanticRerankMixin:
         kwargs["batch_size"] = min(raw, self._CPU_PREDICT_BATCH_CAP)
         return kwargs
 
+    @staticmethod
+    def _record_daemon_latency(method: str, duration_s: float) -> None:
+        try:
+            import sys
+
+            minnid_mod = sys.modules.get("minni.minnid")
+            if minnid_mod is not None:
+                recorder = getattr(minnid_mod, "_record_latency", None)
+                if callable(recorder):
+                    recorder(method, duration_s)
+        except Exception:
+            pass
+
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
         """Re-rank candidates using the cross-encoder with generation-scoped caching."""
         import minni.retrieval as _ret
@@ -366,8 +379,12 @@ class SemanticRerankMixin:
                 self.last_rerank_degraded = "search deadline; skipped rerank"
                 return candidates
             if cross_encoder_unlocked_predict_safe():
+                ce_started = _ret.time.perf_counter()
                 scores = reranker.predict(
                     pairs, **self._pinned_cpu_cross_encoder_predict_kwargs()
+                )
+                self._record_daemon_latency(
+                    "cross_encoder", _ret.time.perf_counter() - ce_started
                 )
                 if _ret.past_search_deadline(self._current_deadline(), min_remaining=0):
                     self.last_rerank_degraded = (
@@ -380,7 +397,11 @@ class SemanticRerankMixin:
                     if not acquired or _ret.past_search_deadline(self._current_deadline()):
                         self.last_rerank_degraded = "search deadline; skipped rerank"
                         return candidates
+                    ce_started = _ret.time.perf_counter()
                     scores = reranker.predict(pairs, show_progress_bar=False)
+                    self._record_daemon_latency(
+                        "cross_encoder", _ret.time.perf_counter() - ce_started
+                    )
                     if _ret.past_search_deadline(
                         self._current_deadline(), min_remaining=0
                     ):
@@ -680,7 +701,9 @@ class SemanticRerankMixin:
                         query, show_progress_bar=False
                     ).astype(np.float32)
                 finally:
-                    self._add_encode_ms((_ret.time.perf_counter() - started) * 1000)
+                    elapsed_s = _ret.time.perf_counter() - started
+                    self._add_encode_ms(elapsed_s * 1000)
+                    self._record_daemon_latency("embedding", elapsed_s)
                 if _ret.past_search_deadline(deadline_monotonic, min_remaining=0):
                     self.last_vector_degraded = (
                         "search deadline exceeded during nonpreemptible encode"

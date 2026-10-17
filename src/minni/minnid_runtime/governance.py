@@ -235,11 +235,17 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         )
 
         import numpy as np
+        from minni.afm_passes.consolidation import (
+            content_hash as _content_hash,
+            find_active_learning_by_hash,
+        )
         from minni.writeback import CATEGORIES
 
         now = time.time()
         doc_ids_json = json.dumps(evidence_doc_ids) if evidence_doc_ids else None
-
+        supersedes = params.get("supersedes")
+        _have_hash_col = ensure_content_hash_column(wb.db)
+        _chash = _content_hash(content)
 
         emb_bytes = None
         if wb.model:
@@ -258,25 +264,56 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
             category = "general"
 
         with wb.db.cursor() as c:
-            c.execute("""
-                INSERT INTO learnings
-                (agent_id, category, content, source_doc_ids, source_query,
-                 confidence, embedding, created_at,
-                 assertion, applies_when, evidence_doc_ids, contradicts_id, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                agent_id, category, content,
+            if not supersedes and contradicts_id is None:
+                existing = find_active_learning_by_hash(c, _chash, agent_id)
+                if existing is not None:
+                    existing_lid = int(existing["learning_id"])
+                    if _have_hash_col:
+                        c.execute(
+                            "UPDATE learnings SET content_hash = ? "
+                            "WHERE learning_id = ? AND content_hash IS NULL",
+                            (_chash, existing_lid),
+                        )
+                    return context.make_response(
+                        {
+                            "status": "ok",
+                            "learning_id": existing_lid,
+                            "agent_id": agent_id,
+                            "category": existing.get("category") or category,
+                            "deduplicated": True,
+                        },
+                        request_id,
+                    )
+
+            _cols = (
+                "agent_id, category, content, source_doc_ids, source_query, "
+                "confidence, embedding, created_at, "
+                "assertion, applies_when, evidence_doc_ids, contradicts_id, status"
+            )
+            _vals = [
+                agent_id,
+                category,
+                content,
                 None,
                 params.get("source_query"),
                 params.get("confidence", 1.0),
-                emb_bytes, now,
-                assertion, applies_when, doc_ids_json,
+                emb_bytes,
+                now,
+                assertion,
+                applies_when,
+                doc_ids_json,
                 contradicts_id,
                 "active",
-            ))
+            ]
+            if _have_hash_col:
+                _cols += ", content_hash"
+                _vals.append(_chash)
+            c.execute(
+                f"INSERT INTO learnings ({_cols}) VALUES ({', '.join('?' * len(_vals))})",
+                _vals,
+            )
             lid = c.lastrowid
 
-            supersedes = params.get("supersedes")
             if supersedes:
                 c.execute(
                     "UPDATE learnings SET superseded_by = ? WHERE learning_id = ?",
@@ -1471,6 +1508,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
     try:
         db = context.sovereign_db()
         lid = None
+        deduplicated_accept = False
         author_agent = principal.agent_id
         with db.transaction() as c:
             c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
@@ -1551,19 +1589,70 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 ))
 
             if new_status == "accepted":
+                from minni.afm_passes.consolidation import (
+                    content_hash as _content_hash,
+                    find_active_learning_by_hash,
+                )
                 from minni.writeback import CATEGORIES
 
                 raw_cat = str(rowd.get("category") or params.get("category") or "general").strip().lower()
                 cat = raw_cat if raw_cat in CATEGORIES else "general"
+                _chash = _content_hash(content)
+                pragma_l = c.execute("PRAGMA table_info(learnings)").fetchall()
+                l_cols = {
+                    r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                    for r in pragma_l
+                }
+                _have_hash_col = "content_hash" in l_cols
+                _have_status_col = "status" in l_cols
+                existing_lids: list[int] = []
+                while True:
+                    existing = find_active_learning_by_hash(c, _chash, author_agent)
+                    if existing is None:
+                        break
+                    ex_lid = int(existing["learning_id"])
+                    if ex_lid in existing_lids:
+                        break
+                    existing_lids.append(ex_lid)
+                    if _have_status_col:
+                        c.execute(
+                            "UPDATE learnings SET status = 'superseded' WHERE learning_id = ?",
+                            (ex_lid,),
+                        )
+                    elif "superseded_by" in l_cols:
+                        c.execute(
+                            "UPDATE learnings SET superseded_by = -1 WHERE learning_id = ?",
+                            (ex_lid,),
+                        )
+                    else:
+                        break
+                ins_cols = ["agent_id", "category", "content", "created_at"]
+                ins_vals: list[Any] = [author_agent, cat, content, now]
+                if _have_status_col:
+                    ins_cols.append("status")
+                    ins_vals.append("active")
+                if _have_hash_col:
+                    ins_cols.append("content_hash")
+                    ins_vals.append(_chash)
                 c.execute(
-                    """
-                    INSERT INTO learnings
-                    (agent_id, category, content, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (author_agent, cat, content, now),
+                    f"INSERT INTO learnings ({', '.join(ins_cols)}) "
+                    f"VALUES ({', '.join('?' * len(ins_vals))})",
+                    ins_vals,
                 )
                 lid = c.lastrowid
+                for ex_lid in existing_lids:
+                    if _have_status_col and "superseded_by" in l_cols:
+                        c.execute(
+                            "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
+                            "WHERE learning_id = ?",
+                            (lid, ex_lid),
+                        )
+                    elif "superseded_by" in l_cols:
+                        c.execute(
+                            "UPDATE learnings SET superseded_by = ? "
+                            "WHERE learning_id = ?",
+                            (lid, ex_lid),
+                        )
                 # Coordinated canonical commit: the join row lands in the same
                 # transaction as the learning + candidate status update, so a
                 # mid-commit failure rolls all three back. Typed edges come

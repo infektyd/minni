@@ -2367,20 +2367,77 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                     lines.append(line)
 
         with db.cursor() as c:
-            c.execute("""
-                SELECT learning_id, category, content, confidence, created_at
-                FROM learnings
-                WHERE agent_id = ? AND superseded_by IS NULL
-                ORDER BY created_at DESC
-                LIMIT 10
-            """, (agent_id,))
+            try:
+                c.execute(
+                    """
+                    SELECT learning_id, category, content, confidence, created_at, content_hash
+                    FROM learnings
+                    WHERE agent_id = ?
+                      AND superseded_by IS NULL
+                      AND COALESCE(status, 'active') = 'active'
+                    ORDER BY created_at DESC, learning_id DESC
+                    LIMIT 50
+                    """,
+                    (agent_id,),
+                )
+            except Exception:
+                try:
+                    c.execute(
+                        """
+                        SELECT learning_id, category, content, confidence, created_at
+                        FROM learnings
+                        WHERE agent_id = ?
+                          AND superseded_by IS NULL
+                          AND COALESCE(status, 'active') = 'active'
+                        ORDER BY created_at DESC, learning_id DESC
+                        LIMIT 50
+                        """,
+                        (agent_id,),
+                    )
+                except Exception:
+                    c.execute(
+                        """
+                        SELECT learning_id, category, content, confidence, created_at
+                        FROM learnings
+                        WHERE agent_id = ?
+                          AND superseded_by IS NULL
+                        ORDER BY created_at DESC, learning_id DESC
+                        LIMIT 50
+                        """,
+                        (agent_id,),
+                    )
             rows = c.fetchall()
-            if rows:
+            from minni.afm_passes.consolidation import (
+                content_hash as _content_hash,
+                is_low_signal_boot_learning,
+            )
+
+            seen_hashes: set[str] = set()
+            selected_rows = []
+            for row in rows:
+                text = str(row["content"] or "")
+                if is_low_signal_boot_learning(text):
+                    continue
+                row_keys = row.keys() if hasattr(row, "keys") else ()
+                h = (
+                    row["content_hash"]
+                    if "content_hash" in row_keys and row["content_hash"]
+                    else None
+                ) or _content_hash(text)
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                selected_rows.append(row)
+                if len(selected_rows) >= 10:
+                    break
+
+            if selected_rows:
                 lines.append(f"\n## Learnings ({agent_id})")
-                for row in rows:
+                for row in selected_rows:
+                    conf = row["confidence"] if row["confidence"] is not None else 1.0
                     lines.append(
                         f"  - [{row['category']}] {row['content'][:150]} "
-                        f"(conf={row['confidence']:.1f})"
+                        f"(conf={float(conf):.1f})"
                     )
                     try:
                         c.execute(
@@ -2437,3 +2494,6 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
             except Exception:
                 pass
         context.record_latency("read", time.perf_counter() - started_at)
+
+
+handle_context = handle_read
