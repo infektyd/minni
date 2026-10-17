@@ -324,7 +324,7 @@ def _format_latency_block(latencies: object) -> str:
     """Render daemon.latencies ({method: {count, p50_ms, p95_ms}}) honestly.
 
     Only methods the daemon actually reports are shown; a method with no
-    samples (e.g. cross_encoder, never recorded on any path) reads 'no
+    samples (e.g. cross_encoder before any rerank has run) reads 'no
     samples yet' — never a fabricated zero. Malformed rows read
     'unavailable', and a missing/unshaped payload reads as not-reported.
     """

@@ -78,6 +78,29 @@ def content_hash(content: str) -> str:
     return hashlib.sha1(_normalize(content).encode("utf-8")).hexdigest()
 
 
+_RAW_PROMPT_ECHO_RE = re.compile(
+    r"^\s*(?:executed\s+prompt|user\s+prompt|raw\s+prompt|system\s+prompt|prompt\s+transcript)\s*:",
+    re.IGNORECASE,
+)
+_RAW_TEST_OUTPUT_RE = re.compile(
+    r"(?:^\s*=+\s*\d+\s+(?:passed|failed|skipped|error|errors|deselected)\b.*=+\s*$|^\s*(?:ran\s+\d+\s+tests?\s+in\s+[\d.]+s|test\s+suites?:\s+\d+\s+passed(?:\b.*)?|\d+\s+passed(?:,\s+\d+\s+\w+)*\s+in\s+[\d.]+s)\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def is_low_signal_boot_learning(content: str) -> bool:
+    """Return True if content is blank, a raw prompt echo, raw test runner output,
+    or an audit telemetry echo unsuitable for the boot context envelope."""
+    text = (content or "").strip() if isinstance(content, str) else ""
+    if not text:
+        return True
+    if _RAW_PROMPT_ECHO_RE.search(content) or _RAW_TEST_OUTPUT_RE.search(content):
+        return True
+    from minni.afm_passes.inbox_ingest import is_audit_echo
+
+    return is_audit_echo(content)
+
+
 def _quality_blockers(content: str) -> List[str]:
     """Structural quality gate. Returns reasons to WITHHOLD auto-promotion
     (the candidate is routed to review, never silently dropped).
@@ -90,6 +113,10 @@ def _quality_blockers(content: str) -> List[str]:
     text = (content or "").strip()
     if len(text) > 8000:
         reasons.append("oversized blob")
+    if _RAW_PROMPT_ECHO_RE.search(text):
+        reasons.append("raw prompt echo")
+    if _RAW_TEST_OUTPUT_RE.search(text):
+        reasons.append("raw test output telemetry")
     alnum_chars = {ch.lower() for ch in text if ch.isalnum()}
     if len(text) > 10 and len(alnum_chars) <= 2:
         reasons.append("low character diversity (filler)")
@@ -123,8 +150,84 @@ def _ensure_dedup_index(db) -> None:
             for r in nulls:
                 c.execute(
                     "UPDATE learnings SET content_hash=? WHERE learning_id=?",
-                    (content_hash(r["content"]), r["learning_id"]),
+                    (content_hash(r["content"] or ""), r["learning_id"]),
                 )
+
+
+def _learning_row_to_dict(r: Any) -> Dict[str, Any]:
+    if isinstance(r, dict) or hasattr(r, "keys"):
+        return dict(r)
+    return {
+        "learning_id": r[0],
+        "category": r[1],
+        "content": r[2],
+        "status": r[3],
+    }
+
+
+def find_active_learning_by_hash(
+    cursor, h: str, agent_id: str
+) -> Optional[Dict[str, Any]]:
+    """Return the newest active un-superseded learning matching (agent_id, h), or None."""
+    pragma = cursor.execute("PRAGMA table_info(learnings)").fetchall()
+    cols = {
+        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+        for r in pragma
+    }
+    status_col = "status" if "status" in cols else "'active' AS status"
+    status_where = (
+        "AND COALESCE(status, 'active') = 'active'" if "status" in cols else ""
+    )
+    sup_where = "AND superseded_by IS NULL" if "superseded_by" in cols else ""
+
+    if "content_hash" in cols:
+        cursor.execute(
+            f"""
+            SELECT learning_id, category, content, {status_col}
+            FROM learnings
+            WHERE content_hash = ? AND agent_id = ?
+              {status_where}
+              {sup_where}
+            ORDER BY created_at DESC, learning_id DESC
+            LIMIT 1
+            """,
+            (h, agent_id),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return _learning_row_to_dict(row)
+        cursor.execute(
+            f"""
+            SELECT learning_id, category, content, {status_col}
+            FROM learnings
+            WHERE content_hash IS NULL AND agent_id = ?
+              {status_where}
+              {sup_where}
+            ORDER BY created_at DESC, learning_id DESC
+            """,
+            (agent_id,),
+        )
+        for r in cursor.fetchall():
+            rd = _learning_row_to_dict(r)
+            if content_hash(rd["content"] or "") == h:
+                return rd
+    else:
+        cursor.execute(
+            f"""
+            SELECT learning_id, category, content, {status_col}
+            FROM learnings
+            WHERE agent_id = ?
+              {status_where}
+              {sup_where}
+            ORDER BY created_at DESC, learning_id DESC
+            """,
+            (agent_id,),
+        )
+        for r in cursor.fetchall():
+            rd = _learning_row_to_dict(r)
+            if content_hash(rd["content"] or "") == h:
+                return rd
+    return None
 
 
 def has_active_learning_hash(cursor, h: str, agent_id: str) -> bool:
@@ -134,12 +237,69 @@ def has_active_learning_hash(cursor, h: str, agent_id: str) -> bool:
     learning. Accept an existing cursor so auto-accept keeps its check inside
     the write transaction rather than opening a cursor that commits it early.
     """
-    cursor.execute(
-        "SELECT 1 FROM learnings WHERE content_hash=? AND agent_id=? "
-        "AND status='active' AND superseded_by IS NULL LIMIT 1",
-        (h, agent_id),
+    return find_active_learning_by_hash(cursor, h, agent_id) is not None
+
+
+def dedup_active_learnings(
+    db, agent_id: Optional[str] = None
+) -> Dict[str, int]:
+    """Supersede duplicate active learnings (keeping the newest learning_id per
+    (agent_id, content_hash)) and prune low-signal boot rows."""
+    _ensure_dedup_index(db)
+    query = (
+        "SELECT learning_id, agent_id, content, content_hash "
+        "FROM learnings "
+        "WHERE COALESCE(status, 'active') = 'active' "
+        "  AND superseded_by IS NULL"
     )
-    return cursor.fetchone() is not None
+    params: list[Any] = []
+    if agent_id is not None:
+        query += " AND agent_id = ?"
+        params.append(agent_id)
+    query += " ORDER BY created_at DESC, learning_id DESC"
+
+    with db.cursor() as c:
+        c.execute(query, params)
+        rows = [dict(r) for r in c.fetchall()]
+
+    winners: Dict[tuple[str, str], int] = {}
+    dup_updates: List[tuple[int, int]] = []
+    low_sig_ids: List[int] = []
+
+    for row in rows:
+        lid = int(row["learning_id"])
+        text = str(row.get("content") or "")
+        if is_low_signal_boot_learning(text):
+            low_sig_ids.append(lid)
+            continue
+        owner = str(row.get("agent_id") or "")
+        h = str(row.get("content_hash") or "") or content_hash(text)
+        key = (owner, h)
+        if key not in winners:
+            winners[key] = lid
+        else:
+            dup_updates.append((winners[key], lid))
+
+    if dup_updates or low_sig_ids:
+        with db.transaction() as c:
+            for winner_id, dup_id in dup_updates:
+                c.execute(
+                    "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
+                    "WHERE learning_id = ? AND superseded_by IS NULL",
+                    (winner_id, dup_id),
+                )
+            for low_id in low_sig_ids:
+                c.execute(
+                    "UPDATE learnings SET status = 'rejected' "
+                    "WHERE learning_id = ? AND superseded_by IS NULL",
+                    (low_id,),
+                )
+
+    return {
+        "superseded_duplicates": len(dup_updates),
+        "pruned_low_signal": len(low_sig_ids),
+        "examined": len(rows),
+    }
 
 
 def _hash_in_learnings(db, h: str, agent_id: str) -> bool:
