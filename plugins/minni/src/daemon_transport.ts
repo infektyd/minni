@@ -1188,6 +1188,41 @@ function isRoutineForeignScopeSuppression(
   );
 }
 
+/** Hit identifiers recorded on a `minni_recall` audit entry. */
+export interface RecallAuditHits {
+  doc_ids: number[];
+  chunk_ids: number[];
+  learning_ids: number[];
+}
+
+function collectIntIds(items: unknown, key: string): number[] {
+  if (!Array.isArray(items)) return [];
+  const ids: number[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const value = (item as Record<string, unknown>)[key];
+    if (typeof value === "number" && Number.isInteger(value) && !ids.includes(value)) {
+      ids.push(value);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Learn→recall lineage: the recall audit used to record only local
+ * `vaultMatches` paths, so a shared-store learning or daemon document that came
+ * back from a recall left no trace — "was this learning ever recalled?" needed
+ * raw session transcripts to answer. Record the daemon's own ids (ids only, no
+ * content or paths) so lineage is a join against the audit log.
+ */
+export function recallAuditHits(response: RecallResponse | undefined): RecallAuditHits {
+  return {
+    doc_ids: collectIntIds(response?.results, "doc_id"),
+    chunk_ids: collectIntIds(response?.results, "chunk_id"),
+    learning_ids: collectIntIds(response?.learnings, "learning_id"),
+  };
+}
+
 /**
  * W5: detect "the daemon answered but has nothing" from the wire shape, not
  * from English prose. Prefers `count` (recall.py response_payload always

@@ -8,6 +8,10 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `minni_recall` audit entries now record the daemon's returned `doc_ids`, `chunk_ids` and `learning_ids` (ids only, no content), so learn→recall lineage can be answered from the audit log instead of raw session transcripts. Previously only local `vaultMatches` paths were logged.
+
 ### Removed
 
 - Retired the Grok CI review and mechanical-approve gate, disabled since August for cost: the `Grok`, `Grok Code Review`, `Grok Mechanical Approve Gate` and `Grok Boundary Test` workflows, `.github/scripts/` (`grok_approve_gate.py`, `parse_grok_verdict.py`, `check-no-credential-leak.py`), their tests, and the `docs/ops/grok-reviewer-app.md` runbook. Merge trust on `main` is now required status checks only. Grok Build as a Minni runtime (hooks, adapter, `grok-build` principal, `docs/runtimes/grok.md`) is unaffected.

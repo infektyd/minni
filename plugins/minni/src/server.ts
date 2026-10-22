@@ -24,6 +24,7 @@ import {
   isDaemonResultEmpty,
   learnMemory,
   listPendingHandoffs,
+  recallAuditHits,
   recallCrossAgentDegrade,
   recallMemory,
   recallResponseText,
@@ -707,6 +708,9 @@ server.registerTool(
         agentId: DEFAULT_AGENT_ID, // G11: no longer from model
         includeVault: includeVault !== false,
         vaultMatches: vaultResults.map((match) => match.relativePath),
+        // Learn→recall lineage for daemon hits (vaultMatches only covers the
+        // local pre-scan). Ids only; empty on denial/outage.
+        ...(daemonOk && !identityDenied ? recallAuditHits(result.data) : {}),
         error: result.error,
         crossAgentDegraded: degradeText !== undefined,
         // Same id the daemon trace receives, so MCP recalls attribute in
