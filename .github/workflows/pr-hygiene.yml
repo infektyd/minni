@@ -16,7 +16,7 @@ jobs:
     name: Forbidden Files
     # Consumes the content verdict so the split does not DE-REQUIRE it.
     # "Forbidden Content" is not in branch protection's required set (checked:
-    # Forbidden Files, Free public cloud smoke, grok-mechanical-approve), so
+    # Forbidden Files, Free public cloud smoke), so
     # splitting alone would have moved a blocking failure onto a context nobody
     # enforces — a content hit would then merge. `always()` is required because
     # a skipped dependency otherwise skips this job too.

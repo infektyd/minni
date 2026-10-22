@@ -1,10 +1,10 @@
 """#258 — Make-driven pytest must import minni from *this* tree.
 
-Landing a ``tests/conftest.py`` edit forfeits the mechanical gate's automatic
-approval (``.github/scripts/grok_approve_gate.py`` path-denies it, along with
-``pyproject.toml`` and friends, since collection config can silently disable
-every tripwire below) — it needs operator/manual review instead, which is why
-the original #258 fix here avoided it. This module:
+Landing a ``tests/conftest.py`` edit forfeited the (since removed) mechanical
+gate's automatic approval (it path-denied it, along with ``pyproject.toml`` and
+friends, since collection config can silently disable every tripwire below) —
+it needed operator/manual review instead, which is why the original #258 fix
+here avoided it. This module:
 
 1. Pins that Makefile recipe text (fail-closed, active assignment on the same
    line as pytest)

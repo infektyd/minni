@@ -88,5 +88,4 @@ if the *intent* was legitimate.
    arrives pre-verified. For the manual section machine silence is not N/A;
    state N/A explicitly when none.
 
-See also: personal Grok App playbook in [grok-reviewer-app.md](grok-reviewer-app.md)
 (“Assumptions that became next PR goals”).
