@@ -106,8 +106,8 @@ def test_the_file_scan_still_runs_on_forks():
 
 def test_the_required_check_consumes_the_content_verdict():
     """The split moved a blocking failure onto a context nobody enforces.
-    Branch protection requires Forbidden Files, Free public cloud smoke and
-    grok-mechanical-approve — not Forbidden Content — so without this the
+    Branch protection requires Forbidden Files and Free public cloud smoke
+    — not Forbidden Content — so without this the
     content gate could fail and the PR would still merge."""
     files_job_name, files_job = _job_containing("No forbidden files in PR diff")
     content_job_name, _ = _job_containing("FORBIDDEN_CONTENT_PATTERN")
