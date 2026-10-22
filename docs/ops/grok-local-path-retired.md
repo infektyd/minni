@@ -1,8 +1,10 @@
 # The local Grok path (retired)
 
-**Status: retired.** Grok on this repo is served exclusively by GitHub Actions
-(`.github/workflows/grok.yml`, `grok-review.yml`, `grok-boundary-test.yml`). No
-Grok CI credential and no Grok agent execution lives on the operator's machine.
+**Status: retired.** Grok on this repo was later served exclusively by GitHub
+Actions (`.github/workflows/grok.yml`, `grok-review.yml`, `grok-boundary-test.yml`).
+Those workflows, the mechanical approve gate and `.github/scripts/` were retired
+in turn for cost; see the CHANGELOG. No Grok CI credential and no Grok agent
+execution lives on the operator's machine.
 
 The retired implementation was `scripts/grok_local_watch.py` (a poller that
 answered `@grok-local` GitHub mentions by running the Grok CLI locally against a

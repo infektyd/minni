@@ -43,7 +43,6 @@ Then restart agent apps so they reload `server.js` / hook entrypoints.
 
 - Truth policy (honesty vs goals): [docs-truth-policy.md](docs-truth-policy.md)
 - Fleet update: `minni sync` / [install.md](../install.md)
-- Grok App (personal CI gate): [grok-reviewer-app.md](grok-reviewer-app.md)
 
 ## Verification bar (Grok cold-tool guard)
 

@@ -24,7 +24,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 CLAUDE = WORKFLOWS / "claude.yml"
-GROK = WORKFLOWS / "grok.yml"
 
 ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
@@ -211,13 +210,6 @@ def test_a_mention_is_still_required(event):
     assert not _gate(event, "OWNER", mention=False)
 
 
-def test_author_gate_matches_the_grok_counterpart():
-    """Divergence between the two agent paths is the bug #236 filed."""
-    grok = _load(GROK)["jobs"]["decide"]["if"]
-    grok_roles = set(json.loads(re.search(r"fromJSON\('(\[.*?\])'\)", grok, re.S).group(1)))
-    assert grok_roles == ALLOWED_ASSOCIATIONS
-
-
 def test_no_dead_trigger_that_the_gate_can_never_admit():
     """`issues: assigned` reads the ISSUE AUTHOR's association, never the
     assigner's, so with the gate it could only fire for collaborator-authored
@@ -257,18 +249,6 @@ def test_the_review_workflow_that_never_reviewed_is_gone():
     )
 
 
-def test_the_gate_does_not_wait_on_a_workflow_that_no_longer_exists():
-    """grok-approve-gate re-evaluates on workflow_run completions. Naming a
-    deleted workflow there is stale config that reads as coverage."""
-    gate = _load(WORKFLOWS / "grok-approve-gate.yml")
-    listed = set((gate.get("on") or gate[True])["workflow_run"]["workflows"])
-    existing = {
-        _load(f).get("name") or f.name
-        for pattern in ("*.yml", "*.yaml") for f in WORKFLOWS.glob(pattern)
-    }
-    assert listed <= existing, f"gate waits on missing workflows: {listed - existing}"
-
-
 def test_no_commented_out_guard_masquerading_as_one():
     """A commented-out condition with no explanation reads as a guard that
     exists. #236 asks for a real gate or a stated reason — never this."""
@@ -281,29 +261,3 @@ def test_no_commented_out_guard_masquerading_as_one():
 @pytest.mark.parametrize("path", sorted(WORKFLOWS.glob("*.yml")))
 def test_every_workflow_still_parses(path):
     assert _load(path)["jobs"], f"{path.name}: no jobs"
-
-
-def test_the_operator_runbook_cannot_require_a_check_nothing_produces():
-    """docs/ops/grok-reviewer-app.md carries branch-protection payloads meant
-    to be run VERBATIM, and the doc itself notes that `checks` REPLACES the
-    whole list. It listed `claude-review`, produced by the job in the workflow
-    #240 removed — so following the runbook after that deletion would have
-    required a check that can never report again, blocking every merge to main
-    with no failure message. A landmine created by the deletion, not present
-    before it."""
-    runbook = (ROOT / "docs" / "ops" / "grok-reviewer-app.md").read_text(encoding="utf-8")
-    contexts = set(re.findall(r'"context":\s*"([^"]+)"', runbook))
-    assert contexts, "no protection payloads found — has the runbook moved?"
-
-    produced = set()
-    for pattern in ("*.yml", "*.yaml"):
-        for path in WORKFLOWS.glob(pattern):
-            for name, job in (_load(path).get("jobs") or {}).items():
-                produced.add(job.get("name") or name)
-    # Checks posted by an App rather than a job, named in the runbook's own prose.
-    produced |= {"grok-mechanical-approve"}
-
-    missing = contexts - produced
-    assert not missing, (
-        f"runbook would require checks nothing produces: {sorted(missing)}"
-    )

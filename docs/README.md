@@ -15,7 +15,7 @@ the reference.
 | [Security model](security.md) | Local-first boundaries and how the threat model is enforced |
 | [Contracts](contracts/) | The agent, capability, vault, workflow, and threat-model contracts |
 | [Deploy / root sync](../deploy/README.md) | `make sync-root`, D7 fleet partition (wire vs propagate), `deploy.stale` / `plugin_dist` |
-| [Ops notes](ops/) | Operator-facing notes (e.g. Grok local-path retirement, reviewer app) |
+| [Ops notes](ops/) | Operator-facing notes (e.g. Grok local-path retirement) |
 
 Operational references that predate this tree and remain canonical:
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md), [VAULT_INGEST.md](VAULT_INGEST.md),
