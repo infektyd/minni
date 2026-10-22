@@ -8,6 +8,10 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `minni_recall` audit entries now record the daemon's returned `doc_ids`, `chunk_ids` and `learning_ids` (ids only, no content), so learn→recall lineage can be answered from the audit log instead of raw session transcripts. Previously only local `vaultMatches` paths were logged.
+
 ## [0.6.0] - 2026-10-14
 
 Close of the 5-Phase Architectural Inquest & Rootside Promotion campaign. This release extinguishes legacy `sovereign_*` shims and dead vector stubs, decomposes `RetrievalEngine` into focused lexical/semantic mixins with a `< 0.5 ms` Tier 1 Trie + `< 10 ms` Tier 2 FTS5 BM25 fast path, adds synchronous single-file indexing on `minni_learn` and candidate acceptance, unblocks legacy `afm_review`-fenced candidates via migration `023`, and enforces a rootside-first `.git/.proven-shas` attestation and promotion pipeline. **Minor** version per the pre-1.0 convention: it contains breaking shim removals.
