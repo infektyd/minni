@@ -157,10 +157,70 @@ test("duplicate keys are examined once and never inflate the remainder", async (
   assert.deepEqual([result.sessions, result.remaining], [1, 1], "A once; only B is left");
 });
 
-// r4d: on a case-insensitive filesystem (APFS by default) any other spelling of
-// a session key names the same directory. Every key the ledger writes is
-// lowercase, so only that spelling is accepted from a caller.
-test("a cased spelling of unlabeled, or of a real key, finalises nothing and creates no directory", async (t) => {
+// r4d: every key the ledger writes is lowercase, so only that spelling is
+// accepted from a caller. Two shapes, so the test holds on both kinds of
+// filesystem:
+//   - EXACT: the cased spelling is a real directory of its own (no lowercase
+//     twin), with an unjudged surfacing and a state file holding an open
+//     window. That is what a case-sensitive filesystem (Linux CI) has, and on
+//     a case-insensitive one it is still its own directory: base finalises
+//     it on both.
+//   - ALIAS: only the lowercase session exists and the caller names it in
+//     another case. Base finalises it only where the filesystem folds case
+//     (APFS by default); elsewhere the alias names nothing.
+
+/** A detector state file with one open window (the shape agentFrom reads). */
+function openWindowState(sessionKey, sid) {
+  const acc = { actions: 0, seen: 0, first_text: false, dismissed: false, applied: false, cite_handle: false, cite_title: false, opened: false, title_assessable: false };
+  return {
+    v: 1,
+    session_key: sessionKey,
+    agents: {
+      main: {
+        wire: "claude-code",
+        principal: "claude-code",
+        reset_id: "initial",
+        windows: [
+          { sid, mkey: "vault:wiki/sessions/open.md", channel: "prompt_pointer", visible: true, title: "Open note", handles: [], shingles: [], echo: [], injected_is_memory: false, scope: "turn", turn_key: -1, boot_turns: 0, acc },
+        ],
+        exposures: [],
+        done: [],
+        last_activity: new Date(T0).toISOString(),
+      },
+    },
+  };
+}
+
+test("EXACT: a cased session that really exists on disk is never finalised through sessionKeys", async (t) => {
+  for (const cased of ["Unlabeled", "UNLABELED", A.toUpperCase()]) {
+    const { vault } = await makeVault(t, "minni-idle-exact-");
+    const row = seedIdle(vault, cased);
+    const stateDir = path.join(vault, ".runtime", "use-detector", "sessions", cased);
+    fs.mkdirSync(stateDir, { recursive: true });
+    const stateFile = path.join(stateDir, "windows.json");
+    fs.writeFileSync(stateFile, `${JSON.stringify(openWindowState(cased, row.sid))}\n`);
+    const before = fs.readFileSync(stateFile, "utf8");
+
+    const result = finalizeIdleSessions(vault, { now: IDLE_NOW, sessionKeys: [cased] });
+    assert.deepEqual([result.status, result.sessions, result.remaining], ["ran", 0, 0], cased);
+    assert.equal(judgedCount(vault, cased), 0, `${cased}: no judged rows`);
+    assert.equal(fs.readFileSync(stateFile, "utf8"), before, `${cased}: its state is unchanged`);
+  }
+});
+
+test("EXACT, walked: the walk leaves any spelling of unlabeled out", async (t) => {
+  for (const cased of ["Unlabeled", "UNLABELED"]) {
+    const { vault } = await makeVault(t, "minni-idle-walk-case-");
+    seedIdle(vault, cased);
+    seedIdle(vault, A);
+    const result = finalizeIdleSessions(vault, { now: IDLE_NOW });
+    assert.equal(result.sessions, 1, `${cased}: only A`);
+    assert.equal(judgedCount(vault, cased), 0, `${cased}: never finalised by the walk`);
+    assert.equal(judgedCount(vault, A), 1);
+  }
+});
+
+test("ALIAS: a cased spelling of an existing lowercase session finalises nothing and creates no directory", async (t) => {
   for (const spelling of ["Unlabeled", "UNLABELED", "upper-of-A"]) {
     const { vault } = await makeVault(t, "minni-idle-case-");
     seedIdle(vault, "unlabeled");
@@ -171,6 +231,15 @@ test("a cased spelling of unlabeled, or of a real key, finalises nothing and cre
     assert.equal(judgedCount(vault, "unlabeled"), 0, `${spelling}: the unlabeled session stays out`);
     assert.equal(judgedCount(vault, A), 0, `${spelling}: no session is finalised under an alias`);
     assert.equal(fs.existsSync(path.join(vault, ".runtime", "use-detector", "sessions")), false, `${spelling}: no state directory`);
+  }
+});
+
+test("isCanonicalSessionKey: a valid session name, lowercase, never unlabeled", async () => {
+  const { isCanonicalSessionKey } = await import("../dist/use-detector.js");
+  assert.equal(typeof isCanonicalSessionKey, "function", "exported");
+  for (const key of [A, "tx-0123456789abcdef", "a", "0", "ab_c-d"]) assert.equal(isCanonicalSessionKey(key), true, key);
+  for (const key of ["unlabeled", "Unlabeled", "UNLABELED", A.toUpperCase(), "Tx-0123456789abcdef", "../x", "a/b", "", "-a", "x".repeat(65), 7, null, undefined, {}]) {
+    assert.equal(isCanonicalSessionKey(key), false, JSON.stringify(key) ?? String(key));
   }
 });
 

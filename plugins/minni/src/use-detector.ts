@@ -127,7 +127,12 @@ const MIN_SLUG_CHARS = 8;
 /** A title shorter than this is too generic to open a memory by substring. */
 const MIN_TITLE_SUBSTRING_CHARS = 8;
 const SESSION_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-const AGENT_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+/**
+ * The agent keys a live producer emits (agentKeyFrom): `main`, or `a-` and 12
+ * lowercase hex. Capture's own form (use-capture.ts), copied: any other
+ * spelling (a crafted "Main") is refused rather than judged as a subagent.
+ */
+const AGENT_KEY_RE = /^(?:main|a-[0-9a-f]{12})$/;
 const TX_KEY_RE = /^[0-9a-f]{16}$/;
 const RESET_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const INITIAL_EPOCH = "initial";
@@ -2890,7 +2895,7 @@ function isSessionKeyName(name: unknown): name is string {
  * case-insensitive filesystem any other spelling aliases a real session's
  * directory: its rows would be finalised under the alias.
  */
-function isCanonicalSessionKey(key: unknown): key is string {
+export function isCanonicalSessionKey(key: unknown): key is string {
   return isSessionKeyName(key) && key === key.toLowerCase();
 }
 

@@ -70,6 +70,8 @@ const MAX_AUDIT_LOG_BYTES = 16 * 1024 * 1024;
 /** `## [<ISO>] <tool> | <summary>`, as recordAudit writes each entry header. Bounded fields. */
 const AUDIT_HEADER_RE = /^## \[([^\]\n]{1,64})\] ([^|\n]{1,200}) \|/;
 const SESSION_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+/** Capture's agent-key form (`main`, or `a-` and 12 lowercase hex); a row with any other is not counted. */
+const AGENT_KEY_RE = /^(?:main|a-[0-9a-f]{12})$/;
 
 export interface UseReportOptions {
   /** The last N days up to `now` (default 7 when no other range is given). */
@@ -529,8 +531,12 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
     const ms = msOf(ts);
     return ms !== null && ms >= range.since && ms < range.until;
   };
-  const measured = (row: { wire?: unknown; principal?: unknown }): boolean =>
-    typeof row.wire === "string" && MEASURED_WIRES.includes(row.wire) && row.principal === principal;
+  const measured = (row: { wire?: unknown; principal?: unknown; agent_key?: unknown }): boolean =>
+    typeof row.wire === "string" &&
+    MEASURED_WIRES.includes(row.wire) &&
+    row.principal === principal &&
+    typeof row.agent_key === "string" &&
+    AGENT_KEY_RE.test(row.agent_key);
 
   const coverage = new Map<string, { rows: number; sessions: Set<string> }>();
   const features = new Map<string, { features: string[]; rows: number }>();
