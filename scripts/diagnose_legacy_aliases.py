@@ -51,7 +51,7 @@ def main(argv=None):
 
     connection = None
     try:
-        connection = sqlite3.connect(args.db.resolve().as_uri() + "?mode=ro")
+        connection = sqlite3.connect(args.db.resolve().as_uri() + "?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")

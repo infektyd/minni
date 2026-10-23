@@ -5,8 +5,10 @@ Minni is pre-v1. The workflow below is what the repo actually enforces today
 
 ## Requirements
 
-- Python 3.14+ (pinned in `.python-version`). The engine venv is built for you
-  by `make setup` using your system `python3`; you don't manage it by hand.
+- Python 3.14, exactly the minor version pinned in `.python-version`. The engine
+  venv is built for you by `make setup` using your system `python3` when it
+  matches, or a uv-managed interpreter when it does not; you don't manage it by
+  hand.
 - Node >=20 (pinned in `.nvmrc`), for the TypeScript plugin under
   `plugins/minni/`.
 

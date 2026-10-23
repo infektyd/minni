@@ -19,10 +19,9 @@
 #   make help    - list targets
 #
 # Tooling: the venv lives at .venv (repo root; v0.2 moved it out of the old
-# engine/ dir) and is built with the system python3, which is the supported
-# Python 3.14 path for this repo; when system python3 is older than 3.14 and uv
-# is installed, setup provisions a uv-managed Python 3.14 instead (the version
-# floor itself never changes). The editable install (`pip install -e .`) is what
+# engine/ dir) and is built with the system python3 when it matches the
+# .python-version pin (3.14) on major.minor; when it does not and uv is
+# installed, setup provisions a uv-managed Python at the pinned version instead. The editable install (`pip install -e .`) is what
 # makes `import minni` and the `minni`/`minnid` console scripts work for normal
 # single-checkout use. Test targets additionally set PYTHONPATH=src so a
 # worktree's pytest does not silently import minni from another checkout's
@@ -38,7 +37,7 @@ SOCKET ?= $(HOME)/.minni/run/minnid.sock
 # Scoped engine pytest for `make check`: a fast, model-free core that exercises
 # daemon import, dispatch, status, learn/read, and the observability surface.
 # Override to widen, e.g. `make check CHECK_PYTEST="tests -q"` for the full suite.
-CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py tests/test_worktree_import_resolution.py tests/test_promote_proven.py -q
+CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py tests/test_worktree_import_resolution.py tests/test_promote_proven.py tests/test_python_version_gate.py tests/test_diagnose_legacy_aliases_uri.py -q
 
 .DEFAULT_GOAL := help
 
@@ -61,31 +60,46 @@ help:
 	@echo "  bench      run the membench fixture end-to-end"
 
 # ── Setup ────────────────────────────────────────────────────────────────
-.PHONY: setup
-# The interpreter gate: system python3 >= 3.14 is the classic path; when it is
-# older, uv (https://docs.astral.sh/uv/) provisions a managed Python 3.14 so
-# newcomers never install an interpreter by hand. The 3.14 floor itself is
-# unchanged. Deps install from the compiled lockfile (requirements.lock) for
-# reproducibility; requirements.txt stays the human-edited source spec. The
-# final editable install is load-bearing: it is how `import minni` resolves and
-# how the `minni` / `minnid` console scripts land in the venv.
-setup:
-	if $(PYTHON_FOR_VENV) -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)" 2>/dev/null; then \
+.PHONY: setup venv
+# The interpreter gate (`make venv`, which setup runs first): the venv's Python
+# must match .python-version exactly on major.minor
+# (scripts/python_version_gate.py). A minimum is not enough: a newer system
+# python3 builds a venv the locked wheels cannot install into. When system
+# python3 does not match and uv (https://docs.astral.sh/uv/) is installed, uv
+# provisions the pinned Python so newcomers never install an interpreter by
+# hand. An unreadable or malformed pin (gate exit 2) stops setup before any
+# existing .venv is touched. Deps install from the compiled lockfile
+# (requirements.lock) for reproducibility; requirements.txt stays the
+# human-edited source spec. The final editable install is load-bearing: it is
+# how `import minni` resolves and how the `minni` / `minnid` console scripts
+# land in the venv.
+PY_PIN := $(shell tr -d '[:space:]' < .python-version 2>/dev/null)
+
+venv:
+	sys_rc=0; $(PYTHON_FOR_VENV) scripts/python_version_gate.py 2>/dev/null || sys_rc=$$?; \
+	if [ $$sys_rc -eq 2 ]; then \
+	  $(PYTHON_FOR_VENV) scripts/python_version_gate.py; \
+	  echo "make setup stopped: fix .python-version (or restore scripts/python_version_gate.py); .venv was not touched."; \
+	  exit 1; \
+	elif [ $$sys_rc -eq 0 ]; then \
 	  true; \
 	elif command -v uv >/dev/null 2>&1; then \
-	  echo "system python3 is older than 3.14 — uv will provision Python 3.14 for .venv"; \
+	  echo "system python3 does not match .python-version ($(PY_PIN)) — uv will provision Python $(PY_PIN) for .venv"; \
 	else \
-	  echo "Python 3.14+ is required for the Minni venv."; \
-	  echo "Install Python 3.14, or install uv (https://docs.astral.sh/uv/) and re-run make setup — uv downloads the interpreter for you."; \
+	  echo "Python $(PY_PIN) (.python-version) is required for the Minni venv."; \
+	  echo "Install Python $(PY_PIN), or install uv (https://docs.astral.sh/uv/) and re-run make setup — uv downloads the interpreter for you."; \
 	  exit 1; \
 	fi
-	if [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)"; then \
-	  echo ".venv already uses Python 3.14+"; \
-	elif $(PYTHON_FOR_VENV) -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)" 2>/dev/null; then \
+	venv_rc=1; if [ -x .venv/bin/python ]; then venv_rc=0; .venv/bin/python scripts/python_version_gate.py || venv_rc=$$?; fi; \
+	if [ $$venv_rc -eq 0 ]; then \
+	  echo ".venv already uses Python $(PY_PIN)"; \
+	elif $(PYTHON_FOR_VENV) scripts/python_version_gate.py 2>/dev/null; then \
 	  echo "recreating .venv with $(PYTHON_FOR_VENV)"; rm -rf .venv && $(PYTHON_FOR_VENV) -m venv .venv; \
 	else \
-	  echo "recreating .venv with uv-managed Python 3.14"; rm -rf .venv && uv venv --seed --python 3.14 .venv; \
+	  echo "recreating .venv with uv-managed Python $(PY_PIN)"; rm -rf .venv && uv venv --seed --python "$(PY_PIN)" .venv; \
 	fi
+
+setup: venv
 	.venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.lock && .venv/bin/python -m pip install --no-deps -e .
 	cd $(PLUGIN_DIR) && npm ci
 	git config core.hooksPath .githooks
