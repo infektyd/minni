@@ -2369,6 +2369,79 @@ interface VaultSearchCacheEntry {
 
 const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
 
+/**
+ * A note search never scores (superseded, rejected, expired or draft, or one
+ * that names its successor). Shared by the search cache and the use
+ * detector's DF recount, so both count the same notes.
+ */
+function skippedByStatus(markdown: string): boolean {
+  const rawStatus = frontmatterField(markdown, "status")?.toLowerCase();
+  return (
+    rawStatus === "superseded" ||
+    rawStatus === "rejected" ||
+    rawStatus === "expired" ||
+    rawStatus === "draft" ||
+    Boolean(frontmatterField(markdown, "superseded_by"))
+  );
+}
+
+/**
+ * The vault's notes as the search scan walks them (`wiki/**\/*.md` through
+ * listMarkdownFiles: containment on every entry, symlinks never followed),
+ * as sorted vault-relative paths. For the use detector's DF recount, which
+ * reads them a slice at a time at Stop (rev5 §4.4). Never throws.
+ */
+export async function listVaultNoteRelPaths(vaultPath: string): Promise<string[]> {
+  try {
+    const files = await listMarkdownFiles(path.join(vaultPath, "wiki"));
+    return files.map((file) => path.relative(vaultPath, file)).sort();
+  } catch {
+    return [];
+  }
+}
+
+const DF_NOTE_READ_FLAGS =
+  fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
+/**
+ * One note's text for the DF recount, `title + "\n" + markdown` exactly as
+ * the search cache holds it; null for a note search never indexes or scores
+ * (`blocked` privacy, `skippedByStatus`), one outside the vault, anything not
+ * a regular file (judged on the opened, non-blocking descriptor: a FIFO never
+ * blocks), or one over `maxBytes`. Synchronous and bounded. Never throws.
+ */
+export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    if (typeof relativePath !== "string" || relativePath.length === 0 || path.isAbsolute(relativePath)) return null;
+    const notePath = path.join(vaultPath, relativePath);
+    assertUnder(notePath, path.join(vaultPath, "wiki"));
+    fd = fs.openSync(notePath, DF_NOTE_READ_FLAGS);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    const buffer = Buffer.alloc(stat.size);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const n = fs.readSync(fd, buffer, filled, buffer.length - filled, filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    const markdown = buffer.toString("utf8", 0, filled);
+    if (privacyFromMarkdown(markdown) === "blocked" || skippedByStatus(markdown)) return null;
+    return `${titleFromMarkdown(relativePath, markdown)}\n${markdown}`;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // A read-only descriptor: nothing to lose.
+      }
+    }
+  }
+}
+
 function buildCachedVaultNoteEntry(
   notePath: string,
   relativePath: string,
@@ -2377,13 +2450,7 @@ function buildCachedVaultNoteEntry(
   privacy: PrivacyLevel | undefined,
 ): CachedVaultNoteEntry {
   const status = statusFromMarkdown(markdown);
-  const rawStatus = frontmatterField(markdown, "status")?.toLowerCase();
-  const skipByStatus =
-    rawStatus === "superseded" ||
-    rawStatus === "rejected" ||
-    rawStatus === "expired" ||
-    rawStatus === "draft" ||
-    Boolean(frontmatterField(markdown, "superseded_by"));
+  const skipByStatus = skippedByStatus(markdown);
   const pageType = frontmatterField(markdown, "type")?.toLowerCase();
   return {
     notePath,

@@ -87,13 +87,14 @@ export async function snapshotTree(dir) {
       if (stat.isDirectory()) {
         await walk(full, relPath);
       } else if (stat.isSymbolicLink()) {
-        out.set(relPath, { link: true, size: stat.size, mtimeMs: stat.mtimeMs, sha256: null });
+        out.set(relPath, { link: true, size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino, sha256: null });
       } else {
         const bytes = await readFile(full);
         out.set(relPath, {
           link: false,
           size: stat.size,
           mtimeMs: stat.mtimeMs,
+          ino: stat.ino,
           sha256: createHash("sha256").update(bytes).digest("hex"),
           bytes,
         });

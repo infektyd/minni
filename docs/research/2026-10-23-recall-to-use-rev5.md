@@ -1291,11 +1291,26 @@ There is one switch per feature, and every one defaults to `on`.
          - `jev-harvest-state.json`: pre-existing Stop behaviour, independent of the ledger (the Jev harvest
            cursor, written whenever the payload carries a transcript path). Same presence and the same bytes
            with the ledger on and off.
+         - On a recount turn only (the DF snapshot missing or over a day old, §4.4), the recount slice
+           (`use-df-recount.ts`) also writes, each through a temp name and a rename:
+           `df-snapshot.partial.json`, the pass's state between slices, and `df-snapshot.json`, when a pass
+           completes (`writeDfSnapshot`).
          - Nothing else. In particular, nothing under `recall-session.d/` changes (`counters.json`,
-           `hit-keys.json`, `<agent_key>.reset`), and neither does `df-snapshot.json`, which only UPS writes.
-    - **Order.** The detector's commit is registered last, after every commit Stop registers to consume or
-      confirm something (a parked correction's archive, a relay cursor). Deferred commits run in registration
-      order, so those settle before the detector starts, never up to its 1.5 s cap later.
+           `hit-keys.json`, `<agent_key>.reset`). `df-snapshot.json` is unchanged except on a recount turn,
+           and then only through the atomic write. UPS never writes either file.
+    - **Order.** The ledger's commits are registered last: the detector's, then the DF recount slice. They
+      come after every commit Stop registers to consume or confirm something (a parked correction's archive, a
+      relay cursor). Deferred commits run in registration order, so those settle before the detector starts,
+      never up to its 1.5 s cap later. The recount waits for the detector.
+    - **The DF recount** (§4.4) runs one slice per measured Stop, after delivery, only while the snapshot is
+      due. A fresh snapshot costs one `lstat`.
+      - A slice counts notes for at most 40 ms of its 50 ms cap, checked between notes. The rest is kept for
+        the partial write, and one note's work is the slack.
+      - It reads the notes through the search scan's own walker and filters (`listVaultNoteRelPaths`,
+        `readVaultNoteTextForDf`: `wiki/**/*.md`, containment, no symlink followed, `blocked` and
+        `skippedByStatus` notes left out, 2 MB per note, non-blocking opens).
+      - A pass that started over a day ago restarts. A corrupt or foreign partial restarts it cleanly. A
+        snapshot or partial path a safe write cannot replace (a symlink, a directory) does nothing.
     - **Failures.** A detector that throws, will not load, is slow, or stops at its caps (1.5 s, 2 MB) changes
       no byte of the Stop output, which is already delivered, and never fails the hook. A failure (a module
       that will not load; a status of `invalid`, `refused`, `write_failed` or `error`; a throw) is audited

@@ -418,8 +418,8 @@ export async function handleStopCore(
   prepareOutcomeFn: typeof prepareOutcome = prepareOutcome,
 ): Promise<HookOutput> {
   const core = await stopCore(config, payload, prepareOutcomeFn);
-  // A direct caller registers nothing after this, so the detector is last.
-  if (core.measured) scheduleStopUseDetector(config, payload);
+  // A direct caller registers nothing after this, so the ledger's work is last.
+  if (core.measured) scheduleStopLedgerWork(config, payload);
   return core.output;
 }
 
@@ -463,6 +463,48 @@ async function stopCore(
     ledgerMayBeOn(config.vaultPath);
   const output = await stopCoreOutput(config, payload, prepareOutcomeFn, measured);
   return { output, measured };
+}
+
+/**
+ * A measured Stop's post-delivery ledger work, in this order: the detector
+ * judges the turn, then one capped slice of the DF recount (rev5 §4.4) runs.
+ * Both record only; registered after every other commit (handleStop).
+ */
+function scheduleStopLedgerWork(config: StopCoreConfig, payload: Record<string, unknown>): void {
+  scheduleStopUseDetector(config, payload);
+  scheduleStopDfRecount(config);
+}
+
+/**
+ * Stop: one slice of the DF snapshot recount, after the detector. Nothing
+ * while the snapshot is under a day old (one lstat); otherwise about 50 ms of
+ * counting (use-df-recount.ts). flags.ts confirms the ledger first. A failure
+ * is audited once, throttled, by code. Never fails the hook.
+ */
+function scheduleStopDfRecount(config: StopCoreConfig): void {
+  const vaultPath = config.vaultPath;
+  const auditPrefix = config.auditPrefix;
+  deferUntilDelivered(
+    async () => {
+      let problem: string | null = null;
+      try {
+        const flags = await import("./flags.js");
+        if (!flags.flagOn(vaultPath, "MINNI_USE_LEDGER")) return;
+        const recount = await import("./use-df-recount.js");
+        const result = await recount.runDfRecountSlice(vaultPath);
+        if (result.status === "failed") problem = "failed";
+      } catch {
+        problem = "unavailable";
+      }
+      if (problem === null) return;
+      await recordAudit(vaultPath, {
+        tool: `${auditPrefix}_df_recount_failed`,
+        summary: `Stop: DF snapshot recount ${problem}; the snapshot stays as it was`,
+        throttleKey: `${auditPrefix}_df_recount_failed`,
+      }).catch(() => undefined);
+    },
+    { recordOnly: true },
+  );
 }
 
 /** Detector statuses that mean this turn could not be judged: one audit line each, throttled. */
@@ -2095,11 +2137,12 @@ export function createHookHandlers(
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
     const core = await stopCore(config, payload, prepareOutcomeFn);
     const output = await stopOutput(payload, core.output);
-    // S1b: the use detector's commit is registered LAST. Deferred commits run
-    // in registration order and the detector may take its full 1.5 s cap, so
-    // everything Stop consumes or confirms (a parked correction's archive, a
-    // relay cursor) settles first; the detector only records.
-    if (core.measured) scheduleStopUseDetector(config, payload);
+    // S1b: the ledger's commits are registered LAST (the detector, then the DF
+    // recount slice). Deferred commits run in registration order and the
+    // detector may take its full 1.5 s cap, so everything Stop consumes or
+    // confirms (a parked correction's archive, a relay cursor) settles first;
+    // the ledger's work only records.
+    if (core.measured) scheduleStopLedgerWork(config, payload);
     return output;
   }
 

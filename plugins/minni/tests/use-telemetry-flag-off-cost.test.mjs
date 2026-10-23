@@ -161,6 +161,14 @@ const STOP_WRITES = [
   // cursor (jev-harvest.ts JEV_HARVEST_STATE_RELPATH), compared on vs off below.
   /^jev-harvest-state\.json$/,
 ];
+// On a recount turn only (the DF snapshot over a day old), the recount slice
+// (use-df-recount.ts) also writes, each through a temp name and a rename:
+const RECOUNT_WRITES = [
+  // the completed snapshot (writeDfSnapshot), replaced atomically;
+  /^df-snapshot\.json$/,
+  // the pass's partial state between slices (writePartial).
+  /^df-snapshot\.partial\.json$/,
+];
 // windows.lock (acquireLock), temp names (`.tmp`) and stale-lock asides are
 // transient: absent once the hook has exited.
 
@@ -177,7 +185,7 @@ test(
     const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
     /** One Stop that judges a window, at a fixed root; the before/after .runtime snapshots. */
-    async function judgedStop(at, { counts, env = {} }) {
+    async function judgedStop(at, { counts, env = {}, recount = false }) {
       const fixture = await makeFixture(null, "ledger-gate-stop-on", { at });
       t.after(() => closeFixture(fixture));
       await startFakeDaemon(fixture);
@@ -190,6 +198,12 @@ test(
       await writeFile(path.join(side, "hit-keys.json"), '{"v":1,"task_signature":"t","hits":[]}', "utf8");
       await writeFile(path.join(side, "main.reset"), '{"reset_id":"r1","at":"2026-10-23T09:59:00.000Z","reason":"SessionStart:startup"}', "utf8");
       await writeDfSnapshot(fixture.vault);
+      if (recount) {
+        // A day and more old: this Stop is a recount turn.
+        const { utimes } = await import("node:fs/promises");
+        const stale = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        await utimes(path.join(runtime, "df-snapshot.json"), stale, stale);
+      }
       const countsFile = path.join(runtime, "prompt-templates.json");
       if (counts) await writeFile(countsFile, '{"v":1,"templates":{}}', "utf8");
       const before = await snapshotTree(runtime);
@@ -200,9 +214,13 @@ test(
 
     const root = await mkdtemp(path.join(tmpdir(), "minni-ledger-gate-stop-on-"));
     t.after(() => rm(root, { recursive: true, force: true }));
-    for (const counts of [false, true]) {
-      const run = await judgedStop(path.join(root, counts ? "with-counts" : "no-counts"), { counts });
-      const label = counts ? "counts file present" : "no counts file";
+    for (const [counts, recount] of [
+      [false, false],
+      [true, false],
+      [false, true],
+    ]) {
+      const run = await judgedStop(path.join(root, recount ? "recount" : counts ? "with-counts" : "no-counts"), { counts, recount });
+      const label = recount ? "recount turn" : counts ? "counts file present" : "no counts file";
 
       // 1-2. The detector and the reader load; the capture writers never do.
       for (const module of ["use-detector.js", "use-report.js"]) {
@@ -233,15 +251,27 @@ test(
 
       // 5. Stop's writes are the closed list, and the day file only grows by the detector's own rows.
       const changed = changedPaths(run.before, run.after);
+      const allowed = recount ? [...STOP_WRITES, ...RECOUNT_WRITES] : STOP_WRITES;
       for (const rel of changed) {
-        assert.ok(STOP_WRITES.some((pattern) => pattern.test(rel)), `${label}: Stop wrote ${rel}, which is not on its list`);
+        assert.ok(allowed.some((pattern) => pattern.test(rel)), `${label}: Stop wrote ${rel}, which is not on its list`);
         assert.ok(run.after.has(rel), `${label}: Stop removed ${rel}`);
       }
       for (const rel of run.after.keys()) {
         assert.ok(!/windows\.lock|\.tmp$|\.stale-/.test(rel), `${label}: transient ${rel} left behind`);
       }
       assert.ok(!changed.some((rel) => rel.startsWith("recall-session.d/")), `${label}: recall-session.d changed`);
-      assert.ok(!changed.includes("df-snapshot.json"), `${label}: only UPS writes the DF snapshot`);
+      if (recount) {
+        // The snapshot changes only through the atomic write: a new file, a whole snapshot.
+        const was = run.before.get("df-snapshot.json");
+        const now = run.after.get("df-snapshot.json");
+        assert.ok(now && was && now.ino !== was.ino, `${label}: the snapshot was replaced by a rename, not written in place`);
+        const snapshot = JSON.parse(now.bytes.toString("utf8"));
+        assert.equal(snapshot.v, 1);
+        assert.ok(Number.isSafeInteger(snapshot.notes) && snapshot.notes >= 1, `${label}: a completed pass`);
+      } else {
+        assert.ok(!changed.includes("df-snapshot.json"), `${label}: the snapshot is fresh, so nothing recounts it`);
+        assert.ok(!run.after.has("df-snapshot.partial.json"), `${label}: no recount, no partial`);
+      }
       const dayFiles = changed.filter((rel) => DAY_FILE.test(rel));
       assert.ok(dayFiles.length > 0, `${label}: the Stop judged nothing (positive control)`);
       const appended = [];
@@ -265,7 +295,7 @@ test(
       );
 
       // jev-harvest-state.json is base Stop behaviour: the same with the ledger off.
-      if (!counts) {
+      if (!counts && !recount) {
         await closeFixture(run.fixture);
         const off = await judgedStop(path.join(root, "no-counts"), { counts, env: { MINNI_USE_LEDGER: "off" } });
         const onJev = run.after.get("jev-harvest-state.json");
