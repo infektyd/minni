@@ -2376,10 +2376,10 @@ interface VaultSearchCacheEntry {
 const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
 
 /**
- * How searchVaultNotes picks the notes it scores. Both paths select exactly
- * the same notes in exactly the same order, so results, scores and ranking are
- * identical (pinned by tests/vault-search-candidates-parity.test.mjs); they
- * differ only in what they cost.
+ * How searchVaultNotes picks the notes it scores. On a cache whose notes were
+ * all read from disk, both paths select exactly the same notes in exactly the
+ * same order, so results, scores and ranking are identical (pinned by
+ * tests/vault-search-candidates-parity.test.mjs); they differ only in cost.
  *
  * - "index" (default): build an inverted index from every lookup key of every
  *   note once per cache, then answer each query with a few map lookups. The
@@ -2393,6 +2393,13 @@ const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
  *   build on every prompt to answer a single query.
  *
  * The caller chooses; nothing switches paths by heuristic.
+ *
+ * After writeVaultPage rewrites a note in the same process, the index keeps
+ * the note's old keys (it only ever adds), so the index path can admit the
+ * note as an extra candidate the scan would not. The extra is scored on its
+ * current text, so results differ only if that text scores for the query
+ * without producing any of the query's lookup keys — the case the lookup
+ * already misses on a fresh cache (e.g. `x_foo_bar` for the query `foo_bar`).
  */
 export type VaultSearchCandidates = "index" | "scan";
 
@@ -2673,10 +2680,11 @@ function indexCandidateEntries(
   return subset;
 }
 
-// "scan" path: the same union in the same order, without the index. The index
-// path admits a note at the first key whose bucket holds it, and walks each
-// bucket in cache order; so does this — keys in order, the notes not yet
-// admitted in cache order — and a note admitted once is never tested again.
+// "scan" path: the union an index built from the cached notes gives, in the
+// same order, without the index. The index path admits a note at the first
+// key whose bucket holds it, and walks each bucket in cache order; so does
+// this — keys in order, the notes not yet admitted in cache order — and a note
+// admitted once is never tested again.
 function scanCandidateEntries(
   cache: VaultSearchCacheEntry,
   keys: string[],
