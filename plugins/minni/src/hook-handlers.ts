@@ -1269,6 +1269,14 @@ export function createHookHandlers(
         reassert_entries_pending_clear: reassertPendingClear,
         reassert_entries_parked: reassertParked,
         reassert_tails_pending_defer: reassertTailsPendingDefer,
+        // S1b (§8.2 "ledger-off stretches stay visible"): whether this boot
+        // records to the use ledger, and, when it does, the switches in effect
+        // (the capture's own `features`: featuresInEffect's list, from the one
+        // flags read dispatch made). "off" needs no module: dispatch opened no
+        // capture because ledger-gate (or flags.ts) said off, or the capture
+        // module would not load; a direct handler call records nothing either.
+        use_ledger: ledger ? "on" : "off",
+        ...(ledger ? { features: [...ledger.capture.context.features] } : {}),
       },
     });
 
