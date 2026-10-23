@@ -24,6 +24,9 @@
 //   recall-session.d/.sweep.json                      the retention sweep's cursor
 //   prompt-templates.json                             the classifier's counts
 //       (harness-envelope.ts; UPS is its only writer)
+//   df-snapshot.json                                  the use detector's DF snapshot,
+//       refreshed at most daily by UPS from the vault scan it already ran
+//       (`scheduleDfSnapshot`)
 // Session directories idle for 90 days are removed by a bounded sweep after a
 // SessionStart is delivered (`scheduleSessionSweep`), and so are ledger session
 // directories the use detector holds nothing open for (use-retention.ts).
@@ -64,7 +67,7 @@ import type { LedgerContext, MemoryRef, SurfaceChannel, SurfacedItem } from "./u
 // Re-exported so hook-handlers.ts can read it without loading use-ledger.js itself.
 export { ledgerFailureCount } from "./use-ledger.js";
 import { sweepLedgerDirs } from "./use-retention.js";
-import { assertWriteTargetUnder, recordAudit } from "./vault.js";
+import { assertWriteTargetUnder, recordAudit, scannedNoteTexts } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
 /** Per-session capture state, under the vault. */
@@ -1180,5 +1183,90 @@ export function scheduleSessionSweep(capture: UseCapture | null): void {
       sweep();
     },
     { recordOnly: true, onAbandon: sweep },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The use detector's DF snapshot (§4.4 "Distinctive tokens")
+// ---------------------------------------------------------------------------
+
+/** UPS rewrites the snapshot once it is this old. */
+export const DF_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** An mtime this far ahead of the clock is a skewed clock, not a fresh file. */
+const DF_SNAPSHOT_FUTURE_SLACK_MS = 5 * 60 * 1000;
+/** use-detector.ts DF_SNAPSHOT_RELPATH, mirrored so the freshness check loads nothing. */
+const DF_SNAPSHOT_RELPATH = path.join(".runtime", "df-snapshot.json");
+
+/**
+ * Whether UPS should write the DF snapshot now. One lstat, never a follow:
+ *   - a regular file written in the last 24 h is fresh: no;
+ *   - absent, or a regular file older than that (or dated more than 5 minutes
+ *     ahead of the clock): yes;
+ *   - a symlink, or anything else `writeDfSnapshot`'s own safe write refuses
+ *     (assertWriteTargetUnder): no, because the write would fail and every
+ *     prompt would pay for the count again; a directory: no, for the same
+ *     reason (a rename cannot replace it);
+ *   - any other non-regular file (a FIFO): yes; the rename replaces it.
+ * Never throws.
+ */
+export function dfSnapshotDue(vaultPath: string, now: number = Date.now()): boolean {
+  try {
+    const file = path.join(vaultPath, DF_SNAPSHOT_RELPATH);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(file);
+    } catch (error) {
+      return errorCode(error) === "ENOENT";
+    }
+    if (stat.isFile()) {
+      // A file written a moment ago can carry an mtime a hair past Date.now();
+      // only a date well in the future (a skewed clock) counts as stale.
+      const age = now - stat.mtimeMs;
+      if (age > -DF_SNAPSHOT_FUTURE_SLACK_MS && age < DF_SNAPSHOT_MAX_AGE_MS) return false;
+    }
+    if (stat.isDirectory()) return false;
+    assertWriteTargetUnder(file, vaultPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export type DfSnapshotRefresh = "fresh" | "no_scan" | "written" | "failed";
+
+/**
+ * Write the DF snapshot from the vault scan this process already ran
+ * (`scannedNoteTexts`), when it is due. "fresh" and "no_scan" return before
+ * use-detector.js is loaded: the daily check costs one lstat. With no scan in
+ * this process (an empty query, a spent budget) nothing is written this time.
+ * Notes `searchVaultNotes` never scores (`skipByStatus`) are left out; S3b's
+ * noise predicate narrows the set further when it ships. Never throws.
+ */
+export async function refreshDfSnapshot(vaultPath: string, options: { now?: number } = {}): Promise<DfSnapshotRefresh> {
+  try {
+    if (!dfSnapshotDue(vaultPath, options.now)) return "fresh";
+    const texts = scannedNoteTexts(vaultPath);
+    if (texts === null || texts.length === 0) return "no_scan";
+    const { documentFrequencies, writeDfSnapshot } = await import("./use-detector.js");
+    return writeDfSnapshot(vaultPath, documentFrequencies(texts)) ? "written" : "failed";
+  } catch {
+    return "failed";
+  }
+}
+
+/**
+ * UPS: refresh the DF snapshot once this prompt's output has reached the host,
+ * record-only. Called only with a capture open (the ledger is on), and only
+ * when UPS started its vault scan. Nothing runs on an abandoned delivery: the
+ * count over the whole vault must never sit in front of a degraded flush.
+ */
+export function scheduleDfSnapshot(capture: UseCapture | null | undefined): void {
+  if (!capture) return;
+  const vaultPath = capture.vaultPath;
+  deferUntilDelivered(
+    async () => {
+      await refreshDfSnapshot(vaultPath);
+    },
+    { recordOnly: true },
   );
 }

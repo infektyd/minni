@@ -2369,6 +2369,24 @@ interface VaultSearchCacheEntry {
 
 const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
 
+/**
+ * The texts of the scan `searchVaultNotes` already ran in this process, one
+ * `title + "\n" + markdown` per note it indexes (`skipByStatus` notes, the ones
+ * search never scores, are left out; `blocked` notes never enter the cache).
+ * Null when no scan ran here: no I/O, never a vault read of its own. A fresh
+ * array, so a caller cannot touch the cache. For the use detector's DF snapshot
+ * (rev5 §4.4), which UPS writes from this scan rather than from a new one.
+ */
+export function scannedNoteTexts(vaultPath: string): string[] | null {
+  const cache = _vaultSearchCache.get(vaultPath);
+  if (!cache) return null;
+  const texts: string[] = [];
+  for (const entry of cache.notes.values()) {
+    if (!entry.skipByStatus) texts.push(`${entry.title}\n${entry.markdown}`);
+  }
+  return texts;
+}
+
 function buildCachedVaultNoteEntry(
   notePath: string,
   relativePath: string,

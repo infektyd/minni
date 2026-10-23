@@ -1457,6 +1457,9 @@ export function createHookHandlers(
     // this factory — every platform sharing this handler has been leaking
     // non-safe notes into UserPromptSubmit. Fixed once, for all six.
     const vaultResults = filterSafeVaultResults(vaultResultsRaw).slice(0, VAULT_RESULT_LIMIT);
+    // S1b: the use detector's DF snapshot comes from the scan just started,
+    // never from a new vault read; at most daily, after delivery, ledger on.
+    if (use && !recallBudgetSpent) use.api.scheduleDfSnapshot(use.capture);
     // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
     // the weak-turn path below, which CLEARS recall-state.
     const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
