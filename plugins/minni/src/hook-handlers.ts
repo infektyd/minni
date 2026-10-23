@@ -110,6 +110,66 @@ import {
   subscribeContradictions,
 } from "./daemon_transport.js";
 import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
+// S1a-2: use-capture.js (and use-ledger, flags, harness-envelope behind it) is
+// loaded with a dynamic import, and only when ledger-gate.ts says the ledger
+// may be on. These type imports are erased: with the ledger off, a hook loads
+// nothing it did not load before.
+import { LEDGER_EVENTS, ledgerMayBeOn } from "./ledger-gate.js";
+import type { TurnRecord, UseCapture } from "./use-capture.js";
+
+type CaptureApi = typeof import("./use-capture.js");
+
+/** One event's use-ledger capture: the loaded module and its capture context. */
+interface LedgerCapture {
+  api: CaptureApi;
+  capture: UseCapture;
+}
+
+/** What handleUserPromptSubmit receives from its dispatch arm. */
+interface UpsLedgerCapture extends LedgerCapture {
+  turn: TurnRecord;
+}
+
+interface OpenedLedger {
+  ledger: LedgerCapture | null;
+  settle(): Promise<void>;
+}
+
+// Process-scoped, like hook-delivery's state: a hook process handles one event.
+let captureApi: CaptureApi | undefined;
+
+/**
+ * use-capture.js, loaded on first use; null when it cannot be loaded (a
+ * stripped or half-updated install), so a missing file degrades to "ledger
+ * off" instead of failing the hook. Never rejects.
+ */
+async function loadCaptureApi(): Promise<CaptureApi | null> {
+  if (captureApi) return captureApi;
+  try {
+    captureApi = await import("./use-capture.js");
+    return captureApi;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * After delivery: one throttled audit line when this process failed to write
+ * ledger rows, by count only. Nothing to do when the ledger never loaded.
+ */
+async function auditLedgerFailures(config: AgentHookConfig): Promise<void> {
+  try {
+    const failed = captureApi?.ledgerFailureCount() ?? 0;
+    if (failed <= 0) return;
+    await recordAudit(config.vaultPath, {
+      tool: `${config.auditPrefix}_use_ledger_failed`,
+      summary: `use ledger: ${failed} row(s) not written by this hook`,
+      throttleKey: `${config.auditPrefix}_use_ledger_failed`,
+    });
+  } catch {
+    // Losing the count must not cost the event.
+  }
+}
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -653,7 +713,12 @@ export function createHookHandlers(
     return output as HookOutput;
   };
 
-  async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
+  // `ledger` (S1a-2) is passed only by dispatch, with the use ledger on; a
+  // direct call records nothing.
+  async function handleSessionStart(
+    payload: Record<string, unknown>,
+    ledger?: LedgerCapture,
+  ): Promise<HookOutput> {
     // rawSessionId is the payload's own id, possibly empty — never the
     // "session" synthetic fallback. It is what gets threaded into the daemon
     // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
@@ -1210,12 +1275,22 @@ export function createHookHandlers(
       bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
         ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
         : "";
-    return render(
-      injectIntent("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n")),
-    );
+    const bootText = [nativeLayer1, envelope].filter(Boolean).join("\n\n");
+    // S1a-2: what this boot surfaced, judged on the exact emitted string. The
+    // rows are deferred and land only once this output does.
+    ledger?.api.captureBootSurfacings(ledger.capture, { emitted: bootText, recall, identity: identityRead });
+    return render(injectIntent("SessionStart", bootText));
   }
 
-  async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput> {
+  // `use` (S1a-2) comes from the dispatch arm's withTurnRecord: every return
+  // below names its exit on it first. A direct call records nothing.
+  async function handleUserPromptSubmit(
+    payload: Record<string, unknown>,
+    use?: UpsLedgerCapture,
+  ): Promise<HookOutput> {
+    const exit = (reason: string): void => {
+      if (use) use.turn.exit = reason;
+    };
     // BUDGET (parity with the claude-code hook): every host kills a prompt-time
     // hook and DISCARDS its output, so an overrun costs the whole turn's
     // injection silently. The budget is clamped to this platform's manifest
@@ -1228,6 +1303,7 @@ export function createHookHandlers(
 
     const prompt = asString(payload.prompt) || asString(payload.user_prompt);
     if (!prompt.trim()) {
+      exit("empty_prompt");
       return render(noIntent);
     }
 
@@ -1301,6 +1377,7 @@ export function createHookHandlers(
       await clearRecallState(config.vaultPath).catch(() => {});
       // #283: the persistent lifecycle visibility must survive this
       // write-intent early-return.
+      exit("write_intent");
       return lifecycleOnlyOutput();
     }
 
@@ -1482,6 +1559,7 @@ export function createHookHandlers(
       });
       // #283: even with nothing salient (no strong recall, no active plan)
       // the persistent lifecycle line still rides this turn's envelope.
+      exit("nothing_salient");
       return lifecycleOnlyOutput();
     }
 
@@ -1496,10 +1574,12 @@ export function createHookHandlers(
         task_signature: signature,
       },
     };
+    let recallPointer: string | undefined;
     if (strong) {
       // LIGHT POINTER, not the full pack: the full top hits live in the portable
       // recall-state file (read by the s6 guard); the prompt only gets a signpost.
-      envelopeBody.recall_pointer = buildRecallPointer(strong);
+      recallPointer = buildRecallPointer(strong);
+      envelopeBody.recall_pointer = recallPointer;
       envelopeBody.recall_state = recallStateFile;
     } else if (stalePointer !== undefined) {
       envelopeBody.recall_pointer = stalePointer;
@@ -1579,14 +1659,31 @@ export function createHookHandlers(
       },
     });
 
+    if (use && strong && recallPointer !== undefined) {
+      // S1a-2: the hit the pointer names, deliver first; and, when the guard
+      // was armed, the keys of the hits it may list.
+      use.api.capturePromptPointer(use, {
+        emitted: envelope,
+        pointer: recallPointer,
+        strong,
+        recall: recall.ok ? recall.data : undefined,
+        vaultResults,
+        threshold,
+        taskSignature: signature,
+        armed: recallStateFile !== undefined,
+      });
+    }
+    exit(strong ? "pointer" : stalePointer !== undefined ? "stale_pointer" : "plan");
     return render(injectIntent("UserPromptSubmit", envelope));
   }
 
   // s6 PreToolUse recall guard (BACKSTOP). Same logic as the claude-code hook's
   // handlePreToolUse, against this agent's vault. The output is the
   // permissionDecision shape (deny-to-surface), NOT an envelope.
+  // `recordDeny` (S1a-2) is set only by dispatch; a direct call records nothing.
   async function handlePreToolUse(
     payload: Record<string, unknown>,
+    options: { recordDeny?: boolean } = {},
   ): Promise<PreToolUseDecisionOutput> {
     const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
     if (mode === "off") return preToolUseAllow();
@@ -1632,7 +1729,19 @@ export function createHookHandlers(
       },
     }).catch(() => {});
     if (!consumed) return preToolUseAllow();
-    return preToolUseDeny(state!);
+    const deny = preToolUseDeny(state!);
+    if (options.recordDeny) {
+      // S1a-2: only a deny actually returned is recorded, one row per listed
+      // hit; the capture loads here, so an allowed call never pays for it.
+      const opened = await openLedger(PRE_TOOL_USE_EVENT, payload);
+      opened?.ledger?.api.captureGuardDeny(
+        opened.ledger.capture,
+        state!,
+        deny.hookSpecificOutput?.permissionDecisionReason ?? "",
+      );
+      await opened?.settle();
+    }
+    return deny;
   }
 
   async function handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput> {
@@ -1928,18 +2037,92 @@ export function createHookHandlers(
     return render(noIntent);
   }
 
+  // S1a-2: the use-ledger capture is opened here, once per event (a hook
+  // process handles one), so a direct handler call never records. One cheap
+  // check decides whether the capture modules load at all; when they do, the
+  // flags are read once through flags.ts, and a note about them is audited
+  // after the handler has built its output, so it cannot reach this event's
+  // audit_tail.
+  //
+  // PreToolUse is the exception: it fires on every tool call and records only
+  // a deny, which is rare, so it opens its capture inside handlePreToolUse, for
+  // a deny it is about to return. The allow path pays nothing.
   async function dispatch(
     event: string,
     payload: Record<string, unknown>,
   ): Promise<HookOutput | PreToolUseDecisionOutput> {
+    const opened =
+      event !== PRE_TOOL_USE_EVENT && LEDGER_EVENTS.has(event) ? await openLedger(event, payload) : null;
+    try {
+      return await route(event, payload, opened?.ledger ?? null);
+    } finally {
+      await opened?.settle();
+    }
+  }
+
+  /**
+   * The use-ledger capture for one event: null when the cheap check says the
+   * ledger is off (nothing loads). `ledger` is null when the capture module
+   * cannot be loaded or flags.ts says off after all; the hook then runs exactly
+   * as with the ledger off. `settle` audits what must not reach this event's
+   * own output (a flag note, an unloadable capture module), so call it once the
+   * handler has built its output. Never rejects.
+   */
+  async function openLedger(event: string, payload: Record<string, unknown>): Promise<OpenedLedger | null> {
+    if (!ledgerMayBeOn(config.vaultPath)) return null;
+    const api = await loadCaptureApi();
+    if (api === null) {
+      return {
+        ledger: null,
+        settle: () =>
+          recordAudit(config.vaultPath, {
+            tool: `${config.auditPrefix}_use_capture_unavailable`,
+            // A code, never the loader's message: that names an install path.
+            summary: `${event}: the use-ledger capture module could not be loaded; nothing was recorded`,
+            throttleKey: `${config.auditPrefix}_use_capture_unavailable`,
+          }).then(
+            () => undefined,
+            () => undefined,
+          ),
+      };
+    }
+    const session = api.openLedgerSession({
+      vaultPath: config.vaultPath,
+      event,
+      payload,
+      wire,
+      principal: config.agentId,
+    });
+    return {
+      ledger: session.capture ? { api, capture: session.capture } : null,
+      settle: () => api.auditFlagNotes(config.vaultPath, config.auditPrefix, session.flags),
+    };
+  }
+
+  async function route(
+    event: string,
+    payload: Record<string, unknown>,
+    ledger: LedgerCapture | null,
+  ): Promise<HookOutput | PreToolUseDecisionOutput> {
     switch (event) {
       case "SessionStart":
-        return handleSessionStart(payload);
+        if (ledger) {
+          ledger.api.recordReset(ledger.capture, event, payload);
+          // Retention, after delivery and bounded (§6.2.5).
+          ledger.api.scheduleSessionSweep(ledger.capture);
+        }
+        return handleSessionStart(payload, ledger ?? undefined);
       case "UserPromptSubmit":
-        return handleUserPromptSubmit(payload);
+        // Every exit is counted: one `turn` row per prompt, written when the
+        // handler returns or throws (§4.3).
+        if (!ledger) return handleUserPromptSubmit(payload);
+        return ledger.api.withTurnRecord(ledger.capture, payload, (turn) =>
+          handleUserPromptSubmit(payload, { ...ledger, turn }),
+        );
       case PRE_TOOL_USE_EVENT:
-        return handlePreToolUse(payload);
+        return handlePreToolUse(payload, { recordDeny: true });
       case "PreCompact":
+        ledger?.api.recordReset(ledger.capture, event, payload);
         return handlePreCompact(payload);
       // #283 / #227: primary compaction-summary delivery for a platform
       // whose own hook system fires a dedicated post-compaction event
@@ -1947,6 +2130,7 @@ export function createHookHandlers(
       // no other platform's manifest declares this event today, so this
       // case simply never fires for them.
       case "PostCompact":
+        ledger?.api.recordReset(ledger.capture, event, payload);
         return handlePostCompact(payload);
       case "CompactSummary":
         return handleCompactSummary(payload);
@@ -2117,6 +2301,8 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
       auditPrefix: config.auditPrefix,
       event,
     });
+    // S1a-2: the deferred ledger rows have been written or abandoned by now.
+    await auditLedgerFailures(config);
     // Delivery is settled; nothing left to wait for. See exitAfterDelivery.
     exitAfterDelivery();
   } catch (error) {
@@ -2131,6 +2317,7 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
     } catch {
       // audit unavailable; the systemMessage below still surfaces the failure
     }
+    await auditLedgerFailures(config);
     // hooks-PL-5: a degraded boot must never look like a clean one — say so.
     // failAndExit, not emit: the degraded signal has to be FLUSHED before an
     // abandoned RPC handle can keep this process alive into the harness kill.

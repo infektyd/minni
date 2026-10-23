@@ -38,9 +38,19 @@ export interface DeferOptions {
    * a recorded fact rather than an absence.
    */
   onAbandon?: AbandonHandler;
+  /**
+   * The commit only RECORDS this delivery (the use ledger) and consumes
+   * nothing. It runs and abandons exactly like any other, but it is left out of
+   * the rollback count in the undelivered audit: nothing it carried "stays
+   * re-deliverable", and counting it would turn a wire drop that
+   * `_intent_dropped` already recorded into a second, double-counting row.
+   */
+  recordOnly?: boolean;
 }
 
 const pendingCommits: DeliveryCommit[] = [];
+// How many of pendingCommits are recordOnly; settled with them.
+let pendingRecordOnly = 0;
 // Registered alongside their commits and settled together: a delivery runs the
 // commits and drops these; a discard drops the commits and runs these.
 const pendingAbandons: AbandonHandler[] = [];
@@ -80,6 +90,7 @@ export function markOutputDropped(): void {
  */
 export function deferUntilDelivered(commit: DeliveryCommit, options?: DeferOptions): void {
   pendingCommits.push(commit);
+  if (options?.recordOnly === true) pendingRecordOnly += 1;
   if (options?.onAbandon) pendingAbandons.push(options.onAbandon);
 }
 
@@ -99,6 +110,7 @@ export function pendingDeliveryCommitCount(): number {
  */
 export function discardDeliveryCommits(): void {
   pendingCommits.length = 0;
+  pendingRecordOnly = 0;
   outputDropped = false;
   const abandons = pendingAbandons.splice(0);
   for (const onAbandon of abandons) {
@@ -139,6 +151,7 @@ export async function settleAbandonHandlers(budgetMs = ABANDON_SETTLE_BUDGET_MS)
 /** Run and clear every deferred commit, in registration order. */
 export async function runDeliveryCommits(): Promise<void> {
   const commits = pendingCommits.splice(0);
+  pendingRecordOnly = 0;
   // Delivered: whatever would have recorded an abandonment no longer applies.
   pendingAbandons.length = 0;
   outputDropped = false;
@@ -225,7 +238,8 @@ export async function emitAndCommit(
     await runDeliveryCommits();
     return true;
   }
-  const abandoned = pendingDeliveryCommitCount();
+  // Record-only commits (ledger rows) are not rollbacks; see DeferOptions.
+  const abandoned = pendingDeliveryCommitCount() - pendingRecordOnly;
   discardDeliveryCommits();
   await settleAbandonHandlers();
   // A non-delivery is audited even when nothing was rolled back: an envelope
