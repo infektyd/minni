@@ -172,8 +172,12 @@ interface SweepState {
 export interface LedgerSweepResult {
   removed: number;
   scanned: number;
-  /** Past the horizon, but the detector still holds open work (or its state is unknown). */
+  /** Past the horizon, but the detector's state is locked, unknown, or still open after a finalize. */
   kept_open: number;
+  /** Past the horizon with open work: handed to the detector's idle close this run. */
+  finalized: number;
+  /** Finalize candidates this run did not reach (budget): the cursor resumes before the first. */
+  carried: number;
   /** The pass reached the end of the directory. */
   complete: boolean;
   /** Nothing to do: no ledger yet, or the last complete pass is too recent. */
@@ -228,7 +232,7 @@ function isPastHorizon(dir: string, dirStat: fs.Stats, now: number): boolean {
   return now - newest > LEDGER_IDLE_MAX_MS;
 }
 
-type SweepOutcome = "removed" | "kept" | "kept_open";
+type SweepOutcome = "removed" | "kept" | "kept_open" | "candidate";
 
 /** Handle one name. Never follows a symlink; throws on a filesystem failure. */
 function sweepOne(vaultPath: string, root: string, name: string, now: number): SweepOutcome {
@@ -243,32 +247,80 @@ function sweepOne(vaultPath: string, root: string, name: string, now: number): S
   }
   if (!isPastHorizon(target, stat, now)) return "kept";
   const detector = detectorSessionState(vaultPath, name, now);
+  // Open work past the horizon: a finalize candidate (closed, then removed,
+  // by the caller). Locked or unknown state is never finalized or removed.
+  if (detector === "open") return "candidate";
   if (detector !== "none" && detector !== "closed") return "kept_open";
-  // Renamed first, so a removal cut short leaves a .trash- name the next run
-  // finishes, never a half-emptied session directory.
-  const trash = path.join(root, `.trash-${Math.floor(now)}-${name}`);
-  fs.renameSync(target, trash);
-  fs.rmSync(trash, { recursive: true, force: true });
+  removeSessionDir(root, name, now);
   return "removed";
+}
+
+/**
+ * Renamed first, so a removal cut short leaves a .trash- name the next run
+ * finishes, never a half-emptied session directory. Throws on failure.
+ */
+function removeSessionDir(root: string, name: string, now: number): void {
+  const trash = path.join(root, `.trash-${Math.floor(now)}-${name}`);
+  fs.renameSync(path.join(root, name), trash);
+  fs.rmSync(trash, { recursive: true, force: true });
+}
+
+/** The detector's idle close, scoped and budgeted (use-detector.ts `finalizeIdleSessions`). */
+export type Finalizer = (vaultPath: string, options: { sessionKeys: readonly string[]; budgetMs: number }) => unknown;
+
+async function detectorFinalizer(): Promise<Finalizer> {
+  // Lazy: SessionStart loads the detector only when a candidate needs closing.
+  const { finalizeIdleSessions } = await import("./use-detector.js");
+  return finalizeIdleSessions;
 }
 
 /**
  * Remove `.runtime/use-ledger/<session_key>` directories past the 90-day
  * horizon whose detector state is closed (or absent), and finish any `.trash-`
- * a cut-off run left. Bounded: at most 20 removals and about `budgetMs` per
- * run, checked between items, with a cursor so the next run resumes where this
- * one stopped; after a complete pass the next waits a day. Never throws.
+ * a cut-off run left. A directory past the horizon whose state still holds
+ * open work (an epoch, a window, an unflushed reply) is a finalize candidate:
+ * the detector's own idle close (`finalizeIdleSessions`, scoped to the
+ * candidates and to the budget left) closes it, then its state is re-read and
+ * the directory removed only if it is now closed. The horizon is judged before
+ * the finalize, whose own rows would otherwise make it look fresh.
+ *
+ * Bounded: at most 20 removals per run and about `budgetMs` (or the shared
+ * `deadline`), checked between items, with one item's slack: the item in
+ * progress, and on a spent budget the first candidate's close-and-remove, so
+ * every run that finds a candidate makes progress. The scan keeps half the
+ * budget for its candidates. A cursor resumes the pass, also before the first
+ * candidate a cut-off run did not reach; after a complete pass the next waits
+ * a day. A budget spent on arrival does nothing at all. use-detector.js is
+ * loaded only when a candidate exists.
+ * Never throws.
  */
-export function sweepLedgerDirs(
+export async function sweepLedgerDirs(
   vaultPath: string,
-  options: { now?: number; budgetMs?: number; clock?: () => number } = {},
-): LedgerSweepResult {
+  options: { now?: number; budgetMs?: number; clock?: () => number; deadline?: number; finalizer?: Finalizer } = {},
+): Promise<LedgerSweepResult> {
   const clock = options.clock ?? Date.now;
-  const started = clock();
-  const now = options.now ?? started;
-  const budgetMs = options.budgetMs ?? LEDGER_SWEEP_BUDGET_MS;
-  const result: LedgerSweepResult = { removed: 0, scanned: 0, kept_open: 0, complete: false, skipped: false };
-  const spent = (): boolean => clock() - started >= budgetMs;
+  const started = options.deadline === undefined ? clock() : undefined;
+  // A shared `deadline` (runSessionMaintenance) or this call's own budget.
+  const deadline = options.deadline ?? (started as number) + (options.budgetMs ?? LEDGER_SWEEP_BUDGET_MS);
+  const now = options.now ?? started ?? Date.now();
+  const result: LedgerSweepResult = {
+    removed: 0,
+    scanned: 0,
+    kept_open: 0,
+    finalized: 0,
+    carried: 0,
+    complete: false,
+    skipped: false,
+  };
+  const left = (): number => deadline - clock();
+  const spent = (): boolean => left() <= 0;
+  // The budget this run has, read once (no extra clock reading on the
+  // budgetMs path, so item checks stay where they were).
+  const budgetHere = options.deadline === undefined ? (options.budgetMs ?? LEDGER_SWEEP_BUDGET_MS) : left();
+  if (!(budgetHere > 0)) {
+    result.skipped = true;
+    return result;
+  }
   try {
     const root = containedDir(vaultPath, LEDGER_RELDIR.split(path.sep), false);
     if (root === null) {
@@ -289,20 +341,70 @@ export function sweepLedgerDirs(
     let index = cursor === null ? 0 : names.findIndex((name) => name > cursor);
     if (index < 0) index = names.length;
     let last = cursor;
+    const candidates: string[] = [];
+    // Half the budget is kept for closing and removing the candidates found,
+    // so a run that finds some always gets to work on them.
+    const reserveMs = budgetHere / 2;
     for (; index < names.length; index += 1) {
-      if (spent() || result.removed >= LEDGER_SWEEP_MAX_REMOVALS) break;
+      if (spent() || result.removed + candidates.length >= LEDGER_SWEEP_MAX_REMOVALS) break;
+      if (candidates.length > 0 && left() <= reserveMs) break;
       const name = names[index] as string;
       result.scanned += 1;
       try {
         const outcome = sweepOne(vaultPath, root, name, now);
         if (outcome === "removed") result.removed += 1;
         else if (outcome === "kept_open") result.kept_open += 1;
+        else if (outcome === "candidate") candidates.push(name);
       } catch {
         // One directory that cannot be judged or removed does not stop the pass.
       }
       last = name;
     }
     result.complete = index >= names.length;
+    // Finalize, then remove what is now closed, in name order while the budget
+    // lasts. A spent budget still takes the first candidate (one item's slack),
+    // so every run that finds one makes progress.
+    let firstUnreached: string | null = null;
+    if (candidates.length > 0) {
+      const batch = spent() ? candidates.slice(0, 1) : candidates;
+      let examined = batch.length;
+      try {
+        const finalize = options.finalizer ?? (await detectorFinalizer());
+        const closed = finalize(vaultPath, { sessionKeys: batch, budgetMs: Math.max(1, left()) }) as
+          | { remaining?: unknown }
+          | undefined;
+        const remaining = closed && typeof closed.remaining === "number" ? closed.remaining : 0;
+        if (Number.isSafeInteger(remaining) && remaining > 0 && remaining < batch.length) examined = batch.length - remaining;
+      } catch {
+        // A detector that will not load closes nothing; the candidates stay open.
+      }
+      for (let i = 0; i < batch.length; i += 1) {
+        const name = batch[i] as string;
+        if (i >= examined || (i > 0 && spent())) {
+          firstUnreached = name;
+          break;
+        }
+        try {
+          const after = detectorSessionState(vaultPath, name, now);
+          if (after === "none" || after === "closed") {
+            removeSessionDir(root, name, now);
+            result.removed += 1;
+            result.finalized += 1;
+          } else {
+            result.kept_open += 1;
+          }
+        } catch {
+          result.kept_open += 1;
+        }
+      }
+      if (firstUnreached === null && batch.length < candidates.length) firstUnreached = candidates[batch.length] as string;
+    }
+    if (firstUnreached !== null) {
+      result.carried = candidates.length - candidates.indexOf(firstUnreached);
+      result.complete = false;
+      const before = names[names.indexOf(firstUnreached) - 1];
+      last = before !== undefined && before > (cursor ?? "") ? before : cursor;
+    }
     writeSweepState(
       stateFile,
       result.complete

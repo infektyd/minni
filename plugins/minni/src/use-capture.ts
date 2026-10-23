@@ -64,6 +64,7 @@ import type { LedgerContext, MemoryRef, SurfaceChannel, SurfacedItem } from "./u
 // Re-exported so hook-handlers.ts can read it without loading use-ledger.js itself.
 export { ledgerFailureCount } from "./use-ledger.js";
 import { sweepLedgerDirs } from "./use-retention.js";
+import type { Finalizer, LedgerSweepResult } from "./use-retention.js";
 import { assertWriteTargetUnder, recordAudit } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
@@ -1093,14 +1094,28 @@ function sweepOne(root: string, name: string, now: number): boolean {
  */
 export function sweepSessionDirs(
   vaultPath: string,
-  options: { now?: number; budgetMs?: number; clock?: () => number } = {},
+  options: { now?: number; budgetMs?: number; clock?: () => number; deadline?: number } = {},
 ): SweepResult {
   const clock = options.clock ?? Date.now;
-  const started = clock();
-  const now = options.now ?? started;
-  const budgetMs = options.budgetMs ?? SWEEP_BUDGET_MS;
   const result: SweepResult = { removed: 0, scanned: 0, temps_removed: 0, complete: false, skipped: false };
-  const spent = (): boolean => clock() - started >= budgetMs;
+  // With a shared `deadline` (runSessionMaintenance) a spent budget does
+  // nothing at all; on its own, the budget runs from this call's start.
+  let spent: () => boolean;
+  let now: number;
+  if (options.deadline !== undefined) {
+    const deadline = options.deadline;
+    if (clock() >= deadline) {
+      result.skipped = true;
+      return result;
+    }
+    spent = () => clock() >= deadline;
+    now = options.now ?? Date.now();
+  } else {
+    const started = clock();
+    const budgetMs = options.budgetMs ?? SWEEP_BUDGET_MS;
+    spent = () => clock() - started >= budgetMs;
+    now = options.now ?? started;
+  }
   try {
     const root = containedDir(vaultPath, SESSION_RELDIR.split(path.sep), false);
     if (root === null) {
@@ -1156,29 +1171,60 @@ export function sweepSessionDirs(
   return result;
 }
 
+/** ONE budget for all of SessionStart's post-delivery maintenance (§4.3, §6.2.5). */
+export const SESSION_MAINTENANCE_BUDGET_MS = 150;
+
+export interface SessionMaintenanceResult {
+  /** Null only when the maintenance itself failed before the sweep ran. */
+  sessions: SweepResult | null;
+  ledger: LedgerSweepResult | null;
+}
+
 /**
- * SessionStart: run the retention sweeps once the boot output is settled, on
- * every outcome: `recall-session.d` (above), then the ledger's own session
- * directories (use-retention.ts, §4.3 "Retention"). They consume nothing, so
- * delivery is irrelevant to them: they run as the commit when the output was
- * delivered, and as the abandon handler when it was not (a wire that drops
- * SessionStart, such as Grok, would otherwise never sweep, and both trees
- * would grow without bound). Record-only, so an abandoned run is not counted
- * as a rollback. They add to the hook's wall time (P16), hence a budget each;
- * after a complete pass each waits a day, so a typical boot pays two cursor
- * reads. On the throw path the abandon handler runs before the degraded
- * output is flushed; the same budgets bound it there.
+ * SessionStart's post-delivery maintenance, under ONE deadline: the
+ * `recall-session.d` sweep, then the ledger's retention (its finalize step
+ * included), in that fixed order, each handed what is left of the shared
+ * budget (one absolute deadline). A sweep that finds it passed does nothing
+ * (`skipped`) and resumes next time from its own cursor. The deadline is
+ * checked before every item, so the total can overrun by one item's work: the
+ * item in progress when it passes (one directory removal, or one session's
+ * idle close, which is at least one session even on a tiny budget). Never
+ * throws.
+ */
+export async function runSessionMaintenance(
+  vaultPath: string,
+  options: { budgetMs?: number; clock?: () => number; now?: number; finalizer?: Finalizer } = {},
+): Promise<SessionMaintenanceResult> {
+  const clock = options.clock ?? Date.now;
+  const deadline = clock() + (options.budgetMs ?? SESSION_MAINTENANCE_BUDGET_MS);
+  const out: SessionMaintenanceResult = { sessions: null, ledger: null };
+  try {
+    // Fixed order, one absolute deadline: each sweep checks it before every
+    // item, and does nothing when it finds it passed.
+    out.sessions = sweepSessionDirs(vaultPath, { deadline, clock, now: options.now });
+    out.ledger = await sweepLedgerDirs(vaultPath, { deadline, clock, now: options.now, finalizer: options.finalizer });
+  } catch {
+    // Best effort: maintenance runs again next boot.
+  }
+  return out;
+}
+
+/**
+ * SessionStart: run the maintenance (above) once the boot output is settled,
+ * on every outcome (S1a-2 review F4): it consumes nothing, so delivery is
+ * irrelevant to it. It runs as the commit when the output was delivered, and
+ * as the abandon handler when it was not (a wire that drops SessionStart,
+ * such as Grok, would otherwise never sweep, and both trees would grow without
+ * bound). Record-only, so an abandoned run is not counted as a rollback. It
+ * adds to the hook's wall time (P16), hence its single budget; after a
+ * complete pass each sweep waits a day, so a typical boot pays two cursor
+ * reads. On the throw path the abandon handler starts before the degraded
+ * output is flushed and is awaited within hook-delivery's settle budget.
  */
 export function scheduleSessionSweep(capture: UseCapture | null): void {
   if (capture === null) return;
-  const sweep = (): void => {
-    sweepSessionDirs(capture.vaultPath);
-    sweepLedgerDirs(capture.vaultPath);
+  const sweep = async (): Promise<void> => {
+    await runSessionMaintenance(capture.vaultPath);
   };
-  deferUntilDelivered(
-    async () => {
-      sweep();
-    },
-    { recordOnly: true, onAbandon: sweep },
-  );
+  deferUntilDelivered(sweep, { recordOnly: true, onAbandon: sweep });
 }

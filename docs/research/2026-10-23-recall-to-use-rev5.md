@@ -278,26 +278,41 @@ another resume):
 
   The plugin hashes `content` into shingles and never stores or injects it.
 - **Retention (S1b).** Ledger session directories (`.runtime/use-ledger/<session_key>`) past the 90-day
-  horizon, with nothing open in the detector, are removed by a sweep (`sweepLedgerDirs`, `use-retention.ts`).
+  horizon are closed, then removed, by a sweep (`sweepLedgerDirs`, `use-retention.ts`).
   - "Past the horizon" is the `recall-session.d` rule below: the directory and every entry in it are older
-    than 90 days, and a directory with more than 256 entries is never judged idle.
-  - "Nothing open" is read from the detector's per-session state (`.runtime/use-detector/sessions/<key>/
-    windows.json`), read-only and through the containment walk. A directory is kept while any agent there has
-    an open window, an open epoch (exposures not yet written), or an ended turn whose reply was not flushed.
-    It is also kept while a run holds `windows.lock` (younger than 30 s), and while the state cannot be read
-    with certainty (unreadable, oversize, refused, or an unknown version).
-  - With no detector state at all, nothing is open, so the directory may go.
+    than 90 days, and a directory with more than 256 entries is never judged idle. It is judged before any
+    close, because the close's own rows would make the directory look fresh.
+  - The detector's per-session state (`.runtime/use-detector/sessions/<key>/windows.json`) is read-only here
+    and reached through the containment walk:
+    - No state, or every agent closed: the directory goes.
+    - Open work (an open window, an open epoch whose exposures are not yet written, or an ended turn whose
+      reply was not flushed): the session is a finalize candidate. The detector's own idle close,
+      `finalizeIdleSessions({ sessionKeys, budgetMs })`, is scoped to the candidates and to the budget left.
+      The state is then re-read, and the directory removed only if it is now closed.
+    - A fresh `windows.lock` (a run in progress, younger than 30 s), or a state that cannot be read with
+      certainty (unreadable, oversize, refused, unknown version): kept, never closed.
+  - `use-detector.js` loads on SessionStart only when a candidate exists, and only with the ledger on.
   - Retention removes only the ledger directory. The detector's own state and cursors are not its to remove.
-  - It runs with the `recall-session.d` sweep, in the same SessionStart commit and abandon handler, on every
-    outcome.
-  - At most 20 per run, each renamed to `.trash-<ts>-<key>` first.
-  - It runs within its own cooperative 150 ms budget, checked between items, and resumes from a cursor in
-    `use-ledger/.sweep.json`. After a complete pass it waits a day.
+  - At most 20 per run, removals and candidates together, each renamed to `.trash-<ts>-<key>` first.
+  - It resumes from a cursor in `use-ledger/.sweep.json`. A candidate the run did not reach is carried: the
+    cursor stops before it. After a complete pass it waits a day.
   - It skips symlinks and plain files and never follows a link. Ledger readers skip dot names, so `.sweep.json`
     and `.trash-*` are invisible to them.
-  - One race is accepted: a detector run that starts between the open-window check and the rename. That is a
+  - One race is accepted: a detector run that starts between the state check and the rename. That is a
     microsecond window on a session idle for 90 days, and the rows that run appends are lost with the
     directory.
+- **SessionStart maintenance: one budget.** Once a SessionStart's output is settled, on every outcome
+  (`runSessionMaintenance`, as the commit and as the abandon handler: S1a-2 review F4), the maintenance runs
+  under ONE deadline of 150 ms (`SESSION_MAINTENANCE_BUDGET_MS`). The order is fixed: the `recall-session.d`
+  sweep, then ledger retention with its close step.
+  - Each sweep checks the shared deadline before every item. A sweep that finds it passed does nothing and
+    resumes next time from its own cursor. Every sweep still progresses across runs: each caps its own work
+    per run, and after a complete pass waits a day.
+  - The cap can be overrun by one item's work: the item in progress when the deadline passes (one
+    directory's removal, or one session's close-and-remove). A run that finds a finalize candidate on a spent
+    budget still takes the first one, so it makes progress.
+  - The ledger scan keeps half its share of the budget for its candidates.
+  - `use-retention.test.mjs` pins the total on a fake clock.
 - **Per-session side files (S1a-2).** `.runtime/recall-session.d/<session_key>/` holds the capture state that
   is not a ledger row. Every directory is reached through the ledger's containment walk, and every file is
   replaced through a temp name and a rename. None of them holds text.
@@ -337,7 +352,8 @@ another resume):
     - It removes at most 20 directories per run, each renamed to `.trash-<ts>-<key>` first.
     - It also removes orphaned counts-file temp files (`.runtime/prompt-templates.json.<pid>.<uuid>.tmp`)
       older than an hour: regular files only, at most 20 per run.
-    - It stays inside the cooperative 150 ms budget, checked between items (§6.2.5).
+    - It stays inside SessionStart's one shared 150 ms maintenance budget, checked between items (§6.2.5,
+      "SessionStart maintenance" above).
     - It resumes from a cursor in `recall-session.d/.sweep.json`. After a complete pass it waits a day.
     - It skips symlinks and plain files, and never follows a link out of the vault.
     - A directory with more than 256 entries is never judged idle.
