@@ -837,11 +837,13 @@ Even a spilled envelope's 2 KB preview then carries the contract and the warning
   with **no `permissionDecision`**. The call runs. The user's permission flow is untouched. Nothing is
   bounced.
 - `PreToolUseDecisionOutput` (`recall-guard.ts:151-158`) widens to a union.
-- **Other wires.** Only agy (the gemini wire) arms the guard today, because it injects at UPS. Cursor and
-  grok cannot inject at UPS, so `handlePreToolUse` allows before the guard runs
-  (`hook-handlers.ts:1575`; `CURSOR_INJECTABLE`, `GROK_INJECTABLE` in `hook-platform.ts`). They stay that
-  way.
-  - agy keeps deny delivery, now session-scoped and claimed once per arming.
+- **Other wires.** The guard arms only on wires that inject at UPS: claude-code, codex, kilocode and agy (the
+  gemini wire). grok-build, cursor and the unprofiled generic wire cannot inject at UPS, so
+  `handlePreToolUse` allows before the guard runs (`hook-handlers.ts:1575`; `GROK_INJECTABLE`,
+  `CURSOR_INJECTABLE` and `unprofiledWire` in `hook-platform.ts`). They stay that way, and their existing
+  allow-tests stay unedited.
+  - codex, kilocode and agy keep deny delivery, now session-scoped and claimed once per arming. Each gets an
+    explicit "still denies" test (Hans's approval condition).
   - The adapters already fall through to allow for any non-deny shape (`cursor-adapter.ts:34`,
     `gemini-adapter.ts:142`, `grok-adapter.ts:113`). A test pins that the context shape maps to allow.
 - **Surfacing still consumes.** Context delivery calls `markRecallConsumed` after a won claim, exactly as
@@ -931,8 +933,8 @@ spawns in the corpus).
 - `recall-guard-context-delivery.test.mjs`:
   - a claude-code Read with armed state returns `additionalContext`, no `permissionDecision`, and leaves
     `consumed === true`
-  - agy still denies, once per arming
-  - cursor and grok allow, unchanged
+  - codex, kilocode and agy still deny, once per arming
+  - grok-build, cursor and the generic wire allow, unchanged
 
   Today claude-code denies.
 - `recall-guard-already-surfaced.test.mjs`: with `pointer_named` set, a main-thread Read gets no surfacing.
@@ -1085,7 +1087,15 @@ records the flags in effect (`features`), so a spot comparison is attributable.
   - the plan digest tests
 - **Edits that approval authorizes**, each recorded in its slice, and nothing else:
   - `sessionstart-layer1-shelf.test.mjs:96-130`: the inline shelf size pin, under Q2(a) (§6.2.4)
-  - the claude-code deny-shape assertions that context delivery replaces (§6.3.3):
+  - the claude-code deny-shape assertions that context delivery replaces (§6.3.3). Hans's approval condition
+    (2026-10-23):
+    - each replaced deny assertion gets a positive assertion of the new behaviour: context delivered, no
+      `permissionDecision`, guard text and wikilink present
+    - each replacement is shown RED on the old code
+    - codex, kilocode and agy each keep a "still denies" test
+    - the shelf pin is replaced by a pin on the 4,000-char boot form, not just removed
+
+    The assertions:
     - `recall-guard.test.mjs:123`, `:125-128`, `:143`, `:233`
     - `recall-guard-dropped-inject.test.mjs:244-245`
     - `hook-behavior.test.mjs:984`, `:1007`
@@ -1133,8 +1143,8 @@ records the flags in effect (`features`), so a spot comparison is attributable.
   framing.
 - **Wires.**
   - Only claude-code is measured, and only claude-code gets context delivery.
-  - agy keeps deny, now session-scoped and claimed once per arming.
-  - Cursor and grok never arm the guard (`hook-handlers.ts:1575`), today or after.
+  - codex, kilocode and agy keep deny, now session-scoped and claimed once per arming.
+  - grok-build, cursor and the generic wire never arm the guard (`hook-handlers.ts:1575`), today or after.
   - Every non-claude-code wire is reported `unmeasured`.
 
 ---
@@ -1236,7 +1246,7 @@ Verdict before fixes: "not fit as written; fit once F1–F3 are fixed and F4–F
 | F1 | blocker | Context delivery turns red claude-code deny-shape assertions that the doc promised to keep green; the consume call and the claim key were unspecified | §6.3.3 lists the assertions and the two ways to edit each; §3 and §8.3 make them approval-authorized; surfacing still calls `markRecallConsumed`; claim key falls back to `task_signature + ts`; S2b first confirms the red list by a run |
 | F2 | blocker | The before window has no classifier, so "per 100 human prompt turns" shifts denominator at the switch | The classifier ships in S1a, record-only (§4.3, §5.2.1, §8.1) |
 | F3 | should-fix | `d:` handles cannot be resolved by `{doc_id, source}`; the daemon keys on `src` | A per-session handle registry; drill sends `{doc_id, src, source}`; the test asserts what the fake daemon receives (§4.2, §5.3) |
-| F4 | should-fix | Cursor and grok cannot "still deny"; their guard is disarmed | §6.3.3, §6.4 and §9 scoped to agy |
+| F4 | should-fix | Cursor and grok cannot "still deny"; their guard is disarmed | §6.3.3, §6.4 and §9 corrected. The reviewer's "only agy injects at UPS" was itself incomplete: codex and kilocode inject too and keep deny (author's check of `hook-platform.ts`, after approval). |
 | F5 | should-fix | Carry-over credit collides with final `judged` rows and leaves the per-surfacing rate biased | Replaced by exposure-level judging (§4.4, §4.7, test renamed) |
 | F6 | should-fix | The template rule cannot count "before `at`" from its stored fields; UPS and harvest disagree at the 3rd occurrence | An occurrence ring of `{ts, pid}`, with harvest excluding its own `promptId` (checked: every transcript user entry carries `promptId`) |
 | F7 | should-fix | Unordered slices write the same files; SubagentStart's output seam was unowned | One total merge order; S2b emits the subagent arms' output directly and owns their wiring (§8.1, §6.3.6) |
