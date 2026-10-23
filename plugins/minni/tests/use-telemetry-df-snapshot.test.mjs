@@ -504,3 +504,38 @@ test("recount: a vault with no countable note is parked for the week, not recoun
   assert.equal(grown.reason, "trigger");
   assert.equal(grown.status, "written");
 });
+
+// ---- Review 3 follow-ups ------------------------------------------------------
+
+test("recount: an empty vault with an OLD snapshot is parked for the week too (R1)", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-df-recount-empty-old-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const vault = path.join(root, "vault");
+  const wiki = path.join(vault, "wiki", "concepts");
+  await mkdir(wiki, { recursive: true });
+  for (let i = 0; i < 20; i += 1) await writeFile(path.join(wiki, `old-${i}.md`), `---\nstatus: superseded\n---\n# Old ${i}\n`, "utf8");
+  // A snapshot from when the vault still had countable notes, over a week old.
+  await writeFixtureSnapshot(vault);
+  const old = new Date(Date.now() - 8 * DAY);
+  await utimes(path.join(vault, DF_SNAPSHOT_RELPATH), old, old);
+  const statuses = [];
+  for (let i = 0; i < 6; i += 1) statuses.push((await runDfRecountSlice(vault)).status);
+  assert.equal(statuses[0], "empty", "the first due Stop finds nothing to count");
+  assert.deepEqual(statuses.slice(1), ["fresh", "fresh", "fresh", "fresh", "fresh"], `parked, not recounted every Stop: ${JSON.stringify(statuses)}`);
+  // A week later it runs again.
+  assert.equal((await runDfRecountSlice(vault, { now: Date.now() + 8 * DAY })).status, "empty");
+});
+
+test("recount: a partial whose token count exceeds the notes counted restarts the pass (N4)", async (t) => {
+  const { vault, partial } = await recountVault(t, 40);
+  const paths = await listVaultNoteRelPaths(vault);
+  await mkdir(path.dirname(partial), { recursive: true });
+  await writeFile(
+    partial,
+    JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: Date.now() - HOUR, listed: paths.length, paths, next: 10, notes: 10, tokens: ["otter"], counts: [11] }),
+    "utf8",
+  );
+  const result = await runDfRecountSlice(vault, { clock: stepClock(5) });
+  assert.equal(result.restarted, true, "a token in 11 of 10 notes is not a pass this module wrote");
+  assert.equal(result.pass_notes, result.counted);
+});
