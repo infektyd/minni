@@ -299,11 +299,24 @@ SubagentStop (§6.3.6), and from `use-report`.
     turns after its latest visible surfacing, whether or not it is named again.
   - **Credits.** Each turn's `used_ii` evidence for the mkey gives one credit for that (exposure, turn) pair.
     Two surfacing rows on one turn (boot plus pointer, or pointer plus guard) share that one credit.
+    - A credit is the turn's `turn_ix`. A turn with no `turn` row (a subagent, or a row that never landed)
+      is credited under a detector-local id, `-(prompt line offset + 1)`, which can never collide with a
+      real `turn_ix`.
+    - Dismissal never gates a credit (S1b review): the same transcript credits alike whether the memory is
+      re-named every turn or named once.
   - **The `exposure` row** is written when the epoch closes:
     `{exposure_id = sha256(session_key, agent_key, reset_id, mkey)[:16], first_sid, channel, visible, outcome, credits: [turn_ix…], final}`.
     - The epoch closes at a reset, at the session's end, or after 24 h idle. Until then the row is
       provisional.
-    - `outcome` is the strongest across the epoch.
+    - `outcome` is the strongest **per-turn evidence** across the epoch (applied, cited, cited_handle,
+      opened), else `dismissed` when some turn was dismissed, else `ignored` or `unknown`. It is never
+      folded from window judgments, which exist only on named turns and would differ by naming cadence.
+    - `dismissed_turns` counts the creditable turns whose first assistant text matched the dismissal
+      lexicon. It is checked on every such turn, named or not, so it is symmetric across pointer formats;
+      it is a diagnostic only.
+  - **A SessionStart reset due with boot surfacings** (no transcript entry between them) is applied first,
+    whatever the timestamps, so the boot rows open in the SessionStart epoch. S1a writes the reset first;
+    this is defence in depth.
   - Per-surfacing `judged` rows stay, as diagnostics per channel. They are not the comparison unit.
 - **Closing at Stop(N).**
   1. Read the transcript delta.
@@ -315,22 +328,40 @@ SubagentStop (§6.3.6), and from `use-report`.
   1. **`applied`**: a stored body shingle, not in the echo set, appears in assistant text or a tool input.
      - For channels whose injected text *is* the memory (boot learnings, boot recall text), injected shingles
        count only inside a tool input. Reciting them is not applying them.
-  2. **`cited`**: by handle (wikilink, slug, `m:`/`d:` handle, `learning #id`), or by title: at least 3
-     distinctive title tokens in one assistant sentence.
+     - In assistant text, a shingle the current or previous 2 human prompts carried does not count:
+       restating a prompt that quotes a memory body is not applying it. In a tool input it still counts.
+  2. **`cited`**: by title: at least 3 distinctive title tokens in one assistant sentence.
      - Title tokens that also occur in the current or the previous 2 human prompts are dropped first.
-     - A title with fewer than 3 distinctive tokens left is `title_assessable: false`.
+     - A title with fewer than 3 distinctive tokens left is `title_assessable: false`. This is computed for
+       each turn the window is judged in, never latched at activation; a boot window is assessable when the
+       rule could fire on any of its turns.
      - For boot learnings, which have no title, the same rule runs over the stored content's distinctive
        tokens.
-  3. **`opened`**: a Read of the note's path, a read-verb Bash over it, or a `minni_drill`/`minni_recall`
-     that names it.
-     - Writing a handle and then opening it is `opened`, not `cited`.
-  4. **`dismissed`**: the first assistant text after the surfacing matches the dismissal lexicon.
-     - Dismissal is sticky: the window can still end `applied`, never `cited`.
-  5. Otherwise `ignored` if visible, else `unknown(<reason>)`.
-- **Headline used = `cited` + `applied`.**
+     - **The echo rule (S1b review): recital is not use.** For channels whose injected text is the memory
+       (boot learnings, boot recall), title and content tokens count only outside an 8-word echo of the
+       injected line. A verbatim recital is `ignored`; outside the echo, a paraphrase (3 or more distinctive
+       tokens in one sentence) or an application counts.
+  3. **`cited_handle`**: by handle: a wikilink, slug, vault path, `m:`/`d:` handle or `learning #id`. It is
+     its own bucket in both windows and **never `used_ii`**.
+     - Every handle-style form is removed from the text before the title, content and shingle passes, so a
+       handle's own words (a slug tokenises into title words) never become title or applied evidence.
+  4. **`opened`**: a Read of the note's path, a read-verb Bash over it, or a `minni_drill`/`minni_recall`
+     that names it. Paths and slugs match bounded (a longer name that contains the note's is not it).
+     - Writing a handle (or title) and then opening it is `opened`, not a citation.
+  5. **`dismissed`**: the first assistant text after the surfacing matches the dismissal lexicon.
+     - Dismissal is sticky: the window can still end `applied` or `opened`, never cited.
+  6. Otherwise `ignored` if visible, else `unknown(<reason>)`.
+- **Headline used = `applied` + `cited` + `cited_handle`.**
 - **The before/after comparison uses `used_ii`**, the identifier-independent subset: `applied`, plus
-  title-cited. The after pointer prints handles and today's does not, so a handle citation would favour the
-  after window by construction.
+  title/content `cited`. The after pointer prints handles and today's does not, so a handle citation would
+  favour the after window by construction; it is reported as its own column.
+- **Symmetry is the governing property** (S1b review): every rule is applied identically whatever the
+  pointer format; `use-detector-symmetry.test.mjs` feeds one transcript through a before-format and an
+  after-format ledger per rule and requires equal `used_ii`, dismissed counts and exposure outcomes. The
+  one intended difference is that a handle can be cited only where one was printed. Two residual
+  asymmetries are known: the 50-turn horizon restarts at each visible surfacing (the after pointer
+  re-names at most every 10 turns), and the capture must record the memory's full title, not the
+  after pointer's 32-character print.
 - **Distinctive tokens.** A token is distinctive when its document frequency over non-noise notes is at most
   `max(1, ⌈5% × notes⌉)`.
   - The DF snapshot lives in `.runtime/df-snapshot.json`. It is written by UPS from the scan UPS already
@@ -340,6 +371,9 @@ SubagentStop (§6.3.6), and from `use-report`.
   - Result text carries wikilinks and sources, not ids (§4.1). So cards are keyed through `memoryKeyFor` on
     their source.
   - A card that cannot be keyed is counted `unnameable` and reported. It is never silently dropped.
+  - An `explicit_recall` row carries no body shingles (the detector never reads note bodies), so its own
+    window never ends `applied`; it can end cited, cited_handle or opened. An exposure it opens can still be
+    `applied` through shingles another channel recorded for the same mkey.
 - **Reading the transcript.**
   - **Fast path:** a byte scan with no JSON parse, when no window is open, no surfacing row is new, and the
     delta contains neither `minni_recall` nor `minni_drill`.
@@ -366,7 +400,8 @@ SubagentStop (§6.3.6), and from `use-report`.
   - the share of rows left provisional, and the share `unknown`
   - the share of explicit-recall cards counted `unnameable`
   - the `features` in effect
-  - the fixed line "lower bounds; silent use is invisible"
+  - `cited_handle` as its own column, and exposures with a dismissed turn
+  - the fixed line "lower bounds; silent use is invisible", and the fixed undercount caveat (§4.7)
 - Phase 1 measures one principal, claude-code. Other wires appear as `unmeasured` in a coverage table.
 - **Stop receipt.** `SessionReceipt` gains use counts.
   - `formatSessionReceiptLine` stays **byte-identical** when `surfaced` is 0, which keeps
@@ -448,6 +483,9 @@ SubagentStop (§6.3.6), and from `use-report`.
   - **The guard channel will be nearly silent after the switch,** by design. It surfaces only when no
     pointer was delivered (§6.3.4). The channel comparison that matters is the pointer's.
   - Either way, the result is reported, never auto-reverted. It carries the §0 caveats.
+  - Every report also carries this fixed line: "Known undercount: a short rule applied by quoting it word
+    for word reads as recital and is not counted; this affects both windows equally, and the used rate is a
+    floor."
 
 ---
 

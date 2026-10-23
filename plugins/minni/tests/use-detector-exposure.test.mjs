@@ -147,3 +147,87 @@ test("an exposure stays creditable for 50 human prompt turns after its latest vi
   const [exposure] = ledgerRows(s.vault, "exposure");
   assert.deepEqual(exposure.credits, [51], "turn 51 is the 50th human turn after the surfacing; turn 52 is past it");
 });
+
+test("credits ignore dismissal: named every turn and named once credit identical turn-3 evidence", async (t) => {
+  const credits = [];
+  for (const renamed of [true, false]) {
+    const s = await setup(t);
+    await turn(s, 1, { prompt: "Look at the nightly stall.", rows: (p) => [pointer(s, p)], replies: ["Looking."] });
+    await turn(s, 2, { prompt: "Keep going.", rows: (p) => (renamed ? [pointer(s, p)] : []), replies: ["Still."] });
+    await turn(s, 3, { prompt: "Any progress?", rows: (p) => (renamed ? [pointer(s, p)] : []), replies: ["That isn't relevant to the stall.", CITE] });
+    closeSession(s);
+    credits.push(ledgerRows(s.vault, "exposure").map((exposure) => exposure.credits));
+  }
+  assert.deepEqual(credits[0], credits[1], "before (re-named) and after (named once) credit alike");
+  assert.deepEqual(credits[0], [[3]]);
+});
+
+test("a SessionStart reset written after its boot rows still opens the epoch before them", async (t) => {
+  const s = await setup(t);
+  const boot = surfacedRow({ channel: "boot_recall", mkey: MKEY, title: TITLE, ts: s.clock.next(10) });
+  const reset = resetRow({ ts: s.clock.next(10), event: "SessionStart" });
+  append(s.vault, [boot, reset]);
+  await turn(s, 1, { prompt: "Look at the nightly stall.", replies: [CITE] });
+  closeSession(s);
+  assert.equal(finalJudged(s.vault, boot.sid).outcome, "cited");
+  const exposures = ledgerRows(s.vault, "exposure");
+  assert.equal(exposures.length, 1);
+  assert.equal(exposures[0].reset_id, reset.reset_id, "the boot exposure lives in the SessionStart epoch");
+  assert.deepEqual(exposures[0].credits, [1]);
+});
+
+test("control: a SessionStart reset written before its boot rows", async (t) => {
+  const s = await setup(t);
+  const reset = resetRow({ ts: s.clock.next(10), event: "SessionStart" });
+  const boot = surfacedRow({ channel: "boot_recall", mkey: MKEY, title: TITLE, ts: s.clock.next(10) });
+  append(s.vault, [reset, boot]);
+  await turn(s, 1, { prompt: "Look at the nightly stall.", replies: [CITE] });
+  closeSession(s);
+  assert.equal(finalJudged(s.vault, boot.sid).outcome, "cited");
+  assert.deepEqual(ledgerRows(s.vault, "exposure").map((exposure) => exposure.credits), [[1]]);
+});
+
+test("a reset for another agent key does not close main's epoch", async (t) => {
+  const s = await setup(t);
+  await turn(s, 1, { prompt: "Look at the nightly stall.", rows: (p) => [pointer(s, p)], replies: ["Looking into it."] });
+  append(s.vault, [resetRow({ ts: s.clock.next(50), event: "PreCompact", agentKey: "a-0123456789ab" })]);
+  await turn(s, 2, { prompt: "Any progress?", replies: [CITE] });
+  closeSession(s);
+  const exposures = ledgerRows(s.vault, "exposure");
+  assert.equal(exposures.length, 1);
+  assert.deepEqual(exposures[0].credits, [2]);
+});
+
+test("a missed Stop: the turn-1 window closes at the next prompt and takes no turn-2 evidence", async (t) => {
+  const s = await setup(t);
+  s.tx.prompt("Look at the nightly stall.", "p1");
+  const [first] = [pointer(s, "p1")];
+  append(s.vault, [turnRow({ turnIx: 1, promptId: "p1", ts: s.clock.next(5) }), first]);
+  s.tx.say("Looking into it.");
+  await s.tx.flush(); // no Stop for turn 1
+  await turn(s, 2, { prompt: "Any progress?", replies: [CITE] });
+  closeSession(s);
+  assert.equal(finalJudged(s.vault, first.sid).outcome, "ignored");
+  assert.deepEqual(ledgerRows(s.vault, "exposure")[0].credits, [2]);
+});
+
+test("a turn with no turn row is credited under its own id, never colliding with a real turn_ix", async (t) => {
+  const s = await setup(t);
+  const promptTurn = async (promptId, prompt, rows, reply, turnIx) => {
+    s.tx.prompt(prompt, promptId);
+    append(s.vault, [...(turnIx === undefined ? [] : [turnRow({ turnIx, promptId, ts: s.clock.next(5) })]), ...rows]);
+    s.tx.say(reply);
+    await s.tx.flush();
+    runDetector(detectorArgs(s.vault, s.transcriptPath, s.clock, { lastAssistantMessage: reply }));
+  };
+  // The detector starts mid-session: turn_ix 10, then a prompt whose turn row
+  // never landed, then turn_ix 11.
+  await promptTurn("p1", "Look at the nightly stall.", [pointer(s, "p1")], "Looking into it.", 10);
+  await promptTurn("p2", "Any progress?", [], CITE, undefined);
+  await promptTurn("p3", "And now?", [], CITE, 11);
+  closeSession(s);
+  const [exposure] = ledgerRows(s.vault, "exposure");
+  assert.equal(exposure.credits.length, 2, `two credited turns stay two: ${JSON.stringify(exposure.credits)}`);
+  assert.ok(exposure.credits.includes(11));
+  assert.ok(exposure.credits.some((ix) => ix < 0), "the row-less turn has a detector-local (negative) id");
+});

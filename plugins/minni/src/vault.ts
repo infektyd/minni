@@ -1926,7 +1926,10 @@ export interface SessionReceipt {
  */
 export interface SessionUseCounts {
   surfaced: number;
+  /** Title/content citations. */
   cited: number;
+  /** Handle-style citations (wikilink, slug, m:/d: handle, learning #id). */
+  cited_handle: number;
   applied: number;
   opened: number;
   dismissed: number;
@@ -2256,7 +2259,9 @@ export function formatSessionReceiptLine(receipt: SessionReceipt): string {
   const use = receipt.use;
   if (!use || !(typeof use.surfaced === "number" && use.surfaced > 0)) return line;
   const count = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
-  return `${line} Use: ${count(use.surfaced)} surfaced, ${count(use.cited)} cited, ${count(use.applied)} applied.`;
+  // "cited" on the receipt counts every citation, title/content and handle alike.
+  const cited = count(use.cited) + count(use.cited_handle);
+  return `${line} Use: ${count(use.surfaced)} surfaced, ${cited} cited, ${count(use.applied)} applied.`;
 }
 
 /**

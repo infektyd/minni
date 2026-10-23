@@ -3,10 +3,13 @@
 // Reads the use ledger (and, for epochs still open, the detector's
 // windows.json) and reports what was surfaced and what was used:
 //   - counts by outcome;
-//   - used (cited + applied) and used_ii (applied + title-cited) per visible
-//     EXPOSURE, the before/after comparison unit, by channel of first
-//     surfacing and by agent (main, and each subagent type); the same per
-//     SURFACING, as diagnostics;
+//   - used (applied + cited + cited_handle, the headline) and used_ii
+//     (applied + title/content cited, the comparison) per visible EXPOSURE,
+//     the before/after unit, by channel of first surfacing and by agent (main,
+//     and each subagent type); the same per SURFACING, as diagnostics. Handle
+//     citations (wikilink, slug, m:/d: handle, learning #id) are their own
+//     column, cited_handle, and never used_ii: only the after pointer prints
+//     handles;
 //   - used_ii credits per 100 human prompt turns (`turn` rows whose
 //     envelope_kind is `human`), so a rate cannot rise just because less was
 //     shown;
@@ -38,6 +41,9 @@ import {
 import { assertWriteTargetUnder, type SessionUseCounts } from "./vault.js";
 
 export const USE_REPORT_NOTE = "lower bounds; silent use is invisible";
+/** The recital rule's known blind spot (rev5 §4.7), printed with every report. */
+export const USE_REPORT_CAVEAT =
+  "Known undercount: a short rule applied by quoting it word for word reads as recital and is not counted; this affects both windows equally, and the used rate is a floor.";
 /** The wires whose rows feed the rates (Phase 1). */
 export const MEASURED_WIRES: readonly string[] = ["claude-code"];
 export const DEFAULT_USE_PRINCIPAL = "claude-code";
@@ -76,8 +82,14 @@ export interface UseReportOptions {
 export interface UseBreakdown {
   total: number;
   visible: number;
+  /** Headline: applied + cited + cited_handle. */
   used: number;
+  /** The comparison: applied + title/content cited (exposures: a credited turn). */
   used_ii: number;
+  /** Handle-style citations: their own bucket, never used_ii. */
+  cited_handle: number;
+  /** Surfacings judged dismissed; exposures with a dismissed turn. */
+  dismissed: number;
   used_per_visible: number | null;
   used_ii_per_visible: number | null;
 }
@@ -91,6 +103,7 @@ export interface UseSection extends UseBreakdown {
 export interface UseReport {
   principal: string;
   note: string;
+  caveat: string;
   since: string;
   until: string;
   days?: number;
@@ -138,19 +151,33 @@ function ratio(n: number, d: number): number | null {
 }
 
 function emptyBreakdown(): UseBreakdown {
-  return { total: 0, visible: 0, used: 0, used_ii: 0, used_per_visible: null, used_ii_per_visible: null };
+  return { total: 0, visible: 0, used: 0, used_ii: 0, cited_handle: 0, dismissed: 0, used_per_visible: null, used_ii_per_visible: null };
 }
 
 function emptySection(): UseSection {
   return { ...emptyBreakdown(), by_outcome: {}, by_channel: {}, by_agent: { main: emptyBreakdown(), subagents: {} } };
 }
 
-function tally(target: UseBreakdown, visible: boolean, used: boolean, usedII: boolean): void {
+interface Item {
+  channel: string;
+  agentKey: string;
+  subagentType?: string;
+  visible: boolean;
+  used: boolean;
+  usedII: boolean;
+  citedHandle: boolean;
+  dismissed: boolean;
+  outcome: string;
+}
+
+function tally(target: UseBreakdown, item: Item): void {
   target.total += 1;
-  if (!visible) return;
+  if (!item.visible) return;
   target.visible += 1;
-  if (used) target.used += 1;
-  if (usedII) target.used_ii += 1;
+  if (item.used) target.used += 1;
+  if (item.usedII) target.used_ii += 1;
+  if (item.citedHandle) target.cited_handle += 1;
+  if (item.dismissed) target.dismissed += 1;
 }
 
 function finish(target: UseBreakdown): void {
@@ -165,21 +192,18 @@ function finishSection(section: UseSection): void {
   for (const breakdown of Object.values(section.by_agent.subagents)) finish(breakdown);
 }
 
-function addTo(section: UseSection, item: { channel: string; agentKey: string; subagentType?: string; visible: boolean; used: boolean; usedII: boolean; outcome: string }): void {
-  tally(section, item.visible, item.used, item.usedII);
+function addTo(section: UseSection, item: Item): void {
+  tally(section, item);
   section.by_outcome[item.outcome] = (section.by_outcome[item.outcome] ?? 0) + 1;
-  const channel = (section.by_channel[item.channel] ??= emptyBreakdown());
-  tally(channel, item.visible, item.used, item.usedII);
+  tally((section.by_channel[item.channel] ??= emptyBreakdown()), item);
   if (item.agentKey === "main") {
-    tally(section.by_agent.main, item.visible, item.used, item.usedII);
+    tally(section.by_agent.main, item);
   } else {
-    const type = item.subagentType ?? "unknown";
-    const agent = (section.by_agent.subagents[type] ??= emptyBreakdown());
-    tally(agent, item.visible, item.used, item.usedII);
+    tally((section.by_agent.subagents[item.subagentType ?? "unknown"] ??= emptyBreakdown()), item);
   }
 }
 
-const isUsed = (outcome: string): boolean => outcome === "cited" || outcome === "applied";
+const isUsed = (outcome: string): boolean => outcome === "cited" || outcome === "applied" || outcome === "cited_handle";
 
 /** Read a named window from `.runtime/use-windows.json`. Throws when it is not there. */
 export function resolveUseWindow(vaultPath: string, name: "before" | "after"): { since: number; until: number | null } {
@@ -263,6 +287,7 @@ function sessionsInRange(vaultPath: string, since: number, until: number): strin
 }
 
 interface OpenExposure {
+  dismissed_turns: number;
   exposure_id: string;
   mkey: string;
   first_sid: string;
@@ -294,6 +319,7 @@ function openExposures(vaultPath: string, sessionKey: string): OpenExposure[] {
       for (const exposure of agent.exposures) {
         if (!isRecord(exposure) || typeof exposure.exposure_id !== "string" || typeof exposure.mkey !== "string") continue;
         const open: OpenExposure = {
+          dismissed_turns: Number.isSafeInteger(exposure.dismissed_turns) ? (exposure.dismissed_turns as number) : 0,
           exposure_id: exposure.exposure_id,
           mkey: exposure.mkey,
           first_sid: typeof exposure.first_sid === "string" ? exposure.first_sid : "",
@@ -354,6 +380,7 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
   const report: UseReport = {
     principal,
     note: USE_REPORT_NOTE,
+    caveat: USE_REPORT_CAVEAT,
     since: new Date(range.since).toISOString(),
     until: new Date(range.until).toISOString(),
     ledger: flagOn(vaultPath, "MINNI_USE_LEDGER") ? "on" : "off",
@@ -430,7 +457,8 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
       const outcome = judgment?.outcome ?? "pending";
       const visible = surfaced.visible === true && surfaced.delivered === true;
       const used = isUsed(outcome);
-      const usedII = outcome === "applied" || (outcome === "cited" && Array.isArray(judgment?.evidence) && judgment.evidence.includes("title"));
+      const titleEvidence = Array.isArray(judgment?.evidence) && judgment.evidence.includes("title");
+      const usedII = outcome === "applied" || (outcome === "cited" && titleEvidence);
       addTo(report.surfacings, {
         channel: surfaced.channel,
         agentKey: surfaced.agent_key,
@@ -438,6 +466,9 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
         visible,
         used,
         usedII,
+        // A pre-s1b-2 `cited` row resting on handle evidence alone is a handle citation.
+        citedHandle: outcome === "cited_handle" || (outcome === "cited" && !titleEvidence),
+        dismissed: outcome === "dismissed",
         outcome,
       });
       if (!judgment || judgment.final !== true) provisionalSurfacings += 1;
@@ -466,6 +497,7 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
     const closed = standingExposures(rows);
     for (const row of closed.values()) {
       exposures.push({
+        dismissed_turns: Number.isSafeInteger(row.dismissed_turns) ? (row.dismissed_turns as number) : 0,
         exposure_id: row.exposure_id,
         mkey: row.mkey,
         first_sid: row.first_sid,
@@ -495,6 +527,8 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
         visible: exposure.visible,
         used,
         usedII,
+        citedHandle: exposure.outcome === "cited_handle",
+        dismissed: exposure.dismissed_turns > 0,
         outcome: exposure.outcome,
       });
       if (provisional) report.exposures.provisional += 1;
@@ -569,7 +603,17 @@ export function sessionUseCounts(vaultPath: string, sessionId: string): SessionU
     const { rows, refused } = readSessionLedger(vaultPath, sessionKey);
     if (refused) return null;
     const judgments = standingJudgments(rows);
-    const counts: SessionUseCounts = { surfaced: 0, cited: 0, applied: 0, opened: 0, dismissed: 0, ignored: 0, unknown: 0, pending: 0 };
+    const counts: SessionUseCounts = {
+      surfaced: 0,
+      cited: 0,
+      cited_handle: 0,
+      applied: 0,
+      opened: 0,
+      dismissed: 0,
+      ignored: 0,
+      unknown: 0,
+      pending: 0,
+    };
     const seen = new Set<string>();
     for (const row of rows) {
       if (row.kind !== "surfaced" || row.delivered !== true || seen.has(row.sid)) continue;
@@ -577,7 +621,14 @@ export function sessionUseCounts(vaultPath: string, sessionId: string): SessionU
       counts.surfaced += 1;
       const outcome = judgments.get(row.sid)?.outcome;
       if (outcome === undefined) counts.pending += 1;
-      else if (outcome === "cited" || outcome === "applied" || outcome === "opened" || outcome === "dismissed" || outcome === "ignored") {
+      else if (
+        outcome === "cited" ||
+        outcome === "cited_handle" ||
+        outcome === "applied" ||
+        outcome === "opened" ||
+        outcome === "dismissed" ||
+        outcome === "ignored"
+      ) {
         counts[outcome] += 1;
       } else counts.unknown += 1;
     }

@@ -1,11 +1,16 @@
 // Recall-to-use S1b (§4.4): the outcome rules, one case each.
 //
-// Order: applied, then cited (handle or title), then opened, then dismissed
-// (sticky), then ignored/unknown. Title citation needs at least 3 distinctive
-// title tokens in one assistant sentence, after dropping the tokens of the
-// current and previous 2 prompts. Writing a handle and then opening it is
-// `opened`, not `cited`. Boot channels' injected text IS the memory, so its
-// shingles count only inside a tool input.
+// Order: applied, then cited (title or content), then cited_handle, then
+// opened, then dismissed (sticky), then ignored/unknown. Title citation needs
+// at least 3 distinctive title tokens in one assistant sentence, after
+// dropping the tokens of the current and previous 2 prompts and every
+// handle-style form (wikilink, slug, path, m:/d: handle, learning #id): a
+// handle is its own bucket, cited_handle, and never used_ii. Writing a handle
+// and then opening it is `opened`. Boot channels' injected text IS the
+// memory: its shingles count only inside a tool input, and its title/content
+// tokens only outside an 8-word echo of the injected line (recital is not
+// use; a paraphrase is). Shingles the recent prompts carried never count as
+// applied in assistant text.
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
@@ -17,6 +22,7 @@ import {
   Clock,
   detectorArgs,
   finalJudged,
+  ledgerRows,
   makeVault,
   surfacedRow,
   Transcript,
@@ -37,6 +43,27 @@ function stop(s, lastAssistantMessage, extra = {}) {
   const result = runDetector(detectorArgs(s.vault, s.transcriptPath, s.clock, { lastAssistantMessage, ...extra }));
   assert.equal(result.status, "ran", JSON.stringify(result));
   return result;
+}
+
+function closeSession(s) {
+  const result = runDetector(detectorArgs(s.vault, s.transcriptPath, s.clock, { endsTurn: false, sessionEnd: true }));
+  assert.equal(result.status, "ran", JSON.stringify(result));
+}
+
+const TITLE = "Beryl harbor checkpoint cadence";
+const CITE = "Per the beryl harbor checkpoint cadence, I moved the job earlier.";
+
+/** One prompt turn with its surfacings and replies, ending in a Stop. */
+async function turn(s, ix, { prompt, rows = () => [], replies = [], tools = [], run = true }) {
+  const promptId = `p${ix}`;
+  s.tx.prompt(prompt, promptId);
+  const surfaced = rows(promptId);
+  append(s.vault, [turnRow({ turnIx: ix, promptId, ts: s.clock.next(5) }), ...surfaced]);
+  for (const [name, input] of tools) s.tx.tool(name, input);
+  for (const reply of replies) s.tx.say(reply);
+  await s.tx.flush();
+  if (run) stop(s, replies.at(-1));
+  return surfaced;
 }
 
 test("applied: a body shingle the injection did not carry, inside a tool input", async (t) => {
@@ -72,10 +99,12 @@ test("applied: a body shingle the injection did not carry, inside a tool input",
   assert.ok(judged.evidence.includes("shingle"));
 });
 
-test("applied on a boot channel: reciting injected text is not applying it; a tool input is", async (t) => {
+test("boot channel, with a DF snapshot: recital is ignored, a paraphrase is cited, a tool input is applied", async (t) => {
   const s = await setup(t);
+  await writeDfSnapshot(s.vault, { the: 90 });
   const recited = "Run the beryl migration scripts in numeric order, never in parallel batches.";
   const written = "Rotate the harbor signing keys only after the quartz drain has fully completed.";
+  const paraphrased = "Pin the resolver mirror before every nightly fetch to avoid flaky builds.";
   const boot = (mkey, text, rank) =>
     surfacedRow({
       channel: "boot_recent_learnings",
@@ -88,25 +117,32 @@ test("applied on a boot channel: reciting injected text is not applying it; a to
     });
   const onlyRecited = boot("learning:41", recited, 0);
   const alsoWritten = boot("learning:42", written, 1);
-  append(s.vault, [onlyRecited, alsoWritten]);
+  const paraphrase = boot("learning:43", paraphrased, 2);
+  append(s.vault, [onlyRecited, alsoWritten, paraphrase]);
 
   s.tx.prompt("Set up the database for the release.", "p1");
   append(s.vault, [turnRow({ turnIx: 1, promptId: "p1", ts: s.clock.next(5) })]);
-  s.tx.say(`Noted: ${recited.toLowerCase()} Also: ${written.toLowerCase()}`);
+  const recital = `Noted: ${recited.toLowerCase()} Also: ${written.toLowerCase()} And: ${paraphrased.toLowerCase()}`;
+  s.tx.say(recital);
   await s.tx.flush();
-  stop(s, `Noted: ${recited.toLowerCase()} Also: ${written.toLowerCase()}`);
+  stop(s, recital);
 
   s.tx.prompt("Go ahead with the plan.", "p2");
   append(s.vault, [turnRow({ turnIx: 2, promptId: "p2", ts: s.clock.next(5) })]);
   s.tx.tool("Write", { file_path: "/synthetic/PLAN.md", content: `Checklist: ${written}` });
-  s.tx.say("Plan written.");
+  s.tx.say("I pinned the resolver to the mirror so nightly fetches stop flaking.");
   await s.tx.flush();
-  stop(s, "Plan written.");
+  stop(s, "I pinned the resolver to the mirror so nightly fetches stop flaking.");
 
-  assert.equal(finalJudged(s.vault, onlyRecited.sid).outcome, "ignored", "recital in assistant text is not use");
+  const ignored = finalJudged(s.vault, onlyRecited.sid);
+  assert.equal(ignored.outcome, "ignored", "a verbatim recital is neither applied nor cited");
+  assert.equal(ignored.title_assessable, true, "the content rule was in force");
   const applied = finalJudged(s.vault, alsoWritten.sid);
   assert.equal(applied.outcome, "applied", "the injected text inside a tool input is use");
   assert.ok(applied.evidence.includes("shingle"));
+  const cited = finalJudged(s.vault, paraphrase.sid);
+  assert.equal(cited.outcome, "cited", "a paraphrase with 3 distinctive content tokens is use");
+  assert.deepEqual(cited.evidence, ["title"]);
 });
 
 test("title-cited: 3 distinctive title tokens in one sentence, prompt tokens excluded", async (t) => {
@@ -244,7 +280,7 @@ test("dismissal is sticky: it blocks a later citation but not an application", a
   assert.equal(finalJudged(s.vault, applied.sid).outcome, "applied", "a dismissed window can still end applied");
 });
 
-test("naming a handle and then opening it is opened; opening and then citing is cited", async (t) => {
+test("naming a handle and then opening it is opened; opening and then citing is cited_handle", async (t) => {
   const s = await setup(t);
   const deltaRel = "wiki/sessions/delta-note.md";
   const epsilonRel = "wiki/sessions/epsilon-note.md";
@@ -279,8 +315,8 @@ test("naming a handle and then opening it is opened; opening and then citing is 
   const opened = finalJudged(s.vault, namedThenOpened.sid);
   assert.equal(opened.outcome, "opened", "a handle written before opening is not a citation");
   const cited = finalJudged(s.vault, openedThenCited.sid);
-  assert.equal(cited.outcome, "cited");
-  assert.ok(cited.evidence.includes("handle"));
+  assert.equal(cited.outcome, "cited_handle", "a handle citation is its own bucket");
+  assert.deepEqual(cited.evidence, ["handle", "open"]);
 });
 
 test("an invisible surfacing with no evidence is unknown(not_visible); an undelivered one unknown(not_delivered)", async (t) => {
@@ -302,4 +338,117 @@ test("an invisible surfacing with no evidence is unknown(not_visible); an undeli
   stop(s, "Nothing obvious yet.");
   assert.equal(finalJudged(s.vault, hidden.sid).outcome, "unknown(not_visible)");
   assert.equal(finalJudged(s.vault, dropped.sid).outcome, "unknown(not_delivered)");
+});
+
+test("a handle-style citation is cited_handle with handle evidence only, and never a credit", async (t) => {
+  const rel = "wiki/sessions/beryl-harbor-checkpoint-cadence.md";
+  const handle = vaultHandle(rel);
+  const replies = [
+    "See [[wiki/sessions/beryl-harbor-checkpoint-cadence]] for the fix.",
+    "See beryl-harbor-checkpoint-cadence for the fix.",
+    `See ${rel} for the fix.`,
+    `See ${handle} for the fix.`,
+  ];
+  for (const reply of replies) {
+    const s = await setup(t);
+    await writeDfSnapshot(s.vault, { the: 90 });
+    const [row] = await turn(s, 1, {
+      prompt: "Look at the nightly stall.",
+      rows: (p) => [surfacedRow({ mkey: `vault:${rel}`, title: TITLE, handles: [handle], promptId: p, ts: s.clock.next(10) })],
+      replies: [reply],
+    });
+    closeSession(s);
+    const judged = finalJudged(s.vault, row.sid);
+    assert.equal(judged.outcome, "cited_handle", reply);
+    assert.deepEqual(judged.evidence, ["handle"], `the handle's own words are not title tokens: ${reply}`);
+    const [exposure] = ledgerRows(s.vault, "exposure");
+    assert.deepEqual(exposure.credits, [], `a handle is never used_ii: ${reply}`);
+    assert.equal(exposure.outcome, "cited_handle");
+  }
+});
+
+test("restating a prompt that quotes a memory body is not applied; the same run in a tool input is", async (t) => {
+  const body = "## Resolution\nAlways drain the quartz queue before rotating the lattice keys at midnight.";
+  const prompt = "Should we always drain the quartz queue before rotating the lattice keys at midnight?";
+  const run = "always drain the quartz queue before rotating the lattice keys at midnight";
+  const outcomes = [];
+  for (const where of ["text", "tool"]) {
+    const s = await setup(t);
+    const [row] = await turn(s, 1, {
+      prompt,
+      rows: (p) => [
+        surfacedRow({
+          mkey: "vault:wiki/sessions/quartz.md",
+          title: "Quartz rotation",
+          promptId: p,
+          ts: s.clock.next(10),
+          shingles: shingleHashes(body),
+          echo: echoHashes("Relevant memory: Quartz rotation."),
+        }),
+      ],
+      tools: where === "tool" ? [["Edit", { file_path: "/synthetic/rotate.ts", old_string: "x", new_string: `// ${run}` }]] : [],
+      replies: where === "text" ? [`Yes: ${run}.`] : ["Done."],
+    });
+    outcomes.push(finalJudged(s.vault, row.sid).outcome);
+  }
+  assert.deepEqual(outcomes, ["ignored", "applied"]);
+});
+
+test("applied from assistant text alone: a body shingle restated in prose", async (t) => {
+  const s = await setup(t);
+  const body = "## Fix\nPin the harbor resolver to the beryl mirror before the nightly fetch runs.";
+  const [row] = await turn(s, 1, {
+    prompt: "Why is the build flaky?",
+    rows: (p) => [
+      surfacedRow({
+        mkey: "vault:wiki/sessions/resolver-pin.md",
+        title: "Resolver pin",
+        promptId: p,
+        ts: s.clock.next(10),
+        shingles: shingleHashes(body),
+        echo: echoHashes("Relevant memory: Resolver pin."),
+      }),
+    ],
+    replies: ["The fix is to pin the harbor resolver to the beryl mirror before the nightly fetch runs."],
+  });
+  const judged = finalJudged(s.vault, row.sid);
+  assert.equal(judged.outcome, "applied");
+  assert.deepEqual(judged.evidence, ["shingle"]);
+});
+
+test("only the FIRST assistant text after a surfacing is checked for dismissal", async (t) => {
+  const s = await setup(t);
+  await writeDfSnapshot(s.vault);
+  const [row] = await turn(s, 1, {
+    prompt: "Look at the nightly stall.",
+    rows: (p) => [surfacedRow({ mkey: "vault:wiki/sessions/beryl-cadence.md", title: TITLE, promptId: p, ts: s.clock.next(10) })],
+    replies: ["Looking at this now.", "Not relevant to this task.", CITE],
+  });
+  assert.equal(finalJudged(s.vault, row.sid).outcome, "cited");
+});
+
+test("title_assessable is recomputed per turn, not latched by the activation", async (t) => {
+  const s = await setup(t);
+  await writeDfSnapshot(s.vault);
+  const boot = surfacedRow({ channel: "boot_recall", mkey: "vault:wiki/sessions/beryl-cadence.md", title: TITLE, ts: s.clock.next(10) });
+  append(s.vault, [boot]);
+  // Both of the boot window's turns drop "harbor" and "checkpoint": 2 tokens left.
+  await turn(s, 1, { prompt: "Why does the harbor checkpoint stall?", replies: ["Looking."] });
+  await turn(s, 2, { prompt: "Keep going.", replies: ["Still looking."] });
+  const judged = finalJudged(s.vault, boot.sid);
+  assert.equal(judged.title_assessable, false);
+});
+
+test("opens are bounded: a longer slug or path that merely contains the note's is not an open", async (t) => {
+  const s = await setup(t);
+  const [row] = await turn(s, 1, {
+    prompt: "Check the cadence notes.",
+    rows: (p) => [surfacedRow({ mkey: "vault:wiki/sessions/beryl-cadence.md", title: "Cadence", promptId: p, ts: s.clock.next(10) })],
+    tools: [
+      ["Bash", { command: "cat notes/beryl-cadence-v2.md" }],
+      ["mcp__minni__minni_drill", { references: ["[[wiki/sessions/beryl-cadence-v2]]"] }],
+    ],
+    replies: ["Read the v2 notes."],
+  });
+  assert.equal(finalJudged(s.vault, row.sid).outcome, "ignored");
 });

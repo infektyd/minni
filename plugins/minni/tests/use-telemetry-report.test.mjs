@@ -161,3 +161,27 @@ test("node dist/cli.js use-report --days N, --memory and --window", async (t) =>
 
   await assert.rejects(run(process.execPath, [CLI, "use-report", "--window", "after"], { env }), /no "after" window/);
 });
+
+test("handle citations are their own column; exposure dismissals are counted; the undercount caveat is fixed", async (t) => {
+  const { vault } = await makeVault(t, "minni-use-report-handle-");
+  const main = context();
+  const at = (minutes) => new Date(Date.now() - 2 * HOUR + minutes * 60_000).toISOString();
+  const handleCited = buildSurfacedRow(main, { channel: "prompt_pointer", mkey: "vault:wiki/h.md", title: "Handle note", rank: 0, visible: true, delivered: true, turn_ix: 1 }, at(1));
+  const rows = [
+    buildTurnRow({ ...main, prompt_id: "p1" }, { turn_ix: 1, envelope_kind: "human", subkind: null, exit: "strong" }, at(0)),
+    handleCited,
+    buildJudgedRow(main, { sid: handleCited.sid, outcome: "cited_handle", via: "transcript", evidence: ["handle"], title_assessable: true, final: true, rule_version: "s1b-2" }, at(2)),
+    buildExposureRow(main, { reset_id: "initial", mkey: "vault:wiki/h.md", first_sid: handleCited.sid, channel: "prompt_pointer", visible: true, outcome: "cited_handle", credits: [], final: true, dismissed_turns: 1 }, at(3)),
+  ];
+  assert.equal(appendLedgerRows(vault, rows).written, rows.length);
+  const { use } = await auditReport(vault, 100, { useDays: 7 });
+  assert.equal(use.surfacings.cited_handle, 1);
+  assert.equal(use.surfacings.used_ii, 0, "a handle citation is never used_ii");
+  assert.equal(use.exposures.cited_handle, 1);
+  assert.equal(use.exposures.used_ii, 0);
+  assert.equal(use.exposures.dismissed, 1);
+  assert.equal(
+    use.caveat,
+    "Known undercount: a short rule applied by quoting it word for word reads as recital and is not counted; this affects both windows equally, and the used rate is a floor.",
+  );
+});

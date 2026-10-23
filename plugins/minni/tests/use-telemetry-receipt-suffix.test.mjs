@@ -78,3 +78,27 @@ test("sessionReceipt reads the session's use counts from the ledger", async (t) 
   assert.equal("use" in quiet, false, "no surfacings: the receipt keeps today's shape");
   assert.equal(formatSessionReceiptLine(quiet).includes("Use:"), false);
 });
+
+test("the receipt's cited count includes handle citations", async (t) => {
+  const { vault } = await makeVault(t, "minni-receipt-handle-");
+  await ensureVault(vault);
+  const sessionId = "synthetic-receipt-handle";
+  const ctx = {
+    session_key: sessionKeyFrom({ session_id: sessionId }),
+    agent_key: "main",
+    wire: "claude-code",
+    principal: "claude-code",
+    features: ["MINNI_USE_LEDGER"],
+  };
+  const ts = new Date().toISOString();
+  const a = buildSurfacedRow(ctx, { channel: "prompt_pointer", mkey: "vault:wiki/a.md", title: "A", rank: 0, visible: true, delivered: true }, ts);
+  const judged = buildJudgedRow(
+    ctx,
+    { sid: a.sid, outcome: "cited_handle", via: "transcript", evidence: ["handle"], title_assessable: true, final: true, rule_version: "s1b-2" },
+    ts,
+  );
+  assert.equal(appendLedgerRows(vault, [a, judged]).written, 2);
+  const receipt = await sessionReceipt(vault, sessionId);
+  assert.equal(receipt.use?.cited_handle, 1);
+  assert.match(formatSessionReceiptLine(receipt), / Use: 1 surfaced, 1 cited, 0 applied\.$/);
+});

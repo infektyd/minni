@@ -487,6 +487,8 @@ export interface ExposureFields {
   outcome: string;
   credits: readonly number[];
   final: boolean;
+  /** Creditable turns whose first assistant text matched the dismissal lexicon (a diagnostic). */
+  dismissed_turns?: number;
 }
 
 export type TurnRow = LedgerCommon & { kind: "turn" } & TurnFields;
@@ -532,6 +534,7 @@ export type ExposureRow = LedgerCommon & {
   outcome: string;
   credits: number[];
   final: boolean;
+  dismissed_turns?: number;
 };
 export type LedgerRow = TurnRow | SurfacedRow | JudgedRow | ResetRow | ExposureRow;
 
@@ -750,6 +753,9 @@ export function buildExposureRow(
     outcome: fields.outcome,
     credits: [...fields.credits],
     final: fields.final,
+    ...(Number.isSafeInteger(fields.dismissed_turns) && (fields.dismissed_turns as number) >= 0
+      ? { dismissed_turns: fields.dismissed_turns as number }
+      : {}),
   };
 }
 
@@ -1032,7 +1038,8 @@ function wordsOf(text: string): string[] {
   return text.normalize("NFKC").toLowerCase().match(WORD_RE) ?? [];
 }
 
-function shingleHashOf(words: readonly string[]): string {
+/** The hash of one shingle (its words, already normalised). Shared with the detector. */
+export function shingleHashOf(words: readonly string[]): string {
   // 64 bits as 16 hex chars: JSON has no exact 64-bit integers.
   return hexDigest("sha256", words.join(" ")).slice(0, 16);
 }

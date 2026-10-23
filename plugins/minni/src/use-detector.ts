@@ -73,6 +73,8 @@ import {
   LEDGER_RELDIR,
   memoryKeyFor,
   readSessionLedger,
+  shingleHashOf,
+  SHINGLE_WORDS,
   type EvidenceKind,
   type LedgerContext,
   type LedgerRow,
@@ -83,7 +85,7 @@ import {
 } from "./use-ledger.js";
 import { assertWriteTargetUnder } from "./vault.js";
 
-export const DETECTOR_RULE_VERSION = "s1b-1";
+export const DETECTOR_RULE_VERSION = "s1b-2";
 /** Detector state root under the vault. */
 export const DETECTOR_RELDIR = path.join(".runtime", "use-detector");
 /** Token document frequencies, written by UPS from its own vault scan. */
@@ -112,6 +114,8 @@ const MAX_TOOL_IDS = 128;
 const MAX_RESETS = 64;
 const MAX_TEXT_HASHES = 256;
 const MAX_PROMPT_TOKENS = 2000;
+/** Shingle hashes kept per recent prompt for the text-act echo rule. */
+const MAX_PROMPT_SHINGLES = 1024;
 const MAX_SET = 128;
 const MAX_CREDITS = 512;
 const MAX_INPUT_CHARS = 200_000;
@@ -529,6 +533,10 @@ interface ExposureState extends MemoryCore {
   /** Human prompt turns since the latest visible surfacing. */
   idle_turns: number;
   seen_this_turn: boolean;
+  /** Creditable turns whose first assistant text matched the dismissal lexicon (a diagnostic). */
+  dismissed_turns: number;
+  /** Assistant actions observed while creditable: none means the exposure was never reached. */
+  seen_total: number;
   /** Evidence since the last fold (the current turn). */
   acc: Acc;
   /** The current turn's evidence plus last_assistant_message, while the reply is unflushed. */
@@ -538,6 +546,10 @@ interface ExposureState extends MemoryCore {
 interface TurnState {
   /** Byte offset of the turn's prompt line: a stable turn id. */
   key: number;
+  /**
+   * The `turn` row's turn_ix; for a turn with no row, -(key + 1): a
+   * detector-local id that can never collide with a real turn_ix.
+   */
   ix: number;
   prompt_id?: string;
   /** The prompt line's timestamp. */
@@ -564,7 +576,8 @@ interface AgentState {
   turn: TurnState | null;
   /** Token hashes of the last 3 non-skip prompts, newest last. */
   prompts: string[][];
-  seq: number;
+  /** Shingle hashes of the same prompts. */
+  prompt_shingles: string[][];
   windows: WindowState[];
   exposures: ExposureState[];
   done: string[];
@@ -609,7 +622,7 @@ function newAgent(wire: string, principal: string, subagentType: string | undefi
     history_stale: false,
     turn: null,
     prompts: [],
-    seq: 0,
+    prompt_shingles: [],
     windows: [],
     exposures: [],
     done: [],
@@ -665,11 +678,13 @@ function agentFrom(value: unknown, nowIso: string): AgentState | null {
   agent.tx = typeof value.tx === "string" && TX_KEY_RE.test(value.tx) ? value.tx : null;
   agent.offset = Math.max(0, int(value.offset));
   agent.history_stale = bool(value.history_stale);
-  agent.seq = Math.max(0, int(value.seq));
   agent.done = strList(value.done, MAX_DONE);
   agent.last_activity = typeof value.last_activity === "string" && tsMs(value.last_activity) !== null ? value.last_activity : nowIso;
   if (Array.isArray(value.prompts)) {
     agent.prompts = value.prompts.filter(Array.isArray).slice(-3).map((list) => strList(list, MAX_PROMPT_TOKENS));
+  }
+  if (Array.isArray(value.prompt_shingles)) {
+    agent.prompt_shingles = value.prompt_shingles.filter(Array.isArray).slice(-3).map((list) => strList(list, MAX_PROMPT_SHINGLES));
   }
   if (isRecord(value.tool_ids)) {
     for (const [id, kind] of Object.entries(value.tool_ids).slice(-MAX_TOOL_IDS)) {
@@ -728,6 +743,8 @@ function agentFrom(value: unknown, nowIso: string): AgentState | null {
       credits: Array.isArray(raw.credits) ? raw.credits.filter((n): n is number => Number.isSafeInteger(n)).slice(0, MAX_CREDITS) : [],
       idle_turns: int(raw.idle_turns),
       seen_this_turn: bool(raw.seen_this_turn),
+      dismissed_turns: int(raw.dismissed_turns),
+      seen_total: int(raw.seen_total),
       acc: accFrom(raw.acc),
     };
     if (raw.pending !== undefined) exposure.pending = accFrom(raw.pending);
@@ -979,9 +996,16 @@ function parseEntry(line: RawLine): TxEntry | null {
 
 interface TextAct {
   kind: "text";
+  /** The raw text: handle-style citations are looked for here. */
   text: string;
+  /** The text's words with every handle-style form removed, in order. */
+  words: string[];
+  /** Sentence index of each word. */
+  sentenceOf: number[];
+  /** Hash of the 8-word shingle starting at each word; null where it would span a removed handle. */
+  windows: Array<string | null>;
   shingles: Set<string>;
-  /** Token sets per sentence. */
+  /** Token sets per sentence, from the handle-free words. */
   sentences: Set<string>[];
 }
 
@@ -998,12 +1022,119 @@ interface ToolAct {
 
 type Act = TextAct | ToolAct;
 
-function textAct(text: string): TextAct {
-  const sentences = text
-    .split(SENTENCE_SPLIT_RE)
-    .filter((sentence) => sentence.trim().length > 0)
-    .map((sentence) => new Set(useTokens(sentence)));
-  return { kind: "text", text, shingles: new Set(allShingleHashes(text)), sentences };
+/**
+ * Handle-style forms in assistant text: wikilinks, m:/d: handles,
+ * `learning #id`, paths (anything with a slash, or a `.md` name), and joined
+ * identifiers of 8+ characters (slugs such as `beryl-harbor-checkpoint-cadence`).
+ * They are evidence for cited_handle only. They are removed before the title,
+ * content and shingle passes, so a handle's own words never become title or
+ * applied evidence: only the after window's pointer prints handles, and
+ * letting them leak into used_ii would bias the comparison toward it.
+ */
+const HANDLE_FORM_RES: readonly RegExp[] = [
+  /\[\[[^\]\n]{1,512}\]\]/g,
+  /\bm:[0-9a-f]{8}\b/g,
+  /\bd:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}/g,
+  /\blearning\s*#\s*[A-Za-z0-9_.-]+/gi,
+  /[\p{L}\p{N}_.~-]*(?:\/[\p{L}\p{N}_.~-]+)+\/?/gu,
+  /[\p{L}\p{N}_-]+\.md\b/giu,
+];
+/** Hyphen- or underscore-joined identifiers; removed when at least 8 characters long. */
+const JOINED_RE = /(?<![\p{L}\p{N}])[\p{L}\p{N}]+(?:[-_][\p{L}\p{N}]+)+(?![\p{L}\p{N}])/gu;
+const MIN_JOINED_CHARS = 8;
+
+/** Sorted, merged [start, end) spans of handle-style forms in `text`. */
+function handleSpans(text: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  for (const re of HANDLE_FORM_RES) {
+    for (const match of text.matchAll(re)) {
+      if (match[0].length > 0) spans.push([match.index as number, (match.index as number) + match[0].length]);
+    }
+  }
+  for (const match of text.matchAll(JOINED_RE)) {
+    if (match[0].length >= MIN_JOINED_CHARS) spans.push([match.index as number, (match.index as number) + match[0].length]);
+  }
+  spans.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<[number, number]> = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]);
+    else merged.push([span[0], span[1]]);
+  }
+  return merged;
+}
+
+/** Per-sentence token sets (words of 3+ characters), optionally only of the kept words. */
+function tokenSets(words: readonly string[], sentenceOf: readonly number[], keep: readonly boolean[] | null): Set<string>[] {
+  const bySentence = new Map<number, Set<string>>();
+  for (let i = 0; i < words.length; i += 1) {
+    if (keep && !keep[i]) continue;
+    const word = words[i] as string;
+    if (word.length < 3) continue;
+    const sentence = sentenceOf[i] as number;
+    let set = bySentence.get(sentence);
+    if (!set) {
+      set = new Set();
+      bySentence.set(sentence, set);
+    }
+    set.add(word);
+  }
+  return [...bySentence.values()];
+}
+
+function textAct(raw: string): TextAct {
+  const text = raw.slice(0, MAX_INPUT_CHARS);
+  const words: string[] = [];
+  const sentenceOf: number[] = [];
+  const segmentOf: number[] = [];
+  let sentence = 0;
+  let segment = 0;
+  const addPiece = (piece: string): void => {
+    piece.split(SENTENCE_SPLIT_RE).forEach((part, index) => {
+      if (index > 0) sentence += 1;
+      for (const word of wordsOf(part)) {
+        words.push(word);
+        sentenceOf.push(sentence);
+        segmentOf.push(segment);
+      }
+    });
+  };
+  let at = 0;
+  for (const [start, end] of handleSpans(text)) {
+    addPiece(text.slice(at, start));
+    segment += 1; // a shingle never spans a removed handle
+    at = end;
+  }
+  addPiece(text.slice(at));
+  const windows: Array<string | null> = [];
+  const shingles = new Set<string>();
+  for (let i = 0; i < words.length; i += 1) {
+    if (i + SHINGLE_WORDS <= words.length && segmentOf[i] === segmentOf[i + SHINGLE_WORDS - 1]) {
+      const hash = shingleHashOf(words.slice(i, i + SHINGLE_WORDS));
+      windows.push(hash);
+      shingles.add(hash);
+    } else {
+      windows.push(null);
+    }
+  }
+  return { kind: "text", text, words, sentenceOf, windows, shingles, sentences: tokenSets(words, sentenceOf, null) };
+}
+
+/**
+ * Sentence token sets of the words NOT inside an 8-word echo of the injected
+ * text. For channels whose injected text is the memory, a recital is not use:
+ * title/content tokens count only outside it, so a paraphrase still does.
+ */
+function sentencesOutsideEcho(act: TextAct, echo: ReadonlySet<string>): Set<string>[] {
+  let covered: boolean[] | null = null;
+  for (let i = 0; i < act.windows.length; i += 1) {
+    const hash = act.windows[i];
+    if (hash === null || hash === undefined || !echo.has(hash)) continue;
+    covered ??= new Array<boolean>(act.words.length).fill(false);
+    for (let j = i; j < i + SHINGLE_WORDS && j < act.words.length; j += 1) covered[j] = true;
+  }
+  if (!covered) return act.sentences;
+  return tokenSets(act.words, act.sentenceOf, covered.map((value) => !value));
 }
 
 function inputLeaves(input: unknown): string {
@@ -1054,14 +1185,19 @@ interface Profile {
   echo: Set<string>;
   /** Distinctive title tokens with their hashes; null when the title rule is off. */
   title: Array<{ token: string; hash: string }> | null;
-  /** Literal strings whose presence in assistant text is a citation. */
-  citeNames: string[];
+  /** Bounded patterns of every name of the memory: handles, wikilinks, paths, slug, learning #id. */
+  names: RegExp[];
+  /** The vault path (with or without .md), bounded: for Bash opens. */
+  relRe: RegExp | null;
   slugRe: RegExp | null;
-  learningRe: RegExp | null;
-  /** Vault-relative path, for opens. */
+  /** Vault-relative path, for Read opens. */
   rel: string | null;
-  slug: string | null;
   doc: { src: string; id: string } | null;
+}
+
+/** `name` not inside a longer name: no name character on either side. */
+function boundedName(name: string, suffix = ""): RegExp {
+  return new RegExp(`(?<![\\p{L}\\p{N}_.:-])${escapeRegExp(name)}${suffix}(?![\\p{L}\\p{N}_-]|\\.[\\p{L}\\p{N}])`, "iu");
 }
 
 function profileFor(core: MemoryCore, df: DfSnapshot | null): Profile {
@@ -1071,11 +1207,10 @@ function profileFor(core: MemoryCore, df: DfSnapshot | null): Profile {
     shingles: new Set(core.shingles),
     echo: new Set(core.echo),
     title: null,
-    citeNames: [...handles],
+    names: handles.map((handle) => boundedName(handle)),
+    relRe: null,
     slugRe: null,
-    learningRe: null,
     rel: null,
-    slug: null,
     doc: null,
   };
   if (df) {
@@ -1087,16 +1222,16 @@ function profileFor(core: MemoryCore, df: DfSnapshot | null): Profile {
     const rel = core.mkey.slice("vault:".length);
     const bare = rel.replace(/\.md$/i, "");
     profile.rel = rel;
-    profile.citeNames.push(`[[${bare}]]`, `[[${rel}]]`);
+    profile.relRe = boundedName(bare, "(?:\\.md)?");
+    profile.names.push(profile.relRe);
     const slug = path.posix.basename(bare);
     if (slug.length >= MIN_SLUG_CHARS) {
-      profile.slug = slug;
-      profile.citeNames.push(`[[${slug}]]`);
-      profile.slugRe = new RegExp(`(?:^|[^\\p{L}\\p{N}_-])${escapeRegExp(slug)}(?![\\p{L}\\p{N}_-])`, "iu");
+      profile.slugRe = boundedName(slug, "(?:\\.md)?");
+      profile.names.push(profile.slugRe);
     }
   } else if (core.mkey.startsWith("learning:")) {
     const id = core.mkey.slice("learning:".length);
-    profile.learningRe = new RegExp(`\\blearning\\s*#\\s*${escapeRegExp(id)}(?![\\p{L}\\p{N}])`, "iu");
+    profile.names.push(new RegExp(`\\blearning\\s*#\\s*${escapeRegExp(id)}(?![\\p{L}\\p{N}])`, "iu"));
   } else {
     const doc = /^doc:([^:]+):(.+)$/.exec(core.mkey);
     if (doc) profile.doc = { src: doc[1] as string, id: doc[2] as string };
@@ -1105,9 +1240,7 @@ function profileFor(core: MemoryCore, df: DfSnapshot | null): Profile {
 }
 
 function citesHandle(profile: Profile, text: string): boolean {
-  if (profile.citeNames.some((name) => name.length > 0 && text.includes(name))) return true;
-  if (profile.slugRe && profile.slugRe.test(text)) return true;
-  return profile.learningRe !== null && profile.learningRe.test(text);
+  return profile.names.some((re) => re.test(text));
 }
 
 function citesTitle(tokens: ReadonlyArray<{ token: string }>, sentences: readonly Set<string>[]): boolean {
@@ -1121,9 +1254,21 @@ function citesTitle(tokens: ReadonlyArray<{ token: string }>, sentences: readonl
   return false;
 }
 
-function hitsShingle(profile: Profile, found: ReadonlySet<string>, inToolInput: boolean): boolean {
+/**
+ * A stored body shingle found in an act. Never one the injection carried
+ * (echo), except inside a tool input for channels whose injected text is the
+ * memory; never, in assistant text, one the recent prompts carried (restating
+ * the prompt is not applying the memory).
+ */
+function hitsShingle(
+  profile: Profile,
+  found: ReadonlySet<string>,
+  inToolInput: boolean,
+  promptShingles: ReadonlySet<string>,
+): boolean {
   for (const hash of profile.shingles) {
     if (!found.has(hash)) continue;
+    if (!inToolInput && promptShingles.has(hash)) continue;
     if (!profile.echo.has(hash)) return true;
     if (profile.core.injected_is_memory && inToolInput) return true;
   }
@@ -1140,14 +1285,11 @@ function opens(profile: Profile, act: ToolAct): boolean {
   if (profile.rel) {
     if (base === "Read" && act.filePath && pathNames(act.filePath, profile.rel)) return true;
     if (base === "Bash" && act.command && READ_VERB_RE.test(`${act.command} `)) {
-      if (act.command.includes(profile.rel)) return true;
-      if (profile.slug && act.command.includes(profile.slug)) return true;
+      if (profile.relRe?.test(act.command) || profile.slugRe?.test(act.command)) return true;
     }
   }
   if (act.minni) {
-    if (profile.citeNames.some((name) => name.length > 0 && act.leaves.includes(name))) return true;
-    if (profile.rel && act.leaves.includes(profile.rel.replace(/\.md$/i, ""))) return true;
-    if (profile.slug && act.leaves.includes(profile.slug)) return true;
+    if (profile.names.some((re) => re.test(act.leaves))) return true;
     if (profile.doc) {
       const lines = act.leaves.split("\n");
       if (lines.includes(profile.doc.id) && lines.includes(profile.doc.src)) return true;
@@ -1168,6 +1310,7 @@ function observe(
   act: Act,
   title: ReadonlyArray<{ token: string }> | null,
   capped: boolean,
+  promptShingles: ReadonlySet<string>,
 ): void {
   if (capped && acc.actions >= TURN_ACTION_CAP) return;
   acc.actions += 1;
@@ -1177,11 +1320,14 @@ function observe(
       acc.first_text = true;
       if (isDismissal(act.text)) acc.dismissed = true;
     }
-    if (hitsShingle(profile, act.shingles, false)) acc.applied = true;
+    if (hitsShingle(profile, act.shingles, false, promptShingles)) acc.applied = true;
     if (citesHandle(profile, act.text)) acc.cite_handle = true;
-    if (title && title.length >= MIN_TITLE_TOKENS && citesTitle(title, act.sentences)) acc.cite_title = true;
+    if (title && title.length >= MIN_TITLE_TOKENS) {
+      const sentences = profile.core.injected_is_memory ? sentencesOutsideEcho(act, profile.echo) : act.sentences;
+      if (citesTitle(title, sentences)) acc.cite_title = true;
+    }
   } else {
-    if (hitsShingle(profile, act.shingles, true)) acc.applied = true;
+    if (hitsShingle(profile, act.shingles, true, promptShingles)) acc.applied = true;
     if (opens(profile, act)) {
       // Naming before opening: a citation followed by an open is the open.
       acc.opened = true;
@@ -1197,6 +1343,11 @@ interface Judgment {
   title_assessable: boolean;
 }
 
+/**
+ * A window's outcome. `cited` is a title/content citation (used_ii);
+ * `cited_handle` a handle-style one, its own bucket and never used_ii.
+ * Dismissal is sticky for both: the window can still end applied or opened.
+ */
 function judge(acc: Acc, visible: boolean, unreached: string): Judgment {
   const evidence: EvidenceKind[] = [];
   if (acc.applied) evidence.push("shingle");
@@ -1206,7 +1357,8 @@ function judge(acc: Acc, visible: boolean, unreached: string): Judgment {
   if (acc.dismissed) evidence.push("lexicon");
   let outcome: string;
   if (acc.applied) outcome = "applied";
-  else if ((acc.cite_handle || acc.cite_title) && !acc.dismissed) outcome = "cited";
+  else if (acc.cite_title && !acc.dismissed) outcome = "cited";
+  else if (acc.cite_handle && !acc.dismissed) outcome = "cited_handle";
   else if (acc.opened) outcome = "opened";
   else if (acc.dismissed) outcome = "dismissed";
   else if (!visible) outcome = "unknown(not_visible)";
@@ -1215,7 +1367,7 @@ function judge(acc: Acc, visible: boolean, unreached: string): Judgment {
   return { outcome, evidence, title_assessable: acc.title_assessable };
 }
 
-const OUTCOME_RANK: Record<string, number> = { applied: 6, cited: 5, opened: 4, dismissed: 3, ignored: 2 };
+const OUTCOME_RANK: Record<string, number> = { applied: 7, cited: 6, cited_handle: 5, opened: 4, dismissed: 3, ignored: 2 };
 
 function rank(outcome: string | null): number {
   if (outcome === null) return 0;
@@ -1226,10 +1378,15 @@ function strongest(a: string | null, b: string | null): string | null {
   return rank(b) > rank(a) ? b : a;
 }
 
-/** An evidence-backed outcome for an exposure's turn, or null when there is none. */
+/**
+ * An exposure turn's evidence outcome, or null. No dismissal gate: at the
+ * exposure level dismissal is a counted diagnostic only, so a re-named and a
+ * named-once memory are judged alike.
+ */
 function evidenceOutcome(acc: Acc): string | null {
   if (acc.applied) return "applied";
-  if ((acc.cite_handle || acc.cite_title) && !acc.dismissed) return "cited";
+  if (acc.cite_title) return "cited";
+  if (acc.cite_handle) return "cited_handle";
   if (acc.opened) return "opened";
   return null;
 }
@@ -1414,6 +1571,19 @@ function indexLedger(rows: readonly LedgerRow[], agentKey: string): LedgerIndex 
   return index;
 }
 
+/**
+ * An exposure's outcome: the strongest evidence across its creditable turns,
+ * else dismissed (a dismissal on some turn), else ignored, or unknown when it
+ * was never visible or never reached. Built from per-turn evidence only, never
+ * from window judgments, so a re-named and a named-once memory get the same.
+ */
+function exposureOutcome(exposure: ExposureState): string {
+  if (exposure.outcome) return exposure.outcome;
+  if (!exposure.visible) return "unknown(not_visible)";
+  if (exposure.dismissed_turns > 0) return "dismissed";
+  return exposure.seen_total > 0 ? "ignored" : "unknown(unreached)";
+}
+
 class RowWriter {
   readonly rows: LedgerRow[] = [];
   judged = 0;
@@ -1465,9 +1635,10 @@ class RowWriter {
         first_sid: exposure.first_sid,
         channel: exposure.channel,
         visible: exposure.visible,
-        outcome: exposure.outcome ?? (exposure.visible ? "ignored" : "unknown(not_visible)"),
+        outcome: exposureOutcome(exposure),
         credits,
         final: true,
+        dismissed_turns: exposure.dismissed_turns,
       },
       this.ts,
     );
@@ -1511,9 +1682,36 @@ interface RunEnv {
   deadline: number;
 }
 
+interface DueEvent {
+  ts: number;
+  reset: boolean;
+  sessionStart: boolean;
+  boot: boolean;
+  apply: () => void;
+}
+
+/**
+ * Apply one batch of events due with no transcript entry between them: in
+ * time order, except that a SessionStart reset goes before the batch's boot
+ * surfacings whatever their timestamps. A SessionStart opens the epoch its
+ * boot rows belong to; written in the other order, a final judgment would
+ * otherwise close those windows unreached (defence in depth: S1a writes the
+ * reset first).
+ */
+function applyBatch(due: DueEvent[]): void {
+  const bootTimes = due.filter((event) => event.boot).map((event) => event.ts);
+  if (bootTimes.length > 0) {
+    const firstBoot = Math.min(...bootTimes);
+    for (const event of due) if (event.sessionStart && firstBoot < event.ts) event.ts = firstBoot - 0.5;
+  }
+  due.sort((a, b) => a.ts - b.ts || Number(b.reset) - Number(a.reset));
+  for (const event of due) event.apply();
+}
+
 class DetectorRun {
   private readonly profiles = new Map<string, Profile>();
   private promptHashes = new Set<string>();
+  private promptShingles = new Set<string>();
   private pending: PendingSurfacing[] = [];
   private resets: Array<{ row: ResetRow; ts: number; done: boolean }> = [];
   private readonly known = new Set<string>();
@@ -1536,6 +1734,7 @@ class DetectorRun {
     for (const sid of agent.done) this.known.add(sid);
     for (const sid of index.finalSids) this.known.add(sid);
     this.promptHashes = new Set(agent.prompts.flat());
+    this.promptShingles = new Set(agent.prompt_shingles.flat());
   }
 
   get isMain(): boolean {
@@ -1643,8 +1842,11 @@ class DetectorRun {
       pushBounded(this.agent.done, row.sid, MAX_DONE);
     } else if (this.agent.windows.length < MAX_WINDOWS) {
       const window: WindowState = { ...core, sid: row.sid, scope, turn_key: turnKey, boot_turns: 0, acc: newAcc(false) };
-      const title = this.titleFor(window);
-      if (title && title.length >= MIN_TITLE_TOKENS && (scope === "boot" || turnKey !== -1)) window.acc.title_assessable = true;
+      // Assessable for a turn it is judged in; a window not yet in a turn is
+      // decided when it joins one (boundary or Stop), never latched here.
+      const turn = this.agent.turn;
+      const live = turn !== null && !turn.closed && !turn.ended;
+      if (scope === "turn" ? turnKey !== -1 : live) window.acc.title_assessable = this.assessable(window);
       this.agent.windows.push(window);
     }
     let exposure = this.agent.exposures.find((entry) => entry.mkey === core.mkey);
@@ -1660,7 +1862,9 @@ class DetectorRun {
         credits: [],
         idle_turns: 0,
         seen_this_turn: false,
-        acc: newAcc(true),
+        dismissed_turns: 0,
+        seen_total: 0,
+        acc: newAcc(!core.visible),
       };
       this.agent.exposures.push(exposure);
     } else {
@@ -1677,12 +1881,19 @@ class DetectorRun {
         exposure.first_sid = row.sid;
         exposure.first_ts = row.ts;
         exposure.channel = channel;
+        exposure.acc.first_text = false; // its first visible turn: check its first text
       }
       exposure.idle_turns = 0;
       exposure.seen_this_turn = true;
-      // Dismissal is checked on the first text after each visible surfacing.
-      exposure.acc.first_text = false;
+      // Re-naming never re-arms the dismissal check: an exposure checks the
+      // first assistant text of each turn, named or not (symmetry).
     }
+  }
+
+  /** Whether the title rule can assess this memory on the current turn. */
+  private assessable(core: MemoryCore & { sid?: string; exposure_id?: string }): boolean {
+    const title = this.titleFor(core);
+    return title !== null && title.length >= MIN_TITLE_TOKENS;
   }
 
   private dueSurfacing(pending: PendingSurfacing, entry: TxEntry): boolean {
@@ -1695,41 +1906,47 @@ class DetectorRun {
     return entry.ts !== null && entry.ts > pending.ts;
   }
 
-  /** Apply every reset and surfacing positioned before `entry`, in time order. */
+  private resetEvent(reset: { row: ResetRow; ts: number }): DueEvent {
+    return { ts: reset.ts, reset: true, sessionStart: reset.row.event === "SessionStart", boot: false, apply: () => this.applyReset(reset.row) };
+  }
+
+  private surfaceEvent(pending: PendingSurfacing): DueEvent {
+    return { ts: pending.ts, reset: false, sessionStart: false, boot: BOOT_SCOPE.has(pending.row.channel), apply: () => this.activate(pending.row) };
+  }
+
+  /** Apply every reset and surfacing positioned before `entry` (see applyBatch). */
   private applyDue(entry: TxEntry): void {
-    const due: Array<{ ts: number; apply: () => void }> = [];
+    const due: DueEvent[] = [];
     for (const reset of this.resets) {
       if (!reset.done && entry.ts !== null && reset.ts < entry.ts) {
-        due.push({ ts: reset.ts, apply: () => this.applyReset(reset.row) });
+        due.push(this.resetEvent(reset));
         reset.done = true;
       }
     }
     for (const pending of this.pending) {
       if (!pending.done && this.dueSurfacing(pending, entry)) {
-        due.push({ ts: pending.ts, apply: () => this.activate(pending.row) });
+        due.push(this.surfaceEvent(pending));
         pending.done = true;
       }
     }
-    due.sort((a, b) => a.ts - b.ts);
-    for (const event of due) event.apply();
+    applyBatch(due);
   }
 
   /** End of the stream: everything still pending happened after the last line read. */
   flushEvents(): void {
-    const due: Array<{ ts: number; apply: () => void }> = [];
+    const due: DueEvent[] = [];
     for (const reset of this.resets) {
       if (!reset.done) {
-        due.push({ ts: reset.ts, apply: () => this.applyReset(reset.row) });
+        due.push(this.resetEvent(reset));
         reset.done = true;
       }
     }
     for (const pending of this.pending) {
       if (pending.done) continue;
       pending.done = true;
-      due.push({ ts: pending.ts, apply: () => this.activate(pending.row) });
+      due.push(this.surfaceEvent(pending));
     }
-    due.sort((a, b) => a.ts - b.ts);
-    for (const event of due) event.apply();
+    applyBatch(due);
   }
 
   /** A reset of this agent closes its open windows and its epoch. */
@@ -1773,8 +1990,6 @@ class DetectorRun {
       if (via === "idle") via = "unflushed_tail";
     }
     this.writer.writeJudged(window.sid, judgment, true, via, finalReason);
-    const exposure = this.agent.exposures.find((entry) => entry.mkey === window.mkey);
-    if (exposure) exposure.outcome = strongest(exposure.outcome, judgment.outcome);
     pushBounded(this.agent.done, window.sid, MAX_DONE);
     this.agent.windows = this.agent.windows.filter((entry) => entry !== window);
   }
@@ -1786,7 +2001,11 @@ class DetectorRun {
       const creditable = exposure.visible && exposure.idle_turns < CREDIT_IDLE_TURNS;
       if (creditable) {
         exposure.outcome = strongest(exposure.outcome, evidenceOutcome(acc));
-        const usedII = acc.applied || (acc.cite_title && !acc.dismissed);
+        exposure.seen_total += acc.seen;
+        if (acc.dismissed) exposure.dismissed_turns += 1;
+        // used_ii: applied, or a title/content citation. A handle citation is
+        // never used_ii, and dismissal never gates a credit (symmetry).
+        const usedII = acc.applied || acc.cite_title;
         if (usedII && ix !== null && !exposure.credits.includes(ix) && exposure.credits.length < MAX_CREDITS) {
           exposure.credits.push(ix);
         }
@@ -1823,8 +2042,7 @@ class DetectorRun {
     const promptId = entry.promptId;
     const row = promptId ? this.index.turnsByPrompt.get(promptId) : undefined;
     const kind = typeof row?.envelope_kind === "string" ? row.envelope_kind : classifyPromptEnvelope(entry.text ?? "").kind;
-    const ix = Number.isSafeInteger(row?.turn_ix) ? (row?.turn_ix as number) : this.agent.seq + 1;
-    this.agent.seq = Math.max(this.agent.seq, ix);
+    const ix = Number.isSafeInteger(row?.turn_ix) ? (row?.turn_ix as number) : -(entry.off + 1);
     const turn: TurnState = {
       key: entry.off,
       ix,
@@ -1839,17 +2057,23 @@ class DetectorRun {
     this.msgTexts = new Map();
     if (turn.non_skip) {
       pushBounded(this.agent.prompts, useTokens(entry.text ?? "").slice(0, MAX_PROMPT_TOKENS).map(tokenHash), 3);
+      pushBounded(this.agent.prompt_shingles, allShingleHashes(entry.text ?? "").slice(0, MAX_PROMPT_SHINGLES), 3);
     }
     this.promptHashes = new Set(this.agent.prompts.flat());
+    this.promptShingles = new Set(this.agent.prompt_shingles.flat());
     for (const window of this.agent.windows) {
-      if (window.scope === "turn" && window.turn_key === -1) window.turn_key = turn.key;
-      if (window.scope === "boot" && turn.non_skip) window.boot_turns += 1;
-      const title = this.titleFor(window);
-      if (title && title.length >= MIN_TITLE_TOKENS) window.acc.title_assessable = true;
+      if (window.scope === "turn" && window.turn_key === -1) {
+        window.turn_key = turn.key;
+        window.acc.title_assessable = this.assessable(window);
+      } else if (window.scope === "boot") {
+        if (turn.non_skip) window.boot_turns += 1;
+        // A boot window spans turns: assessable when the rule could fire on any of them.
+        window.acc.title_assessable = window.acc.title_assessable || this.assessable(window);
+      }
     }
     for (const exposure of this.agent.exposures) {
       exposure.seen_this_turn = false;
-      exposure.acc = newAcc(true);
+      exposure.acc = newAcc(!exposure.visible); // dismissal: each turn's first text
     }
     for (const pending of this.pending) {
       if (pending.done || !pending.bound || pending.row.prompt_id !== promptId) continue;
@@ -1864,11 +2088,11 @@ class DetectorRun {
   private observeAll(act: Act): void {
     for (const window of this.agent.windows) {
       if (window.scope === "turn" && window.turn_key === -1) continue;
-      observe(window.acc, this.profile(window), act, this.titleFor(window), window.scope === "turn");
+      observe(window.acc, this.profile(window), act, this.titleFor(window), window.scope === "turn", this.promptShingles);
     }
     for (const exposure of this.agent.exposures) {
       if (!exposure.visible || exposure.idle_turns >= CREDIT_IDLE_TURNS) continue;
-      observe(exposure.acc, this.profile(exposure), act, this.titleFor(exposure), false);
+      observe(exposure.acc, this.profile(exposure), act, this.titleFor(exposure), false, this.promptShingles);
     }
   }
 
@@ -1908,7 +2132,7 @@ class DetectorRun {
           handles: handlesForKey(mkey),
           title: card.title ?? card.wikilink ?? "",
           rank: card.rank,
-          turn_ix: turn?.ix,
+          turn_ix: turn && turn.ix >= 0 ? turn.ix : undefined,
           visible: true,
           delivered: true,
           tool_use_id: result.tool_use_id,
@@ -1988,12 +2212,15 @@ class DetectorRun {
     this.agent.prompts = prompts
       .slice(-3)
       .map((entry) => useTokens(entry.text ?? "").slice(0, MAX_PROMPT_TOKENS).map(tokenHash));
+    this.agent.prompt_shingles = prompts
+      .slice(-3)
+      .map((entry) => allShingleHashes(entry.text ?? "").slice(0, MAX_PROMPT_SHINGLES));
     this.promptHashes = new Set(this.agent.prompts.flat());
+    this.promptShingles = new Set(this.agent.prompt_shingles.flat());
     if (lastPrompt) {
       const row = lastPrompt.promptId ? this.index.turnsByPrompt.get(lastPrompt.promptId) : undefined;
       const kind = typeof row?.envelope_kind === "string" ? row.envelope_kind : classifyPromptEnvelope(lastPrompt.text ?? "").kind;
-      const ix = Number.isSafeInteger(row?.turn_ix) ? (row?.turn_ix as number) : this.agent.seq;
-      this.agent.seq = Math.max(this.agent.seq, ix);
+      const ix = Number.isSafeInteger(row?.turn_ix) ? (row?.turn_ix as number) : -(lastPrompt.off + 1);
       this.agent.turn = {
         key: lastPrompt.off,
         ix,
@@ -2017,7 +2244,12 @@ class DetectorRun {
     // Every surfacing in the ledger at Stop(N) came from a turn <= N: one not
     // yet placed in a turn belongs to the one ending now.
     if (turn) {
-      for (const window of this.agent.windows) if (window.scope === "turn" && window.turn_key === -1) window.turn_key = turn.key;
+      for (const window of this.agent.windows) {
+        if (window.scope === "turn" && window.turn_key === -1) {
+          window.turn_key = turn.key;
+          window.acc.title_assessable = this.assessable(window);
+        }
+      }
     }
     const closing = this.agent.windows.filter((window) =>
       window.scope === "turn" ? turn === null || window.turn_key === turn.key : window.boot_turns >= 2,
@@ -2033,7 +2265,7 @@ class DetectorRun {
     const act = textAct(lam as string);
     for (const window of closing) {
       const acc = cloneAcc(window.acc);
-      observe(acc, this.profile(window), act, this.titleFor(window), window.scope === "turn");
+      observe(acc, this.profile(window), act, this.titleFor(window), window.scope === "turn", this.promptShingles);
       const judgment = judge(acc, window.visible, this.unreachedReason());
       window.provisional = { ...judgment, ts: this.env.nowIso };
       if (this.writer.writeJudged(window.sid, judgment, false, "last_message")) this.provisional += 1;
@@ -2041,7 +2273,7 @@ class DetectorRun {
     for (const exposure of this.agent.exposures) {
       if (!exposure.visible || exposure.idle_turns >= CREDIT_IDLE_TURNS) continue;
       const acc = cloneAcc(exposure.acc);
-      observe(acc, this.profile(exposure), act, this.titleFor(exposure), false);
+      observe(acc, this.profile(exposure), act, this.titleFor(exposure), false, this.promptShingles);
       exposure.pending = acc;
     }
     if (turn) turn.ended = { lam_hash: lamHash, ts: this.env.nowIso };
