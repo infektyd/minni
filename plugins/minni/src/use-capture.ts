@@ -301,15 +301,85 @@ function sleepSync(ms: number): void {
   Atomics.wait(sleepCell, 0, 0, ms);
 }
 
+/** Test seam for acquireCounterLock; production callers pass nothing. */
+export interface CounterLockHooks {
+  /** Runs after a lock was judged stale and before it is broken. */
+  beforeBreak?: () => void;
+}
+
+/**
+ * Break a lock judged stale. It is renamed away first: of several breakers,
+ * exactly one rename takes it, the others get ENOENT and retry the create.
+ * What a breaker renamed may still not be the lock it judged: another breaker
+ * can have broken that one and a fresh lock taken its place in between. So
+ * only a renamed lock that is still stale is removed; a fresh one is linked
+ * back (never over a lock that appeared meanwhile) and the breaker retries.
+ */
+function breakStaleLock(lock: string): "broken" | "fresh" | "gone" | "error" {
+  const grave = `${lock}.stale-${process.pid}-${randomUUID()}`;
+  try {
+    fs.renameSync(lock, grave);
+  } catch (error) {
+    return errorCode(error) === "ENOENT" ? "gone" : "error";
+  }
+  let stale = false;
+  try {
+    const stat = fs.lstatSync(grave);
+    stale = stat.isFile() && Date.now() - stat.mtimeMs > COUNTER_LOCK_STALE_MS;
+  } catch {
+    // Unjudgeable: treat it as live and put it back.
+  }
+  if (!stale) {
+    try {
+      fs.linkSync(grave, lock);
+    } catch {
+      // EEXIST: a newer lock holds the path; its holder is the one inside.
+    }
+  }
+  try {
+    fs.unlinkSync(grave);
+  } catch {
+    // Best effort: a leftover grave holds no lock.
+  }
+  return stale ? "broken" : "fresh";
+}
+
+/** Remove the lock only if it is still ours (its token), never another holder's. */
+function releaseCounterLock(lock: string, token: string): void {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(lock, READ_FLAGS);
+    const buffer = Buffer.alloc(token.length + 1);
+    const n = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    if (buffer.subarray(0, n).toString("utf8") === token) fs.unlinkSync(lock);
+  } catch {
+    // Already gone, or not ours: nothing to release.
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Nothing was written.
+      }
+    }
+  }
+}
+
 /**
  * Take `counters.json.lock` (O_EXCL) in a session directory. Returns its
  * release, or null when it could not be taken within the bounded wait, or
  * something that is not a lock file sits in its place. A lock older than
- * COUNTER_LOCK_STALE_MS is broken (best effort: the critical section is a few
- * small file operations, so a lock that old has no live holder).
+ * COUNTER_LOCK_STALE_MS is broken through breakStaleLock (the critical
+ * section is a few small file operations, so a lock that old has no live
+ * holder). Each lock carries a random token, so a release removes only its own.
  */
-function lockCounter(dir: string, vaultPath: string): (() => void) | null {
+export function acquireCounterLock(
+  dir: string,
+  vaultPath: string,
+  hooks: CounterLockHooks = {},
+): (() => void) | null {
   const lock = path.join(dir, "counters.json.lock");
+  const token = `${process.pid} ${randomUUID()}\n`;
   const deadline = Date.now() + COUNTER_LOCK_WAIT_MS;
   for (let attempt = 0; ; attempt += 1) {
     if (attempt > 0 && Date.now() >= deadline) return null;
@@ -317,17 +387,11 @@ function lockCounter(dir: string, vaultPath: string): (() => void) | null {
       assertWriteTargetUnder(lock, vaultPath);
       const fd = fs.openSync(lock, LOCK_FLAGS, 0o600);
       try {
-        fs.writeSync(fd, `${process.pid} ${Date.now()}\n`);
+        fs.writeSync(fd, token);
       } finally {
         fs.closeSync(fd);
       }
-      return () => {
-        try {
-          fs.unlinkSync(lock);
-        } catch {
-          // Already gone: nothing to release.
-        }
-      };
+      return () => releaseCounterLock(lock, token);
     } catch (error) {
       if (errorCode(error) !== "EEXIST") return null;
     }
@@ -335,7 +399,8 @@ function lockCounter(dir: string, vaultPath: string): (() => void) | null {
       const stat = fs.lstatSync(lock);
       if (!stat.isFile()) return null;
       if (Date.now() - stat.mtimeMs > COUNTER_LOCK_STALE_MS) {
-        fs.unlinkSync(lock);
+        hooks.beforeBreak?.();
+        if (breakStaleLock(lock) === "error") sleepSync(COUNTER_LOCK_POLL_MS);
         continue;
       }
     } catch (error) {
@@ -356,7 +421,7 @@ function nextTurnIndex(capture: UseCapture): number {
   try {
     const dir = sessionDir(capture, true);
     if (dir === null) return 0;
-    const release = lockCounter(dir, capture.vaultPath);
+    const release = acquireCounterLock(dir, capture.vaultPath);
     if (release === null) return 0;
     try {
       const file = path.join(dir, "counters.json");
