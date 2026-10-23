@@ -110,6 +110,17 @@ import {
   subscribeContradictions,
 } from "./daemon_transport.js";
 import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
+import { loadFlags } from "./flags.js";
+import {
+  auditFlagNotes,
+  captureBootSurfacings,
+  captureGuardDeny,
+  capturePromptPointer,
+  openDispatchCapture,
+  recordReset,
+  withTurnRecord,
+} from "./use-capture.js";
+import type { UpsCapture, UseCapture } from "./use-capture.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -653,7 +664,12 @@ export function createHookHandlers(
     return output as HookOutput;
   };
 
-  async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
+  // `capture` (S1a-2) is passed only by dispatch, with the use ledger on; a
+  // direct call records nothing.
+  async function handleSessionStart(
+    payload: Record<string, unknown>,
+    capture?: UseCapture,
+  ): Promise<HookOutput> {
     // rawSessionId is the payload's own id, possibly empty — never the
     // "session" synthetic fallback. It is what gets threaded into the daemon
     // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
@@ -1210,12 +1226,22 @@ export function createHookHandlers(
       bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
         ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
         : "";
-    return render(
-      injectIntent("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n")),
-    );
+    const bootText = [nativeLayer1, envelope].filter(Boolean).join("\n\n");
+    // S1a-2: what this boot surfaced, judged on the exact emitted string. The
+    // rows are deferred and land only once this output does.
+    captureBootSurfacings(capture, { emitted: bootText, recall, identity: identityRead });
+    return render(injectIntent("SessionStart", bootText));
   }
 
-  async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput> {
+  // `use` (S1a-2) comes from the dispatch arm's withTurnRecord: every return
+  // below names its exit on it first. A direct call records nothing.
+  async function handleUserPromptSubmit(
+    payload: Record<string, unknown>,
+    use?: UpsCapture,
+  ): Promise<HookOutput> {
+    const exit = (reason: string): void => {
+      if (use) use.turn.exit = reason;
+    };
     // BUDGET (parity with the claude-code hook): every host kills a prompt-time
     // hook and DISCARDS its output, so an overrun costs the whole turn's
     // injection silently. The budget is clamped to this platform's manifest
@@ -1228,6 +1254,7 @@ export function createHookHandlers(
 
     const prompt = asString(payload.prompt) || asString(payload.user_prompt);
     if (!prompt.trim()) {
+      exit("empty_prompt");
       return render(noIntent);
     }
 
@@ -1301,6 +1328,7 @@ export function createHookHandlers(
       await clearRecallState(config.vaultPath).catch(() => {});
       // #283: the persistent lifecycle visibility must survive this
       // write-intent early-return.
+      exit("write_intent");
       return lifecycleOnlyOutput();
     }
 
@@ -1482,6 +1510,7 @@ export function createHookHandlers(
       });
       // #283: even with nothing salient (no strong recall, no active plan)
       // the persistent lifecycle line still rides this turn's envelope.
+      exit("nothing_salient");
       return lifecycleOnlyOutput();
     }
 
@@ -1496,10 +1525,12 @@ export function createHookHandlers(
         task_signature: signature,
       },
     };
+    let recallPointer: string | undefined;
     if (strong) {
       // LIGHT POINTER, not the full pack: the full top hits live in the portable
       // recall-state file (read by the s6 guard); the prompt only gets a signpost.
-      envelopeBody.recall_pointer = buildRecallPointer(strong);
+      recallPointer = buildRecallPointer(strong);
+      envelopeBody.recall_pointer = recallPointer;
       envelopeBody.recall_state = recallStateFile;
     } else if (stalePointer !== undefined) {
       envelopeBody.recall_pointer = stalePointer;
@@ -1579,6 +1610,21 @@ export function createHookHandlers(
       },
     });
 
+    if (strong && recallPointer !== undefined) {
+      // S1a-2: the hit the pointer names, deliver first; and, when the guard
+      // was armed, the keys of the hits it may list.
+      capturePromptPointer(use, {
+        emitted: envelope,
+        pointer: recallPointer,
+        strong,
+        recall: recall.ok ? recall.data : undefined,
+        vaultResults,
+        threshold,
+        taskSignature: signature,
+        armed: recallStateFile !== undefined,
+      });
+    }
+    exit(strong ? "pointer" : stalePointer !== undefined ? "stale_pointer" : "plan");
     return render(injectIntent("UserPromptSubmit", envelope));
   }
 
@@ -1587,6 +1633,7 @@ export function createHookHandlers(
   // permissionDecision shape (deny-to-surface), NOT an envelope.
   async function handlePreToolUse(
     payload: Record<string, unknown>,
+    capture?: UseCapture,
   ): Promise<PreToolUseDecisionOutput> {
     const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
     if (mode === "off") return preToolUseAllow();
@@ -1632,7 +1679,10 @@ export function createHookHandlers(
       },
     }).catch(() => {});
     if (!consumed) return preToolUseAllow();
-    return preToolUseDeny(state!);
+    const deny = preToolUseDeny(state!);
+    // S1a-2: only a deny actually returned is recorded, one row per listed hit.
+    captureGuardDeny(capture, state!, deny.hookSpecificOutput?.permissionDecisionReason ?? "");
+    return deny;
   }
 
   async function handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput> {
@@ -1928,18 +1978,49 @@ export function createHookHandlers(
     return render(noIntent);
   }
 
+  // S1a-2: the use-ledger capture is opened here, once per event (a hook
+  // process handles one), so a direct handler call never records. The flags
+  // are loaded once; a note about them is audited after the handler has built
+  // its output, so the audit line cannot reach this event's audit_tail.
   async function dispatch(
     event: string,
     payload: Record<string, unknown>,
   ): Promise<HookOutput | PreToolUseDecisionOutput> {
+    const flags = loadFlags(config.vaultPath);
+    const capture = openDispatchCapture({
+      vaultPath: config.vaultPath,
+      event,
+      payload,
+      wire,
+      principal: config.agentId,
+      flags,
+    });
+    try {
+      return await route(event, payload, capture);
+    } finally {
+      await auditFlagNotes(config.vaultPath, config.auditPrefix, flags);
+    }
+  }
+
+  async function route(
+    event: string,
+    payload: Record<string, unknown>,
+    capture: UseCapture | null,
+  ): Promise<HookOutput | PreToolUseDecisionOutput> {
     switch (event) {
       case "SessionStart":
-        return handleSessionStart(payload);
+        recordReset(capture, event, payload);
+        return handleSessionStart(payload, capture ?? undefined);
       case "UserPromptSubmit":
-        return handleUserPromptSubmit(payload);
+        // Every exit is counted: one `turn` row per prompt, written when the
+        // handler returns or throws (§4.3).
+        return withTurnRecord(capture, payload, (turn) =>
+          handleUserPromptSubmit(payload, capture ? { capture, turn } : undefined),
+        );
       case PRE_TOOL_USE_EVENT:
-        return handlePreToolUse(payload);
+        return handlePreToolUse(payload, capture ?? undefined);
       case "PreCompact":
+        recordReset(capture, event, payload);
         return handlePreCompact(payload);
       // #283 / #227: primary compaction-summary delivery for a platform
       // whose own hook system fires a dedicated post-compaction event
@@ -1947,6 +2028,7 @@ export function createHookHandlers(
       // no other platform's manifest declares this event today, so this
       // case simply never fires for them.
       case "PostCompact":
+        recordReset(capture, event, payload);
         return handlePostCompact(payload);
       case "CompactSummary":
         return handleCompactSummary(payload);

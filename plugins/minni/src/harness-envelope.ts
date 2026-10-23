@@ -13,7 +13,9 @@
 // (`<vault>/.runtime/prompt-templates.json`) holds counts and timestamps only,
 // never prompt text. UPS is its only writer; harvest only reads it.
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -385,6 +387,8 @@ const SESSION_KEY_PATTERN = /^[0-9A-Za-z_-]{1,8}$/;
 const MAX_PID_CHARS = 128;
 /** A legitimate file is well under 1 MB (500 entries); anything past this is not ours. */
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const READ_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
 
 export function promptTemplatesPath(vaultPath: string): string {
   return path.join(vaultPath, PROMPT_TEMPLATES_RELPATH);
@@ -461,7 +465,8 @@ function isAbsentError(error: unknown): boolean {
  */
 function isUnusableError(error: unknown): boolean {
   const code = errorCode(error);
-  return code === "EISDIR" || code === "EACCES" || code === "EPERM";
+  // ELOOP: O_NOFOLLOW met a symlink swapped in after the containment check.
+  return code === "EISDIR" || code === "EACCES" || code === "EPERM" || code === "ELOOP";
 }
 
 function isExpectedReadFailure(error: unknown): boolean {
@@ -476,20 +481,29 @@ function isExpectedReadFailure(error: unknown): boolean {
 async function loadPromptTemplates(vaultPath: string): Promise<PromptTemplatesFile | null> {
   const filePath = promptTemplatesPath(vaultPath);
   assertWriteTargetUnder(filePath, vaultPath);
+  let handle: FileHandle | undefined;
   try {
-    const info = await stat(filePath);
-    if (info.size > MAX_FILE_BYTES) return null;
-    return sanitizeFile(JSON.parse(await readFile(filePath, "utf8")));
+    // Opened without blocking and without following a link, then checked to be
+    // a regular file. A FIFO in the file's place would otherwise block the
+    // read, and a read blocked in the threadpool also blocks process exit, so
+    // UPS (which reads this on every prompt) could never finish.
+    handle = await open(filePath, READ_FLAGS);
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > MAX_FILE_BYTES) return null;
+    return sanitizeFile(JSON.parse(await handle.readFile("utf8")));
   } catch (error) {
     if (error instanceof SyntaxError || isAbsentError(error)) return null;
     throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
 /**
  * Read-only reader (harvest uses this). Null when the file is absent, malformed,
- * oversize, of another version, unusable (a directory in its place, or no
- * permission to read it: EISDIR, EACCES, EPERM), or refused by the containment
+ * oversize, of another version, unusable (not a regular file, such as a
+ * directory or a FIFO in its place, or no permission to read it: EISDIR,
+ * EACCES, EPERM), or refused by the containment
  * check (a symlink that escapes the vault is treated as absent, never followed).
  * A null means "no evidence", so the template rule answers `human`. Any other
  * I/O error still throws. `recordOccurrence` keeps throwing on all of these.

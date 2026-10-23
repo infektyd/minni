@@ -170,7 +170,7 @@ export function ledgerFilePath(vaultPath: string, sessionKey: string, ts: string
  * component that failed the check. Returns the directory path, or null when it
  * is missing and `create` is false. Throws on refusal.
  */
-function containedDir(vaultPath: string, segments: readonly string[], create: boolean): string | null {
+export function containedDir(vaultPath: string, segments: readonly string[], create: boolean): string | null {
   const root = fs.realpathSync(vaultPath);
   let current = vaultPath;
   for (const segment of segments) {
@@ -785,8 +785,15 @@ function encodeRow(row: LedgerRow): EncodedRow | null {
   return clipped.length <= MAX_ROW_BYTES ? { bytes: clipped, clipped: true } : null;
 }
 
+// O_NONBLOCK: a FIFO planted in a day file's place would otherwise block the
+// open (no reader), and with it the hook. It changes nothing for a regular
+// file, and anything that is not one is refused after the open.
 const OPEN_FLAGS =
-  fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0);
+  fs.constants.O_WRONLY |
+  fs.constants.O_APPEND |
+  fs.constants.O_CREAT |
+  (fs.constants.O_NOFOLLOW ?? 0) |
+  (fs.constants.O_NONBLOCK ?? 0);
 
 /**
  * Append rows to their session/day files: one write() per row. Never throws;
@@ -824,6 +831,7 @@ export function appendLedgerRows(vaultPath: string, rows: readonly LedgerRow[]):
         containedDir(vaultPath, ledgerSegments(group.sessionKey), true);
         assertWriteTargetUnder(file, vaultPath);
         fd = fs.openSync(file, OPEN_FLAGS, 0o600);
+        if (!fs.fstatSync(fd).isFile()) throw new Error("use-ledger: day file is not a regular file");
         for (const line of group.lines) {
           attempted += 1;
           try {
@@ -1027,9 +1035,10 @@ function wordsOf(text: string): string[] {
   return text.normalize("NFKC").toLowerCase().match(WORD_RE) ?? [];
 }
 
-function shingleHashOf(words: readonly string[]): string {
+/** The hash of one shingle, given as its words joined by single spaces. */
+function shingleHashOf(text: string): string {
   // 64 bits as 16 hex chars: JSON has no exact 64-bit integers.
-  return hexDigest("sha256", words.join(" ")).slice(0, 16);
+  return hexDigest("sha256", text).slice(0, 16);
 }
 
 /**
@@ -1043,7 +1052,7 @@ export function allShingleHashes(text: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (let i = 0; i + SHINGLE_WORDS <= words.length; i += 1) {
-    const hash = shingleHashOf(words.slice(i, i + SHINGLE_WORDS));
+    const hash = shingleHashOf(words.slice(i, i + SHINGLE_WORDS).join(" "));
     if (!seen.has(hash)) {
       seen.add(hash);
       out.push(hash);
@@ -1092,27 +1101,33 @@ export function shingleHashes(
       inResolution.push(marked);
     }
   }
+  // Deduplicated by the shingle's text rather than its hash: the same
+  // equivalence (the hash is a function of the text), without hashing every
+  // position. A hook calls this at boot, and a 4,000-char body has ~600
+  // shingles of which at most `max` are kept.
   const seen = new Set<string>();
-  const resolution: Array<{ hash: string; pos: number }> = [];
-  const rest: Array<{ hash: string; pos: number }> = [];
+  const resolution: Array<{ text: string; pos: number }> = [];
+  const rest: Array<{ text: string; pos: number }> = [];
   for (let i = 0; i + SHINGLE_WORDS <= words.length; i += 1) {
-    const hash = shingleHashOf(words.slice(i, i + SHINGLE_WORDS));
-    if (seen.has(hash)) continue;
-    seen.add(hash);
-    (inResolution[i] ? resolution : rest).push({ hash, pos: i });
+    const text = words.slice(i, i + SHINGLE_WORDS).join(" ");
+    if (seen.has(text)) continue;
+    seen.add(text);
+    (inResolution[i] ? resolution : rest).push({ text, pos: i });
   }
   const df = options.df;
-  if (df) {
-    const rarity = (entry: { hash: string; pos: number }): number => {
-      const count = df.get(entry.hash);
-      return typeof count === "number" && Number.isFinite(count) ? count : 0;
-    };
-    const byRarity = (a: { hash: string; pos: number }, b: { hash: string; pos: number }): number =>
-      rarity(a) - rarity(b) || a.pos - b.pos;
-    resolution.sort(byRarity);
-    rest.sort(byRarity);
-  }
-  return [...resolution, ...rest].slice(0, max).map((entry) => entry.hash);
+  // Without a DF map the order is positional, so only the survivors are hashed.
+  if (!df) return [...resolution, ...rest].slice(0, max).map((entry) => shingleHashOf(entry.text));
+  const hashed = (group: Array<{ text: string; pos: number }>): Array<{ hash: string; pos: number }> =>
+    group.map((entry) => ({ hash: shingleHashOf(entry.text), pos: entry.pos }));
+  const rarity = (entry: { hash: string; pos: number }): number => {
+    const count = df.get(entry.hash);
+    return typeof count === "number" && Number.isFinite(count) ? count : 0;
+  };
+  const byRarity = (a: { hash: string; pos: number }, b: { hash: string; pos: number }): number =>
+    rarity(a) - rarity(b) || a.pos - b.pos;
+  return [...hashed(resolution).sort(byRarity), ...hashed(rest).sort(byRarity)]
+    .slice(0, max)
+    .map((entry) => entry.hash);
 }
 
 /** At most 64 shingle hashes of the text injected for an item, in position order. */
@@ -1259,6 +1274,7 @@ export function recordSurfaced(args: RecordSurfacedArgs): RecordSurfacedResult {
         appendLedgerRows(vaultPath, rows);
       },
       {
+        recordOnly: true,
         onAbandon: () => {
           appendLedgerRows(
             vaultPath,
