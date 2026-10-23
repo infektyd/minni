@@ -63,6 +63,49 @@ export interface PlatformWire {
    * is "always run"; a profile overrides it to suppress the duplicates.
    */
   shouldHandle?(event: string, payload: Record<string, unknown>): boolean;
+  /**
+   * Host facts the use ledger and the envelope fitter read. Optional: a wire
+   * without them is answered with conservative defaults by
+   * {@link wireCapabilities}, never assumed to be Claude Code.
+   */
+  readonly capabilities?: WireCapabilities;
+}
+
+/** Declared per wire; every field optional. */
+export interface WireCapabilities {
+  /**
+   * Chars an injected context string may carry inline before the host spills
+   * it to a preview. Unknown means visibility cannot be judged.
+   */
+  hostInlineCapChars?: number;
+  /** Whether PreToolUse can carry `additionalContext` to the model. */
+  preToolUseContext?: boolean;
+  /** Which transcript reader applies (e.g. "claude-code"). */
+  transcriptShape?: string;
+}
+
+/** {@link WireCapabilities} with every field answered. */
+export interface ResolvedWireCapabilities {
+  hostInlineCapChars: number | undefined;
+  preToolUseContext: boolean;
+  transcriptShape: string;
+}
+
+/**
+ * Capabilities of `wire`, with a default for anything absent or malformed: no
+ * known inline cap, no PreToolUse context, transcript shape "unknown". Fields
+ * fall back one by one, and the result is a fresh object.
+ */
+export function wireCapabilities(wire: PlatformWire): ResolvedWireCapabilities {
+  const declared = wire.capabilities;
+  const cap = declared?.hostInlineCapChars;
+  const shape = declared?.transcriptShape;
+  return {
+    hostInlineCapChars:
+      typeof cap === "number" && Number.isSafeInteger(cap) && cap > 0 ? cap : undefined,
+    preToolUseContext: declared?.preToolUseContext === true,
+    transcriptShape: typeof shape === "string" && shape.length > 0 ? shape : "unknown",
+  };
 }
 
 /** Claude Code's `hookSpecificOutput.additionalContext` envelope. */
@@ -93,6 +136,9 @@ export const claudeCodeWire: PlatformWire = {
     CLAUDE_INJECTABLE.has(event) ? claudeShapedInject(event, text) : null,
   note: (_event, text) => ({ continue: true, systemMessage: text }),
   lastTaskText: snakeAssistantMessage,
+  // 10,000 chars inline, then a 2,000-char preview (host docs; probe P6).
+  // preToolUseContext stays false until S2b ships context delivery.
+  capabilities: { hostInlineCapChars: 10_000, preToolUseContext: false, transcriptShape: "claude-code" },
 };
 
 // --- Codex -----------------------------------------------------------------

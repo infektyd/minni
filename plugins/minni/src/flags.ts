@@ -1,0 +1,201 @@
+// Kill switches for the recall-to-use features (design rev5 §8.2).
+//
+// One switch per feature, every one defaulting to `on`. They are read from
+// `<vault>/.runtime/flags.json` (`{"<FLAG>": "on" | "off"}`) because hooks the
+// desktop app launches do not reliably inherit the user's shell environment: a
+// switch that lives only in env cannot be thrown where it matters. The
+// same-named env var still overrides the file, for a spot check from a shell.
+//
+// Parsing is strict. Only the exact strings "on" and "off" count; anything else
+// is ignored and leaves a one-line note in `notes` for the caller to audit, so a
+// typo can never flip a feature silently. This module does no audit write of its
+// own: flags are read on synchronous paths, and the hook that loads them decides
+// where the note goes.
+//
+// The file is read once per process (a hook process handles one event), so a
+// hook sees one consistent snapshot even if the file changes under it.
+import fs from "node:fs";
+import path from "node:path";
+
+import { assertWriteTargetUnder } from "./vault.js";
+
+export const FLAG_NAMES = [
+  "MINNI_USE_LEDGER",
+  "MINNI_BOOT_FIT",
+  "MINNI_GUARD_V2",
+  "MINNI_SUBAGENT_BRIEF",
+  "MINNI_PROMPT_CLASSES",
+  "MINNI_RECENT_LEARNINGS_RANK",
+  "MINNI_UPS_RANK_V2",
+  "MINNI_RECALL_NOISE_LAST",
+] as const;
+
+export type FlagName = (typeof FLAG_NAMES)[number];
+export type FlagValue = "on" | "off";
+export type FlagSource = "default" | "file" | "env";
+
+/** Relative location of the flags file under the vault. */
+export const FLAGS_RELPATH = path.join(".runtime", "flags.json");
+
+/** A flags file larger than this is not a flags file; it is ignored. */
+const MAX_FLAGS_FILE_BYTES = 64 * 1024;
+
+export interface FlagSnapshot {
+  values: Record<FlagName, FlagValue>;
+  sources: Record<FlagName, FlagSource>;
+  /** One line per ignored value or refused read, for the caller to audit. */
+  notes: string[];
+}
+
+interface FileFlags {
+  values: Partial<Record<FlagName, FlagValue>>;
+  notes: string[];
+}
+
+const fileCache = new Map<string, FileFlags>();
+
+const FLAG_SET: ReadonlySet<string> = new Set(FLAG_NAMES);
+
+// Built from a string, as sanitizeRecallField does, to keep the literal out of
+// no-control-regex.
+const CONTROL_CHARS = new RegExp("[\\u0000-\\u001F\\u007F]+", "g");
+
+function strictValue(raw: unknown): FlagValue | undefined {
+  return raw === "on" || raw === "off" ? raw : undefined;
+}
+
+/** Bounded, single-line rendering of an ignored value for a note. */
+function describe(raw: unknown): string {
+  let text: string;
+  try {
+    text = typeof raw === "string" ? JSON.stringify(raw) : String(JSON.stringify(raw));
+  } catch {
+    text = typeof raw;
+  }
+  text = text.replace(CONTROL_CHARS, " ");
+  return text.length > 40 ? `${text.slice(0, 39)}…` : text;
+}
+
+function readFileFlags(vaultPath: string): FileFlags {
+  const notes: string[] = [];
+  const values: Partial<Record<FlagName, FlagValue>> = {};
+  const filePath = path.join(vaultPath, FLAGS_RELPATH);
+  try {
+    // Same containment check readRecallState uses: refuse a symlinked flags
+    // file, or a .runtime parent that resolves outside the vault.
+    assertWriteTargetUnder(filePath, vaultPath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/escapes root|is a symlink/.test(message)) {
+      notes.push(`flags: ${FLAGS_RELPATH} refused (containment); using defaults`);
+      return { values, notes };
+    }
+    // A missing .runtime fails the parent realpath; that is "no file", not a refusal.
+    if (!fs.existsSync(path.dirname(filePath))) return { values, notes };
+    notes.push(`flags: ${FLAGS_RELPATH} unreadable; using defaults`);
+    return { values, notes };
+  }
+  let raw: string;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      notes.push(`flags: ${FLAGS_RELPATH} is not a regular file; using defaults`);
+      return { values, notes };
+    }
+    if (stat.size > MAX_FLAGS_FILE_BYTES) {
+      notes.push(`flags: ${FLAGS_RELPATH} exceeds ${MAX_FLAGS_FILE_BYTES} bytes; using defaults`);
+      return { values, notes };
+    }
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code !== "ENOENT") {
+      notes.push(`flags: ${FLAGS_RELPATH} unreadable (${String(code ?? "error")}); using defaults`);
+    }
+    return { values, notes };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    notes.push(`flags: ${FLAGS_RELPATH} is not valid JSON; using defaults`);
+    return { values, notes };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    notes.push(`flags: ${FLAGS_RELPATH} is not a JSON object; using defaults`);
+    return { values, notes };
+  }
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!FLAG_SET.has(key)) {
+      notes.push(`flags: unknown flag ${describe(key)} in ${FLAGS_RELPATH} ignored`);
+      continue;
+    }
+    const strict = strictValue(value);
+    if (strict === undefined) {
+      notes.push(`flags: ${key}=${describe(value)} in ${FLAGS_RELPATH} ignored (want "on" or "off")`);
+      continue;
+    }
+    values[key as FlagName] = strict;
+  }
+  return { values, notes };
+}
+
+function fileFlagsFor(vaultPath: string): FileFlags {
+  const key = path.resolve(vaultPath);
+  let cached = fileCache.get(key);
+  if (!cached) {
+    try {
+      cached = readFileFlags(vaultPath);
+    } catch {
+      // Never let a flags read fail a hook: an unreadable file means defaults.
+      cached = { values: {}, notes: [`flags: ${FLAGS_RELPATH} could not be read; using defaults`] };
+    }
+    fileCache.set(key, cached);
+  }
+  return cached;
+}
+
+/**
+ * Every flag's value in effect for `vaultPath`: env (strict) over the file
+ * (strict) over the default `on`. Never throws.
+ */
+export function loadFlags(vaultPath: string, env: NodeJS.ProcessEnv = process.env): FlagSnapshot {
+  const file = fileFlagsFor(vaultPath);
+  const notes = [...file.notes];
+  const values = {} as Record<FlagName, FlagValue>;
+  const sources = {} as Record<FlagName, FlagSource>;
+  for (const name of FLAG_NAMES) {
+    const fromEnv = env[name];
+    const strictEnv = strictValue(fromEnv);
+    if (fromEnv !== undefined && strictEnv === undefined) {
+      notes.push(`flags: env ${name}=${describe(fromEnv)} ignored (want "on" or "off")`);
+    }
+    if (strictEnv !== undefined) {
+      values[name] = strictEnv;
+      sources[name] = "env";
+    } else if (file.values[name] !== undefined) {
+      values[name] = file.values[name] as FlagValue;
+      sources[name] = "file";
+    } else {
+      values[name] = "on";
+      sources[name] = "default";
+    }
+  }
+  return { values, sources, notes };
+}
+
+/** Whether one flag is on. */
+export function flagOn(vaultPath: string, name: FlagName, env: NodeJS.ProcessEnv = process.env): boolean {
+  return loadFlags(vaultPath, env).values[name] === "on";
+}
+
+/** The flags that are on, sorted: the ledger's `features` field. */
+export function featuresInEffect(vaultPath: string, env: NodeJS.ProcessEnv = process.env): FlagName[] {
+  const { values } = loadFlags(vaultPath, env);
+  return FLAG_NAMES.filter((name) => values[name] === "on").sort();
+}
+
+/** Forget the per-process file snapshot. Tests only. */
+export function resetFlagsCacheForTests(): void {
+  fileCache.clear();
+}
