@@ -453,7 +453,7 @@ test("opens are bounded: a longer slug or path that merely contains the note's i
   assert.equal(finalJudged(s.vault, row.sid).outcome, "ignored");
 });
 
-test("a title citation survives an open: each pointer format's natural open after the same sentence", async (t) => {
+test("a title citation survives an open in both formats: before re-recalls by title, after drills the handle", async (t) => {
   const rel = "wiki/sessions/beryl-cadence.md";
   const handle = vaultHandle(rel);
   const sentence = "Per the beryl harbor checkpoint cadence note, let me check it.";
@@ -478,7 +478,37 @@ test("a title citation survives an open: each pointer format's natural open afte
   for (const name of ["before", "after"]) {
     assert.equal(results[name].judged.outcome, "cited", name);
     assert.ok(results[name].judged.evidence.includes("title"), name);
+    assert.ok(results[name].judged.evidence.includes("open"), `${name}: its tool call really is an open`);
     assert.deepEqual(results[name].credits, [1], `${name}: an open never cancels a title citation`);
+  }
+});
+
+test("a minni_recall whose query cites the title is an open: the title rule, or the full title as a substring", async (t) => {
+  const rel = "wiki/sessions/beryl-cadence.md";
+  const cases = [
+    { query: TITLE, prompt: "Look at the nightly stall.", opened: true, why: "the full title" },
+    { query: "beryl harbor checkpoint cadence history", prompt: "Look at the nightly stall.", opened: true, why: "the full title, inside a longer query" },
+    { query: "beryl checkpoint cadence", prompt: "Look at the nightly stall.", opened: true, why: "3 distinctive title tokens" },
+    {
+      query: TITLE,
+      prompt: "Is the beryl harbor checkpoint cadence note still right?",
+      opened: true,
+      why: "the full title, though the prompt filter leaves the title rule no tokens",
+    },
+    { query: "beryl harbor checkpoint", prompt: "Look at the beryl harbor stall.", opened: false, why: "2 tokens left after the prompt filter" },
+    { query: "nightly stall", prompt: "Look at the nightly stall.", opened: false, why: "no title tokens" },
+  ];
+  for (const { query, prompt, opened, why } of cases) {
+    const s = await setup(t);
+    await writeDfSnapshot(s.vault, { the: 90 });
+    const [row] = await turn(s, 1, {
+      prompt,
+      rows: (p) => [surfacedRow({ mkey: `vault:${rel}`, title: TITLE, promptId: p, ts: s.clock.next(10) })],
+      tools: [["mcp__minni__minni_recall", { query }]],
+      replies: ["Checked."],
+    });
+    const judged = finalJudged(s.vault, row.sid);
+    assert.equal(judged.outcome, opened ? "opened" : "ignored", `${why}: ${query}`);
   }
 });
 
@@ -558,4 +588,39 @@ test("applied from prose survives paths and identifiers inside the restated body
     });
     assert.equal(finalJudged(s.vault, row.sid).outcome, "applied", sentence);
   }
+});
+
+test("tokenisation matches the ledger exactly (lowercase, then match): İstanbul", async (t) => {
+  // NFKC keeps U+0130; lowercasing it yields "i" + U+0307, which the word
+  // rule splits. The ledger lowercases before matching, so the detector must too.
+  const line = "Route traffic via İstanbul and never via the beryl mirror.";
+  for (const [reply, expected] of [
+    [`Noted: ${line}`, "ignored"],
+    ["Traffic should go through İstanbul, avoiding the beryl mirror route.", "cited"],
+  ]) {
+    const s = await setup(t);
+    await writeDfSnapshot(s.vault, { the: 90 });
+    const boot = surfacedRow({ channel: "boot_recent_learnings", mkey: "learning:41", title: line, ts: s.clock.next(10), shingles: shingleHashes(line), echo: echoHashes(line) });
+    append(s.vault, [boot]);
+    await turn(s, 1, { prompt: "Set up the database for the release.", replies: [reply] });
+    await turn(s, 2, { prompt: "Go ahead.", replies: ["Done."] });
+    assert.equal(finalJudged(s.vault, boot.sid).outcome, expected, reply);
+  }
+  const s = await setup(t);
+  const body = "## Fix\nRoute İstanbul traffic via the beryl mirror first.";
+  const [row] = await turn(s, 1, {
+    prompt: "Why is the build flaky?",
+    rows: (p) => [
+      surfacedRow({
+        mkey: "vault:wiki/sessions/route.md",
+        title: "Route note",
+        promptId: p,
+        ts: s.clock.next(10),
+        shingles: shingleHashes(body),
+        echo: echoHashes("Relevant memory: Route note."),
+      }),
+    ],
+    replies: ["The fix: route İstanbul traffic via the beryl mirror first."],
+  });
+  assert.equal(finalJudged(s.vault, row.sid).outcome, "applied", "every shingle spans the dotted capital");
 });

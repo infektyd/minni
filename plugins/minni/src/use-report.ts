@@ -14,6 +14,7 @@
 //     envelope_kind is `human`), so a rate cannot rise just because less was
 //     shown;
 //   - top-10 surfaced-never-used and used memories;
+//   - the ledger-off stretches inside the window (from session_start audit rows);
 //   - the provisional, unknown and unnameable shares, the title_assessable
 //     share (per channel and agent, so "not cited" can be told apart from
 //     "not assessable"), the features in effect, the fixed line "lower bounds;
@@ -28,7 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { flagOn } from "./flags.js";
-import { DETECTOR_RELDIR, readDfSnapshot } from "./use-detector.js";
+import { DETECTOR_RELDIR, readDfSnapshot, readRegularFileSync } from "./use-detector.js";
 import {
   containedDir,
   LEDGER_RELDIR,
@@ -64,6 +65,10 @@ const TOP_N = 10;
 const MAX_WINDOWS_FILE_BYTES = 64 * 1024;
 const MAX_STATE_BYTES = 8 * 1024 * 1024;
 const DAY_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
+/** A daily audit log larger than this is not read. */
+const MAX_AUDIT_LOG_BYTES = 16 * 1024 * 1024;
+/** `## [<ISO>] <tool> | <summary>`, as recordAudit writes each entry header. Bounded fields. */
+const AUDIT_HEADER_RE = /^## \[([^\]\n]{1,64})\] ([^|\n]{1,200}) \|/;
 const SESSION_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 export interface UseReportOptions {
@@ -126,6 +131,20 @@ export interface UseReport {
   unknown_share: number | null;
   /** Explicit-recall cards: keyed (one surfaced row each) plus unnameable (never dropped). */
   explicit_recall: { cards: number; keyed: number; unnameable: number; unnameable_share: number | null };
+  /**
+   * Stretches with the ledger off (rev5 §8.2), from the `<prefix>_session_start`
+   * audit rows in the window: `details.use_ledger` is "on" or "off". A run of
+   * consecutive "off" session starts is one stretch; a row without the field
+   * is counted `unknown` and neither starts nor ends one.
+   */
+  ledger_off: {
+    session_starts: number;
+    off: number;
+    unknown: number;
+    stretches: Array<{ count: number; first: string; last: string }>;
+    /** Days in the window with no daily audit log (pruned after 30 days, or no activity). */
+    days_without_log: number;
+  };
   features: Array<{ features: string[]; rows: number }>;
   coverage: Array<{ wire: string; rows: number; sessions: number; status: "measured" | "unmeasured" }>;
   top_unused?: Array<{ mkey: string; title: string; surfaced: number }>;
@@ -237,9 +256,9 @@ export function resolveUseWindow(vaultPath: string, name: "before" | "after"): {
   let raw: unknown;
   try {
     assertWriteTargetUnder(file, vaultPath);
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > MAX_WINDOWS_FILE_BYTES) throw new Error("not a windows file");
-    raw = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_WINDOWS_FILE_BYTES);
+    if (text === null) throw new Error("not a windows file");
+    raw = JSON.parse(text) as unknown;
   } catch {
     throw new Error(`use-report: no "${name}" window: ${USE_WINDOWS_RELPATH} is missing or unreadable`);
   }
@@ -273,6 +292,85 @@ function resolveRange(vaultPath: string, options: UseReportOptions): { since: nu
       ? Math.min(options.days, MAX_DAYS)
       : STATUS_USE_DAYS;
   return { since: now - days * DAY_MS, until: now, days };
+}
+
+/** One session_start audit row: its time and whether the ledger was on. */
+interface SessionStartRow {
+  ts: number;
+  iso: string;
+  ledger: "on" | "off" | "unknown";
+}
+
+/** The session_start rows of one daily audit log; tolerant of torn or hand-edited entries. */
+function sessionStartRows(text: string): SessionStartRow[] {
+  const rows: SessionStartRow[] = [];
+  const entries = text.split(/\n(?=## \[)/);
+  for (const entry of entries) {
+    const header = AUDIT_HEADER_RE.exec(entry);
+    if (!header) continue;
+    const tool = (header[2] as string).trim();
+    if (!tool.endsWith("_session_start")) continue;
+    const iso = (header[1] as string).trim();
+    const ts = Date.parse(iso);
+    if (!Number.isFinite(ts)) continue;
+    let ledger: SessionStartRow["ledger"] = "unknown";
+    const open = entry.indexOf("```json\n");
+    const close = open >= 0 ? entry.indexOf("\n```", open + 8) : -1;
+    if (open >= 0 && close > open) {
+      try {
+        const details = JSON.parse(entry.slice(open + 8, close)) as unknown;
+        const value = isRecord(details) ? details.use_ledger : undefined;
+        if (value === "on" || value === "off") ledger = value;
+      } catch {
+        // An unparseable details block says nothing about the ledger.
+      }
+    }
+    rows.push({ ts, iso, ledger });
+  }
+  return rows;
+}
+
+function ledgerOffStretches(vaultPath: string, since: number, until: number): UseReport["ledger_off"] {
+  const out: UseReport["ledger_off"] = { session_starts: 0, off: 0, unknown: 0, stretches: [], days_without_log: 0 };
+  const rows: SessionStartRow[] = [];
+  const lastDay = dayOf(until);
+  let cursor = Date.parse(`${dayOf(since)}T00:00:00.000Z`);
+  for (let guard = 0; guard <= MAX_DAYS + 1 && dayOf(cursor) <= lastDay; guard += 1, cursor += DAY_MS) {
+    const file = path.join(vaultPath, "logs", `${dayOf(cursor)}.md`);
+    try {
+      assertWriteTargetUnder(file, vaultPath);
+      // Non-blocking and judged on the opened descriptor: a FIFO is a missing day.
+      const text = readRegularFileSync(file, MAX_AUDIT_LOG_BYTES);
+      if (text === null) {
+        out.days_without_log += 1;
+        continue;
+      }
+      rows.push(...sessionStartRows(text));
+    } catch {
+      out.days_without_log += 1;
+    }
+  }
+  rows.sort((a, b) => a.ts - b.ts);
+  let current: { count: number; first: string; last: string } | null = null;
+  for (const row of rows) {
+    if (row.ts < since || row.ts >= until) continue;
+    out.session_starts += 1;
+    if (row.ledger === "unknown") {
+      out.unknown += 1;
+    } else if (row.ledger === "off") {
+      out.off += 1;
+      if (current) {
+        current.count += 1;
+        current.last = row.iso;
+      } else {
+        current = { count: 1, first: row.iso, last: row.iso };
+        out.stretches.push(current);
+      }
+    } else {
+      current = null;
+    }
+  }
+  return out;
 }
 
 function dayOf(ms: number): string {
@@ -335,9 +433,9 @@ function openExposures(vaultPath: string, sessionKey: string): OpenExposure[] {
     if (!dir) return [];
     const file = path.join(dir, "windows.json");
     assertWriteTargetUnder(file, vaultPath);
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > MAX_STATE_BYTES) return [];
-    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_STATE_BYTES);
+    if (text === null) return [];
+    const raw = JSON.parse(text) as unknown;
     if (!isRecord(raw) || !isRecord(raw.agents)) return [];
     const out: OpenExposure[] = [];
     for (const [agentKey, agent] of Object.entries(raw.agents)) {
@@ -419,6 +517,7 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
     provisional_share: null,
     unknown_share: null,
     explicit_recall: { cards: 0, keyed: 0, unnameable: 0, unnameable_share: null },
+    ledger_off: ledgerOffStretches(vaultPath, range.since, range.until),
     features: [],
     coverage: [],
   };
@@ -495,7 +594,9 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
         // A pre-s1b-2 `cited` row resting on handle evidence alone is a handle citation.
         citedHandle: outcome === "cited_handle" || (outcome === "cited" && !titleEvidence),
         dismissed: outcome === "dismissed",
-        titleAssessable: judgment ? judgment.title_assessable === true : null,
+        // An unknown(*) outcome (unreached, missed, unparsed) was never assessed:
+        // it stays out of the share's denominator.
+        titleAssessable: judgment && !outcome.startsWith("unknown") ? judgment.title_assessable === true : null,
         outcome,
       });
       if (!judgment || judgment.final !== true) provisionalSurfacings += 1;

@@ -392,6 +392,11 @@ SubagentStop (§6.3.6), and from `use-report`.
        and identifiers included) and then mapped onto the words the title/content pass keeps, so a learning
        that carries an identifier or a path (`minni_recall`, `.runtime/use-ledger/`) is still recognised as
        recited.
+     - Words are tokenised by the same word rule as the ledger: NFKC, lowercased, then matched. Lowercasing
+       can split a word (`İ` becomes `i` + U+0307, which the rule does not match), so each matched word is
+       lowercased and re-split before it is counted. The ledger lowercases the whole text and the detector
+       each word, so context-dependent lowercasing (Greek final sigma beside case-ignorable punctuation,
+       `ΑΣ.Β`) can differ; it differs symmetrically in both windows.
   3. **`cited_handle`**: by handle: a wikilink, slug, vault path, `m:`/`d:` handle or `learning #id`. It is
      its own bucket in both windows and **never `used_ii`**.
      - Every handle-style form is removed from the text before the title/content pass, so a handle's own
@@ -401,6 +406,9 @@ SubagentStop (§6.3.6), and from `use-report`.
      that names it. Paths and slugs match bounded (a longer name that contains the note's is not it).
      - Writing a handle and then opening it is `opened`, not `cited_handle`. A title citation stands: an open
        never cancels it (each window opens its own way, recall by title or drill by handle).
+     - A `minni_recall` whose query cites the memory's title opens it, in both windows: by the same title rule
+       as a citation (3 distinctive, prompt-filtered title tokens, handle forms removed), or by the full
+       sanitized title (8 or more characters) as a substring. Before has only the title to recall by.
   5. **`dismissed`**: the first assistant text after the surfacing matches the dismissal lexicon.
      - Dismissal is sticky: the window can still end `applied` or `opened`, never cited.
   6. Otherwise `ignored` if visible, else `unknown(<reason>)`.
@@ -412,15 +420,25 @@ SubagentStop (§6.3.6), and from `use-report`.
   pointer format; `use-detector-symmetry.test.mjs` feeds one transcript through a before-format and an
   after-format ledger per rule and requires equal `used_ii`, dismissed counts and exposure outcomes. The
   one intended difference is that a handle can be cited only where one was printed. Format-dependent
-  actions are modelled too: each window opens the memory its own natural way. One residual asymmetry is
-  known: the 50-turn horizon restarts at each visible surfacing, and the after pointer re-names at most
-  every 10 turns. (The capture records each memory's full title; the after pointer prints titles up to
-  100 characters, §5.2 item 6.)
+  actions are modelled too: each window opens the memory its own natural way, and both can open by
+  recalling the title. Two residual asymmetries are known:
+  - the 50-turn horizon restarts at each visible surfacing, and the after pointer re-names at most every 10
+    turns;
+  - **announce, then open**: an agent that names the memory before opening it can only name it by title in
+    the before window, which earns `used_ii`, while in the after window it can name it by handle, which
+    never does. This inflates the before window, which is conservative for the comparison (§4.7). The
+    symmetry suite pins today's behaviour as a known difference.
+
+  (The capture records each memory's full title; the after pointer prints titles up to 100 characters,
+  §5.2 item 6.)
 - **Distinctive tokens.** A token is distinctive when its document frequency over non-noise notes is at most
   `max(1, ⌈5% × notes⌉)`.
   - The DF snapshot lives in `.runtime/df-snapshot.json`. It is written by UPS from the scan UPS already
     runs, at most once a day.
   - The detector never scans the vault. With no snapshot, the title rule is off and reported as off.
+  - Until S3b ships its noise predicate, the snapshot's note set excludes only status-skipped notes
+    (`skipByStatus`), so session summaries and plan logs count toward document frequency. S3b narrows it to
+    non-noise notes; S1c calibration re-checks the 5% threshold against both.
 - **`explicit_recall` rows** are rebuilt from the transcript's `minni_recall`/`minni_drill` results.
   - Result text carries wikilinks and sources, not ids (§4.1). So cards are keyed through `memoryKeyFor` on
     their source.
@@ -550,7 +568,26 @@ SubagentStop (§6.3.6), and from `use-report`.
     3 distinctive tokens once the prompt filter runs. Title citation therefore adds little to `used_ii`, and
     the headline number should be read with that in mind. S1c calibration revisits the 5% DF threshold.
   - The after pointer prints titles up to 100 characters (§5.2 item 6) so that both windows show comparable
-    title text; the title rule can then fire in either window.
+    title text; the title rule can then fire in either window. Today's pointer prints up to 120 characters
+    (`sanitizeRecallField`'s clamp), so a title between 101 and 120 characters is shown whole only before.
+    This is symmetric for every shorter title.
+  - **Announce, then open** (§4.4): before can only announce by title, which earns `used_ii`; after can
+    announce by handle, which never does. The bias inflates the before window, so an after > before result
+    is not produced by it.
+  - **The 8-word echo is only one edit wide on short learnings.** A learning of about 12 words has 5 eight-word
+    windows. A one-word swap or insertion in its middle leaves none of them intact, so a near-verbatim
+    recital scores `cited`; at its edge it leaves 4 of 5 intact, and the recital is still masked. This is
+    symmetric (boot learnings are the same in both windows) and an overcount edge.
+  - **Hyphenated and slashed prose is stripped from the title pass.** The joined-identifier rule removes
+    hyphenated or underscored words of 8 or more characters (`claude-code`, `follow-up`, `2026-10-23`); the
+    path rule removes any word with a slash (`and/or`, `10/23/2026`). Both run before title tokens are
+    counted. This is symmetric and an undercount.
+  - **Recall by title fans out to siblings.** A `minni_recall` whose query cites a title opens every surfaced
+    memory that shares that title text. This is symmetric and affects `opened` only.
+  - **After only: an open cancels a handle citation.** "See `<handle>`, then recall another title" ends
+    `opened` where it would be `cited_handle`, because the recall opens the first memory too when the titles
+    share text. Only the after window prints handles, so this moves the `used` and `cited_handle` columns,
+    never `used_ii`.
 
 ---
 
