@@ -466,8 +466,10 @@ SubagentStop (§6.3.6), and from `use-report`.
   §5.2 item 6.)
 - **Distinctive tokens.** A token is distinctive when its document frequency over non-noise notes is at most
   `max(1, ⌈5% × notes⌉)`.
-  - The DF snapshot lives in `.runtime/df-snapshot.json`. It is written by UPS from the scan UPS already
-    runs, at most once a day.
+  - The DF snapshot lives in `.runtime/df-snapshot.json`. It is recounted at Stop, after delivery, one slice
+    per measured Stop capped at 50 ms (about 30 slices a day at the real vault size). Each slice resumes from
+    `.runtime/df-snapshot.partial.json`, and the snapshot is written only when a pass completes, at most once
+    a day. A pass may span a few turns while the vault changes; DF is a statistic.
   - The detector never scans the vault. With no snapshot, the title rule is off and reported as off.
   - Until S3b ships its noise predicate, the snapshot's note set excludes only status-skipped notes
     (`skipByStatus`), so session summaries and plan logs count toward document frequency. S3b narrows it to
@@ -1442,8 +1444,8 @@ records the flags in effect (`features`), so a spot comparison is attributable.
   - Temp-name renames for every rewritten JSON file.
   - Session ids are hashed before use in paths.
 - **Hook budgets.**
-  - No vault-wide read on SessionStart, Stop or SubagentStart.
-  - The DF snapshot is written by UPS from its own scan.
+  - No unbounded vault read in hooks. The DF recount reads at most its per-slice cap (50 ms) of notes, at
+    turn end, after delivery. UPS writes nothing for it.
   - Maintenance is post-delivery and cooperative, and it is stated as such.
 - **Injection.** Every injected title, handle and brief goes through `sanitizeRecallField` and the EVIDENCE
   framing.
@@ -1525,7 +1527,7 @@ Two follow-ups this turned up, both outside this design and not done here:
 | 2 | Suppression biases T1/T2 | Fixed: exposure-level judging, `(session, agent, reset epoch, mkey)`, in both windows (§4.4). The first draft's "carry-over credit" was under-defined (review F5). |
 | 3 | The template rule's 16-entry window flips classes | Fixed: an occurrence ring of `{ts, pid}` plus a separate `first_seen` and per-session first timestamps; prior means `ts < at` and a different `pid`, so UPS and harvest agree (§5.2.1, review F6) |
 | 4 | The `capture` row exceeds 4 KB | Removed: no `capture` row |
-| 5 | Full vault reads on SessionStart/Stop; cooperative cap | Fixed: boot noise from result fields; DF snapshot written by UPS; no vault-wide read in hooks; cap stated as cooperative (§6.2.3, §6.2.5) |
+| 5 | Full vault reads on SessionStart/Stop; cooperative cap | Fixed: boot noise from result fields; DF snapshot recounted in capped Stop slices after delivery; no unbounded vault read in hooks; cap stated as cooperative (§6.2.3, §6.2.5) |
 | 6, 15 | Flags are env vars that don't reach hooks | Fixed: a flags file with env override (§8.2) |
 | 7, 8, 9 | Arm pinning, placebo eligibility, net-T1 estimator | Removed with the holdout |
 | 10, 20 | Need-moment target has no mechanism, no in-context condition | Restated: 2 of 3 addressable moments, with an in-context visibility definition; recurrences deferred (§5.4) |
