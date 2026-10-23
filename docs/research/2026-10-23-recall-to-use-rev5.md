@@ -128,12 +128,15 @@ guard channel's uptake before and after. Nothing here assumes it.
 **Settled from the host docs:** P6. The 10,000-char cap and its 2,000-char preview apply to every
 `additionalContext` string, PreToolUse included. An empirical confirmation is optional.
 
-**Still to probe in S0** (each one is a design input for Phase 1):
-- P12: do PreCompact and PostCompact carry `session_id`, and which SessionStart `source` values exist?
-- P15: does Stop fire after an interrupt, and is `last_assistant_message` the turn's final text?
-- P16: does the host wait for the hook process after it flushes?
-- P17: at SubagentStart, does the parent transcript already hold the `Agent`/`Task` `tool_use` with the task
-  prompt? (§6.3.6)
+**S0, probed on 2026-10-23** (same isolation; a persisted scratch session, then a resume, `/compact`, and
+another resume):
+
+| Probe | Question | Result |
+|---|---|---|
+| P12 | Do PreCompact and PostCompact carry `session_id`? Which SessionStart `source` values exist? | **Yes**, plus `trigger`; PreCompact adds `custom_instructions` and PostCompact `compact_summary`. Sources seen: `startup`, `resume`, `compact` (`clear` not exercised). |
+| P15 | Is `last_assistant_message` the turn's final text, and is it flushed by Stop? | **Yes, and yes**: in 4 of 4 Stops, a transcript entry with the same text hash was already present. Provisional `judged` rows should be rare. The interrupt case needs an interactive session and was not run. |
+| P16 | Does the host wait for a hook process after it closes stdout? | **Yes.** A Stop hook that closed stdout and then slept 8 s made that run 16 s, against 7–9 s. Post-delivery maintenance adds directly to wall time, so its 150 ms cap is load-bearing (§6.2.5). |
+| P17 | At SubagentStart, is the parent's `Agent`/`Task` `tool_use` already in the transcript? | **No.** It appears afterwards (name `Agent`, input keys `description, prompt, run_in_background, subagent_type`), but it was not flushed when SubagentStart ran. The brief takes the task prompt from the parent's PreToolUse instead (§6.3.6). |
 
 ---
 
@@ -884,19 +887,25 @@ Even a spilled envelope's 2 KB preview then carries the contract and the warning
   - It injects `additionalContext` of at most 600 chars:
     - the parent session's current named set (titles plus handles)
     - plus, when the task prompt is recoverable, up to 2 gated hits from a recall on it
-  - The task prompt is not in the payload (P13). The hook looks for it in the last 64 KB of the parent
-    transcript: the newest `Agent`/`Task` `tool_use` whose `subagent_type` equals `agent_type`. P17 confirms
-    that this is flushed in time. If it is not found, the brief carries only the named set.
+  - **Where the task prompt comes from.** It is not in the SubagentStart payload (P13), and the parent
+    transcript has not flushed the `Agent` call yet (P17). The parent's own PreToolUse for that call does
+    carry it, as `tool_input.prompt`, with `tool_use_id` and `subagent_type`.
+    - So Minni's PreToolUse, for `Agent` or `Task`, appends `{tool_use_id, subagent_type, prompt_hash, prompt ≤ 2,000 chars, ts}`
+      to `.runtime/recall-session.d/<session_key>/subagent-pending.json`.
+    - That file is private and pruned after 10 minutes. The prompt is clipped and never written to the
+      ledger.
+    - SubagentStart claims the oldest unclaimed entry with its `agent_type`, through a `wx` claim marker.
+      Parallel subagents of one type are paired in order. That is approximate, and the report counts it.
+    - With no entry, the brief carries only the named set.
   - Each brief writes `subagent_brief` ledger rows under the subagent's `agent_key`.
   - Kill switch: `MINNI_SUBAGENT_BRIEF`.
 - **SubagentStop judging** (new event arm). It runs the detector over `agent_transcript_path` for that
   `agent_key`'s windows: the brief, explicit recalls made inside the subagent, and its final
   `last_assistant_message`.
-- If P17 fails, the brief ships with the named set only, and the report says so.
 
 **7. PreToolUse matcher.** `hooks.json` PreToolUse gains a matcher built from the guard's scope sets:
-`Grep`, `Read`, `Glob`, `Bash`, `run_terminal_command`, and `mcp__.*minni_(recall|drill)`. A test derives it
-from `recall-guard.ts`. This removes the hook spawn on Edit, Write and other MCP calls (17,761 PreToolUse
+`Grep`, `Read`, `Glob`, `Bash`, `run_terminal_command`, `mcp__.*minni_(recall|drill)`, and `Agent|Task`
+for the subagent brief's prompt stash. A test derives it from `recall-guard.ts`. This removes the hook spawn on Edit, Write and other MCP calls (17,761 PreToolUse
 spawns in the corpus).
 
 ### 6.4 RED tests (new files)
@@ -931,7 +940,8 @@ spawns in the corpus).
 - `recall-guard-subagent.test.mjs`: a payload with `agent_id` gets no guard surfacing.
 - `subagent-brief.test.mjs`:
   - SubagentStart returns a brief within 600 chars, holding the parent's named set and the hits from a task
-    prompt found in a synthetic parent transcript tail
+    prompt stashed by a preceding parent PreToolUse(`Agent`)
+  - two stashed prompts of one type are claimed once each, in order
   - with no task prompt found, the named set alone
 - `subagent-stop-judging.test.mjs`: a synthetic subagent transcript that cites the brief's memory gives a
   `cited` `judged` row under the subagent's `agent_key`.
@@ -999,7 +1009,7 @@ starts from facts.
 
 | Slice | Content | Depends on | Owns (single writer) |
 |---|---|---|---|
-| **S0** | Remaining probes P12, P15, P16, P17. P1, P2, P3, P5, P7, P8 and P13 are done (§2); P6 is settled from the docs. | — | probe notes, private root |
+| **S0** | Done on 2026-10-23: P1, P2, P3, P5, P7, P8, P12, P13, P15, P16 and P17 probed; P6 settled from the docs (§2). Open: P15's interrupt case and non-claude-code wires. | — | probe notes, private root |
 | **S1a** | Ledger, keys, the UPS turn wrapper, deliver-first capture with `onAbandon`, SessionStart/UPS/guard capture calls, **the prompt classifier in record-only mode** (envelope rules, template rule, Python mirror, case file, parity tests), wire capability field (`hostInlineCapChars`, `preToolUseContext`, `transcriptShape`), receipt fields, flags file reader, latency baseline. S1a-D: daemon `read` ids. | S0 (P12, P15) | new `use-ledger.ts`, `flags.ts`, `harness-envelope*.ts`; `harness_envelopes.py`; case file; `hook-delivery.ts` (additive); `hook-platform.ts` capability field; capture calls and wrapper in `hook-handlers.ts`; `vault.ts` receipt; `recall.py` `read` |
 | **S1b** | Detector, exposures, reports, `use-report`, explicit-recall rebuild, retention | S1a | new `use-detector.ts`; Stop wiring; `server.ts` status/report blocks; `cli.ts` |
 | **S1c** | Offline harness: private-root guard, corpus builder, labelling pass, replay runner (pure plus handler layers), noise-free reference run, ρ and K calibration | S1a (for its pure functions) | `scripts/recall_replay/`; `tests/test_recall_replay_*.py` |
@@ -1158,7 +1168,7 @@ Two follow-ups this turned up, both outside this design and not done here:
 
 ## 11. NOT RUN
 
-- **Probes P12, P15, P16, P17**, and every non-claude-code wire probe.
+- **P15's interrupt case**, which needs an interactive session, and every non-claude-code wire probe.
 - **The full plugin suite with the claude-code `preToolUseContext` capability flipped.** The §8.3 deny-shape
   list comes from reading the fixtures, not from a run. S2b runs it first.
 - **The committed harness.** The corpus builder, labelling pass and replay runner do not exist yet. The §1
