@@ -41,6 +41,8 @@ export const FLAGS_RELPATH = path.join(".runtime", "flags.json");
 
 /** A flags file larger than this is not a flags file; it is ignored. */
 const MAX_FLAGS_FILE_BYTES = 64 * 1024;
+const READ_FLAGS =
+  fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
 
 export interface FlagSnapshot {
   values: Record<FlagName, FlagValue>;
@@ -105,8 +107,14 @@ function readFileFlags(vaultPath: string): FileFlags {
     return { values, notes };
   }
   let raw: string;
+  // Opened non-blocking without following a link, and judged on the OPENED
+  // descriptor (as ledger-gate.ts reads it): a flags file swapped for a FIFO
+  // after any earlier stat would otherwise block the read, and Stop reaches
+  // this through flagOn while the host waits for the hook to exit.
+  let fd: number | undefined;
   try {
-    const stat = fs.statSync(filePath);
+    fd = fs.openSync(filePath, READ_FLAGS);
+    const stat = fs.fstatSync(fd);
     if (!stat.isFile()) {
       notes.push(`flags: ${FLAGS_RELPATH} is not a regular file; using defaults`);
       return { values, notes };
@@ -115,13 +123,28 @@ function readFileFlags(vaultPath: string): FileFlags {
       notes.push(`flags: ${FLAGS_RELPATH} exceeds ${MAX_FLAGS_FILE_BYTES} bytes; using defaults`);
       return { values, notes };
     }
-    raw = fs.readFileSync(filePath, "utf8");
+    const buffer = Buffer.alloc(stat.size);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const n = fs.readSync(fd, buffer, filled, buffer.length - filled, filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    raw = buffer.toString("utf8", 0, filled);
   } catch (error) {
     const code = (error as { code?: unknown } | null)?.code;
     if (code !== "ENOENT") {
       notes.push(`flags: ${FLAGS_RELPATH} unreadable (${String(code ?? "error")}); using defaults`);
     }
     return { values, notes };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // A read-only descriptor: nothing to lose.
+      }
+    }
   }
   let parsed: unknown;
   try {
