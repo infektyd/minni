@@ -1311,6 +1311,20 @@ There is one switch per feature, and every one defaults to `on`.
         `skippedByStatus` notes left out, 2 MB per note, non-blocking opens).
       - A pass that started over a day ago restarts. A corrupt or foreign partial restarts it cleanly. A
         snapshot or partial path a safe write cannot replace (a symlink, a directory) does nothing.
+    - **What Stop costs the user** (claude-code 2.1.301 waits for the Stop hook to EXIT, so the user-visible
+      cost is the whole exit-time delta, paid at turn end). Measured on 2026-10-23, n=50, interleaved, load 3.4
+      to 4.4:
+      - A normal turn with the ledger on: +20.2 ms p50 and +28.6 ms p95 to exit. Of that, +5.0 ms comes before
+        stdout: the receipt's reader and the detector module load. About 15 ms comes after delivery: the
+        detector run.
+      - The ledger off, or an unmeasured wire (codex): within noise of base (−0.3 ms and +0.3 ms p50).
+      - A recount turn adds +43.9 ms p50 (+44.4 ms p95) to exit, and +0.3 ms to stdout. The slice runs after
+        delivery: 40.4 ms p50 and 41.4 ms max, against its 50 ms cap.
+      - At the real vault size (800 notes, about 12 MB) a pass is 28 to 31 slices of about 30 notes. So about
+        30 measured Stops a day pay the recount, and then none until the snapshot is a day old.
+    - **What UPS costs** for the DF snapshot: nothing. UPS never counts, writes or loads the detector for it.
+      On a recount day and on a normal day UPS's exit and stdout match within noise (−3.2 ms and −3.5 ms p50,
+      800 notes, ledger on).
     - **Failures.** A detector that throws, will not load, is slow, or stops at its caps (1.5 s, 2 MB) changes
       no byte of the Stop output, which is already delivered, and never fails the hook. A failure (a module
       that will not load; a status of `invalid`, `refused`, `write_failed` or `error`; a throw) is audited
