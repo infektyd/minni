@@ -8,6 +8,9 @@
 Two directions are pinned, so a rule added on only one side fails a gate:
   1. every rule_id in this side's constants has at least one case;
   2. every rule_id a case expects exists in this side's constants.
+The case file also pins the constants and rule tables themselves, and holds cases
+at N and N+1 of every bound (and of the wrapper depth), including astral
+characters, which JS counts as two UTF-16 units and Python as one code point.
 
 The template rule is TypeScript only (the daemon never sees the counts file),
 so it has no case here.
@@ -47,6 +50,30 @@ def test_classify_prompt_envelope(case):
         "body": got["body"],
         "suspicious_prefix": got.get("suspicious_prefix", False) is True,
     } == case["expected"]
+
+
+def test_pinned_constants_in_the_case_file_match_the_python_constants():
+    pinned = CASES["constants"]
+    assert he.RULES_VERSION == pinned["version"]
+    assert he.MAX_WRAPPER_DEPTH == pinned["maxWrapperDepth"]
+    assert he.MAX_OPEN_TAG_CHARS == pinned["maxOpenTagChars"]
+    assert he.MAX_BLOCK_OPEN_TAG_CHARS == pinned["maxBlockOpenTagChars"]
+    assert he.MAX_HEADER_CHARS == pinned["maxHeaderChars"]
+    assert he.SUSPICIOUS_PREFIX_PATTERN == pinned["suspiciousPrefixPattern"]
+    assert he.TRIM_CHARS == pinned["trimChars"]
+    # The numbers the cases are built around.
+    assert [
+        pinned["maxWrapperDepth"],
+        pinned["maxOpenTagChars"],
+        pinned["maxBlockOpenTagChars"],
+        pinned["maxHeaderChars"],
+    ] == [4, 512, 256, 256]
+
+
+def test_pinned_rule_tables_in_the_case_file_match_the_python_rules():
+    assert list(he.BLOCK_TAGS) == CASES["rules"]["blockTags"]
+    assert list(he.SKIP_RULES) == CASES["rules"]["skip"]
+    assert list(he.WRAPPER_RULES) == CASES["rules"]["wrappers"]
 
 
 def test_every_rule_id_in_the_python_constants_has_a_case():

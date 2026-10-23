@@ -8,12 +8,17 @@
 // Two directions are pinned, so a rule added on only one side fails a gate:
 //   1. every rule_id in this side's constants has at least one case;
 //   2. every rule_id a case expects exists in this side's constants.
+// The case file also pins the constants and the rule tables themselves, and holds
+// cases at N and N+1 of every bound (and of the wrapper depth) so a drifted number
+// on one side fails a gate even when no other case happens to reach it.
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   HARNESS_ENVELOPE_RULES,
+  HARNESS_TRIM_CHARS,
+  classificationRuleIds,
   harnessEnvelopeRuleIds,
 } from "../dist/harness-envelope-rules.js";
 import {
@@ -57,6 +62,28 @@ for (const c of cases.classify_cases) {
   });
 }
 
+test("the pinned constants in the case file match the TypeScript constants", () => {
+  const pinned = cases.constants;
+  assert.equal(HARNESS_ENVELOPE_RULES.version, pinned.version);
+  assert.equal(HARNESS_ENVELOPE_RULES.maxWrapperDepth, pinned.maxWrapperDepth);
+  assert.equal(HARNESS_ENVELOPE_RULES.maxOpenTagChars, pinned.maxOpenTagChars);
+  assert.equal(HARNESS_ENVELOPE_RULES.maxBlockOpenTagChars, pinned.maxBlockOpenTagChars);
+  assert.equal(HARNESS_ENVELOPE_RULES.maxHeaderChars, pinned.maxHeaderChars);
+  assert.equal(HARNESS_ENVELOPE_RULES.suspiciousPrefixPattern, pinned.suspiciousPrefixPattern);
+  assert.equal(HARNESS_TRIM_CHARS, pinned.trimChars);
+  // The numbers the tests below are built around.
+  assert.deepEqual(
+    [pinned.maxWrapperDepth, pinned.maxOpenTagChars, pinned.maxBlockOpenTagChars, pinned.maxHeaderChars],
+    [4, 512, 256, 256],
+  );
+});
+
+test("the pinned rule tables in the case file match the TypeScript rules", () => {
+  assert.deepEqual(HARNESS_ENVELOPE_RULES.blockTags, cases.rules.blockTags);
+  assert.deepEqual(HARNESS_ENVELOPE_RULES.skip, cases.rules.skip);
+  assert.deepEqual(HARNESS_ENVELOPE_RULES.wrappers, cases.rules.wrappers);
+});
+
 test("every rule_id in the TypeScript constants has at least one case", () => {
   const expectedIds = new Set(cases.classify_cases.map((c) => c.expected.rule_id));
   const missing = harnessEnvelopeRuleIds().filter((id) => !expectedIds.has(id));
@@ -85,4 +112,17 @@ test("rule ids are unique and stable-shaped", () => {
 
 test("the template rule id is not part of the shared text-rule set", () => {
   assert.ok(!harnessEnvelopeRuleIds().includes(HARNESS_ENVELOPE_RULES.templateRule.rule_id));
+});
+
+test("classificationRuleIds is the text rules plus the template rule, for consumers to validate against", () => {
+  const all = classificationRuleIds();
+  assert.deepEqual(all, [...harnessEnvelopeRuleIds(), "scheduled.template"]);
+  assert.equal(all.at(-1), HARNESS_ENVELOPE_RULES.templateRule.rule_id);
+  assert.equal(new Set(all).size, all.length);
+  // Every rule_id the classifier emits on the shared cases is in the list.
+  const known = new Set(all);
+  for (const c of cases.classify_cases) {
+    const got = classifyPromptEnvelope(c.input);
+    if (got.rule_id !== undefined) assert.ok(known.has(got.rule_id), `${c.id}: ${got.rule_id}`);
+  }
 });

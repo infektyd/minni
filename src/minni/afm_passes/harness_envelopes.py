@@ -20,9 +20,14 @@ one side only fails a gate. Precedent: ``inbox_ingest.is_audit_echo``.
 
 Rule order matters (first match wins) and matching is case sensitive. Every
 character class is spelled out, never ``\\s`` or a bare ``strip()``, because the
-two languages disagree about what those cover. The only known divergence left is
-that the length bounds below count UTF-16 units in JS and code points here, so
-they differ only for astral characters inside an over-long tag attribute run.
+two languages disagree about what those cover.
+
+The length bounds below count UTF-16 code units, as a JS string ``.length`` does.
+Python counts code points, so each prompt is first rewritten so that every astral
+character becomes its surrogate pair (two ``str`` characters), the rules run on
+that, and the result is joined back. After that every index, slice and regex
+quantifier here means what it means in the TypeScript. The shared case file holds
+astral cases at each bound.
 
 Record-only: nothing calls the classifier yet.
 """
@@ -59,7 +64,9 @@ SKIP_RULES: Tuple[Dict[str, str], ...] = (
 #: Wrappers are stripped and the body is kept. Tried at the start of the text
 #: and repeated (at most ``MAX_WRAPPER_DEPTH`` passes); the first rule that
 #: matched names the result.
-#:   tag_pair   ``<tag ...>`` inner ``</tag>``; a missing close tag keeps the rest
+#:   tag_pair   ``<tag ...>`` inner ``</tag>`` trailer: the inner text AND what
+#:              follows the close tag are kept, only the two tags are dropped; a
+#:              missing close tag keeps the rest
 #:   lead_line  the whole first line is dropped
 #:   header     the bracketed ``[Prefix ...]`` part is dropped, the rest of its
 #:              line stays; no ``]`` on the first line means it is not a header
@@ -99,6 +106,30 @@ MAX_HEADER_CHARS = 256
 #: flagged ``suspicious_prefix``. It only flags; it never changes the class.
 SUSPICIOUS_PREFIX_PATTERN = r"^(?:<[A-Za-z]|\[[A-Z])"
 _SUSPICIOUS_PREFIX = re.compile(SUSPICIOUS_PREFIX_PATTERN)
+
+
+_ASTRAL = re.compile("[\U00010000-\U0010ffff]")
+_SURROGATE_PAIR = re.compile("[\ud800-\udbff][\udc00-\udfff]")
+
+
+def _split_astral(match: "re.Match[str]") -> str:
+    code = ord(match.group(0)) - 0x10000
+    return chr(0xD800 + (code >> 10)) + chr(0xDC00 + (code & 0x3FF))
+
+
+def _join_pair(match: "re.Match[str]") -> str:
+    high, low = match.group(0)
+    return chr(0x10000 + ((ord(high) - 0xD800) << 10) + (ord(low) - 0xDC00))
+
+
+def _to_units(text: str) -> str:
+    """Rewrite astral characters as surrogate pairs: one ``str`` char per UTF-16 unit."""
+    return text if text.isascii() else _ASTRAL.sub(_split_astral, text)
+
+
+def _from_units(text: str) -> str:
+    """Inverse of ``_to_units``: join each high+low surrogate pair back into one character."""
+    return text if text.isascii() else _SURROGATE_PAIR.sub(_join_pair, text)
 
 
 def rule_ids() -> List[str]:
@@ -144,7 +175,8 @@ def _strip_block_tag(text: str, tag: str) -> Tuple[str, bool]:
 
 
 def _strip_blocks_detailed(text: Any) -> Tuple[str, List[str]]:
-    current = text if isinstance(text, str) else ""
+    """Strip blocks and trim. Takes any text, returns UTF-16-unit text (see ``_to_units``)."""
+    current = _to_units(text) if isinstance(text, str) else ""
     fired: List[str] = []
     for rule in BLOCK_TAGS:
         current, stripped = _strip_block_tag(current, rule["tag"])
@@ -155,7 +187,7 @@ def _strip_blocks_detailed(text: Any) -> Tuple[str, List[str]]:
 
 def strip_harness_blocks(text: Any) -> str:
     """Remove harness blocks (such as ``system-reminder``) anywhere, then trim."""
-    return _strip_blocks_detailed(text)[0]
+    return _from_units(_strip_blocks_detailed(text)[0])
 
 
 def _unwrap(rule: Dict[str, str], text: str) -> Optional[str]:
@@ -205,6 +237,9 @@ def _unwrap(rule: Dict[str, str], text: str) -> Optional[str]:
 def classify_prompt_envelope(text: Any) -> Dict[str, Any]:
     """Classify one prompt by the text rules.
 
+    Takes any text; a non-string is an empty ``human`` prompt. Lengths are UTF-16
+    units (see the module docstring).
+
     Returns ``{kind, subkind, body}`` plus ``rule_id`` when a rule decided (for
     ``human``: the block rule, when a block was removed; a skip or wrapper rule
     outranks it) and ``suspicious_prefix: True`` when it applies. ``kind`` is
@@ -225,7 +260,7 @@ def classify_prompt_envelope(text: Any) -> Dict[str, Any]:
             return {
                 "kind": "skip",
                 "subkind": rule["subkind"],
-                "body": stripped,
+                "body": _from_units(stripped),
                 "rule_id": rule["rule_id"],
             }
 
@@ -248,11 +283,11 @@ def classify_prompt_envelope(text: Any) -> Dict[str, Any]:
         return {
             "kind": "wrapped",
             "subkind": outermost["subkind"],
-            "body": current,
+            "body": _from_units(current),
             "rule_id": outermost["rule_id"],
         }
 
-    result = {"kind": "human", "subkind": "typed", "body": stripped}
+    result = {"kind": "human", "subkind": "typed", "body": _from_units(stripped)}
     if block_rule_id is not None:
         result["rule_id"] = block_rule_id
     if _SUSPICIOUS_PREFIX.match(stripped):
