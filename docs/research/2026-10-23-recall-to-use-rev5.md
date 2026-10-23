@@ -470,10 +470,29 @@ SubagentStop (§6.3.6), and from `use-report`.
   §5.2 item 6.)
 - **Distinctive tokens.** A token is distinctive when its document frequency over non-noise notes is at most
   `max(1, ⌈5% × notes⌉)`.
-  - The DF snapshot lives in `.runtime/df-snapshot.json`. It is recounted at Stop, after delivery, one slice
-    per measured Stop capped at 50 ms (about 30 slices a day at the real vault size). Each slice resumes from
-    `.runtime/df-snapshot.partial.json`, and the snapshot is written only when a pass completes, at most once
-    a day. A pass may span a few turns while the vault changes; DF is a statistic.
+  - The DF snapshot lives in `.runtime/df-snapshot.json`. It is recounted at Stop, after delivery, on a measured
+    wire with the ledger on (`use-df-recount.ts`), weekly.
+    - A pass starts when the snapshot is at least 7 days old, or when the early trigger fires. The trigger: the
+      vault's note count has moved by more than 5% from the count the last completed pass listed. The count is a
+      directory listing only, with no note read (0.7 ms in a fresh process at 800 notes), and it is checked at
+      most once a day per vault (`.runtime/df-recount.json`).
+    - A pass lists the notes once, through the search scan's walker. Each Stop then counts the next notes, in
+      a window capped at 40 ms of its 50 ms slice, and always at least one note.
+    - Measured at the real vault size (800 notes, about 12 MB), one fresh hook process per slice: about 126
+      notes per slice at normal load, so a pass is 6–7 slices. At load 11 it is 45 notes per slice and 11–20
+      slices.
+    - A pass may span a few turns while the vault changes; DF is a statistic. The snapshot is written only
+      when a pass completes.
+  - The partial state between slices, `.runtime/df-snapshot.partial.json`, holds plain-text token counts for
+    the notes counted so far, `private` and `local-only` notes included (tokens are not hashed and no note is
+    excluded beyond the scan's own filters).
+    - It also holds the pass's note listing and the note count the pass started from.
+    - It is created with mode 0600 through a temp name and a rename. A symlink in its place is never followed:
+      the link is removed and replaced. A directory there refuses the slice.
+    - It lives for one pass, at most 7 days. It is discarded early when the note count moves past the trigger,
+      and a discarded partial is removed even when no new pass starts.
+    - It is deleted as soon as the snapshot's atomic write succeeds. If that write fails it is kept, so the
+      pass resumes.
   - The detector never scans the vault. With no snapshot, the title rule is off and reported as off.
   - Until S3b ships its noise predicate, the snapshot's note set excludes only status-skipped notes
     (`skipByStatus`), so session summaries and plan logs count toward document frequency. S3b narrows it to
@@ -1297,10 +1316,12 @@ There is one switch per feature, and every one defaults to `on`.
          - `jev-harvest-state.json`: pre-existing Stop behaviour, independent of the ledger (the Jev harvest
            cursor, written whenever the payload carries a transcript path). Same presence and the same bytes
            with the ledger on and off.
-         - On a recount turn only (the DF snapshot missing or over a day old, §4.4), the recount slice
+         - The recount's state, `df-recount.json` (the early trigger's baseline and its once-a-day check),
+           temp-and-rename, at most once a day outside a pass.
+         - On a recount turn only (a pass due weekly or on the early trigger, §4.4), the recount slice
            (`use-df-recount.ts`) also writes, each through a temp name and a rename:
-           `df-snapshot.partial.json`, the pass's state between slices, and `df-snapshot.json`, when a pass
-           completes (`writeDfSnapshot`).
+           `df-snapshot.partial.json`, the pass's state between slices (0600), and `df-snapshot.json`, when a
+           pass completes (`writeDfSnapshot`).
          - Nothing else. In particular, nothing under `recall-session.d/` changes (`counters.json`,
            `hit-keys.json`, `<agent_key>.reset`). `df-snapshot.json` is unchanged except on a recount turn,
            and then only through the atomic write. UPS never writes either file.
@@ -1308,15 +1329,19 @@ There is one switch per feature, and every one defaults to `on`.
       come after every commit Stop registers to consume or confirm something (a parked correction's archive, a
       relay cursor). Deferred commits run in registration order, so those settle before the detector starts,
       never up to its 1.5 s cap later. The recount waits for the detector.
-    - **The DF recount** (§4.4) runs one slice per measured Stop, after delivery, only while the snapshot is
-      due. A fresh snapshot costs one `lstat`.
-      - A slice counts notes for at most 40 ms of its 50 ms cap, checked between notes. The rest is kept for
-        the partial write, and one note's work is the slack.
-      - It reads the notes through the search scan's own walker and filters (`listVaultNoteRelPaths`,
-        `readVaultNoteTextForDf`: `wiki/**/*.md`, containment, no symlink followed, `blocked` and
-        `skippedByStatus` notes left out, 2 MB per note, non-blocking opens).
-      - A pass that started over a day ago restarts. A corrupt or foreign partial restarts it cleanly. A
-        snapshot or partial path a safe write cannot replace (a symlink, a directory) does nothing.
+    - **The DF recount** (§4.4) runs one slice per measured Stop, after delivery, only while a pass is due
+      (weekly, or on the early trigger). A Stop with nothing due costs a few `lstat`s and, at most once a day,
+      the note count: a directory listing, no note read.
+      - A slice counts notes for at most 40 ms of its 50 ms cap, from the end of its setup, checked between
+        notes, and always counts at least one note. The rest is kept for the partial write.
+      - Setup is the partial read and the per-slice note count. On a pass's first slice it also includes the
+        one walk of the vault (`listVaultNoteRelPaths`).
+      - Notes are read through the search scan's own filters (`readVaultNoteTextForDf`: containment, no
+        symlink followed, `blocked` and `skippedByStatus` notes left out, 2 MB per note, non-blocking opens).
+      - A pass older than 7 days, or outgrown by the vault, restarts. A corrupt or foreign partial or state
+        restarts cleanly. A vault with no countable note is parked for the week.
+      - At the snapshot path, a symlink or directory refuses the slice. At the partial or state path, a
+        symlink is replaced without being followed and a directory refuses.
     - **What Stop costs the user** (claude-code 2.1.301 waits for the Stop hook to EXIT, so the user-visible
       cost is the whole exit-time delta, paid at turn end). Measured on 2026-10-23, n=50, interleaved, load 3.4
       to 4.4:
@@ -1324,13 +1349,16 @@ There is one switch per feature, and every one defaults to `on`.
         stdout: the receipt's reader and the detector module load. About 15 ms comes after delivery: the
         detector run.
       - The ledger off, or an unmeasured wire (codex): within noise of base (−0.3 ms and +0.3 ms p50).
-      - A recount turn adds +43.9 ms p50 (+44.4 ms p95) to exit, and +0.3 ms to stdout. The slice runs after
-        delivery: 40.4 ms p50 and 41.4 ms max, against its 50 ms cap.
-      - At the real vault size (800 notes, about 12 MB) a pass is 28 to 31 slices of about 30 notes. So about
-        30 measured Stops a day pay the recount, and then none until the snapshot is a day old.
+      - A recount turn, measured 2026-10-23 (n=30, interleaved, load 4.1, 800 notes, about 12 MB):
+        - A mid-pass slice adds +39.2 ms p50 (+43.4 ms p95) to exit.
+        - A pass's first slice, which also walks the vault once, adds +73.8 ms p50 (+79.2 ms p95).
+        - Stdout is unchanged (−0.9 and −2.0 ms): all of it is after delivery.
+      - A pass is 6–7 such turns at normal load (about 126 notes per slice), and 11–20 at load 11 (about 45). A
+        pass happens weekly, or sooner when the note count moves more than 5%. The other measured Stops pay
+        only the normal-turn cost above, and once a day the 0.7 ms note count.
     - **What UPS costs** for the DF snapshot: nothing. UPS never counts, writes or loads the detector for it.
       On a recount day and on a normal day UPS's exit and stdout match within noise (−3.2 ms and −3.5 ms p50,
-      800 notes, ledger on).
+      800 notes, ledger on; measured before the weekly cadence, which changes nothing on UPS).
     - **Failures.** A detector that throws, will not load, is slow, or stops at its caps (1.5 s, 2 MB) changes
       no byte of the Stop output, which is already delivered, and never fails the hook. A failure (a module
       that will not load; a status of `invalid`, `refused`, `write_failed` or `error`; a throw) is audited
@@ -1448,8 +1476,17 @@ records the flags in effect (`features`), so a spot comparison is attributable.
   - Temp-name renames for every rewritten JSON file.
   - Session ids are hashed before use in paths.
 - **Hook budgets.**
-  - No unbounded vault read in hooks. The DF recount reads at most its per-slice cap (50 ms) of notes, at
-    turn end, after delivery. UPS writes nothing for it.
+  - No unbounded vault read in hooks. The DF recount runs only at Stop, after delivery, and only while a pass
+    is due. UPS writes nothing for it.
+    - Bounded by the cap: the counting window, 40 ms of its 50 ms slice, checked between notes. The slack is
+      one note: at most 2 MB read, with tokenisation capped at 200,000 characters. A slice always counts at
+      least one note, so a spent clock cannot livelock a pass.
+    - Not bounded by the cap, and run before the window opens:
+      - reading the partial (at most 16 MB);
+      - the per-slice note count (a directory listing, no note read);
+      - on a pass's first slice only, the one walk of the vault's tree (`listVaultNoteRelPaths`, a realpath per
+        entry). At 800 notes that walk is about 30 ms at normal load, and longer under load.
+    - The partial write follows the window, within the slice's 10 ms reserve.
   - Maintenance is post-delivery and cooperative, and it is stated as such.
 - **Injection.** Every injected title, handle and brief goes through `sanitizeRecallField` and the EVIDENCE
   framing.
