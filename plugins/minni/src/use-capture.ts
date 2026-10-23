@@ -25,7 +25,8 @@
 //   prompt-templates.json                             the classifier's counts
 //       (harness-envelope.ts; UPS is its only writer)
 // Session directories idle for 90 days are removed by a bounded sweep after a
-// SessionStart is delivered (`scheduleSessionSweep`).
+// SessionStart is delivered (`scheduleSessionSweep`), and so are ledger session
+// directories the use detector holds nothing open for (use-retention.ts).
 //
 // Privacy: rows hold keys, hashes and sanitized titles only. The prompt text and
 // its template hash never reach the ledger.
@@ -62,6 +63,7 @@ import {
 import type { LedgerContext, MemoryRef, SurfaceChannel, SurfacedItem } from "./use-ledger.js";
 // Re-exported so hook-handlers.ts can read it without loading use-ledger.js itself.
 export { ledgerFailureCount } from "./use-ledger.js";
+import { sweepLedgerDirs } from "./use-retention.js";
 import { assertWriteTargetUnder, recordAudit } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
@@ -1155,19 +1157,23 @@ export function sweepSessionDirs(
 }
 
 /**
- * SessionStart: run the retention sweep once the boot output is settled, on
- * every outcome. It consumes nothing, so delivery is irrelevant to it: it runs
- * as the commit when the output was delivered, and as the abandon handler when
- * it was not (a wire that drops SessionStart, such as Grok, would otherwise
- * never sweep, and recall-session.d would grow without bound). Record-only,
- * so an abandoned run is not counted as a rollback. It adds to the hook's wall
- * time (P16), hence its budget. On the throw path the abandon handler runs
- * before the degraded output is flushed; the same budget bounds it there.
+ * SessionStart: run the retention sweeps once the boot output is settled, on
+ * every outcome: `recall-session.d` (above), then the ledger's own session
+ * directories (use-retention.ts, §4.3 "Retention"). They consume nothing, so
+ * delivery is irrelevant to them: they run as the commit when the output was
+ * delivered, and as the abandon handler when it was not (a wire that drops
+ * SessionStart, such as Grok, would otherwise never sweep, and both trees
+ * would grow without bound). Record-only, so an abandoned run is not counted
+ * as a rollback. They add to the hook's wall time (P16), hence a budget each;
+ * after a complete pass each waits a day, so a typical boot pays two cursor
+ * reads. On the throw path the abandon handler runs before the degraded
+ * output is flushed; the same budgets bound it there.
  */
 export function scheduleSessionSweep(capture: UseCapture | null): void {
   if (capture === null) return;
   const sweep = (): void => {
     sweepSessionDirs(capture.vaultPath);
+    sweepLedgerDirs(capture.vaultPath);
   };
   deferUntilDelivered(
     async () => {

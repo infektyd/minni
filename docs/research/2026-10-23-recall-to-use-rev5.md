@@ -277,10 +277,27 @@ another resume):
   - `daemon_version`
 
   The plugin hashes `content` into shingles and never stores or injects it.
-- **Retention (S1b, not yet shipped).** Ledger session directories (`.runtime/use-ledger/<session_key>`) older
-  than 90 days with no open windows are removed after delivery, at most 20 per run. Each is first renamed to
-  `.trash-<ts>`. S1a does not do this: it ships only the `recall-session.d` sweep below. The ledger needs
-  S1b's open-window check, so S1b owns this retention (§8.1).
+- **Retention (S1b).** Ledger session directories (`.runtime/use-ledger/<session_key>`) past the 90-day
+  horizon, with nothing open in the detector, are removed by a sweep (`sweepLedgerDirs`, `use-retention.ts`).
+  - "Past the horizon" is the `recall-session.d` rule below: the directory and every entry in it are older
+    than 90 days, and a directory with more than 256 entries is never judged idle.
+  - "Nothing open" is read from the detector's per-session state (`.runtime/use-detector/sessions/<key>/
+    windows.json`), read-only and through the containment walk. A directory is kept while any agent there has
+    an open window, an open epoch (exposures not yet written), or an ended turn whose reply was not flushed.
+    It is also kept while a run holds `windows.lock` (younger than 30 s), and while the state cannot be read
+    with certainty (unreadable, oversize, refused, or an unknown version).
+  - With no detector state at all, nothing is open, so the directory may go.
+  - Retention removes only the ledger directory. The detector's own state and cursors are not its to remove.
+  - It runs with the `recall-session.d` sweep, in the same SessionStart commit and abandon handler, on every
+    outcome.
+  - At most 20 per run, each renamed to `.trash-<ts>-<key>` first.
+  - It runs within its own cooperative 150 ms budget, checked between items, and resumes from a cursor in
+    `use-ledger/.sweep.json`. After a complete pass it waits a day.
+  - It skips symlinks and plain files and never follows a link. Ledger readers skip dot names, so `.sweep.json`
+    and `.trash-*` are invisible to them.
+  - One race is accepted: a detector run that starts between the open-window check and the rename. That is a
+    microsecond window on a session idle for 90 days, and the rows that run appends are lost with the
+    directory.
 - **Per-session side files (S1a-2).** `.runtime/recall-session.d/<session_key>/` holds the capture state that
   is not a ledger row. Every directory is reached through the ledger's containment walk, and every file is
   replaced through a temp name and a rename. None of them holds text.
