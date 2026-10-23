@@ -21,6 +21,26 @@ import {
 } from "../dist/vault.js";
 import { extractJevLearning } from "../dist/jev-harvest.js";
 
+// Wall-clock budgets for warm searchVaultNotes calls. Two things make a raw
+// handful of samples unreliable against a sub-millisecond bound: the first
+// calls after a cache build still run un-optimised (~1.6x steady state), and
+// shared CI runners preempt the process for several ms at a time. So: run a
+// warm-up loop first, then take the median of many samples. Spikes land in the
+// tail, the median tracks steady state, and the budget stays strict.
+// `check` runs on every result outside the timed region.
+async function warmMedianMs(fn, check, { warmup = 20, samples = 41 } = {}) {
+  for (let i = 0; i < warmup; i++) check(await fn());
+  const times = [];
+  for (let i = 0; i < samples; i++) {
+    const t0 = performance.now();
+    const out = await fn();
+    times.push(performance.now() - t0);
+    check(out);
+  }
+  times.sort((a, b) => a - b);
+  return times[Math.floor(times.length / 2)];
+}
+
 test("Phase 1: formatDegradation and buildBootRecallSlice suppress routine foreign scope_blackout noise", () => {
   const responseWithForeignBlackout = {
     count: 2,
@@ -152,13 +172,13 @@ test("Phase 2: searchVaultNotes uses in-memory Trie cache (< 2 ms warm over 100 
   assert.match(initialHits[0].title, /Zirconium Hypergraph Indexing/);
 
   // Measure warm lookup latency
-  const t0 = performance.now();
-  const warmHits = await searchVaultNotes(vault, "zirconium hypergraph", 5);
-  const elapsedMs = performance.now() - t0;
-  assert.equal(warmHits.length, 1);
+  const medianMs = await warmMedianMs(
+    () => searchVaultNotes(vault, "zirconium hypergraph", 5),
+    (warmHits) => assert.equal(warmHits.length, 1),
+  );
   assert.ok(
-    elapsedMs < 2.0,
-    `Expected warm in-memory Trie searchVaultNotes < 2.0 ms, took ${elapsedMs.toFixed(3)} ms`,
+    medianMs < 2.0,
+    `Expected warm in-memory Trie searchVaultNotes < 2.0 ms, median was ${medianMs.toFixed(3)} ms`,
   );
 
   // Verify incremental update on writeVaultPage
@@ -286,21 +306,19 @@ test("Phase 2b: warm searchVaultNotes over 707 notes (200 matching common term) 
   );
   assert.equal(coldHits.length, 5);
 
-  // Measure median of 5 warm runs
-  const samples = [];
-  for (let r = 0; r < 5; r++) {
-    const t0 = performance.now();
-    const hits = await searchVaultNotes(
-      vault,
-      "CandidatePacket auto_accept_own governance",
-      5,
-    );
-    samples.push(performance.now() - t0);
-    assert.equal(hits.length, 5);
-    assert.ok(hits[0].snippet.includes("CandidatePacket"));
-  }
-  samples.sort((a, b) => a - b);
-  const medianMs = samples[2];
+  // Every warm run must return exactly the cold ranking and scores.
+  const coldRanking = coldHits.map((h) => [h.relativePath, h.score]);
+  const medianMs = await warmMedianMs(
+    () => searchVaultNotes(vault, "CandidatePacket auto_accept_own governance", 5),
+    (hits) => {
+      assert.equal(hits.length, 5);
+      assert.ok(hits[0].snippet.includes("CandidatePacket"));
+      assert.deepEqual(
+        hits.map((h) => [h.relativePath, h.score]),
+        coldRanking,
+      );
+    },
+  );
   assert.ok(
     medianMs < 0.5,
     `Expected warm 707-note searchVaultNotes < 0.5 ms, median was ${medianMs.toFixed(3)} ms`,
