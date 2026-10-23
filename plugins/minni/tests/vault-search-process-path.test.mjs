@@ -80,6 +80,32 @@ test("hook process: a prompt past the scan's work budget hands the search to the
   assert.equal(state.prefixIndex, true, "past the budget the hook process runs the index path");
 });
 
+test("prepareTask runs its vault search on the index path", async () => {
+  const { prepareTask } = await import("../dist/task.js");
+  const { vaultSearchCacheState } = await import("../dist/vault.js");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-search-path-task-"));
+  const previousHome = process.env.MINNI_HOME;
+  process.env.MINNI_HOME = path.join(root, "home");
+  try {
+    await seedNotes(root);
+    const packet = await prepareTask(
+      { task: "how does the cache policy handle tests", vaultPath: root, useAfm: false },
+      {
+        recall: async () => ({ ok: false, error: "offline in this test" }),
+        audit: async () => {},
+      },
+    );
+    assert.ok(packet, "prepareTask returned a packet");
+    const state = vaultSearchCacheState(root);
+    assert.ok(state && state.notes >= 20, "prepareTask searched the vault in this process");
+    assert.equal(state.prefixIndex, true, "prepareTask keeps the index path");
+  } finally {
+    if (previousHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = previousHome;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("MCP server process: minni_recall's vault pre-scan runs on the index path", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-search-path-server-"));
   const home = path.join(root, "home");
