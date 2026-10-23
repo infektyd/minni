@@ -216,3 +216,66 @@ test("the title_assessable share is reported per channel and overall, in the rep
   assert.equal(status.surfacings.title_assessable_share, 0.5, "the minni_status block carries it too");
   assert.equal(status.surfacings.by_channel.prompt_pointer.title_assessable_share, 0.3333);
 });
+
+test("title_judged excludes unknown(*) outcomes: an unreached window was never assessed", async (t) => {
+  const { vault } = await makeVault(t, "minni-use-report-unknown-");
+  const main = context();
+  const at = (minutes) => new Date(Date.now() - 2 * HOUR + minutes * 60_000).toISOString();
+  const rows = [];
+  const judged = (mkey, outcome, assessable, minute) => {
+    const surfaced = buildSurfacedRow(main, { channel: "prompt_pointer", mkey, title: "T", rank: 0, visible: true, delivered: true }, at(minute));
+    rows.push(
+      surfaced,
+      buildJudgedRow(main, { sid: surfaced.sid, outcome, via: "transcript", evidence: [], title_assessable: assessable, final: true, rule_version: "s1b-3" }, at(minute + 1)),
+    );
+  };
+  judged("vault:wiki/a.md", "ignored", true, 1);
+  judged("vault:wiki/b.md", "unknown(missed_window)", false, 2);
+  judged("vault:wiki/c.md", "unknown(unparsed_transcript)", false, 3);
+  assert.equal(appendLedgerRows(vault, rows).written, rows.length);
+  const { use } = await auditReport(vault, 100, { useDays: 7 });
+  assert.equal(use.surfacings.title_judged, 1);
+  assert.equal(use.surfacings.title_assessable, 1);
+  assert.equal(use.surfacings.title_assessable_share, 1);
+});
+
+/** One audit entry exactly as recordAudit writes it. */
+function auditEntry(ts, tool, summary, details) {
+  const block = details ? `\`\`\`json\n${JSON.stringify(details, null, 2)}\n\`\`\`\n\n` : "";
+  return `## [${ts}] ${tool} | ${summary}\n\n${block}`;
+}
+
+test("ledger-off stretches are listed from the session_start audit rows inside the window", async (t) => {
+  const { vault } = await makeVault(t, "minni-use-report-ledger-off-");
+  const base = Date.now() - 6 * HOUR;
+  const at = (minutes) => new Date(base + minutes * 60_000).toISOString();
+  const on = { use_ledger: "on", features: ["MINNI_UPS_RANK_V2", "MINNI_USE_LEDGER"] };
+  const off = { use_ledger: "off" };
+  const entries = [
+    [at(0), "hook_claude_code_session_start", "boot s1", on],
+    [at(10), "hook_claude_code_session_start", "boot s2", off],
+    [at(12), "hook_claude_code_user_prompt_submit", "prompt", { recall_strong: false }],
+    [at(20), "hook_codex_session_start", "boot s3", off],
+    [at(30), "hook_claude_code_session_start", "boot s4", { recall: "legacy row without the field" }],
+    [at(40), "hook_claude_code_session_start", "boot s5", on],
+    [at(50), "hook_claude_code_session_start", "boot s6", off],
+  ];
+  const old = new Date(Date.now() - 20 * 24 * HOUR).toISOString();
+  entries.unshift([old, "hook_claude_code_session_start", "boot s0", off]);
+  const byDay = new Map();
+  for (const [ts, tool, summary, details] of entries) {
+    const day = ts.slice(0, 10);
+    byDay.set(day, (byDay.get(day) ?? `# ${day} Minni Audit\n\n`) + auditEntry(ts, tool, summary, details));
+  }
+  await mkdir(path.join(vault, "logs"), { recursive: true });
+  for (const [day, text] of byDay) await writeFile(path.join(vault, "logs", `${day}.md`), text, "utf8");
+
+  const { use } = await auditReport(vault, 100, { useDays: 7 });
+  assert.equal(use.ledger_off.session_starts, 6, "the 20-day-old row is outside the window");
+  assert.equal(use.ledger_off.off, 3);
+  assert.equal(use.ledger_off.unknown, 1, "a row without use_ledger is counted, never guessed");
+  assert.deepEqual(use.ledger_off.stretches, [
+    { count: 2, first: at(10), last: at(20) },
+    { count: 1, first: at(50), last: at(50) },
+  ]);
+});

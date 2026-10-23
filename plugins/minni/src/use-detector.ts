@@ -85,7 +85,7 @@ import {
 } from "./use-ledger.js";
 import { assertWriteTargetUnder } from "./vault.js";
 
-export const DETECTOR_RULE_VERSION = "s1b-3";
+export const DETECTOR_RULE_VERSION = "s1b-4";
 /** Detector state root under the vault. */
 export const DETECTOR_RELDIR = path.join(".runtime", "use-detector");
 /** Token document frequencies, written by UPS from its own vault scan. */
@@ -124,6 +124,8 @@ const FAST_SCAN_CHUNK = 256 * 1024;
 const DISMISSAL_PREFIX_CHARS = 300;
 const MIN_TITLE_TOKENS = 3;
 const MIN_SLUG_CHARS = 8;
+/** A title shorter than this is too generic to open a memory by substring. */
+const MIN_TITLE_SUBSTRING_CHARS = 8;
 const SESSION_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const AGENT_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const TX_KEY_RE = /^[0-9a-f]{16}$/;
@@ -237,6 +239,46 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Read-only open flags for every file the detector and the report read. With
+ * O_NONBLOCK a FIFO opens at once (instead of waiting for a writer, which
+ * under the Stop wiring would hold the host up to its Stop timeout) and is
+ * then refused by the fstat below; O_NOFOLLOW refuses a symlinked leaf.
+ */
+const READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
+/**
+ * A regular file's text, or null: opened non-blocking, judged on the OPENED
+ * descriptor (so a file swapped for a FIFO after a stat is still refused),
+ * at most `maxBytes`. Never blocks, never throws.
+ */
+export function readRegularFileSync(file: string, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, READ_FLAGS);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    const buffer = Buffer.alloc(stat.size);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const n = fs.readSync(fd, buffer, filled, buffer.length - filled, filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    return buffer.toString("utf8", 0, filled);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // A read-only descriptor: nothing to lose.
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // DF snapshot (§4.4 "Distinctive tokens")
 // ---------------------------------------------------------------------------
@@ -272,7 +314,9 @@ export function readDfSnapshot(vaultPath: string): DfSnapshot | null {
     const cached = dfCache.get(key);
     if (cached && cached.signature === signature) return cached.snapshot;
     let snapshot: DfSnapshot | null = null;
-    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_DF_BYTES);
+    if (text === null) return null;
+    const raw = JSON.parse(text) as unknown;
     if (isRecord(raw) && raw.v === 1 && Number.isSafeInteger(raw.notes) && (raw.notes as number) >= 1 && isRecord(raw.df)) {
       const df = new Map<string, number>();
       for (const [token, count] of Object.entries(raw.df)) {
@@ -368,9 +412,8 @@ function writeJsonAtomic(vaultPath: string, file: string, value: unknown): void 
 function readJsonFile(vaultPath: string, file: string): unknown {
   try {
     assertWriteTargetUnder(file, vaultPath);
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > MAX_STATE_BYTES) return null;
-    return JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_STATE_BYTES);
+    return text === null ? null : (JSON.parse(text) as unknown);
   } catch {
     return null;
   }
@@ -805,7 +848,8 @@ function openTranscript(transcriptPath: unknown): TranscriptHandle | null {
   let fd: number | undefined;
   try {
     const real = fs.realpathSync(transcriptPath);
-    fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    // O_NONBLOCK: a FIFO must open at once and be refused below, never wait for a writer.
+    fd = fs.openSync(real, READ_FLAGS);
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) {
       fs.closeSync(fd);
@@ -1010,6 +1054,8 @@ interface TextAct {
   keptSentence: number[];
   /** Token sets per sentence, from the kept words. */
   sentences: Set<string>[];
+  /** isDismissal(text), computed once per act (memo). */
+  dismissal?: boolean;
 }
 
 interface ToolAct {
@@ -1020,7 +1066,20 @@ interface ToolAct {
   shingles: Set<string>;
   filePath?: string;
   command?: string;
+  /** A minni_recall's query. */
+  query?: string;
   minni: "recall" | "drill" | null;
+  // Per-act data, computed once per act and never per window (memos):
+  /** The tool's base name (`mcp__x__minni_recall` -> `minni_recall`). */
+  base: string;
+  /** A Bash command that uses a read verb. */
+  readVerb: boolean;
+  /** The input's leaves, one per line, for doc-id opens. */
+  leafLines?: string[];
+  /** The recall query, NFKC. */
+  queryText?: string;
+  /** The recall query's kept words of 3+ characters, as one token set. */
+  queryTokens?: Set<string>;
 }
 
 type Act = TextAct | ToolAct;
@@ -1036,14 +1095,18 @@ type Act = TextAct | ToolAct;
  * shingle (applied) and echo passes see every word: a body sentence that
  * contains a path or an identifier must still match.
  */
-const HANDLE_FORM_RES: readonly RegExp[] = [
-  /\[\[[^\]\n]{1,512}\]\]/g,
-  /\bm:[0-9a-f]{8}\b/g,
-  /\bd:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}/g,
-  /\blearning\s*#\s*[A-Za-z0-9_.-]+/gi,
-  /[\p{L}\p{N}_.~-]*(?:\/[\p{L}\p{N}_.~-]+)+\/?/gu,
-  /[\p{L}\p{N}_-]+\.md\b/giu,
-];
+//
+// Every pattern here runs over assistant text the detector does not control,
+// inside a 1.5 s hook, so each is written to be linear: a repeated class may
+// only start where its token starts (a lookbehind), or is bounded, so no
+// start position re-scans a long token (use-detector-regex-cost.test.mjs).
+const WIKILINK_RE = /\[\[[^\[\]\n]{1,512}\]\]/g;
+const M_HANDLE_RE = /\bm:[0-9a-f]{8}\b/g;
+const D_HANDLE_RE = /\bd:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}/g;
+const LEARNING_REF_RE = /\blearning\s*#\s*[A-Za-z0-9_.-]+/gi;
+const PATH_RE = /(?<![\p{L}\p{N}_.~-])[\p{L}\p{N}_.~-]*(?:\/[\p{L}\p{N}_.~-]+)+\/?/gu;
+const MD_NAME_RE = /(?<![\p{L}\p{N}_-])[\p{L}\p{N}_-]+\.md\b/giu;
+const HANDLE_FORM_RES: readonly RegExp[] = [WIKILINK_RE, M_HANDLE_RE, D_HANDLE_RE, LEARNING_REF_RE, PATH_RE, MD_NAME_RE];
 /** Hyphen- or underscore-joined identifiers; removed when at least 8 characters long. */
 const JOINED_RE = /(?<![\p{L}\p{N}])[\p{L}\p{N}]+(?:[-_][\p{L}\p{N}]+)+(?![\p{L}\p{N}])/gu;
 const MIN_JOINED_CHARS = 8;
@@ -1094,7 +1157,16 @@ function tokenSets(words: readonly string[], sentenceOf: readonly number[], keep
  * one word scan with offsets, so an echo window covering raw words maps
  * exactly onto the kept words it touches.
  */
-function textAct(raw: string): TextAct {
+interface WordScan {
+  text: string;
+  rawWords: string[];
+  keptWords: string[];
+  keptRaw: number[];
+  keptSentence: number[];
+}
+
+/** The one word scan: NFKC, handle spans, sentence ids, lowercased words (raw and kept). */
+function scanWords(raw: string): WordScan {
   const text = raw.slice(0, MAX_INPUT_CHARS).normalize("NFKC");
   const spans = handleSpans(text);
   let spanAt = 0;
@@ -1115,14 +1187,25 @@ function textAct(raw: string): TextAct {
   for (const match of text.matchAll(WORD_RE)) {
     const offset = match.index as number;
     while (sentence < realBreaks.length && (realBreaks[sentence] as number) < offset) sentence += 1;
-    const word = match[0].toLowerCase();
-    if (!insideSpan(offset)) {
-      keptWords.push(word);
-      keptRaw.push(rawWords.length);
-      keptSentence.push(sentence);
+    const kept = !insideSpan(offset);
+    // The ledger lowercases, then matches. Lowercasing can split a word
+    // ("İ" -> "i" + U+0307, which the word rule does not match), so each
+    // lowercased match is re-split by the same rule: identical words, and a
+    // raw index for every piece.
+    for (const word of match[0].toLowerCase().match(WORD_RE) ?? []) {
+      if (kept) {
+        keptWords.push(word);
+        keptRaw.push(rawWords.length);
+        keptSentence.push(sentence);
+      }
+      rawWords.push(word);
     }
-    rawWords.push(word);
   }
+  return { text, rawWords, keptWords, keptRaw, keptSentence };
+}
+
+function textAct(raw: string): TextAct {
+  const { text, rawWords, keptWords, keptRaw, keptSentence } = scanWords(raw);
   const rawWindows: Array<string | null> = [];
   const shingles = new Set<string>();
   for (let i = 0; i < rawWords.length; i += 1) {
@@ -1153,6 +1236,15 @@ function textAct(raw: string): TextAct {
  * title/content tokens count only outside it, so a paraphrase still does.
  */
 function sentencesOutsideEcho(act: TextAct, echo: ReadonlySet<string>): Set<string>[] {
+  // Fast path, O(|echo|): no echo shingle in this act means nothing to mask.
+  let any = false;
+  for (const hash of echo) {
+    if (act.shingles.has(hash)) {
+      any = true;
+      break;
+    }
+  }
+  if (!any) return act.sentences;
   // Coverage on the raw words, where the ledger's echo hashes live; then
   // mapped onto the kept words. A window that spans an identifier still
   // matches, because identifiers are stripped only from the title pass.
@@ -1196,11 +1288,15 @@ function toolAct(name: string, input: unknown): ToolAct {
     leaves,
     shingles: new Set(allShingleHashes(leaves)),
     minni: (MINNI_TOOL_RE.exec(name)?.[1] as "recall" | "drill" | undefined) ?? null,
+    base: name.split("__").pop() ?? name,
+    readVerb: false,
   };
   if (isRecord(input)) {
     if (typeof input.file_path === "string") act.filePath = input.file_path;
     if (typeof input.command === "string") act.command = input.command;
+    if (typeof input.query === "string") act.query = input.query.slice(0, MAX_INPUT_CHARS);
   }
+  if (act.base === "Bash" && act.command) act.readVerb = READ_VERB_RE.test(`${act.command} `);
   return act;
 }
 
@@ -1224,6 +1320,8 @@ interface Profile {
   /** Vault-relative path, for Read opens. */
   rel: string | null;
   doc: { src: string; id: string } | null;
+  /** The full sanitized title, bounded and case-insensitive: a minni_recall query naming it opens it. */
+  titleRe: RegExp | null;
 }
 
 /** `name` not inside a longer name: no name character on either side. */
@@ -1243,7 +1341,15 @@ function profileFor(core: MemoryCore, df: DfSnapshot | null): Profile {
     slugRe: null,
     rel: null,
     doc: null,
+    titleRe: null,
   };
+  const fullTitle = core.title.normalize("NFKC").trim();
+  if (fullTitle.length >= MIN_TITLE_SUBSTRING_CHARS) {
+    profile.titleRe = new RegExp(
+      `(?<![\\p{L}\\p{N}])${fullTitle.split(/\s+/).map(escapeRegExp).join("\\s+")}(?![\\p{L}\\p{N}])`,
+      "iu",
+    );
+  }
   if (df) {
     profile.title = useTokens(core.title)
       .filter((token) => (df.df.get(token) ?? 0) <= df.threshold)
@@ -1311,19 +1417,36 @@ function pathNames(filePath: string, rel: string): boolean {
   return normalized === rel || normalized.endsWith(`/${rel}`);
 }
 
-function opens(profile: Profile, act: ToolAct): boolean {
-  const base = act.name.split("__").pop() ?? act.name;
+/**
+ * A minni_recall query that cites the memory's title opens it, in both
+ * windows (before has only the title to recall by): the same title rule as a
+ * citation (3 distinctive, prompt-filtered title tokens, handle forms
+ * removed), or the full sanitized title as a substring.
+ */
+function recallCitesTitle(profile: Profile, act: ToolAct, title: ReadonlyArray<{ token: string }> | null): boolean {
+  // Tokenised once per act: this runs for every open window and exposure.
+  if (act.queryText === undefined) act.queryText = (act.query ?? act.leaves).normalize("NFKC");
+  if (profile.titleRe?.test(act.queryText)) return true;
+  if (!title || title.length < MIN_TITLE_TOKENS) return false;
+  if (act.queryTokens === undefined) {
+    act.queryTokens = new Set(scanWords(act.queryText).keptWords.filter((word) => word.length >= 3));
+  }
+  return citesTitle(title, [act.queryTokens]);
+}
+
+function opens(profile: Profile, act: ToolAct, title: ReadonlyArray<{ token: string }> | null): boolean {
   if (profile.rel) {
-    if (base === "Read" && act.filePath && pathNames(act.filePath, profile.rel)) return true;
-    if (base === "Bash" && act.command && READ_VERB_RE.test(`${act.command} `)) {
+    if (act.base === "Read" && act.filePath && pathNames(act.filePath, profile.rel)) return true;
+    if (act.readVerb && act.command) {
       if (profile.relRe?.test(act.command) || profile.slugRe?.test(act.command)) return true;
     }
   }
   if (act.minni) {
     if (profile.names.some((re) => re.test(act.leaves))) return true;
+    if (act.minni === "recall" && recallCitesTitle(profile, act, title)) return true;
     if (profile.doc) {
-      const lines = act.leaves.split("\n");
-      if (lines.includes(profile.doc.id) && lines.includes(profile.doc.src)) return true;
+      act.leafLines ??= act.leaves.split("\n");
+      if (act.leafLines.includes(profile.doc.id) && act.leafLines.includes(profile.doc.src)) return true;
     }
   }
   return false;
@@ -1349,7 +1472,8 @@ function observe(
   if (act.kind === "text") {
     if (!acc.first_text) {
       acc.first_text = true;
-      if (isDismissal(act.text)) acc.dismissed = true;
+      act.dismissal ??= isDismissal(act.text);
+      if (act.dismissal) acc.dismissed = true;
     }
     if (hitsShingle(profile, act.shingles, false, promptShingles)) acc.applied = true;
     if (citesHandle(profile, act.text)) acc.cite_handle = true;
@@ -1359,7 +1483,7 @@ function observe(
     }
   } else {
     if (hitsShingle(profile, act.shingles, true, promptShingles)) acc.applied = true;
-    if (opens(profile, act)) {
+    if (opens(profile, act, title)) {
       // Naming a handle and then opening it is the open, not a citation. A
       // title citation stands: it is identifier-free evidence in both windows,
       // and each window opens its own way (recall by title, drill by handle).
@@ -1437,7 +1561,12 @@ interface Card {
 }
 
 const CARD_LINE_RE = /^\s*(\d{1,3})\.\s+\[\[([^\]\n]{1,512})\]\](.*)$/;
-const EVIDENCE_SOURCE_RE = /<EVIDENCE\b[^>]*?\bsource="([^"]*)"/i;
+/** Bounded: the attribute list and the value are scanned at most 512 / 2,048 chars per tag. */
+const EVIDENCE_SOURCE_RE = /<EVIDENCE\b[^>\n]{0,512}?\bsource="([^"\n]{0,2048})"/i;
+/** Leading whitespace only from the start of its run, and a bounded score value: linear. */
+const SCORE_SUFFIX_RE = /(?<!\s)\s*\((?:vault )?score=[^)\n]{0,64}\)\s*$/;
+/** Only this much of a card line's tail is examined for its title and score. */
+const CARD_TAIL_CHARS = 1024;
 
 function unescapeAttr(value: string): string {
   return value
@@ -1456,7 +1585,7 @@ function recallCards(text: string): Card[] {
     const match = CARD_LINE_RE.exec(line);
     if (match) {
       if (cards.length >= MAX_CARDS) break;
-      const rest = (match[3] as string).replace(/\s*\((?:vault )?score=[^)]*\)\s*$/, "");
+      const rest = (match[3] as string).slice(0, CARD_TAIL_CHARS).replace(SCORE_SUFFIX_RE, "");
       const title = /^\s+—\s+(.+)$/.exec(rest)?.[1]?.trim();
       current = { rank: cards.length, wikilink: match[2] as string };
       if (title) current.title = title;
@@ -1543,6 +1672,28 @@ function keyCard(vaultPath: string, card: Card): string | null {
   }
   return null;
 }
+
+/**
+ * Every regex the detector runs over untrusted text, by name, for the
+ * linear-cost test. Not used by the detector itself; frozen.
+ */
+export const DETECTOR_TEXT_PATTERNS: Readonly<Record<string, RegExp>> = Object.freeze({
+  wikilink: WIKILINK_RE,
+  m_handle: M_HANDLE_RE,
+  d_handle: D_HANDLE_RE,
+  learning_ref: LEARNING_REF_RE,
+  path: PATH_RE,
+  md_name: MD_NAME_RE,
+  joined: JOINED_RE,
+  word: WORD_RE,
+  sentence_break: SENTENCE_BREAK_RE,
+  read_verb: READ_VERB_RE,
+  minni_tool: MINNI_TOOL_RE,
+  card_line: CARD_LINE_RE,
+  evidence_source: EVIDENCE_SOURCE_RE,
+  score_suffix: SCORE_SUFFIX_RE,
+  ...Object.fromEntries(DISMISSAL_PATTERNS.map((pattern, index) => [`dismissal_${index}`, pattern])),
+});
 
 // ---------------------------------------------------------------------------
 // Ledger index and row writer
@@ -2688,6 +2839,34 @@ export interface IdleCloseResult {
   sessions: number;
   judged_written: number;
   exposures_written: number;
+  /**
+   * Candidate sessions left unexamined when the call stopped early (the time
+   * budget ran out, or `limit` sessions were closed): retry them. Present only
+   * when `sessionKeys` or `budgetMs` was passed.
+   */
+  remaining?: number;
+}
+
+export interface IdleCloseOptions {
+  now?: number | string | Date;
+  /** At most this many sessions are closed per call (default 50). */
+  limit?: number;
+  /**
+   * Examine ONLY these sessions, in this order: no walk of the session
+   * directories and no read of any other session's ledger. Each key must pass
+   * the walk's own rule for a session directory name; others are skipped.
+   */
+  sessionKeys?: readonly string[];
+  /**
+   * Wall-clock budget, checked between sessions and never inside one (the
+   * first candidate is always examined); what is left is in `remaining`.
+   */
+  budgetMs?: number;
+}
+
+/** The walk's rule for a session directory name. */
+function isSessionKeyName(name: unknown): name is string {
+  return typeof name === "string" && SESSION_KEY_RE.test(name) && name !== "unlabeled";
 }
 
 function listSessionKeys(vaultPath: string): string[] {
@@ -2697,7 +2876,7 @@ function listSessionKeys(vaultPath: string): string[] {
       const dir = containedDir(vaultPath, segments, false);
       if (!dir) continue;
       for (const name of fs.readdirSync(dir)) {
-        if (SESSION_KEY_RE.test(name) && name !== "unlabeled") keys.add(name);
+        if (isSessionKeyName(name)) keys.add(name);
       }
     } catch {
       // A refused or unreadable root contributes no sessions.
@@ -2751,10 +2930,7 @@ function alreadyClosed(vaultPath: string, sessionKey: string, signature: string)
  * unknown(unreached); and each open epoch writes its exposure rows. Run from
  * `use-report`. At most `limit` sessions are closed per call. Never throws.
  */
-export function finalizeIdleSessions(
-  vaultPath: string,
-  options: { now?: number | string | Date; limit?: number } = {},
-): IdleCloseResult {
+export function finalizeIdleSessions(vaultPath: string, options: IdleCloseOptions = {}): IdleCloseResult {
   const out: IdleCloseResult = { status: "ran", sessions: 0, judged_written: 0, exposures_written: 0 };
   try {
     if (typeof vaultPath !== "string" || vaultPath.length === 0 || vaultPath.includes("\0") || !fs.existsSync(vaultPath)) {
@@ -2768,8 +2944,19 @@ export function finalizeIdleSessions(
     const nowMs = toMs(options.now);
     const nowIso = new Date(nowMs).toISOString();
     const limit = Number.isSafeInteger(options.limit) && (options.limit as number) > 0 ? (options.limit as number) : 50;
-    for (const sessionKey of listSessionKeys(vaultPath)) {
-      if (out.sessions >= limit) break;
+    const named = Array.isArray(options.sessionKeys);
+    const budgeted = typeof options.budgetMs === "number" && Number.isFinite(options.budgetMs) && options.budgetMs > 0;
+    const deadline = budgeted ? Date.now() + (options.budgetMs as number) : null;
+    const candidates = named
+      ? [...new Set((options.sessionKeys as readonly unknown[]).filter(isSessionKeyName))]
+      : listSessionKeys(vaultPath);
+    if (named || options.budgetMs !== undefined) out.remaining = 0;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const sessionKey = candidates[index] as string;
+      if (out.sessions >= limit || (deadline !== null && index > 0 && Date.now() >= deadline)) {
+        if (out.remaining !== undefined) out.remaining = candidates.length - index;
+        break;
+      }
       if (alreadyClosed(vaultPath, sessionKey, ledgerSignature(vaultPath, sessionKey))) continue;
       // Lock-free look first, so a busy or finished session costs no lock and no directory.
       const existing = sessionDir(vaultPath, sessionKey, false);

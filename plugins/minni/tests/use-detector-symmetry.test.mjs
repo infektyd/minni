@@ -195,21 +195,49 @@ test("handle cited (the same text in both windows): cited_handle, never used_ii"
   assert.equal(result.facts[0].outcome, "cited_handle");
 });
 
-test("a title citation, then each window's natural open (before: recall by title; after: drill the handle)", async (t) => {
+const RECALL_BY_TITLE = ["mcp__minni__minni_recall", { query: TITLE }];
+const DRILL_HANDLE = ["mcp__minni__minni_drill", { references: [HANDLE] }];
+
+test("recall by title is an open in both windows", async (t) => {
   const result = await symmetric(t, {
-    turns: [
-      {
-        prompt: "Look at the nightly stall.",
-        actions: (format) => [
-          "Per the beryl harbor checkpoint cadence note, let me check it.",
-          format.name === "after" ? ["mcp__minni__minni_drill", { references: [HANDLE] }] : ["mcp__minni__minni_recall", { query: TITLE }],
-          "Checked; nothing to change.",
-        ],
-      },
-    ],
+    turns: [{ prompt: "Look at the nightly stall.", actions: () => ["Checking the archive.", RECALL_BY_TITLE, "Done."] }],
   });
-  assert.deepEqual(result.facts.map((fact) => [fact.credits, fact.outcome]), [[[1], "cited"]]);
+  assert.deepEqual(result.facts.map((fact) => [fact.credits, fact.outcome]), [[[], "opened"]]);
 });
+
+for (const afterOpen of ["drill", "recall"]) {
+  test(`an open alone: before recalls by title, after opens by ${afterOpen}`, async (t) => {
+    const result = await symmetric(t, {
+      turns: [
+        {
+          prompt: "Look at the nightly stall.",
+          actions: (format) => [
+            "Checking the archive.",
+            format.name === "after" && afterOpen === "drill" ? DRILL_HANDLE : RECALL_BY_TITLE,
+            "Done.",
+          ],
+        },
+      ],
+    });
+    assert.deepEqual(result.facts.map((fact) => [fact.credits, fact.outcome]), [[[], "opened"]]);
+  });
+
+  test(`a title citation, then each window's natural open (before: recall by title; after: ${afterOpen})`, async (t) => {
+    const result = await symmetric(t, {
+      turns: [
+        {
+          prompt: "Look at the nightly stall.",
+          actions: (format) => [
+            "Per the beryl harbor checkpoint cadence note, let me check it.",
+            format.name === "after" && afterOpen === "drill" ? DRILL_HANDLE : RECALL_BY_TITLE,
+            "Checked; nothing to change.",
+          ],
+        },
+      ],
+    });
+    assert.deepEqual(result.facts.map((fact) => [fact.credits, fact.outcome]), [[[1], "cited"]]);
+  });
+}
 
 test("opened", async (t) => {
   const result = await symmetric(t, {
@@ -290,4 +318,26 @@ test("the intended difference: only the after window can cite a handle, and it n
   assert.equal(after.used_ii, before.used_ii, "used_ii is equal");
   assert.equal(before.facts[0].outcome, "ignored");
   assert.equal(after.facts[0].outcome, "cited_handle", "the handle lands in its own bucket");
+});
+
+test("a known difference (F1, pinned): announcing an open names the title in before but a handle in after", async (t) => {
+  // Each window announces with the identifier its own pointer gave it. BEFORE
+  // only has the title, and a title citation is used_ii; AFTER also has a
+  // handle, and a handle citation never is. This inflates BEFORE, which is
+  // conservative for the before/after comparison (rev5 §4.4, §4.7).
+  const script = {
+    turns: [
+      {
+        prompt: "Look at the nightly stall.",
+        actions: (format) =>
+          format.name === "after"
+            ? [`Let me drill ${HANDLE} first.`, DRILL_HANDLE, "Checked; nothing to change."]
+            : [`Let me recall the ${TITLE} note first.`, RECALL_BY_TITLE, "Checked; nothing to change."],
+      },
+    ],
+  };
+  const before = await runWindow(t, BEFORE, script);
+  const after = await runWindow(t, AFTER, script);
+  assert.deepEqual(before.facts.map((fact) => [fact.credits, fact.outcome]), [[[1], "cited"]]);
+  assert.deepEqual(after.facts.map((fact) => [fact.credits, fact.outcome]), [[[], "opened"]]);
 });
