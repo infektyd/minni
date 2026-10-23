@@ -294,12 +294,16 @@ another resume):
   - `use-detector.js` loads on SessionStart only when a candidate exists, and only with the ledger on.
   - Retention removes only the ledger directory. The detector's own state and cursors are not its to remove.
   - At most 20 per run, removals and candidates together, each renamed to `.trash-<ts>-<key>` first.
-  - It resumes from a cursor in `use-ledger/.sweep.json`. A candidate the run did not reach is carried: the
-    cursor stops before it. After a complete pass it waits a day.
+  - Every candidate the close examined and left closed is removed in the same run, whatever the budget says.
+    Each was judged past the horizon before the close, and the close's own rows would hide it from the horizon
+    for another 90 days. That costs one rename and removal each, at most 20.
+  - Candidates the close did not examine (its `remaining`) are carried: the cursor in `use-ledger/.sweep.json`
+    stops before the first, and the next run resumes there. After a complete pass it waits a day.
   - It skips symlinks and plain files and never follows a link. Ledger readers skip dot names, so `.sweep.json`
     and `.trash-*` are invisible to them.
-  - One race is accepted: a detector run that starts between the state check and the rename. That is a
-    microsecond window on a session idle for 90 days, and the rows that run appends are lost with the
+  - One race is accepted: a detector run that starts between the state check and the rename. For a
+    finalize candidate, that window spans the close itself (milliseconds per session, within the budget),
+    not microseconds. It concerns a session idle for 90 days, and the rows such a run appends are lost with the
     directory.
 - **SessionStart maintenance: one budget.** Once a SessionStart's output is settled, on every outcome
   (`runSessionMaintenance`, as the commit and as the abandon handler: S1a-2 review F4), the maintenance runs

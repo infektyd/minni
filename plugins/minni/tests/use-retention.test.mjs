@@ -347,25 +347,26 @@ test("more than 20 finalize candidates are spread across runs, through the curso
   assert.deepEqual(await readdir(ledger), [".sweep.json"]);
 });
 
-test("candidates a spent budget did not reach are carried: the cursor resumes before them", async (t) => {
+test("candidates the close did not reach are carried: the cursor resumes before them", async (t) => {
   const { vault: v, ledger } = await vault(t);
   for (let n = 0; n < 4; n += 1) {
     await ledgerDir(ledger, key(n));
     await detectorState(v, key(n), { main: { ...idleAgent, windows: [{ sid: "w" }] } });
   }
+  // A close whose own budget ends after the first candidate, as
+  // finalizeIdleSessions reports it: `remaining` names the rest unexamined.
   const handed = [];
-  // 10 ms per clock reading, 75 ms of budget: the scan reaches all four, the
-  // removals after the finalize stop part way.
-  let tick = 0;
-  const clock = () => NOW + 10 * tick++;
-  const first = await sweepLedgerDirs(v, { now: NOW, clock, budgetMs: 75, finalizer: closingFinalizer(v, handed) });
-  assert.ok(first.removed >= 1, `a run that finds candidates makes progress: ${JSON.stringify(first)}`);
-  assert.ok(first.carried > 0, `the candidates it did not reach are carried: ${JSON.stringify(first)}`);
+  const firstOnly = (vaultPath, options) => {
+    handed.push(options.sessionKeys.length);
+    closingFinalizer(v, [])(vaultPath, { sessionKeys: options.sessionKeys.slice(0, 1) });
+    return { remaining: options.sessionKeys.length - 1 };
+  };
+  const first = await sweepLedgerDirs(v, { now: NOW, finalizer: firstOnly });
+  assert.equal(first.removed, 1, `the examined candidate is removed: ${JSON.stringify(first)}`);
+  assert.equal(first.carried, 3, `the unexamined ones are carried: ${JSON.stringify(first)}`);
   assert.equal(first.complete, false);
-  const carriedName = key(first.removed);
-  // The next run resumes before the carried candidate, never past it.
+  // The next run resumes before the first carried candidate, never past it.
   const second = await sweepLedgerDirs(v, { now: NOW, finalizer: closingFinalizer(v, handed) });
-  assert.ok(!(await exists(path.join(ledger, carriedName))), "the carried candidate is closed and removed next run");
   assert.equal(first.removed + second.removed, 4, JSON.stringify(second));
   assert.deepEqual(await readdir(ledger), [".sweep.json"]);
 });
@@ -482,4 +483,46 @@ test("SessionStart closes and removes an old open session; it loads use-detector
   assert.ok(busyNames.includes("use-detector.js"), "a candidate loads the detector for its idle close");
   assert.ok(!(await exists(ledgerOf)), "finalized, then removed, after the boot was delivered");
   assert.equal(detectorSessionState(busy.vault, FIXTURE_SESSION), "closed");
+});
+
+test("every candidate the REAL close examined is removed in the same run, even when the budget ends after the close", async (t) => {
+  const { finalizeIdleSessions } = await import("../dist/use-detector.js");
+  const { appendLedgerRows, buildSurfacedRow } = await import("../dist/use-ledger.js");
+  const { vault: v, transcriptPath } = await makeVault(t, "minni-ledger-retention-cut-");
+  const longAgo = Date.now() - LEDGER_IDLE_MAX_MS - 10 * DAY;
+  /** An open epoch for `sessionKey`, written by the real detector `longAgo`, its ledger aged to match. */
+  async function openSession(sessionKey, txPath) {
+    await writeFile(txPath, "", "utf8");
+    const clock = new Clock(longAgo);
+    const tx = new Transcript(txPath, clock);
+    const context = { session_key: sessionKey, agent_key: "main", wire: "claude-code", principal: "claude-code", features: ["MINNI_USE_LEDGER"] };
+    const row = buildSurfacedRow(
+      context,
+      { channel: "boot_recall", mkey: `vault:wiki/${sessionKey}.md`, title: `Note ${sessionKey} retention`, rank: 0, visible: true, delivered: true },
+      clock.next(),
+    );
+    assert.equal(appendLedgerRows(v, [row]).written, 1);
+    tx.prompt("first prompt of the session", "p1");
+    tx.say("working on it");
+    await tx.flush();
+    assert.equal(runDetector({ ...detectorArgs(v, txPath, clock), session_key: sessionKey }).status, "ran");
+    const dir = path.join(v, LEDGER_RELDIR, sessionKey);
+    await ageTo(dir, new Date(longAgo));
+    assert.equal(detectorSessionState(v, sessionKey), "open");
+    return dir;
+  }
+  const dirA = await openSession(FIXTURE_SESSION, transcriptPath);
+  const dirB = await openSession("bbbbbbbbbbbbbbbb", path.join(path.dirname(transcriptPath), "second.jsonl"));
+  // The real close, after which the sweep's clock says the budget is gone (a slow close).
+  let after = false;
+  const clock = () => (after ? Date.now() + 10 * 60 * 1000 : Date.now());
+  const finalizer = (vaultPath, options) => {
+    const closed = finalizeIdleSessions(vaultPath, options);
+    after = true;
+    return closed;
+  };
+  const run = await sweepLedgerDirs(v, { budgetMs: 150, clock, finalizer });
+  assert.equal(run.finalized, 2, JSON.stringify(run));
+  assert.ok(!(await exists(dirA)) && !(await exists(dirB)), "both closed candidates went in the run that closed them");
+  assert.equal(detectorSessionState(v, "bbbbbbbbbbbbbbbb"), "closed");
 });

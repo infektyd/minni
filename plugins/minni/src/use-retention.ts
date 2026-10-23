@@ -287,7 +287,9 @@ async function detectorFinalizer(): Promise<Finalizer> {
  * Bounded: at most 20 removals per run and about `budgetMs` (or the shared
  * `deadline`), checked between items, with one item's slack: the item in
  * progress, and on a spent budget the first candidate's close-and-remove, so
- * every run that finds a candidate makes progress. The scan keeps half the
+ * every run that finds a candidate makes progress. Every candidate the close
+ * examined and closed is removed in the same run, budget or not (its own
+ * close rows would otherwise hide it from the horizon for 90 days). The scan keeps half the
  * budget for its candidates. A cursor resumes the pass, also before the first
  * candidate a cut-off run did not reach; after a complete pass the next waits
  * a day. A budget spent on arrival does nothing at all. use-detector.js is
@@ -361,9 +363,13 @@ export async function sweepLedgerDirs(
       last = name;
     }
     result.complete = index >= names.length;
-    // Finalize, then remove what is now closed, in name order while the budget
-    // lasts. A spent budget still takes the first candidate (one item's slack),
-    // so every run that finds one makes progress.
+    // Finalize, then remove EVERY candidate the close examined and left closed,
+    // whatever the clock says: each was judged past the horizon before the
+    // close, and the close's own rows would make it look fresh to any later
+    // run, so stopping here would keep it for another 90 days. That costs one
+    // rename and removal per examined candidate (at most 20). A spent budget
+    // still hands the close its first candidate, so every run that finds one
+    // makes progress; candidates the close did not reach are carried.
     let firstUnreached: string | null = null;
     if (candidates.length > 0) {
       const batch = spent() ? candidates.slice(0, 1) : candidates;
@@ -374,13 +380,13 @@ export async function sweepLedgerDirs(
           | { remaining?: unknown }
           | undefined;
         const remaining = closed && typeof closed.remaining === "number" ? closed.remaining : 0;
-        if (Number.isSafeInteger(remaining) && remaining > 0 && remaining < batch.length) examined = batch.length - remaining;
+        if (Number.isSafeInteger(remaining) && remaining > 0 && remaining <= batch.length) examined = batch.length - remaining;
       } catch {
         // A detector that will not load closes nothing; the candidates stay open.
       }
       for (let i = 0; i < batch.length; i += 1) {
         const name = batch[i] as string;
-        if (i >= examined || (i > 0 && spent())) {
+        if (i >= examined) {
           firstUnreached = name;
           break;
         }
