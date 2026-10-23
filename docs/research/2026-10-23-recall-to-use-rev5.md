@@ -228,8 +228,13 @@ another resume):
     - It is the denominator for "per 100 human prompt turns".
     - It is written when the handler returns, before emission, because it records an input.
     - **The classifier ships in S1a, in record-only mode** (§5.2.1 rules, case file and parity tests). It
-      fills `envelope_kind` and `subkind` from the first day of the before window and changes no behaviour.
-      S3a later wires the actions. Both windows therefore count human prompt turns with the same rules.
+      fills `envelope_kind`, `subkind`, `template_rule` (`on` or `off`) and `rule_id` from the first day of
+      the before window, and changes no behaviour.
+      - It runs with its template context from day one, so UPS records each eligible prompt in the counts
+        file during record-only too. Otherwise the same text would be `human` before the switch and
+        `scheduled` after it.
+      - S3a later wires the actions. Both windows therefore count human prompt turns with the same rules.
+      - The template hash itself is never written to the ledger.
   - **`surfaced`** holds
     `{sid, channel, mkey, handles[], title ≤ 120 (sanitized), rank, score?, route?, turn_ix?, visible, delivered, tx_off?, shingles?, echo?}`.
     - `sid = sha256(session_key, ts, channel, mkey, rank)[:16]`.
