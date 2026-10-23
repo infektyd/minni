@@ -1036,14 +1036,18 @@ type Act = TextAct | ToolAct;
  * shingle (applied) and echo passes see every word: a body sentence that
  * contains a path or an identifier must still match.
  */
-const HANDLE_FORM_RES: readonly RegExp[] = [
-  /\[\[[^\]\n]{1,512}\]\]/g,
-  /\bm:[0-9a-f]{8}\b/g,
-  /\bd:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}/g,
-  /\blearning\s*#\s*[A-Za-z0-9_.-]+/gi,
-  /[\p{L}\p{N}_.~-]*(?:\/[\p{L}\p{N}_.~-]+)+\/?/gu,
-  /[\p{L}\p{N}_-]+\.md\b/giu,
-];
+//
+// Every pattern here runs over assistant text the detector does not control,
+// inside a 1.5 s hook, so each is written to be linear: a repeated class may
+// only start where its token starts (a lookbehind), or is bounded, so no
+// start position re-scans a long token (use-detector-regex-cost.test.mjs).
+const WIKILINK_RE = /\[\[[^\[\]\n]{1,512}\]\]/g;
+const M_HANDLE_RE = /\bm:[0-9a-f]{8}\b/g;
+const D_HANDLE_RE = /\bd:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}/g;
+const LEARNING_REF_RE = /\blearning\s*#\s*[A-Za-z0-9_.-]+/gi;
+const PATH_RE = /(?<![\p{L}\p{N}_.~-])[\p{L}\p{N}_.~-]*(?:\/[\p{L}\p{N}_.~-]+)+\/?/gu;
+const MD_NAME_RE = /(?<![\p{L}\p{N}_-])[\p{L}\p{N}_-]+\.md\b/giu;
+const HANDLE_FORM_RES: readonly RegExp[] = [WIKILINK_RE, M_HANDLE_RE, D_HANDLE_RE, LEARNING_REF_RE, PATH_RE, MD_NAME_RE];
 /** Hyphen- or underscore-joined identifiers; removed when at least 8 characters long. */
 const JOINED_RE = /(?<![\p{L}\p{N}])[\p{L}\p{N}]+(?:[-_][\p{L}\p{N}]+)+(?![\p{L}\p{N}])/gu;
 const MIN_JOINED_CHARS = 8;
@@ -1437,7 +1441,12 @@ interface Card {
 }
 
 const CARD_LINE_RE = /^\s*(\d{1,3})\.\s+\[\[([^\]\n]{1,512})\]\](.*)$/;
-const EVIDENCE_SOURCE_RE = /<EVIDENCE\b[^>]*?\bsource="([^"]*)"/i;
+/** Bounded: the attribute list and the value are scanned at most 512 / 2,048 chars per tag. */
+const EVIDENCE_SOURCE_RE = /<EVIDENCE\b[^>\n]{0,512}?\bsource="([^"\n]{0,2048})"/i;
+/** Leading whitespace only from the start of its run, and a bounded score value: linear. */
+const SCORE_SUFFIX_RE = /(?<!\s)\s*\((?:vault )?score=[^)\n]{0,64}\)\s*$/;
+/** Only this much of a card line's tail is examined for its title and score. */
+const CARD_TAIL_CHARS = 1024;
 
 function unescapeAttr(value: string): string {
   return value
@@ -1456,7 +1465,7 @@ function recallCards(text: string): Card[] {
     const match = CARD_LINE_RE.exec(line);
     if (match) {
       if (cards.length >= MAX_CARDS) break;
-      const rest = (match[3] as string).replace(/\s*\((?:vault )?score=[^)]*\)\s*$/, "");
+      const rest = (match[3] as string).slice(0, CARD_TAIL_CHARS).replace(SCORE_SUFFIX_RE, "");
       const title = /^\s+—\s+(.+)$/.exec(rest)?.[1]?.trim();
       current = { rank: cards.length, wikilink: match[2] as string };
       if (title) current.title = title;
@@ -1543,6 +1552,28 @@ function keyCard(vaultPath: string, card: Card): string | null {
   }
   return null;
 }
+
+/**
+ * Every regex the detector runs over untrusted text, by name, for the
+ * linear-cost test. Not used by the detector itself; frozen.
+ */
+export const DETECTOR_TEXT_PATTERNS: Readonly<Record<string, RegExp>> = Object.freeze({
+  wikilink: WIKILINK_RE,
+  m_handle: M_HANDLE_RE,
+  d_handle: D_HANDLE_RE,
+  learning_ref: LEARNING_REF_RE,
+  path: PATH_RE,
+  md_name: MD_NAME_RE,
+  joined: JOINED_RE,
+  word: WORD_RE,
+  sentence_break: SENTENCE_BREAK_RE,
+  read_verb: READ_VERB_RE,
+  minni_tool: MINNI_TOOL_RE,
+  card_line: CARD_LINE_RE,
+  evidence_source: EVIDENCE_SOURCE_RE,
+  score_suffix: SCORE_SUFFIX_RE,
+  ...Object.fromEntries(DISMISSAL_PATTERNS.map((pattern, index) => [`dismissal_${index}`, pattern])),
+});
 
 // ---------------------------------------------------------------------------
 // Ledger index and row writer
