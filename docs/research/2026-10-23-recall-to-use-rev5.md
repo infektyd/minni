@@ -206,8 +206,12 @@ another resume):
   - A colliding `m:` handle resolves to every candidate.
 - **Session key.** `sha256(session_id)[:16]`. Failing that, `tx-` plus a hash of the transcript path.
   Otherwise `unlabeled`, which stays out of every rate.
-- **Agent key.** `main` on the main thread. `a-<sha256(agent_id)[:12]>` when the payload has `agent_id`
-  (P5), or when its transcript path sits under `subagents/`.
+- **Agent key.** `main` on the main thread. `a-<sha256(canonical id)[:12]>` when the payload has `agent_id`
+  (P5), or when its transcript path sits under `subagents/` (then the id is the file basename).
+  - The canonical id strips one leading `agent-` and one trailing `.jsonl`.
+  - That is needed because the host spells one subagent both ways: its docs show `agent-abc123` in one
+    payload and a bare id in another, and transcripts are named `agent-<id>.jsonl`.
+  - Erratum from the S1a-1 review; the code already does this.
 
 ### 4.3 Ledger
 
