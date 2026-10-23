@@ -2165,8 +2165,8 @@ export async function sessionReceipt(
   sessionId: string,
   limit = 500,
   // useCounts: read the session's use counts from the ledger (default on).
-  // The Stop hook passes false until the Stop wiring slice, because loading
-  // the reader would make Stop pay for the ledger (§8.2).
+  // The Stop hook passes it only when ledger-gate says the ledger may be on,
+  // because loading the reader makes Stop pay for the ledger (§8.2).
   options: { includeStamped?: boolean; useCounts?: boolean } = {},
 ): Promise<SessionReceipt> {
   // Read the ROLLING log, not the daily file auditTail prefers: a session

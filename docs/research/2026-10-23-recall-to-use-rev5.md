@@ -481,10 +481,12 @@ SubagentStop (§6.3.6), and from `use-report`.
     `vault.test.mjs:1880` and `:1906` green unedited.
   - Otherwise it appends ` Use: <n> surfaced, <c> cited, <a> applied.` to the same line, which
     `maskTelemetry` already drops.
-  - S1b builds the counts (`sessionReceipt` reads them by default), but the Stop hook passes
-    `useCounts: false` until the Stop wiring slice. Reading them loads the ledger reader, and S1a-2 pins
-    that Stop loads none of the ledger modules, whatever the flag (`use-telemetry-flag-off-cost`). The
-    wiring slice settles Stop's module-load contract and turns the counts on.
+  - `sessionReceipt` reads the counts by default. The Stop hook passes `useCounts` only when ledger-gate says
+    the ledger may be on, because reading them loads the ledger reader (`use-report.js`). With the ledger off
+    the line is byte-identical to the line without counts, and Stop loads no ledger module (§8.2).
+  - The counts stand as of the Stop's start. The detector judges that Stop's turn after the output is
+    delivered, so a surfacing first shows as surfaced and uncited, and its outcome shows on the next Stop's
+    receipt.
 
 ### 4.6 RED tests (new files)
 
@@ -1195,6 +1197,46 @@ There is one switch per feature, and every one defaults to `on`.
   - **A capture module that will not load** (a stripped or half-updated install) makes the hook run exactly
     as with the ledger off. It is audited once, throttled, as `<prefix>_use_capture_unavailable`, by code and
     never with the loader's message, which names a path.
+  - **Stop (S1b).** Stop records nothing of its own. It reads the ledger for the receipt and, after delivery,
+    runs the detector. Pinned by `use-telemetry-flag-off-cost`, `use-telemetry-stop-detector` and
+    `use-telemetry-stop-receipt`.
+    - **Ledger off** (env, or `flags.json`, as ledger-gate decides it): Stop loads no ledger module. None of
+      `use-capture.js`, `use-ledger.js`, `flags.js`, `harness-envelope.js`, `harness-envelope-rules.js`,
+      `use-detector.js` or `use-report.js` loads, and the receipt line is byte-identical to the line without
+      use counts.
+    - **Ledger on** (ledger-gate says it may be on):
+      1. Stop loads `use-detector.js` (lazily, once delivered, and only after `flags.js` confirms the ledger)
+         and `use-report.js` (the receipt), with their `use-ledger.js` and `flags.js`.
+      2. It never loads `use-capture.js`.
+      3. `harness-envelope.js` and `harness-envelope-rules.js` load only through `use-detector.js`'s import
+         (the detector's prompt classifier, for turns with no `turn` row); nothing else on the Stop path
+         imports them.
+      4. Stop writes no template counts: `.runtime/prompt-templates.json` stays absent when it was absent, and
+         byte-identical with the same mtime when it was present.
+      5. Stop's writes under `.runtime` are a closed list:
+         - The session's ledger day file, `use-ledger/<session_key>/<yyyy-mm-dd>.jsonl`, append-only
+           (`appendLedgerRows`). Every appended row is the detector's own: `judged`, `exposure`, or a
+           `surfaced` row with `channel: "explicit_recall"`, which the detector rebuilds from the
+           transcript's `minni_recall`/`minni_drill` results (§4.4). It is never `turn`, never `reset`, and
+           never a `surfaced` row on another channel.
+         - The detector's per-session state, `use-detector/sessions/<session_key>/windows.json`
+           (`writeJsonAtomic`).
+         - Its lock, `windows.lock` in the same directory (`acquireLock`), released before exit, so it is
+           absent afterwards.
+         - The per-transcript cursor, `use-detector/cursors/<tx_key>.json` (`writeCursor`).
+         - Transient names only, gone by exit: `*.tmp` temps renamed into place, and the detector's
+           stale-lock asides (`windows.lock.stale-*`).
+         - `jev-harvest-state.json`: pre-existing Stop behaviour, independent of the ledger (the Jev harvest
+           cursor, written whenever the payload carries a transcript path). Same presence and the same bytes
+           with the ledger on and off.
+         - Nothing else. In particular, nothing under `recall-session.d/` changes (`counters.json`,
+           `hit-keys.json`, `<agent_key>.reset`), and neither does `df-snapshot.json`, which only UPS writes.
+    - **Failures.** A detector that throws, will not load, is slow, or stops at its caps (1.5 s, 2 MB) changes
+      no byte of the Stop output, which is already delivered, and never fails the hook. A failure (a module
+      that will not load; a status of `invalid`, `refused`, `write_failed` or `error`; a throw) is audited
+      once, throttled, as `<prefix>_use_detector_failed`, by code and never with a message. A carry at the
+      caps is not a failure. An undelivered Stop runs no detector; the next Stop carries the transcript
+      forward.
 - **The daemon flag** is read from the daemon's config or env, because the daemon runs under `minni up` or
   launchd.
 - **Ledger-off stretches stay visible.** With `MINNI_USE_LEDGER=off`, no ledger rows are written, but the
