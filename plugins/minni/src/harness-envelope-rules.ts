@@ -52,8 +52,9 @@ export const HARNESS_ENVELOPE_RULES = {
    * unwraps fully (at most `maxWrapperDepth` passes). The first rule that matched
    * names the result.
    *
-   * - `tag_pair`: `<tag …>` … `</tag>`. The inner text is kept; a missing close
-   *   tag keeps everything after the open tag.
+   * - `tag_pair`: `<tag …>` … `</tag>`. The inner text is kept, PLUS whatever
+   *   follows the close tag (the trailer); only the two tags themselves are
+   *   dropped. A missing close tag keeps everything after the open tag.
    * - `lead_line`: the whole first line is dropped.
    * - `header`: the bracketed `[Prefix …]` part is dropped, the rest of its line
    *   stays. A header with no `]` on its first line is not a header.
@@ -86,7 +87,11 @@ export const HARNESS_ENVELOPE_RULES = {
   ],
 
   maxWrapperDepth: 4,
-  /** Longest run of attribute text accepted inside an open tag, and inside a `[Header …]`. */
+  /**
+   * Longest run of attribute text accepted inside an open tag (a wrapper's, then a
+   * block's) and inside a `[Header …]`. These count UTF-16 code units, like a JS
+   * string `.length`; the Python mirror counts the same units, so an emoji is 2.
+   */
   maxOpenTagChars: 512,
   maxBlockOpenTagChars: 256,
   maxHeaderChars: 256,
@@ -138,4 +143,14 @@ export function harnessEnvelopeRuleIds(): string[] {
     ...HARNESS_ENVELOPE_RULES.skip.map((r) => r.rule_id),
     ...HARNESS_ENVELOPE_RULES.wrappers.map((r) => r.rule_id),
   ];
+}
+
+/**
+ * Every rule id a classification can carry: the shared text rules (in rule order)
+ * plus `scheduled.template`. Consumers that validate a recorded `rule_id` (the
+ * ledger's `turn` row, the audit) check against this list, not against
+ * `harnessEnvelopeRuleIds()`, which is the parity set and has no template rule.
+ */
+export function classificationRuleIds(): string[] {
+  return [...harnessEnvelopeRuleIds(), HARNESS_ENVELOPE_RULES.templateRule.rule_id];
 }

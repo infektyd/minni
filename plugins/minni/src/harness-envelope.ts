@@ -54,8 +54,6 @@ export interface PromptTemplateContext {
   at: number;
   /** The prompt's own id (the host's `prompt_id` / transcript `promptId`). */
   pid: string;
-  /** Session key prefix, used only to tell the prompt's own session apart. */
-  sessionKeyPrefix?: string;
   /** Look up the counts entry for a template hash. */
   templateEntry: (hash: string) => PromptTemplateEntry | null | undefined;
 }
@@ -231,17 +229,24 @@ function isFiniteNumber(value: unknown): value is number {
  *
  * `first_seen` and the per-session first timestamps live outside the 16-entry
  * ring, so a long single-session cadence does not flip class once the ring rolls
- * past its start. The prompt's own pid is excluded, and so is the session whose
- * first sighting IS that occurrence, so harvest (own occurrence already recorded)
- * sees the same priors UPS saw (own occurrence not yet recorded).
+ * past its start. The prompt's own pid is excluded, and so is a session whose
+ * first sighting IS that occurrence (its `first_ts` equals the own occurrence's
+ * `ts`), so harvest (own occurrence already recorded) sees the same priors UPS saw
+ * (own occurrence not yet recorded). The exclusion goes by timestamp alone, never
+ * by session key: a caller's key can only disagree with what UPS did.
  *
- * `ownSession` narrows that exclusion to one session key when the caller has it.
+ * Known limit, left as is (S1a-3 review): that exclusion drops ONE session, so if a
+ * different session's first sighting landed in the very same millisecond as the
+ * own occurrence, harvest counts it where UPS (which tests `first_ts < at`) did
+ * not. Likewise a prior recorded with `ts` in `[own ts, at)` (a transcript
+ * timestamp that trails the hook clock) counts at harvest and not at UPS. Both
+ * need a same-millisecond or skewed collision on the same long prompt; an
+ * "effective at = the recorded own ts" rule would close them, and is not applied.
  */
 export function isScheduledTemplate(
   entry: PromptTemplateEntry | null | undefined,
   at: number,
   pid: string,
-  ownSession?: string,
 ): boolean {
   if (!isFiniteNumber(at) || entry === null || entry === undefined || typeof entry !== "object") {
     return false;
@@ -267,14 +272,9 @@ export function isScheduledTemplate(
     typeof entry.sessions === "object" && entry.sessions !== null ? entry.sessions : {};
   let before = 0;
   let ownExcluded = false;
-  for (const [key, firstTs] of Object.entries(sessions)) {
+  for (const firstTs of Object.values(sessions)) {
     if (!isFiniteNumber(firstTs) || firstTs >= at) continue;
-    if (
-      !ownExcluded &&
-      own !== undefined &&
-      firstTs === own.ts &&
-      (ownSession === undefined || key === ownSession)
-    ) {
+    if (!ownExcluded && own !== undefined && firstTs === own.ts) {
       ownExcluded = true;
       continue;
     }
@@ -343,11 +343,9 @@ export function classifyPromptEnvelope(text: string, ctx?: PromptTemplateContext
   let template: PromptTemplateInfo | undefined;
   if (ctx !== undefined && stripped.length >= TEMPLATE.minChars) {
     const hash = templateHash(text);
-    const ownSession =
-      ctx.sessionKeyPrefix === undefined ? undefined : ctx.sessionKeyPrefix.slice(0, 8);
     template = {
       hash,
-      scheduled: isScheduledTemplate(ctx.templateEntry(hash), ctx.at, ctx.pid, ownSession),
+      scheduled: isScheduledTemplate(ctx.templateEntry(hash), ctx.at, ctx.pid),
     };
   }
 
@@ -445,15 +443,29 @@ function sanitizeFile(raw: unknown): PromptTemplatesFile | null {
   return { v: TEMPLATE.fileVersion, templates };
 }
 
+function errorCode(error: unknown): unknown {
+  return typeof error === "object" && error !== null && "code" in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+}
+
 /** The file (or a parent) is simply not there: `.runtime` missing, or a plain file in its place. */
 function isAbsentError(error: unknown): boolean {
-  if (typeof error !== "object" || error === null || !("code" in error)) return false;
-  const code = (error as { code?: unknown }).code;
+  const code = errorCode(error);
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+/**
+ * The file is there but cannot be used as evidence: a directory in its place, or
+ * no permission to read it.
+ */
+function isUnusableError(error: unknown): boolean {
+  const code = errorCode(error);
+  return code === "EISDIR" || code === "EACCES" || code === "EPERM";
+}
+
 function isExpectedReadFailure(error: unknown): boolean {
-  if (error instanceof SyntaxError || isAbsentError(error)) return true;
+  if (error instanceof SyntaxError || isAbsentError(error) || isUnusableError(error)) return true;
   return error instanceof Error && /symlink|escapes root|containment/i.test(error.message);
 }
 
@@ -476,9 +488,11 @@ async function loadPromptTemplates(vaultPath: string): Promise<PromptTemplatesFi
 
 /**
  * Read-only reader (harvest uses this). Null when the file is absent, malformed,
- * oversize, of another version, or refused by the containment check (a symlink
- * that escapes the vault is treated as absent, never followed). A null means
- * "no evidence", so the template rule answers `human`.
+ * oversize, of another version, unusable (a directory in its place, or no
+ * permission to read it: EISDIR, EACCES, EPERM), or refused by the containment
+ * check (a symlink that escapes the vault is treated as absent, never followed).
+ * A null means "no evidence", so the template rule answers `human`. Any other
+ * I/O error still throws. `recordOccurrence` keeps throwing on all of these.
  */
 export async function readPromptTemplates(vaultPath: string): Promise<PromptTemplatesFile | null> {
   try {

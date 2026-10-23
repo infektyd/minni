@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -19,7 +20,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { HARNESS_ENVELOPE_RULES } from "../dist/harness-envelope-rules.js";
+import {
+  HARNESS_ENVELOPE_RULES,
+  classificationRuleIds,
+} from "../dist/harness-envelope-rules.js";
 import {
   PROMPT_TEMPLATES_RELPATH,
   classifyPromptEnvelope,
@@ -50,11 +54,11 @@ async function withVault(fn) {
   }
 }
 
-function ctxFor(file, { at, pid, session }) {
+// Classification takes no session key: the rule reads the counts file by hash.
+function ctxFor(file, { at, pid }) {
   return {
     at,
     pid,
-    sessionKeyPrefix: session,
     templateEntry: (hash) => file?.templates[hash],
   };
 }
@@ -62,7 +66,7 @@ function ctxFor(file, { at, pid, session }) {
 /** What UPS will do: read, classify before counting, then record the occurrence. */
 async function ups(vault, text, { at, pid, session }) {
   const file = await readPromptTemplates(vault);
-  const result = classifyPromptEnvelope(text, ctxFor(file, { at, pid, session }));
+  const result = classifyPromptEnvelope(text, ctxFor(file, { at, pid }));
   if (result.template) {
     await recordOccurrence(vault, {
       hash: result.template.hash,
@@ -76,9 +80,9 @@ async function ups(vault, text, { at, pid, session }) {
 }
 
 /** What harvest will do: read-only, the same prompt by its own promptId. */
-async function harvest(vault, text, { at, pid, session }) {
+async function harvest(vault, text, { at, pid }) {
   const file = await readPromptTemplates(vault);
-  return classifyPromptEnvelope(text, ctxFor(file, { at, pid, session }));
+  return classifyPromptEnvelope(text, ctxFor(file, { at, pid }));
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +120,7 @@ test("a task notification is skip", () => {
 
 test("text rules win over the template rule: skip and wrapped prompts never reach it", () => {
   const file = { v: 1, templates: {} };
-  const ctx = ctxFor(file, { at: T0, pid: "p1", session: "s1" });
+  const ctx = ctxFor(file, { at: T0, pid: "p1" });
   const skip = classifyPromptEnvelope(
     `<task-notification>${"x".repeat(200)}</task-notification>`,
     ctx,
@@ -269,6 +273,7 @@ test("the 4th occurrence 2 h after first_seen is scheduled", async () => {
     assert.equal(fourth.kind, "scheduled");
     assert.equal(fourth.subkind, "template");
     assert.equal(fourth.rule_id, RULE.rule_id);
+    assert.ok(classificationRuleIds().includes(fourth.rule_id));
     assert.equal(fourth.template.scheduled, true);
     assert.equal(fourth.body, checkIn(3));
   });
@@ -409,6 +414,36 @@ test("harvest evaluating a prompt by its own pid gets the class UPS recorded", a
   });
 });
 
+test("harvest agrees with UPS whatever session key it holds, or none", async () => {
+  await withVault(async (vault) => {
+    // Three priors in session sa; the prompt under test opens session sb.
+    for (const [i, m] of [0, 10, 20].entries()) {
+      await ups(vault, checkIn(i), { at: T0 + m * MIN, pid: `a${i}`, session: "sa" });
+    }
+    const atUps = T0 + 30 * MIN;
+    const seenByUps = await ups(vault, checkIn(3), { at: atUps, pid: "b1", session: "sb" });
+    assert.equal(seenByUps.kind, "human");
+
+    // The file now holds sb with first_ts == atUps. The classifier ignores any key
+    // a caller still hands it: none, the right one, a wrong one, another session's.
+    const file = await readPromptTemplates(vault);
+    for (const key of [undefined, "sb", "zzzzzzzz", "sa", ""]) {
+      const ctx = {
+        at: atUps + 37,
+        pid: "b1",
+        templateEntry: (hash) => file.templates[hash],
+        ...(key === undefined ? {} : { sessionKeyPrefix: key }),
+      };
+      const seenByHarvest = classifyPromptEnvelope(checkIn(3), ctx);
+      assert.equal(seenByHarvest.kind, seenByUps.kind, `session key ${JSON.stringify(key)}`);
+    }
+  });
+});
+
+test("isScheduledTemplate takes exactly (entry, at, pid)", () => {
+  assert.equal(isScheduledTemplate.length, 3);
+});
+
 test("UPS and harvest agree on every prompt of a mixed three-session history", async () => {
   await withVault(async (vault) => {
     const history = [
@@ -482,7 +517,7 @@ test("a short prompt is never scheduled", async () => {
 
 test("the minimum length counts the stripped text, not the raw prompt", () => {
   const padded = `<system-reminder>${"r".repeat(500)}</system-reminder>short typed line`;
-  const got = classifyPromptEnvelope(padded, ctxFor(null, { at: T0, pid: "p", session: "s1" }));
+  const got = classifyPromptEnvelope(padded, ctxFor(null, { at: T0, pid: "p" }));
   assert.equal(got.kind, "human");
   assert.equal(got.template, undefined);
 });
@@ -743,6 +778,54 @@ test("a foreign-version or oversize file is replaced by a fresh one on the next 
       now: T0,
     });
     assert.deepEqual(Object.keys((await readPromptTemplates(vault)).templates), [hashOf(2)]);
+  });
+});
+
+test("a directory where the counts file should be reads as no evidence", async () => {
+  await withVault(async (vault) => {
+    await mkdir(promptTemplatesPath(vault), { recursive: true });
+    assert.equal(await readPromptTemplates(vault), null);
+    // The writer may keep throwing: it must not pretend it recorded anything.
+    await assert.rejects(
+      recordOccurrence(vault, {
+        hash: hashOf(1),
+        ts: T0,
+        pid: "p1",
+        sessionKeyPrefix: "s1",
+        now: T0,
+      }),
+      { code: "EISDIR" },
+    );
+  });
+});
+
+test("an unreadable counts file (mode 0o000) reads as no evidence", async (t) => {
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("root ignores file modes, so the file would be readable");
+    return;
+  }
+  await withVault(async (vault) => {
+    await mkdir(path.join(vault, ".runtime"), { recursive: true });
+    const file = promptTemplatesPath(vault);
+    // A valid file: were it readable, the reader would return it, so null can only
+    // come from the permission error.
+    await writeFile(file, JSON.stringify({ v: 1, templates: {} }), "utf8");
+    await chmod(file, 0o000);
+    try {
+      assert.equal(await readPromptTemplates(vault), null);
+      await assert.rejects(
+        recordOccurrence(vault, {
+          hash: hashOf(1),
+          ts: T0,
+          pid: "p1",
+          sessionKeyPrefix: "s1",
+          now: T0,
+        }),
+        { code: "EACCES" },
+      );
+    } finally {
+      await chmod(file, 0o600);
+    }
   });
 });
 
