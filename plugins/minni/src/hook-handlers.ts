@@ -1231,11 +1231,10 @@ export function createHookHandlers(
       return render(noIntent);
     }
 
-    await withBudget(
-      ensureVault(config.vaultPath, { agentId: config.agentId }),
-      remainingMs(),
-      undefined,
-    );
+    // Awaited, not raced: the budget clock already counts it (deadline set at
+    // entry), and a raced ensureVault that lost the race kept seeding vault
+    // files after this handler answered. Same as every other handler here.
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
 
     const workspaceId = workspaceFor(payload);
     // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
@@ -1332,7 +1331,14 @@ export function createHookHandlers(
     // finding) rather than expanding this fix's scope.
     const VAULT_RESULT_LIMIT = 6;
     const VAULT_SEARCH_OVERFETCH = 18;
-    const [vaultResultsRaw, recall] = await Promise.all([
+    // A spent budget gets the same fallbacks withBudget(0) would return, but
+    // without starting work that would keep running (and writing: the cold
+    // vault scan seeds missing vault files) after this handler answers.
+    const recallBudgetSpent = remainingMs() <= 0;
+    const [vaultResultsRaw, recall] = recallBudgetSpent ? [
+      [] as Awaited<ReturnType<typeof searchVaultNotes>>,
+      { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
+    ] as const : await Promise.all([
       withBudget(
         searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH, config.agentId),
         remainingMs(),
