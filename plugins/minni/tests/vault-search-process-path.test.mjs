@@ -58,6 +58,28 @@ test("hook process: UserPromptSubmit searches the vault on the scan path, with n
   assert.equal(state.prefixIndex, false, "a hook process must never build the prefix index");
 });
 
+test("hook process: a prompt past the scan's work budget hands the search to the index", async (t) => {
+  // 400 distinct terms that match no note (a pasted id list): each would cost
+  // the scan a whole pass, so the budget (SCAN_BUDGET_PASSES) hands over. No
+  // term may match the seeded notes: a key that admits every note ends the
+  // scan at once, with nothing left to spend the budget on.
+  const ids = Array.from({ length: 400 }, (_, i) => `zq${i.toString(36)}x${(i * 7919).toString(36)}`);
+  const fixture = await makeFixture(t, "search-path-hook-budget");
+  await seedNotes(fixture.vault);
+  await startFakeDaemon(fixture);
+  const { stderr, code } = await runHook(
+    fixture,
+    "UserPromptSubmit",
+    { session_id: "search-path-hook-budget", prompt_id: "p1", prompt: `please look up these ids ${ids.join(" ")}` },
+    { nodeArgs: ["--import", PROBE], env: { MINNI_TEST_SEARCH_PROBE_VAULT: fixture.vault } },
+  );
+  assert.equal(code, 0);
+  const state = probeState(stderr);
+  assert.ok(state, "the hook searched the vault in this process");
+  assert.ok(state.notes >= 20, `the cache holds the vault (${state.notes} notes)`);
+  assert.equal(state.prefixIndex, true, "past the budget the hook process runs the index path");
+});
+
 test("MCP server process: minni_recall's vault pre-scan runs on the index path", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-search-path-server-"));
   const home = path.join(root, "home");

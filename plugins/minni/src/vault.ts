@@ -2390,9 +2390,13 @@ const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
  * - "scan": no index; test each query key against each note's text directly.
  *   This is for a one-shot process that searches once and exits — the hook
  *   processes (UserPromptSubmit) — which would otherwise pay the full index
- *   build on every prompt to answer a single query.
+ *   build on every prompt to answer a single query. A query whose keys keep
+ *   missing (see SCAN_BUDGET_PASSES) is handed to the index instead, so a
+ *   scan never costs much more than the build it avoids.
  *
- * The caller chooses; nothing switches paths by heuristic.
+ * The caller chooses the path for its process type. The only switch inside a
+ * path is that deterministic work budget, and it cannot change what is
+ * selected, only what selecting it costs.
  *
  * After writeVaultPage rewrites a note in the same process, the index keeps
  * the note's old keys (it only ever adds), so the index path can admit the
@@ -2680,19 +2684,51 @@ function indexCandidateEntries(
   return subset;
 }
 
+// The scan path's work budget, in full passes over the text of the notes it
+// tests. Testing a key against a note it does not admit reads the note's whole
+// text, and a note that is never admitted is read again for every key; the
+// number of keys is the number of distinct query terms, which nothing caps.
+// So a query of many keys that match nothing (a pasted hex dump, a UUID list,
+// code full of long identifiers) would cost a pass per key, and the hook would
+// end up slower than the index build the scan exists to avoid. Once the reads
+// spent on notes a key did not admit exceed this many passes, the scan stops
+// and hands the query to the index path, which selects the same candidates in
+// the same order. The worst case is then about this many passes plus one
+// index build. It counts characters, not time, so the switch is deterministic.
+// A note a key does admit is not counted: it leaves the scan, so all of those
+// reads together come to at most one more pass.
+//
+// Derived, not measured on one vault: the cold index build of a real
+// 783-note, 12 MB vault measured 265-306 ms. A pass for a key that matches
+// nothing, measured on a synthetic vault of the same size (783 notes, 12.6 MB,
+// English-like letter frequencies, two-byte text), costs 1-21 ms by key shape:
+// about 2 ms for long hex ids, 4 ms for keys starting with a rare letter,
+// 21 ms for short keys starting with `e` (every `e` is a substring-search
+// candidate). Against the worst shape the crossover is 265 / 21.4 = 12.4
+// passes, rounded down to 12. A worst-shape query then costs at most about two
+// index builds; a typical one, one build and a little.
+const SCAN_BUDGET_PASSES = 12;
+
 // "scan" path: the union an index built from the cached notes gives, in the
 // same order, without the index. The index path admits a note at the first
 // key whose bucket holds it, and walks each bucket in cache order; so does
 // this — keys in order, the notes not yet admitted in cache order — and a note
-// admitted once is never tested again.
+// admitted once is never tested again. Undefined once the work budget above
+// is spent; the caller then runs the index path.
 function scanCandidateEntries(
   cache: VaultSearchCacheEntry,
   keys: string[],
-): CachedVaultNoteEntry[] {
+): CachedVaultNoteEntry[] | undefined {
   let pending: CachedVaultNoteEntry[] = [];
+  let passChars = 0;
   for (const entry of cache.notes.values()) {
-    if (!entry.skipByStatus) pending.push(entry);
+    if (!entry.skipByStatus) {
+      pending.push(entry);
+      passChars += entry.haystackLower.length;
+    }
   }
+  const budgetChars = SCAN_BUDGET_PASSES * passChars;
+  let spentChars = 0;
   const subset: CachedVaultNoteEntry[] = [];
   const seenKeys = new Set<string>();
   for (const key of keys) {
@@ -2702,10 +2738,15 @@ function scanCandidateEntries(
     seenKeys.add(key);
     const stillPending: CachedVaultNoteEntry[] = [];
     for (const entry of pending) {
-      if (haystackHasIndexKey(entry.haystackLower, key)) subset.push(entry);
-      else stillPending.push(entry);
+      if (haystackHasIndexKey(entry.haystackLower, key)) {
+        subset.push(entry);
+      } else {
+        stillPending.push(entry);
+        spentChars += entry.haystackLower.length;
+      }
     }
     pending = stillPending;
+    if (spentChars > budgetChars) return undefined;
   }
   return subset;
 }
@@ -2718,9 +2759,11 @@ function selectCandidateEntries(
   const keys =
     cache.notes.size >= 20 ? candidateLookupKeys(terms) : undefined;
   if (!keys) return cache.notes.values();
-  return candidates === "scan"
-    ? scanCandidateEntries(cache, keys)
-    : indexCandidateEntries(cache, keys);
+  if (candidates === "scan") {
+    const scanned = scanCandidateEntries(cache, keys);
+    if (scanned) return scanned;
+  }
+  return indexCandidateEntries(cache, keys);
 }
 
 /**

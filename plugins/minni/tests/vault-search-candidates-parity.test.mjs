@@ -262,6 +262,58 @@ test("parity: an empty or whitespace-only query returns nothing and builds nothi
   }
 });
 
+// Distinct keys that match no note: each costs the scan one whole pass, which
+// is what its work budget (SCAN_BUDGET_PASSES in src/vault.ts) bounds.
+function missingKeys(count, salt = "") {
+  return Array.from({ length: count }, (_, i) => `zq${salt}${i.toString(36)}x${(i * 7919).toString(36)}`);
+}
+
+test("parity: past the scan's work budget the scan hands over to the index, with identical results", async () => {
+  const vault = await writeVault("budget", FIXTURE);
+
+  // A few missing keys stay on the scan...
+  await searchVaultNotes(vault, missingKeys(5).join(" "), ALL, undefined, { candidates: "scan" });
+  assert.equal(vaultSearchCacheState(vault).prefixIndex, false, "5 missing keys stay within the budget");
+  await searchVaultNotes(vault, `${missingKeys(5).join(" ")} cache tests`, ALL, undefined, { candidates: "scan" });
+  assert.equal(vaultSearchCacheState(vault).prefixIndex, false);
+  // ...400 of them do not: the scan stopped and built the index instead.
+  const many = await searchVaultNotes(vault, `${missingKeys(400).join(" ")} cache tests`, ALL, undefined, {
+    candidates: "scan",
+  });
+  assert.equal(vaultSearchCacheState(vault).prefixIndex, true, "400 missing keys exhaust the budget");
+  assert.ok(many.length > 0, "the matching terms after the missing keys still find notes");
+
+  // Results and candidates are those of the index path, on either side of
+  // the switch and across it (hand-over with a partial selection already made).
+  const shapes = [
+    missingKeys(400).join(" "),
+    `${missingKeys(400).join(" ")} cache tests`,
+    `cache ${missingKeys(400, "a").join(" ")} bar precondition`,
+    `${missingKeys(50).join(" ")} foo_bar`,
+    missingKeys(100).join(" "),
+  ];
+  // Every count from 1 to 48 missing keys: the switch point (12 passes
+  // today) and both sides of it, with room for the budget to be retuned.
+  for (let count = 1; count <= 48; count++) {
+    shapes.push(`${missingKeys(count, "b").join(" ")} tests cfg`);
+  }
+  for (const count of [1, 8, 11, 12, 13, 14, 16, 24, 48]) {
+    shapes.push(`cache ${missingKeys(count, "c").join(" ")}`);
+  }
+  for (const query of shapes) {
+    const fresh = await writeVault("budget-fresh", FIXTURE);
+    // On a fresh cache each time, so the scan really runs (and decides) rather
+    // than finding an index another query already built.
+    const scan = await searchVaultNotes(fresh, query, ALL, undefined, { candidates: "scan" });
+    const scanCandidates = vaultSearchCandidatePaths(fresh, query, "scan");
+    const index = await searchVaultNotes(fresh, query, ALL, undefined, { candidates: "index" });
+    const indexCandidates = vaultSearchCandidatePaths(fresh, query, "index");
+    const label = `${query.split(" ").length} terms`;
+    assert.deepStrictEqual(scan, index, `budget: results differ (${label})`);
+    assert.deepStrictEqual(scanCandidates, indexCandidates, `budget: candidates differ (${label})`);
+  }
+});
+
 test("parity: below the 20-note gate every note is a candidate on both paths", async () => {
   const small = FIXTURE.filter((note) => !note.rel.includes("blocked")).slice(0, 19);
   const vault = await writeVault("small", small);
