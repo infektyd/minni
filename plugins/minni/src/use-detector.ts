@@ -2839,6 +2839,34 @@ export interface IdleCloseResult {
   sessions: number;
   judged_written: number;
   exposures_written: number;
+  /**
+   * Candidate sessions left unexamined when the call stopped early (the time
+   * budget ran out, or `limit` sessions were closed): retry them. Present only
+   * when `sessionKeys` or `budgetMs` was passed.
+   */
+  remaining?: number;
+}
+
+export interface IdleCloseOptions {
+  now?: number | string | Date;
+  /** At most this many sessions are closed per call (default 50). */
+  limit?: number;
+  /**
+   * Examine ONLY these sessions, in this order: no walk of the session
+   * directories and no read of any other session's ledger. Each key must pass
+   * the walk's own rule for a session directory name; others are skipped.
+   */
+  sessionKeys?: readonly string[];
+  /**
+   * Wall-clock budget, checked between sessions and never inside one (the
+   * first candidate is always examined); what is left is in `remaining`.
+   */
+  budgetMs?: number;
+}
+
+/** The walk's rule for a session directory name. */
+function isSessionKeyName(name: unknown): name is string {
+  return typeof name === "string" && SESSION_KEY_RE.test(name) && name !== "unlabeled";
 }
 
 function listSessionKeys(vaultPath: string): string[] {
@@ -2848,7 +2876,7 @@ function listSessionKeys(vaultPath: string): string[] {
       const dir = containedDir(vaultPath, segments, false);
       if (!dir) continue;
       for (const name of fs.readdirSync(dir)) {
-        if (SESSION_KEY_RE.test(name) && name !== "unlabeled") keys.add(name);
+        if (isSessionKeyName(name)) keys.add(name);
       }
     } catch {
       // A refused or unreadable root contributes no sessions.
@@ -2902,10 +2930,7 @@ function alreadyClosed(vaultPath: string, sessionKey: string, signature: string)
  * unknown(unreached); and each open epoch writes its exposure rows. Run from
  * `use-report`. At most `limit` sessions are closed per call. Never throws.
  */
-export function finalizeIdleSessions(
-  vaultPath: string,
-  options: { now?: number | string | Date; limit?: number } = {},
-): IdleCloseResult {
+export function finalizeIdleSessions(vaultPath: string, options: IdleCloseOptions = {}): IdleCloseResult {
   const out: IdleCloseResult = { status: "ran", sessions: 0, judged_written: 0, exposures_written: 0 };
   try {
     if (typeof vaultPath !== "string" || vaultPath.length === 0 || vaultPath.includes("\0") || !fs.existsSync(vaultPath)) {
@@ -2919,8 +2944,19 @@ export function finalizeIdleSessions(
     const nowMs = toMs(options.now);
     const nowIso = new Date(nowMs).toISOString();
     const limit = Number.isSafeInteger(options.limit) && (options.limit as number) > 0 ? (options.limit as number) : 50;
-    for (const sessionKey of listSessionKeys(vaultPath)) {
-      if (out.sessions >= limit) break;
+    const named = Array.isArray(options.sessionKeys);
+    const budgeted = typeof options.budgetMs === "number" && Number.isFinite(options.budgetMs) && options.budgetMs > 0;
+    const deadline = budgeted ? Date.now() + (options.budgetMs as number) : null;
+    const candidates = named
+      ? [...new Set((options.sessionKeys as readonly unknown[]).filter(isSessionKeyName))]
+      : listSessionKeys(vaultPath);
+    if (named || options.budgetMs !== undefined) out.remaining = 0;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const sessionKey = candidates[index] as string;
+      if (out.sessions >= limit || (deadline !== null && index > 0 && Date.now() >= deadline)) {
+        if (out.remaining !== undefined) out.remaining = candidates.length - index;
+        break;
+      }
       if (alreadyClosed(vaultPath, sessionKey, ledgerSignature(vaultPath, sessionKey))) continue;
       // Lock-free look first, so a busy or finished session costs no lock and no directory.
       const existing = sessionDir(vaultPath, sessionKey, false);
