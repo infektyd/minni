@@ -85,7 +85,7 @@ import {
 } from "./use-ledger.js";
 import { assertWriteTargetUnder } from "./vault.js";
 
-export const DETECTOR_RULE_VERSION = "s1b-2";
+export const DETECTOR_RULE_VERSION = "s1b-3";
 /** Detector state root under the vault. */
 export const DETECTOR_RELDIR = path.join(".runtime", "use-detector");
 /** Token document frequencies, written by UPS from its own vault scan. */
@@ -137,7 +137,7 @@ const INJECTED_IS_MEMORY: ReadonlySet<string> = new Set(["boot_recall", "boot_re
 const MINNI_TOOL_RE = /(?:^|__)minni_(recall|drill)$/;
 const READ_VERB_RE = /(?:^|[\s;&|(`$])(?:cat|head|tail|less|more|bat|sed|awk|grep|rg|nl|wc|jq|view|xxd|od|strings)\s/;
 const WORD_RE = /[\p{L}\p{N}]+/gu;
-const SENTENCE_SPLIT_RE = /(?<=[.!?;])\s+|\n+/u;
+const SENTENCE_BREAK_RE = /(?<=[.!?;])\s+|\n+/gu;
 
 /**
  * The dismissal lexicon (§4.4), matched against the opening of the first
@@ -998,14 +998,17 @@ interface TextAct {
   kind: "text";
   /** The raw text: handle-style citations are looked for here. */
   text: string;
-  /** The text's words with every handle-style form removed, in order. */
-  words: string[];
-  /** Sentence index of each word. */
-  sentenceOf: number[];
-  /** Hash of the 8-word shingle starting at each word; null where it would span a removed handle. */
-  windows: Array<string | null>;
+  /** Every word, tokenised as the ledger's shingles are: the applied and echo passes. */
+  rawWords: string[];
+  /** Hash of the 8-word shingle starting at each raw word; null near the end. */
+  rawWindows: Array<string | null>;
+  /** Every raw shingle. Handles are NOT stripped here (they are from the title/content pass). */
   shingles: Set<string>;
-  /** Token sets per sentence, from the handle-free words. */
+  /** The words outside handle-style forms (the title/content pass), each with its raw index and sentence. */
+  keptWords: string[];
+  keptRaw: number[];
+  keptSentence: number[];
+  /** Token sets per sentence, from the kept words. */
   sentences: Set<string>[];
 }
 
@@ -1026,10 +1029,12 @@ type Act = TextAct | ToolAct;
  * Handle-style forms in assistant text: wikilinks, m:/d: handles,
  * `learning #id`, paths (anything with a slash, or a `.md` name), and joined
  * identifiers of 8+ characters (slugs such as `beryl-harbor-checkpoint-cadence`).
- * They are evidence for cited_handle only. They are removed before the title,
- * content and shingle passes, so a handle's own words never become title or
- * applied evidence: only the after window's pointer prints handles, and
- * letting them leak into used_ii would bias the comparison toward it.
+ * They are evidence for cited_handle only, and are removed before the
+ * title/content pass so a handle's own words (a slug tokenises into title
+ * words) never become title evidence: only the after pointer prints handles,
+ * and letting them into used_ii would bias the comparison toward it. The
+ * shingle (applied) and echo passes see every word: a body sentence that
+ * contains a path or an identifier must still match.
  */
 const HANDLE_FORM_RES: readonly RegExp[] = [
   /\[\[[^\]\n]{1,512}\]\]/g,
@@ -1082,42 +1087,64 @@ function tokenSets(words: readonly string[], sentenceOf: readonly number[], keep
   return [...bySentence.values()];
 }
 
+/**
+ * One assistant text, tokenised once. Raw words (all of them, as the ledger
+ * tokenises bodies and injected text) feed the shingle and echo passes; the
+ * words outside handle-style spans feed the title/content pass. Both come from
+ * one word scan with offsets, so an echo window covering raw words maps
+ * exactly onto the kept words it touches.
+ */
 function textAct(raw: string): TextAct {
-  const text = raw.slice(0, MAX_INPUT_CHARS);
-  const words: string[] = [];
-  const sentenceOf: number[] = [];
-  const segmentOf: number[] = [];
-  let sentence = 0;
-  let segment = 0;
-  const addPiece = (piece: string): void => {
-    piece.split(SENTENCE_SPLIT_RE).forEach((part, index) => {
-      if (index > 0) sentence += 1;
-      for (const word of wordsOf(part)) {
-        words.push(word);
-        sentenceOf.push(sentence);
-        segmentOf.push(segment);
-      }
-    });
+  const text = raw.slice(0, MAX_INPUT_CHARS).normalize("NFKC");
+  const spans = handleSpans(text);
+  let spanAt = 0;
+  const insideSpan = (offset: number): boolean => {
+    while (spanAt < spans.length && (spans[spanAt] as [number, number])[1] <= offset) spanAt += 1;
+    return spanAt < spans.length && (spans[spanAt] as [number, number])[0] <= offset;
   };
-  let at = 0;
-  for (const [start, end] of handleSpans(text)) {
-    addPiece(text.slice(at, start));
-    segment += 1; // a shingle never spans a removed handle
-    at = end;
+  const breaks: number[] = [];
+  for (const match of text.matchAll(SENTENCE_BREAK_RE)) breaks.push(match.index as number);
+  spanAt = 0;
+  const realBreaks = breaks.filter((offset) => !insideSpan(offset));
+  spanAt = 0;
+  const rawWords: string[] = [];
+  const keptWords: string[] = [];
+  const keptRaw: number[] = [];
+  const keptSentence: number[] = [];
+  let sentence = 0;
+  for (const match of text.matchAll(WORD_RE)) {
+    const offset = match.index as number;
+    while (sentence < realBreaks.length && (realBreaks[sentence] as number) < offset) sentence += 1;
+    const word = match[0].toLowerCase();
+    if (!insideSpan(offset)) {
+      keptWords.push(word);
+      keptRaw.push(rawWords.length);
+      keptSentence.push(sentence);
+    }
+    rawWords.push(word);
   }
-  addPiece(text.slice(at));
-  const windows: Array<string | null> = [];
+  const rawWindows: Array<string | null> = [];
   const shingles = new Set<string>();
-  for (let i = 0; i < words.length; i += 1) {
-    if (i + SHINGLE_WORDS <= words.length && segmentOf[i] === segmentOf[i + SHINGLE_WORDS - 1]) {
-      const hash = shingleHashOf(words.slice(i, i + SHINGLE_WORDS));
-      windows.push(hash);
+  for (let i = 0; i < rawWords.length; i += 1) {
+    if (i + SHINGLE_WORDS <= rawWords.length) {
+      const hash = shingleHashOf(rawWords.slice(i, i + SHINGLE_WORDS));
+      rawWindows.push(hash);
       shingles.add(hash);
     } else {
-      windows.push(null);
+      rawWindows.push(null);
     }
   }
-  return { kind: "text", text, words, sentenceOf, windows, shingles, sentences: tokenSets(words, sentenceOf, null) };
+  return {
+    kind: "text",
+    text,
+    rawWords,
+    rawWindows,
+    shingles,
+    keptWords,
+    keptRaw,
+    keptSentence,
+    sentences: tokenSets(keptWords, keptSentence, null),
+  };
 }
 
 /**
@@ -1126,15 +1153,19 @@ function textAct(raw: string): TextAct {
  * title/content tokens count only outside it, so a paraphrase still does.
  */
 function sentencesOutsideEcho(act: TextAct, echo: ReadonlySet<string>): Set<string>[] {
+  // Coverage on the raw words, where the ledger's echo hashes live; then
+  // mapped onto the kept words. A window that spans an identifier still
+  // matches, because identifiers are stripped only from the title pass.
   let covered: boolean[] | null = null;
-  for (let i = 0; i < act.windows.length; i += 1) {
-    const hash = act.windows[i];
+  for (let i = 0; i < act.rawWindows.length; i += 1) {
+    const hash = act.rawWindows[i];
     if (hash === null || hash === undefined || !echo.has(hash)) continue;
-    covered ??= new Array<boolean>(act.words.length).fill(false);
-    for (let j = i; j < i + SHINGLE_WORDS && j < act.words.length; j += 1) covered[j] = true;
+    covered ??= new Array<boolean>(act.rawWords.length).fill(false);
+    for (let j = i; j < i + SHINGLE_WORDS && j < act.rawWords.length; j += 1) covered[j] = true;
   }
   if (!covered) return act.sentences;
-  return tokenSets(act.words, act.sentenceOf, covered.map((value) => !value));
+  const cover = covered;
+  return tokenSets(act.keptWords, act.keptSentence, act.keptRaw.map((index) => !cover[index]));
 }
 
 function inputLeaves(input: unknown): string {
@@ -1329,10 +1360,11 @@ function observe(
   } else {
     if (hitsShingle(profile, act.shingles, true, promptShingles)) acc.applied = true;
     if (opens(profile, act)) {
-      // Naming before opening: a citation followed by an open is the open.
+      // Naming a handle and then opening it is the open, not a citation. A
+      // title citation stands: it is identifier-free evidence in both windows,
+      // and each window opens its own way (recall by title, drill by handle).
       acc.opened = true;
       acc.cite_handle = false;
-      acc.cite_title = false;
     }
   }
 }

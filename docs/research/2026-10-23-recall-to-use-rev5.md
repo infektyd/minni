@@ -341,13 +341,19 @@ SubagentStop (§6.3.6), and from `use-report`.
        (boot learnings, boot recall), title and content tokens count only outside an 8-word echo of the
        injected line. A verbatim recital is `ignored`; outside the echo, a paraphrase (3 or more distinctive
        tokens in one sentence) or an application counts.
+     - Echo coverage is computed on the same tokenisation as the ledger's echo hashes (every word, handles
+       and identifiers included) and then mapped onto the words the title/content pass keeps, so a learning
+       that carries an identifier or a path (`minni_recall`, `.runtime/use-ledger/`) is still recognised as
+       recited.
   3. **`cited_handle`**: by handle: a wikilink, slug, vault path, `m:`/`d:` handle or `learning #id`. It is
      its own bucket in both windows and **never `used_ii`**.
-     - Every handle-style form is removed from the text before the title, content and shingle passes, so a
-       handle's own words (a slug tokenises into title words) never become title or applied evidence.
+     - Every handle-style form is removed from the text before the title/content pass, so a handle's own
+       words (a slug tokenises into title words) never become title evidence. The shingle (`applied`) and
+       echo passes see every word: a body sentence that contains a path or an identifier still matches.
   4. **`opened`**: a Read of the note's path, a read-verb Bash over it, or a `minni_drill`/`minni_recall`
      that names it. Paths and slugs match bounded (a longer name that contains the note's is not it).
-     - Writing a handle (or title) and then opening it is `opened`, not a citation.
+     - Writing a handle and then opening it is `opened`, not `cited_handle`. A title citation stands: an open
+       never cancels it (each window opens its own way, recall by title or drill by handle).
   5. **`dismissed`**: the first assistant text after the surfacing matches the dismissal lexicon.
      - Dismissal is sticky: the window can still end `applied` or `opened`, never cited.
   6. Otherwise `ignored` if visible, else `unknown(<reason>)`.
@@ -358,10 +364,11 @@ SubagentStop (§6.3.6), and from `use-report`.
 - **Symmetry is the governing property** (S1b review): every rule is applied identically whatever the
   pointer format; `use-detector-symmetry.test.mjs` feeds one transcript through a before-format and an
   after-format ledger per rule and requires equal `used_ii`, dismissed counts and exposure outcomes. The
-  one intended difference is that a handle can be cited only where one was printed. Two residual
-  asymmetries are known: the 50-turn horizon restarts at each visible surfacing (the after pointer
-  re-names at most every 10 turns), and the capture must record the memory's full title, not the
-  after pointer's 32-character print.
+  one intended difference is that a handle can be cited only where one was printed. Format-dependent
+  actions are modelled too: each window opens the memory its own natural way. One residual asymmetry is
+  known: the 50-turn horizon restarts at each visible surfacing, and the after pointer re-names at most
+  every 10 turns. (The capture records each memory's full title; the after pointer prints titles up to
+  100 characters, §5.2 item 6.)
 - **Distinctive tokens.** A token is distinctive when its document frequency over non-noise notes is at most
   `max(1, ⌈5% × notes⌉)`.
   - The DF snapshot lives in `.runtime/df-snapshot.json`. It is written by UPS from the scan UPS already
@@ -401,6 +408,8 @@ SubagentStop (§6.3.6), and from `use-report`.
   - the share of explicit-recall cards counted `unnameable`
   - the `features` in effect
   - `cited_handle` as its own column, and exposures with a dismissed turn
+  - the `title_assessable` share, overall and per channel and agent (in `minni_status` too), so "not
+    cited" can be told apart from "not assessable"
   - the fixed line "lower bounds; silent use is invisible", and the fixed undercount caveat (§4.7)
 - Phase 1 measures one principal, claude-code. Other wires appear as `unmeasured` in a coverage table.
 - **Stop receipt.** `SessionReceipt` gains use counts.
@@ -486,6 +495,11 @@ SubagentStop (§6.3.6), and from `use-report`.
   - Every report also carries this fixed line: "Known undercount: a short rule applied by quoting it word
     for word reads as recital and is not counted; this affects both windows equally, and the used rate is a
     floor."
+  - **`used_ii` is mostly `applied`.** `title_assessable` is about 3% of titles in this vault: few titles keep
+    3 distinctive tokens once the prompt filter runs. Title citation therefore adds little to `used_ii`, and
+    the headline number should be read with that in mind. S1c calibration revisits the 5% DF threshold.
+  - The after pointer prints titles up to 100 characters (§5.2 item 6) so that both windows show comparable
+    title text; the title rule can then fire in either window.
 
 ---
 
@@ -621,9 +635,13 @@ Rules 1–2 key on Claude fields. Rules 3–5 apply to every wire.
      vault. Then come in-band candidates, within 0.15 of their own route's top.
   5. A noise hit may take slot 2 or 3 only when a non-noise hit holds a slot.
 - **Rendering.**
-  - Each hit is `"<title ≤ 32>" (m:<8hex>|d:<src>:<id>) <score>`.
-  - The top hit carries its full wikilink if the pointer stays within 120 estimated tokens. Identifiers are
-    never clipped, and a hit that does not fit is dropped.
+  - Each named hit is `"<title>" (m:<8hex>|d:<src>:<id>) <score>`, where `<title>` is the hit's sanitized
+    title, up to 100 characters. (Decided after the S1b review: a 32-character clip made title citation
+    impossible in the after window, 0 of 49 assessable titles; see §4.7.)
+  - No hit carries its full wikilink: the `m:`/`d:` handles resolve through `minni_drill`.
+  - Budget: a header of about 80 characters plus 3 hits of about 120 characters is about 440 characters,
+    about 110 estimated tokens, inside the pinned 120-token budget. Identifiers are never clipped, and a hit
+    that does not fit is dropped.
   - The pinned phrases "relevant memor" and "Consult minni_recall" stay.
 - **`minni_drill`** accepts these handles in `references`:
   - `m:` resolves locally, safe notes only.
@@ -679,8 +697,12 @@ Rules 1–2 key on Claude fields. Rules 3–5 apply to every wire.
   - route (b) on 3 distinctive terms, one in the title, does open it
 - `ups-durable-crowdout.test.mjs`: 22 plan journals echoing a 14-term prompt, plus one decision note with 3
   of those terms in its title. The decision note is named. Today it ranks 23rd and is cut.
-- `recall-pointer-multihit.test.mjs`: 3 gated hits with 90–150-char paths are named with unclipped handles,
-  within 120 tokens.
+- `recall-pointer-multihit.test.mjs`: the 120-token budget stays a pinned test. Its fixture is 3 gated hits
+  with maximal 100-character titles and 90–150-char paths; with the header and their unclipped handles,
+  the pointer stays within 120 tokens, and no wikilink is printed.
+- `recall-pointer-title-sanitize.test.mjs`: a title containing control characters, bidi overrides
+  (U+202A–U+202E, U+2066–U+2069) and newlines comes out with none of them, and is still at most 100
+  characters.
 - `recall-pointer-route-bands.test.mjs`: a vault phrase hit at 1.0 does not exclude daemon hits at 0.6–0.7.
 - `drill-handle-resolve.test.mjs`:
   - `m:` resolves locally with the daemon down

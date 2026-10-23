@@ -452,3 +452,110 @@ test("opens are bounded: a longer slug or path that merely contains the note's i
   });
   assert.equal(finalJudged(s.vault, row.sid).outcome, "ignored");
 });
+
+test("a title citation survives an open: each pointer format's natural open after the same sentence", async (t) => {
+  const rel = "wiki/sessions/beryl-cadence.md";
+  const handle = vaultHandle(rel);
+  const sentence = "Per the beryl harbor checkpoint cadence note, let me check it.";
+  const results = {};
+  for (const [name, handles, tool] of [
+    ["before", [], ["mcp__minni__minni_recall", { query: TITLE }]],
+    ["after", [handle], ["mcp__minni__minni_drill", { references: [handle] }]],
+  ]) {
+    const s = await setup(t);
+    await writeDfSnapshot(s.vault, { the: 90 });
+    s.tx.prompt("Look at the nightly stall.", "p1");
+    const row = surfacedRow({ mkey: `vault:${rel}`, title: TITLE, handles, promptId: "p1", ts: s.clock.next(10) });
+    append(s.vault, [turnRow({ turnIx: 1, promptId: "p1", ts: s.clock.next(5) }), row]);
+    s.tx.say(sentence);
+    s.tx.tool(tool[0], tool[1]);
+    s.tx.say("Checked; nothing to change.");
+    await s.tx.flush();
+    stop(s, "Checked; nothing to change.");
+    closeSession(s);
+    results[name] = { judged: finalJudged(s.vault, row.sid), credits: ledgerRows(s.vault, "exposure")[0].credits };
+  }
+  for (const name of ["before", "after"]) {
+    assert.equal(results[name].judged.outcome, "cited", name);
+    assert.ok(results[name].judged.evidence.includes("title"), name);
+    assert.deepEqual(results[name].credits, [1], `${name}: an open never cancels a title citation`);
+  }
+});
+
+test("the boot echo rule holds for learnings that carry identifiers or paths (DF snapshot on)", async (t) => {
+  const cases = [
+    {
+      line: "Run the beryl migration scripts in numeric order, never in parallel batches.",
+      paraphrase: "I will keep the beryl migrations strictly numeric and avoid parallel runs.",
+    },
+    {
+      line: "Always call minni_recall before deriving anything in a claude-code session, every turn.",
+      paraphrase: "I will always consult recall first rather than deriving things in each session.",
+    },
+    {
+      line: "Keep the ledger under .runtime/use-ledger/ and never scan the vault from the detector.",
+      paraphrase: "The detector will only touch its ledger directory and will not walk the vault.",
+    },
+  ];
+  for (const { line, paraphrase } of cases) {
+    for (const [mode, reply] of [
+      ["recital", `Noted: ${line.toLowerCase()}`],
+      // A handle-style span BEFORE the recital: raw and kept word indices diverge.
+      ["recital", `Checked src/use-detector.ts already. Noted: ${line.toLowerCase()}`],
+      ["paraphrase", paraphrase],
+    ]) {
+      const s = await setup(t);
+      await writeDfSnapshot(s.vault, { the: 90, run: 90, before: 90 });
+      const boot = surfacedRow({
+        channel: "boot_recent_learnings",
+        mkey: "learning:41",
+        title: line,
+        ts: s.clock.next(10),
+        shingles: shingleHashes(line),
+        echo: echoHashes(line),
+      });
+      append(s.vault, [boot]);
+      await turn(s, 1, { prompt: "Set up the database for the release.", replies: [reply] });
+      await turn(s, 2, { prompt: "Go ahead.", replies: ["Done."] });
+      closeSession(s);
+      const judged = finalJudged(s.vault, boot.sid);
+      const [exposure] = ledgerRows(s.vault, "exposure");
+      if (mode === "recital") {
+        assert.equal(judged.outcome, "ignored", `a verbatim recital is not use: ${line}`);
+        assert.deepEqual(exposure.credits, [], line);
+      } else {
+        assert.equal(judged.outcome, "cited", `a paraphrase is use: ${line}`);
+        assert.deepEqual(exposure.credits, [1], line);
+      }
+    }
+  }
+});
+
+test("applied from prose survives paths and identifiers inside the restated body sentence", async (t) => {
+  for (const sentence of [
+    "Pin the harbor resolver to the beryl mirror before the nightly fetch runs.",
+    "Pin the resolver in src/use-detector.ts to the beryl mirror before the nightly fetch runs.",
+    "Pin the resolver with MINNI_USE_LEDGER on to the beryl mirror before the nightly fetch runs.",
+    "Set MINNI_USE_LEDGER to off before the nightly fetch.",
+    "Then run cat .runtime/flags.json before each fetch.",
+  ]) {
+    const s = await setup(t);
+    const body = `## Fix\n${sentence}`;
+    const reply = `The fix is to ${sentence.charAt(0).toLowerCase()}${sentence.slice(1)}`;
+    const [row] = await turn(s, 1, {
+      prompt: "Why is the build flaky?",
+      rows: (p) => [
+        surfacedRow({
+          mkey: "vault:wiki/sessions/resolver-pin.md",
+          title: "Resolver pin",
+          promptId: p,
+          ts: s.clock.next(10),
+          shingles: shingleHashes(body),
+          echo: echoHashes("Relevant memory: Resolver pin."),
+        }),
+      ],
+      replies: [reply],
+    });
+    assert.equal(finalJudged(s.vault, row.sid).outcome, "applied", sentence);
+  }
+});

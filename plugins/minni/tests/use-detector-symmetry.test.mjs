@@ -5,15 +5,16 @@
 // assistant transcript through two ledgers that differ only in pointer format:
 //   - BEFORE, today's pointer (recall-state.ts buildRecallPointer): title only,
 //     no handles, re-named on every strong turn;
-//   - AFTER, rev5 §5.2 items 6-7: `"<title ≤ 32>" (m:<8hex>) <score>` plus the
-//     top hit's wikilink, named once and then suppressed until a reset or 10
-//     turns have passed.
+//   - AFTER, rev5 §5.2 items 6-7: each named hit as `"<title ≤ 100>"
+//     (m:<8hex>) <score>`, no wikilink, named once and then suppressed until a
+//     reset or 10 turns have passed.
 // and asserts equal used_ii (exposure credits), equal dismissed counts and
 // equal exposure outcomes. Both ledgers record the memory's full title and
-// body shingles; only the handles, the injected text (echo) and the naming
-// cadence differ. The one intended difference is the last case: a handle can
-// be cited only where one was printed, and it lands in cited_handle, never in
-// used_ii.
+// body shingles; only the handles, the injected text (echo), the naming
+// cadence and format-dependent actions (each window opens the memory its own
+// natural way) differ. The one intended difference is the last case: a handle
+// can be cited only where one was printed, and it lands in cited_handle, never
+// in used_ii.
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
@@ -61,8 +62,7 @@ const AFTER = {
   name: "after",
   renames: false,
   handles: [HANDLE],
-  text: (title) =>
-    `📓 1 relevant memory: "${title.slice(0, 32)}" (${HANDLE}) 0.91 [[${REL.replace(/\.md$/, "")}]]. Consult minni_recall before deriving from scratch.`,
+  text: (title) => `📓 1 relevant memory: "${title.slice(0, 100)}" (${HANDLE}) 0.91. Consult minni_recall before deriving from scratch.`,
 };
 
 /**
@@ -193,6 +193,22 @@ test("handle cited (the same text in both windows): cited_handle, never used_ii"
   });
   assert.equal(result.used_ii, 0);
   assert.equal(result.facts[0].outcome, "cited_handle");
+});
+
+test("a title citation, then each window's natural open (before: recall by title; after: drill the handle)", async (t) => {
+  const result = await symmetric(t, {
+    turns: [
+      {
+        prompt: "Look at the nightly stall.",
+        actions: (format) => [
+          "Per the beryl harbor checkpoint cadence note, let me check it.",
+          format.name === "after" ? ["mcp__minni__minni_drill", { references: [HANDLE] }] : ["mcp__minni__minni_recall", { query: TITLE }],
+          "Checked; nothing to change.",
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(result.facts.map((fact) => [fact.credits, fact.outcome]), [[[1], "cited"]]);
 });
 
 test("opened", async (t) => {

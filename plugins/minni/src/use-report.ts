@@ -14,8 +14,10 @@
 //     envelope_kind is `human`), so a rate cannot rise just because less was
 //     shown;
 //   - top-10 surfaced-never-used and used memories;
-//   - the provisional, unknown and unnameable shares, the features in effect,
-//     and the fixed line "lower bounds; silent use is invisible".
+//   - the provisional, unknown and unnameable shares, the title_assessable
+//     share (per channel and agent, so "not cited" can be told apart from
+//     "not assessable"), the features in effect, the fixed line "lower bounds;
+//     silent use is invisible", and the undercount caveat.
 // Phase 1 measures one principal (claude-code); every other wire appears in
 // the coverage table as `unmeasured` and is never mixed into a rate. The
 // `unlabeled` session stays out of every rate.
@@ -90,6 +92,11 @@ export interface UseBreakdown {
   cited_handle: number;
   /** Surfacings judged dismissed; exposures with a dismissed turn. */
   dismissed: number;
+  /** Visible surfacings with a standing judgment (surfacings only; 0 for exposures). */
+  title_judged: number;
+  /** Of those, the ones the title rule could assess: "not cited" vs "not assessable". */
+  title_assessable: number;
+  title_assessable_share: number | null;
   used_per_visible: number | null;
   used_ii_per_visible: number | null;
 }
@@ -151,7 +158,19 @@ function ratio(n: number, d: number): number | null {
 }
 
 function emptyBreakdown(): UseBreakdown {
-  return { total: 0, visible: 0, used: 0, used_ii: 0, cited_handle: 0, dismissed: 0, used_per_visible: null, used_ii_per_visible: null };
+  return {
+    total: 0,
+    visible: 0,
+    used: 0,
+    used_ii: 0,
+    cited_handle: 0,
+    dismissed: 0,
+    title_judged: 0,
+    title_assessable: 0,
+    title_assessable_share: null,
+    used_per_visible: null,
+    used_ii_per_visible: null,
+  };
 }
 
 function emptySection(): UseSection {
@@ -167,6 +186,8 @@ interface Item {
   usedII: boolean;
   citedHandle: boolean;
   dismissed: boolean;
+  /** The standing judgment's title_assessable; null when there is none (or for exposures). */
+  titleAssessable: boolean | null;
   outcome: string;
 }
 
@@ -178,11 +199,16 @@ function tally(target: UseBreakdown, item: Item): void {
   if (item.usedII) target.used_ii += 1;
   if (item.citedHandle) target.cited_handle += 1;
   if (item.dismissed) target.dismissed += 1;
+  if (item.titleAssessable !== null) {
+    target.title_judged += 1;
+    if (item.titleAssessable) target.title_assessable += 1;
+  }
 }
 
 function finish(target: UseBreakdown): void {
   target.used_per_visible = ratio(target.used, target.visible);
   target.used_ii_per_visible = ratio(target.used_ii, target.visible);
+  target.title_assessable_share = ratio(target.title_assessable, target.title_judged);
 }
 
 function finishSection(section: UseSection): void {
@@ -469,6 +495,7 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
         // A pre-s1b-2 `cited` row resting on handle evidence alone is a handle citation.
         citedHandle: outcome === "cited_handle" || (outcome === "cited" && !titleEvidence),
         dismissed: outcome === "dismissed",
+        titleAssessable: judgment ? judgment.title_assessable === true : null,
         outcome,
       });
       if (!judgment || judgment.final !== true) provisionalSurfacings += 1;
@@ -529,6 +556,7 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
         usedII,
         citedHandle: exposure.outcome === "cited_handle",
         dismissed: exposure.dismissed_turns > 0,
+        titleAssessable: null,
         outcome: exposure.outcome,
       });
       if (provisional) report.exposures.provisional += 1;

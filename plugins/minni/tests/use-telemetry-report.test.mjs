@@ -24,6 +24,7 @@ import {
   sessionKeyFrom,
 } from "../dist/use-ledger.js";
 import { auditReport } from "../dist/vault.js";
+import { useStatusBlock } from "../dist/use-report.js";
 import { makeVault } from "./fixtures/use-detector-fixtures.mjs";
 
 delete process.env.MINNI_USE_LEDGER;
@@ -184,4 +185,34 @@ test("handle citations are their own column; exposure dismissals are counted; th
     use.caveat,
     "Known undercount: a short rule applied by quoting it word for word reads as recital and is not counted; this affects both windows equally, and the used rate is a floor.",
   );
+});
+
+test("the title_assessable share is reported per channel and overall, in the report and the status block", async (t) => {
+  const { vault } = await makeVault(t, "minni-use-report-assessable-");
+  const main = context();
+  const at = (minutes) => new Date(Date.now() - 2 * HOUR + minutes * 60_000).toISOString();
+  const rows = [];
+  const judged = (channel, mkey, assessable, minute) => {
+    const surfaced = buildSurfacedRow(main, { channel, mkey, title: "T", rank: 0, visible: true, delivered: true }, at(minute));
+    rows.push(
+      surfaced,
+      buildJudgedRow(main, { sid: surfaced.sid, outcome: "ignored", via: "transcript", evidence: [], title_assessable: assessable, final: true, rule_version: "s1b-3" }, at(minute + 1)),
+    );
+  };
+  judged("prompt_pointer", "vault:wiki/a.md", true, 1);
+  judged("prompt_pointer", "vault:wiki/b.md", false, 2);
+  judged("prompt_pointer", "vault:wiki/c.md", false, 3);
+  judged("guard", "vault:wiki/d.md", true, 4);
+  assert.equal(appendLedgerRows(vault, rows).written, rows.length);
+
+  const { use } = await auditReport(vault, 100, { useDays: 7 });
+  assert.equal(use.surfacings.title_assessable, 2);
+  assert.equal(use.surfacings.title_assessable_share, 0.5);
+  assert.equal(use.surfacings.by_channel.prompt_pointer.title_assessable_share, 0.3333);
+  assert.equal(use.surfacings.by_channel.guard.title_assessable_share, 1);
+  assert.equal(use.surfacings.by_agent.main.title_assessable_share, 0.5);
+
+  const status = useStatusBlock(vault);
+  assert.equal(status.surfacings.title_assessable_share, 0.5, "the minni_status block carries it too");
+  assert.equal(status.surfacings.by_channel.prompt_pointer.title_assessable_share, 0.3333);
 });
