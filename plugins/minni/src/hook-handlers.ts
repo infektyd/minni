@@ -572,6 +572,12 @@ const PATH_ONLY_COMPACT_HARVEST_ALLOW = new Set<string>([]);
  * cancel work. compact|resume is NOT wait-capped — see harvest block below. */
 const COMPACT_HARVEST_PATH_ONLY_BUDGET_MS = 250;
 
+/** How long before the UserPromptSubmit deadline the active-plan lock wait gives
+ * up (ms). `withBudget` does not cancel work, so a wait that ends AT the
+ * deadline keeps polling the plan lock after the hook has answered; this slack
+ * lets the THREAD_BUSY audit land inside the budget instead. */
+const PLAN_LOCK_SLACK_MS = 250;
+
 /** True when path-only (no `source`) SessionStart may start a tail-read. */
 export function isPathOnlyCompactHarvestAllowed(platform: string | undefined): boolean {
   const id = (platform ?? "").trim().toLowerCase();
@@ -1418,8 +1424,17 @@ export function createHookHandlers(
     // not empty. A raw await here waits out THREAD_BUSY (default 5s lock)
     // after the recall budget — the host then kills the hook and discards
     // the envelope, which looks like "no active plan" again.
-    const planRead = await withBudget(
-      resolveActivePlanView(config.vaultPath)
+    //
+    // withBudget races rather than cancels, so a read whose lock wait outlived
+    // the budget kept polling the plan lock after this handler had answered.
+    // Do not start it once the budget is spent (same degraded outcome), and
+    // make its lock wait give up PLAN_LOCK_SLACK_MS before the deadline, so
+    // the THREAD_BUSY audit lands inside the budget rather than after it.
+    const planBudgetMs = remainingMs();
+    const planRead = planBudgetMs <= 0 ? { ok: false as const, view: undefined } : await withBudget(
+      resolveActivePlanView(config.vaultPath, undefined, {
+        lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS),
+      })
         .then((view) => ({ ok: true as const, view }))
         .catch(async (error: unknown) => {
           await recordAudit(config.vaultPath, {
