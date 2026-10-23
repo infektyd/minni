@@ -288,6 +288,16 @@ another resume):
     - Its read-modify-write holds an `O_EXCL` lock, `counters.json.lock`, so concurrent prompts never share
       an index. The wait is bounded (200 ms), and a lock older than 2 s is broken. If the lock is not taken,
       the turn records `turn_ix: 0`.
+    - A stale lock is broken by renaming it to a unique name, so of several breakers exactly one takes it.
+      If the renamed lock turns out fresh, it is linked back, never over a newer lock. Each lock carries a
+      random token, and a release removes only its own.
+    - Two residual windows remain. Both are microsecond-scale, need a crashed holder, and fail open:
+      - A third taker between the rename and the link-back gives two holders, so at worst one duplicate
+        `turn_ix`.
+      - A holder that releases inside that window gets its lock linked back with no owner. That session's
+        prompts record `turn_ix: 0` for at most 2 s, until the lock is stale and broken again.
+    - On a filesystem without hard links the link-back fails and the live lock is removed, which allows the
+      same one duplicate. APFS has hard links.
     - A file that is present but not a counter (corrupt, foreign version, not a regular file) is left as it
       is, and the turn records `turn_ix: 0`. Only an absent file starts the count at 1.
   - `<agent_key>.reset` = `{reset_id, at, reason}`, written on PreCompact, PostCompact and SessionStart.
