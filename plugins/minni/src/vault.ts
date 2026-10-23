@@ -2400,6 +2400,30 @@ export async function listVaultNoteRelPaths(vaultPath: string): Promise<string[]
   }
 }
 
+/**
+ * How many notes `listVaultNoteRelPaths` would list, from directory entries
+ * alone: no note is opened and no path resolved per entry. listMarkdownFiles
+ * keeps exactly the `*.md` entries that are regular files, inside directories
+ * that are real directories (a symlink entry is neither, so it is never
+ * followed), so the entry types give the same count. For the use detector's
+ * daily early-trigger check (rev5 §4.4). Null on an unexpected failure.
+ */
+export function countVaultNotes(vaultPath: string): number | null {
+  const walk = (dir: string): number => {
+    let count = 0;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) count += walk(path.join(dir, entry.name));
+      else if (entry.isFile() && entry.name.endsWith(".md")) count += 1;
+    }
+    return count;
+  };
+  try {
+    return walk(path.join(vaultPath, "wiki"));
+  } catch (error) {
+    return (error as { code?: unknown } | null)?.code === "ENOENT" ? 0 : null;
+  }
+}
+
 const DF_NOTE_READ_FLAGS =
   fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
 

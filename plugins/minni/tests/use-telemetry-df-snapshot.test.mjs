@@ -17,6 +17,7 @@ import { writeDfSnapshot as writeFixtureSnapshot } from "./fixtures/use-detector
 import { exists, makeFixture, runHook, startFakeDaemon } from "./use-telemetry-hook-fixture.mjs";
 
 const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
 
 async function writeNotes(vault) {
   const wiki = path.join(vault, "wiki", "concepts");
@@ -89,13 +90,15 @@ test("UPS with the ledger on is read-only for the DF snapshot: absent stays abse
 // ---- The Stop recount (use-df-recount.ts) -----------------------------------
 //
 // The snapshot is recounted at Stop, after delivery, one capped slice per Stop:
-// a pass starts when the snapshot is missing or over a day old, resumes from a
-// cursor kept in `.runtime/df-snapshot.partial.json`, and writes the snapshot
-// only when it completes.
+// a pass starts when the snapshot is missing or at least 7 days old, or when
+// the early trigger fires (the note count moved by more than 5% since the last
+// pass, checked at most daily from a directory listing), resumes from the
+// partial state in `.runtime/df-snapshot.partial.json`, and writes the
+// snapshot only when it completes.
 
-const { DF_PARTIAL_RELPATH, DF_RECOUNT_SLICE_MS, runDfRecountSlice } = await import("../dist/use-df-recount.js");
+const { DF_PARTIAL_RELPATH, DF_RECOUNT_SLICE_MS, DF_STATE_RELPATH, earlyTriggerFires, runDfRecountSlice } = await import("../dist/use-df-recount.js");
 const { documentFrequencies, readDfSnapshot } = await import("../dist/use-detector.js");
-const { listVaultNoteRelPaths, readVaultNoteTextForDf } = await import("../dist/vault.js");
+const { countVaultNotes, listVaultNoteRelPaths, readVaultNoteTextForDf } = await import("../dist/vault.js");
 const { lstat, symlink } = await import("node:fs/promises");
 
 const WORDS = ["otter", "badger", "heron", "lattice", "quokka", "zebra", "pancake", "waffle", "kernel", "window"];
@@ -110,7 +113,13 @@ async function recountVault(t, notes = 40) {
     const words = Array.from({ length: 30 }, (_, k) => WORDS[(i * 3 + k * 7) % WORDS.length]).join(" ");
     await writeFile(path.join(wiki, `note-${String(i).padStart(3, "0")}.md`), `# Note ${i}\n\n${words} unique${i}token\n`, "utf8");
   }
-  return { root, vault, snapshot: path.join(vault, DF_SNAPSHOT_RELPATH), partial: path.join(vault, DF_PARTIAL_RELPATH) };
+  return {
+    root,
+    vault,
+    snapshot: path.join(vault, DF_SNAPSHOT_RELPATH),
+    partial: path.join(vault, DF_PARTIAL_RELPATH),
+    state: path.join(vault, DF_STATE_RELPATH),
+  };
 }
 
 /** A fake clock: each reading moves it `step` ms. */
@@ -169,7 +178,7 @@ test("recount: the pass resumes across Stops and completes with exactly the one-
 test("recount: a stale snapshot stays byte-identical until the new pass completes", async (t) => {
   const { vault, snapshot } = await recountVault(t, 40);
   await writeFixtureSnapshot(vault);
-  const stale = new Date(Date.now() - 48 * HOUR);
+  const stale = new Date(Date.now() - 8 * DAY);
   await utimes(snapshot, stale, stale);
   const bytes = await readFile(snapshot);
   const first = await runDfRecountSlice(vault, { clock: stepClock(5) });
@@ -180,12 +189,14 @@ test("recount: a stale snapshot stays byte-identical until the new pass complete
 test("recount: a corrupt or foreign partial restarts the pass cleanly", async (t) => {
   for (const [label, content] of [
     ["not json", "{not json"],
-    ["foreign version", JSON.stringify({ v: 2, kind: "df-recount", started_at: Date.now(), cursor: null, notes: 1, df: {} })],
-    ["foreign kind", JSON.stringify({ v: 1, kind: "other", started_at: Date.now(), cursor: null, notes: 1, df: {} })],
+    ["the old v1 format", JSON.stringify({ v: 1, kind: "df-recount", started_at: Date.now(), cursor: null, notes: 1, df: {} })],
+    ["foreign kind", JSON.stringify({ v: 2, kind: "other", started_at: Date.now(), paths: [], next: 0, notes: 0, tokens: [], counts: [] })],
     ["not an object", "[]"],
-    ["bad start", JSON.stringify({ v: 1, kind: "df-recount", started_at: "yesterday", cursor: null, notes: 1, df: {} })],
-    ["absolute cursor", JSON.stringify({ v: 1, kind: "df-recount", started_at: Date.now(), cursor: "/etc/passwd", notes: 1, df: {} })],
-    ["negative count", JSON.stringify({ v: 1, kind: "df-recount", started_at: Date.now(), cursor: null, notes: 1, df: { otter: -3 } })],
+    ["bad start", JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: "yesterday", paths: [], next: 0, notes: 0, tokens: [], counts: [] })],
+    ["absolute path", JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: Date.now(), paths: ["/etc/passwd"], next: 0, notes: 0, tokens: [], counts: [] })],
+    ["next past the end", JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: Date.now(), paths: ["wiki/a.md"], next: 9, notes: 0, tokens: [], counts: [] })],
+    ["negative count", JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: Date.now(), paths: [], next: 0, notes: 0, tokens: ["otter"], counts: [-3] })],
+    ["mismatched arrays", JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: Date.now(), paths: [], next: 0, notes: 0, tokens: ["otter"], counts: [] })],
   ]) {
     const { vault, partial } = await recountVault(t, 40);
     await mkdir(path.dirname(partial), { recursive: true });
@@ -195,22 +206,29 @@ test("recount: a corrupt or foreign partial restarts the pass cleanly", async (t
     assert.equal(result.status, "partial", label);
     assert.equal(result.pass_notes, result.counted, `${label}: nothing of the corrupt state survives`);
     const kept = JSON.parse(await readFile(partial, "utf8"));
-    assert.equal(kept.v, 1, `${label}: replaced by a valid partial`);
+    assert.equal(kept.v, 2, `${label}: replaced by a valid partial`);
+    assert.equal(kept.next, result.counted, `${label}: the new pass starts at the first note`);
   }
 });
 
-test("recount: a pass older than a day restarts from the first note", async (t) => {
-  const { vault, partial } = await recountVault(t, 40);
-  await mkdir(path.dirname(partial), { recursive: true });
-  await writeFile(
-    partial,
-    JSON.stringify({ v: 1, kind: "df-recount", started_at: Date.now() - 25 * HOUR, cursor: "wiki/concepts/note-030.md", notes: 999, df: { otter: 999 } }),
-    "utf8",
-  );
-  const result = await runDfRecountSlice(vault, { clock: stepClock(5) });
-  assert.equal(result.restarted, true);
-  assert.equal(result.pass_notes, result.counted);
-  assert.equal(JSON.parse(await readFile(partial, "utf8")).cursor, `wiki/concepts/note-${String(result.counted - 1).padStart(3, "0")}.md`);
+test("recount: a pass older than 7 days restarts from the first note; a younger one continues", async (t) => {
+  for (const [label, age, restarts] of [
+    ["8 days", 8 * DAY, true],
+    ["6 days", 6 * DAY, false],
+  ]) {
+    const { vault, partial } = await recountVault(t, 40);
+    const paths = await listVaultNoteRelPaths(vault);
+    await mkdir(path.dirname(partial), { recursive: true });
+    await writeFile(
+      partial,
+      JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: Date.now() - age, listed: paths.length, paths, next: 30, notes: 30, tokens: ["otter"], counts: [30] }),
+      "utf8",
+    );
+    const result = await runDfRecountSlice(vault, { clock: stepClock(5) });
+    assert.equal(result.restarted, restarts, label);
+    if (restarts) assert.equal(result.pass_notes, result.counted, `${label}: nothing of the old pass survives`);
+    else assert.equal(result.pass_notes, 30 + result.counted, `${label}: the pass continues from its own list`);
+  }
 });
 
 test("recount: links are never followed, and paths a safe write cannot replace do nothing", async (t) => {
@@ -256,4 +274,233 @@ test("recount at Stop: a measured Stop with the ledger on writes it; ledger off 
     const wrote = (await exists(path.join(fixture.vault, DF_SNAPSHOT_RELPATH))) || (await exists(path.join(fixture.vault, DF_PARTIAL_RELPATH)));
     assert.equal(wrote, label === "claude-on", `${label}: recount ${label === "claude-on" ? "ran" : "must not run"}`);
   }
+});
+
+// ---- Weekly cadence and the early trigger -------------------------------------
+
+/** A completed pass's snapshot, `ageMs` old, and the recount state it leaves. */
+async function settled(env, { ageMs, listed, checkedAgoMs }) {
+  await writeFixtureSnapshot(env.vault);
+  const when = new Date(Date.now() - ageMs);
+  await utimes(env.snapshot, when, when);
+  await writeFile(env.state, JSON.stringify({ v: 1, kind: "df-recount-state", listed, checked_at: Date.now() - checkedAgoMs }), "utf8");
+}
+
+test("cadence: no pass before 7 days without a trigger; a pass at 7 days", async (t) => {
+  const young = await recountVault(t, 40);
+  await settled(young, { ageMs: 6 * DAY, listed: 40, checkedAgoMs: 2 * DAY });
+  const quiet = await runDfRecountSlice(young.vault);
+  assert.equal(quiet.status, "fresh");
+  assert.equal(quiet.checked, true, "the daily check ran");
+  assert.ok(!(await exists(young.partial)), "no pass started");
+
+  const due = await recountVault(t, 40);
+  await settled(due, { ageMs: 7 * DAY + HOUR, listed: 40, checkedAgoMs: HOUR });
+  const pass = await runDfRecountSlice(due.vault, { clock: stepClock(5) });
+  assert.equal(pass.reason, "age");
+  assert.equal(pass.status, "partial");
+});
+
+test("cadence: the early trigger fires at more than 5% and not at 5% or less", async (t) => {
+  assert.equal(earlyTriggerFires(100, 106), true);
+  assert.equal(earlyTriggerFires(100, 105), false, "exactly 5% does not fire");
+  assert.equal(earlyTriggerFires(100, 95), false);
+  assert.equal(earlyTriggerFires(100, 94), true);
+  assert.equal(earlyTriggerFires(null, 500), false, "no baseline, no trigger");
+  for (const [notes, fires] of [
+    [42, false], // 40 -> 42 is exactly 5%
+    [43, true], // 7.5%
+  ]) {
+    const env = await recountVault(t, notes);
+    await settled(env, { ageMs: DAY, listed: 40, checkedAgoMs: 2 * DAY });
+    const result = await runDfRecountSlice(env.vault, { clock: stepClock(5) });
+    assert.equal(result.checked, true);
+    assert.equal(result.reason === "trigger", fires, `${notes} notes against 40`);
+    assert.equal(await exists(env.partial), fires);
+  }
+});
+
+test("cadence: the note-count check runs at most once a day per vault", async (t) => {
+  const env = await recountVault(t, 40);
+  await settled(env, { ageMs: DAY, listed: 40, checkedAgoMs: 2 * DAY });
+  const first = await runDfRecountSlice(env.vault);
+  assert.equal(first.checked, true);
+  const stamp = JSON.parse(await readFile(env.state, "utf8")).checked_at;
+  // The vault grows by 25% within the day: no check, so no trigger yet.
+  for (let i = 40; i < 50; i += 1) await writeFile(path.join(env.vault, "wiki", "concepts", `late-${i}.md`), `# Late ${i}\n`, "utf8");
+  const same = await runDfRecountSlice(env.vault);
+  assert.equal(same.checked, false, "within a day: no listing at all");
+  assert.equal(same.status, "fresh");
+  assert.equal(JSON.parse(await readFile(env.state, "utf8")).checked_at, stamp);
+  // A day later the check runs and the trigger fires.
+  const later = await runDfRecountSlice(env.vault, { now: Date.now() + DAY + HOUR, clock: stepClock(5) });
+  assert.equal(later.checked, true);
+  assert.equal(later.reason, "trigger");
+});
+
+test("cadence: a corrupt state file means no baseline: the check runs, takes today's count, and does not fire", async (t) => {
+  const env = await recountVault(t, 40);
+  await settled(env, { ageMs: DAY, listed: 40, checkedAgoMs: 0 });
+  await writeFile(env.state, "{not json", "utf8");
+  const result = await runDfRecountSlice(env.vault);
+  assert.equal(result.checked, true);
+  assert.equal(result.status, "fresh");
+  const state = JSON.parse(await readFile(env.state, "utf8"));
+  assert.equal(state.listed, 40, "the baseline is today's count");
+});
+
+test("countVaultNotes counts exactly what listVaultNoteRelPaths lists, from entries alone", async (t) => {
+  const env = await recountVault(t, 12);
+  const wiki = path.join(env.vault, "wiki");
+  await mkdir(path.join(wiki, "deep", "deeper"), { recursive: true });
+  await writeFile(path.join(wiki, "deep", "deeper", "x.md"), "# X\n", "utf8");
+  await writeFile(path.join(wiki, "deep", "notes.txt"), "not markdown", "utf8");
+  await writeFile(path.join(env.root, "outside.md"), "# Outside\n", "utf8");
+  await symlink(path.join(env.root, "outside.md"), path.join(wiki, "linked.md"));
+  await mkdir(path.join(env.root, "outside-dir"), { recursive: true });
+  await writeFile(path.join(env.root, "outside-dir", "y.md"), "# Y\n", "utf8");
+  await symlink(path.join(env.root, "outside-dir"), path.join(wiki, "linked-dir"));
+  const listed = await listVaultNoteRelPaths(env.vault);
+  assert.equal(countVaultNotes(env.vault), listed.length);
+  assert.equal(listed.length, 13, "12 notes and the nested one; no symlink, no .txt");
+});
+
+// ---- Review follow-ups: progress, the partial's guards, due edges, empty vaults ----
+
+test("recount: every slice counts at least one note, so a spent clock can never livelock the pass", async (t) => {
+  const { vault, snapshot } = await recountVault(t, 12);
+  // Each reading jumps a second: the counting window is gone before any note.
+  const clock = stepClock(1000);
+  const counts = [];
+  for (let i = 0; i < 30; i += 1) {
+    const result = await runDfRecountSlice(vault, { clock });
+    counts.push(result.counted);
+    if (result.status === "written") break;
+  }
+  assert.ok(counts.every((n) => n >= 1), `a note per slice at least: ${JSON.stringify(counts)}`);
+  assert.equal(counts.reduce((a, b) => a + b, 0), 12);
+  assert.ok(await exists(snapshot), "the pass completed");
+});
+
+test("recount: the partial is plain counts at mode 0600, and is gone once the snapshot is written", async (t) => {
+  const { vault, snapshot, partial } = await recountVault(t, 40);
+  const first = await runDfRecountSlice(vault, { clock: stepClock(5) });
+  assert.equal(first.status, "partial");
+  assert.equal((await stat(partial)).mode & 0o777, 0o600, "created 0600");
+  const kept = JSON.parse(await readFile(partial, "utf8"));
+  assert.equal(kept.listed, kept.paths.length, "the pass records the note count it started from");
+  assert.ok(Array.isArray(kept.tokens) && Array.isArray(kept.counts), "token counts, in plain text");
+  for (let i = 0; i < 20 && !(await exists(snapshot)); i += 1) await runDfRecountSlice(vault, { clock: stepClock(5) });
+  assert.ok(await exists(snapshot), "the snapshot is present");
+  assert.ok(!(await exists(partial)), "and the partial is gone");
+});
+
+test("recount: an aged-out pass is removed; its replacement, if a pass starts, is the new pass's", async (t) => {
+  // Aged out, and nothing due: the stale partial goes and none replaces it.
+  const quiet = await recountVault(t, 40);
+  await settled(quiet, { ageMs: DAY, listed: 40, checkedAgoMs: HOUR });
+  const paths = await listVaultNoteRelPaths(quiet.vault);
+  const stale = { v: 2, kind: "df-recount-pass", started_at: Date.now() - 8 * DAY, listed: paths.length, paths, next: 10, notes: 10, tokens: ["otter"], counts: [10] };
+  await writeFile(quiet.partial, JSON.stringify(stale), "utf8");
+  const none = await runDfRecountSlice(quiet.vault);
+  assert.equal(none.status, "fresh");
+  assert.ok(!(await exists(quiet.partial)), "the aged-out partial is gone");
+  // Aged out while a pass is due: the replacement belongs to the new pass.
+  const due = await recountVault(t, 40);
+  await mkdir(path.dirname(due.partial), { recursive: true });
+  await writeFile(due.partial, JSON.stringify(stale), "utf8");
+  const fresh = await runDfRecountSlice(due.vault, { clock: stepClock(5) });
+  assert.equal(fresh.restarted, true);
+  const kept = JSON.parse(await readFile(due.partial, "utf8"));
+  assert.ok(Date.now() - kept.started_at < HOUR, "the new pass's partial");
+  assert.equal(kept.next, fresh.counted);
+});
+
+test("recount: a pass the vault outgrew (note count past the trigger) is discarded and restarts at once", async (t) => {
+  const env = await recountVault(t, 40);
+  await settled(env, { ageMs: DAY, listed: 40, checkedAgoMs: HOUR });
+  const paths = await listVaultNoteRelPaths(env.vault);
+  await writeFile(
+    env.partial,
+    JSON.stringify({ v: 2, kind: "df-recount-pass", started_at: Date.now() - HOUR, listed: paths.length, paths, next: 10, notes: 10, tokens: ["otter"], counts: [10] }),
+    "utf8",
+  );
+  for (let i = 0; i < 10; i += 1) await writeFile(path.join(env.vault, "wiki", "concepts", `grown-${i}.md`), `# Grown ${i}\n`, "utf8");
+  const result = await runDfRecountSlice(env.vault, { clock: stepClock(5) });
+  assert.equal(result.restarted, true);
+  assert.equal(result.reason, "trigger");
+  const kept = JSON.parse(await readFile(env.partial, "utf8"));
+  assert.equal(kept.listed, 50, "the new pass lists the grown vault");
+});
+
+test("recount: a symlinked partial is never followed; the link is replaced by a fresh 0600 file", async (t) => {
+  const { root, vault, partial } = await recountVault(t, 40);
+  const outside = path.join(root, "outside-partial.json");
+  await writeFile(outside, "keep me", "utf8");
+  await mkdir(path.dirname(partial), { recursive: true });
+  await symlink(outside, partial);
+  const result = await runDfRecountSlice(vault, { clock: stepClock(5) });
+  assert.equal(result.status, "partial");
+  assert.equal(await readFile(outside, "utf8"), "keep me", "the link's target is untouched");
+  const st = await lstat(partial);
+  assert.ok(st.isFile() && !st.isSymbolicLink(), "a regular file now");
+  assert.equal(st.mode & 0o777, 0o600);
+});
+
+test("recount: a snapshot write that fails keeps the partial, so the pass resumes", async (t) => {
+  const { cp, mkdtemp: mkd, writeFile: wf, symlink: ln, readFile: rf } = await import("node:fs/promises");
+  const { PLUGIN_ROOT, DEFAULT_DIST } = await import("./use-telemetry-hook-fixture.mjs");
+  const root = await mkd(path.join(tmpdir(), "minni-df-recount-nowrite-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dist = path.join(root, "dist");
+  await cp(DEFAULT_DIST, dist, { recursive: true });
+  const detector = path.join(dist, "use-detector.js");
+  const source = await rf(detector, "utf8");
+  const marker = "export function writeDfSnapshot(vaultPath, input) {";
+  assert.ok(source.includes(marker), "the mutation's anchor exists");
+  await wf(detector, source.replace(marker, `${marker}\n    return false;`), "utf8");
+  await wf(path.join(root, "package.json"), '{"type":"module"}\n', "utf8");
+  await ln(path.join(PLUGIN_ROOT, "node_modules"), path.join(root, "node_modules"));
+  const failing = await import(pathToFileURL(path.join(dist, "use-df-recount.js")).href);
+  const env = await recountVault(t, 5);
+  const result = await failing.runDfRecountSlice(env.vault);
+  assert.equal(result.status, "failed");
+  assert.ok(!(await exists(env.snapshot)));
+  const kept = JSON.parse(await readFile(env.partial, "utf8"));
+  assert.equal(kept.next, kept.paths.length, "the counted pass is kept whole");
+  assert.equal(kept.notes, 5);
+});
+
+test("recount: a future-dated snapshot is due; a directory at the snapshot path refuses", async (t) => {
+  const future = await recountVault(t, 5);
+  await writeFixtureSnapshot(future.vault);
+  const ahead = new Date(Date.now() + DAY);
+  await utimes(future.snapshot, ahead, ahead);
+  const due = await runDfRecountSlice(future.vault);
+  assert.equal(due.reason, "age", "an mtime well ahead of the clock is a skewed clock, so the snapshot is due");
+  const dir = await recountVault(t, 5);
+  await mkdir(dir.snapshot, { recursive: true });
+  assert.equal((await runDfRecountSlice(dir.vault)).status, "refused");
+  assert.ok((await stat(dir.snapshot)).isDirectory(), "left as it was");
+});
+
+test("recount: a vault with no countable note is parked for the week, not recounted every Stop", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-df-recount-empty-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const vault = path.join(root, "vault");
+  const wiki = path.join(vault, "wiki", "concepts");
+  await mkdir(wiki, { recursive: true });
+  for (let i = 0; i < 20; i += 1) await writeFile(path.join(wiki, `old-${i}.md`), `---\nstatus: superseded\n---\n# Old ${i}\n`, "utf8");
+  const first = await runDfRecountSlice(vault);
+  assert.equal(first.status, "empty");
+  const again = await runDfRecountSlice(vault);
+  assert.equal(again.status, "fresh", "parked: the next Stop does not recount");
+  assert.equal(again.restarted, false);
+  // A week later it runs again; and within the week, a count past the trigger still fires.
+  const later = await runDfRecountSlice(vault, { now: Date.now() + 8 * DAY });
+  assert.equal(later.status, "empty");
+  for (let i = 0; i < 5; i += 1) await writeFile(path.join(wiki, `new-${i}.md`), `# New ${i}\n\nfresh words here\n`, "utf8");
+  const grown = await runDfRecountSlice(vault, { now: Date.now() + 9 * DAY + HOUR });
+  assert.equal(grown.reason, "trigger");
+  assert.equal(grown.status, "written");
 });

@@ -160,13 +160,16 @@ const STOP_WRITES = [
   // pre-existing Stop behaviour, independent of the ledger: the Jev harvest
   // cursor (jev-harvest.ts JEV_HARVEST_STATE_RELPATH), compared on vs off below.
   /^jev-harvest-state\.json$/,
+  // the DF recount's state (use-df-recount.ts writeAtomic): the early trigger's
+  // baseline and its once-a-day note-count check, temp + rename.
+  /^df-recount\.json$/,
 ];
-// On a recount turn only (the DF snapshot over a day old), the recount slice
-// (use-df-recount.ts) also writes, each through a temp name and a rename:
+// On a recount turn only (the DF snapshot 7 days old or more, or the early
+// trigger), the recount slice also writes, each through a temp name and a rename:
 const RECOUNT_WRITES = [
   // the completed snapshot (writeDfSnapshot), replaced atomically;
   /^df-snapshot\.json$/,
-  // the pass's partial state between slices (writePartial).
+  // the pass's partial state between slices (writeAtomic).
   /^df-snapshot\.partial\.json$/,
 ];
 // windows.lock (acquireLock), temp names (`.tmp`) and stale-lock asides are
@@ -199,9 +202,9 @@ test(
       await writeFile(path.join(side, "main.reset"), '{"reset_id":"r1","at":"2026-10-23T09:59:00.000Z","reason":"SessionStart:startup"}', "utf8");
       await writeDfSnapshot(fixture.vault);
       if (recount) {
-        // A day and more old: this Stop is a recount turn.
+        // A week and more old: this Stop is a recount turn.
         const { utimes } = await import("node:fs/promises");
-        const stale = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const stale = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
         await utimes(path.join(runtime, "df-snapshot.json"), stale, stale);
       }
       const countsFile = path.join(runtime, "prompt-templates.json");
