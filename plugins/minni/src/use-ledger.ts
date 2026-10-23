@@ -928,17 +928,42 @@ export function parseLedgerText(text: string): LedgerFileRead {
   return { rows, skipped };
 }
 
+// Readers open non-blocking and without following a link: a day file swapped
+// for a FIFO would otherwise block the read (Stop reaches it through the
+// receipt's use counts, and the host waits for the hook to exit). The kind and
+// size are judged on the OPENED descriptor, so a swap after any earlier stat is
+// still refused.
+const READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
 /**
- * Read one day file, skipping torn and malformed lines. Missing file: no rows.
+ * Read one day file, skipping torn and malformed lines. Missing, not a regular
+ * file, or over the size cap: no rows. Never blocks, never throws.
  * Internal: the caller (readSessionLedger) has already checked containment.
  */
 function readDayFile(filePath: string): LedgerFileRead {
+  let fd: number | undefined;
   try {
-    const stat = fs.statSync(filePath);
+    fd = fs.openSync(filePath, READ_FLAGS);
+    const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.size > MAX_LEDGER_FILE_BYTES) return { rows: [], skipped: 0 };
-    return parseLedgerText(fs.readFileSync(filePath, "utf8"));
+    const buffer = Buffer.alloc(stat.size);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const n = fs.readSync(fd, buffer, filled, buffer.length - filled, filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    return parseLedgerText(buffer.toString("utf8", 0, filled));
   } catch {
     return { rows: [], skipped: 0 };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // A read-only descriptor: nothing to lose.
+      }
+    }
   }
 }
 

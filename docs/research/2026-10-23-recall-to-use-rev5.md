@@ -277,10 +277,42 @@ another resume):
   - `daemon_version`
 
   The plugin hashes `content` into shingles and never stores or injects it.
-- **Retention (S1b, not yet shipped).** Ledger session directories (`.runtime/use-ledger/<session_key>`) older
-  than 90 days with no open windows are removed after delivery, at most 20 per run. Each is first renamed to
-  `.trash-<ts>`. S1a does not do this: it ships only the `recall-session.d` sweep below. The ledger needs
-  S1b's open-window check, so S1b owns this retention (§8.1).
+- **Retention (S1b).** Ledger session directories (`.runtime/use-ledger/<session_key>`) past the 90-day
+  horizon are closed, then removed, by a sweep (`sweepLedgerDirs`, `use-retention.ts`).
+  - "Past the horizon" is the `recall-session.d` rule below: the directory and every entry in it are older
+    than 90 days, and a directory with more than 256 entries is never judged idle. It is judged before any
+    close, because the close's own rows would make the directory look fresh.
+  - The detector's per-session state (`.runtime/use-detector/sessions/<key>/windows.json`) is read-only here
+    and reached through the containment walk:
+    - No state, or every agent closed: the directory goes.
+    - Open work (an open window, an open epoch whose exposures are not yet written, or an ended turn whose
+      reply was not flushed): the session is a finalize candidate. The detector's own idle close,
+      `finalizeIdleSessions({ sessionKeys, budgetMs })`, is scoped to the candidates and to the budget left.
+      The state is then re-read, and the directory removed only if it is now closed.
+    - A fresh `windows.lock` (a run in progress, younger than 30 s), or a state that cannot be read with
+      certainty (unreadable, oversize, refused, unknown version): kept, never closed.
+  - `use-detector.js` loads on SessionStart only when a candidate exists, and only with the ledger on.
+  - Retention removes only the ledger directory. The detector's own state and cursors are not its to remove.
+  - At most 20 per run, removals and candidates together, each renamed to `.trash-<ts>-<key>` first.
+  - It resumes from a cursor in `use-ledger/.sweep.json`. A candidate the run did not reach is carried: the
+    cursor stops before it. After a complete pass it waits a day.
+  - It skips symlinks and plain files and never follows a link. Ledger readers skip dot names, so `.sweep.json`
+    and `.trash-*` are invisible to them.
+  - One race is accepted: a detector run that starts between the state check and the rename. That is a
+    microsecond window on a session idle for 90 days, and the rows that run appends are lost with the
+    directory.
+- **SessionStart maintenance: one budget.** Once a SessionStart's output is settled, on every outcome
+  (`runSessionMaintenance`, as the commit and as the abandon handler: S1a-2 review F4), the maintenance runs
+  under ONE deadline of 150 ms (`SESSION_MAINTENANCE_BUDGET_MS`). The order is fixed: the `recall-session.d`
+  sweep, then ledger retention with its close step.
+  - Each sweep checks the shared deadline before every item. A sweep that finds it passed does nothing and
+    resumes next time from its own cursor. Every sweep still progresses across runs: each caps its own work
+    per run, and after a complete pass waits a day.
+  - The cap can be overrun by one item's work: the item in progress when the deadline passes (one
+    directory's removal, or one session's close-and-remove). A run that finds a finalize candidate on a spent
+    budget still takes the first one, so it makes progress.
+  - The ledger scan keeps half its share of the budget for its candidates.
+  - `use-retention.test.mjs` pins the total on a fake clock.
 - **Per-session side files (S1a-2).** `.runtime/recall-session.d/<session_key>/` holds the capture state that
   is not a ledger row. Every directory is reached through the ledger's containment walk, and every file is
   replaced through a temp name and a rename. None of them holds text.
@@ -320,7 +352,8 @@ another resume):
     - It removes at most 20 directories per run, each renamed to `.trash-<ts>-<key>` first.
     - It also removes orphaned counts-file temp files (`.runtime/prompt-templates.json.<pid>.<uuid>.tmp`)
       older than an hour: regular files only, at most 20 per run.
-    - It stays inside the cooperative 150 ms budget, checked between items (§6.2.5).
+    - It stays inside SessionStart's one shared 150 ms maintenance budget, checked between items (§6.2.5,
+      "SessionStart maintenance" above).
     - It resumes from a cursor in `recall-session.d/.sweep.json`. After a complete pass it waits a day.
     - It skips symlinks and plain files, and never follows a link out of the vault.
     - A directory with more than 256 entries is never judged idle.
@@ -482,10 +515,14 @@ SubagentStop (§6.3.6), and from `use-report`.
     `vault.test.mjs:1880` and `:1906` green unedited.
   - Otherwise it appends ` Use: <n> surfaced, <c> cited, <a> applied.` to the same line, which
     `maskTelemetry` already drops.
-  - S1b builds the counts (`sessionReceipt` reads them by default), but the Stop hook passes
-    `useCounts: false` until the Stop wiring slice. Reading them loads the ledger reader, and S1a-2 pins
-    that Stop loads none of the ledger modules, whatever the flag (`use-telemetry-flag-off-cost`). The
-    wiring slice settles Stop's module-load contract and turns the counts on.
+  - `sessionReceipt` reads the counts by default. The Stop hook passes `useCounts` only when ledger-gate says
+    the ledger may be on, because reading them loads the ledger reader (`use-report.js`). With the ledger off
+    the line is byte-identical to the line without counts, and Stop loads no ledger module (§8.2).
+  - **The counts lag one Stop.** They stand as of the Stop's start, because the detector judges that Stop's
+    own turn only after the output is delivered. A surfacing first shows as surfaced and uncited (pending),
+    and its outcome shows on the next Stop's receipt. The last turn of a session is never reflected in a
+    receipt; `use-report` still counts it.
+  - Only measured wires show counts (§8.2): an unmeasured wire's receipt is the line without them.
 
 ### 4.6 RED tests (new files)
 
@@ -1215,11 +1252,111 @@ There is one switch per feature, and every one defaults to `on`.
   - **A capture module that will not load** (a stripped or half-updated install) makes the hook run exactly
     as with the ledger off. It is audited once, throttled, as `<prefix>_use_capture_unavailable`, by code and
     never with the loader's message, which names a path.
+  - **Stop (S1b).** Stop records nothing of its own. It reads the ledger for the receipt and, after delivery,
+    runs the detector. Pinned by `use-telemetry-flag-off-cost`, `use-telemetry-stop-detector` and
+    `use-telemetry-stop-receipt`.
+    - **Measured wires only.** Phase 1 measures the wires whose transcript the detector parses: those whose
+      `transcriptShape` capability (`hook-platform.ts`) is `claude-code`, which today is claude-code alone.
+      Every other wire is unmeasured (§4.5), so on its Stop neither the detector nor the receipt's use counts
+      run, and Stop behaves as with the ledger off below, whatever the flag.
+    - **Ledger off** (env, or `flags.json`, as ledger-gate decides it), or an unmeasured wire: Stop loads no
+      ledger module. None of `use-capture.js`, `use-ledger.js`, `flags.js`, `harness-envelope.js`,
+      `harness-envelope-rules.js`, `use-detector.js` or `use-report.js` loads, and the receipt line is
+      byte-identical to the line without use counts.
+    - **Ledger on** (ledger-gate says it may be on), on a measured wire:
+      1. Stop loads `use-report.js` for the receipt, before its output is delivered. `use-report.js`
+         statically imports `use-detector.js`, so the detector MODULE loads then too, with `use-ledger.js`,
+         `flags.js` and the classifier (probe load order: use-report, use-detector, flags, use-ledger). Only
+         the detector RUN waits: it starts once the output is delivered, and only after `flags.ts` confirms
+         the ledger.
+      2. It never loads `use-capture.js`.
+      3. `harness-envelope.js` and `harness-envelope-rules.js` load only through `use-detector.js`'s import
+         (the detector's prompt classifier, for turns with no `turn` row); nothing else on the Stop path
+         imports them.
+      4. Stop writes no template counts: `.runtime/prompt-templates.json` stays absent when it was absent, and
+         byte-identical with the same mtime when it was present.
+      5. Stop's writes under `.runtime` are a closed list:
+         - The session's ledger day file, `use-ledger/<session_key>/<yyyy-mm-dd>.jsonl`, append-only
+           (`appendLedgerRows`). Every appended row is the detector's own: `judged`, `exposure`, or a
+           `surfaced` row with `channel: "explicit_recall"`, which the detector rebuilds from the
+           transcript's `minni_recall`/`minni_drill` results (§4.4). It is never `turn`, never `reset`, and
+           never a `surfaced` row on another channel.
+         - The detector's per-session state, `use-detector/sessions/<session_key>/windows.json`
+           (`writeJsonAtomic`).
+         - Its lock, `windows.lock` in the same directory (`acquireLock`), released before exit, so it is
+           absent afterwards.
+         - The per-transcript cursor, `use-detector/cursors/<tx_key>.json` (`writeCursor`).
+         - Transient names only, gone by exit: `*.tmp` temps renamed into place, and the detector's
+           stale-lock asides (`windows.lock.stale-*`).
+         - `jev-harvest-state.json`: pre-existing Stop behaviour, independent of the ledger (the Jev harvest
+           cursor, written whenever the payload carries a transcript path). Same presence and the same bytes
+           with the ledger on and off.
+         - On a recount turn only (the DF snapshot missing or over a day old, §4.4), the recount slice
+           (`use-df-recount.ts`) also writes, each through a temp name and a rename:
+           `df-snapshot.partial.json`, the pass's state between slices, and `df-snapshot.json`, when a pass
+           completes (`writeDfSnapshot`).
+         - Nothing else. In particular, nothing under `recall-session.d/` changes (`counters.json`,
+           `hit-keys.json`, `<agent_key>.reset`). `df-snapshot.json` is unchanged except on a recount turn,
+           and then only through the atomic write. UPS never writes either file.
+    - **Order.** The ledger's commits are registered last: the detector's, then the DF recount slice. They
+      come after every commit Stop registers to consume or confirm something (a parked correction's archive, a
+      relay cursor). Deferred commits run in registration order, so those settle before the detector starts,
+      never up to its 1.5 s cap later. The recount waits for the detector.
+    - **The DF recount** (§4.4) runs one slice per measured Stop, after delivery, only while the snapshot is
+      due. A fresh snapshot costs one `lstat`.
+      - A slice counts notes for at most 40 ms of its 50 ms cap, checked between notes. The rest is kept for
+        the partial write, and one note's work is the slack.
+      - It reads the notes through the search scan's own walker and filters (`listVaultNoteRelPaths`,
+        `readVaultNoteTextForDf`: `wiki/**/*.md`, containment, no symlink followed, `blocked` and
+        `skippedByStatus` notes left out, 2 MB per note, non-blocking opens).
+      - A pass that started over a day ago restarts. A corrupt or foreign partial restarts it cleanly. A
+        snapshot or partial path a safe write cannot replace (a symlink, a directory) does nothing.
+    - **What Stop costs the user** (claude-code 2.1.301 waits for the Stop hook to EXIT, so the user-visible
+      cost is the whole exit-time delta, paid at turn end). Measured on 2026-10-23, n=50, interleaved, load 3.4
+      to 4.4:
+      - A normal turn with the ledger on: +20.2 ms p50 and +28.6 ms p95 to exit. Of that, +5.0 ms comes before
+        stdout: the receipt's reader and the detector module load. About 15 ms comes after delivery: the
+        detector run.
+      - The ledger off, or an unmeasured wire (codex): within noise of base (−0.3 ms and +0.3 ms p50).
+      - A recount turn adds +43.9 ms p50 (+44.4 ms p95) to exit, and +0.3 ms to stdout. The slice runs after
+        delivery: 40.4 ms p50 and 41.4 ms max, against its 50 ms cap.
+      - At the real vault size (800 notes, about 12 MB) a pass is 28 to 31 slices of about 30 notes. So about
+        30 measured Stops a day pay the recount, and then none until the snapshot is a day old.
+    - **What UPS costs** for the DF snapshot: nothing. UPS never counts, writes or loads the detector for it.
+      On a recount day and on a normal day UPS's exit and stdout match within noise (−3.2 ms and −3.5 ms p50,
+      800 notes, ledger on).
+    - **Failures.** A detector that throws, will not load, is slow, or stops at its caps (1.5 s, 2 MB) changes
+      no byte of the Stop output, which is already delivered, and never fails the hook. A failure (a module
+      that will not load; a status of `invalid`, `refused`, `write_failed` or `error`; a throw) is audited
+      once, throttled, as `<prefix>_use_detector_failed`, by code and never with a message. A carry at the
+      caps is not a failure. An undelivered Stop runs no detector; the next Stop carries the transcript
+      forward.
+    - **Measured means a real session id too.** A Stop with no `session_id` (the receipt's synthetic
+      "session" fallback) runs neither the detector nor the receipt counts. Its rows would key under a
+      transcript hash that no capture wrote.
+    - **Known cost, left as is.** On the detector's fast path (nothing open, nothing new) the run still
+      rewrites `windows.json`, though only the agent's activity time and offset change: one small
+      temp-and-rename per measured Stop. Skipping that write belongs in `use-detector.ts` (another slice's
+      file). It also needs care, because the activity time feeds the 24 h idle close. So it is not done here.
+    - **A transcript that is not a regular file** (a FIFO, a directory) is passed to the detector as no
+      transcript, after a `stat` that follows links as the detector's `realpath` does. The host waits for the
+      hook to exit, so the detector's own open, which a FIFO would block, must never be reached. A
+      stat-then-open window remains until the detector's open is itself non-blocking (S1b r4b); swapping the
+      path for a FIFO inside that window needs an active local attacker.
 - **The daemon flag** is read from the daemon's config or env, because the daemon runs under `minni up` or
   launchd.
 - **Ledger-off stretches stay visible.** With `MINNI_USE_LEDGER=off`, no ledger rows are written, but the
   SessionStart audit row records the flags in effect. `use-report` lists those stretches from the audit
   log.
+  - The fields (S1b): every `<prefix>_session_start` row carries `details.use_ledger`, `"on"` or `"off"`.
+    With the ledger on it also carries `details.features`, the switches in effect, sorted. "On" means this
+    boot opened a ledger capture. "Off" means ledger-gate or `flags.ts` said off, or the capture module would
+    not load. With the ledger off no capture module loads to compute the field.
+  - **Caveat: the audit throttle.** `<prefix>_session_start` is not exempt from the 5 s per-event audit
+    throttle (`vault.ts` `shouldThrottleAudit`). Two boots of the same agent within 5 s keep only the first
+    row. Each row stands for its own boot, so a dropped row loses one sample, and the stretch boundaries
+    come from the rows that survive. Exempting it would need edits to pre-rev-5 throttle tests
+    (`audit-rcm008.test.mjs` uses `hook_session_start` as its duplicate case), so it is left for Hans.
 
 | Flag | Feature |
 |---|---|

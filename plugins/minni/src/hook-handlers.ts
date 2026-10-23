@@ -17,6 +17,8 @@
 // decided per platform by hook-platform.ts. Emitting Claude Code's envelope
 // everywhere is what silently voided Codex's PreCompact output and discarded
 // Grok Build's memory outright.
+import fs from "node:fs";
+
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
@@ -55,7 +57,7 @@ import { harvestTranscriptDelta } from "./jev-harvest.js";
 import type { JevTrigger, JevLearnPayload } from "./jev-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
-import { canInject, renderIntent, wireFor } from "./hook-platform.js";
+import { canInject, renderIntent, wireCapabilities, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import {
@@ -113,7 +115,9 @@ import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutco
 // S1a-2: use-capture.js (and use-ledger, flags, harness-envelope behind it) is
 // loaded with a dynamic import, and only when ledger-gate.ts says the ledger
 // may be on. These type imports are erased: with the ledger off, a hook loads
-// nothing it did not load before.
+// nothing it did not load before. S1b: Stop never loads use-capture.js; with
+// the ledger maybe on it loads flags.js, use-detector.js and use-ledger.js
+// (after delivery) and use-report.js (the receipt), all dynamically.
 import { LEDGER_EVENTS, ledgerMayBeOn } from "./ledger-gate.js";
 import type { TurnRecord, UseCapture } from "./use-capture.js";
 
@@ -413,6 +417,201 @@ export async function handleStopCore(
   payload: Record<string, unknown>,
   prepareOutcomeFn: typeof prepareOutcome = prepareOutcome,
 ): Promise<HookOutput> {
+  const core = await stopCore(config, payload, prepareOutcomeFn);
+  // A direct caller registers nothing after this, so the ledger's work is last.
+  if (core.measured) scheduleStopLedgerWork(config, payload);
+  return core.output;
+}
+
+/** The transcript shape the use detector parses (use-detector.ts reads Claude Code JSONL). */
+const DETECTOR_TRANSCRIPT_SHAPE = "claude-code";
+
+interface StopCoreResult {
+  output: HookOutput;
+  /**
+   * This Stop is measured: its wire's transcript is one the detector parses,
+   * and ledger-gate says the ledger may be on. The receipt read its use counts,
+   * and the caller must schedule the detector, after every other commit.
+   */
+  measured: boolean;
+}
+
+/**
+ * S1b (§8.2): one decision for both ledger reads Stop makes, the receipt's use
+ * counts and the detector run. Phase 1 measures only wires whose transcript the
+ * detector parses (`transcriptShape`, hook-platform.ts), and only a Stop that
+ * carries a real session id; anything else is unmeasured, so neither runs and
+ * its Stop loads no ledger module, as it does with the ledger off (env, or
+ * flags.json, ledger-gate's cheap check).
+ * Measured and maybe on: the receipt loads the reader (use-report.js) and,
+ * after delivery, the detector runs (use-detector.js). Neither ever loads the
+ * capture writers.
+ */
+async function stopCore(
+  config: StopCoreConfig,
+  payload: Record<string, unknown>,
+  prepareOutcomeFn: typeof prepareOutcome,
+): Promise<StopCoreResult> {
+  const wire = config.wire ?? wireFor(config.agentId);
+  // A Stop with no real session id (the receipt's synthetic "session"
+  // fallback) is unmeasured too: its rows would be keyed under a transcript
+  // hash no capture used, and the receipt reads no counts on that path.
+  const hasSessionId = Boolean(asString(payload.session_id) || asString(payload.sessionId));
+  const measured =
+    hasSessionId &&
+    wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE &&
+    ledgerMayBeOn(config.vaultPath);
+  const output = await stopCoreOutput(config, payload, prepareOutcomeFn, measured);
+  return { output, measured };
+}
+
+/**
+ * A measured Stop's post-delivery ledger work, in this order: the detector
+ * judges the turn, then one capped slice of the DF recount (rev5 §4.4) runs.
+ * Both record only; registered after every other commit (handleStop).
+ */
+function scheduleStopLedgerWork(config: StopCoreConfig, payload: Record<string, unknown>): void {
+  scheduleStopUseDetector(config, payload);
+  scheduleStopDfRecount(config);
+}
+
+/**
+ * Stop: one slice of the DF snapshot recount, after the detector. Nothing
+ * while the snapshot is under a day old (one lstat); otherwise about 50 ms of
+ * counting (use-df-recount.ts). flags.ts confirms the ledger first. A failure
+ * is audited once, throttled, by code. Never fails the hook.
+ */
+function scheduleStopDfRecount(config: StopCoreConfig): void {
+  const vaultPath = config.vaultPath;
+  const auditPrefix = config.auditPrefix;
+  deferUntilDelivered(
+    async () => {
+      let problem: string | null = null;
+      try {
+        const flags = await import("./flags.js");
+        if (!flags.flagOn(vaultPath, "MINNI_USE_LEDGER")) return;
+        const recount = await import("./use-df-recount.js");
+        const result = await recount.runDfRecountSlice(vaultPath);
+        if (result.status === "failed") problem = "failed";
+      } catch {
+        problem = "unavailable";
+      }
+      if (problem === null) return;
+      await recordAudit(vaultPath, {
+        tool: `${auditPrefix}_df_recount_failed`,
+        summary: `Stop: DF snapshot recount ${problem}; the snapshot stays as it was`,
+        throttleKey: `${auditPrefix}_df_recount_failed`,
+      }).catch(() => undefined);
+    },
+    { recordOnly: true },
+  );
+}
+
+/** Detector statuses that mean this turn could not be judged: one audit line each, throttled. */
+const DETECTOR_FAILURES: ReadonlySet<string> = new Set(["invalid", "refused", "write_failed", "error"]);
+
+/**
+ * Stop (§4.4): judge the main agent's surfacings against its transcript once
+ * this Stop's output has reached the host. Deliver first, record only: the
+ * output is already on the wire when the detector starts, so nothing it does
+ * (a throw, a module that will not load, its 1.5 s / 2 MB caps) can change a
+ * byte of it, and a failure never fails the hook. Nothing runs when the output
+ * was not delivered; the next Stop carries the transcript forward. flags.ts
+ * confirms the ledger before the detector loads. A failure is audited once,
+ * throttled, by code: never the loader's or the detector's message, which can
+ * name a path.
+ */
+function scheduleStopUseDetector(config: StopCoreConfig, payload: Record<string, unknown>): void {
+  const vaultPath = config.vaultPath;
+  const auditPrefix = config.auditPrefix;
+  const wireId = (config.wire ?? wireFor(config.agentId)).id;
+  const principal = config.agentId;
+  const transcriptPath = asString(payload.transcript_path) || asString(payload.transcriptPath) || null;
+  const lastAssistantMessage = asString(payload.last_assistant_message) || null;
+  deferUntilDelivered(
+    async () => {
+      const problem = await runStopUseDetector({ vaultPath, wireId, principal, payload, transcriptPath, lastAssistantMessage });
+      if (problem === null) return;
+      await recordAudit(vaultPath, {
+        tool: `${auditPrefix}_use_detector_failed`,
+        summary: `Stop: use detector ${problem}; this turn's surfacings were not judged`,
+        throttleKey: `${auditPrefix}_use_detector_failed`,
+      }).catch(() => undefined);
+    },
+    { recordOnly: true },
+  );
+}
+
+/** One detector run for Stop's main agent; the failure code, or null. Never rejects. */
+async function runStopUseDetector(args: {
+  vaultPath: string;
+  wireId: string;
+  principal: string;
+  payload: Record<string, unknown>;
+  transcriptPath: string | null;
+  lastAssistantMessage: string | null;
+}): Promise<string | null> {
+  let flags: typeof import("./flags.js");
+  try {
+    flags = await import("./flags.js");
+  } catch {
+    return "unavailable";
+  }
+  try {
+    if (!flags.flagOn(args.vaultPath, "MINNI_USE_LEDGER")) return null;
+  } catch {
+    return "error";
+  }
+  let detector: typeof import("./use-detector.js");
+  let ledger: typeof import("./use-ledger.js");
+  try {
+    [detector, ledger] = await Promise.all([import("./use-detector.js"), import("./use-ledger.js")]);
+  } catch {
+    return "unavailable";
+  }
+  try {
+    // Keyed exactly as capture keys its rows (ledgerContextFrom), so the
+    // detector reads the session and agent the surfacings were written under.
+    const result = detector.runDetector({
+      vaultPath: args.vaultPath,
+      wire: args.wireId,
+      principal: args.principal,
+      session_key: ledger.sessionKeyFrom(args.payload),
+      agent_key: ledger.agentKeyFrom(args.payload),
+      transcriptPath: regularFileOrNull(args.transcriptPath),
+      lastAssistantMessage: args.lastAssistantMessage,
+      endsTurn: true,
+    });
+    return DETECTOR_FAILURES.has(result.status) ? result.status : null;
+  } catch {
+    return "threw";
+  }
+}
+
+/**
+ * The transcript path when it names a regular file (links followed, as the
+ * detector's own realpath follows them); null when it names anything else.
+ * The detector treats a non-file as "no transcript" too, but only after an
+ * open that a FIFO would block; the host waits for this process to exit, so
+ * that open must never be reached. A missing path is passed through (the
+ * detector's own "no transcript"). Never throws.
+ */
+function regularFileOrNull(transcriptPath: string | null): string | null {
+  if (transcriptPath === null) return null;
+  try {
+    return fs.statSync(transcriptPath).isFile() ? transcriptPath : null;
+  } catch {
+    return transcriptPath;
+  }
+}
+
+/** handleStopCore's body: the Stop output, built before anything is delivered. */
+async function stopCoreOutput(
+  config: StopCoreConfig,
+  payload: Record<string, unknown>,
+  prepareOutcomeFn: typeof prepareOutcome,
+  useCounts: boolean,
+): Promise<HookOutput> {
   await ensureVault(config.vaultPath, { agentId: config.agentId });
   // Stop keeps the defaulted "session" fallback (inbox filename, marker text,
   // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime that
@@ -423,8 +622,10 @@ export async function handleStopCore(
   // On the synthetic fallback, turns that DID stamp a real session_id must
   // still count inside this window — otherwise the receipt reports zeros
   // despite real activity.
-  // No use counts yet: the Stop wiring slice turns them on (sessionReceipt).
-  const receiptOptions = { includeStamped: !rawSessionId, useCounts: false };
+  // Use counts only when the ledger may be on (handleStopCore's one check):
+  // they load the ledger reader. They stand as of this Stop's start: this
+  // turn's own judgments land after delivery, so they show on the next Stop.
+  const receiptOptions = { includeStamped: !rawSessionId, useCounts };
   const workspaceId = workspaceFromPayload(payload, config.defaultWorkspaceId);
   // Task and summary must stay distinct. Falling back to `summary` for the
   // task field made summary-only payloads compose `"<summary>: <summary>"` —
@@ -1269,6 +1470,14 @@ export function createHookHandlers(
         reassert_entries_pending_clear: reassertPendingClear,
         reassert_entries_parked: reassertParked,
         reassert_tails_pending_defer: reassertTailsPendingDefer,
+        // S1b (§8.2 "ledger-off stretches stay visible"): whether this boot
+        // records to the use ledger, and, when it does, the switches in effect
+        // (the capture's own `features`: featuresInEffect's list, from the one
+        // flags read dispatch made). "off" needs no module: dispatch opened no
+        // capture because ledger-gate (or flags.ts) said off, or the capture
+        // module would not load; a direct handler call records nothing either.
+        use_ledger: ledger ? "on" : "off",
+        ...(ledger ? { features: [...ledger.capture.context.features] } : {}),
       },
     });
 
@@ -1909,21 +2118,35 @@ export function createHookHandlers(
     return { continue: true };
   }
 
-  // Stop lives in the shared handleStopCore (above) so the governance posture
-  // has exactly one implementation across all five entrypoints — see its
-  // doc comment for why hook.ts routes here too.
+  // Stop lives in the shared stopCore / handleStopCore (above) so the
+  // governance posture has exactly one implementation across all five
+  // entrypoints — see handleStopCore's doc comment for why hook.ts routes here
+  // too.
   //
   // Issue #253: after the stop breadcrumb / candidate write, deliver any
   // corrections SessionStart parked under inbox/.undeliverable (wires that
   // cannot inject at boot). Ordering is intentional:
-  //   1. handleStopCore first — inbox write / receipt is independent of
+  //   1. the shared Stop core first — inbox write / receipt is independent of
   //      correction delivery and must not be gated on the park dir;
-  //   2. then inject corrections_reassert at Stop when the wire can carry it.
+  //   2. then inject corrections_reassert at Stop when the wire can carry it;
+  //   3. (S1b) the use detector's commit last, after everything above has
+  //      registered its own.
   // "Re-assert at end of turn" is the honest semantics on a platform whose
   // only injectable event is Stop: the model sees the correction before the
   // next turn begins, not at session boot. Prefer acting on them next turn.
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
-    const result = await handleStopCore(config, payload, prepareOutcomeFn);
+    const core = await stopCore(config, payload, prepareOutcomeFn);
+    const output = await stopOutput(payload, core.output);
+    // S1b: the ledger's commits are registered LAST (the detector, then the DF
+    // recount slice). Deferred commits run in registration order and the
+    // detector may take its full 1.5 s cap, so everything Stop consumes or
+    // confirms (a parked correction's archive, a relay cursor) settles first;
+    // the ledger's work only records.
+    if (core.measured) scheduleStopLedgerWork(config, payload);
+    return output;
+  }
+
+  async function stopOutput(payload: Record<string, unknown>, result: HookOutput): Promise<HookOutput> {
 
     let correctionsEnvelope = "";
     // Only attempt when Stop can actually inject — parking only happens when

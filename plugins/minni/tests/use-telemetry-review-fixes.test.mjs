@@ -242,7 +242,7 @@ test("F6: orphaned counts-file temp files older than an hour are swept; links an
   const vault = path.join(root, "vault");
   const runtime = path.join(vault, ".runtime");
   await mkdir(path.join(runtime, "recall-session.d"), { recursive: true });
-  const uuid = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const uuid = "00000000-0000-4000-8000-000000000001";
   const name = (pid) => `prompt-templates.json.${pid}.${uuid}.tmp`;
   const now = Date.now();
   const twoHours = new Date(now - 2 * 60 * 60 * 1000);
