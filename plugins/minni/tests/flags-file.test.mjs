@@ -154,19 +154,51 @@ test("a long-lived importer sees a flip once the file's mtime changes", async (t
 
 test("an unchanged file is parsed once; later calls only stat it", async (t) => {
   const { vault } = await makeVault(t, { MINNI_USE_LEDGER: "off" });
-  const file = path.join(vault, FLAGS_RELPATH);
-  const original = fs.readFileSync;
+  const file = path.resolve(vault, FLAGS_RELPATH);
+  // The reader opens the file and reads the opened descriptor, so count opens
+  // of the flags path and every read of a descriptor opened for it (readSync,
+  // or readFileSync on that fd, or on the path itself).
+  const original = { openSync: fs.openSync, closeSync: fs.closeSync, readSync: fs.readSync, readFileSync: fs.readFileSync };
+  const flagFds = new Set();
   let reads = 0;
-  fs.readFileSync = function (target, ...rest) {
-    if (target === file) reads += 1;
-    return original.call(this, target, ...rest);
+  let fdReads = 0;
+  fs.openSync = function (target, ...rest) {
+    const fd = original.openSync.call(this, target, ...rest);
+    if (typeof target === "string" && path.resolve(target) === file) {
+      reads += 1;
+      flagFds.add(fd);
+    }
+    return fd;
   };
+  fs.closeSync = function (fd, ...rest) {
+    flagFds.delete(fd);
+    return original.closeSync.call(this, fd, ...rest);
+  };
+  fs.readSync = function (fd, ...rest) {
+    if (flagFds.has(fd)) fdReads += 1;
+    return original.readSync.call(this, fd, ...rest);
+  };
+  fs.readFileSync = function (target, ...rest) {
+    if (typeof target === "number" ? flagFds.has(target) : typeof target === "string" && path.resolve(target) === file) {
+      fdReads += 1;
+    }
+    return original.readFileSync.call(this, target, ...rest);
+  };
+  const perCall = [];
   try {
-    for (let i = 0; i < 5; i += 1) assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), false);
+    for (let i = 0; i < 5; i += 1) {
+      const before = { opens: reads, fdReads };
+      assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), false);
+      perCall.push({ opens: reads - before.opens, fdReads: fdReads - before.fdReads });
+    }
   } finally {
-    fs.readFileSync = original;
+    Object.assign(fs, original);
   }
   assert.equal(reads, 1, "one consistent snapshot while the file is unchanged");
+  assert.ok(perCall[0].opens === 1 && perCall[0].fdReads >= 1, `the first call opens and reads the file: ${JSON.stringify(perCall[0])}`);
+  for (const [i, call] of perCall.slice(1).entries()) {
+    assert.deepEqual(call, { opens: 0, fdReads: 0 }, `call ${i + 2} on the unchanged file only stats it`);
+  }
 });
 
 test("a hostile vault path never throws", () => {
