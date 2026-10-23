@@ -12,8 +12,10 @@
 // own: flags are read on synchronous paths, and the hook that loads them decides
 // where the note goes.
 //
-// The file is read once per process (a hook process handles one event), so a
-// hook sees one consistent snapshot even if the file changes under it.
+// The parsed file is cached per vault and revalidated on every call with one
+// statSync: it is re-read only when its mtime (or size) changed. A hook
+// process therefore parses it once, and a long-lived importer (the MCP server,
+// the console) still sees a switch thrown while it runs.
 import fs from "node:fs";
 import path from "node:path";
 
@@ -52,7 +54,14 @@ interface FileFlags {
   notes: string[];
 }
 
-const fileCache = new Map<string, FileFlags>();
+interface CachedFlags extends FileFlags {
+  /** mtime and size of the file when it was parsed, or why it could not be stat'd. */
+  signature: string;
+}
+
+const fileCache = new Map<string, CachedFlags>();
+
+const DEFAULTS_ONLY: FileFlags = { values: {}, notes: [] };
 
 const FLAG_SET: ReadonlySet<string> = new Set(FLAG_NAMES);
 
@@ -140,19 +149,37 @@ function readFileFlags(vaultPath: string): FileFlags {
   return { values, notes };
 }
 
+/** Cheap change detector: one statSync. The read itself re-checks containment. */
+function signatureOf(filePath: string): string {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch (error) {
+    return `missing:${String((error as { code?: unknown } | null)?.code ?? "error")}`;
+  }
+}
+
 function fileFlagsFor(vaultPath: string): FileFlags {
-  const key = path.resolve(vaultPath);
-  let cached = fileCache.get(key);
-  if (!cached) {
+  try {
+    // Inside the try: a non-string or NUL-bearing vault path must mean
+    // defaults, never an exception out of a hook.
+    const key = path.resolve(vaultPath);
+    const signature = signatureOf(path.join(vaultPath, FLAGS_RELPATH));
+    const cached = fileCache.get(key);
+    if (cached && cached.signature === signature) return cached;
+    let parsed: FileFlags;
     try {
-      cached = readFileFlags(vaultPath);
+      parsed = readFileFlags(vaultPath);
     } catch {
       // Never let a flags read fail a hook: an unreadable file means defaults.
-      cached = { values: {}, notes: [`flags: ${FLAGS_RELPATH} could not be read; using defaults`] };
+      parsed = { values: {}, notes: [`flags: ${FLAGS_RELPATH} could not be read; using defaults`] };
     }
-    fileCache.set(key, cached);
+    const entry: CachedFlags = { ...parsed, signature };
+    fileCache.set(key, entry);
+    return entry;
+  } catch {
+    return DEFAULTS_ONLY;
   }
-  return cached;
 }
 
 /**

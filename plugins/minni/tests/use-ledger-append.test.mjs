@@ -13,13 +13,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import * as ledger from "../dist/use-ledger.js";
 import {
   appendLedgerRows,
+  buildJudgedRow,
   buildSurfacedRow,
   buildTurnRow,
   ledgerFilePath,
   MAX_ROW_BYTES,
-  readLedgerFile,
   readSessionLedger,
 } from "../dist/use-ledger.js";
 
@@ -89,12 +90,15 @@ test("each row is one write() and one newline-terminated line", async (t) => {
 
 test("no row exceeds 4 KB: oversized hash lists are clipped, unclippable rows rejected", async (t) => {
   const { vault } = await makeVault(t);
+  // Hash lists are capped at 64 each, so a row over 4 KB needs a long key as
+  // well: with both lists full it overflows, and without them it fits.
   const many = Array.from({ length: 400 }, (_, i) => i.toString(16).padStart(16, "0"));
+  const longKey = `vault:wiki/${"k".repeat(2_000)}.md`;
   const clippable = buildSurfacedRow(
     CTX,
     {
       channel: "prompt_pointer",
-      mkey: "vault:wiki/a.md",
+      mkey: longKey,
       handles: ["m:00000000"],
       title: "A",
       rank: 1,
@@ -105,6 +109,9 @@ test("no row exceeds 4 KB: oversized hash lists are clipped, unclippable rows re
     },
     TS,
   );
+  assert.equal(clippable.shingles.length, 64, "a hash list is capped at 64 entries");
+  assert.equal(clippable.echo.length, 64);
+  assert.ok(Buffer.byteLength(`${JSON.stringify(clippable)}\n`, "utf8") > MAX_ROW_BYTES, "the fixture really overflows");
   const unclippable = buildSurfacedRow(
     CTX,
     {
@@ -131,7 +138,7 @@ test("no row exceeds 4 KB: oversized hash lists are clipped, unclippable rows re
     assert.ok(Buffer.byteLength(`${line}\n`, "utf8") <= MAX_ROW_BYTES, "every line fits the bound");
   }
   const kept = JSON.parse(lines[0]);
-  assert.equal(kept.mkey, "vault:wiki/a.md");
+  assert.equal(kept.mkey, longKey);
   assert.equal(kept.clipped, true);
   assert.equal(kept.shingles, undefined);
   assert.equal(kept.echo, undefined);
@@ -146,7 +153,7 @@ test("a torn last line and a malformed line are skipped by the reader", async (t
   appendLedgerRows(vault, [turn(3)]);
   await writeFile(file, '{"v":5,"kind":"turn","session_key":"0123', { flag: "a" });
 
-  const { rows, skipped } = readLedgerFile(file);
+  const { rows, skipped } = readSessionLedger(vault, CTX.session_key);
   assert.deepEqual(rows.map((row) => row.turn_ix), [1, 2, 3]);
   assert.equal(skipped, 2);
 
@@ -156,11 +163,123 @@ test("a torn last line and a malformed line are skipped by the reader", async (t
   appendLedgerRows(vault, [turn(4)]);
   const full = JSON.stringify(turn(5));
   await writeFile(file, full, { flag: "a" });
-  const again = readLedgerFile(file);
+  const again = readSessionLedger(vault, CTX.session_key);
   assert.deepEqual(again.rows.map((row) => row.turn_ix), [1, 2, 3, 4]);
+});
 
-  const session = readSessionLedger(vault, CTX.session_key);
-  assert.deepEqual(session.rows.map((row) => row.turn_ix), [1, 2, 3, 4]);
+test("a short write is terminated, so it costs one row, not two", async (t) => {
+  const { vault } = await makeVault(t);
+  // Row 2's write lands only half its bytes. Unterminated, those bytes would
+  // fuse with row 3's O_APPEND write into one malformed line, losing both.
+  const original = fs.writeSync;
+  let calls = 0;
+  fs.writeSync = function (...args) {
+    calls += 1;
+    if (calls === 2 && Buffer.isBuffer(args[1])) {
+      const [fd, buffer] = args;
+      return original.call(this, fd, buffer, 0, Math.floor(buffer.length / 2));
+    }
+    return original.apply(this, args);
+  };
+  let result;
+  try {
+    result = appendLedgerRows(vault, [turn(1), turn(2), turn(3)]);
+  } finally {
+    fs.writeSync = original;
+  }
+  assert.equal(result.written, 2);
+  assert.equal(result.failed, 1);
+
+  const { rows, skipped } = readSessionLedger(vault, CTX.session_key);
+  assert.deepEqual(rows.map((row) => row.turn_ix), [1, 3], "the row after a short write survives");
+  assert.equal(skipped, 1, "the short write costs exactly one line");
+});
+
+test("hash lists keep only 16-hex hashes; caller text never reaches a row", () => {
+  const row = buildSurfacedRow(
+    CTX,
+    {
+      channel: "prompt_pointer",
+      mkey: "vault:wiki/a.md",
+      handles: ["m:0123abcd", "d:p:42", "free text pretending to be a handle"],
+      title: "A",
+      rank: 1,
+      visible: true,
+      delivered: true,
+      shingles: ["0123456789abcdef", "SECRET body text", "0123456789ABCDEF", "0123456789abcdef0", 7],
+      echo: ["fedcba9876543210", "an injected SECRET sentence"],
+    },
+    TS,
+  );
+  assert.deepEqual(row.shingles, ["0123456789abcdef"]);
+  assert.deepEqual(row.echo, ["fedcba9876543210"]);
+  assert.deepEqual(row.handles, ["m:0123abcd", "d:p:42"]);
+  assert.ok(!JSON.stringify(row).includes("SECRET"));
+  assert.ok(!JSON.stringify(row).includes("pretending"));
+});
+
+test("judged evidence is a bounded enum, never free text", () => {
+  const judged = buildJudgedRow(
+    CTX,
+    {
+      sid: "0123456789abcdef",
+      outcome: "cited",
+      via: "title",
+      evidence: ["title", "handle", "the reply said SECRET verbatim", "title", "lexicon", "shingle", "open", 3],
+      title_assessable: true,
+      final: true,
+      rule_version: 1,
+    },
+    TS,
+  );
+  assert.deepEqual(judged.evidence, ["title", "handle", "lexicon", "shingle", "open"]);
+  assert.ok(!JSON.stringify(judged).includes("SECRET"));
+
+  for (const evidence of ["handle", { handle: true }, null, undefined]) {
+    const row = buildJudgedRow(
+      CTX,
+      { sid: "0123456789abcdef", outcome: "ignored", via: "none", evidence, title_assessable: false, final: false, rule_version: 1 },
+      TS,
+    );
+    assert.deepEqual(row.evidence, [], `non-array evidence ${JSON.stringify(evidence)}`);
+  }
+});
+
+test("turn rows say whether the scheduled-template rule ran, and never carry its hash", () => {
+  const on = buildTurnRow(
+    CTX,
+    { turn_ix: 1, envelope_kind: "human", subkind: null, exit: "pointer", template_rule: "on", rule_id: "sched-template-v1" },
+    TS,
+  );
+  assert.equal(on.template_rule, "on");
+  assert.equal(on.rule_id, "sched-template-v1");
+
+  const off = buildTurnRow(CTX, { turn_ix: 2, envelope_kind: "human", subkind: null, exit: "pointer", template_rule: "off" }, TS);
+  assert.equal(off.template_rule, "off");
+  assert.equal("rule_id" in off, false);
+
+  // Absent or junk values are left out rather than guessed.
+  const absent = buildTurnRow(CTX, { turn_ix: 3, envelope_kind: "human", subkind: null, exit: "pointer" }, TS);
+  assert.equal("template_rule" in absent, false);
+  assert.equal("rule_id" in absent, false);
+  const junk = buildTurnRow(
+    CTX,
+    { turn_ix: 4, envelope_kind: "human", subkind: null, exit: "pointer", template_rule: "ON", rule_id: "has spaces and SECRET text" },
+    TS,
+  );
+  assert.equal("template_rule" in junk, false);
+  assert.equal("rule_id" in junk, false);
+
+  // The turn row's keys are exactly the common fields plus these: no template hash.
+  assert.deepEqual(Object.keys(on).sort(), [
+    "agent_key", "build", "envelope_kind", "exit", "features", "kind", "principal", "rule_id",
+    "session_key", "subkind", "template_rule", "ts", "turn_ix", "v", "wire",
+  ]);
+});
+
+test("the per-file reader is not exported: reads go through the contained session reader", () => {
+  assert.equal(ledger.readLedgerFile, undefined);
+  assert.equal(typeof ledger.readSessionLedger, "function");
 });
 
 test("a symlinked .runtime that escapes the vault is refused, and nothing is created outside", async (t) => {

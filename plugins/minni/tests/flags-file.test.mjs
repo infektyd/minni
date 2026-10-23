@@ -6,7 +6,8 @@
 // var as an override. Parsing is strict (only "on"/"off"), every flag defaults
 // on, and the file read refuses symlink escapes exactly like readRecallState.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import fs from "node:fs";
+import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -126,11 +127,51 @@ test("a flags.json that is itself a symlink is refused", async (t) => {
   assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), true);
 });
 
-test("the file is read once per process", async (t) => {
-  const { vault } = await makeVault(t, { MINNI_USE_LEDGER: "off" });
-  assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), false);
-  await writeFile(path.join(vault, FLAGS_RELPATH), JSON.stringify({ MINNI_USE_LEDGER: "on" }), "utf8");
-  assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), false, "a hook process sees one consistent snapshot");
-  resetFlagsCacheForTests();
+test("a long-lived importer sees a flip once the file's mtime changes", async (t) => {
+  const { vault } = await makeVault(t, { MINNI_USE_LEDGER: "on" });
+  const file = path.join(vault, FLAGS_RELPATH);
   assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), true);
+
+  await writeFile(file, JSON.stringify({ MINNI_USE_LEDGER: "off" }), "utf8");
+  const later = new Date(Date.now() + 5_000);
+  await utimes(file, later, later);
+  assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), false, "the server process sees the kill switch");
+
+  // And back on, without any cache reset.
+  await writeFile(file, JSON.stringify({ MINNI_USE_LEDGER: "on" }), "utf8");
+  const later2 = new Date(Date.now() + 10_000);
+  await utimes(file, later2, later2);
+  assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), true);
+
+  // Deleting the file returns every flag to its default.
+  await writeFile(file, JSON.stringify({ MINNI_USE_LEDGER: "off" }), "utf8");
+  const later3 = new Date(Date.now() + 15_000);
+  await utimes(file, later3, later3);
+  assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), false);
+  await rm(file);
+  assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), true);
+});
+
+test("an unchanged file is parsed once; later calls only stat it", async (t) => {
+  const { vault } = await makeVault(t, { MINNI_USE_LEDGER: "off" });
+  const file = path.join(vault, FLAGS_RELPATH);
+  const original = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function (target, ...rest) {
+    if (target === file) reads += 1;
+    return original.call(this, target, ...rest);
+  };
+  try {
+    for (let i = 0; i < 5; i += 1) assert.equal(flagOn(vault, "MINNI_USE_LEDGER", {}), false);
+  } finally {
+    fs.readFileSync = original;
+  }
+  assert.equal(reads, 1, "one consistent snapshot while the file is unchanged");
+});
+
+test("a hostile vault path never throws", () => {
+  for (const vaultPath of [undefined, null, 42, {}, "\0bad"]) {
+    assert.doesNotThrow(() => flagOn(vaultPath, "MINNI_USE_LEDGER", {}));
+    assert.equal(flagOn(vaultPath, "MINNI_USE_LEDGER", {}), true, String(vaultPath));
+  }
 });
