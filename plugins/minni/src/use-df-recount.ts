@@ -30,13 +30,15 @@
 //     arrays: compact, and cheap to parse), is read once and replaced once per
 //     slice, atomically. The snapshot is written (`writeDfSnapshot`, temp +
 //     rename) only when a pass completes; the partial is then removed.
-//   - `.runtime/df-recount.json` = `{v, kind, listed, checked_at}` holds the
-//     early trigger's baseline (the listed count of the last completed pass)
-//     and the time of the last daily check.
-//   - A slice is capped at about 50 ms of wall time, from its very start (the
-//     partial read included), with counting stopped 10 ms early to keep time
-//     for the partial write; one note's work is the slack. A pass's first slice
-//     spends most of its share on the listing.
+//   - `.runtime/df-recount.json` = `{v, kind, listed, checked_at, empty_at?}`
+//     holds the early trigger's baseline (the listed count of the last
+//     completed pass), the time of the last daily check, and when a pass last
+//     found no countable note (which parks the cadence for a week).
+//   - A slice's counting window is capped at 40 ms of its 50 ms, and starts
+//     AFTER setup: the partial read, the per-slice note count, and on a pass's
+//     first slice the one walk of the vault, none of which the cap bounds. The
+//     remaining 10 ms are kept for the partial write; one note's work is the
+//     slack, and every slice counts at least one note.
 //   - A corrupt or foreign partial or state file restarts cleanly. A path a
 //     safe write cannot replace (a symlink, a directory) makes the slice do
 //     nothing. A partial too large to keep parks the pass for a week, so a
@@ -247,7 +249,10 @@ function passStateIn(raw: unknown): PassState | null {
   }
   for (let i = 0; i < tokens.length; i += 1) {
     const count = counts[i];
-    if (typeof tokens[i] !== "string" || !Number.isSafeInteger(count) || (count as number) < 1) return null;
+    // A token cannot appear in more notes than the pass has counted.
+    if (typeof tokens[i] !== "string" || !Number.isSafeInteger(count) || (count as number) < 1 || (count as number) > (notes as number)) {
+      return null;
+    }
   }
   return {
     v: 2,
@@ -358,8 +363,10 @@ export async function runDfRecountSlice(
       // Is a pass due? The snapshot's age first (one lstat), then, at most
       // daily, the note count (a directory listing, no note read).
       const age = snapshotAge(snapshotFile, now);
+      // A pass that found no countable note parks the cadence for a week,
+      // whether or not an older snapshot still exists (only the trigger wakes it).
       const parkedEmpty =
-        age === null && state?.empty_at !== undefined && now - state.empty_at < DF_SNAPSHOT_MAX_AGE_MS && state.empty_at <= now + FUTURE_SLACK_MS;
+        state?.empty_at !== undefined && now - state.empty_at < DF_SNAPSHOT_MAX_AGE_MS && state.empty_at <= now + FUTURE_SLACK_MS;
       let reason: "age" | "trigger" | null =
         !parkedEmpty && (age === null || age >= DF_SNAPSHOT_MAX_AGE_MS || age <= -FUTURE_SLACK_MS) ? "age" : null;
       // A pass the vault outgrew restarts at once: the count has moved past the trigger.

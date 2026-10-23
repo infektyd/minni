@@ -312,11 +312,18 @@ another resume):
   - Each sweep checks the shared deadline before every item. A sweep that finds it passed does nothing and
     resumes next time from its own cursor. Every sweep still progresses across runs: each caps its own work
     per run, and after a complete pass waits a day.
-  - The cap can be overrun by one item's work: the item in progress when the deadline passes (one
-    directory's removal, or one session's close-and-remove). A run that finds a finalize candidate on a spent
-    budget still takes the first one, so it makes progress.
+  - The cap can be overrun in two ways:
+    - Before the close: by the item in progress when the deadline passes (one directory's removal, or the
+      scan of one session).
+    - After the close: by every removal it makes necessary. Each candidate the close examined and closed is
+      removed in the same run whatever the clock says (§4.3 "Retention"), so the overrun there is up to 20
+      renames and removals.
+    - The close itself stops between sessions on its own budget, and on a spent budget still takes the first
+      candidate, so a run makes progress.
   - The ledger scan keeps half its share of the budget for its candidates.
-  - `use-retention.test.mjs` pins the total on a fake clock.
+  - `use-retention.test.mjs` pins the total on a fake clock that counts clock readings. The removals after
+    the close read no clock, so that pin cannot see them; their cost is bounded by their count (at most 20),
+    not by the clock.
 - **Per-session side files (S1a-2).** `.runtime/recall-session.d/<session_key>/` holds the capture state that
   is not a ledger row. Every directory is reached through the ledger's containment walk, and every file is
   replaced through a temp name and a rename. None of them holds text.
