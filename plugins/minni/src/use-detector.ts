@@ -85,7 +85,7 @@ import {
 } from "./use-ledger.js";
 import { assertWriteTargetUnder } from "./vault.js";
 
-export const DETECTOR_RULE_VERSION = "s1b-3";
+export const DETECTOR_RULE_VERSION = "s1b-4";
 /** Detector state root under the vault. */
 export const DETECTOR_RELDIR = path.join(".runtime", "use-detector");
 /** Token document frequencies, written by UPS from its own vault scan. */
@@ -124,6 +124,8 @@ const FAST_SCAN_CHUNK = 256 * 1024;
 const DISMISSAL_PREFIX_CHARS = 300;
 const MIN_TITLE_TOKENS = 3;
 const MIN_SLUG_CHARS = 8;
+/** A title shorter than this is too generic to open a memory by substring. */
+const MIN_TITLE_SUBSTRING_CHARS = 8;
 const SESSION_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const AGENT_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const TX_KEY_RE = /^[0-9a-f]{16}$/;
@@ -1020,6 +1022,8 @@ interface ToolAct {
   shingles: Set<string>;
   filePath?: string;
   command?: string;
+  /** A minni_recall's query. */
+  query?: string;
   minni: "recall" | "drill" | null;
 }
 
@@ -1119,13 +1123,19 @@ function textAct(raw: string): TextAct {
   for (const match of text.matchAll(WORD_RE)) {
     const offset = match.index as number;
     while (sentence < realBreaks.length && (realBreaks[sentence] as number) < offset) sentence += 1;
-    const word = match[0].toLowerCase();
-    if (!insideSpan(offset)) {
-      keptWords.push(word);
-      keptRaw.push(rawWords.length);
-      keptSentence.push(sentence);
+    const kept = !insideSpan(offset);
+    // The ledger lowercases, then matches. Lowercasing can split a word
+    // ("İ" -> "i" + U+0307, which the word rule does not match), so each
+    // lowercased match is re-split by the same rule: identical words, and a
+    // raw index for every piece.
+    for (const word of match[0].toLowerCase().match(WORD_RE) ?? []) {
+      if (kept) {
+        keptWords.push(word);
+        keptRaw.push(rawWords.length);
+        keptSentence.push(sentence);
+      }
+      rawWords.push(word);
     }
-    rawWords.push(word);
   }
   const rawWindows: Array<string | null> = [];
   const shingles = new Set<string>();
@@ -1204,6 +1214,7 @@ function toolAct(name: string, input: unknown): ToolAct {
   if (isRecord(input)) {
     if (typeof input.file_path === "string") act.filePath = input.file_path;
     if (typeof input.command === "string") act.command = input.command;
+    if (typeof input.query === "string") act.query = input.query.slice(0, MAX_INPUT_CHARS);
   }
   return act;
 }
@@ -1228,6 +1239,8 @@ interface Profile {
   /** Vault-relative path, for Read opens. */
   rel: string | null;
   doc: { src: string; id: string } | null;
+  /** The full sanitized title, bounded and case-insensitive: a minni_recall query naming it opens it. */
+  titleRe: RegExp | null;
 }
 
 /** `name` not inside a longer name: no name character on either side. */
@@ -1247,7 +1260,15 @@ function profileFor(core: MemoryCore, df: DfSnapshot | null): Profile {
     slugRe: null,
     rel: null,
     doc: null,
+    titleRe: null,
   };
+  const fullTitle = core.title.normalize("NFKC").trim();
+  if (fullTitle.length >= MIN_TITLE_SUBSTRING_CHARS) {
+    profile.titleRe = new RegExp(
+      `(?<![\\p{L}\\p{N}])${fullTitle.split(/\s+/).map(escapeRegExp).join("\\s+")}(?![\\p{L}\\p{N}])`,
+      "iu",
+    );
+  }
   if (df) {
     profile.title = useTokens(core.title)
       .filter((token) => (df.df.get(token) ?? 0) <= df.threshold)
@@ -1315,7 +1336,19 @@ function pathNames(filePath: string, rel: string): boolean {
   return normalized === rel || normalized.endsWith(`/${rel}`);
 }
 
-function opens(profile: Profile, act: ToolAct): boolean {
+/**
+ * A minni_recall query that cites the memory's title opens it, in both
+ * windows (before has only the title to recall by): the same title rule as a
+ * citation (3 distinctive, prompt-filtered title tokens, handle forms
+ * removed), or the full sanitized title as a substring.
+ */
+function recallCitesTitle(profile: Profile, query: string, title: ReadonlyArray<{ token: string }> | null): boolean {
+  if (profile.titleRe?.test(query.normalize("NFKC"))) return true;
+  if (!title || title.length < MIN_TITLE_TOKENS) return false;
+  return citesTitle(title, [new Set(textAct(query).keptWords.filter((word) => word.length >= 3))]);
+}
+
+function opens(profile: Profile, act: ToolAct, title: ReadonlyArray<{ token: string }> | null): boolean {
   const base = act.name.split("__").pop() ?? act.name;
   if (profile.rel) {
     if (base === "Read" && act.filePath && pathNames(act.filePath, profile.rel)) return true;
@@ -1325,6 +1358,7 @@ function opens(profile: Profile, act: ToolAct): boolean {
   }
   if (act.minni) {
     if (profile.names.some((re) => re.test(act.leaves))) return true;
+    if (act.minni === "recall" && recallCitesTitle(profile, act.query ?? act.leaves, title)) return true;
     if (profile.doc) {
       const lines = act.leaves.split("\n");
       if (lines.includes(profile.doc.id) && lines.includes(profile.doc.src)) return true;
@@ -1363,7 +1397,7 @@ function observe(
     }
   } else {
     if (hitsShingle(profile, act.shingles, true, promptShingles)) acc.applied = true;
-    if (opens(profile, act)) {
+    if (opens(profile, act, title)) {
       // Naming a handle and then opening it is the open, not a citation. A
       // title citation stands: it is identifier-free evidence in both windows,
       // and each window opens its own way (recall by title, drill by handle).

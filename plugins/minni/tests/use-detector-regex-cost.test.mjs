@@ -41,6 +41,8 @@ const ADVERSARIAL = {
   "m handles": repeatTo("m:", LONG),
   "learning refs": `learning${repeatTo(" ", LONG)}`,
   "evidence tags": repeatTo('<EVIDENCE source="', LONG),
+  "evidence, no source": repeatTo("<EVIDENCE x", LONG),
+  "evidence, open value": `<EVIDENCE source="${repeatTo("a", LONG)}`,
   "score parens": repeatTo("(score=", LONG),
   "slashes": repeatTo("/", LONG),
   "md dots": repeatTo("a.md.", LONG),
