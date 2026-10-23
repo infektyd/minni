@@ -26,7 +26,7 @@ do and the `MINNI_SKIP_HOOKS` escape hatch.
 ## The commands you'll actually run
 
 ```bash
-make check    # fast gate: lint + typecheck + plugin build/test + scoped engine pytest (stamps .git/.proven-shas)
+make check    # fast gate: lint + typecheck + public content scan + plugin build/test + scoped engine pytest (stamps .git/.proven-shas)
 make attest   # full rootside attestation: make check + make smoke + check-versions --repo-only + check-public-boundary.sh
 make promote  # verify HEAD's tree-SHA in .git/.proven-shas, push main to origin, and sync-root
 make test     # full suites (engine pytest + plugin test, including e2e_real_minnid.test.mjs) — heavier, loads embedding/FAISS models
@@ -37,6 +37,14 @@ Prefer the Make targets above: they set `PYTHONPATH=src` so a git worktree
 does not silently import `minni` from another checkout's editable install
 (#258). If you run bare pytest, use `PYTHONPATH=src .venv/bin/python -m pytest …`
 from the repo root (scoped agent runs included).
+
+The public content scan (`scripts/check-public-content.sh`: home paths, deep
+vault paths, plan ids and credential shapes inside tracked files) runs over the
+whole tree in CI and in `make check`. `.githooks/pre-push` runs it in range mode
+(`--pre-push`), scanning only the lines the push adds, because CI runs after the
+push. The receipt fast path keeps only the path check
+(`scripts/check-public-boundary.sh`). It is defence in depth on top of the
+local commit hook.
 
 `make check` is the fast validation gate and stamps `HEAD`'s tree-SHA into
 `.git/.proven-shas` via `scripts/promote-proven.sh`. The `.githooks/pre-push`

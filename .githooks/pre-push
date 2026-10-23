@@ -42,6 +42,12 @@ fi
 if [ -f "scripts/check-migrations.sh" ]; then
   bash scripts/check-migrations.sh
 fi
+# Content check of only the lines this push adds (a range scan, well under a
+# second); on a public repo CI runs after the push. The full-tree content scan
+# runs in CI and in `make check`.
+if [ -f "scripts/check-public-content.sh" ]; then
+  printf '%s\n' "$stdin_payload" | bash scripts/check-public-content.sh --pre-push "${1:-origin}"
+fi
 
 git_dir="$(git rev-parse --git-dir)"
 receipt_file="${git_dir}/.proven-shas"

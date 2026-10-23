@@ -634,7 +634,7 @@ const WORD_REGEX_CACHE_LIMIT = 512;
 // But "no bindable anchor" is not the same as "no lexical content", and
 // rejecting on the edges alone silently DELETED every path-shaped term.
 // queryTerms tokenises `/` (`[a-z0-9_/-]{2,}`), so `/api/` and
-// `/users/hans/projects/` arrive here as ordinary terms with both edges `/`;
+// `/users/someuser/projects/` arrive here as ordinary terms with both edges `/`;
 // they were dropped, and a query for a literal path returned nothing even
 // against a note containing it verbatim. Anchoring cannot help them — every
 // position adjacent to their alphanumeric runs is a separator they carry

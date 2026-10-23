@@ -164,6 +164,7 @@ coverage-engine:
 # static gates plus a scoped engine pytest (not the full model-loading suite).
 .PHONY: check
 check: lint typecheck build
+	@bash scripts/check-public-content.sh
 	cd $(PLUGIN_DIR) && npm test
 	PYTHONPATH=src:$$PYTHONPATH $(VENV_PY) -m pytest $(CHECK_PYTEST)
 	@bash scripts/promote-proven.sh --stamp-only make-check

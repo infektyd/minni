@@ -132,10 +132,16 @@ jobs:
 
           echo "✓ No forbidden files in PR diff."
 
+      - name: Git version (content scan needs >= 2.42; fails closed below)
+        run: git --version
+
       - name: Public boundary & migration guard
         run: |
           bash scripts/check-public-boundary.sh
           bash scripts/check-migrations.sh
+
+      - name: Public content scan
+        run: bash scripts/check-public-content.sh
 
       - name: Require the content gate verdict
         # Deliberately NOT a duplicate of the content job: it re-publishes that

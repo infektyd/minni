@@ -2064,7 +2064,7 @@ export function createHookHandlers(
     return render(injectIntent("PreCompact", envelope));
   }
 
-  // Post-compaction summary delivery (plan-3e5a410b9ab6f715). Platforms whose
+  // Post-compaction summary delivery (plan-<id>). Platforms whose
   // bridge can read the finished summary back (Kilo: session.compacted event +
   // SDK read-back in the native plugin) deliver it here; the hook stores the
   // RAW text as a compact_summary inbox file and the daemon's AFM-loop

@@ -4,7 +4,7 @@
 - **Author:** claude-code (with operator)
 - **Status:** Draft for review
 - **Branch:** `feat/membench-harness`
-- **Plan / slice:** `plan-b46896893de24598`, slice **s0** (design spec only — no code, no scaffolding, this document is the sole deliverable)
+- **Plan / slice:** `plan-<id>`, slice **s0** (design spec only — no code, no scaffolding, this document is the sole deliverable)
 - **Scope of this doc:** the *complete methodology contract* for membench. Implementation of `bench/` is later slices (s1–s7). This spec is what the skeptic reviews before any code exists.
 
 ---

@@ -626,7 +626,7 @@ function queueContext(sessionID, result) {
   evictOldest(pending, PENDING_MAX, "pending context");
 }
 
-// Post-compaction summary read-back (plan-3e5a410b9ab6f715). Kilo's
+// Post-compaction summary read-back (plan-<id>). Kilo's
 // experimental.session.compacting hook fires BEFORE the summary exists and its
 // input is {sessionID} only (verified against the installed 7.1.0 bundle — the
 // docs describe a richer shape that is not present locally). The summary is

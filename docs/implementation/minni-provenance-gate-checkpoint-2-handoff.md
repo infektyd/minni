@@ -1,6 +1,6 @@
 # Minni provenance gate checkpoint 2 handoff
 
-Plan: `plan-fdf220b75b172595`
+Plan: `plan-<id>`
 Branch: `feat/minni-provenance-gate`
 Implementer: codex
 Verifier/coordinator: claude-code
