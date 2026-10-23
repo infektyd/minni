@@ -145,9 +145,9 @@ export function hookEnv(fixture, extra = {}) {
 }
 
 /** Run `dist/<bin> <event>` with `payload` on stdin; resolves with the parsed last stdout line. */
-export function runHook(fixture, event, payload, { env = {}, bin = "hook.js", dist = DEFAULT_DIST } = {}) {
+export function runHook(fixture, event, payload, { env = {}, bin = "hook.js", dist = DEFAULT_DIST, nodeArgs = [] } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(dist, bin), event], {
+    const child = spawn(process.execPath, [...nodeArgs, path.join(dist, bin), event], {
       env: hookEnv(fixture, env),
       stdio: ["pipe", "pipe", "pipe"],
     });

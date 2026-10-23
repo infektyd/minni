@@ -8,8 +8,9 @@
 // The hard rule: capture only RECORDS. Nothing here changes a byte of hook
 // output, and nothing here throws into a hook. Every write is best effort; a
 // write that fails is not made (the ledger counts its own failures). With
-// MINNI_USE_LEDGER off, `openDispatchCapture` returns null and no file of any
-// kind is written.
+// MINNI_USE_LEDGER off this module is not even loaded (ledger-gate.ts), and if
+// flags.ts says off after all, `openLedgerSession` opens no capture: no file
+// of any kind is written.
 //
 // Files, all under <vault>/.runtime, every directory walked with the ledger's
 // containment check (a component that is a symlink out of the vault is
@@ -20,8 +21,11 @@
 //       strong UPS armed the guard with, so a deny can key the hits it lists
 //       (the recall-state file holds only titles and wikilinks, and a wikilink
 //       does not name one memory: §4.2)
+//   recall-session.d/.sweep.json                      the retention sweep's cursor
 //   prompt-templates.json                             the classifier's counts
 //       (harness-envelope.ts; UPS is its only writer)
+// Session directories idle for 90 days are removed by a bounded sweep after a
+// SessionStart is delivered (`scheduleSessionSweep`).
 //
 // Privacy: rows hold keys, hashes and sanitized titles only. The prompt text and
 // its template hash never reach the ledger.
@@ -32,13 +36,15 @@ import path from "node:path";
 import { stableStringify } from "./agent_envelope.js";
 import { extractLearningsSection } from "./daemon_transport.js";
 import type { JsonResult, ReadContextResponse, RecallResponse } from "./daemon_transport.js";
-import { FLAG_NAMES } from "./flags.js";
+import { FLAG_NAMES, loadFlags } from "./flags.js";
 import type { FlagSnapshot } from "./flags.js";
 import { classifyPromptEnvelope, readPromptTemplates, recordOccurrence } from "./harness-envelope.js";
 import type { PromptTemplateEntry, PromptTemplatesFile } from "./harness-envelope.js";
 import { wireCapabilities } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
+import { deferUntilDelivered } from "./hook-delivery.js";
 import { asString } from "./hook-utils.js";
+import { LEDGER_EVENTS } from "./ledger-gate.js";
 import { extractStrongRecall, sanitizeRecallField } from "./recall-state.js";
 import type { RecallState, StrongRecall } from "./recall-state.js";
 import {
@@ -71,15 +77,6 @@ const GUARD_LISTED_HITS = 5;
 const MAX_PID_CHARS = 128;
 const RECENT_LEARNING_CONTENT_MAX = 4000;
 
-/** Events that open a capture: the ones that surface, count a turn, or reset. */
-const CAPTURE_EVENTS: ReadonlySet<string> = new Set([
-  "SessionStart",
-  "UserPromptSubmit",
-  "PreToolUse",
-  "PreCompact",
-  "PostCompact",
-]);
-
 /** One hook event's capture: who is recording, and what the wire can show. */
 export interface UseCapture {
   readonly vaultPath: string;
@@ -110,12 +107,30 @@ function errorCode(error: unknown): unknown {
 // Opening a capture; the flags (§8.2)
 // ---------------------------------------------------------------------------
 
+/** A dispatched event's flags (read once) and its capture, when it has one. */
+export interface LedgerSession {
+  flags: FlagSnapshot;
+  capture: UseCapture | null;
+}
+
 /**
- * The capture for one dispatched event, or null when the event captures
- * nothing or MINNI_USE_LEDGER is off. Reads nothing but the payload and the
- * already-loaded flags. Never throws.
+ * The flags for this hook process (read once, through flags.ts) and the
+ * capture for one dispatched event: null when the event captures nothing or
+ * flags.ts says MINNI_USE_LEDGER is off. hook-handlers.ts only loads this
+ * module once ledger-gate.ts has said the ledger may be on. Never throws.
  */
-export function openDispatchCapture(args: {
+export function openLedgerSession(args: {
+  vaultPath: string;
+  event: string;
+  payload: Record<string, unknown>;
+  wire: PlatformWire;
+  principal: string;
+}): LedgerSession {
+  const flags = loadFlags(args.vaultPath);
+  return { flags, capture: openCapture({ ...args, flags }) };
+}
+
+function openCapture(args: {
   vaultPath: string;
   event: string;
   payload: Record<string, unknown>;
@@ -124,7 +139,7 @@ export function openDispatchCapture(args: {
   flags: FlagSnapshot;
 }): UseCapture | null {
   try {
-    if (!CAPTURE_EVENTS.has(args.event)) return null;
+    if (!LEDGER_EVENTS.has(args.event)) return null;
     if (args.flags.values.MINNI_USE_LEDGER !== "on") return null;
     const features = FLAG_NAMES.filter((name) => args.flags.values[name] === "on").sort();
     const context = ledgerContextFrom(args.payload, {
@@ -792,4 +807,162 @@ export function captureGuardDeny(capture: UseCapture | undefined, state: RecallS
   } catch {
     // Best effort.
   }
+}
+
+// ---------------------------------------------------------------------------
+// Retention of recall-session.d (§4.3 "Retention", §6.2.5)
+// ---------------------------------------------------------------------------
+
+/** A session directory idle this long is removed: the ledger's own retention horizon. */
+export const SESSION_IDLE_MAX_MS = 90 * 24 * 60 * 60 * 1000;
+/** After a complete pass, the next sweep waits this long. */
+export const SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** Cooperative budget for one run (§6.2.5): checked at every item boundary. */
+export const SWEEP_BUDGET_MS = 150;
+/** At most this many directories are removed per run (§4.3). */
+export const SWEEP_MAX_REMOVALS = 20;
+/** A session directory holding more entries than this is never judged idle (bounds the lstat calls). */
+const SWEEP_MAX_ENTRIES_PER_DIR = 256;
+const SWEEP_STATE_FILE = ".sweep.json";
+const TRASH_RE = /^\.trash-\d{1,16}-[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+interface SweepState {
+  v: 1;
+  /** No new pass starts before this (epoch ms). */
+  next_after: number;
+  /** The last name a cut-off pass handled; the next run resumes after it. */
+  cursor: string | null;
+}
+
+export interface SweepResult {
+  removed: number;
+  scanned: number;
+  /** The pass reached the end of the directory. */
+  complete: boolean;
+  /** Nothing to do: no directory yet, or the last complete pass is too recent. */
+  skipped: boolean;
+}
+
+function sweepStateIn(raw: unknown): SweepState | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const value = raw as Record<string, unknown>;
+  if (value.v !== 1 || typeof value.next_after !== "number" || !Number.isFinite(value.next_after)) return undefined;
+  const cursor = value.cursor;
+  if (cursor !== null && !(typeof cursor === "string" && (SESSION_KEY_RE.test(cursor) || TRASH_RE.test(cursor)))) {
+    return undefined;
+  }
+  return { v: 1, next_after: value.next_after, cursor };
+}
+
+/** Whether every entry of a session directory (and the directory) is older than the horizon. */
+function isIdleSessionDir(dir: string, dirStat: fs.Stats, now: number): boolean {
+  let newest = dirStat.mtimeMs;
+  const entries = fs.readdirSync(dir);
+  if (entries.length > SWEEP_MAX_ENTRIES_PER_DIR) return false;
+  for (const entry of entries) {
+    newest = Math.max(newest, fs.lstatSync(path.join(dir, entry)).mtimeMs);
+  }
+  return now - newest > SESSION_IDLE_MAX_MS;
+}
+
+/** Handle one name; true when a directory was removed. Never follows a symlink. */
+function sweepOne(root: string, name: string, now: number): boolean {
+  const target = path.join(root, name);
+  const stat = fs.lstatSync(target);
+  // A symlink or a plain file is never followed and never removed.
+  if (!stat.isDirectory()) return false;
+  if (TRASH_RE.test(name)) {
+    // A run cut off between its rename and its removal.
+    fs.rmSync(target, { recursive: true, force: true });
+    return true;
+  }
+  if (!isIdleSessionDir(target, stat, now)) return false;
+  // Renamed first, so a removal cut short leaves a .trash- name the next run
+  // finishes, never a half-emptied session directory.
+  const trash = path.join(root, `.trash-${Math.floor(now)}-${name}`);
+  fs.renameSync(target, trash);
+  fs.rmSync(trash, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * Remove `recall-session.d/<session_key>` directories idle for 90 days, and
+ * finish any `.trash-` left by a cut-off run. Bounded: at most 20 removals and
+ * about `budgetMs` per run, checked between items, with a cursor so the next
+ * run resumes where this one stopped; after a complete pass the next waits a
+ * day. The directory is reached through the containment walk, and nothing in
+ * it that is a symlink is followed. Never throws.
+ */
+export function sweepSessionDirs(
+  vaultPath: string,
+  options: { now?: number; budgetMs?: number; clock?: () => number } = {},
+): SweepResult {
+  const clock = options.clock ?? Date.now;
+  const started = clock();
+  const now = options.now ?? started;
+  const budgetMs = options.budgetMs ?? SWEEP_BUDGET_MS;
+  const result: SweepResult = { removed: 0, scanned: 0, complete: false, skipped: false };
+  try {
+    const root = containedDir(vaultPath, SESSION_RELDIR.split(path.sep), false);
+    if (root === null) {
+      result.skipped = true;
+      return result;
+    }
+    const stateFile = path.join(root, SWEEP_STATE_FILE);
+    let state: SweepState = { v: 1, next_after: 0, cursor: null };
+    try {
+      state = sweepStateIn(readSideFile(stateFile, vaultPath)) ?? state;
+    } catch {
+      // Unreadable state: start a fresh pass.
+    }
+    if (state.cursor === null && now < state.next_after) {
+      result.skipped = true;
+      return result;
+    }
+    const names = fs
+      .readdirSync(root)
+      .filter((name) => SESSION_KEY_RE.test(name) || TRASH_RE.test(name))
+      .sort();
+    const cursor = state.cursor;
+    let index = cursor === null ? 0 : names.findIndex((name) => name > cursor);
+    if (index < 0) index = names.length;
+    let last = cursor;
+    for (; index < names.length; index += 1) {
+      if (clock() - started >= budgetMs || result.removed >= SWEEP_MAX_REMOVALS) break;
+      const name = names[index] as string;
+      result.scanned += 1;
+      try {
+        if (sweepOne(root, name, now)) result.removed += 1;
+      } catch {
+        // One directory that cannot be judged or removed does not stop the pass.
+      }
+      last = name;
+    }
+    result.complete = index >= names.length;
+    writeSideFile(
+      stateFile,
+      result.complete
+        ? { v: 1, next_after: now + SWEEP_INTERVAL_MS, cursor: null }
+        : { v: 1, next_after: state.next_after, cursor: last },
+      vaultPath,
+    );
+  } catch {
+    // Best effort: retention runs again next boot.
+  }
+  return result;
+}
+
+/**
+ * SessionStart: run the retention sweep after the boot output is delivered
+ * (it adds to the hook's wall time, P16, hence the budget). Registered as
+ * record-only: it consumes nothing, so it is not a rollback if abandoned.
+ */
+export function scheduleSessionSweep(capture: UseCapture | null): void {
+  if (capture === null) return;
+  deferUntilDelivered(
+    async () => {
+      sweepSessionDirs(capture.vaultPath);
+    },
+    { recordOnly: true },
+  );
 }

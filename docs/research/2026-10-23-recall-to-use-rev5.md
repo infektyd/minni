@@ -277,6 +277,28 @@ another resume):
   The plugin hashes `content` into shingles and never stores or injects it.
 - **Retention.** Session directories older than 90 days with no open windows are removed after delivery, at
   most 20 per run. Each is first renamed to `.trash-<ts>`.
+- **Per-session side files (S1a-2).** `.runtime/recall-session.d/<session_key>/` holds the capture state that
+  is not a ledger row. Every directory is reached through the ledger's containment walk, and every file is
+  replaced through a temp name and a rename. None of them holds text.
+  - `counters.json` = `{v, turn_ix}`. UPS is the only writer. S3c extends it (§5.2.7).
+  - `<agent_key>.reset` = `{reset_id, at, reason}`, written on PreCompact, PostCompact and SessionStart.
+  - `hit-keys.json` = `{v, task_signature, hits: [{wikilink, score, mkey}]}`, at most the 5 `top_hits`.
+    - **Writer:** UPS, on a strong turn that armed the guard (the recall-state file was written).
+    - **Reader:** the guard capture, when it returns a deny. It matches each hit the deny lists by
+      `wikilink` and `score` under the same `task_signature`, and keys that hit's `guard` row with the
+      recorded `mkey`.
+    - **Why:** the recall-state file holds titles and wikilinks only, and a wikilink alone does not
+      identify one memory (§4.2). The file holds keys and the two match fields, nothing else. A `mkey` read
+      back must have a valid key shape. A listed hit with no recorded key gets no row; its key is never
+      guessed from the wikilink.
+  - **Retention of `recall-session.d`.** These directories follow the ledger's horizon. They are removed
+    once every entry is idle for 90 days, by a sweep (`sweepSessionDirs`):
+    - It runs after a SessionStart is delivered, registered with `deferUntilDelivered`.
+    - It removes at most 20 directories per run, each renamed to `.trash-<ts>-<key>` first.
+    - It stays inside the cooperative 150 ms budget, checked between items (§6.2.5).
+    - It resumes from a cursor in `recall-session.d/.sweep.json`. After a complete pass it waits a day.
+    - It skips symlinks and plain files, and never follows a link out of the vault.
+    - A directory with more than 256 entries is never judged idle.
 
 ### 4.4 Use detector (S1b)
 
@@ -1055,6 +1077,11 @@ There is one switch per feature, and every one defaults to `on`.
   (`{"<FLAG>": "on" | "off"}`), with the same-named env var as an override.
   - The read uses the same containment check as `readRecallState`: symlink escapes are refused.
   - Values are parsed strictly. Anything but `on` or `off` is ignored, with a one-line audit note.
+  - **Ledger off costs about nothing (S1a-2).** Before any of that, dispatch makes one cheap check
+    (`ledger-gate.ts`), and loads the capture modules only when it says the ledger may be on. The check reads
+    the env var, then a non-blocking, no-follow read of `flags.json` (regular file, 64 KiB cap, strict
+    value). It may answer "off" only where `flags.ts` would too; any doubt answers "maybe on", and then the
+    full read above decides.
 - **The daemon flag** is read from the daemon's config or env, because the daemon runs under `minni up` or
   launchd.
 - **Ledger-off stretches stay visible.** With `MINNI_USE_LEDGER=off`, no ledger rows are written, but the
