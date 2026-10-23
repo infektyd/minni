@@ -2311,7 +2311,9 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
     Returns ``agent_id`` and the rendered text ``context`` (injected natively as
     Layer 1 by some hosts, so its bytes are pinned), plus the additive S1a-D
     fields ``recent_learnings`` (``[{learning_id, category, line, content}]`` in
-    rendered order) and ``daemon_version``.
+    rendered order) and ``daemon_version``. A ``line`` may span physical lines
+    (stored content can contain a newline), so consumers must locate it by
+    substring, not by splitting ``context`` on newlines.
     """
     if context.increment_request_count is not None:
         context.increment_request_count()
