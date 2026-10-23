@@ -22,6 +22,9 @@ import type { LearningQualityReport } from "./policy.js";
 // touches the other's binding at top-level/module-evaluation time.
 import { filterSafeVaultResults } from "./task.js";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
+// Type-only: use-report.ts imports FROM this module, so the runtime import
+// below is dynamic and function-scoped (same pattern as task.ts above).
+import type { UseReport } from "./use-report.js";
 
 export type VaultSection =
   | "raw"
@@ -138,6 +141,8 @@ export interface AuditReport {
   tools: Record<string, number>;
   recentSummaries: string[];
   latest?: string;
+  /** Recall-to-use report over the last `useDays` days (rev5 §4.5); only when asked for. */
+  use?: UseReport | { error: string };
 }
 
 export interface VaultSearchResult {
@@ -1855,7 +1860,7 @@ export async function auditTail(
 export async function auditReport(
   vaultPath: string,
   limit = 100,
-  options: { includeLatest?: boolean } = {},
+  options: { includeLatest?: boolean; useDays?: number } = {},
 ): Promise<AuditReport> {
   const tail = await auditTail(vaultPath, limit);
   const tools: Record<string, number> = {};
@@ -1881,6 +1886,15 @@ export async function auditReport(
   if (options.includeLatest) {
     report.latest = tail.entries.at(-1);
   }
+  if (options.useDays !== undefined) {
+    const days = Number.isSafeInteger(options.useDays) ? Math.min(Math.max(options.useDays, 1), 90) : 7;
+    try {
+      const { buildUseReport } = await import("./use-report.js");
+      report.use = buildUseReport(vaultPath, { days });
+    } catch (error) {
+      report.use = { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   return report;
 }
 
@@ -1902,6 +1916,23 @@ export interface SessionReceipt {
   candidates_drafted: number;
   jev_learns?: number;
   jev_annotation?: string;
+  /** Recall-to-use counts from the use ledger (rev5 §4.5); absent when nothing was surfaced. */
+  use?: SessionUseCounts;
+}
+
+/**
+ * One session's surfacings and the standing outcome of each, from the use
+ * ledger. `pending` counts surfacings the detector has not judged yet.
+ */
+export interface SessionUseCounts {
+  surfaced: number;
+  cited: number;
+  applied: number;
+  opened: number;
+  dismissed: number;
+  ignored: number;
+  unknown: number;
+  pending: number;
 }
 
 /**
@@ -2178,7 +2209,7 @@ export async function sessionReceipt(
     windowEnd = closeWindow(parsed, windowStart, [sessionId, windowSessionId]).end;
   }
 
-  return tallyWindow(
+  const receipt = tallyWindow(
     parsed,
     sessionId,
     windowStart,
@@ -2186,6 +2217,18 @@ export async function sessionReceipt(
     windowSessionId,
     options.includeStamped === true,
   );
+  // Use counts come from the ledger, keyed by the real session id. The
+  // synthetic fallback (includeStamped: the payload had no id) has none.
+  if (options.includeStamped !== true) {
+    try {
+      const { sessionUseCounts } = await import("./use-report.js");
+      const use = sessionUseCounts(vaultPath, sessionId);
+      if (use) receipt.use = use;
+    } catch {
+      // A ledger problem never costs the receipt.
+    }
+  }
+  return receipt;
 }
 
 /**
@@ -2207,7 +2250,13 @@ export function formatSessionReceiptLine(receipt: SessionReceipt): string {
     `${receipt.learns} learn${receipt.learns === 1 ? "" : "s"} committed${jevSuffix}`,
     `${receipt.candidates_drafted} candidate${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
   ];
-  return `Minni session receipt: ${parts.join(", ")}.`;
+  const line = `Minni session receipt: ${parts.join(", ")}.`;
+  // Byte-identical to the line above whenever nothing was surfaced; otherwise
+  // the use counts ride on the same line, which maskTelemetry already drops.
+  const use = receipt.use;
+  if (!use || !(typeof use.surfaced === "number" && use.surfaced > 0)) return line;
+  const count = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  return `${line} Use: ${count(use.surfaced)} surfaced, ${count(use.cited)} cited, ${count(use.applied)} applied.`;
 }
 
 /**

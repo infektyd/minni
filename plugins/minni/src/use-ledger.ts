@@ -170,7 +170,7 @@ export function ledgerFilePath(vaultPath: string, sessionKey: string, ts: string
  * component that failed the check. Returns the directory path, or null when it
  * is missing and `create` is false. Throws on refusal.
  */
-function containedDir(vaultPath: string, segments: readonly string[], create: boolean): string | null {
+export function containedDir(vaultPath: string, segments: readonly string[], create: boolean): string | null {
   const root = fs.realpathSync(vaultPath);
   let current = vaultPath;
   for (const segment of segments) {
@@ -468,6 +468,8 @@ export interface JudgedFields {
   title_assessable: boolean;
   final: boolean;
   rule_version: string | number;
+  /** Why a final row was written without its full evidence, e.g. `unflushed_tail` (§4.4). */
+  final_reason?: string;
 }
 
 export interface ResetFields {
@@ -516,6 +518,7 @@ export type JudgedRow = LedgerCommon & {
   title_assessable: boolean;
   final: boolean;
   rule_version: string | number;
+  final_reason?: string;
 };
 export type ResetRow = LedgerCommon & { kind: "reset"; event: string; reset_id: string };
 export type ExposureRow = LedgerCommon & {
@@ -699,7 +702,7 @@ function token(value: unknown): string {
 
 export function buildJudgedRow(context: LedgerContext, fields: JudgedFields, ts: string = nowIso()): JudgedRow {
   const version = fields.rule_version;
-  return {
+  const row: JudgedRow = {
     ...common(context, "judged", ts),
     sid: typeof fields.sid === "string" && SHINGLE_HASH_RE.test(fields.sid) ? fields.sid : "invalid",
     outcome: token(fields.outcome),
@@ -713,6 +716,8 @@ export function buildJudgedRow(context: LedgerContext, fields: JudgedFields, ts:
         ? version
         : "invalid",
   };
+  if (fields.final_reason !== undefined) row.final_reason = token(fields.final_reason);
+  return row;
 }
 
 /** A reset of the payload's OWN agent key; `reset_id` defaults to a hash of who/when/why. */

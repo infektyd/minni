@@ -251,6 +251,7 @@ function threadWorkerErrorResult(
 // Defined in ./mcp-instructions.ts -- a leaf module with no side effects, so a
 // test can import the SHIPPED value without constructing this server.
 import { MINNI_INSTRUCTIONS } from "./mcp-instructions.js";
+import { useStatusBlock } from "./use-report.js";
 export { MINNI_INSTRUCTIONS };
 
 const server = new McpServer(
@@ -552,7 +553,8 @@ server.registerTool(
     const gated = await requireSharedGate("audit.status", { tool: "minni_status" });
     if (gated) return gated;
     const report = await statusAndAudit(DEFAULT_VAULT_PATH);
-    return textResult(JSON.stringify(report, null, 2));
+    // Recall-to-use (rev5 §4.5): a fixed 7-day use block; it never fails the status call.
+    return textResult(JSON.stringify({ ...report, use: useStatusBlock(DEFAULT_VAULT_PATH) }, null, 2));
   },
 );
 
@@ -1045,15 +1047,16 @@ server.registerTool(
   {
     title: "Minni Audit Report",
     description:
-      "Summarize recent Minni tool activity for transparent self-auditing.",
+      "Summarize recent Minni tool activity for transparent self-auditing. Pass useDays for a recall-to-use report over that many days.",
     inputSchema: {
       limit: z.number().int().min(1).max(200).optional(),
+      useDays: z.number().int().min(1).max(90).optional(),
     },
   },
-  async ({ limit }) => {
+  async ({ limit, useDays }) => {
     const gated = await requireSharedGate("audit.report", { limit: limit ?? 100 });
     if (gated) return gated;
-    const report = await auditReport(DEFAULT_VAULT_PATH, limit ?? 100);
+    const report = await auditReport(DEFAULT_VAULT_PATH, limit ?? 100, useDays !== undefined ? { useDays } : {});
     return textResult(JSON.stringify(report, null, 2));
   },
 );
