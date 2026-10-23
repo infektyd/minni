@@ -298,10 +298,10 @@ def test_allowlisted_line_passes_and_same_text_elsewhere_fails(tmp_path: Path) -
 
 
 def test_allowlist_entry_covers_only_the_match_it_overlaps_on_its_line(tmp_path: Path) -> None:
-    runner = _j("/ho", "me/", "runner", "/work")
+    allowed = _j("/ho", "me/", "zqally", "/work")
     other = _j("/Us", "ers/", "zqother", "/secret/notes")
-    allow = [("docs/a.md", "home-path", "/[h]ome/runner/", "CI runner example")]
-    result = _scan(_make_repo(tmp_path, {"docs/a.md": f"see {runner} and also {other}\n"}, allow=allow))
+    allow = [("docs/a.md", "home-path", "/[h]ome/zqally/", "CI runner example")]
+    result = _scan(_make_repo(tmp_path, {"docs/a.md": f"see {allowed} and also {other}\n"}, allow=allow))
     assert result.returncode == 1, result.stderr
     assert "docs/a.md:1: home-path: /Use... " in result.stderr
     assert "docs/a.md:1: home-path: /hom" not in result.stderr
@@ -312,7 +312,7 @@ def test_allowlist_entry_never_covers_another_line_of_its_file(tmp_path: Path) -
     # Kills a mutation that lets path + class exempt the whole file.
     tok1 = _j("gh", "p_", "Q" * 24)
     tok2 = _j("gh", "p_", "R" * 24)
-    home1 = _j("/ho", "me/", "runner", "/work")
+    home1 = _j("/ho", "me/", "zqally", "/work")
     home2 = _j("/ho", "me/", "zqother", "/work")
     files = {
         "tests/fixture.py": f'FAKE_GH = "{tok1}"\nREAL_GH = "{tok2}"\n',
@@ -320,7 +320,7 @@ def test_allowlist_entry_never_covers_another_line_of_its_file(tmp_path: Path) -
     }
     allow = [
         ("tests/fixture.py", "token-github", "FAKE_[G]H = \"[g]hp_", "synthetic token"),
-        ("docs/a.md", "home-path", "/[h]ome/runner/", "CI runner example"),
+        ("docs/a.md", "home-path", "/[h]ome/zqally/", "CI runner example"),
     ]
     result = _scan(_make_repo(tmp_path, files, allow=allow))
     assert result.returncode == 1, result.stderr
@@ -465,6 +465,41 @@ def test_os_user_is_forced_locally_but_not_under_github_actions(tmp_path: Path) 
     ci_env = _scan(repo, env={"GITHUB_ACTIONS": "true", "MINNI_BOUNDARY_FORBIDDEN_NAMES": os_user})
     assert ci_env.returncode == 1, ci_env.stderr
     assert "forbidden name" in ci_env.stderr
+
+
+def test_runner_os_user_is_forbidden_locally_and_allowlisted_in_ci(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_id = fake_bin / "id"
+    fake_id.write_text("#!/bin/sh\necho runner\n", encoding="utf-8")
+    fake_id.chmod(0o755)
+    runner_path = f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    runner_dir = tmp_path / "runner_dir"
+    runner_dir.mkdir()
+    runner_repo = _make_repo(
+        runner_dir,
+        {"docs/a.md": _j("/ho", "me/", "runner", "/work\n")},
+        allow=[("docs/a.md", "home-path", "/[h]ome/runner/", "CI runner example")],
+    )
+    local_runner = _scan(runner_repo, env={"PATH": runner_path})
+    assert local_runner.returncode == 1, local_runner.stderr
+    assert "docs/a.md:1: home-path: " in local_runner.stderr
+    assert "forbidden name" in local_runner.stderr
+    assert "runner" not in local_runner.stdout + local_runner.stderr
+
+    zqally_dir = tmp_path / "zqally_dir"
+    zqally_dir.mkdir()
+    zqally_repo = _make_repo(
+        zqally_dir,
+        {"docs/a.md": _j("/ho", "me/", "zqally", "/work\n")},
+        allow=[("docs/a.md", "home-path", "/[h]ome/zqally/", "allowlisted fixture example")],
+    )
+    local_zqally = _scan(zqally_repo, env={"PATH": runner_path})
+    assert local_zqally.returncode == 0, local_zqally.stderr
+
+    ci_runner = _scan(runner_repo, env={"PATH": runner_path, "GITHUB_ACTIONS": "true"})
+    assert ci_runner.returncode == 0, ci_runner.stderr
 
 
 def _fake_git(tmp_path: Path, version_line: str) -> str:
@@ -704,9 +739,9 @@ def test_pre_push_clean_range_passes(tmp_path: Path) -> None:
 
 def test_pre_push_ignores_lines_outside_the_range(tmp_path: Path) -> None:
     plan = _j("pl", "an-", "0123456789abcdef")
-    runner = _j("/ho", "me/", "runner", "/work")
-    allow = [("docs/allowed.md", "home-path", "/[h]ome/runner/", "CI runner example")]
-    repo = _make_repo(tmp_path, {"docs/old.md": f"{plan}\n", "docs/allowed.md": f"{runner}\n"}, allow=allow)
+    allowed = _j("/ho", "me/", "zqally", "/work")
+    allow = [("docs/allowed.md", "home-path", "/[h]ome/zqally/", "CI runner example")]
+    repo = _make_repo(tmp_path, {"docs/old.md": f"{plan}\n", "docs/allowed.md": f"{allowed}\n"}, allow=allow)
     base = _commit(repo, "base with pre-existing hits")
     tip = _commit(repo, "clean change", {"docs/new.md": "clean\n"})
     result = _push(repo, f"refs/heads/main {tip} refs/heads/main {base}")
@@ -717,6 +752,8 @@ def test_pre_push_ignores_lines_outside_the_range(tmp_path: Path) -> None:
     full = _scan(repo)
     assert full.returncode == 1
     assert "docs/old.md:1: plan-id: " in full.stderr
+    assert "docs/allowed.md" not in full.stderr
+    assert "unused allowlist entry" not in full.stderr
 
 
 def test_pre_push_new_branch_uses_the_merge_base(tmp_path: Path) -> None:
@@ -792,12 +829,12 @@ def test_pre_push_planted_token_prints_no_excerpt(tmp_path: Path) -> None:
 
 
 def test_pre_push_uses_new_line_numbers_and_the_allowlist(tmp_path: Path) -> None:
-    runner = _j("/ho", "me/", "runner", "/work")
+    allowed = _j("/ho", "me/", "zqally", "/work")
     other = _j("/Us", "ers/", "zqfixture", "/x")
-    allow = [("docs/a.md", "home-path", "/[h]ome/runner/", "CI runner example")]
+    allow = [("docs/a.md", "home-path", "/[h]ome/zqally/", "CI runner example")]
     repo = _make_repo(tmp_path, {"docs/a.md": "one\ntwo\nthree\n"}, allow=allow)
     base = _commit(repo, "base")
-    tip = _commit(repo, "edit", {"docs/a.md": f"one\n{other}\ntwo\n{runner}\nthree\n"})
+    tip = _commit(repo, "edit", {"docs/a.md": f"one\n{other}\ntwo\n{allowed}\nthree\n"})
     result = _push(repo, f"refs/heads/main {tip} refs/heads/main {base}")
     assert result.returncode == 1, result.stderr
     assert "Content check failed (pre-push)." in result.stderr
@@ -861,8 +898,8 @@ def test_pre_push_hook_runs_the_range_check_and_keeps_its_bypass(tmp_path: Path)
 
 # --- exact columns on multi-match lines (review probes A and E) ---------------
 
-PROBE_A = _j("see /ho", "me/runner/work and /Us", "ers/zqreal/secret/ and /ho", "me/runner/other")
-PROBE_E = _j("see /Us", "ers/zqreal/secret/ and also then later /ho", "me/runner/work")
+PROBE_A = _j("see /ho", "me/zqally/work and /Us", "ers/zqreal/secret/ and /ho", "me/zqally/other")
+PROBE_E = _j("see /Us", "ers/zqreal/secret/ and also then later /ho", "me/zqally/work")
 
 
 @pytest.mark.parametrize(
@@ -877,7 +914,7 @@ PROBE_E = _j("see /Us", "ers/zqreal/secret/ and also then later /ho", "me/runner
 def test_allowlist_overlap_uses_exact_columns_on_multi_match_lines(
     tmp_path: Path, line: str, flagged_excerpt: str
 ) -> None:
-    allow = [("docs/a.md", "home-path", "/[h]ome/runner/", "CI runner example")]
+    allow = [("docs/a.md", "home-path", "/[h]ome/zqally/", "CI runner example")]
     result = _scan(_make_repo(tmp_path, {"docs/a.md": line + "\n"}, allow=allow))
     assert result.returncode == 1, result.stderr
     hits = [ln for ln in result.stderr.splitlines() if ln.startswith("docs/a.md:1: home-path: ")]
@@ -886,7 +923,7 @@ def test_allowlist_overlap_uses_exact_columns_on_multi_match_lines(
 
 
 def test_pre_push_overlap_uses_exact_columns_on_multi_match_lines(tmp_path: Path) -> None:
-    allow = [("docs/a.md", "home-path", "/[h]ome/runner/", "CI runner example")]
+    allow = [("docs/a.md", "home-path", "/[h]ome/zqally/", "CI runner example")]
     repo = _make_repo(tmp_path, {"docs/a.md": "clean\n"}, allow=allow)
     base = _commit(repo, "base")
     tip = _commit(repo, "probe A", {"docs/a.md": f"clean\n{PROBE_A}\n"})
