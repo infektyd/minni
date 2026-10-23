@@ -424,6 +424,16 @@ export interface TurnFields {
   envelope_kind: string | null;
   subkind: string | null;
   exit: string;
+  /**
+   * Whether the scheduled-template rule ran for this prompt. Without it a
+   * "human" turn classified with the rule off is indistinguishable from one
+   * classified with it on, and the per-turn denominator could shift between
+   * windows. Never accompanied by the template's hash: a long human prompt
+   * would leave a fingerprint in the ledger.
+   */
+  template_rule?: "on" | "off";
+  /** Which template rule decided, as a short identifier. */
+  rule_id?: string;
 }
 
 export interface SurfacedFields {
@@ -445,11 +455,16 @@ export interface SurfacedFields {
   tool_use_id?: string;
 }
 
+/** What kind of evidence a judgment rested on. Kinds only: never the text itself. */
+export type EvidenceKind = "handle" | "title" | "shingle" | "open" | "lexicon";
+export const EVIDENCE_KINDS: readonly EvidenceKind[] = ["handle", "title", "shingle", "open", "lexicon"];
+const EVIDENCE_SET: ReadonlySet<string> = new Set(EVIDENCE_KINDS);
+
 export interface JudgedFields {
   sid: string;
   outcome: string;
   via: string;
-  evidence: unknown;
+  evidence: readonly EvidenceKind[];
   title_assessable: boolean;
   final: boolean;
   rule_version: string | number;
@@ -492,7 +507,16 @@ export type SurfacedRow = LedgerCommon & {
   echo?: string[];
   clipped?: true;
 };
-export type JudgedRow = LedgerCommon & { kind: "judged" } & JudgedFields;
+export type JudgedRow = LedgerCommon & {
+  kind: "judged";
+  sid: string;
+  outcome: string;
+  via: string;
+  evidence: EvidenceKind[];
+  title_assessable: boolean;
+  final: boolean;
+  rule_version: string | number;
+};
 export type ResetRow = LedgerCommon & { kind: "reset"; event: string; reset_id: string };
 export type ExposureRow = LedgerCommon & {
   kind: "exposure";
@@ -518,18 +542,20 @@ function shortField(value: unknown): string | undefined {
 
 /**
  * The row context for a hook payload. `features` defaults to the flags in
- * effect for `vaultPath` (empty when neither is given).
+ * effect for `vaultPath`, which is required so a row can never claim no
+ * switches were on just because the caller forgot to say. An explicit
+ * `features` (already computed by the caller) wins.
  */
 export function ledgerContextFrom(
   payload: Payload,
-  options: { wire: string; principal: string; vaultPath?: string; features?: readonly string[] },
+  options: { wire: string; principal: string; vaultPath: string; features?: readonly string[] },
 ): LedgerContext {
   const context: LedgerContext = {
     session_key: sessionKeyFrom(payload),
     agent_key: agentKeyFrom(payload),
     wire: options.wire,
     principal: options.principal,
-    features: options.features ?? (options.vaultPath ? featuresInEffect(options.vaultPath) : []),
+    features: options.features ?? featuresInEffect(options.vaultPath),
   };
   const promptId = shortField(field(payload, "prompt_id"));
   if (promptId) context.prompt_id = promptId;
@@ -561,14 +587,20 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+const RULE_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
 export function buildTurnRow(context: LedgerContext, fields: TurnFields, ts: string = nowIso()): TurnRow {
-  return {
+  const row: TurnRow = {
     ...common(context, "turn", ts),
     turn_ix: fields.turn_ix,
     envelope_kind: fields.envelope_kind,
     subkind: fields.subkind,
     exit: fields.exit,
   };
+  // Strict: a junk value is left out rather than recorded as either answer.
+  if (fields.template_rule === "on" || fields.template_rule === "off") row.template_rule = fields.template_rule;
+  if (typeof fields.rule_id === "string" && RULE_ID_RE.test(fields.rule_id)) row.rule_id = fields.rule_id;
+  return row;
 }
 
 /**
@@ -589,9 +621,37 @@ export function surfacedSid(args: {
   return idHash([args.session_key, args.ts, args.channel, args.mkey, args.rank]);
 }
 
+const SHINGLE_HASH_RE = /^[0-9a-f]{16}$/;
+const HANDLE_RE = /^(?:m:[0-9a-f]{8}|d:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128})$/;
+const MAX_HANDLES = 8;
+
+/**
+ * Only well-formed 64-bit shingle hashes survive, at most MAX_SHINGLES: these
+ * lists are the one place a caller hands the ledger bulk data, so anything
+ * that is not a hash (body text, an injected sentence) is dropped here rather
+ * than trusted to the caller.
+ */
 function hashList(values: readonly string[] | undefined): string[] | undefined {
   if (!Array.isArray(values)) return undefined;
-  return values.filter((value) => typeof value === "string");
+  return values.filter((value) => typeof value === "string" && SHINGLE_HASH_RE.test(value)).slice(0, MAX_SHINGLES);
+}
+
+/** Only `m:`/`d:` handle shapes survive, at most MAX_HANDLES. */
+function handleList(values: readonly string[] | undefined): string[] {
+  if (!Array.isArray(values)) return [];
+  return values.filter((value) => typeof value === "string" && HANDLE_RE.test(value)).slice(0, MAX_HANDLES);
+}
+
+/** Known evidence kinds, deduplicated in first-seen order; anything else dropped. */
+function evidenceList(values: unknown): EvidenceKind[] {
+  if (!Array.isArray(values)) return [];
+  const out: EvidenceKind[] = [];
+  for (const value of values) {
+    if (typeof value === "string" && EVIDENCE_SET.has(value) && !out.includes(value as EvidenceKind)) {
+      out.push(value as EvidenceKind);
+    }
+  }
+  return out;
 }
 
 export function buildSurfacedRow(
@@ -611,8 +671,8 @@ export function buildSurfacedRow(
     }),
     channel: fields.channel,
     mkey: fields.mkey,
-    handles: (fields.handles ?? []).filter((handle) => typeof handle === "string").slice(0, 8),
-    title: sanitizeRecallField(fields.title ?? "", TITLE_MAX),
+    handles: handleList(fields.handles),
+    title: sanitizeRecallField(typeof fields.title === "string" ? fields.title : "", TITLE_MAX),
     rank: fields.rank,
     visible: fields.visible,
     delivered: fields.delivered,
@@ -620,7 +680,7 @@ export function buildSurfacedRow(
   if (typeof fields.score === "number" && Number.isFinite(fields.score)) row.score = fields.score;
   const route = shortField(fields.route);
   if (route) row.route = route;
-  if (typeof fields.turn_ix === "number") row.turn_ix = fields.turn_ix;
+  if (Number.isSafeInteger(fields.turn_ix)) row.turn_ix = fields.turn_ix;
   if (fields.cap_unknown === true) row.cap_unknown = true;
   if (typeof fields.tx_off === "number" && Number.isFinite(fields.tx_off)) row.tx_off = fields.tx_off;
   const shingles = hashList(fields.shingles);
@@ -630,16 +690,28 @@ export function buildSurfacedRow(
   return row;
 }
 
+// `cited`, `unknown(not_delivered)`: a detector token, never a sentence.
+const OUTCOME_TOKEN_RE = /^[a-z][a-z0-9_]{0,31}(?:\([a-z0-9_]{1,31}\))?$/;
+
+function token(value: unknown): string {
+  return typeof value === "string" && OUTCOME_TOKEN_RE.test(value) ? value : "invalid";
+}
+
 export function buildJudgedRow(context: LedgerContext, fields: JudgedFields, ts: string = nowIso()): JudgedRow {
+  const version = fields.rule_version;
   return {
     ...common(context, "judged", ts),
-    sid: fields.sid,
-    outcome: fields.outcome,
-    via: fields.via,
-    evidence: fields.evidence,
-    title_assessable: fields.title_assessable,
-    final: fields.final,
-    rule_version: fields.rule_version,
+    sid: typeof fields.sid === "string" && SHINGLE_HASH_RE.test(fields.sid) ? fields.sid : "invalid",
+    outcome: token(fields.outcome),
+    via: token(fields.via),
+    evidence: evidenceList(fields.evidence),
+    title_assessable: fields.title_assessable === true,
+    final: fields.final === true,
+    rule_version:
+      (typeof version === "number" && Number.isSafeInteger(version)) ||
+      (typeof version === "string" && RULE_ID_RE.test(version))
+        ? version
+        : "invalid",
   };
 }
 
@@ -760,8 +832,17 @@ export function appendLedgerRows(vaultPath: string, rows: readonly LedgerRow[]):
               result.written += 1;
               if (line.clipped) result.clipped += 1;
             } else {
-              // A short write leaves a torn line, which readers skip.
               result.failed += 1;
+              // A short write leaves unterminated bytes. Left alone, the next
+              // O_APPEND row would land on the same line and one torn row would
+              // destroy two. Terminate it, best effort, so readers skip just it.
+              if (n > 0) {
+                try {
+                  fs.writeSync(fd, "\n");
+                } catch {
+                  // Nothing more to do: the reader still skips the torn line.
+                }
+              }
             }
           } catch {
             result.failed += 1;
@@ -828,8 +909,11 @@ export function parseLedgerText(text: string): LedgerFileRead {
   return { rows, skipped };
 }
 
-/** Read one day file, skipping torn and malformed lines. Missing file: no rows. */
-export function readLedgerFile(filePath: string): LedgerFileRead {
+/**
+ * Read one day file, skipping torn and malformed lines. Missing file: no rows.
+ * Internal: the caller (readSessionLedger) has already checked containment.
+ */
+function readDayFile(filePath: string): LedgerFileRead {
   try {
     const stat = fs.statSync(filePath);
     if (!stat.isFile() || stat.size > MAX_LEDGER_FILE_BYTES) return { rows: [], skipped: 0 };
@@ -868,7 +952,7 @@ export function readSessionLedger(vaultPath: string, sessionKey: string): Ledger
       result.refused = true;
       continue;
     }
-    const read = readLedgerFile(file);
+    const read = readDayFile(file);
     result.rows.push(...read.rows);
     result.skipped += read.skipped;
   }
@@ -906,7 +990,7 @@ export function locateItems(
     (value) => (typeof value === "string" ? value : ""),
   );
   const capKnown = typeof capChars === "number" && Number.isFinite(capChars) && capChars > 0;
-  return items.map((item) => {
+  return (Array.isArray(items) ? items : []).map((item) => {
     const text = typeof item === "string" ? item : typeof item?.text === "string" ? item.text : "";
     let first: ItemLocation | undefined;
     if (text.length > 0) {
@@ -1074,23 +1158,79 @@ export interface RecordSurfacedResult {
   registered: boolean;
 }
 
+const CHANNELS: ReadonlySet<string> = new Set<SurfaceChannel>([
+  "boot_recall",
+  "boot_recent_learnings",
+  "prompt_pointer",
+  "guard",
+  "explicit_recall",
+  "subagent_brief",
+]);
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+/** A context whose every field is the type a row expects: nothing else is copied into one. */
+function isLedgerContext(value: unknown): value is LedgerContext {
+  if (value === null || typeof value !== "object") return false;
+  const c = value as Record<string, unknown>;
+  return (
+    typeof c.session_key === "string" &&
+    typeof c.agent_key === "string" &&
+    typeof c.wire === "string" &&
+    typeof c.principal === "string" &&
+    isOptionalString(c.prompt_id) &&
+    isOptionalString(c.subagent_type) &&
+    Array.isArray(c.features) &&
+    c.features.every((feature) => typeof feature === "string")
+  );
+}
+
+/** An item names a memory (non-empty mkey) at a rank (a non-negative integer). */
+function isSurfacedItem(value: unknown): value is SurfacedItem {
+  if (value === null || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.mkey === "string" &&
+    item.mkey.length > 0 &&
+    typeof item.rank === "number" &&
+    Number.isSafeInteger(item.rank) &&
+    item.rank >= 0
+  );
+}
+
+function notRecorded(): RecordSurfacedResult {
+  return { rows: [], registered: false };
+}
+
 /**
  * Build `surfaced` rows in memory and register them to be written once the
  * output is delivered. If the output is abandoned instead, they are written as
- * `delivered: false, visible: false`. Never throws; with MINNI_USE_LEDGER off,
- * registers nothing.
+ * `delivered: false, visible: false`. Never throws. Registers nothing when
+ * MINNI_USE_LEDGER is off, or when the vault, context or channel is not what a
+ * row needs; malformed items are dropped and the rest recorded.
  */
 export function recordSurfaced(args: RecordSurfacedArgs): RecordSurfacedResult {
   try {
-    if (!Array.isArray(args.items) || args.items.length === 0) return { rows: [], registered: false };
-    if (!flagOn(args.vaultPath, "MINNI_USE_LEDGER")) return { rows: [], registered: false };
-    const ts = args.ts ?? nowIso();
+    if (args === null || typeof args !== "object") return notRecorded();
+    const vaultPath = args.vaultPath;
+    if (typeof vaultPath !== "string" || vaultPath.length === 0) return notRecorded();
+    if (!isLedgerContext(args.context) || !CHANNELS.has(args.channel as string)) {
+      return notRecorded();
+    }
+    const items = Array.isArray(args.items) ? args.items.filter(isSurfacedItem) : [];
+    if (items.length === 0) return notRecorded();
+    if (!flagOn(vaultPath, "MINNI_USE_LEDGER")) return notRecorded();
+    const ts = typeof args.ts === "string" && Number.isFinite(Date.parse(args.ts)) ? args.ts : nowIso();
     const locations = locateItems(
       args.emitted,
-      args.items.map((item) => ({ text: item.locate ?? item.title ?? "" })),
+      items.map((item) => ({
+        text: typeof item.locate === "string" ? item.locate : typeof item.title === "string" ? item.title : "",
+      })),
       args.capChars,
     );
-    const rows = args.items.map((item, index) => {
+    const rows = items.map((item, index) => {
       const location = locations[index] as ItemLocation;
       return buildSurfacedRow(
         args.context,
@@ -1114,7 +1254,6 @@ export function recordSurfaced(args: RecordSurfacedArgs): RecordSurfacedResult {
         ts,
       );
     });
-    const vaultPath = args.vaultPath;
     deferUntilDelivered(
       async () => {
         appendLedgerRows(vaultPath, rows);
@@ -1134,6 +1273,6 @@ export function recordSurfaced(args: RecordSurfacedArgs): RecordSurfacedResult {
     );
     return { rows, registered: true };
   } catch {
-    return { rows: [], registered: false };
+    return notRecorded();
   }
 }

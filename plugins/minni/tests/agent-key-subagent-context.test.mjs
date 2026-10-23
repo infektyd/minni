@@ -6,7 +6,12 @@
 // payload (probe P5), or a transcript that lives under a `subagents/` directory.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+
+import { featuresInEffect } from "../dist/flags.js";
 
 import {
   agentKeyFrom,
@@ -89,10 +94,16 @@ test("`subagents` must be a directory component, not a file name or substring", 
   assert.equal(agentKeyFrom({ transcript_path: "/tmp/minni-fixture/subagents.jsonl" }), "main");
 });
 
-test("a subagent's reset row carries its own key and never closes the parent's", () => {
+test("a subagent's reset row carries its own key and never closes the parent's", (t) => {
   const child = { ...PARENT, agent_id: "agent-fixture-7", agent_type: "Explore", prompt_id: "prompt-fixture" };
-  const parentCtx = ledgerContextFrom(PARENT, { wire: "claude-code", principal: "claude-code", features: [] });
-  const childCtx = ledgerContextFrom(child, { wire: "claude-code", principal: "claude-code", features: [] });
+  const vaultPath = mkdtempSync(path.join(tmpdir(), "minni-agent-key-"));
+  t.after(() => rmSync(vaultPath, { recursive: true, force: true }));
+  const parentCtx = ledgerContextFrom(PARENT, { wire: "claude-code", principal: "claude-code", vaultPath });
+  const childCtx = ledgerContextFrom(child, { wire: "claude-code", principal: "claude-code", vaultPath });
+  // With no explicit features, a row reports the switches in effect for the
+  // vault (all on here), never an empty list.
+  assert.deepEqual(parentCtx.features, featuresInEffect(vaultPath, process.env));
+  assert.ok(parentCtx.features.includes("MINNI_USE_LEDGER"));
 
   assert.equal(childCtx.session_key, parentCtx.session_key, "same host session");
   assert.equal(childCtx.session_key, sessionKeyFrom(PARENT));
