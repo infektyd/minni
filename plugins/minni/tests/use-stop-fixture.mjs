@@ -114,3 +114,42 @@ export function changedPaths(before, after) {
   for (const rel of before.keys()) if (!after.has(rel)) changed.push(rel);
   return changed.sort();
 }
+
+/**
+ * Append one more judgeable turn (turn row, pointer surfacing, transcript
+ * lines) to a session seedStopTurn started. Returns the Stop payload and the
+ * new surfacing row; `after` is any extra transcript text appended after the
+ * reply (tool chatter), flushed with the turn.
+ */
+export async function seedNextTurn(fixture, transcriptPath, { turnIx, at, title, after = "" }) {
+  const clock = new Clock(at);
+  const tx = new Transcript(transcriptPath, clock);
+  const promptId = `p${turnIx}`;
+  tx.prompt(`What else changed in step ${turnIx}?`, promptId);
+  const surfaced = surfacedRow({ mkey: `vault:wiki/concepts/turn-${turnIx}.md`, title, promptId, ts: clock.next(10), turnIx });
+  append(fixture.vault, [turnRow({ turnIx, promptId, ts: surfaced.ts }), surfaced]);
+  const reply = `Step ${turnIx} is done.`;
+  tx.say(reply);
+  await tx.flush();
+  if (after) {
+    const { appendFile } = await import("node:fs/promises");
+    await appendFile(transcriptPath, after, "utf8");
+  }
+  return {
+    surfaced,
+    payload: { session_id: SESSION_ID, hook_event_name: "Stop", transcript_path: transcriptPath, last_assistant_message: reply },
+  };
+}
+
+/** The detector's cursor offset for a transcript, or null (one cursor file per transcript). */
+export async function detectorCursorOffset(vault) {
+  const dir = path.join(vault, ".runtime", "use-detector", "cursors");
+  let names = [];
+  try {
+    names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return null;
+  }
+  if (names.length !== 1) return null;
+  return JSON.parse(await readFile(path.join(dir, names[0]), "utf8")).offset;
+}

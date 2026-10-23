@@ -1248,8 +1248,11 @@ There is one switch per feature, and every one defaults to `on`.
       `harness-envelope-rules.js`, `use-detector.js` or `use-report.js` loads, and the receipt line is
       byte-identical to the line without use counts.
     - **Ledger on** (ledger-gate says it may be on), on a measured wire:
-      1. Stop loads `use-detector.js` (lazily, once delivered, and only after `flags.js` confirms the ledger)
-         and `use-report.js` (the receipt), with their `use-ledger.js` and `flags.js`.
+      1. Stop loads `use-report.js` for the receipt, before its output is delivered. `use-report.js`
+         statically imports `use-detector.js`, so the detector MODULE loads then too, with `use-ledger.js`,
+         `flags.js` and the classifier (probe load order: use-report, use-detector, flags, use-ledger). Only
+         the detector RUN waits: it starts once the output is delivered, and only after `flags.ts` confirms
+         the ledger.
       2. It never loads `use-capture.js`.
       3. `harness-envelope.js` and `harness-envelope-rules.js` load only through `use-detector.js`'s import
          (the detector's prompt classifier, for turns with no `turn` row); nothing else on the Stop path
@@ -1283,6 +1286,13 @@ There is one switch per feature, and every one defaults to `on`.
       once, throttled, as `<prefix>_use_detector_failed`, by code and never with a message. A carry at the
       caps is not a failure. An undelivered Stop runs no detector; the next Stop carries the transcript
       forward.
+    - **Measured means a real session id too.** A Stop with no `session_id` (the receipt's synthetic
+      "session" fallback) runs neither the detector nor the receipt counts. Its rows would key under a
+      transcript hash that no capture wrote.
+    - **Known cost, left as is.** On the detector's fast path (nothing open, nothing new) the run still
+      rewrites `windows.json`, though only the agent's activity time and offset change: one small
+      temp-and-rename per measured Stop. Skipping that write belongs in `use-detector.ts` (another slice's
+      file). It also needs care, because the activity time feeds the 24 h idle close. So it is not done here.
     - **A transcript that is not a regular file** (a FIFO, a directory) is passed to the detector as no
       transcript, after a `stat` that follows links as the detector's `realpath` does. The host waits for the
       hook to exit, so the detector's own open, which a FIFO would block, must never be reached. A

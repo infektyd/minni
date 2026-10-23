@@ -193,27 +193,53 @@ test("a throwing detector: output byte-identical, exit clean, one audit line by 
 });
 
 test("a capped detector (a transcript over 2 MB) carries forward: same output, no failure audit", { timeout: 120_000 }, async (t) => {
+  const { detectorCursorOffset, seedNextTurn } = await import("./use-stop-fixture.mjs");
   const at = path.join(tmpdir(), `minni-stop-detector-cap-${process.pid}`);
   t.after(() => rm(at, { recursive: true, force: true }));
-  const normal = await stopAt(at);
-
-  const fixture = await makeFixture(null, "stop-detector", { at });
-  t.after(() => closeFixture(fixture));
-  await startFakeDaemon(fixture);
-  const { payload, transcriptPath, surfaced } = await seedStopTurn(fixture, { at: Date.parse("2026-10-23T10:00:00.000Z") });
-  // 2.5 MB of tool chatter after the reply, in short lines: the slow path's
-  // 2 MB read cap stops short of the end, and the rest carries forward.
+  const T1 = Date.parse("2026-10-23T10:00:00.000Z");
+  const T2 = Date.parse("2026-10-23T10:05:00.000Z");
+  // 2.5 MB of tool chatter after turn 2's reply, in short lines: read from the
+  // cursor turn 1 left, the slow path's 2 MB cap stops short of the end.
   const line = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(900) }] } });
-  await appendFile(transcriptPath, `${line}\n`.repeat(Math.ceil((2.5 * 1024 * 1024) / (line.length + 1))), "utf8");
-  const capped = await runHook(fixture, "Stop", payload);
-  assert.equal(capped.code, 0);
-  assert.equal(capped.raw, normal.raw, "the caps change no byte of the output");
-  assert.equal(detectorFailures((await auditTail(fixture.vault, 100)).entries).length, 0, "a carry is not a failure");
-  assert.equal(
-    ledgerRows(fixture.vault, "judged").filter((row) => row.sid === surfaced.sid && row.final).length,
-    0,
-    "the turn's end was not reached: nothing is final yet",
-  );
+  const chatter = `${line}\n`.repeat(Math.ceil((2.5 * 1024 * 1024) / (line.length + 1)));
+  const outputs = {};
+  for (const variant of ["normal", "capped"]) {
+    const fixture = await makeFixture(null, "stop-detector", { at });
+    await startFakeDaemon(fixture);
+    try {
+      const first = await seedStopTurn(fixture, { at: T1 });
+      assert.equal((await runHook(fixture, "Stop", first.payload)).code, 0);
+      const before = await detectorCursorOffset(fixture.vault);
+      assert.ok(before > 0, "turn 1 left a cursor");
+      const second = await seedNextTurn(fixture, first.transcriptPath, {
+        turnIx: 2,
+        at: T2,
+        title: "Heron cursor drift",
+        after: variant === "capped" ? chatter : "",
+      });
+      const run = await runHook(fixture, "Stop", second.payload);
+      assert.equal(run.code, 0);
+      outputs[variant] = run.raw;
+      if (variant === "capped") {
+        assert.equal(detectorFailures((await auditTail(fixture.vault, 100)).entries).length, 0, "a carry is not a failure");
+        // Positive controls: the detector ran, and its read stopped at the cap.
+        assert.ok(await exists(path.join(fixture.vault, ".runtime", "use-detector", "sessions", FIXTURE_SESSION, "windows.json")));
+        const advanced = (await detectorCursorOffset(fixture.vault)) - before;
+        assert.ok(
+          advanced > 2 * 1024 * 1024 - 4096 && advanced <= 2 * 1024 * 1024,
+          `the read advanced ${advanced} bytes: the 2 MB cap, not the whole 2.5 MB`,
+        );
+        assert.equal(
+          ledgerRows(fixture.vault, "judged").filter((row) => row.sid === second.surfaced.sid && row.final).length,
+          0,
+          "turn 2's end was not reached: nothing is final yet",
+        );
+      }
+    } finally {
+      await closeFixture(fixture);
+    }
+  }
+  assert.equal(outputs.capped, outputs.normal, "the caps change no byte of the output");
 });
 
 test("a transcript_path that is a FIFO never holds the host: Stop exits cleanly, promptly", { timeout: 60_000 }, async (t) => {
@@ -244,6 +270,11 @@ test("a transcript_path that is a FIFO never holds the host: Stop exits cleanly,
   assert.equal(result.code, 0);
   assert.equal(JSON.parse(result.stdout.trim().split("\n").at(-1)).continue, true);
   assert.equal(detectorFailures((await auditTail(fixture.vault, 100)).entries).length, 0, "no transcript is not a failure");
+  // Positive control: the detector did run, with no transcript.
+  assert.ok(
+    await exists(path.join(fixture.vault, ".runtime", "use-detector", "sessions", FIXTURE_SESSION, "windows.json")),
+    "the detector ran (its state was written) even though the transcript was refused",
+  );
 });
 
 /** The module file names a spawned hook resolves. */
@@ -377,4 +408,17 @@ test("the detector's commit runs last: a wedged detector never delays the parked
   assert.equal(observed.during.exited, false, "the check ran while the wedged detector was still running");
   assert.deepEqual(observed.during.parked, [], "the parked entry was archived before the detector ran");
   assert.equal(observed.during.archived.length, 1);
+});
+
+test("a Stop with no session id is unmeasured: no detector run, no detector state, no ledger module", { timeout: 60_000 }, async (t) => {
+  const fixture = await makeFixture(t, "stop-detector-no-session");
+  await startFakeDaemon(fixture);
+  const { payload } = await seedStopTurn(fixture);
+  const { session_id: _dropped, ...noSession } = payload;
+  const run = await loadedNames(t, fixture, "Stop", noSession);
+  assert.equal(run.code, 0);
+  assert.ok(run.names.includes("hook-handlers.js"), "the hook ran");
+  for (const module of LEDGER_MODULES) assert.ok(!run.names.includes(module), `a session-less Stop loaded ${module}`);
+  assert.ok(!(await exists(path.join(fixture.vault, ".runtime", "use-detector"))), "no detector state under a tx- key");
+  assert.equal(ledgerRows(fixture.vault, "judged").length, 0);
 });

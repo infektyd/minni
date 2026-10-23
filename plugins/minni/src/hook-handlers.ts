@@ -439,9 +439,10 @@ interface StopCoreResult {
 /**
  * S1b (§8.2): one decision for both ledger reads Stop makes, the receipt's use
  * counts and the detector run. Phase 1 measures only wires whose transcript the
- * detector parses (`transcriptShape`, hook-platform.ts); every other wire is
- * unmeasured, so neither runs there and its Stop loads no ledger module, as it
- * does with the ledger off (env, or flags.json, ledger-gate's cheap check).
+ * detector parses (`transcriptShape`, hook-platform.ts), and only a Stop that
+ * carries a real session id; anything else is unmeasured, so neither runs and
+ * its Stop loads no ledger module, as it does with the ledger off (env, or
+ * flags.json, ledger-gate's cheap check).
  * Measured and maybe on: the receipt loads the reader (use-report.js) and,
  * after delivery, the detector runs (use-detector.js). Neither ever loads the
  * capture writers.
@@ -452,8 +453,14 @@ async function stopCore(
   prepareOutcomeFn: typeof prepareOutcome,
 ): Promise<StopCoreResult> {
   const wire = config.wire ?? wireFor(config.agentId);
+  // A Stop with no real session id (the receipt's synthetic "session"
+  // fallback) is unmeasured too: its rows would be keyed under a transcript
+  // hash no capture used, and the receipt reads no counts on that path.
+  const hasSessionId = Boolean(asString(payload.session_id) || asString(payload.sessionId));
   const measured =
-    wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE && ledgerMayBeOn(config.vaultPath);
+    hasSessionId &&
+    wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE &&
+    ledgerMayBeOn(config.vaultPath);
   const output = await stopCoreOutput(config, payload, prepareOutcomeFn, measured);
   return { output, measured };
 }
