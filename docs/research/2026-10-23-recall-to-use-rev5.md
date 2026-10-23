@@ -464,6 +464,10 @@ SubagentStop (§6.3.6), and from `use-report`.
     `vault.test.mjs:1880` and `:1906` green unedited.
   - Otherwise it appends ` Use: <n> surfaced, <c> cited, <a> applied.` to the same line, which
     `maskTelemetry` already drops.
+  - S1b builds the counts (`sessionReceipt` reads them by default), but the Stop hook passes
+    `useCounts: false` until the Stop wiring slice. Reading them loads the ledger reader, and S1a-2 pins
+    that Stop loads none of the ledger modules, whatever the flag (`use-telemetry-flag-off-cost`). The
+    wiring slice settles Stop's module-load contract and turns the counts on.
 
 ### 4.6 RED tests (new files)
 

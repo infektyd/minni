@@ -2164,7 +2164,10 @@ export async function sessionReceipt(
   vaultPath: string,
   sessionId: string,
   limit = 500,
-  options: { includeStamped?: boolean } = {},
+  // useCounts: read the session's use counts from the ledger (default on).
+  // The Stop hook passes false until the Stop wiring slice, because loading
+  // the reader would make Stop pay for the ledger (§8.2).
+  options: { includeStamped?: boolean; useCounts?: boolean } = {},
 ): Promise<SessionReceipt> {
   // Read the ROLLING log, not the daily file auditTail prefers: a session
   // that crosses midnight has its boot marker in yesterday's daily file, but
@@ -2222,7 +2225,7 @@ export async function sessionReceipt(
   );
   // Use counts come from the ledger, keyed by the real session id. The
   // synthetic fallback (includeStamped: the payload had no id) has none.
-  if (options.includeStamped !== true) {
+  if (options.includeStamped !== true && options.useCounts !== false) {
     try {
       const { sessionUseCounts } = await import("./use-report.js");
       const use = sessionUseCounts(vaultPath, sessionId);

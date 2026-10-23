@@ -423,7 +423,8 @@ export async function handleStopCore(
   // On the synthetic fallback, turns that DID stamp a real session_id must
   // still count inside this window — otherwise the receipt reports zeros
   // despite real activity.
-  const receiptOptions = { includeStamped: !rawSessionId };
+  // No use counts yet: the Stop wiring slice turns them on (sessionReceipt).
+  const receiptOptions = { includeStamped: !rawSessionId, useCounts: false };
   const workspaceId = workspaceFromPayload(payload, config.defaultWorkspaceId);
   // Task and summary must stay distinct. Falling back to `summary` for the
   // task field made summary-only payloads compose `"<summary>: <summary>"` —
