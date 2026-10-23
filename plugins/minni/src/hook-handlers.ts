@@ -17,6 +17,8 @@
 // decided per platform by hook-platform.ts. Emitting Claude Code's envelope
 // everywhere is what silently voided Codex's PreCompact output and discarded
 // Grok Build's memory outright.
+import fs from "node:fs";
+
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
@@ -501,13 +503,30 @@ async function runStopUseDetector(args: {
       principal: args.principal,
       session_key: ledger.sessionKeyFrom(args.payload),
       agent_key: ledger.agentKeyFrom(args.payload),
-      transcriptPath: args.transcriptPath,
+      transcriptPath: regularFileOrNull(args.transcriptPath),
       lastAssistantMessage: args.lastAssistantMessage,
       endsTurn: true,
     });
     return DETECTOR_FAILURES.has(result.status) ? result.status : null;
   } catch {
     return "threw";
+  }
+}
+
+/**
+ * The transcript path when it names a regular file (links followed, as the
+ * detector's own realpath follows them); null when it names anything else.
+ * The detector treats a non-file as "no transcript" too, but only after an
+ * open that a FIFO would block; the host waits for this process to exit, so
+ * that open must never be reached. A missing path is passed through (the
+ * detector's own "no transcript"). Never throws.
+ */
+function regularFileOrNull(transcriptPath: string | null): string | null {
+  if (transcriptPath === null) return null;
+  try {
+    return fs.statSync(transcriptPath).isFile() ? transcriptPath : null;
+  } catch {
+    return transcriptPath;
   }
 }
 

@@ -1237,6 +1237,11 @@ There is one switch per feature, and every one defaults to `on`.
       once, throttled, as `<prefix>_use_detector_failed`, by code and never with a message. A carry at the
       caps is not a failure. An undelivered Stop runs no detector; the next Stop carries the transcript
       forward.
+    - **A transcript that is not a regular file** (a FIFO, a directory) is passed to the detector as no
+      transcript, after a `stat` that follows links as the detector's `realpath` does. The host waits for the
+      hook to exit, so the detector's own open, which a FIFO would block, must never be reached. A
+      stat-then-open window remains until the detector's open is itself non-blocking (S1b r4b); swapping the
+      path for a FIFO inside that window needs an active local attacker.
 - **The daemon flag** is read from the daemon's config or env, because the daemon runs under `minni up` or
   launchd.
 - **Ledger-off stretches stay visible.** With `MINNI_USE_LEDGER=off`, no ledger rows are written, but the

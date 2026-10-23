@@ -215,3 +215,33 @@ test("a capped detector (a transcript over 2 MB) carries forward: same output, n
     "the turn's end was not reached: nothing is final yet",
   );
 });
+
+test("a transcript_path that is a FIFO never holds the host: Stop exits cleanly, promptly", { timeout: 60_000 }, async (t) => {
+  const { execFileSync } = await import("node:child_process");
+  const fixture = await makeFixture(t, "stop-detector-fifo");
+  await startFakeDaemon(fixture);
+  const { payload } = await seedStopTurn(fixture);
+  const fifo = path.join(fixture.root, "transcript.fifo");
+  execFileSync("mkfifo", [fifo]);
+  const started = Date.now();
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(DEFAULT_DIST, "hook.js"), "Stop"], {
+      env: hookEnv(fixture),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    const killer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+    child.on("error", reject);
+    child.stderr.resume();
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.on("close", (code, signal) => {
+      clearTimeout(killer);
+      resolve({ code, signal, stdout });
+    });
+    child.stdin.end(JSON.stringify({ ...payload, transcript_path: fifo }));
+  });
+  assert.equal(result.signal, null, `the hook was still running after ${Date.now() - started} ms (blocked on the FIFO)`);
+  assert.equal(result.code, 0);
+  assert.equal(JSON.parse(result.stdout.trim().split("\n").at(-1)).continue, true);
+  assert.equal(detectorFailures((await auditTail(fixture.vault, 100)).entries).length, 0, "no transcript is not a failure");
+});
