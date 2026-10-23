@@ -2361,10 +2361,16 @@ interface CachedVaultNoteEntry {
   wordCounts: Map<string, number>;
 }
 
+// The per-process search cache, keyed by vault path. It always holds the
+// parsed notes; reuse is gated by the warm-cache rule in searchVaultNotes (at
+// least 20 notes, built within the last 30 s). `tokenMap` is the inverted
+// lookup index (see indexNoteTokensIntoMap), built only by the "index"
+// candidate path and only on first use — a process that only ever runs the
+// "scan" path never builds it. See VaultSearchCandidates.
 interface VaultSearchCacheEntry {
   builtAtMs: number;
   notes: Map<string, CachedVaultNoteEntry>;
-  tokenMap: Map<string, Set<string>>;
+  tokenMap?: Map<string, Set<string>>;
 }
 
 const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
@@ -2464,6 +2470,42 @@ export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, 
       }
     }
   }
+}
+
+/**
+ * How searchVaultNotes picks the notes it scores. On a cache whose notes were
+ * all read from disk, both paths select exactly the same notes in exactly the
+ * same order, so results, scores and ranking are identical (pinned by
+ * tests/vault-search-candidates-parity.test.mjs); they differ only in cost.
+ *
+ * - "index" (default): build an inverted index from every lookup key of every
+ *   note once per cache, then answer each query with a few map lookups. The
+ *   build dominates a cold search (most of its cost on a vault of several
+ *   hundred notes), so this is for a long-lived process that keeps the cache
+ *   warm across queries — the MCP server, and the prepare_task / handoff
+ *   packet paths it serves.
+ * - "scan": no index; test each query key against each note's text directly.
+ *   This is for a one-shot process that searches once and exits — the hook
+ *   processes (UserPromptSubmit) — which would otherwise pay the full index
+ *   build on every prompt to answer a single query. A query whose keys keep
+ *   missing (see SCAN_BUDGET_PASSES) is handed to the index instead, so a
+ *   scan never costs much more than the build it avoids.
+ *
+ * The caller chooses the path for its process type. The only switch inside a
+ * path is that deterministic work budget, and it cannot change what is
+ * selected, only what selecting it costs.
+ *
+ * After writeVaultPage rewrites a note in the same process, the index keeps
+ * the note's old keys (it only ever adds), so the index path can admit the
+ * note as an extra candidate the scan would not. The extra is scored on its
+ * current text, so results differ only if that text scores for the query
+ * without producing any of the query's lookup keys — the case the lookup
+ * already misses on a fresh cache (e.g. `x_foo_bar` for the query `foo_bar`).
+ */
+export type VaultSearchCandidates = "index" | "scan";
+
+export interface VaultSearchOptions {
+  candidates?: VaultSearchCandidates;
 }
 
 function buildCachedVaultNoteEntry(
@@ -2575,6 +2617,280 @@ function indexNoteTokensIntoMap(
   }
 }
 
+// The "index" path's index, built on first use from the cached notes in their
+// cache order — the same bucket order an index built while reading them has.
+function vaultSearchTokenMap(
+  cache: VaultSearchCacheEntry,
+): Map<string, Set<string>> {
+  if (!cache.tokenMap) {
+    const tokenMap = new Map<string, Set<string>>();
+    for (const entry of cache.notes.values()) {
+      if (!entry.skipByStatus) {
+        indexNoteTokensIntoMap(tokenMap, entry.notePath, entry.haystackLower);
+      }
+    }
+    cache.tokenMap = tokenMap;
+  }
+  return cache.tokenMap;
+}
+
+/**
+ * The keys a query is looked up under, in lookup order: for each term, the
+ * first `[a-z0-9_]{2,}` run of the term, then that run minus a trailing `s`
+ * when it is longer than 3 characters. Undefined when some term has no such
+ * run (or is not a plain `[a-z0-9_/-]` token), which makes every cached note a
+ * candidate.
+ */
+function candidateLookupKeys(terms: string[]): string[] | undefined {
+  const lookupSubtokens = terms.map((term) => {
+    const t = term.toLowerCase();
+    return /^[a-z0-9_][a-z0-9_/-]*[a-z0-9_]$/.test(t)
+      ? (t.match(/[a-z0-9_]{2,}/g) ?? [])
+      : [];
+  });
+  const allIndexableTokens =
+    lookupSubtokens.length > 0 && lookupSubtokens.every((subs) => subs.length > 0);
+  if (!allIndexableTokens) return undefined;
+  const keys: string[] = [];
+  for (const subs of lookupSubtokens) {
+    const tok = subs[0];
+    keys.push(tok);
+    if (tok.length > 3 && tok.endsWith("s")) keys.push(tok.slice(0, -1));
+  }
+  return keys;
+}
+
+// End of the run of token characters ([a-z0-9_], indexNoteTokensIntoMap's
+// regex) starting at `from`; with `pieceOnly`, `_` ends the run too (a
+// `_`-split subtoken).
+function indexTokenRunEnd(text: string, from: number, pieceOnly: boolean): number {
+  let end = from;
+  while (end < text.length) {
+    const code = text.charCodeAt(end);
+    if (!(isAsciiLowerWordChar(code) || (!pieceOnly && code === 95))) break;
+    end++;
+  }
+  return end;
+}
+
+// Whether indexNoteTokensIntoMap's addTokenKeys(T) emits `key`, for a token T
+// = text[start, end) already known to begin with `key`. Every key it emits is
+// a prefix of T, so the only question is which prefix lengths it emits:
+//   - T itself;
+//   - T minus `s` (T longer than 3), minus `es`/`ed` (T at least 6), minus
+//     `ing` (T at least 7);
+//   - every prefix of 3..min(|T| - 1, 10) characters.
+// So a key of 3..10 characters is emitted by every T it begins (T itself or a
+// longer T's prefix), a 2-character key only by T equal to it (no rule above
+// yields a 2-character key from a longer T), and a key of 11+ characters only
+// by T equal to it or to it plus `s`, `es`, `ed` or `ing`.
+function indexTokenEmitsKey(
+  text: string,
+  start: number,
+  end: number,
+  key: string,
+): boolean {
+  const keyLen = key.length;
+  if (keyLen >= 3 && keyLen <= 10) return true;
+  const rest = end - start - keyLen;
+  if (keyLen < 3) return rest === 0;
+  const at = start + keyLen;
+  switch (rest) {
+    case 0:
+      return true;
+    case 1:
+      return text.charCodeAt(at) === 115; // s
+    case 2:
+      return (
+        text.charCodeAt(at) === 101 && // e
+        (text.charCodeAt(at + 1) === 115 || text.charCodeAt(at + 1) === 100) // s, d
+      );
+    case 3:
+      return text.startsWith("ing", at);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Whether the "index" path's index would list this note under `key`, decided
+ * from the note's text alone. `key` is a `[a-z0-9_]{2,}` lookup key (see
+ * candidateLookupKeys); `haystackLower` is the text indexNoteTokensIntoMap
+ * indexes.
+ *
+ * The index lists a note under every key that addTokenKeys emits for one of
+ * its tokens, where a token is a maximal `[a-z0-9_]{2,}` run of the text, or,
+ * for a run containing `_`, one of its `_`-separated pieces of 2+ characters.
+ * Every key is a prefix of the token that emits it, so it suffices to visit
+ * each occurrence of `key` and ask whether a token starts there that emits it:
+ *   - a whole run starts there when the character before is not [a-z0-9_];
+ *   - a piece starts there when the character before is not [a-z0-9] (a `_`,
+ *     or the run's start), and only for a key with no `_` (a piece has none).
+ *     At a run's start with no `_` in the run, the piece is the run itself,
+ *     so the two readings agree.
+ */
+function haystackHasIndexKey(haystackLower: string, key: string): boolean {
+  const keyLen = key.length;
+  if (keyLen === 0) return false;
+  const keyHasUnderscore = key.includes("_");
+  // A 3..10-character key is emitted by any token it begins, so its end
+  // does not matter (indexTokenEmitsKey ignores it).
+  const needsEnd = keyLen < 3 || keyLen > 10;
+  let at = haystackLower.indexOf(key);
+  while (at !== -1) {
+    const prev = at > 0 ? haystackLower.charCodeAt(at - 1) : -1;
+    if (!isAsciiLowerWordChar(prev)) {
+      if (prev !== 95) {
+        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, false) : 0;
+        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
+      }
+      if (!keyHasUnderscore) {
+        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, true) : 0;
+        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
+      }
+    }
+    at = haystackLower.indexOf(key, at + 1);
+  }
+  return false;
+}
+
+// "index" path: union the index buckets of each key, in key order.
+function indexCandidateEntries(
+  cache: VaultSearchCacheEntry,
+  keys: string[],
+): CachedVaultNoteEntry[] {
+  const tokenMap = vaultSearchTokenMap(cache);
+  const matchedPaths = new Set<string>();
+  for (const key of keys) {
+    const bucket = tokenMap.get(key);
+    if (bucket) {
+      for (const p of bucket) matchedPaths.add(p);
+    }
+  }
+  const subset: CachedVaultNoteEntry[] = [];
+  for (const p of matchedPaths) {
+    const entry = cache.notes.get(p);
+    if (entry && !entry.skipByStatus) subset.push(entry);
+  }
+  return subset;
+}
+
+// The scan path's work budget, in full passes over the text of the notes it
+// tests. Testing a key against a note it does not admit reads the note's whole
+// text, and a note that is never admitted is read again for every key; the
+// number of keys is the number of distinct query terms, which nothing caps.
+// So a query of many keys that match nothing (a pasted hex dump, a UUID list,
+// code full of long identifiers) would cost a pass per key, and the hook would
+// end up slower than the index build the scan exists to avoid. Once the reads
+// spent on notes a key did not admit exceed this many passes, the scan stops
+// and hands the query to the index path, which selects the same candidates in
+// the same order. The worst case is then about this many passes plus one
+// index build. It counts characters, not time, so the switch is deterministic.
+// A note a key does admit is not counted: it leaves the scan, so all of those
+// reads together come to at most one more pass.
+//
+// Derived, not measured on one vault: the cold index build of a real
+// 783-note, 12 MB vault measured 265-306 ms. A pass for a key that matches
+// nothing, measured on a synthetic vault of the same size (783 notes, 12.6 MB,
+// English-like letter frequencies, two-byte text), costs 1-21 ms by key shape:
+// about 2 ms for long hex ids, 4 ms for keys starting with a rare letter,
+// 21 ms for short keys starting with `e` (every `e` is a substring-search
+// candidate). Against the worst shape the crossover is 265 / 21.4 = 12.4
+// passes, rounded down to 12. A worst-shape query then costs at most about two
+// index builds; a typical one, one build and a little.
+const SCAN_BUDGET_PASSES = 12;
+
+// "scan" path: the union an index built from the cached notes gives, in the
+// same order, without the index. The index path admits a note at the first
+// key whose bucket holds it, and walks each bucket in cache order; so does
+// this — keys in order, the notes not yet admitted in cache order — and a note
+// admitted once is never tested again. Undefined once the work budget above
+// is spent; the caller then runs the index path.
+function scanCandidateEntries(
+  cache: VaultSearchCacheEntry,
+  keys: string[],
+): CachedVaultNoteEntry[] | undefined {
+  let pending: CachedVaultNoteEntry[] = [];
+  let passChars = 0;
+  for (const entry of cache.notes.values()) {
+    if (!entry.skipByStatus) {
+      pending.push(entry);
+      passChars += entry.haystackLower.length;
+    }
+  }
+  const budgetChars = SCAN_BUDGET_PASSES * passChars;
+  let spentChars = 0;
+  const subset: CachedVaultNoteEntry[] = [];
+  const seenKeys = new Set<string>();
+  for (const key of keys) {
+    if (pending.length === 0) break;
+    // A repeated key admits nothing the first visit did not.
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const stillPending: CachedVaultNoteEntry[] = [];
+    for (const entry of pending) {
+      if (haystackHasIndexKey(entry.haystackLower, key)) {
+        subset.push(entry);
+      } else {
+        stillPending.push(entry);
+        spentChars += entry.haystackLower.length;
+      }
+    }
+    pending = stillPending;
+    if (spentChars > budgetChars) return undefined;
+  }
+  return subset;
+}
+
+function selectCandidateEntries(
+  cache: VaultSearchCacheEntry,
+  terms: string[],
+  candidates: VaultSearchCandidates,
+): Iterable<CachedVaultNoteEntry> {
+  const keys =
+    cache.notes.size >= 20 ? candidateLookupKeys(terms) : undefined;
+  if (!keys) return cache.notes.values();
+  if (candidates === "scan") {
+    const scanned = scanCandidateEntries(cache, keys);
+    if (scanned) return scanned;
+  }
+  return indexCandidateEntries(cache, keys);
+}
+
+/**
+ * What this process's search cache holds for `vaultPath`: how many notes, and
+ * whether the "index" path's index has been built. Undefined when nothing is
+ * cached. Read-only; it never builds or refreshes anything.
+ */
+export function vaultSearchCacheState(
+  vaultPath: string,
+): { notes: number; prefixIndex: boolean } | undefined {
+  const cache = _vaultSearchCache.get(vaultPath);
+  if (!cache) return undefined;
+  return { notes: cache.notes.size, prefixIndex: cache.tokenMap !== undefined };
+}
+
+/**
+ * The candidates `candidates` selects for `query` from this process's cache
+ * for `vaultPath`, as relative paths in the order they are scored — the
+ * selection searchVaultNotes runs, exposed so the parity test can compare the
+ * two paths' candidates directly rather than only their scored results.
+ * Undefined when nothing is cached; it never reads the vault. The "index"
+ * path builds its index here if it is missing, exactly as a search would.
+ */
+export function vaultSearchCandidatePaths(
+  vaultPath: string,
+  query: string,
+  candidates: VaultSearchCandidates,
+): string[] | undefined {
+  const cache = _vaultSearchCache.get(vaultPath);
+  if (!cache) return undefined;
+  return Array.from(
+    selectCandidateEntries(cache, queryTerms(query), candidates),
+    (entry) => entry.relativePath,
+  );
+}
+
 function updateVaultSearchCacheOnWrite(
   vaultPath: string,
   notePath: string,
@@ -2598,7 +2914,7 @@ function updateVaultSearchCacheOnWrite(
     privacy,
   );
   cached.notes.set(notePath, entry);
-  if (!entry.skipByStatus) {
+  if (!entry.skipByStatus && cached.tokenMap) {
     indexNoteTokensIntoMap(cached.tokenMap, notePath, entry.haystackLower);
   }
   cached.builtAtMs = Date.now();
@@ -2609,7 +2925,9 @@ export async function searchVaultNotes(
   query: string,
   limit = 5,
   agentId?: string,
+  options: VaultSearchOptions = {},
 ): Promise<VaultSearchResult[]> {
+  const candidates = options.candidates ?? "index";
   const terms = queryTerms(query);
   const phrases = phraseForms(query);
   // Only bail when there is nothing to match on at all. Bailing on an empty
@@ -2636,7 +2954,6 @@ export async function searchVaultNotes(
       return [];
     }
     const notes = new Map<string, CachedVaultNoteEntry>();
-    const tokenMap = new Map<string, Set<string>>();
     await Promise.all(
       files.map(async (notePath) => {
         const markdown = await readFile(notePath, "utf8");
@@ -2652,46 +2969,16 @@ export async function searchVaultNotes(
           privacy,
         );
         notes.set(notePath, entry);
-        if (!entry.skipByStatus) {
-          indexNoteTokensIntoMap(tokenMap, notePath, entry.haystackLower);
-        }
       }),
     );
-    cache = { builtAtMs: now, notes, tokenMap };
+    cache = { builtAtMs: now, notes };
     _vaultSearchCache.set(vaultPath, cache);
   }
+  // The "index" path keeps its index current for every later search and
+  // write in this process, as it always has; the "scan" path never builds it.
+  if (candidates === "index") vaultSearchTokenMap(cache);
 
-  let candidateEntries: Iterable<CachedVaultNoteEntry> = cache.notes.values();
-  const lowerTerms = terms.map((t) => t.toLowerCase());
-  const lookupSubtokens = lowerTerms.map((t) =>
-    /^[a-z0-9_][a-z0-9_/-]*[a-z0-9_]$/.test(t)
-      ? (t.match(/[a-z0-9_]{2,}/g) ?? [])
-      : [],
-  );
-  const allIndexableTokens =
-    lookupSubtokens.length > 0 && lookupSubtokens.every((subs) => subs.length > 0);
-  if (allIndexableTokens && cache.notes.size >= 20) {
-    const matchedPaths = new Set<string>();
-    for (const subs of lookupSubtokens) {
-      const tok = subs[0];
-      const exactSet = cache.tokenMap.get(tok);
-      if (exactSet) {
-        for (const p of exactSet) matchedPaths.add(p);
-      }
-      if (tok.length > 3 && tok.endsWith("s")) {
-        const stemSet = cache.tokenMap.get(tok.slice(0, -1));
-        if (stemSet) {
-          for (const p of stemSet) matchedPaths.add(p);
-        }
-      }
-    }
-    const subset: CachedVaultNoteEntry[] = [];
-    for (const p of matchedPaths) {
-      const entry = cache.notes.get(p);
-      if (entry && !entry.skipByStatus) subset.push(entry);
-    }
-    candidateEntries = subset;
-  }
+  const candidateEntries = selectCandidateEntries(cache, terms, candidates);
 
   const scored: Array<{ entry: CachedVaultNoteEntry; score: number }> = [];
   for (const entry of candidateEntries) {

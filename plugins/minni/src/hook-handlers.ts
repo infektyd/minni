@@ -1627,7 +1627,13 @@ export function createHookHandlers(
       { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
     ] as const : await Promise.all([
       withBudget(
-        searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH, config.agentId),
+        // "scan": a hook is a fresh process that searches once and exits, so
+        // the prefix index the "index" path builds would be paid on every
+        // prompt for a single query. Same candidates, same results — see
+        // VaultSearchCandidates in vault.ts.
+        searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH, config.agentId, {
+          candidates: "scan",
+        }),
         remainingMs(),
         [],
       ),
