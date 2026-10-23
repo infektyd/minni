@@ -392,9 +392,11 @@ SubagentStop (§6.3.6), and from `use-report`.
        and identifiers included) and then mapped onto the words the title/content pass keeps, so a learning
        that carries an identifier or a path (`minni_recall`, `.runtime/use-ledger/`) is still recognised as
        recited.
-     - Words are tokenised exactly as the ledger tokenises: NFKC, lowercased, then matched by the word rule.
-       Lowercasing can split a word (`İ` becomes `i` + U+0307, which the rule does not match), so each word
-       is lowercased and re-split before it is counted.
+     - Words are tokenised by the same word rule as the ledger: NFKC, lowercased, then matched. Lowercasing
+       can split a word (`İ` becomes `i` + U+0307, which the rule does not match), so each matched word is
+       lowercased and re-split before it is counted. The ledger lowercases the whole text and the detector
+       each word, so context-dependent lowercasing (Greek final sigma beside case-ignorable punctuation,
+       `ΑΣ.Β`) can differ; it differs symmetrically in both windows.
   3. **`cited_handle`**: by handle: a wikilink, slug, vault path, `m:`/`d:` handle or `learning #id`. It is
      its own bucket in both windows and **never `used_ii`**.
      - Every handle-style form is removed from the text before the title/content pass, so a handle's own
@@ -572,12 +574,20 @@ SubagentStop (§6.3.6), and from `use-report`.
   - **Announce, then open** (§4.4): before can only announce by title, which earns `used_ii`; after can
     announce by handle, which never does. The bias inflates the before window, so an after > before result
     is not produced by it.
-  - **The 8-word echo is only one edit wide on short learnings.** A one-word swap or one inserted word in a
-    learning of about 12 words leaves no 8-word window intact, so a near-verbatim recital scores `cited`.
-    This is symmetric (boot learnings are the same in both windows) and an overcount edge.
-  - **Hyphenated prose is stripped from the title pass.** The joined-identifier and path rules also remove
-    hyphenated words and dates of 8 or more characters (`claude-code`, `follow-up`, `2026-10-23`) before
-    title tokens are counted. This is symmetric and an undercount.
+  - **The 8-word echo is only one edit wide on short learnings.** A learning of about 12 words has 5 eight-word
+    windows. A one-word swap or insertion in its middle leaves none of them intact, so a near-verbatim
+    recital scores `cited`; at its edge it leaves 4 of 5 intact, and the recital is still masked. This is
+    symmetric (boot learnings are the same in both windows) and an overcount edge.
+  - **Hyphenated and slashed prose is stripped from the title pass.** The joined-identifier rule removes
+    hyphenated or underscored words of 8 or more characters (`claude-code`, `follow-up`, `2026-10-23`); the
+    path rule removes any word with a slash (`and/or`, `10/23/2026`). Both run before title tokens are
+    counted. This is symmetric and an undercount.
+  - **Recall by title fans out to siblings.** A `minni_recall` whose query cites a title opens every surfaced
+    memory that shares that title text. This is symmetric and affects `opened` only.
+  - **After only: an open cancels a handle citation.** "See `<handle>`, then recall another title" ends
+    `opened` where it would be `cited_handle`, because the recall opens the first memory too when the titles
+    share text. Only the after window prints handles, so this moves the `used` and `cited_handle` columns,
+    never `used_ii`.
 
 ---
 

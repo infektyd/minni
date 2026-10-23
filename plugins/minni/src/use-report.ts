@@ -29,7 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { flagOn } from "./flags.js";
-import { DETECTOR_RELDIR, readDfSnapshot } from "./use-detector.js";
+import { DETECTOR_RELDIR, readDfSnapshot, readRegularFileSync } from "./use-detector.js";
 import {
   containedDir,
   LEDGER_RELDIR,
@@ -256,9 +256,9 @@ export function resolveUseWindow(vaultPath: string, name: "before" | "after"): {
   let raw: unknown;
   try {
     assertWriteTargetUnder(file, vaultPath);
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > MAX_WINDOWS_FILE_BYTES) throw new Error("not a windows file");
-    raw = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_WINDOWS_FILE_BYTES);
+    if (text === null) throw new Error("not a windows file");
+    raw = JSON.parse(text) as unknown;
   } catch {
     throw new Error(`use-report: no "${name}" window: ${USE_WINDOWS_RELPATH} is missing or unreadable`);
   }
@@ -339,12 +339,13 @@ function ledgerOffStretches(vaultPath: string, since: number, until: number): Us
     const file = path.join(vaultPath, "logs", `${dayOf(cursor)}.md`);
     try {
       assertWriteTargetUnder(file, vaultPath);
-      const stat = fs.statSync(file);
-      if (!stat.isFile() || stat.size > MAX_AUDIT_LOG_BYTES) {
+      // Non-blocking and judged on the opened descriptor: a FIFO is a missing day.
+      const text = readRegularFileSync(file, MAX_AUDIT_LOG_BYTES);
+      if (text === null) {
         out.days_without_log += 1;
         continue;
       }
-      rows.push(...sessionStartRows(fs.readFileSync(file, "utf8")));
+      rows.push(...sessionStartRows(text));
     } catch {
       out.days_without_log += 1;
     }
@@ -432,9 +433,9 @@ function openExposures(vaultPath: string, sessionKey: string): OpenExposure[] {
     if (!dir) return [];
     const file = path.join(dir, "windows.json");
     assertWriteTargetUnder(file, vaultPath);
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > MAX_STATE_BYTES) return [];
-    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_STATE_BYTES);
+    if (text === null) return [];
+    const raw = JSON.parse(text) as unknown;
     if (!isRecord(raw) || !isRecord(raw.agents)) return [];
     const out: OpenExposure[] = [];
     for (const [agentKey, agent] of Object.entries(raw.agents)) {

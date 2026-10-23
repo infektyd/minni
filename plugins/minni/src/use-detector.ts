@@ -239,6 +239,46 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Read-only open flags for every file the detector and the report read. With
+ * O_NONBLOCK a FIFO opens at once (instead of waiting for a writer, which
+ * under the Stop wiring would hold the host up to its Stop timeout) and is
+ * then refused by the fstat below; O_NOFOLLOW refuses a symlinked leaf.
+ */
+const READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
+/**
+ * A regular file's text, or null: opened non-blocking, judged on the OPENED
+ * descriptor (so a file swapped for a FIFO after a stat is still refused),
+ * at most `maxBytes`. Never blocks, never throws.
+ */
+export function readRegularFileSync(file: string, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, READ_FLAGS);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    const buffer = Buffer.alloc(stat.size);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const n = fs.readSync(fd, buffer, filled, buffer.length - filled, filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    return buffer.toString("utf8", 0, filled);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // A read-only descriptor: nothing to lose.
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // DF snapshot (§4.4 "Distinctive tokens")
 // ---------------------------------------------------------------------------
@@ -274,7 +314,9 @@ export function readDfSnapshot(vaultPath: string): DfSnapshot | null {
     const cached = dfCache.get(key);
     if (cached && cached.signature === signature) return cached.snapshot;
     let snapshot: DfSnapshot | null = null;
-    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_DF_BYTES);
+    if (text === null) return null;
+    const raw = JSON.parse(text) as unknown;
     if (isRecord(raw) && raw.v === 1 && Number.isSafeInteger(raw.notes) && (raw.notes as number) >= 1 && isRecord(raw.df)) {
       const df = new Map<string, number>();
       for (const [token, count] of Object.entries(raw.df)) {
@@ -370,9 +412,8 @@ function writeJsonAtomic(vaultPath: string, file: string, value: unknown): void 
 function readJsonFile(vaultPath: string, file: string): unknown {
   try {
     assertWriteTargetUnder(file, vaultPath);
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > MAX_STATE_BYTES) return null;
-    return JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const text = readRegularFileSync(file, MAX_STATE_BYTES);
+    return text === null ? null : (JSON.parse(text) as unknown);
   } catch {
     return null;
   }
@@ -807,7 +848,8 @@ function openTranscript(transcriptPath: unknown): TranscriptHandle | null {
   let fd: number | undefined;
   try {
     const real = fs.realpathSync(transcriptPath);
-    fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    // O_NONBLOCK: a FIFO must open at once and be refused below, never wait for a writer.
+    fd = fs.openSync(real, READ_FLAGS);
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) {
       fs.closeSync(fd);
@@ -1012,6 +1054,8 @@ interface TextAct {
   keptSentence: number[];
   /** Token sets per sentence, from the kept words. */
   sentences: Set<string>[];
+  /** isDismissal(text), computed once per act (memo). */
+  dismissal?: boolean;
 }
 
 interface ToolAct {
@@ -1025,6 +1069,17 @@ interface ToolAct {
   /** A minni_recall's query. */
   query?: string;
   minni: "recall" | "drill" | null;
+  // Per-act data, computed once per act and never per window (memos):
+  /** The tool's base name (`mcp__x__minni_recall` -> `minni_recall`). */
+  base: string;
+  /** A Bash command that uses a read verb. */
+  readVerb: boolean;
+  /** The input's leaves, one per line, for doc-id opens. */
+  leafLines?: string[];
+  /** The recall query, NFKC. */
+  queryText?: string;
+  /** The recall query's kept words of 3+ characters, as one token set. */
+  queryTokens?: Set<string>;
 }
 
 type Act = TextAct | ToolAct;
@@ -1102,7 +1157,16 @@ function tokenSets(words: readonly string[], sentenceOf: readonly number[], keep
  * one word scan with offsets, so an echo window covering raw words maps
  * exactly onto the kept words it touches.
  */
-function textAct(raw: string): TextAct {
+interface WordScan {
+  text: string;
+  rawWords: string[];
+  keptWords: string[];
+  keptRaw: number[];
+  keptSentence: number[];
+}
+
+/** The one word scan: NFKC, handle spans, sentence ids, lowercased words (raw and kept). */
+function scanWords(raw: string): WordScan {
   const text = raw.slice(0, MAX_INPUT_CHARS).normalize("NFKC");
   const spans = handleSpans(text);
   let spanAt = 0;
@@ -1137,6 +1201,11 @@ function textAct(raw: string): TextAct {
       rawWords.push(word);
     }
   }
+  return { text, rawWords, keptWords, keptRaw, keptSentence };
+}
+
+function textAct(raw: string): TextAct {
+  const { text, rawWords, keptWords, keptRaw, keptSentence } = scanWords(raw);
   const rawWindows: Array<string | null> = [];
   const shingles = new Set<string>();
   for (let i = 0; i < rawWords.length; i += 1) {
@@ -1167,6 +1236,15 @@ function textAct(raw: string): TextAct {
  * title/content tokens count only outside it, so a paraphrase still does.
  */
 function sentencesOutsideEcho(act: TextAct, echo: ReadonlySet<string>): Set<string>[] {
+  // Fast path, O(|echo|): no echo shingle in this act means nothing to mask.
+  let any = false;
+  for (const hash of echo) {
+    if (act.shingles.has(hash)) {
+      any = true;
+      break;
+    }
+  }
+  if (!any) return act.sentences;
   // Coverage on the raw words, where the ledger's echo hashes live; then
   // mapped onto the kept words. A window that spans an identifier still
   // matches, because identifiers are stripped only from the title pass.
@@ -1210,12 +1288,15 @@ function toolAct(name: string, input: unknown): ToolAct {
     leaves,
     shingles: new Set(allShingleHashes(leaves)),
     minni: (MINNI_TOOL_RE.exec(name)?.[1] as "recall" | "drill" | undefined) ?? null,
+    base: name.split("__").pop() ?? name,
+    readVerb: false,
   };
   if (isRecord(input)) {
     if (typeof input.file_path === "string") act.filePath = input.file_path;
     if (typeof input.command === "string") act.command = input.command;
     if (typeof input.query === "string") act.query = input.query.slice(0, MAX_INPUT_CHARS);
   }
+  if (act.base === "Bash" && act.command) act.readVerb = READ_VERB_RE.test(`${act.command} `);
   return act;
 }
 
@@ -1342,26 +1423,30 @@ function pathNames(filePath: string, rel: string): boolean {
  * citation (3 distinctive, prompt-filtered title tokens, handle forms
  * removed), or the full sanitized title as a substring.
  */
-function recallCitesTitle(profile: Profile, query: string, title: ReadonlyArray<{ token: string }> | null): boolean {
-  if (profile.titleRe?.test(query.normalize("NFKC"))) return true;
+function recallCitesTitle(profile: Profile, act: ToolAct, title: ReadonlyArray<{ token: string }> | null): boolean {
+  // Tokenised once per act: this runs for every open window and exposure.
+  if (act.queryText === undefined) act.queryText = (act.query ?? act.leaves).normalize("NFKC");
+  if (profile.titleRe?.test(act.queryText)) return true;
   if (!title || title.length < MIN_TITLE_TOKENS) return false;
-  return citesTitle(title, [new Set(textAct(query).keptWords.filter((word) => word.length >= 3))]);
+  if (act.queryTokens === undefined) {
+    act.queryTokens = new Set(scanWords(act.queryText).keptWords.filter((word) => word.length >= 3));
+  }
+  return citesTitle(title, [act.queryTokens]);
 }
 
 function opens(profile: Profile, act: ToolAct, title: ReadonlyArray<{ token: string }> | null): boolean {
-  const base = act.name.split("__").pop() ?? act.name;
   if (profile.rel) {
-    if (base === "Read" && act.filePath && pathNames(act.filePath, profile.rel)) return true;
-    if (base === "Bash" && act.command && READ_VERB_RE.test(`${act.command} `)) {
+    if (act.base === "Read" && act.filePath && pathNames(act.filePath, profile.rel)) return true;
+    if (act.readVerb && act.command) {
       if (profile.relRe?.test(act.command) || profile.slugRe?.test(act.command)) return true;
     }
   }
   if (act.minni) {
     if (profile.names.some((re) => re.test(act.leaves))) return true;
-    if (act.minni === "recall" && recallCitesTitle(profile, act.query ?? act.leaves, title)) return true;
+    if (act.minni === "recall" && recallCitesTitle(profile, act, title)) return true;
     if (profile.doc) {
-      const lines = act.leaves.split("\n");
-      if (lines.includes(profile.doc.id) && lines.includes(profile.doc.src)) return true;
+      act.leafLines ??= act.leaves.split("\n");
+      if (act.leafLines.includes(profile.doc.id) && act.leafLines.includes(profile.doc.src)) return true;
     }
   }
   return false;
@@ -1387,7 +1472,8 @@ function observe(
   if (act.kind === "text") {
     if (!acc.first_text) {
       acc.first_text = true;
-      if (isDismissal(act.text)) acc.dismissed = true;
+      act.dismissal ??= isDismissal(act.text);
+      if (act.dismissal) acc.dismissed = true;
     }
     if (hitsShingle(profile, act.shingles, false, promptShingles)) acc.applied = true;
     if (citesHandle(profile, act.text)) acc.cite_handle = true;
