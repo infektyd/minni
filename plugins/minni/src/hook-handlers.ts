@@ -57,7 +57,7 @@ import { harvestTranscriptDelta } from "./jev-harvest.js";
 import type { JevTrigger, JevLearnPayload } from "./jev-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
-import { canInject, renderIntent, wireFor } from "./hook-platform.js";
+import { canInject, renderIntent, wireCapabilities, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import {
@@ -417,19 +417,45 @@ export async function handleStopCore(
   payload: Record<string, unknown>,
   prepareOutcomeFn: typeof prepareOutcome = prepareOutcome,
 ): Promise<HookOutput> {
-  // S1b (§8.2): ONE cheap check decides both ledger reads Stop makes, the
-  // receipt's use counts and the detector run. With the ledger off (env, or
-  // flags.json) Stop loads no ledger module at all; with it maybe on, the
-  // receipt loads the reader (use-report.js) and, after delivery, the detector
-  // runs (use-detector.js). Neither ever loads the capture writers.
-  const ledgerMayBeOnHere = ledgerMayBeOn(config.vaultPath);
-  const output = await stopCoreOutput(config, payload, prepareOutcomeFn, ledgerMayBeOnHere);
-  // Registered once the output is built. Deferred commits run in registration
-  // order, so commits handleStop registers after this returns (a parked
-  // correction's archive, a relay cursor) wait for the detector: at most its
-  // 1.5 s cap, and the host waits for the process to exit either way.
-  if (ledgerMayBeOnHere) scheduleStopUseDetector(config, payload);
-  return output;
+  const core = await stopCore(config, payload, prepareOutcomeFn);
+  // A direct caller registers nothing after this, so the detector is last.
+  if (core.measured) scheduleStopUseDetector(config, payload);
+  return core.output;
+}
+
+/** The transcript shape the use detector parses (use-detector.ts reads Claude Code JSONL). */
+const DETECTOR_TRANSCRIPT_SHAPE = "claude-code";
+
+interface StopCoreResult {
+  output: HookOutput;
+  /**
+   * This Stop is measured: its wire's transcript is one the detector parses,
+   * and ledger-gate says the ledger may be on. The receipt read its use counts,
+   * and the caller must schedule the detector, after every other commit.
+   */
+  measured: boolean;
+}
+
+/**
+ * S1b (§8.2): one decision for both ledger reads Stop makes, the receipt's use
+ * counts and the detector run. Phase 1 measures only wires whose transcript the
+ * detector parses (`transcriptShape`, hook-platform.ts); every other wire is
+ * unmeasured, so neither runs there and its Stop loads no ledger module, as it
+ * does with the ledger off (env, or flags.json, ledger-gate's cheap check).
+ * Measured and maybe on: the receipt loads the reader (use-report.js) and,
+ * after delivery, the detector runs (use-detector.js). Neither ever loads the
+ * capture writers.
+ */
+async function stopCore(
+  config: StopCoreConfig,
+  payload: Record<string, unknown>,
+  prepareOutcomeFn: typeof prepareOutcome,
+): Promise<StopCoreResult> {
+  const wire = config.wire ?? wireFor(config.agentId);
+  const measured =
+    wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE && ledgerMayBeOn(config.vaultPath);
+  const output = await stopCoreOutput(config, payload, prepareOutcomeFn, measured);
+  return { output, measured };
 }
 
 /** Detector statuses that mean this turn could not be judged: one audit line each, throttled. */
@@ -2046,21 +2072,34 @@ export function createHookHandlers(
     return { continue: true };
   }
 
-  // Stop lives in the shared handleStopCore (above) so the governance posture
-  // has exactly one implementation across all five entrypoints — see its
-  // doc comment for why hook.ts routes here too.
+  // Stop lives in the shared stopCore / handleStopCore (above) so the
+  // governance posture has exactly one implementation across all five
+  // entrypoints — see handleStopCore's doc comment for why hook.ts routes here
+  // too.
   //
   // Issue #253: after the stop breadcrumb / candidate write, deliver any
   // corrections SessionStart parked under inbox/.undeliverable (wires that
   // cannot inject at boot). Ordering is intentional:
-  //   1. handleStopCore first — inbox write / receipt is independent of
+  //   1. the shared Stop core first — inbox write / receipt is independent of
   //      correction delivery and must not be gated on the park dir;
-  //   2. then inject corrections_reassert at Stop when the wire can carry it.
+  //   2. then inject corrections_reassert at Stop when the wire can carry it;
+  //   3. (S1b) the use detector's commit last, after everything above has
+  //      registered its own.
   // "Re-assert at end of turn" is the honest semantics on a platform whose
   // only injectable event is Stop: the model sees the correction before the
   // next turn begins, not at session boot. Prefer acting on them next turn.
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
-    const result = await handleStopCore(config, payload, prepareOutcomeFn);
+    const core = await stopCore(config, payload, prepareOutcomeFn);
+    const output = await stopOutput(payload, core.output);
+    // S1b: the use detector's commit is registered LAST. Deferred commits run
+    // in registration order and the detector may take its full 1.5 s cap, so
+    // everything Stop consumes or confirms (a parked correction's archive, a
+    // relay cursor) settles first; the detector only records.
+    if (core.measured) scheduleStopUseDetector(config, payload);
+    return output;
+  }
+
+  async function stopOutput(payload: Record<string, unknown>, result: HookOutput): Promise<HookOutput> {
 
     let correctionsEnvelope = "";
     // Only attempt when Stop can actually inject — parking only happens when

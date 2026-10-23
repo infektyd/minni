@@ -245,3 +245,136 @@ test("a transcript_path that is a FIFO never holds the host: Stop exits cleanly,
   assert.equal(JSON.parse(result.stdout.trim().split("\n").at(-1)).continue, true);
   assert.equal(detectorFailures((await auditTail(fixture.vault, 100)).entries).length, 0, "no transcript is not a failure");
 });
+
+/** The module file names a spawned hook resolves. */
+async function loadedNames(t, fixture, event, payload, { env = {}, bin } = {}) {
+  const dir = await mkdtemp(path.join(tmpdir(), "minni-stop-detector-loads-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const log = path.join(dir, "loads.log");
+  const preload = path.join(dir, "log-resolve.mjs");
+  await writeFile(
+    preload,
+    [
+      'import { registerHooks } from "node:module";',
+      'import { appendFileSync } from "node:fs";',
+      "registerHooks({",
+      "  resolve(specifier, context, nextResolve) {",
+      "    const result = nextResolve(specifier, context);",
+      "    appendFileSync(process.env.MINNI_TEST_LOAD_LOG, `${result.url}\\n`);",
+      "    return result;",
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const { pathToFileURL } = await import("node:url");
+  const result = await runHook(fixture, event, payload, {
+    env: { ...env, MINNI_TEST_LOAD_LOG: log },
+    nodeArgs: ["--import", pathToFileURL(preload).href],
+    ...(bin ? { bin } : {}),
+  });
+  const names = (await readFile(log, "utf8")).split("\n").filter(Boolean).map((url) => url.split("/").pop());
+  return { ...result, names };
+}
+
+const LEDGER_MODULES = [
+  "use-capture.js",
+  "use-ledger.js",
+  "flags.js",
+  "harness-envelope.js",
+  "harness-envelope-rules.js",
+  "use-detector.js",
+  "use-report.js",
+];
+
+test("an unmeasured wire (codex) with the ledger on: no detector, no receipt counts, no ledger module, today's line", { timeout: 120_000 }, async (t) => {
+  const at = path.join(tmpdir(), `minni-stop-detector-codex-${process.pid}`);
+  t.after(() => rm(at, { recursive: true, force: true }));
+  const raws = {};
+  for (const ledger of ["on", "off"]) {
+    const fixture = await makeFixture(null, "stop-detector-codex", { at });
+    await startFakeDaemon(fixture);
+    try {
+      // A Claude-shaped transcript the detector could parse: only the wire gate stops it.
+      const { payload } = await seedStopTurn(fixture, { at: Date.parse("2026-10-23T10:00:00.000Z") });
+      const run = await loadedNames(t, fixture, "Stop", payload, {
+        bin: "codex-hook.js",
+        env: { MINNI_CODEX_VAULT_PATH: fixture.vault, MINNI_USE_LEDGER: ledger },
+      });
+      assert.equal(run.code, 0);
+      assert.ok(run.names.includes("hook-handlers.js"), "the hook ran");
+      raws[ledger] = run.raw;
+      if (ledger === "on") {
+        for (const module of LEDGER_MODULES) assert.ok(!run.names.includes(module), `codex Stop loaded ${module}`);
+        assert.equal(ledgerRows(fixture.vault, "judged").length, 0, "an unmeasured wire writes no judged rows");
+        assert.ok(!(await exists(path.join(fixture.vault, ".runtime", "use-detector"))));
+        assert.doesNotMatch(run.raw, / Use: /);
+      }
+    } finally {
+      await closeFixture(fixture);
+    }
+  }
+  assert.equal(raws.on, raws.off, "the receipt line is today's, byte-identical to the ledger off");
+
+  // The measured wire is unchanged: the same seed on claude-code judges and counts.
+  const fixture = await makeFixture(t, "stop-detector-claude-measured");
+  await startFakeDaemon(fixture);
+  const { payload, surfaced } = await seedStopTurn(fixture);
+  const claude = await runHook(fixture, "Stop", payload);
+  assert.match(claude.raw, / Use: 1 surfaced, 0 cited, 0 applied\./);
+  assert.equal(ledgerRows(fixture.vault, "judged").filter((row) => row.sid === surfaced.sid).length, 1);
+});
+
+test("the detector's commit runs last: a wedged detector never delays the parked-correction archive", { timeout: 120_000 }, async (t) => {
+  const dist = await mutatedDist(t, slowRun);
+  const fixture = await makeFixture(t, "stop-detector-order");
+  await startFakeDaemon(fixture);
+  const { payload } = await seedStopTurn(fixture);
+  // A correction SessionStart parked as undeliverable: claude-code's Stop can
+  // inject, so it re-asserts it and archives the entry once delivered.
+  const parked = path.join(fixture.vault, "inbox", ".undeliverable");
+  const { mkdir, readdir } = await import("node:fs/promises");
+  await mkdir(parked, { recursive: true });
+  const stamp = Date.now() - 86_400_000;
+  await writeFile(
+    path.join(parked, `${new Date(stamp).toISOString().slice(0, 10)}-${stamp.toString(36)}-precompact-reassert.json`),
+    JSON.stringify({
+      slug: "precompact-reassert",
+      kind: "precompact_reassert",
+      createdAt: new Date(stamp).toISOString(),
+      stale_belief_events: [
+        { event_id: 4242, superseded_learning_id: 11, new_learning_id: 12, originating_agent: "codex", created_at: 1_754_000_000 },
+      ],
+    }),
+    "utf8",
+  );
+  const listJson = async (dir) => (await readdir(dir).catch(() => [])).filter((name) => name.endsWith(".json"));
+  const observed = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(dist, "hook.js"), "Stop"], { env: hookEnv(fixture), stdio: ["pipe", "pipe", "pipe"] });
+    let exited = false;
+    let stdout = "";
+    let check = null;
+    child.on("error", reject);
+    child.stderr.resume();
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      // 700 ms after the output is delivered: inside the detector's 2.5 s wedge.
+      check ??= new Promise((done) =>
+        setTimeout(async () => {
+          done({ exited, parked: await listJson(parked), archived: await listJson(path.join(fixture.vault, "inbox", ".archive")) });
+        }, 700),
+      );
+    });
+    child.on("close", async (code) => {
+      exited = true;
+      resolve({ code, stdout, during: await check });
+    });
+    child.stdin.end(JSON.stringify(payload));
+  });
+  assert.equal(observed.code, 0);
+  assert.match(observed.stdout, /corrections_reassert/, "positive control: Stop re-asserted the parked correction");
+  assert.equal(observed.during.exited, false, "the check ran while the wedged detector was still running");
+  assert.deepEqual(observed.during.parked, [], "the parked entry was archived before the detector ran");
+  assert.equal(observed.during.archived.length, 1);
+});

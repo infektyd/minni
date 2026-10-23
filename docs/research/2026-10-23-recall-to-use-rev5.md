@@ -1200,11 +1200,15 @@ There is one switch per feature, and every one defaults to `on`.
   - **Stop (S1b).** Stop records nothing of its own. It reads the ledger for the receipt and, after delivery,
     runs the detector. Pinned by `use-telemetry-flag-off-cost`, `use-telemetry-stop-detector` and
     `use-telemetry-stop-receipt`.
-    - **Ledger off** (env, or `flags.json`, as ledger-gate decides it): Stop loads no ledger module. None of
-      `use-capture.js`, `use-ledger.js`, `flags.js`, `harness-envelope.js`, `harness-envelope-rules.js`,
-      `use-detector.js` or `use-report.js` loads, and the receipt line is byte-identical to the line without
-      use counts.
-    - **Ledger on** (ledger-gate says it may be on):
+    - **Measured wires only.** Phase 1 measures the wires whose transcript the detector parses: those whose
+      `transcriptShape` capability (`hook-platform.ts`) is `claude-code`, which today is claude-code alone.
+      Every other wire is unmeasured (§4.5), so on its Stop neither the detector nor the receipt's use counts
+      run, and Stop behaves as with the ledger off below, whatever the flag.
+    - **Ledger off** (env, or `flags.json`, as ledger-gate decides it), or an unmeasured wire: Stop loads no
+      ledger module. None of `use-capture.js`, `use-ledger.js`, `flags.js`, `harness-envelope.js`,
+      `harness-envelope-rules.js`, `use-detector.js` or `use-report.js` loads, and the receipt line is
+      byte-identical to the line without use counts.
+    - **Ledger on** (ledger-gate says it may be on), on a measured wire:
       1. Stop loads `use-detector.js` (lazily, once delivered, and only after `flags.js` confirms the ledger)
          and `use-report.js` (the receipt), with their `use-ledger.js` and `flags.js`.
       2. It never loads `use-capture.js`.
@@ -1231,6 +1235,9 @@ There is one switch per feature, and every one defaults to `on`.
            with the ledger on and off.
          - Nothing else. In particular, nothing under `recall-session.d/` changes (`counters.json`,
            `hit-keys.json`, `<agent_key>.reset`), and neither does `df-snapshot.json`, which only UPS writes.
+    - **Order.** The detector's commit is registered last, after every commit Stop registers to consume or
+      confirm something (a parked correction's archive, a relay cursor). Deferred commits run in registration
+      order, so those settle before the detector starts, never up to its 1.5 s cap later.
     - **Failures.** A detector that throws, will not load, is slow, or stops at its caps (1.5 s, 2 MB) changes
       no byte of the Stop output, which is already delivered, and never fails the hook. A failure (a module
       that will not load; a status of `invalid`, `refused`, `write_failed` or `error`; a throw) is audited
