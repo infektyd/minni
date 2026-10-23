@@ -90,6 +90,11 @@ const FIXTURE = [
   { rel: `${C}/long-es.md`, frontmatter: { title: "Long es" }, body: "Workers spawn multiprocesses here." },
   { rel: `${C}/long-s.md`, frontmatter: { title: "Long s" }, body: "Several configurations exist." },
   { rel: `${C}/long-non-stem.md`, frontmatter: { title: "Long non stem" }, body: "Speaking configurationally, and abcdefghijxyz too." },
+  // an 11+-character key plus 1, 2 or 3 characters that are not a stem
+  // suffix: none of these may admit `precondition`
+  { rel: `${C}/long-rest-1.md`, frontmatter: { title: "Rest one" }, body: "Logs say preconditionx once." },
+  { rel: `${C}/long-rest-2.md`, frontmatter: { title: "Rest two" }, body: "Logs say preconditionxy once." },
+  { rel: `${C}/long-rest-3.md`, frontmatter: { title: "Rest three" }, body: "Logs say preconditionxyz once." },
   // prefixes at the 3- and 10-character edges
   { rel: `${C}/prefix-3.md`, frontmatter: { title: "Prefix three" }, body: "The cfgloader reads files." },
   { rel: `${C}/prefix-10.md`, frontmatter: { title: "Prefix ten" }, body: "Token abcdefghijk is eleven long." },
@@ -141,6 +146,7 @@ const QUERIES = [
   "testing", "tested", "boxes", "box", "bus", "runs", "sizes", "boxing", "caches", "cached",
   // long-key stem edges (11+ characters)
   "precondition", "preconditions", "preconditioned", "preconditioning", "multiprocess",
+  "preconditionx", "preconditionxy", "preconditionxyz",
   "multiprocesses", "configuration", "configurations", "configurationally",
   // prefix edges: 3, 10, 11 and 12 characters
   "cfg", "cfgl", "abcdefghij", "abcdefghijk", "abcdefghijks", "abcdefghijx", "abc",
@@ -195,6 +201,11 @@ test("parity: the fixed fixture, every query shape, candidates and results ident
     ["multiprocess", `${C}/long-es.md`, true],
     ["configuration", `${C}/long-s.md`, true],
     ["configuration", `${C}/long-non-stem.md`, false],
+    ["precondition", `${C}/long-rest-1.md`, false],
+    ["precondition", `${C}/long-rest-2.md`, false],
+    ["precondition", `${C}/long-rest-3.md`, false],
+    ["preconditionx", `${C}/long-rest-1.md`, true],
+    ["preconditionxyz", `${C}/long-rest-3.md`, true],
     ["abcdefghij", `${C}/long-non-stem.md`, true],
     ["abcdefghijx", `${C}/long-non-stem.md`, false],
     ["abcdefghij", `${C}/prefix-10.md`, true],
