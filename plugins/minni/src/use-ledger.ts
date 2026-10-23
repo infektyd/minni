@@ -468,6 +468,8 @@ export interface JudgedFields {
   title_assessable: boolean;
   final: boolean;
   rule_version: string | number;
+  /** Why a final row was written without its full evidence, e.g. `unflushed_tail` (§4.4). */
+  final_reason?: string;
 }
 
 export interface ResetFields {
@@ -485,6 +487,8 @@ export interface ExposureFields {
   outcome: string;
   credits: readonly number[];
   final: boolean;
+  /** Creditable turns whose first assistant text matched the dismissal lexicon (a diagnostic). */
+  dismissed_turns?: number;
 }
 
 export type TurnRow = LedgerCommon & { kind: "turn" } & TurnFields;
@@ -516,6 +520,7 @@ export type JudgedRow = LedgerCommon & {
   title_assessable: boolean;
   final: boolean;
   rule_version: string | number;
+  final_reason?: string;
 };
 export type ResetRow = LedgerCommon & { kind: "reset"; event: string; reset_id: string };
 export type ExposureRow = LedgerCommon & {
@@ -529,6 +534,7 @@ export type ExposureRow = LedgerCommon & {
   outcome: string;
   credits: number[];
   final: boolean;
+  dismissed_turns?: number;
 };
 export type LedgerRow = TurnRow | SurfacedRow | JudgedRow | ResetRow | ExposureRow;
 
@@ -699,7 +705,7 @@ function token(value: unknown): string {
 
 export function buildJudgedRow(context: LedgerContext, fields: JudgedFields, ts: string = nowIso()): JudgedRow {
   const version = fields.rule_version;
-  return {
+  const row: JudgedRow = {
     ...common(context, "judged", ts),
     sid: typeof fields.sid === "string" && SHINGLE_HASH_RE.test(fields.sid) ? fields.sid : "invalid",
     outcome: token(fields.outcome),
@@ -713,6 +719,8 @@ export function buildJudgedRow(context: LedgerContext, fields: JudgedFields, ts:
         ? version
         : "invalid",
   };
+  if (fields.final_reason !== undefined) row.final_reason = token(fields.final_reason);
+  return row;
 }
 
 /** A reset of the payload's OWN agent key; `reset_id` defaults to a hash of who/when/why. */
@@ -745,6 +753,9 @@ export function buildExposureRow(
     outcome: fields.outcome,
     credits: [...fields.credits],
     final: fields.final,
+    ...(Number.isSafeInteger(fields.dismissed_turns) && (fields.dismissed_turns as number) >= 0
+      ? { dismissed_turns: fields.dismissed_turns as number }
+      : {}),
   };
 }
 
@@ -1035,8 +1046,11 @@ function wordsOf(text: string): string[] {
   return text.normalize("NFKC").toLowerCase().match(WORD_RE) ?? [];
 }
 
-/** The hash of one shingle, given as its words joined by single spaces. */
-function shingleHashOf(text: string): string {
+/**
+ * The hash of one shingle, given as its words (already normalised) joined by
+ * single spaces. Shared with the detector.
+ */
+export function shingleHashOf(text: string): string {
   // 64 bits as 16 hex chars: JSON has no exact 64-bit integers.
   return hexDigest("sha256", text).slice(0, 16);
 }

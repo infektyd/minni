@@ -4,6 +4,8 @@ import { readAgentContext, statusAndAudit } from "./daemon_transport.js";
 import { prepareOutcome, prepareTask } from "./task.js";
 import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "./team.js";
 import { auditReport, auditTail, ensureVault, vaultFirstLearn, writeVaultPage } from "./vault.js";
+import { finalizeIdleSessions } from "./use-detector.js";
+import { buildUseReport, type UseReportOptions } from "./use-report.js";
 
 function parsePrepareArgs(args: string[]) {
   const remaining: string[] = [];
@@ -70,12 +72,52 @@ function parsePrepareOutcomeArgs(args: string[]) {
   };
 }
 
+/**
+ * `use-report --days N [--memory <mkey>] [--window before|after] [--since ISO] [--until ISO]`.
+ * A named window comes from <vault>/.runtime/use-windows.json; --since/--until
+ * give an explicit range; otherwise the last N days (default 7).
+ */
+function parseUseReportArgs(args: string[]): UseReportOptions {
+  const options: UseReportOptions = {};
+  const value = (index: number, flag: string): string => {
+    const next = args[index + 1];
+    if (next === undefined || next.startsWith("--")) throw new Error(`use-report: ${flag} needs a value`);
+    return next;
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--days") {
+      const days = Number(value(index, arg));
+      if (!Number.isSafeInteger(days) || days < 1 || days > 365) throw new Error("use-report: --days is a whole number from 1 to 365");
+      options.days = days;
+      index += 1;
+    } else if (arg === "--memory") {
+      options.memory = value(index, arg);
+      index += 1;
+    } else if (arg === "--window") {
+      const name = value(index, arg);
+      if (name !== "before" && name !== "after") throw new Error("use-report: --window is before or after");
+      options.window = name;
+      index += 1;
+    } else if (arg === "--since" || arg === "--until") {
+      const text = value(index, arg);
+      if (!Number.isFinite(Date.parse(text))) throw new Error(`use-report: ${arg} is not a date`);
+      if (arg === "--since") options.since = text;
+      else options.until = text;
+      index += 1;
+    } else {
+      throw new Error(`use-report: unknown argument ${arg}`);
+    }
+  }
+  return options;
+}
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
 
   if (!command || command === "help") {
     console.log(
-      "Usage: node dist/cli.js <status|read|ensure-vault|audit-tail|audit-report|route|prepare|prepare-outcome|team-runtime|team-evidence|team-promotion|quality|learn|write> ...",
+      "Usage: node dist/cli.js <status|read|ensure-vault|audit-tail|audit-report|use-report|route|prepare|prepare-outcome|team-runtime|team-evidence|team-promotion|quality|learn|write> ...",
     );
     return;
   }
@@ -104,6 +146,14 @@ async function main() {
   if (command === "audit-report") {
     const limit = Number(args[0] ?? "100");
     console.log(JSON.stringify(await auditReport(DEFAULT_VAULT_PATH, limit), null, 2));
+    return;
+  }
+
+  if (command === "use-report") {
+    const options = parseUseReportArgs(args);
+    // The detector also runs from here (rev5 §4.4): close sessions idle > 24 h first.
+    finalizeIdleSessions(DEFAULT_VAULT_PATH);
+    console.log(JSON.stringify(buildUseReport(DEFAULT_VAULT_PATH, options), null, 2));
     return;
   }
 
