@@ -220,6 +220,8 @@ another resume):
   - Readers skip torn lines.
   - Every path goes through `assertWriteTargetUnder`.
   - Rows never go through `recordAudit`, so its 5 s throttle cannot drop them.
+  - Rows a hook could not write are counted. After delivery, one throttled audit line,
+    `<prefix>_use_ledger_failed`, gives the count only (S1a-2).
 - **Common fields:** `{v:5, kind, ts, session_key, agent_key, wire, principal, prompt_id?, subagent_type?, features, build}`.
   `features` is the set of kill switches in effect, so before and after rows say what was on.
 - **Row kinds:**
@@ -275,12 +277,19 @@ another resume):
   - `daemon_version`
 
   The plugin hashes `content` into shingles and never stores or injects it.
-- **Retention.** Session directories older than 90 days with no open windows are removed after delivery, at
-  most 20 per run. Each is first renamed to `.trash-<ts>`.
+- **Retention (S1b, not yet shipped).** Ledger session directories (`.runtime/use-ledger/<session_key>`) older
+  than 90 days with no open windows are removed after delivery, at most 20 per run. Each is first renamed to
+  `.trash-<ts>`. S1a does not do this: it ships only the `recall-session.d` sweep below. The ledger needs
+  S1b's open-window check, so S1b owns this retention (§8.1).
 - **Per-session side files (S1a-2).** `.runtime/recall-session.d/<session_key>/` holds the capture state that
   is not a ledger row. Every directory is reached through the ledger's containment walk, and every file is
   replaced through a temp name and a rename. None of them holds text.
   - `counters.json` = `{v, turn_ix}`. UPS is the only writer. S3c extends it (§5.2.7).
+    - Its read-modify-write holds an `O_EXCL` lock, `counters.json.lock`, so concurrent prompts never share
+      an index. The wait is bounded (200 ms), and a lock older than 2 s is broken. If the lock is not taken,
+      the turn records `turn_ix: 0`.
+    - A file that is present but not a counter (corrupt, foreign version, not a regular file) is left as it
+      is, and the turn records `turn_ix: 0`. Only an absent file starts the count at 1.
   - `<agent_key>.reset` = `{reset_id, at, reason}`, written on PreCompact, PostCompact and SessionStart.
   - `hit-keys.json` = `{v, task_signature, hits: [{wikilink, score, mkey}]}`, at most the 5 `top_hits`.
     - **Writer:** UPS, on a strong turn that armed the guard (the recall-state file was written).
@@ -288,13 +297,19 @@ another resume):
       `wikilink` and `score` under the same `task_signature`, and keys that hit's `guard` row with the
       recorded `mkey`.
     - **Why:** the recall-state file holds titles and wikilinks only, and a wikilink alone does not
-      identify one memory (§4.2). The file holds keys and the two match fields, nothing else. A `mkey` read
-      back must have a valid key shape. A listed hit with no recorded key gets no row; its key is never
-      guessed from the wikilink.
+      identify one memory (§4.2). The file holds keys and the two match fields, nothing else.
+    - **Read back as untrusted.** A `mkey` read back must have the shape `memoryKeyFor` gives. A `vault:` key
+      must be vault-relative: no leading `/`, drive letter, backslash, control character, or empty, `.` or
+      `..` segment. A listed hit with no valid recorded key gets no row; its key is never guessed from the
+      wikilink.
   - **Retention of `recall-session.d`.** These directories follow the ledger's horizon. They are removed
     once every entry is idle for 90 days, by a sweep (`sweepSessionDirs`):
-    - It runs after a SessionStart is delivered, registered with `deferUntilDelivered`.
+    - It runs once a SessionStart's output is settled, on every outcome. It is registered with
+      `deferUntilDelivered` both as the commit and as the abandon handler, because it consumes nothing. A
+      wire that drops SessionStart (Grok) still sweeps.
     - It removes at most 20 directories per run, each renamed to `.trash-<ts>-<key>` first.
+    - It also removes orphaned counts-file temp files (`.runtime/prompt-templates.json.<pid>.<uuid>.tmp`)
+      older than an hour: regular files only, at most 20 per run.
     - It stays inside the cooperative 150 ms budget, checked between items (§6.2.5).
     - It resumes from a cursor in `recall-session.d/.sweep.json`. After a complete pass it waits a day.
     - It skips symlinks and plain files, and never follows a link out of the vault.
@@ -1082,6 +1097,13 @@ There is one switch per feature, and every one defaults to `on`.
     the env var, then a non-blocking, no-follow read of `flags.json` (regular file, 64 KiB cap, strict
     value). It may answer "off" only where `flags.ts` would too; any doubt answers "maybe on", and then the
     full read above decides.
+  - **The cost of that.** When the check says off, `flags.ts` is never loaded. A hook then audits no note
+    about the other flags: a typo in any other flag goes unreported until the ledger is on again. PreToolUse
+    goes further: it runs the check only for a deny it is about to return, so an allowed call never loads
+    the capture either.
+  - **A capture module that will not load** (a stripped or half-updated install) makes the hook run exactly
+    as with the ledger off. It is audited once, throttled, as `<prefix>_use_capture_unavailable`, by code and
+    never with the loader's message, which names a path.
 - **The daemon flag** is read from the daemon's config or env, because the daemon runs under `minni up` or
   launchd.
 - **Ledger-off stretches stay visible.** With `MINNI_USE_LEDGER=off`, no ledger rows are written, but the

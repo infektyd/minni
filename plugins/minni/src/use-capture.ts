@@ -60,6 +60,8 @@ import {
   shingleHashes,
 } from "./use-ledger.js";
 import type { LedgerContext, MemoryRef, SurfaceChannel, SurfacedItem } from "./use-ledger.js";
+// Re-exported so hook-handlers.ts can read it without loading use-ledger.js itself.
+export { ledgerFailureCount } from "./use-ledger.js";
 import { assertWriteTargetUnder, recordAudit } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
@@ -217,13 +219,13 @@ const READ_FLAGS =
  * or oversize. Opened without following a symlink and without blocking (a FIFO
  * planted in its place cannot hang the hook). Throws on refusal or bad JSON.
  */
-function readSideFile(file: string, vaultPath: string): unknown {
+function readSideFile(file: string, vaultPath: string, missing: unknown = undefined): unknown {
   assertWriteTargetUnder(file, vaultPath);
   let fd: number;
   try {
     fd = fs.openSync(file, READ_FLAGS);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return undefined;
+    if (errorCode(error) === "ENOENT") return missing;
     throw error;
   }
   try {
@@ -267,21 +269,105 @@ function turnIndexIn(raw: unknown): number | undefined {
     : undefined;
 }
 
-/** Increment and return this session's turn counter; 0 when it cannot be kept. */
+const MISSING = Symbol("missing");
+
+/**
+ * The counter's current value: 0 when the file is absent, null when it is
+ * present but not a counter (corrupt, foreign, not a regular file, refused).
+ * A present-but-invalid file is evidence of something; it is never overwritten
+ * with a restart at 1, which would hand out indices the session already used.
+ */
+function counterIn(file: string, vaultPath: string): number | null {
+  let raw: unknown;
+  try {
+    raw = readSideFile(file, vaultPath, MISSING);
+  } catch {
+    return null;
+  }
+  if (raw === MISSING) return 0;
+  return turnIndexIn(raw) ?? null;
+}
+
+/** Wait this long, at most, for another UPS holding the counter lock. */
+const COUNTER_LOCK_WAIT_MS = 200;
+/** A lock this old belongs to a process that died holding it; it is broken. */
+export const COUNTER_LOCK_STALE_MS = 2000;
+const COUNTER_LOCK_POLL_MS = 2;
+const LOCK_FLAGS =
+  fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms: number): void {
+  Atomics.wait(sleepCell, 0, 0, ms);
+}
+
+/**
+ * Take `counters.json.lock` (O_EXCL) in a session directory. Returns its
+ * release, or null when it could not be taken within the bounded wait, or
+ * something that is not a lock file sits in its place. A lock older than
+ * COUNTER_LOCK_STALE_MS is broken (best effort: the critical section is a few
+ * small file operations, so a lock that old has no live holder).
+ */
+function lockCounter(dir: string, vaultPath: string): (() => void) | null {
+  const lock = path.join(dir, "counters.json.lock");
+  const deadline = Date.now() + COUNTER_LOCK_WAIT_MS;
+  for (let attempt = 0; ; attempt += 1) {
+    if (attempt > 0 && Date.now() >= deadline) return null;
+    try {
+      assertWriteTargetUnder(lock, vaultPath);
+      const fd = fs.openSync(lock, LOCK_FLAGS, 0o600);
+      try {
+        fs.writeSync(fd, `${process.pid} ${Date.now()}\n`);
+      } finally {
+        fs.closeSync(fd);
+      }
+      return () => {
+        try {
+          fs.unlinkSync(lock);
+        } catch {
+          // Already gone: nothing to release.
+        }
+      };
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") return null;
+    }
+    try {
+      const stat = fs.lstatSync(lock);
+      if (!stat.isFile()) return null;
+      if (Date.now() - stat.mtimeMs > COUNTER_LOCK_STALE_MS) {
+        fs.unlinkSync(lock);
+        continue;
+      }
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") continue;
+      return null;
+    }
+    sleepSync(COUNTER_LOCK_POLL_MS);
+  }
+}
+
+/**
+ * Increment and return this session's turn counter, under its lock, so
+ * concurrent prompts never share an index. 0 when it cannot be kept: the lock
+ * was not taken in time, the file is present but invalid (left as it is), or
+ * the new value could not be written.
+ */
 function nextTurnIndex(capture: UseCapture): number {
   try {
     const dir = sessionDir(capture, true);
     if (dir === null) return 0;
-    const file = path.join(dir, "counters.json");
-    let current = 0;
+    const release = lockCounter(dir, capture.vaultPath);
+    if (release === null) return 0;
     try {
-      current = turnIndexIn(readSideFile(file, capture.vaultPath)) ?? 0;
-    } catch {
-      // Unreadable or corrupt: the write below decides whether we can go on.
+      const file = path.join(dir, "counters.json");
+      const current = counterIn(file, capture.vaultPath);
+      if (current === null) return 0;
+      const next = current + 1;
+      writeSideFile(file, { v: 1, turn_ix: next }, capture.vaultPath);
+      return next;
+    } finally {
+      release();
     }
-    const next = current + 1;
-    writeSideFile(file, { v: 1, turn_ix: next }, capture.vaultPath);
-    return next;
   } catch {
     // An index that could not be persisted would repeat next turn; say unknown.
     return 0;
@@ -637,11 +723,23 @@ interface HitKey {
   mkey: string | null;
 }
 
+const NON_VAULT_MKEY_RE = /^(?:doc:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}|learning:[A-Za-z0-9_.-]{1,128}|lhash:[0-9a-f]{12})$/;
 // Built from a string, as flags.ts does, to keep the literal out of no-control-regex.
-const MKEY_RE = new RegExp(
-  "^(?:vault:[^\\u0000-\\u001F\\u007F]{1,1024}|doc:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}|" +
-    "learning:[A-Za-z0-9_.-]{1,128}|lhash:[0-9a-f]{12})$",
-);
+const CONTROL_RE = new RegExp("[\\u0000-\\u001F\\u007F\\\\]");
+
+/**
+ * A key read back from `hit-keys.json` (a file any local process can write)
+ * has the shape memoryKeyFor gives: a `vault:` key is a vault-relative POSIX
+ * path, so an absolute path, a drive letter, a backslash, an empty, `.` or
+ * `..` segment, or a control character is refused rather than recorded.
+ */
+function isValidMkey(value: string): boolean {
+  if (!value.startsWith("vault:")) return NON_VAULT_MKEY_RE.test(value);
+  const rel = value.slice("vault:".length);
+  if (rel.length === 0 || rel.length > 1024 || CONTROL_RE.test(rel)) return false;
+  if (rel.startsWith("/") || /^[A-Za-z]:/.test(rel)) return false;
+  return rel.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
 
 function sameHit(a: { title: unknown; wikilink: unknown; score: unknown }, b: typeof a): boolean {
   return a.title === b.title && a.wikilink === b.wikilink && a.score === b.score;
@@ -763,7 +861,7 @@ function readHitKeys(capture: UseCapture, taskSignature: string): HitKey[] {
       if (typeof value.wikilink !== "string" || typeof value.score !== "number") continue;
       // The file lives in a vault any local process can write: only a
       // well-formed key may reach a row.
-      const mkey = typeof value.mkey === "string" && MKEY_RE.test(value.mkey) ? value.mkey : null;
+      const mkey = typeof value.mkey === "string" && isValidMkey(value.mkey) ? value.mkey : null;
       out.push({ wikilink: value.wikilink, score: value.score, mkey });
     }
     return out;
@@ -837,6 +935,8 @@ interface SweepState {
 export interface SweepResult {
   removed: number;
   scanned: number;
+  /** Orphaned counts-file temp files removed from `.runtime`. */
+  temps_removed: number;
   /** The pass reached the end of the directory. */
   complete: boolean;
   /** Nothing to do: no directory yet, or the last complete pass is too recent. */
@@ -863,6 +963,37 @@ function isIdleSessionDir(dir: string, dirStat: fs.Stats, now: number): boolean 
     newest = Math.max(newest, fs.lstatSync(path.join(dir, entry)).mtimeMs);
   }
   return now - newest > SESSION_IDLE_MAX_MS;
+}
+
+/** A counts-file temp file this old was left by a writer that died before its rename. */
+export const TEMP_ORPHAN_AGE_MS = 60 * 60 * 1000;
+const TEMPLATE_TMP_RE =
+  /^prompt-templates\.json\.\d{1,10}\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+
+/**
+ * Remove `prompt-templates.json.<pid>.<uuid>.tmp` files older than an hour
+ * from `.runtime` (recordOccurrence's temp names, orphaned by a writer that
+ * died before its rename). Regular files only, reached through the
+ * containment walk; at most SWEEP_MAX_REMOVALS, stopping when `spent()`.
+ */
+function sweepTemplateTemps(vaultPath: string, now: number, spent: () => boolean): number {
+  const runtime = containedDir(vaultPath, [".runtime"], false);
+  if (runtime === null) return 0;
+  let removed = 0;
+  for (const name of fs.readdirSync(runtime)) {
+    if (!TEMPLATE_TMP_RE.test(name)) continue;
+    if (spent() || removed >= SWEEP_MAX_REMOVALS) break;
+    try {
+      const target = path.join(runtime, name);
+      const stat = fs.lstatSync(target);
+      if (!stat.isFile() || now - stat.mtimeMs <= TEMP_ORPHAN_AGE_MS) continue;
+      fs.unlinkSync(target);
+      removed += 1;
+    } catch {
+      // Gone already, or not ours to remove.
+    }
+  }
+  return removed;
 }
 
 /** Handle one name; true when a directory was removed. Never follows a symlink. */
@@ -901,7 +1032,8 @@ export function sweepSessionDirs(
   const started = clock();
   const now = options.now ?? started;
   const budgetMs = options.budgetMs ?? SWEEP_BUDGET_MS;
-  const result: SweepResult = { removed: 0, scanned: 0, complete: false, skipped: false };
+  const result: SweepResult = { removed: 0, scanned: 0, temps_removed: 0, complete: false, skipped: false };
+  const spent = (): boolean => clock() - started >= budgetMs;
   try {
     const root = containedDir(vaultPath, SESSION_RELDIR.split(path.sep), false);
     if (root === null) {
@@ -919,6 +1051,11 @@ export function sweepSessionDirs(
       result.skipped = true;
       return result;
     }
+    try {
+      result.temps_removed = sweepTemplateTemps(vaultPath, now, spent);
+    } catch {
+      // The session pass below does not depend on it.
+    }
     const names = fs
       .readdirSync(root)
       .filter((name) => SESSION_KEY_RE.test(name) || TRASH_RE.test(name))
@@ -928,7 +1065,7 @@ export function sweepSessionDirs(
     if (index < 0) index = names.length;
     let last = cursor;
     for (; index < names.length; index += 1) {
-      if (clock() - started >= budgetMs || result.removed >= SWEEP_MAX_REMOVALS) break;
+      if (spent() || result.removed >= SWEEP_MAX_REMOVALS) break;
       const name = names[index] as string;
       result.scanned += 1;
       try {
@@ -953,16 +1090,24 @@ export function sweepSessionDirs(
 }
 
 /**
- * SessionStart: run the retention sweep after the boot output is delivered
- * (it adds to the hook's wall time, P16, hence the budget). Registered as
- * record-only: it consumes nothing, so it is not a rollback if abandoned.
+ * SessionStart: run the retention sweep once the boot output is settled, on
+ * every outcome. It consumes nothing, so delivery is irrelevant to it: it runs
+ * as the commit when the output was delivered, and as the abandon handler when
+ * it was not (a wire that drops SessionStart, such as Grok, would otherwise
+ * never sweep, and recall-session.d would grow without bound). Record-only,
+ * so an abandoned run is not counted as a rollback. It adds to the hook's wall
+ * time (P16), hence its budget. On the throw path the abandon handler runs
+ * before the degraded output is flushed; the same budget bounds it there.
  */
 export function scheduleSessionSweep(capture: UseCapture | null): void {
   if (capture === null) return;
+  const sweep = (): void => {
+    sweepSessionDirs(capture.vaultPath);
+  };
   deferUntilDelivered(
     async () => {
-      sweepSessionDirs(capture.vaultPath);
+      sweep();
     },
-    { recordOnly: true },
+    { recordOnly: true, onAbandon: sweep },
   );
 }
