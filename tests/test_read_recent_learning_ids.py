@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -142,15 +143,17 @@ def _read(minnid, agent="main"):
 
 
 def _rendered_learning_lines(context: str) -> list[str]:
-    """The lines of the Learnings section as the text consumer sees them."""
-    rows = context.split("\n")
-    start = rows.index(_HEADER) + 1
-    out = []
-    for row in rows[start:]:
-        if not row.startswith("  - ["):
-            break
-        out.append(row)
-    return out
+    """The entries of the Learnings section as the text consumer sees them.
+
+    An entry starts at a physical line beginning ``  - [``; stored content may
+    contain newlines, so an entry can span several physical lines. The section
+    ends at the next ``## `` header (rendered as a blank line then ``## ``) or
+    at the end of the text.
+    """
+    _, _, body = context.partition("\n" + _HEADER + "\n")
+    assert body, f"no {_HEADER!r} section in context"
+    body = body.split("\n\n## ", 1)[0]
+    return re.split(r"\n(?=  - \[)", body)
 
 
 def test_recent_learnings_match_rendered_lines_one_to_one_in_order(tmp_path, monkeypatch):
@@ -362,6 +365,49 @@ def test_blob_stored_content_stays_json_serialisable(tmp_path, monkeypatch):
     ]
 
 
+def test_multiline_stored_content_is_located_by_substring(tmp_path, monkeypatch):
+    """The learn path strips but does not collapse whitespace, so a stored
+    learning can contain a newline and its rendered ``line`` then spans
+    physical lines. Consumers must locate it by substring, and the structured
+    list must still match the rendered text one-to-one, in order."""
+    import minni.minnid as minnid
+
+    db_obj, _wb, _cfg = _make_db(tmp_path, monkeypatch)
+    multiline = "First line of a note.\nSecond line of the same note."
+    with db_obj.cursor() as c:
+        older = _insert(c, 1, "fact", "A single-line neighbour learning.")
+        multi = _insert(c, 2, "fact", multiline)
+        newer = _insert(c, 3, "lesson", "Another single-line neighbour.")
+
+    result = _read(minnid)
+
+    assert "recent_learnings" in result, sorted(result)
+    recent = result["recent_learnings"]
+    context = result["context"]
+    multi_line = "  - [fact] First line of a note.\nSecond line of the same note. (conf=1.0)"
+
+    assert [r["learning_id"] for r in recent] == [newer, multi, older]
+    assert recent[1]["line"] == multi_line
+    assert "\n" in recent[1]["line"]
+    assert recent[1]["content"] == multiline
+    # Every structured line is a substring of the text the host injects ...
+    for row in recent:
+        assert row["line"] in context
+    # ... in the same order, with nothing extra and nothing missing.
+    positions = [context.index(row["line"]) for row in recent]
+    assert positions == sorted(positions)
+    rendered = _rendered_learning_lines(context)
+    assert len(rendered) == len(recent) == 3
+    assert rendered == [row["line"] for row in recent]
+    # Text context is byte-identical to the pre-change rendering rule.
+    assert context == (
+        "\n" + _HEADER + "\n"
+        "  - [lesson] Another single-line neighbour. (conf=1.0)\n"
+        + multi_line + "\n"
+        "  - [fact] A single-line neighbour learning. (conf=1.0)"
+    )
+
+
 def test_learning_reads_rows_match_structured_ids(tmp_path, monkeypatch):
     import minni.minnid as minnid
 
@@ -396,6 +442,23 @@ def test_daemon_version_is_the_existing_source_of_truth(tmp_path, monkeypatch):
     assert result["daemon_version"].strip()
     assert result["daemon_version"] == minnid.VERSION
     assert minnid._recall_context().version == minnid.VERSION
+
+
+def test_daemon_version_echoes_the_daemon_global_not_a_default(tmp_path, monkeypatch):
+    """If package metadata resolved to "unknown", asserting equality with
+    minnid.VERSION would pass even with the field wired to a constant. Pin a
+    sentinel: `_recall_context()` reads the module global at call time."""
+    import minni.minnid as minnid
+
+    db_obj, _wb, _cfg = _make_db(tmp_path, monkeypatch)
+    _seed_fixture(db_obj)
+    monkeypatch.setattr(minnid, "VERSION", "9.9.9-test")
+
+    result = _read(minnid)
+
+    assert "daemon_version" in result, sorted(result)
+    assert result["daemon_version"] == "9.9.9-test"
+    assert minnid._recall_context().version == "9.9.9-test"
 
 
 def test_response_is_json_serialisable_and_additive(tmp_path, monkeypatch):
