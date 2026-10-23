@@ -484,9 +484,11 @@ SubagentStop (§6.3.6), and from `use-report`.
   - `sessionReceipt` reads the counts by default. The Stop hook passes `useCounts` only when ledger-gate says
     the ledger may be on, because reading them loads the ledger reader (`use-report.js`). With the ledger off
     the line is byte-identical to the line without counts, and Stop loads no ledger module (§8.2).
-  - The counts stand as of the Stop's start. The detector judges that Stop's turn after the output is
-    delivered, so a surfacing first shows as surfaced and uncited, and its outcome shows on the next Stop's
-    receipt.
+  - **The counts lag one Stop.** They stand as of the Stop's start, because the detector judges that Stop's
+    own turn only after the output is delivered. A surfacing first shows as surfaced and uncited (pending),
+    and its outcome shows on the next Stop's receipt. The last turn of a session is never reflected in a
+    receipt; `use-report` still counts it.
+  - Only measured wires show counts (§8.2): an unmeasured wire's receipt is the line without them.
 
 ### 4.6 RED tests (new files)
 
