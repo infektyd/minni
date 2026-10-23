@@ -2707,10 +2707,12 @@ export function runDetector(args: RunDetectorArgs): DetectorResult {
     if (typeof vaultPath !== "string" || vaultPath.length === 0 || vaultPath.includes("\0")) return result;
     if (typeof sessionKey !== "string" || !SESSION_KEY_RE.test(sessionKey)) return result;
     if (typeof agentKey !== "string" || !AGENT_KEY_RE.test(agentKey)) return result;
-    if (sessionKey === "unlabeled") {
+    if (isUnlabeledKey(sessionKey)) {
       result.status = "unlabeled";
       return result;
     }
+    // A cased spelling of a real key would alias its directory (see isCanonicalSessionKey).
+    if (sessionKey !== sessionKey.toLowerCase()) return result;
     if (!fs.existsSync(vaultPath)) return result;
     if (!flagOn(vaultPath, "MINNI_USE_LEDGER")) {
       result.status = "disabled";
@@ -2842,7 +2844,9 @@ export interface IdleCloseResult {
   /**
    * Candidate sessions left unexamined when the call stopped early (the time
    * budget ran out, or `limit` sessions were closed): retry them. Present only
-   * when `sessionKeys` or `budgetMs` was passed.
+   * when `sessionKeys` or `budgetMs` was passed. A session that was examined
+   * but `locked` (another run held it) or `refused` (containment) is counted
+   * neither in `sessions` nor in `remaining`; the next sweep sees it again.
    */
   remaining?: number;
 }
@@ -2854,7 +2858,9 @@ export interface IdleCloseOptions {
   /**
    * Examine ONLY these sessions, in this order: no walk of the session
    * directories and no read of any other session's ledger. Each key must pass
-   * the walk's own rule for a session directory name; others are skipped.
+   * the walk's own rule for a session directory name, in its canonical
+   * lowercase spelling; others are skipped. A value that is not an array
+   * yields no candidates (never the full walk).
    */
   sessionKeys?: readonly string[];
   /**
@@ -2864,9 +2870,28 @@ export interface IdleCloseOptions {
   budgetMs?: number;
 }
 
+/**
+ * Any spelling of `unlabeled`. On a case-insensitive filesystem (APFS by
+ * default) "Unlabeled" names the same directory, so the exclusion must not
+ * depend on case.
+ */
+export function isUnlabeledKey(key: string): boolean {
+  return key.toLowerCase() === "unlabeled";
+}
+
 /** The walk's rule for a session directory name. */
 function isSessionKeyName(name: unknown): name is string {
-  return typeof name === "string" && SESSION_KEY_RE.test(name) && name !== "unlabeled";
+  return typeof name === "string" && SESSION_KEY_RE.test(name) && !isUnlabeledKey(name);
+}
+
+/**
+ * A caller-supplied session key: a valid name in its canonical spelling.
+ * Every key the ledger writes is lowercase (hex digests, `tx-…`), and on a
+ * case-insensitive filesystem any other spelling aliases a real session's
+ * directory: its rows would be finalised under the alias.
+ */
+function isCanonicalSessionKey(key: unknown): key is string {
+  return isSessionKeyName(key) && key === key.toLowerCase();
 }
 
 function listSessionKeys(vaultPath: string): string[] {
@@ -2944,12 +2969,14 @@ export function finalizeIdleSessions(vaultPath: string, options: IdleCloseOption
     const nowMs = toMs(options.now);
     const nowIso = new Date(nowMs).toISOString();
     const limit = Number.isSafeInteger(options.limit) && (options.limit as number) > 0 ? (options.limit as number) : 50;
-    const named = Array.isArray(options.sessionKeys);
+    const named = options.sessionKeys !== undefined;
     const budgeted = typeof options.budgetMs === "number" && Number.isFinite(options.budgetMs) && options.budgetMs > 0;
     const deadline = budgeted ? Date.now() + (options.budgetMs as number) : null;
-    const candidates = named
-      ? [...new Set((options.sessionKeys as readonly unknown[]).filter(isSessionKeyName))]
-      : listSessionKeys(vaultPath);
+    const candidates = !named
+      ? listSessionKeys(vaultPath)
+      : Array.isArray(options.sessionKeys)
+        ? [...new Set((options.sessionKeys as readonly unknown[]).filter(isCanonicalSessionKey))]
+        : [];
     if (named || options.budgetMs !== undefined) out.remaining = 0;
     for (let index = 0; index < candidates.length; index += 1) {
       const sessionKey = candidates[index] as string;

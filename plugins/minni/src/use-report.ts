@@ -396,7 +396,7 @@ function sessionsInRange(vaultPath: string, since: number, until: number): strin
     return [];
   }
   for (const name of names) {
-    if (!SESSION_KEY_RE.test(name) || name === "unlabeled") continue;
+    if (!SESSION_KEY_RE.test(name) || name.toLowerCase() === "unlabeled") continue;
     try {
       const days = fs
         .readdirSync(path.join(root, name))

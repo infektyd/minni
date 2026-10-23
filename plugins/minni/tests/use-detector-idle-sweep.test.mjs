@@ -13,7 +13,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { appendLedgerRows, buildSurfacedRow, LEDGER_RELDIR, readSessionLedger, sessionKeyFrom } from "../dist/use-ledger.js";
-import { finalizeIdleSessions } from "../dist/use-detector.js";
+import { finalizeIdleSessions, runDetector } from "../dist/use-detector.js";
 import { makeVault, T0 } from "./fixtures/use-detector-fixtures.mjs";
 
 delete process.env.MINNI_USE_LEDGER;
@@ -155,4 +155,40 @@ test("duplicate keys are examined once and never inflate the remainder", async (
     Date.now = realNow;
   }
   assert.deepEqual([result.sessions, result.remaining], [1, 1], "A once; only B is left");
+});
+
+// r4d: on a case-insensitive filesystem (APFS by default) any other spelling of
+// a session key names the same directory. Every key the ledger writes is
+// lowercase, so only that spelling is accepted from a caller.
+test("a cased spelling of unlabeled, or of a real key, finalises nothing and creates no directory", async (t) => {
+  for (const spelling of ["Unlabeled", "UNLABELED", "upper-of-A"]) {
+    const { vault } = await makeVault(t, "minni-idle-case-");
+    seedIdle(vault, "unlabeled");
+    seedIdle(vault, A);
+    const key = spelling === "upper-of-A" ? A.toUpperCase() : spelling;
+    const result = finalizeIdleSessions(vault, { now: IDLE_NOW, sessionKeys: [key] });
+    assert.deepEqual([result.status, result.sessions, result.remaining], ["ran", 0, 0], spelling);
+    assert.equal(judgedCount(vault, "unlabeled"), 0, `${spelling}: the unlabeled session stays out`);
+    assert.equal(judgedCount(vault, A), 0, `${spelling}: no session is finalised under an alias`);
+    assert.equal(fs.existsSync(path.join(vault, ".runtime", "use-detector", "sessions")), false, `${spelling}: no state directory`);
+  }
+});
+
+test("runDetector treats any spelling of unlabeled as unlabeled, and refuses a cased key", async (t) => {
+  for (const [key, status] of [["Unlabeled", "unlabeled"], ["UNLABELED", "unlabeled"], [A.toUpperCase(), "invalid"]]) {
+    const { vault, transcriptPath } = await makeVault(t, "minni-detector-case-");
+    const result = runDetector({ vaultPath: vault, wire: "claude-code", session_key: key, agent_key: "main", transcriptPath, now: IDLE_NOW });
+    assert.equal(result.status, status, key);
+    assert.equal(fs.existsSync(path.join(vault, ".runtime", "use-detector")), false, `${key}: nothing created`);
+  }
+});
+
+test("a non-array sessionKeys yields no candidates, never the full walk", async (t) => {
+  for (const value of [A, { 0: A, length: 1 }, null, 7]) {
+    const { vault } = await makeVault(t, "minni-idle-nonarray-");
+    seedIdle(vault, A);
+    const result = finalizeIdleSessions(vault, { now: IDLE_NOW, sessionKeys: value });
+    assert.deepEqual([result.status, result.sessions, result.remaining], ["ran", 0, 0], JSON.stringify(value));
+    assert.equal(judgedCount(vault, A), 0, `${JSON.stringify(value)}: nothing examined`);
+  }
 });
