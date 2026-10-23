@@ -1247,6 +1247,15 @@ There is one switch per feature, and every one defaults to `on`.
 - **Ledger-off stretches stay visible.** With `MINNI_USE_LEDGER=off`, no ledger rows are written, but the
   SessionStart audit row records the flags in effect. `use-report` lists those stretches from the audit
   log.
+  - The fields (S1b): every `<prefix>_session_start` row carries `details.use_ledger`, `"on"` or `"off"`.
+    With the ledger on it also carries `details.features`, the switches in effect, sorted. "On" means this
+    boot opened a ledger capture. "Off" means ledger-gate or `flags.ts` said off, or the capture module would
+    not load. With the ledger off no capture module loads to compute the field.
+  - **Caveat: the audit throttle.** `<prefix>_session_start` is not exempt from the 5 s per-event audit
+    throttle (`vault.ts` `shouldThrottleAudit`). Two boots of the same agent within 5 s keep only the first
+    row. Each row stands for its own boot, so a dropped row loses one sample, and the stretch boundaries
+    come from the rows that survive. Exempting it would need edits to pre-rev-5 throttle tests
+    (`audit-rcm008.test.mjs` uses `hook_session_start` as its duplicate case), so it is left for Hans.
 
 | Flag | Feature |
 |---|---|
