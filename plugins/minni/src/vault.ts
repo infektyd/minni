@@ -439,13 +439,27 @@ function snippetFor(
     .replace(/^#+\s+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
-  const earliest = (indexes: number[]): number =>
-    indexes.filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? -1;
-  let firstHit = earliest(terms.map((term) => firstWordIndex(plain, term)));
-  if (firstHit < 0) {
-    // terms are lowercased by queryTerms; the whole-word regexes carry /i.
-    const lower = plain.toLowerCase();
-    firstHit = earliest(terms.map((term) => lower.indexOf(term)));
+  let firstHit = -1;
+  let usedFastPath = false;
+  if (terms.length > 2) {
+    const matcher = getMultiTermMatcher(terms);
+    if (!matcher.hasNonAsciiOrRejected) {
+      const lower = plain.toLowerCase();
+      if (plain.length === lower.length) {
+        firstHit = matcher.firstSnippetHit(plain, lower);
+        usedFastPath = true;
+      }
+    }
+  }
+  if (!usedFastPath) {
+    const earliest = (indexes: number[]): number =>
+      indexes.filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? -1;
+    firstHit = earliest(terms.map((term) => firstWordIndex(plain, term)));
+    if (firstHit < 0) {
+      // terms are lowercased by queryTerms; the whole-word regexes carry /i.
+      const lower = plain.toLowerCase();
+      firstHit = earliest(terms.map((term) => lower.indexOf(term)));
+    }
   }
   const start = Math.max(0, Math.max(firstHit, 0) - 80);
   const end = Math.min(plain.length, start + maxLength);
@@ -812,6 +826,482 @@ function countWordOccurrences(
   return count;
 }
 
+const MULTI_TERM_WEAK_CACHE = new WeakMap<readonly string[], MultiTermMatcher>();
+const MULTI_TERM_LRU_CACHE = new Map<string, MultiTermMatcher>();
+const MULTI_TERM_LRU_LIMIT = 64;
+
+// Single-pass Aho-Corasick matcher over a query's pure-lower-ASCII terms with
+// pre-resolved 128-wide ASCII goto transitions and exact word-boundary /
+// morphological-suffix parity with countWordOccurrences (Backlog rows l & p).
+class MultiTermMatcher {
+  readonly numPatterns: number;
+  readonly termToPatIdx: Int32Array;
+  readonly hasNonAsciiOrRejected: boolean;
+  private readonly patternStr: string[];
+  private readonly patLen: Int32Array;
+  private readonly maxPatLen: number;
+  private readonly leadReq: Uint8Array;
+  private readonly tailReq: Uint8Array;
+  private readonly allowSuf: Uint8Array;
+  private readonly gotoTable: Int32Array;
+  private readonly firstMatchAtState: Int32Array;
+  private readonly nextMatch: Int32Array;
+  private readonly countsBuf: Int32Array;
+  private readonly nextAllowedBuf: Int32Array;
+  private readonly fallbackBuf: Uint8Array;
+
+  constructor(terms: readonly string[]) {
+    const termToPatIdx = new Int32Array(terms.length);
+    const patternStr: string[] = [];
+    const seenPatterns = new Map<string, number>();
+    let hasNonAsciiOrRejected = false;
+    let totalChars = 0;
+    let maxPatLen = 0;
+
+    for (let i = 0; i < terms.length; i++) {
+      const t = terms[i];
+      if (!t) {
+        termToPatIdx[i] = -1;
+        hasNonAsciiOrRejected = true;
+        continue;
+      }
+      if (!isPureLowerAscii(t)) {
+        termToPatIdx[i] = -2;
+        hasNonAsciiOrRejected = true;
+        continue;
+      }
+      const existing = seenPatterns.get(t);
+      if (existing !== undefined) {
+        termToPatIdx[i] = existing;
+        continue;
+      }
+      const firstCode = t.charCodeAt(0);
+      const lastCode = t.charCodeAt(t.length - 1);
+      const leadRequired = isAsciiLowerEdgeChar(firstCode);
+      const tailRequired = isAsciiLowerEdgeChar(lastCode);
+      if (!leadRequired && !tailRequired && !hasAsciiWordChar(t)) {
+        termToPatIdx[i] = -1;
+        hasNonAsciiOrRejected = true;
+        continue;
+      }
+      const patIdx = patternStr.length;
+      patternStr.push(t);
+      seenPatterns.set(t, patIdx);
+      termToPatIdx[i] = patIdx;
+      totalChars += t.length;
+      if (t.length > maxPatLen) maxPatLen = t.length;
+    }
+
+    const numPatterns = patternStr.length;
+    this.numPatterns = numPatterns;
+    this.termToPatIdx = termToPatIdx;
+    this.hasNonAsciiOrRejected = hasNonAsciiOrRejected;
+    this.patternStr = patternStr;
+    this.maxPatLen = maxPatLen;
+
+    const patLen = new Int32Array(numPatterns);
+    const leadReq = new Uint8Array(numPatterns);
+    const tailReq = new Uint8Array(numPatterns);
+    const allowSuf = new Uint8Array(numPatterns);
+    const nextMatch = new Int32Array(numPatterns).fill(-1);
+
+    const maxStates = totalChars + 1;
+    const rawGoto = new Int32Array(maxStates * 128).fill(-1);
+    const rawFirstMatch = new Int32Array(maxStates).fill(-1);
+    let numStates = 1;
+
+    for (let m = 0; m < numPatterns; m++) {
+      const t = patternStr[m];
+      const len = t.length;
+      const firstCode = t.charCodeAt(0);
+      const lastCode = t.charCodeAt(len - 1);
+      patLen[m] = len;
+      leadReq[m] = isAsciiLowerEdgeChar(firstCode) ? 1 : 0;
+      tailReq[m] = isAsciiLowerEdgeChar(lastCode) ? 1 : 0;
+      allowSuf[m] =
+        len >= MIN_MORPHOLOGICAL_LENGTH && lastCode >= 97 && lastCode <= 122
+          ? 1
+          : 0;
+
+      let state = 0;
+      for (let j = 0; j < len; j++) {
+        const code = t.charCodeAt(j);
+        const edgeIdx = (state << 7) | code;
+        let next = rawGoto[edgeIdx];
+        if (next === -1) {
+          next = numStates++;
+          rawGoto[edgeIdx] = next;
+        }
+        state = next;
+      }
+      rawFirstMatch[state] = m;
+    }
+
+    const failLink = new Int32Array(numStates);
+    const bfsQueue = new Int32Array(numStates);
+    let qHead = 0;
+    let qTail = 0;
+
+    for (let c = 0; c < 128; c++) {
+      const next = rawGoto[c];
+      if (next !== -1) {
+        failLink[next] = 0;
+        bfsQueue[qTail++] = next;
+      } else {
+        rawGoto[c] = 0;
+      }
+    }
+
+    while (qHead < qTail) {
+      const u = bfsQueue[qHead++];
+      const f = failLink[u];
+      const fMatch = rawFirstMatch[f];
+      if (fMatch >= 0) {
+        const uMatch = rawFirstMatch[u];
+        if (uMatch >= 0) {
+          nextMatch[uMatch] = fMatch;
+        } else {
+          rawFirstMatch[u] = fMatch;
+        }
+      }
+      const uBase = u << 7;
+      const fBase = f << 7;
+      for (let c = 0; c < 128; c++) {
+        const next = rawGoto[uBase | c];
+        if (next !== -1) {
+          failLink[next] = rawGoto[fBase | c];
+          bfsQueue[qTail++] = next;
+        } else {
+          rawGoto[uBase | c] = rawGoto[fBase | c];
+        }
+      }
+    }
+
+    this.patLen = patLen;
+    this.leadReq = leadReq;
+    this.tailReq = tailReq;
+    this.allowSuf = allowSuf;
+    this.gotoTable = rawGoto.subarray(0, numStates * 128);
+    this.firstMatchAtState = rawFirstMatch.subarray(0, numStates);
+    this.nextMatch = nextMatch;
+    this.countsBuf = new Int32Array(numPatterns);
+    this.nextAllowedBuf = new Int32Array(numPatterns);
+    this.fallbackBuf = new Uint8Array(numPatterns);
+  }
+
+  countAll(text: string, maxCount = 5): Int32Array {
+    const numPatterns = this.numPatterns;
+    const counts = this.countsBuf;
+    if (numPatterns === 0) return counts;
+    counts.fill(0);
+    const nextAllowedPos = this.nextAllowedBuf;
+    nextAllowedPos.fill(0);
+    const needsFallback = this.fallbackBuf;
+    needsFallback.fill(0);
+
+    const gotoTable = this.gotoTable;
+    const firstMatchAtState = this.firstMatchAtState;
+    const nextMatch = this.nextMatch;
+    const patLen = this.patLen;
+    const leadReq = this.leadReq;
+    const tailReq = this.tailReq;
+    const allowSuf = this.allowSuf;
+
+    const textLen = text.length;
+    let state = 0;
+    let hasFallback = false;
+
+    for (let i = 0; i < textLen; i++) {
+      const code = text.charCodeAt(i);
+      if (code >= 128) {
+        state = 0;
+        continue;
+      }
+      state = gotoTable[(state << 7) | code];
+      let m = firstMatchAtState[state];
+      if (m < 0) continue;
+
+      const afterIdx = i + 1;
+      for (; m >= 0; m = nextMatch[m]) {
+        if (counts[m] >= maxCount || needsFallback[m] !== 0) continue;
+        const idx = afterIdx - patLen[m];
+        if (idx < nextAllowedPos[m]) continue;
+
+        if (leadReq[m] !== 0 && idx > 0) {
+          const prevCode = text.charCodeAt(idx - 1);
+          if (prevCode >= 128) {
+            needsFallback[m] = 1;
+            hasFallback = true;
+            continue;
+          }
+          if (isAsciiLowerWordChar(prevCode)) {
+            continue;
+          }
+        }
+
+        if (tailReq[m] === 0) {
+          counts[m]++;
+          nextAllowedPos[m] = afterIdx;
+          continue;
+        }
+
+        let advance = -1;
+        if (afterIdx >= textLen) {
+          advance = afterIdx;
+        } else {
+          const c0 = text.charCodeAt(afterIdx);
+          if (c0 >= 128) {
+            needsFallback[m] = 1;
+            hasFallback = true;
+            continue;
+          }
+          if (!isAsciiLowerWordChar(c0)) {
+            advance = afterIdx;
+          } else if (allowSuf[m] !== 0) {
+            if (c0 === 115) {
+              const p = afterIdx + 1;
+              if (p >= textLen) {
+                advance = p;
+              } else {
+                const cp = text.charCodeAt(p);
+                if (cp >= 128) {
+                  needsFallback[m] = 1;
+                  hasFallback = true;
+                  continue;
+                }
+                if (!isAsciiLowerWordChar(cp)) advance = p;
+              }
+            } else if (c0 === 101 && afterIdx + 1 < textLen) {
+              const c1 = text.charCodeAt(afterIdx + 1);
+              if (c1 >= 128) {
+                needsFallback[m] = 1;
+                hasFallback = true;
+                continue;
+              }
+              if (c1 === 115 || c1 === 100) {
+                const p = afterIdx + 2;
+                if (p >= textLen) {
+                  advance = p;
+                } else {
+                  const cp = text.charCodeAt(p);
+                  if (cp >= 128) {
+                    needsFallback[m] = 1;
+                    hasFallback = true;
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) advance = p;
+                }
+              }
+            } else if (c0 === 105 && afterIdx + 2 < textLen) {
+              const c1 = text.charCodeAt(afterIdx + 1);
+              const c2 = text.charCodeAt(afterIdx + 2);
+              if (c1 >= 128 || c2 >= 128) {
+                needsFallback[m] = 1;
+                hasFallback = true;
+                continue;
+              }
+              if (c1 === 110 && c2 === 103) {
+                const p = afterIdx + 3;
+                if (p >= textLen) {
+                  advance = p;
+                } else {
+                  const cp = text.charCodeAt(p);
+                  if (cp >= 128) {
+                    needsFallback[m] = 1;
+                    hasFallback = true;
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) advance = p;
+                }
+              }
+            }
+          }
+        }
+
+        if (advance !== -1) {
+          counts[m]++;
+          nextAllowedPos[m] = advance;
+        }
+      }
+    }
+
+    if (hasFallback) {
+      const patternStr = this.patternStr;
+      for (let m = 0; m < numPatterns; m++) {
+        if (needsFallback[m] !== 0) {
+          const c = countWordOccurrencesRegex(text, patternStr[m], true);
+          counts[m] = c > maxCount ? maxCount : c;
+        }
+      }
+    }
+
+    return counts;
+  }
+
+  firstSnippetHit(plain: string, lower: string): number {
+    const numPatterns = this.numPatterns;
+    if (numPatterns === 0) return -1;
+    const gotoTable = this.gotoTable;
+    const firstMatchAtState = this.firstMatchAtState;
+    const nextMatch = this.nextMatch;
+    const patLen = this.patLen;
+    const leadReq = this.leadReq;
+    const tailReq = this.tailReq;
+    const allowSuf = this.allowSuf;
+    const maxPatLen = this.maxPatLen;
+    const needsFallback = this.fallbackBuf;
+    let fallbackCleaned = false;
+
+    const runFallback = (m: number): void => {
+      if (!fallbackCleaned) {
+        needsFallback.fill(0);
+        fallbackCleaned = true;
+      }
+      if (needsFallback[m] !== 0) return;
+      needsFallback[m] = 1;
+      const wIdx = firstWordIndex(plain, this.patternStr[m]);
+      if (wIdx >= 0 && (firstWordHit < 0 || wIdx < firstWordHit)) {
+        firstWordHit = wIdx;
+      }
+    };
+
+    const textLen = lower.length;
+    let state = 0;
+    let firstWordHit = -1;
+    let firstSubHit = -1;
+
+    for (let i = 0; i < textLen; i++) {
+      if (firstWordHit >= 0 && i + 1 - maxPatLen >= firstWordHit) {
+        break;
+      }
+      const code = lower.charCodeAt(i);
+      if (code >= 128) {
+        state = 0;
+        continue;
+      }
+      state = gotoTable[(state << 7) | code];
+      let m = firstMatchAtState[state];
+      if (m < 0) continue;
+
+      const afterIdx = i + 1;
+      for (; m >= 0; m = nextMatch[m]) {
+        const idx = afterIdx - patLen[m];
+        if (firstSubHit < 0 || idx < firstSubHit) {
+          firstSubHit = idx;
+        }
+        if (firstWordHit >= 0 && idx >= firstWordHit) {
+          continue;
+        }
+        if (leadReq[m] !== 0 && idx > 0) {
+          const prevCode = lower.charCodeAt(idx - 1);
+          if (prevCode >= 128) {
+            runFallback(m);
+            continue;
+          }
+          if (isAsciiLowerWordChar(prevCode)) {
+            continue;
+          }
+        }
+        if (tailReq[m] === 0) {
+          firstWordHit = idx;
+          continue;
+        }
+        let matched = false;
+        if (afterIdx >= textLen) {
+          matched = true;
+        } else {
+          const c0 = lower.charCodeAt(afterIdx);
+          if (c0 >= 128) {
+            runFallback(m);
+            continue;
+          }
+          if (!isAsciiLowerWordChar(c0)) {
+            matched = true;
+          } else if (allowSuf[m] !== 0) {
+            if (c0 === 115) {
+              const p = afterIdx + 1;
+              if (p >= textLen) {
+                matched = true;
+              } else {
+                const cp = lower.charCodeAt(p);
+                if (cp >= 128) {
+                  runFallback(m);
+                  continue;
+                }
+                if (!isAsciiLowerWordChar(cp)) matched = true;
+              }
+            } else if (c0 === 101 && afterIdx + 1 < textLen) {
+              const c1 = lower.charCodeAt(afterIdx + 1);
+              if (c1 >= 128) {
+                runFallback(m);
+                continue;
+              }
+              if (c1 === 115 || c1 === 100) {
+                const p = afterIdx + 2;
+                if (p >= textLen) {
+                  matched = true;
+                } else {
+                  const cp = lower.charCodeAt(p);
+                  if (cp >= 128) {
+                    runFallback(m);
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) matched = true;
+                }
+              }
+            } else if (c0 === 105 && afterIdx + 2 < textLen) {
+              const c1 = lower.charCodeAt(afterIdx + 1);
+              const c2 = lower.charCodeAt(afterIdx + 2);
+              if (c1 >= 128 || c2 >= 128) {
+                runFallback(m);
+                continue;
+              }
+              if (c1 === 110 && c2 === 103) {
+                const p = afterIdx + 3;
+                if (p >= textLen) {
+                  matched = true;
+                } else {
+                  const cp = lower.charCodeAt(p);
+                  if (cp >= 128) {
+                    runFallback(m);
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) matched = true;
+                }
+              }
+            }
+          }
+        }
+        if (matched) {
+          firstWordHit = idx;
+        }
+      }
+    }
+    return firstWordHit >= 0 ? firstWordHit : firstSubHit;
+  }
+}
+
+function getMultiTermMatcher(terms: readonly string[]): MultiTermMatcher {
+  const weak = MULTI_TERM_WEAK_CACHE.get(terms);
+  if (weak) return weak;
+  const key = terms.join("\0");
+  let matcher = MULTI_TERM_LRU_CACHE.get(key);
+  if (matcher) {
+    MULTI_TERM_LRU_CACHE.delete(key);
+    MULTI_TERM_LRU_CACHE.set(key, matcher);
+    MULTI_TERM_WEAK_CACHE.set(terms, matcher);
+    return matcher;
+  }
+  matcher = new MultiTermMatcher(terms);
+  if (MULTI_TERM_LRU_CACHE.size >= MULTI_TERM_LRU_LIMIT) {
+    const oldestKey = MULTI_TERM_LRU_CACHE.keys().next().value;
+    if (oldestKey !== undefined) MULTI_TERM_LRU_CACHE.delete(oldestKey);
+  }
+  MULTI_TERM_LRU_CACHE.set(key, matcher);
+  MULTI_TERM_WEAK_CACHE.set(terms, matcher);
+  return matcher;
+}
+
 // Recall queries are natural language and routinely carry terminal punctuation
 // ("how do i fix ci?"). Strip the outer punctuation before the exact-phrase
 // check so the strongest ranking signal in the scorer survives the question
@@ -901,10 +1391,32 @@ function scoreVaultNote(
       break;
     }
   }
-  for (const term of terms) {
-    const count = countWordOccurrences(haystack, term);
-    if (count > 0) termScore += Math.min(count, 5);
-    if (countWordOccurrences(titleLower, term) > 0) termScore += 3;
+  if (terms.length > 2) {
+    const matcher = getMultiTermMatcher(terms);
+    const counts = matcher.countAll(haystack, 5);
+    const termToPatIdx = matcher.termToPatIdx;
+    for (let i = 0; i < terms.length; i++) {
+      const term = terms[i];
+      const patIdx = termToPatIdx[i];
+      const count =
+        patIdx >= 0
+          ? counts[patIdx]
+          : patIdx === -2
+            ? countWordOccurrences(haystack, term, true, 5)
+            : 0;
+      if (count > 0) {
+        termScore += Math.min(count, 5);
+        if (countWordOccurrences(titleLower, term, true, 1) > 0) {
+          termScore += 3;
+        }
+      }
+    }
+  } else {
+    for (const term of terms) {
+      const count = countWordOccurrences(haystack, term);
+      if (count > 0) termScore += Math.min(count, 5);
+      if (countWordOccurrences(titleLower, term) > 0) termScore += 3;
+    }
   }
   // The floor gates TERM EVIDENCE, not the final score. Its stated purpose is
   // "more than single-word noise", which is a question about how many times the
@@ -2550,20 +3062,55 @@ function scoreVaultNoteCached(
       break;
     }
   }
-  for (const term of terms) {
-    let contrib = wordCounts.get(term);
-    if (contrib === undefined) {
-      const count = countWordOccurrences(haystackLower, term, true, 5);
-      contrib =
-        count > 0
-          ? Math.min(count, 5) +
-            (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
-          : 0;
-      if (wordCounts.size < 256) {
-        wordCounts.set(term, contrib);
-      }
+  let missingCount = 0;
+  for (let i = 0; i < terms.length; i++) {
+    if (!wordCounts.has(terms[i])) {
+      missingCount++;
+      if (missingCount > 2) break;
     }
-    termScore += contrib;
+  }
+  if (missingCount > 2) {
+    const matcher = getMultiTermMatcher(terms);
+    const counts = matcher.countAll(haystackLower, 5);
+    const termToPatIdx = matcher.termToPatIdx;
+    for (let i = 0; i < terms.length; i++) {
+      const term = terms[i];
+      let contrib = wordCounts.get(term);
+      if (contrib === undefined) {
+        const patIdx = termToPatIdx[i];
+        const count =
+          patIdx >= 0
+            ? counts[patIdx]
+            : patIdx === -2
+              ? countWordOccurrences(haystackLower, term, true, 5)
+              : 0;
+        contrib =
+          count > 0
+            ? Math.min(count, 5) +
+              (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
+            : 0;
+        if (wordCounts.size < 512) {
+          wordCounts.set(term, contrib);
+        }
+      }
+      termScore += contrib;
+    }
+  } else {
+    for (const term of terms) {
+      let contrib = wordCounts.get(term);
+      if (contrib === undefined) {
+        const count = countWordOccurrences(haystackLower, term, true, 5);
+        contrib =
+          count > 0
+            ? Math.min(count, 5) +
+              (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
+            : 0;
+        if (wordCounts.size < 512) {
+          wordCounts.set(term, contrib);
+        }
+      }
+      termScore += contrib;
+    }
   }
   if (termScore < MIN_TERM_SCORE) return 0;
 
