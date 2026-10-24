@@ -77,9 +77,30 @@ async function loadedModules(t, fixture, event, payload, env = {}) {
   const preload = path.join(dir, "log-resolve.mjs");
   await writeFile(
     preload,
-    'import { registerHooks } from "node:module";\nimport { appendFileSync } from "node:fs";\n' +
-      "registerHooks({ resolve(specifier, context, nextResolve) { const r = nextResolve(specifier, context);" +
-      " appendFileSync(process.env.MINNI_TEST_LOAD_LOG, `${r.url}\\n`); return r; } });\n",
+    [
+      'import * as nodeModule from "node:module";',
+      'import { isMainThread } from "node:worker_threads";',
+      'import { appendFileSync } from "node:fs";',
+      "export async function resolve(specifier, context, nextResolve) {",
+      "  const r = await nextResolve(specifier, context);",
+      "  appendFileSync(process.env.MINNI_TEST_LOAD_LOG, `${r.url}\\n`);",
+      "  return r;",
+      "}",
+      "if (isMainThread) {",
+      '  if (typeof nodeModule.registerHooks === "function") {',
+      "    nodeModule.registerHooks({",
+      "      resolve(specifier, context, nextResolve) {",
+      "        const r = nextResolve(specifier, context);",
+      "        appendFileSync(process.env.MINNI_TEST_LOAD_LOG, `${r.url}\\n`);",
+      "        return r;",
+      "      },",
+      "    });",
+      "  } else {",
+      "    nodeModule.register(import.meta.url);",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
     "utf8",
   );
   const result = await runHook(fixture, event, payload, {

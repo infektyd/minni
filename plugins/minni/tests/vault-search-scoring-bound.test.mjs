@@ -55,6 +55,12 @@ const SINGLE_NO_SEPARATOR_CHAR = new RegExp(
   `^[${NO_SEPARATOR_SCRIPTS}]$`,
   "u",
 );
+const LEAD_STICKY_RE = new RegExp(NOT_WORD_BEFORE, "yu");
+const TAIL_EXACT_STICKY_RE = new RegExp(NOT_WORD_AFTER, "yu");
+const TAIL_INFLECT_STICKY_RE = new RegExp(
+  `${MORPHOLOGICAL_SUFFIX}${NOT_WORD_AFTER}`,
+  "yu",
+);
 
 const STOP_WORDS = new Set([
   "a",
@@ -129,17 +135,100 @@ function oracleWordRegex(term, inflect) {
 }
 
 function oracleCountWordOccurrences(text, term, inflect = true, maxCount = 5) {
-  const regex = oracleWordRegex(term, inflect);
-  if (!regex) return 0;
-  const matches = text.match(regex);
-  return matches ? Math.min(matches.length, maxCount) : 0;
+  if (!term) return 0;
+  const textLower = text.toLowerCase();
+  const termLower = term.toLowerCase();
+  let idx = textLower.indexOf(termLower);
+  if (idx === -1) return 0;
+  if (termLower.length <= 256) {
+    try {
+      const regex = oracleWordRegex(term, inflect);
+      if (!regex) return 0;
+      const matches = text.match(regex);
+      return matches ? Math.min(matches.length, maxCount) : 0;
+    } catch {
+      // Fall through to sticky boundary scan on engines with strict RegExp size caps.
+    }
+  }
+  const last = termLower[termLower.length - 1];
+  const leadRequired = WORD_EDGE_CHAR.test(termLower[0]);
+  const tailRequired = WORD_EDGE_CHAR.test(last);
+  if (!leadRequired && !tailRequired && !/[\p{L}\p{N}]/u.test(termLower)) {
+    return 0;
+  }
+  const allowSuffix =
+    inflect &&
+    termLower.length >= MIN_MORPHOLOGICAL_LENGTH &&
+    /\p{L}/u.test(last);
+  const tailRe = allowSuffix ? TAIL_INFLECT_STICKY_RE : TAIL_EXACT_STICKY_RE;
+  let count = 0;
+  while (idx !== -1) {
+    if (leadRequired) {
+      LEAD_STICKY_RE.lastIndex = idx;
+      if (!LEAD_STICKY_RE.test(textLower)) {
+        idx = textLower.indexOf(termLower, idx + 1);
+        continue;
+      }
+    }
+    const afterIdx = idx + termLower.length;
+    if (!tailRequired) {
+      count++;
+      if (count >= maxCount) return count;
+      idx = textLower.indexOf(termLower, afterIdx);
+      continue;
+    }
+    tailRe.lastIndex = afterIdx;
+    if (tailRe.test(textLower)) {
+      count++;
+      if (count >= maxCount) return count;
+      idx = textLower.indexOf(termLower, tailRe.lastIndex);
+    } else {
+      idx = textLower.indexOf(termLower, idx + 1);
+    }
+  }
+  return count;
 }
 
 function oracleFirstWordIndex(text, term) {
-  const regex = oracleWordRegex(term, true);
-  if (!regex) return -1;
-  regex.lastIndex = 0;
-  return regex.exec(text)?.index ?? -1;
+  if (!term) return -1;
+  const textLower = text.toLowerCase();
+  const termLower = term.toLowerCase();
+  let idx = textLower.indexOf(termLower);
+  if (idx === -1) return -1;
+  if (termLower.length <= 256) {
+    try {
+      const regex = oracleWordRegex(term, true);
+      if (!regex) return -1;
+      regex.lastIndex = 0;
+      return regex.exec(text)?.index ?? -1;
+    } catch {
+      // Fall through to sticky boundary scan.
+    }
+  }
+  const last = termLower[termLower.length - 1];
+  const leadRequired = WORD_EDGE_CHAR.test(termLower[0]);
+  const tailRequired = WORD_EDGE_CHAR.test(last);
+  if (!leadRequired && !tailRequired && !/[\p{L}\p{N}]/u.test(termLower)) {
+    return -1;
+  }
+  const allowSuffix =
+    termLower.length >= MIN_MORPHOLOGICAL_LENGTH && /\p{L}/u.test(last);
+  const tailRe = allowSuffix ? TAIL_INFLECT_STICKY_RE : TAIL_EXACT_STICKY_RE;
+  while (idx !== -1) {
+    if (leadRequired) {
+      LEAD_STICKY_RE.lastIndex = idx;
+      if (!LEAD_STICKY_RE.test(textLower)) {
+        idx = textLower.indexOf(termLower, idx + 1);
+        continue;
+      }
+    }
+    const afterIdx = idx + termLower.length;
+    if (!tailRequired) return idx;
+    tailRe.lastIndex = afterIdx;
+    if (tailRe.test(textLower)) return idx;
+    idx = textLower.indexOf(termLower, idx + 1);
+  }
+  return -1;
 }
 
 function oracleSnippetFor(markdown, terms, maxLength = 280) {
@@ -344,6 +433,12 @@ const NATURAL_300_WORD_PROMPT = [
   ),
 ].join(" ");
 
+PARITY_NOTES.push({
+  rel: "wiki/concepts/exact-300-word-phrase.md",
+  frontmatter: { title: "Exact Long Non-ASCII Phrase Note", status: "accepted" },
+  body: `Prefix context before exact prompt match: ${NATURAL_300_WORD_PROMPT} — trailing context after match.`,
+});
+
 // Build a 405-term query whose terms appear across the parity vault
 const MATCHING_405_TERM_PARITY_QUERY = [
   "work",
@@ -516,7 +611,7 @@ const VOCAB_WORDS = Array.from({ length: 1200 }, (_, i) => {
   return `${c0}${c1}${c2}${c3}${c4}${c5}${c6}`;
 });
 
-async function writeBenchVault(label) {
+async function writeBenchVault(label, collectHaystacks) {
   const root = await mkdtemp(path.join(tmpdir(), `sm-scoring-bench-${label}-`));
   roots.push(root);
   const dir = path.join(root, "wiki", "concepts");
@@ -532,12 +627,46 @@ async function writeBenchVault(label) {
       body += VOCAB_WORDS[next() % VOCAB_WORDS.length];
       body += next() % 11 === 0 ? " — " : " ";
     }
-    await writeFile(
-      path.join(dir, `note-${n}.md`),
-      `---\ntitle: Bench Note ${n}\nstatus: accepted\n---\n\n# Bench Note ${n}\n\n${body}\n`,
-    );
+    const md = `---\ntitle: Bench Note ${n}\nstatus: accepted\n---\n\n# Bench Note ${n}\n\n${body}\n`;
+    if (collectHaystacks) {
+      collectHaystacks.push(`bench note ${n}\nwiki/concepts/note-${n}.md\n${md}`.toLowerCase());
+    }
+    await writeFile(path.join(dir, `note-${n}.md`), md);
   }
   return root;
+}
+
+// Pre-Aho-Corasick per-term ASCII word-occurrence counter (vault.ts countWordOccurrences)
+// used as the in-process baseline so the bound scales with runner CPU speed.
+function legacyCountWordOccurrencesAscii(text, term, maxCount = 5) {
+  let idx = text.indexOf(term);
+  if (idx === -1) return 0;
+  const termLen = term.length;
+  const textLen = text.length;
+  let count = 0;
+  while (idx !== -1) {
+    if (idx > 0) {
+      const prev = text.charCodeAt(idx - 1);
+      if ((prev >= 97 && prev <= 122) || (prev >= 48 && prev <= 57)) {
+        idx = text.indexOf(term, idx + 1);
+        continue;
+      }
+    }
+    const afterIdx = idx + termLen;
+    if (afterIdx >= textLen) {
+      count++;
+      break;
+    }
+    const c0 = text.charCodeAt(afterIdx);
+    if (!((c0 >= 97 && c0 <= 122) || (c0 >= 48 && c0 <= 57))) {
+      count++;
+      if (count >= maxCount) return count;
+      idx = text.indexOf(term, afterIdx);
+    } else {
+      idx = text.indexOf(term, idx + 1);
+    }
+  }
+  return count;
 }
 
 const MATCHING_405_QUERY = [
@@ -545,10 +674,12 @@ const MATCHING_405_QUERY = [
   ...VOCAB_WORDS.slice(0, 401),
 ].join(" ");
 
-test("bound: 405 matching terms across 783 notes (~12.6 MB) score in < 200 ms with scan/index parity", async (t) => {
-  assert.equal(oracleQueryTerms(MATCHING_405_QUERY).length, 405);
+test("bound: 405 matching terms across 783 notes (~12.6 MB) score in < 650 ms and > 4x faster than per-term with scan/index parity", async (t) => {
+  const queryTermsList = oracleQueryTerms(MATCHING_405_QUERY);
+  assert.equal(queryTermsList.length, 405);
 
-  const scanVault = await writeBenchVault("scan");
+  const haystacks = [];
+  const scanVault = await writeBenchVault("scan", haystacks);
   const indexVault = await writeBenchVault("index");
 
   // Warm the note caches (and the index on indexVault) with a 1-term query not
@@ -560,6 +691,19 @@ test("bound: 405 matching terms across 783 notes (~12.6 MB) score in < 200 ms wi
   await searchVaultNotes(indexVault, "warmup", 5, undefined, {
     candidates: "index",
   });
+
+  // Measure the legacy per-(note, term) scoring loop on the same 783 haystacks
+  // in the same process so machine load affects both sides equally.
+  const perTermStart = performance.now();
+  let perTermSink = 0;
+  for (let n = 0; n < haystacks.length; n++) {
+    const h = haystacks[n];
+    for (let i = 0; i < queryTermsList.length; i++) {
+      perTermSink += legacyCountWordOccurrencesAscii(h, queryTermsList[i], 5);
+    }
+  }
+  const perTermMs = performance.now() - perTermStart;
+  assert.ok(perTermSink > 0);
 
   const scanStart = performance.now();
   const viaScan = await searchVaultNotes(
@@ -581,8 +725,9 @@ test("bound: 405 matching terms across 783 notes (~12.6 MB) score in < 200 ms wi
   );
   const indexMs = performance.now() - indexStart;
 
+  const relativeLimitMs = perTermMs / 4;
   t.diagnostic(
-    `405-term matching query over 783 notes: scan=${scanMs.toFixed(1)} ms, index=${indexMs.toFixed(1)} ms`,
+    `405-term matching query over 783 notes: scan=${scanMs.toFixed(1)} ms, index=${indexMs.toFixed(1)} ms, legacyPerTerm=${perTermMs.toFixed(1)} ms (limit=${relativeLimitMs.toFixed(1)} ms)`,
   );
 
   const normalize = (results) =>
@@ -596,7 +741,11 @@ test("bound: 405 matching terms across 783 notes (~12.6 MB) score in < 200 ms wi
     "scan path admitted all notes on the first common term without building prefixIndex",
   );
   assert.ok(
-    scanMs < 200,
-    `405-term scan scoring took ${scanMs.toFixed(1)} ms (bound is < 200 ms)`,
+    scanMs < relativeLimitMs,
+    `405-term scan scoring took ${scanMs.toFixed(1)} ms (must be < 1/4 of legacy per-term ${perTermMs.toFixed(1)} ms = ${relativeLimitMs.toFixed(1)} ms)`,
+  );
+  assert.ok(
+    scanMs < 650,
+    `405-term scan scoring took ${scanMs.toFixed(1)} ms (hard ceiling is < 650 ms)`,
   );
 });
