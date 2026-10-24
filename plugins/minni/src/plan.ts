@@ -7,7 +7,7 @@ import { writeVaultPage, appendFileWithFsync, writeFileAtomic, type VaultWriteRe
 import type { PageStatus } from "./vault.js";
 import type { ScarTissueEntry } from "./task.js";
 import { stableStringify } from "./agent_envelope.js";
-import { withThreadLock, ThreadBusyError } from "./thread-lock.js";
+import { DEFAULT_WAIT_MS, withThreadLock, ThreadBusyError } from "./thread-lock.js";
 import {
   appendOrderedEventBatch,
   deriveSystemEventKey,
@@ -2651,6 +2651,7 @@ export async function resolvePlanIdOrActive(
 export async function resolveActivePlanView(
   vaultPath: string,
   liveShelfContent?: string,
+  options: { lockWaitMs?: number } = {},
 ): Promise<{
   plan_id: string;
   rev: number;
@@ -2768,6 +2769,11 @@ export async function resolveActivePlanView(
             : {}),
         };
       },
+      // A hook caller may only SHORTEN the lock wait (never past the default),
+      // so an abandoned read cannot keep polling after the hook has answered.
+      options.lockWaitMs !== undefined
+        ? { waitMs: Math.max(0, Math.min(options.lockWaitMs, DEFAULT_WAIT_MS)) }
+        : {},
     );
   } catch (error) {
     // FS failures and lock contention must not look like "no active plan."

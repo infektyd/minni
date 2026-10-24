@@ -909,7 +909,7 @@ def test_unhashable_kind_does_not_abort_the_whole_ingest_pass(tmp_path):
 # choke point every inbox file passes through, so the drop is enforced here too.
 
 # Verbatim candidate text from a live junk file
-# (~/.minni/claudecode-vault/inbox/2026-07-31-ms9ig002-*.json), trimmed.
+# (<vault>/inbox/<date>-<session>-*.json), trimmed.
 _AUDIT_ECHO_CANDIDATE = (
     "6a5ba70f-70b3-44e5-8a78-2e21d774cd71: "
     '## [2026-07-31T02:40:35.186Z] hook_pre_compact | pre-compact 1d3bb2eb '

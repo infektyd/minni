@@ -427,7 +427,7 @@ test("resolveActivePlanView self-heals a stuck-draft plan whose slices are all t
       { vaultPath: root },
     );
     // Simulate the stale-plugin shape: every slice terminal but status still
-    // 'draft' (live evidence: plan-3da1b00ca39d2500 et al).
+    // 'draft' (live evidence: plan-<id> et al).
     plan.slices[0] = { ...plan.slices[0], status: "done", evidence: "tests/inbox-lifecycle.test.mjs passing" };
     plan.slices[1] = { ...plan.slices[1], status: "superseded", superseded_by: "replan-test" };
     assert.equal(plan.status, "draft");

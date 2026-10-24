@@ -1,4 +1,4 @@
-# Minni Recall Fix Report — plan-5631eeaec8000f40
+# Minni Recall Fix Report — plan-<id>
 
 **Date:** 2026-06-16  
 **Branch:** fix/minni-recall-correctness  

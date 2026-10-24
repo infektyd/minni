@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone recall bisect harness for Minni (plan-5631eeaec8000f40, s1).
+"""Standalone recall bisect harness for Minni (plan-<id>, s1).
 
 Builds a fresh in-process RetrievalEngine against a temp SQLite DB + FAISS
 index, ingests the 522 real corpus docs, queries all 145 positive gold queries

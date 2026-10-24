@@ -1,4 +1,4 @@
-"""Security slice regression tests (plan plan-0f3f87e260f2e382)."""
+"""Security slice regression tests (plan plan-<id>)."""
 
 from __future__ import annotations
 

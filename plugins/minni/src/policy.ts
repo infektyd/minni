@@ -362,7 +362,7 @@ export function detectSecretMaterial(content: string): string | null {
   // SRI checksums (`sha512-…`) are stripped first — high-entropy, not secret.
   const scannable = content.replace(SRI_CHECKSUM_RE, " ");
   for (const rawSpan of scannable.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
-    // Path-SHAPED spans (2+ slashes: `/Users/Hans/Projects/v2/…`,
+    // Path-SHAPED spans (2+ slashes: `/Users/someuser/Projects/v2/…`,
     // `github.com/Org/Repo/runs/123…`) are evaluated per "/"-segment, so
     // they decompose into short low-entropy pieces. A span with 0-1 slashes
     // is evaluated WHOLE — a single mid-string slash in a base64 secret

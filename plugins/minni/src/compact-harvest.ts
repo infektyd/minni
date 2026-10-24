@@ -1,4 +1,4 @@
-// Compaction-summary harvest (plan-3e5a410b9ab6f715).
+// Compaction-summary harvest (plan-<id>).
 //
 // When a platform compacts its context it first DISTILLS the session into a
 // structured summary — the highest-signal outcome document the session ever

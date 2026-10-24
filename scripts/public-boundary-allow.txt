@@ -1,0 +1,126 @@
+# Allowlist for the content scan in scripts/check-public-content.sh.
+#
+# One deliberate exception per line, four TAB-separated fields:
+#   <path>	<class>	<line ERE | line-sha256:<hex>>	<reason>
+# - path: exact tracked path (no globs).
+# - class: a scan class (home-path, vault-deep-path, plan-id, token-*, private-key).
+# - line ERE: POSIX ERE (git grep -E) run against the flagged line. It exempts a
+#   hit only where one of its matches OVERLAPS the flagged match, so pin it to
+#   the hit and its context, never to the bare pattern class.
+# - line-sha256:<64 lowercase hex>: exempts only a line whose full text (its
+#   bytes without the newline) has this sha256, i.e. exactly one line content.
+#   Compute it with:
+#     git cat-file blob :<path> | sed -n '<N>p' | tr -d '\n' | shasum -a 256
+#   Use it where an ERE would have to wildcard a name or an id.
+# - reason: why the hit is not a leak. "pending operator" marks an entry that
+#   waits on an operator decision to change the content instead.
+#
+# Write any literal that the scan would flag in bracket form ([s]k-ant-,
+# /[U]sers/, [P]RIVATE) so the entry does not trip the scan itself. Never
+# write a real name, id or secret here; pin by context instead.
+# An entry that no longer matches anything fails the scan: remove it.
+# A home path whose name is the current OS user (or is listed in
+# MINNI_BOUNDARY_FORBIDDEN_NAMES) fails whatever this file says.
+
+# --- home-path: container and CI-runner homes -------------------------------
+.github/workflows/docker.yml	home-path	/[h]ome/minni/\.minni/run/minnid\.sock	container user's home inside the published eval image, not a host account
+Dockerfile	home-path	/[h]ome/minni/\.minni	container user's home inside the published eval image, not a host account
+tests/test_policy_redaction_contract_237.py	home-path	redact_text[(]"path=/[h]ome/minni/vault/secrets\.md"[)]	container-style home path fed to the redaction engine as a fixture
+bench/membench/adapters/minni_adapter.py	home-path	[(]e\.g\. /[h]ome/runner/[)]	GitHub Actions runner home named as an example in a redaction comment
+bench/membench/run_bench.py	home-path	/[h]ome/runner/	GitHub Actions runner home named as an example of what the redaction strips
+bench/tests/test_minni_adapter.py	home-path	/[h]ome/runner/work/Minni/engine/minnid\.py	synthetic CI-runner path fed to the redaction test
+bench/tests/test_run_bench.py	home-path	/[h]ome/runner/work/leak	synthetic CI-runner path in a crash-redaction test
+
+# --- home-path: synthetic fixture names in redaction tests ------------------
+bench/tests/test_run_bench.py	home-path	/[U]sers/secret/path/leak	synthetic non-home user in a crash-redaction test
+bench/tests/test_run_bench.py	home-path	/[U]sers/operator/vault	synthetic user in a skip-id normalisation test
+plugins/minni/tests/slice-g-hardening.test.mjs	home-path	/[U]sers/secret/(op/\.minni/auth\.json|seed-path\.json)	synthetic user in an error-detail redaction test
+plugins/minni/tests/team-harvest.test.mjs	home-path	/[U]sers/foo/bar\.fmadapter	synthetic user in a harvest redaction test
+plugins/minni/tests/ui-server.test.mjs	home-path	/[U]sers/notme/external-secret-project/vault	synthetic foreign user in a console vault-path test
+scripts/afm-minni-scenarios.mjs	home-path	/[U]sers/operator/\.adapters/harvest_v3\.fmadapter	synthetic user in an AFM scenario prompt
+tests/test_compact_distillation.py	home-path	/[U]sers/someone/(x\.log|secret/token\.log)	synthetic user in a distillation redaction test
+tests/test_policy_redaction_contract_237.py	home-path	redact_text[(]"path=/[U]sers/operator/\.minni/auth\.json"[)]	synthetic user fed to the redaction engine
+tests/test_policy_redaction_contract_237.py	home-path	redact_text[(]"socket=/[U]sers/op/\.minni/run/minnid\.sock"[)]	synthetic user fed to the redaction engine
+tests/test_pr11_observability.py	home-path	"socket_path": "/[U]sers/secret/minnid\.sock"	synthetic user in an observability redaction test
+tests/test_r8_observability.py	home-path	leak = "/[U]sers/operator/\.minni/index\.db	synthetic user in an observability redaction test
+tests/test_agent_id_validation.py	home-path	_principal_for_inbox[(]Path[(]"/[h]ome/claudecode-vault/inbox"[)]	synthetic vault dir under /home in an agent-id parsing test
+tests/test_agent_id_validation.py	home-path	_principal_for_inbox[(]Path[(]"/[h]ome/grok-build-vault/inbox"[)]	synthetic vault dir under /home in an agent-id parsing test
+tests/test_agent_id_validation.py	home-path	_principal_for_inbox[(]Path[(]"/[h]ome/codex-vault/inbox"[)]	synthetic vault dir under /home in an agent-id parsing test
+tests/test_agent_id_validation.py	home-path	_principal_for_inbox[(]Path[(]"/[h]ome/unknown-vault/inbox"[)]	synthetic vault dir under /home in an agent-id parsing test
+tests/test_agent_id_validation.py	home-path	_principal_for_inbox[(]Path[(]"/[h]ome/vault/inbox"[)]	synthetic vault dir under /home in an agent-id parsing test
+
+# --- home-path: placeholders in comments ------------------------------------
+plugins/minni/src/task.ts	home-path	[(]"/[U]sers/…/src/x\.ts"[)]	elided example path in a comment
+plugins/minni/src/vault.ts	home-path	MINNI_GEMINI_VAULT_PATH=/[h]ome/u/gemini	example env value in a comment
+
+# --- home-path: bare home dirs (no trailing slash), one per (file, name) --
+Dockerfile	home-path	/[h]ome/minni( |$)	container user's home dir inside the published eval image (bare dir form)
+README.md	home-path	minni-data:/[h]ome/minni[ ]	docker volume mount target inside the eval image, not a host account
+docs/install.md	home-path	minni-data:/[h]ome/minni[ ]	docker volume mount target inside the eval image, not a host account
+plugins/minni/skills/readme-audit/references/example-audit-2026-08-01.md	home-path	minni-data:/[h]ome/minni`	docker volume mount target quoted in an audit example
+tests/test_policy_redaction_contract_237.py	home-path	/[h]ome/minni"	container-style home fed to the redaction engine as a fixture
+bench/membench/adapters/minni_adapter.py	home-path	/[U]sers/jane[ `]	synthetic user with a space in the path, in a redaction comment
+bench/membench/run_bench.py	home-path	/[U]sers/jane(`|$)	synthetic user with a space in the path, in a redaction comment
+bench/membench/run_bench.py	home-path	ANY other /[U]sers/[*],	regex/glob source, not a username
+bench/tests/test_minni_adapter.py	home-path	/[U]sers/jane[ ]	synthetic user with a space in the path, in a redaction test
+bench/tests/test_minni_adapter.py	home-path	"""/[h]ome/, /opt/, /root/	regex/glob source, not a username (directory list in a docstring)
+bench/tests/test_minni_adapter.py	home-path	real_home = "/[U]sers/operator-real-home-should-not-leak"	synthetic home dir in a leak test
+bench/tests/test_run_bench.py	home-path	/[U]sers/jane[ `]	synthetic user with a space in the path, in a redaction test
+bench/tests/test_run_bench.py	home-path	/[h]ome/runner[ ]	GitHub Actions runner home in a redaction test
+bench/tests/test_run_bench.py	home-path	/[U]sers/secret"	synthetic non-home user in a crash-redaction test
+plugins/minni/tests/slice-g-hardening.test.mjs	home-path	/[U]sers/secret"	synthetic user in an error-detail redaction test
+plugins/minni/tests/team-harvest.test.mjs	home-path	/[U]sers/foo"	synthetic user in a harvest redaction test
+scripts/afm-minni-scenarios.mjs	home-path	User /[U]sers/operator keeps	synthetic user in an AFM scenario prompt
+src/minni/launchd/com.minni.minnid.plist.example	home-path	literal /[U]sers/<you>$	placeholder in the example plist's setup comment
+src/minni/minnid_runtime/redaction.py	home-path	[:|]/([U]sers|[h]ome)/\[\^ \\n\\r	regex/glob source, not a username
+tests/test_compact_distillation.py	home-path	/[U]sers/someone"	synthetic user in a distillation redaction test
+tests/test_r8_observability.py	home-path	/[U]sers/operator"	synthetic user in an observability redaction test
+tests/test_wire_claude_plugin.py	home-path	HOME like /[U]sers/Hakan the blob	synthetic non-ASCII-home fixture named in a test docstring
+
+# --- home-path: pending operator (fixture home dir uses a personal name) ----
+plugins/minni/tests/afm-contract-golden.test.mjs	home-path	line-sha256:36de813e138bf0a0a6d55a75c557a7f289ca1df71c1a5557cc64f82e33f63d34	pending operator: exact line pinned (line 176); swap this fixture home dir to a neutral name
+plugins/minni/tests/afm-contract-golden.test.mjs	home-path	line-sha256:70430f5209e79a89d37c30262cb6c92e397aac1bbe03f7fb86275360c2c627c1	pending operator: exact line pinned (line 420); swap this fixture home dir to a neutral name
+plugins/minni/tests/policy-secret-gate.test.mjs	home-path	line-sha256:670cf43c89d4eb4191d5dbf70468ca89e9b2c7b94f45d23b3784997072479d2c	pending operator: exact line pinned (line 105); swap this fixture home dir to a neutral name
+plugins/minni/tests/vault.test.mjs	home-path	line-sha256:9b1c21be10ddf7426eacab9735bd6937972513505877273727d43130af17242d	pending operator: exact line pinned (line 1699); swap this fixture home dir to a neutral name
+plugins/minni/tests/vault.test.mjs	home-path	line-sha256:f3c3ccdd977437bb3500ebf235f28603cb6e4c450aa3583ee3ba1e97c1c9cc7b	pending operator: exact line pinned (line 1703); swap this fixture home dir to a neutral name
+
+# --- vault-deep-path: layout only (standard dirs and files, no note names) --
+docs/archive/MINNI_HYGIENE_BACKLOG.md	vault-deep-path	`~/\.[m]inni/claudecode-vault/inbox/`	layout: the vault's inbox directory
+docs/investigations/2026-07-25-recall-returns-empty.md	vault-deep-path	`~/\.[m]inni/claudecode-vault/log\.md`	layout: the vault's standard audit log file
+docs/research/2026-06-11-minni-handoff-design.md	vault-deep-path	~/\.[m]inni/grok-build-vault/wiki/artifacts/<builder_plan_id>\.md	layout: placeholder plan note in a design doc
+docs/research/2026-06-11-minni-handoff-design.md	vault-deep-path	~/\.[m]inni/grok-build-vault/wiki/artifacts/<builder_plan_id>\.log\.md	layout: placeholder plan journal in a design doc
+docs/research/2026-06-11-minni-handoff-design.md	vault-deep-path	~/\.[m]inni/grok-build-vault/wiki/artifacts/<builder_plan_id>\.history\.jsonl	layout: placeholder plan history in a design doc
+docs/research/2026-06-11-minni-handoff-design.md	vault-deep-path	~/\.[m]inni/grok-build-vault/wiki/artifacts/_active_plan\.json	layout: the standard active-plan pointer file
+docs/runtimes/gemini.md	vault-deep-path	`~/\.[m]inni/gemini-vault/inbox/`	layout: the vault's inbox directory
+plugins/minni/.kilocode-plugin/commands/learn.md	vault-deep-path	`~/\.[m]inni/kilocode-vault/inbox/`	layout: live agent instruction naming the inbox directory
+plugins/minni/commands/learn.md	vault-deep-path	`~/\.[m]inni/claudecode-vault/inbox/`	layout: live agent instruction naming the inbox directory
+plugins/minni/skills/minni-doctor/SKILL.md	vault-deep-path	`~/\.[m]inni/<agent>-vault/inbox/`	layout: placeholder agent, inbox directory
+plugins/minni/tests/sessionstart-shelf-drift.test.mjs	vault-deep-path	~/\.[m]inni/claudecode-vault/layer1/core\.md	layout: the standard layer1 core file
+
+# --- plan-id ----------------------------------------------------------------
+tests/test_recall_blackout_p0.py	plan-id	line-sha256:7de51a20b222d5ec8fdd2a89a5a7c35840434d2bf293d01497de0aa983e0bf67	pending operator: exact line pinned (line 209); swap to a synthetic id (proposal a)
+tests/test_recall_blackout_p0.py	plan-id	line-sha256:9917ec0cccdbbe95b8266a7a0d85d826ec105347e2fe0608ccae7828cd30afc7	pending operator: exact line pinned (line 219); swap to a synthetic id (proposal a)
+
+# --- tokens: redaction code and docs that name the prefixes -----------------
+bench/membench/scrub.py	token-anthropic	[s]k-ant-api03-([`<. ]|$)	the prefix named in scrub docs and comments, never followed by key chars
+bench/membench/scrub.py	token-github	[g]ithub_pat_(``|[ ]and similar|[[]A-Za-z0-9_[]][{]20,[}])	the prefix named in a docstring, a comment and the regex source
+bench/membench/scrub.py	private-key	``password=-----BEGIN RSA [P]RIVATE KEY-----	PEM header named in a comment about assignment values
+src/minni/minnid_runtime/redaction.py	token-anthropic	/ [s]k-ant-… [(]>=16 trailing key chars[)]	the prefix named in a redaction comment
+src/minni/minnid_runtime/redaction.py	token-github	re\.compile[(]r"\\b[g]ithub_pat_[[]A-Za-z0-9_[]][{]20,[}]	regex source of the redaction pattern
+plugins/minni/src/policy.ts	token-github	"\\\\b[g]ithub_pat_[[]A-Za-z0-9_[]][{]20,[}]",	regex source of the redaction pattern
+docs/contracts/POLICY.md	token-github	`[g]ithub_pat_…`	the prefix listed in the redaction coverage table
+docs/contracts/THREAT_MODEL.md	token-github	`[g]ithub_pat_`	the prefix listed in the threat model
+docs/contracts/THREAT_MODEL_SCANNER.md	token-github	/`[g]ithub_pat_`/	the prefix listed in the scanner threat model
+docs/security.md	token-github	/`[g]ithub_pat_`/	the prefix listed in the security doc
+
+# --- tokens: fake values in tests and scenarios -----------------------------
+bench/tests/test_scrub.py	token-anthropic	(FAKE Anthropic [s]k-ant-api03- key|FAKE_ANT_KEY = "[s]k-ant-api03-FAKEFAKE|covers [s]k-ant-api03- [(]fix 6)	FAKE key (literally FAKEFAKE) and comments naming the prefix
+bench/tests/test_scrub.py	token-sk	FAKE_KEY = "[s]k-TESTKEY	FAKE test key
+bench/tests/test_scrub.py	private-key	^    "-----BEGIN RSA [P]RIVATE KEY-----	header of FAKE_PEM, a bogus key whose body is fakefake padding
+plugins/minni/tests/policy-secret-gate.test.mjs	token-github	j[(]"[g]ithub_pat_", "11ABCDEFG0abcdefghijklmnopqrstuvwxyz"[)]	fake token split with j() so no literal token is committed
+plugins/minni/tests/policy-secret-gate.test.mjs	token-slack	j[(]"[x]oxb-", "1234567890-abcdefghijklmn"[)]	fake token split with j() so no literal token is committed
+tests/test_policy_redaction_contract_237.py	token-sk	[s]k-TEST(exampletokenvalue00|EXAMPLETOKEN0123456789abcd)	TEST fake keys fed to the redaction engine
+tests/test_policy_redaction_contract_237.py	token-github	[g]hp_TESTTESTTESTTESTTESTTESTTES|[g]ithub_pat_TESTTEST0TESTTESTTESTTESTTEST	TEST fake tokens fed to the redaction engine
+tests/test_policy_redaction_contract_237.py	token-aws	redact_text[(]"[A]KIATESTTESTTESTTEST leftover"[)]	TEST fake key id fed to the redaction engine
+tests/test_policy_redaction_contract_237.py	private-key	pem = "-----BEGIN RSA [P]RIVATE KEY-----.nMIIEfakekeymaterial	fake PEM (body is MIIEfakekeymaterial) fed to the redaction engine
+scripts/afm-minni-scenarios.mjs	token-assignment	"Set OPENAI_API_KEY=[s]k-proj-AbCdEf12345 in ~/[.]zshrc to test	fake key in an AFM scenario prompt

@@ -302,8 +302,13 @@ layout), bring your checkout current:
   automatically on the next daemon start.
 - **First recall hangs for minutes** — it's the one-time model download; the
   daemon announces it with sizes. Subsequent starts are fast.
-- **`Python 3.14+ is required`** — install Python 3.14, or install uv and
-  re-run `make setup` (uv downloads the interpreter for you).
+- **`Python 3.14 (.python-version) is required`** — the venv needs exactly the
+  Python minor version pinned in `.python-version`; a newer one (for example
+  3.15) is rejected, because the locked wheels may not exist for it. Install
+  Python 3.14, or install uv and re-run `make setup` (uv downloads the pinned
+  interpreter for you).
+- **`make setup stopped: fix .python-version`** — the pin file is missing or
+  malformed; setup stops before touching an existing `.venv`.
 - **A daemon answers but `minni down` refuses** — the daemon wasn't started by
   `minni up` (no PID file); stop it where it was started (the `make daemon`
   shell, or launchd).

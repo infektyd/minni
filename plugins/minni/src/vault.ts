@@ -22,6 +22,9 @@ import type { LearningQualityReport } from "./policy.js";
 // touches the other's binding at top-level/module-evaluation time.
 import { filterSafeVaultResults } from "./task.js";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
+// Type-only: use-report.ts imports FROM this module, so the runtime import
+// below is dynamic and function-scoped (same pattern as task.ts above).
+import type { UseReport } from "./use-report.js";
 
 export type VaultSection =
   | "raw"
@@ -138,6 +141,8 @@ export interface AuditReport {
   tools: Record<string, number>;
   recentSummaries: string[];
   latest?: string;
+  /** Recall-to-use report over the last `useDays` days (rev5 §4.5); only when asked for. */
+  use?: UseReport | { error: string };
 }
 
 export interface VaultSearchResult {
@@ -434,13 +439,27 @@ function snippetFor(
     .replace(/^#+\s+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
-  const earliest = (indexes: number[]): number =>
-    indexes.filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? -1;
-  let firstHit = earliest(terms.map((term) => firstWordIndex(plain, term)));
-  if (firstHit < 0) {
-    // terms are lowercased by queryTerms; the whole-word regexes carry /i.
-    const lower = plain.toLowerCase();
-    firstHit = earliest(terms.map((term) => lower.indexOf(term)));
+  let firstHit = -1;
+  let usedFastPath = false;
+  if (terms.length > 2) {
+    const matcher = getMultiTermMatcher(terms);
+    if (!matcher.hasNonAsciiOrRejected) {
+      const lower = plain.toLowerCase();
+      if (plain.length === lower.length) {
+        firstHit = matcher.firstSnippetHit(plain, lower);
+        usedFastPath = true;
+      }
+    }
+  }
+  if (!usedFastPath) {
+    const earliest = (indexes: number[]): number =>
+      indexes.filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? -1;
+    firstHit = earliest(terms.map((term) => firstWordIndex(plain, term)));
+    if (firstHit < 0) {
+      // terms are lowercased by queryTerms; the whole-word regexes carry /i.
+      const lower = plain.toLowerCase();
+      firstHit = earliest(terms.map((term) => lower.indexOf(term)));
+    }
   }
   const start = Math.max(0, Math.max(firstHit, 0) - 80);
   const end = Math.min(plain.length, start + maxLength);
@@ -629,7 +648,7 @@ const WORD_REGEX_CACHE_LIMIT = 512;
 // But "no bindable anchor" is not the same as "no lexical content", and
 // rejecting on the edges alone silently DELETED every path-shaped term.
 // queryTerms tokenises `/` (`[a-z0-9_/-]{2,}`), so `/api/` and
-// `/users/hans/projects/` arrive here as ordinary terms with both edges `/`;
+// `/users/someuser/projects/` arrive here as ordinary terms with both edges `/`;
 // they were dropped, and a query for a literal path returned nothing even
 // against a note containing it verbatim. Anchoring cannot help them — every
 // position adjacent to their alphanumeric runs is a separator they carry
@@ -807,6 +826,482 @@ function countWordOccurrences(
   return count;
 }
 
+const MULTI_TERM_WEAK_CACHE = new WeakMap<readonly string[], MultiTermMatcher>();
+const MULTI_TERM_LRU_CACHE = new Map<string, MultiTermMatcher>();
+const MULTI_TERM_LRU_LIMIT = 64;
+
+// Single-pass Aho-Corasick matcher over a query's pure-lower-ASCII terms with
+// pre-resolved 128-wide ASCII goto transitions and exact word-boundary /
+// morphological-suffix parity with countWordOccurrences (Backlog rows l & p).
+class MultiTermMatcher {
+  readonly numPatterns: number;
+  readonly termToPatIdx: Int32Array;
+  readonly hasNonAsciiOrRejected: boolean;
+  private readonly patternStr: string[];
+  private readonly patLen: Int32Array;
+  private readonly maxPatLen: number;
+  private readonly leadReq: Uint8Array;
+  private readonly tailReq: Uint8Array;
+  private readonly allowSuf: Uint8Array;
+  private readonly gotoTable: Int32Array;
+  private readonly firstMatchAtState: Int32Array;
+  private readonly nextMatch: Int32Array;
+  private readonly countsBuf: Int32Array;
+  private readonly nextAllowedBuf: Int32Array;
+  private readonly fallbackBuf: Uint8Array;
+
+  constructor(terms: readonly string[]) {
+    const termToPatIdx = new Int32Array(terms.length);
+    const patternStr: string[] = [];
+    const seenPatterns = new Map<string, number>();
+    let hasNonAsciiOrRejected = false;
+    let totalChars = 0;
+    let maxPatLen = 0;
+
+    for (let i = 0; i < terms.length; i++) {
+      const t = terms[i];
+      if (!t) {
+        termToPatIdx[i] = -1;
+        hasNonAsciiOrRejected = true;
+        continue;
+      }
+      if (!isPureLowerAscii(t)) {
+        termToPatIdx[i] = -2;
+        hasNonAsciiOrRejected = true;
+        continue;
+      }
+      const existing = seenPatterns.get(t);
+      if (existing !== undefined) {
+        termToPatIdx[i] = existing;
+        continue;
+      }
+      const firstCode = t.charCodeAt(0);
+      const lastCode = t.charCodeAt(t.length - 1);
+      const leadRequired = isAsciiLowerEdgeChar(firstCode);
+      const tailRequired = isAsciiLowerEdgeChar(lastCode);
+      if (!leadRequired && !tailRequired && !hasAsciiWordChar(t)) {
+        termToPatIdx[i] = -1;
+        hasNonAsciiOrRejected = true;
+        continue;
+      }
+      const patIdx = patternStr.length;
+      patternStr.push(t);
+      seenPatterns.set(t, patIdx);
+      termToPatIdx[i] = patIdx;
+      totalChars += t.length;
+      if (t.length > maxPatLen) maxPatLen = t.length;
+    }
+
+    const numPatterns = patternStr.length;
+    this.numPatterns = numPatterns;
+    this.termToPatIdx = termToPatIdx;
+    this.hasNonAsciiOrRejected = hasNonAsciiOrRejected;
+    this.patternStr = patternStr;
+    this.maxPatLen = maxPatLen;
+
+    const patLen = new Int32Array(numPatterns);
+    const leadReq = new Uint8Array(numPatterns);
+    const tailReq = new Uint8Array(numPatterns);
+    const allowSuf = new Uint8Array(numPatterns);
+    const nextMatch = new Int32Array(numPatterns).fill(-1);
+
+    const maxStates = totalChars + 1;
+    const rawGoto = new Int32Array(maxStates * 128).fill(-1);
+    const rawFirstMatch = new Int32Array(maxStates).fill(-1);
+    let numStates = 1;
+
+    for (let m = 0; m < numPatterns; m++) {
+      const t = patternStr[m];
+      const len = t.length;
+      const firstCode = t.charCodeAt(0);
+      const lastCode = t.charCodeAt(len - 1);
+      patLen[m] = len;
+      leadReq[m] = isAsciiLowerEdgeChar(firstCode) ? 1 : 0;
+      tailReq[m] = isAsciiLowerEdgeChar(lastCode) ? 1 : 0;
+      allowSuf[m] =
+        len >= MIN_MORPHOLOGICAL_LENGTH && lastCode >= 97 && lastCode <= 122
+          ? 1
+          : 0;
+
+      let state = 0;
+      for (let j = 0; j < len; j++) {
+        const code = t.charCodeAt(j);
+        const edgeIdx = (state << 7) | code;
+        let next = rawGoto[edgeIdx];
+        if (next === -1) {
+          next = numStates++;
+          rawGoto[edgeIdx] = next;
+        }
+        state = next;
+      }
+      rawFirstMatch[state] = m;
+    }
+
+    const failLink = new Int32Array(numStates);
+    const bfsQueue = new Int32Array(numStates);
+    let qHead = 0;
+    let qTail = 0;
+
+    for (let c = 0; c < 128; c++) {
+      const next = rawGoto[c];
+      if (next !== -1) {
+        failLink[next] = 0;
+        bfsQueue[qTail++] = next;
+      } else {
+        rawGoto[c] = 0;
+      }
+    }
+
+    while (qHead < qTail) {
+      const u = bfsQueue[qHead++];
+      const f = failLink[u];
+      const fMatch = rawFirstMatch[f];
+      if (fMatch >= 0) {
+        const uMatch = rawFirstMatch[u];
+        if (uMatch >= 0) {
+          nextMatch[uMatch] = fMatch;
+        } else {
+          rawFirstMatch[u] = fMatch;
+        }
+      }
+      const uBase = u << 7;
+      const fBase = f << 7;
+      for (let c = 0; c < 128; c++) {
+        const next = rawGoto[uBase | c];
+        if (next !== -1) {
+          failLink[next] = rawGoto[fBase | c];
+          bfsQueue[qTail++] = next;
+        } else {
+          rawGoto[uBase | c] = rawGoto[fBase | c];
+        }
+      }
+    }
+
+    this.patLen = patLen;
+    this.leadReq = leadReq;
+    this.tailReq = tailReq;
+    this.allowSuf = allowSuf;
+    this.gotoTable = rawGoto.subarray(0, numStates * 128);
+    this.firstMatchAtState = rawFirstMatch.subarray(0, numStates);
+    this.nextMatch = nextMatch;
+    this.countsBuf = new Int32Array(numPatterns);
+    this.nextAllowedBuf = new Int32Array(numPatterns);
+    this.fallbackBuf = new Uint8Array(numPatterns);
+  }
+
+  countAll(text: string, maxCount = 5): Int32Array {
+    const numPatterns = this.numPatterns;
+    const counts = this.countsBuf;
+    if (numPatterns === 0) return counts;
+    counts.fill(0);
+    const nextAllowedPos = this.nextAllowedBuf;
+    nextAllowedPos.fill(0);
+    const needsFallback = this.fallbackBuf;
+    needsFallback.fill(0);
+
+    const gotoTable = this.gotoTable;
+    const firstMatchAtState = this.firstMatchAtState;
+    const nextMatch = this.nextMatch;
+    const patLen = this.patLen;
+    const leadReq = this.leadReq;
+    const tailReq = this.tailReq;
+    const allowSuf = this.allowSuf;
+
+    const textLen = text.length;
+    let state = 0;
+    let hasFallback = false;
+
+    for (let i = 0; i < textLen; i++) {
+      const code = text.charCodeAt(i);
+      if (code >= 128) {
+        state = 0;
+        continue;
+      }
+      state = gotoTable[(state << 7) | code];
+      let m = firstMatchAtState[state];
+      if (m < 0) continue;
+
+      const afterIdx = i + 1;
+      for (; m >= 0; m = nextMatch[m]) {
+        if (counts[m] >= maxCount || needsFallback[m] !== 0) continue;
+        const idx = afterIdx - patLen[m];
+        if (idx < nextAllowedPos[m]) continue;
+
+        if (leadReq[m] !== 0 && idx > 0) {
+          const prevCode = text.charCodeAt(idx - 1);
+          if (prevCode >= 128) {
+            needsFallback[m] = 1;
+            hasFallback = true;
+            continue;
+          }
+          if (isAsciiLowerWordChar(prevCode)) {
+            continue;
+          }
+        }
+
+        if (tailReq[m] === 0) {
+          counts[m]++;
+          nextAllowedPos[m] = afterIdx;
+          continue;
+        }
+
+        let advance = -1;
+        if (afterIdx >= textLen) {
+          advance = afterIdx;
+        } else {
+          const c0 = text.charCodeAt(afterIdx);
+          if (c0 >= 128) {
+            needsFallback[m] = 1;
+            hasFallback = true;
+            continue;
+          }
+          if (!isAsciiLowerWordChar(c0)) {
+            advance = afterIdx;
+          } else if (allowSuf[m] !== 0) {
+            if (c0 === 115) {
+              const p = afterIdx + 1;
+              if (p >= textLen) {
+                advance = p;
+              } else {
+                const cp = text.charCodeAt(p);
+                if (cp >= 128) {
+                  needsFallback[m] = 1;
+                  hasFallback = true;
+                  continue;
+                }
+                if (!isAsciiLowerWordChar(cp)) advance = p;
+              }
+            } else if (c0 === 101 && afterIdx + 1 < textLen) {
+              const c1 = text.charCodeAt(afterIdx + 1);
+              if (c1 >= 128) {
+                needsFallback[m] = 1;
+                hasFallback = true;
+                continue;
+              }
+              if (c1 === 115 || c1 === 100) {
+                const p = afterIdx + 2;
+                if (p >= textLen) {
+                  advance = p;
+                } else {
+                  const cp = text.charCodeAt(p);
+                  if (cp >= 128) {
+                    needsFallback[m] = 1;
+                    hasFallback = true;
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) advance = p;
+                }
+              }
+            } else if (c0 === 105 && afterIdx + 2 < textLen) {
+              const c1 = text.charCodeAt(afterIdx + 1);
+              const c2 = text.charCodeAt(afterIdx + 2);
+              if (c1 >= 128 || c2 >= 128) {
+                needsFallback[m] = 1;
+                hasFallback = true;
+                continue;
+              }
+              if (c1 === 110 && c2 === 103) {
+                const p = afterIdx + 3;
+                if (p >= textLen) {
+                  advance = p;
+                } else {
+                  const cp = text.charCodeAt(p);
+                  if (cp >= 128) {
+                    needsFallback[m] = 1;
+                    hasFallback = true;
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) advance = p;
+                }
+              }
+            }
+          }
+        }
+
+        if (advance !== -1) {
+          counts[m]++;
+          nextAllowedPos[m] = advance;
+        }
+      }
+    }
+
+    if (hasFallback) {
+      const patternStr = this.patternStr;
+      for (let m = 0; m < numPatterns; m++) {
+        if (needsFallback[m] !== 0) {
+          const c = countWordOccurrencesRegex(text, patternStr[m], true);
+          counts[m] = c > maxCount ? maxCount : c;
+        }
+      }
+    }
+
+    return counts;
+  }
+
+  firstSnippetHit(plain: string, lower: string): number {
+    const numPatterns = this.numPatterns;
+    if (numPatterns === 0) return -1;
+    const gotoTable = this.gotoTable;
+    const firstMatchAtState = this.firstMatchAtState;
+    const nextMatch = this.nextMatch;
+    const patLen = this.patLen;
+    const leadReq = this.leadReq;
+    const tailReq = this.tailReq;
+    const allowSuf = this.allowSuf;
+    const maxPatLen = this.maxPatLen;
+    const needsFallback = this.fallbackBuf;
+    let fallbackCleaned = false;
+
+    const runFallback = (m: number): void => {
+      if (!fallbackCleaned) {
+        needsFallback.fill(0);
+        fallbackCleaned = true;
+      }
+      if (needsFallback[m] !== 0) return;
+      needsFallback[m] = 1;
+      const wIdx = firstWordIndex(plain, this.patternStr[m]);
+      if (wIdx >= 0 && (firstWordHit < 0 || wIdx < firstWordHit)) {
+        firstWordHit = wIdx;
+      }
+    };
+
+    const textLen = lower.length;
+    let state = 0;
+    let firstWordHit = -1;
+    let firstSubHit = -1;
+
+    for (let i = 0; i < textLen; i++) {
+      if (firstWordHit >= 0 && i + 1 - maxPatLen >= firstWordHit) {
+        break;
+      }
+      const code = lower.charCodeAt(i);
+      if (code >= 128) {
+        state = 0;
+        continue;
+      }
+      state = gotoTable[(state << 7) | code];
+      let m = firstMatchAtState[state];
+      if (m < 0) continue;
+
+      const afterIdx = i + 1;
+      for (; m >= 0; m = nextMatch[m]) {
+        const idx = afterIdx - patLen[m];
+        if (firstSubHit < 0 || idx < firstSubHit) {
+          firstSubHit = idx;
+        }
+        if (firstWordHit >= 0 && idx >= firstWordHit) {
+          continue;
+        }
+        if (leadReq[m] !== 0 && idx > 0) {
+          const prevCode = lower.charCodeAt(idx - 1);
+          if (prevCode >= 128) {
+            runFallback(m);
+            continue;
+          }
+          if (isAsciiLowerWordChar(prevCode)) {
+            continue;
+          }
+        }
+        if (tailReq[m] === 0) {
+          firstWordHit = idx;
+          continue;
+        }
+        let matched = false;
+        if (afterIdx >= textLen) {
+          matched = true;
+        } else {
+          const c0 = lower.charCodeAt(afterIdx);
+          if (c0 >= 128) {
+            runFallback(m);
+            continue;
+          }
+          if (!isAsciiLowerWordChar(c0)) {
+            matched = true;
+          } else if (allowSuf[m] !== 0) {
+            if (c0 === 115) {
+              const p = afterIdx + 1;
+              if (p >= textLen) {
+                matched = true;
+              } else {
+                const cp = lower.charCodeAt(p);
+                if (cp >= 128) {
+                  runFallback(m);
+                  continue;
+                }
+                if (!isAsciiLowerWordChar(cp)) matched = true;
+              }
+            } else if (c0 === 101 && afterIdx + 1 < textLen) {
+              const c1 = lower.charCodeAt(afterIdx + 1);
+              if (c1 >= 128) {
+                runFallback(m);
+                continue;
+              }
+              if (c1 === 115 || c1 === 100) {
+                const p = afterIdx + 2;
+                if (p >= textLen) {
+                  matched = true;
+                } else {
+                  const cp = lower.charCodeAt(p);
+                  if (cp >= 128) {
+                    runFallback(m);
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) matched = true;
+                }
+              }
+            } else if (c0 === 105 && afterIdx + 2 < textLen) {
+              const c1 = lower.charCodeAt(afterIdx + 1);
+              const c2 = lower.charCodeAt(afterIdx + 2);
+              if (c1 >= 128 || c2 >= 128) {
+                runFallback(m);
+                continue;
+              }
+              if (c1 === 110 && c2 === 103) {
+                const p = afterIdx + 3;
+                if (p >= textLen) {
+                  matched = true;
+                } else {
+                  const cp = lower.charCodeAt(p);
+                  if (cp >= 128) {
+                    runFallback(m);
+                    continue;
+                  }
+                  if (!isAsciiLowerWordChar(cp)) matched = true;
+                }
+              }
+            }
+          }
+        }
+        if (matched) {
+          firstWordHit = idx;
+        }
+      }
+    }
+    return firstWordHit >= 0 ? firstWordHit : firstSubHit;
+  }
+}
+
+function getMultiTermMatcher(terms: readonly string[]): MultiTermMatcher {
+  const weak = MULTI_TERM_WEAK_CACHE.get(terms);
+  if (weak) return weak;
+  const key = terms.join("\0");
+  let matcher = MULTI_TERM_LRU_CACHE.get(key);
+  if (matcher) {
+    MULTI_TERM_LRU_CACHE.delete(key);
+    MULTI_TERM_LRU_CACHE.set(key, matcher);
+    MULTI_TERM_WEAK_CACHE.set(terms, matcher);
+    return matcher;
+  }
+  matcher = new MultiTermMatcher(terms);
+  if (MULTI_TERM_LRU_CACHE.size >= MULTI_TERM_LRU_LIMIT) {
+    const oldestKey = MULTI_TERM_LRU_CACHE.keys().next().value;
+    if (oldestKey !== undefined) MULTI_TERM_LRU_CACHE.delete(oldestKey);
+  }
+  MULTI_TERM_LRU_CACHE.set(key, matcher);
+  MULTI_TERM_WEAK_CACHE.set(terms, matcher);
+  return matcher;
+}
+
 // Recall queries are natural language and routinely carry terminal punctuation
 // ("how do i fix ci?"). Strip the outer punctuation before the exact-phrase
 // check so the strongest ranking signal in the scorer survives the question
@@ -896,10 +1391,32 @@ function scoreVaultNote(
       break;
     }
   }
-  for (const term of terms) {
-    const count = countWordOccurrences(haystack, term);
-    if (count > 0) termScore += Math.min(count, 5);
-    if (countWordOccurrences(titleLower, term) > 0) termScore += 3;
+  if (terms.length > 2) {
+    const matcher = getMultiTermMatcher(terms);
+    const counts = matcher.countAll(haystack, 5);
+    const termToPatIdx = matcher.termToPatIdx;
+    for (let i = 0; i < terms.length; i++) {
+      const term = terms[i];
+      const patIdx = termToPatIdx[i];
+      const count =
+        patIdx >= 0
+          ? counts[patIdx]
+          : patIdx === -2
+            ? countWordOccurrences(haystack, term, true, 5)
+            : 0;
+      if (count > 0) {
+        termScore += Math.min(count, 5);
+        if (countWordOccurrences(titleLower, term, true, 1) > 0) {
+          termScore += 3;
+        }
+      }
+    }
+  } else {
+    for (const term of terms) {
+      const count = countWordOccurrences(haystack, term);
+      if (count > 0) termScore += Math.min(count, 5);
+      if (countWordOccurrences(titleLower, term) > 0) termScore += 3;
+    }
   }
   // The floor gates TERM EVIDENCE, not the final score. Its stated purpose is
   // "more than single-word noise", which is a question about how many times the
@@ -1855,7 +2372,7 @@ export async function auditTail(
 export async function auditReport(
   vaultPath: string,
   limit = 100,
-  options: { includeLatest?: boolean } = {},
+  options: { includeLatest?: boolean; useDays?: number } = {},
 ): Promise<AuditReport> {
   const tail = await auditTail(vaultPath, limit);
   const tools: Record<string, number> = {};
@@ -1881,6 +2398,15 @@ export async function auditReport(
   if (options.includeLatest) {
     report.latest = tail.entries.at(-1);
   }
+  if (options.useDays !== undefined) {
+    const days = Number.isSafeInteger(options.useDays) ? Math.min(Math.max(options.useDays, 1), 90) : 7;
+    try {
+      const { buildUseReport } = await import("./use-report.js");
+      report.use = buildUseReport(vaultPath, { days });
+    } catch (error) {
+      report.use = { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   return report;
 }
 
@@ -1902,6 +2428,26 @@ export interface SessionReceipt {
   candidates_drafted: number;
   jev_learns?: number;
   jev_annotation?: string;
+  /** Recall-to-use counts from the use ledger (rev5 §4.5); absent when nothing was surfaced. */
+  use?: SessionUseCounts;
+}
+
+/**
+ * One session's surfacings and the standing outcome of each, from the use
+ * ledger. `pending` counts surfacings the detector has not judged yet.
+ */
+export interface SessionUseCounts {
+  surfaced: number;
+  /** Title/content citations. */
+  cited: number;
+  /** Handle-style citations (wikilink, slug, m:/d: handle, learning #id). */
+  cited_handle: number;
+  applied: number;
+  opened: number;
+  dismissed: number;
+  ignored: number;
+  unknown: number;
+  pending: number;
 }
 
 /**
@@ -2130,7 +2676,10 @@ export async function sessionReceipt(
   vaultPath: string,
   sessionId: string,
   limit = 500,
-  options: { includeStamped?: boolean } = {},
+  // useCounts: read the session's use counts from the ledger (default on).
+  // The Stop hook passes it only when ledger-gate says the ledger may be on,
+  // because loading the reader makes Stop pay for the ledger (§8.2).
+  options: { includeStamped?: boolean; useCounts?: boolean } = {},
 ): Promise<SessionReceipt> {
   // Read the ROLLING log, not the daily file auditTail prefers: a session
   // that crosses midnight has its boot marker in yesterday's daily file, but
@@ -2178,7 +2727,7 @@ export async function sessionReceipt(
     windowEnd = closeWindow(parsed, windowStart, [sessionId, windowSessionId]).end;
   }
 
-  return tallyWindow(
+  const receipt = tallyWindow(
     parsed,
     sessionId,
     windowStart,
@@ -2186,6 +2735,18 @@ export async function sessionReceipt(
     windowSessionId,
     options.includeStamped === true,
   );
+  // Use counts come from the ledger, keyed by the real session id. The
+  // synthetic fallback (includeStamped: the payload had no id) has none.
+  if (options.includeStamped !== true && options.useCounts !== false) {
+    try {
+      const { sessionUseCounts } = await import("./use-report.js");
+      const use = sessionUseCounts(vaultPath, sessionId);
+      if (use) receipt.use = use;
+    } catch {
+      // A ledger problem never costs the receipt.
+    }
+  }
+  return receipt;
 }
 
 /**
@@ -2207,7 +2768,15 @@ export function formatSessionReceiptLine(receipt: SessionReceipt): string {
     `${receipt.learns} learn${receipt.learns === 1 ? "" : "s"} committed${jevSuffix}`,
     `${receipt.candidates_drafted} candidate${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
   ];
-  return `Minni session receipt: ${parts.join(", ")}.`;
+  const line = `Minni session receipt: ${parts.join(", ")}.`;
+  // Byte-identical to the line above whenever nothing was surfaced; otherwise
+  // the use counts ride on the same line, which maskTelemetry already drops.
+  const use = receipt.use;
+  if (!use || !(typeof use.surfaced === "number" && use.surfaced > 0)) return line;
+  const count = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  // "cited" on the receipt counts every citation, title/content and handle alike.
+  const cited = count(use.cited) + count(use.cited_handle);
+  return `${line} Use: ${count(use.surfaced)} surfaced, ${cited} cited, ${count(use.applied)} applied.`;
 }
 
 /**
@@ -2304,13 +2873,152 @@ interface CachedVaultNoteEntry {
   wordCounts: Map<string, number>;
 }
 
+// The per-process search cache, keyed by vault path. It always holds the
+// parsed notes; reuse is gated by the warm-cache rule in searchVaultNotes (at
+// least 20 notes, built within the last 30 s). `tokenMap` is the inverted
+// lookup index (see indexNoteTokensIntoMap), built only by the "index"
+// candidate path and only on first use — a process that only ever runs the
+// "scan" path never builds it. See VaultSearchCandidates.
 interface VaultSearchCacheEntry {
   builtAtMs: number;
   notes: Map<string, CachedVaultNoteEntry>;
-  tokenMap: Map<string, Set<string>>;
+  tokenMap?: Map<string, Set<string>>;
 }
 
 const _vaultSearchCache = new Map<string, VaultSearchCacheEntry>();
+
+/**
+ * A note search never scores (superseded, rejected, expired or draft, or one
+ * that names its successor). Shared by the search cache and the use
+ * detector's DF recount, so both count the same notes.
+ */
+function skippedByStatus(markdown: string): boolean {
+  const rawStatus = frontmatterField(markdown, "status")?.toLowerCase();
+  return (
+    rawStatus === "superseded" ||
+    rawStatus === "rejected" ||
+    rawStatus === "expired" ||
+    rawStatus === "draft" ||
+    Boolean(frontmatterField(markdown, "superseded_by"))
+  );
+}
+
+/**
+ * The vault's notes as the search scan walks them (`wiki/**\/*.md` through
+ * listMarkdownFiles: containment on every entry, symlinks never followed),
+ * as sorted vault-relative paths. For the use detector's DF recount, which
+ * reads them a slice at a time at Stop (rev5 §4.4). Never throws.
+ */
+export async function listVaultNoteRelPaths(vaultPath: string): Promise<string[]> {
+  try {
+    const files = await listMarkdownFiles(path.join(vaultPath, "wiki"));
+    return files.map((file) => path.relative(vaultPath, file)).sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * How many notes `listVaultNoteRelPaths` would list, from directory entries
+ * alone: no note is opened and no path resolved per entry. listMarkdownFiles
+ * keeps exactly the `*.md` entries that are regular files, inside directories
+ * that are real directories (a symlink entry is neither, so it is never
+ * followed), so the entry types give the same count. For the use detector's
+ * daily early-trigger check (rev5 §4.4). Null on an unexpected failure.
+ */
+export function countVaultNotes(vaultPath: string): number | null {
+  const walk = (dir: string): number => {
+    let count = 0;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) count += walk(path.join(dir, entry.name));
+      else if (entry.isFile() && entry.name.endsWith(".md")) count += 1;
+    }
+    return count;
+  };
+  try {
+    return walk(path.join(vaultPath, "wiki"));
+  } catch (error) {
+    return (error as { code?: unknown } | null)?.code === "ENOENT" ? 0 : null;
+  }
+}
+
+const DF_NOTE_READ_FLAGS =
+  fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
+/**
+ * One note's text for the DF recount, `title + "\n" + markdown` exactly as
+ * the search cache holds it; null for a note search never indexes or scores
+ * (`blocked` privacy, `skippedByStatus`), one outside the vault, anything not
+ * a regular file (judged on the opened, non-blocking descriptor: a FIFO never
+ * blocks), or one over `maxBytes`. Synchronous and bounded. Never throws.
+ */
+export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    if (typeof relativePath !== "string" || relativePath.length === 0 || path.isAbsolute(relativePath)) return null;
+    const notePath = path.join(vaultPath, relativePath);
+    assertUnder(notePath, path.join(vaultPath, "wiki"));
+    fd = fs.openSync(notePath, DF_NOTE_READ_FLAGS);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    const buffer = Buffer.alloc(stat.size);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const n = fs.readSync(fd, buffer, filled, buffer.length - filled, filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    const markdown = buffer.toString("utf8", 0, filled);
+    if (privacyFromMarkdown(markdown) === "blocked" || skippedByStatus(markdown)) return null;
+    return `${titleFromMarkdown(relativePath, markdown)}\n${markdown}`;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // A read-only descriptor: nothing to lose.
+      }
+    }
+  }
+}
+
+/**
+ * How searchVaultNotes picks the notes it scores. On a cache whose notes were
+ * all read from disk, both paths select exactly the same notes in exactly the
+ * same order, so results, scores and ranking are identical (pinned by
+ * tests/vault-search-candidates-parity.test.mjs); they differ only in cost.
+ *
+ * - "index" (default): build an inverted index from every lookup key of every
+ *   note once per cache, then answer each query with a few map lookups. The
+ *   build dominates a cold search (most of its cost on a vault of several
+ *   hundred notes), so this is for a long-lived process that keeps the cache
+ *   warm across queries — the MCP server, and the prepare_task / handoff
+ *   packet paths it serves.
+ * - "scan": no index; test each query key against each note's text directly.
+ *   This is for a one-shot process that searches once and exits — the hook
+ *   processes (UserPromptSubmit) — which would otherwise pay the full index
+ *   build on every prompt to answer a single query. A query whose keys keep
+ *   missing (see SCAN_BUDGET_PASSES) is handed to the index instead, so a
+ *   scan never costs much more than the build it avoids.
+ *
+ * The caller chooses the path for its process type. The only switch inside a
+ * path is that deterministic work budget, and it cannot change what is
+ * selected, only what selecting it costs.
+ *
+ * After writeVaultPage rewrites a note in the same process, the index keeps
+ * the note's old keys (it only ever adds), so the index path can admit the
+ * note as an extra candidate the scan would not. The extra is scored on its
+ * current text, so results differ only if that text scores for the query
+ * without producing any of the query's lookup keys — the case the lookup
+ * already misses on a fresh cache (e.g. `x_foo_bar` for the query `foo_bar`).
+ */
+export type VaultSearchCandidates = "index" | "scan";
+
+export interface VaultSearchOptions {
+  candidates?: VaultSearchCandidates;
+}
 
 function buildCachedVaultNoteEntry(
   notePath: string,
@@ -2320,13 +3028,7 @@ function buildCachedVaultNoteEntry(
   privacy: PrivacyLevel | undefined,
 ): CachedVaultNoteEntry {
   const status = statusFromMarkdown(markdown);
-  const rawStatus = frontmatterField(markdown, "status")?.toLowerCase();
-  const skipByStatus =
-    rawStatus === "superseded" ||
-    rawStatus === "rejected" ||
-    rawStatus === "expired" ||
-    rawStatus === "draft" ||
-    Boolean(frontmatterField(markdown, "superseded_by"));
+  const skipByStatus = skippedByStatus(markdown);
   const pageType = frontmatterField(markdown, "type")?.toLowerCase();
   return {
     notePath,
@@ -2360,20 +3062,55 @@ function scoreVaultNoteCached(
       break;
     }
   }
-  for (const term of terms) {
-    let contrib = wordCounts.get(term);
-    if (contrib === undefined) {
-      const count = countWordOccurrences(haystackLower, term, true, 5);
-      contrib =
-        count > 0
-          ? Math.min(count, 5) +
-            (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
-          : 0;
-      if (wordCounts.size < 256) {
-        wordCounts.set(term, contrib);
-      }
+  let missingCount = 0;
+  for (let i = 0; i < terms.length; i++) {
+    if (!wordCounts.has(terms[i])) {
+      missingCount++;
+      if (missingCount > 2) break;
     }
-    termScore += contrib;
+  }
+  if (missingCount > 2) {
+    const matcher = getMultiTermMatcher(terms);
+    const counts = matcher.countAll(haystackLower, 5);
+    const termToPatIdx = matcher.termToPatIdx;
+    for (let i = 0; i < terms.length; i++) {
+      const term = terms[i];
+      let contrib = wordCounts.get(term);
+      if (contrib === undefined) {
+        const patIdx = termToPatIdx[i];
+        const count =
+          patIdx >= 0
+            ? counts[patIdx]
+            : patIdx === -2
+              ? countWordOccurrences(haystackLower, term, true, 5)
+              : 0;
+        contrib =
+          count > 0
+            ? Math.min(count, 5) +
+              (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
+            : 0;
+        if (wordCounts.size < 512) {
+          wordCounts.set(term, contrib);
+        }
+      }
+      termScore += contrib;
+    }
+  } else {
+    for (const term of terms) {
+      let contrib = wordCounts.get(term);
+      if (contrib === undefined) {
+        const count = countWordOccurrences(haystackLower, term, true, 5);
+        contrib =
+          count > 0
+            ? Math.min(count, 5) +
+              (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
+            : 0;
+        if (wordCounts.size < 512) {
+          wordCounts.set(term, contrib);
+        }
+      }
+      termScore += contrib;
+    }
   }
   if (termScore < MIN_TERM_SCORE) return 0;
 
@@ -2427,6 +3164,280 @@ function indexNoteTokensIntoMap(
   }
 }
 
+// The "index" path's index, built on first use from the cached notes in their
+// cache order — the same bucket order an index built while reading them has.
+function vaultSearchTokenMap(
+  cache: VaultSearchCacheEntry,
+): Map<string, Set<string>> {
+  if (!cache.tokenMap) {
+    const tokenMap = new Map<string, Set<string>>();
+    for (const entry of cache.notes.values()) {
+      if (!entry.skipByStatus) {
+        indexNoteTokensIntoMap(tokenMap, entry.notePath, entry.haystackLower);
+      }
+    }
+    cache.tokenMap = tokenMap;
+  }
+  return cache.tokenMap;
+}
+
+/**
+ * The keys a query is looked up under, in lookup order: for each term, the
+ * first `[a-z0-9_]{2,}` run of the term, then that run minus a trailing `s`
+ * when it is longer than 3 characters. Undefined when some term has no such
+ * run (or is not a plain `[a-z0-9_/-]` token), which makes every cached note a
+ * candidate.
+ */
+function candidateLookupKeys(terms: string[]): string[] | undefined {
+  const lookupSubtokens = terms.map((term) => {
+    const t = term.toLowerCase();
+    return /^[a-z0-9_][a-z0-9_/-]*[a-z0-9_]$/.test(t)
+      ? (t.match(/[a-z0-9_]{2,}/g) ?? [])
+      : [];
+  });
+  const allIndexableTokens =
+    lookupSubtokens.length > 0 && lookupSubtokens.every((subs) => subs.length > 0);
+  if (!allIndexableTokens) return undefined;
+  const keys: string[] = [];
+  for (const subs of lookupSubtokens) {
+    const tok = subs[0];
+    keys.push(tok);
+    if (tok.length > 3 && tok.endsWith("s")) keys.push(tok.slice(0, -1));
+  }
+  return keys;
+}
+
+// End of the run of token characters ([a-z0-9_], indexNoteTokensIntoMap's
+// regex) starting at `from`; with `pieceOnly`, `_` ends the run too (a
+// `_`-split subtoken).
+function indexTokenRunEnd(text: string, from: number, pieceOnly: boolean): number {
+  let end = from;
+  while (end < text.length) {
+    const code = text.charCodeAt(end);
+    if (!(isAsciiLowerWordChar(code) || (!pieceOnly && code === 95))) break;
+    end++;
+  }
+  return end;
+}
+
+// Whether indexNoteTokensIntoMap's addTokenKeys(T) emits `key`, for a token T
+// = text[start, end) already known to begin with `key`. Every key it emits is
+// a prefix of T, so the only question is which prefix lengths it emits:
+//   - T itself;
+//   - T minus `s` (T longer than 3), minus `es`/`ed` (T at least 6), minus
+//     `ing` (T at least 7);
+//   - every prefix of 3..min(|T| - 1, 10) characters.
+// So a key of 3..10 characters is emitted by every T it begins (T itself or a
+// longer T's prefix), a 2-character key only by T equal to it (no rule above
+// yields a 2-character key from a longer T), and a key of 11+ characters only
+// by T equal to it or to it plus `s`, `es`, `ed` or `ing`.
+function indexTokenEmitsKey(
+  text: string,
+  start: number,
+  end: number,
+  key: string,
+): boolean {
+  const keyLen = key.length;
+  if (keyLen >= 3 && keyLen <= 10) return true;
+  const rest = end - start - keyLen;
+  if (keyLen < 3) return rest === 0;
+  const at = start + keyLen;
+  switch (rest) {
+    case 0:
+      return true;
+    case 1:
+      return text.charCodeAt(at) === 115; // s
+    case 2:
+      return (
+        text.charCodeAt(at) === 101 && // e
+        (text.charCodeAt(at + 1) === 115 || text.charCodeAt(at + 1) === 100) // s, d
+      );
+    case 3:
+      return text.startsWith("ing", at);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Whether the "index" path's index would list this note under `key`, decided
+ * from the note's text alone. `key` is a `[a-z0-9_]{2,}` lookup key (see
+ * candidateLookupKeys); `haystackLower` is the text indexNoteTokensIntoMap
+ * indexes.
+ *
+ * The index lists a note under every key that addTokenKeys emits for one of
+ * its tokens, where a token is a maximal `[a-z0-9_]{2,}` run of the text, or,
+ * for a run containing `_`, one of its `_`-separated pieces of 2+ characters.
+ * Every key is a prefix of the token that emits it, so it suffices to visit
+ * each occurrence of `key` and ask whether a token starts there that emits it:
+ *   - a whole run starts there when the character before is not [a-z0-9_];
+ *   - a piece starts there when the character before is not [a-z0-9] (a `_`,
+ *     or the run's start), and only for a key with no `_` (a piece has none).
+ *     At a run's start with no `_` in the run, the piece is the run itself,
+ *     so the two readings agree.
+ */
+function haystackHasIndexKey(haystackLower: string, key: string): boolean {
+  const keyLen = key.length;
+  if (keyLen === 0) return false;
+  const keyHasUnderscore = key.includes("_");
+  // A 3..10-character key is emitted by any token it begins, so its end
+  // does not matter (indexTokenEmitsKey ignores it).
+  const needsEnd = keyLen < 3 || keyLen > 10;
+  let at = haystackLower.indexOf(key);
+  while (at !== -1) {
+    const prev = at > 0 ? haystackLower.charCodeAt(at - 1) : -1;
+    if (!isAsciiLowerWordChar(prev)) {
+      if (prev !== 95) {
+        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, false) : 0;
+        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
+      }
+      if (!keyHasUnderscore) {
+        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, true) : 0;
+        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
+      }
+    }
+    at = haystackLower.indexOf(key, at + 1);
+  }
+  return false;
+}
+
+// "index" path: union the index buckets of each key, in key order.
+function indexCandidateEntries(
+  cache: VaultSearchCacheEntry,
+  keys: string[],
+): CachedVaultNoteEntry[] {
+  const tokenMap = vaultSearchTokenMap(cache);
+  const matchedPaths = new Set<string>();
+  for (const key of keys) {
+    const bucket = tokenMap.get(key);
+    if (bucket) {
+      for (const p of bucket) matchedPaths.add(p);
+    }
+  }
+  const subset: CachedVaultNoteEntry[] = [];
+  for (const p of matchedPaths) {
+    const entry = cache.notes.get(p);
+    if (entry && !entry.skipByStatus) subset.push(entry);
+  }
+  return subset;
+}
+
+// The scan path's work budget, in full passes over the text of the notes it
+// tests. Testing a key against a note it does not admit reads the note's whole
+// text, and a note that is never admitted is read again for every key; the
+// number of keys is the number of distinct query terms, which nothing caps.
+// So a query of many keys that match nothing (a pasted hex dump, a UUID list,
+// code full of long identifiers) would cost a pass per key, and the hook would
+// end up slower than the index build the scan exists to avoid. Once the reads
+// spent on notes a key did not admit exceed this many passes, the scan stops
+// and hands the query to the index path, which selects the same candidates in
+// the same order. The worst case is then about this many passes plus one
+// index build. It counts characters, not time, so the switch is deterministic.
+// A note a key does admit is not counted: it leaves the scan, so all of those
+// reads together come to at most one more pass.
+//
+// Derived, not measured on one vault: the cold index build of a real
+// 783-note, 12 MB vault measured 265-306 ms. A pass for a key that matches
+// nothing, measured on a synthetic vault of the same size (783 notes, 12.6 MB,
+// English-like letter frequencies, two-byte text), costs 1-21 ms by key shape:
+// about 2 ms for long hex ids, 4 ms for keys starting with a rare letter,
+// 21 ms for short keys starting with `e` (every `e` is a substring-search
+// candidate). Against the worst shape the crossover is 265 / 21.4 = 12.4
+// passes, rounded down to 12. A worst-shape query then costs at most about two
+// index builds; a typical one, one build and a little.
+const SCAN_BUDGET_PASSES = 12;
+
+// "scan" path: the union an index built from the cached notes gives, in the
+// same order, without the index. The index path admits a note at the first
+// key whose bucket holds it, and walks each bucket in cache order; so does
+// this — keys in order, the notes not yet admitted in cache order — and a note
+// admitted once is never tested again. Undefined once the work budget above
+// is spent; the caller then runs the index path.
+function scanCandidateEntries(
+  cache: VaultSearchCacheEntry,
+  keys: string[],
+): CachedVaultNoteEntry[] | undefined {
+  let pending: CachedVaultNoteEntry[] = [];
+  let passChars = 0;
+  for (const entry of cache.notes.values()) {
+    if (!entry.skipByStatus) {
+      pending.push(entry);
+      passChars += entry.haystackLower.length;
+    }
+  }
+  const budgetChars = SCAN_BUDGET_PASSES * passChars;
+  let spentChars = 0;
+  const subset: CachedVaultNoteEntry[] = [];
+  const seenKeys = new Set<string>();
+  for (const key of keys) {
+    if (pending.length === 0) break;
+    // A repeated key admits nothing the first visit did not.
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const stillPending: CachedVaultNoteEntry[] = [];
+    for (const entry of pending) {
+      if (haystackHasIndexKey(entry.haystackLower, key)) {
+        subset.push(entry);
+      } else {
+        stillPending.push(entry);
+        spentChars += entry.haystackLower.length;
+      }
+    }
+    pending = stillPending;
+    if (spentChars > budgetChars) return undefined;
+  }
+  return subset;
+}
+
+function selectCandidateEntries(
+  cache: VaultSearchCacheEntry,
+  terms: string[],
+  candidates: VaultSearchCandidates,
+): Iterable<CachedVaultNoteEntry> {
+  const keys =
+    cache.notes.size >= 20 ? candidateLookupKeys(terms) : undefined;
+  if (!keys) return cache.notes.values();
+  if (candidates === "scan") {
+    const scanned = scanCandidateEntries(cache, keys);
+    if (scanned) return scanned;
+  }
+  return indexCandidateEntries(cache, keys);
+}
+
+/**
+ * What this process's search cache holds for `vaultPath`: how many notes, and
+ * whether the "index" path's index has been built. Undefined when nothing is
+ * cached. Read-only; it never builds or refreshes anything.
+ */
+export function vaultSearchCacheState(
+  vaultPath: string,
+): { notes: number; prefixIndex: boolean } | undefined {
+  const cache = _vaultSearchCache.get(vaultPath);
+  if (!cache) return undefined;
+  return { notes: cache.notes.size, prefixIndex: cache.tokenMap !== undefined };
+}
+
+/**
+ * The candidates `candidates` selects for `query` from this process's cache
+ * for `vaultPath`, as relative paths in the order they are scored — the
+ * selection searchVaultNotes runs, exposed so the parity test can compare the
+ * two paths' candidates directly rather than only their scored results.
+ * Undefined when nothing is cached; it never reads the vault. The "index"
+ * path builds its index here if it is missing, exactly as a search would.
+ */
+export function vaultSearchCandidatePaths(
+  vaultPath: string,
+  query: string,
+  candidates: VaultSearchCandidates,
+): string[] | undefined {
+  const cache = _vaultSearchCache.get(vaultPath);
+  if (!cache) return undefined;
+  return Array.from(
+    selectCandidateEntries(cache, queryTerms(query), candidates),
+    (entry) => entry.relativePath,
+  );
+}
+
 function updateVaultSearchCacheOnWrite(
   vaultPath: string,
   notePath: string,
@@ -2450,7 +3461,7 @@ function updateVaultSearchCacheOnWrite(
     privacy,
   );
   cached.notes.set(notePath, entry);
-  if (!entry.skipByStatus) {
+  if (!entry.skipByStatus && cached.tokenMap) {
     indexNoteTokensIntoMap(cached.tokenMap, notePath, entry.haystackLower);
   }
   cached.builtAtMs = Date.now();
@@ -2461,7 +3472,9 @@ export async function searchVaultNotes(
   query: string,
   limit = 5,
   agentId?: string,
+  options: VaultSearchOptions = {},
 ): Promise<VaultSearchResult[]> {
+  const candidates = options.candidates ?? "index";
   const terms = queryTerms(query);
   const phrases = phraseForms(query);
   // Only bail when there is nothing to match on at all. Bailing on an empty
@@ -2488,7 +3501,6 @@ export async function searchVaultNotes(
       return [];
     }
     const notes = new Map<string, CachedVaultNoteEntry>();
-    const tokenMap = new Map<string, Set<string>>();
     await Promise.all(
       files.map(async (notePath) => {
         const markdown = await readFile(notePath, "utf8");
@@ -2504,46 +3516,16 @@ export async function searchVaultNotes(
           privacy,
         );
         notes.set(notePath, entry);
-        if (!entry.skipByStatus) {
-          indexNoteTokensIntoMap(tokenMap, notePath, entry.haystackLower);
-        }
       }),
     );
-    cache = { builtAtMs: now, notes, tokenMap };
+    cache = { builtAtMs: now, notes };
     _vaultSearchCache.set(vaultPath, cache);
   }
+  // The "index" path keeps its index current for every later search and
+  // write in this process, as it always has; the "scan" path never builds it.
+  if (candidates === "index") vaultSearchTokenMap(cache);
 
-  let candidateEntries: Iterable<CachedVaultNoteEntry> = cache.notes.values();
-  const lowerTerms = terms.map((t) => t.toLowerCase());
-  const lookupSubtokens = lowerTerms.map((t) =>
-    /^[a-z0-9_][a-z0-9_/-]*[a-z0-9_]$/.test(t)
-      ? (t.match(/[a-z0-9_]{2,}/g) ?? [])
-      : [],
-  );
-  const allIndexableTokens =
-    lookupSubtokens.length > 0 && lookupSubtokens.every((subs) => subs.length > 0);
-  if (allIndexableTokens && cache.notes.size >= 20) {
-    const matchedPaths = new Set<string>();
-    for (const subs of lookupSubtokens) {
-      const tok = subs[0];
-      const exactSet = cache.tokenMap.get(tok);
-      if (exactSet) {
-        for (const p of exactSet) matchedPaths.add(p);
-      }
-      if (tok.length > 3 && tok.endsWith("s")) {
-        const stemSet = cache.tokenMap.get(tok.slice(0, -1));
-        if (stemSet) {
-          for (const p of stemSet) matchedPaths.add(p);
-        }
-      }
-    }
-    const subset: CachedVaultNoteEntry[] = [];
-    for (const p of matchedPaths) {
-      const entry = cache.notes.get(p);
-      if (entry && !entry.skipByStatus) subset.push(entry);
-    }
-    candidateEntries = subset;
-  }
+  const candidateEntries = selectCandidateEntries(cache, terms, candidates);
 
   const scored: Array<{ entry: CachedVaultNoteEntry; score: number }> = [];
   for (const entry of candidateEntries) {

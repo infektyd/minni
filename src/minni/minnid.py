@@ -759,6 +759,7 @@ def _recall_context() -> RecallContext:
         lazy_episodic=_lazy_episodic,
         sovereign_db=MinniDB,
         logger=logger,
+        version=VERSION,
     )
 
 

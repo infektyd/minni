@@ -1419,14 +1419,14 @@ test("searchVaultNotes does not let the noise floor delete boosted correction no
 // whole-word matching turned real notes into zero-score notes outright.
 for (const [name, query, body] of [
   [
-    // plan-3a21c152c0d609b3.md: `learnings` x9, `learnings_fts` x10,
+    // plan-<id>.md: `learnings` x9, `learnings_fts` x10,
     // `learning_id` x2, `search_learnings` x3, standalone `learning` x0.
     "learning/learnings",
     "learning",
     "# Schema\n\nThe learnings table and learnings_fts index share a learning_id; search_learnings reads both.\n",
   ],
   [
-    // plan-98572c3eb1ea4394.md: `pipelines` only.
+    // plan-<id>.md: `pipelines` only.
     "pipeline/pipelines",
     "pipeline",
     "# Build\n\nBoth pipelines run nightly.\n",
@@ -1623,7 +1623,7 @@ for (const [name, query] of EMPTY_PHRASE_QUERIES) {
 // A term that carries an alphanumeric run is NOT refused, and the run is the
 // only specificity it can have: "-a-" therefore does match inside "x-a-y",
 // which the pre-round-4 rule excluded. That exclusion was not free — it applied
-// to "/api/" and "/users/hans/projects/" identically and deleted them — and
+// to "/api/" and "/users/someuser/projects/" identically and deleted them — and
 // there is no assertion that separates the two cases, since both occurrences
 // sit between separators the term supplies itself.
 test("searchVaultNotes refuses terms with no alphanumeric content", async () => {

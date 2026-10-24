@@ -125,6 +125,9 @@ class RecallContext:
     make_capability_denied_error: Callable[..., dict] = make_capability_denied_error
     redact_value: Callable[[Any], tuple[Any, bool]] = redact_value
     logger: logging.Logger = logger
+    # Daemon version, injected from minnid.VERSION (the one source of truth).
+    # recall.py cannot import minnid (circular), mirroring HealthContext.version.
+    version: str = "unknown"
 
 
 def tag_document_results(results: list, *, src: str) -> list:
@@ -2297,8 +2300,21 @@ def handle_list_events(params: dict, request_id: Any, context: RecallContext) ->
         context.record_latency("list_events", time.perf_counter() - started_at)
 
 
+# Max characters of a boot learning's stored content echoed in the structured
+# `recent_learnings` field (the rendered text line keeps its own 150-char clip).
+RECENT_LEARNING_CONTENT_MAX = 4000
+
+
 def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
-    """Read agent startup context (identity + knowledge + learnings)."""
+    """Read agent startup context (identity + knowledge + learnings).
+
+    Returns ``agent_id`` and the rendered text ``context`` (injected natively as
+    Layer 1 by some hosts, so its bytes are pinned), plus the additive S1a-D
+    fields ``recent_learnings`` (``[{learning_id, category, line, content}]`` in
+    rendered order) and ``daemon_version``. A ``line`` may span physical lines
+    (stored content can contain a newline), so consumers must locate it by
+    substring, not by splitting ``context`` on newlines.
+    """
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()
@@ -2313,6 +2329,7 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
     try:
         db = context.sovereign_db()
         lines = []
+        recent_learnings: list[dict] = []
 
         with db.cursor() as c:
             c.execute("""
@@ -2435,9 +2452,24 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                 lines.append(f"\n## Learnings ({agent_id})")
                 for row in selected_rows:
                     conf = row["confidence"] if row["confidence"] is not None else 1.0
-                    lines.append(
+                    learning_line = (
                         f"  - [{row['category']}] {row['content'][:150]} "
                         f"(conf={float(conf):.1f})"
+                    )
+                    lines.append(learning_line)
+                    # S1a-D: the structured twin of the rendered line, keyed by
+                    # learning_id, so the plugin can attribute each boot
+                    # learning. Same loop, same `learning_line` string: the
+                    # two channels cannot drift. Additive; text is unchanged.
+                    # str() is the identity for text and keeps a BLOB-stored
+                    # row JSON-safe, matching how the f-string above renders it.
+                    recent_learnings.append(
+                        {
+                            "learning_id": row["learning_id"],
+                            "category": str(row["category"]),
+                            "line": learning_line,
+                            "content": str(row["content"])[:RECENT_LEARNING_CONTENT_MAX],
+                        }
                     )
                     try:
                         c.execute(
@@ -2483,6 +2515,8 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
         return context.make_response({
             "agent_id": agent_id,
             "context": "\n".join(lines) if lines else f"No context for '{agent_id}'.",
+            "recent_learnings": recent_learnings,
+            "daemon_version": context.version,
         }, request_id)
     except Exception as exc:
         context.logger.exception("read failed")

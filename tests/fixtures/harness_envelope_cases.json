@@ -1,0 +1,921 @@
+{
+  "version": 1,
+  "description": "Synthetic cases for the harness-envelope TEXT rules. Run by both plugins/minni/tests/harness-envelope-parity.test.mjs and tests/test_harness_envelope_parity.py. `constants` and `rules` pin the values both sides must hold. The template rule is TypeScript only and is not covered here.",
+  "constants": {
+    "version": 1,
+    "maxWrapperDepth": 4,
+    "maxOpenTagChars": 512,
+    "maxBlockOpenTagChars": 256,
+    "maxHeaderChars": 256,
+    "suspiciousPrefixPattern": "^(?:<[A-Za-z]|\\[[A-Z])",
+    "trimChars": " \t\r\n\f\u000b"
+  },
+  "rules": {
+    "blockTags": [
+      {
+        "rule_id": "block.system_reminder",
+        "tag": "system-reminder"
+      }
+    ],
+    "skip": [
+      {
+        "rule_id": "skip.task_notification",
+        "prefix": "<task-notification",
+        "subkind": "task_notification"
+      },
+      {
+        "rule_id": "skip.side_sessions_event",
+        "prefix": "<side-sessions-event>",
+        "subkind": "side_sessions_event"
+      },
+      {
+        "rule_id": "skip.ci_monitor_event",
+        "prefix": "<ci-monitor-event>",
+        "subkind": "ci_monitor_event"
+      },
+      {
+        "rule_id": "skip.command_name",
+        "prefix": "<command-name>",
+        "subkind": "slash_command"
+      },
+      {
+        "rule_id": "skip.command_message",
+        "prefix": "<command-message>",
+        "subkind": "slash_command"
+      },
+      {
+        "rule_id": "skip.local_command_stdout",
+        "prefix": "<local-command-stdout>",
+        "subkind": "local_command_output"
+      },
+      {
+        "rule_id": "skip.local_command_caveat",
+        "prefix": "<local-command-caveat>",
+        "subkind": "local_command_output"
+      },
+      {
+        "rule_id": "skip.bash_input",
+        "prefix": "<bash-input>",
+        "subkind": "human_shell"
+      }
+    ],
+    "wrappers": [
+      {
+        "rule_id": "wrap.cross_session_message",
+        "form": "tag_pair",
+        "tag": "cross-session-message",
+        "subkind": "cross_session_message"
+      },
+      {
+        "rule_id": "wrap.another_session_lead",
+        "form": "lead_line",
+        "prefix": "Another Claude session sent a message",
+        "subkind": "cross_session_lead"
+      },
+      {
+        "rule_id": "wrap.workflow_harness_header",
+        "form": "header",
+        "prefix": "[Workflow harness",
+        "subkind": "workflow_harness"
+      },
+      {
+        "rule_id": "wrap.artifact_comment_header",
+        "form": "header",
+        "prefix": "[Artifact comment",
+        "subkind": "artifact_comment"
+      }
+    ]
+  },
+  "strip_cases": [
+    {
+      "id": "strip-01",
+      "note": "no block",
+      "input": "plain text",
+      "expected": "plain text"
+    },
+    {
+      "id": "strip-02",
+      "note": "leading block",
+      "input": "<system-reminder>\nnote\n</system-reminder>\nFix the test",
+      "expected": "Fix the test"
+    },
+    {
+      "id": "strip-03",
+      "note": "block in the middle",
+      "input": "Fix <system-reminder>noise</system-reminder> this",
+      "expected": "Fix  this"
+    },
+    {
+      "id": "strip-04",
+      "note": "two blocks",
+      "input": "<system-reminder>a</system-reminder>one<system-reminder>b</system-reminder>two",
+      "expected": "onetwo"
+    },
+    {
+      "id": "strip-05",
+      "note": "nested blocks",
+      "input": "<system-reminder>a<system-reminder>b</system-reminder>c</system-reminder>real",
+      "expected": "real"
+    },
+    {
+      "id": "strip-06",
+      "note": "open tag with attributes",
+      "input": "<system-reminder kind=\"x\">a</system-reminder>real",
+      "expected": "real"
+    },
+    {
+      "id": "strip-07",
+      "note": "unterminated block is left alone",
+      "input": "Fix this <system-reminder>never closed",
+      "expected": "Fix this <system-reminder>never closed"
+    },
+    {
+      "id": "strip-08",
+      "note": "stray close tag is left alone",
+      "input": "text </system-reminder> more",
+      "expected": "text </system-reminder> more"
+    },
+    {
+      "id": "strip-09",
+      "note": "lookalike tag name is not a block",
+      "input": "<system-reminders>x</system-reminders>",
+      "expected": "<system-reminders>x</system-reminders>"
+    },
+    {
+      "id": "strip-10",
+      "note": "only blocks and whitespace",
+      "input": "  <system-reminder>x</system-reminder>\n  ",
+      "expected": ""
+    },
+    {
+      "id": "strip-11",
+      "note": "non-breaking spaces are not trimmed",
+      "input": "\u00a0 x \u00a0",
+      "expected": "\u00a0 x \u00a0"
+    },
+    {
+      "id": "strip-12",
+      "note": "vertical tab and form feed are trimmed",
+      "input": "\u000b\ftext\r\n",
+      "expected": "text"
+    },
+    {
+      "id": "strip-13",
+      "note": "closed block then an unterminated one",
+      "input": "<system-reminder>a</system-reminder> keep <system-reminder>open",
+      "expected": "keep <system-reminder>open"
+    },
+    {
+      "id": "strip-14",
+      "note": "tag names are case sensitive",
+      "input": "<SYSTEM-REMINDER>x</SYSTEM-REMINDER>",
+      "expected": "<SYSTEM-REMINDER>x</SYSTEM-REMINDER>"
+    },
+    {
+      "id": "strip-15",
+      "note": "crlf inside and around a block",
+      "input": "<system-reminder>\r\nx\r\n</system-reminder>\r\nreal\r\n",
+      "expected": "real"
+    },
+    {
+      "id": "strip-16",
+      "note": "block open tag, attribute run at the 256 bound",
+      "input": "<system-reminder aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>hidden</system-reminder>real",
+      "expected": "real"
+    },
+    {
+      "id": "strip-17",
+      "note": "block open tag, attribute run one past the bound is not a tag",
+      "input": "<system-reminder aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>hidden</system-reminder>real",
+      "expected": "<system-reminder aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>hidden</system-reminder>real"
+    },
+    {
+      "id": "strip-18",
+      "note": "block open tag, astral attribute run at the bound (256 UTF-16 units)",
+      "input": "<system-reminder \ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00a>x</system-reminder>real",
+      "expected": "real"
+    },
+    {
+      "id": "strip-19",
+      "note": "block open tag, astral attribute run one unit past the bound",
+      "input": "<system-reminder \ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00ab>x</system-reminder>real",
+      "expected": "<system-reminder \ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00ab>x</system-reminder>real"
+    },
+    {
+      "id": "strip-20",
+      "note": "lone surrogate passes through",
+      "input": "\ud800 lone",
+      "expected": "\ud800 lone"
+    }
+  ],
+  "classify_cases": [
+    {
+      "id": "classify-01",
+      "note": "typed prose",
+      "input": "Please add a retry to the sync loop.",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "Please add a retry to the sync loop.",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-02",
+      "note": "empty string",
+      "input": "",
+      "expected": {
+        "kind": "human",
+        "subkind": "empty",
+        "rule_id": null,
+        "body": "",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-03",
+      "note": "whitespace only",
+      "input": "  \n\t ",
+      "expected": {
+        "kind": "human",
+        "subkind": "empty",
+        "rule_id": null,
+        "body": "",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-04",
+      "note": "reminder only",
+      "input": "<system-reminder>\nSome harness note.\n</system-reminder>",
+      "expected": {
+        "kind": "human",
+        "subkind": "empty",
+        "rule_id": "block.system_reminder",
+        "body": "",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-05",
+      "note": "reminder on a human-typed prompt",
+      "input": "<system-reminder>\nAttribution note.\n</system-reminder>\nFix the flaky test",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": "block.system_reminder",
+        "body": "Fix the flaky test",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-06",
+      "note": "reminder in the middle of typed text",
+      "input": "Fix <system-reminder>noise</system-reminder> this",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": "block.system_reminder",
+        "body": "Fix  this",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-07",
+      "note": "task notification",
+      "input": "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n</task-notification>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "task_notification",
+        "rule_id": "skip.task_notification",
+        "body": "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n</task-notification>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-08",
+      "note": "task notification with an attribute (prefix has no closing bracket)",
+      "input": "<task-notification id=\"t2\">done</task-notification>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "task_notification",
+        "rule_id": "skip.task_notification",
+        "body": "<task-notification id=\"t2\">done</task-notification>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-09",
+      "note": "reminder ahead of a task notification",
+      "input": "<system-reminder>x</system-reminder>\n<task-notification>\nbody\n</task-notification>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "task_notification",
+        "rule_id": "skip.task_notification",
+        "body": "<task-notification>\nbody\n</task-notification>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-10",
+      "note": "side-sessions event",
+      "input": "<side-sessions-event>\nsession b finished\n</side-sessions-event>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "side_sessions_event",
+        "rule_id": "skip.side_sessions_event",
+        "body": "<side-sessions-event>\nsession b finished\n</side-sessions-event>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-11",
+      "note": "ci monitor event",
+      "input": "<ci-monitor-event>checks passed</ci-monitor-event>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "ci_monitor_event",
+        "rule_id": "skip.ci_monitor_event",
+        "body": "<ci-monitor-event>checks passed</ci-monitor-event>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-12",
+      "note": "slash command, name first",
+      "input": "<command-name>/clear</command-name>\n<command-message>clear</command-message>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "slash_command",
+        "rule_id": "skip.command_name",
+        "body": "<command-name>/clear</command-name>\n<command-message>clear</command-message>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-13",
+      "note": "slash command, message first",
+      "input": "<command-message>deploy</command-message>\n<command-name>/deploy</command-name>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "slash_command",
+        "rule_id": "skip.command_message",
+        "body": "<command-message>deploy</command-message>\n<command-name>/deploy</command-name>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-14",
+      "note": "local command stdout",
+      "input": "<local-command-stdout>ok</local-command-stdout>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "local_command_output",
+        "rule_id": "skip.local_command_stdout",
+        "body": "<local-command-stdout>ok</local-command-stdout>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-15",
+      "note": "local command caveat",
+      "input": "<local-command-caveat>Caveat: generated by the host.</local-command-caveat>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "local_command_output",
+        "rule_id": "skip.local_command_caveat",
+        "body": "<local-command-caveat>Caveat: generated by the host.</local-command-caveat>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-16",
+      "note": "human shell input",
+      "input": "<bash-input>ls -la</bash-input>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "human_shell",
+        "rule_id": "skip.bash_input",
+        "body": "<bash-input>ls -la</bash-input>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-17",
+      "note": "skip prefix after leading whitespace",
+      "input": "  \n<task-notification>x</task-notification>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "task_notification",
+        "rule_id": "skip.task_notification",
+        "body": "<task-notification>x</task-notification>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-18",
+      "note": "skip prefix after a tab, with a trailing newline",
+      "input": "\t<bash-input>pwd</bash-input>\n",
+      "expected": {
+        "kind": "skip",
+        "subkind": "human_shell",
+        "rule_id": "skip.bash_input",
+        "body": "<bash-input>pwd</bash-input>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-19",
+      "note": "skip prefix is open ended on the right",
+      "input": "<task-notifications>x</task-notifications>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "task_notification",
+        "rule_id": "skip.task_notification",
+        "body": "<task-notifications>x</task-notifications>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-20",
+      "note": "relay tag pair",
+      "input": "<cross-session-message from=\"peer-a\">\nPlease review the plan.\n</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_message",
+        "rule_id": "wrap.cross_session_message",
+        "body": "Please review the plan.",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-21",
+      "note": "relay tag pair with crlf",
+      "input": "<cross-session-message>\r\nbody line\r\n</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_message",
+        "rule_id": "wrap.cross_session_message",
+        "body": "body line",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-22",
+      "note": "relay tag pair with no close tag",
+      "input": "<cross-session-message from=\"peer-a\">\nhello there",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_message",
+        "rule_id": "wrap.cross_session_message",
+        "body": "hello there",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-23",
+      "note": "relay tag pair with text after the close tag",
+      "input": "<cross-session-message>inner</cross-session-message>\ntrailer",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_message",
+        "rule_id": "wrap.cross_session_message",
+        "body": "inner\ntrailer",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-24",
+      "note": "relay lead line then tag pair",
+      "input": "Another Claude session sent a message (peer-b):\n<cross-session-message from=\"peer-b\">\nCan you check the build?\n</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_lead",
+        "rule_id": "wrap.another_session_lead",
+        "body": "Can you check the build?",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-25",
+      "note": "relay lead line then plain body",
+      "input": "Another Claude session sent a message:\nCan you check the build?",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_lead",
+        "rule_id": "wrap.another_session_lead",
+        "body": "Can you check the build?",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-26",
+      "note": "relay lead line with no body",
+      "input": "Another Claude session sent a message",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_lead",
+        "rule_id": "wrap.another_session_lead",
+        "body": "",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-27",
+      "note": "workflow harness header",
+      "input": "[Workflow harness step 2 of 4]\nSummarize the findings.",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "workflow_harness",
+        "rule_id": "wrap.workflow_harness_header",
+        "body": "Summarize the findings.",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-28",
+      "note": "workflow harness header with the body on the same line",
+      "input": "[Workflow harness] go ahead",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "workflow_harness",
+        "rule_id": "wrap.workflow_harness_header",
+        "body": "go ahead",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-29",
+      "note": "artifact comment header",
+      "input": "[Artifact comment sent to Claude]\nTighten the intro.",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "artifact_comment",
+        "rule_id": "wrap.artifact_comment_header",
+        "body": "Tighten the intro.",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-30",
+      "note": "stacked wrappers keep the outermost rule",
+      "input": "Another Claude session sent a message:\n[Workflow harness step 1]\nDo it.",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_lead",
+        "rule_id": "wrap.another_session_lead",
+        "body": "Do it.",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-31",
+      "note": "reminder ahead of a relay",
+      "input": "<system-reminder>x</system-reminder>\n<cross-session-message from=\"a\">hi</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_message",
+        "rule_id": "wrap.cross_session_message",
+        "body": "hi",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-32",
+      "note": "reminder inside an artifact comment",
+      "input": "[Artifact comment sent to Claude]\n<system-reminder>x</system-reminder>\nFix typo",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "artifact_comment",
+        "rule_id": "wrap.artifact_comment_header",
+        "body": "Fix typo",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-33",
+      "note": "unknown tag prefix is flagged, not classified",
+      "input": "<mystery-event>\npayload\n</mystery-event>",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<mystery-event>\npayload\n</mystery-event>",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-34",
+      "note": "unknown header prefix is flagged, not classified",
+      "input": "[Unknown Header] some text",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "[Unknown Header] some text",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-35",
+      "note": "lowercase bracket is not a header",
+      "input": "[wip] fix the parser",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "[wip] fix the parser",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-36",
+      "note": "less-than before a digit is not a tag",
+      "input": "<3 this change",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<3 this change",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-37",
+      "note": "header with no closing bracket on its line",
+      "input": "[Workflow harness step 2\nSummarize",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "[Workflow harness step 2\nSummarize",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-38",
+      "note": "lookalike relay tag",
+      "input": "<cross-session-messages>hi</cross-session-messages>",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<cross-session-messages>hi</cross-session-messages>",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-39",
+      "note": "skip prefix in the middle of typed text",
+      "input": "Please explain the <task-notification> format",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "Please explain the <task-notification> format",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-40",
+      "note": "tag names are case sensitive",
+      "input": "<TASK-NOTIFICATION>x</TASK-NOTIFICATION>",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<TASK-NOTIFICATION>x</TASK-NOTIFICATION>",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-41",
+      "note": "non-breaking space ahead of a skip prefix is not whitespace",
+      "input": "\u00a0<task-notification>x</task-notification>",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "\u00a0<task-notification>x</task-notification>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-42",
+      "note": "line separator ahead of a skip prefix is not whitespace",
+      "input": "\u2028<bash-input>ls</bash-input>",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "\u2028<bash-input>ls</bash-input>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-43",
+      "note": "non-ascii typed prose",
+      "input": "R\u00e9sum\u00e9 the \u65e5\u672c\u8a9e notes, please",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "R\u00e9sum\u00e9 the \u65e5\u672c\u8a9e notes, please",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-44",
+      "note": "unterminated nested reminder is left whole",
+      "input": "<system-reminder>one <system-reminder>two</system-reminder> end",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<system-reminder>one <system-reminder>two</system-reminder> end",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-45",
+      "note": "relay open tag, attribute run at the 512 bound",
+      "input": "<cross-session-message aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>\nhi\n</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_message",
+        "rule_id": "wrap.cross_session_message",
+        "body": "hi",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-46",
+      "note": "relay open tag, attribute run one past the bound is not a wrapper",
+      "input": "<cross-session-message aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>\nhi\n</cross-session-message>",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<cross-session-message aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>\nhi\n</cross-session-message>",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-47",
+      "note": "relay open tag, astral attribute run at the bound (512 UTF-16 units)",
+      "input": "<cross-session-message \ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00a>\nhi\n</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_message",
+        "rule_id": "wrap.cross_session_message",
+        "body": "hi",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-48",
+      "note": "relay open tag, astral attribute run one unit past the bound",
+      "input": "<cross-session-message \ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00ab>\nhi\n</cross-session-message>",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<cross-session-message \ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00ab>\nhi\n</cross-session-message>",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-49",
+      "note": "workflow header, text up to the 256 bound",
+      "input": "[Workflow harnessxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\nbody",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "workflow_harness",
+        "rule_id": "wrap.workflow_harness_header",
+        "body": "body",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-50",
+      "note": "workflow header, one past the bound is not a header",
+      "input": "[Workflow harnessxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\nbody",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "[Workflow harnessxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\nbody",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-51",
+      "note": "workflow header, astral text at the bound (256 UTF-16 units)",
+      "input": "[Workflow harness\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00]\nbody",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "workflow_harness",
+        "rule_id": "wrap.workflow_harness_header",
+        "body": "body",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-52",
+      "note": "workflow header, astral text one unit past the bound",
+      "input": "[Workflow harness\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00x]\nbody",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "[Workflow harness\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00x]\nbody",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-53",
+      "note": "artifact header, text up to the 256 bound",
+      "input": "[Artifact commentxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\nbody",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "artifact_comment",
+        "rule_id": "wrap.artifact_comment_header",
+        "body": "body",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-54",
+      "note": "artifact header, one past the bound is not a header",
+      "input": "[Artifact commentxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\nbody",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "[Artifact commentxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]\nbody",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-55",
+      "note": "reminder open tag at the bound strips, typed text stays",
+      "input": "<system-reminder aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>x</system-reminder>Fix it",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": "block.system_reminder",
+        "body": "Fix it",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-56",
+      "note": "reminder open tag one past the bound strips nothing",
+      "input": "<system-reminder aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>x</system-reminder>Fix it",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "<system-reminder aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>x</system-reminder>Fix it",
+        "suspicious_prefix": true
+      }
+    },
+    {
+      "id": "classify-57",
+      "note": "four stacked wrappers unwrap fully",
+      "input": "Another Claude session sent a message:\n[Workflow harness a]\n[Artifact comment b]\n<cross-session-message>deep</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_lead",
+        "rule_id": "wrap.another_session_lead",
+        "body": "deep",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-58",
+      "note": "a fifth stacked wrapper is left in the body",
+      "input": "Another Claude session sent a message:\n[Workflow harness a]\n[Artifact comment b]\n[Workflow harness c]\n<cross-session-message>deep</cross-session-message>",
+      "expected": {
+        "kind": "wrapped",
+        "subkind": "cross_session_lead",
+        "rule_id": "wrap.another_session_lead",
+        "body": "<cross-session-message>deep</cross-session-message>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-59",
+      "note": "lone surrogate in typed text",
+      "input": "\ud800 lone",
+      "expected": {
+        "kind": "human",
+        "subkind": "typed",
+        "rule_id": null,
+        "body": "\ud800 lone",
+        "suspicious_prefix": false
+      }
+    }
+  ]
+}

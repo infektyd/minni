@@ -7,7 +7,7 @@
 > record with already-stale line citations, not current guidance.
 
 
-Plan: `plan-fdf220b75b172595`
+Plan: `plan-<id>`
 Slice: `ground-and-resolve`
 Branch: `feat/minni-provenance-gate`
 Date: 2026-06-15
@@ -26,11 +26,11 @@ wired through the gate.
 
 ## Source documents read
 
-- Plan artifact: `~/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md:23`
-- Ground-and-resolve gate: `~/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md:39`
-- Design doc gate location/fail-loud model: `~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:24`
-- Design doc authoritative binary split: `~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:60`
-- Design doc measured scatter count: `~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:107`
+- Plan artifact: `<vault>/wiki/artifacts/<plan>.md:23`
+- Ground-and-resolve gate: `<vault>/wiki/artifacts/<plan>.md:39`
+- Design doc gate location/fail-loud model: `<vault>/wiki/sessions/<design-note>.md:24`
+- Design doc authoritative binary split: `<vault>/wiki/sessions/<design-note>.md:60`
+- Design doc measured scatter count: `<vault>/wiki/sessions/<design-note>.md:107`
 
 ## Seam completeness
 
@@ -364,9 +364,9 @@ ids resolve to their own id in current code.
 ```text
 git status --short --branch
 git switch -c feat/minni-provenance-gate main
-rg --files ~/.minni/codex-vault ~/.minni/claudecode-vault | rg 'plan-fdf220b75b172595|20260615-design-seed'
-nl -ba ~/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md
-nl -ba ~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md
+rg --files ~/.minni/codex-vault ~/.minni/claudecode-vault | rg 'plan-<id>|<design-note>'
+nl -ba <vault>/wiki/artifacts/<plan>.md
+nl -ba <vault>/wiki/sessions/<design-note>.md
 rg -n "resolve_effective_principal\\(" engine/*.py engine/afm_passes/*.py engine/tools/*.py
 rg -n "DEFAULT_AGENT_ID|DEFAULT_VAULT_PATH" plugins/minni/src/server.ts plugins/minni/src/config.ts plugins/minni/src/task.ts plugins/minni/src/agent_ping.ts plugins/minni/src/plan.ts plugins/minni/src/codex-hook.ts plugins/minni/src/hook-handlers.ts
 rg -n "platform_agent_ids|legacy_agent_ids|aliases|agent_scope_for|from_local_transport|_default_deny_principal|OPERATOR_RESERVED_AGENT_IDS|CANONICAL_PRINCIPAL_NAMES|lru_cache|cache_clear|SIGHUP|reload" engine/principal.py engine/minnid.py engine/test_principal_binding.py

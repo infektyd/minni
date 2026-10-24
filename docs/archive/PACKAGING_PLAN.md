@@ -243,7 +243,7 @@ npm publishing deliberately absent (§6.1/§6.6).
 ## 9. v0.2 outcome record (2026-07-03)
 
 The §6.1-approved rename shipped as the src-layout restructure (PR #135,
-plan `plan-f6de4d8c58189d44`): `engine/` → `src/minni/` (git mv, history
+plan `plan-<id>`): `engine/` → `src/minni/` (git mv, history
 preserved), tests to `tests/`, packaging configs to repo root, 1091 internal
 imports package-qualified by a stdlib-ast codemod, console scripts
 `minni` + `minnid`, venv at root `.venv` with `pip install -e .` replacing
