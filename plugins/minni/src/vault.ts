@@ -392,12 +392,23 @@ function titleFromMarkdown(relativePath: string, markdown: string): string {
   return path.basename(relativePath, ".md");
 }
 
+const MAX_REGEX_TERM_LENGTH = 256;
+const MULTI_TERM_THRESHOLD = 8;
+
 /** First WHOLE-WORD occurrence of `term` in `text`, or -1. */
 function firstWordIndex(text: string, term: string): number {
-  const regex = wordRegex(term, true);
-  if (!regex) return -1;
-  regex.lastIndex = 0; // shared cached /g regex
-  return regex.exec(text)?.index ?? -1;
+  if (!term) return -1;
+  if (term.length > MAX_REGEX_TERM_LENGTH) {
+    return firstLongWordIndex(text, term, true);
+  }
+  try {
+    const regex = wordRegex(term, true);
+    if (!regex) return -1;
+    regex.lastIndex = 0; // shared cached /g regex
+    return regex.exec(text)?.index ?? -1;
+  } catch {
+    return firstLongWordIndex(text, term, true);
+  }
 }
 
 // The window is located in two tiers, and the ORDER is the whole point.
@@ -441,7 +452,7 @@ function snippetFor(
     .trim();
   let firstHit = -1;
   let usedFastPath = false;
-  if (terms.length > 2) {
+  if (terms.length > MULTI_TERM_THRESHOLD) {
     const matcher = getMultiTermMatcher(terms);
     if (!matcher.hasNonAsciiOrRejected) {
       const lower = plain.toLowerCase();
@@ -624,6 +635,93 @@ const NOT_WORD_AFTER = `(?:(?![\\p{L}\\p{N}])|(?=[${NO_SEPARATOR_SCRIPTS}]))`;
 // that was the defect.
 const MORPHOLOGICAL_SUFFIX = "(?:s|es|ing|ed)?";
 const MIN_MORPHOLOGICAL_LENGTH = 4;
+const LEAD_STICKY_RE = new RegExp(NOT_WORD_BEFORE, "yu");
+const TAIL_EXACT_STICKY_RE = new RegExp(NOT_WORD_AFTER, "yu");
+const TAIL_INFLECT_STICKY_RE = new RegExp(
+  `${MORPHOLOGICAL_SUFFIX}${NOT_WORD_AFTER}`,
+  "yu",
+);
+
+function firstLongWordIndex(text: string, term: string, inflect = true): number {
+  if (!term) return -1;
+  const textLower = isPureLowerAscii(text) ? text : text.toLowerCase();
+  const termLower = isPureLowerAscii(term) ? term : term.toLowerCase();
+  let idx = textLower.indexOf(termLower);
+  if (idx === -1) return -1;
+  const last = termLower[termLower.length - 1];
+  const leadRequired = WORD_EDGE_CHAR.test(termLower[0]);
+  const tailRequired = WORD_EDGE_CHAR.test(last);
+  if (!leadRequired && !tailRequired && !/[\p{L}\p{N}]/u.test(termLower)) {
+    return -1;
+  }
+  const allowSuffix =
+    inflect &&
+    termLower.length >= MIN_MORPHOLOGICAL_LENGTH &&
+    /\p{L}/u.test(last);
+  const tailRe = allowSuffix ? TAIL_INFLECT_STICKY_RE : TAIL_EXACT_STICKY_RE;
+  while (idx !== -1) {
+    if (leadRequired) {
+      LEAD_STICKY_RE.lastIndex = idx;
+      if (!LEAD_STICKY_RE.test(textLower)) {
+        idx = textLower.indexOf(termLower, idx + 1);
+        continue;
+      }
+    }
+    const afterIdx = idx + termLower.length;
+    if (!tailRequired) return idx;
+    tailRe.lastIndex = afterIdx;
+    if (tailRe.test(textLower)) return idx;
+    idx = textLower.indexOf(termLower, idx + 1);
+  }
+  return -1;
+}
+
+function countLongWordOccurrences(
+  textLower: string,
+  termLower: string,
+  firstIdx: number,
+  inflect: boolean,
+  maxCount = 5,
+): number {
+  const last = termLower[termLower.length - 1];
+  const leadRequired = WORD_EDGE_CHAR.test(termLower[0]);
+  const tailRequired = WORD_EDGE_CHAR.test(last);
+  if (!leadRequired && !tailRequired && !/[\p{L}\p{N}]/u.test(termLower)) {
+    return 0;
+  }
+  const allowSuffix =
+    inflect &&
+    termLower.length >= MIN_MORPHOLOGICAL_LENGTH &&
+    /\p{L}/u.test(last);
+  const tailRe = allowSuffix ? TAIL_INFLECT_STICKY_RE : TAIL_EXACT_STICKY_RE;
+  let idx = firstIdx;
+  let count = 0;
+  while (idx !== -1) {
+    if (leadRequired) {
+      LEAD_STICKY_RE.lastIndex = idx;
+      if (!LEAD_STICKY_RE.test(textLower)) {
+        idx = textLower.indexOf(termLower, idx + 1);
+        continue;
+      }
+    }
+    const afterIdx = idx + termLower.length;
+    if (!tailRequired) {
+      count++;
+      if (count >= maxCount) return count;
+      idx = textLower.indexOf(termLower, afterIdx);
+      continue;
+    }
+    tailRe.lastIndex = afterIdx;
+    if (tailRe.test(textLower)) {
+      count++;
+      if (count >= maxCount) return count;
+      idx = textLower.indexOf(termLower, tailRe.lastIndex);
+    } else {
+      idx = textLower.indexOf(termLower, idx + 1);
+    }
+  }
+  return count;
+}
 
 // The matcher is called once per (term, note) and the term set is tiny while
 // the note set is not, so the pattern is built once per term and reused. The
@@ -702,11 +800,36 @@ function countWordOccurrencesRegex(
   text: string,
   term: string,
   inflect: boolean,
+  maxCount = 5,
 ): number {
-  const regex = wordRegex(term, inflect);
-  if (!regex) return 0;
-  const matches = text.match(regex);
-  return matches ? matches.length : 0;
+  if (!term) return 0;
+  const textLower = isPureLowerAscii(text) ? text : text.toLowerCase();
+  const termLower = isPureLowerAscii(term) ? term : term.toLowerCase();
+  const firstIdx = textLower.indexOf(termLower);
+  if (firstIdx === -1) return 0;
+  if (termLower.length > MAX_REGEX_TERM_LENGTH) {
+    return countLongWordOccurrences(
+      textLower,
+      termLower,
+      firstIdx,
+      inflect,
+      maxCount,
+    );
+  }
+  try {
+    const regex = wordRegex(term, inflect);
+    if (!regex) return 0;
+    const matches = text.match(regex);
+    return matches ? Math.min(matches.length, maxCount) : 0;
+  } catch {
+    return countLongWordOccurrences(
+      textLower,
+      termLower,
+      firstIdx,
+      inflect,
+      maxCount,
+    );
+  }
 }
 
 function countWordOccurrences(
@@ -717,7 +840,7 @@ function countWordOccurrences(
 ): number {
   if (!term) return 0;
   if (!isPureLowerAscii(term)) {
-    return countWordOccurrencesRegex(text, term, inflect);
+    return countWordOccurrencesRegex(text, term, inflect, maxCount);
   }
   let idx = text.indexOf(term);
   if (idx === -1) return 0;
@@ -1391,7 +1514,7 @@ function scoreVaultNote(
       break;
     }
   }
-  if (terms.length > 2) {
+  if (terms.length > MULTI_TERM_THRESHOLD) {
     const matcher = getMultiTermMatcher(terms);
     const counts = matcher.countAll(haystack, 5);
     const termToPatIdx = matcher.termToPatIdx;
@@ -3063,13 +3186,15 @@ function scoreVaultNoteCached(
     }
   }
   let missingCount = 0;
-  for (let i = 0; i < terms.length; i++) {
-    if (!wordCounts.has(terms[i])) {
-      missingCount++;
-      if (missingCount > 2) break;
+  if (terms.length > MULTI_TERM_THRESHOLD) {
+    for (let i = 0; i < terms.length; i++) {
+      if (!wordCounts.has(terms[i])) {
+        missingCount++;
+        if (missingCount > MULTI_TERM_THRESHOLD) break;
+      }
     }
   }
-  if (missingCount > 2) {
+  if (missingCount > MULTI_TERM_THRESHOLD) {
     const matcher = getMultiTermMatcher(terms);
     const counts = matcher.countAll(haystackLower, 5);
     const termToPatIdx = matcher.termToPatIdx;
