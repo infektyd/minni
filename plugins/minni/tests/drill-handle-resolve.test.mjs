@@ -161,6 +161,18 @@ test("drillMemory forwards registered d:<src>:<id> as {doc_id, src, source} and 
     ]);
     assert.equal(unregRes.data.source_unverified, true);
     assert.equal(unregRes.data.results[0].source_unverified, true);
+
+    // 3. Registered d: handle drilled from a synthetic MCP process session id -> still resolves via fallback scan
+    const mcpRes = await drillMemory(
+      { references: [registeredHandle], vaultPath: vault, sessionId: "mcp-m9xyz-12345678" },
+      fakeDaemon,
+    );
+    assert.equal(mcpRes.ok, true);
+    assert.equal(observedRpcCalls.length, 3);
+    assert.deepEqual(observedRpcCalls[2].params.references, [
+      { doc_id: 4412, src: "episodic", source: "session:2026-10-20" },
+    ]);
+    assert.equal(mcpRes.data.source_unverified, false);
   });
 });
 

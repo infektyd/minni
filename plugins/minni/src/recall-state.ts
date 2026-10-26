@@ -1356,20 +1356,33 @@ export async function readSessionHandle(
     if (fromState) return fromState;
   }
 
-  // Fallback scan when sessionId was not provided by the caller: check any
-  // session handle file in .runtime/recall-state.d.
-  if (!sKey) {
-    try {
-      const dirPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH);
-      assertWriteTargetUnder(dirPath, vaultPath);
-      for (const name of fs.readdirSync(dirPath)) {
-        if (!name.endsWith(".handles.json")) continue;
-        const found = tryReadHandlesFile(path.join(dirPath, name));
-        if (found) return found;
+  // Fallback scan when candidateKeys did not match (e.g. MCP minni_drill using
+  // synthetic MCP_PROCESS_SESSION_ID while handles were recorded under a hook's
+  // session_id): scan .runtime/recall-state.d/*.handles.json newest-first.
+  try {
+    const dirPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH);
+    assertWriteTargetUnder(dirPath, vaultPath);
+    const checkedFiles = new Set(candidateKeys.map((k) => `${k}.handles.json`));
+    const candidates: Array<{ filePath: string; mtimeMs: number }> = [];
+    for (const name of fs.readdirSync(dirPath)) {
+      if (!name.endsWith(".handles.json") || checkedFiles.has(name)) continue;
+      const filePath = path.join(dirPath, name);
+      try {
+        const st = fs.lstatSync(filePath);
+        if (st.isFile() && !st.isSymbolicLink()) {
+          candidates.push({ filePath, mtimeMs: st.mtimeMs });
+        }
+      } catch {
+        // Ignore stat error.
       }
-    } catch {
-      // Ignore scan errors.
     }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const { filePath } of candidates) {
+      const found = tryReadHandlesFile(filePath);
+      if (found) return found;
+    }
+  } catch {
+    // Ignore scan errors.
   }
   return null;
 }
@@ -1510,21 +1523,17 @@ export function shouldSuppressHit(hit: RecallStateHit, state: SessionSurfacedSta
   };
 
   if (entry.scores && typeof entry.scores === "object") {
-    let checkedSharedRoute = false;
     for (const r of ["daemon", "vault"] as const) {
       const nowVal = nowScores[r];
       const prevVal = entry.scores[r];
       if (typeof nowVal === "number" && typeof prevVal === "number") {
-        checkedSharedRoute = true;
         const gain = Math.round((nowVal - prevVal) * 1e6) / 1e6;
         if (gain >= SUPPRESSION_SCORE_JUMP) {
           return false;
         }
       }
     }
-    if (checkedSharedRoute) {
-      return true;
-    }
+    return true;
   }
 
   const scoreGain = Math.round((hit.score - entry.score) * 1e6) / 1e6;

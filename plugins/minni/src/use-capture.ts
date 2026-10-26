@@ -433,8 +433,12 @@ function nextTurnIndex(capture: UseCapture): number {
       const current = counterIn(file, capture.vaultPath);
       if (current === null) return 0;
       const existing = readSideFile(file, capture.vaultPath) as
-        | { surfaced?: Record<string, unknown> }
+        | { reset_id?: unknown; surfaced?: Record<string, unknown> }
         | null;
+      const existingResetId =
+        existing && typeof existing.reset_id === "string" && existing.reset_id.trim()
+          ? existing.reset_id.trim()
+          : undefined;
       const existingSurfaced =
         existing && existing.surfaced && typeof existing.surfaced === "object"
           ? existing.surfaced
@@ -445,6 +449,7 @@ function nextTurnIndex(capture: UseCapture): number {
         {
           v: 1,
           turn_ix: next,
+          ...(existingResetId ? { reset_id: existingResetId } : {}),
           ...(existingSurfaced ? { surfaced: existingSurfaced } : {}),
         },
         capture.vaultPath,
