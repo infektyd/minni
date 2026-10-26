@@ -76,7 +76,12 @@ test("an over-cap boot: items ending past char 2,000 are invisible, earlier ones
     search: () => ({ agent_id: "claude-code", results }),
     read: () => ({ agent_id: "claude-code", context: READ_CONTEXT, recent_learnings: STRUCTURED, daemon_version: "test" }),
   });
-  const { output, code } = await runHook(fixture, "SessionStart", { session_id: "boot-over-cap", source: "startup" });
+  const { output, code } = await runHook(
+    fixture,
+    "SessionStart",
+    { session_id: "boot-over-cap", source: "startup" },
+    { env: { MINNI_BOOT_FIT: "off" } },
+  );
   assert.equal(code, 0);
   const emitted = additionalContext(output);
   assert.ok(emitted.length > 10_000, `the fixture must overflow the cap (got ${emitted.length})`);
@@ -125,12 +130,37 @@ test("an under-cap boot: every item is visible", { timeout: 60_000 }, async (t) 
     search: () => ({ agent_id: "claude-code", results }),
     read: () => ({ agent_id: "claude-code", context: READ_CONTEXT, recent_learnings: STRUCTURED }),
   });
-  const { output } = await runHook(fixture, "SessionStart", { session_id: "boot-under-cap", source: "startup" });
+  const { output } = await runHook(
+    fixture,
+    "SessionStart",
+    { session_id: "boot-under-cap", source: "startup" },
+    { env: { MINNI_BOOT_FIT: "off" } },
+  );
   assert.ok(additionalContext(output).length <= 10_000);
   const rows = await readLedger(fixture.vault);
   const surfaced = rows.filter((row) => row.kind === "surfaced");
   assert.equal(surfaced.length, results.length + STRUCTURED.length);
   for (const row of surfaced) assert.equal(row.visible, true, `${row.channel} ${row.mkey}`);
+});
+
+test("a fitted boot (MINNI_BOOT_FIT=on default): projected boot_recall rows keep mkeys and are visible", { timeout: 60_000 }, async (t) => {
+  const fixture = await makeFixture(t, "boot-fitted");
+  const results = await bootResults(fixture.vault, { long: true });
+  await startFakeDaemon(fixture, {
+    search: () => ({ agent_id: "claude-code", results }),
+    read: () => ({ agent_id: "claude-code", context: READ_CONTEXT, recent_learnings: STRUCTURED }),
+  });
+  const { output, code } = await runHook(fixture, "SessionStart", { session_id: "boot-fitted", source: "startup" });
+  assert.equal(code, 0);
+  assert.ok(additionalContext(output).length <= 10_000);
+  const rows = await readLedger(fixture.vault);
+  const recall = rowsOf(rows, "boot_recall");
+  assert.equal(recall.length, 3, "S2a caps non-identity boot recall at 3 projected results");
+  assert.equal(recall[0].mkey, "doc:personal:7");
+  assert.deepEqual(recall[0].handles, ["d:personal:7"]);
+  assert.equal(recall[1].mkey, "vault:wiki/decisions/port-move.md");
+  assert.equal(recall[2].mkey, "doc:shared:102");
+  for (const row of recall) assert.equal(row.visible, true, `${row.channel} ${row.mkey}`);
 });
 
 test("a daemon without structured ids: boot learnings key as lhash: from the Learnings lines", { timeout: 60_000 }, async (t) => {
