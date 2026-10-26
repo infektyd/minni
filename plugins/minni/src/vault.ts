@@ -23,6 +23,7 @@ import type { LearningQualityReport } from "./policy.js";
 import { filterSafeVaultResults } from "./task.js";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
 import { durabilityOf, type DurabilityKind } from "./durability.js";
+import { stripHarnessBlocks } from "./prompt-class.js";
 // Type-only: use-report.ts imports FROM this module, so the runtime import
 // below is dynamic and function-scoped (same pattern as task.ts above).
 import type { UseReport } from "./use-report.js";
@@ -167,12 +168,16 @@ export interface VaultSearchResult {
   durability?: DurabilityKind;
   /** Calibrated UPS strong-gate score in [0, 1] (rev5 §5.2 item 5). */
   gateScore?: number;
-  /** UPS strong-gate route ("a" | "b" | "c" | null) when evaluated. */
-  gateRoute?: "a" | "b" | "c" | null;
-  /** Whether this note clears the UPS strong-gate threshold (>= 0.55 after class weight). */
+  /** UPS strong-gate route ("a" | "b" | null) when evaluated. */
+  gateRoute?: "a" | "b" | null;
+  /** Whether this note clears the UPS strong-gate threshold (`durability !== "noise"` and route "a" or "b"). */
   clearsGate?: boolean;
-  /** Class-weighted gate score (`gateScore * classWeight`, where noise uses `rho`, default 0). */
+  /** Class-weighted gate score (`gateScore * classWeight`, where noise uses 0.25 and non-noise uses 1.0). */
   weightedScore?: number;
+  /** Query terms matched in title, markdown headings, and body (when rank === "ups_gate"). */
+  contributingTerms?: { title: string[]; heading: string[]; body: string[] };
+  /** Count of distinctive query terms covered by this note (when rank === "ups_gate"). */
+  coveredDistinctive?: number;
 }
 
 const VAULT_DIRS = [
@@ -3002,6 +3007,7 @@ interface CachedVaultNoteEntry {
   haystackLower: string;
   titleLower: string;
   bodyLower: string;
+  headingsLower: string[];
   durability: DurabilityKind;
   handle: string;
   isSessionNote: boolean;
@@ -3164,9 +3170,11 @@ export interface VaultSearchOptions {
 
 interface UpsGateEvaluation {
   gateScore: number;
-  gateRoute: "a" | "b" | "c" | null;
+  gateRoute: "a" | "b" | null;
   clearsGate: boolean;
   weightedScore: number;
+  contributingTerms: { title: string[]; heading: string[]; body: string[] };
+  coveredDistinctive: number;
 }
 
 function computeVaultHandleForRelPath(relativePath: string): string {
@@ -3184,7 +3192,14 @@ function buildCachedVaultNoteEntry(
   const status = statusFromMarkdown(markdown);
   const skipByStatus = skippedByStatus(markdown);
   const pageType = frontmatterField(markdown, "type")?.toLowerCase();
-  const bodyLower = markdown.replace(FRONTMATTER_RE, "").toLowerCase();
+  const bodyWithoutFrontmatter = markdown.replace(FRONTMATTER_RE, "");
+  const bodyLower = bodyWithoutFrontmatter.toLowerCase();
+  const headingsLower: string[] = [];
+  for (const match of bodyWithoutFrontmatter.matchAll(/^#{1,6}\s+(.+)$/gm)) {
+    if (match[1]) {
+      headingsLower.push(match[1].trim().toLowerCase());
+    }
+  }
   const rawDurability = durabilityOf({ path: relativePath, title, content: markdown });
   const durability: DurabilityKind =
     rawDurability === "ordinary" && /^\s*\[Subagent Context\]/i.test(title)
@@ -3202,6 +3217,7 @@ function buildCachedVaultNoteEntry(
     haystackLower: `${title}\n${relativePath}\n${markdown}`.toLowerCase(),
     titleLower: title.toLowerCase(),
     bodyLower,
+    headingsLower,
     durability,
     handle: computeVaultHandleForRelPath(relativePath),
     isSessionNote: relativePath.startsWith("wiki/sessions/"),
@@ -3212,68 +3228,77 @@ function buildCachedVaultNoteEntry(
 }
 
 function evaluateUpsGate(
+  effectiveQueryTrimLen: number,
   phrases: string[],
   terms: string[],
+  distinctiveSet: Set<string>,
+  k_q: number,
   entry: CachedVaultNoteEntry,
-  rho?: number,
+  rawScore: number,
 ): UpsGateEvaluation {
-  const { haystackLower, titleLower, bodyLower, durability } = entry;
-  let gateScore = 0;
-  let gateRoute: "a" | "b" | "c" | null = null;
-
-  const exactPhraseHit =
+  const { haystackLower, titleLower, headingsLower, durability, wordCounts } = entry;
+  const phraseHit =
+    effectiveQueryTrimLen >= 24 &&
+    terms.length >= 2 &&
     phrases.some(
-      (p) =>
-        p.length >= 24 &&
-        (terms.length >= 2 || (p.match(/[a-z0-9]{2,}/g)?.length ?? 0) >= 2) &&
-        countWordOccurrences(haystackLower, p, false, 1) > 0,
-    ) ||
-    (terms.length <= 6 &&
-      terms.some(
-        (t) =>
-          t.length >= 24 &&
-          (t.match(/[a-z0-9]{2,}/g)?.length ?? 0) >= 2 &&
-          countWordOccurrences(haystackLower, t, false, 1) > 0,
-      ));
-  if (exactPhraseHit) {
-    gateScore = 1.0;
-    gateRoute = "a";
-  } else if (terms.length > 0) {
-    let titleHits = 0;
-    for (const term of terms) {
-      if (countWordOccurrences(titleLower, term, true, 1) > 0) {
-        titleHits += 1;
-      }
-    }
-    const titleCov = titleHits / terms.length;
-    const minTitleHits = Math.max(3, Math.ceil(0.25 * terms.length));
-    if (titleHits >= 2 && (titleHits >= minTitleHits || titleCov >= 0.6)) {
-      gateScore = Math.min(0.85, 0.55 + 0.2 * titleCov + 0.05 * Math.min(titleHits, 4));
-      gateRoute = "b";
-    } else if (terms.length >= 4) {
-      let bodyHits = 0;
-      for (const term of terms) {
-        if (countWordOccurrences(bodyLower, term, true, 1) > 0) {
-          bodyHits += 1;
-        }
-      }
-      const bodyCov = bodyHits / terms.length;
-      if (bodyHits >= 4 && bodyCov >= 0.75) {
-        gateScore = Math.min(0.7, 0.55 + 0.15 * bodyCov);
-        gateRoute = "c";
+      (p) => p.length >= 24 && countWordOccurrences(haystackLower, p, false, 1) > 0,
+    );
+
+  const titleTerms: string[] = [];
+  const headingTerms: string[] = [];
+  const bodyTerms: string[] = [];
+  let coveredDistinctive = 0;
+  let hasTitleOrHeadingDistinctive = false;
+
+  for (const term of terms) {
+    const inHaystack =
+      (wordCounts.has(term)
+        ? wordCounts.get(term)!
+        : countWordOccurrences(haystackLower, term, true, 1)) > 0;
+    if (!inHaystack) continue;
+    const inTitle = countWordOccurrences(titleLower, term, true, 1) > 0;
+    const inHeading = headingsLower.some((h) => countWordOccurrences(h, term, true, 1) > 0);
+    if (inTitle) titleTerms.push(term);
+    if (inHeading) headingTerms.push(term);
+    if (!inTitle && !inHeading) bodyTerms.push(term);
+    if (distinctiveSet.has(term)) {
+      coveredDistinctive += 1;
+      if (inTitle || inHeading) {
+        hasTitleOrHeadingDistinctive = true;
       }
     }
   }
 
-  const classWeight =
-    durability === "noise"
-      ? typeof rho === "number" && Number.isFinite(rho)
-        ? Math.max(0, rho)
-        : 0
-      : 1.0;
-  const weightedScore = Math.round(gateScore * classWeight * 1e6) / 1e6;
-  const clearsGate = weightedScore >= 0.55;
-  return { gateScore, gateRoute, clearsGate, weightedScore };
+  const routeA = phraseHit;
+  const routeB = coveredDistinctive >= k_q && hasTitleOrHeadingDistinctive;
+  let gateRoute: "a" | "b" | null = null;
+  let gateScore = 0;
+  if (routeA) {
+    gateRoute = "a";
+    gateScore = 1.0;
+  } else if (routeB) {
+    gateRoute = "b";
+    gateScore = Math.min(1.0, Math.max(0.55, coveredDistinctive / Math.max(1, k_q)));
+  } else {
+    gateRoute = null;
+    gateScore = Math.min(0.50, rawScore / 100);
+  }
+
+  const classWeight = durability === "noise" ? 0.25 : 1.0;
+  const weightedScore = classWeight * gateScore;
+  const clearsGate = durability !== "noise" && (gateRoute === "a" || gateRoute === "b");
+  return {
+    gateScore,
+    gateRoute,
+    clearsGate,
+    weightedScore,
+    contributingTerms: {
+      title: titleTerms,
+      heading: headingTerms,
+      body: bodyTerms,
+    },
+    coveredDistinctive,
+  };
 }
 
 function scoreVaultNoteCached(
@@ -3708,8 +3733,10 @@ export async function searchVaultNotes(
   const resolvedOptions =
     typeof agentId === "object" && agentId !== null ? agentId : options;
   const candidates = resolvedOptions.candidates ?? "index";
-  const terms = queryTerms(query);
-  const phrases = phraseForms(query);
+  const rankMode = resolvedOptions.rank ?? "legacy";
+  const effectiveQuery = rankMode === "ups_gate" ? stripHarnessBlocks(query) : query;
+  const terms = queryTerms(effectiveQuery);
+  const phrases = phraseForms(effectiveQuery);
   // Only bail when there is nothing to match on at all. Bailing on an empty
   // term list alone threw away the exact-phrase bonus, which is the strongest
   // signal in the scorer and needs no tokens — but phraseForms yields nothing
@@ -3724,7 +3751,12 @@ export async function searchVaultNotes(
     await ensureVault(vaultPath, resolvedAgentId ? { agentId: resolvedAgentId } : undefined);
   }
   options = resolvedOptions;
-  if (terms.length === 0 && phrases.length === 0) return [];
+  if (
+    (rankMode === "ups_gate" && terms.length === 0) ||
+    (terms.length === 0 && phrases.length === 0)
+  ) {
+    return [];
+  }
 
   const wikiRoot = path.join(vaultPath, "wiki");
   if (!hasWarmCache || !cache) {
@@ -3773,7 +3805,47 @@ export async function searchVaultNotes(
     if (excludeSet.size === 0) excludeSet = undefined;
   }
 
-  const rankMode = options.rank ?? "legacy";
+  const effectiveQueryTrimLen = effectiveQuery.trim().length;
+  let distinctiveSet: Set<string> | undefined;
+  let k_q = 3;
+  if (rankMode === "ups_gate") {
+    let nonNoiseCount = 0;
+    const df = new Map<string, number>();
+    for (const t of terms) df.set(t, 0);
+    for (const entry of cache.notes.values()) {
+      if (entry.skipByStatus || entry.durability === "noise") continue;
+      if (
+        excludeSet &&
+        (excludeSet.has(entry.relativePath) ||
+          excludeSet.has(entry.relativePath.replaceAll("\\", "/")) ||
+          excludeSet.has(entry.notePath))
+      ) {
+        continue;
+      }
+      nonNoiseCount += 1;
+      for (const t of terms) {
+        const present =
+          (entry.wordCounts.has(t)
+            ? entry.wordCounts.get(t)!
+            : countWordOccurrences(entry.haystackLower, t, true, 1)) > 0;
+        if (present) {
+          df.set(t, (df.get(t) ?? 0) + 1);
+        }
+      }
+    }
+    const dfThreshold = Math.max(1, Math.ceil(0.05 * Math.max(1, nonNoiseCount)));
+    const distinctiveQueryTerms = terms.filter((t) => {
+      const d = df.get(t) ?? 0;
+      return d > 0 && d <= dfThreshold;
+    });
+    distinctiveSet = new Set(distinctiveQueryTerms);
+    const rho =
+      typeof options.rho === "number" && Number.isFinite(options.rho)
+        ? options.rho
+        : 0.2;
+    k_q = Math.max(3, Math.ceil(rho * distinctiveQueryTerms.length));
+  }
+
   const scored: Array<{
     entry: CachedVaultNoteEntry;
     score: number;
@@ -3793,7 +3865,15 @@ export async function searchVaultNotes(
     if (score > 0) {
       const gate =
         rankMode === "ups_gate"
-          ? evaluateUpsGate(phrases, terms, entry, options.rho)
+          ? evaluateUpsGate(
+              effectiveQueryTrimLen,
+              phrases,
+              terms,
+              distinctiveSet!,
+              k_q,
+              entry,
+              score,
+            )
           : undefined;
       scored.push({ entry, score, gate });
     }
@@ -3805,11 +3885,6 @@ export async function searchVaultNotes(
       const gb = b.gate!;
       if (ga.clearsGate !== gb.clearsGate) {
         return gb.clearsGate ? 1 : -1;
-      }
-      const na = a.entry.durability === "noise" ? 1 : 0;
-      const nb = b.entry.durability === "noise" ? 1 : 0;
-      if (na !== nb) {
-        return na - nb;
       }
       return (
         gb.weightedScore - ga.weightedScore ||
@@ -3838,8 +3913,7 @@ export async function searchVaultNotes(
   }
 
   return scored.slice(0, limit).map(({ entry, score, gate }) => {
-    const resolvedGate = gate ?? evaluateUpsGate(phrases, terms, entry, options.rho);
-    return {
+    const base: VaultSearchResult = {
       notePath: entry.notePath,
       relativePath: entry.relativePath,
       wikilink: entry.wikilink,
@@ -3849,11 +3923,16 @@ export async function searchVaultNotes(
       privacy: entry.privacy,
       status: entry.status,
       durability: entry.durability,
-      gateScore: resolvedGate.gateScore,
-      gateRoute: resolvedGate.gateRoute,
-      clearsGate: resolvedGate.clearsGate,
-      weightedScore: resolvedGate.weightedScore,
     };
+    if (gate) {
+      base.gateScore = gate.gateScore;
+      base.gateRoute = gate.gateRoute;
+      base.clearsGate = gate.clearsGate;
+      base.weightedScore = gate.weightedScore;
+      base.contributingTerms = gate.contributingTerms;
+      base.coveredDistinctive = gate.coveredDistinctive;
+    }
+    return base;
   });
 }
 
@@ -3886,6 +3965,72 @@ export async function resolveVaultHandleRelPath(
     }
   }
   return null;
+}
+
+export type ResolvedVaultHandleNote =
+  | {
+      status: "resolved";
+      relativePath: string;
+      title: string;
+      content: string;
+      wikilink: string;
+    }
+  | {
+      status: "unresolved";
+      reason: "missing" | "unsafe";
+    };
+
+/**
+ * Resolve a short vault handle (`m:<8hex>`) locally against `vaultPath`,
+ * enforcing containment, non-symlink file check, status check, and
+ * `filterSafeVaultResults` privacy gating (rev5 §5.2.6 / §5.3).
+ */
+export async function resolveSafeVaultHandleNote(
+  vaultPath: string,
+  handle: string,
+): Promise<ResolvedVaultHandleNote> {
+  const relPath = await resolveVaultHandleRelPath(vaultPath, handle);
+  if (!relPath) {
+    return { status: "unresolved", reason: "missing" };
+  }
+  const notePath = path.join(vaultPath, relPath);
+  try {
+    assertUnder(notePath, vaultPath);
+    const st = await lstat(notePath);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      return { status: "unresolved", reason: "unsafe" };
+    }
+    const markdown = await readFile(notePath, "utf8");
+    const privacy = privacyFromMarkdown(markdown);
+    if (privacy === "blocked" || skippedByStatus(markdown)) {
+      return { status: "unresolved", reason: "unsafe" };
+    }
+    const normalizedRel = relPath.replaceAll("\\", "/");
+    const title = titleFromMarkdown(normalizedRel, markdown);
+    const wikilink = wikilinkFor(normalizedRel);
+    const candidate: VaultSearchResult = {
+      notePath,
+      relativePath: normalizedRel,
+      wikilink,
+      title,
+      snippet: markdown.slice(0, 520),
+      score: 1,
+      privacy,
+      status: statusFromMarkdown(markdown),
+    };
+    if (filterSafeVaultResults([candidate]).length === 0) {
+      return { status: "unresolved", reason: "unsafe" };
+    }
+    return {
+      status: "resolved",
+      relativePath: normalizedRel,
+      title,
+      content: markdown,
+      wikilink,
+    };
+  } catch {
+    return { status: "unresolved", reason: "missing" };
+  }
 }
 
 export interface InboxEntry {

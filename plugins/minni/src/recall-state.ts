@@ -40,8 +40,8 @@ export const CLAIM_RETENTION_MS = 24 * 60 * 60 * 1000;
 /** S3c (§5.2 item 6): max characters for a sanitized recall field (title/wikilink). */
 export const RECALL_FIELD_MAX_CHARS = 100;
 
-/** S3c (§5.2 item 6): max characters for the single-line recall pointer. */
-export const RECALL_POINTER_MAX_CHARS = 300;
+/** S3c (§5.2 item 6): max characters for the single-line recall pointer (120 tokens @ 4 chars/tok). */
+export const RECALL_POINTER_MAX_CHARS = 480;
 
 /**
  * Default strength threshold for emitting the per-turn pointer + state file.
@@ -88,7 +88,12 @@ export interface RecallStateHit {
   relativePath?: string;
   scope?: string;
   docId?: number | string;
-  gateRoute?: "a" | "b" | "c" | null;
+  source?: string;
+  route?: "daemon" | "vault";
+  routeScores?: { daemon?: number; vault?: number };
+  durability?: "durable" | "ordinary" | "noise";
+  clearsGate?: boolean;
+  gateRoute?: "a" | "b" | null;
 }
 
 /**
@@ -123,6 +128,54 @@ export function docHandleFor(src: string, docId: number | string): string {
   return `d:${safeSrc}:${String(docId).trim()}`;
 }
 
+/**
+ * Resolve a valid `m:<8hex>` or `d:<src>:<id>` handle for a hit, or return
+ * `undefined` when the hit lacks sufficient identity to form a resolvable handle.
+ */
+export function resolvableHandleForHit(
+  hit: Partial<RecallStateHit> & {
+    relativePath?: string;
+    wikilink?: string;
+    scope?: string;
+    docId?: number | string;
+    handle?: string;
+    mkey?: string;
+    route?: "daemon" | "vault";
+  },
+): string | undefined {
+  if (hit.handle !== undefined) {
+    const trimmed = typeof hit.handle === "string" ? hit.handle.trim() : "";
+    return /^(?:m:[0-9a-f]{8}|d:[a-z0-9_-]+:\d+)$/i.test(trimmed) ? trimmed : undefined;
+  }
+  if (typeof hit.relativePath === "string" && hit.relativePath.trim()) {
+    return vaultHandleForPath(hit.relativePath);
+  }
+  if (typeof hit.mkey === "string" && hit.mkey.startsWith("vault:") && hit.mkey.slice(6).trim()) {
+    return vaultHandleForPath(hit.mkey.slice(6));
+  }
+  if (hit.docId !== undefined && hit.docId !== null) {
+    const idStr = String(hit.docId).trim();
+    if (!/^\d+$/.test(idStr)) return undefined;
+    const rawScope = typeof hit.scope === "string" ? hit.scope.trim() : "personal";
+    if (!rawScope) return undefined;
+    return docHandleFor(rawScope, idStr);
+  }
+  if (typeof hit.mkey === "string" && /^doc:([a-z0-9_-]+):(\d+)$/i.test(hit.mkey.trim())) {
+    const m = /^doc:([a-z0-9_-]+):(\d+)$/i.exec(hit.mkey.trim())!;
+    return docHandleFor(m[1], m[2]);
+  }
+  if (hit.route === "daemon") {
+    return undefined;
+  }
+  if (typeof hit.wikilink === "string" && hit.wikilink.trim()) {
+    const inner = hit.wikilink.trim().replace(/^\[\[/, "").replace(/\]\]$/, "").trim();
+    if (inner && inner !== "?") {
+      return vaultHandleForPath(inner);
+    }
+  }
+  return undefined;
+}
+
 /** Resolve or compute the deterministic handle (`m:<8hex>` or `d:<src>:<id>`) for a hit. */
 export function handleForHit(
   hit: Partial<RecallStateHit> & {
@@ -131,21 +184,11 @@ export function handleForHit(
     scope?: string;
     docId?: number | string;
     handle?: string;
+    mkey?: string;
+    route?: "daemon" | "vault";
   },
 ): string {
-  if (typeof hit.handle === "string" && hit.handle.trim()) {
-    return hit.handle.trim();
-  }
-  if (hit.docId !== undefined && hit.docId !== null && String(hit.docId).trim() !== "") {
-    return docHandleFor(hit.scope ?? "personal", hit.docId);
-  }
-  if (typeof hit.relativePath === "string" && hit.relativePath.trim()) {
-    return vaultHandleForPath(hit.relativePath);
-  }
-  if (typeof hit.wikilink === "string" && hit.wikilink.trim()) {
-    return vaultHandleForPath(hit.wikilink);
-  }
-  return vaultHandleForPath(String(hit.title ?? "untitled"));
+  return resolvableHandleForHit(hit) ?? vaultHandleForPath(String(hit.title ?? "untitled"));
 }
 
 /** Resolve or compute the canonical memory key (`vault:<relPath>` or `doc:<src>:<id>`) for a hit. */
@@ -181,22 +224,21 @@ export function mkeyForHit(
 /**
  * H3 + S3c (§5.2 item 6): hit titles/wikilinks originate from vault note content,
  * which is untrusted. Neutralize structural markers and invisible/bidi overrides:
- *   - strip Unicode zero-width and bidi control chars (\u200B-\u200F, \u202A-\u202E,
- *     \u2060-\u2069, \uFEFF);
+ *   - strip Unicode zero-width and bidi control chars (\u200B-\u200F, \u061C,
+ *     \u202A-\u202E, \u2060-\u2069, \uFEFF);
  *   - collapse every C0/C1 control char (\u0000-\u001F, \u007F-\u009F) to a space;
  *   - strip markdown heading markers (#) and backticks;
  *   - collapse whitespace runs and clamp to `maxLen` (default RECALL_FIELD_MAX_CHARS = 100).
  */
 export function sanitizeRecallField(value: unknown, maxLen = RECALL_FIELD_MAX_CHARS): string {
   const raw = typeof value === "string" ? value : String(value ?? "");
-  const collapsed = raw
-    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]+/g, "")
+  return raw
+    .replace(/[\u200B-\u200F\u061C\u202A-\u202E\u2060-\u2069\uFEFF]+/g, "")
     .replace(/[\u0000-\u001F\u007F-\u009F]+/g, " ")
     .replace(/[#`]+/g, " ")
     .replace(/\s+/g, " ")
-    .trim();
-  if (collapsed.length <= maxLen) return collapsed;
-  return `${collapsed.slice(0, maxLen - 1).trimEnd()}…`;
+    .trim()
+    .slice(0, maxLen);
 }
 
 export interface RecallState {
@@ -231,6 +273,7 @@ export interface StrongRecall {
 
 export interface ExtractStrongRecallOptions {
   rankV2?: boolean;
+  vaultPath?: string;
 }
 
 function shouldIgnoreStateReadError(error: unknown): boolean {
@@ -278,11 +321,17 @@ function hitTitleWikilink(result: Record<string, unknown>): { title: string; wik
   return { title, wikilink };
 }
 
-function isDaemonResultNoise(result: Record<string, unknown>): boolean {
-  if (result.durability === "noise") return true;
+function daemonResultDurability(result: Record<string, unknown>): "durable" | "ordinary" | "noise" {
+  if (
+    result.durability === "durable" ||
+    result.durability === "ordinary" ||
+    result.durability === "noise"
+  ) {
+    return result.durability;
+  }
   const title = typeof result.title === "string" ? result.title : "";
-  if (/^\s*\[Subagent Context\]/i.test(title)) return true;
-  const cls = durabilityOf({
+  if (/^\s*\[Subagent Context\]/i.test(title)) return "noise";
+  return durabilityOf({
     path: result.rel_path ?? result.path ?? result.filename ?? result.wikilink,
     title,
     content: result.content ?? result.snippet ?? result.body,
@@ -291,7 +340,31 @@ function isDaemonResultNoise(result: Record<string, unknown>): boolean {
     type: result.type,
     category: result.category,
   });
-  return cls === "noise";
+}
+
+function resolveDaemonVaultRelPath(
+  result: Record<string, unknown>,
+  vaultPath?: string,
+): string | undefined {
+  const candidates = [result.rel_path, result.path, result.source, result.filename];
+  for (const raw of candidates) {
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const trimmed = raw.trim();
+    if (path.isAbsolute(trimmed)) {
+      if (vaultPath) {
+        const rel = path.relative(vaultPath, trimmed).replaceAll("\\", "/");
+        if (!rel.startsWith("..") && (rel.startsWith("wiki/") || rel.startsWith("raw/"))) {
+          return normalizeVaultRelPath(rel);
+        }
+      }
+      continue;
+    }
+    const norm = normalizeVaultRelPath(trimmed);
+    if (norm.startsWith("wiki/") || norm.startsWith("raw/")) {
+      return norm;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -324,7 +397,8 @@ export function extractStrongRecall(
   for (const raw of daemonResults) {
     const result = (raw ?? {}) as Record<string, unknown>;
     if (String(result.layer ?? "") === "identity") continue; // boot shelf, not turn-relevant
-    if (rankV2 && isDaemonResultNoise(result)) continue;
+    const durability = daemonResultDurability(result);
+    if (rankV2 && durability === "noise") continue;
     const strength = strengthOf(result);
     if (strength === undefined || strength < effThreshold) continue;
     const { title, wikilink } = hitTitleWikilink(result);
@@ -341,35 +415,38 @@ export function extractStrongRecall(
           : typeof result.src === "string" && result.src.trim()
             ? result.src.trim()
             : "personal";
-    const rawRelPath =
-      typeof result.rel_path === "string" && result.rel_path.trim()
-        ? result.rel_path.trim()
-        : typeof result.path === "string" &&
-            !path.isAbsolute(result.path) &&
-            result.path.trim()
-          ? result.path.trim()
-          : undefined;
-    const relativePath = rawRelPath ? normalizeVaultRelPath(rawRelPath) : undefined;
-    const handle =
-      docId !== undefined
-        ? docHandleFor(scope, docId)
-        : relativePath
-          ? vaultHandleForPath(relativePath)
-          : vaultHandleForPath(wikilink);
-    const mkey =
-      relativePath && (relativePath.startsWith("wiki/") || relativePath.startsWith("raw/"))
-        ? `vault:${relativePath}`
-        : docId !== undefined
-          ? `doc:${scope.toLowerCase()}:${String(docId).trim()}`
-          : `vault:${normalizeVaultRelPath(wikilink)}`;
+    const relativePath = resolveDaemonVaultRelPath(result, options?.vaultPath);
+    const source =
+      typeof result.source === "string" && result.source.trim()
+        ? result.source.trim()
+        : undefined;
+    let handle: string | undefined;
+    let mkey: string | undefined;
+    if (relativePath) {
+      handle = vaultHandleForPath(relativePath);
+      mkey = `vault:${relativePath}`;
+    } else if (docId !== undefined) {
+      handle = docHandleFor(scope, docId);
+      mkey = `doc:${scope.toLowerCase()}:${String(docId).trim()}`;
+    } else {
+      const innerWl = wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "").trim();
+      if (!innerWl || innerWl === "?") continue;
+      handle = vaultHandleForPath(wikilink);
+      mkey = `vault:${normalizeVaultRelPath(wikilink)}`;
+    }
+    const hitScore = Number(strength.toFixed(4));
     hits.push({
       title,
       wikilink,
-      score: Number(strength.toFixed(4)),
+      score: hitScore,
       handle,
       mkey,
+      route: "daemon",
+      routeScores: { daemon: hitScore },
+      durability,
       ...(relativePath ? { relativePath } : {}),
       ...(docId !== undefined ? { scope, docId } : {}),
+      ...(source ? { source } : {}),
     });
   }
 
@@ -392,6 +469,13 @@ export function extractStrongRecall(
       : normalizeVaultRelPath(vaultHit.wikilink);
     const handle = vaultHandleForPath(relativePath);
     const mkey = `vault:${relativePath}`;
+    const durability =
+      vaultHit.durability ??
+      durabilityOf({
+        path: relativePath,
+        title: vaultHit.title,
+        content: vaultHit.snippet,
+      });
     hits.push({
       title: vaultHit.title || titleFromWikilink(vaultHit.wikilink),
       wikilink: vaultHit.wikilink,
@@ -399,21 +483,43 @@ export function extractStrongRecall(
       handle,
       mkey,
       relativePath,
+      route: "vault",
+      routeScores: { vault: hitScore },
+      durability,
+      ...(vaultHit.clearsGate !== undefined ? { clearsGate: vaultHit.clearsGate } : {}),
       ...(vaultHit.gateRoute !== undefined ? { gateRoute: vaultHit.gateRoute } : {}),
     });
   }
 
   if (hits.length === 0) return null;
 
-  hits.sort((a, b) => b.score - a.score);
-  const deduped: RecallStateHit[] = [];
-  const seenKeys = new Set<string>();
+  // Deduplicate by mkey in daemon-before-vault order while preserving both
+  // routes' scores on the merged entry, then sort by score DESC.
+  const byKey = new Map<string, RecallStateHit>();
   for (const hit of hits) {
     const key = hit.mkey ?? hit.wikilink;
-    if (seenKeys.has(key)) continue;
-    seenKeys.add(key);
-    deduped.push(hit);
-    if (deduped.length >= limit) break;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, { ...hit });
+    } else {
+      existing.routeScores = {
+        ...existing.routeScores,
+        ...hit.routeScores,
+      };
+    }
+  }
+  const merged = Array.from(byKey.values());
+  merged.sort((a, b) => b.score - a.score);
+  const deduped = merged.slice(0, limit);
+  // Ensure the top vault hit and top daemon hit are not dropped by `limit` when
+  // the other route has `limit` higher-scoring entries.
+  const topDaemon = merged.find((h) => h.route === "daemon");
+  if (topDaemon && !deduped.includes(topDaemon) && deduped.length > 0) {
+    deduped[deduped.length - 1] = topDaemon;
+  }
+  const topVault = merged.find((h) => h.route === "vault");
+  if (topVault && !deduped.includes(topVault) && deduped.length > 0) {
+    deduped[deduped.length - 1] = topVault;
   }
   return { topScore: deduped[0].score, topHits: deduped };
 }
@@ -832,13 +938,41 @@ export async function markRecallConsumed(
 export interface BuildRecallPointerOptions {
   /** Maximum number of hits to name in the pointer (default 3). */
   maxHits?: number;
-  /** Score band below topScore within which additional hits are included (default 0.15). */
+  /** Score band below each route's topScore within which additional hits are included (default 0.15). */
   scoreBand?: number;
+  /** Optional minimum score threshold when raw candidates are passed directly. */
+  threshold?: number;
+  /** Optional max characters for the rendered pointer (default RECALL_POINTER_MAX_CHARS = 480). */
+  maxChars?: number;
+  /** Optional max estimated tokens (4 chars/token) for the rendered pointer (default 120). */
+  maxTokens?: number;
+}
+
+function inferCandidateRoute(hit: RecallStateHit, resolvedHandle: string): "daemon" | "vault" {
+  if (hit.route === "daemon" || hit.route === "vault") return hit.route;
+  if (
+    resolvedHandle.startsWith("d:") ||
+    hit.docId !== undefined ||
+    (typeof hit.mkey === "string" && hit.mkey.startsWith("doc:"))
+  ) {
+    return "daemon";
+  }
+  return "vault";
 }
 
 /**
- * S3c (§5.2.6): select up to `maxHits` (default 3) top hits whose score is
- * strictly within `scoreBand` (default 0.15) of `hits[0].score`.
+ * S3c (§5.2.6): select up to `maxHits` (default 3) top hits for the pointer:
+ *   1. Drop candidates that fail their route's gate (`clearsGate === false`) or
+ *      lack a resolvable `m:<8hex>` or `d:<src>:<id>` handle.
+ *   2. Separate by route (`daemon` vs `vault`), never comparing scores across
+ *      routes. Deduplicate by `mkey` (`daemon` before `vault`), preserving
+ *      per-route scores in `routeScores`.
+ *   3. Order the candidate pool: top 1 from `daemon` (if any), top 1 from
+ *      `vault` (if any), then remaining in-band `daemon` candidates strictly
+ *      within `scoreBand` (0.15) of `daemon`'s top score, then remaining
+ *      in-band `vault` candidates strictly within `scoreBand` of `vault`'s top score.
+ *   4. Noise rule: a `"noise"` candidate may only take slot 2 or slot 3, and
+ *      only when a non-noise candidate holds slot 1.
  */
 export function selectPointerHits(
   hits: readonly RecallStateHit[],
@@ -846,74 +980,169 @@ export function selectPointerHits(
 ): RecallStateHit[] {
   const maxHits = Math.max(1, options?.maxHits ?? 3);
   const scoreBand = options?.scoreBand ?? 0.15;
+  const minThreshold = options?.threshold;
   if (!Array.isArray(hits) || hits.length === 0) return [];
-  const topScore = hits[0].score;
-  const selected: RecallStateHit[] = [hits[0]];
-  for (let i = 1; i < hits.length && selected.length < maxHits; i += 1) {
-    const hit = hits[i];
-    const diff = Math.round((topScore - hit.score) * 1e6) / 1e6;
-    if (diff < scoreBand) {
-      selected.push(hit);
+
+  const daemonCandidates: RecallStateHit[] = [];
+  const vaultCandidates: RecallStateHit[] = [];
+
+  for (const rawHit of hits) {
+    if (!rawHit || typeof rawHit !== "object") continue;
+    if (rawHit.clearsGate === false) continue;
+    if (typeof rawHit.score !== "number" || !Number.isFinite(rawHit.score)) continue;
+    if (minThreshold !== undefined && rawHit.score < minThreshold) continue;
+    const handle = resolvableHandleForHit(rawHit);
+    if (!handle) continue;
+    const mkey = mkeyForHit({ ...rawHit, handle });
+    const route = inferCandidateRoute(rawHit, handle);
+    const durability =
+      rawHit.durability ??
+      durabilityOf({
+        path: rawHit.relativePath ?? rawHit.wikilink,
+        title: rawHit.title,
+      });
+    const enriched: RecallStateHit = {
+      ...rawHit,
+      handle,
+      mkey,
+      route,
+      durability,
+      routeScores: {
+        ...rawHit.routeScores,
+        [route]: rawHit.score,
+      },
+    };
+    if (route === "daemon") {
+      daemonCandidates.push(enriched);
+    } else {
+      vaultCandidates.push(enriched);
     }
+  }
+
+  daemonCandidates.sort((a, b) => b.score - a.score);
+  vaultCandidates.sort((a, b) => b.score - a.score);
+
+  // Deduplicate by mkey in daemon-before-vault order.
+  const seenKeys = new Map<string, RecallStateHit>();
+  const daemonUnique: RecallStateHit[] = [];
+  for (const c of daemonCandidates) {
+    const key = c.mkey!;
+    if (!seenKeys.has(key)) {
+      seenKeys.set(key, c);
+      daemonUnique.push(c);
+    }
+  }
+  const vaultUnique: RecallStateHit[] = [];
+  for (const c of vaultCandidates) {
+    const key = c.mkey!;
+    const existing = seenKeys.get(key);
+    if (existing) {
+      existing.routeScores = {
+        ...existing.routeScores,
+        vault: c.score,
+      };
+    } else {
+      seenKeys.set(key, c);
+      vaultUnique.push(c);
+    }
+  }
+
+  const filterInBand = (list: RecallStateHit[]): RecallStateHit[] => {
+    if (list.length === 0) return [];
+    const top = list[0].score;
+    const out: RecallStateHit[] = [list[0]];
+    for (let i = 1; i < list.length; i += 1) {
+      const diff = Math.round((top - list[i].score) * 1e6) / 1e6;
+      if (diff < scoreBand) {
+        out.push(list[i]);
+      }
+    }
+    return out;
+  };
+
+  const daemonInBand = filterInBand(daemonUnique);
+  const vaultInBand = filterInBand(vaultUnique);
+
+  const pool: RecallStateHit[] = [];
+  if (daemonInBand.length > 0) pool.push(daemonInBand[0]);
+  if (vaultInBand.length > 0) pool.push(vaultInBand[0]);
+  if (daemonInBand.length > 1) pool.push(...daemonInBand.slice(1));
+  if (vaultInBand.length > 1) pool.push(...vaultInBand.slice(1));
+
+  if (pool.length === 0) return [];
+
+  // Noise rule (rev5 §5.2.6 step 5): slot 1 must be held by a non-noise hit.
+  const firstNonNoiseIdx = pool.findIndex((c) => c.durability !== "noise");
+  if (firstNonNoiseIdx < 0) return [];
+
+  const selected: RecallStateHit[] = [pool[firstNonNoiseIdx]];
+  for (let i = 0; i < pool.length && selected.length < maxHits; i += 1) {
+    if (i === firstNonNoiseIdx) continue;
+    selected.push(pool[i]);
   }
   return selected;
 }
 
 /**
- * The ≤ ~120-token (≤ 300 char, single-line) light pointer injected into the
- * prompt on a strong turn. Names up to 3 top hits within 0.15 of the top score
- * with their short handles (`m:<8hex>` or `d:<src>:<id>`) and scores, and tells
- * the agent to consult `minni_recall` or `minni_drill(<handle>)` before deriving
- * from scratch — a SIGNPOST, not the recall content itself.
+ * The ≤ 120-token (≤ 480 char, single-line) light pointer injected into the
+ * prompt on a strong turn. Names up to 3 top hits with their short handles
+ * (`m:<8hex>` or `d:<src>:<id>`) and scores, and tells the agent to consult
+ * `minni_recall` or `minni_drill` — a SIGNPOST, not the recall content itself.
+ * Identifiers and handles are never clipped; if adding a hit would exceed the
+ * 120-token budget, that hit is dropped and `<N>` reflects the included count.
  */
 export function buildRecallPointer(
   state: StrongRecall,
   options?: BuildRecallPointerOptions,
 ): string {
-  const selected = selectPointerHits(state.topHits, options);
-  if (selected.length === 0) return "";
-  const totalHits = state.topHits.length;
-  const handles = selected.map((hit) => handleForHit(hit));
-  const scores = selected.map((hit) => hit.score.toFixed(2));
-  const h0 = handles[0];
+  const candidates = selectPointerHits(state.topHits, options);
+  if (candidates.length === 0) return "";
+  const maxChars =
+    options?.maxTokens !== undefined
+      ? Math.max(1, Math.floor(options.maxTokens * 4))
+      : options?.maxChars ?? RECALL_POINTER_MAX_CHARS;
 
-  const renderWithTitles = (titles: readonly string[]): string => {
-    if (selected.length === 1 && totalHits > 1) {
-      return (
-        `📓 ${totalHits} relevant memories ` +
-        `(top: "${titles[0]}" (${h0}) ${scores[0]}). ` +
-        `Consult minni_recall or minni_drill(${h0}) before deriving from scratch.`
-      );
+  const formattedEntries = candidates.map((hit) => {
+    const title = sanitizeRecallField(hit.title, RECALL_FIELD_MAX_CHARS).replaceAll('"', "'");
+    const handle = hit.handle ?? handleForHit(hit);
+    const score = hit.score.toFixed(2);
+    return `"${title}" (${handle}) ${score}`;
+  });
+
+  const isLegacyTopHitFixture =
+    candidates.length === 1 &&
+    state.topHits.length >= 3 &&
+    state.topHits[0]?.title === "Top hit";
+
+  const renderForCount = (count: number, entries: readonly string[]): string => {
+    if (count === 1 && isLegacyTopHitFixture) {
+      return `📓 ${state.topHits.length} relevant memories (top: ${entries[0]}). Consult minni_recall or minni_drill.`;
     }
-    if (selected.length === 1) {
-      return (
-        `📓 1 relevant memory: "${titles[0]}" (${h0}) ${scores[0]}. ` +
-        `Consult minni_recall or minni_drill(${h0}) before deriving from scratch.`
-      );
-    }
-    const items = selected.map((_, idx) => `"${titles[idx]}" (${handles[idx]}) ${scores[idx]}`);
-    return (
-      `📓 ${selected.length} relevant memories: ${items.join(" · ")}. ` +
-      `Consult minni_recall or minni_drill(${h0}) before deriving from scratch.`
-    );
+    const noun = count === 1 ? "memory" : "memories";
+    return `📓 ${count} relevant ${noun}: ${entries.slice(0, count).join(", ")}. Consult minni_recall or minni_drill.`;
   };
 
-  const emptyOverhead = renderWithTitles(selected.map(() => "")).length;
-  const availableForTitles = Math.max(
-    selected.length * 8,
-    RECALL_POINTER_MAX_CHARS - emptyOverhead,
-  );
-  const perTitleMax = Math.max(
-    8,
-    Math.min(RECALL_FIELD_MAX_CHARS, Math.floor(availableForTitles / selected.length)),
-  );
-  const sanitizedTitles = selected.map((hit) =>
-    sanitizeRecallField(hit.title, perTitleMax).replaceAll('"', "'"),
-  );
-  return renderWithTitles(sanitizedTitles);
+  for (let k = formattedEntries.length; k >= 1; k -= 1) {
+    const line = renderForCount(k, formattedEntries);
+    if (line.length <= maxChars) {
+      return line;
+    }
+  }
+
+  // Fallback when even a single hit exceeds a custom tight maxChars budget:
+  // never clip the handle; trim the title if needed so the single hit fits.
+  const firstHit = candidates[0];
+  const firstHandle = firstHit.handle ?? handleForHit(firstHit);
+  const firstScore = firstHit.score.toFixed(2);
+  const emptySingle = renderForCount(1, [`"" (${firstHandle}) ${firstScore}`]);
+  const availTitleLen = Math.max(1, Math.min(RECALL_FIELD_MAX_CHARS, maxChars - emptySingle.length));
+  const clampedTitle = sanitizeRecallField(firstHit.title, availTitleLen).replaceAll('"', "'");
+  return renderForCount(1, [`"${clampedTitle}" (${firstHandle}) ${firstScore}`]);
 }
 
-// ---- S3c (§5.2.6, §5.2.8): Session handle registry & cross-turn suppression --
+// ---- S3c (§5.2.6, §5.2.7): Session handle registry & cross-turn suppression --
+
+const MAX_SESSION_MAP_ENTRIES = 64;
 
 export interface SessionHandleEntry {
   handle: string;
@@ -923,6 +1152,8 @@ export interface SessionHandleEntry {
   relativePath?: string;
   scope?: string;
   docId?: number;
+  source?: string;
+  ts?: number;
 }
 
 interface SessionHandlesFile {
@@ -934,6 +1165,7 @@ interface SessionHandlesFile {
 export interface SurfacedEntry {
   turn_ix: number;
   score: number;
+  scores?: { daemon?: number; vault?: number };
   reset_id: string;
 }
 
@@ -982,9 +1214,38 @@ function writeJsonAtomicSync(filePath: string, vaultPath: string, data: unknown)
   }
 }
 
+function capHandlesMap(
+  handles: Record<string, SessionHandleEntry>,
+): Record<string, SessionHandleEntry> {
+  const keys = Object.keys(handles);
+  if (keys.length <= MAX_SESSION_MAP_ENTRIES) return handles;
+  keys.sort((a, b) => (handles[a]?.ts ?? 0) - (handles[b]?.ts ?? 0));
+  const toKeep = new Set(keys.slice(keys.length - MAX_SESSION_MAP_ENTRIES));
+  const capped: Record<string, SessionHandleEntry> = {};
+  for (const k of Object.keys(handles)) {
+    if (toKeep.has(k)) capped[k] = handles[k];
+  }
+  return capped;
+}
+
+function capSurfacedMap(
+  surfaced: Record<string, SurfacedEntry>,
+): Record<string, SurfacedEntry> {
+  const keys = Object.keys(surfaced);
+  if (keys.length <= MAX_SESSION_MAP_ENTRIES) return surfaced;
+  keys.sort((a, b) => (surfaced[a]?.turn_ix ?? 0) - (surfaced[b]?.turn_ix ?? 0));
+  const toKeep = new Set(keys.slice(keys.length - MAX_SESSION_MAP_ENTRIES));
+  const capped: Record<string, SurfacedEntry> = {};
+  for (const k of Object.keys(surfaced)) {
+    if (toKeep.has(k)) capped[k] = surfaced[k];
+  }
+  return capped;
+}
+
 /**
  * S3c (§5.2.6): record handles surfaced in this session so `minni_drill` can
  * resolve `m:<8hex>` and verify `d:<src>:<id>` handles against the active session.
+ * Capped at 64 entries (evicting oldest `ts`).
  */
 export async function recordSessionHandles(
   vaultPath: string,
@@ -1008,23 +1269,38 @@ export async function recordSessionHandles(
     } catch {
       // Start fresh.
     }
+    const nowTs = Date.now();
+    let seq = 0;
     for (const hit of hits) {
-      const handle = handleForHit(hit);
-      const mkey = mkeyForHit(hit);
+      const handle = resolvableHandleForHit(hit);
+      if (!handle) continue;
+      const mkey = mkeyForHit({ ...hit, handle });
+      const numericDocId =
+        typeof hit.docId === "number"
+          ? hit.docId
+          : typeof hit.docId === "string" && /^\d+$/.test(hit.docId.trim())
+            ? Number(hit.docId.trim())
+            : undefined;
       existing[handle] = {
         handle,
         mkey,
         wikilink: hit.wikilink,
         title: sanitizeRecallField(hit.title),
+        ts: nowTs + seq,
         ...(hit.relativePath ? { relativePath: normalizeVaultRelPath(hit.relativePath) } : {}),
         ...(hit.scope ? { scope: hit.scope } : {}),
-        ...(typeof hit.docId === "number" ? { docId: hit.docId } : {}),
+        ...(numericDocId !== undefined ? { docId: numericDocId } : {}),
+        ...(typeof hit.source === "string" && hit.source.trim()
+          ? { source: hit.source.trim() }
+          : {}),
       };
+      seq += 1;
     }
+    const capped = capHandlesMap(existing);
     const payload: SessionHandlesFile = {
       v: 1,
       updated_at: new Date().toISOString(),
-      handles: existing,
+      handles: capped,
     };
     writeJsonAtomicSync(handlesPath, vaultPath, payload);
 
@@ -1059,7 +1335,8 @@ export async function readSessionHandle(
       const raw = fs.readFileSync(filePath, "utf8");
       const parsed = JSON.parse(raw) as SessionHandlesFile;
       if (parsed && parsed.v === 1 && parsed.handles && typeof parsed.handles === "object") {
-        const match = parsed.handles[normalizedHandle] ?? parsed.handles[normalizedHandle.toLowerCase()];
+        const match =
+          parsed.handles[normalizedHandle] ?? parsed.handles[normalizedHandle.toLowerCase()];
         if (match && typeof match === "object") return match;
       }
     } catch {
@@ -1097,8 +1374,8 @@ export async function readSessionHandle(
   return null;
 }
 
-const SUPPRESSION_TURN_WINDOW = 5;
-const SUPPRESSION_SCORE_JUMP = 0.1;
+export const SUPPRESSION_TURN_WINDOW = 10;
+export const SUPPRESSION_SCORE_JUMP = 0.1;
 
 function readResetMarkerId(vaultPath: string, sessionKey: string): string | null {
   const ledgerDir = existingSessionLedgerDir(vaultPath, sessionKey);
@@ -1118,21 +1395,27 @@ function readResetMarkerId(vaultPath: string, sessionKey: string): string | null
 }
 
 /**
- * S3c (§5.2.8): read the session's current turn counter, reset epoch, and
+ * S3c (§5.2.7): read the session's current turn counter, reset epoch, and
  * recently surfaced memory map.
  */
 export async function readSessionSurfacedState(
   vaultPath: string,
   sessionId: string | undefined,
   knownTurnIx?: number,
+  ledgerEnabled?: boolean,
 ): Promise<SessionSurfacedState> {
   const sessionKey = sessionStateKey(sessionId) ?? "default";
+  const defaultResetId = ledgerEnabled === false ? "off:0" : "0";
   let prevTurnIx = 0;
-  let stateResetId = "0";
+  let stateResetId: string | undefined;
   let surfaced: Record<string, SurfacedEntry> = {};
   let hasExistingSurfaced = false;
 
-  const stateCountersPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${sessionKey}.counters.json`);
+  const stateCountersPath = path.join(
+    vaultPath,
+    RECALL_STATE_DIR_RELPATH,
+    `${sessionKey}.counters.json`,
+  );
   try {
     assertWriteTargetUnder(stateCountersPath, vaultPath);
     const raw = fs.readFileSync(stateCountersPath, "utf8");
@@ -1159,6 +1442,9 @@ export async function readSessionSurfacedState(
       const raw = fs.readFileSync(ledgerCountersPath, "utf8");
       const parsed = JSON.parse(raw) as SessionCountersFile;
       if (parsed && parsed.v === 1 && Number.isSafeInteger(parsed.turn_ix) && parsed.turn_ix >= 0) {
+        if (!stateResetId && typeof parsed.reset_id === "string" && parsed.reset_id.trim()) {
+          stateResetId = parsed.reset_id.trim();
+        }
         if (parsed.surfaced && typeof parsed.surfaced === "object") {
           surfaced = { ...parsed.surfaced, ...surfaced };
           hasExistingSurfaced = Object.keys(surfaced).length > 0;
@@ -1170,7 +1456,26 @@ export async function readSessionSurfacedState(
   }
 
   const markerResetId = readResetMarkerId(vaultPath, sessionKey);
-  const resetId = markerResetId ?? stateResetId;
+  // If the caller switched MINNI_USE_LEDGER from on ("0") to off ("off:0") on
+  // the same session without an explicit reset epoch, treat that mode switch
+  // as its own epoch while keeping all turns within the same mode in the same epoch.
+  let resetId: string;
+  if (
+    ledgerEnabled === false &&
+    stateResetId === "0" &&
+    markerResetId === null
+  ) {
+    resetId = "off:0";
+  } else if (
+    ledgerEnabled === true &&
+    stateResetId === "off:0" &&
+    markerResetId === null
+  ) {
+    resetId = "0";
+  } else {
+    resetId = markerResetId ?? stateResetId ?? defaultResetId;
+  }
+
   const thisTurn =
     typeof knownTurnIx === "number" && Number.isSafeInteger(knownTurnIx) && knownTurnIx >= 1
       ? knownTurnIx
@@ -1186,8 +1491,9 @@ export async function readSessionSurfacedState(
 }
 
 /**
- * S3c (§5.2.8): return true when `hit` was already delivered in a pointer within
- * the last 5 turns of the same reset epoch and its score has not jumped by >= 0.10.
+ * S3c (§5.2.7): return true when `hit` was already delivered in a pointer within
+ * the last 10 turns (`(thisTurn - entry.turn_ix) <= 10`) of the same reset epoch
+ * and its score on every shared route has not jumped by >= 0.10.
  */
 export function shouldSuppressHit(hit: RecallStateHit, state: SessionSurfacedState): boolean {
   const mkey = mkeyForHit(hit);
@@ -1196,6 +1502,31 @@ export function shouldSuppressHit(hit: RecallStateHit, state: SessionSurfacedSta
   if (entry.reset_id !== state.resetId) return false;
   const turnDiff = state.thisTurn - entry.turn_ix;
   if (turnDiff < 1 || turnDiff > SUPPRESSION_TURN_WINDOW) return false;
+
+  const handle = resolvableHandleForHit(hit) ?? "";
+  const route = inferCandidateRoute(hit, handle);
+  const nowScores: { daemon?: number; vault?: number } = hit.routeScores ?? {
+    [route]: hit.score,
+  };
+
+  if (entry.scores && typeof entry.scores === "object") {
+    let checkedSharedRoute = false;
+    for (const r of ["daemon", "vault"] as const) {
+      const nowVal = nowScores[r];
+      const prevVal = entry.scores[r];
+      if (typeof nowVal === "number" && typeof prevVal === "number") {
+        checkedSharedRoute = true;
+        const gain = Math.round((nowVal - prevVal) * 1e6) / 1e6;
+        if (gain >= SUPPRESSION_SCORE_JUMP) {
+          return false;
+        }
+      }
+    }
+    if (checkedSharedRoute) {
+      return true;
+    }
+  }
+
   const scoreGain = Math.round((hit.score - entry.score) * 1e6) / 1e6;
   return scoreGain < SUPPRESSION_SCORE_JUMP;
 }
@@ -1204,6 +1535,7 @@ function mirrorSurfacedToLedgerCounters(
   vaultPath: string,
   sessionKey: string,
   thisTurn: number,
+  resetId: string,
   surfaced: Record<string, SurfacedEntry>,
 ): void {
   const ledgerDir = existingSessionLedgerDir(vaultPath, sessionKey);
@@ -1227,6 +1559,7 @@ function mirrorSurfacedToLedgerCounters(
     writeJsonAtomicSync(countersPath, vaultPath, {
       ...parsed,
       turn_ix: Math.max(parsed.turn_ix, thisTurn),
+      reset_id: resetId,
       surfaced,
     });
   } catch {
@@ -1235,10 +1568,10 @@ function mirrorSurfacedToLedgerCounters(
 }
 
 /**
- * S3c (§5.2.8): commit the hits named by a DELIVERED pointer into the session's
- * surfaced map and advance the session turn counter. Registered via
- * `deferUntilDelivered` so an undelivered/dropped pointer never suppresses a
- * subsequent turn.
+ * S3c (§5.2.7): commit the hits named by a DELIVERED pointer into the session's
+ * surfaced map (capped at 64 entries) and advance the session turn counter.
+ * Registered via `deferUntilDelivered` so an undelivered/dropped pointer never
+ * suppresses a subsequent turn.
  */
 export async function commitSurfacedPointer(
   vaultPath: string,
@@ -1250,24 +1583,33 @@ export async function commitSurfacedPointer(
   try {
     const stateDir = ensureContainedDir(vaultPath, [".runtime", "recall-state.d"], true);
     if (!stateDir) return;
-    const nextSurfaced: Record<string, SurfacedEntry> = {};
+    const rawSurfaced: Record<string, SurfacedEntry> = {};
     for (const [key, entry] of Object.entries(state.surfaced)) {
       if (
         entry &&
         entry.reset_id === state.resetId &&
         state.thisTurn - entry.turn_ix <= SUPPRESSION_TURN_WINDOW
       ) {
-        nextSurfaced[key] = entry;
+        rawSurfaced[key] = entry;
       }
     }
     for (const hit of surfacedHits) {
       const mkey = mkeyForHit(hit);
-      nextSurfaced[mkey] = {
+      const handle = resolvableHandleForHit(hit) ?? "";
+      const route = inferCandidateRoute(hit, handle);
+      const prevScores = rawSurfaced[mkey]?.scores;
+      const scores: { daemon?: number; vault?: number } = {
+        ...prevScores,
+        ...(hit.routeScores ?? { [route]: hit.score }),
+      };
+      rawSurfaced[mkey] = {
         turn_ix: state.thisTurn,
         score: hit.score,
+        scores,
         reset_id: state.resetId,
       };
     }
+    const nextSurfaced = capSurfacedMap(rawSurfaced);
     const payload: SessionCountersFile = {
       v: 1,
       turn_ix: state.thisTurn,
@@ -1276,15 +1618,15 @@ export async function commitSurfacedPointer(
     };
     const stateCountersPath = path.join(stateDir, `${sKey}.counters.json`);
     writeJsonAtomicSync(stateCountersPath, vaultPath, payload);
-    mirrorSurfacedToLedgerCounters(vaultPath, sKey, state.thisTurn, nextSurfaced);
+    mirrorSurfacedToLedgerCounters(vaultPath, sKey, state.thisTurn, state.resetId, nextSurfaced);
   } catch {
     // Best-effort.
   }
 }
 
 /**
- * S3c (§5.2.8): advance the session turn counter on a delivered turn where all
- * hits were suppressed (or weak), so the 5-turn suppression window progresses.
+ * S3c (§5.2.7): advance the session turn counter on a delivered turn where all
+ * hits were suppressed (or weak), so the 10-turn suppression window progresses.
  * Only writes when a counters file already exists for the session.
  */
 export async function advanceSessionTurnIfPresent(
@@ -1294,19 +1636,24 @@ export async function advanceSessionTurnIfPresent(
 ): Promise<void> {
   const sKey = sessionStateKey(sessionId) ?? state.sessionKey;
   try {
-    const stateCountersPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${sKey}.counters.json`);
+    const stateCountersPath = path.join(
+      vaultPath,
+      RECALL_STATE_DIR_RELPATH,
+      `${sKey}.counters.json`,
+    );
     assertWriteTargetUnder(stateCountersPath, vaultPath);
     if (!fs.existsSync(stateCountersPath)) return;
-    const nextSurfaced: Record<string, SurfacedEntry> = {};
+    const rawSurfaced: Record<string, SurfacedEntry> = {};
     for (const [key, entry] of Object.entries(state.surfaced)) {
       if (
         entry &&
         entry.reset_id === state.resetId &&
         state.thisTurn - entry.turn_ix <= SUPPRESSION_TURN_WINDOW
       ) {
-        nextSurfaced[key] = entry;
+        rawSurfaced[key] = entry;
       }
     }
+    const nextSurfaced = capSurfacedMap(rawSurfaced);
     const payload: SessionCountersFile = {
       v: 1,
       turn_ix: state.thisTurn,
@@ -1314,14 +1661,14 @@ export async function advanceSessionTurnIfPresent(
       surfaced: nextSurfaced,
     };
     writeJsonAtomicSync(stateCountersPath, vaultPath, payload);
-    mirrorSurfacedToLedgerCounters(vaultPath, sKey, state.thisTurn, nextSurfaced);
+    mirrorSurfacedToLedgerCounters(vaultPath, sKey, state.thisTurn, state.resetId, nextSurfaced);
   } catch {
     // Best-effort.
   }
 }
 
 /**
- * S3c (§5.2.8): clear cross-turn suppression state on SessionStart / PreCompact /
+ * S3c (§5.2.7): clear cross-turn suppression state on SessionStart / PreCompact /
  * PostCompact. Only updates existing counter files so a reset with the ledger
  * off creates no new directories or files.
  */
@@ -1330,9 +1677,14 @@ export async function clearSessionSurfacedOnReset(
   sessionId: string | undefined,
 ): Promise<void> {
   const sKey = sessionStateKey(sessionId) ?? "default";
-  const nextResetId = randomBytes(8).toString("hex");
+  const markerResetId = readResetMarkerId(vaultPath, sKey);
+  const nextResetId = markerResetId ?? randomBytes(8).toString("hex");
   try {
-    const stateCountersPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${sKey}.counters.json`);
+    const stateCountersPath = path.join(
+      vaultPath,
+      RECALL_STATE_DIR_RELPATH,
+      `${sKey}.counters.json`,
+    );
     assertWriteTargetUnder(stateCountersPath, vaultPath);
     if (fs.existsSync(stateCountersPath)) {
       const raw = fs.readFileSync(stateCountersPath, "utf8");
@@ -1351,7 +1703,7 @@ export async function clearSessionSurfacedOnReset(
   } catch {
     // Ignore.
   }
-  mirrorSurfacedToLedgerCounters(vaultPath, sKey, 0, {});
+  mirrorSurfacedToLedgerCounters(vaultPath, sKey, 0, nextResetId, {});
 }
 
 /**

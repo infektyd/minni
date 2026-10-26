@@ -2246,26 +2246,28 @@ export function createHookHandlers(
       const upsRankV2 = use
         ? use.capture.context.features.includes("MINNI_UPS_RANK_V2")
         : isFeatureEnabled(config.vaultPath, "MINNI_UPS_RANK_V2");
-      const surfacedState =
-        upsRankV2 && isFeatureEnabled(config.vaultPath, "MINNI_USE_LEDGER")
-          ? await readSessionSurfacedState(
-              config.vaultPath,
-              rawSessionId || undefined,
-              use?.turn.turn_ix,
-            )
-          : undefined;
-      // Only pre-exclude vault paths whose prior score is > 0.90 (so even a max
-      // 1.00 score cannot achieve the >= 0.10 jump required to override suppression).
+      const ledgerEnabled = isFeatureEnabled(config.vaultPath, "MINNI_USE_LEDGER");
+      const surfacedState = upsRankV2
+        ? await readSessionSurfacedState(
+            config.vaultPath,
+            rawSessionId || undefined,
+            use?.turn.turn_ix,
+            ledgerEnabled,
+          )
+        : undefined;
+      // Only pre-exclude vault paths whose prior vault score is > 0.90 (so even
+      // a max 1.00 score cannot achieve the >= 0.10 jump required to override suppression).
       const excludePaths: string[] = [];
       if (surfacedState) {
         for (const [mkey, entry] of Object.entries(surfacedState.surfaced)) {
+          const priorVaultScore = entry?.scores?.vault ?? entry?.score ?? 0;
           if (
             mkey.startsWith("vault:") &&
             entry &&
             entry.reset_id === surfacedState.resetId &&
             surfacedState.thisTurn - entry.turn_ix >= 1 &&
-            surfacedState.thisTurn - entry.turn_ix <= 5 &&
-            entry.score > 0.9
+            surfacedState.thisTurn - entry.turn_ix <= 10 &&
+            priorVaultScore > 0.9
           ) {
             excludePaths.push(mkey.slice("vault:".length));
           }
@@ -2351,12 +2353,12 @@ export function createHookHandlers(
         vaultResults,
         threshold,
         5,
-        { rankV2: upsRankV2 },
+        { rankV2: upsRankV2, vaultPath: config.vaultPath },
       );
       if (upsRankV2 && strong && surfacedState) {
         const unsuppressed = strong.topHits.filter((hit) => !shouldSuppressHit(hit, surfacedState));
         strong =
-          unsuppressed.length > 0
+          unsuppressed.length > 0 && selectPointerHits(unsuppressed).length > 0
             ? { topScore: unsuppressed[0].score, topHits: unsuppressed }
             : null;
       }

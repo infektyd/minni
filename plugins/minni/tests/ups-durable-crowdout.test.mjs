@@ -1,118 +1,128 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { createHookHandlers } from "../dist/hook-handlers.js";
-import { extractStrongRecall } from "../dist/recall-state.js";
-import { ensureVault, searchVaultNotes } from "../dist/vault.js";
+import { buildRecallPointer, extractStrongRecall } from "../dist/recall-state.js";
+import { searchVaultNotes } from "../dist/vault.js";
 
-async function withTempVault(fn) {
-  const root = await mkdtemp(path.join(tmpdir(), "minni-s3c-crowdout-"));
+test("ups_gate prevents 22 plan journals echoing a 14-term prompt from crowding out 1 durable decision note with 3 distinctive title terms", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "minni-s3c-crowdout-"));
+  const vault = path.join(root, "vault");
+  await mkdir(path.join(vault, "wiki", "artifacts"), { recursive: true });
+  await mkdir(path.join(vault, "wiki", "decisions"), { recursive: true });
+  await mkdir(path.join(vault, "wiki", "concepts"), { recursive: true });
+
   try {
-    await ensureVault(root);
-    return await fn(root);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-}
+    // 14-term prompt where 3 terms ("socket", "retry", "backoff") are distinctive in the decision note's title
+    // and the other 11 terms appear across background notes or plan journals.
+    const fourteenTermPrompt =
+      "investigate socket retry backoff behavior during transient daemon connection failures across local worker processes";
 
-test("20 high-term-count noise notes cannot crowd out a durable Route (b) note under ups_gate", async () => {
-  await withTempVault(async (vault) => {
-    const sessionsDir = path.join(vault, "wiki", "sessions");
-    const decisionsDir = path.join(vault, "wiki", "decisions");
-    await mkdir(sessionsDir, { recursive: true });
-    await mkdir(decisionsDir, { recursive: true });
-
-    const query = "heliosgrine federation quorum handoff";
-    // Write 20 noise notes (compaction dumps and [Subagent Context] notes) that
-    // repeat the query terms many times so their raw term score is huge (> 80).
-    for (let i = 0; i < 20; i += 1) {
-      const isSubagent = i % 2 === 0;
-      const relName = isSubagent
-        ? `20260618-subagent-${i}.md`
-        : `20260618-compact-${i}.md`;
-      const title = isSubagent
-        ? `[Subagent Context] heliosgrine federation quorum handoff ${i}`
-        : `Session compaction heliosgrine federation quorum handoff ${i}`;
-      const repeated = Array.from({ length: 12 }, () => query).join(" ");
+    // Add 20 ordinary notes that do NOT contain "socket", "retry", or "backoff" so nonNoiseCount = 21
+    // and dfThreshold = ceil(0.05 * 21) = 2, making "socket", "retry", "backoff" (df = 1) distinctive!
+    for (let i = 1; i <= 20; i += 1) {
       await writeFile(
-        path.join(sessionsDir, relName),
+        path.join(vault, "wiki", "concepts", `background-note-${String(i).padStart(2, "0")}.md`),
         [
           "---",
-          `title: "${title}"`,
-          "source: compact_distillation:subagent",
-          "privacy: safe",
-          "status: accepted",
+          `title: Background Concept ${i}`,
+          "type: concept",
+          "status: active",
           "---",
+          `# Background Concept ${i}`,
           "",
-          `# ${title}`,
-          "",
-          repeated,
-          "",
+          "General architectural notes on module boundaries and state persistence.",
         ].join("\n"),
         "utf8",
       );
     }
 
-    // Write 1 durable decision note that matches via Route (b) (3 of 4 terms in title).
+    // 22 noise plan journals (`wiki/artifacts/plan-*.log.md`) that echo every single word of the 14-term prompt
+    // multiple times in their title and body (so their raw lexical score is huge).
+    for (let i = 1; i <= 22; i += 1) {
+      const slug = `plan-20261025-slice-${String(i).padStart(2, "0")}.log.md`;
+      await writeFile(
+        path.join(vault, "wiki", "artifacts", slug),
+        [
+          "---",
+          `title: Plan Journal ${i} — ${fourteenTermPrompt}`,
+          "type: plan",
+          "status: active",
+          "---",
+          `# Plan Journal ${i}`,
+          "",
+          fourteenTermPrompt,
+          fourteenTermPrompt,
+          fourteenTermPrompt,
+        ].join("\n"),
+        "utf8",
+      );
+    }
+
+    // 1 durable decision note whose title has only the 3 distinctive terms ("Socket Retry Backoff")
+    // and does NOT contain the full 14-term phrase.
+    const decisionRelPath = path.join("wiki", "decisions", "socket-retry-backoff.md");
     await writeFile(
-      path.join(decisionsDir, "heliosgrine-quorum-handoff.md"),
+      path.join(vault, decisionRelPath),
       [
         "---",
-        "title: Heliosgrine federation quorum rule",
+        "title: Socket Retry Backoff Policy",
         "type: decision",
         "category: decision",
-        "status: accepted",
-        "privacy: safe",
+        "status: active",
         "---",
+        "# Socket Retry Backoff Policy",
         "",
-        "# Heliosgrine federation quorum rule",
-        "",
-        "Decision: The heliosgrine federation quorum requires two-thirds agreement before handoff.",
-        "",
+        "Decision: cap exponential retry backoff at 500ms on local Unix domain socket connections.",
       ].join("\n"),
       "utf8",
     );
 
-    const results = await searchVaultNotes(vault, query, 5, undefined, { rank: "ups_gate" });
-    assert.ok(results.length >= 1);
+    // Under legacy ranking with limit = 6, the 22 plan journals completely crowd out the decision note.
+    const legacyResults = await searchVaultNotes(vault, fourteenTermPrompt, 6, undefined, {
+      rank: "legacy",
+      candidates: "scan",
+    });
     assert.equal(
-      results[0].relativePath,
-      path.join("wiki", "decisions", "heliosgrine-quorum-handoff.md"),
-      "durable decision note must rank #1 ahead of all 20 noise notes",
+      legacyResults.some((r) => r.relativePath.includes("socket-retry-backoff")),
+      false,
+      "precondition: under legacy ranking, the 22 echoing plan journals crowd out the decision note from top 6",
     );
-    assert.equal(results[0].clearsGate, true);
-    assert.equal(results[0].durability, "durable");
 
-    const strong = extractStrongRecall(undefined, results, 0.55, 5);
-    assert.ok(strong, "durable note must produce a StrongRecall");
-    assert.equal(strong.topHits.length, 1, "only the durable note may enter topHits");
-    assert.equal(strong.topHits[0].title, "Heliosgrine federation quorum rule");
+    // Under ups_gate ranking, the decision note clears Route B (3 distinctive terms in title) and ranks #1,
+    // while all 22 plan journals are classified as noise (clearsGate: false, weightedScore <= 0.25).
+    const gatedResults = await searchVaultNotes(vault, fourteenTermPrompt, 18, undefined, {
+      rank: "ups_gate",
+      candidates: "scan",
+    });
 
-    // Also verify end-to-end through handleUserPromptSubmit.
-    const prevSocket = process.env.MINNI_SOCKET_PATH;
-    process.env.MINNI_SOCKET_PATH = path.join(vault, ".runtime", "missing.sock");
-    try {
-      const handlers = createHookHandlers({
-        agentId: "claude-code",
-        vaultPath: vault,
-        defaultWorkspaceId: "test-ws",
-        contextWindow: 200_000,
-        hooksEnabled: true,
-        auditPrefix: "hook_test",
-      });
-      const out = await handlers.handleUserPromptSubmit({
-        session_id: "crowdout-sess-1",
-        prompt: `Where is the ${query} documented?`,
-      });
-      const ctx = out.hookSpecificOutput?.additionalContext ?? "";
-      assert.match(ctx, /Heliosgrine federation quorum rule/);
-      assert.doesNotMatch(ctx, /Subagent Context|Session compaction/);
-    } finally {
-      if (prevSocket === undefined) delete process.env.MINNI_SOCKET_PATH;
-      else process.env.MINNI_SOCKET_PATH = prevSocket;
+    assert.ok(gatedResults.length > 0);
+    assert.equal(gatedResults[0].relativePath, decisionRelPath);
+    assert.equal(gatedResults[0].durability, "durable");
+    assert.equal(gatedResults[0].gateRoute, "b");
+    assert.equal(gatedResults[0].clearsGate, true);
+    assert.ok(gatedResults[0].weightedScore >= 0.55);
+
+    for (const r of gatedResults.slice(1)) {
+      if (r.relativePath.startsWith("wiki/artifacts/plan-")) {
+        assert.equal(r.durability, "noise");
+        assert.equal(r.clearsGate, false);
+        assert.ok(r.weightedScore <= 0.25);
+      }
     }
-  });
+
+    // Strong recall extraction + pointer names ONLY the durable decision note.
+    const strong = extractStrongRecall(undefined, gatedResults.slice(0, 6));
+    assert.ok(strong, "durable decision note must open strong recall gate");
+    assert.equal(strong.topHits.length, 1);
+    assert.equal(strong.topHits[0].title, "Socket Retry Backoff Policy");
+
+    const pointer = buildRecallPointer(strong);
+    assert.match(pointer, /Socket Retry Backoff Policy/);
+    assert.doesNotMatch(pointer, /Plan Journal/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -3,101 +3,111 @@ import test from "node:test";
 
 import {
   buildRecallPointer,
+  docHandleFor,
   RECALL_POINTER_MAX_CHARS,
-  selectPointerHits,
   vaultHandleForPath,
 } from "../dist/recall-state.js";
 
-test("buildRecallPointer formats 1, 2, and 3 hits on a single line <= 300 chars with handles and minni_drill guidance", () => {
-  const h1 = vaultHandleForPath("wiki/decisions/alpha.md");
-  const h2 = vaultHandleForPath("wiki/decisions/beta.md");
-  const h3 = "d:personal:42";
+const estTokens = (s) => Math.ceil(s.length / 4);
 
-  assert.match(h1, /^m:[0-9a-f]{8}$/);
-  assert.match(h2, /^m:[0-9a-f]{8}$/);
+test("buildRecallPointer: 3 gated hits with maximal 100-char titles and 90-150-char paths fit within 120 tokens with unclipped handles and no wikilinks", () => {
+  assert.equal(RECALL_POINTER_MAX_CHARS, 480);
 
-  const single = buildRecallPointer({
-    topScore: 0.91,
-    topHits: [
-      { title: "Alpha decision", wikilink: "[[wiki/decisions/alpha]]", score: 0.91, handle: h1 },
-    ],
-  });
-  assert.ok(!single.includes("\n"), "pointer must be single-line");
-  assert.ok(single.length <= RECALL_POINTER_MAX_CHARS);
-  assert.match(single, /^📓 1 relevant memory:/);
-  assert.ok(single.includes(`"Alpha decision" (${h1}) 0.91`), `got: ${single}`);
-  assert.ok(single.includes(`minni_drill(${h1})`), `got: ${single}`);
+  const rel1 = `wiki/decisions/${"a".repeat(85)}-auth-token-rotation.md`; // > 100 chars
+  const rel2 = `wiki/concepts/${"b".repeat(105)}-lease-fencing-quorum.md`; // > 120 chars
+  const rel3 = `wiki/sessions/${"c".repeat(105)}-socket-retry-backoff.md`; // 143 chars (90..150)
+  assert.ok(rel1.length >= 90 && rel1.length <= 150);
+  assert.ok(rel2.length >= 90 && rel2.length <= 150);
+  assert.ok(rel3.length >= 90 && rel3.length <= 150);
 
-  const two = buildRecallPointer({
-    topScore: 0.91,
-    topHits: [
-      { title: "Alpha decision", wikilink: "[[wiki/decisions/alpha]]", score: 0.91, handle: h1 },
-      { title: "Beta runbook", wikilink: "[[wiki/decisions/beta]]", score: 0.84, handle: h2 },
-    ],
-  });
-  assert.ok(!two.includes("\n"));
-  assert.ok(two.length <= RECALL_POINTER_MAX_CHARS);
-  assert.match(two, /^📓 2 relevant memories:/);
-  assert.ok(two.includes(`"Alpha decision" (${h1}) 0.91`), `got: ${two}`);
-  assert.ok(two.includes(`"Beta runbook" (${h2}) 0.84`), `got: ${two}`);
-  assert.ok(two.includes("minni_drill("), `got: ${two}`);
+  const title1 = `Decision_${"X".repeat(91)}`; // 100 chars
+  const title2 = `Concept_${"Y".repeat(92)}`; // 100 chars
+  const title3 = `Session_${"Z".repeat(92)}`; // 100 chars
+  assert.equal(title1.length, 100);
+  assert.equal(title2.length, 100);
+  assert.equal(title3.length, 100);
 
-  const three = buildRecallPointer({
-    topScore: 0.91,
-    topHits: [
-      { title: "Alpha decision", wikilink: "[[wiki/decisions/alpha]]", score: 0.91, handle: h1 },
-      { title: "Beta runbook", wikilink: "[[wiki/decisions/beta]]", score: 0.84, handle: h2 },
-      { title: "Gamma daemon doc", wikilink: "[[wiki/decisions/gamma]]", score: 0.79, handle: h3 },
-    ],
-  });
-  assert.ok(!three.includes("\n"));
-  assert.ok(three.length <= RECALL_POINTER_MAX_CHARS);
-  assert.match(three, /^📓 3 relevant memories:/);
-  assert.ok(three.includes(`"Alpha decision" (${h1}) 0.91`), `got: ${three}`);
-  assert.ok(three.includes(`"Beta runbook" (${h2}) 0.84`), `got: ${three}`);
-  assert.ok(three.includes(`"Gamma daemon doc" (${h3}) 0.79`), `got: ${three}`);
-});
+  const h1 = vaultHandleForPath(rel1);
+  const h2 = vaultHandleForPath(rel2);
+  const h3 = docHandleFor("episodic", 4412);
 
-test("selectPointerHits excludes hits outside the 0.15 score band and caps at 3 hits", () => {
-  const hits = [
-    { title: "Hit 1", wikilink: "[[a]]", score: 0.92, handle: "m:11111111" },
-    { title: "Hit 2", wikilink: "[[b]]", score: 0.83, handle: "m:22222222" },
-    { title: "Hit 3", wikilink: "[[c]]", score: 0.79, handle: "m:33333333" },
-    { title: "Hit 4 (in band but >3)", wikilink: "[[d]]", score: 0.78, handle: "m:44444444" },
-    { title: "Hit 5 (out of band)", wikilink: "[[e]]", score: 0.70, handle: "m:55555555" },
-  ];
-  const selected = selectPointerHits(hits, { maxHits: 3, scoreBand: 0.15 });
-  assert.equal(selected.length, 3);
-  assert.deepEqual(
-    selected.map((h) => h.title),
-    ["Hit 1", "Hit 2", "Hit 3"],
-  );
-
-  const wideSpread = [
-    { title: "Top quote", wikilink: "[[a]]", score: 0.95, handle: "m:11111111" },
-    { title: "Far second", wikilink: "[[b]]", score: 0.72, handle: "m:22222222" },
-  ];
-  const singleSelected = selectPointerHits(wideSpread, { maxHits: 3, scoreBand: 0.15 });
-  assert.equal(singleSelected.length, 1);
-  assert.equal(singleSelected[0].title, "Top quote");
-});
-
-test("buildRecallPointer enforces RECALL_POINTER_MAX_CHARS = 300 even with three 100-char titles", () => {
-  const longA = "A".repeat(100);
-  const longB = "B".repeat(100);
-  const longC = "C".repeat(100);
   const pointer = buildRecallPointer({
-    topScore: 0.9,
+    topScore: 0.92,
     topHits: [
-      { title: longA, wikilink: "[[wiki/a]]", score: 0.9, handle: "m:aaaaaaaa" },
-      { title: longB, wikilink: "[[wiki/b]]", score: 0.85, handle: "m:bbbbbbbb" },
-      { title: longC, wikilink: "[[wiki/c]]", score: 0.82, handle: "m:cccccccc" },
+      {
+        title: title1,
+        wikilink: `[[${rel1.replace(/\.md$/, "")}]]`,
+        relativePath: rel1,
+        route: "vault",
+        score: 0.92,
+      },
+      {
+        title: title2,
+        wikilink: `[[${rel2.replace(/\.md$/, "")}]]`,
+        relativePath: rel2,
+        route: "vault",
+        score: 0.86,
+      },
+      {
+        title: title3,
+        wikilink: `[[${rel3.replace(/\.md$/, "")}]]`,
+        scope: "episodic",
+        docId: 4412,
+        route: "daemon",
+        score: 0.88,
+      },
     ],
   });
-  assert.ok(!pointer.includes("\n"), "pointer must remain single-line");
+
+  assert.equal(pointer.includes("\n"), false, "pointer must be a single line");
   assert.ok(
-    pointer.length <= RECALL_POINTER_MAX_CHARS,
-    `expected pointer length <= ${RECALL_POINTER_MAX_CHARS}, got ${pointer.length}: ${pointer}`,
+    estTokens(pointer) <= 120,
+    `pointer must stay within 120 estimated tokens (got ${estTokens(pointer)} tokens, ${pointer.length} chars)`,
   );
-  assert.match(pointer, /minni_drill\(/);
+  assert.ok(pointer.length <= RECALL_POINTER_MAX_CHARS);
+  assert.ok(!pointer.includes("[["), "pointer must never print wikilinks");
+  assert.ok(!pointer.includes("]]"), "pointer must never print wikilinks");
+
+  // Unclipped handles and comma-separated multi-hit format.
+  assert.match(pointer, /^📓 3 relevant memories: /);
+  assert.ok(pointer.includes(`(${h3}) 0.88`), "daemon route leader handle and score must be intact");
+  assert.ok(pointer.includes(`(${h1}) 0.92`), "vault route leader handle and score must be intact");
+  assert.ok(pointer.includes(`(${h2}) 0.86`), "second vault hit handle and score must be intact");
+  assert.ok(pointer.includes(`"${title1}"`), "100-char title1 must not be clipped below 100 chars");
+  assert.ok(pointer.includes(`"${title2}"`), "100-char title2 must not be clipped below 100 chars");
+  assert.ok(pointer.includes(`"${title3}"`), "100-char title3 must not be clipped below 100 chars");
+  assert.match(pointer, /\. Consult minni_recall or minni_drill\.$/);
+});
+
+test("buildRecallPointer drops trailing hits rather than clipping handles when budget is constrained", () => {
+  const hits = [
+    {
+      title: "First memory with a moderately long descriptive title for budget testing",
+      wikilink: "[[wiki/decisions/first]]",
+      relativePath: "wiki/decisions/first.md",
+      route: "vault",
+      score: 0.91,
+    },
+    {
+      title: "Second memory with another descriptive title that fits inside two-hit budget",
+      wikilink: "[[wiki/decisions/second]]",
+      relativePath: "wiki/decisions/second.md",
+      route: "vault",
+      score: 0.87,
+    },
+    {
+      title: "Third memory whose addition would push the pointer past a tight 70-token cap",
+      wikilink: "[[wiki/decisions/third]]",
+      relativePath: "wiki/decisions/third.md",
+      route: "vault",
+      score: 0.83,
+    },
+  ];
+
+  const pointer = buildRecallPointer({ topScore: 0.91, topHits: hits }, { maxTokens: 70 });
+  assert.ok(estTokens(pointer) <= 70, `expected <= 70 tokens, got ${estTokens(pointer)}`);
+  assert.match(pointer, /^📓 2 relevant memories: /);
+  assert.ok(pointer.includes(`(${vaultHandleForPath("wiki/decisions/first.md")}) 0.91`));
+  assert.ok(pointer.includes(`(${vaultHandleForPath("wiki/decisions/second.md")}) 0.87`));
+  assert.ok(!pointer.includes("Third memory"), "third hit must be dropped cleanly");
 });

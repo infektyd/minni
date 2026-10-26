@@ -134,31 +134,49 @@ export function maskTelemetry(text: string): string {
       continue;
     }
     if (
-      /^📓\s*\d+\s+relevant\s+memor(?:y|ies)\b/i.test(trimmed) ||
-      /^⚠️\s*STALE\s+recall\s+pointer\b/i.test(trimmed)
+      /^📓\s*\d+\s+relevant\s+memor(?:y|ies)\b/iu.test(trimmed) ||
+      /^⚠️\s*STALE\s+recall\s+pointer\b/iu.test(trimmed) ||
+      /^PreToolUse(?::[A-Za-z0-9_.-]+)?\s+hook\s+additional\s+context:/iu.test(trimmed)
     ) {
       continue;
     }
     if (
-      /^Minni recall guard\s*\(/i.test(trimmed) ||
-      /^\[Minni Subagent Brief\]$/i.test(trimmed) ||
-      /^Minni subagent brief\b/i.test(trimmed)
+      /^📓\s+Minni\s+recall\s+guard:/iu.test(trimmed) ||
+      /^Minni\s+recall\s+guard\b/iu.test(trimmed) ||
+      /^Top\s+\d+\s+relevant\s+memor(?:y|ies)\b/iu.test(trimmed) ||
+      /^\[Minni\s+Subagent\s+Brief\]$/iu.test(trimmed) ||
+      /^Minni\s+subagent\s+brief\b/iu.test(trimmed)
     ) {
-      inTelemetryBlock =
-        trimmed.endsWith(":") || /^\[Minni Subagent Brief\]$/i.test(trimmed);
+      inTelemetryBlock = true;
       continue;
     }
     if (
-      /^Treat recalled snippets as evidence\b/i.test(trimmed) ||
-      /^You have unconsulted recall for this turn\b/i.test(trimmed)
+      /^Treat\s+recalled\s+snippets\s+as\s+evidence\b/iu.test(trimmed) ||
+      /^You\s+have\s+unconsulted\s+recall\s+for\s+this\s+turn\b/iu.test(trimmed)
     ) {
       inTelemetryBlock = false;
       continue;
     }
-    if (inTelemetryBlock && /^\s*-\s+"/.test(line)) {
+    if (
+      /^-\s+"[^"]+"\s+(?:\[\[[^\]]+\]\]|\([md]:[0-9a-fA-Z:_.-]+\))\s*(?:\(score\s+[0-9.]+\)|—)/u.test(
+        trimmed,
+      ) ||
+      /^-\s+\[\[[^\]]+\]\]\s+—\s+.*\((?:score=[0-9.?]+)\)/u.test(trimmed) ||
+      /^-\s+\([md]:[0-9a-fA-Z:_.-]+\)\s+/u.test(trimmed)
+    ) {
       continue;
     }
-    inTelemetryBlock = false;
+    if (inTelemetryBlock) {
+      if (
+        /^(?:Active\s+thread|Goal|Current\s+slice|Relevant\s+memories):/iu.test(trimmed) ||
+        /^-\s+"/.test(trimmed) ||
+        /^-\s+\([md]:/i.test(trimmed) ||
+        /^-\s+\[\[/.test(trimmed)
+      ) {
+        continue;
+      }
+      inTelemetryBlock = false;
+    }
 
     if (trimmed.startsWith("Minni session receipt:")) continue;
     if (/^>\s*hook_[a-z0-9_]+/i.test(trimmed)) continue;

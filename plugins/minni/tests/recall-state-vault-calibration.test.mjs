@@ -1,244 +1,240 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { extractStrongRecall } from "../dist/recall-state.js";
-import { ensureVault, searchVaultNotes } from "../dist/vault.js";
+import { searchVaultNotes } from "../dist/vault.js";
 
 async function withTempVault(fn) {
-  const root = await mkdtemp(path.join(tmpdir(), "minni-s3c-vault-cal-"));
+  const root = await mkdtemp(path.join(os.tmpdir(), "minni-s3c-vault-cal-"));
+  const vault = path.join(root, "vault");
+  await mkdir(path.join(vault, "wiki", "decisions"), { recursive: true });
+  await mkdir(path.join(vault, "wiki", "artifacts"), { recursive: true });
+  await mkdir(path.join(vault, "wiki", "sessions"), { recursive: true });
   try {
-    await ensureVault(root);
-    return await fn(root);
+    await fn(vault);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 }
 
-test("Route (a): exact phrase match (>= 24 chars, >= 2 terms) clears gate at 1.0 with gateRoute 'a'", async () => {
+test("ups_gate Route A: exact phrase hit >= 24 chars with >= 2 tokens clears gate with gateScore=1.0", async () => {
   await withTempVault(async (vault) => {
-    const dir = path.join(vault, "wiki", "decisions");
-    await mkdir(dir, { recursive: true });
-    const phrase = "quasar_flux_capacitor_stabilizer_protocol";
+    const decisionPath = path.join(vault, "wiki", "decisions", "zephyr-quorum-lease.md");
     await writeFile(
-      path.join(dir, "quasar-protocol.md"),
+      decisionPath,
       [
         "---",
-        "title: System architecture notes",
+        "title: Core Consensus Notes",
         "type: decision",
-        "status: accepted",
-        "privacy: safe",
+        "status: active",
         "---",
+        "# Core Consensus Notes",
         "",
-        "# System architecture notes",
-        "",
-        `Always initialize the ${phrase} before opening the main valve.`,
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-
-    const results = await searchVaultNotes(vault, phrase, 5, undefined, { rank: "ups_gate" });
-    assert.equal(results.length, 1);
-    const hit = results[0];
-    assert.equal(hit.clearsGate, true);
-    assert.equal(hit.gateRoute, "a");
-    assert.equal(hit.gateScore, 1.0);
-    assert.equal(hit.weightedScore, 1.0);
-    assert.equal(hit.durability, "durable");
-  });
-});
-
-test("Route (b): title + coverage (>= 2 title hits and (>= 3 title hits or titleCov >= 0.60)) clears gate in [0.55, 0.85]", async () => {
-  await withTempVault(async (vault) => {
-    const dir = path.join(vault, "wiki", "decisions");
-    await mkdir(dir, { recursive: true });
-    await writeFile(
-      path.join(dir, "zircon-token-rotation.md"),
-      [
-        "---",
-        "title: Zircon token rotation schedule",
-        "type: decision",
-        "status: accepted",
-        "privacy: safe",
-        "---",
-        "",
-        "# Zircon token rotation schedule",
-        "",
-        "Rotate zircon credentials every 30 days using the automated key escrow.",
-        "",
+        "Always enforce zephyr quorum lease fencing protocol before promoting a standby node.",
       ].join("\n"),
       "utf8",
     );
 
     const results = await searchVaultNotes(
       vault,
-      "zircon token rotation policy",
+      "zephyr quorum lease fencing protocol",
       5,
       undefined,
-      { rank: "ups_gate" },
+      { rank: "ups_gate", candidates: "scan" },
     );
+
     assert.equal(results.length, 1);
-    const hit = results[0];
-    assert.equal(hit.clearsGate, true);
-    assert.equal(hit.gateRoute, "b");
-    assert.ok(
-      typeof hit.gateScore === "number" && hit.gateScore >= 0.55 && hit.gateScore <= 0.85,
-      `expected Route (b) gateScore in [0.55, 0.85], got ${hit.gateScore}`,
-    );
-    assert.equal(hit.weightedScore, hit.gateScore);
+    assert.equal(results[0].gateRoute, "a");
+    assert.equal(results[0].gateScore, 1.0);
+    assert.equal(results[0].weightedScore, 1.0);
+    assert.equal(results[0].clearsGate, true);
+    assert.equal(results[0].durability, "durable");
   });
 });
 
-test("Route (c): dense body coverage (>= 4 query terms in body and bodyCov >= 0.75) clears gate in [0.55, 0.70]", async () => {
+test("ups_gate 1-word query (>= 24 chars) never opens Route A", async () => {
   await withTempVault(async (vault) => {
-    const dir = path.join(vault, "wiki", "concepts");
-    await mkdir(dir, { recursive: true });
+    const longSingleToken = "quasar_flux_capacitor_stabilizer_protocol";
+    assert.ok(longSingleToken.length >= 24);
     await writeFile(
-      path.join(dir, "general-ops-runbook.md"),
+      path.join(vault, "wiki", "decisions", "single-token.md"),
       [
         "---",
-        "title: General operational runbook",
-        "type: concept",
-        "status: accepted",
-        "privacy: safe",
+        "title: Single Token Identifier Note",
+        "type: decision",
+        "status: active",
         "---",
+        "# Single Token Identifier Note",
         "",
-        "# General operational runbook",
-        "",
-        "During failover, check beryllium, germanium, strontium, and palladium sensors before restarting.",
-        "",
+        `The identifier ${longSingleToken} appears verbatim in the body.`,
       ].join("\n"),
       "utf8",
     );
 
-    const results = await searchVaultNotes(
-      vault,
-      "beryllium germanium strontium palladium tungsten",
-      5,
-      undefined,
-      { rank: "ups_gate" },
-    );
-    assert.equal(results.length, 1);
-    const hit = results[0];
-    assert.equal(hit.clearsGate, true);
-    assert.equal(hit.gateRoute, "c");
-    assert.ok(
-      typeof hit.gateScore === "number" && hit.gateScore >= 0.55 && hit.gateScore <= 0.70,
-      `expected Route (c) gateScore in [0.55, 0.70], got ${hit.gateScore}`,
-    );
-    assert.equal(hit.weightedScore, hit.gateScore);
-  });
-});
-
-test("Weak matches (1/4 title terms or 2/5 body terms) fail the UPS gate and do not clear", async () => {
-  await withTempVault(async (vault) => {
-    const dir = path.join(vault, "wiki", "concepts");
-    await mkdir(dir, { recursive: true });
-    await writeFile(
-      path.join(dir, "weak-title.md"),
-      [
-        "---",
-        "title: Cobalt overview",
-        "type: concept",
-        "status: accepted",
-        "privacy: safe",
-        "---",
-        "",
-        "# Cobalt overview",
-        "",
-        "Cobalt is a transition metal.",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await writeFile(
-      path.join(dir, "weak-body.md"),
-      [
-        "---",
-        "title: Miscellaneous notes",
-        "type: concept",
-        "status: accepted",
-        "privacy: safe",
-        "---",
-        "",
-        "# Miscellaneous notes",
-        "",
-        "Mentions rhodium and iridium in passing.",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-
-    const titleResults = await searchVaultNotes(
-      vault,
-      "cobalt lanthanum cerium praseodymium",
-      5,
-      undefined,
-      { rank: "ups_gate" },
-    );
-    assert.equal(titleResults.length, 1);
-    assert.equal(titleResults[0].clearsGate, false);
-    assert.equal(titleResults[0].gateRoute, null);
-    assert.equal(titleResults[0].gateScore, 0);
-    assert.equal(titleResults[0].weightedScore, 0);
-    assert.equal(extractStrongRecall(undefined, titleResults), null);
-
-    const bodyResults = await searchVaultNotes(
-      vault,
-      "rhodium iridium osmium ruthenium platinum",
-      5,
-      undefined,
-      { rank: "ups_gate" },
-    );
-    assert.equal(bodyResults.length, 1);
-    assert.equal(bodyResults[0].clearsGate, false);
-    assert.equal(bodyResults[0].gateRoute, null);
-    assert.equal(bodyResults[0].gateScore, 0);
-    assert.equal(bodyResults[0].weightedScore, 0);
-    assert.equal(extractStrongRecall(undefined, bodyResults), null);
-  });
-});
-
-test("Noise notes get weightedScore = gateScore * rho (default rho = 0 -> clearsGate = false)", async () => {
-  await withTempVault(async (vault) => {
-    const sessionsDir = path.join(vault, "wiki", "sessions");
-    const conceptsDir = path.join(vault, "wiki", "concepts");
-    await mkdir(sessionsDir, { recursive: true });
-    await mkdir(conceptsDir, { recursive: true });
-
-    const phrase = "neodymium_magnet_quench_recovery_procedure";
-    await writeFile(
-      path.join(sessionsDir, "20260617-compact-abc.md"),
-      `---\ntitle: Session compaction\nprivacy: safe\n---\n\n# Session compaction\n\n${phrase}\n`,
-      "utf8",
-    );
-    await writeFile(
-      path.join(conceptsDir, "subagent-ctx.md"),
-      `---\ntitle: "[Subagent Context] Worker run"\nsource: compact_distillation:subagent\nprivacy: safe\n---\n\n# [Subagent Context] Worker run\n\n${phrase}\n`,
-      "utf8",
-    );
-
-    const defaultResults = await searchVaultNotes(vault, phrase, 5, undefined, { rank: "ups_gate" });
-    assert.equal(defaultResults.length, 2);
-    for (const hit of defaultResults) {
-      assert.equal(hit.durability, "noise");
-      assert.equal(hit.gateRoute, "a");
-      assert.equal(hit.gateScore, 1.0);
-      assert.equal(hit.weightedScore, 0);
-      assert.equal(hit.clearsGate, false);
-    }
-    assert.equal(extractStrongRecall(undefined, defaultResults), null);
-
-    const rhoResults = await searchVaultNotes(vault, phrase, 5, undefined, {
+    const results = await searchVaultNotes(vault, longSingleToken, 5, undefined, {
       rank: "ups_gate",
-      rho: 0.6,
+      candidates: "scan",
     });
-    for (const hit of rhoResults) {
-      assert.equal(hit.weightedScore, 0.6);
-      assert.equal(hit.clearsGate, true);
+
+    assert.equal(results.length, 1);
+    assert.notEqual(results[0].gateRoute, "a", "1-word query must never open Route A");
+    assert.equal(results[0].gateRoute, null);
+    assert.equal(results[0].clearsGate, false);
+    assert.ok(results[0].gateScore <= 0.5);
+  });
+});
+
+test("ups_gate Route B vs body-only: >= k_q distinctive terms with >= 1 in title/heading clears; body-only stays <= 0.50", async () => {
+  await withTempVault(async (vault) => {
+    // Seed 20 unrelated non-noise notes so N=22 and ceil(0.05 * 22) = 2, allowing
+    // both test notes below to share the same 3 distinctive terms (df=2 <= 2).
+    for (let i = 0; i < 20; i += 1) {
+      await writeFile(
+        path.join(vault, "wiki", "decisions", `bg-${i}.md`),
+        `# Background Decision ${i}\n\nUnrelated baseline note ${i}.\n`,
+        "utf8",
+      );
     }
+
+    // Route B match: 3 distinctive terms ("helios", "backpressure", "watermark"), with "helios" in title
+    // and "backpressure" in a markdown heading, and "watermark" in body.
+    await writeFile(
+      path.join(vault, "wiki", "decisions", "helios-heading.md"),
+      [
+        "---",
+        "title: Helios stream controller",
+        "type: decision",
+        "status: active",
+        "---",
+        "# Stream controller",
+        "",
+        "## Backpressure handling",
+        "",
+        "Raise the watermark threshold when downstream queues saturate.",
+      ].join("\n"),
+      "utf8",
+    );
+
+    // Body-only match: has all 4 distinctive terms in body, but 0 in title or headings, and no phrase match.
+    await writeFile(
+      path.join(vault, "wiki", "decisions", "body-only.md"),
+      [
+        "---",
+        "title: General operational notes",
+        "type: decision",
+        "status: active",
+        "---",
+        "# General operational notes",
+        "",
+        "## Overview",
+        "",
+        "First we check helios. Later we inspect backpressure. Finally watermark and jitter are logged.",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const results = await searchVaultNotes(
+      vault,
+      "configure helios backpressure watermark jitter",
+      10,
+      undefined,
+      { rank: "ups_gate", candidates: "scan" },
+    );
+
+    const routeBHit = results.find((r) => r.relativePath.endsWith("helios-heading.md"));
+    const bodyOnlyHit = results.find((r) => r.relativePath.endsWith("body-only.md"));
+    assert.ok(routeBHit, "Route B note must be returned");
+    assert.ok(bodyOnlyHit, "Body-only note must be returned");
+
+    assert.equal(routeBHit.gateRoute, "b");
+    assert.equal(routeBHit.clearsGate, true);
+    assert.ok(routeBHit.gateScore >= 0.55);
+    assert.equal(routeBHit.coveredDistinctive, 3);
+    assert.deepEqual(routeBHit.contributingTerms, {
+      title: ["helios"],
+      heading: ["backpressure"],
+      body: ["watermark"],
+    });
+
+    assert.equal(bodyOnlyHit.gateRoute, null, "body-only match must have gateRoute = null");
+    assert.equal(bodyOnlyHit.clearsGate, false, "body-only match must not clear gate");
+    assert.ok(bodyOnlyHit.gateScore <= 0.5, `expected gateScore <= 0.50, got ${bodyOnlyHit.gateScore}`);
+    assert.equal(results[0].relativePath, routeBHit.relativePath, "clearing note must rank above non-clearing note");
+  });
+});
+
+test("ups_gate DF threshold: ubiquitous terms (df > ceil(0.05 * N)) are not distinctive and cannot open Route B", async () => {
+  await withTempVault(async (vault) => {
+    // Create 25 non-noise notes so ceil(0.05 * 25) = 2.
+    // Put "service", "config", "update" in 10 notes (df = 10 > 2 -> NOT distinctive).
+    for (let i = 0; i < 10; i += 1) {
+      await writeFile(
+        path.join(vault, "wiki", "decisions", `common-${i}.md`),
+        `# Routine Note ${i}\n\nContains service, config, and update tokens ${i}.\n`,
+        "utf8",
+      );
+    }
+    for (let i = 10; i < 25; i += 1) {
+      await writeFile(
+        path.join(vault, "wiki", "decisions", `filler-${i}.md`),
+        `# Unrelated Note ${i}\n\nNothing matching here.\n`,
+        "utf8",
+      );
+    }
+
+    // Query has 3 ubiquitous terms ("service", "config", "update") and only 1 distinctive term ("kestrel").
+    // Avoid contiguous query substring so Route A does not fire and Route B is tested in isolation.
+    await writeFile(
+      path.join(vault, "wiki", "decisions", "kestrel-target.md"),
+      `# Kestrel — Service, Config, and Update\n\nAdjust the kestrel daemon's service settings and config during an update.\n`,
+      "utf8",
+    );
+
+    const results = await searchVaultNotes(
+      vault,
+      "kestrel service config update",
+      5,
+      undefined,
+      { rank: "ups_gate", candidates: "scan" },
+    );
+
+    const target = results.find((r) => r.relativePath.endsWith("kestrel-target.md"));
+    assert.ok(target);
+    assert.equal(target.coveredDistinctive, 1, "only kestrel is distinctive (df <= 2)");
+    assert.equal(target.gateRoute, null, "1 distinctive term (< k_q=3) must not open Route B");
+    assert.equal(target.clearsGate, false);
+  });
+});
+
+test("ups_gate noise notes receive classWeight = 0.25 and never clear the gate regardless of rho", async () => {
+  await withTempVault(async (vault) => {
+    const phrase = "chronos distributed lock lease renewal invariant";
+    await writeFile(
+      path.join(vault, "wiki", "artifacts", "plan-chronos.log.md"),
+      `# Chronos Distributed Lock Lease Renewal Invariant\n\n${phrase}\n`,
+      "utf8",
+    );
+
+    const resultsDefault = await searchVaultNotes(vault, phrase, 5, undefined, {
+      rank: "ups_gate",
+      candidates: "scan",
+    });
+    assert.equal(resultsDefault.length, 1);
+    assert.equal(resultsDefault[0].durability, "noise");
+    assert.equal(resultsDefault[0].gateRoute, "a");
+    assert.equal(resultsDefault[0].gateScore, 1.0);
+    assert.equal(resultsDefault[0].weightedScore, 0.25);
+    assert.equal(resultsDefault[0].clearsGate, false);
+
+    // Passing rho = 0.8 (distinctive-term fraction parameter) must NOT alter noise classWeight or allow noise to clear.
+    const resultsCustomRho = await searchVaultNotes(vault, phrase, 5, undefined, {
+      rank: "ups_gate",
+      candidates: "scan",
+      rho: 0.8,
+    });
+    assert.equal(resultsCustomRho[0].weightedScore, 0.25);
+    assert.equal(resultsCustomRho[0].clearsGate, false);
   });
 });

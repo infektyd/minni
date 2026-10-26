@@ -1,7 +1,7 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { existsSync, readFileSync } from "node:fs";
-import { readFile, stat, readdir } from "node:fs/promises";
+import { stat, readdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
@@ -23,7 +23,7 @@ import {
   auditTail,
   ensureVault,
   recordAudit,
-  resolveVaultHandleRelPath,
+  resolveSafeVaultHandleNote,
   searchVaultNotes,
   vaultExists,
   writeInbox,
@@ -476,31 +476,20 @@ export function partitionRecallResultsNoiseLast<T>(results: readonly T[]): T[] {
     const rec = (item ?? {}) as Record<string, unknown>;
     const title = typeof rec.title === "string" ? rec.title : "";
     const isNoise =
+      rec.durability === "noise" ||
+      /^\s*\[Subagent Context\]/i.test(title) ||
       durabilityOf({
-        relativePath:
-          typeof rec.relativePath === "string"
-            ? rec.relativePath
-            : typeof rec.source === "string"
-              ? rec.source
-              : typeof rec.filename === "string"
-                ? rec.filename
-                : undefined,
-        category:
-          typeof rec.category === "string"
-            ? rec.category
-            : typeof rec.type === "string"
-              ? rec.type
-              : undefined,
-        tags: Array.isArray(rec.tags)
-          ? rec.tags.filter((t): t is string => typeof t === "string")
-          : undefined,
-        source:
-          typeof rec.source_kind === "string"
-            ? rec.source_kind
-            : typeof rec.source === "string"
-              ? rec.source
-              : undefined,
-      }) === "noise" || /^\s*\[Subagent Context\]/i.test(title);
+        ...rec,
+        path:
+          rec.relativePath ??
+          rec.rel_path ??
+          rec.path ??
+          rec.filename ??
+          rec.wikilink,
+        title,
+        content: rec.content ?? rec.snippet ?? rec.text ?? rec.body,
+        source: rec.source_kind ?? rec.source,
+      }) === "noise";
     if (isNoise) noise.push(item);
     else nonNoise.push(item);
   }
@@ -908,6 +897,14 @@ export interface DrillMemoryInput {
   sessionId?: string;
 }
 
+function xmlAttrEscapeDrill(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 export async function drillMemory(
   inputOrConfig: DrillMemoryInput | TransportConfigLike,
   requesterOrInput?: JsonRpcRequester | DrillMemoryInput,
@@ -916,7 +913,12 @@ export async function drillMemory(
   const isTwoObjectArgs =
     typeof requesterOrInput === "object" &&
     requesterOrInput !== null &&
-    !("daemonSocketPath" in requesterOrInput);
+    ("resultIds" in requesterOrInput ||
+      "chunkIds" in requesterOrInput ||
+      "references" in requesterOrInput ||
+      "handle" in requesterOrInput ||
+      "wikilink" in requesterOrInput ||
+      "depth" in requesterOrInput);
   const config: TransportConfigLike | undefined = isTwoObjectArgs
     ? (inputOrConfig as TransportConfigLike)
     : undefined;
@@ -934,163 +936,205 @@ export async function drillMemory(
     : baseRequester;
 
   const effectiveVaultPath = input.vaultPath ?? config?.vaultPath ?? DEFAULT_VAULT_PATH;
-  const rawHandle =
-    typeof input.handle === "string" && input.handle.trim()
-      ? input.handle.trim()
-      : typeof input.wikilink === "string" && input.wikilink.trim()
-        ? input.wikilink.trim()
-        : Array.isArray(input.references) &&
-            input.references.length === 1 &&
-            typeof input.references[0] === "string"
-          ? input.references[0].trim()
-          : undefined;
 
-  if (rawHandle && rawHandle.startsWith("m:")) {
-    if (!/^m:[0-9a-f]{8}$/i.test(rawHandle)) {
-      return {
-        ok: false,
-        error: `invalid_handle: ${rawHandle}`,
-        data: { found: false, handle: rawHandle },
-      };
+  const rawRefs: unknown[] =
+    Array.isArray(input.references) && input.references.length > 0
+      ? [...input.references]
+      : typeof input.handle === "string" && input.handle.trim()
+        ? [input.handle.trim()]
+        : typeof input.wikilink === "string" && input.wikilink.trim()
+          ? [input.wikilink.trim()]
+          : [];
+
+  const hasHandleRef = rawRefs.some(
+    (r) => typeof r === "string" && (r.trim().startsWith("m:") || r.trim().startsWith("d:")),
+  );
+
+  if (hasHandleRef) {
+    const localResults: Array<Record<string, unknown>> = [];
+    const daemonReferences: Array<unknown> = [];
+    const daemonMeta: Array<{
+      handle?: string;
+      doc_id?: number;
+      src?: string;
+      source?: string;
+      source_unverified?: boolean;
+      sessionEntry?: Awaited<ReturnType<typeof readSessionHandle>>;
+    }> = [];
+
+    for (const rawRef of rawRefs) {
+      if (typeof rawRef === "string" && rawRef.trim().startsWith("m:")) {
+        const trimmed = rawRef.trim();
+        if (!/^m:[0-9a-f]{8}$/i.test(trimmed)) {
+          localResults.push({
+            handle: trimmed,
+            status: "unresolved",
+            reason: "invalid_handle",
+            found: false,
+          });
+          continue;
+        }
+        const normalizedHandle = trimmed.toLowerCase();
+        const resolved = await resolveSafeVaultHandleNote(effectiveVaultPath, normalizedHandle);
+        if (resolved.status === "unresolved") {
+          localResults.push({
+            handle: normalizedHandle,
+            status: "unresolved",
+            reason: resolved.reason,
+            found: false,
+          });
+          continue;
+        }
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
+        localResults.push({
+          handle: normalizedHandle,
+          status: "resolved",
+          found: true,
+          wikilink: resolved.wikilink,
+          relativePath: resolved.relativePath,
+          source: resolved.relativePath,
+          title: resolved.title,
+          text: wrapped,
+          content: wrapped,
+          raw_content: resolved.content,
+        });
+        continue;
+      }
+
+      if (typeof rawRef === "string" && rawRef.trim().startsWith("d:")) {
+        const trimmed = rawRef.trim();
+        const match = /^d:([a-z0-9_-]+):(\d+)$/i.exec(trimmed);
+        if (!match) {
+          localResults.push({
+            handle: trimmed,
+            status: "unresolved",
+            reason: "invalid_handle",
+            found: false,
+          });
+          continue;
+        }
+        const src = match[1].toLowerCase();
+        const docId = Number(match[2]);
+        const sessionEntry = await readSessionHandle(effectiveVaultPath, input.sessionId, trimmed);
+        const sourceUnverified = sessionEntry === null;
+        const entrySource =
+          sessionEntry?.source ?? sessionEntry?.relativePath ?? undefined;
+        daemonReferences.push(
+          !sourceUnverified && entrySource
+            ? { doc_id: docId, src, source: entrySource }
+            : { doc_id: docId, src },
+        );
+        daemonMeta.push({
+          handle: trimmed,
+          doc_id: docId,
+          src,
+          ...(entrySource ? { source: entrySource } : {}),
+          source_unverified: sourceUnverified,
+          sessionEntry,
+        });
+        continue;
+      }
+
+      daemonReferences.push(rawRef);
+      daemonMeta.push({});
     }
-    const normalizedHandle = rawHandle.toLowerCase();
-    const sessionEntry = await readSessionHandle(
-      effectiveVaultPath,
-      input.sessionId,
-      normalizedHandle,
-    );
-    const relPath =
-      sessionEntry?.relativePath ??
-      (await resolveVaultHandleRelPath(effectiveVaultPath, normalizedHandle));
-    if (!relPath) {
-      return {
-        ok: false,
-        error: `handle_not_found: ${normalizedHandle}`,
-        data: { found: false, handle: normalizedHandle },
-      };
-    }
-    try {
-      const fullPath = path.join(effectiveVaultPath, relPath);
-      assertWriteTargetUnder(fullPath, effectiveVaultPath);
-      const content = await readFile(fullPath, "utf8");
-      const wikilink = `[[${relPath.replace(/\.md$/i, "")}]]`;
+
+    // Pure local `m:` resolution (no daemon references needed): succeeds even
+    // when the daemon is completely down.
+    if (daemonReferences.length === 0 && !input.resultIds && !input.chunkIds) {
+      const anyResolved = localResults.some((r) => r.status === "resolved");
+      const first = localResults[0] ?? { status: "unresolved", found: false };
+      if (!anyResolved) {
+        const errCode =
+          first.reason === "invalid_handle"
+            ? `invalid_handle: ${String(first.handle ?? "")}`
+            : first.reason === "unsafe"
+              ? `unsafe_handle: ${String(first.handle ?? "")}`
+              : `handle_not_found: ${String(first.handle ?? "")}`;
+        return {
+          ok: false,
+          error: errCode,
+          data: {
+            ...first,
+            results: localResults,
+            items: localResults,
+          },
+        };
+      }
       return {
         ok: true,
         source: "vault-fallback",
         data: {
-          found: true,
-          handle: normalizedHandle,
-          wikilink,
-          relativePath: relPath,
-          source: relPath,
-          content,
-          results: [
-            {
-              handle: normalizedHandle,
-              wikilink,
-              source: relPath,
-              text: content,
-              content,
-            },
-          ],
+          ...first,
+          results: localResults,
+          items: localResults,
         },
       };
-    } catch (err) {
-      return {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-        data: { found: false, handle: normalizedHandle },
-      };
     }
-  }
 
-  if (rawHandle && rawHandle.startsWith("d:")) {
-    const match = /^d:([a-z0-9_-]+):(\d+)$/i.exec(rawHandle);
-    if (!match) {
-      return {
-        ok: false,
-        error: `invalid_handle: ${rawHandle}`,
-        data: { found: false, handle: rawHandle },
-      };
-    }
-    const scope = match[1].toLowerCase();
-    const docId = Number(match[2]);
-    const sessionEntry = await readSessionHandle(effectiveVaultPath, input.sessionId, rawHandle);
-    const sourceUnverified = sessionEntry === null;
-    const rpcSrc = scope === "personal" ? "p" : scope === "combined" ? "c" : scope;
     const rpcRes = (await jsonRpcSocketRequestWithFallbackRequester(
       "sm_drill",
       {
-        references: [
-          {
-            doc_id: docId,
-            src: rpcSrc,
-            ...(sessionEntry?.wikilink ? { wikilink: sessionEntry.wikilink } : {}),
-          },
-        ],
+        ...(input.resultIds ? { result_ids: input.resultIds } : {}),
+        ...(input.chunkIds ? { chunk_ids: input.chunkIds } : {}),
+        references: daemonReferences,
         depth: input.depth ?? "snippet",
       },
       requester,
     )) as JsonResult<Record<string, unknown>>;
 
     if (rpcRes.ok && rpcRes.data) {
+      const rawDaemonItems = Array.isArray(rpcRes.data.results)
+        ? (rpcRes.data.results as Array<Record<string, unknown>>)
+        : Array.isArray(rpcRes.data.items)
+          ? (rpcRes.data.items as Array<Record<string, unknown>>)
+          : [];
+      const mergedDaemonItems = daemonMeta.map((meta, idx) => {
+        const dItem = rawDaemonItems[idx] ?? {};
+        return {
+          ...dItem,
+          ...(meta.handle ? { handle: meta.handle } : {}),
+          ...(meta.doc_id !== undefined ? { doc_id: meta.doc_id } : {}),
+          ...(meta.src ? { src: meta.src } : {}),
+          ...(meta.source && !dItem.source ? { source: meta.source } : {}),
+          ...(meta.source_unverified !== undefined
+            ? { source_unverified: meta.source_unverified }
+            : {}),
+        };
+      });
+      const combinedResults = [...localResults, ...mergedDaemonItems];
+      const firstMeta = daemonMeta[0] ?? {};
       return {
         ok: true,
         data: {
           ...rpcRes.data,
           found: true,
-          handle: rawHandle,
-          doc_id: docId,
-          src: scope,
-          source_unverified: sourceUnverified,
+          ...(firstMeta.handle ? { handle: firstMeta.handle } : {}),
+          ...(firstMeta.doc_id !== undefined ? { doc_id: firstMeta.doc_id } : {}),
+          ...(firstMeta.src ? { src: firstMeta.src } : {}),
+          ...(firstMeta.source_unverified !== undefined
+            ? { source_unverified: firstMeta.source_unverified }
+            : {}),
+          results: combinedResults,
+          items: combinedResults,
         },
       };
     }
 
-    if (!sourceUnverified && sessionEntry?.relativePath) {
-      try {
-        const fullPath = path.join(effectiveVaultPath, sessionEntry.relativePath);
-        assertWriteTargetUnder(fullPath, effectiveVaultPath);
-        const content = await readFile(fullPath, "utf8");
-        return {
-          ok: true,
-          source: "vault-fallback",
-          data: {
-            found: true,
-            handle: rawHandle,
-            doc_id: docId,
-            src: scope,
-            source_unverified: false,
-            wikilink: sessionEntry.wikilink,
-            relativePath: sessionEntry.relativePath,
-            source: sessionEntry.relativePath,
-            content,
-            results: [
-              {
-                handle: rawHandle,
-                doc_id: docId,
-                src: scope,
-                source: sessionEntry.relativePath,
-                text: content,
-                content,
-              },
-            ],
-          },
-        };
-      } catch {
-        // Fall through to error.
-      }
-    }
-
+    const firstMeta = daemonMeta[0] ?? {};
     return {
       ok: false,
-      error: rpcRes.error ?? `handle_not_found: ${rawHandle}`,
+      error: rpcRes.error ?? `handle_not_found: ${String(firstMeta.handle ?? "")}`,
       data: {
         found: false,
-        handle: rawHandle,
-        doc_id: docId,
-        src: scope,
-        source_unverified: sourceUnverified,
+        ...(firstMeta.handle ? { handle: firstMeta.handle } : {}),
+        ...(firstMeta.doc_id !== undefined ? { doc_id: firstMeta.doc_id } : {}),
+        ...(firstMeta.src ? { src: firstMeta.src } : {}),
+        ...(firstMeta.source_unverified !== undefined
+          ? { source_unverified: firstMeta.source_unverified }
+          : {}),
+        results: localResults,
+        items: localResults,
       },
     };
   }

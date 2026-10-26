@@ -899,11 +899,11 @@ function topHitDetails(
   const daemonResults = response && Array.isArray(response.results) ? response.results : [];
   for (const raw of daemonResults) {
     const rec = (raw ?? {}) as Record<string, unknown>;
-    const hit = extractStrongRecall({ results: [raw] }, [], threshold, 1)?.topHits[0];
+    const hit = extractStrongRecall({ results: [raw] }, [], threshold, 1, { vaultPath })?.topHits[0];
     if (hit) pool.push({ hit, ref: daemonRef(rec), body: daemonBodyText(rec) });
   }
   for (const result of vaultResults) {
-    const hit = extractStrongRecall(undefined, [result], threshold, 1)?.topHits[0];
+    const hit = extractStrongRecall(undefined, [result], threshold, 1, { vaultPath })?.topHits[0];
     if (hit) {
       pool.push({
         hit,
@@ -977,7 +977,9 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
     const pointerItems: SurfacedItem[] = [];
     for (let i = 0; i < namedHits.length; i += 1) {
       const hit = namedHits[i];
-      const detailIdx = input.strong.topHits.indexOf(hit);
+      const detailIdx = input.strong.topHits.findIndex(
+        (h) => (h.mkey && hit.mkey && h.mkey === hit.mkey) || sameHit(h, hit),
+      );
       const mkey = (detailIdx >= 0 ? details[detailIdx]?.mkey : undefined) ?? hit.mkey ?? null;
       if (!mkey) continue;
       pointerItems.push({
