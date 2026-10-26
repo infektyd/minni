@@ -334,9 +334,24 @@ function subagentSessionDir(vaultPath: string, sessionKey: string, create = fals
 }
 
 function readSubagentPendingList(pendingFile: string, vaultPath: string, nowMs: number): SubagentPendingEntry[] {
+  let fd: number | undefined;
   try {
     assertWriteTargetUnder(pendingFile, vaultPath);
-    const raw = JSON.parse(fs.readFileSync(pendingFile, "utf8")) as unknown;
+    const openFlags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    fd = fs.openSync(pendingFile, openFlags);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0 || st.size > 512 * 1024) return [];
+    const buf = Buffer.alloc(st.size);
+    let total = 0;
+    while (total < st.size) {
+      const n = fs.readSync(fd, buf, total, st.size - total, total);
+      if (n <= 0) break;
+      total += n;
+    }
+    const raw = JSON.parse(buf.subarray(0, total).toString("utf8")) as unknown;
     const entries = Array.isArray(raw)
       ? raw
       : raw !== null && typeof raw === "object" && Array.isArray((raw as { entries?: unknown }).entries)
@@ -359,6 +374,14 @@ function readSubagentPendingList(pendingFile: string, vaultPath: string, nowMs: 
     return out;
   } catch {
     return [];
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
   }
 }
 
