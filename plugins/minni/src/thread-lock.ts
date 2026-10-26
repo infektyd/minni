@@ -342,62 +342,123 @@ export async function withThreadLock<T>(
       }
     }
 
-    observedOwner = await readOwner(ownerPath);
+    let beforeLockStat: Awaited<ReturnType<typeof stat>> | undefined;
     let ageMs: number | undefined;
     try {
-      const lockStat = await stat(lockDir);
-      ageMs = Math.max(0, now().getTime() - lockStat.mtimeMs);
+      beforeLockStat = await stat(lockDir);
+      ageMs = Math.max(0, now().getTime() - beforeLockStat.mtimeMs);
     } catch (error) {
-      if (!isErrno(error, "ENOENT")) {
-        throw error;
+      if (isErrno(error, "ENOENT")) {
+        continue;
       }
+      throw error;
     }
 
+    observedOwner = await readOwner(ownerPath);
+
     let recoveryReason: ThreadLockRecoveryReason | undefined;
-    if (ageMs !== undefined && ageMs > staleMs) {
-      if (observedOwner === undefined) {
-        // Distinguish missing owner file from unparseable JSON for the audit.
-        try {
-          await readFile(ownerPath, "utf8");
+    if (observedOwner !== undefined) {
+      const liveness = ownerLooksLive(
+        observedOwner,
+        isProcessAlive,
+        getProcessStartMarker,
+      );
+      if (!liveness.live) {
+        recoveryReason = liveness.reasonIfStale;
+      }
+    } else if (ageMs !== undefined && ageMs > staleMs) {
+      // Distinguish missing owner file from unparseable JSON for the audit.
+      try {
+        await readFile(ownerPath, "utf8");
+        recoveryReason = "stale_invalid_owner";
+      } catch (error) {
+        if (isErrno(error, "ENOENT")) {
+          recoveryReason = "stale_ownerless";
+        } else {
           recoveryReason = "stale_invalid_owner";
-        } catch (error) {
-          if (isErrno(error, "ENOENT")) {
-            recoveryReason = "stale_ownerless";
-          } else {
-            recoveryReason = "stale_invalid_owner";
-          }
-        }
-      } else {
-        const liveness = ownerLooksLive(
-          observedOwner,
-          isProcessAlive,
-          getProcessStartMarker,
-        );
-        if (!liveness.live) {
-          recoveryReason = liveness.reasonIfStale;
         }
       }
     }
 
     if (recoveryReason !== undefined) {
-      const quarantineDir = `${lockDir}.stale-${randomUUID()}`;
+      const reapLockPath = `${lockDir}.reap.lock`;
+      let acquiredReapLock = false;
       try {
-        await rename(lockDir, quarantineDir);
+        await writeFile(reapLockPath, `${process.pid}\n`, {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+        acquiredReapLock = true;
       } catch (error) {
-        if (!isErrno(error, "ENOENT")) {
+        if (isErrno(error, "EEXIST")) {
+          try {
+            const rStat = await stat(reapLockPath);
+            if (Math.max(0, now().getTime() - rStat.mtimeMs) > 5_000) {
+              await rm(reapLockPath, { force: true }).catch(() => {});
+            }
+          } catch {}
+        } else {
           throw error;
         }
       }
-      await rm(quarantineDir, { recursive: true, force: true }).catch(() => {});
-      // Best-effort audit: recovery must still succeed if the audit write
-      // fails (lock progress > audit completeness).
-      await appendRecoveryAudit(vaultPath, {
-        at: now().toISOString(),
-        plan_id: planId,
-        reason: recoveryReason,
-        ...(observedOwner ? { previous_owner: observedOwner } : {}),
-      }).catch(() => {});
-      continue;
+
+      if (acquiredReapLock) {
+        let shouldReap = true;
+        try {
+          const afterLockStat = await stat(lockDir);
+          if (
+            afterLockStat.dev !== beforeLockStat.dev ||
+            afterLockStat.ino !== beforeLockStat.ino
+          ) {
+            shouldReap = false;
+          } else if (observedOwner !== undefined) {
+            const currentOwner = await readOwner(ownerPath);
+            if (
+              currentOwner === undefined ||
+              currentOwner.operationId !== observedOwner.operationId ||
+              currentOwner.pid !== observedOwner.pid
+            ) {
+              shouldReap = false;
+            }
+          }
+        } catch (error) {
+          if (isErrno(error, "ENOENT")) {
+            shouldReap = false;
+          } else {
+            await rm(reapLockPath, { force: true }).catch(() => {});
+            throw error;
+          }
+        }
+
+        if (shouldReap) {
+          const quarantineDir = `${lockDir}.stale-${randomUUID()}`;
+          let renamed = false;
+          try {
+            await rename(lockDir, quarantineDir);
+            renamed = true;
+          } catch (error) {
+            if (!isErrno(error, "ENOENT")) {
+              await rm(reapLockPath, { force: true }).catch(() => {});
+              throw error;
+            }
+          }
+          await rm(reapLockPath, { force: true }).catch(() => {});
+          if (renamed) {
+            await rm(quarantineDir, { recursive: true, force: true }).catch(() => {});
+            // Best-effort audit: recovery must still succeed if the audit write
+            // fails (lock progress > audit completeness).
+            await appendRecoveryAudit(vaultPath, {
+              at: now().toISOString(),
+              plan_id: planId,
+              reason: recoveryReason,
+              ...(observedOwner ? { previous_owner: observedOwner } : {}),
+            }).catch(() => {});
+          }
+          continue;
+        }
+        await rm(reapLockPath, { force: true }).catch(() => {});
+      }
     }
 
     const remainingMs = deadline - Date.now();

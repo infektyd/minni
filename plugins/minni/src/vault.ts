@@ -1729,10 +1729,32 @@ async function refuseSymlink(filePath: string, kind: "seed" | "append"): Promise
     if (st.isSymbolicLink()) {
       throw new Error(`refusing to ${kind} through symlink: ${filePath}`);
     }
+    if (!st.isFile()) {
+      throw new Error(`refusing to ${kind} non-regular file: ${filePath}`);
+    }
   } catch (error) {
     if (!isErrno(error, "ENOENT")) {
       throw error;
     }
+  }
+}
+
+async function readRegularTextFile(filePath: string): Promise<string> {
+  const flags =
+    fs.constants.O_RDONLY |
+    (fs.constants.O_NOFOLLOW ?? 0) |
+    (fs.constants.O_NONBLOCK ?? 0);
+  const fh = await open(filePath, flags);
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) {
+      const err = new Error(`refusing to read non-regular file: ${filePath}`) as NodeJS.ErrnoException;
+      err.code = "EINVAL";
+      throw err;
+    }
+    return await fh.readFile("utf8");
+  } finally {
+    await fh.close();
   }
 }
 
@@ -1860,7 +1882,10 @@ async function seedOrPromoteVaultFile(
       if (beforeStat.isSymbolicLink()) {
         throw new Error(`refusing to seed through symlink: ${filePath}`);
       }
-      existing = await readFile(filePath, "utf8");
+      if (!beforeStat.isFile()) {
+        throw new Error(`refusing to seed non-regular file: ${filePath}`);
+      }
+      existing = await readRegularTextFile(filePath);
     } catch (error) {
       if (isErrno(error, "ENOENT")) {
         return;
@@ -2053,11 +2078,16 @@ export function getAgentIdFromVaultPath(vaultPath: string): string {
 export async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
   await withVaultFileLock(filePath, async () => {
     const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+    const nonblock = typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0;
     const fh = await open(
       filePath,
-      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow,
+      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow | nonblock,
     );
     try {
+      const st = await fh.stat();
+      if (!st.isFile()) {
+        throw new Error(`refusing to append non-regular file: ${filePath}`);
+      }
       await fh.writeFile(content, "utf8");
       await fh.sync();
     } finally {
@@ -2249,7 +2279,7 @@ export async function recordAudit(
   if (currentSize >= 5 * 1024 * 1024) {
     // An explicit ensureVault agent can't be recovered from the path, so keep
     // the tenant the current log header was seeded with.
-    const seededHeader = await readFile(logPath, "utf8")
+    const seededHeader = await readRegularTextFile(logPath)
       .then((text) => text.split("\n", 1)[0] ?? "")
       .catch(() => "");
     const seededAgent =
@@ -2376,7 +2406,7 @@ async function appendIndex(
 ): Promise<void> {
   await ensureVault(vaultPath);
   const indexPath = path.join(vaultPath, "index.md");
-  const existing = await readFile(indexPath, "utf8");
+  const existing = await readRegularTextFile(indexPath);
   const link = wikilinkFor(relativePath);
   if (existing.includes(link)) return;
   const line = `- ${link} - ${summary.replace(/\s+/g, " ").slice(0, 160)}\n`;
@@ -2496,7 +2526,7 @@ export async function auditTail(
   const target = (await exists(todayPath)) ? todayPath : fallbackPath;
   let text = "";
   try {
-    text = await readFile(target, "utf8");
+    text = await readRegularTextFile(target);
   } catch {
     return { entries: [], text: "" };
   }
@@ -2824,10 +2854,10 @@ export async function sessionReceipt(
   // that crosses midnight has its boot marker in yesterday's daily file, but
   // log.md carries both days (up to the 5 MB rotation, the receipt's honest
   // horizon).
-  await ensureVault(vaultPath);
+  await ensureVault(vaultPath).catch(() => {});
   let text = "";
   try {
-    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+    text = await readRegularTextFile(path.join(vaultPath, "log.md"));
   } catch {
     // fall through to an empty tail — the receipt reports zeros.
   }
@@ -2952,7 +2982,7 @@ export async function listSessions(
 ): Promise<SessionSummary[]> {
   let text = "";
   try {
-    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+    text = await readRegularTextFile(path.join(vaultPath, "log.md"));
   } catch {
     // Missing (or unreadable) rolling log: no sessions to report, and we never
     // create it — listSessions is a pure reader.
@@ -3154,9 +3184,8 @@ export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, 
  * After writeVaultPage rewrites a note in the same process, the index keeps
  * the note's old keys (it only ever adds), so the index path can admit the
  * note as an extra candidate the scan would not. The extra is scored on its
- * current text, so results differ only if that text scores for the query
- * without producing any of the query's lookup keys — the case the lookup
- * already misses on a fresh cache (e.g. `x_foo_bar` for the query `foo_bar`).
+ * current text, so results agree whenever candidate selection admits every
+ * note the scorer can score.
  */
 export type VaultSearchCandidates = "index" | "scan";
 export type VaultSearchRankMode = "legacy" | "ups_gate" | "noise_last";
@@ -3301,20 +3330,11 @@ function evaluateUpsGate(
   };
 }
 
-function scoreVaultNoteCached(
-  phrases: string[],
+function ensureEntryWordCounts(
   terms: string[],
   entry: CachedVaultNoteEntry,
-): number {
-  if (entry.skipByStatus) return 0;
+): Map<string, number> {
   const { haystackLower, titleLower, wordCounts } = entry;
-  let termScore = 0;
-  for (const phrase of phrases) {
-    if (countWordOccurrences(haystackLower, phrase, false, 1) > 0) {
-      termScore += 50;
-      break;
-    }
-  }
   let missingCount = 0;
   if (terms.length > MULTI_TERM_THRESHOLD) {
     for (let i = 0; i < terms.length; i++) {
@@ -3330,8 +3350,7 @@ function scoreVaultNoteCached(
     const termToPatIdx = matcher.termToPatIdx;
     for (let i = 0; i < terms.length; i++) {
       const term = terms[i];
-      let contrib = wordCounts.get(term);
-      if (contrib === undefined) {
+      if (!wordCounts.has(term)) {
         const patIdx = termToPatIdx[i];
         const count =
           patIdx >= 0
@@ -3339,33 +3358,60 @@ function scoreVaultNoteCached(
             : patIdx === -2
               ? countWordOccurrences(haystackLower, term, true, 5)
               : 0;
-        contrib =
+        const contrib =
           count > 0
             ? Math.min(count, 5) +
               (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
             : 0;
-        if (wordCounts.size < 512) {
+        if (wordCounts.size < 4096) {
           wordCounts.set(term, contrib);
         }
       }
-      termScore += contrib;
     }
   } else {
     for (const term of terms) {
-      let contrib = wordCounts.get(term);
-      if (contrib === undefined) {
+      if (!wordCounts.has(term)) {
         const count = countWordOccurrences(haystackLower, term, true, 5);
-        contrib =
+        const contrib =
           count > 0
             ? Math.min(count, 5) +
               (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
             : 0;
-        if (wordCounts.size < 512) {
+        if (wordCounts.size < 4096) {
           wordCounts.set(term, contrib);
         }
       }
-      termScore += contrib;
     }
+  }
+  return wordCounts;
+}
+
+function scoreVaultNoteCached(
+  phrases: string[],
+  terms: string[],
+  entry: CachedVaultNoteEntry,
+): number {
+  if (entry.skipByStatus) return 0;
+  const { haystackLower, titleLower } = entry;
+  const wordCounts = ensureEntryWordCounts(terms, entry);
+  let termScore = 0;
+  for (const phrase of phrases) {
+    if (countWordOccurrences(haystackLower, phrase, false, 1) > 0) {
+      termScore += 50;
+      break;
+    }
+  }
+  for (const term of terms) {
+    let contrib = wordCounts.get(term);
+    if (contrib === undefined) {
+      const count = countWordOccurrences(haystackLower, term, true, 5);
+      contrib =
+        count > 0
+          ? Math.min(count, 5) +
+            (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
+          : 0;
+    }
+    termScore += contrib;
   }
   if (termScore < MIN_TERM_SCORE) return 0;
 
@@ -3404,6 +3450,25 @@ function indexNoteTokensIntoMap(
   for (const tok of rawMatches) {
     addTokenKeys(tok);
     if (tok.includes("_")) {
+      const starts: number[] = [0];
+      const ends: number[] = [];
+      for (let i = 0; i < tok.length; i++) {
+        if (tok.charCodeAt(i) === 95) {
+          ends.push(i);
+          if (i + 1 < tok.length) starts.push(i + 1);
+        }
+      }
+      ends.push(tok.length);
+      for (const s of starts) {
+        if (s > 0 && tok.length - s >= 2) {
+          addTokenKeys(tok.slice(s));
+        }
+        for (const e of ends) {
+          if (e < tok.length && e - s >= 11) {
+            addTokenKeys(tok.slice(s, e));
+          }
+        }
+      }
       for (const sub of tok.split("_")) {
         if (sub.length >= 2) addTokenKeys(sub);
       }
@@ -3522,19 +3587,15 @@ function indexTokenEmitsKey(
  *
  * The index lists a note under every key that addTokenKeys emits for one of
  * its tokens, where a token is a maximal `[a-z0-9_]{2,}` run of the text, or,
- * for a run containing `_`, one of its `_`-separated pieces of 2+ characters.
- * Every key is a prefix of the token that emits it, so it suffices to visit
- * each occurrence of `key` and ask whether a token starts there that emits it:
- *   - a whole run starts there when the character before is not [a-z0-9_];
- *   - a piece starts there when the character before is not [a-z0-9] (a `_`,
- *     or the run's start), and only for a key with no `_` (a piece has none).
- *     At a run's start with no `_` in the run, the piece is the run itself,
- *     so the two readings agree.
+ * for a run containing `_`, any `_`-preceded suffix or `_`-separated piece of
+ * 2+ characters. Every key is a prefix of the token that emits it, so it
+ * suffices to visit each occurrence of `key` preceded by a non-`[a-z0-9]`
+ * character (a run start or `_`) and ask whether a run/suffix or piece starts
+ * there that emits it.
  */
 function haystackHasIndexKey(haystackLower: string, key: string): boolean {
   const keyLen = key.length;
   if (keyLen === 0) return false;
-  const keyHasUnderscore = key.includes("_");
   // A 3..10-character key is emitted by any token it begins, so its end
   // does not matter (indexTokenEmitsKey ignores it).
   const needsEnd = keyLen < 3 || keyLen > 10;
@@ -3542,14 +3603,10 @@ function haystackHasIndexKey(haystackLower: string, key: string): boolean {
   while (at !== -1) {
     const prev = at > 0 ? haystackLower.charCodeAt(at - 1) : -1;
     if (!isAsciiLowerWordChar(prev)) {
-      if (prev !== 95) {
-        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, false) : 0;
-        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
-      }
-      if (!keyHasUnderscore) {
-        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, true) : 0;
-        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
-      }
+      const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, false) : 0;
+      if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
+      const pieceEnd = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, true) : 0;
+      if (indexTokenEmitsKey(haystackLower, at, pieceEnd, key)) return true;
     }
     at = haystackLower.indexOf(key, at + 1);
   }
@@ -3742,20 +3799,20 @@ export async function searchVaultNotes(
   // signal in the scorer and needs no tokens — but phraseForms yields nothing
   // for a query with no phrase of substance, so `-` or `--` (no tokens, no
   // usable phrase) stops here instead of reaching the scorer with terms = [].
-  let cache = _vaultSearchCache.get(vaultPath);
-  const now = Date.now();
-  const hasWarmCache = Boolean(
-    cache && cache.notes.size >= 20 && now - cache.builtAtMs <= 30_000,
-  );
-  if (!hasWarmCache) {
-    await ensureVault(vaultPath, resolvedAgentId ? { agentId: resolvedAgentId } : undefined);
-  }
   options = resolvedOptions;
   if (
     (rankMode === "ups_gate" && terms.length === 0) ||
     (terms.length === 0 && phrases.length === 0)
   ) {
     return [];
+  }
+  let cache = _vaultSearchCache.get(vaultPath);
+  const now = Date.now();
+  const hasWarmCache = Boolean(
+    cache && cache.notes.size >= 20 && now - cache.builtAtMs <= 30_000,
+  );
+  if (!hasWarmCache && resolvedAgentId !== undefined && candidates !== "scan") {
+    await ensureVault(vaultPath, { agentId: resolvedAgentId });
   }
 
   const wikiRoot = path.join(vaultPath, "wiki");
@@ -3791,7 +3848,9 @@ export async function searchVaultNotes(
   // write in this process, as it always has; the "scan" path never builds it.
   if (candidates === "index") vaultSearchTokenMap(cache);
 
-  const candidateEntries = selectCandidateEntries(cache, terms, candidates);
+  const candidateEntries = Array.from(
+    selectCandidateEntries(cache, terms, candidates),
+  );
 
   let excludeSet: Set<string> | undefined;
   if (options.excludePaths) {
@@ -3823,10 +3882,22 @@ export async function searchVaultNotes(
         continue;
       }
       nonNoiseCount += 1;
+    }
+    for (const entry of candidateEntries) {
+      if (entry.skipByStatus || entry.durability === "noise") continue;
+      if (
+        excludeSet &&
+        (excludeSet.has(entry.relativePath) ||
+          excludeSet.has(entry.relativePath.replaceAll("\\", "/")) ||
+          excludeSet.has(entry.notePath))
+      ) {
+        continue;
+      }
+      const wordCounts = ensureEntryWordCounts(terms, entry);
       for (const t of terms) {
         const present =
-          (entry.wordCounts.has(t)
-            ? entry.wordCounts.get(t)!
+          (wordCounts.has(t)
+            ? wordCounts.get(t)!
             : countWordOccurrences(entry.haystackLower, t, true, 1)) > 0;
         if (present) {
           df.set(t, (df.get(t) ?? 0) + 1);
@@ -4052,7 +4123,12 @@ export async function writeInbox(
   slug: string,
   payload: Record<string, unknown>,
 ): Promise<InboxEntry> {
-  await ensureVault(vaultPath);
+  await ensureVault(vaultPath).catch((error) => {
+    if (!String((error as Error)?.message ?? "").includes("non-regular file")) {
+      throw error;
+    }
+  });
+  await mkdir(path.join(vaultPath, "inbox"), { recursive: true });
   const safeSlug = slugify(slug || "session");
   const stamp = `${isoDate()}-${Date.now().toString(36)}`;
   const fileName = `${stamp}-${safeSlug}.json`;

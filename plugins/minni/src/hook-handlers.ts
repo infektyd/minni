@@ -1056,7 +1056,7 @@ async function stopCoreOutput(
   prepareOutcomeFn: typeof prepareOutcome,
   useCounts: boolean,
 ): Promise<HookOutput> {
-  await ensureVault(config.vaultPath, { agentId: config.agentId });
+  await ensureVault(config.vaultPath, { agentId: config.agentId }).catch(() => {});
   // Stop keeps the defaulted "session" fallback (inbox filename, marker text,
   // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime that
   // never labeled any turn with a real session_id still gets a best-effort
@@ -1146,7 +1146,7 @@ async function stopCoreOutput(
         reason,
         ...(receipt ? { receipt } : {}),
       },
-    });
+    }).catch(() => {});
     // Surface the receipt even with zero activity: proof that no memory work
     // happened is itself the signal. Platforms without a note channel drop it
     // via renderIntent; the audit marker still closes the session window.
@@ -1228,7 +1228,7 @@ async function stopCoreOutput(
       inbox_path: inbox.filePath,
       ...(receipt ? { receipt } : {}),
     },
-  });
+  }).catch(() => {});
 
   const displayReceipt = receipt
     ? { ...receipt, candidates_drafted: receipt.candidates_drafted + candidates.length }
@@ -1717,10 +1717,12 @@ export function createHookHandlers(
     // No try/catch around resolveActivePlanView: withBudget turns rejection
     // into its fallback. A budget cut still surfaces via planRead.ok === false
     // -> degraded.sections.
-    planRead = await withBudget(
+    const planBudgetMs = remainingMs();
+    planRead = planBudgetMs <= 0 ? { ok: false, view: undefined } : await withBudget(
       resolveActivePlanView(
         config.vaultPath,
         layer1Shelf.ok && !layer1Shelf.truncated ? layer1Shelf.content : undefined,
+        { lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS) },
       ).then((view) => ({ ok: true, view })),
       remainingMs(),
       { ok: false, view: undefined },

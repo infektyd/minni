@@ -15,7 +15,7 @@ import { afmHealth, recallMemory, formatDegradation } from "./daemon_transport.j
 import type { JsonResult, RecallResponse } from "./daemon_transport.js";
 import { isInstructionLike } from "./safety.js";
 import { recordAudit, searchVaultNotes } from "./vault.js";
-import type { PrivacyLevel, VaultSearchResult } from "./vault.js";
+import type { PrivacyLevel, VaultSearchOptions, VaultSearchResult } from "./vault.js";
 
 export type TaskProfile = "compact" | "standard" | "deep";
 export type SourceAuthority = "schema" | "handoff" | "decision" | "session" | "concept" | "daemon" | "vault";
@@ -130,6 +130,7 @@ export interface PrepareTaskInput {
   recallAgentId?: string;
   vaultPath?: string;
   includeVault?: boolean;
+  vaultSearchOptions?: VaultSearchOptions;
   afmPrepareUrl?: string;
   afmModel?: string;
   afmProviderMode?: AfmProviderMode;
@@ -1067,7 +1068,9 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   const [vaultResults, recallResult] = await Promise.all([
     input.includeVault === false
       ? Promise.resolve([])
-      : search(vaultPath, input.task, vaultSearchOverfetchLimit(limit)),
+      : input.vaultSearchOptions !== undefined
+        ? search(vaultPath, input.task, vaultSearchOverfetchLimit(limit), undefined, input.vaultSearchOptions)
+        : search(vaultPath, input.task, vaultSearchOverfetchLimit(limit)),
     recall({
       query: input.task,
       layer: input.layer,

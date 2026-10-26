@@ -583,7 +583,7 @@ export async function recallMemory(
       effectiveVaultPath,
       input.query,
       input.limit ?? 5,
-      input.agentId ?? config?.agentId,
+      undefined,
       { rank: noiseLast ? "noise_last" : "legacy" },
     );
     return {

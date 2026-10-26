@@ -11,7 +11,7 @@
 //   vault files (`open(…, "ax")`) after they had been deleted
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,7 +19,7 @@ import test from "node:test";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
 import { createPlan } from "../dist/plan.js";
-import { ensureVault } from "../dist/vault.js";
+import { ensureVault, searchVaultNotes } from "../dist/vault.js";
 
 async function withFixture(run) {
   const root = await mkdtemp(path.join(tmpdir(), "sm-ups-no-linger-"));
@@ -60,6 +60,8 @@ function lockPaths(vault, planId) {
 
 /** Watch, for `ms`, whether any active-plan-view operation takes the lock. */
 async function watchForActivePlanAcquire(ownerPath, ms) {
+  const locksRoot = path.dirname(path.dirname(ownerPath));
+  const baselineMtimeNs = existsSync(locksRoot) ? statSync(locksRoot, { bigint: true }).mtimeNs : 0n;
   const until = Date.now() + ms;
   while (Date.now() < until) {
     if (existsSync(ownerPath)) {
@@ -69,6 +71,9 @@ async function watchForActivePlanAcquire(ownerPath, ms) {
       } catch {
         // Owner file mid-write: look again.
       }
+    }
+    if (existsSync(locksRoot) && statSync(locksRoot, { bigint: true }).mtimeNs !== baselineMtimeNs) {
+      return true;
     }
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
@@ -167,6 +172,9 @@ test("spent-budget UPS leaves no active-plan read waiting on the lock", { timeou
       workspace_id: "workspace-fixture",
     });
     assert.equal(output.continue, true);
+    const body = parseUpsEnvelope(output);
+    assert.ok(body, "held lock degrades active_thread, making the turn salient");
+    assert.equal(body.degraded?.daemon_recall, "timed_out");
 
     // Release the holder the way a fixture teardown would. A plan read still
     // waiting on the lock takes it on its next poll (every 25 ms by default).
@@ -242,3 +250,83 @@ test("UPS with budget and a free lock still injects the active thread pointer", 
     );
   });
 });
+
+async function runHeldLockSessionStart(vault, sessionStartHookTimeoutMs) {
+  const { plan } = await createPlan(
+    { goal: "SessionStart must not linger on the plan lock", vaultPath: vault },
+    { vaultPath: vault },
+  );
+  const { lockDir, ownerPath } = lockPaths(vault, plan.plan_id);
+  await mkdir(lockDir, { recursive: true });
+  await writeFile(
+    ownerPath,
+    `${JSON.stringify({ pid: process.pid, operationId: "test-live-holder", acquiredAt: new Date().toISOString() })}\n`,
+    { mode: 0o600 },
+  );
+  const handlers = createHookHandlers({
+    agentId: "claude-code",
+    vaultPath: vault,
+    defaultWorkspaceId: "workspace-fixture",
+    contextWindow: 200_000,
+    hooksEnabled: true,
+    auditPrefix: "hook_test",
+    alwaysWriteStopInbox: false,
+    sessionStartHookTimeoutMs,
+  });
+  const started = Date.now();
+  const output = await handlers.handleSessionStart({
+    workspace_id: "workspace-fixture",
+  });
+  return { output, elapsedMs: Date.now() - started, lockDir, ownerPath };
+}
+
+test("mid-budget SessionStart gives up the plan lock before it answers", { timeout: 15_000 }, async () => {
+  await withFixture(async ({ vault }) => {
+    await ensureVault(vault);
+    const { output, elapsedMs, lockDir, ownerPath } = await runHeldLockSessionStart(vault, 3_000);
+    assert.equal(output.continue, true);
+    assert.ok(elapsedMs < 2_500, `SessionStart must answer inside its 1.8 s budget; took ${elapsedMs}ms`);
+
+    await rm(lockDir, { recursive: true, force: true });
+    const acquired = await watchForActivePlanAcquire(ownerPath, 400);
+    assert.equal(
+      acquired,
+      false,
+      "the plan read must not still be waiting on the lock after SessionStart answered",
+    );
+  });
+});
+
+test("spent-budget SessionStart leaves no active-plan read waiting on the lock", { timeout: 10_000 }, async () => {
+  await withFixture(async ({ vault }) => {
+    await ensureVault(vault);
+    const { output, lockDir, ownerPath } = await runHeldLockSessionStart(vault, 2);
+    assert.equal(output.continue, true);
+
+    await rm(lockDir, { recursive: true, force: true });
+    const acquired = await watchForActivePlanAcquire(ownerPath, 400);
+    assert.equal(
+      acquired,
+      false,
+      "a SessionStart that answered with its budget spent must not still be waiting on the plan lock",
+    );
+  });
+});
+
+test(
+  "searchVaultNotes on the scan path or without an explicit agentId is strictly read-only and does not seed a missing vault",
+  { timeout: 10_000 },
+  async () => {
+    await withFixture(async ({ vault }) => {
+      const missingVaultA = path.join(vault, "missing-a");
+      const missingVaultB = path.join(vault, "missing-b");
+      assert.deepEqual(await searchVaultNotes(missingVaultA, "cache policy", 5), []);
+      assert.deepEqual(
+        await searchVaultNotes(missingVaultB, "cache policy", 5, "claude-code", { candidates: "scan" }),
+        [],
+      );
+      assert.equal(existsSync(missingVaultA), false, "read-only search without agentId must not create vault files");
+      assert.equal(existsSync(missingVaultB), false, "scan-path search must not create vault files");
+    });
+  },
+);
