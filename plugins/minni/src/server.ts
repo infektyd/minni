@@ -22,6 +22,7 @@ import {
   handoffMemory,
   identityDenialFrom,
   isDaemonResultEmpty,
+  isRecallNoiseLastEnabled,
   learnMemory,
   listPendingHandoffs,
   recallAuditHits,
@@ -677,12 +678,15 @@ server.registerTool(
     // outscoring a safe match still reproduce the crowd-out. See #339 for
     // the durable fix (gate inside searchVaultNotes itself).
     const vaultResultCap = Math.min(limit ?? 5, 8);
+    const noiseLast = isRecallNoiseLastEnabled(effectiveVaultPath);
     const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
       ? filterSafeVaultResults(
           await searchVaultNotes(
             effectiveVaultPath,
             query,
             vaultResultCap * VAULT_SEARCH_OVERFETCH_MULTIPLIER,
+            undefined,
+            { rank: noiseLast ? "noise_last" : "legacy" },
           ),
         ).slice(0, vaultResultCap)
       : [];
@@ -729,16 +733,27 @@ server.registerTool(
   {
     title: "Minni Drill",
     description:
-      "Drill headline recall results to snippet, chunk, or document depth by result/chunk id.",
+      "Drill headline recall results to snippet, chunk, or document depth by result/chunk id or handle (m:<8hex>, d:<src>:<id>).",
     inputSchema: {
       resultIds: z.array(z.number().int()).optional(),
       chunkIds: z.array(z.number().int()).optional(),
       references: z.array(z.union([z.string(), z.object({}).passthrough()])).optional(),
+      handle: z.string().optional(),
+      wikilink: z.string().optional(),
       depth: z.enum(["snippet", "chunk", "document"]).optional(),
     },
   },
-  async ({ resultIds, chunkIds, references, depth }) => {
-    const result = await drillMemory({ resultIds, chunkIds, references, depth });
+  async ({ resultIds, chunkIds, references, handle, wikilink, depth }) => {
+    const result = await drillMemory({
+      resultIds,
+      chunkIds,
+      references,
+      handle,
+      wikilink,
+      depth,
+      vaultPath: DEFAULT_VAULT_PATH,
+      sessionId: MCP_PROCESS_SESSION_ID,
+    });
     return textResult(JSON.stringify(result, null, 2));
   },
 );

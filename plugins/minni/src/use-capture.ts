@@ -46,7 +46,7 @@ import type { PlatformWire } from "./hook-platform.js";
 import { deferUntilDelivered } from "./hook-delivery.js";
 import { asString } from "./hook-utils.js";
 import { LEDGER_EVENTS } from "./ledger-gate.js";
-import { extractStrongRecall, sanitizeRecallField } from "./recall-state.js";
+import { extractStrongRecall, sanitizeRecallField, selectPointerHits } from "./recall-state.js";
 import type { RecallState, StrongRecall } from "./recall-state.js";
 import {
   appendLedgerRows,
@@ -432,8 +432,23 @@ function nextTurnIndex(capture: UseCapture): number {
       const file = path.join(dir, "counters.json");
       const current = counterIn(file, capture.vaultPath);
       if (current === null) return 0;
+      const existing = readSideFile(file, capture.vaultPath) as
+        | { surfaced?: Record<string, unknown> }
+        | null;
+      const existingSurfaced =
+        existing && existing.surfaced && typeof existing.surfaced === "object"
+          ? existing.surfaced
+          : undefined;
       const next = current + 1;
-      writeSideFile(file, { v: 1, turn_ix: next }, capture.vaultPath);
+      writeSideFile(
+        file,
+        {
+          v: 1,
+          turn_ix: next,
+          ...(existingSurfaced ? { surfaced: existingSurfaced } : {}),
+        },
+        capture.vaultPath,
+      );
       return next;
     } finally {
       release();
@@ -958,22 +973,27 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
         // The guard then records no keyed rows for this state; the pointer row stands.
       }
     }
-    const top = input.strong.topHits[0];
-    const mkey = details[0]?.mkey ?? null;
-    if (!top || !mkey) return;
+    const namedHits = selectPointerHits(input.strong.topHits);
+    const pointerItems: SurfacedItem[] = [];
+    for (let i = 0; i < namedHits.length; i += 1) {
+      const hit = namedHits[i];
+      const detailIdx = input.strong.topHits.indexOf(hit);
+      const mkey = (detailIdx >= 0 ? details[detailIdx]?.mkey : undefined) ?? hit.mkey ?? null;
+      if (!mkey) continue;
+      pointerItems.push({
+        mkey,
+        handles: handlesForKey(mkey),
+        title: hit.title,
+        rank: i + 1,
+        score: hit.score,
+        locate: locateText(input.emitted, input.pointer),
+      });
+    }
+    if (pointerItems.length === 0) return;
     record(
       capture,
       "prompt_pointer",
-      [
-        {
-          mkey,
-          handles: handlesForKey(mkey),
-          title: top.title,
-          rank: 1,
-          score: top.score,
-          locate: locateText(input.emitted, input.pointer),
-        },
-      ],
+      pointerItems,
       input.emitted,
       use.turn.turn_ix,
     );

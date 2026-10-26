@@ -1,7 +1,7 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { existsSync } from "node:fs";
-import { stat, readdir } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { readFile, stat, readdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
@@ -18,9 +18,19 @@ import {
   type AfmProviderResolution,
   type ProviderHealth,
 } from "./afm.js";
-import { auditTail, ensureVault, recordAudit, vaultExists, writeInbox } from "./vault.js";
+import {
+  assertWriteTargetUnder,
+  auditTail,
+  ensureVault,
+  recordAudit,
+  resolveVaultHandleRelPath,
+  searchVaultNotes,
+  vaultExists,
+  writeInbox,
+} from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 import { durabilityOf } from "./durability.js";
+import { readSessionHandle } from "./recall-state.js";
 
 export interface JsonResult<T = unknown> {
   ok: boolean;
@@ -439,7 +449,65 @@ export function buildBootRecallSlice(
   };
 }
 
-export async function recallMemory(input: {
+export function isRecallNoiseLastEnabled(vaultPath?: string): boolean {
+  const rawEnv = process.env.MINNI_RECALL_NOISE_LAST;
+  if (rawEnv === "off") return false;
+  if (rawEnv === "on") return true;
+  if (!vaultPath || typeof vaultPath !== "string") return true;
+  try {
+    const flagsPath = path.join(vaultPath, ".runtime", "flags.json");
+    assertWriteTargetUnder(flagsPath, vaultPath);
+    const raw = readFileSync(flagsPath, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (parsed.MINNI_RECALL_NOISE_LAST === "off") return false;
+      if (parsed.MINNI_RECALL_NOISE_LAST === "on") return true;
+    }
+  } catch {
+    // Default "on".
+  }
+  return true;
+}
+
+export function partitionRecallResultsNoiseLast<T>(results: readonly T[]): T[] {
+  const nonNoise: T[] = [];
+  const noise: T[] = [];
+  for (const item of results) {
+    const rec = (item ?? {}) as Record<string, unknown>;
+    const title = typeof rec.title === "string" ? rec.title : "";
+    const isNoise =
+      durabilityOf({
+        relativePath:
+          typeof rec.relativePath === "string"
+            ? rec.relativePath
+            : typeof rec.source === "string"
+              ? rec.source
+              : typeof rec.filename === "string"
+                ? rec.filename
+                : undefined,
+        category:
+          typeof rec.category === "string"
+            ? rec.category
+            : typeof rec.type === "string"
+              ? rec.type
+              : undefined,
+        tags: Array.isArray(rec.tags)
+          ? rec.tags.filter((t): t is string => typeof t === "string")
+          : undefined,
+        source:
+          typeof rec.source_kind === "string"
+            ? rec.source_kind
+            : typeof rec.source === "string"
+              ? rec.source
+              : undefined,
+      }) === "noise" || /^\s*\[Subagent Context\]/i.test(title);
+    if (isNoise) noise.push(item);
+    else nonNoise.push(item);
+  }
+  return [...nonNoise, ...noise];
+}
+
+export interface RecallMemoryInput {
   query: string;
   agentId?: string;
   layer?: string;
@@ -450,6 +518,7 @@ export async function recallMemory(input: {
   crossAgent?: boolean;
   cross_agent?: boolean;
   sessionId?: string;
+  vaultPath?: string;
   /**
    * TOTAL deadline for the recall RPC. Prompt-time hooks pass their remaining
    * budget so a cold daemon (lazy embedder/cross-encoder/FAISS load) degrades to
@@ -457,32 +526,87 @@ export async function recallMemory(input: {
    * discarded. Omitted elsewhere → the 30s default.
    */
   timeoutMs?: number;
-}, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
-  // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
-  // directly instead of masking it behind a dead HTTP-over-socket fallback.
-  // M-2 fix: explicitly pass depth="snippet" so agents receive evidence text
-  // (~120 tokens/result) rather than headline-only (wikilink + score, no text).
-  // The daemon's previous default was "headline" despite the docstring claiming
-  // "snippet". Both the daemon default and this call-site now agree on "snippet".
-  const timeoutMs = input.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
-  return jsonRpcSocketRequestWithFallbackRequester("search", {
-    query: input.query,
-    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
-    layers: input.layers ?? (input.layer ? [input.layer] : undefined),
-    limit: input.limit,
-    scope: input.scope,
-    cross_agent: input.crossAgent ?? input.cross_agent,
-    depth: "snippet",
-    // Daemon search is to_thread and uncancellable; pass the same budget so
-    // retrieve() can stop FAISS/expand/CE before this client kills the socket.
-    timeout_ms: timeoutMs,
-    // Session receipts: the daemon records a durable episodic recall-trace event
-    // (thread_id=session_id) when this is present. Omit it entirely when the
-    // caller has no session context so the daemon param stays absent, not null.
-    ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
-  }, requester, { timeoutMs }) as Promise<
-    JsonResult<RecallResponse>
-  >;
+}
+
+export interface TransportConfigLike {
+  agentId?: string;
+  vaultPath?: string;
+  workspaceId?: string;
+  daemonSocketPath?: string;
+  daemonTimeoutMs?: number;
+  recallTimeoutMs?: number;
+}
+
+export async function recallMemory(
+  inputOrConfig: RecallMemoryInput | TransportConfigLike,
+  requesterOrInput?: JsonRpcRequester | RecallMemoryInput,
+  maybeRequester?: JsonRpcRequester,
+): Promise<JsonResult<RecallResponse> & { source?: string }> {
+  const isTwoObjectArgs =
+    typeof requesterOrInput === "object" &&
+    requesterOrInput !== null &&
+    typeof (requesterOrInput as RecallMemoryInput).query === "string";
+  const config: TransportConfigLike | undefined = isTwoObjectArgs
+    ? (inputOrConfig as TransportConfigLike)
+    : undefined;
+  const input: RecallMemoryInput = isTwoObjectArgs
+    ? (requesterOrInput as RecallMemoryInput)
+    : (inputOrConfig as RecallMemoryInput);
+  const baseRequester: JsonRpcRequester = isTwoObjectArgs
+    ? (maybeRequester ?? jsonRpcSocketRequest)
+    : typeof requesterOrInput === "function"
+      ? requesterOrInput
+      : jsonRpcSocketRequest;
+  const requester: JsonRpcRequester = config?.daemonSocketPath
+    ? (_sock, method, params, opts) =>
+        baseRequester(config.daemonSocketPath!, method, params, opts)
+    : baseRequester;
+
+  const effectiveVaultPath = input.vaultPath ?? config?.vaultPath;
+  const noiseLast = isRecallNoiseLastEnabled(effectiveVaultPath ?? DEFAULT_VAULT_PATH);
+  const timeoutMs =
+    input.timeoutMs ?? config?.recallTimeoutMs ?? config?.daemonTimeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
+
+  const res = (await jsonRpcSocketRequestWithFallbackRequester(
+    "search",
+    {
+      query: input.query,
+      agent_id: input.agentId ?? config?.agentId ?? DEFAULT_AGENT_ID,
+      layers: input.layers ?? (input.layer ? [input.layer] : undefined),
+      limit: input.limit,
+      scope: input.scope,
+      cross_agent: input.crossAgent ?? input.cross_agent,
+      depth: "snippet",
+      timeout_ms: timeoutMs,
+      ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
+    },
+    requester,
+    { timeoutMs },
+  )) as JsonResult<RecallResponse> & { source?: string };
+
+  if (res.ok && res.data && Array.isArray(res.data.results) && noiseLast) {
+    res.data = {
+      ...res.data,
+      results: partitionRecallResultsNoiseLast(res.data.results),
+    };
+  } else if (!res.ok && effectiveVaultPath && isSharedGateUnavailable(res.error)) {
+    const vaultHits = await searchVaultNotes(
+      effectiveVaultPath,
+      input.query,
+      input.limit ?? 5,
+      input.agentId ?? config?.agentId,
+      { rank: noiseLast ? "noise_last" : "legacy" },
+    );
+    return {
+      ok: true,
+      source: "vault-fallback",
+      data: {
+        results: vaultHits,
+        count: vaultHits.length,
+      },
+    };
+  }
+  return res;
 }
 
 export async function learnMemory(input: {
@@ -602,7 +726,8 @@ export type JsonRpcRequester = (
 ) => Promise<JsonResult>;
 
 function jsonRpcSocketCandidates(): string[] {
-  return [SOCKET_PATH];
+  const envSock = process.env.MINNI_SOCKET_PATH?.trim();
+  return [envSock || SOCKET_PATH];
 }
 
 /**
@@ -772,21 +897,214 @@ export function isSharedGateUnavailable(error: string | undefined): boolean {
   return /^(?:Error:\s*)?(?:connect\s+)?(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
 }
 
+export interface DrillMemoryInput {
+  resultIds?: number[];
+  chunkIds?: number[];
+  references?: Array<Record<string, unknown> | string>;
+  handle?: string;
+  wikilink?: string;
+  depth?: "snippet" | "chunk" | "document";
+  vaultPath?: string;
+  sessionId?: string;
+}
+
 export async function drillMemory(
-  input: {
-    resultIds?: number[];
-    chunkIds?: number[];
-    references?: Array<Record<string, unknown> | string>;
-    depth?: "snippet" | "chunk" | "document";
-  },
-  requester: JsonRpcRequester = jsonRpcSocketRequest,
-): Promise<JsonResult> {
-  return jsonRpcSocketRequestWithFallbackRequester("sm_drill", {
-    result_ids: input.resultIds,
-    chunk_ids: input.chunkIds,
-    references: input.references,
-    depth: input.depth ?? "snippet",
-  }, requester);
+  inputOrConfig: DrillMemoryInput | TransportConfigLike,
+  requesterOrInput?: JsonRpcRequester | DrillMemoryInput,
+  maybeRequester?: JsonRpcRequester,
+): Promise<JsonResult<Record<string, unknown>> & { source?: string }> {
+  const isTwoObjectArgs =
+    typeof requesterOrInput === "object" &&
+    requesterOrInput !== null &&
+    !("daemonSocketPath" in requesterOrInput);
+  const config: TransportConfigLike | undefined = isTwoObjectArgs
+    ? (inputOrConfig as TransportConfigLike)
+    : undefined;
+  const input: DrillMemoryInput = isTwoObjectArgs
+    ? (requesterOrInput as DrillMemoryInput)
+    : (inputOrConfig as DrillMemoryInput);
+  const baseRequester: JsonRpcRequester = isTwoObjectArgs
+    ? (maybeRequester ?? jsonRpcSocketRequest)
+    : typeof requesterOrInput === "function"
+      ? requesterOrInput
+      : jsonRpcSocketRequest;
+  const requester: JsonRpcRequester = config?.daemonSocketPath
+    ? (_sock, method, params, opts) =>
+        baseRequester(config.daemonSocketPath!, method, params, opts)
+    : baseRequester;
+
+  const effectiveVaultPath = input.vaultPath ?? config?.vaultPath ?? DEFAULT_VAULT_PATH;
+  const rawHandle =
+    typeof input.handle === "string" && input.handle.trim()
+      ? input.handle.trim()
+      : typeof input.wikilink === "string" && input.wikilink.trim()
+        ? input.wikilink.trim()
+        : Array.isArray(input.references) &&
+            input.references.length === 1 &&
+            typeof input.references[0] === "string"
+          ? input.references[0].trim()
+          : undefined;
+
+  if (rawHandle && rawHandle.startsWith("m:")) {
+    if (!/^m:[0-9a-f]{8}$/i.test(rawHandle)) {
+      return {
+        ok: false,
+        error: `invalid_handle: ${rawHandle}`,
+        data: { found: false, handle: rawHandle },
+      };
+    }
+    const normalizedHandle = rawHandle.toLowerCase();
+    const sessionEntry = await readSessionHandle(
+      effectiveVaultPath,
+      input.sessionId,
+      normalizedHandle,
+    );
+    const relPath =
+      sessionEntry?.relativePath ??
+      (await resolveVaultHandleRelPath(effectiveVaultPath, normalizedHandle));
+    if (!relPath) {
+      return {
+        ok: false,
+        error: `handle_not_found: ${normalizedHandle}`,
+        data: { found: false, handle: normalizedHandle },
+      };
+    }
+    try {
+      const fullPath = path.join(effectiveVaultPath, relPath);
+      assertWriteTargetUnder(fullPath, effectiveVaultPath);
+      const content = await readFile(fullPath, "utf8");
+      const wikilink = `[[${relPath.replace(/\.md$/i, "")}]]`;
+      return {
+        ok: true,
+        source: "vault-fallback",
+        data: {
+          found: true,
+          handle: normalizedHandle,
+          wikilink,
+          relativePath: relPath,
+          source: relPath,
+          content,
+          results: [
+            {
+              handle: normalizedHandle,
+              wikilink,
+              source: relPath,
+              text: content,
+              content,
+            },
+          ],
+        },
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+        data: { found: false, handle: normalizedHandle },
+      };
+    }
+  }
+
+  if (rawHandle && rawHandle.startsWith("d:")) {
+    const match = /^d:([a-z0-9_-]+):(\d+)$/i.exec(rawHandle);
+    if (!match) {
+      return {
+        ok: false,
+        error: `invalid_handle: ${rawHandle}`,
+        data: { found: false, handle: rawHandle },
+      };
+    }
+    const scope = match[1].toLowerCase();
+    const docId = Number(match[2]);
+    const sessionEntry = await readSessionHandle(effectiveVaultPath, input.sessionId, rawHandle);
+    const sourceUnverified = sessionEntry === null;
+    const rpcSrc = scope === "personal" ? "p" : scope === "combined" ? "c" : scope;
+    const rpcRes = (await jsonRpcSocketRequestWithFallbackRequester(
+      "sm_drill",
+      {
+        references: [
+          {
+            doc_id: docId,
+            src: rpcSrc,
+            ...(sessionEntry?.wikilink ? { wikilink: sessionEntry.wikilink } : {}),
+          },
+        ],
+        depth: input.depth ?? "snippet",
+      },
+      requester,
+    )) as JsonResult<Record<string, unknown>>;
+
+    if (rpcRes.ok && rpcRes.data) {
+      return {
+        ok: true,
+        data: {
+          ...rpcRes.data,
+          found: true,
+          handle: rawHandle,
+          doc_id: docId,
+          src: scope,
+          source_unverified: sourceUnverified,
+        },
+      };
+    }
+
+    if (!sourceUnverified && sessionEntry?.relativePath) {
+      try {
+        const fullPath = path.join(effectiveVaultPath, sessionEntry.relativePath);
+        assertWriteTargetUnder(fullPath, effectiveVaultPath);
+        const content = await readFile(fullPath, "utf8");
+        return {
+          ok: true,
+          source: "vault-fallback",
+          data: {
+            found: true,
+            handle: rawHandle,
+            doc_id: docId,
+            src: scope,
+            source_unverified: false,
+            wikilink: sessionEntry.wikilink,
+            relativePath: sessionEntry.relativePath,
+            source: sessionEntry.relativePath,
+            content,
+            results: [
+              {
+                handle: rawHandle,
+                doc_id: docId,
+                src: scope,
+                source: sessionEntry.relativePath,
+                text: content,
+                content,
+              },
+            ],
+          },
+        };
+      } catch {
+        // Fall through to error.
+      }
+    }
+
+    return {
+      ok: false,
+      error: rpcRes.error ?? `handle_not_found: ${rawHandle}`,
+      data: {
+        found: false,
+        handle: rawHandle,
+        doc_id: docId,
+        src: scope,
+        source_unverified: sourceUnverified,
+      },
+    };
+  }
+
+  return jsonRpcSocketRequestWithFallbackRequester(
+    "sm_drill",
+    {
+      result_ids: input.resultIds,
+      chunk_ids: input.chunkIds,
+      references: input.references,
+      depth: input.depth ?? "snippet",
+    },
+    requester,
+  ) as Promise<JsonResult<Record<string, unknown>>>;
 }
 
 export async function exportContextPack(

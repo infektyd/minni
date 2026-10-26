@@ -74,20 +74,27 @@ import type { RelayHook } from "./thread-notification-relay.js";
 
 import { routeMemoryIntent } from "./policy.js";
 import {
+  advanceSessionTurnIfPresent,
   armingKeyFor,
   buildRecallPointer,
   buildStaleRecallPointer,
   claimArming,
   clearRecallState,
+  clearSessionSurfacedOnReset,
+  commitSurfacedPointer,
   extractStrongRecall,
   markRecallConsumed,
   pruneOldClaimFiles,
   readLifecycleState,
   readRecallState,
+  readSessionSurfacedState,
   recallPointerThreshold,
   recallStatePath,
+  recordSessionHandles,
   sanitizeRecallField,
+  selectPointerHits,
   sessionStateKey,
+  shouldSuppressHit,
   writeLifecycleState,
   writeRecallState,
 } from "./recall-state.js";
@@ -231,7 +238,9 @@ type LocalFeatureFlag =
   | "MINNI_BOOT_FIT"
   | "MINNI_GUARD_V2"
   | "MINNI_SUBAGENT_BRIEF"
-  | "MINNI_PROMPT_CLASSES";
+  | "MINNI_PROMPT_CLASSES"
+  | "MINNI_UPS_RANK_V2"
+  | "MINNI_RECALL_NOISE_LAST";
 
 /**
  * S2a/S2b/S3a (§8.1): check whether a default-"on" feature switch is enabled
@@ -1462,6 +1471,7 @@ export function createHookHandlers(
         emphasized: [],
       }).catch(() => {});
     }
+    await clearSessionSurfacedOnReset(config.vaultPath, rawSessionId || sessionId).catch(() => {});
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
@@ -2233,6 +2243,34 @@ export function createHookHandlers(
     let stalePointer: string | undefined;
 
     if (!isSkip) {
+      const upsRankV2 = use
+        ? use.capture.context.features.includes("MINNI_UPS_RANK_V2")
+        : isFeatureEnabled(config.vaultPath, "MINNI_UPS_RANK_V2");
+      const surfacedState =
+        upsRankV2 && isFeatureEnabled(config.vaultPath, "MINNI_USE_LEDGER")
+          ? await readSessionSurfacedState(
+              config.vaultPath,
+              rawSessionId || undefined,
+              use?.turn.turn_ix,
+            )
+          : undefined;
+      // Only pre-exclude vault paths whose prior score is > 0.90 (so even a max
+      // 1.00 score cannot achieve the >= 0.10 jump required to override suppression).
+      const excludePaths: string[] = [];
+      if (surfacedState) {
+        for (const [mkey, entry] of Object.entries(surfacedState.surfaced)) {
+          if (
+            mkey.startsWith("vault:") &&
+            entry &&
+            entry.reset_id === surfacedState.resetId &&
+            surfacedState.thisTurn - entry.turn_ix >= 1 &&
+            surfacedState.thisTurn - entry.turn_ix <= 5 &&
+            entry.score > 0.9
+          ) {
+            excludePaths.push(mkey.slice("vault:".length));
+          }
+        }
+      }
       // A spent budget gets the same fallbacks withBudget(0) would return, but
       // without starting work that would keep running (and writing: the cold
       // vault scan seeds missing vault files) after this handler answers.
@@ -2261,9 +2299,15 @@ export function createHookHandlers(
                   recallQuery,
                   VAULT_SEARCH_OVERFETCH,
                   config.agentId,
-                  {
-                    candidates: "scan",
-                  },
+                  upsRankV2
+                    ? {
+                        candidates: "scan",
+                        rank: "ups_gate",
+                        ...(excludePaths.length > 0 ? { excludePaths } : {}),
+                      }
+                    : {
+                        candidates: "scan",
+                      },
                 ),
                 remainingMs(),
                 [],
@@ -2306,7 +2350,16 @@ export function createHookHandlers(
         recall.ok ? recall.data : undefined,
         vaultResults,
         threshold,
+        5,
+        { rankV2: upsRankV2 },
       );
+      if (upsRankV2 && strong && surfacedState) {
+        const unsuppressed = strong.topHits.filter((hit) => !shouldSuppressHit(hit, surfacedState));
+        strong =
+          unsuppressed.length > 0
+            ? { topScore: unsuppressed[0].score, topHits: unsuppressed }
+            : null;
+      }
       if (strong) {
         // s6 UNCONSULTED deny is a backstop for an envelope the model actually
         // received. Grok UPS/SS and Cursor UPS structurally drop inject
@@ -2331,6 +2384,24 @@ export function createHookHandlers(
           } catch {
             // best-effort: a state-write failure must not break the hook
           }
+          await recordSessionHandles(
+            config.vaultPath,
+            rawSessionId || undefined,
+            strong.topHits,
+          ).catch(() => {});
+          if (upsRankV2 && surfacedState) {
+            const pointerHits = selectPointerHits(strong.topHits);
+            deferUntilDelivered(
+              () =>
+                commitSurfacedPointer(
+                  config.vaultPath,
+                  rawSessionId || undefined,
+                  surfacedState,
+                  pointerHits,
+                ),
+              { recordOnly: true },
+            );
+          }
         } else {
           // Prior dropped-UPS plants left consumed=false on disk; this turn
           // would have overwritten them with another false plant. Clear instead
@@ -2351,6 +2422,22 @@ export function createHookHandlers(
         }
       } else {
         await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
+        if (
+          upsRankV2 &&
+          surfacedState &&
+          surfacedState.hasExistingSurfaced &&
+          canInject(wire, "UserPromptSubmit")
+        ) {
+          deferUntilDelivered(
+            () =>
+              advanceSessionTurnIfPresent(
+                config.vaultPath,
+                rawSessionId || undefined,
+                surfacedState,
+              ),
+            { recordOnly: true },
+          );
+        }
       }
     }
 
@@ -2677,6 +2764,7 @@ export function createHookHandlers(
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
+    await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
 
     // hooks-PL-3: compaction is exactly when a correction the agent already
     // saw can fall out of context. Stash the current stale-belief /
@@ -2784,6 +2872,7 @@ export function createHookHandlers(
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     // Same provenance stamp as SessionStart harvest — dual delivery paths
     // must not disagree on `platform` when runtime and agentId differ.
     await harvestSummaryText(
@@ -2820,6 +2909,7 @@ export function createHookHandlers(
   async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     await harvestSummaryText(
       {
         vaultPath: config.vaultPath,

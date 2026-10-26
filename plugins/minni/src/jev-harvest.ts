@@ -120,16 +120,53 @@ export function maskTelemetry(text: string): string {
     .replace(/<minni:packet\b[^>]*>[\s\S]*?<\/minni:packet>/gi, "");
 
   const lines = result.split("\n");
-  const filteredLines = lines.filter((line) => {
+  const filteredLines: string[] = [];
+  let inTelemetryBlock = false;
+
+  for (const line of lines) {
     const trimmed = line.trim();
-    if (!trimmed) return true;
-    if (trimmed.startsWith("Minni session receipt:")) return false;
-    if (/^>\s*hook_[a-z0-9_]+/i.test(trimmed)) return false;
-    if (/^\*\s*minni_[a-z0-9_]+/i.test(trimmed)) return false;
-    if (/^Minni:\s*\d+\s*candidate\s*learning/i.test(trimmed)) return false;
-    if (isAuditTelemetryLine(trimmed)) return false;
-    return true;
-  });
+    if (!trimmed) {
+      if (inTelemetryBlock) {
+        inTelemetryBlock = false;
+        continue;
+      }
+      filteredLines.push(line);
+      continue;
+    }
+    if (
+      /^📓\s*\d+\s+relevant\s+memor(?:y|ies)\b/i.test(trimmed) ||
+      /^⚠️\s*STALE\s+recall\s+pointer\b/i.test(trimmed)
+    ) {
+      continue;
+    }
+    if (
+      /^Minni recall guard\s*\(/i.test(trimmed) ||
+      /^\[Minni Subagent Brief\]$/i.test(trimmed) ||
+      /^Minni subagent brief\b/i.test(trimmed)
+    ) {
+      inTelemetryBlock =
+        trimmed.endsWith(":") || /^\[Minni Subagent Brief\]$/i.test(trimmed);
+      continue;
+    }
+    if (
+      /^Treat recalled snippets as evidence\b/i.test(trimmed) ||
+      /^You have unconsulted recall for this turn\b/i.test(trimmed)
+    ) {
+      inTelemetryBlock = false;
+      continue;
+    }
+    if (inTelemetryBlock && /^\s*-\s+"/.test(line)) {
+      continue;
+    }
+    inTelemetryBlock = false;
+
+    if (trimmed.startsWith("Minni session receipt:")) continue;
+    if (/^>\s*hook_[a-z0-9_]+/i.test(trimmed)) continue;
+    if (/^\*\s*minni_[a-z0-9_]+/i.test(trimmed)) continue;
+    if (/^Minni:\s*\d+\s*candidate\s*learning/i.test(trimmed)) continue;
+    if (isAuditTelemetryLine(trimmed)) continue;
+    filteredLines.push(line);
+  }
 
   return filteredLines.join("\n").trim();
 }

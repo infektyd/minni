@@ -24,6 +24,7 @@ import path from "node:path";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 
 import type { RecallResponse } from "./daemon_transport.js";
+import { durabilityOf } from "./durability.js";
 import type { VaultSearchResult } from "./vault.js";
 import { assertWriteTargetUnder } from "./vault.js";
 
@@ -35,6 +36,12 @@ export const RECALL_STATE_DIR_RELPATH = path.join(".runtime", "recall-state.d");
 
 /** S2b (§6.3.2): retention horizon for .claim files under recall-state.d (24h). */
 export const CLAIM_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/** S3c (§5.2 item 6): max characters for a sanitized recall field (title/wikilink). */
+export const RECALL_FIELD_MAX_CHARS = 100;
+
+/** S3c (§5.2 item 6): max characters for the single-line recall pointer. */
+export const RECALL_POINTER_MAX_CHARS = 300;
 
 /**
  * Default strength threshold for emitting the per-turn pointer + state file.
@@ -74,29 +81,117 @@ export function recallPointerThreshold(
 export interface RecallStateHit {
   title: string;
   wikilink: string;
-  /** The per-hit strength used (daemon confidence in [0,1], or normalized vault signal). */
+  /** The per-hit strength used (daemon confidence in [0,1], or calibrated vault signal). */
   score: number;
+  handle?: string;
+  mkey?: string;
+  relativePath?: string;
+  scope?: string;
+  docId?: number | string;
+  gateRoute?: "a" | "b" | "c" | null;
 }
 
 /**
- * H3: hit titles/wikilinks originate from vault note content, which is untrusted
- * (any local process can write a note). These strings are interpolated into the
- * PreToolUse deny reason and the per-turn pointer — text the model reads as
- * guidance. A title carrying newlines/control chars could smuggle its own lines
- * (e.g. "\n## SYSTEM: ignore prior instructions") that read as fresh imperative
- * instructions rather than inert data. Neutralize the structural markers an
- * injection relies on:
- *   - collapse every ASCII control char (CR/LF/tab included) to a space;
- *   - strip markdown heading markers (#) and backticks so a title cannot render
- *     as its own heading or code fence;
- *   - collapse whitespace runs and clamp the length.
- * The result is a single, bounded, inert token that stays inside the fixed
- * template rather than reading as structure.
+ * Normalize a vault path or wikilink to a canonical vault-relative path
+ * (`wiki/.../foo.md`).
  */
-export function sanitizeRecallField(value: unknown, maxLen = 120): string {
+export function normalizeVaultRelPath(rawPathOrWikilink: string): string {
+  let cleaned = typeof rawPathOrWikilink === "string" ? rawPathOrWikilink.trim() : "";
+  if (cleaned.startsWith("[[") && cleaned.endsWith("]]")) {
+    cleaned = cleaned.slice(2, -2).trim();
+  }
+  cleaned = cleaned.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/^\/+/, "");
+  if ((cleaned.startsWith("wiki/") || cleaned.startsWith("raw/")) && !cleaned.endsWith(".md")) {
+    cleaned = `${cleaned}.md`;
+  }
+  return cleaned;
+}
+
+/** Deterministic short handle `m:<sha1(relPath)[:8]>` for a vault note. */
+export function vaultHandleForPath(relPath: string): string {
+  const norm = normalizeVaultRelPath(relPath);
+  return `m:${createHash("sha1").update(norm, "utf8").digest("hex").slice(0, 8)}`;
+}
+
+/** Deterministic daemon document handle `d:<src>:<id>`. */
+export function docHandleFor(src: string, docId: number | string): string {
+  const safeSrc =
+    String(src || "personal")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, "") || "personal";
+  return `d:${safeSrc}:${String(docId).trim()}`;
+}
+
+/** Resolve or compute the deterministic handle (`m:<8hex>` or `d:<src>:<id>`) for a hit. */
+export function handleForHit(
+  hit: Partial<RecallStateHit> & {
+    relativePath?: string;
+    wikilink?: string;
+    scope?: string;
+    docId?: number | string;
+    handle?: string;
+  },
+): string {
+  if (typeof hit.handle === "string" && hit.handle.trim()) {
+    return hit.handle.trim();
+  }
+  if (hit.docId !== undefined && hit.docId !== null && String(hit.docId).trim() !== "") {
+    return docHandleFor(hit.scope ?? "personal", hit.docId);
+  }
+  if (typeof hit.relativePath === "string" && hit.relativePath.trim()) {
+    return vaultHandleForPath(hit.relativePath);
+  }
+  if (typeof hit.wikilink === "string" && hit.wikilink.trim()) {
+    return vaultHandleForPath(hit.wikilink);
+  }
+  return vaultHandleForPath(String(hit.title ?? "untitled"));
+}
+
+/** Resolve or compute the canonical memory key (`vault:<relPath>` or `doc:<src>:<id>`) for a hit. */
+export function mkeyForHit(
+  hit: Partial<RecallStateHit> & {
+    relativePath?: string;
+    wikilink?: string;
+    scope?: string;
+    docId?: number | string;
+    mkey?: string;
+  },
+): string {
+  if (typeof hit.mkey === "string" && hit.mkey.trim()) {
+    return hit.mkey.trim();
+  }
+  if (typeof hit.relativePath === "string" && hit.relativePath.trim()) {
+    return `vault:${normalizeVaultRelPath(hit.relativePath)}`;
+  }
+  if (hit.docId !== undefined && hit.docId !== null && String(hit.docId).trim() !== "") {
+    const safeSrc =
+      String(hit.scope || "personal")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, "") || "personal";
+    return `doc:${safeSrc}:${String(hit.docId).trim()}`;
+  }
+  if (typeof hit.wikilink === "string" && hit.wikilink.trim()) {
+    return `vault:${normalizeVaultRelPath(hit.wikilink)}`;
+  }
+  return `vault:${normalizeVaultRelPath(String(hit.title ?? "untitled"))}`;
+}
+
+/**
+ * H3 + S3c (§5.2 item 6): hit titles/wikilinks originate from vault note content,
+ * which is untrusted. Neutralize structural markers and invisible/bidi overrides:
+ *   - strip Unicode zero-width and bidi control chars (\u200B-\u200F, \u202A-\u202E,
+ *     \u2060-\u2069, \uFEFF);
+ *   - collapse every C0/C1 control char (\u0000-\u001F, \u007F-\u009F) to a space;
+ *   - strip markdown heading markers (#) and backticks;
+ *   - collapse whitespace runs and clamp to `maxLen` (default RECALL_FIELD_MAX_CHARS = 100).
+ */
+export function sanitizeRecallField(value: unknown, maxLen = RECALL_FIELD_MAX_CHARS): string {
   const raw = typeof value === "string" ? value : String(value ?? "");
   const collapsed = raw
-    .replace(new RegExp("[\\u0000-\\u001F\\u007F]+", "g"), " ")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]+/g, "")
+    .replace(/[\u0000-\u001F\u007F-\u009F]+/g, " ")
     .replace(/[#`]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -132,6 +227,10 @@ export interface RecallStateOptions {
 export interface StrongRecall {
   topScore: number;
   topHits: RecallStateHit[];
+}
+
+export interface ExtractStrongRecallOptions {
+  rankV2?: boolean;
 }
 
 function shouldIgnoreStateReadError(error: unknown): boolean {
@@ -179,6 +278,22 @@ function hitTitleWikilink(result: Record<string, unknown>): { title: string; wik
   return { title, wikilink };
 }
 
+function isDaemonResultNoise(result: Record<string, unknown>): boolean {
+  if (result.durability === "noise") return true;
+  const title = typeof result.title === "string" ? result.title : "";
+  if (/^\s*\[Subagent Context\]/i.test(title)) return true;
+  const cls = durabilityOf({
+    path: result.rel_path ?? result.path ?? result.filename ?? result.wikilink,
+    title,
+    content: result.content ?? result.snippet ?? result.body,
+    source: result.source,
+    status: result.status,
+    type: result.type,
+    category: result.category,
+  });
+  return cls === "noise";
+}
+
 /**
  * Decide whether this turn's recall is STRONG enough to surface a pointer, and
  * collect the top hits for the state file. Pure: no I/O. Returns null when the
@@ -186,45 +301,121 @@ function hitTitleWikilink(result: Record<string, unknown>): { title: string; wik
  *
  * Strength sources (gate opens if EITHER clears its bar):
  *   - daemon recall: per-result calibrated confidence ≥ `threshold`
- *     (identity-shelf hits excluded — they are boot context, not turn-relevant);
- *   - vault search: a direct substring match (raw score ≥ VAULT_DIRECT_MATCH_SCORE),
- *     normalized into [0,1] for the unified top_score scale.
+ *     (identity-shelf hits and, when rankV2 is active, noise hits excluded);
+ *   - vault search: calibrated `ups_gate` score (`clearsGate && weightedScore >= threshold`),
+ *     falling back to legacy `score >= VAULT_DIRECT_MATCH_SCORE` only when `rankV2 === false`
+ *     or when a caller passes un-calibrated mock results without `weightedScore`.
  */
 export function extractStrongRecall(
   response: RecallResponse | undefined,
   vaultResults: VaultSearchResult[],
-  threshold: number,
+  threshold: number = DEFAULT_RECALL_POINTER_THRESHOLD,
   limit = 5,
+  options?: ExtractStrongRecallOptions,
 ): StrongRecall | null {
+  const rankV2 = options?.rankV2 !== false;
+  const effThreshold =
+    typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0
+      ? threshold
+      : DEFAULT_RECALL_POINTER_THRESHOLD;
   const hits: RecallStateHit[] = [];
 
   const daemonResults = response && Array.isArray(response.results) ? response.results : [];
   for (const raw of daemonResults) {
     const result = (raw ?? {}) as Record<string, unknown>;
     if (String(result.layer ?? "") === "identity") continue; // boot shelf, not turn-relevant
+    if (rankV2 && isDaemonResultNoise(result)) continue;
     const strength = strengthOf(result);
-    if (strength === undefined || strength < threshold) continue;
+    if (strength === undefined || strength < effThreshold) continue;
     const { title, wikilink } = hitTitleWikilink(result);
-    hits.push({ title, wikilink, score: Number(strength.toFixed(4)) });
+    const rawDocId = result.id ?? result.doc_id ?? result.learning_id;
+    const docId =
+      typeof rawDocId === "number" || (typeof rawDocId === "string" && rawDocId.trim() !== "")
+        ? rawDocId
+        : undefined;
+    const scope =
+      typeof result.scope === "string" && result.scope.trim()
+        ? result.scope.trim()
+        : typeof result.source_scope === "string" && result.source_scope.trim()
+          ? result.source_scope.trim()
+          : typeof result.src === "string" && result.src.trim()
+            ? result.src.trim()
+            : "personal";
+    const rawRelPath =
+      typeof result.rel_path === "string" && result.rel_path.trim()
+        ? result.rel_path.trim()
+        : typeof result.path === "string" &&
+            !path.isAbsolute(result.path) &&
+            result.path.trim()
+          ? result.path.trim()
+          : undefined;
+    const relativePath = rawRelPath ? normalizeVaultRelPath(rawRelPath) : undefined;
+    const handle =
+      docId !== undefined
+        ? docHandleFor(scope, docId)
+        : relativePath
+          ? vaultHandleForPath(relativePath)
+          : vaultHandleForPath(wikilink);
+    const mkey =
+      relativePath && (relativePath.startsWith("wiki/") || relativePath.startsWith("raw/"))
+        ? `vault:${relativePath}`
+        : docId !== undefined
+          ? `doc:${scope.toLowerCase()}:${String(docId).trim()}`
+          : `vault:${normalizeVaultRelPath(wikilink)}`;
+    hits.push({
+      title,
+      wikilink,
+      score: Number(strength.toFixed(4)),
+      handle,
+      mkey,
+      ...(relativePath ? { relativePath } : {}),
+      ...(docId !== undefined ? { scope, docId } : {}),
+    });
   }
 
   for (const vaultHit of vaultResults) {
-    if (vaultHit.score < VAULT_DIRECT_MATCH_SCORE) continue;
-    // Normalize the vault raw score into [0,1] relative to the direct-match
-    // floor so it shares the top_score scale (1.0 == a clean full-query hit).
-    const normalized = Math.min(1, vaultHit.score / VAULT_DIRECT_MATCH_SCORE);
+    const hasCalibrated =
+      typeof vaultHit.weightedScore === "number" || typeof vaultHit.clearsGate === "boolean";
+    let hitScore: number;
+    if (rankV2 && hasCalibrated) {
+      if (vaultHit.clearsGate !== true) continue;
+      const weighted = vaultHit.weightedScore ?? vaultHit.gateScore ?? 0;
+      if (weighted < effThreshold) continue;
+      hitScore = Number(Math.max(0, Math.min(1, weighted)).toFixed(4));
+    } else {
+      if (vaultHit.score < VAULT_DIRECT_MATCH_SCORE) continue;
+      const normalized = Math.min(1, vaultHit.score / VAULT_DIRECT_MATCH_SCORE);
+      hitScore = Number(normalized.toFixed(4));
+    }
+    const relativePath = vaultHit.relativePath
+      ? normalizeVaultRelPath(vaultHit.relativePath)
+      : normalizeVaultRelPath(vaultHit.wikilink);
+    const handle = vaultHandleForPath(relativePath);
+    const mkey = `vault:${relativePath}`;
     hits.push({
       title: vaultHit.title || titleFromWikilink(vaultHit.wikilink),
       wikilink: vaultHit.wikilink,
-      score: Number(normalized.toFixed(4)),
+      score: hitScore,
+      handle,
+      mkey,
+      relativePath,
+      ...(vaultHit.gateRoute !== undefined ? { gateRoute: vaultHit.gateRoute } : {}),
     });
   }
 
   if (hits.length === 0) return null;
 
   hits.sort((a, b) => b.score - a.score);
-  const topHits = hits.slice(0, limit);
-  return { topScore: topHits[0].score, topHits };
+  const deduped: RecallStateHit[] = [];
+  const seenKeys = new Set<string>();
+  for (const hit of hits) {
+    const key = hit.mkey ?? hit.wikilink;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    deduped.push(hit);
+    if (deduped.length >= limit) break;
+  }
+  return { topScore: deduped[0].score, topHits: deduped };
 }
 
 /** Absolute path to the recall-state file for a vault. */
@@ -638,23 +829,529 @@ export async function markRecallConsumed(
   return mirrorOk;
 }
 
+export interface BuildRecallPointerOptions {
+  /** Maximum number of hits to name in the pointer (default 3). */
+  maxHits?: number;
+  /** Score band below topScore within which additional hits are included (default 0.15). */
+  scoreBand?: number;
+}
+
 /**
- * The ≤ ~120-token light pointer injected into the prompt on a strong turn.
- * Names the count + top hit + score and tells the agent to consult minni_recall
- * before deriving from scratch — a SIGNPOST, not the recall content itself.
+ * S3c (§5.2.6): select up to `maxHits` (default 3) top hits whose score is
+ * strictly within `scoreBand` (default 0.15) of `hits[0].score`.
  */
-export function buildRecallPointer(state: StrongRecall): string {
-  const top = state.topHits[0];
-  const n = state.topHits.length;
-  // H3: `top.title` is untrusted note content — sanitize (strip newlines/control
-  // chars, clamp) and quote it as inert data so a crafted title cannot inject
-  // its own line/instruction into the prompt pointer.
-  const title = sanitizeRecallField(top.title);
-  return (
-    `📓 ${n} relevant ${n === 1 ? "memory" : "memories"} ` +
-    `(top: "${title}", score ${top.score.toFixed(2)}). ` +
-    `Consult minni_recall (or the recall-state file) before deriving from scratch.`
+export function selectPointerHits(
+  hits: readonly RecallStateHit[],
+  options?: BuildRecallPointerOptions,
+): RecallStateHit[] {
+  const maxHits = Math.max(1, options?.maxHits ?? 3);
+  const scoreBand = options?.scoreBand ?? 0.15;
+  if (!Array.isArray(hits) || hits.length === 0) return [];
+  const topScore = hits[0].score;
+  const selected: RecallStateHit[] = [hits[0]];
+  for (let i = 1; i < hits.length && selected.length < maxHits; i += 1) {
+    const hit = hits[i];
+    const diff = Math.round((topScore - hit.score) * 1e6) / 1e6;
+    if (diff < scoreBand) {
+      selected.push(hit);
+    }
+  }
+  return selected;
+}
+
+/**
+ * The ≤ ~120-token (≤ 300 char, single-line) light pointer injected into the
+ * prompt on a strong turn. Names up to 3 top hits within 0.15 of the top score
+ * with their short handles (`m:<8hex>` or `d:<src>:<id>`) and scores, and tells
+ * the agent to consult `minni_recall` or `minni_drill(<handle>)` before deriving
+ * from scratch — a SIGNPOST, not the recall content itself.
+ */
+export function buildRecallPointer(
+  state: StrongRecall,
+  options?: BuildRecallPointerOptions,
+): string {
+  const selected = selectPointerHits(state.topHits, options);
+  if (selected.length === 0) return "";
+  const totalHits = state.topHits.length;
+  const handles = selected.map((hit) => handleForHit(hit));
+  const scores = selected.map((hit) => hit.score.toFixed(2));
+  const h0 = handles[0];
+
+  const renderWithTitles = (titles: readonly string[]): string => {
+    if (selected.length === 1 && totalHits > 1) {
+      return (
+        `📓 ${totalHits} relevant memories ` +
+        `(top: "${titles[0]}" (${h0}) ${scores[0]}). ` +
+        `Consult minni_recall or minni_drill(${h0}) before deriving from scratch.`
+      );
+    }
+    if (selected.length === 1) {
+      return (
+        `📓 1 relevant memory: "${titles[0]}" (${h0}) ${scores[0]}. ` +
+        `Consult minni_recall or minni_drill(${h0}) before deriving from scratch.`
+      );
+    }
+    const items = selected.map((_, idx) => `"${titles[idx]}" (${handles[idx]}) ${scores[idx]}`);
+    return (
+      `📓 ${selected.length} relevant memories: ${items.join(" · ")}. ` +
+      `Consult minni_recall or minni_drill(${h0}) before deriving from scratch.`
+    );
+  };
+
+  const emptyOverhead = renderWithTitles(selected.map(() => "")).length;
+  const availableForTitles = Math.max(
+    selected.length * 8,
+    RECALL_POINTER_MAX_CHARS - emptyOverhead,
   );
+  const perTitleMax = Math.max(
+    8,
+    Math.min(RECALL_FIELD_MAX_CHARS, Math.floor(availableForTitles / selected.length)),
+  );
+  const sanitizedTitles = selected.map((hit) =>
+    sanitizeRecallField(hit.title, perTitleMax).replaceAll('"', "'"),
+  );
+  return renderWithTitles(sanitizedTitles);
+}
+
+// ---- S3c (§5.2.6, §5.2.8): Session handle registry & cross-turn suppression --
+
+export interface SessionHandleEntry {
+  handle: string;
+  mkey: string;
+  wikilink: string;
+  title: string;
+  relativePath?: string;
+  scope?: string;
+  docId?: number;
+}
+
+interface SessionHandlesFile {
+  v: 1;
+  updated_at: string;
+  handles: Record<string, SessionHandleEntry>;
+}
+
+export interface SurfacedEntry {
+  turn_ix: number;
+  score: number;
+  reset_id: string;
+}
+
+export interface SessionSurfacedState {
+  sessionKey: string;
+  thisTurn: number;
+  resetId: string;
+  surfaced: Record<string, SurfacedEntry>;
+  hasExistingSurfaced: boolean;
+}
+
+interface SessionCountersFile {
+  v: 1;
+  turn_ix: number;
+  reset_id?: string;
+  surfaced?: Record<string, SurfacedEntry>;
+}
+
+function existingSessionLedgerDir(vaultPath: string, sessionKey: string): string | null {
+  try {
+    const dirPath = path.join(vaultPath, ".runtime", "recall-session.d", sessionKey);
+    assertWriteTargetUnder(dirPath, vaultPath);
+    const st = fs.lstatSync(dirPath);
+    if (st.isDirectory() && !st.isSymbolicLink()) return dirPath;
+  } catch {
+    // Directory does not exist or failed containment.
+  }
+  return null;
+}
+
+function writeJsonAtomicSync(filePath: string, vaultPath: string, data: unknown): void {
+  assertWriteTargetUnder(filePath, vaultPath);
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    fs.writeFileSync(tmpPath, `${JSON.stringify(data)}\n`, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // Ignore cleanup error.
+    }
+    throw err;
+  }
+}
+
+/**
+ * S3c (§5.2.6): record handles surfaced in this session so `minni_drill` can
+ * resolve `m:<8hex>` and verify `d:<src>:<id>` handles against the active session.
+ */
+export async function recordSessionHandles(
+  vaultPath: string,
+  sessionId: string | undefined,
+  hits: readonly RecallStateHit[],
+): Promise<void> {
+  if (!Array.isArray(hits) || hits.length === 0) return;
+  const sKey = sessionStateKey(sessionId) ?? "default";
+  try {
+    const stateDir = ensureContainedDir(vaultPath, [".runtime", "recall-state.d"], true);
+    if (!stateDir) return;
+    const handlesPath = path.join(stateDir, `${sKey}.handles.json`);
+    let existing: Record<string, SessionHandleEntry> = {};
+    try {
+      assertWriteTargetUnder(handlesPath, vaultPath);
+      const raw = fs.readFileSync(handlesPath, "utf8");
+      const parsed = JSON.parse(raw) as SessionHandlesFile;
+      if (parsed && parsed.v === 1 && parsed.handles && typeof parsed.handles === "object") {
+        existing = { ...parsed.handles };
+      }
+    } catch {
+      // Start fresh.
+    }
+    for (const hit of hits) {
+      const handle = handleForHit(hit);
+      const mkey = mkeyForHit(hit);
+      existing[handle] = {
+        handle,
+        mkey,
+        wikilink: hit.wikilink,
+        title: sanitizeRecallField(hit.title),
+        ...(hit.relativePath ? { relativePath: normalizeVaultRelPath(hit.relativePath) } : {}),
+        ...(hit.scope ? { scope: hit.scope } : {}),
+        ...(typeof hit.docId === "number" ? { docId: hit.docId } : {}),
+      };
+    }
+    const payload: SessionHandlesFile = {
+      v: 1,
+      updated_at: new Date().toISOString(),
+      handles: existing,
+    };
+    writeJsonAtomicSync(handlesPath, vaultPath, payload);
+
+    const ledgerDir = existingSessionLedgerDir(vaultPath, sKey);
+    if (ledgerDir) {
+      const mirrorPath = path.join(ledgerDir, "handles.json");
+      writeJsonAtomicSync(mirrorPath, vaultPath, payload);
+    }
+  } catch {
+    // Best-effort.
+  }
+}
+
+/**
+ * S3c (§5.2.6): look up a handle in the session handle registry.
+ */
+export async function readSessionHandle(
+  vaultPath: string,
+  sessionId: string | undefined,
+  handle: string,
+): Promise<SessionHandleEntry | null> {
+  const normalizedHandle = handle.trim();
+  if (!normalizedHandle) return null;
+  const candidateKeys: string[] = [];
+  const sKey = sessionStateKey(sessionId);
+  if (sKey) candidateKeys.push(sKey);
+  candidateKeys.push("default");
+
+  const tryReadHandlesFile = (filePath: string): SessionHandleEntry | null => {
+    try {
+      assertWriteTargetUnder(filePath, vaultPath);
+      const raw = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw) as SessionHandlesFile;
+      if (parsed && parsed.v === 1 && parsed.handles && typeof parsed.handles === "object") {
+        const match = parsed.handles[normalizedHandle] ?? parsed.handles[normalizedHandle.toLowerCase()];
+        if (match && typeof match === "object") return match;
+      }
+    } catch {
+      // Ignore missing or unreadable file.
+    }
+    return null;
+  };
+
+  for (const key of candidateKeys) {
+    const ledgerDir = existingSessionLedgerDir(vaultPath, key);
+    if (ledgerDir) {
+      const fromLedger = tryReadHandlesFile(path.join(ledgerDir, "handles.json"));
+      if (fromLedger) return fromLedger;
+    }
+    const stateFile = path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${key}.handles.json`);
+    const fromState = tryReadHandlesFile(stateFile);
+    if (fromState) return fromState;
+  }
+
+  // Fallback scan when sessionId was not provided by the caller: check any
+  // session handle file in .runtime/recall-state.d.
+  if (!sKey) {
+    try {
+      const dirPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH);
+      assertWriteTargetUnder(dirPath, vaultPath);
+      for (const name of fs.readdirSync(dirPath)) {
+        if (!name.endsWith(".handles.json")) continue;
+        const found = tryReadHandlesFile(path.join(dirPath, name));
+        if (found) return found;
+      }
+    } catch {
+      // Ignore scan errors.
+    }
+  }
+  return null;
+}
+
+const SUPPRESSION_TURN_WINDOW = 5;
+const SUPPRESSION_SCORE_JUMP = 0.1;
+
+function readResetMarkerId(vaultPath: string, sessionKey: string): string | null {
+  const ledgerDir = existingSessionLedgerDir(vaultPath, sessionKey);
+  if (!ledgerDir) return null;
+  try {
+    const resetPath = path.join(ledgerDir, "main.reset");
+    assertWriteTargetUnder(resetPath, vaultPath);
+    const raw = fs.readFileSync(resetPath, "utf8");
+    const parsed = JSON.parse(raw) as { reset_id?: unknown };
+    if (parsed && typeof parsed.reset_id === "string" && parsed.reset_id.trim()) {
+      return parsed.reset_id.trim();
+    }
+  } catch {
+    // Absent or unreadable.
+  }
+  return null;
+}
+
+/**
+ * S3c (§5.2.8): read the session's current turn counter, reset epoch, and
+ * recently surfaced memory map.
+ */
+export async function readSessionSurfacedState(
+  vaultPath: string,
+  sessionId: string | undefined,
+  knownTurnIx?: number,
+): Promise<SessionSurfacedState> {
+  const sessionKey = sessionStateKey(sessionId) ?? "default";
+  let prevTurnIx = 0;
+  let stateResetId = "0";
+  let surfaced: Record<string, SurfacedEntry> = {};
+  let hasExistingSurfaced = false;
+
+  const stateCountersPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${sessionKey}.counters.json`);
+  try {
+    assertWriteTargetUnder(stateCountersPath, vaultPath);
+    const raw = fs.readFileSync(stateCountersPath, "utf8");
+    const parsed = JSON.parse(raw) as SessionCountersFile;
+    if (parsed && parsed.v === 1 && Number.isSafeInteger(parsed.turn_ix) && parsed.turn_ix >= 0) {
+      prevTurnIx = parsed.turn_ix;
+      if (typeof parsed.reset_id === "string" && parsed.reset_id.trim()) {
+        stateResetId = parsed.reset_id.trim();
+      }
+      if (parsed.surfaced && typeof parsed.surfaced === "object") {
+        surfaced = { ...parsed.surfaced };
+        hasExistingSurfaced = Object.keys(surfaced).length > 0;
+      }
+    }
+  } catch {
+    // Absent or unreadable.
+  }
+
+  const ledgerDir = existingSessionLedgerDir(vaultPath, sessionKey);
+  if (ledgerDir) {
+    try {
+      const ledgerCountersPath = path.join(ledgerDir, "counters.json");
+      assertWriteTargetUnder(ledgerCountersPath, vaultPath);
+      const raw = fs.readFileSync(ledgerCountersPath, "utf8");
+      const parsed = JSON.parse(raw) as SessionCountersFile;
+      if (parsed && parsed.v === 1 && Number.isSafeInteger(parsed.turn_ix) && parsed.turn_ix >= 0) {
+        if (parsed.surfaced && typeof parsed.surfaced === "object") {
+          surfaced = { ...parsed.surfaced, ...surfaced };
+          hasExistingSurfaced = Object.keys(surfaced).length > 0;
+        }
+      }
+    } catch {
+      // Ignore.
+    }
+  }
+
+  const markerResetId = readResetMarkerId(vaultPath, sessionKey);
+  const resetId = markerResetId ?? stateResetId;
+  const thisTurn =
+    typeof knownTurnIx === "number" && Number.isSafeInteger(knownTurnIx) && knownTurnIx >= 1
+      ? knownTurnIx
+      : prevTurnIx + 1;
+
+  return {
+    sessionKey,
+    thisTurn,
+    resetId,
+    surfaced,
+    hasExistingSurfaced,
+  };
+}
+
+/**
+ * S3c (§5.2.8): return true when `hit` was already delivered in a pointer within
+ * the last 5 turns of the same reset epoch and its score has not jumped by >= 0.10.
+ */
+export function shouldSuppressHit(hit: RecallStateHit, state: SessionSurfacedState): boolean {
+  const mkey = mkeyForHit(hit);
+  const entry = state.surfaced[mkey];
+  if (!entry || typeof entry !== "object") return false;
+  if (entry.reset_id !== state.resetId) return false;
+  const turnDiff = state.thisTurn - entry.turn_ix;
+  if (turnDiff < 1 || turnDiff > SUPPRESSION_TURN_WINDOW) return false;
+  const scoreGain = Math.round((hit.score - entry.score) * 1e6) / 1e6;
+  return scoreGain < SUPPRESSION_SCORE_JUMP;
+}
+
+function mirrorSurfacedToLedgerCounters(
+  vaultPath: string,
+  sessionKey: string,
+  thisTurn: number,
+  surfaced: Record<string, SurfacedEntry>,
+): void {
+  const ledgerDir = existingSessionLedgerDir(vaultPath, sessionKey);
+  if (!ledgerDir) return;
+  const countersPath = path.join(ledgerDir, "counters.json");
+  try {
+    assertWriteTargetUnder(countersPath, vaultPath);
+    if (!fs.existsSync(countersPath)) return;
+    const raw = fs.readFileSync(countersPath, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    // Never overwrite a corrupt counters.json (preserves F8 review invariant).
+    if (
+      !parsed ||
+      parsed.v !== 1 ||
+      typeof parsed.turn_ix !== "number" ||
+      !Number.isSafeInteger(parsed.turn_ix) ||
+      parsed.turn_ix < 0
+    ) {
+      return;
+    }
+    writeJsonAtomicSync(countersPath, vaultPath, {
+      ...parsed,
+      turn_ix: Math.max(parsed.turn_ix, thisTurn),
+      surfaced,
+    });
+  } catch {
+    // Best-effort.
+  }
+}
+
+/**
+ * S3c (§5.2.8): commit the hits named by a DELIVERED pointer into the session's
+ * surfaced map and advance the session turn counter. Registered via
+ * `deferUntilDelivered` so an undelivered/dropped pointer never suppresses a
+ * subsequent turn.
+ */
+export async function commitSurfacedPointer(
+  vaultPath: string,
+  sessionId: string | undefined,
+  state: SessionSurfacedState,
+  surfacedHits: readonly RecallStateHit[],
+): Promise<void> {
+  const sKey = sessionStateKey(sessionId) ?? state.sessionKey;
+  try {
+    const stateDir = ensureContainedDir(vaultPath, [".runtime", "recall-state.d"], true);
+    if (!stateDir) return;
+    const nextSurfaced: Record<string, SurfacedEntry> = {};
+    for (const [key, entry] of Object.entries(state.surfaced)) {
+      if (
+        entry &&
+        entry.reset_id === state.resetId &&
+        state.thisTurn - entry.turn_ix <= SUPPRESSION_TURN_WINDOW
+      ) {
+        nextSurfaced[key] = entry;
+      }
+    }
+    for (const hit of surfacedHits) {
+      const mkey = mkeyForHit(hit);
+      nextSurfaced[mkey] = {
+        turn_ix: state.thisTurn,
+        score: hit.score,
+        reset_id: state.resetId,
+      };
+    }
+    const payload: SessionCountersFile = {
+      v: 1,
+      turn_ix: state.thisTurn,
+      reset_id: state.resetId,
+      surfaced: nextSurfaced,
+    };
+    const stateCountersPath = path.join(stateDir, `${sKey}.counters.json`);
+    writeJsonAtomicSync(stateCountersPath, vaultPath, payload);
+    mirrorSurfacedToLedgerCounters(vaultPath, sKey, state.thisTurn, nextSurfaced);
+  } catch {
+    // Best-effort.
+  }
+}
+
+/**
+ * S3c (§5.2.8): advance the session turn counter on a delivered turn where all
+ * hits were suppressed (or weak), so the 5-turn suppression window progresses.
+ * Only writes when a counters file already exists for the session.
+ */
+export async function advanceSessionTurnIfPresent(
+  vaultPath: string,
+  sessionId: string | undefined,
+  state: SessionSurfacedState,
+): Promise<void> {
+  const sKey = sessionStateKey(sessionId) ?? state.sessionKey;
+  try {
+    const stateCountersPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${sKey}.counters.json`);
+    assertWriteTargetUnder(stateCountersPath, vaultPath);
+    if (!fs.existsSync(stateCountersPath)) return;
+    const nextSurfaced: Record<string, SurfacedEntry> = {};
+    for (const [key, entry] of Object.entries(state.surfaced)) {
+      if (
+        entry &&
+        entry.reset_id === state.resetId &&
+        state.thisTurn - entry.turn_ix <= SUPPRESSION_TURN_WINDOW
+      ) {
+        nextSurfaced[key] = entry;
+      }
+    }
+    const payload: SessionCountersFile = {
+      v: 1,
+      turn_ix: state.thisTurn,
+      reset_id: state.resetId,
+      surfaced: nextSurfaced,
+    };
+    writeJsonAtomicSync(stateCountersPath, vaultPath, payload);
+    mirrorSurfacedToLedgerCounters(vaultPath, sKey, state.thisTurn, nextSurfaced);
+  } catch {
+    // Best-effort.
+  }
+}
+
+/**
+ * S3c (§5.2.8): clear cross-turn suppression state on SessionStart / PreCompact /
+ * PostCompact. Only updates existing counter files so a reset with the ledger
+ * off creates no new directories or files.
+ */
+export async function clearSessionSurfacedOnReset(
+  vaultPath: string,
+  sessionId: string | undefined,
+): Promise<void> {
+  const sKey = sessionStateKey(sessionId) ?? "default";
+  const nextResetId = randomBytes(8).toString("hex");
+  try {
+    const stateCountersPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${sKey}.counters.json`);
+    assertWriteTargetUnder(stateCountersPath, vaultPath);
+    if (fs.existsSync(stateCountersPath)) {
+      const raw = fs.readFileSync(stateCountersPath, "utf8");
+      const parsed = JSON.parse(raw) as SessionCountersFile;
+      const turnIx =
+        parsed && parsed.v === 1 && Number.isSafeInteger(parsed.turn_ix) && parsed.turn_ix >= 0
+          ? parsed.turn_ix
+          : 0;
+      writeJsonAtomicSync(stateCountersPath, vaultPath, {
+        v: 1,
+        turn_ix: turnIx,
+        reset_id: nextResetId,
+        surfaced: {},
+      });
+    }
+  } catch {
+    // Ignore.
+  }
+  mirrorSurfacedToLedgerCounters(vaultPath, sKey, 0, {});
 }
 
 /**
