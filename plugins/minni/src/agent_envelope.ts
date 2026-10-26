@@ -407,7 +407,8 @@ export function fitEnvelope<T extends EnvelopeBody>(
   const measure = (): { json: string; tokens: number; totalChars: number } => {
     const json = serializeEnvelope(working);
     const tokens = estimateTokens(json);
-    let totalChars = json.length;
+    const nativePrefixLen = currentNativeLayer1 ? currentNativeLayer1.length + 2 : 0;
+    let totalChars = nativePrefixLen + json.length;
     if (limits.event || limits.agent) {
       const ev = limits.event ?? "SessionStart";
       const ag = limits.agent ?? "claudecode";
@@ -415,7 +416,6 @@ export function fitEnvelope<T extends EnvelopeBody>(
         limits.tokenLimit ? ` budget="${limits.tokenLimit}"` : ""
       }>`;
       const wrappedLen = open.length + 1 + json.length + 1 + "</minni:context>".length;
-      const nativePrefixLen = currentNativeLayer1 ? currentNativeLayer1.length + 2 : 0;
       totalChars = nativePrefixLen + wrappedLen;
     }
     return { json, tokens, totalChars };
@@ -428,11 +428,13 @@ export function fitEnvelope<T extends EnvelopeBody>(
     return false;
   };
 
+  // A reader-truncated shelf (core.md > 8,192 bytes, truncated: true) is
+  // unconditionally converted to its <= 4,000-char boot form (§6.2.4 / §8.3)
+  // before evaluating whether Steps 1–5 need to trim other sections.
+  ensureTruncatedShelfBootForm();
+
   if (!needsTrim()) {
-    ensureTruncatedShelfBootForm();
-    if (!needsTrim()) {
-      return working as T;
-    }
+    return working as T;
   }
 
   // Step 1: audit_tail -> 0 entries
@@ -440,10 +442,7 @@ export function fitEnvelope<T extends EnvelopeBody>(
     const from = working.audit_tail.length;
     working.audit_tail = [];
     recordTrim("audit_tail", from, 0);
-    if (!needsTrim()) {
-      ensureTruncatedShelfBootForm();
-      if (!needsTrim()) return working as T;
-    }
+    if (!needsTrim()) return working as T;
   }
 
   // Step 2: recall -> drop episodic first, then shrink results to top 1 non-identity + up to 2 corrections
@@ -517,10 +516,7 @@ export function fitEnvelope<T extends EnvelopeBody>(
       }
     }
 
-    if (!needsTrim()) {
-      ensureTruncatedShelfBootForm();
-      if (!needsTrim()) return working as T;
-    }
+    if (!needsTrim()) return working as T;
   }
 
   // Step 3: recent_learnings -> 3 (durable first; candidate lines dropped first)
@@ -582,8 +578,10 @@ export function fitEnvelope<T extends EnvelopeBody>(
           const durableBullets: string[] = [];
           const ordinaryBullets: string[] = [];
           const candidateBullets: string[] = [];
+          const candidateTagRe =
+            /^\s*-\s*(?:\[\d{4}-\d{2}-\d{2}\]\s*)?\[candidate\]|\((?:[^\n)]*\b)?(?:review_state|status)\s*[:=]\s*["']?candidate\b|\b(?:review_state|status)\s*[:=]\s*["']?candidate\b/i;
           for (const b of bullets) {
-            if (/\bcandidate\b|\[candidate\]/i.test(b)) {
+            if (candidateTagRe.test(b)) {
               candidateBullets.push(b);
             } else if (DURABLE_LEARNING_TAG_RE.test(b)) {
               durableBullets.push(b);
@@ -603,10 +601,7 @@ export function fitEnvelope<T extends EnvelopeBody>(
         }
       }
     }
-    if (!needsTrim()) {
-      ensureTruncatedShelfBootForm();
-      if (!needsTrim()) return working as T;
-    }
+    if (!needsTrim()) return working as T;
   }
 
   // Step 4: handoff_context -> refs only (strip inline note bodies)
@@ -639,10 +634,7 @@ export function fitEnvelope<T extends EnvelopeBody>(
         recordTrim("handoff_context", fromChars, toChars);
       }
     }
-    if (!needsTrim()) {
-      ensureTruncatedShelfBootForm();
-      if (!needsTrim()) return working as T;
-    }
+    if (!needsTrim()) return working as T;
   }
 
   // Step 5: pending_attention -> { count } summary
@@ -666,10 +658,7 @@ export function fitEnvelope<T extends EnvelopeBody>(
         recordTrim("pending_attention", from, 1);
       }
     }
-    if (!needsTrim()) {
-      ensureTruncatedShelfBootForm();
-      if (!needsTrim()) return working as T;
-    }
+    if (!needsTrim()) return working as T;
   }
 
   // Step 6: layer1_shelf -> <= 4,000-char boot form + marker (inline_trim: true)
@@ -679,9 +668,6 @@ export function fitEnvelope<T extends EnvelopeBody>(
         ? (working.layer1_shelf as Record<string, unknown>)
         : undefined;
     convertShelfToBootForm(shelf?.truncated === true);
-    if (!needsTrim()) return working as T;
-  } else {
-    ensureTruncatedShelfBootForm();
     if (!needsTrim()) return working as T;
   }
 

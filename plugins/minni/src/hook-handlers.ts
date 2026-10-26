@@ -1575,12 +1575,66 @@ export function createHookHandlers(
             },
           }
         : recall;
+    const trimmedMap =
+      bootFitOn &&
+      bodyForEnvelope.trimmed !== null &&
+      typeof bodyForEnvelope.trimmed === "object"
+        ? (bodyForEnvelope.trimmed as Record<string, unknown>)
+        : undefined;
+    const fittedLearningsObj =
+      bootFitOn &&
+      bodyForEnvelope.recent_learnings !== null &&
+      typeof bodyForEnvelope.recent_learnings === "object" &&
+      !Array.isArray(bodyForEnvelope.recent_learnings)
+        ? (bodyForEnvelope.recent_learnings as Record<string, unknown>)
+        : undefined;
+    const learningsTrimmed =
+      trimmedMap !== undefined &&
+      ("recent_learnings" in trimmedMap ||
+        (bootIdentity === "agent-context" && "identity_body" in trimmedMap));
+    const survivingLearningsText =
+      bootIdentity === "agent-context"
+        ? nativeLayer1
+        : typeof fittedLearningsObj?.context === "string"
+          ? fittedLearningsObj.context
+          : undefined;
+    const identityForCapture: typeof identityRead =
+      learningsTrimmed &&
+      identityRead.ok &&
+      identityRead.data &&
+      survivingLearningsText !== undefined
+        ? {
+            ...identityRead,
+            data: {
+              ...identityRead.data,
+              context: survivingLearningsText,
+              ...(Array.isArray(
+                (identityRead.data as Record<string, unknown>).recent_learnings,
+              )
+                ? {
+                    recent_learnings: (
+                      (identityRead.data as Record<string, unknown>)
+                        .recent_learnings as unknown[]
+                    ).filter((entry) => {
+                      if (!entry || typeof entry !== "object") return false;
+                      const line = (entry as Record<string, unknown>).line;
+                      return (
+                        typeof line === "string" &&
+                        line.length > 0 &&
+                        survivingLearningsText.includes(line)
+                      );
+                    }),
+                  }
+                : {}),
+            },
+          }
+        : identityRead;
     // S1a-2: what this boot surfaced, judged on the exact emitted string. The
     // rows are deferred and land only once this output does.
     ledger?.api.captureBootSurfacings(ledger.capture, {
       emitted: bootText,
       recall: recallForCapture,
-      identity: identityRead,
+      identity: identityForCapture,
     });
     return render(injectIntent("SessionStart", bootText));
   }

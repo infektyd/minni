@@ -320,3 +320,54 @@ test(
     assert.equal(fitted.layer1_shelf.content, "# Short Core\n concise shelf.");
   },
 );
+
+test(
+  "fitEnvelope converts reader-truncated layer1_shelf before Steps 1-5 and preserves durable learnings mentioning 'candidate' in prose",
+  () => {
+    // F1: truncated: true shelf (8192 chars) + audit_tail + recent_learnings -> converting shelf first brings under 6000 chars without dropping audit_tail
+    const bodyWithTruncatedShelf = {
+      contract: "MEMORY CONTRACT",
+      layer1_shelf: {
+        ok: true,
+        path: "layer1/core.md",
+        content: ("### Section\n" + "Shelf rule text. ".repeat(10) + "\n\n").repeat(45).slice(0, 8192),
+        truncated: true,
+        omitted_bytes: 500,
+      },
+      audit_tail: [{ tool: "hook_session_start", summary: "keep me" }],
+    };
+    const fittedShelfFirst = fitEnvelope(bodyWithTruncatedShelf, { tokenLimit: 2500, charLimit: 6000 });
+    assert.equal(fittedShelfFirst.layer1_shelf.inline_trim, true);
+    assert.equal(
+      fittedShelfFirst.audit_tail.length,
+      1,
+      "audit_tail must not be wiped when reader-truncated shelf boot form already satisfies limits",
+    );
+
+    // F2: durable learning bullet mentioning the English word "candidate" in prose must stay durable, not be dropped as a candidate
+    const learningsBody = {
+      contract: "MEMORY CONTRACT",
+      recent_learnings: {
+        ok: true,
+        context: [
+          "## Learnings (claude-code)",
+          "  - [candidate] Unverified note",
+          "  - [note] Ordinary observation 1",
+          "  - [note] Ordinary observation 2",
+          "  - [note] Ordinary observation 3",
+          "  - [correction] resolve_candidate requires a stamped principal",
+        ].join("\n"),
+      },
+      audit_tail: [],
+    };
+    const fittedLearnings = fitEnvelope(learningsBody, { tokenLimit: 10, charLimit: 50 });
+    assert.ok(
+      fittedLearnings.recent_learnings.context.includes("resolve_candidate requires a stamped principal"),
+      "durable [correction] mentioning 'candidate' in prose must be retained ahead of ordinary/candidate lines",
+    );
+    assert.ok(
+      !fittedLearnings.recent_learnings.context.includes("[candidate] Unverified note"),
+      "[candidate] tagged line must be dropped first",
+    );
+  },
+);
