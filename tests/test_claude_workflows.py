@@ -258,6 +258,48 @@ def test_no_commented_out_guard_masquerading_as_one():
             raise AssertionError(f"claude.yml: commented-out condition: {stripped}")
 
 
+def test_claude_action_bounds_tool_surface():
+    """#316 / #236: The interactive @claude action posts agent output publicly.
+    Without tool restriction, the agent has unrestricted shell (Bash) and write
+    access. claude_args must bound the tool surface to safe read-only repo inspection
+    and disallow Bash and mutations."""
+    steps = _job(CLAUDE).get("steps", [])
+    claude_step = next(
+        (s for s in steps if str(s.get("uses", "")).startswith("anthropics/claude-code-action")),
+        None,
+    )
+    assert claude_step is not None, "claude.yml: anthropics/claude-code-action step not found"
+    claude_args = (claude_step.get("with") or {}).get("claude_args", "")
+    assert isinstance(claude_args, str) and claude_args.strip(), (
+        "claude.yml: claude_args is missing or empty"
+    )
+    assert "--allowed-tools" in claude_args or "--allowedTools" in claude_args
+    assert "--disallowed-tools" in claude_args or "--disallowedTools" in claude_args
+    allowed_match = re.search(r"--allowed(?:-tools|Tools)\s+([^\s]+)", claude_args)
+    disallowed_match = re.search(r"--disallowed(?:-tools|Tools)\s+([^\s]+)", claude_args)
+    allowed = allowed_match.group(1).split(",") if allowed_match else []
+    disallowed = disallowed_match.group(1).split(",") if disallowed_match else []
+    assert "Bash" not in allowed, f"Bash should not be allowed: {allowed}"
+    assert "Bash" in disallowed, f"Bash should be explicitly disallowed: {disallowed}"
+    assert set(allowed) == {"Read", "Grep", "Glob"}, (
+        f"claude.yml allowed tools should be strictly read-only repo inspection: {allowed}"
+    )
+    required_disallowed = {"Bash", "Write", "Edit", "MultiEdit", "WebFetch", "WebSearch"}
+    assert required_disallowed <= set(disallowed), (
+        f"claude.yml disallowed tools missing required entries: {required_disallowed - set(disallowed)}"
+    )
+
+
+def test_claude_workflow_removes_sec_g9_exempt_carveout():
+    """#316: SEC-G9-EXEMPT was a temporary deferral marker for unmitigated agent
+    leak gate in claude.yml. Once tool surface is bounded, the carve-out is resolved
+    and the exemption marker must not remain."""
+    content = CLAUDE.read_text(encoding="utf-8")
+    assert "SEC-G9-EXEMPT" not in content, (
+        "claude.yml still contains SEC-G9-EXEMPT deferral marker"
+    )
+
+
 @pytest.mark.parametrize("path", sorted(WORKFLOWS.glob("*.yml")))
 def test_every_workflow_still_parses(path):
     assert _load(path)["jobs"], f"{path.name}: no jobs"

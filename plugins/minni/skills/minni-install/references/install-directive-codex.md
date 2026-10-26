@@ -32,7 +32,7 @@ context; they do not restrict authorized cross-project recall.
 
 The payload contains `.codex-plugin/plugin.json`, which names
 `./hooks/hooks-codex.json`. Its supported events are `SessionStart`,
-`UserPromptSubmit`, `PreToolUse`, `PreCompact`, and `Stop`; commands use Codex's
+`UserPromptSubmit`, `PreToolUse`, `PreCompact`, `PostCompact`, and `Stop`; commands use Codex's
 `PLUGIN_ROOT` environment variable. Copying these files does not enable them.
 
 `minni wire codex` configures MCP; it does not install/enable Minni in Codex's

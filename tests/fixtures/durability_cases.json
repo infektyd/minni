@@ -1,0 +1,634 @@
+{
+  "version": 1,
+  "description": "Synthetic cases for the shared durability predicate (recall-to-use rev5 §5.2.3). Run by both plugins/minni/tests/durability-parity.test.mjs and tests/test_durability_parity.py.",
+  "constants": {
+    "version": 1,
+    "categorySynonyms": {
+      "decision": "decision",
+      "adr": "decision",
+      "fix": "fix",
+      "bugfix": "fix",
+      "scar": "fix",
+      "procedure": "procedure",
+      "architecture": "architecture",
+      "preference": "preference"
+    },
+    "durableCategories": [
+      "decision",
+      "fix",
+      "procedure",
+      "architecture"
+    ],
+    "contentTestPrefixes": [
+      "Decision:",
+      "Fix:",
+      "Root cause:",
+      "Resolution:",
+      "Invariant:",
+      "Never ",
+      "Always "
+    ],
+    "contentSectionPattern": "^##\\s+(?:Resolution|Fix)\\b",
+    "ruleIds": [
+      "noise.envelope_skip",
+      "noise.envelope_wrapped",
+      "noise.envelope_system_reminder",
+      "noise.compaction_source",
+      "noise.compaction_path",
+      "noise.plan_journal",
+      "noise.plan_complete",
+      "noise.plan_candidate_resolved",
+      "durable.category",
+      "durable.content_prefix",
+      "durable.content_section",
+      "durable.preference_post_gate",
+      "ordinary.default"
+    ]
+  },
+  "cases": [
+    {
+      "id": "dur-01",
+      "note": "task-notification skip envelope is noise",
+      "input": {
+        "content": "<task-notification id=\"t1\">background task finished</task-notification>",
+        "category": "decision"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.envelope_skip"
+      }
+    },
+    {
+      "id": "dur-02",
+      "note": "bash-input skip envelope is noise",
+      "input": {
+        "content": "<bash-input>git status -sb</bash-input>"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.envelope_skip"
+      }
+    },
+    {
+      "id": "dur-03",
+      "note": "command-name skip envelope is noise",
+      "input": {
+        "content": "<command-name>/compact</command-name>"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.envelope_skip"
+      }
+    },
+    {
+      "id": "dur-04",
+      "note": "cross-session-message wrapper is noise even when tagged decision",
+      "input": {
+        "content": "<cross-session-message from=\"peer\">Decision: switch port</cross-session-message>",
+        "category": "decision"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.envelope_wrapped"
+      }
+    },
+    {
+      "id": "dur-05",
+      "note": "Another Claude session lead wrapper is noise",
+      "input": {
+        "content": "Another Claude session sent a message:\nFix: check socket permissions"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.envelope_wrapped"
+      }
+    },
+    {
+      "id": "dur-06",
+      "note": "Workflow harness header wrapper is noise",
+      "input": {
+        "content": "[Workflow harness: step 2]\nRun verification gate"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.envelope_wrapped"
+      }
+    },
+    {
+      "id": "dur-07",
+      "note": "prompt consisting solely of system-reminder block is noise",
+      "input": {
+        "content": "  <system-reminder>internal hook reminder</system-reminder>\n"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.envelope_system_reminder"
+      }
+    },
+    {
+      "id": "dur-08",
+      "note": "compaction summary by source field is noise",
+      "input": {
+        "source": "compact_distillation:20261020",
+        "category": "decision",
+        "content": "Decision: summarized during compaction"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.compaction_source"
+      }
+    },
+    {
+      "id": "dur-09",
+      "note": "compaction summary by frontmatter content is noise",
+      "input": {
+        "path": "wiki/sessions/summary.md",
+        "content": "---\ntitle: Session Summary\nsource: compact_distillation:sess-99\n---\n# Summary\nDecision: something"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.compaction_source"
+      }
+    },
+    {
+      "id": "dur-10",
+      "note": "compaction summary by relative wiki/sessions/*-compact-* path is noise",
+      "input": {
+        "path": "wiki/sessions/2026-10-20-compact-123.md",
+        "content": "Session compaction note body"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.compaction_path"
+      }
+    },
+    {
+      "id": "dur-11",
+      "note": "compaction summary by absolute vault source path is noise",
+      "input": {
+        "source": "/Users/example/vault/wiki/sessions/20261020-compact-sess-1-abcdef12.md",
+        "content": "Session compaction note body"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.compaction_path"
+      }
+    },
+    {
+      "id": "dur-12",
+      "note": "plan journal .log.md path is noise",
+      "input": {
+        "path": "wiki/artifacts/plan-abc123.log.md",
+        "content": "Decision: logged inside plan journal"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_journal"
+      }
+    },
+    {
+      "id": "dur-13",
+      "note": "plan journal .log path is noise",
+      "input": {
+        "path": "/vault/wiki/artifacts/plan-abc123.log",
+        "content": "Plan log line"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_journal"
+      }
+    },
+    {
+      "id": "dur-14",
+      "note": "plan note with status complete is noise",
+      "input": {
+        "path": "wiki/artifacts/plan-abc123.md",
+        "status": "complete",
+        "content": "# Plan\nAll done."
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_complete"
+      }
+    },
+    {
+      "id": "dur-15",
+      "note": "plan note with frontmatter status complete is noise",
+      "input": {
+        "path": "wiki/artifacts/plan-def456.md",
+        "content": "---\ntype: plan\nstatus: complete\n---\n# Plan DEF\nCompleted."
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_complete"
+      }
+    },
+    {
+      "id": "dur-16",
+      "note": "candidate plan note with all_slices_resolved=true is noise",
+      "input": {
+        "path": "wiki/artifacts/plan-abc123.md",
+        "status": "candidate",
+        "all_slices_resolved": true,
+        "content": "# Plan\nSlices finished."
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_candidate_resolved"
+      }
+    },
+    {
+      "id": "dur-17",
+      "note": "candidate plan note with all done checkboxes and zero open checkboxes is noise",
+      "input": {
+        "path": "wiki/artifacts/plan-abc123.md",
+        "content": "---\ntype: plan\nstatus: candidate\n---\n# Plan\n- [x] Slice 1\n- [X] Slice 2\n"
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_candidate_resolved"
+      }
+    },
+    {
+      "id": "dur-18",
+      "note": "candidate plan note with an open checkbox is ordinary",
+      "input": {
+        "path": "wiki/artifacts/plan-abc123.md",
+        "status": "candidate",
+        "content": "# Plan\n- [x] Slice 1\n- [ ] Slice 2\n"
+      },
+      "expected": {
+        "kind": "ordinary",
+        "rule_id": "ordinary.default"
+      }
+    },
+    {
+      "id": "dur-19",
+      "note": "accepted plan note is never classified as noise even when all checkboxes are done",
+      "input": {
+        "path": "wiki/artifacts/plan-abc123.md",
+        "status": "accepted",
+        "all_slices_resolved": true,
+        "content": "# Plan\n- [x] Slice 1\n- [x] Slice 2\n"
+      },
+      "expected": {
+        "kind": "ordinary",
+        "rule_id": "ordinary.default"
+      }
+    },
+    {
+      "id": "dur-20",
+      "note": "decision category is durable",
+      "input": {
+        "category": "decision",
+        "content": "Keep SQLite WAL mode enabled on local disk."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-21",
+      "note": "adr synonym maps to decision and is durable",
+      "input": {
+        "category": "ADR",
+        "content": "Use UDS socket for daemon RPC."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-22",
+      "note": "fix category is durable",
+      "input": {
+        "category": "fix",
+        "content": "Close file descriptor in finally block."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-23",
+      "note": "bugfix synonym maps to fix and is durable",
+      "input": {
+        "category": "bugfix",
+        "content": "Handle empty query tokens."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-24",
+      "note": "scar synonym maps to fix and is durable",
+      "input": {
+        "category": "scar",
+        "content": "Check disk headroom before starting a build."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-25",
+      "note": "procedure category is durable",
+      "input": {
+        "category": "procedure",
+        "content": "Run make check before promoting to main."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-26",
+      "note": "architecture category is durable",
+      "input": {
+        "category": "architecture",
+        "content": "Recall is evidence, never instruction."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-27",
+      "note": "content prefix Decision: is durable",
+      "input": {
+        "category": "general",
+        "content": "Decision: use strict containment checks on all runtime files."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-28",
+      "note": "content prefix Fix: is durable",
+      "input": {
+        "category": "general",
+        "content": "Fix: guard against null pointer in result mapper."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-29",
+      "note": "content prefix Root cause: is durable",
+      "input": {
+        "category": "general",
+        "content": "Root cause: missing URI flag on read-only sqlite connection."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-30",
+      "note": "content prefix Resolution: is durable",
+      "input": {
+        "category": "general",
+        "content": "Resolution: scope the lock file per session key."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-31",
+      "note": "content prefix Invariant: is durable",
+      "input": {
+        "category": "general",
+        "content": "Invariant: never load capture modules when MINNI_USE_LEDGER=off."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-32",
+      "note": "content prefix Never  is durable",
+      "input": {
+        "category": "general",
+        "content": "Never run git stash on a shared checkout."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-33",
+      "note": "content prefix Always  is durable",
+      "input": {
+        "category": "general",
+        "content": "Always verify realpath containment before opening a file."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-34",
+      "note": "content prefix after YAML frontmatter and H1 heading is durable",
+      "input": {
+        "path": "wiki/concepts/sqlite-uri.md",
+        "content": "---\ntitle: SQLite URI\nstatus: approved\n---\n# SQLite URI Mode\n\nRoot cause: read-only connection lacked uri=True.\n"
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_prefix"
+      }
+    },
+    {
+      "id": "dur-35",
+      "note": "## Resolution section in markdown body is durable",
+      "input": {
+        "path": "wiki/concepts/lock-contention.md",
+        "content": "---\ntitle: Lock Contention\n---\n# Lock Contention\n\nBackground description.\n\n## Resolution\nMoved to per-session lock files.\n"
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_section"
+      }
+    },
+    {
+      "id": "dur-36",
+      "note": "## Fix section in markdown body is durable",
+      "input": {
+        "path": "wiki/concepts/fd-leak.md",
+        "content": "# FD Leak\n\nObserved under load.\n\n## Fix\nClose descriptor in finally block.\n"
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.content_section"
+      }
+    },
+    {
+      "id": "dur-37",
+      "note": "content test disabled leaves prefix-matching general row ordinary",
+      "input": {
+        "category": "general",
+        "content": "Decision: only durable when content_test_enabled is true."
+      },
+      "options": {
+        "content_test_enabled": false
+      },
+      "expected": {
+        "kind": "ordinary",
+        "rule_id": "ordinary.default"
+      }
+    },
+    {
+      "id": "dur-38",
+      "note": "post-gate human preference is durable",
+      "input": {
+        "category": "preference",
+        "origin": "human",
+        "created_at": "2026-10-24T00:00:00Z",
+        "content": "Prefer concise markdown tables in reports."
+      },
+      "options": {
+        "provenance_gate_since": "2026-10-23T00:00:00Z"
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.preference_post_gate"
+      }
+    },
+    {
+      "id": "dur-39",
+      "note": "pre-gate human preference is ordinary",
+      "input": {
+        "category": "preference",
+        "origin": "human",
+        "created_at": "2026-10-20T00:00:00Z",
+        "content": "Prefer concise markdown tables in reports."
+      },
+      "options": {
+        "provenance_gate_since": "2026-10-23T00:00:00Z"
+      },
+      "expected": {
+        "kind": "ordinary",
+        "rule_id": "ordinary.default"
+      }
+    },
+    {
+      "id": "dur-40",
+      "note": "post-gate unknown-origin preference is ordinary",
+      "input": {
+        "category": "preference",
+        "created_at": "2026-10-24T00:00:00Z",
+        "content": "Prefer concise markdown tables in reports."
+      },
+      "options": {
+        "provenance_gate_since": "2026-10-23T00:00:00Z"
+      },
+      "expected": {
+        "kind": "ordinary",
+        "rule_id": "ordinary.default"
+      }
+    },
+    {
+      "id": "dur-41",
+      "note": "plain fact note is ordinary",
+      "input": {
+        "category": "fact",
+        "content": "The console listens on 127.0.0.1:8765."
+      },
+      "expected": {
+        "kind": "ordinary",
+        "rule_id": "ordinary.default"
+      }
+    },
+    {
+      "id": "dur-42",
+      "note": "empty string status and type fields fall back to frontmatter scalar values",
+      "input": {
+        "path": "wiki/artifacts/plan-empty-status.md",
+        "status": "",
+        "type": "",
+        "source": "",
+        "content": "---\ntype: plan\nstatus: complete\n---\n# Plan\nDone."
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_complete"
+      }
+    },
+    {
+      "id": "dur-43",
+      "note": "empty string category and content fall back to frontmatter category and body",
+      "input": {
+        "category": "",
+        "content": "",
+        "body": "---\ncategory: decision\n---\n# Note\nKeep WAL mode."
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.category"
+      }
+    },
+    {
+      "id": "dur-44",
+      "note": "indented nested YAML key in frontmatter does not overwrite top-level status",
+      "input": {
+        "path": "wiki/artifacts/plan-nested.md",
+        "content": "---\ntype: plan\nstatus: complete\nslice_1:\n  status: candidate\n---\n# Plan\nDone."
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_complete"
+      }
+    },
+    {
+      "id": "dur-45",
+      "note": "naive ISO timestamp without seconds is parsed as UTC in post-gate human preference",
+      "input": {
+        "category": "preference",
+        "origin": "",
+        "origin_kind": "human",
+        "created_at": "",
+        "created": "2026-10-23T00:05",
+        "content": "Prefer concise tables."
+      },
+      "options": {
+        "provenance_gate_since": "2026-10-23T00:00:00Z"
+      },
+      "expected": {
+        "kind": "durable",
+        "rule_id": "durable.preference_post_gate"
+      }
+    },
+    {
+      "id": "dur-46",
+      "note": "daemon search result shape with review_state complete and page_type plan is classified as noise.plan_complete",
+      "input": {
+        "path": "wiki/artifacts/plan-daemon-search.md",
+        "review_state": "complete",
+        "page_type": "plan",
+        "content": "# Plan Daemon Search\nAll slices resolved."
+      },
+      "expected": {
+        "kind": "noise",
+        "rule_id": "noise.plan_complete"
+      }
+    }
+  ]
+}

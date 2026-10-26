@@ -7,6 +7,15 @@ import { promisify } from "node:util";
 import { asString, inboxPrincipalForVaultPath } from "./hook-utils.js";
 import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial } from "./policy.js";
 import type { LearningQualityReport } from "./policy.js";
+import {
+  classifyPromptEnvelope,
+  isCronScheduledPrompt,
+  isPromptClassesEnabled,
+  readPromptTemplates,
+  readPromptTemplatesSync,
+  stripHarnessBlocks,
+} from "./prompt-class.js";
+import type { PromptTemplateContext, PromptTemplatesFile } from "./prompt-class.js";
 import { isAuditTelemetryLine } from "./task.js";
 import { recordAudit, vaultFirstLearn } from "./vault.js";
 import type { VaultWriteResult } from "./vault.js";
@@ -25,11 +34,29 @@ export interface TranscriptEntry {
   content?: unknown;
   tool_name?: string;
   is_error?: boolean;
+  isMeta?: boolean;
+  origin?: {
+    kind?: string;
+    [key: string]: unknown;
+  };
   message?: {
     role?: string;
     content?: unknown;
+    isMeta?: boolean;
+    origin?: {
+      kind?: string;
+      [key: string]: unknown;
+    };
   };
   [key: string]: unknown;
+}
+
+export interface JevProvenanceOptions {
+  vaultPath?: string;
+  templates?: PromptTemplatesFile | null;
+  sessionCrons?: unknown;
+  session_crons?: unknown;
+  promptClasses?: boolean;
 }
 
 export type TriggerKind = "operator_directive" | "test_insight" | "scar";
@@ -67,6 +94,8 @@ export interface JevHarvestInput {
   transcriptPath?: string;
   sessionId: string;
   event?: "Stop" | "PreCompact" | string;
+  sessionCrons?: unknown;
+  session_crons?: unknown;
 }
 
 export interface JevHarvestResult {
@@ -91,16 +120,72 @@ export function maskTelemetry(text: string): string {
     .replace(/<minni:packet\b[^>]*>[\s\S]*?<\/minni:packet>/gi, "");
 
   const lines = result.split("\n");
-  const filteredLines = lines.filter((line) => {
+  const filteredLines: string[] = [];
+  let inTelemetryBlock = false;
+
+  for (const line of lines) {
     const trimmed = line.trim();
-    if (!trimmed) return true;
-    if (trimmed.startsWith("Minni session receipt:")) return false;
-    if (/^>\s*hook_[a-z0-9_]+/i.test(trimmed)) return false;
-    if (/^\*\s*minni_[a-z0-9_]+/i.test(trimmed)) return false;
-    if (/^Minni:\s*\d+\s*candidate\s*learning/i.test(trimmed)) return false;
-    if (isAuditTelemetryLine(trimmed)) return false;
-    return true;
-  });
+    if (!trimmed) {
+      if (inTelemetryBlock) {
+        inTelemetryBlock = false;
+        continue;
+      }
+      filteredLines.push(line);
+      continue;
+    }
+    if (
+      /^📓\s*\d+\s+relevant\s+memor(?:y|ies)\b/iu.test(trimmed) ||
+      /^📓\s*Minni\s+failure\s+lesson\b/iu.test(trimmed) ||
+      /^⚠️\s*STALE\s+recall\s+pointer\b/iu.test(trimmed) ||
+      /^(?:PreToolUse|PostToolUse(?:Failure)?)(?::[A-Za-z0-9_.-]+)?\s+hook\s+additional\s+context:/iu.test(trimmed)
+    ) {
+      continue;
+    }
+    if (
+      /^📓\s+Minni\s+recall\s+guard:/iu.test(trimmed) ||
+      /^Minni\s+recall\s+guard\b/iu.test(trimmed) ||
+      /^Top\s+\d+\s+relevant\s+memor(?:y|ies)\b/iu.test(trimmed) ||
+      /^\[Minni\s+Subagent\s+Brief\]$/iu.test(trimmed) ||
+      /^Minni\s+subagent\s+brief\b/iu.test(trimmed)
+    ) {
+      inTelemetryBlock = true;
+      continue;
+    }
+    if (
+      /^Treat\s+recalled\s+snippets\s+as\s+evidence\b/iu.test(trimmed) ||
+      /^You\s+have\s+unconsulted\s+recall\s+for\s+this\s+turn\b/iu.test(trimmed)
+    ) {
+      inTelemetryBlock = false;
+      continue;
+    }
+    if (
+      /^-\s+"[^"]+"\s+(?:\[\[[^\]]+\]\]|\([md]:[0-9a-fA-Z:_.-]+\))\s*(?:\(score\s+[0-9.]+\)|—)/u.test(
+        trimmed,
+      ) ||
+      /^-\s+\[\[[^\]]+\]\]\s+—\s+.*\((?:score=[0-9.?]+)\)/u.test(trimmed) ||
+      /^-\s+\([md]:[0-9a-fA-Z:_.-]+\)\s+/u.test(trimmed)
+    ) {
+      continue;
+    }
+    if (inTelemetryBlock) {
+      if (
+        /^(?:Active\s+thread|Goal|Current\s+slice|Relevant\s+memories):/iu.test(trimmed) ||
+        /^-\s+"/.test(trimmed) ||
+        /^-\s+\([md]:/i.test(trimmed) ||
+        /^-\s+\[\[/.test(trimmed)
+      ) {
+        continue;
+      }
+      inTelemetryBlock = false;
+    }
+
+    if (trimmed.startsWith("Minni session receipt:")) continue;
+    if (/^>\s*hook_[a-z0-9_]+/i.test(trimmed)) continue;
+    if (/^\*\s*minni_[a-z0-9_]+/i.test(trimmed)) continue;
+    if (/^Minni:\s*\d+\s*candidate\s*learning/i.test(trimmed)) continue;
+    if (isAuditTelemetryLine(trimmed)) continue;
+    filteredLines.push(line);
+  }
 
   return filteredLines.join("\n").trim();
 }
@@ -109,11 +194,16 @@ export function maskTelemetry(text: string): string {
 // Origin Filtering (Invariant 1: Directives strictly from human-typed input)
 // ---------------------------------------------------------------------------
 
-/**
- * Check if a transcript entry originates from genuine human typing.
- * Rejects all tool results, web searches, subagent responses, and files.
- */
-export function isHumanTypedInput(entry: TranscriptEntry): boolean {
+function extractOriginKind(obj: unknown): string | undefined {
+  if (!obj || typeof obj !== "object") return undefined;
+  const origin = (obj as Record<string, unknown>).origin;
+  if (typeof origin === "string") return origin;
+  if (!origin || typeof origin !== "object") return undefined;
+  const kind = (origin as Record<string, unknown>).kind;
+  return typeof kind === "string" ? kind : undefined;
+}
+
+function hasHumanRoleOrSource(entry: TranscriptEntry): boolean {
   if (!entry || typeof entry !== "object") return false;
 
   // Explicit tool execution and result filters
@@ -166,6 +256,119 @@ export function isHumanTypedInput(entry: TranscriptEntry): boolean {
   if (entry.type === "user") return true;
 
   return false;
+}
+
+/**
+ * Check if a transcript entry originates from genuine human typing.
+ * Rejects all tool results, web searches, subagent responses, files,
+ * and (when MINNI_PROMPT_CLASSES is enabled, §5.3) runs the 5-step
+ * provenance gate:
+ *   1. Reject `isMeta`.
+ *   2. Reject a present `origin.kind` other than `"human"`.
+ *   3. Strip `<system-reminder>` blocks (`stripHarnessBlocks`) and reject empty.
+ *   4. Classify with `classifyPromptEnvelope` and reject `skip` and `wrapped`.
+ *   5. Reject `scheduled`, by host marker or by the template rule (read-only).
+ */
+export function isHumanTypedInput(
+  entry: TranscriptEntry,
+  options?: JevProvenanceOptions,
+): boolean {
+  if (!entry || typeof entry !== "object") return false;
+
+  const promptClassesOn =
+    options?.promptClasses ?? isPromptClassesEnabled(options?.vaultPath);
+  if (!promptClassesOn) {
+    return hasHumanRoleOrSource(entry);
+  }
+
+  const msgObj =
+    entry.message && typeof entry.message === "object"
+      ? (entry.message as Record<string, unknown>)
+      : undefined;
+
+  // Step 1: Reject `isMeta` (top-level or nested on `entry.message`).
+  if (entry.isMeta === true || msgObj?.isMeta === true) {
+    return false;
+  }
+
+  // Step 2: Reject a present `origin.kind` other than `"human"`.
+  const entryOriginKind = extractOriginKind(entry);
+  if (entryOriginKind !== undefined && entryOriginKind !== "human") {
+    return false;
+  }
+  const msgOriginKind = extractOriginKind(entry.message);
+  if (msgOriginKind !== undefined && msgOriginKind !== "human") {
+    return false;
+  }
+
+  // Base role/source check (tool results, assistant messages, etc.)
+  if (!hasHumanRoleOrSource(entry)) return false;
+
+  // Step 3: Strip `<system-reminder>` blocks and reject empty.
+  const rawText = maskTelemetry(extractEntryText(entry));
+  const strippedText = stripHarnessBlocks(rawText);
+  if (!strippedText) return false;
+
+  // Step 4: Classify with `classifyPromptEnvelope` and reject `skip` and `wrapped`.
+  const templates =
+    options?.templates !== undefined
+      ? options.templates
+      : options?.vaultPath
+        ? readPromptTemplatesSync(options.vaultPath)
+        : null;
+  const rawTs = entry.timestamp ?? entry.ts ?? msgObj?.timestamp ?? msgObj?.ts;
+  const parsedTs =
+    typeof rawTs === "string"
+      ? Date.parse(rawTs)
+      : typeof rawTs === "number"
+        ? rawTs
+        : NaN;
+  const at = Number.isFinite(parsedTs) ? parsedTs : Date.now();
+  const pid =
+    asString(entry.promptId) ||
+    asString(entry.prompt_id) ||
+    asString(entry.uuid) ||
+    asString(entry.id) ||
+    asString(msgObj?.promptId) ||
+    asString(msgObj?.prompt_id) ||
+    asString(msgObj?.uuid) ||
+    asString(msgObj?.id) ||
+    "__harvest__";
+  const templateCtx: PromptTemplateContext | undefined =
+    templates !== null
+      ? {
+          at,
+          pid,
+          templateEntry: (hash) =>
+            Object.hasOwn(templates.templates, hash)
+              ? templates.templates[hash]
+              : undefined,
+        }
+      : undefined;
+
+  const classified = classifyPromptEnvelope(rawText, templateCtx);
+  if (classified.kind === "skip" || classified.kind === "wrapped") {
+    return false;
+  }
+
+  // Step 5: Reject `scheduled`, by host marker or by the template rule (read-only).
+  if (entry.scheduled === true || entry.isScheduled === true) return false;
+  if (msgObj?.scheduled === true || msgObj?.isScheduled === true) return false;
+  const crons =
+    options?.sessionCrons ??
+    options?.session_crons ??
+    entry.session_crons ??
+    entry.sessionCrons ??
+    msgObj?.session_crons ??
+    msgObj?.sessionCrons;
+  if (isCronScheduledPrompt(rawText, crons)) {
+    return false;
+  }
+  if (classified.kind === "scheduled") {
+    return false;
+  }
+
+  return true;
 }
 
 export function extractEntryText(entry: TranscriptEntry): string {
@@ -290,18 +493,37 @@ const TOOL_ERROR_PATTERN =
 const EDIT_TOOL_PATTERN =
   /\b(?:replace_file_content|write_to_file|str_replace_editor|edit|patch)\b/i;
 
-export function screenTranscriptChunk(entries: TranscriptEntry[]): JevTrigger[] {
+export function screenTranscriptChunk(
+  entries: TranscriptEntry[],
+  options?: JevProvenanceOptions,
+): JevTrigger[] {
   const triggers: JevTrigger[] = [];
+  const promptClassesOn =
+    options?.promptClasses ?? isPromptClassesEnabled(options?.vaultPath);
+  const templates =
+    promptClassesOn
+      ? options?.templates !== undefined
+        ? options.templates
+        : options?.vaultPath
+          ? readPromptTemplatesSync(options.vaultPath)
+          : null
+      : null;
+  const resolvedOptions: JevProvenanceOptions = {
+    ...options,
+    promptClasses: promptClassesOn,
+    templates,
+  };
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
-    const entryText = maskTelemetry(extractEntryText(entry));
+    const rawEntryText = maskTelemetry(extractEntryText(entry));
+    const entryText = promptClassesOn ? stripHarnessBlocks(rawEntryText) : rawEntryText;
     if (isPromptDispatchBlock(entryText)) {
       continue;
     }
 
     // 1. Operator Directives (strictly human input, excluding raw /boost, /apex, or # DIRECTIVE: task briefs)
-    if (isHumanTypedInput(entry)) {
+    if (isHumanTypedInput(entry, resolvedOptions)) {
       if (
         entryText.length >= 10 &&
         entryText.length <= 2000 &&
@@ -641,7 +863,16 @@ export async function harvestTranscriptDelta(
   // Update cursor position
   state.cursors[transcriptPath] = newOffset;
 
-  const triggers = screenTranscriptChunk(entries);
+  const promptClassesOn = isPromptClassesEnabled(config.vaultPath);
+  const templates = promptClassesOn
+    ? await readPromptTemplates(config.vaultPath).catch(() => null)
+    : null;
+  const triggers = screenTranscriptChunk(entries, {
+    vaultPath: config.vaultPath,
+    templates,
+    sessionCrons: input.sessionCrons ?? input.session_crons,
+    promptClasses: promptClassesOn,
+  });
   if (triggers.length === 0) {
     await writeJevHarvestState(config.vaultPath, state);
     return { harvested: false, learnings: [], reason: "no_triggers" };

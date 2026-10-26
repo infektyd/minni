@@ -17,7 +17,7 @@
 // that the fixture really reaches the key rules it is meant to stress, so
 // parity cannot pass vacuously.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,6 +26,7 @@ import {
   searchVaultNotes,
   vaultSearchCacheState,
   vaultSearchCandidatePaths,
+  writeVaultPage,
 } from "../dist/vault.js";
 
 // Hermetic: ensureVault and anything it touches stay out of the real home.
@@ -100,7 +101,7 @@ const FIXTURE = [
   { rel: `${C}/prefix-10.md`, frontmatter: { title: "Prefix ten" }, body: "Token abcdefghijk is eleven long." },
   { rel: `${C}/boundary.md`, frontmatter: { title: "Boundary" }, body: "Something about a thing, nothing more." },
   // `_`-joined tokens, digits
-  { rel: `${C}/underscore.md`, frontmatter: { title: "Underscore" }, body: "Call foo_bar_baz then ab_cd and _leading with trailing_ and double__under." },
+  { rel: `${C}/underscore.md`, frontmatter: { title: "Underscore" }, body: "Call foo_bar_baz then x_foo_bar then ab_cd and _leading with _x86_64 and trailing_ and double__under." },
   { rel: `${C}/digits.md`, frontmatter: { title: "Digits" }, body: "Use v2 over http2 on x86_64 with utf8 and sha256 since 2026." },
   // status-skipped (never candidates, never results) and privacy-blocked
   { rel: `${C}/superseded.md`, frontmatter: { title: "Cache superseded", status: "superseded" }, body: "cache tests foo_bar cfgloader preconditioning" },
@@ -215,8 +216,9 @@ test("parity: the fixed fixture, every query shape, candidates and results ident
     ["thing", `${C}/boundary.md`, true],
     ["bar", `${C}/underscore.md`, true],
     ["ab", `${C}/underscore.md`, true],
-    ["bar_baz", `${C}/underscore.md`, false],
+    ["bar_baz", `${C}/underscore.md`, true],
     ["foo_bar", `${C}/underscore.md`, true],
+    ["x86_64", `${C}/underscore.md`, true],
     ["under", `${C}/underscore.md`, true],
     ["x86", `${C}/digits.md`, true],
     ["86_64", `${C}/digits.md`, false],
@@ -419,3 +421,115 @@ test("parity: property pass over random vaults and queries (fixed seed)", async 
   // every-note fallback.
   assert.ok(indexEngaged > iterations / 3, `seed=${seed}: only ${indexEngaged}/${iterations} iterations engaged the lookup`);
 });
+
+test("parity: _-joined compound tails (x_foo_bar, _x86_64, foo_bar_baz) are admitted and scored on 20+-note vaults on both paths", async () => {
+  const notes = [
+    ...FIXTURE.slice(0, 22).map((n, i) => ({
+      rel: `${C}/pad-${i}.md`,
+      frontmatter: { title: `Pad ${i}` },
+      body: `Unrelated padding note ${i}.`,
+    })),
+    {
+      rel: `${C}/tail-compounds.md`,
+      frontmatter: { title: "Tail compounds" },
+      body: "Identifiers x_foo_bar and _x86_64 and foo_bar_baz live here.",
+    },
+  ];
+  for (const candidates of ["scan", "index"]) {
+    const vault = await writeVault(`tail-compounds-${candidates}`, notes);
+    for (const query of ["foo_bar", "bar_baz", "x86_64"]) {
+      const results = await searchVaultNotes(vault, query, ALL, undefined, { candidates });
+      assert.deepEqual(
+        results.map((r) => r.relativePath),
+        [`${C}/tail-compounds.md`],
+        `${candidates} path must admit and score tail compound for query ${JSON.stringify(query)}`,
+      );
+    }
+  }
+});
+
+test("parity (Row n): writeVaultPage rewrites, status skips, privacy blocks, and new notes preserve warm scan/index and cold-index parity", async () => {
+  const vault = await writeVault("write-parity", FIXTURE);
+  await assertParity(vault, "cache", "warm-before-write");
+  assert.equal(vaultSearchCacheState(vault).prefixIndex, true, "prefix index is warm");
+
+  // 1. Rewrite an existing early note (wiki/concepts/boundary.md):
+  //    - removes old token "thing"
+  //    - adds shared token "deploy" (which would be appended out of cache order if not rebuilt cleanly)
+  await writeVaultPage({
+    vaultPath: vault,
+    section: "concepts",
+    title: "boundary",
+    status: "accepted",
+    content: "Updated note about deploy and cache.",
+  });
+
+  // Removed token "thing" must no longer admit boundary.md as a candidate on the index path
+  await assertParity(vault, "thing", "after-rewrite-removed-token");
+  assert.deepEqual(vaultSearchCandidatePaths(vault, "thing", "index"), []);
+
+  // Added shared token "deploy" must keep exact bucket ordering matching scan and cold index
+  await assertParity(vault, "deploy", "after-rewrite-added-shared-token");
+
+  // 2. Rewrite an existing note (wiki/concepts/prefix-3.md, token "cfgloader") to status: "superseded"
+  await writeVaultPage({
+    vaultPath: vault,
+    section: "concepts",
+    title: "prefix-3",
+    status: "superseded",
+    content: "The cfgloader reads files.",
+  });
+  await assertParity(vault, "cfg", "after-rewrite-superseded");
+  assert.deepEqual(vaultSearchCandidatePaths(vault, "cfg", "index"), []);
+
+  // 3. Rewrite an existing note (wiki/concepts/prefix-10.md, token "abcdefghijk") to privacy: "blocked"
+  await writeVaultPage({
+    vaultPath: vault,
+    section: "concepts",
+    title: "prefix-10",
+    status: "accepted",
+    privacy: "blocked",
+    content: "Token abcdefghijk is eleven long.",
+  });
+  await assertParity(vault, "abcdefghijk", "after-rewrite-blocked");
+  assert.deepEqual(vaultSearchCandidatePaths(vault, "abcdefghijk", "index"), []);
+
+  // 4. Insert a brand-new early note via writeVaultPage (with padded/quoted title to verify titleFromMarkdown parity)
+  await writeVaultPage({
+    vaultPath: vault,
+    section: "concepts",
+    title: ' "aaa-early-deploy" ',
+    status: "accepted",
+    content: "Early deploy target for cache parity.",
+  });
+  await assertParity(vault, "deploy", "after-insert-new-note");
+
+  // 4b. Write a raw section page (outside wiki/); cold searchVaultNotes only indexes wiki/, so warm cache must not index raw/
+  await writeVaultPage({
+    vaultPath: vault,
+    section: "raw",
+    title: "raw-excerpt",
+    status: "accepted",
+    content: "Raw excerpt mentioning deploy and rawonlymarker.",
+  });
+  await assertParity(vault, "rawonlymarker", "after-write-raw-page");
+
+  // 5. Compare warm in-process index against a freshly read cold index build on the same on-disk vault state
+  const coldVault = await mkdtemp(path.join(tmpdir(), "sm-parity-cold-clone-"));
+  roots.push(coldVault);
+  await cp(vault, coldVault, { recursive: true });
+
+  for (const query of ["thing", "deploy", "cfg", "abcdefghijk", "cache", "tests", "rawonlymarker"]) {
+    const warmResults = await searchVaultNotes(vault, query, ALL, undefined, { candidates: "index" });
+    const coldResults = (await searchVaultNotes(coldVault, query, ALL, undefined, { candidates: "index" })).map(
+      (r) => ({ ...r, notePath: r.notePath.replace(coldVault, vault) }),
+    );
+    assert.deepStrictEqual(warmResults, coldResults, `cold parity results differ for ${JSON.stringify(query)}`);
+    assert.deepStrictEqual(
+      vaultSearchCandidatePaths(vault, query, "index"),
+      vaultSearchCandidatePaths(coldVault, query, "index"),
+      `cold parity candidates differ for ${JSON.stringify(query)}`,
+    );
+  }
+});
+

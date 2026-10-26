@@ -436,11 +436,10 @@ class MinniDB:
         c.execute("CREATE INDEX IF NOT EXISTS idx_ep_thread ON episodic_events(thread_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ep_created ON episodic_events(created_at)")
 
-        # === Episodic FTS ===
+        # === Episodic FTS (#311: keyed by rowid = event_id) ===
         c.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS episodic_fts
             USING fts5(
-                event_id UNINDEXED,
                 agent_id UNINDEXED,
                 content,
                 tokenize='porter unicode61'
@@ -575,59 +574,40 @@ class MinniDB:
             AFTER INSERT ON episodic_events
             WHEN NEW.content IS NOT NULL
             BEGIN
-                INSERT INTO episodic_fts(event_id, agent_id, content)
+                INSERT INTO episodic_fts(rowid, agent_id, content)
                 VALUES (NEW.event_id, NEW.agent_id, NEW.content);
             END
         """)
 
-        # #287: episodic_events carried an INSERT trigger only, while learnings
-        # below has insert/update/delete. The asymmetry was latent (nothing in
-        # src/ UPDATEs episodic_events) but the failure mode is silent: an
-        # UPDATE left episodic_fts holding the OLD text, so the new content was
-        # unfindable while the stale content still matched, and
-        # episodic_index_coverage could not see it — that metric checks
-        # presence, not fidelity. Deletes are covered for the same reason: both
-        # prune paths in episodic.py delete FTS rows by hand today, and a third
-        # one that forgot would leave orphans behind.
+        # #287 / #311: episodic_fts is keyed by built-in INTEGER PRIMARY KEY
+        # `rowid = event_id` rather than an UNINDEXED `event_id` payload column.
+        # Keyed deletes (`WHERE rowid = OLD.event_id`) use the FTS5 B-tree in
+        # O(log n) (~0.008s for 5,000 deletes across 50,000 retained rows, vs
+        # 16.674s when scanning an UNINDEXED column), restoring full
+        # insert/update/delete trigger symmetry with `learnings_fts`.
         #
-        # DELETE-then-conditional-INSERT rather than learnings' UPDATE-in-place,
-        # because episodic's insert trigger is guarded on
-        # `WHEN NEW.content IS NOT NULL`. An UPDATE that sets content to NULL
-        # must therefore REMOVE the index row, not leave the old text sitting
-        # in it — an in-place UPDATE would write NULL content into fts5 and keep
-        # a row the insert path would never have created. The delete also
-        # repairs the case where an event somehow has more than one index row.
+        # UPDATE remains DELETE-then-conditional-INSERT rather than an in-place
+        # UPDATE because episodic's insert trigger is guarded on
+        # `WHEN NEW.content IS NOT NULL`: an UPDATE that sets content to NULL
+        # must remove the index row rather than write NULL content into fts5.
         c.execute("""
             CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_update
-            AFTER UPDATE OF agent_id, content ON episodic_events
+            AFTER UPDATE OF content, agent_id, event_id ON episodic_events
             BEGIN
-                DELETE FROM episodic_fts WHERE event_id = OLD.event_id;
-                INSERT INTO episodic_fts(event_id, agent_id, content)
+                DELETE FROM episodic_fts WHERE rowid = OLD.event_id;
+                INSERT INTO episodic_fts(rowid, agent_id, content)
                 SELECT NEW.event_id, NEW.agent_id, NEW.content
                 WHERE NEW.content IS NOT NULL;
             END
         """)
 
-        # NO delete trigger here, deliberately — see #287. The obvious
-        # symmetry with trg_learnings_fts_delete is a trap: episodic_fts.event_id
-        # is an UNINDEXED fts5 column, so `DELETE ... WHERE event_id = OLD.event_id`
-        # is a full scan of the content shadow table, once PER DELETED ROW.
-        # episodic_events is the high-volume table and its prune path runs on
-        # the user-facing search path (recall.handle_* calls
-        # trim_recall_traces() on every search), so a row trigger turns a
-        # set-wise delete into a quadratic one. Measured, 5000 expiring traces
-        # against 50000 retained events:
-        #
-        #   without the trigger   trim_recall_traces -> 5000 rows in  0.014s
-        #   with the trigger      trim_recall_traces -> 5000 rows in 16.674s
-        #
-        # learnings does not have this problem because nothing bulk-prunes it
-        # on a hot path. Both episodic prune paths (trim_recall_traces,
-        # cleanup_expired) already delete their FTS rows set-wise first, and
-        # reconcile_episodic_fts sweeps up any index row that matches no event —
-        # set-wise, once per sweep — so orphans are collected without paying a
-        # scan per deleted row. episodic_fts_orphans in the health report is the
-        # backstop that makes a regression here visible.
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_delete
+            AFTER DELETE ON episodic_events
+            BEGIN
+                DELETE FROM episodic_fts WHERE rowid = OLD.event_id;
+            END
+        """)
 
         # Auto-index learnings into FTS
         c.execute("""

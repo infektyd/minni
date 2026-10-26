@@ -436,10 +436,10 @@ class FtsSearchMixin:
             if agent_id:
                 c.execute(
                     f"""
-                    SELECT ef.event_id, ef.agent_id, ef.content, e.event_type,
+                    SELECT ef.rowid AS event_id, ef.agent_id, ef.content, e.event_type,
                            e.task_id, e.thread_id, e.created_at
                     FROM episodic_fts ef
-                    JOIN episodic_events e ON e.event_id = ef.event_id
+                    JOIN episodic_events e ON e.event_id = ef.rowid
                     WHERE episodic_fts MATCH ? AND ef.agent_id = ?{type_clause}
                     ORDER BY rank
                     LIMIT ?
@@ -449,10 +449,10 @@ class FtsSearchMixin:
             else:
                 c.execute(
                     f"""
-                    SELECT ef.event_id, ef.agent_id, ef.content, e.event_type,
+                    SELECT ef.rowid AS event_id, ef.agent_id, ef.content, e.event_type,
                            e.task_id, e.thread_id, e.created_at
                     FROM episodic_fts ef
-                    JOIN episodic_events e ON e.event_id = ef.event_id
+                    JOIN episodic_events e ON e.event_id = ef.rowid
                     WHERE episodic_fts MATCH ?{type_clause}
                     ORDER BY rank
                     LIMIT ?

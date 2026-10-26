@@ -22,6 +22,8 @@ import type { LearningQualityReport } from "./policy.js";
 // touches the other's binding at top-level/module-evaluation time.
 import { filterSafeVaultResults } from "./task.js";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
+import { durabilityOf, type DurabilityKind } from "./durability.js";
+import { stripHarnessBlocks } from "./prompt-class.js";
 // Type-only: use-report.ts imports FROM this module, so the runtime import
 // below is dynamic and function-scoped (same pattern as task.ts above).
 import type { UseReport } from "./use-report.js";
@@ -162,6 +164,20 @@ export interface VaultSearchResult {
   privacy?: PrivacyLevel;
   /** Authored `status:` frontmatter (lifecycle), when present. */
   status?: PageStatus;
+  /** Durability classification ("durable" | "ordinary" | "noise") from durabilityOf (rev5 §5.2). */
+  durability?: DurabilityKind;
+  /** Calibrated UPS strong-gate score in [0, 1] (rev5 §5.2 item 5). */
+  gateScore?: number;
+  /** UPS strong-gate route ("a" | "b" | null) when evaluated. */
+  gateRoute?: "a" | "b" | null;
+  /** Whether this note clears the UPS strong-gate threshold (`durability !== "noise"` and route "a" or "b"). */
+  clearsGate?: boolean;
+  /** Class-weighted gate score (`gateScore * classWeight`, where noise uses 0.25 and non-noise uses 1.0). */
+  weightedScore?: number;
+  /** Query terms matched in title, markdown headings, and body (when rank === "ups_gate"). */
+  contributingTerms?: { title: string[]; heading: string[]; body: string[] };
+  /** Count of distinctive query terms covered by this note (when rank === "ups_gate"). */
+  coveredDistinctive?: number;
 }
 
 const VAULT_DIRS = [
@@ -486,7 +502,9 @@ async function listMarkdownFiles(root: string): Promise<string[]> {
   } catch {
     return [];
   }
-  const entries = await readdir(root, { withFileTypes: true });
+  const entries = (await readdir(root, { withFileTypes: true })).sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  );
   const files = await Promise.all(
     entries.map(async (entry) => {
       const full = path.join(root, entry.name);
@@ -1713,10 +1731,32 @@ async function refuseSymlink(filePath: string, kind: "seed" | "append"): Promise
     if (st.isSymbolicLink()) {
       throw new Error(`refusing to ${kind} through symlink: ${filePath}`);
     }
+    if (!st.isFile()) {
+      throw new Error(`refusing to ${kind} non-regular file: ${filePath}`);
+    }
   } catch (error) {
     if (!isErrno(error, "ENOENT")) {
       throw error;
     }
+  }
+}
+
+async function readRegularTextFile(filePath: string): Promise<string> {
+  const flags =
+    fs.constants.O_RDONLY |
+    (fs.constants.O_NOFOLLOW ?? 0) |
+    (fs.constants.O_NONBLOCK ?? 0);
+  const fh = await open(filePath, flags);
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) {
+      const err = new Error(`refusing to read non-regular file: ${filePath}`) as NodeJS.ErrnoException;
+      err.code = "EINVAL";
+      throw err;
+    }
+    return await fh.readFile("utf8");
+  } finally {
+    await fh.close();
   }
 }
 
@@ -1844,7 +1884,10 @@ async function seedOrPromoteVaultFile(
       if (beforeStat.isSymbolicLink()) {
         throw new Error(`refusing to seed through symlink: ${filePath}`);
       }
-      existing = await readFile(filePath, "utf8");
+      if (!beforeStat.isFile()) {
+        throw new Error(`refusing to seed non-regular file: ${filePath}`);
+      }
+      existing = await readRegularTextFile(filePath);
     } catch (error) {
       if (isErrno(error, "ENOENT")) {
         return;
@@ -2037,11 +2080,16 @@ export function getAgentIdFromVaultPath(vaultPath: string): string {
 export async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
   await withVaultFileLock(filePath, async () => {
     const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+    const nonblock = typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0;
     const fh = await open(
       filePath,
-      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow,
+      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | nofollow | nonblock,
     );
     try {
+      const st = await fh.stat();
+      if (!st.isFile()) {
+        throw new Error(`refusing to append non-regular file: ${filePath}`);
+      }
       await fh.writeFile(content, "utf8");
       await fh.sync();
     } finally {
@@ -2169,7 +2217,14 @@ function isExemptFromAuditThrottle(entry: AuditEntry): boolean {
   // diagnostic spawns are budget-capped (DIAGNOSTIC_MAX_IN_FLIGHT, kill
   // timer) and session-evict is coalesced to one spawn per interval, so the
   // frequency ceiling is set upstream of the audit call.
-  return entry.tool.endsWith("_stop") || entry.tool.endsWith("_bridge_failure");
+  //
+  // rev5 §8.2 (Row j): <prefix>_session_start is also exempt so rapid
+  // consecutive boots never drop a details.use_ledger stretch boundary.
+  return (
+    entry.tool.endsWith("_stop") ||
+    entry.tool.endsWith("_bridge_failure") ||
+    entry.tool.endsWith("_session_start")
+  );
 }
 
 function shouldThrottleAudit(entry: AuditEntry): boolean {
@@ -2233,7 +2288,7 @@ export async function recordAudit(
   if (currentSize >= 5 * 1024 * 1024) {
     // An explicit ensureVault agent can't be recovered from the path, so keep
     // the tenant the current log header was seeded with.
-    const seededHeader = await readFile(logPath, "utf8")
+    const seededHeader = await readRegularTextFile(logPath)
       .then((text) => text.split("\n", 1)[0] ?? "")
       .catch(() => "");
     const seededAgent =
@@ -2360,7 +2415,7 @@ async function appendIndex(
 ): Promise<void> {
   await ensureVault(vaultPath);
   const indexPath = path.join(vaultPath, "index.md");
-  const existing = await readFile(indexPath, "utf8");
+  const existing = await readRegularTextFile(indexPath);
   const link = wikilinkFor(relativePath);
   if (existing.includes(link)) return;
   const line = `- ${link} - ${summary.replace(/\s+/g, " ").slice(0, 160)}\n`;
@@ -2480,7 +2535,7 @@ export async function auditTail(
   const target = (await exists(todayPath)) ? todayPath : fallbackPath;
   let text = "";
   try {
-    text = await readFile(target, "utf8");
+    text = await readRegularTextFile(target);
   } catch {
     return { entries: [], text: "" };
   }
@@ -2808,10 +2863,10 @@ export async function sessionReceipt(
   // that crosses midnight has its boot marker in yesterday's daily file, but
   // log.md carries both days (up to the 5 MB rotation, the receipt's honest
   // horizon).
-  await ensureVault(vaultPath);
+  await ensureVault(vaultPath).catch(() => {});
   let text = "";
   try {
-    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+    text = await readRegularTextFile(path.join(vaultPath, "log.md"));
   } catch {
     // fall through to an empty tail — the receipt reports zeros.
   }
@@ -2936,7 +2991,7 @@ export async function listSessions(
 ): Promise<SessionSummary[]> {
   let text = "";
   try {
-    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+    text = await readRegularTextFile(path.join(vaultPath, "log.md"));
   } catch {
     // Missing (or unreadable) rolling log: no sessions to report, and we never
     // create it — listSessions is a pure reader.
@@ -2990,6 +3045,10 @@ interface CachedVaultNoteEntry {
   skipByStatus: boolean;
   haystackLower: string;
   titleLower: string;
+  bodyLower: string;
+  headingsLower: string[];
+  durability: DurabilityKind;
+  handle: string;
   isSessionNote: boolean;
   isMinniLearning: boolean;
   hasCorrectionBoost: boolean;
@@ -3093,6 +3152,7 @@ export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, 
     }
     const markdown = buffer.toString("utf8", 0, filled);
     if (privacyFromMarkdown(markdown) === "blocked" || skippedByStatus(markdown)) return null;
+    if (durabilityOf({ path: relativePath, content: markdown }) === "noise") return null;
     return `${titleFromMarkdown(relativePath, markdown)}\n${markdown}`;
   } catch {
     return null;
@@ -3130,17 +3190,33 @@ export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, 
  * path is that deterministic work budget, and it cannot change what is
  * selected, only what selecting it costs.
  *
- * After writeVaultPage rewrites a note in the same process, the index keeps
- * the note's old keys (it only ever adds), so the index path can admit the
- * note as an extra candidate the scan would not. The extra is scored on its
- * current text, so results differ only if that text scores for the query
- * without producing any of the query's lookup keys — the case the lookup
- * already misses on a fresh cache (e.g. `x_foo_bar` for the query `foo_bar`).
+ * After writeVaultPage writes or rewrites a note in the same process,
+ * updateVaultSearchCacheOnWrite keeps cached.notes in deterministic sorted
+ * order and rebuilds cached.tokenMap (when present) so stale keys are removed
+ * and bucket ordering matches both "scan" and a cold index build.
  */
 export type VaultSearchCandidates = "index" | "scan";
+export type VaultSearchRankMode = "legacy" | "ups_gate" | "noise_last";
 
 export interface VaultSearchOptions {
   candidates?: VaultSearchCandidates;
+  rank?: VaultSearchRankMode;
+  excludePaths?: Iterable<string>;
+  rho?: number;
+}
+
+interface UpsGateEvaluation {
+  gateScore: number;
+  gateRoute: "a" | "b" | null;
+  clearsGate: boolean;
+  weightedScore: number;
+  contributingTerms: { title: string[]; heading: string[]; body: string[] };
+  coveredDistinctive: number;
+}
+
+function computeVaultHandleForRelPath(relativePath: string): string {
+  const norm = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/^\/+/, "");
+  return `m:${createHash("sha1").update(norm, "utf8").digest("hex").slice(0, 8)}`;
 }
 
 function buildCachedVaultNoteEntry(
@@ -3153,6 +3229,19 @@ function buildCachedVaultNoteEntry(
   const status = statusFromMarkdown(markdown);
   const skipByStatus = skippedByStatus(markdown);
   const pageType = frontmatterField(markdown, "type")?.toLowerCase();
+  const bodyWithoutFrontmatter = markdown.replace(FRONTMATTER_RE, "");
+  const bodyLower = bodyWithoutFrontmatter.toLowerCase();
+  const headingsLower: string[] = [];
+  for (const match of bodyWithoutFrontmatter.matchAll(/^#{1,6}\s+(.+)$/gm)) {
+    if (match[1]) {
+      headingsLower.push(match[1].trim().toLowerCase());
+    }
+  }
+  const rawDurability = durabilityOf({ path: relativePath, title, content: markdown });
+  const durability: DurabilityKind =
+    rawDurability === "ordinary" && /^\s*\[Subagent Context\]/i.test(title)
+      ? "noise"
+      : rawDurability;
   return {
     notePath,
     relativePath,
@@ -3164,6 +3253,10 @@ function buildCachedVaultNoteEntry(
     skipByStatus,
     haystackLower: `${title}\n${relativePath}\n${markdown}`.toLowerCase(),
     titleLower: title.toLowerCase(),
+    bodyLower,
+    headingsLower,
+    durability,
+    handle: computeVaultHandleForRelPath(relativePath),
     isSessionNote: relativePath.startsWith("wiki/sessions/"),
     isMinniLearning: /minni_learning:\s*true/i.test(markdown),
     hasCorrectionBoost: Boolean(pageType && CORRECTION_CLASS_TYPES.has(pageType)),
@@ -3171,20 +3264,85 @@ function buildCachedVaultNoteEntry(
   };
 }
 
-function scoreVaultNoteCached(
+function evaluateUpsGate(
+  effectiveQueryTrimLen: number,
   phrases: string[],
   terms: string[],
+  distinctiveSet: Set<string>,
+  k_q: number,
   entry: CachedVaultNoteEntry,
-): number {
-  if (entry.skipByStatus) return 0;
-  const { haystackLower, titleLower, wordCounts } = entry;
-  let termScore = 0;
-  for (const phrase of phrases) {
-    if (countWordOccurrences(haystackLower, phrase, false, 1) > 0) {
-      termScore += 50;
-      break;
+  rawScore: number,
+): UpsGateEvaluation {
+  const { haystackLower, titleLower, headingsLower, durability, wordCounts } = entry;
+  const phraseHit =
+    effectiveQueryTrimLen >= 24 &&
+    terms.length >= 2 &&
+    phrases.some(
+      (p) => p.length >= 24 && countWordOccurrences(haystackLower, p, false, 1) > 0,
+    );
+
+  const titleTerms: string[] = [];
+  const headingTerms: string[] = [];
+  const bodyTerms: string[] = [];
+  let coveredDistinctive = 0;
+  let hasTitleOrHeadingDistinctive = false;
+
+  for (const term of terms) {
+    const inHaystack =
+      (wordCounts.has(term)
+        ? wordCounts.get(term)!
+        : countWordOccurrences(haystackLower, term, true, 1)) > 0;
+    if (!inHaystack) continue;
+    const inTitle = countWordOccurrences(titleLower, term, true, 1) > 0;
+    const inHeading = headingsLower.some((h) => countWordOccurrences(h, term, true, 1) > 0);
+    if (inTitle) titleTerms.push(term);
+    if (inHeading) headingTerms.push(term);
+    if (!inTitle && !inHeading) bodyTerms.push(term);
+    if (distinctiveSet.has(term)) {
+      coveredDistinctive += 1;
+      if (inTitle || inHeading) {
+        hasTitleOrHeadingDistinctive = true;
+      }
     }
   }
+
+  const routeA = phraseHit;
+  const routeB = coveredDistinctive >= k_q && hasTitleOrHeadingDistinctive;
+  let gateRoute: "a" | "b" | null = null;
+  let gateScore = 0;
+  if (routeA) {
+    gateRoute = "a";
+    gateScore = 1.0;
+  } else if (routeB) {
+    gateRoute = "b";
+    gateScore = Math.min(1.0, Math.max(0.55, coveredDistinctive / Math.max(1, k_q)));
+  } else {
+    gateRoute = null;
+    gateScore = Math.min(0.50, rawScore / 100);
+  }
+
+  const classWeight = durability === "noise" ? 0.25 : 1.0;
+  const weightedScore = classWeight * gateScore;
+  const clearsGate = durability !== "noise" && (gateRoute === "a" || gateRoute === "b");
+  return {
+    gateScore,
+    gateRoute,
+    clearsGate,
+    weightedScore,
+    contributingTerms: {
+      title: titleTerms,
+      heading: headingTerms,
+      body: bodyTerms,
+    },
+    coveredDistinctive,
+  };
+}
+
+function ensureEntryWordCounts(
+  terms: string[],
+  entry: CachedVaultNoteEntry,
+): Map<string, number> {
+  const { haystackLower, titleLower, wordCounts } = entry;
   let missingCount = 0;
   if (terms.length > MULTI_TERM_THRESHOLD) {
     for (let i = 0; i < terms.length; i++) {
@@ -3200,8 +3358,7 @@ function scoreVaultNoteCached(
     const termToPatIdx = matcher.termToPatIdx;
     for (let i = 0; i < terms.length; i++) {
       const term = terms[i];
-      let contrib = wordCounts.get(term);
-      if (contrib === undefined) {
+      if (!wordCounts.has(term)) {
         const patIdx = termToPatIdx[i];
         const count =
           patIdx >= 0
@@ -3209,33 +3366,60 @@ function scoreVaultNoteCached(
             : patIdx === -2
               ? countWordOccurrences(haystackLower, term, true, 5)
               : 0;
-        contrib =
+        const contrib =
           count > 0
             ? Math.min(count, 5) +
               (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
             : 0;
-        if (wordCounts.size < 512) {
+        if (wordCounts.size < 4096) {
           wordCounts.set(term, contrib);
         }
       }
-      termScore += contrib;
     }
   } else {
     for (const term of terms) {
-      let contrib = wordCounts.get(term);
-      if (contrib === undefined) {
+      if (!wordCounts.has(term)) {
         const count = countWordOccurrences(haystackLower, term, true, 5);
-        contrib =
+        const contrib =
           count > 0
             ? Math.min(count, 5) +
               (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
             : 0;
-        if (wordCounts.size < 512) {
+        if (wordCounts.size < 4096) {
           wordCounts.set(term, contrib);
         }
       }
-      termScore += contrib;
     }
+  }
+  return wordCounts;
+}
+
+function scoreVaultNoteCached(
+  phrases: string[],
+  terms: string[],
+  entry: CachedVaultNoteEntry,
+): number {
+  if (entry.skipByStatus) return 0;
+  const { haystackLower, titleLower } = entry;
+  const wordCounts = ensureEntryWordCounts(terms, entry);
+  let termScore = 0;
+  for (const phrase of phrases) {
+    if (countWordOccurrences(haystackLower, phrase, false, 1) > 0) {
+      termScore += 50;
+      break;
+    }
+  }
+  for (const term of terms) {
+    let contrib = wordCounts.get(term);
+    if (contrib === undefined) {
+      const count = countWordOccurrences(haystackLower, term, true, 5);
+      contrib =
+        count > 0
+          ? Math.min(count, 5) +
+            (countWordOccurrences(titleLower, term, true, 1) > 0 ? 3 : 0)
+          : 0;
+    }
+    termScore += contrib;
   }
   if (termScore < MIN_TERM_SCORE) return 0;
 
@@ -3274,6 +3458,25 @@ function indexNoteTokensIntoMap(
   for (const tok of rawMatches) {
     addTokenKeys(tok);
     if (tok.includes("_")) {
+      const starts: number[] = [0];
+      const ends: number[] = [];
+      for (let i = 0; i < tok.length; i++) {
+        if (tok.charCodeAt(i) === 95) {
+          ends.push(i);
+          if (i + 1 < tok.length) starts.push(i + 1);
+        }
+      }
+      ends.push(tok.length);
+      for (const s of starts) {
+        if (s > 0 && tok.length - s >= 2) {
+          addTokenKeys(tok.slice(s));
+        }
+        for (const e of ends) {
+          if (e < tok.length && e - s >= 11) {
+            addTokenKeys(tok.slice(s, e));
+          }
+        }
+      }
       for (const sub of tok.split("_")) {
         if (sub.length >= 2) addTokenKeys(sub);
       }
@@ -3392,19 +3595,15 @@ function indexTokenEmitsKey(
  *
  * The index lists a note under every key that addTokenKeys emits for one of
  * its tokens, where a token is a maximal `[a-z0-9_]{2,}` run of the text, or,
- * for a run containing `_`, one of its `_`-separated pieces of 2+ characters.
- * Every key is a prefix of the token that emits it, so it suffices to visit
- * each occurrence of `key` and ask whether a token starts there that emits it:
- *   - a whole run starts there when the character before is not [a-z0-9_];
- *   - a piece starts there when the character before is not [a-z0-9] (a `_`,
- *     or the run's start), and only for a key with no `_` (a piece has none).
- *     At a run's start with no `_` in the run, the piece is the run itself,
- *     so the two readings agree.
+ * for a run containing `_`, any `_`-preceded suffix or `_`-separated piece of
+ * 2+ characters. Every key is a prefix of the token that emits it, so it
+ * suffices to visit each occurrence of `key` preceded by a non-`[a-z0-9]`
+ * character (a run start or `_`) and ask whether a run/suffix or piece starts
+ * there that emits it.
  */
 function haystackHasIndexKey(haystackLower: string, key: string): boolean {
   const keyLen = key.length;
   if (keyLen === 0) return false;
-  const keyHasUnderscore = key.includes("_");
   // A 3..10-character key is emitted by any token it begins, so its end
   // does not matter (indexTokenEmitsKey ignores it).
   const needsEnd = keyLen < 3 || keyLen > 10;
@@ -3412,14 +3611,10 @@ function haystackHasIndexKey(haystackLower: string, key: string): boolean {
   while (at !== -1) {
     const prev = at > 0 ? haystackLower.charCodeAt(at - 1) : -1;
     if (!isAsciiLowerWordChar(prev)) {
-      if (prev !== 95) {
-        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, false) : 0;
-        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
-      }
-      if (!keyHasUnderscore) {
-        const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, true) : 0;
-        if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
-      }
+      const end = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, false) : 0;
+      if (indexTokenEmitsKey(haystackLower, at, end, key)) return true;
+      const pieceEnd = needsEnd ? indexTokenRunEnd(haystackLower, at + keyLen, true) : 0;
+      if (indexTokenEmitsKey(haystackLower, at, pieceEnd, key)) return true;
     }
     at = haystackLower.indexOf(key, at + 1);
   }
@@ -3572,12 +3767,19 @@ function updateVaultSearchCacheOnWrite(
 ): void {
   const cached = _vaultSearchCache.get(vaultPath);
   if (!cached) return;
+  const wikiRel = path.relative(path.join(vaultPath, "wiki"), notePath);
+  if (!wikiRel || wikiRel.startsWith("..") || path.isAbsolute(wikiRel)) return;
   const privacy = privacyFromMarkdown(markdown);
   if (privacy === "blocked") {
     cached.notes.delete(notePath);
+    if (cached.tokenMap) {
+      cached.tokenMap = undefined;
+      vaultSearchTokenMap(cached);
+    }
+    cached.builtAtMs = Date.now();
     return;
   }
-  const resolvedTitle = title || titleFromMarkdown(relativePath, markdown);
+  const resolvedTitle = titleFromMarkdown(relativePath, markdown) || title;
   const entry = buildCachedVaultNoteEntry(
     notePath,
     relativePath,
@@ -3585,9 +3787,17 @@ function updateVaultSearchCacheOnWrite(
     markdown,
     privacy,
   );
-  cached.notes.set(notePath, entry);
-  if (!entry.skipByStatus && cached.tokenMap) {
-    indexNoteTokensIntoMap(cached.tokenMap, notePath, entry.haystackLower);
+  if (cached.notes.has(notePath)) {
+    cached.notes.set(notePath, entry);
+  } else {
+    const entries = [...cached.notes.entries(), [notePath, entry] as const].sort(
+      (a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
+    );
+    cached.notes = new Map(entries);
+  }
+  if (cached.tokenMap) {
+    cached.tokenMap = undefined;
+    vaultSearchTokenMap(cached);
   }
   cached.builtAtMs = Date.now();
 }
@@ -3596,26 +3806,37 @@ export async function searchVaultNotes(
   vaultPath: string,
   query: string,
   limit = 5,
-  agentId?: string,
+  agentId?: string | VaultSearchOptions,
   options: VaultSearchOptions = {},
 ): Promise<VaultSearchResult[]> {
-  const candidates = options.candidates ?? "index";
-  const terms = queryTerms(query);
-  const phrases = phraseForms(query);
+  const resolvedAgentId = typeof agentId === "string" ? agentId : undefined;
+  const resolvedOptions =
+    typeof agentId === "object" && agentId !== null ? agentId : options;
+  const candidates = resolvedOptions.candidates ?? "index";
+  const rankMode = resolvedOptions.rank ?? "legacy";
+  const effectiveQuery = rankMode === "ups_gate" ? stripHarnessBlocks(query) : query;
+  const terms = queryTerms(effectiveQuery);
+  const phrases = phraseForms(effectiveQuery);
   // Only bail when there is nothing to match on at all. Bailing on an empty
   // term list alone threw away the exact-phrase bonus, which is the strongest
   // signal in the scorer and needs no tokens — but phraseForms yields nothing
   // for a query with no phrase of substance, so `-` or `--` (no tokens, no
   // usable phrase) stops here instead of reaching the scorer with terms = [].
+  options = resolvedOptions;
+  if (
+    (rankMode === "ups_gate" && terms.length === 0) ||
+    (terms.length === 0 && phrases.length === 0)
+  ) {
+    return [];
+  }
   let cache = _vaultSearchCache.get(vaultPath);
   const now = Date.now();
   const hasWarmCache = Boolean(
     cache && cache.notes.size >= 20 && now - cache.builtAtMs <= 30_000,
   );
-  if (!hasWarmCache) {
-    await ensureVault(vaultPath, agentId ? { agentId } : undefined);
+  if (!hasWarmCache && resolvedAgentId !== undefined && candidates !== "scan") {
+    await ensureVault(vaultPath, { agentId: resolvedAgentId });
   }
-  if (terms.length === 0 && phrases.length === 0) return [];
 
   const wikiRoot = path.join(vaultPath, "wiki");
   if (!hasWarmCache || !cache) {
@@ -3625,12 +3846,12 @@ export async function searchVaultNotes(
     } catch {
       return [];
     }
-    const notes = new Map<string, CachedVaultNoteEntry>();
-    await Promise.all(
+    files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const loaded = await Promise.all(
       files.map(async (notePath) => {
         const markdown = await readFile(notePath, "utf8");
         const privacy = privacyFromMarkdown(markdown);
-        if (privacy === "blocked") return;
+        if (privacy === "blocked") return undefined;
         const relativePath = path.relative(vaultPath, notePath);
         const title = titleFromMarkdown(relativePath, markdown);
         const entry = buildCachedVaultNoteEntry(
@@ -3640,9 +3861,13 @@ export async function searchVaultNotes(
           markdown,
           privacy,
         );
-        notes.set(notePath, entry);
+        return [notePath, entry] as const;
       }),
     );
+    const notes = new Map<string, CachedVaultNoteEntry>();
+    for (const item of loaded) {
+      if (item) notes.set(item[0], item[1]);
+    }
     cache = { builtAtMs: now, notes };
     _vaultSearchCache.set(vaultPath, cache);
   }
@@ -3650,32 +3875,260 @@ export async function searchVaultNotes(
   // write in this process, as it always has; the "scan" path never builds it.
   if (candidates === "index") vaultSearchTokenMap(cache);
 
-  const candidateEntries = selectCandidateEntries(cache, terms, candidates);
+  const candidateEntries = Array.from(
+    selectCandidateEntries(cache, terms, candidates),
+  );
 
-  const scored: Array<{ entry: CachedVaultNoteEntry; score: number }> = [];
+  let excludeSet: Set<string> | undefined;
+  if (options.excludePaths) {
+    excludeSet = new Set<string>();
+    for (const p of options.excludePaths) {
+      if (typeof p === "string" && p.length > 0) {
+        excludeSet.add(p);
+        excludeSet.add(p.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/^\/+/, ""));
+      }
+    }
+    if (excludeSet.size === 0) excludeSet = undefined;
+  }
+
+  const effectiveQueryTrimLen = effectiveQuery.trim().length;
+  let distinctiveSet: Set<string> | undefined;
+  let k_q = 3;
+  if (rankMode === "ups_gate") {
+    let nonNoiseCount = 0;
+    const df = new Map<string, number>();
+    for (const t of terms) df.set(t, 0);
+    for (const entry of cache.notes.values()) {
+      if (entry.skipByStatus || entry.durability === "noise") continue;
+      if (
+        excludeSet &&
+        (excludeSet.has(entry.relativePath) ||
+          excludeSet.has(entry.relativePath.replaceAll("\\", "/")) ||
+          excludeSet.has(entry.notePath))
+      ) {
+        continue;
+      }
+      nonNoiseCount += 1;
+    }
+    for (const entry of candidateEntries) {
+      if (entry.skipByStatus || entry.durability === "noise") continue;
+      if (
+        excludeSet &&
+        (excludeSet.has(entry.relativePath) ||
+          excludeSet.has(entry.relativePath.replaceAll("\\", "/")) ||
+          excludeSet.has(entry.notePath))
+      ) {
+        continue;
+      }
+      const wordCounts = ensureEntryWordCounts(terms, entry);
+      for (const t of terms) {
+        const present =
+          (wordCounts.has(t)
+            ? wordCounts.get(t)!
+            : countWordOccurrences(entry.haystackLower, t, true, 1)) > 0;
+        if (present) {
+          df.set(t, (df.get(t) ?? 0) + 1);
+        }
+      }
+    }
+    const dfThreshold = Math.max(1, Math.ceil(0.05 * Math.max(1, nonNoiseCount)));
+    const distinctiveQueryTerms = terms.filter((t) => {
+      const d = df.get(t) ?? 0;
+      return d > 0 && d <= dfThreshold;
+    });
+    distinctiveSet = new Set(distinctiveQueryTerms);
+    const rho =
+      typeof options.rho === "number" && Number.isFinite(options.rho)
+        ? options.rho
+        : 0.2;
+    k_q = Math.max(3, Math.ceil(rho * distinctiveQueryTerms.length));
+  }
+
+  const scored: Array<{
+    entry: CachedVaultNoteEntry;
+    score: number;
+    gate?: UpsGateEvaluation;
+  }> = [];
+
   for (const entry of candidateEntries) {
+    if (
+      excludeSet &&
+      (excludeSet.has(entry.relativePath) ||
+        excludeSet.has(entry.relativePath.replaceAll("\\", "/")) ||
+        excludeSet.has(entry.notePath))
+    ) {
+      continue;
+    }
     const score = scoreVaultNoteCached(phrases, terms, entry);
     if (score > 0) {
-      scored.push({ entry, score });
+      const gate =
+        rankMode === "ups_gate"
+          ? evaluateUpsGate(
+              effectiveQueryTrimLen,
+              phrases,
+              terms,
+              distinctiveSet!,
+              k_q,
+              entry,
+              score,
+            )
+          : undefined;
+      scored.push({ entry, score, gate });
     }
   }
 
-  scored.sort(
-    (a, b) =>
-      b.score - a.score ||
-      a.entry.relativePath.localeCompare(b.entry.relativePath),
-  );
+  if (rankMode === "ups_gate") {
+    scored.sort((a, b) => {
+      const ga = a.gate!;
+      const gb = b.gate!;
+      if (ga.clearsGate !== gb.clearsGate) {
+        return gb.clearsGate ? 1 : -1;
+      }
+      return (
+        gb.weightedScore - ga.weightedScore ||
+        b.score - a.score ||
+        a.entry.relativePath.localeCompare(b.entry.relativePath)
+      );
+    });
+  } else if (rankMode === "noise_last") {
+    scored.sort((a, b) => {
+      const na = a.entry.durability === "noise" ? 1 : 0;
+      const nb = b.entry.durability === "noise" ? 1 : 0;
+      if (na !== nb) {
+        return na - nb;
+      }
+      return (
+        b.score - a.score ||
+        a.entry.relativePath.localeCompare(b.entry.relativePath)
+      );
+    });
+  } else {
+    scored.sort(
+      (a, b) =>
+        b.score - a.score ||
+        a.entry.relativePath.localeCompare(b.entry.relativePath),
+    );
+  }
 
-  return scored.slice(0, limit).map(({ entry, score }) => ({
-    notePath: entry.notePath,
-    relativePath: entry.relativePath,
-    wikilink: entry.wikilink,
-    title: entry.title,
-    snippet: snippetFor(entry.markdown, terms),
-    score,
-    privacy: entry.privacy,
-    status: entry.status,
-  }));
+  return scored.slice(0, limit).map(({ entry, score, gate }) => {
+    const base: VaultSearchResult = {
+      notePath: entry.notePath,
+      relativePath: entry.relativePath,
+      wikilink: entry.wikilink,
+      title: entry.title,
+      snippet: snippetFor(entry.markdown, terms),
+      score,
+      privacy: entry.privacy,
+      status: entry.status,
+      durability: entry.durability,
+    };
+    if (gate) {
+      base.gateScore = gate.gateScore;
+      base.gateRoute = gate.gateRoute;
+      base.clearsGate = gate.clearsGate;
+      base.weightedScore = gate.weightedScore;
+      base.contributingTerms = gate.contributingTerms;
+      base.coveredDistinctive = gate.coveredDistinctive;
+    }
+    return base;
+  });
+}
+
+/**
+ * Resolve a short vault handle (`m:<8hex>`) to a vault-relative path under
+ * `wiki/` using the search cache when warm or `listVaultNoteRelPaths`.
+ * Returns `null` when the handle is malformed or no matching note exists.
+ */
+export async function resolveVaultHandleRelPath(
+  vaultPath: string,
+  handle: string,
+): Promise<string | null> {
+  if (typeof handle !== "string") return null;
+  const trimmed = handle.trim().toLowerCase();
+  if (!/^m:[0-9a-f]{8}$/.test(trimmed)) return null;
+  const cached = _vaultSearchCache.get(vaultPath);
+  if (cached) {
+    for (const entry of cached.notes.values()) {
+      if (entry.handle === trimmed && !entry.skipByStatus) {
+        if (await exists(entry.notePath)) {
+          return entry.relativePath;
+        }
+      }
+    }
+  }
+  const relPaths = await listVaultNoteRelPaths(vaultPath);
+  for (const rel of relPaths) {
+    if (computeVaultHandleForRelPath(rel) === trimmed) {
+      return rel;
+    }
+  }
+  return null;
+}
+
+export type ResolvedVaultHandleNote =
+  | {
+      status: "resolved";
+      relativePath: string;
+      title: string;
+      content: string;
+      wikilink: string;
+    }
+  | {
+      status: "unresolved";
+      reason: "missing" | "unsafe";
+    };
+
+/**
+ * Resolve a short vault handle (`m:<8hex>`) locally against `vaultPath`,
+ * enforcing containment, non-symlink file check, status check, and
+ * `filterSafeVaultResults` privacy gating (rev5 §5.2.6 / §5.3).
+ */
+export async function resolveSafeVaultHandleNote(
+  vaultPath: string,
+  handle: string,
+): Promise<ResolvedVaultHandleNote> {
+  const relPath = await resolveVaultHandleRelPath(vaultPath, handle);
+  if (!relPath) {
+    return { status: "unresolved", reason: "missing" };
+  }
+  const notePath = path.join(vaultPath, relPath);
+  try {
+    assertUnder(notePath, vaultPath);
+    const st = await lstat(notePath);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      return { status: "unresolved", reason: "unsafe" };
+    }
+    const markdown = await readFile(notePath, "utf8");
+    const privacy = privacyFromMarkdown(markdown);
+    if (privacy === "blocked" || skippedByStatus(markdown)) {
+      return { status: "unresolved", reason: "unsafe" };
+    }
+    const normalizedRel = relPath.replaceAll("\\", "/");
+    const title = titleFromMarkdown(normalizedRel, markdown);
+    const wikilink = wikilinkFor(normalizedRel);
+    const candidate: VaultSearchResult = {
+      notePath,
+      relativePath: normalizedRel,
+      wikilink,
+      title,
+      snippet: markdown.slice(0, 520),
+      score: 1,
+      privacy,
+      status: statusFromMarkdown(markdown),
+    };
+    if (filterSafeVaultResults([candidate]).length === 0) {
+      return { status: "unresolved", reason: "unsafe" };
+    }
+    return {
+      status: "resolved",
+      relativePath: normalizedRel,
+      title,
+      content: markdown,
+      wikilink,
+    };
+  } catch {
+    return { status: "unresolved", reason: "missing" };
+  }
 }
 
 export interface InboxEntry {
@@ -3697,7 +4150,12 @@ export async function writeInbox(
   slug: string,
   payload: Record<string, unknown>,
 ): Promise<InboxEntry> {
-  await ensureVault(vaultPath);
+  await ensureVault(vaultPath).catch((error) => {
+    if (!String((error as Error)?.message ?? "").includes("non-regular file")) {
+      throw error;
+    }
+  });
+  await mkdir(path.join(vaultPath, "inbox"), { recursive: true });
   const safeSlug = slugify(slug || "session");
   const stamp = `${isoDate()}-${Date.now().toString(36)}`;
   const fileName = `${stamp}-${safeSlug}.json`;
@@ -4765,3 +5223,121 @@ export function layer1ShelfBody(result: Layer1ShelfResult): Record<string, unkno
       : {}),
   };
 }
+
+/**
+ * S2a (§6.2.4, §8.3): 4,000-char ceiling for the inlined Layer 1 shelf boot
+ * form. The raw reader (`readLayer1Shelf`, `LAYER1_SHELF_MAX_BYTES = 8192`)
+ * stays untouched so `resolveActivePlanView` / `shelfDrift` always hash the
+ * full shelf content before any boot-form inline trim occurs.
+ */
+export const LAYER1_BOOT_FORM_MAX_CHARS = 4000;
+
+/**
+ * Safely read `<vault>/layer1/boot.md` when present as a regular file inside
+ * the vault. Refuses symlinks (`O_NOFOLLOW`) and FIFOs (`O_NONBLOCK` +
+ * `fstatSync(fd).isFile()`). Returns `null` when absent, empty, or refused.
+ */
+export function readLayer1BootFileSync(vaultPath: string): string | null {
+  if (!vaultPath || typeof vaultPath !== "string") return null;
+  const bootPath = path.join(vaultPath, "layer1", "boot.md");
+  let fd: number | undefined;
+  try {
+    assertWriteTargetUnder(bootPath, vaultPath);
+    const flags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    fd = fs.openSync(bootPath, flags);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0) return null;
+    const cap = Math.min(st.size, LAYER1_SHELF_MAX_BYTES);
+    const buf = Buffer.alloc(cap);
+    let total = 0;
+    while (total < cap) {
+      const n = fs.readSync(fd, buf, total, cap - total, total);
+      if (n <= 0) break;
+      total += n;
+    }
+    if (total <= 0) return null;
+    const text = buf.subarray(0, total).toString("utf8");
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close errors.
+      }
+    }
+  }
+}
+
+/**
+ * Build the `<= 4,000`-char Layer 1 boot form string from `sourceContent`
+ * (`layer1/boot.md` when present, else `layer1/core.md`), clipping at a
+ * paragraph boundary (`\n\n`) when needed and appending the explicit marker:
+ * `[layer1 shelf: boot form, <n> of <m> chars; full file: layer1/core.md]`.
+ */
+export function formatLayer1BootFormContent(
+  sourceContent: string,
+  totalCoreChars: number,
+  maxChars: number = LAYER1_BOOT_FORM_MAX_CHARS,
+): string {
+  const m = Math.max(totalCoreChars, sourceContent.length);
+  const worstMarker = `\n\n[layer1 shelf: boot form, ${maxChars} of ${Math.max(m, maxChars)} chars; full file: layer1/core.md]`;
+  const maxExcerpt = Math.max(0, maxChars - worstMarker.length);
+  let excerpt: string;
+  if (sourceContent.length <= maxExcerpt) {
+    excerpt = sourceContent;
+  } else {
+    const slice = sourceContent.slice(0, maxExcerpt);
+    const lastParagraph = slice.lastIndexOf("\n\n");
+    excerpt = lastParagraph > 0 ? slice.slice(0, lastParagraph) : slice;
+  }
+  const n = excerpt.length;
+  const sep = n > 0 ? "\n\n" : "";
+  return `${excerpt}${sep}[layer1 shelf: boot form, ${n} of ${m} chars; full file: layer1/core.md]`;
+}
+
+/**
+ * Convert a `layer1_shelf` envelope object into its `<= 4,000`-char boot form,
+ * preserving all reader fields (`ok`, `truncated`, `omitted_bytes`, `note`) and
+ * setting `inline_trim: true`.
+ */
+export function applyLayer1BootForm(
+  shelfBody: Record<string, unknown>,
+  vaultPath?: string,
+  maxChars: number = LAYER1_BOOT_FORM_MAX_CHARS,
+): Record<string, unknown> {
+  if (
+    !shelfBody ||
+    typeof shelfBody !== "object" ||
+    shelfBody.ok !== true ||
+    typeof shelfBody.content !== "string"
+  ) {
+    return shelfBody;
+  }
+  if (shelfBody.inline_trim === true && shelfBody.content.length <= maxChars) {
+    return shelfBody;
+  }
+  const rawContent = shelfBody.content;
+  const omittedBytes =
+    shelfBody.truncated === true && typeof shelfBody.omitted_bytes === "number"
+      ? shelfBody.omitted_bytes
+      : 0;
+  const totalCoreChars =
+    shelfBody.truncated === true
+      ? Math.max(rawContent.length, LAYER1_SHELF_MAX_BYTES) + omittedBytes
+      : rawContent.length;
+  const bootFileContent = vaultPath ? readLayer1BootFileSync(vaultPath) : null;
+  const sourceContent = bootFileContent ?? rawContent;
+  const bootContent = formatLayer1BootFormContent(sourceContent, totalCoreChars, maxChars);
+  return {
+    ...shelfBody,
+    content: bootContent,
+    inline_trim: true,
+  };
+}
+

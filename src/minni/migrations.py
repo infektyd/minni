@@ -130,7 +130,26 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
         return _column_exists(conn, "candidate_packets", "requested_privacy")
     if version == 23:
         return _column_exists(conn, "candidate_packets", "category")
+    if version == 24:
+        return (
+            _table_exists(conn, "episodic_fts")
+            and not _column_exists(conn, "episodic_fts", "event_id")
+            and _trigger_exists(conn, "trg_episodic_fts_insert")
+            and _trigger_exists(conn, "trg_episodic_fts_update")
+            and _trigger_exists(conn, "trg_episodic_fts_delete")
+        )
     return True
+
+
+def _trigger_exists(conn: sqlite3.Connection, trigger: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+            (trigger,),
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -243,6 +262,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                 if version == 21:
                     if not _verify_migration_021_graph_schema(conn):
                         continue
+                if version == 24:
+                    _apply_migration_024_rebuild_episodic_fts_rowid(conn)
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, os.path.basename(filepath), now),
@@ -467,7 +488,7 @@ def _verify_migration_021_graph_schema(conn: sqlite3.Connection) -> bool:
 
 
 def _apply_migration_019_episodic_fts_update_trigger(conn: sqlite3.Connection) -> None:
-    """Install trg_episodic_fts_update on databases that predate it (#287).
+    """Install trg_episodic_fts_update on databases that predate it (#287 / #311).
 
     Guarded on both episodic tables existing. SQLite resolves trigger-body
     tables at FIRE time, not CREATE time, so creating this on a schema with
@@ -475,7 +496,7 @@ def _apply_migration_019_episodic_fts_update_trigger(conn: sqlite3.Connection) -
     subsequent UPDATE with "no such table: main.episodic_fts" —
     _execute_tolerant cannot help, because there is no error at CREATE time to
     tolerate. Partial schemas are real; see the .sql file for the full
-    rationale, including why there is deliberately no DELETE counterpart.
+    rationale.
     """
     from minni.episodic import _episodic_tables_present
 
@@ -485,19 +506,130 @@ def _apply_migration_019_episodic_fts_update_trigger(conn: sqlite3.Connection) -
             "trigger (creating it would break later UPDATEs on this schema)"
         )
         return
+    if _column_exists(conn, "episodic_fts", "event_id"):
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_update
+            AFTER UPDATE OF agent_id, content ON episodic_events
+            BEGIN
+                DELETE FROM episodic_fts WHERE event_id = OLD.event_id;
+                INSERT INTO episodic_fts(event_id, agent_id, content)
+                SELECT NEW.event_id, NEW.agent_id, NEW.content
+                WHERE NEW.content IS NOT NULL;
+            END
+            """
+        )
+    else:
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_update
+            AFTER UPDATE OF content, agent_id, event_id ON episodic_events
+            BEGIN
+                DELETE FROM episodic_fts WHERE rowid = OLD.event_id;
+                INSERT INTO episodic_fts(rowid, agent_id, content)
+                SELECT NEW.event_id, NEW.agent_id, NEW.content
+                WHERE NEW.content IS NOT NULL;
+            END
+            """
+        )
+    logger.info("Migration 019: episodic_fts UPDATE trigger present")
+
+
+def _apply_migration_024_rebuild_episodic_fts_rowid(conn: sqlite3.Connection) -> None:
+    """Rebuild episodic_fts keyed by built-in rowid = event_id (#311).
+
+    No-op on partial schemas lacking episodic_events or episodic_fts. When a
+    legacy episodic_fts table with an `event_id` column is present, drops the
+    legacy triggers and table, recreates `episodic_fts(agent_id UNINDEXED,
+    content)`, installs the rowid-keyed insert/update/delete triggers, and
+    repopulates via `reconcile_episodic_fts`.
+    """
+    from minni.episodic import _episodic_tables_present, reconcile_episodic_fts
+
+    if not _episodic_tables_present(conn):
+        logger.info(
+            "Migration 024: episodic tables incomplete — skipping episodic_fts "
+            "rowid rebuild (no-op on partial schema)"
+        )
+        return
+
+    if _column_exists(conn, "episodic_fts", "event_id"):
+        conn.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_insert")
+        conn.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_update")
+        conn.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_delete")
+        conn.execute("DROP TABLE episodic_fts")
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE episodic_fts
+            USING fts5(
+                agent_id UNINDEXED,
+                content,
+                tokenize='porter unicode61'
+            )
+            """
+        )
+    else:
+        for trig_name in (
+            "trg_episodic_fts_insert",
+            "trg_episodic_fts_update",
+            "trg_episodic_fts_delete",
+        ):
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (trig_name,),
+            ).fetchone()
+            if row and row[0] and (
+                "episodic_fts(event_id" in row[0] or "WHERE event_id =" in row[0]
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig_name}")
+
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_insert
+        AFTER INSERT ON episodic_events
+        WHEN NEW.content IS NOT NULL
+        BEGIN
+            INSERT INTO episodic_fts(rowid, agent_id, content)
+            VALUES (NEW.event_id, NEW.agent_id, NEW.content);
+        END
+        """
+    )
     conn.execute(
         """
         CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_update
-        AFTER UPDATE OF agent_id, content ON episodic_events
+        AFTER UPDATE OF content, agent_id, event_id ON episodic_events
         BEGIN
-            DELETE FROM episodic_fts WHERE event_id = OLD.event_id;
-            INSERT INTO episodic_fts(event_id, agent_id, content)
+            DELETE FROM episodic_fts WHERE rowid = OLD.event_id;
+            INSERT INTO episodic_fts(rowid, agent_id, content)
             SELECT NEW.event_id, NEW.agent_id, NEW.content
             WHERE NEW.content IS NOT NULL;
         END
         """
     )
-    logger.info("Migration 019: episodic_fts UPDATE trigger present")
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_delete
+        AFTER DELETE ON episodic_events
+        BEGIN
+            DELETE FROM episodic_fts WHERE rowid = OLD.event_id;
+        END
+        """
+    )
+
+    try:
+        result = reconcile_episodic_fts(conn)
+    except Exception:
+        logger.warning(
+            "Migration 024: episodic FTS reconcile failed — schema migration "
+            "continues; periodic backfill sweep will retry.",
+            exc_info=True,
+        )
+        return
+    logger.info(
+        "Migration 024: episodic_fts rowid schema ready (%d event(s) indexed, %d orphan(s) removed)",
+        result["inserted"],
+        result["removed"],
+    )
 
 
 def _apply_migration_018_episodic_fts_backfill(conn: sqlite3.Connection) -> None:

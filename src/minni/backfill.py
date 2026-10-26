@@ -256,7 +256,7 @@ def episodic_index_coverage(db: MinniDB) -> Dict[str, object]:
                 f"""SELECT COUNT(DISTINCT e.event_id) AS n
                       FROM episodic_events e
                       JOIN episodic_fts f
-                        ON CAST(f.event_id AS INTEGER) = e.event_id
+                        ON f.rowid = e.event_id
                        AND f.agent_id IS e.agent_id
                      WHERE {_memory_only('e')}""",
                 NON_MEMORY_EVENT_TYPES,
@@ -270,15 +270,11 @@ def episodic_index_coverage(db: MinniDB) -> Dict[str, object]:
             # search_episodic INNER JOINs episodic_events — but reported rather
             # than hidden, since a climbing count means a delete path is
             # skipping the index.
-            # A NULL event_id counts as an orphan too: it joins to no event and
-            # the backfill can never claim it. Excluding it would leave
-            # indexed + orphans failing to reconcile against the FTS row count,
-            # which is how index junk stays invisible.
             orphans = c.execute(
-                "SELECT COUNT(*) AS n FROM episodic_fts f"
-                " WHERE f.event_id IS NULL"
-                " OR CAST(f.event_id AS INTEGER) NOT IN"
-                " (SELECT event_id FROM episodic_events)"
+                """SELECT COUNT(*) AS n FROM episodic_fts f
+                    WHERE f.rowid NOT IN (
+                        SELECT event_id FROM episodic_events
+                    )"""
             ).fetchone()["n"]
     except Exception as exc:
         # warning, not debug: at the default level a debug line means a broken

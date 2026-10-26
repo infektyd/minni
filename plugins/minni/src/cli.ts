@@ -165,7 +165,20 @@ async function main() {
   if (command === "prepare") {
     const { task, useAfm, profile, afmProviderMode } = parsePrepareArgs(args);
     if (!task) throw new Error("prepare requires a task");
-    console.log(JSON.stringify(await prepareTask({ task, vaultPath: DEFAULT_VAULT_PATH, useAfm, profile: profile as never, afmProviderMode }), null, 2));
+    console.log(
+      JSON.stringify(
+        await prepareTask({
+          task,
+          vaultPath: DEFAULT_VAULT_PATH,
+          useAfm,
+          profile: profile as never,
+          afmProviderMode,
+          vaultSearchOptions: { candidates: "scan" },
+        }),
+        null,
+        2,
+      ),
+    );
     return;
   }
 

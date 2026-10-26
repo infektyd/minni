@@ -1,6 +1,6 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { stat, readdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -18,8 +18,19 @@ import {
   type AfmProviderResolution,
   type ProviderHealth,
 } from "./afm.js";
-import { auditTail, ensureVault, recordAudit, vaultExists, writeInbox } from "./vault.js";
+import {
+  assertWriteTargetUnder,
+  auditTail,
+  ensureVault,
+  recordAudit,
+  resolveSafeVaultHandleNote,
+  searchVaultNotes,
+  vaultExists,
+  writeInbox,
+} from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
+import { durabilityOf } from "./durability.js";
+import { readSessionHandle } from "./recall-state.js";
 
 export interface JsonResult<T = unknown> {
   ok: boolean;
@@ -233,23 +244,185 @@ export const BOOT_RECALL_LAYERS: ReadonlyArray<string> = ["identity", "knowledge
  * the raw array, and only when something is actually wrong: the boot envelope
  * is context-budgeted, and a healthy report is per-corpus noise nobody reads.
  */
+export interface BootRecallSliceOptions {
+  /**
+   * S2a (§6.2.1, §8.1): when true (default, `MINNI_BOOT_FIT=on`), projects each
+   * result to `{ wikilink, title, text, confidence?, score?, layer,
+   * review_state, age_days, correction? }`, caps `results` to at most 3
+   * non-identity items + up to 2 extra correction-salience items, caps
+   * `episodic` to 2, and attaches `note` when both `results` and `episodic`
+   * are empty. When false (`MINNI_BOOT_FIT=off`), returns the legacy slice.
+   */
+  diet?: boolean;
+}
+
+const BOOT_CORRECTION_TAGS = new Set([
+  "correction",
+  "corrections",
+  "fix",
+  "contradiction",
+  "contradicted",
+  "superseded",
+]);
+
+function isBootCorrectionResult(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object") return false;
+  const r = raw as Record<string, unknown>;
+  if (r.correction === true || r.is_correction === true) return true;
+  if (typeof r.salience_boost === "number" && r.salience_boost > 0) return true;
+  if (r.provenance !== null && typeof r.provenance === "object") {
+    const prov = r.provenance as Record<string, unknown>;
+    if (typeof prov.salience_boost === "number" && prov.salience_boost > 0) return true;
+  }
+  for (const field of ["layer", "review_state", "kind", "category", "type"] as const) {
+    const val = typeof r[field] === "string" ? (r[field] as string).trim().toLowerCase() : "";
+    if (val && BOOT_CORRECTION_TAGS.has(val)) return true;
+  }
+  for (const textField of ["title", "text", "snippet", "category"] as const) {
+    const val = typeof r[textField] === "string" ? (r[textField] as string) : "";
+    if (val && /\bcorrection\b/i.test(val)) return true;
+  }
+  return false;
+}
+
+function projectBootRecallResult(raw: unknown): unknown {
+  if (raw === null || typeof raw !== "object") return raw;
+  const r = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  if (typeof r.wikilink === "string") out.wikilink = r.wikilink;
+  if (typeof r.title === "string") out.title = r.title;
+  const text =
+    typeof r.text === "string"
+      ? r.text
+      : typeof r.snippet === "string"
+        ? r.snippet
+        : undefined;
+  if (text !== undefined) out.text = text;
+  if (typeof r.confidence === "number" && Number.isFinite(r.confidence)) {
+    out.confidence = r.confidence;
+  }
+  if (typeof r.score === "number" && Number.isFinite(r.score)) {
+    out.score = r.score;
+  }
+  if (typeof r.layer === "string") out.layer = r.layer;
+  if (typeof r.review_state === "string") out.review_state = r.review_state;
+  if (typeof r.age_days === "number" && Number.isFinite(r.age_days)) {
+    out.age_days = r.age_days;
+  }
+  if (isBootCorrectionResult(r)) {
+    out.correction = true;
+  }
+  // Preserve daemon identity metadata as non-enumerable properties so the S1a-2
+  // use-ledger capture (`daemonRef`) can still derive `mkey` (`doc:<src>:<id>`
+  // or `vault:<rel>`) while JSON/stableStringify serialization omits them.
+  for (const hiddenKey of ["src", "doc_id", "source", "filename"] as const) {
+    if (r[hiddenKey] !== undefined) {
+      Object.defineProperty(out, hiddenKey, {
+        value: r[hiddenKey],
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return out;
+}
+
+function isBootRecallNoiseResult(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object") return false;
+  const r = raw as Record<string, unknown>;
+  const source = typeof r.source === "string" ? r.source : "";
+  const relPath =
+    typeof r.path === "string" && r.path.trim()
+      ? r.path
+      : typeof r.rel_path === "string" && r.rel_path.trim()
+        ? r.rel_path
+        : typeof r.wikilink === "string" && r.wikilink.trim()
+          ? r.wikilink.replace(/^\[\[|\]\]$/g, "")
+          : source;
+  const rawContent =
+    typeof r.content === "string" && r.content.trim()
+      ? r.content
+      : typeof r.text === "string" && r.text.trim()
+        ? r.text
+        : typeof r.snippet === "string" && r.snippet.trim()
+          ? r.snippet
+          : "";
+  const evidenceStatusMatch = /^\s*<EVIDENCE\b[^>]*\bstatus="([^"]+)"/i.exec(rawContent);
+  const content = rawContent
+    .replace(/^\s*<EVIDENCE[^>]*>\s*/i, "")
+    .replace(/\s*<\/EVIDENCE>\s*$/i, "");
+  return (
+    durabilityOf({
+      path: relPath,
+      source,
+      content,
+      category: r.category,
+      type: r.type,
+      page_type: r.page_type,
+      status: r.status ?? (evidenceStatusMatch ? evidenceStatusMatch[1] : undefined),
+      review_state: r.review_state,
+      page_status: r.page_status,
+    }) === "noise"
+  );
+}
+
 export function buildBootRecallSlice(
   data: RecallResponse,
   agentFallback: string,
+  options?: BootRecallSliceOptions,
 ): {
   ok: true;
   results: RecallResponse["results"];
+  count?: number;
   episodic: unknown[];
   episodic_count: number;
   agent_origin: string;
   layer: RecallResponse["layer"];
   layers: ReadonlyArray<string>;
+  note?: string;
   degraded?: true;
   degradation_notes?: string[];
 } {
-  const episodic = Array.isArray(data.episodic) ? data.episodic : [];
-  const episodic_count =
-    typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
+  const diet = options?.diet !== false;
+  const rawEpisodic = Array.isArray(data.episodic) ? data.episodic : [];
+  const episodic = diet ? rawEpisodic.slice(0, 2) : rawEpisodic;
+  const episodic_count = diet
+    ? episodic.length
+    : typeof data.episodic_count === "number"
+      ? data.episodic_count
+      : episodic.length;
+
+  let results: RecallResponse["results"] = data.results;
+  let count: number | undefined = data.count;
+  if (diet && Array.isArray(data.results)) {
+    const nonIdentity = data.results.filter((item) => {
+      if (item === null || typeof item !== "object") return true;
+      const layer = (item as Record<string, unknown>).layer;
+      return layer !== "identity";
+    });
+    const nonNoise: unknown[] = [];
+    const noise: unknown[] = [];
+    for (const item of nonIdentity) {
+      if (isBootRecallNoiseResult(item)) {
+        noise.push(item);
+      } else {
+        nonNoise.push(item);
+      }
+    }
+    const ordered = [...nonNoise, ...noise];
+    const topThree = ordered.slice(0, 3);
+    const extraCorrections = ordered
+      .slice(3)
+      .filter((item) => isBootCorrectionResult(item))
+      .slice(0, 2);
+    const projected = [...topThree, ...extraCorrections].map((item) =>
+      projectBootRecallResult(item),
+    );
+    results = projected;
+    count = projected.length;
+  }
+
   // Only routine foreign-scope blackouts are dropped; a non-routine read-gate
   // suppression must reach the boot envelope the same way formatRecall renders it.
   const notes = formatDegradation({
@@ -258,19 +431,72 @@ export function buildBootRecallSlice(
       (entry) => !isRoutineForeignScopeSuppression((entry ?? {}) as Record<string, unknown>),
     ),
   });
+  const isEmptyRecall =
+    diet &&
+    (!Array.isArray(results) || results.length === 0) &&
+    episodic.length === 0;
   return {
     ok: true,
-    results: data.results,
+    results,
+    ...(count !== undefined ? { count } : {}),
     episodic,
     episodic_count,
     agent_origin: data.agent_id ?? agentFallback,
     layer: data.layer,
     layers: BOOT_RECALL_LAYERS,
+    ...(isEmptyRecall ? { note: "no boot recall results; call minni_recall" } : {}),
     ...(notes ? { degraded: true as const, degradation_notes: notes.split("\n") } : {}),
   };
 }
 
-export async function recallMemory(input: {
+export function isRecallNoiseLastEnabled(vaultPath?: string): boolean {
+  const rawEnv = process.env.MINNI_RECALL_NOISE_LAST;
+  if (rawEnv === "off") return false;
+  if (rawEnv === "on") return true;
+  if (!vaultPath || typeof vaultPath !== "string") return true;
+  try {
+    const flagsPath = path.join(vaultPath, ".runtime", "flags.json");
+    assertWriteTargetUnder(flagsPath, vaultPath);
+    const raw = readFileSync(flagsPath, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (parsed.MINNI_RECALL_NOISE_LAST === "off") return false;
+      if (parsed.MINNI_RECALL_NOISE_LAST === "on") return true;
+    }
+  } catch {
+    // Default "on".
+  }
+  return true;
+}
+
+export function partitionRecallResultsNoiseLast<T>(results: readonly T[]): T[] {
+  const nonNoise: T[] = [];
+  const noise: T[] = [];
+  for (const item of results) {
+    const rec = (item ?? {}) as Record<string, unknown>;
+    const title = typeof rec.title === "string" ? rec.title : "";
+    const isNoise =
+      rec.durability === "noise" ||
+      /^\s*\[Subagent Context\]/i.test(title) ||
+      durabilityOf({
+        ...rec,
+        path:
+          rec.relativePath ??
+          rec.rel_path ??
+          rec.path ??
+          rec.filename ??
+          rec.wikilink,
+        title,
+        content: rec.content ?? rec.snippet ?? rec.text ?? rec.body,
+        source: rec.source_kind ?? rec.source,
+      }) === "noise";
+    if (isNoise) noise.push(item);
+    else nonNoise.push(item);
+  }
+  return [...nonNoise, ...noise];
+}
+
+export interface RecallMemoryInput {
   query: string;
   agentId?: string;
   layer?: string;
@@ -281,6 +507,7 @@ export async function recallMemory(input: {
   crossAgent?: boolean;
   cross_agent?: boolean;
   sessionId?: string;
+  vaultPath?: string;
   /**
    * TOTAL deadline for the recall RPC. Prompt-time hooks pass their remaining
    * budget so a cold daemon (lazy embedder/cross-encoder/FAISS load) degrades to
@@ -288,32 +515,87 @@ export async function recallMemory(input: {
    * discarded. Omitted elsewhere → the 30s default.
    */
   timeoutMs?: number;
-}, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
-  // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
-  // directly instead of masking it behind a dead HTTP-over-socket fallback.
-  // M-2 fix: explicitly pass depth="snippet" so agents receive evidence text
-  // (~120 tokens/result) rather than headline-only (wikilink + score, no text).
-  // The daemon's previous default was "headline" despite the docstring claiming
-  // "snippet". Both the daemon default and this call-site now agree on "snippet".
-  const timeoutMs = input.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
-  return jsonRpcSocketRequestWithFallbackRequester("search", {
-    query: input.query,
-    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
-    layers: input.layers ?? (input.layer ? [input.layer] : undefined),
-    limit: input.limit,
-    scope: input.scope,
-    cross_agent: input.crossAgent ?? input.cross_agent,
-    depth: "snippet",
-    // Daemon search is to_thread and uncancellable; pass the same budget so
-    // retrieve() can stop FAISS/expand/CE before this client kills the socket.
-    timeout_ms: timeoutMs,
-    // Session receipts: the daemon records a durable episodic recall-trace event
-    // (thread_id=session_id) when this is present. Omit it entirely when the
-    // caller has no session context so the daemon param stays absent, not null.
-    ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
-  }, requester, { timeoutMs }) as Promise<
-    JsonResult<RecallResponse>
-  >;
+}
+
+export interface TransportConfigLike {
+  agentId?: string;
+  vaultPath?: string;
+  workspaceId?: string;
+  daemonSocketPath?: string;
+  daemonTimeoutMs?: number;
+  recallTimeoutMs?: number;
+}
+
+export async function recallMemory(
+  inputOrConfig: RecallMemoryInput | TransportConfigLike,
+  requesterOrInput?: JsonRpcRequester | RecallMemoryInput,
+  maybeRequester?: JsonRpcRequester,
+): Promise<JsonResult<RecallResponse> & { source?: string }> {
+  const isTwoObjectArgs =
+    typeof requesterOrInput === "object" &&
+    requesterOrInput !== null &&
+    typeof (requesterOrInput as RecallMemoryInput).query === "string";
+  const config: TransportConfigLike | undefined = isTwoObjectArgs
+    ? (inputOrConfig as TransportConfigLike)
+    : undefined;
+  const input: RecallMemoryInput = isTwoObjectArgs
+    ? (requesterOrInput as RecallMemoryInput)
+    : (inputOrConfig as RecallMemoryInput);
+  const baseRequester: JsonRpcRequester = isTwoObjectArgs
+    ? (maybeRequester ?? jsonRpcSocketRequest)
+    : typeof requesterOrInput === "function"
+      ? requesterOrInput
+      : jsonRpcSocketRequest;
+  const requester: JsonRpcRequester = config?.daemonSocketPath
+    ? (_sock, method, params, opts) =>
+        baseRequester(config.daemonSocketPath!, method, params, opts)
+    : baseRequester;
+
+  const effectiveVaultPath = input.vaultPath ?? config?.vaultPath;
+  const noiseLast = isRecallNoiseLastEnabled(effectiveVaultPath ?? DEFAULT_VAULT_PATH);
+  const timeoutMs =
+    input.timeoutMs ?? config?.recallTimeoutMs ?? config?.daemonTimeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
+
+  const res = (await jsonRpcSocketRequestWithFallbackRequester(
+    "search",
+    {
+      query: input.query,
+      agent_id: input.agentId ?? config?.agentId ?? DEFAULT_AGENT_ID,
+      layers: input.layers ?? (input.layer ? [input.layer] : undefined),
+      limit: input.limit,
+      scope: input.scope,
+      cross_agent: input.crossAgent ?? input.cross_agent,
+      depth: "snippet",
+      timeout_ms: timeoutMs,
+      ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
+    },
+    requester,
+    { timeoutMs },
+  )) as JsonResult<RecallResponse> & { source?: string };
+
+  if (res.ok && res.data && Array.isArray(res.data.results) && noiseLast) {
+    res.data = {
+      ...res.data,
+      results: partitionRecallResultsNoiseLast(res.data.results),
+    };
+  } else if (!res.ok && effectiveVaultPath && isSharedGateUnavailable(res.error)) {
+    const vaultHits = await searchVaultNotes(
+      effectiveVaultPath,
+      input.query,
+      input.limit ?? 5,
+      undefined,
+      { rank: noiseLast ? "noise_last" : "legacy" },
+    );
+    return {
+      ok: true,
+      source: "vault-fallback",
+      data: {
+        results: vaultHits,
+        count: vaultHits.length,
+      },
+    };
+  }
+  return res;
 }
 
 export async function learnMemory(input: {
@@ -433,7 +715,8 @@ export type JsonRpcRequester = (
 ) => Promise<JsonResult>;
 
 function jsonRpcSocketCandidates(): string[] {
-  return [SOCKET_PATH];
+  const envSock = process.env.MINNI_SOCKET_PATH?.trim();
+  return [envSock || SOCKET_PATH];
 }
 
 /**
@@ -603,21 +886,269 @@ export function isSharedGateUnavailable(error: string | undefined): boolean {
   return /^(?:Error:\s*)?(?:connect\s+)?(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
 }
 
+export interface DrillMemoryInput {
+  resultIds?: number[];
+  chunkIds?: number[];
+  references?: Array<Record<string, unknown> | string>;
+  handle?: string;
+  wikilink?: string;
+  depth?: "snippet" | "chunk" | "document";
+  vaultPath?: string;
+  sessionId?: string;
+}
+
+function xmlAttrEscapeDrill(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 export async function drillMemory(
-  input: {
-    resultIds?: number[];
-    chunkIds?: number[];
-    references?: Array<Record<string, unknown> | string>;
-    depth?: "snippet" | "chunk" | "document";
-  },
-  requester: JsonRpcRequester = jsonRpcSocketRequest,
-): Promise<JsonResult> {
-  return jsonRpcSocketRequestWithFallbackRequester("sm_drill", {
-    result_ids: input.resultIds,
-    chunk_ids: input.chunkIds,
-    references: input.references,
-    depth: input.depth ?? "snippet",
-  }, requester);
+  inputOrConfig: DrillMemoryInput | TransportConfigLike,
+  requesterOrInput?: JsonRpcRequester | DrillMemoryInput,
+  maybeRequester?: JsonRpcRequester,
+): Promise<JsonResult<Record<string, unknown>> & { source?: string }> {
+  const isTwoObjectArgs =
+    typeof requesterOrInput === "object" &&
+    requesterOrInput !== null &&
+    ("resultIds" in requesterOrInput ||
+      "chunkIds" in requesterOrInput ||
+      "references" in requesterOrInput ||
+      "handle" in requesterOrInput ||
+      "wikilink" in requesterOrInput ||
+      "depth" in requesterOrInput);
+  const config: TransportConfigLike | undefined = isTwoObjectArgs
+    ? (inputOrConfig as TransportConfigLike)
+    : undefined;
+  const input: DrillMemoryInput = isTwoObjectArgs
+    ? (requesterOrInput as DrillMemoryInput)
+    : (inputOrConfig as DrillMemoryInput);
+  const baseRequester: JsonRpcRequester = isTwoObjectArgs
+    ? (maybeRequester ?? jsonRpcSocketRequest)
+    : typeof requesterOrInput === "function"
+      ? requesterOrInput
+      : jsonRpcSocketRequest;
+  const requester: JsonRpcRequester = config?.daemonSocketPath
+    ? (_sock, method, params, opts) =>
+        baseRequester(config.daemonSocketPath!, method, params, opts)
+    : baseRequester;
+
+  const effectiveVaultPath = input.vaultPath ?? config?.vaultPath ?? DEFAULT_VAULT_PATH;
+
+  const rawRefs: unknown[] =
+    Array.isArray(input.references) && input.references.length > 0
+      ? [...input.references]
+      : typeof input.handle === "string" && input.handle.trim()
+        ? [input.handle.trim()]
+        : typeof input.wikilink === "string" && input.wikilink.trim()
+          ? [input.wikilink.trim()]
+          : [];
+
+  const hasHandleRef = rawRefs.some(
+    (r) => typeof r === "string" && (r.trim().startsWith("m:") || r.trim().startsWith("d:")),
+  );
+
+  if (hasHandleRef) {
+    const localResults: Array<Record<string, unknown>> = [];
+    const daemonReferences: Array<unknown> = [];
+    const daemonMeta: Array<{
+      handle?: string;
+      doc_id?: number;
+      src?: string;
+      source?: string;
+      source_unverified?: boolean;
+      sessionEntry?: Awaited<ReturnType<typeof readSessionHandle>>;
+    }> = [];
+
+    for (const rawRef of rawRefs) {
+      if (typeof rawRef === "string" && rawRef.trim().startsWith("m:")) {
+        const trimmed = rawRef.trim();
+        if (!/^m:[0-9a-f]{8}$/i.test(trimmed)) {
+          localResults.push({
+            handle: trimmed,
+            status: "unresolved",
+            reason: "invalid_handle",
+            found: false,
+          });
+          continue;
+        }
+        const normalizedHandle = trimmed.toLowerCase();
+        const resolved = await resolveSafeVaultHandleNote(effectiveVaultPath, normalizedHandle);
+        if (resolved.status === "unresolved") {
+          localResults.push({
+            handle: normalizedHandle,
+            status: "unresolved",
+            reason: resolved.reason,
+            found: false,
+          });
+          continue;
+        }
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
+        localResults.push({
+          handle: normalizedHandle,
+          status: "resolved",
+          found: true,
+          wikilink: resolved.wikilink,
+          relativePath: resolved.relativePath,
+          source: resolved.relativePath,
+          title: resolved.title,
+          text: wrapped,
+          content: wrapped,
+          raw_content: resolved.content,
+        });
+        continue;
+      }
+
+      if (typeof rawRef === "string" && rawRef.trim().startsWith("d:")) {
+        const trimmed = rawRef.trim();
+        const match = /^d:([a-z0-9_-]+):(\d+)$/i.exec(trimmed);
+        if (!match) {
+          localResults.push({
+            handle: trimmed,
+            status: "unresolved",
+            reason: "invalid_handle",
+            found: false,
+          });
+          continue;
+        }
+        const src = match[1].toLowerCase();
+        const docId = Number(match[2]);
+        const sessionEntry = await readSessionHandle(effectiveVaultPath, input.sessionId, trimmed);
+        const sourceUnverified = sessionEntry === null;
+        const entrySource =
+          sessionEntry?.source ?? sessionEntry?.relativePath ?? undefined;
+        daemonReferences.push(
+          !sourceUnverified && entrySource
+            ? { doc_id: docId, src, source: entrySource }
+            : { doc_id: docId, src },
+        );
+        daemonMeta.push({
+          handle: trimmed,
+          doc_id: docId,
+          src,
+          ...(entrySource ? { source: entrySource } : {}),
+          source_unverified: sourceUnverified,
+          sessionEntry,
+        });
+        continue;
+      }
+
+      daemonReferences.push(rawRef);
+      daemonMeta.push({});
+    }
+
+    // Pure local `m:` resolution (no daemon references needed): succeeds even
+    // when the daemon is completely down.
+    if (daemonReferences.length === 0 && !input.resultIds && !input.chunkIds) {
+      const anyResolved = localResults.some((r) => r.status === "resolved");
+      const first = localResults[0] ?? { status: "unresolved", found: false };
+      if (!anyResolved) {
+        const errCode =
+          first.reason === "invalid_handle"
+            ? `invalid_handle: ${String(first.handle ?? "")}`
+            : first.reason === "unsafe"
+              ? `unsafe_handle: ${String(first.handle ?? "")}`
+              : `handle_not_found: ${String(first.handle ?? "")}`;
+        return {
+          ok: false,
+          error: errCode,
+          data: {
+            ...first,
+            results: localResults,
+            items: localResults,
+          },
+        };
+      }
+      return {
+        ok: true,
+        source: "vault-fallback",
+        data: {
+          ...first,
+          results: localResults,
+          items: localResults,
+        },
+      };
+    }
+
+    const rpcRes = (await jsonRpcSocketRequestWithFallbackRequester(
+      "sm_drill",
+      {
+        ...(input.resultIds ? { result_ids: input.resultIds } : {}),
+        ...(input.chunkIds ? { chunk_ids: input.chunkIds } : {}),
+        references: daemonReferences,
+        depth: input.depth ?? "snippet",
+      },
+      requester,
+    )) as JsonResult<Record<string, unknown>>;
+
+    if (rpcRes.ok && rpcRes.data) {
+      const rawDaemonItems = Array.isArray(rpcRes.data.results)
+        ? (rpcRes.data.results as Array<Record<string, unknown>>)
+        : Array.isArray(rpcRes.data.items)
+          ? (rpcRes.data.items as Array<Record<string, unknown>>)
+          : [];
+      const mergedDaemonItems = daemonMeta.map((meta, idx) => {
+        const dItem = rawDaemonItems[idx] ?? {};
+        return {
+          ...dItem,
+          ...(meta.handle ? { handle: meta.handle } : {}),
+          ...(meta.doc_id !== undefined ? { doc_id: meta.doc_id } : {}),
+          ...(meta.src ? { src: meta.src } : {}),
+          ...(meta.source && !dItem.source ? { source: meta.source } : {}),
+          ...(meta.source_unverified !== undefined
+            ? { source_unverified: meta.source_unverified }
+            : {}),
+        };
+      });
+      const combinedResults = [...localResults, ...mergedDaemonItems];
+      const firstMeta = daemonMeta[0] ?? {};
+      return {
+        ok: true,
+        data: {
+          ...rpcRes.data,
+          found: true,
+          ...(firstMeta.handle ? { handle: firstMeta.handle } : {}),
+          ...(firstMeta.doc_id !== undefined ? { doc_id: firstMeta.doc_id } : {}),
+          ...(firstMeta.src ? { src: firstMeta.src } : {}),
+          ...(firstMeta.source_unverified !== undefined
+            ? { source_unverified: firstMeta.source_unverified }
+            : {}),
+          results: combinedResults,
+          items: combinedResults,
+        },
+      };
+    }
+
+    const firstMeta = daemonMeta[0] ?? {};
+    return {
+      ok: false,
+      error: rpcRes.error ?? `handle_not_found: ${String(firstMeta.handle ?? "")}`,
+      data: {
+        found: false,
+        ...(firstMeta.handle ? { handle: firstMeta.handle } : {}),
+        ...(firstMeta.doc_id !== undefined ? { doc_id: firstMeta.doc_id } : {}),
+        ...(firstMeta.src ? { src: firstMeta.src } : {}),
+        ...(firstMeta.source_unverified !== undefined
+          ? { source_unverified: firstMeta.source_unverified }
+          : {}),
+        results: localResults,
+        items: localResults,
+      },
+    };
+  }
+
+  return jsonRpcSocketRequestWithFallbackRequester(
+    "sm_drill",
+    {
+      result_ids: input.resultIds,
+      chunk_ids: input.chunkIds,
+      references: input.references,
+      depth: input.depth ?? "snippet",
+    },
+    requester,
+  ) as Promise<JsonResult<Record<string, unknown>>>;
 }
 
 export async function exportContextPack(

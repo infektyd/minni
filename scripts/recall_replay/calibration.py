@@ -3,44 +3,39 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
-import fnmatch
 import hashlib
 import math
 import re
 import statistics
 from typing import Any
 
-from minni.afm_passes.harness_envelopes import classify_prompt_envelope, strip_harness_blocks
-
-CATEGORY_SYNONYMS: dict[str, str] = {
-    "decision": "decision",
-    "adr": "decision",
-    "fix": "fix",
-    "bugfix": "fix",
-    "scar": "fix",
-    "procedure": "procedure",
-    "architecture": "architecture",
-    "preference": "preference",
-}
-
-DURABLE_CATEGORIES = frozenset({"decision", "fix", "procedure", "architecture"})
-
-CONTENT_TEST_PREFIXES = (
-    "Decision:",
-    "Fix:",
-    "Root cause:",
-    "Resolution:",
-    "Invariant:",
-    "Never ",
-    "Always ",
+from minni.afm_passes.harness_envelopes import strip_harness_blocks
+from minni.durability import (
+    CATEGORY_SYNONYMS,
+    CONTENT_TEST_PREFIXES,
+    DURABLE_CATEGORIES,
+    classify_durability,
+    durability_of,
+    matches_content_test,
+    normalize_category,
 )
 
-_CONTENT_SECTION_RE = re.compile(r"(?m)^##\s+(?:Resolution|Fix)\b")
-_FRONTMATTER_RE = re.compile(r"\A---\s*\n.*?\n---\s*\n?", re.DOTALL)
-_LEADING_H1_RE = re.compile(r"\A#\s+[^\n]+\n+")
-_CHECKBOX_OPEN_RE = re.compile(r"(?m)^\s*-\s*\[\s\]\s+")
-_CHECKBOX_DONE_RE = re.compile(r"(?m)^\s*-\s*\[[xX]\]\s+")
+__all__ = [
+    "CATEGORY_SYNONYMS",
+    "CONTENT_TEST_PREFIXES",
+    "DURABLE_CATEGORIES",
+    "calibrate_k",
+    "calibrate_rho",
+    "classify_durability",
+    "durability_of",
+    "evaluate_b7_stored_chatter",
+    "evaluate_content_test_precision",
+    "matches_content_test",
+    "normalize_category",
+    "run_noise_free_reference",
+    "score_ups_gate",
+]
+
 _HEADING_LINE_RE = re.compile(r"(?m)^#{1,6}\s+(.+)$")
 _TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 
@@ -83,115 +78,6 @@ _STOPWORDS = frozenset(
         "only",
     }
 )
-
-
-def normalize_category(raw_category: Any) -> str:
-    if not isinstance(raw_category, str):
-        return ""
-    cleaned = raw_category.strip().lower()
-    return CATEGORY_SYNONYMS.get(cleaned, cleaned)
-
-
-def _strip_frontmatter_and_h1(text: str) -> str:
-    body = _FRONTMATTER_RE.sub("", text or "").lstrip()
-    body = _LEADING_H1_RE.sub("", body).lstrip()
-    return body
-
-
-def matches_content_test(text: str) -> bool:
-    """Return True when body text matches the §5.2 item 3 content durability test."""
-    if not isinstance(text, str) or not text.strip():
-        return False
-    body = _strip_frontmatter_and_h1(text)
-    if any(body.startswith(prefix) for prefix in CONTENT_TEST_PREFIXES):
-        return True
-    return bool(_CONTENT_SECTION_RE.search(body))
-
-
-def _parse_ts(value: Any) -> float | None:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
-    return None
-
-
-def durability_of(
-    item: Mapping[str, Any],
-    *,
-    provenance_gate_since: str | float | None = None,
-    content_test_enabled: bool = True,
-) -> str:
-    """Classify a learning or vault note as ``noise``, ``durable``, or ``ordinary`` (§5.2 item 3)."""
-    if not isinstance(item, Mapping):
-        return "ordinary"
-
-    content = str(item.get("content") or item.get("body") or item.get("text") or "")
-    rel_path = str(item.get("path") or item.get("rel_path") or item.get("note") or "").strip().lstrip("/")
-    source = str(item.get("source") or "").strip()
-    status = str(item.get("status") or "").strip().lower()
-    note_type = str(item.get("type") or "").strip().lower()
-
-    # 1. Noise checks
-    if content.strip():
-        env = classify_prompt_envelope(content)
-        if env["kind"] in ("skip", "wrapped"):
-            return "noise"
-        if (
-            env["kind"] == "human"
-            and env["subkind"] == "empty"
-            and env.get("rule_id") == "block.system_reminder"
-        ):
-            return "noise"
-
-    if source.startswith("compact_distillation") or "compact_distillation:" in content:
-        return "noise"
-    if rel_path and (
-        fnmatch.fnmatch(rel_path, "wiki/sessions/*-compact-*")
-        or fnmatch.fnmatch(rel_path, "*/wiki/sessions/*-compact-*")
-    ):
-        return "noise"
-
-    if rel_path and (
-        fnmatch.fnmatch(rel_path, "wiki/artifacts/plan-*.log.md")
-        or fnmatch.fnmatch(rel_path, "wiki/artifacts/plan-*.log")
-    ):
-        return "noise"
-
-    is_plan_note = note_type == "plan" or (
-        rel_path.startswith("wiki/artifacts/plan-") and rel_path.endswith(".md") and not rel_path.endswith(".log.md")
-    )
-    if is_plan_note and status != "accepted":
-        if status == "complete":
-            return "noise"
-        if status == "candidate":
-            if item.get("all_slices_resolved") is True:
-                return "noise"
-            done_boxes = _CHECKBOX_DONE_RE.findall(content)
-            open_boxes = _CHECKBOX_OPEN_RE.findall(content)
-            if done_boxes and not open_boxes:
-                return "noise"
-
-    # 2. Durable checks
-    norm_cat = normalize_category(item.get("category"))
-    if norm_cat in DURABLE_CATEGORIES:
-        return "durable"
-
-    if content_test_enabled and matches_content_test(content):
-        return "durable"
-
-    if norm_cat == "preference":
-        origin = str(item.get("origin") or item.get("origin_kind") or "").strip().lower()
-        if origin == "human" and provenance_gate_since is not None:
-            gate_ts = _parse_ts(provenance_gate_since)
-            created_ts = _parse_ts(item.get("created_at"))
-            if gate_ts is not None and created_ts is not None and created_ts >= gate_ts:
-                return "durable"
-
-    return "ordinary"
 
 
 def evaluate_content_test_precision(sample_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

@@ -1277,6 +1277,10 @@ There is one switch per feature, and every one defaults to `on`.
     the env var, then a non-blocking, no-follow read of `flags.json` (regular file, 64 KiB cap, strict
     value). It may answer "off" only where `flags.ts` would too; any doubt answers "maybe on", and then the
     full read above decides.
+    - **Idle-machine latency re-measure (Row `h`, 2026-10-26, n=100 + 10 warm-up, interleaved A/B/C, fake daemon on Unix socket, load 1.08 start / 2.34 end):**
+      - `SessionStart`: pre-S1a-2 base (`486806bc`) **125.4 ms** p50 / **129.2 ms** p95 / **132.9 ms** p99; `HEAD` with `MINNI_USE_LEDGER=off` **130.6 ms** p50 / **135.9 ms** p95 / **153.7 ms** p99; `HEAD` with `MINNI_USE_LEDGER=on` **133.7 ms** p50 / **138.2 ms** p95 / **144.4 ms** p99 (`on − off`: **+3.1 ms** p50, **+2.3 ms** p95).
+      - `UserPromptSubmit`: pre-S1a-2 base (`486806bc`) **122.9 ms** p50 / **128.6 ms** p95 / **133.4 ms** p99; `HEAD` with `MINNI_USE_LEDGER=off` **128.1 ms** p50 / **133.6 ms** p95 / **143.8 ms** p99; `HEAD` with `MINNI_USE_LEDGER=on` **132.4 ms** p50 / **138.2 ms** p95 / **139.4 ms** p99 (`on − off`: **+4.3 ms** p50, **+4.6 ms** p95).
+      - `PreToolUse (deny)`: pre-S1a-2 base (`486806bc`) **103.7 ms** p50 / **107.5 ms** p95 / **128.7 ms** p99; `HEAD` with `MINNI_USE_LEDGER=off` **108.1 ms** p50 / **120.7 ms** p95 / **126.3 ms** p99; `HEAD` with `MINNI_USE_LEDGER=on` **108.3 ms** p50 / **126.1 ms** p95 / **133.7 ms** p99 (`on − off`: **+0.2 ms** p50, **+5.4 ms** p95). (`HEAD` vs `486806bc` also includes the S2a–S3c handler additions.)
   - **The cost of that.** When the check says off, `flags.ts` is never loaded. A hook then audits no note
     about the other flags: a typo in any other flag goes unreported until the ledger is on again. PreToolUse
     goes further: it runs the check only for a deny it is about to return, so an allowed call never loads
@@ -1393,11 +1397,11 @@ There is one switch per feature, and every one defaults to `on`.
     With the ledger on it also carries `details.features`, the switches in effect, sorted. "On" means this
     boot opened a ledger capture. "Off" means ledger-gate or `flags.ts` said off, or the capture module would
     not load. With the ledger off no capture module loads to compute the field.
-  - **Caveat: the audit throttle.** `<prefix>_session_start` is not exempt from the 5 s per-event audit
-    throttle (`vault.ts` `shouldThrottleAudit`). Two boots of the same agent within 5 s keep only the first
-    row. Each row stands for its own boot, so a dropped row loses one sample, and the stretch boundaries
-    come from the rows that survive. Exempting it would need edits to pre-rev-5 throttle tests
-    (`audit-rcm008.test.mjs` uses `hook_session_start` as its duplicate case), so it is left for Hans.
+  - **Audit throttle exemption (Row `j`).** `<prefix>_session_start` (`entry.tool.endsWith("_session_start")`)
+    is exempt from the 5 s per-event audit throttle (`vault.ts` `isExemptFromAuditThrottle`, alongside
+    `<prefix>_stop` and `<prefix>_bridge_failure`), so rapid consecutive boots of the same agent never drop a
+    `details.use_ledger` stretch boundary. Pinned in `audit-rcm008.test.mjs` and
+    `use-telemetry-session-start-audit.test.mjs`.
 
 | Flag | Feature |
 |---|---|

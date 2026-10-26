@@ -344,7 +344,7 @@ def test_pre_push_hook_skips_make_check_on_fresh_receipt_and_runs_when_missing_o
 
 
 def test_github_workflows_fast_pass_and_hygiene_guards() -> None:
-    """Verify pr-hygiene.yml, ci.yml, and docker.yml wire the promote/* fast-pass and public boundary guards."""
+    """Verify pr-hygiene.yml, ci.yml, and docker.yml wire the fast-pass and public boundary guards."""
     pr_hygiene = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "pr-hygiene.yml").read_text(encoding="utf-8"))
     ci_wf = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
     docker_wf = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8"))
@@ -353,6 +353,12 @@ def test_github_workflows_fast_pass_and_hygiene_guards() -> None:
     step_names = [s.get("name", "") for s in hygiene_steps]
     assert "Public boundary & migration guard" in step_names
 
-    expected_if = "${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'promote/')) }}"
+    expected_if = "${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}"
     assert ci_wf["jobs"]["cloud-smoke"].get("if") == expected_if
-    assert docker_wf["jobs"]["build"].get("if") == expected_if
+
+    docker_on = docker_wf.get("on", docker_wf.get(True, {}))
+    assert "pull_request" not in docker_on
+    assert docker_on.get("push", {}).get("tags") == ["v*"]
+    assert "workflow_dispatch" in docker_on
+    assert "if" not in docker_wf["jobs"]["build"]
+

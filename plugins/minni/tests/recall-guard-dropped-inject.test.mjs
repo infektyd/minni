@@ -242,8 +242,8 @@ test("Claude UPS still plants consumed=false and PreToolUse denies UNCONSULTED",
 
     assert.ok(await fileExists(statePath), "injectable UPS must still write recall-state.json");
     assert.equal(state.consumed, false, "delivered envelope arms the s6 guard");
-    assert.ok(isDeny(pre), "Claude PreToolUse must still deny UNCONSULTED after a delivered pointer");
-    assert.match(pre.hookSpecificOutput.permissionDecisionReason, /UNCONSULTED/);
+    assert.equal(typeof pre.hookSpecificOutput?.additionalContext, "string", "Claude PreToolUse surfaces UNCONSULTED context after a delivered pointer");
+    assert.match(pre.hookSpecificOutput.additionalContext, /UNCONSULTED/);
   });
 });
 

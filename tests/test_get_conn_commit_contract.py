@@ -552,7 +552,7 @@ class TestTheSweepWriteSite:
 
         def _write_then_fail(c):
             c.execute(
-                "INSERT INTO episodic_fts(event_id, agent_id, content)"
+                "INSERT INTO episodic_fts(rowid, agent_id, content)"
                 " VALUES (424242, 'forge', 'half written')"
             )
             raise sqlite3.OperationalError("disk I/O error mid-backfill")

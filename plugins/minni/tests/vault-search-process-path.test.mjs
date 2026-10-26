@@ -185,7 +185,53 @@ test("MCP server process: minni_recall's vault pre-scan runs on the index path",
   }
 });
 
-test("source: only the hook handler opts into the scan path; every other caller keeps the index default", async () => {
+test("CLI process: prepare searches the vault on the scan path, with no prefix index", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-search-path-cli-"));
+  const home = path.join(root, "home");
+  await mkdir(home, { recursive: true });
+  await seedNotes(root);
+  try {
+    const result = await new Promise((resolve) => {
+      const child = spawn(
+        process.execPath,
+        [
+          "--import",
+          PROBE,
+          new URL("../dist/cli.js", import.meta.url).pathname,
+          "prepare",
+          "how does the cache policy handle tests",
+        ],
+        {
+          env: {
+            ...process.env,
+            MINNI_HOME: home,
+            MINNI_SOCKET_PATH: path.join(home, "minnid-unreachable.sock"),
+            MINNI_VAULT_PATH: root,
+            MINNI_CLAUDECODE_VAULT_PATH: root,
+            MINNI_TEST_SEARCH_PROBE_VAULT: root,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => (stdout += chunk));
+      child.stderr.on("data", (chunk) => (stderr += chunk));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+    assert.equal(result.code, 0, `cli prepare exited ${result.code}: ${result.stderr}`);
+    const state = probeState(result.stderr);
+    assert.ok(state, "the CLI searched the vault in this process");
+    assert.ok(state.notes >= 20, `the cache holds the vault (${state.notes} notes), so the lookup gate was open`);
+    assert.equal(state.prefixIndex, false, "one-shot CLI prepare must not build the prefix index");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("source: only one-shot entry points (CLI and hook handler) opt into the scan path; every other caller keeps the index default", async () => {
   const srcDir = new URL("../src/", import.meta.url);
   const optIns = [];
   for (const name of (await readdir(srcDir)).sort()) {
@@ -193,5 +239,5 @@ test("source: only the hook handler opts into the scan path; every other caller 
     const text = await readFile(new URL(name, srcDir), "utf8");
     if (/candidates:\s*"scan"/.test(text) && name !== "vault.ts") optIns.push(name);
   }
-  assert.deepEqual(optIns, ["hook-handlers.ts"]);
+  assert.deepEqual(optIns, ["cli.ts", "hook-handlers.ts"]);
 });

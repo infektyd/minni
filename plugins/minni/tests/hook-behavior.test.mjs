@@ -847,7 +847,7 @@ async function withRawSessionFixture(run) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5 });
   }
 }
 
@@ -981,7 +981,7 @@ test("PreToolUse guard audit stamps session_id only when the payload carries one
       tool_name: "Read",
       tool_input: { file_path: "/tmp/example.txt" },
     });
-    assert.equal(denied.hookSpecificOutput?.permissionDecision, "deny");
+    assert.equal(typeof denied.hookSpecificOutput?.additionalContext, "string");
 
     const details = await lastAuditDetails(vault, "hook_test_pretooluse_guard");
     assert.ok(details, "PreToolUse guard must record an audit entry");
@@ -1004,7 +1004,7 @@ test("PreToolUse guard audit stamps session_id only when the payload carries one
       tool_input: { file_path: "/tmp/example2.txt" },
       session_id: "guard-session-9",
     });
-    assert.equal(deniedWithSession.hookSpecificOutput?.permissionDecision, "deny");
+    assert.equal(typeof deniedWithSession.hookSpecificOutput?.additionalContext, "string");
 
     const detailsWithSession = await lastAuditDetails(vault, "hook_test_pretooluse_guard");
     assert.ok(detailsWithSession);

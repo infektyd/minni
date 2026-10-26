@@ -23,10 +23,10 @@ import {
 
 const DEFAULTS = { hostInlineCapChars: undefined, preToolUseContext: false, transcriptShape: "unknown" };
 
-test("claude-code declares its inline cap and transcript shape, not PreToolUse context yet", () => {
+test("claude-code declares its inline cap, transcript shape, and PreToolUse context", () => {
   assert.deepEqual(wireCapabilities(claudeCodeWire), {
     hostInlineCapChars: 10_000,
-    preToolUseContext: false,
+    preToolUseContext: true,
     transcriptShape: "claude-code",
   });
   assert.deepEqual(wireCapabilities(wireFor("claude-code")), wireCapabilities(claudeCodeWire));

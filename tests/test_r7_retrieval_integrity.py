@@ -2700,7 +2700,7 @@ class TestEpisodicFtsBackfill:
                    AFTER INSERT ON episodic_events
                    WHEN NEW.content IS NOT NULL
                    BEGIN
-                       INSERT INTO episodic_fts(event_id, agent_id, content)
+                       INSERT INTO episodic_fts(rowid, agent_id, content)
                        VALUES (NEW.event_id, NEW.agent_id, NEW.content);
                    END"""
             )
@@ -2759,17 +2759,28 @@ class TestEpisodicFtsBackfill:
         db_obj.close()
 
     def test_backfill_survives_a_null_event_id_in_the_index(self, tmp_path):
-        """episodic_fts.event_id is an UNINDEXED fts5 column: no affinity, no"""
+        """#311: episodic_fts is keyed by rowid (INTEGER PRIMARY KEY). Non-integer
+        keys are rejected at write time, and a NULL rowid auto-assigns an
+        unreferenced integer rowid that reconcile_episodic_fts sweeps as an orphan."""
+        import sqlite3
+
         from minni.episodic import reconcile_episodic_fts
 
         db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
         conn = db_obj._get_conn()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO episodic_fts(rowid, agent_id, content)"
+                " VALUES ('not-an-int', 'claude-code', 'invalid rowid')"
+            )
         conn.execute(
-            "INSERT INTO episodic_fts(event_id, agent_id, content)"
+            "INSERT INTO episodic_fts(rowid, agent_id, content)"
             " VALUES (NULL, 'claude-code', 'orphaned index row')"
         )
 
-        assert reconcile_episodic_fts(conn)["inserted"] == len(self._PRE_TRIGGER)
+        result = reconcile_episodic_fts(conn)
+        assert result["inserted"] == len(self._PRE_TRIGGER)
+        assert result["removed"] == 1
         db_obj.close()
 
     def test_backfill_is_safe_on_a_schema_without_episodic_tables(self):
@@ -2953,11 +2964,11 @@ class TestEpisodicFtsBackfill:
 
         conn = db_obj._get_conn()
         conn.execute(
-            "INSERT INTO episodic_fts(event_id, agent_id, content)"
+            "INSERT INTO episodic_fts(rowid, agent_id, content)"
             " VALUES (999999, 'claude-code', 'index row for a deleted event')"
         )
         conn.execute(
-            "INSERT INTO episodic_fts(event_id, agent_id, content)"
+            "INSERT INTO episodic_fts(rowid, agent_id, content)"
             " VALUES (NULL, 'claude-code', 'index row with no id at all')"
         )
 
@@ -3093,7 +3104,7 @@ class TestEpisodicFtsBackfill:
             )
             event_id = c.lastrowid
             c.execute(
-                "INSERT INTO episodic_fts(event_id, agent_id, content)"
+                "INSERT INTO episodic_fts(rowid, agent_id, content)"
                 " VALUES (?, 'someone-else', 'scoped text')",
                 (event_id,),
             )
@@ -3119,7 +3130,7 @@ class TestEpisodicFtsBackfill:
 
         def _write_then_fail(c):
             c.execute(
-                "INSERT INTO episodic_fts(event_id, agent_id, content)"
+                "INSERT INTO episodic_fts(rowid, agent_id, content)"
                 " VALUES (424242, 'claude-code', 'half-written row')"
             )
             raise sqlite3.OperationalError("disk I/O error mid-backfill")

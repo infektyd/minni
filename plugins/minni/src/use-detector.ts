@@ -140,7 +140,11 @@ const INITIAL_EPOCH = "initial";
 /** Channels whose window is open across prompt turns. */
 const BOOT_SCOPE: ReadonlySet<string> = new Set(["boot_recall", "boot_recent_learnings", "subagent_brief"]);
 /** Channels whose injected text IS the memory: its shingles count only inside a tool input. */
-const INJECTED_IS_MEMORY: ReadonlySet<string> = new Set(["boot_recall", "boot_recent_learnings"]);
+const INJECTED_IS_MEMORY: ReadonlySet<string> = new Set([
+  "boot_recall",
+  "boot_recent_learnings",
+  "failure_lesson",
+]);
 const MINNI_TOOL_RE = /(?:^|__)minni_(recall|drill)$/;
 const READ_VERB_RE = /(?:^|[\s;&|(`$])(?:cat|head|tail|less|more|bat|sed|awk|grep|rg|nl|wc|jq|view|xxd|od|strings)\s/;
 const WORD_RE = /[\p{L}\p{N}]+/gu;

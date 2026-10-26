@@ -126,7 +126,7 @@ test("F2: an allowed PreToolUse never loads the capture; a returned deny does, a
 
   await runHook(fixture, "UserPromptSubmit", { ...session, prompt: "tell me about alpha" });
   const deny = await loadedModules(t, fixture, "PreToolUse", read);
-  assert.equal(deny.output.hookSpecificOutput?.permissionDecision, "deny");
+  assert.equal(typeof deny.output.hookSpecificOutput?.additionalContext, "string");
   assert.ok(deny.names.includes("use-capture.js"), "a deny being returned loads the capture");
   const guard = (await readLedger(fixture.vault)).filter((row) => row.channel === "guard");
   assert.equal(guard.length, 1);
@@ -246,7 +246,7 @@ test("F9: planted absolute or `..` vault keys in hit-keys.json never reach a gua
     tool_name: "Read",
     tool_input: { file_path: "/tmp/x" },
   });
-  assert.equal(output.hookSpecificOutput?.permissionDecision, "deny");
+  assert.equal(typeof output.hookSpecificOutput?.additionalContext, "string");
   const guard = (await readLedger(fixture.vault)).filter((row) => row.channel === "guard");
   assert.deepEqual(
     guard.map((row) => row.mkey),

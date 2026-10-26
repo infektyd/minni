@@ -25,8 +25,11 @@ export const LEDGER_EVENTS: ReadonlySet<string> = new Set([
   "SessionStart",
   "UserPromptSubmit",
   "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
   "PreCompact",
   "PostCompact",
+  "SubagentStart",
 ]);
 
 const FLAG = "MINNI_USE_LEDGER";

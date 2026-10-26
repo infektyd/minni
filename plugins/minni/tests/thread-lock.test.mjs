@@ -604,3 +604,91 @@ test("persistent owner read failure at release surfaces loud", async (t) => {
     syncBuiltinESMExports();
   }
 });
+
+test("withThreadLock immediately recovers a fresh lock whose recorded owner PID is dead without waiting DEFAULT_STALE_MS", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-lock-fresh-dead-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const lockDir = lockDirFor(root, "plan-fresh-dead");
+  const ownerPath = path.join(lockDir, "owner.json");
+  await mkdir(lockDir, { recursive: true });
+  const freshNow = new Date();
+  await writeFile(
+    ownerPath,
+    `${JSON.stringify({
+      pid: 999999,
+      operationId: "killed-hook",
+      acquiredAt: freshNow.toISOString(),
+    })}\n`,
+    { mode: 0o600 },
+  );
+  await utimes(lockDir, freshNow, freshNow);
+
+  let entered = false;
+  await withThreadLock(
+    root,
+    "plan-fresh-dead",
+    "contender-after-kill",
+    async () => {
+      entered = true;
+    },
+    {
+      waitMs: 60,
+      pollMs: 5,
+      isProcessAlive: () => false,
+    },
+  );
+  assert.equal(entered, true, "dead owner PID must be recovered without waiting DEFAULT_STALE_MS");
+  const { readThreadLockRecoveryAudit } = await import("../dist/thread-lock.js");
+  const audit = await readThreadLockRecoveryAudit(root);
+  const last = audit.at(-1);
+  assert.equal(last?.reason, "stale_dead");
+  assert.equal(last?.plan_id, "plan-fresh-dead");
+  assert.equal(last?.previous_owner?.operationId, "killed-hook");
+});
+
+test("withThreadLock does not let a second contender steal a newly acquired lock when two contenders race to reap a dead owner", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-lock-reap-race-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const lockDir = lockDirFor(root, "plan-reap-race");
+  const ownerPath = path.join(lockDir, "owner.json");
+  await mkdir(lockDir, { recursive: true });
+  const freshNow = new Date();
+  await writeFile(
+    ownerPath,
+    `${JSON.stringify({
+      pid: 999999,
+      operationId: "dead-holder",
+      acquiredAt: freshNow.toISOString(),
+    })}\n`,
+    { mode: 0o600 },
+  );
+
+  let activeInCriticalSection = 0;
+  let maxConcurrent = 0;
+  const runContender = (opId) =>
+    withThreadLock(
+      root,
+      "plan-reap-race",
+      opId,
+      async () => {
+        activeInCriticalSection += 1;
+        maxConcurrent = Math.max(maxConcurrent, activeInCriticalSection);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        activeInCriticalSection -= 1;
+        return opId;
+      },
+      {
+        waitMs: 500,
+        pollMs: 5,
+        isProcessAlive: (pid) => pid === process.pid,
+      },
+    );
+
+  const [r1, r2, r3] = await Promise.all([
+    runContender("c1"),
+    runContender("c2"),
+    runContender("c3"),
+  ]);
+  assert.deepEqual([r1, r2, r3], ["c1", "c2", "c3"]);
+  assert.equal(maxConcurrent, 1, "contenders must serialize and never steal a newly acquired lock");
+});

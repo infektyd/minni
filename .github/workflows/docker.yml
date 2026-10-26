@@ -1,5 +1,5 @@
-# Docker eval image: built and smoke-tested in CI on changes to its inputs,
-# published to GHCR on version tags. Never built on a maintainer machine
+# Docker eval image: built and smoke-tested in CI on version tags or
+# workflow_dispatch, published to GHCR on version tags. Never built on a maintainer machine
 # (docs/archive/PACKAGING_PLAN.md §6.5 — local storage constraint).
 #
 # Secrets: none beyond the built-in GITHUB_TOKEN (GHCR login on the publish job).
@@ -8,15 +8,6 @@
 name: Docker
 
 on:
-  pull_request:
-    paths:
-      - 'Dockerfile'
-      - '.dockerignore'
-      - 'src/minni/**'
-      - 'pyproject.toml'
-      - 'requirements.txt'
-      - 'requirements.lock'
-      - '.github/workflows/docker.yml'
   push:
     tags: ['v*']
   workflow_dispatch:
@@ -27,7 +18,6 @@ permissions:
 jobs:
   build:
     name: Build and smoke the eval image
-    if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'promote/')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

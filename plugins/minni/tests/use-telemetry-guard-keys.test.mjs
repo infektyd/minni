@@ -51,8 +51,8 @@ test("armed state, then a Read: one guard row per listed hit, with its mkey", { 
     tool_input: { file_path: "/tmp/anything.txt" },
   });
   assert.equal(code, 0);
-  assert.equal(output.hookSpecificOutput?.permissionDecision, "deny", "the armed guard denies");
-  const reason = output.hookSpecificOutput.permissionDecisionReason;
+  const reason = output.hookSpecificOutput?.additionalContext ?? output.hookSpecificOutput?.permissionDecisionReason;
+  assert.equal(typeof reason, "string", "the armed guard surfaces context");
 
   const guard = (await readLedger(fixture.vault)).filter((row) => row.kind === "surfaced" && row.channel === "guard");
   assert.deepEqual(

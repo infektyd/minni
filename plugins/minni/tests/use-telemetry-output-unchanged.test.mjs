@@ -22,7 +22,7 @@ test("hook output is identical with the use ledger on and off", { timeout: 240_0
     assert.equal(off[name].rows, 0, `${name}: the ledger is off, so nothing is written`);
     assert.ok(on[name].rows > 0, `${name}: with the ledger on, capture must have written rows`);
   }
-  // The deny scenario must really be a deny, or it pins nothing.
-  assert.equal(JSON.parse(on.pretooluse_deny.raw).hookSpecificOutput?.permissionDecision, "deny");
+  // The guard scenario must really surface, or it pins nothing.
+  assert.equal(typeof JSON.parse(on.pretooluse_deny.raw).hookSpecificOutput?.additionalContext, "string");
   assert.match(JSON.parse(on.ups_strong.raw).hookSpecificOutput?.additionalContext ?? "", /recall_pointer/);
 });

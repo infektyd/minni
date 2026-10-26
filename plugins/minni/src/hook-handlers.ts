@@ -17,13 +17,16 @@
 // decided per platform by hook-platform.ts. Emitting Claude Code's envelope
 // everywhere is what silently voided Codex's PreCompact output and discarded
 // Grok Build's memory outright.
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
   buildLifecycleEmphasis,
   envelopeBudgetFor,
+  fitEnvelope,
   hashTaskSignature,
   lifecycleNudgeMode,
   lifecycleSurfaceForIntent,
@@ -71,22 +74,38 @@ import type { RelayHook } from "./thread-notification-relay.js";
 
 import { routeMemoryIntent } from "./policy.js";
 import {
+  advanceSessionTurnIfPresent,
+  armingKeyFor,
   buildRecallPointer,
   buildStaleRecallPointer,
+  claimArming,
   clearRecallState,
+  clearSessionSurfacedOnReset,
+  commitSurfacedPointer,
   extractStrongRecall,
   markRecallConsumed,
+  pruneOldClaimFiles,
   readLifecycleState,
   readRecallState,
+  readSessionSurfacedState,
   recallPointerThreshold,
   recallStatePath,
+  recordSessionHandles,
+  sanitizeRecallField,
+  selectPointerHits,
+  sessionStateKey,
+  shouldSuppressHit,
   writeLifecycleState,
   writeRecallState,
 } from "./recall-state.js";
+import type { RecallStateHit } from "./recall-state.js";
 import {
   PRE_TOOL_USE_EVENT,
   decideGuard,
+  isConsultTool,
+  isSubagentSpawnTool,
   preToolUseAllow,
+  preToolUseContext,
   preToolUseDeny,
   recallGuardMode as resolveRecallGuardModeFromEnv,
 } from "./recall-guard.js";
@@ -120,6 +139,14 @@ import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutco
 // (after delivery) and use-report.js (the receipt), all dynamically.
 import { LEDGER_EVENTS, ledgerMayBeOn } from "./ledger-gate.js";
 import type { TurnRecord, UseCapture } from "./use-capture.js";
+import {
+  POST_TOOL_USE_EVENTS,
+  clearSessionFailureLessonsOnReset,
+  markFailureLessonFired,
+  matchPostToolUseFailureLesson,
+  matchPreToolUseFailureLesson,
+} from "./failure-lessons.js";
+import type { PostToolUseDecisionOutput } from "./failure-lessons.js";
 
 type CaptureApi = typeof import("./use-capture.js");
 
@@ -175,6 +202,7 @@ async function auditLedgerFailures(config: AgentHookConfig): Promise<void> {
   }
 }
 import {
+  assertWriteTargetUnder,
   auditTail,
   collectCorrectionsReassert,
   ensureVault,
@@ -195,6 +223,386 @@ import {
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
+
+import {
+  classifyPromptEnvelope,
+  readPromptTemplates,
+  recordOccurrence,
+} from "./prompt-class.js";
+import type { PromptEnvelope, PromptEnvelopeKind } from "./prompt-class.js";
+
+export const SUBAGENT_EVENTS: ReadonlySet<string> = new Set(["SubagentStart", "SubagentStop"]);
+
+export interface SubagentHookOutput {
+  continue: true;
+  hookSpecificOutput?: {
+    hookEventName: "SubagentStart" | "SubagentStop";
+    additionalContext: string;
+  };
+}
+
+type LocalFeatureFlag =
+  | "MINNI_USE_LEDGER"
+  | "MINNI_BOOT_FIT"
+  | "MINNI_GUARD_V2"
+  | "MINNI_SUBAGENT_BRIEF"
+  | "MINNI_PROMPT_CLASSES"
+  | "MINNI_UPS_RANK_V2"
+  | "MINNI_RECALL_NOISE_LAST";
+
+/**
+ * S2a/S2b/S3a (§8.1): check whether a default-"on" feature switch is enabled
+ * without importing `flags.js` when `MINNI_USE_LEDGER` is off (preserving the
+ * zero-capture-module-load guarantee pinned by `use-telemetry-flag-off-cost`
+ * and `use-telemetry-session-start-audit`). When `ledger` is open, callers read
+ * `ledger.capture.context.features.includes(flagName)` instead.
+ */
+function isFeatureEnabled(vaultPath: string, flagName: LocalFeatureFlag): boolean {
+  const rawEnv = process.env[flagName];
+  if (rawEnv === "off") return false;
+  if (rawEnv === "on") return true;
+  if (!vaultPath || typeof vaultPath !== "string") return true;
+  const flagsPath = path.join(vaultPath, ".runtime", "flags.json");
+  let fd: number | undefined;
+  try {
+    assertWriteTargetUnder(flagsPath, vaultPath);
+    const openFlags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    fd = fs.openSync(flagsPath, openFlags);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0 || st.size > 65_536) return true;
+    const buf = Buffer.alloc(st.size);
+    let total = 0;
+    while (total < st.size) {
+      const n = fs.readSync(fd, buf, total, st.size - total, total);
+      if (n <= 0) break;
+      total += n;
+    }
+    const parsed: unknown = JSON.parse(buf.subarray(0, total).toString("utf8"));
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const val = (parsed as Record<string, unknown>)[flagName];
+      if (val === "off") return false;
+      if (val === "on") return true;
+    }
+  } catch {
+    // Fall back to default "on".
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
+  }
+  return true;
+}
+
+function isBootFitEnabled(vaultPath: string): boolean {
+  return isFeatureEnabled(vaultPath, "MINNI_BOOT_FIT");
+}
+
+const SUBAGENT_PENDING_TTL_MS = 10 * 60 * 1000;
+const SUBAGENT_BRIEF_MAX_CHARS = 600;
+const SUBAGENT_RECALL_BUDGET_MS = 1500;
+
+interface SubagentPendingEntry {
+  tool_use_id: string;
+  subagent_type: string;
+  prompt_hash: string;
+  prompt: string;
+  ts: string;
+}
+
+function subagentSessionKey(payload: Record<string, unknown>): string {
+  const sessionId = asString(payload.session_id) || asString(payload.sessionId);
+  if (sessionId) {
+    return sessionStateKey(sessionId) ?? createHash("sha256").update(sessionId, "utf8").digest("hex").slice(0, 16);
+  }
+  const transcript = asString(payload.transcript_path) || asString(payload.transcriptPath);
+  if (transcript && !transcript.includes("\0")) {
+    return `tx-${createHash("sha256").update(path.resolve(transcript), "utf8").digest("hex").slice(0, 16)}`;
+  }
+  return "unlabeled";
+}
+
+function subagentSessionDir(vaultPath: string, sessionKey: string, create = false): string | null {
+  const safeKey = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(sessionKey) ? sessionKey : "unlabeled";
+  const segments = [".runtime", "recall-session.d", safeKey];
+  let current = vaultPath;
+  for (const segment of segments) {
+    const next = path.join(current, segment);
+    assertWriteTargetUnder(next, vaultPath);
+    let st: fs.Stats | undefined;
+    try {
+      st = fs.lstatSync(next);
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code !== "ENOENT") throw error;
+    }
+    if (!st) {
+      if (!create) return null;
+      try {
+        fs.mkdirSync(next, { mode: 0o700 });
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code !== "EEXIST") throw error;
+      }
+      st = fs.lstatSync(next);
+    }
+    if (st.isSymbolicLink()) {
+      assertWriteTargetUnder(fs.realpathSync(next), vaultPath);
+      st = fs.statSync(next);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`subagent session path component is not a directory: ${next}`);
+    }
+    current = next;
+  }
+  return current;
+}
+
+function readSubagentPendingList(pendingFile: string, vaultPath: string, nowMs: number): SubagentPendingEntry[] {
+  let fd: number | undefined;
+  try {
+    assertWriteTargetUnder(pendingFile, vaultPath);
+    const openFlags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    fd = fs.openSync(pendingFile, openFlags);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0 || st.size > 512 * 1024) return [];
+    const buf = Buffer.alloc(st.size);
+    let total = 0;
+    while (total < st.size) {
+      const n = fs.readSync(fd, buf, total, st.size - total, total);
+      if (n <= 0) break;
+      total += n;
+    }
+    const raw = JSON.parse(buf.subarray(0, total).toString("utf8")) as unknown;
+    const entries = Array.isArray(raw)
+      ? raw
+      : raw !== null && typeof raw === "object" && Array.isArray((raw as { entries?: unknown }).entries)
+        ? ((raw as { entries: unknown[] }).entries)
+        : [];
+    const out: SubagentPendingEntry[] = [];
+    for (const item of entries) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const toolUseId = typeof rec.tool_use_id === "string" ? rec.tool_use_id : "";
+      const subagentType = typeof rec.subagent_type === "string" ? rec.subagent_type : "";
+      const promptHash = typeof rec.prompt_hash === "string" ? rec.prompt_hash : "";
+      const prompt = typeof rec.prompt === "string" ? rec.prompt : "";
+      const ts = typeof rec.ts === "string" ? rec.ts : "";
+      if (!toolUseId || !ts) continue;
+      const parsedMs = Date.parse(ts);
+      if (!Number.isFinite(parsedMs) || nowMs - parsedMs > SUBAGENT_PENDING_TTL_MS) continue;
+      out.push({ tool_use_id: toolUseId, subagent_type: subagentType, prompt_hash: promptHash, prompt, ts });
+    }
+    return out;
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
+  }
+}
+
+function stashSubagentPending(
+  vaultPath: string,
+  payload: Record<string, unknown>,
+  toolInput: Record<string, unknown>,
+): void {
+  try {
+    const rawPrompt = (
+      asString(toolInput.prompt) ||
+      asString(toolInput.description) ||
+      asString(toolInput.task)
+    ).trim();
+    if (!rawPrompt) return;
+    const prompt = rawPrompt.slice(0, 2000);
+    const subagentType =
+      asString(toolInput.subagent_type) ||
+      asString(toolInput.subagentType) ||
+      asString(toolInput.agent_type) ||
+      asString(payload.subagent_type) ||
+      asString(payload.agent_type) ||
+      "default";
+    const rawToolUseId =
+      asString(payload.tool_use_id) ||
+      asString(payload.toolUseId) ||
+      randomUUID();
+    const safeToolUseId = rawToolUseId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) || randomUUID();
+    const sessionKey = subagentSessionKey(payload);
+    const dir = subagentSessionDir(vaultPath, sessionKey, true);
+    if (!dir) return;
+    const pendingFile = path.join(dir, "subagent-pending.json");
+    assertWriteTargetUnder(pendingFile, vaultPath);
+    const nowMs = Date.now();
+    const existing = readSubagentPendingList(pendingFile, vaultPath, nowMs).filter(
+      (entry) => entry.tool_use_id !== safeToolUseId,
+    );
+    existing.push({
+      tool_use_id: safeToolUseId,
+      subagent_type: subagentType.slice(0, 128),
+      prompt_hash: createHash("sha1").update(prompt, "utf8").digest("hex").slice(0, 12),
+      prompt,
+      ts: new Date(nowMs).toISOString(),
+    });
+    const bounded = existing.slice(-32);
+    const tmpFile = `${pendingFile}.${process.pid}.${randomUUID()}.tmp`;
+    assertWriteTargetUnder(tmpFile, vaultPath);
+    fs.writeFileSync(tmpFile, `${JSON.stringify({ v: 1, entries: bounded })}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.renameSync(tmpFile, pendingFile);
+  } catch {
+    // Best-effort stash: never blocks Agent/Task PreToolUse.
+  }
+}
+
+function claimSubagentPending(
+  vaultPath: string,
+  payload: Record<string, unknown>,
+): SubagentPendingEntry | null {
+  try {
+    const sessionKey = subagentSessionKey(payload);
+    const dir = subagentSessionDir(vaultPath, sessionKey, false);
+    if (!dir) return null;
+    const pendingFile = path.join(dir, "subagent-pending.json");
+    const nowMs = Date.now();
+    const entries = readSubagentPendingList(pendingFile, vaultPath, nowMs);
+    if (entries.length === 0) return null;
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.startsWith("subagent-claim-") || !name.endsWith(".claim")) continue;
+        const claimFile = path.join(dir, name);
+        const st = fs.lstatSync(claimFile);
+        if (st.isFile() && nowMs - st.mtimeMs > SUBAGENT_PENDING_TTL_MS) {
+          fs.unlinkSync(claimFile);
+        }
+      }
+    } catch {
+      // Ignore cleanup errors.
+    }
+    const requestedType = (asString(payload.agent_type) || asString(payload.subagent_type)).trim();
+    const matchesType = (entry: SubagentPendingEntry): boolean => {
+      if (!requestedType || !entry.subagent_type || entry.subagent_type === "default") return true;
+      return entry.subagent_type.toLowerCase() === requestedType.toLowerCase();
+    };
+    const ordered = [
+      ...entries.filter(matchesType),
+      ...entries.filter((e) => !matchesType(e)),
+    ];
+    for (const entry of ordered) {
+      const safeId = entry.tool_use_id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+      if (!safeId) continue;
+      const claimPath = path.join(dir, `subagent-claim-${safeId}.claim`);
+      try {
+        assertWriteTargetUnder(claimPath, vaultPath);
+        const fd = fs.openSync(claimPath, "wx", 0o600);
+        try {
+          fs.writeFileSync(fd, `${process.pid} ${nowMs}\n`, "utf8");
+        } finally {
+          fs.closeSync(fd);
+        }
+        return entry;
+      } catch {
+        // Already claimed by a sibling SubagentStart or refused; try next entry.
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function enrichTaskHitsWithSnippets(
+  hits: readonly RecallStateHit[],
+  recallData: Awaited<ReturnType<typeof recallMemory>>["data"] | undefined,
+  vaultResults: ReturnType<typeof filterSafeVaultResults>,
+  threshold: number,
+): Array<RecallStateHit & { snippet?: string }> {
+  const pool: Array<{ hit: RecallStateHit; snippet: string }> = [];
+  const daemonResults = recallData && Array.isArray(recallData.results) ? recallData.results : [];
+  for (const raw of daemonResults) {
+    const rec = (raw ?? {}) as Record<string, unknown>;
+    const extracted = extractStrongRecall({ results: [raw] }, [], threshold, 1)?.topHits[0];
+    const snippet =
+      asString(rec.snippet) || asString(rec.summary) || asString(rec.text) || asString(rec.content);
+    if (extracted) pool.push({ hit: extracted, snippet });
+  }
+  for (const vr of vaultResults) {
+    const extracted = extractStrongRecall(undefined, [vr], threshold, 1)?.topHits[0];
+    if (extracted) pool.push({ hit: extracted, snippet: typeof vr.snippet === "string" ? vr.snippet : "" });
+  }
+  const used = new Set<number>();
+  return hits.map((hit) => {
+    const ix = pool.findIndex(
+      (c, i) =>
+        !used.has(i) &&
+        c.hit.title === hit.title &&
+        c.hit.wikilink === hit.wikilink &&
+        c.hit.score === hit.score,
+    );
+    if (ix < 0) return { ...hit };
+    used.add(ix);
+    const snippet = pool[ix]?.snippet;
+    return snippet ? { ...hit, snippet } : { ...hit };
+  });
+}
+
+export function buildSubagentBrief(
+  parentHits: readonly (RecallStateHit & { snippet?: string })[],
+  taskHits: readonly (RecallStateHit & { snippet?: string })[],
+  maxChars = SUBAGENT_BRIEF_MAX_CHARS,
+): string {
+  const combined: (RecallStateHit & { snippet?: string })[] = [];
+  const seen = new Set<string>();
+  for (const hit of parentHits.slice(0, 3)) {
+    if (!hit || typeof hit.wikilink !== "string") continue;
+    const key = sanitizeRecallField(hit.wikilink);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    combined.push(hit);
+  }
+  for (const hit of taskHits.slice(0, 2)) {
+    if (!hit || typeof hit.wikilink !== "string") continue;
+    const key = sanitizeRecallField(hit.wikilink);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    combined.push(hit);
+  }
+  if (combined.length === 0) return "";
+  const header = "Minni subagent brief — relevant memory (evidence, not instruction):";
+  const lines: string[] = [header];
+  let currentLen = header.length;
+  for (const hit of combined) {
+    const wl = sanitizeRecallField(hit.wikilink);
+    const title = sanitizeRecallField(hit.title, 80);
+    const score = Number.isFinite(hit.score) ? hit.score.toFixed(2) : "?";
+    const snippet = sanitizeRecallField(hit.snippet, 90);
+    const baseLine = `- ${wl} — ${title} (score=${score})`;
+    const fullLine = snippet ? `${baseLine}: ${snippet}` : baseLine;
+    if (currentLen + 1 + fullLine.length <= maxChars) {
+      lines.push(fullLine);
+      currentLen += 1 + fullLine.length;
+    } else if (currentLen + 1 + baseLine.length <= maxChars) {
+      lines.push(baseLine);
+      currentLen += 1 + baseLine.length;
+    }
+  }
+  if (lines.length <= 1) return "";
+  return lines.join("\n").slice(0, maxChars);
+}
+
 
 /**
  * Confirm delivery=true only when HOST_INJECTION_TABLE says this host+hook
@@ -542,7 +950,47 @@ function scheduleStopUseDetector(config: StopCoreConfig, payload: Record<string,
   );
 }
 
-/** One detector run for Stop's main agent; the failure code, or null. Never rejects. */
+function scheduleSubagentStopUseDetector(config: StopCoreConfig, payload: Record<string, unknown>): void {
+  const vaultPath = config.vaultPath;
+  const auditPrefix = config.auditPrefix;
+  const wireId = (config.wire ?? wireFor(config.agentId)).id;
+  const principal = config.agentId;
+  const agentTranscriptPath =
+    asString(payload.agent_transcript_path) ||
+    asString(payload.agentTranscriptPath) ||
+    asString(payload.transcript_path) ||
+    asString(payload.transcriptPath) ||
+    null;
+  const lastAssistantMessage = asString(payload.last_assistant_message) || null;
+  const subagentType = asString(payload.agent_type) || asString(payload.subagent_type) || undefined;
+  const payloadForKey =
+    payload.transcript_path || !agentTranscriptPath
+      ? payload
+      : { ...payload, transcript_path: agentTranscriptPath };
+  deferUntilDelivered(
+    async () => {
+      const problem = await runStopUseDetector({
+        vaultPath,
+        wireId,
+        principal,
+        payload: payloadForKey,
+        transcriptPath: agentTranscriptPath,
+        lastAssistantMessage,
+        sessionEnd: true,
+        subagentType,
+      });
+      if (problem === null) return;
+      await recordAudit(vaultPath, {
+        tool: `${auditPrefix}_use_detector_failed`,
+        summary: `SubagentStop: use detector ${problem}; subagent surfacings were not judged`,
+        throttleKey: `${auditPrefix}_use_detector_failed`,
+      }).catch(() => undefined);
+    },
+    { recordOnly: true },
+  );
+}
+
+/** One detector run for Stop or SubagentStop; the failure code, or null. Never rejects. */
 async function runStopUseDetector(args: {
   vaultPath: string;
   wireId: string;
@@ -550,6 +998,8 @@ async function runStopUseDetector(args: {
   payload: Record<string, unknown>;
   transcriptPath: string | null;
   lastAssistantMessage: string | null;
+  sessionEnd?: boolean;
+  subagentType?: string;
 }): Promise<string | null> {
   let flags: typeof import("./flags.js");
   try {
@@ -581,6 +1031,8 @@ async function runStopUseDetector(args: {
       transcriptPath: regularFileOrNull(args.transcriptPath),
       lastAssistantMessage: args.lastAssistantMessage,
       endsTurn: true,
+      ...(args.sessionEnd ? { sessionEnd: true } : {}),
+      ...(args.subagentType ? { subagent_type: args.subagentType } : {}),
     });
     return DETECTOR_FAILURES.has(result.status) ? result.status : null;
   } catch {
@@ -612,7 +1064,7 @@ async function stopCoreOutput(
   prepareOutcomeFn: typeof prepareOutcome,
   useCounts: boolean,
 ): Promise<HookOutput> {
-  await ensureVault(config.vaultPath, { agentId: config.agentId });
+  await ensureVault(config.vaultPath, { agentId: config.agentId }).catch(() => {});
   // Stop keeps the defaulted "session" fallback (inbox filename, marker text,
   // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime that
   // never labeled any turn with a real session_id still gets a best-effort
@@ -675,6 +1127,7 @@ async function stopCoreOutput(
         transcriptPath,
         sessionId,
         event: "Stop",
+        sessionCrons: payload.session_crons ?? payload.sessionCrons,
       },
     ).catch(() => undefined);
   }
@@ -701,7 +1154,7 @@ async function stopCoreOutput(
         reason,
         ...(receipt ? { receipt } : {}),
       },
-    });
+    }).catch(() => {});
     // Surface the receipt even with zero activity: proof that no memory work
     // happened is itself the signal. Platforms without a note channel drop it
     // via renderIntent; the audit marker still closes the session window.
@@ -783,7 +1236,7 @@ async function stopCoreOutput(
       inbox_path: inbox.filePath,
       ...(receipt ? { receipt } : {}),
     },
-  });
+  }).catch(() => {});
 
   const displayReceipt = receipt
     ? { ...receipt, candidates_drafted: receipt.candidates_drafted + candidates.length }
@@ -804,14 +1257,20 @@ export interface AgentHookHandlers {
   handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput>;
   handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
+  handlePostToolUse(
+    event: "PostToolUse" | "PostToolUseFailure",
+    payload: Record<string, unknown>,
+  ): Promise<PostToolUseDecisionOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput>;
   handleStop(payload: Record<string, unknown>): Promise<HookOutput>;
+  handleSubagentStart(payload: Record<string, unknown>): Promise<SubagentHookOutput>;
+  handleSubagentStop(payload: Record<string, unknown>): Promise<SubagentHookOutput>;
   dispatch(
     event: string,
     payload: Record<string, unknown>,
-  ): Promise<HookOutput | PreToolUseDecisionOutput>;
+  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput | PostToolUseDecisionOutput>;
 }
 
 /**
@@ -945,13 +1404,13 @@ export function createHookHandlers(
     const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
     await ensureVault(config.vaultPath, { agentId: config.agentId });
 
-    // Compaction-summary harvest backstop (P3 / #227). Claude Code's primary
-    // path is PostCompact in hook.ts; Kilo delivers via CompactSummary (its
-    // bridge SessionStart supplies neither transcript_path nor source — so
-    // this backstop is dead for real Kilo boots). Platforms that share this
-    // handler (codex, grok-build, cursor, gemini) previously had no harvest
-    // path at all — and on those hosts this SessionStart path is the ONLY
-    // capture write (no PostCompact).
+    // Compaction-summary harvest backstop (P3 / #227). Claude Code and Codex
+    // deliver primarily via PostCompact (`hooks.json` / `hooks-codex.json`);
+    // Kilo delivers via CompactSummary (its bridge SessionStart supplies
+    // neither transcript_path nor source — so this backstop is dead for real
+    // Kilo boots). For platforms without a post-compaction hook event (cursor,
+    // grok-build, gemini) — or as a next-boot backstop if PostCompact failed —
+    // this SessionStart path captures the summary from the transcript tail.
     //
     // Gate:
     //  1. compact|resume `source` — Claude parity (any runtime). FULLY
@@ -1024,6 +1483,8 @@ export function createHookHandlers(
         emphasized: [],
       }).catch(() => {});
     }
+    await clearSessionSurfacedOnReset(config.vaultPath, rawSessionId || sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, rawSessionId || sessionId);
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
@@ -1269,10 +1730,12 @@ export function createHookHandlers(
     // No try/catch around resolveActivePlanView: withBudget turns rejection
     // into its fallback. A budget cut still surfaces via planRead.ok === false
     // -> degraded.sections.
-    planRead = await withBudget(
+    const planBudgetMs = remainingMs();
+    planRead = planBudgetMs <= 0 ? { ok: false, view: undefined } : await withBudget(
       resolveActivePlanView(
         config.vaultPath,
         layer1Shelf.ok && !layer1Shelf.truncated ? layer1Shelf.content : undefined,
+        { lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS) },
       ).then((view) => ({ ok: true, view })),
       remainingMs(),
       { ok: false, view: undefined },
@@ -1299,6 +1762,10 @@ export function createHookHandlers(
       // stays true) on every other platform.
       config.ackPendingHandoffsAtBoot && !pendingHandoffs.ok ? "handoff_leases" : undefined,
     ].filter((section): section is string => section !== undefined);
+
+    const bootFitOn = ledger
+      ? ledger.capture.context.features.includes("MINNI_BOOT_FIT")
+      : isBootFitEnabled(config.vaultPath);
 
     const envelopeBody: Record<string, unknown> = {
       contract: MEMORY_CONTRACT,
@@ -1352,7 +1819,7 @@ export function createHookHandlers(
           : { ok: false, status: "error", error: contradictions.error },
       recall:
         recall.ok && recall.data
-          ? buildBootRecallSlice(recall.data, config.agentId)
+          ? buildBootRecallSlice(recall.data, config.agentId, { diet: bootFitOn })
           : { ok: false, error: recall.error },
       ...(tail !== undefined
         ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }
@@ -1441,11 +1908,31 @@ export function createHookHandlers(
       }
     }
 
+    let nativeLayer1 =
+      bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
+        ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
+        : "";
+
+    const bodyForEnvelope = bootFitOn
+      ? fitEnvelope(envelopeBody, {
+          tokenLimit: budget,
+          charLimit: wireCapabilities(wire).hostInlineCapChars,
+          vaultPath: config.vaultPath,
+          event: "SessionStart",
+          agent: config.agentId,
+          nativeLayer1,
+          onNativeLayer1Trimmed: (trimmedNative) => {
+            nativeLayer1 = trimmedNative;
+          },
+        })
+      : envelopeBody;
+
     const envelope = wrapEnvelope({
       event: "SessionStart",
       agent: config.agentId,
       budget,
-      body: envelopeBody,
+      body: bodyForEnvelope,
+      legacyKeySort: !bootFitOn,
     });
 
     await recordAudit(config.vaultPath, {
@@ -1481,14 +1968,84 @@ export function createHookHandlers(
       },
     });
 
-    const nativeLayer1 =
-      bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
-        ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
-        : "";
     const bootText = [nativeLayer1, envelope].filter(Boolean).join("\n\n");
+    const fittedRecall =
+      bootFitOn &&
+      bodyForEnvelope.recall !== null &&
+      typeof bodyForEnvelope.recall === "object"
+        ? (bodyForEnvelope.recall as Record<string, unknown>)
+        : undefined;
+    const recallForCapture: typeof recall =
+      bootFitOn && recall.ok && recall.data && Array.isArray(fittedRecall?.results)
+        ? {
+            ...recall,
+            data: {
+              ...recall.data,
+              results: fittedRecall.results as unknown[],
+            },
+          }
+        : recall;
+    const trimmedMap =
+      bootFitOn &&
+      bodyForEnvelope.trimmed !== null &&
+      typeof bodyForEnvelope.trimmed === "object"
+        ? (bodyForEnvelope.trimmed as Record<string, unknown>)
+        : undefined;
+    const fittedLearningsObj =
+      bootFitOn &&
+      bodyForEnvelope.recent_learnings !== null &&
+      typeof bodyForEnvelope.recent_learnings === "object" &&
+      !Array.isArray(bodyForEnvelope.recent_learnings)
+        ? (bodyForEnvelope.recent_learnings as Record<string, unknown>)
+        : undefined;
+    const learningsTrimmed =
+      trimmedMap !== undefined &&
+      ("recent_learnings" in trimmedMap ||
+        (bootIdentity === "agent-context" && "identity_body" in trimmedMap));
+    const survivingLearningsText =
+      bootIdentity === "agent-context"
+        ? nativeLayer1
+        : typeof fittedLearningsObj?.context === "string"
+          ? fittedLearningsObj.context
+          : undefined;
+    const identityForCapture: typeof identityRead =
+      learningsTrimmed &&
+      identityRead.ok &&
+      identityRead.data &&
+      survivingLearningsText !== undefined
+        ? {
+            ...identityRead,
+            data: {
+              ...identityRead.data,
+              context: survivingLearningsText,
+              ...(Array.isArray(
+                (identityRead.data as Record<string, unknown>).recent_learnings,
+              )
+                ? {
+                    recent_learnings: (
+                      (identityRead.data as Record<string, unknown>)
+                        .recent_learnings as unknown[]
+                    ).filter((entry) => {
+                      if (!entry || typeof entry !== "object") return false;
+                      const line = (entry as Record<string, unknown>).line;
+                      return (
+                        typeof line === "string" &&
+                        line.length > 0 &&
+                        survivingLearningsText.includes(line)
+                      );
+                    }),
+                  }
+                : {}),
+            },
+          }
+        : identityRead;
     // S1a-2: what this boot surfaced, judged on the exact emitted string. The
     // rows are deferred and land only once this output does.
-    ledger?.api.captureBootSurfacings(ledger.capture, { emitted: bootText, recall, identity: identityRead });
+    ledger?.api.captureBootSurfacings(ledger.capture, {
+      emitted: bootText,
+      recall: recallForCapture,
+      identity: identityForCapture,
+    });
     return render(injectIntent("SessionStart", bootText));
   }
 
@@ -1575,16 +2132,88 @@ export function createHookHandlers(
       return render(injectIntent("UserPromptSubmit", envelope));
     };
 
-    const intent = routeMemoryIntent(prompt);
+    const guardV2 = use
+      ? use.capture.context.features.includes("MINNI_GUARD_V2")
+      : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
+    const promptClassesOn = use
+      ? use.capture.context.features.includes("MINNI_PROMPT_CLASSES")
+      : isFeatureEnabled(config.vaultPath, "MINNI_PROMPT_CLASSES");
+    const recallStateOpts = { sessionId: rawSessionId || undefined, guardV2 };
+    const promptAgentId = asString(payload.agent_id) || asString(payload.agentId) || undefined;
+    const promptId = asString(payload.prompt_id) || asString(payload.promptId) || undefined;
+
+    let promptEnvelope: PromptEnvelope | undefined;
+    if (promptClassesOn) {
+      if (use?.turn.classified !== undefined) {
+        const turnClass = await use.turn.classified;
+        if (turnClass.envelope_kind !== null && turnClass.subkind !== null) {
+          promptEnvelope = {
+            kind: turnClass.envelope_kind as PromptEnvelopeKind,
+            subkind: turnClass.subkind,
+            body: turnClass.body ?? classifyPromptEnvelope(prompt).body,
+            template_rule: turnClass.template_rule ?? "off",
+            ...(turnClass.rule_id !== undefined ? { rule_id: turnClass.rule_id } : {}),
+            ...(turnClass.suspicious_prefix ? { suspicious_prefix: true } : {}),
+          };
+        } else {
+          promptEnvelope = classifyPromptEnvelope(prompt);
+        }
+      } else {
+        const at = Date.now();
+        const validPromptId =
+          promptId !== undefined && promptId.length > 0 && promptId.length <= 128
+            ? promptId
+            : undefined;
+        const pid = validPromptId ?? `turn:${randomUUID()}`;
+        const templates = await readPromptTemplates(config.vaultPath).catch(() => null);
+        promptEnvelope = classifyPromptEnvelope(prompt, {
+          at,
+          pid,
+          templateEntry: (hash) =>
+            templates !== null && Object.hasOwn(templates.templates, hash)
+              ? templates.templates[hash]
+              : undefined,
+        });
+        if (
+          promptEnvelope.template !== undefined &&
+          isFeatureEnabled(config.vaultPath, "MINNI_USE_LEDGER")
+        ) {
+          const sessionKeyPrefix = (
+            (rawSessionId ? sessionStateKey(rawSessionId) : null) ?? "unlabeled"
+          ).slice(0, 8);
+          await recordOccurrence(config.vaultPath, {
+            hash: promptEnvelope.template.hash,
+            ts: at,
+            pid,
+            sessionKeyPrefix,
+            now: at,
+          }).catch(() => false);
+        }
+      }
+    }
+
+    const isSkip = promptEnvelope?.kind === "skip";
+    const recallQuery = promptEnvelope ? promptEnvelope.body : prompt;
+    const envelopeAuditDetails = promptEnvelope
+      ? {
+          envelope_kind: promptEnvelope.kind,
+          subkind: promptEnvelope.subkind,
+          ...(promptEnvelope.suspicious_prefix ? { suspicious_prefix: true } : {}),
+        }
+      : {};
+
+    const intent = routeMemoryIntent(isSkip ? prompt : recallQuery);
     // Explicit WRITE intents (learn/vault_write carry automaticAllowed:false) are
     // the user dictating memory, not asking the agent to recall — inject no
     // pointer and write no state. (s5 parity with the claude-code hook.)
-    if (!intent.automaticAllowed) {
+    // S3a (§5.2.2): `skip` envelopes never clear or write `recall-state` and
+    // must still carry `active_thread_ref` when a plan is active.
+    if (!isSkip && !intent.automaticAllowed) {
       // Clear any stale strong state from a previous turn BEFORE returning: an
       // unconsumed pointer must not leak into this write-intent turn and let the
       // s6 guard deny an unrelated read/search here (parity with the weak-turn
       // path below, which also clears).
-      await clearRecallState(config.vaultPath).catch(() => {});
+      await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
       // #283: the persistent lifecycle visibility must survive this
       // write-intent early-return.
       exit("write_intent");
@@ -1618,102 +2247,215 @@ export function createHookHandlers(
     // finding) rather than expanding this fix's scope.
     const VAULT_RESULT_LIMIT = 6;
     const VAULT_SEARCH_OVERFETCH = 18;
-    // A spent budget gets the same fallbacks withBudget(0) would return, but
-    // without starting work that would keep running (and writing: the cold
-    // vault scan seeds missing vault files) after this handler answers.
-    const recallBudgetSpent = remainingMs() <= 0;
-    const [vaultResultsRaw, recall] = recallBudgetSpent ? [
-      [] as Awaited<ReturnType<typeof searchVaultNotes>>,
-      { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
-    ] as const : await Promise.all([
-      withBudget(
-        // "scan": a hook is a fresh process that searches once and exits, so
-        // the prefix index the "index" path builds would be paid on every
-        // prompt for a single query. Same candidates, same results — see
-        // VaultSearchCandidates in vault.ts.
-        searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH, config.agentId, {
-          candidates: "scan",
-        }),
-        remainingMs(),
-        [],
-      ),
-      withBudget(
-        recallMemory({
-          query: prompt,
-          limit: 6,
-          agentId: config.agentId,
-          workspaceId,
-          // The load-bearing deadline: it destroys the socket, which is what
-          // lets the hook PROCESS exit. Racing a promise alone cannot do that.
-          timeoutMs: remainingMs(),
-          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-        }),
-        remainingMs(),
-        { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
-      ),
-    ]);
-    // SEC-006 (found during #283 review): searchVaultNotes returns every
-    // match regardless of privacy level — only `filterSafeVaultResults`
-    // keeps `local-only`/`private` notes and privacy-heuristic escalations
-    // (secrets/tokens/paths, see task.ts privacyForSource) out of the
-    // model-facing recall pointer, the
-    // persisted recall-state top_hits, and the PreToolUse guard's deny-
-    // reason text (all three read from `strong`/`vaultResults` below). This
-    // filter existed in claude-code's pre-#283 hook.ts but was never ported
-    // here when codex/grok-build/cursor/gemini/kilocode were extracted onto
-    // this factory — every platform sharing this handler has been leaking
-    // non-safe notes into UserPromptSubmit. Fixed once, for all six.
-    const vaultResults = filterSafeVaultResults(vaultResultsRaw).slice(0, VAULT_RESULT_LIMIT);
-    // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
-    // the weak-turn path below, which CLEARS recall-state.
-    const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
-    // s5 strength gate: emit the light pointer + recall-state file ONLY when the
-    // top recall strength clears the threshold; otherwise inject nothing and
-    // clear any stale state left by a previous strong turn.
-    const strong = extractStrongRecall(
-      recall.ok ? recall.data : undefined,
-      vaultResults,
-      threshold,
-    );
+    let vaultResults: Awaited<ReturnType<typeof searchVaultNotes>> = [];
+    let recall: Awaited<ReturnType<typeof recallMemory>> = {
+      ok: true as const,
+      data: { results: [] },
+    };
+    let daemonTimedOut = false;
+    let strong: ReturnType<typeof extractStrongRecall> = null;
     let recallStateFile: string | undefined;
     let stalePointer: string | undefined;
-    if (strong) {
-      // s6 UNCONSULTED deny is a backstop for an envelope the model actually
-      // received. Grok UPS/SS and Cursor UPS structurally drop inject
-      // (GROK_INJECTABLE={Stop}, CURSOR_INJECTABLE={SessionStart}); planting
-      // consumed=false here would deny cold tools against memory the model
-      // never saw. Do not expand those injectable sets — this gate follows them.
-      if (canInject(wire, "UserPromptSubmit")) {
-        try {
-          recallStateFile = await writeRecallState(config.vaultPath, {
-            task_signature: signature,
-            intent: intent.action,
-            top_hits: strong.topHits,
-            top_score: strong.topScore,
-          });
-        } catch {
-          // best-effort: a state-write failure must not break the hook
+
+    if (!isSkip) {
+      const upsRankV2 = use
+        ? use.capture.context.features.includes("MINNI_UPS_RANK_V2")
+        : isFeatureEnabled(config.vaultPath, "MINNI_UPS_RANK_V2");
+      const ledgerEnabled = isFeatureEnabled(config.vaultPath, "MINNI_USE_LEDGER");
+      const surfacedState = upsRankV2
+        ? await readSessionSurfacedState(
+            config.vaultPath,
+            rawSessionId || undefined,
+            use?.turn.turn_ix,
+            ledgerEnabled,
+          )
+        : undefined;
+      // Only pre-exclude vault paths whose prior vault score is > 0.90 (so even
+      // a max 1.00 score cannot achieve the >= 0.10 jump required to override suppression).
+      const excludePaths: string[] = [];
+      if (surfacedState) {
+        for (const [mkey, entry] of Object.entries(surfacedState.surfaced)) {
+          const priorVaultScore = entry?.scores?.vault ?? entry?.score ?? 0;
+          if (
+            mkey.startsWith("vault:") &&
+            entry &&
+            entry.reset_id === surfacedState.resetId &&
+            surfacedState.thisTurn - entry.turn_ix >= 1 &&
+            surfacedState.thisTurn - entry.turn_ix <= 10 &&
+            priorVaultScore > 0.9
+          ) {
+            excludePaths.push(mkey.slice("vault:".length));
+          }
+        }
+      }
+      // A spent budget gets the same fallbacks withBudget(0) would return, but
+      // without starting work that would keep running (and writing: the cold
+      // vault scan seeds missing vault files) after this handler answers.
+      const recallBudgetSpent = remainingMs() <= 0;
+      const hasQuery = Boolean(recallQuery.trim());
+      const [vaultResultsRaw, recallRaw] = !hasQuery
+        ? [
+            [] as Awaited<ReturnType<typeof searchVaultNotes>>,
+            { ok: true as const, data: { results: [] } } as Awaited<ReturnType<typeof recallMemory>>,
+          ]
+        : recallBudgetSpent
+          ? [
+              [] as Awaited<ReturnType<typeof searchVaultNotes>>,
+              { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR } as Awaited<
+                ReturnType<typeof recallMemory>
+              >,
+            ]
+          : await Promise.all([
+              withBudget(
+                // "scan": a hook is a fresh process that searches once and exits, so
+                // the prefix index the "index" path builds would be paid on every
+                // prompt for a single query. Same candidates, same results — see
+                // VaultSearchCandidates in vault.ts.
+                searchVaultNotes(
+                  config.vaultPath,
+                  recallQuery,
+                  VAULT_SEARCH_OVERFETCH,
+                  config.agentId,
+                  upsRankV2
+                    ? {
+                        candidates: "scan",
+                        rank: "ups_gate",
+                        ...(excludePaths.length > 0 ? { excludePaths } : {}),
+                      }
+                    : {
+                        candidates: "scan",
+                      },
+                ),
+                remainingMs(),
+                [],
+              ),
+              withBudget(
+                recallMemory({
+                  query: recallQuery,
+                  limit: 6,
+                  agentId: config.agentId,
+                  workspaceId,
+                  // The load-bearing deadline: it destroys the socket, which is what
+                  // lets the hook PROCESS exit. Racing a promise alone cannot do that.
+                  timeoutMs: remainingMs(),
+                  ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+                }),
+                remainingMs(),
+                { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
+              ),
+            ]);
+      // SEC-006 (found during #283 review): searchVaultNotes returns every
+      // match regardless of privacy level — only `filterSafeVaultResults`
+      // keeps `local-only`/`private` notes and privacy-heuristic escalations
+      // (secrets/tokens/paths, see task.ts privacyForSource) out of the
+      // model-facing recall pointer, the
+      // persisted recall-state top_hits, and the PreToolUse guard's deny-
+      // reason text (all three read from `strong`/`vaultResults` below). This
+      // filter existed in claude-code's pre-#283 hook.ts but was never ported
+      // here when codex/grok-build/cursor/gemini/kilocode were extracted onto
+      // this factory — every platform sharing this handler has been leaking
+      // non-safe notes into UserPromptSubmit. Fixed once, for all six.
+      vaultResults = filterSafeVaultResults(vaultResultsRaw).slice(0, VAULT_RESULT_LIMIT);
+      recall = recallRaw;
+      // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
+      // the weak-turn path below, which CLEARS recall-state.
+      daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
+      // s5 strength gate: emit the light pointer + recall-state file ONLY when the
+      // top recall strength clears the threshold; otherwise inject nothing and
+      // clear any stale state left by a previous strong turn.
+      strong = extractStrongRecall(
+        recall.ok ? recall.data : undefined,
+        vaultResults,
+        threshold,
+        5,
+        { rankV2: upsRankV2, vaultPath: config.vaultPath },
+      );
+      if (upsRankV2 && strong && surfacedState) {
+        const unsuppressed = strong.topHits.filter((hit) => !shouldSuppressHit(hit, surfacedState));
+        strong =
+          unsuppressed.length > 0 && selectPointerHits(unsuppressed).length > 0
+            ? { topScore: unsuppressed[0].score, topHits: unsuppressed }
+            : null;
+      }
+      if (strong) {
+        // s6 UNCONSULTED deny is a backstop for an envelope the model actually
+        // received. Grok UPS/SS and Cursor UPS structurally drop inject
+        // (GROK_INJECTABLE={Stop}, CURSOR_INJECTABLE={SessionStart}); planting
+        // consumed=false here would deny cold tools against memory the model
+        // never saw. Do not expand those injectable sets — this gate follows them.
+        if (canInject(wire, "UserPromptSubmit")) {
+          try {
+            recallStateFile = await writeRecallState(
+              config.vaultPath,
+              {
+                task_signature: signature,
+                intent: intent.action,
+                top_hits: strong.topHits,
+                top_score: strong.topScore,
+                session_id: rawSessionId || undefined,
+                agent_id: promptAgentId,
+                prompt_id: promptId,
+              },
+              recallStateOpts,
+            );
+          } catch {
+            // best-effort: a state-write failure must not break the hook
+          }
+          await recordSessionHandles(
+            config.vaultPath,
+            rawSessionId || undefined,
+            strong.topHits,
+          ).catch(() => {});
+          if (upsRankV2 && surfacedState) {
+            const pointerHits = selectPointerHits(strong.topHits);
+            deferUntilDelivered(
+              () =>
+                commitSurfacedPointer(
+                  config.vaultPath,
+                  rawSessionId || undefined,
+                  surfacedState,
+                  pointerHits,
+                ),
+              { recordOnly: true },
+            );
+          }
+        } else {
+          // Prior dropped-UPS plants left consumed=false on disk; this turn
+          // would have overwritten them with another false plant. Clear instead
+          // of leaving the guard armed against an undelivered envelope.
+          await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
+        }
+      } else if (daemonTimedOut) {
+        // DEGRADED, not weak — but only keep the pointer if this wire could
+        // have delivered it. Grok UPS/SS and Cursor UPS drop inject, so a
+        // leftover consumed=false would arm UNCONSULTED against an envelope
+        // the model never saw. Same gate as the plant: canInject(UPS) or clear.
+        if (canInject(wire, "UserPromptSubmit")) {
+          stalePointer = buildStaleRecallPointer(
+            await readRecallState(config.vaultPath, recallStateOpts).catch(() => null),
+          );
+        } else {
+          await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
         }
       } else {
-        // Prior dropped-UPS plants left consumed=false on disk; this turn
-        // would have overwritten them with another false plant. Clear instead
-        // of leaving the guard armed against an undelivered envelope.
-        await clearRecallState(config.vaultPath).catch(() => {});
+        await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
+        if (
+          upsRankV2 &&
+          surfacedState &&
+          surfacedState.hasExistingSurfaced &&
+          canInject(wire, "UserPromptSubmit")
+        ) {
+          deferUntilDelivered(
+            () =>
+              advanceSessionTurnIfPresent(
+                config.vaultPath,
+                rawSessionId || undefined,
+                surfacedState,
+              ),
+            { recordOnly: true },
+          );
+        }
       }
-    } else if (daemonTimedOut) {
-      // DEGRADED, not weak — but only keep the pointer if this wire could
-      // have delivered it. Grok UPS/SS and Cursor UPS drop inject, so a
-      // leftover consumed=false would arm UNCONSULTED against an envelope
-      // the model never saw. Same gate as the plant: canInject(UPS) or clear.
-      if (canInject(wire, "UserPromptSubmit")) {
-        stalePointer = buildStaleRecallPointer(
-          await readRecallState(config.vaultPath).catch(() => null),
-        );
-      } else {
-        await clearRecallState(config.vaultPath).catch(() => {});
-      }
-    } else {
-      await clearRecallState(config.vaultPath).catch(() => {});
     }
 
     let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>> = undefined;
@@ -1768,6 +2510,7 @@ export function createHookHandlers(
           task_signature: signature,
           workspace: workspaceId,
           recall_strong: false,
+          ...envelopeAuditDetails,
           // RAW id only — omit rather than stamp the synthetic "session"
           // fallback, so unlabeled turns don't conflate into one audit thread.
           ...(rawSessionId ? { session_id: rawSessionId } : {}),
@@ -1870,6 +2613,7 @@ export function createHookHandlers(
         workspace: workspaceId,
         recall_strong: Boolean(strong),
         top_score: strong?.topScore,
+        ...envelopeAuditDetails,
         // RAW id only — see the weak-path comment above.
         ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
@@ -1895,42 +2639,138 @@ export function createHookHandlers(
 
   // s6 PreToolUse recall guard (BACKSTOP). Same logic as the claude-code hook's
   // handlePreToolUse, against this agent's vault. The output is the
-  // permissionDecision shape (deny-to-surface), NOT an envelope.
+  // permissionDecision shape (deny-to-surface) or additionalContext, NOT an envelope.
   // `recordDeny` (S1a-2) is set only by dispatch; a direct call records nothing.
   async function handlePreToolUse(
     payload: Record<string, unknown>,
     options: { recordDeny?: boolean } = {},
   ): Promise<PreToolUseDecisionOutput> {
-    const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
-    if (mode === "off") return preToolUseAllow();
-    // s6 deny is a backstop for an envelope the model actually received.
-    // Dropped UPS (Grok, Cursor, unprofiled) never delivers that envelope;
-    // leftover consumed=false must not deny cold tools.
-    if (!canInject(wire, "UserPromptSubmit")) return preToolUseAllow();
-
     const toolName = asString(payload.tool_name);
     if (!toolName) return preToolUseAllow();
     const toolInput =
       payload.tool_input && typeof payload.tool_input === "object"
         ? (payload.tool_input as Record<string, unknown>)
         : {};
+    const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const guardAgentId = asString(payload.agent_id) || asString(payload.agentId);
 
-    const state = await readRecallState(config.vaultPath).catch(() => null);
+    // S2b (§6.4): PreToolUse on Agent / Task stashes the task prompt for SubagentStart
+    // and never surfaces or consumes the parent's recall guard arming.
+    if (isSubagentSpawnTool(toolName)) {
+      if (
+        canInject(wire, "UserPromptSubmit") &&
+        isFeatureEnabled(config.vaultPath, "MINNI_SUBAGENT_BRIEF")
+      ) {
+        stashSubagentPending(config.vaultPath, payload, toolInput);
+      }
+      return preToolUseAllow();
+    }
+
+    const maybeSurfacePreToolUseFailureLesson = async (): Promise<PreToolUseDecisionOutput> => {
+      if (!wireCapabilities(wire).preToolUseContext) return preToolUseAllow();
+      const lesson = matchPreToolUseFailureLesson({
+        vaultPath: config.vaultPath,
+        toolName,
+        toolInput,
+        sessionId: guardSessionId || undefined,
+        cwd: asString(payload.cwd) || undefined,
+      });
+      if (!lesson) return preToolUseAllow();
+      markFailureLessonFired(config.vaultPath, guardSessionId || undefined, lesson.lessonId);
+      if (options.recordDeny) {
+        const opened = await openLedger(PRE_TOOL_USE_EVENT, payload);
+        opened?.ledger?.api.captureFailureLesson(opened.ledger.capture, {
+          mkey: lesson.mkey,
+          handles: [lesson.handle],
+          title: lesson.title,
+          lessonText: lesson.lessonText,
+          emitted: lesson.additionalContext,
+        });
+        await opened?.settle();
+      }
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: lesson.additionalContext,
+        },
+      };
+    };
+
+    const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
+    if (mode === "off") return maybeSurfacePreToolUseFailureLesson();
+    // s6 deny is a backstop for an envelope the model actually received.
+    // Dropped UPS (Grok, Cursor, unprofiled) never delivers that envelope;
+    // leftover consumed=false must not deny cold tools.
+    if (!canInject(wire, "UserPromptSubmit")) return preToolUseAllow();
+
+    const guardV2 = isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
+    // S2b (§6.3.6): a PreToolUse carrying agent_id is inside a subagent; it
+    // never surfaces parent recall and never consumes parent arming.
+    if (guardV2 && guardAgentId) return maybeSurfacePreToolUseFailureLesson();
+
+    const recallStateOpts = { sessionId: guardSessionId || undefined, guardV2 };
+
+    // S2b (§6.3.5): consult tools (minni_recall, minni_drill) consume the
+    // armed state and claim the arming so a subsequent Read/Grep in the same
+    // turn does not fire the guard after the model already consulted memory.
+    if (guardV2 && isConsultTool(toolName)) {
+      const consultState = await readRecallState(config.vaultPath, recallStateOpts).catch(
+        () => null,
+      );
+      if (consultState && !consultState.consumed) {
+        await claimArming(
+          config.vaultPath,
+          guardSessionId || consultState.session_id,
+          armingKeyFor(consultState),
+        ).catch(() => false);
+        await markRecallConsumed(config.vaultPath, recallStateOpts).catch(() => false);
+      }
+      return preToolUseAllow();
+    }
+
+    const state = await readRecallState(config.vaultPath, recallStateOpts).catch(() => null);
     const threshold = recallPointerThreshold();
-    const verdict = decideGuard({ state, mode, threshold, toolName, toolInput });
-    if (verdict === "allow") return preToolUseAllow();
+    const verdict = decideGuard({
+      state,
+      mode,
+      threshold,
+      toolName,
+      toolInput,
+      guardV2,
+      agentId: guardAgentId || undefined,
+    });
+    if (verdict === "allow") return maybeSurfacePreToolUseFailureLesson();
 
-    // DENY surfaces the recall ONCE: flip consumed=true FIRST so the re-issued
-    // call (and every other tool call this turn) passes. PR90-2: only deny if
+    // S2b (§6.3.3): atomic claim across sibling PreToolUse processes in a
+    // parallel batch. Only the single winner surfaces; losers return allow.
+    if (guardV2) {
+      const claimed = await claimArming(
+        config.vaultPath,
+        guardSessionId || state!.session_id,
+        armingKeyFor(state!),
+      ).catch(() => false);
+      if (!claimed) return preToolUseAllow();
+    }
+
+    // DENY/CONTEXT surfaces the recall ONCE: flip consumed=true FIRST so the re-issued
+    // call (and every other tool call this turn) passes. PR90-2: only surface if
     // that flag actually persisted — if the write failed, denying would loop the
     // WHOLE turn (every re-issued call re-reads consumed=false and is denied
     // again). On a persistence failure we FAIL OPEN and allow, trading a missed
     // nudge for availability.
-    const consumed = await markRecallConsumed(config.vaultPath).catch(() => false);
+    const consumed = await markRecallConsumed(config.vaultPath, recallStateOpts).catch(() => false);
+    if (guardV2) {
+      deferUntilDelivered(
+        async () => {
+          pruneOldClaimFiles(config.vaultPath);
+        },
+        { recordOnly: true },
+      );
+    }
     // The PreToolUse payload may carry a session_id; stamp it so the Stop
     // receipt can attribute this guard nudge. Only add it when actually present
     // — never invent a "session" placeholder on this path.
-    const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_pretooluse_guard`,
       summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
@@ -1945,19 +2785,24 @@ export function createHookHandlers(
       },
     }).catch(() => {});
     if (!consumed) return preToolUseAllow();
-    const deny = preToolUseDeny(state!);
+    const deliveryOverride = (process.env.MINNI_RECALL_GUARD_DELIVERY ?? "").trim().toLowerCase();
+    const useContextDelivery =
+      guardV2 && deliveryOverride !== "deny" && wireCapabilities(wire).preToolUseContext;
+    const surfacing = useContextDelivery ? preToolUseContext(state!) : preToolUseDeny(state!);
     if (options.recordDeny) {
-      // S1a-2: only a deny actually returned is recorded, one row per listed
-      // hit; the capture loads here, so an allowed call never pays for it.
+      // S1a-2: only a guard surfacing actually returned is recorded, one row per
+      // listed hit; the capture loads here, so an allowed call never pays for it.
       const opened = await openLedger(PRE_TOOL_USE_EVENT, payload);
       opened?.ledger?.api.captureGuardDeny(
         opened.ledger.capture,
         state!,
-        deny.hookSpecificOutput?.permissionDecisionReason ?? "",
+        surfacing.hookSpecificOutput?.additionalContext ??
+          surfacing.hookSpecificOutput?.permissionDecisionReason ??
+          "",
       );
       await opened?.settle();
     }
-    return deny;
+    return surfacing;
   }
 
   async function handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput> {
@@ -1967,6 +2812,8 @@ export function createHookHandlers(
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
+    await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
 
     // hooks-PL-3: compaction is exactly when a correction the agent already
     // saw can fall out of context. Stash the current stale-belief /
@@ -1992,6 +2839,7 @@ export function createHookHandlers(
           transcriptPath,
           sessionId,
           event: "PreCompact",
+          sessionCrons: payload.session_crons ?? payload.sessionCrons,
         },
       ).catch(() => undefined);
       if (jevResult?.harvested && jevResult.learnings.length > 0) {
@@ -2073,6 +2921,8 @@ export function createHookHandlers(
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     // Same provenance stamp as SessionStart harvest — dual delivery paths
     // must not disagree on `platform` when runtime and agentId differ.
     await harvestSummaryText(
@@ -2109,18 +2959,39 @@ export function createHookHandlers(
   async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
-    await harvestSummaryText(
-      {
-        vaultPath: config.vaultPath,
-        workspaceId: workspaceFor(payload),
-        auditPrefix: config.auditPrefix,
-        platform: config.runtime ?? config.agentId,
-      },
-      {
-        summaryText: asString(payload.compact_summary),
-        sessionId,
-      },
-    );
+    await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
+    const summary = asString(payload.compact_summary);
+    if (summary) {
+      await harvestSummaryText(
+        {
+          vaultPath: config.vaultPath,
+          workspaceId: workspaceFor(payload),
+          auditPrefix: config.auditPrefix,
+          platform: config.runtime ?? config.agentId,
+        },
+        {
+          summaryText: summary,
+          sessionId,
+        },
+      );
+    } else {
+      const transcriptPath = asString(payload.transcript_path) || asString(payload.transcriptPath);
+      if (transcriptPath) {
+        await harvestCompactSummary(
+          {
+            vaultPath: config.vaultPath,
+            workspaceId: workspaceFor(payload),
+            auditPrefix: config.auditPrefix,
+            platform: config.runtime ?? config.agentId,
+          },
+          {
+            transcriptPath,
+            sessionId,
+          },
+        );
+      }
+    }
     return { continue: true };
   }
 
@@ -2267,6 +3138,152 @@ export function createHookHandlers(
     return render(noIntent);
   }
 
+  // S2b (§6.4): SubagentStart brief injection (<= 600 chars) combining parent
+  // turn's RecallState (up to 3 items) and bounded recall on the claimed
+  // subagent task prompt (up to 2 gated items).
+  async function handleSubagentStart(
+    payload: Record<string, unknown>,
+    ledger?: LedgerCapture,
+  ): Promise<SubagentHookOutput> {
+    const briefOn = ledger
+      ? ledger.capture.context.features.includes("MINNI_SUBAGENT_BRIEF")
+      : isFeatureEnabled(config.vaultPath, "MINNI_SUBAGENT_BRIEF");
+    if (!briefOn) return { continue: true };
+
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const guardV2 = ledger
+      ? ledger.capture.context.features.includes("MINNI_GUARD_V2")
+      : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
+
+    const parentState = await readRecallState(config.vaultPath, {
+      sessionId: rawSessionId || undefined,
+      guardV2,
+    }).catch(() => null);
+    const parentHits = Array.isArray(parentState?.top_hits)
+      ? parentState!.top_hits.slice(0, 3)
+      : [];
+
+    const claimedPending = claimSubagentPending(config.vaultPath, payload);
+    const threshold = recallPointerThreshold();
+    let taskStrong: ReturnType<typeof extractStrongRecall> = null;
+    let taskRecallData: Awaited<ReturnType<typeof recallMemory>>["data"] | undefined;
+    let safeVaultResults: ReturnType<typeof filterSafeVaultResults> = [];
+
+    if (claimedPending && claimedPending.prompt.trim()) {
+      const taskPrompt = claimedPending.prompt.trim();
+      const workspaceId = workspaceFor(payload);
+      const [vaultRaw, recall] = await Promise.all([
+        withBudget(
+          searchVaultNotes(config.vaultPath, taskPrompt, 12, config.agentId, {
+            candidates: "scan",
+          }),
+          SUBAGENT_RECALL_BUDGET_MS,
+          [],
+        ),
+        withBudget(
+          recallMemory({
+            query: taskPrompt,
+            limit: 4,
+            agentId: config.agentId,
+            workspaceId,
+            timeoutMs: SUBAGENT_RECALL_BUDGET_MS,
+            ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+          }),
+          SUBAGENT_RECALL_BUDGET_MS,
+          { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
+        ),
+      ]);
+      safeVaultResults = filterSafeVaultResults(vaultRaw).slice(0, 4);
+      taskRecallData = recall.ok ? recall.data : undefined;
+      taskStrong = extractStrongRecall(taskRecallData, safeVaultResults, threshold, 2);
+    }
+
+    const taskHits = taskStrong
+      ? enrichTaskHitsWithSnippets(taskStrong.topHits.slice(0, 2), taskRecallData, safeVaultResults, threshold)
+      : [];
+    const brief = buildSubagentBrief(parentHits, taskHits, SUBAGENT_BRIEF_MAX_CHARS);
+    if (!brief) {
+      return { continue: true };
+    }
+
+    ledger?.api.captureSubagentBrief(ledger.capture, {
+      emitted: brief,
+      parentState,
+      taskStrong,
+      taskRecall: taskRecallData,
+      taskVaultResults: safeVaultResults,
+      threshold,
+    });
+
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "SubagentStart",
+        additionalContext: brief,
+      },
+    };
+  }
+
+  // S2b (§6.4): SubagentStop passive detector run against the subagent's own
+  // transcript (`agent_transcript_path`) with `sessionEnd: true`.
+  async function handleSubagentStop(
+    payload: Record<string, unknown>,
+  ): Promise<SubagentHookOutput> {
+    const hasSessionId = Boolean(asString(payload.session_id) || asString(payload.sessionId));
+    const measured =
+      hasSessionId &&
+      wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE &&
+      ledgerMayBeOn(config.vaultPath);
+    if (measured) {
+      scheduleSubagentStopUseDetector(config, payload);
+    }
+    return { continue: true };
+  }
+
+  // Phase 1b (S4c–S4d, §7): PostToolUse and PostToolUseFailure failure-lesson
+  // surfacing. Matches `tool_response` output text on every Bash call even when
+  // `is_error === false` (solving exit-code masking `| tail`, `echo exit=$?`).
+  async function handlePostToolUse(
+    event: "PostToolUse" | "PostToolUseFailure",
+    payload: Record<string, unknown>,
+    options: { recordLedger?: boolean } = {},
+  ): Promise<PostToolUseDecisionOutput> {
+    if (!wireCapabilities(wire).preToolUseContext) {
+      return { continue: true };
+    }
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const lesson = matchPostToolUseFailureLesson({
+      vaultPath: config.vaultPath,
+      event,
+      payload,
+      sessionId: rawSessionId || undefined,
+      cwd: asString(payload.cwd) || undefined,
+    });
+    if (!lesson) {
+      return { continue: true };
+    }
+    markFailureLessonFired(config.vaultPath, rawSessionId || undefined, lesson.lessonId);
+    if (options.recordLedger) {
+      const opened = await openLedger(event, payload);
+      opened?.ledger?.api.captureFailureLesson(opened.ledger.capture, {
+        mkey: lesson.mkey,
+        handles: [lesson.handle],
+        title: lesson.title,
+        lessonText: lesson.lessonText,
+        emitted: lesson.additionalContext,
+      });
+      await opened?.settle();
+    }
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: event,
+        additionalContext: lesson.additionalContext,
+      },
+    };
+  }
+
   // S1a-2: the use-ledger capture is opened here, once per event (a hook
   // process handles one), so a direct handler call never records. One cheap
   // check decides whether the capture modules load at all; when they do, the
@@ -2280,9 +3297,11 @@ export function createHookHandlers(
   async function dispatch(
     event: string,
     payload: Record<string, unknown>,
-  ): Promise<HookOutput | PreToolUseDecisionOutput> {
+  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput | PostToolUseDecisionOutput> {
     const opened =
-      event !== PRE_TOOL_USE_EVENT && LEDGER_EVENTS.has(event) ? await openLedger(event, payload) : null;
+      event !== PRE_TOOL_USE_EVENT && !POST_TOOL_USE_EVENTS.has(event) && LEDGER_EVENTS.has(event)
+        ? await openLedger(event, payload)
+        : null;
     try {
       return await route(event, payload, opened?.ledger ?? null);
     } finally {
@@ -2333,7 +3352,7 @@ export function createHookHandlers(
     event: string,
     payload: Record<string, unknown>,
     ledger: LedgerCapture | null,
-  ): Promise<HookOutput | PreToolUseDecisionOutput> {
+  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput | PostToolUseDecisionOutput> {
     switch (event) {
       case "SessionStart":
         if (ledger) {
@@ -2351,14 +3370,18 @@ export function createHookHandlers(
         );
       case PRE_TOOL_USE_EVENT:
         return handlePreToolUse(payload, { recordDeny: true });
+      case "PostToolUse":
+        return handlePostToolUse("PostToolUse", payload, { recordLedger: true });
+      case "PostToolUseFailure":
+        return handlePostToolUse("PostToolUseFailure", payload, { recordLedger: true });
       case "PreCompact":
         ledger?.api.recordReset(ledger.capture, event, payload);
         return handlePreCompact(payload);
-      // #283 / #227: primary compaction-summary delivery for a platform
+      // #283 / #227: primary compaction-summary delivery for platforms
       // whose own hook system fires a dedicated post-compaction event
-      // (Claude Code's PostCompact). Harmless to route unconditionally —
-      // no other platform's manifest declares this event today, so this
-      // case simply never fires for them.
+      // (Claude Code in hooks.json and Codex in hooks-codex.json). Harmless
+      // to route unconditionally — platforms without PostCompact in their
+      // manifest simply never fire this case.
       case "PostCompact":
         ledger?.api.recordReset(ledger.capture, event, payload);
         return handlePostCompact(payload);
@@ -2366,6 +3389,10 @@ export function createHookHandlers(
         return handleCompactSummary(payload);
       case "Stop":
         return handleStop(payload);
+      case "SubagentStart":
+        return handleSubagentStart(payload, ledger ?? undefined);
+      case "SubagentStop":
+        return handleSubagentStop(payload);
       default:
         // P4 (#228): `render(noIntent)` reports a clean, successful no-op —
         // which is honest for "ran fine, nothing to say" but a lie for "this
@@ -2384,6 +3411,9 @@ export function createHookHandlers(
     handleCompactSummary,
     handleStop,
     handlePreToolUse,
+    handlePostToolUse,
+    handleSubagentStart,
+    handleSubagentStop,
     dispatch,
   };
 }
@@ -2501,7 +3531,7 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   const event = (eventArg || eventFromPayload || "").trim();
   // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is
   // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
-  if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
+  if (event !== PRE_TOOL_USE_EVENT && !SUBAGENT_EVENTS.has(event) && !POST_TOOL_USE_EVENTS.has(event) && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
     // P4 (#228): this exited with a SUCCESS status and no marker of any kind,
     // so an event the platform declared and sent but Minni does not route was
     // indistinguishable from an event that was never sent at all. That is the

@@ -46,7 +46,7 @@ import type { PlatformWire } from "./hook-platform.js";
 import { deferUntilDelivered } from "./hook-delivery.js";
 import { asString } from "./hook-utils.js";
 import { LEDGER_EVENTS } from "./ledger-gate.js";
-import { extractStrongRecall, sanitizeRecallField } from "./recall-state.js";
+import { extractStrongRecall, sanitizeRecallField, selectPointerHits } from "./recall-state.js";
 import type { RecallState, StrongRecall } from "./recall-state.js";
 import {
   appendLedgerRows,
@@ -96,6 +96,8 @@ export interface TurnRecord {
   exit?: string;
   /** This prompt's index in its session, from 1; 0 when the counter could not be kept. */
   readonly turn_ix: number;
+  /** Resolved prompt classification (bounded by CLASSIFY_WAIT_MS). */
+  readonly classified?: Promise<TurnClass>;
 }
 
 /** What handleUserPromptSubmit receives from the dispatch arm when capture is on. */
@@ -430,8 +432,28 @@ function nextTurnIndex(capture: UseCapture): number {
       const file = path.join(dir, "counters.json");
       const current = counterIn(file, capture.vaultPath);
       if (current === null) return 0;
+      const existing = readSideFile(file, capture.vaultPath) as
+        | { reset_id?: unknown; surfaced?: Record<string, unknown> }
+        | null;
+      const existingResetId =
+        existing && typeof existing.reset_id === "string" && existing.reset_id.trim()
+          ? existing.reset_id.trim()
+          : undefined;
+      const existingSurfaced =
+        existing && existing.surfaced && typeof existing.surfaced === "object"
+          ? existing.surfaced
+          : undefined;
       const next = current + 1;
-      writeSideFile(file, { v: 1, turn_ix: next }, capture.vaultPath);
+      writeSideFile(
+        file,
+        {
+          v: 1,
+          turn_ix: next,
+          ...(existingResetId ? { reset_id: existingResetId } : {}),
+          ...(existingSurfaced ? { surfaced: existingSurfaced } : {}),
+        },
+        capture.vaultPath,
+      );
       return next;
     } finally {
       release();
@@ -458,11 +480,13 @@ function currentTurnIndex(capture: UseCapture): number | undefined {
 // The UPS turn record (§4.3 "Every UPS exit is counted")
 // ---------------------------------------------------------------------------
 
-interface TurnClass {
+export interface TurnClass {
   envelope_kind: string | null;
   subkind: string | null;
   template_rule?: "on" | "off";
   rule_id?: string;
+  body?: string;
+  suspicious_prefix?: boolean;
 }
 
 function promptIdOf(payload: Record<string, unknown>): string | undefined {
@@ -475,10 +499,11 @@ function templateEntryIn(file: PromptTemplatesFile | null, hash: string): Prompt
 }
 
 /**
- * Classify the prompt, record-only (§5.2.1), with its template context; count
- * an eligible prompt in the counts file. Changes no behaviour. Never rejects.
- * It runs while the handler does; the handler never touches the counts file,
- * so the overlap is safe, and UPS stays the file's only writer.
+ * Classify the prompt (§5.2.1–5.2.2), with its template context; count
+ * an eligible prompt in the counts file. Never rejects.
+ * It runs while the handler does; the handler reads `turn.classified` and never
+ * touches the counts file directly when capture is open, so UPS stays the file's
+ * only writer.
  */
 async function classifyTurn(capture: UseCapture, payload: Record<string, unknown>, turnIx: number): Promise<TurnClass> {
   try {
@@ -506,7 +531,9 @@ async function classifyTurn(capture: UseCapture, payload: Record<string, unknown
       envelope_kind: envelope.kind,
       subkind: envelope.subkind,
       template_rule: envelope.template_rule,
+      body: envelope.body,
       ...(envelope.rule_id !== undefined ? { rule_id: envelope.rule_id } : {}),
+      ...(envelope.suspicious_prefix ? { suspicious_prefix: true } : {}),
     };
   } catch {
     return { envelope_kind: null, subkind: null };
@@ -562,16 +589,20 @@ export async function withTurnRecord<T>(
   if (capture === null) return inner({ turn_ix: 0 });
   const turnIx = nextTurnIndex(capture);
   // Not awaited here: its file I/O overlaps the handler's own. Never rejects.
-  const classified = classifyTurn(capture, payload, turnIx);
-  const turn: TurnRecord = { turn_ix: turnIx };
+  const classified = settleWithin(
+    classifyTurn(capture, payload, turnIx),
+    CLASSIFY_WAIT_MS,
+    UNCLASSIFIED,
+  );
+  const turn: TurnRecord = { turn_ix: turnIx, classified };
   let result: T;
   try {
     result = await inner(turn);
   } catch (error) {
-    appendTurn(capture, turnIx, await settleWithin(classified, CLASSIFY_WAIT_MS, UNCLASSIFIED), "error");
+    appendTurn(capture, turnIx, await classified, "error");
     throw error;
   }
-  appendTurn(capture, turnIx, await settleWithin(classified, CLASSIFY_WAIT_MS, UNCLASSIFIED), turn.exit ?? "error");
+  appendTurn(capture, turnIx, await classified, turn.exit ?? "error");
   return result;
 }
 
@@ -789,6 +820,7 @@ interface HitKey {
   wikilink: string;
   score: number;
   mkey: string | null;
+  shingles?: string[];
 }
 
 const NON_VAULT_MKEY_RE = /^(?:doc:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}|learning:[A-Za-z0-9_.-]{1,128}|lhash:[0-9a-f]{12})$/;
@@ -813,36 +845,87 @@ function sameHit(a: { title: unknown; wikilink: unknown; score: unknown }, b: ty
   return a.title === b.title && a.wikilink === b.wikilink && a.score === b.score;
 }
 
+function vaultTextForMkey(vaultPath: string, mkey: string | null): string {
+  if (!mkey || !mkey.startsWith("vault:") || !isValidMkey(mkey)) return "";
+  const rel = mkey.slice("vault:".length);
+  const file = path.join(vaultPath, ...rel.split("/"));
+  let fd: number | undefined;
+  try {
+    assertWriteTargetUnder(file, vaultPath);
+    fd = fs.openSync(file, READ_FLAGS);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size <= 0) return "";
+    const len = Math.min(stat.size, MAX_SIDE_FILE_BYTES);
+    const buffer = Buffer.alloc(len);
+    let offset = 0;
+    while (offset < len) {
+      const n = fs.readSync(fd, buffer, offset, len - offset, offset);
+      if (n <= 0) break;
+      offset += n;
+    }
+    return buffer.subarray(0, offset).toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
+  }
+}
+
+function daemonBodyText(raw: Record<string, unknown>): string {
+  return (
+    asString(raw.content) ||
+    asString(raw.text) ||
+    asString(raw.snippet) ||
+    asString(raw.summary)
+  );
+}
+
 /**
- * The mkey of each top hit, by matching it back to the result it came from.
- * Each candidate is projected through extractStrongRecall itself, so the match
- * uses the very title/wikilink/score the top hit carries; candidates are
- * scanned in its insertion order (daemon, then vault) and used once, which is
- * how its stable sort broke any tie.
+ * The mkey and body text of each top hit, by matching it back to the result it
+ * came from. Each candidate is projected through extractStrongRecall itself, so
+ * the match uses the very title/wikilink/score the top hit carries; candidates
+ * are scanned in its insertion order (daemon, then vault) and used once, which
+ * is how its stable sort broke any tie.
  */
-function topHitKeys(
+function topHitDetails(
   vaultPath: string,
   strong: StrongRecall,
   response: RecallResponse | undefined,
   vaultResults: readonly VaultSearchResult[],
   threshold: number,
-): Array<string | null> {
-  const pool: Array<{ hit: StrongRecall["topHits"][number]; ref: MemoryRef }> = [];
+): Array<{ mkey: string | null; body: string }> {
+  const pool: Array<{ hit: StrongRecall["topHits"][number]; ref: MemoryRef; body: string }> = [];
   const daemonResults = response && Array.isArray(response.results) ? response.results : [];
   for (const raw of daemonResults) {
-    const hit = extractStrongRecall({ results: [raw] }, [], threshold, 1)?.topHits[0];
-    if (hit) pool.push({ hit, ref: daemonRef((raw ?? {}) as Record<string, unknown>) });
+    const rec = (raw ?? {}) as Record<string, unknown>;
+    const hit = extractStrongRecall({ results: [raw] }, [], threshold, 1, { vaultPath })?.topHits[0];
+    if (hit) pool.push({ hit, ref: daemonRef(rec), body: daemonBodyText(rec) });
   }
   for (const result of vaultResults) {
-    const hit = extractStrongRecall(undefined, [result], threshold, 1)?.topHits[0];
-    if (hit) pool.push({ hit, ref: { kind: "vault", path: result.relativePath } });
+    const hit = extractStrongRecall(undefined, [result], threshold, 1, { vaultPath })?.topHits[0];
+    if (hit) {
+      pool.push({
+        hit,
+        ref: { kind: "vault", path: result.relativePath },
+        body: typeof result.snippet === "string" ? result.snippet : "",
+      });
+    }
   }
   const used = new Set<number>();
   return strong.topHits.map((hit) => {
     const index = pool.findIndex((candidate, i) => !used.has(i) && sameHit(candidate.hit, hit));
-    if (index < 0) return null;
+    if (index < 0) return { mkey: null, body: "" };
     used.add(index);
-    return memoryKeyFor((pool[index] as { ref: MemoryRef }).ref, vaultPath);
+    const chosen = pool[index] as { ref: MemoryRef; body: string };
+    const mkey = memoryKeyFor(chosen.ref, vaultPath);
+    const body = vaultTextForMkey(vaultPath, mkey) || chosen.body;
+    return { mkey, body };
   });
 }
 
@@ -870,16 +953,21 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
   if (use === undefined) return;
   const { capture } = use;
   try {
-    const keys = topHitKeys(capture.vaultPath, input.strong, input.recall, input.vaultResults, input.threshold);
+    const details = topHitDetails(capture.vaultPath, input.strong, input.recall, input.vaultResults, input.threshold);
     if (input.armed) {
       try {
         const dir = sessionDir(capture, true);
         if (dir !== null) {
-          const hits: HitKey[] = input.strong.topHits.map((hit, index) => ({
-            wikilink: hit.wikilink,
-            score: hit.score,
-            mkey: keys[index] ?? null,
-          }));
+          const hits: HitKey[] = input.strong.topHits.map((hit, index) => {
+            const detail = details[index];
+            const shingles = detail?.body ? shingleHashes(detail.body) : undefined;
+            return {
+              wikilink: hit.wikilink,
+              score: hit.score,
+              mkey: detail?.mkey ?? null,
+              ...(shingles && shingles.length > 0 ? { shingles } : {}),
+            };
+          });
           writeSideFile(
             path.join(dir, "hit-keys.json"),
             { v: 1, task_signature: input.taskSignature, hits },
@@ -890,22 +978,29 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
         // The guard then records no keyed rows for this state; the pointer row stands.
       }
     }
-    const top = input.strong.topHits[0];
-    const mkey = keys[0];
-    if (!top || !mkey) return;
+    const namedHits = selectPointerHits(input.strong.topHits);
+    const pointerItems: SurfacedItem[] = [];
+    for (let i = 0; i < namedHits.length; i += 1) {
+      const hit = namedHits[i];
+      const detailIdx = input.strong.topHits.findIndex(
+        (h) => (h.mkey && hit.mkey && h.mkey === hit.mkey) || sameHit(h, hit),
+      );
+      const mkey = (detailIdx >= 0 ? details[detailIdx]?.mkey : undefined) ?? hit.mkey ?? null;
+      if (!mkey) continue;
+      pointerItems.push({
+        mkey,
+        handles: handlesForKey(mkey),
+        title: hit.title,
+        rank: i + 1,
+        score: hit.score,
+        locate: locateText(input.emitted, input.pointer),
+      });
+    }
+    if (pointerItems.length === 0) return;
     record(
       capture,
       "prompt_pointer",
-      [
-        {
-          mkey,
-          handles: handlesForKey(mkey),
-          title: top.title,
-          rank: 1,
-          score: top.score,
-          locate: locateText(input.emitted, input.pointer),
-        },
-      ],
+      pointerItems,
       input.emitted,
       use.turn.turn_ix,
     );
@@ -930,7 +1025,15 @@ function readHitKeys(capture: UseCapture, taskSignature: string): HitKey[] {
       // The file lives in a vault any local process can write: only a
       // well-formed key may reach a row.
       const mkey = typeof value.mkey === "string" && isValidMkey(value.mkey) ? value.mkey : null;
-      out.push({ wikilink: value.wikilink, score: value.score, mkey });
+      const shingles = Array.isArray(value.shingles)
+        ? value.shingles.filter((s): s is string => typeof s === "string")
+        : undefined;
+      out.push({
+        wikilink: value.wikilink,
+        score: value.score,
+        mkey,
+        ...(shingles ? { shingles } : {}),
+      });
     }
     return out;
   } catch {
@@ -974,6 +1077,170 @@ export function captureGuardDeny(capture: UseCapture | undefined, state: RecallS
     // Best effort.
   }
 }
+
+export interface SubagentBriefCaptureInput {
+  /** The exact brief string SubagentStart emits in additionalContext. */
+  emitted: string;
+  parentState?: RecallState | null;
+  taskStrong?: StrongRecall | null;
+  taskRecall?: RecallResponse | undefined;
+  taskVaultResults?: readonly VaultSearchResult[];
+  threshold: number;
+}
+
+function keyFromVaultWikilink(vaultPath: string, wikilink: string): string | null {
+  const clean = wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "");
+  const inner = (clean.split("|")[0] ?? "").split("#")[0]?.trim() ?? "";
+  if (!inner || inner.includes("\0") || inner.startsWith("/") || inner.split("/").includes("..")) return null;
+  for (const candidate of [inner, `${inner}.md`, `wiki/${inner}`, `wiki/${inner}.md`]) {
+    try {
+      const full = path.join(vaultPath, candidate);
+      if (fs.statSync(full).isFile()) {
+        const key = memoryKeyFor({ kind: "vault", path: candidate }, vaultPath);
+        if (key && isValidMkey(key)) return key;
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+  return null;
+}
+
+function briefLineEcho(emitted: string, locate: string): string[] {
+  const line = emitted.split("\n").find((candidate) => candidate.includes(locate)) ?? emitted;
+  return echoHashes(line);
+}
+
+/**
+ * S2b (§6.4): SubagentStart brief capture. Records one `surfaced` row with
+ * `channel: "subagent_brief"` per hit actually present in `emitted`, keyed from
+ * the parent session's `hit-keys.json` (or vault wikilink fallback) for parent
+ * hits and `topHitDetails` for task-specific recall hits. Never throws.
+ */
+export function captureSubagentBrief(capture: UseCapture | undefined, input: SubagentBriefCaptureInput): void {
+  if (capture === undefined || !input.emitted) return;
+  try {
+    const items: SurfacedItem[] = [];
+    const seenMkeys = new Set<string>();
+    const parentHits = Array.isArray(input.parentState?.top_hits)
+      ? input.parentState!.top_hits.slice(0, 3)
+      : [];
+    const parentKeys =
+      input.parentState && typeof input.parentState.task_signature === "string"
+        ? readHitKeys(capture, input.parentState.task_signature)
+        : [];
+    const usedParentKeyIx = new Set<number>();
+
+    for (const hit of parentHits) {
+      if (!hit || typeof hit.wikilink !== "string") continue;
+      const locate = sanitizeRecallField(hit.wikilink);
+      if (!locate || !input.emitted.includes(locate)) continue;
+      let mkey: string | null = null;
+      let storedShingles: string[] | undefined;
+      const at = parentKeys.findIndex(
+        (k, i) => !usedParentKeyIx.has(i) && k.wikilink === hit.wikilink && k.score === hit.score,
+      );
+      if (at >= 0) {
+        usedParentKeyIx.add(at);
+        mkey = parentKeys[at]?.mkey ?? null;
+        storedShingles = parentKeys[at]?.shingles;
+      }
+      if (!mkey && parentKeys.length === 0) {
+        mkey = keyFromVaultWikilink(capture.vaultPath, hit.wikilink);
+      }
+      if (!mkey || seenMkeys.has(mkey)) continue;
+      seenMkeys.add(mkey);
+      const vaultBody = vaultTextForMkey(capture.vaultPath, mkey);
+      const shingles =
+        storedShingles && storedShingles.length > 0
+          ? storedShingles
+          : shingleHashes(vaultBody);
+      items.push({
+        mkey,
+        handles: handlesForKey(mkey),
+        title: typeof hit.title === "string" ? hit.title : "",
+        rank: items.length + 1,
+        score: finiteOrUndefined(hit.score),
+        locate,
+        shingles,
+        echo: briefLineEcho(input.emitted, locate),
+      });
+    }
+
+    if (input.taskStrong && Array.isArray(input.taskStrong.topHits)) {
+      const taskDetails = topHitDetails(
+        capture.vaultPath,
+        input.taskStrong,
+        input.taskRecall,
+        input.taskVaultResults ?? [],
+        input.threshold,
+      );
+      input.taskStrong.topHits.slice(0, 2).forEach((hit, index) => {
+        if (!hit || typeof hit.wikilink !== "string") return;
+        const locate = sanitizeRecallField(hit.wikilink);
+        if (!locate || !input.emitted.includes(locate)) return;
+        const detail = taskDetails[index];
+        const mkey = detail?.mkey ?? keyFromVaultWikilink(capture.vaultPath, hit.wikilink);
+        if (!mkey || seenMkeys.has(mkey)) return;
+        seenMkeys.add(mkey);
+        const body = detail?.body || vaultTextForMkey(capture.vaultPath, mkey);
+        items.push({
+          mkey,
+          handles: handlesForKey(mkey),
+          title: typeof hit.title === "string" ? hit.title : "",
+          rank: items.length + 1,
+          score: finiteOrUndefined(hit.score),
+          locate,
+          shingles: shingleHashes(body),
+          echo: briefLineEcho(input.emitted, locate),
+        });
+      });
+    }
+
+    record(capture, "subagent_brief", items, input.emitted);
+  } catch {
+    // Best effort.
+  }
+}
+
+export interface FailureLessonCaptureInput {
+  mkey: string;
+  handles: string[];
+  title: string;
+  lessonText: string;
+  emitted: string;
+}
+
+/**
+ * Phase 1b (S4d, §7): capture a failure-moment lesson surfaced on PreToolUse,
+ * PostToolUse, or PostToolUseFailure under `channel: "failure_lesson"`.
+ * Never throws.
+ */
+export function captureFailureLesson(
+  capture: UseCapture | undefined,
+  input: FailureLessonCaptureInput,
+): void {
+  if (capture === undefined || !input.emitted || !input.mkey) return;
+  try {
+    const safeTitle = sanitizeRecallField(input.title, 100);
+    const items: SurfacedItem[] = [
+      {
+        mkey: input.mkey,
+        handles: input.handles,
+        title: safeTitle,
+        rank: 1,
+        score: 1,
+        locate: safeTitle,
+        shingles: shingleHashes(input.lessonText),
+        echo: echoHashes(input.emitted),
+      },
+    ];
+    record(capture, "failure_lesson", items, input.emitted, currentTurnIndex(capture));
+  } catch {
+    // Best effort.
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Retention of recall-session.d (§4.3 "Retention", §6.2.5)
