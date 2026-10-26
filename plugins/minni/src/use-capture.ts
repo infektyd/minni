@@ -96,6 +96,8 @@ export interface TurnRecord {
   exit?: string;
   /** This prompt's index in its session, from 1; 0 when the counter could not be kept. */
   readonly turn_ix: number;
+  /** Resolved prompt classification (bounded by CLASSIFY_WAIT_MS). */
+  readonly classified?: Promise<TurnClass>;
 }
 
 /** What handleUserPromptSubmit receives from the dispatch arm when capture is on. */
@@ -458,11 +460,13 @@ function currentTurnIndex(capture: UseCapture): number | undefined {
 // The UPS turn record (§4.3 "Every UPS exit is counted")
 // ---------------------------------------------------------------------------
 
-interface TurnClass {
+export interface TurnClass {
   envelope_kind: string | null;
   subkind: string | null;
   template_rule?: "on" | "off";
   rule_id?: string;
+  body?: string;
+  suspicious_prefix?: boolean;
 }
 
 function promptIdOf(payload: Record<string, unknown>): string | undefined {
@@ -475,10 +479,11 @@ function templateEntryIn(file: PromptTemplatesFile | null, hash: string): Prompt
 }
 
 /**
- * Classify the prompt, record-only (§5.2.1), with its template context; count
- * an eligible prompt in the counts file. Changes no behaviour. Never rejects.
- * It runs while the handler does; the handler never touches the counts file,
- * so the overlap is safe, and UPS stays the file's only writer.
+ * Classify the prompt (§5.2.1–5.2.2), with its template context; count
+ * an eligible prompt in the counts file. Never rejects.
+ * It runs while the handler does; the handler reads `turn.classified` and never
+ * touches the counts file directly when capture is open, so UPS stays the file's
+ * only writer.
  */
 async function classifyTurn(capture: UseCapture, payload: Record<string, unknown>, turnIx: number): Promise<TurnClass> {
   try {
@@ -506,7 +511,9 @@ async function classifyTurn(capture: UseCapture, payload: Record<string, unknown
       envelope_kind: envelope.kind,
       subkind: envelope.subkind,
       template_rule: envelope.template_rule,
+      body: envelope.body,
       ...(envelope.rule_id !== undefined ? { rule_id: envelope.rule_id } : {}),
+      ...(envelope.suspicious_prefix ? { suspicious_prefix: true } : {}),
     };
   } catch {
     return { envelope_kind: null, subkind: null };
@@ -562,16 +569,20 @@ export async function withTurnRecord<T>(
   if (capture === null) return inner({ turn_ix: 0 });
   const turnIx = nextTurnIndex(capture);
   // Not awaited here: its file I/O overlaps the handler's own. Never rejects.
-  const classified = classifyTurn(capture, payload, turnIx);
-  const turn: TurnRecord = { turn_ix: turnIx };
+  const classified = settleWithin(
+    classifyTurn(capture, payload, turnIx),
+    CLASSIFY_WAIT_MS,
+    UNCLASSIFIED,
+  );
+  const turn: TurnRecord = { turn_ix: turnIx, classified };
   let result: T;
   try {
     result = await inner(turn);
   } catch (error) {
-    appendTurn(capture, turnIx, await settleWithin(classified, CLASSIFY_WAIT_MS, UNCLASSIFIED), "error");
+    appendTurn(capture, turnIx, await classified, "error");
     throw error;
   }
-  appendTurn(capture, turnIx, await settleWithin(classified, CLASSIFY_WAIT_MS, UNCLASSIFIED), turn.exit ?? "error");
+  appendTurn(capture, turnIx, await classified, turn.exit ?? "error");
   return result;
 }
 
