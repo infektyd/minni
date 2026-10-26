@@ -20,6 +20,7 @@ import {
 } from "./afm.js";
 import { auditTail, ensureVault, recordAudit, vaultExists, writeInbox } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
+import { durabilityOf } from "./durability.js";
 
 export interface JsonResult<T = unknown> {
   ok: boolean;
@@ -317,6 +318,45 @@ function projectBootRecallResult(raw: unknown): unknown {
   return out;
 }
 
+function isBootRecallNoiseResult(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object") return false;
+  const r = raw as Record<string, unknown>;
+  const source = typeof r.source === "string" ? r.source : "";
+  const relPath =
+    typeof r.path === "string" && r.path.trim()
+      ? r.path
+      : typeof r.rel_path === "string" && r.rel_path.trim()
+        ? r.rel_path
+        : typeof r.wikilink === "string" && r.wikilink.trim()
+          ? r.wikilink.replace(/^\[\[|\]\]$/g, "")
+          : source;
+  const rawContent =
+    typeof r.content === "string" && r.content.trim()
+      ? r.content
+      : typeof r.text === "string" && r.text.trim()
+        ? r.text
+        : typeof r.snippet === "string" && r.snippet.trim()
+          ? r.snippet
+          : "";
+  const evidenceStatusMatch = /^\s*<EVIDENCE\b[^>]*\bstatus="([^"]+)"/i.exec(rawContent);
+  const content = rawContent
+    .replace(/^\s*<EVIDENCE[^>]*>\s*/i, "")
+    .replace(/\s*<\/EVIDENCE>\s*$/i, "");
+  return (
+    durabilityOf({
+      path: relPath,
+      source,
+      content,
+      category: r.category,
+      type: r.type,
+      page_type: r.page_type,
+      status: r.status ?? (evidenceStatusMatch ? evidenceStatusMatch[1] : undefined),
+      review_state: r.review_state,
+      page_status: r.page_status,
+    }) === "noise"
+  );
+}
+
 export function buildBootRecallSlice(
   data: RecallResponse,
   agentFallback: string,
@@ -351,8 +391,18 @@ export function buildBootRecallSlice(
       const layer = (item as Record<string, unknown>).layer;
       return layer !== "identity";
     });
-    const topThree = nonIdentity.slice(0, 3);
-    const extraCorrections = nonIdentity
+    const nonNoise: unknown[] = [];
+    const noise: unknown[] = [];
+    for (const item of nonIdentity) {
+      if (isBootRecallNoiseResult(item)) {
+        noise.push(item);
+      } else {
+        nonNoise.push(item);
+      }
+    }
+    const ordered = [...nonNoise, ...noise];
+    const topThree = ordered.slice(0, 3);
+    const extraCorrections = ordered
       .slice(3)
       .filter((item) => isBootCorrectionResult(item))
       .slice(0, 2);

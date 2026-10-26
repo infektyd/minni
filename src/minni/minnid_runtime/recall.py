@@ -2304,6 +2304,196 @@ def handle_list_events(params: dict, request_id: Any, context: RecallContext) ->
 # `recent_learnings` field (the rendered text line keeps its own 150-char clip).
 RECENT_LEARNING_CONTENT_MAX = 4000
 
+_DURABLE_SQL_CATEGORIES = (
+    "decision",
+    "adr",
+    "fix",
+    "bugfix",
+    "scar",
+    "procedure",
+    "architecture",
+)
+
+
+def _is_recent_learnings_rank_enabled(context: RecallContext, db: Any = None) -> bool:
+    """Return True when S3b durability-ranked ``recent_learnings`` is enabled."""
+    import stat as stat_mod
+
+    env_val = os.environ.get("MINNI_RECENT_LEARNINGS_RANK")
+    if env_val is not None:
+        cleaned = env_val.strip().lower()
+        if cleaned == "off":
+            return False
+        if cleaned == "on":
+            return True
+
+    vault_path = (
+        getattr(getattr(db, "config", None), "vault_path", None)
+        or getattr(getattr(context, "config", None), "vault_path", None)
+        or getattr(getattr(context, "default_config", None), "vault_path", None)
+    )
+    if not vault_path:
+        return True
+
+    flags_path = Path(str(vault_path)) / ".runtime" / "flags.json"
+    fd: int | None = None
+    try:
+        vault_real = Path(os.path.realpath(str(vault_path)))
+        runtime_dir = flags_path.parent
+        if os.path.islink(str(runtime_dir)):
+            return True
+        runtime_real = Path(os.path.realpath(str(runtime_dir)))
+        if runtime_real != vault_real and vault_real not in runtime_real.parents:
+            return True
+
+        open_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(str(flags_path), open_flags)
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode) or st.st_size > 65536:
+            return True
+        chunks: list[bytes] = []
+        total = 0
+        while total <= 65536:
+            chunk = os.read(fd, 65536 + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > 65536:
+            return True
+        raw = b"".join(chunks).decode("utf-8", errors="replace")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            file_val = parsed.get("MINNI_RECENT_LEARNINGS_RANK")
+            if file_val == "off":
+                return False
+            if file_val == "on":
+                return True
+    except Exception:
+        return True
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+    return True
+
+
+def _fetch_learnings_legacy(cursor: Any, agent_id: str) -> list[Any]:
+    try:
+        cursor.execute(
+            """
+            SELECT learning_id, category, content, confidence, created_at, content_hash
+            FROM learnings
+            WHERE agent_id = ?
+              AND superseded_by IS NULL
+              AND COALESCE(status, 'active') = 'active'
+            ORDER BY created_at DESC, learning_id DESC
+            LIMIT 50
+            """,
+            (agent_id,),
+        )
+    except Exception:
+        try:
+            cursor.execute(
+                """
+                SELECT learning_id, category, content, confidence, created_at
+                FROM learnings
+                WHERE agent_id = ?
+                  AND superseded_by IS NULL
+                  AND COALESCE(status, 'active') = 'active'
+                ORDER BY created_at DESC, learning_id DESC
+                LIMIT 50
+                """,
+                (agent_id,),
+            )
+        except Exception:
+            cursor.execute(
+                """
+                SELECT learning_id, category, content, confidence, created_at
+                FROM learnings
+                WHERE agent_id = ?
+                  AND superseded_by IS NULL
+                ORDER BY created_at DESC, learning_id DESC
+                LIMIT 50
+                """,
+                (agent_id,),
+            )
+    return list(cursor.fetchall())
+
+
+def _fetch_learnings_two_groups(cursor: Any, agent_id: str) -> list[Any]:
+    from minni.durability import _parse_ts
+
+    cat_placeholders = ", ".join("?" for _ in _DURABLE_SQL_CATEGORIES)
+    params = (agent_id, *_DURABLE_SQL_CATEGORIES)
+
+    def _run_pair(select_cols: str, status_clause: str) -> tuple[list[Any], list[Any]]:
+        cursor.execute(
+            f"""
+            SELECT {select_cols}
+            FROM learnings
+            WHERE agent_id = ?
+              AND superseded_by IS NULL
+              {status_clause}
+              AND LOWER(TRIM(COALESCE(category, ''))) IN ({cat_placeholders})
+            ORDER BY created_at DESC, learning_id DESC
+            LIMIT 20
+            """,
+            params,
+        )
+        group_durable = list(cursor.fetchall())
+        cursor.execute(
+            f"""
+            SELECT {select_cols}
+            FROM learnings
+            WHERE agent_id = ?
+              AND superseded_by IS NULL
+              {status_clause}
+              AND LOWER(TRIM(COALESCE(category, ''))) NOT IN ({cat_placeholders})
+            ORDER BY created_at DESC, learning_id DESC
+            LIMIT 100
+            """,
+            params,
+        )
+        group_other = list(cursor.fetchall())
+        return group_durable, group_other
+
+    try:
+        g1, g2 = _run_pair(
+            "learning_id, category, content, confidence, created_at, content_hash",
+            "AND COALESCE(status, 'active') = 'active'",
+        )
+    except Exception:
+        try:
+            g1, g2 = _run_pair(
+                "learning_id, category, content, confidence, created_at",
+                "AND COALESCE(status, 'active') = 'active'",
+            )
+        except Exception:
+            g1, g2 = _run_pair(
+                "learning_id, category, content, confidence, created_at",
+                "",
+            )
+
+    def _row_sort_key(row: Any) -> tuple[float, int]:
+        ts = _parse_ts(row["created_at"])
+        ts_val = ts if ts is not None else 0.0
+        try:
+            lid_val = int(row["learning_id"]) if row["learning_id"] is not None else 0
+        except (TypeError, ValueError):
+            lid_val = 0
+        return (ts_val, lid_val)
+
+    combined = g1 + g2
+    combined.sort(key=_row_sort_key, reverse=True)
+    return combined
+
 
 def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
     """Read agent startup context (identity + knowledge + learnings).
@@ -2384,69 +2574,84 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                     lines.append(line)
 
         with db.cursor() as c:
-            try:
-                c.execute(
-                    """
-                    SELECT learning_id, category, content, confidence, created_at, content_hash
-                    FROM learnings
-                    WHERE agent_id = ?
-                      AND superseded_by IS NULL
-                      AND COALESCE(status, 'active') = 'active'
-                    ORDER BY created_at DESC, learning_id DESC
-                    LIMIT 50
-                    """,
-                    (agent_id,),
-                )
-            except Exception:
-                try:
-                    c.execute(
-                        """
-                        SELECT learning_id, category, content, confidence, created_at
-                        FROM learnings
-                        WHERE agent_id = ?
-                          AND superseded_by IS NULL
-                          AND COALESCE(status, 'active') = 'active'
-                        ORDER BY created_at DESC, learning_id DESC
-                        LIMIT 50
-                        """,
-                        (agent_id,),
-                    )
-                except Exception:
-                    c.execute(
-                        """
-                        SELECT learning_id, category, content, confidence, created_at
-                        FROM learnings
-                        WHERE agent_id = ?
-                          AND superseded_by IS NULL
-                        ORDER BY created_at DESC, learning_id DESC
-                        LIMIT 50
-                        """,
-                        (agent_id,),
-                    )
-            rows = c.fetchall()
             from minni.afm_passes.consolidation import (
                 content_hash as _content_hash,
                 is_low_signal_boot_learning,
             )
 
+            rank_enabled = _is_recent_learnings_rank_enabled(context, db)
             seen_hashes: set[str] = set()
             selected_rows = []
-            for row in rows:
-                text = str(row["content"] or "")
-                if is_low_signal_boot_learning(text):
-                    continue
-                row_keys = row.keys() if hasattr(row, "keys") else ()
-                h = (
-                    row["content_hash"]
-                    if "content_hash" in row_keys and row["content_hash"]
-                    else None
-                ) or _content_hash(text)
-                if h in seen_hashes:
-                    continue
-                seen_hashes.add(h)
-                selected_rows.append(row)
-                if len(selected_rows) >= 10:
-                    break
+            if not rank_enabled:
+                rows = _fetch_learnings_legacy(c, agent_id)
+                for row in rows:
+                    text = str(row["content"] or "")
+                    if is_low_signal_boot_learning(text):
+                        continue
+                    row_keys = row.keys() if hasattr(row, "keys") else ()
+                    h = (
+                        row["content_hash"]
+                        if "content_hash" in row_keys and row["content_hash"]
+                        else None
+                    ) or _content_hash(text)
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.add(h)
+                    selected_rows.append(row)
+                    if len(selected_rows) >= 10:
+                        break
+            else:
+                from minni.durability import durability_of
+
+                rows = _fetch_learnings_two_groups(c, agent_id)
+                gate_since = os.environ.get("MINNI_PROVENANCE_GATE_SINCE")
+                candidates: list[tuple[Any, str]] = []
+                for row in rows:
+                    text = str(row["content"] or "")
+                    if is_low_signal_boot_learning(text):
+                        continue
+                    dur = durability_of(
+                        {
+                            "category": row["category"],
+                            "content": text,
+                            "created_at": row["created_at"],
+                        },
+                        provenance_gate_since=gate_since,
+                    )
+                    if dur == "noise":
+                        continue
+                    row_keys = row.keys() if hasattr(row, "keys") else ()
+                    h = (
+                        row["content_hash"]
+                        if "content_hash" in row_keys and row["content_hash"]
+                        else None
+                    ) or _content_hash(text)
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.add(h)
+                    candidates.append((row, dur))
+
+                if len(candidates) <= 10:
+                    selected_rows = [r for r, _ in candidates]
+                else:
+                    try:
+                        k_reserved = max(
+                            0, min(4, int(os.environ.get("MINNI_RECENT_LEARNINGS_K", "2")))
+                        )
+                    except (TypeError, ValueError):
+                        k_reserved = 2
+                    durable_pool = [r for r, d in candidates if d == "durable"]
+                    if durable_pool and k_reserved > 0:
+                        reserved = durable_pool[:k_reserved]
+                        reserved_ids = {r["learning_id"] for r in reserved}
+                        rest = [
+                            r
+                            for r, _ in candidates
+                            if r["learning_id"] not in reserved_ids
+                        ][: 10 - len(reserved)]
+                        selected_rows = reserved + rest
+                    else:
+                        selected_rows = [r for r, _ in candidates[:10]]
 
             if selected_rows:
                 lines.append(f"\n## Learnings ({agent_id})")

@@ -37,7 +37,7 @@ SOCKET ?= $(HOME)/.minni/run/minnid.sock
 # Scoped engine pytest for `make check`: a fast, model-free core that exercises
 # daemon import, dispatch, status, learn/read, and the observability surface.
 # Override to widen, e.g. `make check CHECK_PYTEST="tests -q"` for the full suite.
-CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py tests/test_worktree_import_resolution.py tests/test_promote_proven.py tests/test_python_version_gate.py tests/test_diagnose_legacy_aliases_uri.py tests/test_harness_envelope_parity.py tests/test_read_recent_learning_ids.py tests/test_recall_replay_private_root.py tests/test_recall_replay_corpus.py tests/test_recall_replay_harness.py -q
+CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py tests/test_worktree_import_resolution.py tests/test_promote_proven.py tests/test_python_version_gate.py tests/test_diagnose_legacy_aliases_uri.py tests/test_harness_envelope_parity.py tests/test_durability_parity.py tests/test_read_recent_learning_ids.py tests/test_recent_learnings_durability.py tests/test_recall_replay_private_root.py tests/test_recall_replay_corpus.py tests/test_recall_replay_harness.py -q
 
 .DEFAULT_GOAL := help
 

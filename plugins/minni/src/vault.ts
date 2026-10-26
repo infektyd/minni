@@ -22,6 +22,7 @@ import type { LearningQualityReport } from "./policy.js";
 // touches the other's binding at top-level/module-evaluation time.
 import { filterSafeVaultResults } from "./task.js";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
+import { durabilityOf } from "./durability.js";
 // Type-only: use-report.ts imports FROM this module, so the runtime import
 // below is dynamic and function-scoped (same pattern as task.ts above).
 import type { UseReport } from "./use-report.js";
@@ -3093,6 +3094,7 @@ export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, 
     }
     const markdown = buffer.toString("utf8", 0, filled);
     if (privacyFromMarkdown(markdown) === "blocked" || skippedByStatus(markdown)) return null;
+    if (durabilityOf({ path: relativePath, content: markdown }) === "noise") return null;
     return `${titleFromMarkdown(relativePath, markdown)}\n${markdown}`;
   } catch {
     return null;
