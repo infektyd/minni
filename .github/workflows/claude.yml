@@ -59,13 +59,10 @@ jobs:
           # `pull-requests: read`. claude-code-action posts through its own App
           # installation, so job permissions do not govern the publish at all.
           #
-          # SEC-G9-EXEMPT (#236, knowingly deferred): grok-review.yml runs a
-          # fail-closed leak gate loaded from the default branch before it
-          # posts; this path has none, and porting one is not mechanical —
-          # claude-code-action composes AND posts internally, leaving no
-          # interception point between the model's output and the public
-          # comment. The real mitigation is bounding what the agent can read
-          # (claude_args: --allowed-tools), not scanning what it emits.
+          # Tool surface is strictly bounded below via claude_args (#316 / #236)
+          # so the interactive @claude responder cannot execute arbitrary shell
+          # commands, read outside the checkout via shell, or mutate files
+          # (--allowed-tools Read,Grep,Glob --disallowed-tools Bash,Write,Edit,MultiEdit,WebFetch,WebSearch).
           # Default checkout persists the token into .git/config as an http
           # extraheader; nothing downstream needs it (the repo is public, so
           # any git fetch here is anonymous).
@@ -85,8 +82,6 @@ jobs:
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+          # Restrict tool surface to safe repo inspection; forbid shell and mutation (#316 / #236)
+          claude_args: '--allowed-tools Read,Grep,Glob --disallowed-tools Bash,Write,Edit,MultiEdit,WebFetch,WebSearch'
 

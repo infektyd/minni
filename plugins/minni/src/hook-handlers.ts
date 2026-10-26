@@ -1404,13 +1404,13 @@ export function createHookHandlers(
     const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
     await ensureVault(config.vaultPath, { agentId: config.agentId });
 
-    // Compaction-summary harvest backstop (P3 / #227). Claude Code's primary
-    // path is PostCompact in hook.ts; Kilo delivers via CompactSummary (its
-    // bridge SessionStart supplies neither transcript_path nor source — so
-    // this backstop is dead for real Kilo boots). Platforms that share this
-    // handler (codex, grok-build, cursor, gemini) previously had no harvest
-    // path at all — and on those hosts this SessionStart path is the ONLY
-    // capture write (no PostCompact).
+    // Compaction-summary harvest backstop (P3 / #227). Claude Code and Codex
+    // deliver primarily via PostCompact (`hooks.json` / `hooks-codex.json`);
+    // Kilo delivers via CompactSummary (its bridge SessionStart supplies
+    // neither transcript_path nor source — so this backstop is dead for real
+    // Kilo boots). For platforms without a post-compaction hook event (cursor,
+    // grok-build, gemini) — or as a next-boot backstop if PostCompact failed —
+    // this SessionStart path captures the summary from the transcript tail.
     //
     // Gate:
     //  1. compact|resume `source` — Claude parity (any runtime). FULLY
@@ -2961,18 +2961,37 @@ export function createHookHandlers(
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
-    await harvestSummaryText(
-      {
-        vaultPath: config.vaultPath,
-        workspaceId: workspaceFor(payload),
-        auditPrefix: config.auditPrefix,
-        platform: config.runtime ?? config.agentId,
-      },
-      {
-        summaryText: asString(payload.compact_summary),
-        sessionId,
-      },
-    );
+    const summary = asString(payload.compact_summary);
+    if (summary) {
+      await harvestSummaryText(
+        {
+          vaultPath: config.vaultPath,
+          workspaceId: workspaceFor(payload),
+          auditPrefix: config.auditPrefix,
+          platform: config.runtime ?? config.agentId,
+        },
+        {
+          summaryText: summary,
+          sessionId,
+        },
+      );
+    } else {
+      const transcriptPath = asString(payload.transcript_path) || asString(payload.transcriptPath);
+      if (transcriptPath) {
+        await harvestCompactSummary(
+          {
+            vaultPath: config.vaultPath,
+            workspaceId: workspaceFor(payload),
+            auditPrefix: config.auditPrefix,
+            platform: config.runtime ?? config.agentId,
+          },
+          {
+            transcriptPath,
+            sessionId,
+          },
+        );
+      }
+    }
     return { continue: true };
   }
 
@@ -3358,11 +3377,11 @@ export function createHookHandlers(
       case "PreCompact":
         ledger?.api.recordReset(ledger.capture, event, payload);
         return handlePreCompact(payload);
-      // #283 / #227: primary compaction-summary delivery for a platform
+      // #283 / #227: primary compaction-summary delivery for platforms
       // whose own hook system fires a dedicated post-compaction event
-      // (Claude Code's PostCompact). Harmless to route unconditionally —
-      // no other platform's manifest declares this event today, so this
-      // case simply never fires for them.
+      // (Claude Code in hooks.json and Codex in hooks-codex.json). Harmless
+      // to route unconditionally — platforms without PostCompact in their
+      // manifest simply never fire this case.
       case "PostCompact":
         ledger?.api.recordReset(ledger.capture, event, payload);
         return handlePostCompact(payload);

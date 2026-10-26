@@ -51,22 +51,20 @@ def _episodic_tables_present(conn: sqlite3.Connection) -> bool:
 def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
     """Insert every content-bearing episodic_events row missing from episodic_fts.
 
-    trg_episodic_fts_insert keeps the index in step going forward, but a trigger
-    only sees rows written after it exists. Every event logged before the trigger
-    was added stayed out of episodic_fts permanently, and nothing reconciled it:
-    the text sat in episodic_events while search_episodic — which reads only the
-    FTS table — could not return it. On the operator's own database that was 35
-    of the 43 non-trace events, so ~81% of real episodic memory was unreachable.
+    #311: episodic_fts is keyed by its built-in INTEGER PRIMARY KEY `rowid`
+    (`rowid = event_id`), retiring all integer casts and NULL-event_id
+    guards. Live inserts, updates, and deletes are mirrored by
+    `trg_episodic_fts_insert`, `trg_episodic_fts_update`, and
+    `trg_episodic_fts_delete`. This function remains the idempotent set-wise
+    reconciler used by migrations and periodic backfill sweeps to heal
+    pre-trigger history, wrong-agent rows, or out-of-band orphans.
 
     Runs in two set-wise passes and returns {missing_before, inserted, removed}:
 
-      1. remove index rows that match no event on BOTH event_id and agent_id —
-         orphans whose event is gone, and rows filed under the wrong agent;
+      1. remove index rows that match no content-bearing event on BOTH
+         `rowid = event_id` and `agent_id` — orphans whose event is gone, and
+         rows filed under the wrong agent;
       2. index every content-bearing event the cleaned index still lacks.
-
-    Pass 1 is why episodic_events has no AFTER DELETE FTS trigger (see db.py):
-    doing it here is one set-wise statement per sweep instead of a full scan of
-    the fts content table per deleted row on the search hot path.
 
     Idempotent by construction: it repairs exactly the rows that disagree with
     episodic_events, so a second run changes nothing. Safe on a fresh or partial
@@ -76,57 +74,40 @@ def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
         logger.debug("reconcile_episodic_fts: episodic tables absent — no-op")
         return {"missing_before": 0, "inserted": 0, "removed": 0}
 
-    # NOT EXISTS rather than the original NOT IN: it is NULL-safe by
-    # construction, so a NULL event_id in the index (an UNINDEXED fts5 column
-    # has no affinity and no NOT NULL constraint) can no longer make the whole
-    # predicate evaluate to NULL and silently repair nothing.
-    unmatched = (
-        "NOT EXISTS (SELECT 1 FROM episodic_fts f"
-        "            WHERE CAST(f.event_id AS INTEGER) = e.event_id"
-        "              AND f.agent_id = e.agent_id)"
-    )
+    counts = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM episodic_events
+             WHERE content IS NOT NULL) AS expected,
+            (SELECT COUNT(*) FROM episodic_events e
+             JOIN episodic_fts f
+               ON f.rowid = e.event_id
+              AND f.agent_id = e.agent_id
+             WHERE e.content IS NOT NULL) AS covered,
+            (SELECT COUNT(*) FROM episodic_fts) AS total_fts
+        """
+    ).fetchone()
+    expected = int(counts[0])
+    covered = int(counts[1])
+    total_fts = int(counts[2])
+    missing_before = max(0, expected - covered)
 
-    # Pass 1 — drop index rows that match no event on BOTH columns. This is the
-    # sweep-side replacement for a per-row AFTER DELETE trigger (see db.py):
-    # set-wise and once per sweep, rather than a full scan of the fts content
-    # table per deleted event on the search hot path. It collects two classes at
-    # once — orphans whose event is gone, and rows filed under the wrong agent,
-    # which are unreachable by their owner AND returned to an agent that never
-    # recorded them. The second class is why a delete-then-insert inside the
-    # repair below was not enough: an event carrying BOTH a correct row and an
-    # intruder row satisfied the repair predicate, so nothing was ever in the
-    # repair set and the leak persisted at a reported ratio of 1.0.
+    if missing_before == 0 and total_fts == covered:
+        return {"missing_before": 0, "inserted": 0, "removed": 0}
+
+    # Step 1 — delete orphans and wrong-agent rows.
     removed = conn.execute(
-        """DELETE FROM episodic_fts
-            WHERE event_id IS NULL
-               OR NOT EXISTS (
-                   SELECT 1 FROM episodic_events e
-                    WHERE e.event_id = CAST(episodic_fts.event_id AS INTEGER)
-                      AND e.agent_id = episodic_fts.agent_id)"""
+        """
+        DELETE FROM episodic_fts
+        WHERE NOT EXISTS (
+            SELECT 1 FROM episodic_events e
+            WHERE e.event_id = episodic_fts.rowid
+              AND e.agent_id = episodic_fts.agent_id
+              AND e.content IS NOT NULL
+        )
+        """
     ).rowcount
     removed = removed if removed and removed > 0 else 0
-
-    # Pass 2 — index every content-bearing event the cleaned index still lacks.
-    #
-    # "Missing" is spelled on event_id AND agent_id so this predicate reads
-    # identically to episodic_index_coverage's "indexed" predicate: the repair
-    # and the metric must not be able to disagree about what coverage means.
-    # Keyed on event_id alone, they did — a wrong-agent row counted as present
-    # here (nothing to repair) while the metric counted it as uncovered, so the
-    # ratio sat below 1.0 and no number of sweeps could move it. A repair set
-    # that cannot close the gap its own metric reports is worse than no repair:
-    # it reports success forever.
-    #
-    # Honest note on the agent_id half: after Pass 1 it is redundant, because
-    # every surviving index row already matches its event on both columns —
-    # dropping it here leaves the suite green, and that mutant is equivalent
-    # rather than escaped. It stays because the two predicates being literally
-    # the same text is the property worth protecting; if Pass 1 is ever
-    # narrowed, this half stops being redundant and starts being the fix again.
-    missing_before = conn.execute(
-        f"SELECT COUNT(*) FROM episodic_events e"
-        f" WHERE e.content IS NOT NULL AND {unmatched}"
-    ).fetchone()[0]
 
     if not missing_before:
         if removed:
@@ -136,12 +117,18 @@ def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
             )
         return {"missing_before": 0, "inserted": 0, "removed": removed}
 
+    # Step 2 — insert missing content-bearing rows keyed by rowid = event_id.
     cur = conn.execute(
-        f"""INSERT INTO episodic_fts(event_id, agent_id, content)
-            SELECT e.event_id, e.agent_id, e.content
-              FROM episodic_events e
-             WHERE e.content IS NOT NULL
-               AND {unmatched}"""
+        """
+        INSERT INTO episodic_fts(rowid, agent_id, content)
+        SELECT e.event_id, e.agent_id, e.content
+        FROM episodic_events e
+        WHERE e.content IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM episodic_fts f
+              WHERE f.rowid = e.event_id
+          )
+        """
     )
     inserted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     logger.info(
@@ -444,13 +431,6 @@ class EpisodicMemory:
         # forever in the one table this method exists to bound.
         marks = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
         with self.db.cursor() as c:
-            c.execute(f"""
-                DELETE FROM episodic_fts
-                WHERE event_id IN (
-                    SELECT event_id FROM episodic_events
-                    WHERE event_type IN ({marks}) AND created_at < ?
-                )
-            """, (*NON_MEMORY_EVENT_TYPES, cutoff))
             c.execute(
                 f"DELETE FROM episodic_events"
                 f" WHERE event_type IN ({marks}) AND created_at < ?",
@@ -461,11 +441,5 @@ class EpisodicMemory:
         """Remove episodic events older than max_age (default 7 days)."""
         cutoff = time.time() - max_age_seconds
         with self.db.cursor() as c:
-            c.execute("""
-                DELETE FROM episodic_fts
-                WHERE event_id IN (
-                    SELECT event_id FROM episodic_events WHERE created_at < ?
-                )
-            """, (cutoff,))
             c.execute("DELETE FROM episodic_events WHERE created_at < ?", (cutoff,))
             return c.rowcount

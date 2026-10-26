@@ -1,0 +1,28 @@
+-- Migration 024: rebuild episodic_fts keyed by built-in rowid = event_id (#311).
+--
+-- Pre-024 databases declared `event_id UNINDEXED` as a payload column inside
+-- `episodic_fts`. Because an UNINDEXED FTS5 column has no index and no type
+-- affinity:
+--   1. Keyed deletes (`DELETE FROM episodic_fts WHERE event_id = OLD.event_id`)
+--      scanned the entire FTS shadow table per deleted row (16.674s at 5,000
+--      expiring / 50,000 retained rows), preventing an AFTER DELETE trigger on
+--      `episodic_events`.
+--   2. Every consumer in `episodic.py` and `backfill.py` needed
+--      `CAST(event_id AS INTEGER)` and `event_id IS NULL` guards.
+--
+-- Rebuilding `episodic_fts` as `USING fts5(agent_id UNINDEXED, content,
+-- tokenize='porter unicode61')` stores `event_id` directly in FTS5's built-in
+-- B-tree indexed integer `rowid` key:
+--   - Keyed deletes and updates (`WHERE rowid = OLD.event_id`) become O(log n)
+--     (~0.008s at the 5,000 / 50,000 shape).
+--   - `trg_episodic_fts_delete` is installed alongside `trg_episodic_fts_insert`
+--     and `trg_episodic_fts_update`, restoring full symmetry with
+--     `learnings_fts`.
+--   - `reconcile_episodic_fts` repopulates the rebuilt table set-wise from
+--     `episodic_events`.
+--
+-- Applied from Python (`migrations._apply_migration_024_rebuild_episodic_fts_rowid`)
+-- so partial test schemas without `episodic_events` or `episodic_fts` no-op
+-- cleanly without leaving dangling triggers.
+
+SELECT 1;

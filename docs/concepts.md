@@ -329,18 +329,22 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    |----------|------------------|----------------------------------|-------|
    | Claude Code | `PostCompact` → `harvestSummaryText` | yes (`source` compact/resume only) | full path |
    | Kilo Code | `session.compacted` SDK read-back → `CompactSummary` | no (bridge supplies no transcript_path / source) | primary only |
-   | Codex | — | compact/resume `source` only | path-only not allowlisted (Claude-shaped JSONL unverified); capture no-op until shape or direct delivery |
-   | Grok Build | — | compact/resume `source` only | harvest is a side effect (SessionStart is not injectable); path-only not allowlisted |
-   | Cursor | — | compact/resume `source` only | do not mine `transcript_path` blind (undocumented schema); cold boots with non-compact `source` skip; path-only not allowlisted |
+   | Codex | `hooks-codex.json` `PostCompact` → `harvestCompactSummary` | yes (`source` compact/resume only) | receives `{session_id, transcript_path, ...}` and harvests from transcript tail via `harvestCompactSummary`; `SessionStart` scan is next-boot backstop |
+   | Grok Build | — | compact/resume `source` only | no compaction hook events; relies on `SessionStart` transcript-tail scan when `transcript_path` is provided; path-only not allowlisted |
+   | Cursor | — | compact/resume `source` only | no post-compaction hook event (`preCompact` only); relies on `SessionStart` (`source: "compact" | "resume"`) transcript-tail backstop; path-only not allowlisted |
    | Gemini / agy | — | compact/resume `source` only | always attaches `transcriptPath`, never `source`; path-only would I/O every cold boot for zero yield (non–Claude-shaped transcript) |
 
-   Platforms without a Claude-shaped `isCompactSummary` transcript entry still
-   *have* a harvest path when the gate fires (they no longer drop the event on
-   the floor by absence of code), but capture is a no-op until the platform
-   emits a compatible summary shape or a direct `CompactSummary`/`summary_text`
-   delivery. Path-only stays empty-allowlist so the residual is not paid as an
-   every-boot I/O cost on unverified hosts. That residual is declared here
-   rather than discovered.
+   `hooks-codex.json` wires `PostCompact` (which receives `{session_id, transcript_path, ...}`
+   and harvests from the transcript tail via `harvestCompactSummary`), with `SessionStart`
+   transcript-tail scan as the next-boot backstop. Cursor has no post-compaction hook event
+   (`preCompact` only) and relies on the `SessionStart` (`source: "compact" | "resume"`)
+   transcript-tail backstop, while Grok has no compaction hook events and relies on `SessionStart`
+   transcript-tail scan when `transcript_path` is provided. Platforms without a Claude-shaped
+   `isCompactSummary` transcript entry still *have* a harvest path when the gate fires (they no
+   longer drop the event on the floor by absence of code), but capture is a no-op until the
+   platform emits a compatible summary shape or a direct `CompactSummary`/`summary_text`
+   delivery. Path-only stays empty-allowlist so the residual is not paid as an every-boot I/O
+   cost on unverified hosts. That residual is declared here rather than discovered.
 2. **Daemon-side distillation (`compact_distillation` AFM pass).** The same
    consolidation timer that ingests stop-candidate learnings picks up
    `compact_summary` inbox files (`src/minni/afm_passes/compact_distillation.py`).

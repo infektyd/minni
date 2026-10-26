@@ -72,8 +72,8 @@ re-asserts them or catches their decay.
 - Issue closed as "working as intended, because …"
 - Issue left open with a written disposition ("carry forward: …")
 - In-code exemption markers — the marker's justification is the rationale.
-  Concrete instance: `SEC-G9-EXEMPT` in `.github/workflows/claude.yml`
-  (finding #236, knowingly deferred; marker landed in PR #314). Note for anyone inventorying markers: `rg` skips hidden
+  Historical instance: `SEC-G9-EXEMPT` in `.github/workflows/claude.yml`
+  (finding #236, marker landed in PR #314 and resolved by #316 via claude_args tool-surface restriction). Note for anyone inventorying markers: `rg` skips hidden
   directories like `.github/` by default — use `rg --hidden` or `grep -r`
 - Plan-slice evidence that accepts a residual ("known gap, tolerable
   because …")
@@ -116,7 +116,7 @@ Filed at adoption, due 2026-10-04:
 - the four dispositions carried forward at campaign close: #346 (for #227),
   #347 (for #311), #348 (for #316), #349 (for #317);
 - the two live in-tree acceptances this page itself names: #355 (for the
-  `SEC-G9-EXEMPT` deferral, finding #236) and #356 (for the SEC-021
+  `SEC-G9-EXEMPT` deferral, finding #236 — resolved by #316) and #356 (for the SEC-021
   deferral in THREAT_MODEL §7).
 
 This inventory is the acceptances known at adoption, not a claim that no

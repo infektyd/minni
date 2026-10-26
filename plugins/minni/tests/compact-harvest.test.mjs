@@ -582,6 +582,53 @@ test("PostCompact-style delivery (no summary id) dedups against the transcript b
   assert.ok(doc.summary_sha1);
 });
 
+// P3 / #227: Codex PostCompact delivers transcript_path (no compact_summary text);
+// handlePostCompact must fall back to harvestCompactSummary from transcript tail.
+test("Codex PostCompact falls back to transcript-tail harvest and deduplicates with SessionStart", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-codex-pc", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault);
+
+  // Codex PostCompact payload shape: transcript_path provided, NO compact_summary
+  const postCompactOutput = await handlers.handlePostCompact({
+    session_id: "s-codex-pc",
+    transcript_path: file,
+    cwd: "/workspace",
+    hook_event_name: "PostCompact",
+    trigger: "auto",
+  });
+  assert.equal(postCompactOutput?.continue, true);
+
+  const harvested = await listCompactSummaries(vault);
+  assert.equal(harvested.length, 1, "expected one compact_summary inbox file at PostCompact time");
+  assert.equal(harvested[0].platform, "codex");
+  assert.ok(
+    String(harvested[0].summary_text ?? "").includes("Primary Request"),
+    "inbox payload must carry the summary body",
+  );
+
+  // Subsequent SessionStart on the same transcript deduplicates against the already-harvested summary
+  await handlers.handleSessionStart({
+    session_id: "s-codex-pc",
+    transcript_path: file,
+    source: "compact",
+  });
+  const afterSessionStart = await listCompactSummaries(vault);
+  assert.equal(afterSessionStart.length, 1, "subsequent SessionStart must deduplicate (only 1 inbox file)");
+
+  // Clean no-op when neither compact_summary nor transcript_path is provided
+  const noOpVault = await tmpVault();
+  const noOpHandlers = sharedHandlers(noOpVault);
+  const noOpOutput = await noOpHandlers.handlePostCompact({
+    session_id: "s-noop",
+  });
+  assert.equal(noOpOutput?.continue, true);
+  assert.equal((await listCompactSummaries(noOpVault)).length, 0, "no-op when missing summary and transcript_path");
+});
+
 test("harvest is fail-open on missing inputs", async () => {
   const vault = await tmpVault();
   assert.deepEqual(await harvestCompactSummary(HARVEST_CONFIG(vault), { sessionId: "s" }), {

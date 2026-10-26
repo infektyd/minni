@@ -142,7 +142,9 @@ test("Codex hook manifest uses only the native adapter with realistic timeouts",
   const expected = {
     SessionStart: 30,
     UserPromptSubmit: 30,
+    PreToolUse: 10,
     PreCompact: 20,
+    PostCompact: 20,
     Stop: 20,
   };
   for (const [event, timeout] of Object.entries(expected)) {
