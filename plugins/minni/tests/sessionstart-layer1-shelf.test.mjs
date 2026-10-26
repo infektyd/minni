@@ -110,9 +110,18 @@ test(
     assert.equal(body.layer1_shelf.ok, true);
     assert.equal(body.layer1_shelf.truncated, true, "an oversized shelf must be flagged truncated");
     assert.equal(
-      body.layer1_shelf.content.length,
-      LAYER1_SHELF_MAX_BYTES,
-      "the inlined content must stop at the byte cap",
+      body.layer1_shelf.inline_trim,
+      true,
+      "an oversized shelf must be converted to the boot form",
+    );
+    assert.ok(
+      body.layer1_shelf.content.length <= 4000,
+      `the inlined boot form must stop at the 4,000-char boot cap (got ${body.layer1_shelf.content.length})`,
+    );
+    assert.match(
+      body.layer1_shelf.content,
+      /\[layer1 shelf: boot form, \d+ of 8692 chars; full file: layer1\/core\.md\]$/,
+      "the boot form must end with the explicit boot-form marker",
     );
     assert.equal(
       body.layer1_shelf.omitted_bytes,

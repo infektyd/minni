@@ -1,3 +1,6 @@
+import { compactPlanPointer } from "./plan.js";
+import { applyLayer1BootForm, LAYER1_BOOT_FORM_MAX_CHARS } from "./vault.js";
+
 export const ENVELOPE_VERSION = "1";
 
 export const EVIDENCE_AUTHORITY_SENTENCE =
@@ -95,12 +98,27 @@ export interface EnvelopeBody {
   lifecycle_focus?: string;
   identity?: unknown;
   identity_body?: unknown;
+  layer1_shelf?: unknown;
+  corrections_reassert?: unknown;
   active_thread?: unknown;
+  active_thread_ref?: unknown;
+  pending_attention?: unknown;
+  handoff_context?: unknown;
+  handoff_acks?: unknown;
+  expired_handoffs?: unknown;
   recall?: unknown;
+  vault_recall?: unknown;
+  recent_learnings?: unknown;
+  pending_learnings?: unknown;
+  inbox?: unknown;
+  degraded?: unknown;
+  layer1_source?: unknown;
+  fallback_commands?: unknown;
+  trimmed?: Record<string, { from: number; to: number }>;
+  over_budget?: { tokens: number; budget: number; char_limit?: number };
   vault?: unknown;
   audit_tail?: unknown;
   scar_tissue?: unknown;
-  pending_learnings?: unknown;
   candidates?: unknown;
   open_questions?: unknown;
   [key: string]: unknown;
@@ -111,12 +129,51 @@ export interface EnvelopeOptions {
   agent: string;
   body: EnvelopeBody;
   budget?: number;
+  priority?: readonly string[];
+  legacyKeySort?: boolean;
 }
 
-function estimateTokens(text: string): number {
+/**
+ * S2a (§6.2.3, §8.2): top-level envelope key priority order so high-salience
+ * sections (`contract`, `identity_body`, `layer1_shelf`, `corrections_reassert`,
+ * `active_thread`, ...) sit at the front of the emitted JSON and low-salience
+ * telemetry (`audit_tail`) sits at the tail.
+ */
+export const ENVELOPE_PRIORITY_ORDER = [
+  "contract",
+  "identity_body",
+  "layer1_shelf",
+  "corrections_reassert",
+  "active_thread",
+  "active_thread_ref",
+  "pending_attention",
+  "handoff_context",
+  "handoff_acks",
+  "expired_handoffs",
+  "recall",
+  "vault_recall",
+  "recent_learnings",
+  "pending_learnings",
+  "inbox",
+  "degraded",
+  "lifecycle",
+  "lifecycle_focus",
+  "layer1_source",
+  "fallback_commands",
+  "trimmed",
+  "over_budget",
+  "audit_tail",
+] as const;
+
+export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/**
+ * Canonical alphabetical JSON serializer. Must remain unchanged so plan digest
+ * hashing (`plan.ts`) and use-ledger span location (`use-capture.ts`) never
+ * drift.
+ */
 export function stableStringify(value: unknown): string {
   if (value === undefined) return "null";
   if (value === null) return "null";
@@ -134,38 +191,472 @@ export function stableStringify(value: unknown): string {
   return `{${entries.join(",")}}`;
 }
 
-export function wrapEnvelope(options: EnvelopeOptions): string {
-  const orderedBody: Record<string, unknown> = {};
-  const keyOrder = [
-    "contract",
-    "lifecycle",
-    "lifecycle_focus",
-    "identity",
-    "identity_body",
-    "active_thread",
-    "active_thread_ref",
-    "pending_learnings",
-    "scar_tissue",
-    "recall",
-    "vault",
-    "audit_tail",
-    "candidates",
-    "open_questions",
-  ] as const;
+/**
+ * S2a (§6.2.3, §8.2): serialize an envelope's top-level keys in `priority`
+ * order (`ENVELOPE_PRIORITY_ORDER`), with any remaining top-level keys sorted
+ * alphabetically after the priority list, while nested values use
+ * `stableStringify` unchanged.
+ */
+export function serializeEnvelope(
+  body: Record<string, unknown>,
+  priority: readonly string[] = ENVELOPE_PRIORITY_ORDER,
+): string {
+  const hasTrailingAuditTail =
+    priority.length > 0 && priority[priority.length - 1] === "audit_tail";
+  const mainPriority = hasTrailingAuditTail ? priority.slice(0, -1) : priority;
+  const seen = new Set<string>();
+  const entries: string[] = [];
+  for (const key of mainPriority) {
+    if (Object.prototype.hasOwnProperty.call(body, key) && body[key] !== undefined) {
+      seen.add(key);
+      entries.push(`${JSON.stringify(key)}:${stableStringify(body[key])}`);
+    }
+  }
+  if (hasTrailingAuditTail) {
+    seen.add("audit_tail");
+  }
+  const restKeys = Object.keys(body)
+    .filter((key) => !seen.has(key) && body[key] !== undefined)
+    .sort((a, b) => a.localeCompare(b));
+  for (const key of restKeys) {
+    entries.push(`${JSON.stringify(key)}:${stableStringify(body[key])}`);
+  }
+  if (
+    hasTrailingAuditTail &&
+    Object.prototype.hasOwnProperty.call(body, "audit_tail") &&
+    body.audit_tail !== undefined
+  ) {
+    entries.push(`${JSON.stringify("audit_tail")}:${stableStringify(body.audit_tail)}`);
+  }
+  return `{${entries.join(",")}}`;
+}
+
+export function wrapEnvelope(
+  optionsOrEvent: EnvelopeOptions | EnvelopeEvent,
+  maybeBody?: EnvelopeBody,
+  maybeBudget?: number,
+  maybeExtra?: { agent?: string; priority?: readonly string[]; legacyKeySort?: boolean },
+): string {
+  const options: EnvelopeOptions =
+    typeof optionsOrEvent === "string"
+      ? {
+          event: optionsOrEvent,
+          agent: maybeExtra?.agent ?? "claudecode",
+          body: (maybeBody ?? {}) as EnvelopeBody,
+          budget: maybeBudget,
+          priority: maybeExtra?.priority,
+          legacyKeySort: maybeExtra?.legacyKeySort,
+        }
+      : optionsOrEvent;
   const bodyAsRecord = options.body as Record<string, unknown>;
-  for (const key of keyOrder) {
-    if (bodyAsRecord[key] !== undefined) orderedBody[key] = bodyAsRecord[key];
-  }
-  for (const [key, value] of Object.entries(bodyAsRecord)) {
-    if (value === undefined) continue;
-    if (!(key in orderedBody)) orderedBody[key] = value;
-  }
-  const json = stableStringify(orderedBody);
+  const json = options.legacyKeySort
+    ? stableStringify(bodyAsRecord)
+    : serializeEnvelope(bodyAsRecord, options.priority ?? ENVELOPE_PRIORITY_ORDER);
   const tokens = estimateTokens(json);
   const open = `<minni:context version="${ENVELOPE_VERSION}" event="${options.event}" agent="${options.agent}" tokens="${tokens}"${
     options.budget ? ` budget="${options.budget}"` : ""
   }>`;
   return `${open}\n${json}\n</minni:context>`;
+}
+
+export interface FitEnvelopeLimits {
+  tokenLimit: number;
+  charLimit?: number;
+  vaultPath?: string;
+  event?: EnvelopeEvent;
+  agent?: string;
+  nativeLayer1?: string;
+  onNativeLayer1Trimmed?: (trimmedNativeLayer1: string) => void;
+}
+
+function isCorrectionItem(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object") return false;
+  const r = raw as Record<string, unknown>;
+  if (r.correction === true) return true;
+  const layer = typeof r.layer === "string" ? r.layer.toLowerCase() : "";
+  if (layer === "corrections" || layer === "correction") return true;
+  const reviewState = typeof r.review_state === "string" ? r.review_state.toLowerCase() : "";
+  if (reviewState === "correction" || reviewState === "contradicted") return true;
+  const kind = typeof r.kind === "string" ? r.kind.toLowerCase() : "";
+  if (kind === "correction") return true;
+  return false;
+}
+
+function stripHandoffBodyItem(item: unknown): unknown {
+  if (item === null || typeof item !== "object") return item;
+  const obj = item as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  if (typeof obj.ref === "string") out.ref = obj.ref;
+  if (typeof obj.path === "string") out.path = obj.path;
+  if (typeof obj.relativePath === "string") out.relativePath = obj.relativePath;
+  if (Object.keys(out).length === 0) {
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === "snippet" || k === "body" || k === "content" || k === "text") continue;
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * S2a (§6.2.2, §6.2.4, §6.4, §8.1, Appendix B F8): fit an envelope body inside
+ * both `limits.tokenLimit` (e.g. 4,000 tokens) and `limits.charLimit` (e.g.
+ * Claude Code's 10,000-char inline cap) by walking the 8-step trim ladder:
+ *
+ * 1. `audit_tail` -> `0` entries
+ * 2. `recall` -> drop `episodic` first, then shrink `results` to top `1` + up to `2` corrections
+ * 3. `recent_learnings` -> `3` items (durable first; candidate lines dropped first)
+ * 4. `handoff_context` -> refs only (strip inline note bodies)
+ * 5. `pending_attention` -> `{ count }` summary
+ * 6. `layer1_shelf` -> `<= 4,000`-char boot form + marker (`inline_trim: true`)
+ * 7. `identity_body` -> `2,000` chars + `[identity_body: truncated at 2000 chars]`
+ * 8. `active_thread` -> `compactPlanPointer` form (`plan.ts:2589`)
+ *
+ * Non-trimmable floors (`contract`, `corrections_reassert`, `expired_handoffs`,
+ * `degraded`, and the Step 2–8 floors) are never dropped. If the envelope
+ * still exceeds either limit after Step 8, `over_budget: { tokens, budget,
+ * char_limit }` is attached.
+ */
+export function fitEnvelope<T extends EnvelopeBody>(
+  body: T,
+  limits: FitEnvelopeLimits,
+): T {
+  const working: Record<string, unknown> = { ...(body as Record<string, unknown>) };
+  const trimmed: Record<string, { from: number; to: number }> = {};
+  let currentNativeLayer1 = limits.nativeLayer1 ?? "";
+
+  const recordTrim = (section: string, from: number, to: number): void => {
+    const existing = trimmed[section];
+    trimmed[section] = {
+      from: existing ? existing.from : from,
+      to,
+    };
+    working.trimmed = { ...trimmed };
+  };
+
+  // Q2(a) / §6.2.4 / §8.3: when core.md itself exceeded the 8,192-byte reader
+  // cap (`truncated === true`), convert `layer1_shelf` to the <= 4,000-char
+  // boot form up front while preserving `truncated`, `omitted_bytes`, and `note`.
+  if (working.layer1_shelf && typeof working.layer1_shelf === "object") {
+    const shelf = working.layer1_shelf as Record<string, unknown>;
+    if (
+      shelf.ok === true &&
+      shelf.truncated === true &&
+      typeof shelf.content === "string" &&
+      shelf.inline_trim !== true
+    ) {
+      const fromChars = shelf.content.length;
+      const bootShelf = applyLayer1BootForm(
+        shelf,
+        limits.vaultPath,
+        LAYER1_BOOT_FORM_MAX_CHARS,
+      );
+      const toChars =
+        typeof bootShelf.content === "string" ? bootShelf.content.length : fromChars;
+      working.layer1_shelf = bootShelf;
+      recordTrim("layer1_shelf", fromChars, toChars);
+    }
+  }
+
+  const measure = (): { json: string; tokens: number; totalChars: number } => {
+    const json = serializeEnvelope(working);
+    const tokens = estimateTokens(json);
+    let totalChars = json.length;
+    if (limits.event || limits.agent) {
+      const ev = limits.event ?? "SessionStart";
+      const ag = limits.agent ?? "claudecode";
+      const open = `<minni:context version="${ENVELOPE_VERSION}" event="${ev}" agent="${ag}" tokens="${tokens}"${
+        limits.tokenLimit ? ` budget="${limits.tokenLimit}"` : ""
+      }>`;
+      const wrappedLen = open.length + 1 + json.length + 1 + "</minni:context>".length;
+      const nativePrefixLen = currentNativeLayer1 ? currentNativeLayer1.length + 2 : 0;
+      totalChars = nativePrefixLen + wrappedLen;
+    }
+    return { json, tokens, totalChars };
+  };
+
+  const needsTrim = (): boolean => {
+    const { tokens, totalChars } = measure();
+    if (tokens > limits.tokenLimit) return true;
+    if (limits.charLimit !== undefined && totalChars > limits.charLimit) return true;
+    return false;
+  };
+
+  if (!needsTrim()) {
+    return working as T;
+  }
+
+  // Step 1: audit_tail -> 0 entries
+  if (Array.isArray(working.audit_tail) && working.audit_tail.length > 0) {
+    const from = working.audit_tail.length;
+    working.audit_tail = [];
+    recordTrim("audit_tail", from, 0);
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 2: recall -> drop episodic first, then shrink results to top 1 + up to 2 corrections
+  if (working.recall && typeof working.recall === "object") {
+    const rec = { ...(working.recall as Record<string, unknown>) };
+    const resArr = Array.isArray(rec.results) ? [...rec.results] : [];
+    const epArr = Array.isArray(rec.episodic) ? [...rec.episodic] : [];
+    const initialCount = resArr.length + epArr.length;
+
+    while (epArr.length > 0 && needsTrim()) {
+      epArr.pop();
+      rec.episodic = [...epArr];
+      rec.episodic_count = epArr.length;
+      working.recall = { ...rec };
+      recordTrim("recall", initialCount, resArr.length + epArr.length);
+    }
+
+    if (needsTrim() && resArr.length > 1) {
+      // Identify up to 2 correction indices beyond index 0 to protect at the floor.
+      const protectedCorrectionIndices = new Set<number>();
+      for (let i = 1; i < resArr.length; i += 1) {
+        if (isCorrectionItem(resArr[i]) && protectedCorrectionIndices.size < 2) {
+          protectedCorrectionIndices.add(i);
+        }
+      }
+      // Drop from the tail any item at index >= 1 that is NOT in protectedCorrectionIndices
+      for (let i = resArr.length - 1; i >= 1 && needsTrim(); i -= 1) {
+        if (protectedCorrectionIndices.has(i)) continue;
+        resArr.splice(i, 1);
+        rec.results = [...resArr];
+        if (typeof rec.count === "number") rec.count = resArr.length;
+        working.recall = { ...rec };
+        recordTrim("recall", initialCount, resArr.length + epArr.length);
+      }
+    }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 3: recent_learnings -> 3 (durable first; candidate lines dropped first)
+  if (working.recent_learnings !== undefined && needsTrim()) {
+    if (Array.isArray(working.recent_learnings) && working.recent_learnings.length > 3) {
+      const arr = working.recent_learnings as unknown[];
+      const from = arr.length;
+      const durable: unknown[] = [];
+      const candidates: unknown[] = [];
+      for (const item of arr) {
+        const isCand =
+          item !== null &&
+          typeof item === "object" &&
+          ((item as Record<string, unknown>).review_state === "candidate" ||
+            (item as Record<string, unknown>).status === "candidate");
+        if (isCand) candidates.push(item);
+        else durable.push(item);
+      }
+      const kept = [...durable, ...candidates].slice(0, 3);
+      working.recent_learnings = kept;
+      recordTrim("recent_learnings", from, kept.length);
+    } else if (
+      working.recent_learnings !== null &&
+      typeof working.recent_learnings === "object"
+    ) {
+      const rl = working.recent_learnings as Record<string, unknown>;
+      if (typeof rl.context === "string") {
+        const lines = rl.context.split("\n");
+        const headerLines: string[] = [];
+        const durableBullets: string[] = [];
+        const candidateBullets: string[] = [];
+        for (const line of lines) {
+          if (/^\s*-\s/.test(line)) {
+            if (/\bcandidate\b|\[candidate\]/i.test(line)) {
+              candidateBullets.push(line);
+            } else {
+              durableBullets.push(line);
+            }
+          } else if (durableBullets.length === 0 && candidateBullets.length === 0) {
+            headerLines.push(line);
+          }
+        }
+        const totalBullets = durableBullets.length + candidateBullets.length;
+        if (totalBullets > 3) {
+          const keptBullets = [...durableBullets, ...candidateBullets].slice(0, 3);
+          working.recent_learnings = {
+            ...rl,
+            context: [...headerLines, ...keptBullets].join("\n"),
+          };
+          recordTrim("recent_learnings", totalBullets, keptBullets.length);
+        }
+      }
+    }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 4: handoff_context -> refs only (strip inline note bodies)
+  if (working.handoff_context !== undefined && needsTrim()) {
+    if (Array.isArray(working.handoff_context) && working.handoff_context.length > 0) {
+      const hc = working.handoff_context as unknown[];
+      const fromChars = stableStringify(hc).length;
+      const stripped = hc.map(stripHandoffBodyItem);
+      const toChars = stableStringify(stripped).length;
+      if (toChars < fromChars) {
+        working.handoff_context = stripped;
+        recordTrim("handoff_context", fromChars, toChars);
+      }
+    } else if (
+      working.handoff_context !== null &&
+      typeof working.handoff_context === "object"
+    ) {
+      const hcObj = working.handoff_context as Record<string, unknown>;
+      const fromChars = stableStringify(hcObj).length;
+      const strippedObj: Record<string, unknown> = { ...hcObj };
+      if (Array.isArray(strippedObj.snippets)) {
+        strippedObj.snippets = strippedObj.snippets.map(stripHandoffBodyItem);
+      }
+      if (Array.isArray(strippedObj.entries)) {
+        strippedObj.entries = strippedObj.entries.map(stripHandoffBodyItem);
+      }
+      const toChars = stableStringify(strippedObj).length;
+      if (toChars < fromChars) {
+        working.handoff_context = strippedObj;
+        recordTrim("handoff_context", fromChars, toChars);
+      }
+    }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 5: pending_attention -> { count } summary
+  if (working.pending_attention !== undefined && needsTrim()) {
+    if (Array.isArray(working.pending_attention) && working.pending_attention.length > 0) {
+      const from = working.pending_attention.length;
+      working.pending_attention = { count: from };
+      recordTrim("pending_attention", from, 1);
+    } else if (
+      working.pending_attention !== null &&
+      typeof working.pending_attention === "object"
+    ) {
+      const pa = working.pending_attention as Record<string, unknown>;
+      if (Array.isArray(pa.notifications)) {
+        const from = pa.notifications.length;
+        working.pending_attention = { count: from };
+        recordTrim("pending_attention", from, 1);
+      }
+    }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 6: layer1_shelf -> <= 4,000-char boot form + marker (inline_trim: true)
+  if (
+    working.layer1_shelf &&
+    typeof working.layer1_shelf === "object" &&
+    needsTrim()
+  ) {
+    const shelf = working.layer1_shelf as Record<string, unknown>;
+    if (
+      shelf.ok === true &&
+      typeof shelf.content === "string" &&
+      shelf.inline_trim !== true
+    ) {
+      const fromChars = shelf.content.length;
+      const bootShelf = applyLayer1BootForm(
+        shelf,
+        limits.vaultPath,
+        LAYER1_BOOT_FORM_MAX_CHARS,
+      );
+      const toChars =
+        typeof bootShelf.content === "string" ? bootShelf.content.length : fromChars;
+      working.layer1_shelf = bootShelf;
+      recordTrim("layer1_shelf", fromChars, toChars);
+    }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 7: identity_body -> 2,000 chars + [identity_body: truncated at 2000 chars]
+  if (needsTrim()) {
+    const marker = "\n[identity_body: truncated at 2000 chars]";
+    if (working.identity_body && typeof working.identity_body === "object") {
+      const idBody = working.identity_body as Record<string, unknown>;
+      if (typeof idBody.content === "string" && idBody.content.length > 2000) {
+        const fromChars = idBody.content.length;
+        const clipped =
+          idBody.content.slice(0, Math.max(0, 2000 - marker.length)) + marker;
+        working.identity_body = {
+          ...idBody,
+          content: clipped,
+          truncated: true,
+        };
+        recordTrim("identity_body", fromChars, clipped.length);
+      }
+    }
+    if (currentNativeLayer1.length > 2000 && needsTrim()) {
+      const fromChars = currentNativeLayer1.length;
+      currentNativeLayer1 =
+        currentNativeLayer1.slice(0, Math.max(0, 2000 - marker.length)) + marker;
+      limits.onNativeLayer1Trimmed?.(currentNativeLayer1);
+      recordTrim("identity_body", fromChars, currentNativeLayer1.length);
+    }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Step 8: active_thread -> compactPlanPointer form (plan.ts:2589)
+  if (
+    working.active_thread &&
+    typeof working.active_thread === "object" &&
+    needsTrim()
+  ) {
+    const at = working.active_thread as Record<string, unknown>;
+    if (typeof at.pull !== "string") {
+      const fromChars = stableStringify(at).length;
+      let pointer: Record<string, unknown>;
+      if (at.view && typeof at.view === "object") {
+        pointer = {
+          ...compactPlanPointer(
+            at as {
+              plan_id: string;
+              rev: number;
+              view: Parameters<typeof compactPlanPointer>[0]["view"];
+            },
+          ),
+          ...(at.shelf_drift !== undefined ? { shelf_drift: at.shelf_drift } : {}),
+        };
+      } else {
+        pointer = {
+          plan_id: typeof at.plan_id === "string" ? at.plan_id : "unknown",
+          rev: typeof at.rev === "number" ? at.rev : 0,
+          headline:
+            typeof at.headline === "string"
+              ? at.headline
+              : typeof at.title === "string"
+                ? at.title
+                : "",
+          next_action: typeof at.next_action === "string" ? at.next_action : "",
+          progress:
+            at.progress ?? {
+              total: 0,
+              completed: 0,
+              in_progress: 0,
+              pending: 0,
+              blocked: 0,
+            },
+          open_questions_count: Array.isArray(at.open_questions)
+            ? at.open_questions.length
+            : 0,
+          scar_tissue: typeof at.scar_tissue === "number" ? at.scar_tissue : 0,
+          pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_thread_status for detail on demand.",
+        };
+      }
+      const toChars = stableStringify(pointer).length;
+      working.active_thread = pointer;
+      recordTrim("active_thread", fromChars, toChars);
+    }
+    if (!needsTrim()) return working as T;
+  }
+
+  // Floor reached and still over budget: attach over_budget diagnostic
+  if (needsTrim()) {
+    const { tokens } = measure();
+    const overBudget: { tokens: number; budget: number; char_limit?: number } = {
+      tokens,
+      budget: limits.tokenLimit,
+      ...(limits.charLimit !== undefined ? { char_limit: limits.charLimit } : {}),
+    };
+    working.over_budget = overBudget;
+    overBudget.tokens = measure().tokens;
+  }
+
+  return working as T;
 }
 
 export function envelopeBudgetFor(contextWindow: number): number {
@@ -194,3 +685,4 @@ export function hashTaskSignature(text: string): string {
   }
   return `t${(hash >>> 0).toString(16)}`;
 }
+

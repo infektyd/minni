@@ -18,12 +18,14 @@
 // everywhere is what silently voided Codex's PreCompact output and discarded
 // Grok Build's memory outright.
 import fs from "node:fs";
+import path from "node:path";
 
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
   buildLifecycleEmphasis,
   envelopeBudgetFor,
+  fitEnvelope,
   hashTaskSignature,
   lifecycleNudgeMode,
   lifecycleSurfaceForIntent,
@@ -175,6 +177,7 @@ async function auditLedgerFailures(config: AgentHookConfig): Promise<void> {
   }
 }
 import {
+  assertWriteTargetUnder,
   auditTail,
   collectCorrectionsReassert,
   ensureVault,
@@ -195,6 +198,62 @@ import {
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
+
+/**
+ * S2a (§8.1): check whether `MINNI_BOOT_FIT` is enabled (`"on"` by default)
+ * without importing `flags.js` when `MINNI_USE_LEDGER` is off (preserving the
+ * zero-capture-module-load guarantee pinned by `use-telemetry-flag-off-cost`
+ * and `use-telemetry-session-start-audit`). When `ledger` is open, callers read
+ * `ledger.capture.context.features.includes("MINNI_BOOT_FIT")` instead.
+ */
+function isBootFitEnabled(vaultPath: string): boolean {
+  const rawEnv = process.env.MINNI_BOOT_FIT;
+  if (typeof rawEnv === "string") {
+    const trimmed = rawEnv.trim();
+    if (trimmed === "off") return false;
+    if (trimmed === "on") return true;
+  }
+  if (!vaultPath || typeof vaultPath !== "string") return true;
+  const flagsPath = path.join(vaultPath, ".runtime", "flags.json");
+  let fd: number | undefined;
+  try {
+    assertWriteTargetUnder(flagsPath, vaultPath);
+    const openFlags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    fd = fs.openSync(flagsPath, openFlags);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0 || st.size > 65_536) return true;
+    const buf = Buffer.alloc(st.size);
+    let total = 0;
+    while (total < st.size) {
+      const n = fs.readSync(fd, buf, total, st.size - total, total);
+      if (n <= 0) break;
+      total += n;
+    }
+    const parsed: unknown = JSON.parse(buf.subarray(0, total).toString("utf8"));
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const val = (parsed as Record<string, unknown>).MINNI_BOOT_FIT;
+      if (typeof val === "string") {
+        const t = val.trim();
+        if (t === "off") return false;
+        if (t === "on") return true;
+      }
+    }
+  } catch {
+    // Fall back to default "on".
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
+  }
+  return true;
+}
 
 /**
  * Confirm delivery=true only when HOST_INJECTION_TABLE says this host+hook
@@ -1300,6 +1359,10 @@ export function createHookHandlers(
       config.ackPendingHandoffsAtBoot && !pendingHandoffs.ok ? "handoff_leases" : undefined,
     ].filter((section): section is string => section !== undefined);
 
+    const bootFitOn = ledger
+      ? ledger.capture.context.features.includes("MINNI_BOOT_FIT")
+      : isBootFitEnabled(config.vaultPath);
+
     const envelopeBody: Record<string, unknown> = {
       contract: MEMORY_CONTRACT,
       identity: {
@@ -1352,7 +1415,7 @@ export function createHookHandlers(
           : { ok: false, status: "error", error: contradictions.error },
       recall:
         recall.ok && recall.data
-          ? buildBootRecallSlice(recall.data, config.agentId)
+          ? buildBootRecallSlice(recall.data, config.agentId, { diet: bootFitOn })
           : { ok: false, error: recall.error },
       ...(tail !== undefined
         ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }
@@ -1441,11 +1504,30 @@ export function createHookHandlers(
       }
     }
 
+    let nativeLayer1 =
+      bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
+        ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
+        : "";
+
+    const bodyForEnvelope = bootFitOn
+      ? fitEnvelope(envelopeBody, {
+          tokenLimit: budget,
+          charLimit: wireCapabilities(wire).hostInlineCapChars,
+          vaultPath: config.vaultPath,
+          event: "SessionStart",
+          agent: config.agentId,
+          nativeLayer1,
+          onNativeLayer1Trimmed: (trimmedNative) => {
+            nativeLayer1 = trimmedNative;
+          },
+        })
+      : envelopeBody;
+
     const envelope = wrapEnvelope({
       event: "SessionStart",
       agent: config.agentId,
       budget,
-      body: envelopeBody,
+      body: bodyForEnvelope,
     });
 
     await recordAudit(config.vaultPath, {
@@ -1481,14 +1563,30 @@ export function createHookHandlers(
       },
     });
 
-    const nativeLayer1 =
-      bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
-        ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
-        : "";
     const bootText = [nativeLayer1, envelope].filter(Boolean).join("\n\n");
+    const fittedRecall =
+      bootFitOn &&
+      bodyForEnvelope.recall !== null &&
+      typeof bodyForEnvelope.recall === "object"
+        ? (bodyForEnvelope.recall as Record<string, unknown>)
+        : undefined;
+    const recallForCapture: typeof recall =
+      bootFitOn && recall.ok && recall.data && Array.isArray(fittedRecall?.results)
+        ? {
+            ...recall,
+            data: {
+              ...recall.data,
+              results: fittedRecall.results as unknown[],
+            },
+          }
+        : recall;
     // S1a-2: what this boot surfaced, judged on the exact emitted string. The
     // rows are deferred and land only once this output does.
-    ledger?.api.captureBootSurfacings(ledger.capture, { emitted: bootText, recall, identity: identityRead });
+    ledger?.api.captureBootSurfacings(ledger.capture, {
+      emitted: bootText,
+      recall: recallForCapture,
+      identity: identityRead,
+    });
     return render(injectIntent("SessionStart", bootText));
   }
 

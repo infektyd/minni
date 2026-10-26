@@ -4765,3 +4765,121 @@ export function layer1ShelfBody(result: Layer1ShelfResult): Record<string, unkno
       : {}),
   };
 }
+
+/**
+ * S2a (§6.2.4, §8.3): 4,000-char ceiling for the inlined Layer 1 shelf boot
+ * form. The raw reader (`readLayer1Shelf`, `LAYER1_SHELF_MAX_BYTES = 8192`)
+ * stays untouched so `resolveActivePlanView` / `shelfDrift` always hash the
+ * full shelf content before any boot-form inline trim occurs.
+ */
+export const LAYER1_BOOT_FORM_MAX_CHARS = 4000;
+
+/**
+ * Safely read `<vault>/layer1/boot.md` when present as a regular file inside
+ * the vault. Refuses symlinks (`O_NOFOLLOW`) and FIFOs (`O_NONBLOCK` +
+ * `fstatSync(fd).isFile()`). Returns `null` when absent, empty, or refused.
+ */
+export function readLayer1BootFileSync(vaultPath: string): string | null {
+  if (!vaultPath || typeof vaultPath !== "string") return null;
+  const bootPath = path.join(vaultPath, "layer1", "boot.md");
+  let fd: number | undefined;
+  try {
+    assertWriteTargetUnder(bootPath, vaultPath);
+    const flags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    fd = fs.openSync(bootPath, flags);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0) return null;
+    const cap = Math.min(st.size, LAYER1_SHELF_MAX_BYTES);
+    const buf = Buffer.alloc(cap);
+    let total = 0;
+    while (total < cap) {
+      const n = fs.readSync(fd, buf, total, cap - total, total);
+      if (n <= 0) break;
+      total += n;
+    }
+    if (total <= 0) return null;
+    const text = buf.subarray(0, total).toString("utf8");
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close errors.
+      }
+    }
+  }
+}
+
+/**
+ * Build the `<= 4,000`-char Layer 1 boot form string from `sourceContent`
+ * (`layer1/boot.md` when present, else `layer1/core.md`), clipping at a
+ * paragraph boundary (`\n\n`) when needed and appending the explicit marker:
+ * `[layer1 shelf: boot form, <n> of <m> chars; full file: layer1/core.md]`.
+ */
+export function formatLayer1BootFormContent(
+  sourceContent: string,
+  totalCoreChars: number,
+  maxChars: number = LAYER1_BOOT_FORM_MAX_CHARS,
+): string {
+  const m = Math.max(totalCoreChars, sourceContent.length);
+  const worstMarker = `\n\n[layer1 shelf: boot form, ${maxChars} of ${Math.max(m, maxChars)} chars; full file: layer1/core.md]`;
+  const maxExcerpt = Math.max(0, maxChars - worstMarker.length);
+  let excerpt: string;
+  if (sourceContent.length <= maxExcerpt) {
+    excerpt = sourceContent;
+  } else {
+    const slice = sourceContent.slice(0, maxExcerpt);
+    const lastParagraph = slice.lastIndexOf("\n\n");
+    excerpt = lastParagraph > 0 ? slice.slice(0, lastParagraph) : slice;
+  }
+  const n = excerpt.length;
+  const sep = n > 0 ? "\n\n" : "";
+  return `${excerpt}${sep}[layer1 shelf: boot form, ${n} of ${m} chars; full file: layer1/core.md]`;
+}
+
+/**
+ * Convert a `layer1_shelf` envelope object into its `<= 4,000`-char boot form,
+ * preserving all reader fields (`ok`, `truncated`, `omitted_bytes`, `note`) and
+ * setting `inline_trim: true`.
+ */
+export function applyLayer1BootForm(
+  shelfBody: Record<string, unknown>,
+  vaultPath?: string,
+  maxChars: number = LAYER1_BOOT_FORM_MAX_CHARS,
+): Record<string, unknown> {
+  if (
+    !shelfBody ||
+    typeof shelfBody !== "object" ||
+    shelfBody.ok !== true ||
+    typeof shelfBody.content !== "string"
+  ) {
+    return shelfBody;
+  }
+  if (shelfBody.inline_trim === true && shelfBody.content.length <= maxChars) {
+    return shelfBody;
+  }
+  const rawContent = shelfBody.content;
+  const omittedBytes =
+    shelfBody.truncated === true && typeof shelfBody.omitted_bytes === "number"
+      ? shelfBody.omitted_bytes
+      : 0;
+  const totalCoreChars =
+    shelfBody.truncated === true
+      ? Math.max(rawContent.length, LAYER1_SHELF_MAX_BYTES) + omittedBytes
+      : rawContent.length;
+  const bootFileContent = vaultPath ? readLayer1BootFileSync(vaultPath) : null;
+  const sourceContent = bootFileContent ?? rawContent;
+  const bootContent = formatLayer1BootFormContent(sourceContent, totalCoreChars, maxChars);
+  return {
+    ...shelfBody,
+    content: bootContent,
+    inline_trim: true,
+  };
+}
+

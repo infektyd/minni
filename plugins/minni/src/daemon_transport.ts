@@ -233,23 +233,120 @@ export const BOOT_RECALL_LAYERS: ReadonlyArray<string> = ["identity", "knowledge
  * the raw array, and only when something is actually wrong: the boot envelope
  * is context-budgeted, and a healthy report is per-corpus noise nobody reads.
  */
+export interface BootRecallSliceOptions {
+  /**
+   * S2a (§6.2.1, §8.1): when true (default, `MINNI_BOOT_FIT=on`), projects each
+   * result to `{ wikilink, title, text, confidence?, score?, layer,
+   * review_state, age_days, correction? }`, caps `results` to at most 3
+   * non-identity items + up to 2 extra correction-salience items, caps
+   * `episodic` to 2, and attaches `note` when both `results` and `episodic`
+   * are empty. When false (`MINNI_BOOT_FIT=off`), returns the legacy slice.
+   */
+  diet?: boolean;
+}
+
+function isBootCorrectionResult(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object") return false;
+  const r = raw as Record<string, unknown>;
+  if (r.correction === true) return true;
+  const layer = typeof r.layer === "string" ? r.layer.toLowerCase() : "";
+  if (layer === "corrections" || layer === "correction") return true;
+  const reviewState = typeof r.review_state === "string" ? r.review_state.toLowerCase() : "";
+  if (reviewState === "correction" || reviewState === "contradicted") return true;
+  const kind = typeof r.kind === "string" ? r.kind.toLowerCase() : "";
+  if (kind === "correction") return true;
+  return false;
+}
+
+function projectBootRecallResult(raw: unknown): unknown {
+  if (raw === null || typeof raw !== "object") return raw;
+  const r = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  if (typeof r.wikilink === "string") out.wikilink = r.wikilink;
+  if (typeof r.title === "string") out.title = r.title;
+  const text =
+    typeof r.text === "string"
+      ? r.text
+      : typeof r.snippet === "string"
+        ? r.snippet
+        : undefined;
+  if (text !== undefined) out.text = text;
+  if (typeof r.confidence === "number" && Number.isFinite(r.confidence)) {
+    out.confidence = r.confidence;
+  }
+  if (typeof r.score === "number" && Number.isFinite(r.score)) {
+    out.score = r.score;
+  }
+  if (typeof r.layer === "string") out.layer = r.layer;
+  if (typeof r.review_state === "string") out.review_state = r.review_state;
+  if (typeof r.age_days === "number" && Number.isFinite(r.age_days)) {
+    out.age_days = r.age_days;
+  }
+  if (isBootCorrectionResult(r)) {
+    out.correction = true;
+  }
+  // Preserve daemon identity metadata as non-enumerable properties so the S1a-2
+  // use-ledger capture (`daemonRef`) can still derive `mkey` (`doc:<src>:<id>`
+  // or `vault:<rel>`) while JSON/stableStringify serialization omits them.
+  for (const hiddenKey of ["src", "doc_id", "source", "filename"] as const) {
+    if (r[hiddenKey] !== undefined) {
+      Object.defineProperty(out, hiddenKey, {
+        value: r[hiddenKey],
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return out;
+}
+
 export function buildBootRecallSlice(
   data: RecallResponse,
   agentFallback: string,
+  options?: BootRecallSliceOptions,
 ): {
   ok: true;
   results: RecallResponse["results"];
+  count?: number;
   episodic: unknown[];
   episodic_count: number;
   agent_origin: string;
   layer: RecallResponse["layer"];
   layers: ReadonlyArray<string>;
+  note?: string;
   degraded?: true;
   degradation_notes?: string[];
 } {
-  const episodic = Array.isArray(data.episodic) ? data.episodic : [];
-  const episodic_count =
-    typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
+  const diet = options?.diet !== false;
+  const rawEpisodic = Array.isArray(data.episodic) ? data.episodic : [];
+  const episodic = diet ? rawEpisodic.slice(0, 2) : rawEpisodic;
+  const episodic_count = diet
+    ? episodic.length
+    : typeof data.episodic_count === "number"
+      ? data.episodic_count
+      : episodic.length;
+
+  let results: RecallResponse["results"] = data.results;
+  let count: number | undefined = data.count;
+  if (diet && Array.isArray(data.results)) {
+    const nonIdentity = data.results.filter((item) => {
+      if (item === null || typeof item !== "object") return true;
+      const layer = (item as Record<string, unknown>).layer;
+      return layer !== "identity";
+    });
+    const topThree = nonIdentity.slice(0, 3);
+    const extraCorrections = nonIdentity
+      .slice(3)
+      .filter((item) => isBootCorrectionResult(item))
+      .slice(0, 2);
+    const projected = [...topThree, ...extraCorrections].map((item) =>
+      projectBootRecallResult(item),
+    );
+    results = projected;
+    count = projected.length;
+  }
+
   // Only routine foreign-scope blackouts are dropped; a non-routine read-gate
   // suppression must reach the boot envelope the same way formatRecall renders it.
   const notes = formatDegradation({
@@ -258,14 +355,20 @@ export function buildBootRecallSlice(
       (entry) => !isRoutineForeignScopeSuppression((entry ?? {}) as Record<string, unknown>),
     ),
   });
+  const isEmptyRecall =
+    diet &&
+    (!Array.isArray(results) || results.length === 0) &&
+    episodic.length === 0;
   return {
     ok: true,
-    results: data.results,
+    results,
+    ...(count !== undefined ? { count } : {}),
     episodic,
     episodic_count,
     agent_origin: data.agent_id ?? agentFallback,
     layer: data.layer,
     layers: BOOT_RECALL_LAYERS,
+    ...(isEmptyRecall ? { note: "no boot recall results; call minni_recall" } : {}),
     ...(notes ? { degraded: true as const, degradation_notes: notes.split("\n") } : {}),
   };
 }
