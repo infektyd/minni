@@ -18,6 +18,8 @@
 // for trigger words". Recall runs as before; the pointer + state are emitted
 // ONLY when the recall itself is strong (top strength ≥ a configurable
 // threshold). Weak/absent hits inject nothing and write no state.
+import { createHash, randomBytes } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 
@@ -27,6 +29,12 @@ import { assertWriteTargetUnder } from "./vault.js";
 
 /** Relative location of the recall-state file under the vault. Portable across agents. */
 export const RECALL_STATE_RELPATH = path.join(".runtime", "recall-state.json");
+
+/** S2b (§6.3.1): session-scoped recall-state directory under the vault. */
+export const RECALL_STATE_DIR_RELPATH = path.join(".runtime", "recall-state.d");
+
+/** S2b (§6.3.2): retention horizon for .claim files under recall-state.d (24h). */
+export const CLAIM_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Default strength threshold for emitting the per-turn pointer + state file.
@@ -104,6 +112,21 @@ export interface RecallState {
   /** s6 guard sets this true once it has surfaced the pointer; reset false each new turn. */
   consumed: boolean;
   ts: string;
+  /** S2b (§6.3.1): raw session_id that armed this state (omitted when unlabeled). */
+  session_id?: string;
+  /** S2b (§6.3.1): agent_id from the arming payload, when present. */
+  agent_id?: string;
+  /** S2b (§6.3.1): prompt_id from the arming payload, when present. */
+  prompt_id?: string;
+  /** S2b (§6.3.4): wikilinks/titles/handles already surfaced in the UPS pointer. */
+  pointer_named?: string[];
+  /** S2b (§6.3.2): fresh random nonce per arming so re-planting is a new arming. */
+  arming_id?: string;
+}
+
+export interface RecallStateOptions {
+  sessionId?: string;
+  guardV2?: boolean;
 }
 
 export interface StrongRecall {
@@ -209,46 +232,148 @@ export function recallStatePath(vaultPath: string): string {
   return path.join(vaultPath, RECALL_STATE_RELPATH);
 }
 
+const HEX16_RE = /^[0-9a-f]{16}$/;
+const SAFE_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
 /**
- * Persist the strong recall for this turn. `consumed` is always written false:
- * a new task_signature is a new turn, and the s6 guard flips it to true once it
- * has surfaced the pointer. Best-effort: a write failure must never break the
- * hook, so the caller treats a thrown error as "no state written".
+ * S2b (§6.3.1): derive the 16-hex session key for a raw session_id (matching
+ * use-ledger.ts sessionKeyFrom). Returns null when unlabeled or synthetic "session".
  */
-export async function writeRecallState(
-  vaultPath: string,
-  state: Omit<RecallState, "consumed" | "ts"> & { ts?: string },
-): Promise<string> {
-  const filePath = recallStatePath(vaultPath);
-  await mkdir(path.dirname(filePath), { recursive: true });
-  // H2: the state file lives under the vault, which is writable by any local
-  // process. A bare writeFile follows symlinks — an attacker who points
-  // <vault>/.runtime (or the target file itself) outside the vault could
-  // redirect this write. Reject any symlink escape before writing.
-  assertWriteTargetUnder(filePath, vaultPath);
-  const existing = await readRecallState(vaultPath).catch(() => null);
-  const preserveConsumed =
-    existing !== null &&
-    existing.task_signature === state.task_signature &&
-    existing.consumed === true;
-  const payload: RecallState = {
-    task_signature: state.task_signature,
-    intent: state.intent,
-    top_hits: state.top_hits,
-    top_score: state.top_score,
-    consumed: preserveConsumed,
-    ts: state.ts ?? new Date().toISOString(),
-  };
-  await writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");
-  return filePath;
+export function sessionStateKey(sessionId?: string): string | null {
+  const trimmed = typeof sessionId === "string" ? sessionId.trim() : "";
+  if (!trimmed || trimmed === "session") return null;
+  if (HEX16_RE.test(trimmed)) return trimmed;
+  return createHash("sha256").update(trimmed, "utf8").digest("hex").slice(0, 16);
 }
 
-/** Read the recall-state file, or null when absent/malformed. */
-export async function readRecallState(vaultPath: string): Promise<RecallState | null> {
-  const filePath = recallStatePath(vaultPath);
+/** Absolute path to the session-scoped recall-state file, or null when unlabeled. */
+export function recallStateSessionPath(vaultPath: string, sessionId?: string): string | null {
+  const key = sessionStateKey(sessionId);
+  if (!key) return null;
+  return path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${key}.json`);
+}
+
+/**
+ * S2b (§6.3.2, §6.3.3): derive the arming key for claimArming.
+ * Uses `state.arming_id` when present, else `sha1(task_signature + ts)[:16]`.
+ */
+export function armingKeyFor(
+  state: Pick<RecallState, "task_signature"> & { ts?: string; arming_id?: string },
+): string {
+  const armingId = typeof state.arming_id === "string" ? state.arming_id.trim() : "";
+  if (armingId && SAFE_TOKEN_RE.test(armingId)) return armingId;
+  return createHash("sha1")
+    .update(`${state.task_signature}${state.ts ?? ""}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function safeClaimSegment(raw: string | undefined, fallback: string): string {
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  if (!trimmed) return fallback;
+  if (SAFE_TOKEN_RE.test(trimmed)) return trimmed;
+  return createHash("sha256").update(trimmed, "utf8").digest("hex").slice(0, 16);
+}
+
+/**
+ * S2b (§6.3.2): best-effort prune of `.claim` files in `<vault>/.runtime/recall-state.d`
+ * older than `maxAgeMs` (default 24h). Never follows symlinks and never throws.
+ */
+export function pruneOldClaimFiles(
+  vaultPath: string,
+  nowMs: number = Date.now(),
+  maxAgeMs: number = CLAIM_RETENTION_MS,
+): number {
+  let removed = 0;
   try {
-    // Mirror write policy: refuse to follow a symlinked state file or
-    // .runtime parent that escapes the vault (Issue: path disclosure via GET).
+    const dirPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH);
+    assertWriteTargetUnder(dirPath, vaultPath);
+    const dirStat = fs.lstatSync(dirPath);
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return 0;
+    for (const name of fs.readdirSync(dirPath)) {
+      if (!name.endsWith(".claim")) continue;
+      try {
+        const target = path.join(dirPath, name);
+        const st = fs.lstatSync(target);
+        if (!st.isFile() || st.isSymbolicLink()) continue;
+        if (nowMs - st.mtimeMs > maxAgeMs) {
+          fs.unlinkSync(target);
+          removed += 1;
+        }
+      } catch {
+        // Ignore per-entry errors.
+      }
+    }
+  } catch {
+    // Best-effort cleanup.
+  }
+  return removed;
+}
+
+function ensureContainedDir(
+  vaultPath: string,
+  segments: readonly string[],
+  create: boolean,
+): string | null {
+  let current = vaultPath;
+  for (const segment of segments) {
+    const next = path.join(current, segment);
+    assertWriteTargetUnder(next, vaultPath);
+    if (!fs.existsSync(next)) {
+      if (!create) return null;
+      fs.mkdirSync(next, { mode: 0o700 });
+    }
+    const st = fs.lstatSync(next);
+    if (!st.isDirectory()) {
+      throw new Error(`write path component is not a directory: ${next}`);
+    }
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * S2b (§6.3.2): atomically claim an arming once across concurrent PreToolUse
+ * processes using `O_CREAT | O_EXCL` (`wx`, mode `0o600`) on
+ * `<vault>/.runtime/recall-state.d/<safeSessionKey>.<safeArmingKey>.claim`.
+ * Returns true for the single winner, false on EEXIST or any error.
+ */
+export async function claimArming(
+  vaultPath: string,
+  sessionKey: string | undefined,
+  armingKey: string,
+): Promise<boolean> {
+  let fd: number | undefined;
+  try {
+    const sKey = sessionStateKey(sessionKey) ?? safeClaimSegment(sessionKey, "default");
+    const aKey = safeClaimSegment(armingKey, "arming");
+    const dirPath = ensureContainedDir(vaultPath, [".runtime", "recall-state.d"], true);
+    if (!dirPath) return false;
+    const claimPath = path.join(dirPath, `${sKey}.${aKey}.claim`);
+    assertWriteTargetUnder(claimPath, vaultPath);
+    const flags =
+      fs.constants.O_CREAT |
+      fs.constants.O_EXCL |
+      fs.constants.O_WRONLY |
+      (fs.constants.O_NOFOLLOW ?? 0);
+    fd = fs.openSync(claimPath, flags, 0o600);
+    fs.writeSync(fd, `${process.pid} ${Date.now()}\n`);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
+  }
+}
+
+async function readStateFileAt(filePath: string, vaultPath: string): Promise<RecallState | null> {
+  try {
     assertWriteTargetUnder(filePath, vaultPath);
     const raw = await readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as RecallState;
@@ -275,55 +400,216 @@ export async function readRecallState(vaultPath: string): Promise<RecallState | 
   return null;
 }
 
-/** Remove the recall-state file (used on weak turns to clear a stale strong pointer). */
-export async function clearRecallState(vaultPath: string): Promise<void> {
-  const filePath = recallStatePath(vaultPath);
-  // H2: a bare rm follows a parent dir symlink — <vault>/.runtime → outside
-  // would unlink the real file in the escape target. Write/markConsumed already
-  // refuse that; clear must too. Callers treat a throw as best-effort no-op.
+async function writeStateFileAtomic(
+  filePath: string,
+  vaultPath: string,
+  payload: RecallState,
+): Promise<void> {
+  const relDir = path.relative(vaultPath, path.dirname(filePath));
+  const segments = relDir.split(path.sep).filter(Boolean);
+  ensureContainedDir(vaultPath, segments, true);
   assertWriteTargetUnder(filePath, vaultPath);
-  await rm(filePath, { force: true });
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    await writeFile(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
+    await rename(tmpPath, filePath);
+  } catch (writeErr) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw writeErr;
+  }
 }
 
 /**
- * s6 guard: flip `consumed` to true in place after the guard has surfaced the
- * recall (denied once). This is the load-bearing idempotency write — once set,
- * the s6 guard ALLOWS every subsequent tool call this turn, so the re-issued
- * call always passes. Best-effort: returns false on any read/write failure so a
- * persistence hiccup degrades to "allow next time" rather than a block loop.
+ * Persist the strong recall for this turn. `consumed` is always written false:
+ * a new task_signature is a new turn, and the s6 guard flips it to true once it
+ * has surfaced the pointer. Best-effort: a write failure must never break the
+ * hook, so the caller treats a thrown error as "no state written".
  */
-export async function markRecallConsumed(vaultPath: string): Promise<boolean> {
-  const filePath = recallStatePath(vaultPath);
+export async function writeRecallState(
+  vaultPath: string,
+  state: Omit<RecallState, "consumed" | "ts"> & { ts?: string; consumed?: boolean },
+  options?: RecallStateOptions,
+): Promise<string> {
+  const mirrorPath = recallStatePath(vaultPath);
+  const rawSession =
+    (typeof state.session_id === "string" && state.session_id.trim()) ||
+    (typeof options?.sessionId === "string" && options.sessionId.trim()) ||
+    undefined;
+  const effectiveSessionId =
+    rawSession && rawSession !== "session" ? rawSession : undefined;
+  await mkdir(path.dirname(mirrorPath), { recursive: true });
+  // H2: the state file lives under the vault, which is writable by any local
+  // process. A bare writeFile follows symlinks — an attacker who points
+  // <vault>/.runtime (or the target file itself) outside the vault could
+  // redirect this write. Reject any symlink escape before writing.
+  assertWriteTargetUnder(mirrorPath, vaultPath);
+  const existing = await readRecallState(vaultPath, {
+    sessionId: effectiveSessionId,
+    guardV2: options?.guardV2,
+  }).catch(() => null);
+  const preserveConsumed =
+    state.consumed === true ||
+    (existing !== null &&
+      existing.task_signature === state.task_signature &&
+      existing.consumed === true);
+  const payload: RecallState = {
+    task_signature: state.task_signature,
+    intent: state.intent,
+    top_hits: state.top_hits,
+    top_score: state.top_score,
+    consumed: preserveConsumed,
+    ts: state.ts ?? new Date().toISOString(),
+    ...(effectiveSessionId ? { session_id: effectiveSessionId } : {}),
+    ...(typeof state.agent_id === "string" && state.agent_id.trim()
+      ? { agent_id: state.agent_id.trim() }
+      : {}),
+    ...(typeof state.prompt_id === "string" && state.prompt_id.trim()
+      ? { prompt_id: state.prompt_id.trim() }
+      : {}),
+    ...(Array.isArray(state.pointer_named)
+      ? { pointer_named: [...state.pointer_named] }
+      : {}),
+    arming_id:
+      preserveConsumed && existing?.arming_id
+        ? existing.arming_id
+        : state.arming_id ?? randomBytes(8).toString("hex"),
+  };
+  if (effectiveSessionId && options?.guardV2 !== false) {
+    const sessionFile = recallStateSessionPath(vaultPath, effectiveSessionId);
+    if (sessionFile) {
+      await writeStateFileAtomic(sessionFile, vaultPath, payload);
+    }
+  }
+  await writeFile(mirrorPath, JSON.stringify(payload, null, 2), "utf8");
+  return mirrorPath;
+}
+
+/** Read the recall-state file, or null when absent/malformed. */
+export async function readRecallState(
+  vaultPath: string,
+  options?: RecallStateOptions,
+): Promise<RecallState | null> {
+  const sessionId =
+    typeof options?.sessionId === "string" &&
+    options.sessionId.trim() &&
+    options.sessionId.trim() !== "session"
+      ? options.sessionId.trim()
+      : undefined;
+  if (sessionId && options?.guardV2 !== false) {
+    const sessionFile = recallStateSessionPath(vaultPath, sessionId);
+    if (sessionFile) {
+      const scoped = await readStateFileAt(sessionFile, vaultPath);
+      if (scoped !== null) return scoped;
+    }
+    const mirror = await readStateFileAt(recallStatePath(vaultPath), vaultPath);
+    if (
+      mirror &&
+      (!mirror.session_id ||
+        mirror.session_id === sessionId ||
+        sessionStateKey(mirror.session_id) === sessionStateKey(sessionId))
+    ) {
+      return mirror;
+    }
+    return null;
+  }
+  const mirror = await readStateFileAt(recallStatePath(vaultPath), vaultPath);
+  if (options?.guardV2 && mirror?.session_id) return null;
+  return mirror;
+}
+
+/** Remove the recall-state file (used on weak turns to clear a stale strong pointer). */
+export async function clearRecallState(
+  vaultPath: string,
+  options?: RecallStateOptions,
+): Promise<void> {
+  const mirrorPath = recallStatePath(vaultPath);
+  // H2: a bare rm follows a parent dir symlink — <vault>/.runtime → outside
+  // would unlink the real file in the escape target. Write/markConsumed already
+  // refuse that; clear must too. Callers treat a throw as best-effort no-op.
+  assertWriteTargetUnder(mirrorPath, vaultPath);
+  const sessionId =
+    typeof options?.sessionId === "string" &&
+    options.sessionId.trim() &&
+    options.sessionId.trim() !== "session"
+      ? options.sessionId.trim()
+      : undefined;
+  if (sessionId && options?.guardV2 !== false) {
+    const sessionFile = recallStateSessionPath(vaultPath, sessionId);
+    if (sessionFile) {
+      const dir = ensureContainedDir(vaultPath, [".runtime", "recall-state.d"], false);
+      if (dir) {
+        assertWriteTargetUnder(sessionFile, vaultPath);
+        await rm(sessionFile, { force: true });
+      }
+    }
+    const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
+    if (
+      !mirror ||
+      !mirror.session_id ||
+      mirror.session_id === sessionId ||
+      sessionStateKey(mirror.session_id) === sessionStateKey(sessionId)
+    ) {
+      await rm(mirrorPath, { force: true });
+    }
+    return;
+  }
+  if (options?.guardV2) {
+    const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
+    if (mirror?.session_id) return;
+  }
+  await rm(mirrorPath, { force: true });
+}
+
+async function markFileConsumed(filePath: string, vaultPath: string): Promise<boolean> {
   try {
-    // H2: refuse to read-modify-write through a symlinked state file or a
-    // symlinked .runtime parent that escapes the vault. Fail closed (return
-    // false via the catch) rather than following the link out of the vault.
     assertWriteTargetUnder(filePath, vaultPath);
     const raw = await readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as RecallState;
     if (!parsed || typeof parsed !== "object") return false;
     parsed.consumed = true;
-    // NEW-03/PR90-3: atomic write. Parallel tool batches run as separate hook
-    // processes that each read-modify-write this file; a direct writeFile can
-    // interleave and leave a reader seeing truncated/half-written JSON. Write a
-    // unique temp sibling, then rename into place (atomic on the same FS). All
-    // racers write consumed=true, so the final state converges regardless of
-    // which rename wins last.
-    const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2)}`;
-    try {
-      await writeFile(tmpPath, JSON.stringify(parsed, null, 2), "utf8");
-      await rename(tmpPath, filePath);
-    } catch (writeErr) {
-      // Never leak the temp sibling — a failed write OR rename must clean up.
-      await rm(tmpPath, { force: true }).catch(() => {});
-      throw writeErr;
-    }
+    await writeStateFileAtomic(filePath, vaultPath, parsed);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * s6 guard: flip `consumed` to true in place after the guard has surfaced the
+ * recall (once). This is the load-bearing idempotency write — once set, the
+ * guard ALLOWS every subsequent tool call this turn, so the re-issued call
+ * always passes. Best-effort: returns false on any read/write failure so a
+ * persistence hiccup degrades to "allow next time" rather than a block loop.
+ */
+export async function markRecallConsumed(
+  vaultPath: string,
+  options?: RecallStateOptions,
+): Promise<boolean> {
+  const mirrorPath = recallStatePath(vaultPath);
+  const sessionId =
+    typeof options?.sessionId === "string" &&
+    options.sessionId.trim() &&
+    options.sessionId.trim() !== "session"
+      ? options.sessionId.trim()
+      : undefined;
+  if (sessionId && options?.guardV2 !== false) {
+    const sessionFile = recallStateSessionPath(vaultPath, sessionId);
+    const scopedOk = sessionFile ? await markFileConsumed(sessionFile, vaultPath) : false;
+    const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
+    let mirrorOk = false;
+    if (
+      mirror &&
+      (!mirror.session_id ||
+        mirror.session_id === sessionId ||
+        sessionStateKey(mirror.session_id) === sessionStateKey(sessionId))
+    ) {
+      mirrorOk = await markFileConsumed(mirrorPath, vaultPath);
+    }
+    return scopedOk || mirrorOk;
+  }
+  return markFileConsumed(mirrorPath, vaultPath);
 }
 
 /**

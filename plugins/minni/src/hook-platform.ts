@@ -137,8 +137,8 @@ export const claudeCodeWire: PlatformWire = {
   note: (_event, text) => ({ continue: true, systemMessage: text }),
   lastTaskText: snakeAssistantMessage,
   // 10,000 chars inline, then a 2,000-char preview (host docs; probe P6).
-  // preToolUseContext stays false until S2b ships context delivery.
-  capabilities: { hostInlineCapChars: 10_000, preToolUseContext: false, transcriptShape: "claude-code" },
+  // S2b (§6.3.3, §8.1): Claude Code PreToolUse supports hookSpecificOutput.additionalContext.
+  capabilities: { hostInlineCapChars: 10_000, preToolUseContext: true, transcriptShape: "claude-code" },
 };
 
 // --- Codex -----------------------------------------------------------------

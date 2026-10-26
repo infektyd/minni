@@ -24,6 +24,7 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "^(?:Grep|Read|Glob|grep|read_file|list_dir|Bash|run_terminal_command|Agent|Task|(?:mcp__.*__)?minni_(?:recall|drill))$",
         "hooks": [
           {
             "type": "command",
@@ -58,6 +59,26 @@
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js Stop"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SubagentStart"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SubagentStop"
           }
         ]
       }

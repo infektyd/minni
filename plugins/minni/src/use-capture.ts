@@ -975,6 +975,114 @@ export function captureGuardDeny(capture: UseCapture | undefined, state: RecallS
   }
 }
 
+export interface SubagentBriefCaptureInput {
+  /** The exact brief string SubagentStart emits in additionalContext. */
+  emitted: string;
+  parentState?: RecallState | null;
+  taskStrong?: StrongRecall | null;
+  taskRecall?: RecallResponse | undefined;
+  taskVaultResults?: readonly VaultSearchResult[];
+  threshold: number;
+}
+
+function keyFromVaultWikilink(vaultPath: string, wikilink: string): string | null {
+  const clean = wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "");
+  const inner = (clean.split("|")[0] ?? "").split("#")[0]?.trim() ?? "";
+  if (!inner || inner.includes("\0") || inner.startsWith("/") || inner.split("/").includes("..")) return null;
+  for (const candidate of [inner, `${inner}.md`, `wiki/${inner}`, `wiki/${inner}.md`]) {
+    try {
+      const full = path.join(vaultPath, candidate);
+      if (fs.statSync(full).isFile()) {
+        const key = memoryKeyFor({ kind: "vault", path: candidate }, vaultPath);
+        if (key && isValidMkey(key)) return key;
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+  return null;
+}
+
+/**
+ * S2b (§6.4): SubagentStart brief capture. Records one `surfaced` row with
+ * `channel: "subagent_brief"` per hit actually present in `emitted`, keyed from
+ * the parent session's `hit-keys.json` (or vault wikilink fallback) for parent
+ * hits and `topHitKeys` for task-specific recall hits. Never throws.
+ */
+export function captureSubagentBrief(capture: UseCapture | undefined, input: SubagentBriefCaptureInput): void {
+  if (capture === undefined || !input.emitted) return;
+  try {
+    const items: SurfacedItem[] = [];
+    const seenMkeys = new Set<string>();
+    const parentHits = Array.isArray(input.parentState?.top_hits)
+      ? input.parentState!.top_hits.slice(0, 3)
+      : [];
+    const parentKeys =
+      input.parentState && typeof input.parentState.task_signature === "string"
+        ? readHitKeys(capture, input.parentState.task_signature)
+        : [];
+    const usedParentKeyIx = new Set<number>();
+
+    for (const hit of parentHits) {
+      if (!hit || typeof hit.wikilink !== "string") continue;
+      const locate = sanitizeRecallField(hit.wikilink);
+      if (!locate || !input.emitted.includes(locate)) continue;
+      let mkey: string | null = null;
+      const at = parentKeys.findIndex(
+        (k, i) => !usedParentKeyIx.has(i) && k.wikilink === hit.wikilink && k.score === hit.score,
+      );
+      if (at >= 0) {
+        usedParentKeyIx.add(at);
+        mkey = parentKeys[at]?.mkey ?? null;
+      }
+      if (!mkey && parentKeys.length === 0) {
+        mkey = keyFromVaultWikilink(capture.vaultPath, hit.wikilink);
+      }
+      if (!mkey || seenMkeys.has(mkey)) continue;
+      seenMkeys.add(mkey);
+      items.push({
+        mkey,
+        handles: handlesForKey(mkey),
+        title: typeof hit.title === "string" ? hit.title : "",
+        rank: items.length + 1,
+        score: finiteOrUndefined(hit.score),
+        locate,
+      });
+    }
+
+    if (input.taskStrong && Array.isArray(input.taskStrong.topHits)) {
+      const taskKeys = topHitKeys(
+        capture.vaultPath,
+        input.taskStrong,
+        input.taskRecall,
+        input.taskVaultResults ?? [],
+        input.threshold,
+      );
+      input.taskStrong.topHits.slice(0, 2).forEach((hit, index) => {
+        if (!hit || typeof hit.wikilink !== "string") return;
+        const locate = sanitizeRecallField(hit.wikilink);
+        if (!locate || !input.emitted.includes(locate)) return;
+        const mkey = taskKeys[index] ?? keyFromVaultWikilink(capture.vaultPath, hit.wikilink);
+        if (!mkey || seenMkeys.has(mkey)) return;
+        seenMkeys.add(mkey);
+        items.push({
+          mkey,
+          handles: handlesForKey(mkey),
+          title: typeof hit.title === "string" ? hit.title : "",
+          rank: items.length + 1,
+          score: finiteOrUndefined(hit.score),
+          locate,
+        });
+      });
+    }
+
+    record(capture, "subagent_brief", items, input.emitted);
+  } catch {
+    // Best effort.
+  }
+}
+
+
 // ---------------------------------------------------------------------------
 // Retention of recall-session.d (§4.3 "Retention", §6.2.5)
 // ---------------------------------------------------------------------------

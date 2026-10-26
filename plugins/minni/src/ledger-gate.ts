@@ -27,6 +27,7 @@ export const LEDGER_EVENTS: ReadonlySet<string> = new Set([
   "PreToolUse",
   "PreCompact",
   "PostCompact",
+  "SubagentStart",
 ]);
 
 const FLAG = "MINNI_USE_LEDGER";

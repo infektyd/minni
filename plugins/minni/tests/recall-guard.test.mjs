@@ -120,12 +120,12 @@ test("deny-first-cold-search: strong+unconsumed state + Grep => deny, reason lis
       tool_input: { pattern: "cobalt" },
     });
 
-    assert.ok(isDeny(output), "strong unconsumed Grep must be denied");
+    assert.equal(output.hookSpecificOutput?.permissionDecision, undefined, "default context delivery omits permissionDecision");
     assert.equal(output.hookSpecificOutput.hookEventName, "PreToolUse");
-    const reason = output.hookSpecificOutput.permissionDecisionReason;
-    assert.match(reason, /cobalt-wal-decision/, "reason must contain the top hit title");
-    assert.match(reason, /\[\[wiki\/knowledge\/cobalt-wal\]\]/, "reason must contain the wikilink");
-    assert.match(reason, /Re-issue this exact call to proceed/);
+    const reason = output.hookSpecificOutput.additionalContext;
+    assert.match(reason, /cobalt-wal-decision/, "context must contain the top hit title");
+    assert.match(reason, /\[\[wiki\/knowledge\/cobalt-wal\]\]/, "context must contain the wikilink");
+    assert.match(reason, /Consult minni_recall\/minni_drill/);
 
     // consumed flipped to true on disk (the idempotency write).
     const after = await readState(vault);
@@ -140,7 +140,7 @@ test("idempotent re-issue: the SAME call after a deny => ALLOW (consumed=true), 
     const handlers = createHookHandlers(turnConfig(vault, { recallGuardMode: "soft" }));
 
     const first = await handlers.handlePreToolUse({ tool_name: "Grep", tool_input: { pattern: "x" } });
-    assert.ok(isDeny(first), "first call denies");
+    assert.equal(typeof first.hookSpecificOutput?.additionalContext, "string", "first call surfaces additionalContext");
 
     // Re-issue the EXACT same call. Must now ALLOW (no permissionDecision).
     const second = await handlers.handlePreToolUse({ tool_name: "Grep", tool_input: { pattern: "x" } });
@@ -230,7 +230,7 @@ test("strict mode guards a read/search Bash command (grep) => deny", async () =>
       tool_name: "Bash",
       tool_input: { command: "grep -rn cobalt src/" },
     });
-    assert.ok(isDeny(out), "strict mode must guard a pure read/search Bash command");
+    assert.equal(typeof out.hookSpecificOutput?.additionalContext, "string", "strict mode must guard a pure read/search Bash command");
   });
 });
 
