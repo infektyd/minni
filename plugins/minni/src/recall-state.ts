@@ -319,11 +319,25 @@ function ensureContainedDir(
   for (const segment of segments) {
     const next = path.join(current, segment);
     assertWriteTargetUnder(next, vaultPath);
-    if (!fs.existsSync(next)) {
-      if (!create) return null;
-      fs.mkdirSync(next, { mode: 0o700 });
+    let st: fs.Stats | undefined;
+    try {
+      st = fs.lstatSync(next);
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code !== "ENOENT") throw error;
     }
-    const st = fs.lstatSync(next);
+    if (!st) {
+      if (!create) return null;
+      try {
+        fs.mkdirSync(next, { mode: 0o700 });
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code !== "EEXIST") throw error;
+      }
+      st = fs.lstatSync(next);
+    }
+    if (st.isSymbolicLink()) {
+      assertWriteTargetUnder(fs.realpathSync(next), vaultPath);
+      st = fs.statSync(next);
+    }
     if (!st.isDirectory()) {
       throw new Error(`write path component is not a directory: ${next}`);
     }
@@ -514,9 +528,7 @@ export async function readRecallState(
     }
     return null;
   }
-  const mirror = await readStateFileAt(recallStatePath(vaultPath), vaultPath);
-  if (options?.guardV2 && mirror?.session_id) return null;
-  return mirror;
+  return readStateFileAt(recallStatePath(vaultPath), vaultPath);
 }
 
 /** Remove the recall-state file (used on weak turns to clear a stale strong pointer). */
@@ -555,11 +567,16 @@ export async function clearRecallState(
     }
     return;
   }
-  if (options?.guardV2) {
-    const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
-    if (mirror?.session_id) return;
-  }
   await rm(mirrorPath, { force: true });
+}
+
+function fileOrLinkExists(filePath: string): boolean {
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function markFileConsumed(filePath: string, vaultPath: string): Promise<boolean> {
@@ -596,7 +613,8 @@ export async function markRecallConsumed(
       : undefined;
   if (sessionId && options?.guardV2 !== false) {
     const sessionFile = recallStateSessionPath(vaultPath, sessionId);
-    const scopedOk = sessionFile ? await markFileConsumed(sessionFile, vaultPath) : false;
+    const hasScoped = sessionFile !== null && fileOrLinkExists(sessionFile);
+    const scopedOk = hasScoped && sessionFile ? await markFileConsumed(sessionFile, vaultPath) : false;
     const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
     let mirrorOk = false;
     if (
@@ -607,9 +625,17 @@ export async function markRecallConsumed(
     ) {
       mirrorOk = await markFileConsumed(mirrorPath, vaultPath);
     }
-    return scopedOk || mirrorOk;
+    return hasScoped ? scopedOk : mirrorOk;
   }
-  return markFileConsumed(mirrorPath, vaultPath);
+  const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
+  const mirrorOk = await markFileConsumed(mirrorPath, vaultPath);
+  if (mirror?.session_id && options?.guardV2 !== false) {
+    const sessionFile = recallStateSessionPath(vaultPath, mirror.session_id);
+    if (sessionFile && fileOrLinkExists(sessionFile)) {
+      await markFileConsumed(sessionFile, vaultPath);
+    }
+  }
+  return mirrorOk;
 }
 
 /**

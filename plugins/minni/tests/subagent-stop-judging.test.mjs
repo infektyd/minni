@@ -3,6 +3,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
+import { writeDfSnapshot } from "../dist/use-detector.js";
+import { handlesForKey } from "../dist/use-ledger.js";
 import {
   agentKeyOf,
   daemonResult,
@@ -17,15 +19,16 @@ const SESSION = "sess-subagent-stop-01";
 const SUBAGENT_ID = "agent-sub-worker-42";
 
 test(
-  "SubagentStop runs use detector against agent_transcript_path with sessionEnd:true and writes final judged + exposure rows under subagent agent_key",
+  "SubagentStop runs use detector against agent_transcript_path with sessionEnd:true and writes final cited judged + exposure rows under subagent agent_key",
   { timeout: 60_000 },
   async (t) => {
     const fixture = await makeFixture(t, "subagent-stop-judging");
+    writeDfSnapshot(fixture.vault, { notes: 20, df: {} });
     const taskNote = path.join(fixture.vault, "wiki", "ops", "task-note.md");
     await mkdir(path.dirname(taskNote), { recursive: true });
     await writeFile(
       taskNote,
-      "# Task Note\n\nSubagent operational protocol requires strict atomic claim files.\n",
+      "# Cobalt Wal Checkpoint\n\nSubagent operational protocol requires strict atomic claim files.\n",
       "utf8",
     );
 
@@ -37,7 +40,7 @@ test(
             source: taskNote,
             docId: 501,
             wikilink: "[[wiki/ops/task-note]]",
-            title: "Task Note",
+            title: "Cobalt Wal Checkpoint",
             confidence: 0.96,
           }),
         ],
@@ -67,7 +70,9 @@ test(
       /\[\[wiki\/ops\/task-note\]\]/,
     );
 
-    // 3. Write a subagent JSONL transcript at agent_transcript_path after the surfacing timestamp.
+    // 3. Write a subagent JSONL transcript at agent_transcript_path after the surfacing timestamp
+    //    that cites the brief's memory (handle + distinctive title tokens).
+    const handle = handlesForKey("vault:wiki/ops/task-note.md")[0];
     const agentTranscriptPath = path.join(fixture.root, `${SUBAGENT_ID}.jsonl`);
     const t1 = new Date(Date.now() + 50).toISOString();
     const t2 = new Date(Date.now() + 100).toISOString();
@@ -89,13 +94,7 @@ test(
           content: [
             {
               type: "text",
-              text: "Consulting [[wiki/ops/task-note]] to verify the operational protocol.",
-            },
-            {
-              type: "tool_use",
-              id: "toolu_read_note",
-              name: "Read",
-              input: { file_path: taskNote },
+              text: `Per Cobalt Wal Checkpoint (${handle}), the operational protocol requires atomic claim files.`,
             },
           ],
         },
@@ -136,10 +135,7 @@ test(
     const finalJudged = judgedRows.find((r) => r.final === true);
     assert.ok(finalJudged, "judged row must be final:true");
     assert.equal(finalJudged.session_key, expectedSessionKey);
-    assert.ok(
-      ["opened", "cited", "applied"].includes(finalJudged.outcome),
-      `expected used outcome (opened/cited/applied), got ${finalJudged.outcome}`,
-    );
+    assert.equal(finalJudged.outcome, "cited");
 
     const exposureRows = rows.filter(
       (r) =>
@@ -155,5 +151,6 @@ test(
     assert.equal(exposureRows[0].final, true);
     assert.equal(exposureRows[0].session_key, expectedSessionKey);
     assert.equal(exposureRows[0].mkey, "vault:wiki/ops/task-note.md");
+    assert.equal(exposureRows[0].outcome, "cited");
   },
 );

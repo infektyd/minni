@@ -789,6 +789,7 @@ interface HitKey {
   wikilink: string;
   score: number;
   mkey: string | null;
+  shingles?: string[];
 }
 
 const NON_VAULT_MKEY_RE = /^(?:doc:[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_.-]{1,128}|learning:[A-Za-z0-9_.-]{1,128}|lhash:[0-9a-f]{12})$/;
@@ -813,36 +814,87 @@ function sameHit(a: { title: unknown; wikilink: unknown; score: unknown }, b: ty
   return a.title === b.title && a.wikilink === b.wikilink && a.score === b.score;
 }
 
+function vaultTextForMkey(vaultPath: string, mkey: string | null): string {
+  if (!mkey || !mkey.startsWith("vault:") || !isValidMkey(mkey)) return "";
+  const rel = mkey.slice("vault:".length);
+  const file = path.join(vaultPath, ...rel.split("/"));
+  let fd: number | undefined;
+  try {
+    assertWriteTargetUnder(file, vaultPath);
+    fd = fs.openSync(file, READ_FLAGS);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size <= 0) return "";
+    const len = Math.min(stat.size, MAX_SIDE_FILE_BYTES);
+    const buffer = Buffer.alloc(len);
+    let offset = 0;
+    while (offset < len) {
+      const n = fs.readSync(fd, buffer, offset, len - offset, offset);
+      if (n <= 0) break;
+      offset += n;
+    }
+    return buffer.subarray(0, offset).toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close error.
+      }
+    }
+  }
+}
+
+function daemonBodyText(raw: Record<string, unknown>): string {
+  return (
+    asString(raw.content) ||
+    asString(raw.text) ||
+    asString(raw.snippet) ||
+    asString(raw.summary)
+  );
+}
+
 /**
- * The mkey of each top hit, by matching it back to the result it came from.
- * Each candidate is projected through extractStrongRecall itself, so the match
- * uses the very title/wikilink/score the top hit carries; candidates are
- * scanned in its insertion order (daemon, then vault) and used once, which is
- * how its stable sort broke any tie.
+ * The mkey and body text of each top hit, by matching it back to the result it
+ * came from. Each candidate is projected through extractStrongRecall itself, so
+ * the match uses the very title/wikilink/score the top hit carries; candidates
+ * are scanned in its insertion order (daemon, then vault) and used once, which
+ * is how its stable sort broke any tie.
  */
-function topHitKeys(
+function topHitDetails(
   vaultPath: string,
   strong: StrongRecall,
   response: RecallResponse | undefined,
   vaultResults: readonly VaultSearchResult[],
   threshold: number,
-): Array<string | null> {
-  const pool: Array<{ hit: StrongRecall["topHits"][number]; ref: MemoryRef }> = [];
+): Array<{ mkey: string | null; body: string }> {
+  const pool: Array<{ hit: StrongRecall["topHits"][number]; ref: MemoryRef; body: string }> = [];
   const daemonResults = response && Array.isArray(response.results) ? response.results : [];
   for (const raw of daemonResults) {
+    const rec = (raw ?? {}) as Record<string, unknown>;
     const hit = extractStrongRecall({ results: [raw] }, [], threshold, 1)?.topHits[0];
-    if (hit) pool.push({ hit, ref: daemonRef((raw ?? {}) as Record<string, unknown>) });
+    if (hit) pool.push({ hit, ref: daemonRef(rec), body: daemonBodyText(rec) });
   }
   for (const result of vaultResults) {
     const hit = extractStrongRecall(undefined, [result], threshold, 1)?.topHits[0];
-    if (hit) pool.push({ hit, ref: { kind: "vault", path: result.relativePath } });
+    if (hit) {
+      pool.push({
+        hit,
+        ref: { kind: "vault", path: result.relativePath },
+        body: typeof result.snippet === "string" ? result.snippet : "",
+      });
+    }
   }
   const used = new Set<number>();
   return strong.topHits.map((hit) => {
     const index = pool.findIndex((candidate, i) => !used.has(i) && sameHit(candidate.hit, hit));
-    if (index < 0) return null;
+    if (index < 0) return { mkey: null, body: "" };
     used.add(index);
-    return memoryKeyFor((pool[index] as { ref: MemoryRef }).ref, vaultPath);
+    const chosen = pool[index] as { ref: MemoryRef; body: string };
+    const mkey = memoryKeyFor(chosen.ref, vaultPath);
+    const body = vaultTextForMkey(vaultPath, mkey) || chosen.body;
+    return { mkey, body };
   });
 }
 
@@ -870,16 +922,21 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
   if (use === undefined) return;
   const { capture } = use;
   try {
-    const keys = topHitKeys(capture.vaultPath, input.strong, input.recall, input.vaultResults, input.threshold);
+    const details = topHitDetails(capture.vaultPath, input.strong, input.recall, input.vaultResults, input.threshold);
     if (input.armed) {
       try {
         const dir = sessionDir(capture, true);
         if (dir !== null) {
-          const hits: HitKey[] = input.strong.topHits.map((hit, index) => ({
-            wikilink: hit.wikilink,
-            score: hit.score,
-            mkey: keys[index] ?? null,
-          }));
+          const hits: HitKey[] = input.strong.topHits.map((hit, index) => {
+            const detail = details[index];
+            const shingles = detail?.body ? shingleHashes(detail.body) : undefined;
+            return {
+              wikilink: hit.wikilink,
+              score: hit.score,
+              mkey: detail?.mkey ?? null,
+              ...(shingles && shingles.length > 0 ? { shingles } : {}),
+            };
+          });
           writeSideFile(
             path.join(dir, "hit-keys.json"),
             { v: 1, task_signature: input.taskSignature, hits },
@@ -891,7 +948,7 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
       }
     }
     const top = input.strong.topHits[0];
-    const mkey = keys[0];
+    const mkey = details[0]?.mkey ?? null;
     if (!top || !mkey) return;
     record(
       capture,
@@ -930,7 +987,15 @@ function readHitKeys(capture: UseCapture, taskSignature: string): HitKey[] {
       // The file lives in a vault any local process can write: only a
       // well-formed key may reach a row.
       const mkey = typeof value.mkey === "string" && isValidMkey(value.mkey) ? value.mkey : null;
-      out.push({ wikilink: value.wikilink, score: value.score, mkey });
+      const shingles = Array.isArray(value.shingles)
+        ? value.shingles.filter((s): s is string => typeof s === "string")
+        : undefined;
+      out.push({
+        wikilink: value.wikilink,
+        score: value.score,
+        mkey,
+        ...(shingles ? { shingles } : {}),
+      });
     }
     return out;
   } catch {
@@ -1003,11 +1068,16 @@ function keyFromVaultWikilink(vaultPath: string, wikilink: string): string | nul
   return null;
 }
 
+function briefLineEcho(emitted: string, locate: string): string[] {
+  const line = emitted.split("\n").find((candidate) => candidate.includes(locate)) ?? emitted;
+  return echoHashes(line);
+}
+
 /**
  * S2b (§6.4): SubagentStart brief capture. Records one `surfaced` row with
  * `channel: "subagent_brief"` per hit actually present in `emitted`, keyed from
  * the parent session's `hit-keys.json` (or vault wikilink fallback) for parent
- * hits and `topHitKeys` for task-specific recall hits. Never throws.
+ * hits and `topHitDetails` for task-specific recall hits. Never throws.
  */
 export function captureSubagentBrief(capture: UseCapture | undefined, input: SubagentBriefCaptureInput): void {
   if (capture === undefined || !input.emitted) return;
@@ -1028,18 +1098,25 @@ export function captureSubagentBrief(capture: UseCapture | undefined, input: Sub
       const locate = sanitizeRecallField(hit.wikilink);
       if (!locate || !input.emitted.includes(locate)) continue;
       let mkey: string | null = null;
+      let storedShingles: string[] | undefined;
       const at = parentKeys.findIndex(
         (k, i) => !usedParentKeyIx.has(i) && k.wikilink === hit.wikilink && k.score === hit.score,
       );
       if (at >= 0) {
         usedParentKeyIx.add(at);
         mkey = parentKeys[at]?.mkey ?? null;
+        storedShingles = parentKeys[at]?.shingles;
       }
       if (!mkey && parentKeys.length === 0) {
         mkey = keyFromVaultWikilink(capture.vaultPath, hit.wikilink);
       }
       if (!mkey || seenMkeys.has(mkey)) continue;
       seenMkeys.add(mkey);
+      const vaultBody = vaultTextForMkey(capture.vaultPath, mkey);
+      const shingles =
+        storedShingles && storedShingles.length > 0
+          ? storedShingles
+          : shingleHashes(vaultBody);
       items.push({
         mkey,
         handles: handlesForKey(mkey),
@@ -1047,11 +1124,13 @@ export function captureSubagentBrief(capture: UseCapture | undefined, input: Sub
         rank: items.length + 1,
         score: finiteOrUndefined(hit.score),
         locate,
+        shingles,
+        echo: briefLineEcho(input.emitted, locate),
       });
     }
 
     if (input.taskStrong && Array.isArray(input.taskStrong.topHits)) {
-      const taskKeys = topHitKeys(
+      const taskDetails = topHitDetails(
         capture.vaultPath,
         input.taskStrong,
         input.taskRecall,
@@ -1062,9 +1141,11 @@ export function captureSubagentBrief(capture: UseCapture | undefined, input: Sub
         if (!hit || typeof hit.wikilink !== "string") return;
         const locate = sanitizeRecallField(hit.wikilink);
         if (!locate || !input.emitted.includes(locate)) return;
-        const mkey = taskKeys[index] ?? keyFromVaultWikilink(capture.vaultPath, hit.wikilink);
+        const detail = taskDetails[index];
+        const mkey = detail?.mkey ?? keyFromVaultWikilink(capture.vaultPath, hit.wikilink);
         if (!mkey || seenMkeys.has(mkey)) return;
         seenMkeys.add(mkey);
+        const body = detail?.body || vaultTextForMkey(capture.vaultPath, mkey);
         items.push({
           mkey,
           handles: handlesForKey(mkey),
@@ -1072,6 +1153,8 @@ export function captureSubagentBrief(capture: UseCapture | undefined, input: Sub
           rank: items.length + 1,
           score: finiteOrUndefined(hit.score),
           locate,
+          shingles: shingleHashes(body),
+          echo: briefLineEcho(input.emitted, locate),
         });
       });
     }

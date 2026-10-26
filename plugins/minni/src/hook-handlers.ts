@@ -87,6 +87,7 @@ import {
   recallPointerThreshold,
   recallStatePath,
   sanitizeRecallField,
+  sessionStateKey,
   writeLifecycleState,
   writeRecallState,
 } from "./recall-state.js";
@@ -289,7 +290,7 @@ interface SubagentPendingEntry {
 function subagentSessionKey(payload: Record<string, unknown>): string {
   const sessionId = asString(payload.session_id) || asString(payload.sessionId);
   if (sessionId) {
-    return createHash("sha256").update(sessionId, "utf8").digest("hex").slice(0, 16);
+    return sessionStateKey(sessionId) ?? createHash("sha256").update(sessionId, "utf8").digest("hex").slice(0, 16);
   }
   const transcript = asString(payload.transcript_path) || asString(payload.transcriptPath);
   if (transcript && !transcript.includes("\0")) {
@@ -305,11 +306,25 @@ function subagentSessionDir(vaultPath: string, sessionKey: string, create = fals
   for (const segment of segments) {
     const next = path.join(current, segment);
     assertWriteTargetUnder(next, vaultPath);
-    if (!fs.existsSync(next)) {
-      if (!create) return null;
-      fs.mkdirSync(next, { mode: 0o700 });
+    let st: fs.Stats | undefined;
+    try {
+      st = fs.lstatSync(next);
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code !== "ENOENT") throw error;
     }
-    const st = fs.lstatSync(next);
+    if (!st) {
+      if (!create) return null;
+      try {
+        fs.mkdirSync(next, { mode: 0o700 });
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code !== "EEXIST") throw error;
+      }
+      st = fs.lstatSync(next);
+    }
+    if (st.isSymbolicLink()) {
+      assertWriteTargetUnder(fs.realpathSync(next), vaultPath);
+      st = fs.statSync(next);
+    }
     if (!st.isDirectory()) {
       throw new Error(`subagent session path component is not a directory: ${next}`);
     }
@@ -353,15 +368,20 @@ function stashSubagentPending(
   toolInput: Record<string, unknown>,
 ): void {
   try {
-    const prompt =
+    const rawPrompt = (
       asString(toolInput.prompt) ||
       asString(toolInput.description) ||
-      asString(toolInput.task);
+      asString(toolInput.task)
+    ).trim();
+    if (!rawPrompt) return;
+    const prompt = rawPrompt.slice(0, 2000);
     const subagentType =
       asString(toolInput.subagent_type) ||
+      asString(toolInput.subagentType) ||
       asString(toolInput.agent_type) ||
       asString(payload.subagent_type) ||
-      asString(payload.agent_type);
+      asString(payload.agent_type) ||
+      "default";
     const rawToolUseId =
       asString(payload.tool_use_id) ||
       asString(payload.toolUseId) ||
@@ -379,8 +399,8 @@ function stashSubagentPending(
     existing.push({
       tool_use_id: safeToolUseId,
       subagent_type: subagentType.slice(0, 128),
-      prompt_hash: createHash("sha256").update(prompt, "utf8").digest("hex").slice(0, 16),
-      prompt: prompt.slice(0, 4000),
+      prompt_hash: createHash("sha1").update(prompt, "utf8").digest("hex").slice(0, 12),
+      prompt,
       ts: new Date(nowMs).toISOString(),
     });
     const bounded = existing.slice(-32);
@@ -422,7 +442,7 @@ function claimSubagentPending(
     }
     const requestedType = (asString(payload.agent_type) || asString(payload.subagent_type)).trim();
     const matchesType = (entry: SubagentPendingEntry): boolean => {
-      if (!requestedType || !entry.subagent_type) return true;
+      if (!requestedType || !entry.subagent_type || entry.subagent_type === "default") return true;
       return entry.subagent_type.toLowerCase() === requestedType.toLowerCase();
     };
     const ordered = [
@@ -450,6 +470,41 @@ function claimSubagentPending(
   } catch {
     return null;
   }
+}
+
+function enrichTaskHitsWithSnippets(
+  hits: readonly RecallStateHit[],
+  recallData: Awaited<ReturnType<typeof recallMemory>>["data"] | undefined,
+  vaultResults: ReturnType<typeof filterSafeVaultResults>,
+  threshold: number,
+): Array<RecallStateHit & { snippet?: string }> {
+  const pool: Array<{ hit: RecallStateHit; snippet: string }> = [];
+  const daemonResults = recallData && Array.isArray(recallData.results) ? recallData.results : [];
+  for (const raw of daemonResults) {
+    const rec = (raw ?? {}) as Record<string, unknown>;
+    const extracted = extractStrongRecall({ results: [raw] }, [], threshold, 1)?.topHits[0];
+    const snippet =
+      asString(rec.snippet) || asString(rec.summary) || asString(rec.text) || asString(rec.content);
+    if (extracted) pool.push({ hit: extracted, snippet });
+  }
+  for (const vr of vaultResults) {
+    const extracted = extractStrongRecall(undefined, [vr], threshold, 1)?.topHits[0];
+    if (extracted) pool.push({ hit: extracted, snippet: typeof vr.snippet === "string" ? vr.snippet : "" });
+  }
+  const used = new Set<number>();
+  return hits.map((hit) => {
+    const ix = pool.findIndex(
+      (c, i) =>
+        !used.has(i) &&
+        c.hit.title === hit.title &&
+        c.hit.wikilink === hit.wikilink &&
+        c.hit.score === hit.score,
+    );
+    if (ix < 0) return { ...hit };
+    used.add(ix);
+    const snippet = pool[ix]?.snippet;
+    return snippet ? { ...hit, snippet } : { ...hit };
+  });
 }
 
 export function buildSubagentBrief(
@@ -2853,7 +2908,9 @@ export function createHookHandlers(
       taskStrong = extractStrongRecall(taskRecallData, safeVaultResults, threshold, 2);
     }
 
-    const taskHits = taskStrong ? taskStrong.topHits.slice(0, 2) : [];
+    const taskHits = taskStrong
+      ? enrichTaskHitsWithSnippets(taskStrong.topHits.slice(0, 2), taskRecallData, safeVaultResults, threshold)
+      : [];
     const brief = buildSubagentBrief(parentHits, taskHits, SUBAGENT_BRIEF_MAX_CHARS);
     if (!brief) {
       return { continue: true };

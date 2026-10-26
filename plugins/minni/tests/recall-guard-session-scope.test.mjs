@@ -1,7 +1,7 @@
 // S2b (§6.3.1): session-scoped RecallState under <vault>/.runtime/recall-state.d/<session_key>.json.
-// Arming in session A never fires or gets cleared by session B; unlabeled sessions stay isolated.
+// Arming in session A never fires or gets cleared by session B; unlabeled payloads read the last-writer mirror.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -44,7 +44,7 @@ function makeConfig(vault) {
 const HITS_A = [{ title: "Session A Note", wikilink: "[[wiki/session-a]]", score: 0.91 }];
 const HITS_B = [{ title: "Session B Note", wikilink: "[[wiki/session-b]]", score: 0.88 }];
 
-test("session A arming does not fire in session B or unlabeled session, and session B weak turn does not clear session A", async () => {
+test("session A arming does not fire in session B, session B weak turn does not clear session A, and unlabeled reads mirror per §6.3.1", async () => {
   await withVault(async ({ vault }) => {
     const handlers = createHookHandlers(makeConfig(vault));
 
@@ -63,6 +63,11 @@ test("session A arming does not fire in session B or unlabeled session, and sess
     const sessionAPath = recallStateSessionPath(vault, "session-alpha");
     assert.ok(sessionAPath && sessionAPath.endsWith(`${sessionStateKey("session-alpha")}.json`));
 
+    // Per §6.3.1: "A payload without session_id reads the mirror, as today."
+    const mirrorRead = await readRecallState(vault, { guardV2: true });
+    assert.equal(mirrorRead?.session_id, "session-alpha");
+    assert.equal(mirrorRead?.task_signature, "sig-a");
+
     // Session B PreToolUse must NOT see Session A's armed state.
     const bOut = await handlers.handlePreToolUse({
       session_id: "session-beta",
@@ -70,13 +75,6 @@ test("session A arming does not fire in session B or unlabeled session, and sess
       tool_input: { file_path: "/tmp/file.txt" },
     });
     assert.equal(bOut.hookSpecificOutput, undefined, "Session B must allow when only Session A is armed");
-
-    // Unlabeled PreToolUse must NOT see Session A's armed state.
-    const unlabeledOut = await handlers.handlePreToolUse({
-      tool_name: "Grep",
-      tool_input: { pattern: "foo" },
-    });
-    assert.equal(unlabeledOut.hookSpecificOutput, undefined, "unlabeled PreToolUse must not read Session A state");
 
     // Session B clearing state (e.g. weak UPS) must NOT clear Session A's state.
     await clearRecallState(vault, { sessionId: "session-beta", guardV2: true });
@@ -129,6 +127,30 @@ test("two concurrent sessions maintain independent arming and consumption lifecy
     assert.equal(s1?.consumed, true);
     assert.equal(s2?.consumed, false, "consuming sess-1 must leave sess-2 unconsumed");
     assert.equal(s2?.top_hits[0]?.title, "Session B Note");
+  });
+});
+
+test("markRecallConsumed returns false when sessionFile exists but cannot be updated", async () => {
+  await withVault(async ({ vault }) => {
+    await writeRecallState(
+      vault,
+      {
+        task_signature: "sig-ro",
+        intent: "recall",
+        top_hits: HITS_A,
+        top_score: 0.91,
+        session_id: "sess-ro",
+      },
+      { sessionId: "sess-ro", guardV2: true },
+    );
+    const dir = path.join(vault, ".runtime", "recall-state.d");
+    await chmod(dir, 0o500);
+    try {
+      const ok = await markRecallConsumed(vault, { sessionId: "sess-ro", guardV2: true });
+      assert.equal(ok, false, "must return false when sessionFile write fails even if mirror succeeds");
+    } finally {
+      await chmod(dir, 0o700);
+    }
   });
 });
 

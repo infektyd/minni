@@ -80,6 +80,31 @@ test("strict mode still surfaces even when pointer_named is non-empty", async ()
   });
 });
 
+test("soft mode on main thread still surfaces when pointer_named is empty or omitted (e.g. dropped UPS injection)", async () => {
+  await withVault(async ({ vault }) => {
+    const { pointer_named: _ignored, ...unnamedState } = NAMED_STATE;
+    await writeRecallState(vault, unnamedState, { sessionId: "sess-named", guardV2: true });
+    const handlers = createHookHandlers({
+      agentId: "claude-code",
+      vaultPath: vault,
+      defaultWorkspaceId: "ws",
+      contextWindow: 200_000,
+      auditPrefix: "hook_unnamed_soft",
+      hooksEnabled: true,
+      recallGuardMode: "soft",
+      wire: claudeCodeWire,
+    });
+
+    const out = await handlers.handlePreToolUse({
+      session_id: "sess-named",
+      tool_name: "Read",
+      tool_input: { file_path: "/tmp/some-file.ts" },
+    });
+    assert.equal(typeof out.hookSpecificOutput?.additionalContext, "string", "soft mode must surface when pointer_named is absent");
+    assert.match(out.hookSpecificOutput.additionalContext, /Already Named Hit/);
+  });
+});
+
 test("decideGuard unit: pointer_named empty or guardV2=false still surfaces in soft mode", () => {
   const baseState = {
     ...NAMED_STATE,

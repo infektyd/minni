@@ -7,10 +7,22 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { adaptCursorOutput } from "../dist/cursor-adapter.js";
+import { adaptPreToolUseOutput } from "../dist/gemini-adapter.js";
+import { adaptGrokPreToolUseOutput } from "../dist/grok-adapter.js";
 import { createHookHandlers } from "../dist/hook-handlers.js";
-import { claudeCodeWire, codexWire } from "../dist/hook-platform.js";
+import {
+  claudeCodeWire,
+  codexWire,
+  cursorWire,
+  geminiWire,
+  grokBuildWire,
+  kilocodeWire,
+  wireCapabilities,
+  wireFor,
+} from "../dist/hook-platform.js";
 import { GUARD_CONTEXT_MAX_HITS, preToolUseContext } from "../dist/recall-guard.js";
-import { writeRecallState } from "../dist/recall-state.js";
+import { readRecallState, writeRecallState } from "../dist/recall-state.js";
 
 async function withVault(fn) {
   const root = await mkdtemp(path.join(os.tmpdir(), "minni-s2b-ctx-delivery-"));
@@ -31,7 +43,7 @@ const FIVE_HITS = [
   { title: "Hit Five", wikilink: "[[wiki/hit-5]]", score: 0.75 },
 ];
 
-test("claude-code emits additionalContext without permissionDecision and caps at 3 hits", async () => {
+test("claude-code emits additionalContext without permissionDecision, marks consumed=true, and caps at 3 hits", async () => {
   await withVault(async ({ vault }) => {
     assert.equal(GUARD_CONTEXT_MAX_HITS, 3);
     await writeRecallState(vault, {
@@ -69,6 +81,9 @@ test("claude-code emits additionalContext without permissionDecision and caps at
     assert.match(ctx, /\[\[wiki\/hit-3\]\]/);
     assert.doesNotMatch(ctx, /\[\[wiki\/hit-4\]\]/, "4th hit must be excluded by 3-hit cap");
     assert.doesNotMatch(ctx, /\[\[wiki\/hit-5\]\]/, "5th hit must be excluded by 3-hit cap");
+
+    const stateAfter = await readRecallState(vault, { sessionId: "sess-ctx", guardV2: true });
+    assert.equal(stateAfter?.consumed, true, "context delivery must mark RecallState consumed=true");
   });
 });
 
@@ -110,32 +125,47 @@ test("MINNI_RECALL_GUARD_DELIVERY=deny forces permissionDecision:deny even on cl
   });
 });
 
-test("non-preToolUseContext wire (codexWire) and MINNI_GUARD_V2=off fallback to permissionDecision:deny", async () => {
+test("codex, kilocode, and agy (geminiWire) deny once per arming and allow on second call; MINNI_GUARD_V2=off falls back to deny", async () => {
   await withVault(async ({ vault }) => {
-    await writeRecallState(vault, {
-      task_signature: "sig-codex",
-      intent: "recall",
-      top_hits: FIVE_HITS.slice(0, 1),
-      top_score: 0.95,
-      session_id: "sess-codex",
-    });
+    for (const [label, wire] of [
+      ["codex", codexWire],
+      ["kilocode", kilocodeWire],
+      ["agy", geminiWire],
+    ]) {
+      const sess = `sess-${label}`;
+      await writeRecallState(vault, {
+        task_signature: `sig-${label}`,
+        intent: "recall",
+        top_hits: FIVE_HITS.slice(0, 1),
+        top_score: 0.95,
+        session_id: sess,
+      });
 
-    const codexHandlers = createHookHandlers({
-      agentId: "codex",
-      vaultPath: vault,
-      defaultWorkspaceId: "ws",
-      contextWindow: 200_000,
-      auditPrefix: "hook_codex",
-      hooksEnabled: true,
-      recallGuardMode: "soft",
-      wire: codexWire,
-    });
-    const codexOut = await codexHandlers.handlePreToolUse({
-      session_id: "sess-codex",
-      tool_name: "Read",
-      tool_input: { file_path: "/tmp/a.ts" },
-    });
-    assert.equal(codexOut.hookSpecificOutput?.permissionDecision, "deny");
+      const handlers = createHookHandlers({
+        agentId: label,
+        vaultPath: vault,
+        defaultWorkspaceId: "ws",
+        contextWindow: 200_000,
+        auditPrefix: `hook_${label}`,
+        hooksEnabled: true,
+        recallGuardMode: "soft",
+        wire,
+      });
+
+      const firstOut = await handlers.handlePreToolUse({
+        session_id: sess,
+        tool_name: "Read",
+        tool_input: { file_path: "/tmp/a.ts" },
+      });
+      assert.equal(firstOut.hookSpecificOutput?.permissionDecision, "deny", `${label} must deny on first call`);
+
+      const secondOut = await handlers.handlePreToolUse({
+        session_id: sess,
+        tool_name: "Read",
+        tool_input: { file_path: "/tmp/a.ts" },
+      });
+      assert.equal(secondOut.hookSpecificOutput, undefined, `${label} must allow on second call`);
+    }
 
     // Now test MINNI_GUARD_V2=off via .runtime/flags.json on claudeCodeWire
     await mkdir(path.join(vault, ".runtime"), { recursive: true });
@@ -161,13 +191,27 @@ test("non-preToolUseContext wire (codexWire) and MINNI_GUARD_V2=off fallback to 
       tool_input: { file_path: "/tmp/a.ts" },
     });
     assert.equal(v2OffOut.hookSpecificOutput?.permissionDecision, "deny");
-    assert.ok(preToolUseContext({
-      task_signature: "sig",
-      intent: "recall",
-      top_hits: FIVE_HITS,
-      top_score: 0.95,
-      consumed: false,
-      ts: new Date().toISOString(),
-    }).hookSpecificOutput?.additionalContext);
   });
+});
+
+test("grok-build, cursor, and unprofiled wires declare preToolUseContext=false, and cursor/gemini/grok adapters map preToolUseContext shape to allow", () => {
+  assert.equal(wireCapabilities(grokBuildWire).preToolUseContext, false);
+  assert.equal(wireCapabilities(cursorWire).preToolUseContext, false);
+  const unprofiled = wireFor("unprofiled-test-host");
+  assert.equal(wireCapabilities(unprofiled).preToolUseContext, false);
+
+  const ctxShape = preToolUseContext({
+    task_signature: "sig",
+    intent: "recall",
+    top_hits: FIVE_HITS,
+    top_score: 0.95,
+    consumed: false,
+    ts: new Date().toISOString(),
+  });
+  assert.ok(ctxShape.hookSpecificOutput?.additionalContext);
+  assert.equal(ctxShape.hookSpecificOutput?.permissionDecision, undefined);
+
+  assert.deepEqual(adaptCursorOutput("PreToolUse", ctxShape), { permission: "allow" });
+  assert.deepEqual(adaptPreToolUseOutput(ctxShape), { decision: "allow" });
+  assert.deepEqual(adaptGrokPreToolUseOutput(ctxShape), { decision: "allow" });
 });
