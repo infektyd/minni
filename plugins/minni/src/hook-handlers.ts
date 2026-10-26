@@ -209,6 +209,13 @@ import {
   writeInbox,
 } from "./vault.js";
 
+import {
+  classifyPromptEnvelope,
+  readPromptTemplates,
+  recordOccurrence,
+} from "./prompt-class.js";
+import type { PromptEnvelope, PromptEnvelopeKind } from "./prompt-class.js";
+
 export const SUBAGENT_EVENTS: ReadonlySet<string> = new Set(["SubagentStart", "SubagentStop"]);
 
 export interface SubagentHookOutput {
@@ -219,10 +226,15 @@ export interface SubagentHookOutput {
   };
 }
 
-type LocalFeatureFlag = "MINNI_BOOT_FIT" | "MINNI_GUARD_V2" | "MINNI_SUBAGENT_BRIEF";
+type LocalFeatureFlag =
+  | "MINNI_USE_LEDGER"
+  | "MINNI_BOOT_FIT"
+  | "MINNI_GUARD_V2"
+  | "MINNI_SUBAGENT_BRIEF"
+  | "MINNI_PROMPT_CLASSES";
 
 /**
- * S2a/S2b (§8.1): check whether a default-"on" feature switch is enabled
+ * S2a/S2b/S3a (§8.1): check whether a default-"on" feature switch is enabled
  * without importing `flags.js` when `MINNI_USE_LEDGER` is off (preserving the
  * zero-capture-module-load guarantee pinned by `use-telemetry-flag-off-cost`
  * and `use-telemetry-session-start-audit`). When `ledger` is open, callers read
@@ -1098,6 +1110,7 @@ async function stopCoreOutput(
         transcriptPath,
         sessionId,
         event: "Stop",
+        sessionCrons: payload.session_crons ?? payload.sessionCrons,
       },
     ).catch(() => undefined);
   }
@@ -2097,15 +2110,80 @@ export function createHookHandlers(
     const guardV2 = use
       ? use.capture.context.features.includes("MINNI_GUARD_V2")
       : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
+    const promptClassesOn = use
+      ? use.capture.context.features.includes("MINNI_PROMPT_CLASSES")
+      : isFeatureEnabled(config.vaultPath, "MINNI_PROMPT_CLASSES");
     const recallStateOpts = { sessionId: rawSessionId || undefined, guardV2 };
     const promptAgentId = asString(payload.agent_id) || asString(payload.agentId) || undefined;
     const promptId = asString(payload.prompt_id) || asString(payload.promptId) || undefined;
 
-    const intent = routeMemoryIntent(prompt);
+    let promptEnvelope: PromptEnvelope | undefined;
+    if (promptClassesOn) {
+      if (use?.turn.classified !== undefined) {
+        const turnClass = await use.turn.classified;
+        if (turnClass.envelope_kind !== null && turnClass.subkind !== null) {
+          promptEnvelope = {
+            kind: turnClass.envelope_kind as PromptEnvelopeKind,
+            subkind: turnClass.subkind,
+            body: turnClass.body ?? classifyPromptEnvelope(prompt).body,
+            template_rule: turnClass.template_rule ?? "off",
+            ...(turnClass.rule_id !== undefined ? { rule_id: turnClass.rule_id } : {}),
+            ...(turnClass.suspicious_prefix ? { suspicious_prefix: true } : {}),
+          };
+        } else {
+          promptEnvelope = classifyPromptEnvelope(prompt);
+        }
+      } else {
+        const at = Date.now();
+        const validPromptId =
+          promptId !== undefined && promptId.length > 0 && promptId.length <= 128
+            ? promptId
+            : undefined;
+        const pid = validPromptId ?? `turn:${randomUUID()}`;
+        const templates = await readPromptTemplates(config.vaultPath).catch(() => null);
+        promptEnvelope = classifyPromptEnvelope(prompt, {
+          at,
+          pid,
+          templateEntry: (hash) =>
+            templates !== null && Object.hasOwn(templates.templates, hash)
+              ? templates.templates[hash]
+              : undefined,
+        });
+        if (
+          promptEnvelope.template !== undefined &&
+          isFeatureEnabled(config.vaultPath, "MINNI_USE_LEDGER")
+        ) {
+          const sessionKeyPrefix = (
+            (rawSessionId ? sessionStateKey(rawSessionId) : null) ?? "unlabeled"
+          ).slice(0, 8);
+          await recordOccurrence(config.vaultPath, {
+            hash: promptEnvelope.template.hash,
+            ts: at,
+            pid,
+            sessionKeyPrefix,
+            now: at,
+          }).catch(() => false);
+        }
+      }
+    }
+
+    const isSkip = promptEnvelope?.kind === "skip";
+    const recallQuery = promptEnvelope ? promptEnvelope.body : prompt;
+    const envelopeAuditDetails = promptEnvelope
+      ? {
+          envelope_kind: promptEnvelope.kind,
+          subkind: promptEnvelope.subkind,
+          ...(promptEnvelope.suspicious_prefix ? { suspicious_prefix: true } : {}),
+        }
+      : {};
+
+    const intent = routeMemoryIntent(isSkip ? prompt : recallQuery);
     // Explicit WRITE intents (learn/vault_write carry automaticAllowed:false) are
     // the user dictating memory, not asking the agent to recall — inject no
     // pointer and write no state. (s5 parity with the claude-code hook.)
-    if (!intent.automaticAllowed) {
+    // S3a (§5.2.2): `skip` envelopes never clear or write `recall-state` and
+    // must still carry `active_thread_ref` when a plan is active.
+    if (!isSkip && !intent.automaticAllowed) {
       // Clear any stale strong state from a previous turn BEFORE returning: an
       // unconsumed pointer must not leak into this write-intent turn and let the
       // s6 guard deny an unrelated read/search here (parity with the weak-turn
@@ -2144,109 +2222,136 @@ export function createHookHandlers(
     // finding) rather than expanding this fix's scope.
     const VAULT_RESULT_LIMIT = 6;
     const VAULT_SEARCH_OVERFETCH = 18;
-    // A spent budget gets the same fallbacks withBudget(0) would return, but
-    // without starting work that would keep running (and writing: the cold
-    // vault scan seeds missing vault files) after this handler answers.
-    const recallBudgetSpent = remainingMs() <= 0;
-    const [vaultResultsRaw, recall] = recallBudgetSpent ? [
-      [] as Awaited<ReturnType<typeof searchVaultNotes>>,
-      { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
-    ] as const : await Promise.all([
-      withBudget(
-        // "scan": a hook is a fresh process that searches once and exits, so
-        // the prefix index the "index" path builds would be paid on every
-        // prompt for a single query. Same candidates, same results — see
-        // VaultSearchCandidates in vault.ts.
-        searchVaultNotes(config.vaultPath, prompt, VAULT_SEARCH_OVERFETCH, config.agentId, {
-          candidates: "scan",
-        }),
-        remainingMs(),
-        [],
-      ),
-      withBudget(
-        recallMemory({
-          query: prompt,
-          limit: 6,
-          agentId: config.agentId,
-          workspaceId,
-          // The load-bearing deadline: it destroys the socket, which is what
-          // lets the hook PROCESS exit. Racing a promise alone cannot do that.
-          timeoutMs: remainingMs(),
-          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-        }),
-        remainingMs(),
-        { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
-      ),
-    ]);
-    // SEC-006 (found during #283 review): searchVaultNotes returns every
-    // match regardless of privacy level — only `filterSafeVaultResults`
-    // keeps `local-only`/`private` notes and privacy-heuristic escalations
-    // (secrets/tokens/paths, see task.ts privacyForSource) out of the
-    // model-facing recall pointer, the
-    // persisted recall-state top_hits, and the PreToolUse guard's deny-
-    // reason text (all three read from `strong`/`vaultResults` below). This
-    // filter existed in claude-code's pre-#283 hook.ts but was never ported
-    // here when codex/grok-build/cursor/gemini/kilocode were extracted onto
-    // this factory — every platform sharing this handler has been leaking
-    // non-safe notes into UserPromptSubmit. Fixed once, for all six.
-    const vaultResults = filterSafeVaultResults(vaultResultsRaw).slice(0, VAULT_RESULT_LIMIT);
-    // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
-    // the weak-turn path below, which CLEARS recall-state.
-    const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
-    // s5 strength gate: emit the light pointer + recall-state file ONLY when the
-    // top recall strength clears the threshold; otherwise inject nothing and
-    // clear any stale state left by a previous strong turn.
-    const strong = extractStrongRecall(
-      recall.ok ? recall.data : undefined,
-      vaultResults,
-      threshold,
-    );
+    let vaultResults: Awaited<ReturnType<typeof searchVaultNotes>> = [];
+    let recall: Awaited<ReturnType<typeof recallMemory>> = {
+      ok: true as const,
+      data: { results: [] },
+    };
+    let daemonTimedOut = false;
+    let strong: ReturnType<typeof extractStrongRecall> = null;
     let recallStateFile: string | undefined;
     let stalePointer: string | undefined;
-    if (strong) {
-      // s6 UNCONSULTED deny is a backstop for an envelope the model actually
-      // received. Grok UPS/SS and Cursor UPS structurally drop inject
-      // (GROK_INJECTABLE={Stop}, CURSOR_INJECTABLE={SessionStart}); planting
-      // consumed=false here would deny cold tools against memory the model
-      // never saw. Do not expand those injectable sets — this gate follows them.
-      if (canInject(wire, "UserPromptSubmit")) {
-        try {
-          recallStateFile = await writeRecallState(
-            config.vaultPath,
-            {
-              task_signature: signature,
-              intent: intent.action,
-              top_hits: strong.topHits,
-              top_score: strong.topScore,
-              session_id: rawSessionId || undefined,
-              agent_id: promptAgentId,
-              prompt_id: promptId,
-            },
-            recallStateOpts,
+
+    if (!isSkip) {
+      // A spent budget gets the same fallbacks withBudget(0) would return, but
+      // without starting work that would keep running (and writing: the cold
+      // vault scan seeds missing vault files) after this handler answers.
+      const recallBudgetSpent = remainingMs() <= 0;
+      const hasQuery = Boolean(recallQuery.trim());
+      const [vaultResultsRaw, recallRaw] = !hasQuery
+        ? [
+            [] as Awaited<ReturnType<typeof searchVaultNotes>>,
+            { ok: true as const, data: { results: [] } } as Awaited<ReturnType<typeof recallMemory>>,
+          ]
+        : recallBudgetSpent
+          ? [
+              [] as Awaited<ReturnType<typeof searchVaultNotes>>,
+              { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR } as Awaited<
+                ReturnType<typeof recallMemory>
+              >,
+            ]
+          : await Promise.all([
+              withBudget(
+                // "scan": a hook is a fresh process that searches once and exits, so
+                // the prefix index the "index" path builds would be paid on every
+                // prompt for a single query. Same candidates, same results — see
+                // VaultSearchCandidates in vault.ts.
+                searchVaultNotes(
+                  config.vaultPath,
+                  recallQuery,
+                  VAULT_SEARCH_OVERFETCH,
+                  config.agentId,
+                  {
+                    candidates: "scan",
+                  },
+                ),
+                remainingMs(),
+                [],
+              ),
+              withBudget(
+                recallMemory({
+                  query: recallQuery,
+                  limit: 6,
+                  agentId: config.agentId,
+                  workspaceId,
+                  // The load-bearing deadline: it destroys the socket, which is what
+                  // lets the hook PROCESS exit. Racing a promise alone cannot do that.
+                  timeoutMs: remainingMs(),
+                  ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+                }),
+                remainingMs(),
+                { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
+              ),
+            ]);
+      // SEC-006 (found during #283 review): searchVaultNotes returns every
+      // match regardless of privacy level — only `filterSafeVaultResults`
+      // keeps `local-only`/`private` notes and privacy-heuristic escalations
+      // (secrets/tokens/paths, see task.ts privacyForSource) out of the
+      // model-facing recall pointer, the
+      // persisted recall-state top_hits, and the PreToolUse guard's deny-
+      // reason text (all three read from `strong`/`vaultResults` below). This
+      // filter existed in claude-code's pre-#283 hook.ts but was never ported
+      // here when codex/grok-build/cursor/gemini/kilocode were extracted onto
+      // this factory — every platform sharing this handler has been leaking
+      // non-safe notes into UserPromptSubmit. Fixed once, for all six.
+      vaultResults = filterSafeVaultResults(vaultResultsRaw).slice(0, VAULT_RESULT_LIMIT);
+      recall = recallRaw;
+      // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
+      // the weak-turn path below, which CLEARS recall-state.
+      daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
+      // s5 strength gate: emit the light pointer + recall-state file ONLY when the
+      // top recall strength clears the threshold; otherwise inject nothing and
+      // clear any stale state left by a previous strong turn.
+      strong = extractStrongRecall(
+        recall.ok ? recall.data : undefined,
+        vaultResults,
+        threshold,
+      );
+      if (strong) {
+        // s6 UNCONSULTED deny is a backstop for an envelope the model actually
+        // received. Grok UPS/SS and Cursor UPS structurally drop inject
+        // (GROK_INJECTABLE={Stop}, CURSOR_INJECTABLE={SessionStart}); planting
+        // consumed=false here would deny cold tools against memory the model
+        // never saw. Do not expand those injectable sets — this gate follows them.
+        if (canInject(wire, "UserPromptSubmit")) {
+          try {
+            recallStateFile = await writeRecallState(
+              config.vaultPath,
+              {
+                task_signature: signature,
+                intent: intent.action,
+                top_hits: strong.topHits,
+                top_score: strong.topScore,
+                session_id: rawSessionId || undefined,
+                agent_id: promptAgentId,
+                prompt_id: promptId,
+              },
+              recallStateOpts,
+            );
+          } catch {
+            // best-effort: a state-write failure must not break the hook
+          }
+        } else {
+          // Prior dropped-UPS plants left consumed=false on disk; this turn
+          // would have overwritten them with another false plant. Clear instead
+          // of leaving the guard armed against an undelivered envelope.
+          await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
+        }
+      } else if (daemonTimedOut) {
+        // DEGRADED, not weak — but only keep the pointer if this wire could
+        // have delivered it. Grok UPS/SS and Cursor UPS drop inject, so a
+        // leftover consumed=false would arm UNCONSULTED against an envelope
+        // the model never saw. Same gate as the plant: canInject(UPS) or clear.
+        if (canInject(wire, "UserPromptSubmit")) {
+          stalePointer = buildStaleRecallPointer(
+            await readRecallState(config.vaultPath, recallStateOpts).catch(() => null),
           );
-        } catch {
-          // best-effort: a state-write failure must not break the hook
+        } else {
+          await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
         }
       } else {
-        // Prior dropped-UPS plants left consumed=false on disk; this turn
-        // would have overwritten them with another false plant. Clear instead
-        // of leaving the guard armed against an undelivered envelope.
         await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
       }
-    } else if (daemonTimedOut) {
-      // DEGRADED, not weak — but only keep the pointer if this wire could
-      // have delivered it. Grok UPS/SS and Cursor UPS drop inject, so a
-      // leftover consumed=false would arm UNCONSULTED against an envelope
-      // the model never saw. Same gate as the plant: canInject(UPS) or clear.
-      if (canInject(wire, "UserPromptSubmit")) {
-        stalePointer = buildStaleRecallPointer(
-          await readRecallState(config.vaultPath, recallStateOpts).catch(() => null),
-        );
-      } else {
-        await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
-      }
-    } else {
-      await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
     }
 
     let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>> = undefined;
@@ -2301,6 +2406,7 @@ export function createHookHandlers(
           task_signature: signature,
           workspace: workspaceId,
           recall_strong: false,
+          ...envelopeAuditDetails,
           // RAW id only — omit rather than stamp the synthetic "session"
           // fallback, so unlabeled turns don't conflate into one audit thread.
           ...(rawSessionId ? { session_id: rawSessionId } : {}),
@@ -2403,6 +2509,7 @@ export function createHookHandlers(
         workspace: workspaceId,
         recall_strong: Boolean(strong),
         top_score: strong?.topScore,
+        ...envelopeAuditDetails,
         // RAW id only — see the weak-path comment above.
         ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
@@ -2595,6 +2702,7 @@ export function createHookHandlers(
           transcriptPath,
           sessionId,
           event: "PreCompact",
+          sessionCrons: payload.session_crons ?? payload.sessionCrons,
         },
       ).catch(() => undefined);
       if (jevResult?.harvested && jevResult.learnings.length > 0) {
