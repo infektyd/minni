@@ -17,13 +17,34 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, "..");
 const CLAUDE_HOOK = path.join(PLUGIN_ROOT, "dist", "hook.js");
 
-test("serializeEnvelope orders top-level keys by ENVELOPE_PRIORITY_ORDER, places audit_tail last, and keeps nested keys alphabetical", () => {
+test("serializeEnvelope orders top-level keys by ENVELOPE_PRIORITY_ORDER (§6.2.1), places audit_tail before unknown keys, and keeps nested keys alphabetical", () => {
   assert.ok(Array.isArray(ENVELOPE_PRIORITY_ORDER), "ENVELOPE_PRIORITY_ORDER must be exported");
-  assert.equal(ENVELOPE_PRIORITY_ORDER[0], "contract");
-  assert.equal(
-    ENVELOPE_PRIORITY_ORDER[ENVELOPE_PRIORITY_ORDER.length - 1],
+  assert.deepEqual(ENVELOPE_PRIORITY_ORDER, [
+    "contract",
+    "trimmed",
+    "over_budget",
+    "identity",
+    "degraded",
+    "corrections_reassert",
+    "lifecycle",
+    "lifecycle_focus",
+    "pending_learnings",
+    "expired_handoffs",
+    "handoff_acks",
+    "handoff_context_withheld",
+    "stale_beliefs",
+    "active_thread",
+    "active_thread_ref",
+    "recall",
+    "recent_learnings",
+    "handoff_context",
+    "pending_attention",
+    "identity_body",
+    "layer1_shelf",
+    "layer1_source",
+    "fallback_commands",
     "audit_tail",
-  );
+  ]);
 
   const body = {
     audit_tail: [{ z_field: 1, a_field: 2 }],
@@ -32,7 +53,10 @@ test("serializeEnvelope orders top-level keys by ENVELOPE_PRIORITY_ORDER, places
     recall: { ok: true, results: [] },
     active_thread: { plan_id: "p1", rev: 1 },
     layer1_shelf: { ok: true, content: "shelf" },
-    identity_body: { ok: true, content: "id" },
+    identity_body: "id-body-string",
+    degraded: { sections: ["status"] },
+    identity: { agent: "claude-code" },
+    trimmed: { audit_tail: { from: 2, to: 0 } },
     contract: "contract-text",
   };
 
@@ -45,13 +69,16 @@ test("serializeEnvelope orders top-level keys by ENVELOPE_PRIORITY_ORDER, places
   const parsedKeys = Object.keys(JSON.parse(json));
   assert.deepEqual(parsedKeys, [
     "contract",
-    "identity_body",
-    "layer1_shelf",
+    "trimmed",
+    "identity",
+    "degraded",
     "active_thread",
     "recall",
+    "identity_body",
+    "layer1_shelf",
+    "audit_tail",
     "aaa_custom",
     "zzz_custom",
-    "audit_tail",
   ]);
 
   // Nested objects inside audit_tail must still be sorted alphabetically via stableStringify

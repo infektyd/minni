@@ -256,18 +256,25 @@ test(
       additionalContext.length > 10_000,
       `with MINNI_BOOT_FIT=off, unfitted envelope should exceed 10,000 chars (got ${additionalContext.length})`,
     );
-    const { body } = parseEnvelopeFromContext(additionalContext);
+    const { body, rawJson } = parseEnvelopeFromContext(additionalContext);
     assert.equal(body.trimmed, undefined, "MINNI_BOOT_FIT=off must not attach body.trimmed");
     assert.equal(body.recall.results.length, 4, "MINNI_BOOT_FIT=off must not cap recall results to 3");
     assert.ok(
       body.recall.results[0].evidence_envelope !== undefined,
       "MINNI_BOOT_FIT=off must preserve raw evidence_envelope",
     );
+    // Legacy key sort: keys are strictly alphabetical (audit_tail comes before contract)
+    const keys = Object.keys(JSON.parse(rawJson));
+    assert.deepEqual(
+      keys,
+      [...keys].sort((a, b) => a.localeCompare(b)),
+      "MINNI_BOOT_FIT=off must restore legacy alphabetical key sorting",
+    );
   },
 );
 
 test(
-  "fitEnvelope attaches over_budget when non-trimmable floor sections exceed limits",
+  "fitEnvelope attaches over_budget ({ tokens, chars, limit, reason }) when non-trimmable floor sections exceed limits",
   () => {
     const body = {
       contract: "MEMORY CONTRACT ".repeat(20),
@@ -280,8 +287,36 @@ test(
       fitted.over_budget && typeof fitted.over_budget === "object",
       "fitEnvelope must set over_budget when floor still exceeds limits",
     );
-    assert.equal(fitted.over_budget.budget, 20);
-    assert.equal(fitted.over_budget.char_limit, 80);
+    assert.equal(fitted.over_budget.limit, 80);
+    assert.equal(fitted.over_budget.reason, "floors_exceed_limit");
     assert.ok(fitted.over_budget.tokens > 20);
+    assert.ok(fitted.over_budget.chars > 80);
+  },
+);
+
+test(
+  "fitEnvelope Step 7 trims string identity_body (> 2,000 chars) to 2,000-char floor and Step 6 does not inflate a short layer1_shelf",
+  () => {
+    const body = {
+      contract: "MEMORY CONTRACT",
+      identity_body: "## Agent Identity: claudecode\n" + "Identity rule line. ".repeat(250),
+      layer1_shelf: {
+        ok: true,
+        content: "# Short Core\n concise shelf.",
+        truncated: false,
+      },
+      audit_tail: [],
+    };
+    const fitted = fitEnvelope(body, { tokenLimit: 800, charLimit: 3200 });
+    assert.equal(typeof fitted.identity_body, "string");
+    assert.equal(fitted.identity_body.length, 2000);
+    assert.match(fitted.identity_body, /\[identity_body trimmed to 2000 chars\]$/);
+    assert.ok(fitted.trimmed?.identity_body, "trimmed.identity_body must be recorded");
+    assert.equal(
+      fitted.trimmed?.layer1_shelf,
+      undefined,
+      "a short non-truncated layer1_shelf must not be inflated by Step 6",
+    );
+    assert.equal(fitted.layer1_shelf.content, "# Short Core\n concise shelf.");
   },
 );

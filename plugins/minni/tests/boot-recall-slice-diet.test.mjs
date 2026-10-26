@@ -164,3 +164,73 @@ test("buildBootRecallSlice projects result fields, drops duplicate evidence_enve
   assert.equal(slice.episodic_count, 2);
   assert.equal(slice.note, undefined);
 });
+
+test("buildBootRecallSlice and fitEnvelope Step 2 detect correction salience from provenance.salience_boost, category, and text, and cap all-correction results to 3 at floor", async () => {
+  const { fitEnvelope } = await import("../dist/agent_envelope.js");
+  const response = {
+    agent_id: "claudecode",
+    results: [
+      {
+        wikilink: "[[c/one]]",
+        title: "First correction",
+        text: "Correction: service X moved to port 9090",
+        layer: "knowledge",
+        score: 1.5,
+      },
+      {
+        wikilink: "[[c/two]]",
+        title: "Second correction",
+        text: "Body 2",
+        layer: "knowledge",
+        category: "fix",
+        score: 1.4,
+      },
+      {
+        wikilink: "[[c/three]]",
+        title: "Third correction",
+        text: "Body 3",
+        layer: "knowledge",
+        provenance: { salience_boost: 0.25 },
+        score: 1.3,
+      },
+      {
+        wikilink: "[[c/four]]",
+        title: "Fourth correction (extra #1)",
+        text: "Body 4",
+        layer: "knowledge",
+        is_correction: true,
+        score: 1.2,
+      },
+      {
+        wikilink: "[[c/five]]",
+        title: "Fifth correction (extra #2)",
+        text: "Body 5",
+        layer: "knowledge",
+        type: "contradiction",
+        score: 1.1,
+      },
+    ],
+    episodic: [],
+    episodic_count: 0,
+  };
+
+  const slice = buildBootRecallSlice(response, "claudecode");
+  assert.equal(slice.results.length, 5);
+  for (const r of slice.results) {
+    assert.equal(r.correction, true, `expected correction:true on ${r.wikilink}`);
+  }
+
+  // When fitEnvelope trims recall (Step 2), floor keeps top 1 + up to 2 corrections = 3
+  const fitted = fitEnvelope(
+    {
+      contract: "C",
+      recall: slice,
+    },
+    { tokenLimit: 100, charLimit: 400 },
+  );
+  assert.equal(fitted.recall.results.length, 3);
+  assert.deepEqual(
+    fitted.recall.results.map((r) => r.wikilink),
+    ["[[c/one]]", "[[c/two]]", "[[c/three]]"],
+  );
+});

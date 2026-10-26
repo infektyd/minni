@@ -245,16 +245,32 @@ export interface BootRecallSliceOptions {
   diet?: boolean;
 }
 
+const BOOT_CORRECTION_TAGS = new Set([
+  "correction",
+  "corrections",
+  "fix",
+  "contradiction",
+  "contradicted",
+  "superseded",
+]);
+
 function isBootCorrectionResult(raw: unknown): boolean {
   if (raw === null || typeof raw !== "object") return false;
   const r = raw as Record<string, unknown>;
-  if (r.correction === true) return true;
-  const layer = typeof r.layer === "string" ? r.layer.toLowerCase() : "";
-  if (layer === "corrections" || layer === "correction") return true;
-  const reviewState = typeof r.review_state === "string" ? r.review_state.toLowerCase() : "";
-  if (reviewState === "correction" || reviewState === "contradicted") return true;
-  const kind = typeof r.kind === "string" ? r.kind.toLowerCase() : "";
-  if (kind === "correction") return true;
+  if (r.correction === true || r.is_correction === true) return true;
+  if (typeof r.salience_boost === "number" && r.salience_boost > 0) return true;
+  if (r.provenance !== null && typeof r.provenance === "object") {
+    const prov = r.provenance as Record<string, unknown>;
+    if (typeof prov.salience_boost === "number" && prov.salience_boost > 0) return true;
+  }
+  for (const field of ["layer", "review_state", "kind", "category", "type"] as const) {
+    const val = typeof r[field] === "string" ? (r[field] as string).trim().toLowerCase() : "";
+    if (val && BOOT_CORRECTION_TAGS.has(val)) return true;
+  }
+  for (const textField of ["title", "text", "snippet", "category"] as const) {
+    const val = typeof r[textField] === "string" ? (r[textField] as string) : "";
+    if (val && /\bcorrection\b/i.test(val)) return true;
+  }
   return false;
 }
 

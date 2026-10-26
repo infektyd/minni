@@ -208,11 +208,8 @@ import {
  */
 function isBootFitEnabled(vaultPath: string): boolean {
   const rawEnv = process.env.MINNI_BOOT_FIT;
-  if (typeof rawEnv === "string") {
-    const trimmed = rawEnv.trim();
-    if (trimmed === "off") return false;
-    if (trimmed === "on") return true;
-  }
+  if (rawEnv === "off") return false;
+  if (rawEnv === "on") return true;
   if (!vaultPath || typeof vaultPath !== "string") return true;
   const flagsPath = path.join(vaultPath, ".runtime", "flags.json");
   let fd: number | undefined;
@@ -235,11 +232,8 @@ function isBootFitEnabled(vaultPath: string): boolean {
     const parsed: unknown = JSON.parse(buf.subarray(0, total).toString("utf8"));
     if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
       const val = (parsed as Record<string, unknown>).MINNI_BOOT_FIT;
-      if (typeof val === "string") {
-        const t = val.trim();
-        if (t === "off") return false;
-        if (t === "on") return true;
-      }
+      if (val === "off") return false;
+      if (val === "on") return true;
     }
   } catch {
     // Fall back to default "on".
@@ -1528,6 +1522,7 @@ export function createHookHandlers(
       agent: config.agentId,
       budget,
       body: bodyForEnvelope,
+      legacyKeySort: !bootFitOn,
     });
 
     await recordAudit(config.vaultPath, {

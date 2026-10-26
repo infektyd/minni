@@ -115,7 +115,7 @@ export interface EnvelopeBody {
   layer1_source?: unknown;
   fallback_commands?: unknown;
   trimmed?: Record<string, { from: number; to: number }>;
-  over_budget?: { tokens: number; budget: number; char_limit?: number };
+  over_budget?: { tokens: number; chars: number; limit: number; reason: string };
   vault?: unknown;
   audit_tail?: unknown;
   scar_tissue?: unknown;
@@ -134,34 +134,35 @@ export interface EnvelopeOptions {
 }
 
 /**
- * S2a (§6.2.3, §8.2): top-level envelope key priority order so high-salience
- * sections (`contract`, `identity_body`, `layer1_shelf`, `corrections_reassert`,
- * `active_thread`, ...) sit at the front of the emitted JSON and low-salience
- * telemetry (`audit_tail`) sits at the tail.
+ * S2a (§6.2.1, §8.2): top-level envelope key priority order so high-salience
+ * contract, trim/budget diagnostics, identity, and warnings sit in the first
+ * 2 KB of the emitted JSON and low-salience telemetry (`audit_tail`) sits at
+ * the end of the known keys, followed by any unknown keys alphabetically.
  */
 export const ENVELOPE_PRIORITY_ORDER = [
   "contract",
-  "identity_body",
-  "layer1_shelf",
-  "corrections_reassert",
-  "active_thread",
-  "active_thread_ref",
-  "pending_attention",
-  "handoff_context",
-  "handoff_acks",
-  "expired_handoffs",
-  "recall",
-  "vault_recall",
-  "recent_learnings",
-  "pending_learnings",
-  "inbox",
-  "degraded",
-  "lifecycle",
-  "lifecycle_focus",
-  "layer1_source",
-  "fallback_commands",
   "trimmed",
   "over_budget",
+  "identity",
+  "degraded",
+  "corrections_reassert",
+  "lifecycle",
+  "lifecycle_focus",
+  "pending_learnings",
+  "expired_handoffs",
+  "handoff_acks",
+  "handoff_context_withheld",
+  "stale_beliefs",
+  "active_thread",
+  "active_thread_ref",
+  "recall",
+  "recent_learnings",
+  "handoff_context",
+  "pending_attention",
+  "identity_body",
+  "layer1_shelf",
+  "layer1_source",
+  "fallback_commands",
   "audit_tail",
 ] as const;
 
@@ -192,7 +193,7 @@ export function stableStringify(value: unknown): string {
 }
 
 /**
- * S2a (§6.2.3, §8.2): serialize an envelope's top-level keys in `priority`
+ * S2a (§6.2.1, §8.2): serialize an envelope's top-level keys in `priority`
  * order (`ENVELOPE_PRIORITY_ORDER`), with any remaining top-level keys sorted
  * alphabetically after the priority list, while nested values use
  * `stableStringify` unchanged.
@@ -201,32 +202,19 @@ export function serializeEnvelope(
   body: Record<string, unknown>,
   priority: readonly string[] = ENVELOPE_PRIORITY_ORDER,
 ): string {
-  const hasTrailingAuditTail =
-    priority.length > 0 && priority[priority.length - 1] === "audit_tail";
-  const mainPriority = hasTrailingAuditTail ? priority.slice(0, -1) : priority;
   const seen = new Set<string>();
   const entries: string[] = [];
-  for (const key of mainPriority) {
+  for (const key of priority) {
     if (Object.prototype.hasOwnProperty.call(body, key) && body[key] !== undefined) {
       seen.add(key);
       entries.push(`${JSON.stringify(key)}:${stableStringify(body[key])}`);
     }
-  }
-  if (hasTrailingAuditTail) {
-    seen.add("audit_tail");
   }
   const restKeys = Object.keys(body)
     .filter((key) => !seen.has(key) && body[key] !== undefined)
     .sort((a, b) => a.localeCompare(b));
   for (const key of restKeys) {
     entries.push(`${JSON.stringify(key)}:${stableStringify(body[key])}`);
-  }
-  if (
-    hasTrailingAuditTail &&
-    Object.prototype.hasOwnProperty.call(body, "audit_tail") &&
-    body.audit_tail !== undefined
-  ) {
-    entries.push(`${JSON.stringify("audit_tail")}:${stableStringify(body.audit_tail)}`);
   }
   return `{${entries.join(",")}}`;
 }
@@ -269,17 +257,61 @@ export interface FitEnvelopeLimits {
   onNativeLayer1Trimmed?: (trimmedNativeLayer1: string) => void;
 }
 
+const CORRECTION_SALIENCE_TAGS = new Set([
+  "correction",
+  "corrections",
+  "fix",
+  "contradiction",
+  "contradicted",
+  "superseded",
+]);
+
 function isCorrectionItem(raw: unknown): boolean {
   if (raw === null || typeof raw !== "object") return false;
   const r = raw as Record<string, unknown>;
-  if (r.correction === true) return true;
-  const layer = typeof r.layer === "string" ? r.layer.toLowerCase() : "";
-  if (layer === "corrections" || layer === "correction") return true;
-  const reviewState = typeof r.review_state === "string" ? r.review_state.toLowerCase() : "";
-  if (reviewState === "correction" || reviewState === "contradicted") return true;
-  const kind = typeof r.kind === "string" ? r.kind.toLowerCase() : "";
-  if (kind === "correction") return true;
+  if (r.correction === true || r.is_correction === true) return true;
+  if (typeof r.salience_boost === "number" && r.salience_boost > 0) return true;
+  if (r.provenance !== null && typeof r.provenance === "object") {
+    const prov = r.provenance as Record<string, unknown>;
+    if (typeof prov.salience_boost === "number" && prov.salience_boost > 0) return true;
+  }
+  for (const field of ["layer", "review_state", "kind", "category", "type"] as const) {
+    const val = typeof r[field] === "string" ? (r[field] as string).trim().toLowerCase() : "";
+    if (val && CORRECTION_SALIENCE_TAGS.has(val)) return true;
+  }
+  for (const textField of ["title", "text", "snippet", "category"] as const) {
+    const val = typeof r[textField] === "string" ? (r[textField] as string) : "";
+    if (val && /\bcorrection\b/i.test(val)) return true;
+  }
   return false;
+}
+
+function clipEvidenceText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const openMatch = /^<EVIDENCE[^>]*>/.exec(text);
+  const closeTag = "</EVIDENCE>";
+  if (openMatch && text.endsWith(closeTag)) {
+    const openTag = openMatch[0];
+    const innerBudget = Math.max(0, maxChars - openTag.length - closeTag.length - 3);
+    const inner = text.slice(openTag.length, text.length - closeTag.length);
+    return `${openTag}${inner.slice(0, innerBudget)}...${closeTag}`;
+  }
+  return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function cloneRecallItemWithText(raw: Record<string, unknown>, newText: string): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...raw, text: newText };
+  for (const hiddenKey of ["src", "doc_id", "source", "filename"] as const) {
+    if (raw[hiddenKey] !== undefined) {
+      Object.defineProperty(out, hiddenKey, {
+        value: raw[hiddenKey],
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return out;
 }
 
 function stripHandoffBodyItem(item: unknown): unknown {
@@ -298,6 +330,9 @@ function stripHandoffBodyItem(item: unknown): unknown {
   return out;
 }
 
+const DURABLE_LEARNING_TAG_RE =
+  /^\s*-\s*(?:\[\d{4}-\d{2}-\d{2}\]\s*)?\[(?:correction|fix|contradiction|superseded|decision|architecture|invariant|rule|contract|gate|security)\]/i;
+
 /**
  * S2a (§6.2.2, §6.2.4, §6.4, §8.1, Appendix B F8): fit an envelope body inside
  * both `limits.tokenLimit` (e.g. 4,000 tokens) and `limits.charLimit` (e.g.
@@ -309,13 +344,13 @@ function stripHandoffBodyItem(item: unknown): unknown {
  * 4. `handoff_context` -> refs only (strip inline note bodies)
  * 5. `pending_attention` -> `{ count }` summary
  * 6. `layer1_shelf` -> `<= 4,000`-char boot form + marker (`inline_trim: true`)
- * 7. `identity_body` -> `2,000` chars + `[identity_body: truncated at 2000 chars]`
+ * 7. `identity_body` -> `2,000` chars + marker
  * 8. `active_thread` -> `compactPlanPointer` form (`plan.ts:2589`)
  *
  * Non-trimmable floors (`contract`, `corrections_reassert`, `expired_handoffs`,
  * `degraded`, and the Step 2–8 floors) are never dropped. If the envelope
- * still exceeds either limit after Step 8, `over_budget: { tokens, budget,
- * char_limit }` is attached.
+ * still exceeds either limit after Step 8, `over_budget: { tokens, chars,
+ * limit, reason }` is attached.
  */
 export function fitEnvelope<T extends EnvelopeBody>(
   body: T,
@@ -334,29 +369,40 @@ export function fitEnvelope<T extends EnvelopeBody>(
     working.trimmed = { ...trimmed };
   };
 
-  // Q2(a) / §6.2.4 / §8.3: when core.md itself exceeded the 8,192-byte reader
-  // cap (`truncated === true`), convert `layer1_shelf` to the <= 4,000-char
-  // boot form up front while preserving `truncated`, `omitted_bytes`, and `note`.
-  if (working.layer1_shelf && typeof working.layer1_shelf === "object") {
+  // Helper to convert layer1_shelf to its <= 4,000-char boot form when Step 6
+  // is reached OR when core.md itself exceeded the 8,192-byte reader cap
+  // (`truncated === true`, Q2(a) / §6.2.4 / §8.3).
+  const convertShelfToBootForm = (forceForTruncatedReader: boolean): void => {
+    if (!working.layer1_shelf || typeof working.layer1_shelf !== "object") return;
     const shelf = working.layer1_shelf as Record<string, unknown>;
     if (
-      shelf.ok === true &&
-      shelf.truncated === true &&
-      typeof shelf.content === "string" &&
-      shelf.inline_trim !== true
+      shelf.ok !== true ||
+      typeof shelf.content !== "string" ||
+      shelf.inline_trim === true
     ) {
-      const fromChars = shelf.content.length;
-      const bootShelf = applyLayer1BootForm(
-        shelf,
-        limits.vaultPath,
-        LAYER1_BOOT_FORM_MAX_CHARS,
-      );
-      const toChars =
-        typeof bootShelf.content === "string" ? bootShelf.content.length : fromChars;
+      return;
+    }
+    const fromChars = shelf.content.length;
+    const bootShelf = applyLayer1BootForm(
+      shelf,
+      limits.vaultPath,
+      LAYER1_BOOT_FORM_MAX_CHARS,
+    );
+    const toChars =
+      typeof bootShelf.content === "string" ? bootShelf.content.length : fromChars;
+    if (forceForTruncatedReader || toChars < fromChars) {
       working.layer1_shelf = bootShelf;
       recordTrim("layer1_shelf", fromChars, toChars);
     }
-  }
+  };
+
+  const ensureTruncatedShelfBootForm = (): void => {
+    if (!working.layer1_shelf || typeof working.layer1_shelf !== "object") return;
+    const shelf = working.layer1_shelf as Record<string, unknown>;
+    if (shelf.ok === true && shelf.truncated === true && shelf.inline_trim !== true) {
+      convertShelfToBootForm(true);
+    }
+  };
 
   const measure = (): { json: string; tokens: number; totalChars: number } => {
     const json = serializeEnvelope(working);
@@ -383,7 +429,10 @@ export function fitEnvelope<T extends EnvelopeBody>(
   };
 
   if (!needsTrim()) {
-    return working as T;
+    ensureTruncatedShelfBootForm();
+    if (!needsTrim()) {
+      return working as T;
+    }
   }
 
   // Step 1: audit_tail -> 0 entries
@@ -391,11 +440,14 @@ export function fitEnvelope<T extends EnvelopeBody>(
     const from = working.audit_tail.length;
     working.audit_tail = [];
     recordTrim("audit_tail", from, 0);
-    if (!needsTrim()) return working as T;
+    if (!needsTrim()) {
+      ensureTruncatedShelfBootForm();
+      if (!needsTrim()) return working as T;
+    }
   }
 
-  // Step 2: recall -> drop episodic first, then shrink results to top 1 + up to 2 corrections
-  if (working.recall && typeof working.recall === "object") {
+  // Step 2: recall -> drop episodic first, then shrink results to top 1 non-identity + up to 2 corrections
+  if (working.recall && typeof working.recall === "object" && needsTrim()) {
     const rec = { ...(working.recall as Record<string, unknown>) };
     const resArr = Array.isArray(rec.results) ? [...rec.results] : [];
     const epArr = Array.isArray(rec.episodic) ? [...rec.episodic] : [];
@@ -410,6 +462,22 @@ export function fitEnvelope<T extends EnvelopeBody>(
     }
 
     if (needsTrim() && resArr.length > 1) {
+      // Drop any identity-layer items first if present
+      for (let i = resArr.length - 1; i >= 0 && needsTrim() && resArr.length > 1; i -= 1) {
+        const item = resArr[i];
+        if (
+          item !== null &&
+          typeof item === "object" &&
+          (item as Record<string, unknown>).layer === "identity"
+        ) {
+          resArr.splice(i, 1);
+          rec.results = [...resArr];
+          if (typeof rec.count === "number") rec.count = resArr.length;
+          working.recall = { ...rec };
+          recordTrim("recall", initialCount, resArr.length + epArr.length);
+        }
+      }
+
       // Identify up to 2 correction indices beyond index 0 to protect at the floor.
       const protectedCorrectionIndices = new Set<number>();
       for (let i = 1; i < resArr.length; i += 1) {
@@ -427,7 +495,32 @@ export function fitEnvelope<T extends EnvelopeBody>(
         recordTrim("recall", initialCount, resArr.length + epArr.length);
       }
     }
-    if (!needsTrim()) return working as T;
+
+    // If remaining recall results still carry oversized text (> 600 chars) and
+    // the envelope exceeds limits, clip their text inside <EVIDENCE> to 600 chars.
+    if (needsTrim() && resArr.length > 0) {
+      let clippedAny = false;
+      for (let i = resArr.length - 1; i >= 0 && needsTrim(); i -= 1) {
+        const item = resArr[i];
+        if (item !== null && typeof item === "object") {
+          const obj = item as Record<string, unknown>;
+          if (typeof obj.text === "string" && obj.text.length > 600) {
+            resArr[i] = cloneRecallItemWithText(obj, clipEvidenceText(obj.text, 600));
+            clippedAny = true;
+          }
+        }
+      }
+      if (clippedAny) {
+        rec.results = [...resArr];
+        working.recall = { ...rec };
+        recordTrim("recall", initialCount, resArr.length + epArr.length);
+      }
+    }
+
+    if (!needsTrim()) {
+      ensureTruncatedShelfBootForm();
+      if (!needsTrim()) return working as T;
+    }
   }
 
   // Step 3: recent_learnings -> 3 (durable first; candidate lines dropped first)
@@ -436,6 +529,7 @@ export function fitEnvelope<T extends EnvelopeBody>(
       const arr = working.recent_learnings as unknown[];
       const from = arr.length;
       const durable: unknown[] = [];
+      const ordinary: unknown[] = [];
       const candidates: unknown[] = [];
       for (const item of arr) {
         const isCand =
@@ -443,10 +537,27 @@ export function fitEnvelope<T extends EnvelopeBody>(
           typeof item === "object" &&
           ((item as Record<string, unknown>).review_state === "candidate" ||
             (item as Record<string, unknown>).status === "candidate");
+        const cat =
+          item !== null &&
+          typeof item === "object" &&
+          typeof (item as Record<string, unknown>).category === "string"
+            ? ((item as Record<string, unknown>).category as string).toLowerCase()
+            : "";
+        const isDurable =
+          !isCand &&
+          (CORRECTION_SALIENCE_TAGS.has(cat) ||
+            cat === "decision" ||
+            cat === "architecture" ||
+            cat === "invariant" ||
+            cat === "rule" ||
+            cat === "contract" ||
+            cat === "gate" ||
+            cat === "security");
         if (isCand) candidates.push(item);
-        else durable.push(item);
+        else if (isDurable) durable.push(item);
+        else ordinary.push(item);
       }
-      const kept = [...durable, ...candidates].slice(0, 3);
+      const kept = [...durable, ...ordinary, ...candidates].slice(0, 3);
       working.recent_learnings = kept;
       recordTrim("recent_learnings", from, kept.length);
     } else if (
@@ -457,31 +568,45 @@ export function fitEnvelope<T extends EnvelopeBody>(
       if (typeof rl.context === "string") {
         const lines = rl.context.split("\n");
         const headerLines: string[] = [];
-        const durableBullets: string[] = [];
-        const candidateBullets: string[] = [];
+        const bullets: string[] = [];
         for (const line of lines) {
           if (/^\s*-\s/.test(line)) {
-            if (/\bcandidate\b|\[candidate\]/i.test(line)) {
-              candidateBullets.push(line);
-            } else {
-              durableBullets.push(line);
-            }
-          } else if (durableBullets.length === 0 && candidateBullets.length === 0) {
+            bullets.push(line);
+          } else if (bullets.length === 0) {
             headerLines.push(line);
+          } else if (line.trim().length > 0) {
+            bullets[bullets.length - 1] = `${bullets[bullets.length - 1]}\n${line}`;
           }
         }
-        const totalBullets = durableBullets.length + candidateBullets.length;
-        if (totalBullets > 3) {
-          const keptBullets = [...durableBullets, ...candidateBullets].slice(0, 3);
+        if (bullets.length > 3) {
+          const durableBullets: string[] = [];
+          const ordinaryBullets: string[] = [];
+          const candidateBullets: string[] = [];
+          for (const b of bullets) {
+            if (/\bcandidate\b|\[candidate\]/i.test(b)) {
+              candidateBullets.push(b);
+            } else if (DURABLE_LEARNING_TAG_RE.test(b)) {
+              durableBullets.push(b);
+            } else {
+              ordinaryBullets.push(b);
+            }
+          }
+          const keptBullets = [...durableBullets, ...ordinaryBullets, ...candidateBullets].slice(
+            0,
+            3,
+          );
           working.recent_learnings = {
             ...rl,
             context: [...headerLines, ...keptBullets].join("\n"),
           };
-          recordTrim("recent_learnings", totalBullets, keptBullets.length);
+          recordTrim("recent_learnings", bullets.length, keptBullets.length);
         }
       }
     }
-    if (!needsTrim()) return working as T;
+    if (!needsTrim()) {
+      ensureTruncatedShelfBootForm();
+      if (!needsTrim()) return working as T;
+    }
   }
 
   // Step 4: handoff_context -> refs only (strip inline note bodies)
@@ -514,7 +639,10 @@ export function fitEnvelope<T extends EnvelopeBody>(
         recordTrim("handoff_context", fromChars, toChars);
       }
     }
-    if (!needsTrim()) return working as T;
+    if (!needsTrim()) {
+      ensureTruncatedShelfBootForm();
+      if (!needsTrim()) return working as T;
+    }
   }
 
   // Step 5: pending_attention -> { count } summary
@@ -532,41 +660,41 @@ export function fitEnvelope<T extends EnvelopeBody>(
         const from = pa.notifications.length;
         working.pending_attention = { count: from };
         recordTrim("pending_attention", from, 1);
+      } else if (Array.isArray(pa.items)) {
+        const from = pa.items.length;
+        working.pending_attention = { count: from };
+        recordTrim("pending_attention", from, 1);
       }
     }
-    if (!needsTrim()) return working as T;
+    if (!needsTrim()) {
+      ensureTruncatedShelfBootForm();
+      if (!needsTrim()) return working as T;
+    }
   }
 
   // Step 6: layer1_shelf -> <= 4,000-char boot form + marker (inline_trim: true)
-  if (
-    working.layer1_shelf &&
-    typeof working.layer1_shelf === "object" &&
-    needsTrim()
-  ) {
-    const shelf = working.layer1_shelf as Record<string, unknown>;
-    if (
-      shelf.ok === true &&
-      typeof shelf.content === "string" &&
-      shelf.inline_trim !== true
-    ) {
-      const fromChars = shelf.content.length;
-      const bootShelf = applyLayer1BootForm(
-        shelf,
-        limits.vaultPath,
-        LAYER1_BOOT_FORM_MAX_CHARS,
-      );
-      const toChars =
-        typeof bootShelf.content === "string" ? bootShelf.content.length : fromChars;
-      working.layer1_shelf = bootShelf;
-      recordTrim("layer1_shelf", fromChars, toChars);
-    }
+  if (needsTrim()) {
+    const shelf =
+      working.layer1_shelf && typeof working.layer1_shelf === "object"
+        ? (working.layer1_shelf as Record<string, unknown>)
+        : undefined;
+    convertShelfToBootForm(shelf?.truncated === true);
+    if (!needsTrim()) return working as T;
+  } else {
+    ensureTruncatedShelfBootForm();
     if (!needsTrim()) return working as T;
   }
 
-  // Step 7: identity_body -> 2,000 chars + [identity_body: truncated at 2000 chars]
+  // Step 7: identity_body -> 2,000 chars + marker
   if (needsTrim()) {
-    const marker = "\n[identity_body: truncated at 2000 chars]";
-    if (working.identity_body && typeof working.identity_body === "object") {
+    const marker = "\n...[identity_body trimmed to 2000 chars]";
+    if (typeof working.identity_body === "string" && working.identity_body.length > 2000) {
+      const fromChars = working.identity_body.length;
+      const clipped =
+        working.identity_body.slice(0, Math.max(0, 2000 - marker.length)) + marker;
+      working.identity_body = clipped;
+      recordTrim("identity_body", fromChars, clipped.length);
+    } else if (working.identity_body && typeof working.identity_body === "object") {
       const idBody = working.identity_body as Record<string, unknown>;
       if (typeof idBody.content === "string" && idBody.content.length > 2000) {
         const fromChars = idBody.content.length;
@@ -614,46 +742,53 @@ export function fitEnvelope<T extends EnvelopeBody>(
       } else {
         pointer = {
           plan_id: typeof at.plan_id === "string" ? at.plan_id : "unknown",
-          rev: typeof at.rev === "number" ? at.rev : 0,
-          headline:
-            typeof at.headline === "string"
-              ? at.headline
-              : typeof at.title === "string"
-                ? at.title
-                : "",
-          next_action: typeof at.next_action === "string" ? at.next_action : "",
-          progress:
-            at.progress ?? {
-              total: 0,
-              completed: 0,
-              in_progress: 0,
-              pending: 0,
-              blocked: 0,
-            },
-          open_questions_count: Array.isArray(at.open_questions)
-            ? at.open_questions.length
-            : 0,
-          scar_tissue: typeof at.scar_tissue === "number" ? at.scar_tissue : 0,
+          ...(typeof at.rev === "number" ? { rev: at.rev } : {}),
+          ...(typeof at.headline === "string"
+            ? { headline: at.headline }
+            : typeof at.title === "string"
+              ? { headline: at.title }
+              : {}),
+          ...(typeof at.plan_goal === "string" ? { plan_goal: at.plan_goal } : {}),
+          ...(typeof at.plan_digest === "string" ? { plan_digest: at.plan_digest } : {}),
+          ...(typeof at.status === "string" ? { status: at.status } : {}),
+          ...(typeof at.next_action === "string" ? { next_action: at.next_action } : {}),
+          ...(typeof at.wikilink === "string" ? { wikilink: at.wikilink } : {}),
+          ...(at.progress !== undefined ? { progress: at.progress } : {}),
+          ...(Array.isArray(at.open_questions)
+            ? { open_questions_count: at.open_questions.length }
+            : {}),
+          ...(typeof at.scar_tissue === "number" ? { scar_tissue: at.scar_tissue } : {}),
+          ...(at.shelf_drift !== undefined ? { shelf_drift: at.shelf_drift } : {}),
           pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_thread_status for detail on demand.",
         };
       }
       const toChars = stableStringify(pointer).length;
-      working.active_thread = pointer;
-      recordTrim("active_thread", fromChars, toChars);
+      if (toChars < fromChars) {
+        working.active_thread = pointer;
+        recordTrim("active_thread", fromChars, toChars);
+      }
     }
     if (!needsTrim()) return working as T;
   }
 
-  // Floor reached and still over budget: attach over_budget diagnostic
+  // Floor reached and still over budget: attach over_budget diagnostic (§6.2.2)
   if (needsTrim()) {
-    const { tokens } = measure();
-    const overBudget: { tokens: number; budget: number; char_limit?: number } = {
-      tokens,
-      budget: limits.tokenLimit,
-      ...(limits.charLimit !== undefined ? { char_limit: limits.charLimit } : {}),
+    const limit = limits.charLimit ?? limits.tokenLimit * 4;
+    const reason = "floors_exceed_limit";
+    const initial = measure();
+    const overBudget = {
+      tokens: initial.tokens,
+      chars: initial.totalChars,
+      limit,
+      reason,
     };
     working.over_budget = overBudget;
-    overBudget.tokens = measure().tokens;
+    const postAttach = measure();
+    overBudget.tokens = postAttach.tokens;
+    overBudget.chars = postAttach.totalChars;
+    const settled = measure();
+    overBudget.tokens = settled.tokens;
+    overBudget.chars = settled.totalChars;
   }
 
   return working as T;
