@@ -22,14 +22,14 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
 
     const now = new Date();
     await recordAudit(root, {
-      tool: "hook_session_start",
+      tool: "hook_user_prompt_submit",
       summary: "First audit",
       timestamp: now,
     });
 
     // Same event again, inside the window: a genuine duplicate -> dropped.
     await recordAudit(root, {
-      tool: "hook_session_start",
+      tool: "hook_user_prompt_submit",
       summary: "Second audit too fast",
       timestamp: new Date(now.getTime() + 2000),
     });
@@ -40,13 +40,13 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
     // second, so PreInvocation was never audited and looked like it had never
     // dispatched at all. Distinct events are not duplicates.
     await recordAudit(root, {
-      tool: "hook_user_prompt_submit",
+      tool: "hook_pre_compact",
       summary: "Distinct event in window",
       timestamp: new Date(now.getTime() + 2000),
     });
 
     const okPath = await recordAudit(root, {
-      tool: "hook_session_start",
+      tool: "hook_user_prompt_submit",
       summary: "Third audit ok",
       timestamp: new Date(now.getTime() + 8000),
     });
@@ -85,7 +85,7 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
 
     const now = new Date();
     await recordAudit(root, {
-      tool: "hook_session_start",
+      tool: "hook_user_prompt_submit",
       summary: "First audit",
       timestamp: now,
     });
@@ -105,7 +105,7 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
 
     // Verify rate limit file has mode 0o600 (on UNIX platforms).
     // The throttle key is per (agent, event), so the filename carries both.
-    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit__hook_session_start.ts");
+    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit__hook_user_prompt_submit.ts");
     const st = await stat(agentTsFile);
     if (process.platform !== "win32") {
       const mode = st.mode & 0o777;
@@ -387,6 +387,59 @@ test("two intent drops on DIFFERENT events both survive the 5s window", async ()
     const after = await readFile(path.join(root, "log.md"), "utf8");
     const stops = [...after.matchAll(/Stop: cursor cannot carry this/g)];
     assert.equal(stops.length, 1, "duplicate suppression must still work per event");
+  } finally {
+    if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("rev5 §8.2 (Row j): <prefix>_session_start is exempt from the 5s audit throttle across consecutive boots", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "session-start-exempt-vault-"));
+  const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
+
+  const origBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  const origHome = process.env.MINNI_HOME;
+
+  try {
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "false";
+    process.env.MINNI_HOME = home;
+    await ensureVault(root);
+
+    const now = new Date();
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "Boot 1 (use_ledger=on)",
+      details: { use_ledger: "on" },
+      timestamp: now,
+    });
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "Boot 2 within 5s (use_ledger=off)",
+      details: { use_ledger: "off" },
+      timestamp: new Date(now.getTime() + 500),
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "Codex Boot 1 (use_ledger=on)",
+      details: { use_ledger: "on" },
+      timestamp: new Date(now.getTime() + 1000),
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "Codex Boot 2 within 5s (use_ledger=off)",
+      details: { use_ledger: "off" },
+      timestamp: new Date(now.getTime() + 1500),
+    });
+
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(log, /Boot 1 \(use_ledger=on\)/);
+    assert.match(log, /Boot 2 within 5s \(use_ledger=off\)/, "hook_session_start must not be throttled within 5s");
+    assert.match(log, /Codex Boot 1 \(use_ledger=on\)/);
+    assert.match(log, /Codex Boot 2 within 5s \(use_ledger=off\)/, "hook_codex_session_start must not be throttled within 5s");
   } finally {
     if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
     else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;

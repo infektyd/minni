@@ -502,7 +502,9 @@ async function listMarkdownFiles(root: string): Promise<string[]> {
   } catch {
     return [];
   }
-  const entries = await readdir(root, { withFileTypes: true });
+  const entries = (await readdir(root, { withFileTypes: true })).sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  );
   const files = await Promise.all(
     entries.map(async (entry) => {
       const full = path.join(root, entry.name);
@@ -2215,7 +2217,14 @@ function isExemptFromAuditThrottle(entry: AuditEntry): boolean {
   // diagnostic spawns are budget-capped (DIAGNOSTIC_MAX_IN_FLIGHT, kill
   // timer) and session-evict is coalesced to one spawn per interval, so the
   // frequency ceiling is set upstream of the audit call.
-  return entry.tool.endsWith("_stop") || entry.tool.endsWith("_bridge_failure");
+  //
+  // rev5 §8.2 (Row j): <prefix>_session_start is also exempt so rapid
+  // consecutive boots never drop a details.use_ledger stretch boundary.
+  return (
+    entry.tool.endsWith("_stop") ||
+    entry.tool.endsWith("_bridge_failure") ||
+    entry.tool.endsWith("_session_start")
+  );
 }
 
 function shouldThrottleAudit(entry: AuditEntry): boolean {
@@ -3181,11 +3190,10 @@ export function readVaultNoteTextForDf(vaultPath: string, relativePath: string, 
  * path is that deterministic work budget, and it cannot change what is
  * selected, only what selecting it costs.
  *
- * After writeVaultPage rewrites a note in the same process, the index keeps
- * the note's old keys (it only ever adds), so the index path can admit the
- * note as an extra candidate the scan would not. The extra is scored on its
- * current text, so results agree whenever candidate selection admits every
- * note the scorer can score.
+ * After writeVaultPage writes or rewrites a note in the same process,
+ * updateVaultSearchCacheOnWrite keeps cached.notes in deterministic sorted
+ * order and rebuilds cached.tokenMap (when present) so stale keys are removed
+ * and bucket ordering matches both "scan" and a cold index build.
  */
 export type VaultSearchCandidates = "index" | "scan";
 export type VaultSearchRankMode = "legacy" | "ups_gate" | "noise_last";
@@ -3759,12 +3767,19 @@ function updateVaultSearchCacheOnWrite(
 ): void {
   const cached = _vaultSearchCache.get(vaultPath);
   if (!cached) return;
+  const wikiRel = path.relative(path.join(vaultPath, "wiki"), notePath);
+  if (!wikiRel || wikiRel.startsWith("..") || path.isAbsolute(wikiRel)) return;
   const privacy = privacyFromMarkdown(markdown);
   if (privacy === "blocked") {
     cached.notes.delete(notePath);
+    if (cached.tokenMap) {
+      cached.tokenMap = undefined;
+      vaultSearchTokenMap(cached);
+    }
+    cached.builtAtMs = Date.now();
     return;
   }
-  const resolvedTitle = title || titleFromMarkdown(relativePath, markdown);
+  const resolvedTitle = titleFromMarkdown(relativePath, markdown) || title;
   const entry = buildCachedVaultNoteEntry(
     notePath,
     relativePath,
@@ -3772,9 +3787,17 @@ function updateVaultSearchCacheOnWrite(
     markdown,
     privacy,
   );
-  cached.notes.set(notePath, entry);
-  if (!entry.skipByStatus && cached.tokenMap) {
-    indexNoteTokensIntoMap(cached.tokenMap, notePath, entry.haystackLower);
+  if (cached.notes.has(notePath)) {
+    cached.notes.set(notePath, entry);
+  } else {
+    const entries = [...cached.notes.entries(), [notePath, entry] as const].sort(
+      (a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
+    );
+    cached.notes = new Map(entries);
+  }
+  if (cached.tokenMap) {
+    cached.tokenMap = undefined;
+    vaultSearchTokenMap(cached);
   }
   cached.builtAtMs = Date.now();
 }
@@ -3823,12 +3846,12 @@ export async function searchVaultNotes(
     } catch {
       return [];
     }
-    const notes = new Map<string, CachedVaultNoteEntry>();
-    await Promise.all(
+    files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const loaded = await Promise.all(
       files.map(async (notePath) => {
         const markdown = await readFile(notePath, "utf8");
         const privacy = privacyFromMarkdown(markdown);
-        if (privacy === "blocked") return;
+        if (privacy === "blocked") return undefined;
         const relativePath = path.relative(vaultPath, notePath);
         const title = titleFromMarkdown(relativePath, markdown);
         const entry = buildCachedVaultNoteEntry(
@@ -3838,9 +3861,13 @@ export async function searchVaultNotes(
           markdown,
           privacy,
         );
-        notes.set(notePath, entry);
+        return [notePath, entry] as const;
       }),
     );
+    const notes = new Map<string, CachedVaultNoteEntry>();
+    for (const item of loaded) {
+      if (item) notes.set(item[0], item[1]);
+    }
     cache = { builtAtMs: now, notes };
     _vaultSearchCache.set(vaultPath, cache);
   }
