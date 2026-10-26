@@ -139,6 +139,14 @@ import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutco
 // (after delivery) and use-report.js (the receipt), all dynamically.
 import { LEDGER_EVENTS, ledgerMayBeOn } from "./ledger-gate.js";
 import type { TurnRecord, UseCapture } from "./use-capture.js";
+import {
+  POST_TOOL_USE_EVENTS,
+  clearSessionFailureLessonsOnReset,
+  markFailureLessonFired,
+  matchPostToolUseFailureLesson,
+  matchPreToolUseFailureLesson,
+} from "./failure-lessons.js";
+import type { PostToolUseDecisionOutput } from "./failure-lessons.js";
 
 type CaptureApi = typeof import("./use-capture.js");
 
@@ -1249,6 +1257,10 @@ export interface AgentHookHandlers {
   handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput>;
   handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
+  handlePostToolUse(
+    event: "PostToolUse" | "PostToolUseFailure",
+    payload: Record<string, unknown>,
+  ): Promise<PostToolUseDecisionOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput>;
@@ -1258,7 +1270,7 @@ export interface AgentHookHandlers {
   dispatch(
     event: string,
     payload: Record<string, unknown>,
-  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput>;
+  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput | PostToolUseDecisionOutput>;
 }
 
 /**
@@ -1472,6 +1484,7 @@ export function createHookHandlers(
       }).catch(() => {});
     }
     await clearSessionSurfacedOnReset(config.vaultPath, rawSessionId || sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, rawSessionId || sessionId);
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
@@ -2653,8 +2666,39 @@ export function createHookHandlers(
       return preToolUseAllow();
     }
 
+    const maybeSurfacePreToolUseFailureLesson = async (): Promise<PreToolUseDecisionOutput> => {
+      if (!wireCapabilities(wire).preToolUseContext) return preToolUseAllow();
+      const lesson = matchPreToolUseFailureLesson({
+        vaultPath: config.vaultPath,
+        toolName,
+        toolInput,
+        sessionId: guardSessionId || undefined,
+        cwd: asString(payload.cwd) || undefined,
+      });
+      if (!lesson) return preToolUseAllow();
+      markFailureLessonFired(config.vaultPath, guardSessionId || undefined, lesson.lessonId);
+      if (options.recordDeny) {
+        const opened = await openLedger(PRE_TOOL_USE_EVENT, payload);
+        opened?.ledger?.api.captureFailureLesson(opened.ledger.capture, {
+          mkey: lesson.mkey,
+          handles: [lesson.handle],
+          title: lesson.title,
+          lessonText: lesson.lessonText,
+          emitted: lesson.additionalContext,
+        });
+        await opened?.settle();
+      }
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: lesson.additionalContext,
+        },
+      };
+    };
+
     const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
-    if (mode === "off") return preToolUseAllow();
+    if (mode === "off") return maybeSurfacePreToolUseFailureLesson();
     // s6 deny is a backstop for an envelope the model actually received.
     // Dropped UPS (Grok, Cursor, unprofiled) never delivers that envelope;
     // leftover consumed=false must not deny cold tools.
@@ -2663,7 +2707,7 @@ export function createHookHandlers(
     const guardV2 = isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
     // S2b (§6.3.6): a PreToolUse carrying agent_id is inside a subagent; it
     // never surfaces parent recall and never consumes parent arming.
-    if (guardV2 && guardAgentId) return preToolUseAllow();
+    if (guardV2 && guardAgentId) return maybeSurfacePreToolUseFailureLesson();
 
     const recallStateOpts = { sessionId: guardSessionId || undefined, guardV2 };
 
@@ -2696,7 +2740,7 @@ export function createHookHandlers(
       guardV2,
       agentId: guardAgentId || undefined,
     });
-    if (verdict === "allow") return preToolUseAllow();
+    if (verdict === "allow") return maybeSurfacePreToolUseFailureLesson();
 
     // S2b (§6.3.3): atomic claim across sibling PreToolUse processes in a
     // parallel batch. Only the single winner surfaces; losers return allow.
@@ -2769,6 +2813,7 @@ export function createHookHandlers(
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
 
     // hooks-PL-3: compaction is exactly when a correction the agent already
     // saw can fall out of context. Stash the current stale-belief /
@@ -2877,6 +2922,7 @@ export function createHookHandlers(
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     // Same provenance stamp as SessionStart harvest — dual delivery paths
     // must not disagree on `platform` when runtime and agentId differ.
     await harvestSummaryText(
@@ -2914,6 +2960,7 @@ export function createHookHandlers(
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
+    clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     await harvestSummaryText(
       {
         vaultPath: config.vaultPath,
@@ -3175,6 +3222,49 @@ export function createHookHandlers(
     return { continue: true };
   }
 
+  // Phase 1b (S4c–S4d, §7): PostToolUse and PostToolUseFailure failure-lesson
+  // surfacing. Matches `tool_response` output text on every Bash call even when
+  // `is_error === false` (solving exit-code masking `| tail`, `echo exit=$?`).
+  async function handlePostToolUse(
+    event: "PostToolUse" | "PostToolUseFailure",
+    payload: Record<string, unknown>,
+    options: { recordLedger?: boolean } = {},
+  ): Promise<PostToolUseDecisionOutput> {
+    if (!wireCapabilities(wire).preToolUseContext) {
+      return { continue: true };
+    }
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const lesson = matchPostToolUseFailureLesson({
+      vaultPath: config.vaultPath,
+      event,
+      payload,
+      sessionId: rawSessionId || undefined,
+      cwd: asString(payload.cwd) || undefined,
+    });
+    if (!lesson) {
+      return { continue: true };
+    }
+    markFailureLessonFired(config.vaultPath, rawSessionId || undefined, lesson.lessonId);
+    if (options.recordLedger) {
+      const opened = await openLedger(event, payload);
+      opened?.ledger?.api.captureFailureLesson(opened.ledger.capture, {
+        mkey: lesson.mkey,
+        handles: [lesson.handle],
+        title: lesson.title,
+        lessonText: lesson.lessonText,
+        emitted: lesson.additionalContext,
+      });
+      await opened?.settle();
+    }
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: event,
+        additionalContext: lesson.additionalContext,
+      },
+    };
+  }
+
   // S1a-2: the use-ledger capture is opened here, once per event (a hook
   // process handles one), so a direct handler call never records. One cheap
   // check decides whether the capture modules load at all; when they do, the
@@ -3188,9 +3278,11 @@ export function createHookHandlers(
   async function dispatch(
     event: string,
     payload: Record<string, unknown>,
-  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput> {
+  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput | PostToolUseDecisionOutput> {
     const opened =
-      event !== PRE_TOOL_USE_EVENT && LEDGER_EVENTS.has(event) ? await openLedger(event, payload) : null;
+      event !== PRE_TOOL_USE_EVENT && !POST_TOOL_USE_EVENTS.has(event) && LEDGER_EVENTS.has(event)
+        ? await openLedger(event, payload)
+        : null;
     try {
       return await route(event, payload, opened?.ledger ?? null);
     } finally {
@@ -3241,7 +3333,7 @@ export function createHookHandlers(
     event: string,
     payload: Record<string, unknown>,
     ledger: LedgerCapture | null,
-  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput> {
+  ): Promise<HookOutput | PreToolUseDecisionOutput | SubagentHookOutput | PostToolUseDecisionOutput> {
     switch (event) {
       case "SessionStart":
         if (ledger) {
@@ -3259,6 +3351,10 @@ export function createHookHandlers(
         );
       case PRE_TOOL_USE_EVENT:
         return handlePreToolUse(payload, { recordDeny: true });
+      case "PostToolUse":
+        return handlePostToolUse("PostToolUse", payload, { recordLedger: true });
+      case "PostToolUseFailure":
+        return handlePostToolUse("PostToolUseFailure", payload, { recordLedger: true });
       case "PreCompact":
         ledger?.api.recordReset(ledger.capture, event, payload);
         return handlePreCompact(payload);
@@ -3296,6 +3392,7 @@ export function createHookHandlers(
     handleCompactSummary,
     handleStop,
     handlePreToolUse,
+    handlePostToolUse,
     handleSubagentStart,
     handleSubagentStop,
     dispatch,
@@ -3415,7 +3512,7 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   const event = (eventArg || eventFromPayload || "").trim();
   // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is
   // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
-  if (event !== PRE_TOOL_USE_EVENT && !SUBAGENT_EVENTS.has(event) && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
+  if (event !== PRE_TOOL_USE_EVENT && !SUBAGENT_EVENTS.has(event) && !POST_TOOL_USE_EVENTS.has(event) && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
     // P4 (#228): this exited with a SUCCESS status and no marker of any kind,
     // so an event the platform declared and sent but Minni does not route was
     // indistinguishable from an event that was never sent at all. That is the

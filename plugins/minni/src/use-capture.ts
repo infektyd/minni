@@ -1203,6 +1203,44 @@ export function captureSubagentBrief(capture: UseCapture | undefined, input: Sub
   }
 }
 
+export interface FailureLessonCaptureInput {
+  mkey: string;
+  handles: string[];
+  title: string;
+  lessonText: string;
+  emitted: string;
+}
+
+/**
+ * Phase 1b (S4d, §7): capture a failure-moment lesson surfaced on PreToolUse,
+ * PostToolUse, or PostToolUseFailure under `channel: "failure_lesson"`.
+ * Never throws.
+ */
+export function captureFailureLesson(
+  capture: UseCapture | undefined,
+  input: FailureLessonCaptureInput,
+): void {
+  if (capture === undefined || !input.emitted || !input.mkey) return;
+  try {
+    const safeTitle = sanitizeRecallField(input.title, 100);
+    const items: SurfacedItem[] = [
+      {
+        mkey: input.mkey,
+        handles: input.handles,
+        title: safeTitle,
+        rank: 1,
+        score: 1,
+        locate: safeTitle,
+        shingles: shingleHashes(input.lessonText),
+        echo: echoHashes(input.emitted),
+      },
+    ];
+    record(capture, "failure_lesson", items, input.emitted, currentTurnIndex(capture));
+  } catch {
+    // Best effort.
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Retention of recall-session.d (§4.3 "Retention", §6.2.5)

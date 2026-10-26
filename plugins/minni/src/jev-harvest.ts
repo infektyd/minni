@@ -135,8 +135,9 @@ export function maskTelemetry(text: string): string {
     }
     if (
       /^📓\s*\d+\s+relevant\s+memor(?:y|ies)\b/iu.test(trimmed) ||
+      /^📓\s*Minni\s+failure\s+lesson\b/iu.test(trimmed) ||
       /^⚠️\s*STALE\s+recall\s+pointer\b/iu.test(trimmed) ||
-      /^PreToolUse(?::[A-Za-z0-9_.-]+)?\s+hook\s+additional\s+context:/iu.test(trimmed)
+      /^(?:PreToolUse|PostToolUse(?:Failure)?)(?::[A-Za-z0-9_.-]+)?\s+hook\s+additional\s+context:/iu.test(trimmed)
     ) {
       continue;
     }

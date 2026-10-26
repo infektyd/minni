@@ -58,7 +58,8 @@ export type SurfaceChannel =
   | "prompt_pointer"
   | "guard"
   | "explicit_recall"
-  | "subagent_brief";
+  | "subagent_brief"
+  | "failure_lesson";
 
 // ---------------------------------------------------------------------------
 // Hashing
@@ -1219,6 +1220,7 @@ const CHANNELS: ReadonlySet<string> = new Set<SurfaceChannel>([
   "guard",
   "explicit_recall",
   "subagent_brief",
+  "failure_lesson",
 ]);
 
 function isOptionalString(value: unknown): boolean {
