@@ -446,7 +446,7 @@ def test_pure_replay_and_handler_replay(tmp_path: Path) -> None:
     priv = tmp_path / "priv_replay"
     priv.mkdir()
 
-    replay_res = run_pure_replay({})
+    replay_res = run_pure_replay({}, allow_synthetic_fixture=True)
     assert replay_res["today"]["all_targets_passed"] is False
     assert replay_res["target"]["all_targets_passed"] is True
     assert replay_res["target"]["metrics"]["machine_output_turns_recalled"] == 0
@@ -485,3 +485,270 @@ def test_pure_replay_and_handler_replay(tmp_path: Path) -> None:
     assert handler_res["status"] == "ok"
     assert len(handler_res["judged"]) == 1
     assert handler_res["judged"][0]["outcome"] in ("applied", "cited")
+
+
+def test_b1_pure_replay_rejects_empty_corpus_without_synthetic_flag_and_computes_real_metrics(
+    tmp_path: Path,
+) -> None:
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    empty_priv = tmp_path / "empty_priv"
+    empty_priv.mkdir()
+
+    with pytest.raises(ValueError, match="No replay corpus found"):
+        run_pure_replay(None, minni_home=empty_home, private_root=empty_priv)
+
+    with pytest.raises(ValueError, match="No replay corpus found"):
+        run_pure_replay({}, minni_home=empty_home, private_root=empty_priv)
+
+    notes = [
+        {
+            "path": "wiki/decisions/realpath-guard.md",
+            "title": "Strict Realpath Guard",
+            "category": "decision",
+            "content": "Decision: enforce strict realpath containment on private root.",
+        },
+        {
+            "path": "wiki/decisions/sqlite-wal.md",
+            "title": "SQLite WAL Busy Timeout",
+            "category": "fix",
+            "content": "Fix: configure busy_timeout = 5000 on SQLite connections.",
+        },
+    ] + [
+        {
+            "path": f"wiki/notes/filler-{i:02d}.md",
+            "title": f"Filler Note {i}",
+            "category": "general",
+            "content": f"ordinary background context note number {i}",
+        }
+        for i in range(40)
+    ]
+
+    corpus_a = {
+        "notes": notes,
+        "turns": [
+            {"prompt": "enforce strict realpath containment on private root", "kind": "human"},
+            {"prompt": "unrelated casual greeting", "kind": "human"},
+            {"prompt": "another unrelated short question", "kind": "human"},
+            {"prompt": "yet another unrelated prompt", "kind": "human"},
+        ],
+        "surfacings": [
+            {"sid": "s1", "visible": True, "outcome": "applied", "rank": 1, "durability": "durable"},
+            {"sid": "s2", "visible": True, "outcome": "ignored", "rank": 2, "durability": "durable"},
+            {"sid": "s3", "visible": True, "outcome": "ignored", "rank": 3, "durability": "noise"},
+        ],
+        "boot_tokens": [310, 350, 390],
+    }
+    corpus_b = {
+        "notes": notes,
+        "turns": [
+            {"prompt": "enforce strict realpath containment on private root", "kind": "human"},
+            {"prompt": "configure busy_timeout = 5000 on SQLite connections", "kind": "human"},
+        ],
+        "surfacings": [
+            {"sid": "s1", "visible": True, "outcome": "applied", "rank": 1, "durability": "durable"},
+            {"sid": "s2", "visible": True, "outcome": "cited", "rank": 1, "durability": "durable"},
+        ],
+        "boot_tokens": [510, 530, 550],
+    }
+
+    res_a = run_pure_replay(corpus_a)
+    res_b = run_pure_replay(corpus_b)
+
+    assert "recall_to_use_rate" in res_a
+    assert "p_at_3" in res_a
+    assert "p50_boot_tokens" in res_a
+    assert res_a["recall_to_use_rate"] == pytest.approx(1 / 3.0)
+    assert res_b["recall_to_use_rate"] == pytest.approx(1.0)
+    assert res_a["p50_boot_tokens"] == 350
+    assert res_b["p50_boot_tokens"] == 530
+    assert res_a["target"]["metrics"]["median_boot_recall_tokens"] == 350
+    assert res_b["target"]["metrics"]["median_boot_recall_tokens"] == 530
+    assert res_a["p_at_3"] != res_b["p_at_3"]
+
+    # When boot_tokens is omitted and allow_synthetic_fixture=False, p50_boot_tokens must be computed from corpus notes/boot items, NOT hardcoded 420
+    corpus_no_boot_list = {
+        "notes": notes,
+        "turns": corpus_a["turns"],
+        "surfacings": corpus_a["surfacings"],
+    }
+    res_no_boot = run_pure_replay(corpus_no_boot_list)
+    assert res_no_boot["p50_boot_tokens"] != 420
+    assert res_no_boot["p50_boot_tokens"] > 0
+
+    # Live/private corpus loader must ingest <minni_home>/*-vault/.runtime/use-outcomes.jsonl, nested use-ledger.d/**/*.jsonl, and minni.db (learnings, documents, episodic_events)
+    import json
+    import sqlite3
+
+    live_home = tmp_path / "live_home"
+    live_vault = live_home / "claudecode-vault"
+    (live_vault / ".runtime" / "use-ledger.d" / "nested").mkdir(parents=True)
+    (live_vault / "layer1").mkdir(parents=True)
+    (live_vault / "layer1" / "core.md").write_text("# Core\n\n" + ("core guidance token " * 40), encoding="utf-8")
+    (live_vault / ".runtime" / "use-outcomes.jsonl").write_text(
+        json.dumps({"sid": "out-1", "visible": True, "outcome": "applied", "rank": 1, "channel": "prompt_pointer", "durability": "durable"}) + "\n",
+        encoding="utf-8",
+    )
+    (live_vault / ".runtime" / "use-ledger.d" / "nested" / "sess1.jsonl").write_text(
+        json.dumps({"kind": "turn", "prompt": "enforce strict realpath containment on private root"}) + "\n",
+        encoding="utf-8",
+    )
+    db_file = live_home / "minni.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("CREATE TABLE learnings (id INTEGER PRIMARY KEY, category TEXT, content TEXT, confidence REAL, source TEXT)")
+    conn.execute("INSERT INTO learnings VALUES (1, 'decision', 'Decision: enforce strict realpath containment on private root.', 0.95, 'claude-code')")
+    conn.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, path TEXT, title TEXT, content TEXT)")
+    conn.execute("INSERT INTO documents VALUES (10, 'wiki/decisions/doc-table.md', 'Doc Table Decision', 'Decision: loaded from documents table.')")
+    conn.execute("CREATE TABLE episodic_events (id INTEGER PRIMARY KEY, session_id TEXT, summary TEXT, content TEXT)")
+    conn.execute("INSERT INTO episodic_events VALUES (20, 'sess-ep-1', ' investigated realpath containment ', 'prompt turn from episodic_events')")
+    conn.commit()
+    conn.close()
+
+    res_live = run_pure_replay(None, minni_home=live_home, private_root=empty_priv)
+    assert res_live["recall_to_use_rate"] == pytest.approx(1.0)
+    assert res_live["p50_boot_tokens"] > 0 and res_live["p50_boot_tokens"] != 420
+
+
+def test_b1_labelling_reads_per_note_unannotated_boot_seen_from_recall_state(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    recall_state_file = tmp_path / "recall-state.json"
+    recall_state_file.write_text(
+        json.dumps(
+            {
+                "noteStats": {
+                    "101": {"unannotatedBootSeen": 3},
+                    "102": {"unannotatedBootSeen": 1},
+                    "103": {"unannotatedBootSeen": 2},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fixture = {
+        "learnings": [
+            {
+                "id": 101,
+                "category": "decision",
+                "class": "recalled-not-used",
+                "surfacings": [
+                    {
+                        "sid": "sid-101-boot-1",
+                        "channel": "SessionStart injection: recent_learnings",
+                        "session": "sess-1",
+                        "ts": "2026-10-20T10:00:00Z",
+                    }
+                ],
+            },
+            {
+                "id": 102,
+                "category": "decision",
+                "class": "recalled-not-used",
+                "surfacings": [
+                    {
+                        "sid": "sid-102-boot-1",
+                        "channel": "SessionStart injection: recent_learnings",
+                        "session": "sess-1",
+                        "ts": "2026-10-20T10:00:00Z",
+                    },
+                    {
+                        "sid": "sid-102-boot-2",
+                        "channel": "SessionStart injection: recent_learnings",
+                        "session": "sess-2",
+                        "ts": "2026-10-20T11:00:00Z",
+                    },
+                    {
+                        "sid": "sid-102-boot-3",
+                        "channel": "SessionStart injection: recent_learnings",
+                        "session": "sess-3",
+                        "ts": "2026-10-20T12:00:00Z",
+                    },
+                ],
+            },
+            {
+                "id": 103,
+                "category": "decision",
+                "class": "recalled-not-used",
+                "surfacings": [
+                    {
+                        "sid": "sid-103-boot-1",
+                        "channel": "SessionStart injection: recent_learnings",
+                        "session": "sess-1",
+                        "ts": "2026-10-20T10:00:00Z",
+                    },
+                    {
+                        "sid": "sid-103-boot-2",
+                        "channel": "SessionStart injection: recent_learnings",
+                        "session": "sess-2",
+                        "ts": "2026-10-20T11:00:00Z",
+                    },
+                ],
+            },
+        ],
+        "scars": [],
+    }
+
+    labels = build_labels_from_audit(fixture, recall_state=recall_state_file)
+    by_sid = {s["sid"]: s for s in labels["surfacings"]}
+    assert by_sid["sid-101-boot-1"]["label_outcome"] == "ignored"
+    assert by_sid["sid-101-boot-1"]["confidence"] == "medium"
+    assert by_sid["sid-102-boot-1"]["label_outcome"] == "abstain"
+    assert by_sid["sid-102-boot-1"]["confidence"] == "low"
+    assert by_sid["sid-102-boot-2"]["label_outcome"] == "abstain"
+    assert by_sid["sid-102-boot-2"]["confidence"] == "low"
+    assert by_sid["sid-102-boot-3"]["label_outcome"] == "ignored"
+    assert by_sid["sid-102-boot-3"]["confidence"] == "medium"
+    assert by_sid["sid-103-boot-1"]["label_outcome"] == "abstain"
+    assert by_sid["sid-103-boot-2"]["label_outcome"] == "ignored"
+
+
+def test_b1_handler_replay_never_falls_back_to_note_body_as_assistant_reply(
+    tmp_path: Path,
+) -> None:
+    priv = tmp_path / "priv_handler_b1"
+    priv.mkdir()
+
+    handler_res = run_handler_replay(
+        events=[
+            {
+                "type": "turn_and_surface",
+                "session_id": "sess-handler-no-reply",
+                "prompt_id": "pid-no-reply",
+                "prompt": "How should we handle stableStringify in envelope ordering?",
+                "note_rel_path": "wiki/decisions/envelope-order.md",
+                "note_title": "Envelope Priority Serializer",
+                "note_body": (
+                    "Decision: never mutate stableStringify because plan digests and thread "
+                    "claims hash through it; use a top-level priority serializer instead."
+                ),
+                # Intentionally omit assistant_reply: must NOT self-match note_body!
+            },
+            {
+                "type": "turn_and_surface",
+                "session_id": "sess-handler-reply-text",
+                "prompt_id": "pid-reply-text",
+                "prompt": "How should we handle stableStringify in envelope ordering?",
+                "note_rel_path": "wiki/decisions/envelope-order.md",
+                "note_title": "Envelope Priority Serializer",
+                "note_body": (
+                    "Decision: never mutate stableStringify because plan digests and thread "
+                    "claims hash through it; use a top-level priority serializer instead."
+                ),
+                "reply_text": (
+                    "We must never mutate stableStringify because plan digests and thread "
+                    "claims hash through it per [[wiki/decisions/envelope-order]]."
+                ),
+            },
+        ],
+        private_root=priv,
+    )
+    assert handler_res["status"] == "ok"
+    assert len(handler_res["judged"]) == 2
+    by_session = {r["session_key"]: r["outcome"] for r in handler_res["judged"]}
+    assert "ignored" in by_session.values()
+    assert any(v in ("applied", "cited") for v in by_session.values())
+
+

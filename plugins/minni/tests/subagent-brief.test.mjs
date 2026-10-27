@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
 import {
+  PLUGIN_ROOT,
   agentKeyOf,
   daemonResult,
   makeFixture,
@@ -289,3 +290,95 @@ test(
     assert.equal(rows.length, 0);
   },
 );
+
+test(
+  "B3: hooks-cursor.json and hooks-gemini.json PreToolUse matchers include Agent|Task, stashSubagentPending writes .runtime/subagent-pending.d/<sessionKey>.json with targetPaths, and claimSubagentPending falls back to it",
+  { timeout: 60_000 },
+  async (t) => {
+    const cursorHooks = JSON.parse(
+      await readFile(path.join(PLUGIN_ROOT, "hooks", "hooks-cursor.json"), "utf8"),
+    );
+    const cursorMatcher = String(cursorHooks?.hooks?.preToolUse?.[0]?.matcher ?? "");
+    assert.match(cursorMatcher, /Agent/, "hooks-cursor.json preToolUse matcher must include Agent");
+    assert.match(cursorMatcher, /Task/, "hooks-cursor.json preToolUse matcher must include Task");
+
+    const geminiHooks = JSON.parse(
+      await readFile(path.join(PLUGIN_ROOT, "hooks", "hooks-gemini.json"), "utf8"),
+    );
+    const geminiMatcher = String(geminiHooks?.minni?.PreToolUse?.[0]?.matcher ?? "");
+    assert.match(geminiMatcher, /Agent/, "hooks-gemini.json PreToolUse matcher must include Agent");
+    assert.match(geminiMatcher, /Task/, "hooks-gemini.json PreToolUse matcher must include Task");
+
+    const fixture = await makeFixture(t, "subagent-b3-pending");
+    await startFakeDaemon(fixture, {
+      search: (params) => {
+        const q = String(params.query ?? "");
+        if (q.includes("plugins/minni/src/hook-handlers.ts")) {
+          return {
+            agent_id: "claude-code",
+            results: [
+              daemonResult({
+                source: "/shared/hook-handlers-note.md",
+                docId: 501,
+                src: "shared",
+                wikilink: "[[wiki/ops/hook-handlers-note]]",
+                title: "Hook Handlers Note",
+                confidence: 0.93,
+              }),
+            ],
+          };
+        }
+        return { agent_id: "claude-code", results: [] };
+      },
+    });
+
+    await runHook(fixture, "PreToolUse", {
+      session_id: SESSION,
+      tool_name: "Task",
+      tool_use_id: "toolu_b3_1",
+      tool_input: {
+        subagent_type: "Explore",
+        description: "Audit vault.ts",
+        prompt: "inspect plugins/minni/src/hook-handlers.ts and scripts/recall_replay/replay.py for subagent pending",
+      },
+    });
+
+    const sKey = sessionKeyOf(SESSION);
+    const fallbackPendingPath = path.join(
+      fixture.vault,
+      ".runtime",
+      "subagent-pending.d",
+      `${sKey}.json`,
+    );
+    const fallbackPending = JSON.parse(await readFile(fallbackPendingPath, "utf8"));
+    assert.equal(fallbackPending.v, 1);
+    assert.equal(fallbackPending.session_id, SESSION, "subagent-pending.d JSON must include top-level session_id");
+    assert.ok(
+      Array.isArray(fallbackPending.targetPaths) &&
+        fallbackPending.targetPaths.includes("plugins/minni/src/hook-handlers.ts") &&
+        fallbackPending.targetPaths.includes("vault.ts"),
+      "subagent-pending.d JSON must include top-level targetPaths extracted from both prompt and description",
+    );
+    assert.ok(Array.isArray(fallbackPending.entries) && fallbackPending.entries.length === 1);
+    assert.ok(
+      Array.isArray(fallbackPending.entries[0].targetPaths) &&
+        fallbackPending.entries[0].targetPaths.includes("plugins/minni/src/hook-handlers.ts"),
+      "stashSubagentPending must extract targetPaths from prompt/tool_input",
+    );
+
+    // Remove the recall-session.d pending file so SubagentStart MUST claim from .runtime/subagent-pending.d/ fallback
+    await rm(
+      path.join(fixture.vault, ".runtime", "recall-session.d", sKey, "subagent-pending.json"),
+      { force: true },
+    );
+
+    const startRes = await runHook(fixture, "SubagentStart", {
+      session_id: SESSION,
+      agent_id: "sub-b3-worker",
+      agent_type: "Explore",
+    });
+    const brief = startRes.output.hookSpecificOutput?.additionalContext ?? "";
+    assert.match(brief, /\[\[wiki\/ops\/hook-handlers-note\]\]/);
+  },
+);
+

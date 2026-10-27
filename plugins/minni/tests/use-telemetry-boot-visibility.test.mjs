@@ -176,3 +176,50 @@ test("a daemon without structured ids: boot learnings key as lhash: from the Lea
   );
   for (const row of learnings) assert.equal(row.visible, true);
 });
+
+test("B5: boot_recall surfaced rows carry non-empty shingles and echo hashes from vault note or daemon result text", { timeout: 60_000 }, async (t) => {
+  const fixture = await makeFixture(t, "boot-b5-shingles-echo");
+  const inVault = path.join(fixture.vault, "wiki", "decisions", "boot-shingle-note.md");
+  await mkdir(path.dirname(inVault), { recursive: true });
+  await writeFile(
+    inVault,
+    "# Boot Shingle Note\n\nSessionStart boot recall rows must carry shingleHashes and echoHashes so R2 and R5 attribution can match.\n",
+    "utf8",
+  );
+  const results = [
+    daemonResult({
+      source: inVault,
+      docId: 901,
+      wikilink: "[[wiki/decisions/boot-shingle-note]]",
+      text: "SessionStart boot recall rows must carry shingleHashes and echoHashes.",
+      title: "Boot Shingle Note",
+    }),
+    daemonResult({
+      source: "/elsewhere/corpus/daemon-only.md",
+      docId: 902,
+      src: "shared",
+      wikilink: "[[wiki/daemon-only]]",
+      text: "Daemon-backed boot recall item with multi-word prose for shingle and echo extraction in SessionStart.",
+      title: "Daemon Only Boot Note",
+    }),
+  ];
+  await startFakeDaemon(fixture, {
+    search: () => ({ agent_id: "claude-code", results }),
+    read: () => ({ agent_id: "claude-code", context: READ_CONTEXT, recent_learnings: STRUCTURED }),
+  });
+  await runHook(fixture, "SessionStart", { session_id: "boot-b5", source: "startup" });
+  const rows = await readLedger(fixture.vault);
+  const recall = rowsOf(rows, "boot_recall");
+  assert.equal(recall.length, 2);
+  for (const row of recall) {
+    assert.ok(
+      Array.isArray(row.shingles) && row.shingles.length > 0 && row.shingles.every((h) => /^[0-9a-f]{16}$/.test(h)),
+      `expected non-empty 16-hex shingles on boot_recall row ${row.mkey}, got ${JSON.stringify(row.shingles)}`,
+    );
+    assert.ok(
+      Array.isArray(row.echo) && row.echo.length > 0 && row.echo.every((h) => /^[0-9a-f]{16}$/.test(h)),
+      `expected non-empty 16-hex echo hashes on boot_recall row ${row.mkey}, got ${JSON.stringify(row.echo)}`,
+    );
+  }
+});
+

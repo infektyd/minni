@@ -313,7 +313,75 @@ interface SubagentPendingEntry {
   subagent_type: string;
   prompt_hash: string;
   prompt: string;
+  targetPaths?: string[];
   ts: string;
+}
+
+function extractSubagentTargetPaths(toolInput: Record<string, unknown>, prompt: string): string[] {
+  const seen = new Set<string>();
+  const addPath = (raw: unknown): void => {
+    if (typeof raw !== "string") return;
+    const cleaned = raw.trim().replace(/^['"`(]+|[)'"`,.;:]+$/g, "");
+    if (!cleaned || cleaned.includes("\0")) return;
+    seen.add(cleaned);
+  };
+  for (const field of [toolInput.target_paths, toolInput.targetPaths, toolInput.paths, toolInput.files]) {
+    if (Array.isArray(field)) {
+      for (const item of field) addPath(item);
+    }
+  }
+  const combinedText = [
+    prompt,
+    asString(toolInput.prompt),
+    asString(toolInput.description),
+    asString(toolInput.task),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const pathRegex = /[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,10}/g;
+  for (const match of combinedText.matchAll(pathRegex)) {
+    const token = match[0];
+    const lastDot = token.lastIndexOf(".");
+    const stem = lastDot > 0 ? token.slice(0, lastDot) : "";
+    const ext = lastDot > 0 ? token.slice(lastDot + 1) : "";
+    if (/[A-Za-z]/.test(stem) && /[A-Za-z]/.test(ext)) {
+      addPath(token);
+    }
+  }
+  return [...seen].slice(0, 16);
+}
+
+function subagentPendingFallbackDir(vaultPath: string, create = false): string | null {
+  const segments = [".runtime", "subagent-pending.d"];
+  let current = vaultPath;
+  for (const segment of segments) {
+    const next = path.join(current, segment);
+    assertWriteTargetUnder(next, vaultPath);
+    let st: fs.Stats | undefined;
+    try {
+      st = fs.lstatSync(next);
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code !== "ENOENT") throw error;
+    }
+    if (!st) {
+      if (!create) return null;
+      try {
+        fs.mkdirSync(next, { mode: 0o700 });
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code !== "EEXIST") throw error;
+      }
+      st = fs.lstatSync(next);
+    }
+    if (st.isSymbolicLink()) {
+      assertWriteTargetUnder(fs.realpathSync(next), vaultPath);
+      st = fs.statSync(next);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`subagent pending path component is not a directory: ${next}`);
+    }
+    current = next;
+  }
+  return current;
 }
 
 function subagentSessionKey(payload: Record<string, unknown>): string {
@@ -394,11 +462,21 @@ function readSubagentPendingList(pendingFile: string, vaultPath: string, nowMs: 
       const subagentType = typeof rec.subagent_type === "string" ? rec.subagent_type : "";
       const promptHash = typeof rec.prompt_hash === "string" ? rec.prompt_hash : "";
       const prompt = typeof rec.prompt === "string" ? rec.prompt : "";
+      const targetPaths = Array.isArray(rec.targetPaths)
+        ? rec.targetPaths.filter((x): x is string => typeof x === "string")
+        : undefined;
       const ts = typeof rec.ts === "string" ? rec.ts : "";
       if (!toolUseId || !ts) continue;
       const parsedMs = Date.parse(ts);
       if (!Number.isFinite(parsedMs) || nowMs - parsedMs > SUBAGENT_PENDING_TTL_MS) continue;
-      out.push({ tool_use_id: toolUseId, subagent_type: subagentType, prompt_hash: promptHash, prompt, ts });
+      out.push({
+        tool_use_id: toolUseId,
+        subagent_type: subagentType,
+        prompt_hash: promptHash,
+        prompt,
+        ...(targetPaths && targetPaths.length > 0 ? { targetPaths } : {}),
+        ts,
+      });
     }
     return out;
   } catch {
@@ -427,6 +505,7 @@ function stashSubagentPending(
     ).trim();
     if (!rawPrompt) return;
     const prompt = rawPrompt.slice(0, 2000);
+    const targetPaths = extractSubagentTargetPaths(toolInput, prompt);
     const subagentType =
       asString(toolInput.subagent_type) ||
       asString(toolInput.subagentType) ||
@@ -439,7 +518,9 @@ function stashSubagentPending(
       asString(payload.toolUseId) ||
       randomUUID();
     const safeToolUseId = rawToolUseId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) || randomUUID();
+    const rawSessionId = (asString(payload.session_id) || asString(payload.sessionId)).trim();
     const sessionKey = subagentSessionKey(payload);
+    const safeKey = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(sessionKey) ? sessionKey : "unlabeled";
     const dir = subagentSessionDir(vaultPath, sessionKey, true);
     if (!dir) return;
     const pendingFile = path.join(dir, "subagent-pending.json");
@@ -453,16 +534,55 @@ function stashSubagentPending(
       subagent_type: subagentType.slice(0, 128),
       prompt_hash: createHash("sha1").update(prompt, "utf8").digest("hex").slice(0, 12),
       prompt,
+      targetPaths,
       ts: new Date(nowMs).toISOString(),
     });
     const bounded = existing.slice(-32);
+    const serialized = `${JSON.stringify({ v: 1, entries: bounded })}\n`;
     const tmpFile = `${pendingFile}.${process.pid}.${randomUUID()}.tmp`;
     assertWriteTargetUnder(tmpFile, vaultPath);
-    fs.writeFileSync(tmpFile, `${JSON.stringify({ v: 1, entries: bounded })}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    fs.renameSync(tmpFile, pendingFile);
+    try {
+      fs.writeFileSync(tmpFile, serialized, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      fs.renameSync(tmpFile, pendingFile);
+    } finally {
+      try {
+        fs.rmSync(tmpFile, { force: true });
+      } catch {
+        // Ignore cleanup failure.
+      }
+    }
+
+    const fallbackDir = subagentPendingFallbackDir(vaultPath, true);
+    if (fallbackDir) {
+      const fallbackFile = path.join(fallbackDir, `${safeKey}.json`);
+      assertWriteTargetUnder(fallbackFile, vaultPath);
+      const fallbackTmp = `${fallbackFile}.${process.pid}.${randomUUID()}.tmp`;
+      assertWriteTargetUnder(fallbackTmp, vaultPath);
+      const fallbackSerialized = `${JSON.stringify({
+        v: 1,
+        session_id: rawSessionId || safeKey,
+        targetPaths,
+        entries: bounded,
+      })}\n`;
+      try {
+        fs.writeFileSync(fallbackTmp, fallbackSerialized, {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx",
+        });
+        fs.renameSync(fallbackTmp, fallbackFile);
+      } finally {
+        try {
+          fs.rmSync(fallbackTmp, { force: true });
+        } catch {
+          // Ignore cleanup failure.
+        }
+      }
+    }
   } catch {
     // Best-effort stash: never blocks Agent/Task PreToolUse.
   }
@@ -474,12 +594,25 @@ function claimSubagentPending(
 ): SubagentPendingEntry | null {
   try {
     const sessionKey = subagentSessionKey(payload);
-    const dir = subagentSessionDir(vaultPath, sessionKey, false);
-    if (!dir) return null;
-    const pendingFile = path.join(dir, "subagent-pending.json");
+    const safeKey = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(sessionKey) ? sessionKey : "unlabeled";
     const nowMs = Date.now();
-    const entries = readSubagentPendingList(pendingFile, vaultPath, nowMs);
-    if (entries.length === 0) return null;
+    let dir = subagentSessionDir(vaultPath, sessionKey, false);
+    let entries: SubagentPendingEntry[] = [];
+    if (dir) {
+      const pendingFile = path.join(dir, "subagent-pending.json");
+      entries = readSubagentPendingList(pendingFile, vaultPath, nowMs);
+    }
+    if (entries.length === 0) {
+      const fallbackDir = subagentPendingFallbackDir(vaultPath, false);
+      if (fallbackDir) {
+        const fallbackFile = path.join(fallbackDir, `${safeKey}.json`);
+        entries = readSubagentPendingList(fallbackFile, vaultPath, nowMs);
+        if (entries.length > 0 && !dir) {
+          dir = subagentSessionDir(vaultPath, sessionKey, true) ?? fallbackDir;
+        }
+      }
+    }
+    if (!dir || entries.length === 0) return null;
     try {
       for (const name of fs.readdirSync(dir)) {
         if (!name.startsWith("subagent-claim-") || !name.endsWith(".claim")) continue;
@@ -1999,9 +2132,8 @@ export function createHookHandlers(
         ? (bodyForEnvelope.recent_learnings as Record<string, unknown>)
         : undefined;
     const learningsTrimmed =
-      trimmedMap !== undefined &&
-      ("recent_learnings" in trimmedMap ||
-        (bootIdentity === "agent-context" && "identity_body" in trimmedMap));
+      bootIdentity === "agent-context" ||
+      (trimmedMap !== undefined && "recent_learnings" in trimmedMap);
     const survivingLearningsText =
       bootIdentity === "agent-context"
         ? nativeLayer1
@@ -2025,14 +2157,26 @@ export function createHookHandlers(
                     recent_learnings: (
                       (identityRead.data as Record<string, unknown>)
                         .recent_learnings as unknown[]
-                    ).filter((entry) => {
-                      if (!entry || typeof entry !== "object") return false;
-                      const line = (entry as Record<string, unknown>).line;
-                      return (
-                        typeof line === "string" &&
-                        line.length > 0 &&
-                        survivingLearningsText.includes(line)
-                      );
+                    ).flatMap((entry) => {
+                      if (!entry || typeof entry !== "object") return [];
+                      const rec = entry as Record<string, unknown>;
+                      const line = rec.line;
+                      if (typeof line !== "string" || line.length === 0) return [];
+                      if (survivingLearningsText.includes(line)) {
+                        return [entry];
+                      }
+                      // Also match bullets clipped by fitEnvelope Step 9a (`${prefix}...`)
+                      for (const survLine of survivingLearningsText.split("\n")) {
+                        const trimmedSurv = survLine.trimEnd();
+                        if (
+                          trimmedSurv.endsWith("...") &&
+                          trimmedSurv.length >= 20 &&
+                          line.startsWith(trimmedSurv.slice(0, -3))
+                        ) {
+                          return [{ ...rec, line: trimmedSurv }];
+                        }
+                      }
+                      return [];
                     }),
                   }
                 : {}),
@@ -2657,10 +2801,7 @@ export function createHookHandlers(
     // S2b (§6.4): PreToolUse on Agent / Task stashes the task prompt for SubagentStart
     // and never surfaces or consumes the parent's recall guard arming.
     if (isSubagentSpawnTool(toolName)) {
-      if (
-        canInject(wire, "UserPromptSubmit") &&
-        isFeatureEnabled(config.vaultPath, "MINNI_SUBAGENT_BRIEF")
-      ) {
+      if (isFeatureEnabled(config.vaultPath, "MINNI_SUBAGENT_BRIEF")) {
         stashSubagentPending(config.vaultPath, payload, toolInput);
       }
       return preToolUseAllow();
@@ -3171,7 +3312,13 @@ export function createHookHandlers(
     let safeVaultResults: ReturnType<typeof filterSafeVaultResults> = [];
 
     if (claimedPending && claimedPending.prompt.trim()) {
-      const taskPrompt = claimedPending.prompt.trim();
+      const extraPaths = Array.isArray(claimedPending.targetPaths)
+        ? claimedPending.targetPaths.filter((p) => !claimedPending.prompt.includes(p))
+        : [];
+      const taskPrompt =
+        extraPaths.length > 0
+          ? `${claimedPending.prompt.trim()} ${extraPaths.join(" ")}`
+          : claimedPending.prompt.trim();
       const workspaceId = workspaceFor(payload);
       const [vaultRaw, recall] = await Promise.all([
         withBudget(

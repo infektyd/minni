@@ -101,6 +101,54 @@ export const APPROVED_FAILURE_LESSON_RULES: ReadonlyArray<FailureLessonRule> = [
     projectScope: "global",
   },
   {
+    ruleId: "unchecked_sendable_forbidden",
+    stage: "PostToolUse",
+    pattern: /@unchecked\s+Sendable/i,
+    lessonId: "scar-unchecked-sendable-forbidden",
+    mkey: "learning:phase1b-unchecked-sendable-forbidden",
+    handle: "m:7a11e510",
+    title: "Scar #2: @unchecked Sendable is forbidden in Swift 6 concurrency",
+    lessonText:
+      "Scar #2: never add `@unchecked Sendable` to silence Swift 6 strict concurrency; convert the type to an `actor`, isolate it to `@MainActor`, or make stored properties immutable `Sendable` values.",
+    projectScope: "swift",
+  },
+  {
+    ruleId: "try_optional_swallows_errors",
+    stage: "PostToolUse",
+    pattern: /\btry\?\s+[A-Za-z_]/,
+    lessonId: "scar-try-optional-swallows-errors",
+    mkey: "learning:phase1b-try-optional-swallows-errors",
+    handle: "m:7a11e511",
+    title: "Scar #3: do not silently swallow errors with try?",
+    lessonText:
+      "Scar #3: avoid `try?` on I/O, persistence, or IPC boundaries where failures must be surfaced or logged; handle the error explicitly with `do/catch` or propagate `throws`.",
+    projectScope: "swift",
+  },
+  {
+    ruleId: "task_detached_forbidden",
+    stage: "PostToolUse",
+    pattern: /\bTask\.detached\s*(?:\(|\{)/,
+    lessonId: "scar-task-detached-forbidden",
+    mkey: "learning:phase1b-task-detached-forbidden",
+    handle: "m:7a11e512",
+    title: "Scar #4: avoid unstructured Task.detached in Swift concurrency",
+    lessonText:
+      "Scar #4: never spawn unstructured `Task.detached` that drops actor context, priority, and cancellation propagation; use structured concurrency (`withTaskGroup`) or actor-isolated `Task`.",
+    projectScope: "swift",
+  },
+  {
+    ruleId: "nslock_in_async_context",
+    stage: "PostToolUse",
+    pattern: /\b(?:NSLock|NSRecursiveLock)\s*\(/,
+    lessonId: "scar-nslock-in-async-context",
+    mkey: "learning:phase1b-nslock-in-async-context",
+    handle: "m:7a11e513",
+    title: "Scar #7: avoid NSLock / NSRecursiveLock in Swift async contexts",
+    lessonText:
+      "Scar #7: never use `NSLock` or `NSRecursiveLock` across Swift `async` suspension points; use an `actor` or `Mutex` / `OSAllocatedUnfairLock` strictly inside synchronous critical sections.",
+    projectScope: "swift",
+  },
+  {
     ruleId: "swift_compiler_error",
     stage: "PostToolUse",
     pattern: /\.swift:\d+:\d+:\s+error:/i,
@@ -158,12 +206,12 @@ export const APPROVED_FAILURE_LESSON_RULES: ReadonlyArray<FailureLessonRule> = [
     title: "Scar #1: never call blocking waitUntilExit() / waitpid() after bounded timeout",
     lessonText:
       "Scar #1: never call blocking `waitUntilExit()` or `waitpid()` on a timed-out subprocess; terminate the process group and drain pipes asynchronously.",
-    projectScope: "global",
+    projectScope: "swift",
   },
   {
     ruleId: "subagent_update_plan_blocked",
     stage: "PostToolUse",
-    pattern: /Not shown:\s*you are a subagent/i,
+    pattern: /(?:Not shown:\s*you are a subagent|update_plan[^\n]*(?:only available in Plan mode|not available|subagent))/i,
     lessonId: "scar-subagent-update-plan-blocked",
     mkey: "learning:phase1b-subagent-update-plan-blocked",
     handle: "m:7a11e508",
@@ -175,7 +223,7 @@ export const APPROVED_FAILURE_LESSON_RULES: ReadonlyArray<FailureLessonRule> = [
   {
     ruleId: "unknown_tool_name",
     stage: "PostToolUse",
-    pattern: /No such tool available:/i,
+    pattern: /(?:No such tool available:|MCP tool\s+`?[^`\n]+`?\s+not found|unknown tool)/i,
     lessonId: "scar-unknown-tool-name",
     mkey: "learning:phase1b-unknown-tool-name",
     handle: "m:7a11e509",
@@ -335,7 +383,12 @@ export function resolveProjectKey(pathOrCwd?: string): string {
 }
 
 function isBashLikeTool(toolName: string): boolean {
-  return toolName === "Bash" || toolName === "run_terminal_command";
+  return (
+    toolName === "Bash" ||
+    toolName === "run_terminal_command" ||
+    toolName === "run_command" ||
+    toolName === "Shell"
+  );
 }
 
 function failureLessonStateFilePath(vaultPath: string, sessionId?: string): string | null {
@@ -464,6 +517,231 @@ export function formatFailureLessonContext(rule: FailureLessonRule): string {
   return `<EVIDENCE source="failure_lesson:${sanitizeRecallField(rule.lessonId, 64)}" confidence="1.00">\n📓 Minni failure lesson (${safeHandle}): "${safeTitle}" — ${safeLesson}\n</EVIDENCE>`;
 }
 
+export function resolveFailureLessonByHandle(handle: string): FailureLessonRule | null {
+  if (typeof handle !== "string" || !handle.startsWith("m:")) return null;
+  const trimmed = handle.trim().toLowerCase();
+  for (const rule of APPROVED_FAILURE_LESSON_RULES) {
+    if (rule.handle.toLowerCase() === trimmed) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+export function ensureFailureLessonHandles(vaultPath: string): void {
+  if (typeof vaultPath !== "string" || !vaultPath || vaultPath.includes("\0")) return;
+  try {
+    const handlesPath = path.join(vaultPath, ".handles.json");
+    assertWriteTargetUnder(handlesPath, vaultPath);
+    let existing: Record<string, unknown> = {};
+    const raw = readSmallRegularFileSync(handlesPath, 256 * 1024);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          existing = { ...(parsed as Record<string, unknown>) };
+        }
+      } catch {
+        existing = {};
+      }
+    }
+    let needsWrite = false;
+    const nowIso = new Date().toISOString();
+    for (const rule of APPROVED_FAILURE_LESSON_RULES) {
+      if (!existing[rule.handle]) {
+        needsWrite = true;
+        existing[rule.handle] = {
+          handle: rule.handle,
+          kind: "vault",
+          title: rule.title,
+          wikilink: `[[wiki/scars/${rule.lessonId}]]`,
+          source: `wiki/scars/${rule.lessonId}.md`,
+          lesson_id: rule.lessonId,
+          mkey: rule.mkey,
+          rule_id: rule.ruleId,
+          lesson_text: rule.lessonText,
+          project_scope: rule.projectScope,
+          score: 1.0,
+          ts: nowIso,
+        };
+      }
+    }
+    if (needsWrite) {
+      const tmpPath = `${handlesPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+      assertWriteTargetUnder(tmpPath, vaultPath);
+      try {
+        fs.writeFileSync(tmpPath, `${JSON.stringify(existing, null, 2)}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx",
+        });
+        fs.renameSync(tmpPath, handlesPath);
+      } catch {
+        try {
+          fs.rmSync(tmpPath, { force: true });
+        } catch {
+          // Ignore cleanup failure.
+        }
+      }
+    }
+
+    // Also persist into <vaultPath>/.runtime/recall-state.d/default.handles.json
+    const stateDir = ensureContainedStateDir(vaultPath);
+    if (stateDir) {
+      const defaultHandlesPath = path.join(stateDir, "default.handles.json");
+      assertWriteTargetUnder(defaultHandlesPath, vaultPath);
+      let rtHandles: Record<string, unknown> = {};
+      let needsRtWrite = false;
+      const rtRaw = readSmallRegularFileSync(defaultHandlesPath, 256 * 1024);
+      if (rtRaw) {
+        try {
+          const parsedRt = JSON.parse(rtRaw) as Record<string, unknown> | null;
+          if (
+            parsedRt &&
+            typeof parsedRt === "object" &&
+            !Array.isArray(parsedRt) &&
+            parsedRt.handles &&
+            typeof parsedRt.handles === "object" &&
+            !Array.isArray(parsedRt.handles)
+          ) {
+            rtHandles = { ...(parsedRt.handles as Record<string, unknown>) };
+          }
+        } catch {
+          rtHandles = {};
+        }
+      } else {
+        needsRtWrite = true;
+      }
+      for (const rule of APPROVED_FAILURE_LESSON_RULES) {
+        if (!rtHandles[rule.handle]) {
+          needsRtWrite = true;
+          rtHandles[rule.handle] = existing[rule.handle];
+        }
+      }
+      if (needsRtWrite) {
+        const rtTmp = `${defaultHandlesPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+        assertWriteTargetUnder(rtTmp, vaultPath);
+        try {
+          fs.writeFileSync(
+            rtTmp,
+            `${JSON.stringify({ v: 1, session_id: "default", updated_at: nowIso, handles: rtHandles }, null, 2)}\n`,
+            { encoding: "utf8", mode: 0o600, flag: "wx" },
+          );
+          fs.renameSync(rtTmp, defaultHandlesPath);
+        } catch {
+          try {
+            fs.rmSync(rtTmp, { force: true });
+          } catch {
+            // Ignore cleanup failure.
+          }
+        }
+      }
+    }
+  } catch {
+    // Best-effort index seed.
+  }
+}
+
+const CODE_ANTIPATTERN_RULE_IDS: ReadonlySet<string> = new Set([
+  "process_wait_until_exit_forbidden",
+  "unchecked_sendable_forbidden",
+  "try_optional_swallows_errors",
+  "task_detached_forbidden",
+  "nslock_in_async_context",
+]);
+
+function dirHasSwiftProjectMarkers(dirPath: string): boolean {
+  try {
+    if (fs.existsSync(path.join(dirPath, "Package.swift"))) return true;
+    for (const entry of fs.readdirSync(dirPath)) {
+      if (entry.endsWith(".xcodeproj") || entry.endsWith(".xcworkspace")) return true;
+    }
+  } catch {
+    // Ignore unreadable directory.
+  }
+  return false;
+}
+
+export function isSwiftOrPraxisContext(
+  cwd?: string,
+  command = "",
+  outputText = "",
+  projectKey?: string,
+): boolean {
+  const effProjectKey = projectKey ?? (cwd ? resolveProjectKey(cwd) : "");
+  if (effProjectKey.includes("praxis")) return true;
+  if (typeof cwd === "string" && /praxis|\.swift\b/i.test(cwd)) return true;
+  if (
+    typeof command === "string" &&
+    /\.swift\b|\bswift\s+(?:build|test|run|package)\b|\bxcodebuild\b|Package\.swift\b/i.test(command)
+  ) {
+    return true;
+  }
+  if (typeof cwd === "string" && cwd.trim()) {
+    const cleanCwd = cwd.trim();
+    if (dirHasSwiftProjectMarkers(cleanCwd)) return true;
+    const commonDir = resolveGitCommonDirWalk(cleanCwd);
+    if (commonDir && path.basename(commonDir) === ".git") {
+      const repoRoot = path.dirname(commonDir);
+      if (dirHasSwiftProjectMarkers(repoRoot)) return true;
+    }
+    return false;
+  }
+  if (typeof command === "string" && command.trim()) {
+    return false;
+  }
+  if (typeof outputText === "string" && /\.swift:\d+|\bxcodebuild\b|Package\.swift\b/.test(outputText)) {
+    return true;
+  }
+  return false;
+}
+
+function isReadOnlyInspectionCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+  // Split compound shell commands (including newlines) and check whether every segment is a read-only search/diff/view command
+  const segments = trimmed
+    .split(/(?:&&|\|\||;|\||\r?\n)/)
+    .map((s) => s.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)+/, ""))
+    .filter(Boolean);
+  if (segments.length === 0) return false;
+  const readOnlyRe =
+    /^(?:(?:\/usr\/bin\/|\/bin\/|\/opt\/homebrew\/bin\/)?(?:rg|ripgrep|grep|egrep|fgrep|git\s+(?:-C\s+\S+\s+)?(?:diff|log|show|status|grep|cat-file|blame|branch|rev-parse)|cat|head|tail|sed(?!\s+-i\b)|awk|find|fd|ls|wc|stat|file|echo|printf|true|cd|pwd))\b/i;
+  return segments.every((seg) => readOnlyRe.test(seg));
+}
+
+function stripCommentOnlyLines(text: string): string {
+  const kept: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    // Strip optional `<file>:<line>(:<col>)?:` prefix from grep/compiler lines before checking comment markers
+    const withoutLoc = line.replace(/^\s*(?:[^\s:]+:\d+(?::\d+)?:)\s*/, "").trim();
+    if (
+      withoutLoc.startsWith("//") ||
+      withoutLoc.startsWith("///") ||
+      withoutLoc.startsWith("/*") ||
+      withoutLoc.startsWith("*")
+    ) {
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
+function ruleMatchesScope(
+  rule: FailureLessonRule,
+  cwd: string | undefined,
+  command: string,
+  outputText: string,
+  projectKey: string,
+): boolean {
+  if (rule.projectScope === "global") return true;
+  if (rule.projectScope === "swift") {
+    return isSwiftOrPraxisContext(cwd, command, outputText, projectKey);
+  }
+  return rule.projectScope === projectKey;
+}
+
 /**
  * Match a PreToolUse Bash command against pre-emptive failure lesson rules (P2/P3).
  */
@@ -477,6 +755,7 @@ export function matchPreToolUseFailureLesson(args: {
   try {
     if (!isBashLikeTool(args.toolName)) return null;
     if (!isFailureLessonsEnabled(args.vaultPath)) return null;
+    ensureFailureLessonHandles(args.vaultPath);
     const command =
       typeof args.toolInput.command === "string"
         ? args.toolInput.command
@@ -490,10 +769,10 @@ export function matchPreToolUseFailureLesson(args: {
     const projectKey = resolveProjectKey(args.cwd);
     for (const rule of APPROVED_FAILURE_LESSON_RULES) {
       if (rule.stage !== "PreToolUse") continue;
-      if (rule.projectScope !== "global" && rule.projectScope !== projectKey) continue;
+      if (!ruleMatchesScope(rule, args.cwd, command, "", projectKey)) continue;
       if (!rule.pattern.test(command)) continue;
       if (hasFailureLessonFired(args.vaultPath, args.sessionId, rule.lessonId)) {
-        return null;
+        continue;
       }
       return {
         ruleId: rule.ruleId,
@@ -541,6 +820,33 @@ function extractToolResponseText(payload: Record<string, unknown>): string {
   return parts.join("\n").slice(0, MAX_OUTPUT_SCAN_CHARS);
 }
 
+function extractCommandAndExitState(
+  event: "PostToolUse" | "PostToolUseFailure",
+  payload: Record<string, unknown>,
+): { command: string; isError: boolean; exitCode: number | null } {
+  const toolInput =
+    payload.tool_input && typeof payload.tool_input === "object" && !Array.isArray(payload.tool_input)
+      ? (payload.tool_input as Record<string, unknown>)
+      : payload.toolInput && typeof payload.toolInput === "object" && !Array.isArray(payload.toolInput)
+        ? (payload.toolInput as Record<string, unknown>)
+        : {};
+  const command =
+    typeof toolInput.command === "string"
+      ? toolInput.command
+      : typeof toolInput.cmd === "string"
+        ? toolInput.cmd
+        : "";
+  const isError = payload.is_error === true || event === "PostToolUseFailure";
+  let exitCode: number | null =
+    typeof payload.exit_code === "number" ? payload.exit_code : null;
+  const tr = payload.tool_response ?? payload.toolResponse;
+  if (exitCode === null && tr && typeof tr === "object" && !Array.isArray(tr)) {
+    const codeVal = (tr as Record<string, unknown>).exit_code ?? (tr as Record<string, unknown>).exitCode;
+    if (typeof codeVal === "number") exitCode = codeVal;
+  }
+  return { command, isError, exitCode };
+}
+
 /**
  * Match a PostToolUse or PostToolUseFailure payload against recurring error
  * signatures. Inspects `tool_response` output text on EVERY Bash call even when
@@ -555,6 +861,7 @@ export function matchPostToolUseFailureLesson(args: {
 }): FailureLessonMatch | null {
   try {
     if (!isFailureLessonsEnabled(args.vaultPath)) return null;
+    ensureFailureLessonHandles(args.vaultPath);
     const toolName =
       typeof args.payload.tool_name === "string"
         ? args.payload.tool_name
@@ -567,13 +874,31 @@ export function matchPostToolUseFailureLesson(args: {
     const outputText = extractToolResponseText(args.payload);
     if (!outputText.trim()) return null;
 
-    const projectKey = resolveProjectKey(args.cwd);
+    const { command, isError, exitCode } = extractCommandAndExitState(args.event, args.payload);
+    const readOnlyCleanExit =
+      !isError && (exitCode === 0 || exitCode === null) && isReadOnlyInspectionCommand(command);
+    const nonCommentText = stripCommentOnlyLines(outputText);
+
+    const effectiveCwd =
+      typeof args.cwd === "string" && args.cwd.trim()
+        ? args.cwd
+        : typeof args.payload.cwd === "string" && args.payload.cwd.trim()
+          ? args.payload.cwd
+          : undefined;
+    const projectKey = resolveProjectKey(effectiveCwd);
+
     for (const rule of APPROVED_FAILURE_LESSON_RULES) {
       if (rule.stage !== "PostToolUse") continue;
-      if (rule.projectScope !== "global" && rule.projectScope !== projectKey) continue;
-      if (!rule.pattern.test(outputText)) continue;
+      if (!ruleMatchesScope(rule, effectiveCwd, command, outputText, projectKey)) continue;
+      const isCodeAntipattern = CODE_ANTIPATTERN_RULE_IDS.has(rule.ruleId);
+      if (isCodeAntipattern) {
+        if (readOnlyCleanExit) continue;
+        if (!nonCommentText.trim() || !rule.pattern.test(nonCommentText)) continue;
+      } else if (!rule.pattern.test(outputText)) {
+        continue;
+      }
       if (hasFailureLessonFired(args.vaultPath, args.sessionId, rule.lessonId)) {
-        return null;
+        continue;
       }
       return {
         ruleId: rule.ruleId,

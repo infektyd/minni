@@ -30,26 +30,76 @@ def _atomic_write_json(target: Path, payload: Mapping[str, Any]) -> None:
                 pass
 
 
-def build_labels_from_audit(audit_fixture: Mapping[str, Any]) -> dict[str, Any]:
+def _load_recall_state_note_stats(
+    recall_state: Mapping[str, Any] | Path | str | None,
+) -> dict[str, dict[str, Any]]:
+    if recall_state is None:
+        return {}
+    data: Mapping[str, Any] | None = None
+    if isinstance(recall_state, (str, Path)):
+        p = Path(recall_state)
+        if p.is_file():
+            try:
+                loaded = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(loaded, Mapping):
+                    data = loaded
+            except (OSError, json.JSONDecodeError):
+                data = None
+    elif isinstance(recall_state, Mapping):
+        data = recall_state
+    if not isinstance(data, Mapping):
+        return {}
+    raw_stats = data.get("noteStats") or data.get("note_stats") or data
+    if not isinstance(raw_stats, Mapping):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in raw_stats.items():
+        if isinstance(v, Mapping):
+            out[str(k)] = dict(v)
+    return out
+
+
+def build_labels_from_audit(
+    audit_fixture: Mapping[str, Any],
+    *,
+    recall_state: Mapping[str, Any] | Path | str | None = None,
+) -> dict[str, Any]:
     """Extract labelled surfacings (visible vs invisible) and the 5 need moments from the audit fixture."""
     learnings = audit_fixture.get("learnings", [])
     if not isinstance(learnings, list):
         learnings = []
 
+    note_stats = _load_recall_state_note_stats(
+        recall_state if recall_state is not None else audit_fixture.get("recall_state")
+    )
+
     surfacings_out: list[dict[str, Any]] = []
     need_moments: list[dict[str, Any]] = []
-
-    # First pass: count SessionStart surfacings without explicit visibility so the 3/26 rule applies if needed
-    unannotated_boot_seen = 0
+    per_note_boot_seen: dict[str, int] = {}
 
     for item in learnings:
         if not isinstance(item, Mapping):
             continue
         lid = item.get("id")
+        note_key = str(lid if lid is not None else item.get("mkey") or "")
         l_class = str(item.get("class") or "")
         notes_txt = str(item.get("notes") or "")
         use_quote = item.get("use_quote") if isinstance(item.get("use_quote"), Mapping) else None
         use_strength = str(item.get("use_strength") or "")
+
+        stat_entry = (
+            note_stats.get(note_key)
+            or note_stats.get(f"learning:{note_key}")
+            or note_stats.get(str(item.get("mkey") or ""))
+            or {}
+        )
+        seeded_boot_seen = int(
+            stat_entry.get(
+                "unannotatedBootSeen",
+                stat_entry.get("unannotated_boot_seen", item.get("unannotated_boot_seen", 0)),
+            )
+            or 0
+        )
 
         if l_class == "never-recalled":
             nm = item.get("need_moment") if isinstance(item.get("need_moment"), Mapping) else {}
@@ -96,14 +146,24 @@ def build_labels_from_audit(audit_fixture: Mapping[str, Any]) -> dict[str, Any]:
                 or hashlib.sha256(f"{lid}:{idx}:{channel}:{sess}:{ts}".encode("utf-8")).hexdigest()[:16]
             )
 
-            if isinstance(surf.get("visible"), bool):
+            has_explicit_vis = isinstance(surf.get("visible"), bool)
+            is_boot = channel.startswith("SessionStart") or channel.startswith("boot_")
+            eff_boot_seen = seeded_boot_seen
+
+            if has_explicit_vis:
                 visible = bool(surf["visible"])
-            elif channel.startswith("SessionStart"):
-                if "recall+" not in channel and unannotated_boot_seen < 3:
-                    visible = True
+                if is_boot:
+                    base_seen = per_note_boot_seen.get(note_key, max(0, seeded_boot_seen - 1))
+                    per_note_boot_seen[note_key] = base_seen + 1
+                    eff_boot_seen = per_note_boot_seen[note_key]
+            elif is_boot:
+                base_seen = per_note_boot_seen.get(note_key, max(0, seeded_boot_seen - 1))
+                per_note_boot_seen[note_key] = base_seen + 1
+                if surf.get("unannotated_boot_seen") is not None:
+                    eff_boot_seen = int(surf["unannotated_boot_seen"])
                 else:
-                    visible = False
-                unannotated_boot_seen += 1
+                    eff_boot_seen = per_note_boot_seen[note_key]
+                visible = "recall+" not in channel and "truncated snippet" not in channel
             else:
                 visible = True
 
@@ -111,18 +171,32 @@ def build_labels_from_audit(audit_fixture: Mapping[str, Any]) -> dict[str, Any]:
                 "dismissed" in notes_txt.lower() and (not ts or ts[:5] in notes_txt or "explicitly dismissed" in notes_txt.lower())
             )
 
+            confidence = "medium"
             if not visible:
                 label_outcome = "invisible"
                 cause = "invisible"
+                confidence = "high"
             elif used_idx == idx:
                 label_outcome = "applied" if use_strength.lower().startswith("strong") else "cited"
                 cause = "used"
+                confidence = "high"
             elif is_dismissed:
                 label_outcome = "dismissed"
                 cause = "irrelevant"
+                confidence = "high"
+            elif is_boot and not has_explicit_vis:
+                if eff_boot_seen >= 3:
+                    label_outcome = "ignored"
+                    cause = "noise_crowded"
+                    confidence = "medium"
+                else:
+                    label_outcome = "abstain"
+                    cause = "unannotated_boot"
+                    confidence = "low"
             else:
                 label_outcome = "ignored"
                 cause = "noise_crowded" if "SessionStart" in channel else "irrelevant"
+                confidence = "medium"
 
             surfacings_out.append(
                 {
@@ -134,6 +208,8 @@ def build_labels_from_audit(audit_fixture: Mapping[str, Any]) -> dict[str, Any]:
                     "ts": ts,
                     "visible": visible,
                     "label_outcome": label_outcome,
+                    "confidence": confidence,
+                    "unannotated_boot_seen": eff_boot_seen,
                     "cause": cause,
                 }
             )

@@ -2,7 +2,7 @@
   "minni": {
     "PreToolUse": [
       {
-        "matcher": "run_command",
+        "matcher": "run_command|Agent|Task",
         "hooks": [
           {
             "type": "command",

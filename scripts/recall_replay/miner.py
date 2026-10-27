@@ -133,7 +133,7 @@ DEFAULT_APPROVED_LESSON_RULES: tuple[dict[str, Any], ...] = (
     {
         "rule_id": "unknown_tool_name",
         "stage": "PostToolUse",
-        "pattern": r"No such tool available:",
+        "pattern": r"(?:No such tool available:|MCP tool\s+`[^`]+`\s+not found|unknown tool)",
         "lesson_id": "scar-unknown-tool-name",
         "mkey": "learning:phase1b-unknown-tool-name",
         "handle": "m:7a11e509",
@@ -142,6 +142,62 @@ DEFAULT_APPROVED_LESSON_RULES: tuple[dict[str, Any], ...] = (
             "Verify the exact registered tool name and MCP server prefix before invoking a tool."
         ),
         "project_scope": "global",
+    },
+    {
+        "rule_id": "unchecked_sendable_forbidden",
+        "stage": "PostToolUse",
+        "pattern": r"@unchecked\s+Sendable",
+        "lesson_id": "scar-unchecked-sendable-forbidden",
+        "mkey": "learning:phase1b-unchecked-sendable-forbidden",
+        "handle": "m:7a11e510",
+        "title": "Scar #2: @unchecked Sendable is forbidden in Swift 6 concurrency",
+        "lesson_text": (
+            "Scar #2: never add `@unchecked Sendable` to silence Swift 6 strict concurrency; "
+            "convert the type to an `actor`, isolate it to `@MainActor`, or make stored properties immutable `Sendable` values."
+        ),
+        "project_scope": "swift",
+    },
+    {
+        "rule_id": "try_optional_swallows_errors",
+        "stage": "PostToolUse",
+        "pattern": r"\btry\?\s+[A-Za-z_]",
+        "lesson_id": "scar-try-optional-swallows-errors",
+        "mkey": "learning:phase1b-try-optional-swallows-errors",
+        "handle": "m:7a11e511",
+        "title": "Scar #3: do not silently swallow errors with try?",
+        "lesson_text": (
+            "Scar #3: avoid `try?` on I/O, persistence, or IPC boundaries where failures must be surfaced or logged; "
+            "handle the error explicitly with `do/catch` or propagate `throws`."
+        ),
+        "project_scope": "swift",
+    },
+    {
+        "rule_id": "task_detached_forbidden",
+        "stage": "PostToolUse",
+        "pattern": r"\bTask\.detached\s*(?:\(| trailing|\{)",
+        "lesson_id": "scar-task-detached-forbidden",
+        "mkey": "learning:phase1b-task-detached-forbidden",
+        "handle": "m:7a11e512",
+        "title": "Scar #4: avoid unstructured Task.detached in Swift concurrency",
+        "lesson_text": (
+            "Scar #4: never spawn unstructured `Task.detached` that drops actor context, priority, and cancellation propagation; "
+            "use structured concurrency (`withTaskGroup`) or actor-isolated `Task`."
+        ),
+        "project_scope": "swift",
+    },
+    {
+        "rule_id": "nslock_in_async_context",
+        "stage": "PostToolUse",
+        "pattern": r"\b(?:NSLock|NSRecursiveLock)\s*\(",
+        "lesson_id": "scar-nslock-in-async-context",
+        "mkey": "learning:phase1b-nslock-in-async-context",
+        "handle": "m:7a11e513",
+        "title": "Scar #7: avoid NSLock / NSRecursiveLock in Swift async contexts",
+        "lesson_text": (
+            "Scar #7: never use `NSLock` or `NSRecursiveLock` across Swift `async` suspension points; "
+            "use an `actor` or `Mutex` / `OSAllocatedUnfairLock` strictly inside synchronous critical sections."
+        ),
+        "project_scope": "swift",
     },
 )
 

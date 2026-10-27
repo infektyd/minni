@@ -746,6 +746,9 @@ function bootRecallItems(capture: UseCapture, input: BootCaptureInput): Surfaced
     const result = raw as Record<string, unknown>;
     const mkey = memoryKeyFor(daemonRef(result), capture.vaultPath);
     if (!mkey) return;
+    const body = vaultTextForMkey(capture.vaultPath, mkey) || daemonBodyText(result);
+    const shingles = body ? shingleHashes(body) : [];
+    const echo = body ? echoHashes(body) : [];
     items.push({
       mkey,
       handles: handlesForKey(mkey),
@@ -755,6 +758,8 @@ function bootRecallItems(capture: UseCapture, input: BootCaptureInput): Surfaced
       // The envelope serializes each projected result with stableStringify,
       // so this is its exact span in the emitted string.
       locate: stableStringify(raw),
+      ...(shingles.length > 0 ? { shingles } : {}),
+      ...(echo.length > 0 ? { echo } : {}),
     });
   });
   return items;
