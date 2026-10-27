@@ -935,6 +935,91 @@ export async function markRecallConsumed(
   return mirrorOk;
 }
 
+/**
+ * Disarm active recall-state armings when the model consults memory (`minni_recall`
+ * or `minni_drill`), either via `PreToolUse` (when `sessionId` is known) or directly
+ * inside the MCP server handler (where the hook's `sessionId` is not in the RPC args).
+ * Claims the arming id and flips `consumed = true` so subsequent cold search/read
+ * tools in the same turn are not denied after memory was already consulted.
+ */
+export async function disarmRecallStateOnConsult(
+  vaultPath: string,
+  sessionId?: string,
+): Promise<boolean> {
+  const effectiveSessionId =
+    typeof sessionId === "string" && sessionId.trim() && sessionId.trim() !== "session"
+      ? sessionId.trim()
+      : undefined;
+
+  if (effectiveSessionId) {
+    const st = await readRecallState(vaultPath, {
+      sessionId: effectiveSessionId,
+      guardV2: true,
+    }).catch(() => null);
+    if (!st) return false;
+    await claimArming(
+      vaultPath,
+      effectiveSessionId || st.session_id,
+      armingKeyFor(st),
+    ).catch(() => false);
+    if (!st.consumed) {
+      return markRecallConsumed(vaultPath, {
+        sessionId: effectiveSessionId,
+        guardV2: true,
+      }).catch(() => false);
+    }
+    return true;
+  }
+
+  let anyDisarmed = false;
+  const mirrorPath = recallStatePath(vaultPath);
+  const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
+  if (mirror) {
+    await claimArming(vaultPath, mirror.session_id, armingKeyFor(mirror)).catch(() => false);
+    if (!mirror.consumed) {
+      const ok = await markFileConsumed(mirrorPath, vaultPath).catch(() => false);
+      if (ok) anyDisarmed = true;
+    } else {
+      anyDisarmed = true;
+    }
+    if (mirror.session_id) {
+      const sessionFile = recallStateSessionPath(vaultPath, mirror.session_id);
+      if (sessionFile && fileOrLinkExists(sessionFile)) {
+        const ok = await markFileConsumed(sessionFile, vaultPath).catch(() => false);
+        if (ok) anyDisarmed = true;
+      }
+    }
+  }
+
+  try {
+    const dirPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH);
+    assertWriteTargetUnder(dirPath, vaultPath);
+    const dirStat = fs.lstatSync(dirPath);
+    if (dirStat.isDirectory() && !dirStat.isSymbolicLink()) {
+      for (const name of fs.readdirSync(dirPath)) {
+        if (!name.endsWith(".json")) continue;
+        const stem = name.slice(0, -5);
+        if (!HEX16_RE.test(stem)) continue;
+        const filePath = path.join(dirPath, name);
+        const st = await readStateFileAt(filePath, vaultPath).catch(() => null);
+        if (!st) continue;
+        const sid = st.session_id || stem;
+        await claimArming(vaultPath, sid, armingKeyFor(st)).catch(() => false);
+        if (!st.consumed) {
+          const ok = await markFileConsumed(filePath, vaultPath).catch(() => false);
+          if (ok) anyDisarmed = true;
+        } else {
+          anyDisarmed = true;
+        }
+      }
+    }
+  } catch {
+    // Best-effort scan of session-scoped recall-state.d.
+  }
+
+  return anyDisarmed;
+}
+
 export interface BuildRecallPointerOptions {
   /** Maximum number of hits to name in the pointer (default 3). */
   maxHits?: number;

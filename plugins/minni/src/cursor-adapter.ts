@@ -6,6 +6,7 @@ export const CURSOR_EVENTS: Record<string, string> = {
   beforeSubmitPrompt: "UserPromptSubmit",
   preCompact: "PreCompact",
   stop: "Stop",
+  Stop: "Stop",
   preToolUse: "PreToolUse",
 };
 

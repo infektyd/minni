@@ -159,6 +159,7 @@ export const codexWire: PlatformWire = {
     CODEX_INJECTABLE.has(event) ? claudeShapedInject(event, text) : null,
   note: (_event, text) => ({ continue: true, systemMessage: text }),
   lastTaskText: snakeAssistantMessage,
+  capabilities: { transcriptShape: "codex" },
 };
 
 // --- Grok Build (xAI) ------------------------------------------------------
@@ -188,6 +189,7 @@ export const grokBuildWire: PlatformWire = {
     const reason = asString(payload.reason);
     return reason === "" || reason === "end_turn";
   },
+  capabilities: { transcriptShape: "grok-build" },
 };
 
 // --- Kilocode --------------------------------------------------------------
@@ -270,6 +272,13 @@ export const geminiWire: PlatformWire = {
     // back-fills `last_user_message` from agy's own transcript_full.jsonl, so
     // here -- uniquely -- that field is real and synthesized by us.
     asString(payload.last_user_message) || snakeAssistantMessage(payload),
+  shouldHandle: (event, payload) => {
+    if (event === "UserPromptSubmit" && (payload.agy_mid_turn === true || payload.agy_duplicate_turn === true)) {
+      return false;
+    }
+    return true;
+  },
+  capabilities: { transcriptShape: "gemini" },
 };
 
 // --- Cursor ----------------------------------------------------------------

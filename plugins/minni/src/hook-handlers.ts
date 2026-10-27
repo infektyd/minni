@@ -82,6 +82,7 @@ import {
   clearRecallState,
   clearSessionSurfacedOnReset,
   commitSurfacedPointer,
+  disarmRecallStateOnConsult,
   extractStrongRecall,
   markRecallConsumed,
   pruneOldClaimFiles,
@@ -384,8 +385,17 @@ function subagentPendingFallbackDir(vaultPath: string, create = false): string |
   return current;
 }
 
+function rawSessionIdFromPayload(payload: Record<string, unknown>): string {
+  return (
+    asString(payload.session_id) ||
+    asString(payload.sessionId) ||
+    asString(payload.conversationId) ||
+    asString(payload.conversation_id)
+  );
+}
+
 function subagentSessionKey(payload: Record<string, unknown>): string {
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const sessionId = rawSessionIdFromPayload(payload);
   if (sessionId) {
     return sessionStateKey(sessionId) ?? createHash("sha256").update(sessionId, "utf8").digest("hex").slice(0, 16);
   }
@@ -964,8 +974,13 @@ export async function handleStopCore(
   return core.output;
 }
 
-/** The transcript shape the use detector parses (use-detector.ts reads Claude Code JSONL). */
-const DETECTOR_TRANSCRIPT_SHAPE = "claude-code";
+/** Transcript shapes the use detector parses (use-detector.ts). */
+const DETECTOR_TRANSCRIPT_SHAPES: ReadonlySet<string> = new Set([
+  "claude-code",
+  "gemini",
+  "codex",
+  "grok-build",
+]);
 
 interface StopCoreResult {
   output: HookOutput;
@@ -979,7 +994,7 @@ interface StopCoreResult {
 
 /**
  * S1b (§8.2): one decision for both ledger reads Stop makes, the receipt's use
- * counts and the detector run. Phase 1 measures only wires whose transcript the
+ * counts and the detector run. Measures wires whose transcript shape the
  * detector parses (`transcriptShape`, hook-platform.ts), and only a Stop that
  * carries a real session id; anything else is unmeasured, so neither runs and
  * its Stop loads no ledger module, as it does with the ledger off (env, or
@@ -997,10 +1012,10 @@ async function stopCore(
   // A Stop with no real session id (the receipt's synthetic "session"
   // fallback) is unmeasured too: its rows would be keyed under a transcript
   // hash no capture used, and the receipt reads no counts on that path.
-  const hasSessionId = Boolean(asString(payload.session_id) || asString(payload.sessionId));
+  const hasSessionId = Boolean(rawSessionIdFromPayload(payload));
   const measured =
     hasSessionId &&
-    wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE &&
+    DETECTOR_TRANSCRIPT_SHAPES.has(wireCapabilities(wire).transcriptShape) &&
     ledgerMayBeOn(config.vaultPath);
   const output = await stopCoreOutput(config, payload, prepareOutcomeFn, measured);
   return { output, measured };
@@ -1068,7 +1083,8 @@ function scheduleStopUseDetector(config: StopCoreConfig, payload: Record<string,
   const wireId = (config.wire ?? wireFor(config.agentId)).id;
   const principal = config.agentId;
   const transcriptPath = asString(payload.transcript_path) || asString(payload.transcriptPath) || null;
-  const lastAssistantMessage = asString(payload.last_assistant_message) || null;
+  const lastAssistantMessage =
+    asString(payload.last_assistant_message) || asString(payload.lastAssistantMessage) || null;
   deferUntilDelivered(
     async () => {
       const problem = await runStopUseDetector({ vaultPath, wireId, principal, payload, transcriptPath, lastAssistantMessage });
@@ -1094,8 +1110,14 @@ function scheduleSubagentStopUseDetector(config: StopCoreConfig, payload: Record
     asString(payload.transcript_path) ||
     asString(payload.transcriptPath) ||
     null;
-  const lastAssistantMessage = asString(payload.last_assistant_message) || null;
-  const subagentType = asString(payload.agent_type) || asString(payload.subagent_type) || undefined;
+  const lastAssistantMessage =
+    asString(payload.last_assistant_message) || asString(payload.lastAssistantMessage) || null;
+  const subagentType =
+    asString(payload.agent_type) ||
+    asString(payload.agentType) ||
+    asString(payload.subagent_type) ||
+    asString(payload.subagentType) ||
+    undefined;
   const payloadForKey =
     payload.transcript_path || !agentTranscriptPath
       ? payload
@@ -1202,7 +1224,7 @@ async function stopCoreOutput(
   // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime that
   // never labeled any turn with a real session_id still gets a best-effort
   // receipt merged onto the synthetic "session" bucket rather than no receipt.
-  const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const rawSessionId = rawSessionIdFromPayload(payload);
   const sessionId = rawSessionId || "session";
   // On the synthetic fallback, turns that DID stamp a real session_id must
   // still count inside this window — otherwise the receipt reports zeros
@@ -1518,7 +1540,7 @@ export function createHookHandlers(
     // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
     // conflate into one synthetic thread_id. sessionId keeps the historical
     // defaulted value for envelope identity / inbox filenames / markers.
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const sessionId = rawSessionId || "session";
     const workspaceId = workspaceFor(payload);
     // BOOT BUDGET: platforms kill SessionStart and DISCARD its output — gemini
@@ -2227,7 +2249,7 @@ export function createHookHandlers(
     // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
     // sessionId keeps the "session" fallback for envelope identity only — see
     // handleSessionStart's comment for why the two must not be conflated.
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const signature = hashTaskSignature(prompt);
 
     // #283 (config.lifecycleEnabled): compute the lifecycle representation
@@ -2795,7 +2817,7 @@ export function createHookHandlers(
       payload.tool_input && typeof payload.tool_input === "object"
         ? (payload.tool_input as Record<string, unknown>)
         : {};
-    const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const guardSessionId = rawSessionIdFromPayload(payload);
     const guardAgentId = asString(payload.agent_id) || asString(payload.agentId);
 
     // S2b (§6.4): PreToolUse on Agent / Task stashes the task prompt for SubagentStart
@@ -2852,21 +2874,14 @@ export function createHookHandlers(
 
     const recallStateOpts = { sessionId: guardSessionId || undefined, guardV2 };
 
-    // S2b (§6.3.5): consult tools (minni_recall, minni_drill) consume the
-    // armed state and claim the arming so a subsequent Read/Grep in the same
-    // turn does not fire the guard after the model already consulted memory.
-    if (guardV2 && isConsultTool(toolName)) {
-      const consultState = await readRecallState(config.vaultPath, recallStateOpts).catch(
-        () => null,
+    // S2b (§6.3.5): consult tools (minni_recall, minni_drill, including lazy
+    // call_mcp_tool wrappers) consume the armed state and claim the arming so a
+    // subsequent Read/Grep/Bash in the same turn does not fire the guard after
+    // the model already consulted memory.
+    if (guardV2 && isConsultTool(toolName, toolInput)) {
+      await disarmRecallStateOnConsult(config.vaultPath, guardSessionId || undefined).catch(
+        () => false,
       );
-      if (consultState && !consultState.consumed) {
-        await claimArming(
-          config.vaultPath,
-          guardSessionId || consultState.session_id,
-          armingKeyFor(consultState),
-        ).catch(() => false);
-        await markRecallConsumed(config.vaultPath, recallStateOpts).catch(() => false);
-      }
       return preToolUseAllow();
     }
 
@@ -2950,7 +2965,7 @@ export function createHookHandlers(
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const tail = await auditTail(config.vaultPath, 60);
     const scarTissue = extractScarTissue(tail.entries);
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    const sessionId = rawSessionIdFromPayload(payload) || "session";
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
@@ -3061,7 +3076,7 @@ export function createHookHandlers(
   // candidates. Injects nothing — there is no model turn to inject into.
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    const sessionId = rawSessionIdFromPayload(payload) || "session";
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     // Same provenance stamp as SessionStart harvest — dual delivery paths
@@ -3099,7 +3114,7 @@ export function createHookHandlers(
   // does the AFM review on its own timer.
   async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    const sessionId = rawSessionIdFromPayload(payload) || "session";
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     const summary = asString(payload.compact_summary);
@@ -3292,7 +3307,7 @@ export function createHookHandlers(
     if (!briefOn) return { continue: true };
 
     await ensureVault(config.vaultPath, { agentId: config.agentId });
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const guardV2 = ledger
       ? ledger.capture.context.features.includes("MINNI_GUARD_V2")
       : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
@@ -3377,10 +3392,10 @@ export function createHookHandlers(
   async function handleSubagentStop(
     payload: Record<string, unknown>,
   ): Promise<SubagentHookOutput> {
-    const hasSessionId = Boolean(asString(payload.session_id) || asString(payload.sessionId));
+    const hasSessionId = Boolean(rawSessionIdFromPayload(payload));
     const measured =
       hasSessionId &&
-      wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE &&
+      DETECTOR_TRANSCRIPT_SHAPES.has(wireCapabilities(wire).transcriptShape) &&
       ledgerMayBeOn(config.vaultPath);
     if (measured) {
       scheduleSubagentStopUseDetector(config, payload);
@@ -3399,7 +3414,7 @@ export function createHookHandlers(
     if (!wireCapabilities(wire).preToolUseContext) {
       return { continue: true };
     }
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const lesson = matchPostToolUseFailureLesson({
       vaultPath: config.vaultPath,
       event,

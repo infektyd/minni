@@ -274,13 +274,13 @@ test("recount at Stop: a measured Stop with the ledger on writes it; ledger off 
   for (const [label, env, bin] of [
     ["claude-on", {}, undefined],
     ["claude-off", { MINNI_USE_LEDGER: "off" }, undefined],
-    ["codex-on", {}, "codex-hook.js"],
+    ["cursor-on", {}, "cursor-hook.js"],
   ]) {
     const fixture = await makeFixture(t, `df-stop-${label}`);
     await startFakeDaemon(fixture);
     await writeNotes(fixture.vault);
     const { payload } = await seedStopTurn(fixture);
-    const vaultEnv = bin ? { MINNI_CODEX_VAULT_PATH: fixture.vault } : {};
+    const vaultEnv = bin ? { MINNI_CURSOR_VAULT_PATH: fixture.vault } : {};
     const { code } = await runHook(fixture, "Stop", payload, { env: { ...vaultEnv, ...env }, ...(bin ? { bin } : {}) });
     assert.equal(code, 0, label);
     const wrote = (await exists(path.join(fixture.vault, DF_SNAPSHOT_RELPATH))) || (await exists(path.join(fixture.vault, DF_PARTIAL_RELPATH)));

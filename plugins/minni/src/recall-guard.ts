@@ -56,10 +56,32 @@ export const SHELL_SCOPE_TOOLS = new Set(["Bash", "run_terminal_command"]);
 export const SUBAGENT_SPAWN_TOOLS = new Set(["Agent", "Task"]);
 
 const CONSULT_TOOL_RE = /(?:^|__)minni_(?:recall|drill)$/;
+const MCP_WRAPPER_TOOL_RE = /(?:^|__)call_mcp_tool$/;
 
-/** S2b (§6.3.4): true when toolName is bare or MCP-prefixed minni_recall / minni_drill. */
-export function isConsultTool(toolName: string): boolean {
-  return typeof toolName === "string" && CONSULT_TOOL_RE.test(toolName.trim());
+/**
+ * S2b (§6.3.4): true when toolName is bare or MCP-prefixed minni_recall / minni_drill,
+ * or when toolName is a lazy-MCP wrapper (`call_mcp_tool`) whose `ToolName` / `tool_name`
+ * input targets `minni_recall` or `minni_drill`.
+ */
+export function isConsultTool(
+  toolName: string,
+  toolInput?: Record<string, unknown>,
+): boolean {
+  if (typeof toolName !== "string") return false;
+  const trimmed = toolName.trim();
+  if (CONSULT_TOOL_RE.test(trimmed)) return true;
+  if (MCP_WRAPPER_TOOL_RE.test(trimmed) && toolInput && typeof toolInput === "object") {
+    const inner =
+      typeof toolInput.ToolName === "string"
+        ? toolInput.ToolName.trim()
+        : typeof toolInput.tool_name === "string"
+          ? toolInput.tool_name.trim()
+          : typeof toolInput.toolName === "string"
+            ? toolInput.toolName.trim()
+            : "";
+    if (inner && CONSULT_TOOL_RE.test(inner)) return true;
+  }
+  return false;
 }
 
 /** S2b (§6.3.6): true when toolName is a subagent spawn tool (Agent / Task). */

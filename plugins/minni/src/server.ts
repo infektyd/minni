@@ -85,6 +85,7 @@ import {
   writeVaultPage,
 } from "./vault.js";
 import { wrapEnvelope } from "./agent_envelope.js";
+import { disarmRecallStateOnConsult } from "./recall-state.js";
 import {
   createAgentPingRequest,
   decideAgentPingRequest,
@@ -636,6 +637,7 @@ server.registerTool(
   },
   async ({ query, layer, limit, workspaceId, scope, cross_agent, includeVault }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
+    await disarmRecallStateOnConsult(effectiveVaultPath).catch(() => false);
     // X5: run the daemon recall FIRST. Its results are workspace/agent-scoped and
     // subject to read policy. The local searchVaultNotes pre-scan is NOT scoped, so
     // it must only be used as an offline fallback (daemon unreachable) — never
@@ -744,6 +746,7 @@ server.registerTool(
     },
   },
   async ({ resultIds, chunkIds, references, handle, wikilink, depth }) => {
+    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH).catch(() => false);
     const result = await drillMemory({
       resultIds,
       chunkIds,

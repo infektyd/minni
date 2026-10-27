@@ -490,7 +490,10 @@ export interface TurnClass {
 }
 
 function promptIdOf(payload: Record<string, unknown>): string | undefined {
-  const raw = payload.prompt_id;
+  const raw =
+    typeof payload.prompt_id === "string" && payload.prompt_id.length > 0
+      ? payload.prompt_id
+      : payload.promptId;
   return typeof raw === "string" && raw.length > 0 && raw.length <= MAX_PID_CHARS ? raw : undefined;
 }
 

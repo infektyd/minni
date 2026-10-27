@@ -842,6 +842,8 @@ interface TxEntry {
   text?: string;
   blocks?: Block[];
   results?: ToolResultBlock[];
+  /** True when the entry came from a streamed Grok chunk (coalesced across adjacent chunks). */
+  chunk?: boolean;
 }
 
 interface TranscriptHandle {
@@ -982,7 +984,80 @@ function resultText(content: unknown): string {
   return parts.join("\n").slice(0, MAX_INPUT_CHARS);
 }
 
-/** One transcript line in the Claude Code JSONL shape; null when it is not JSON. */
+const AGY_USER_REQUEST_RE = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/;
+const AGY_GENERIC_HEADER_RE = /^(?:Created At: [^\n]*\n)?(?:Completed At: [^\n]*\n)?/;
+const CODEX_SYSTEM_ITEM_KINDS: ReadonlySet<string> = new Set([
+  "agents_md.instructions",
+  "environments.environment_context",
+  "memories.instructions",
+  "host_skills.instructions",
+  "permissions.instructions",
+  "collaboration_mode.instructions",
+  "plugins.recommendations",
+]);
+
+function normalizeAgyArgs(rawArgs: unknown): Record<string, unknown> {
+  if (!isRecord(rawArgs)) return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(rawArgs)) {
+    if (
+      typeof value === "string" &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("{") && value.endsWith("}")) ||
+        (value.startsWith("[") && value.endsWith("]")))
+    ) {
+      try {
+        out[key] = JSON.parse(value);
+        continue;
+      } catch {
+        // Keep raw string if it is not valid JSON.
+      }
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function unwrapMcpToolCall(name: string, input: unknown): { name: string; input: unknown } {
+  const base = name.split("__").pop() ?? name;
+  if (base !== "call_mcp_tool" || !isRecord(input)) return { name, input };
+  const innerName =
+    typeof input.ToolName === "string"
+      ? input.ToolName
+      : typeof input.tool_name === "string"
+        ? input.tool_name
+        : typeof input.toolName === "string"
+          ? input.toolName
+          : "";
+  if (!innerName) return { name, input };
+  const rawInnerArgs = input.Arguments ?? input.arguments;
+  let innerInput: unknown = rawInnerArgs ?? input;
+  if (typeof rawInnerArgs === "string" && rawInnerArgs.trim().startsWith("{")) {
+    try {
+      innerInput = JSON.parse(rawInnerArgs);
+    } catch {
+      innerInput = rawInnerArgs;
+    }
+  }
+  return { name: innerName, input: innerInput };
+}
+
+function codexContentText(content: unknown): string {
+  if (typeof content === "string") return content.slice(0, MAX_INPUT_CHARS);
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const item of content) {
+    if (isRecord(item) && typeof item.text === "string") {
+      parts.push(item.text);
+    }
+  }
+  return parts.join("\n").slice(0, MAX_INPUT_CHARS);
+}
+
+/**
+ * One transcript line across supported host shapes (`claude-code`, `gemini` /
+ * Antigravity, `codex`, `grok-build`); null when it is not JSON.
+ */
 function parseEntry(line: RawLine): TxEntry | null {
   let raw: unknown;
   try {
@@ -994,11 +1069,13 @@ function parseEntry(line: RawLine): TxEntry | null {
   const entry: TxEntry = {
     off: line.off,
     end: line.end,
-    ts: tsMs(raw.timestamp),
+    ts: tsMs(raw.timestamp ?? raw.created_at),
     kind: "other",
     sidechain: raw.isSidechain === true,
   };
   if (typeof raw.promptId === "string" && raw.promptId.length > 0) entry.promptId = raw.promptId;
+  else if (typeof raw.prompt_id === "string" && raw.prompt_id.length > 0) entry.promptId = raw.prompt_id;
+
   const message = isRecord(raw.message) ? raw.message : null;
   const meta = raw.isMeta === true || raw.isCompactSummary === true;
   if (raw.type === "user" && message) {
@@ -1027,7 +1104,9 @@ function parseEntry(line: RawLine): TxEntry | null {
         entry.text = texts.join("\n").slice(0, MAX_INPUT_CHARS);
       }
     }
-  } else if (raw.type === "assistant" && message && Array.isArray(message.content)) {
+    return entry;
+  }
+  if (raw.type === "assistant" && message && Array.isArray(message.content)) {
     entry.kind = "assistant";
     const msg = typeof message.id === "string" ? message.id : undefined;
     entry.blocks = [];
@@ -1036,10 +1115,247 @@ function parseEntry(line: RawLine): TxEntry | null {
       if (block.type === "text" && typeof block.text === "string") {
         entry.blocks.push({ kind: "text", text: block.text.slice(0, MAX_INPUT_CHARS), msg });
       } else if (block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string") {
-        entry.blocks.push({ kind: "tool_use", id: block.id, name: block.name, input: block.input });
+        const unwrapped = unwrapMcpToolCall(block.name, block.input);
+        entry.blocks.push({ kind: "tool_use", id: block.id, name: unwrapped.name, input: unwrapped.input });
       }
     }
+    return entry;
   }
+
+  // --- Antigravity / Gemini shape (`transcript_full.jsonl` / `transcript.jsonl`) ---
+  if (
+    raw.source === "USER_EXPLICIT" ||
+    (raw.type === "USER_INPUT" && raw.source !== "SYSTEM_SDK" && raw.source !== "SYSTEM")
+  ) {
+    if (!entry.promptId && typeof raw.step_index === "number" && Number.isSafeInteger(raw.step_index)) {
+      entry.promptId = `agy-step-${raw.step_index}`;
+    }
+    if (typeof raw.content === "string") {
+      const match = AGY_USER_REQUEST_RE.exec(raw.content);
+      const extracted = (match ? match[1] : raw.content).trim();
+      if (extracted.length > 0) {
+        entry.kind = "prompt";
+        entry.text = extracted.slice(0, MAX_INPUT_CHARS);
+      }
+    }
+    return entry;
+  }
+  if (raw.type === "PLANNER_RESPONSE") {
+    entry.kind = "assistant";
+    entry.blocks = [];
+    const msg =
+      typeof raw.step_index === "number" && Number.isSafeInteger(raw.step_index)
+        ? `agy-msg-${raw.step_index}`
+        : undefined;
+    if (typeof raw.content === "string" && raw.content.length > 0) {
+      entry.blocks.push({ kind: "text", text: raw.content.slice(0, MAX_INPUT_CHARS), msg });
+    }
+    if (Array.isArray(raw.tool_calls)) {
+      const stepPrefix =
+        typeof raw.step_index === "number" && Number.isSafeInteger(raw.step_index) ? raw.step_index : line.off;
+      for (let i = 0; i < raw.tool_calls.length; i += 1) {
+        const tc = raw.tool_calls[i];
+        if (!isRecord(tc) || typeof tc.name !== "string") continue;
+        const normArgs = normalizeAgyArgs(tc.args ?? tc.input);
+        const unwrapped = unwrapMcpToolCall(tc.name, normArgs);
+        const callId = typeof tc.id === "string" && tc.id.length > 0 ? tc.id : `agy_tool_${stepPrefix}_${i}`;
+        entry.blocks.push({ kind: "tool_use", id: callId, name: unwrapped.name, input: unwrapped.input });
+      }
+    }
+    return entry;
+  }
+  if (raw.source === "MODEL" && raw.type === "GENERIC" && typeof raw.content === "string") {
+    const stripped = raw.content.replace(AGY_GENERIC_HEADER_RE, "").slice(0, MAX_INPUT_CHARS);
+    const toolUseId =
+      typeof raw.tool_use_id === "string" && raw.tool_use_id.length > 0
+        ? raw.tool_use_id
+        : typeof raw.tool_call_id === "string" && raw.tool_call_id.length > 0
+          ? raw.tool_call_id
+          : "__agy_next__";
+    const isError = raw.status === "ERROR" || stripped.startsWith("Encountered error in tool execution:");
+    entry.kind = "result";
+    entry.results = [{ tool_use_id: toolUseId, text: stripped, is_error: isError }];
+    return entry;
+  }
+
+  // --- Codex rollout JSONL shape (`response_item` / `event_msg`) ---
+  if (raw.type === "response_item" && isRecord(raw.payload)) {
+    const payload = raw.payload;
+    const passthrough = isRecord(payload.internal_chat_message_metadata_passthrough)
+      ? payload.internal_chat_message_metadata_passthrough
+      : null;
+    if (!entry.promptId && passthrough && typeof passthrough.turn_id === "string" && passthrough.turn_id.length > 0) {
+      entry.promptId = passthrough.turn_id;
+    }
+    if (entry.ts === null && passthrough && typeof passthrough.create_time === "number" && Number.isFinite(passthrough.create_time)) {
+      entry.ts = Math.round(passthrough.create_time * 1000);
+    }
+    if (payload.type === "message" && payload.role === "user") {
+      const kinds = passthrough && Array.isArray(passthrough.content_item_kinds) ? passthrough.content_item_kinds : null;
+      const isSystemOnly =
+        kinds !== null &&
+        kinds.length > 0 &&
+        kinds.every((k) => typeof k === "string" && CODEX_SYSTEM_ITEM_KINDS.has(k));
+      if (!isSystemOnly) {
+        const text = codexContentText(payload.content);
+        if (text.length > 0) {
+          entry.kind = "prompt";
+          entry.text = text;
+        }
+      }
+      return entry;
+    }
+    if (payload.type === "message" && payload.role === "assistant") {
+      const text = codexContentText(payload.content);
+      entry.kind = "assistant";
+      entry.blocks =
+        text.length > 0
+          ? [{ kind: "text", text, msg: typeof payload.id === "string" ? payload.id : undefined }]
+          : [];
+      return entry;
+    }
+    if (payload.type === "function_call" || payload.type === "custom_tool_call") {
+      const callId =
+        typeof payload.call_id === "string" && payload.call_id.length > 0
+          ? payload.call_id
+          : typeof payload.id === "string" && payload.id.length > 0
+            ? payload.id
+            : `codex_call_${line.off}`;
+      const name = typeof payload.name === "string" ? payload.name : "";
+      const rawInput = payload.arguments ?? payload.input;
+      let parsedInput: unknown = rawInput;
+      if (typeof rawInput === "string") {
+        const trimmed = rawInput.trim();
+        if (trimmed.startsWith("{")) {
+          try {
+            parsedInput = JSON.parse(trimmed);
+          } catch {
+            parsedInput = { command: rawInput };
+          }
+        } else {
+          parsedInput = { command: rawInput };
+        }
+      }
+      if (name.length > 0) {
+        const unwrapped = unwrapMcpToolCall(name, parsedInput);
+        entry.kind = "assistant";
+        entry.blocks = [{ kind: "tool_use", id: callId, name: unwrapped.name, input: unwrapped.input }];
+      }
+      return entry;
+    }
+    if (payload.type === "function_call_output" || payload.type === "custom_tool_call_output") {
+      const callId =
+        typeof payload.call_id === "string" && payload.call_id.length > 0
+          ? payload.call_id
+          : typeof payload.id === "string" && payload.id.length > 0
+            ? payload.id
+            : "";
+      const text = codexContentText(payload.output);
+      if (callId.length > 0) {
+        entry.kind = "result";
+        entry.results = [{ tool_use_id: callId, text, is_error: payload.is_error === true }];
+      }
+      return entry;
+    }
+    return entry;
+  }
+  if (raw.type === "event_msg" && isRecord(raw.payload) && raw.payload.type === "task_complete") {
+    const lam = raw.payload.last_agent_message;
+    if (typeof lam === "string" && lam.length > 0) {
+      if (!entry.promptId && typeof raw.payload.turn_id === "string" && raw.payload.turn_id.length > 0) {
+        entry.promptId = raw.payload.turn_id;
+      }
+      entry.kind = "assistant";
+      entry.blocks = [{ kind: "text", text: lam.slice(0, MAX_INPUT_CHARS) }];
+    }
+    return entry;
+  }
+
+  // --- Grok Build `updates.jsonl` shape (`session/update` / `_x.ai/session/update`) ---
+  if (isRecord(raw.params) && isRecord(raw.params.update)) {
+    const params = raw.params;
+    const update = params.update as Record<string, unknown>;
+    const metaObj = isRecord(params._meta) ? params._meta : isRecord(raw._meta) ? raw._meta : null;
+    if (metaObj && typeof metaObj.agentTimestampMs === "number" && Number.isFinite(metaObj.agentTimestampMs)) {
+      entry.ts = metaObj.agentTimestampMs;
+    } else if (typeof raw.timestamp === "number" && Number.isFinite(raw.timestamp) && raw.timestamp >= 1e9 && raw.timestamp < 1e11) {
+      entry.ts = raw.timestamp * 1000;
+    }
+    if (!entry.promptId && metaObj && typeof metaObj.promptId === "string" && metaObj.promptId.length > 0) {
+      entry.promptId = metaObj.promptId;
+    }
+    const su = update.sessionUpdate;
+    if (su === "user_message_chunk") {
+      const content = isRecord(update.content) ? update.content : null;
+      const text =
+        content && typeof content.text === "string"
+          ? content.text
+          : typeof update.text === "string"
+            ? update.text
+            : "";
+      if (text.length > 0) {
+        entry.kind = "prompt";
+        entry.text = text.slice(0, MAX_INPUT_CHARS);
+        entry.chunk = true;
+      }
+      return entry;
+    }
+    if (su === "agent_message_chunk") {
+      const content = isRecord(update.content) ? update.content : null;
+      const text =
+        content && typeof content.text === "string"
+          ? content.text
+          : typeof update.text === "string"
+            ? update.text
+            : "";
+      if (text.length > 0) {
+        const msg = entry.promptId ? `grok-msg-${entry.promptId}` : undefined;
+        entry.kind = "assistant";
+        entry.blocks = [{ kind: "text", text: text.slice(0, MAX_INPUT_CHARS), msg }];
+        entry.chunk = true;
+      }
+      return entry;
+    }
+    if (su === "tool_call") {
+      const callId = typeof update.toolCallId === "string" && update.toolCallId.length > 0 ? update.toolCallId : `grok_call_${line.off}`;
+      const uMeta = isRecord(update._meta) && isRecord(update._meta["x.ai/tool"]) ? update._meta["x.ai/tool"] : null;
+      const name =
+        uMeta && typeof uMeta.name === "string" && uMeta.name.length > 0
+          ? uMeta.name
+          : typeof update.title === "string"
+            ? update.title
+            : "";
+      const input = update.rawInput ?? update.input ?? {};
+      if (name.length > 0) {
+        const unwrapped = unwrapMcpToolCall(name, input);
+        entry.kind = "assistant";
+        entry.blocks = [{ kind: "tool_use", id: callId, name: unwrapped.name, input: unwrapped.input }];
+      }
+      return entry;
+    }
+    if (su === "tool_call_update") {
+      const callId = typeof update.toolCallId === "string" ? update.toolCallId : "";
+      const rawOut = update.rawOutput ?? update.output ?? update.content;
+      const text =
+        typeof rawOut === "string"
+          ? rawOut
+          : isRecord(rawOut) && typeof rawOut.text === "string"
+            ? rawOut.text
+            : resultText(rawOut);
+      if (callId.length > 0 && text.length > 0) {
+        entry.kind = "result";
+        entry.results = [
+          {
+            tool_use_id: callId,
+            text: text.slice(0, MAX_INPUT_CHARS),
+            is_error: update.status === "error" || update.isError === true,
+          },
+        ];
+      }
+      return entry;
+    }
+  }
+
   return entry;
 }
 
@@ -1289,20 +1605,30 @@ function inputLeaves(input: unknown): string {
   return parts.join("\n");
 }
 
-function toolAct(name: string, input: unknown): ToolAct {
+function toolAct(rawName: string, rawInput: unknown): ToolAct {
+  const { name, input } = unwrapMcpToolCall(rawName, rawInput);
   const leaves = inputLeaves(input);
+  const rawBase = name.split("__").pop() ?? name;
+  const base =
+    rawBase === "read_file" || rawBase === "view_file"
+      ? "Read"
+      : rawBase === "run_command" || rawBase === "run_terminal_command" || rawBase === "exec_command" || rawBase === "exec" || rawBase === "Shell"
+        ? "Bash"
+        : rawBase;
   const act: ToolAct = {
     kind: "tool",
     name,
     leaves,
     shingles: new Set(allShingleHashes(leaves)),
     minni: (MINNI_TOOL_RE.exec(name)?.[1] as "recall" | "drill" | undefined) ?? null,
-    base: name.split("__").pop() ?? name,
+    base,
     readVerb: false,
   };
   if (isRecord(input)) {
-    if (typeof input.file_path === "string") act.filePath = input.file_path;
-    if (typeof input.command === "string") act.command = input.command;
+    const filePath = input.file_path ?? input.Path ?? input.path ?? input.target_file;
+    if (typeof filePath === "string") act.filePath = filePath;
+    const command = input.command ?? input.CommandLine ?? input.cmd;
+    if (typeof command === "string") act.command = command;
     if (typeof input.query === "string") act.query = input.query.slice(0, MAX_INPUT_CHARS);
   }
   if (act.base === "Bash" && act.command) act.readVerb = READ_VERB_RE.test(`${act.command} `);
@@ -1913,6 +2239,7 @@ class DetectorRun {
   unnameable = 0;
   provisional = 0;
   timedOut = false;
+  noTranscript = false;
   processedEnd: number | null = null;
 
   constructor(
@@ -1990,6 +2317,7 @@ class DetectorRun {
   }
 
   private unreachedReason(): string {
+    if (this.noTranscript && !this.env.lam) return "unknown(no_transcript)";
     return this.linesParsed > 0 && this.assistantSeen === 0 && !this.env.lam
       ? "unknown(unparsed_transcript)"
       : "unknown(unreached)";
@@ -2364,10 +2692,23 @@ class DetectorRun {
     }
     if (entry.kind === "result") {
       for (const result of entry.results ?? []) {
-        const kind = this.agent.tool_ids[result.tool_use_id];
+        let toolUseId = result.tool_use_id;
+        let kind = this.agent.tool_ids[toolUseId];
+        if (!kind && toolUseId === "__agy_next__") {
+          const looksLikeRecall = result.text.includes("# Minni Recall") || recallCards(result.text).length > 0;
+          const looksLikeDrill = !looksLikeRecall && (result.text.includes("# Minni Drill") || drillCards(result.text).length > 0);
+          const wanted = looksLikeRecall ? "recall" : looksLikeDrill ? "drill" : null;
+          if (wanted) {
+            const matchId = Object.keys(this.agent.tool_ids).find((id) => this.agent.tool_ids[id] === wanted);
+            if (matchId) {
+              toolUseId = matchId;
+              kind = wanted;
+            }
+          }
+        }
         if (!kind) continue;
-        delete this.agent.tool_ids[result.tool_use_id];
-        this.explicitRecall(result, kind, entry);
+        delete this.agent.tool_ids[toolUseId];
+        this.explicitRecall({ ...result, tool_use_id: toolUseId }, kind, entry);
       }
     }
   }
@@ -2443,14 +2784,22 @@ class DetectorRun {
         }
       }
     }
+    if (this.noTranscript) {
+      for (const window of this.agent.windows) {
+        if (window.scope === "boot") window.boot_turns += 1;
+      }
+    }
     const closing = this.agent.windows.filter((window) =>
-      window.scope === "turn" ? turn === null || window.turn_key === turn.key : window.boot_turns >= 2,
+      window.scope === "turn"
+        ? turn === null || window.turn_key === turn.key
+        : window.boot_turns >= 2 || (this.noTranscript && !lam),
     );
     if (flushed) {
       if (turn) {
         this.closeTurn("transcript");
       } else {
-        for (const window of closing) this.closeWindow(window, "transcript");
+        const via = this.noTranscript && !lam ? "no_transcript" : "transcript";
+        for (const window of closing) this.closeWindow(window, via);
       }
       return;
     }
@@ -2618,7 +2967,32 @@ function parseLines(lines: readonly RawLine[]): TxEntry[] {
   const entries: TxEntry[] = [];
   for (const line of lines) {
     const entry = parseEntry(line);
-    if (entry) entries.push(entry);
+    if (!entry) continue;
+    const prev = entries[entries.length - 1];
+    if (
+      prev &&
+      prev.chunk === true &&
+      entry.chunk === true &&
+      prev.kind === entry.kind &&
+      (!prev.promptId || !entry.promptId || prev.promptId === entry.promptId)
+    ) {
+      prev.end = entry.end;
+      if (entry.kind === "prompt" && typeof entry.text === "string") {
+        prev.text = `${prev.text ?? ""}${entry.text}`.slice(0, MAX_INPUT_CHARS);
+        continue;
+      }
+      if (
+        entry.kind === "assistant" &&
+        prev.blocks?.length === 1 &&
+        prev.blocks[0]?.kind === "text" &&
+        entry.blocks?.length === 1 &&
+        entry.blocks[0]?.kind === "text"
+      ) {
+        prev.blocks[0].text = `${prev.blocks[0].text}${entry.blocks[0].text}`.slice(0, MAX_INPUT_CHARS);
+        continue;
+      }
+    }
+    entries.push(entry);
   }
   return entries;
 }
@@ -2762,6 +3136,7 @@ export function runDetector(args: RunDetectorArgs): DetectorResult {
 
       let reachedEnd = true;
       const handle = openTranscript(args.transcriptPath);
+      run.noTranscript = !handle;
       try {
         if (handle) {
           const offset = startOffset(vaultPath, agent, handle, run);
