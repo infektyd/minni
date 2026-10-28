@@ -1490,6 +1490,84 @@ function lifecycleFieldsFor(
   return { fields };
 }
 
+const CONVERSATIONAL_PHRASES_RE =
+  /\b(?:what\s+do\s+you\s+(?:suggest|think)|how\s+does\s+that\s+sound|can\s+you\s+explain(?:\s+that)?|could\s+you\s+explain(?:\s+that)?|in\s+plain\s+english|go\s+ahead(?:\s+and\s+do\s+(?:that|it))?|do\s+(?:that|it)|ship\s+it|looks\s+good|sounds\s+good|thank\s+you)\b/gi;
+
+const CONVERSATIONAL_WORDS: ReadonlySet<string> = new Set([
+  "ok",
+  "okay",
+  "k",
+  "yes",
+  "yep",
+  "yeah",
+  "sure",
+  "thanks",
+  "thankx",
+  "thx",
+  "lgtm",
+  "please",
+  "continue",
+  "proceed",
+  "next",
+  "why",
+  "how",
+  "really",
+]);
+
+const CONVERSATIONAL_SLASH_PAIR_RE =
+  /^(?:yes\/no|no\/yes|and\/or|either\/or|true\/false|false\/true|on\/off|off\/on|n\/a|w\/o|c\/o|up\/down|in\/out|pass\/fail|\d+\/\d+)$/i;
+
+const SLASH_PATH_CANDIDATE_RE = /(?:^|[\s"'`(])([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_./-]+)/g;
+
+function hasFilePathAnchor(text: string): boolean {
+  for (const match of text.matchAll(SLASH_PATH_CANDIDATE_RE)) {
+    const candidate = match[1].replace(/[.,;:!?)]+$/, "");
+    if (candidate && !CONVERSATIONAL_SLASH_PAIR_RE.test(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const TECHNICAL_ANCHOR_PATTERNS: ReadonlyArray<RegExp> = [
+  /\b[a-zA-Z0-9_-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|json|jsonl|md|sh|sql|toml|yaml|yml|rs|swift|go|lock)\b/i,
+  /\b[a-zA-Z0-9]+_[a-zA-Z0-9_]+\b/,
+  /\b[a-z]+[A-Z][a-zA-Z0-9]*\b/,
+  /\b[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9]*\b/,
+  /`[^`\n]+`/,
+  /\b(?:minni|minnid|praxis|workbench|jev|faiss|sqlite|fts5|afm|launchd|worktree)\b/i,
+  /(?:^|[\s([{"'])#\d+\b/,
+  /\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b/i,
+  /(?:^|\s)--[a-zA-Z0-9][a-zA-Z0-9-]*/,
+];
+
+export function isSubstantiveRecallPrompt(promptText: string): boolean {
+  if (typeof promptText !== "string") return false;
+  const raw = promptText.trim();
+  if (!raw) return false;
+
+  if (hasFilePathAnchor(raw) || TECHNICAL_ANCHOR_PATTERNS.some((re) => re.test(raw))) {
+    return true;
+  }
+
+  const withoutPhrases = raw.replace(CONVERSATIONAL_PHRASES_RE, " ");
+  const rawTokens = withoutPhrases
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const remainingTokens = rawTokens.filter((tok) => !CONVERSATIONAL_WORDS.has(tok));
+  const nonWsChars = remainingTokens.join("").length;
+  if (nonWsChars < 15) {
+    return false;
+  }
+
+  const substantiveWords = remainingTokens.filter((tok) => tok.length >= 3);
+  return substantiveWords.length >= 3;
+}
+
 export function createHookHandlers(
   config: AgentHookConfig,
   deps: AgentHookDeps = {},
@@ -1685,6 +1763,8 @@ export function createHookHandlers(
           // lets the hook PROCESS exit. Racing a promise alone cannot do that.
           timeoutMs: remainingMs(),
           ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+          passive: true,
+          updateAccess: false,
         }),
         remainingMs(),
         rpcTimedOut,
@@ -2386,6 +2466,12 @@ export function createHookHandlers(
       return lifecycleOnlyOutput();
     }
 
+    if (!isSkip && !isSubstantiveRecallPrompt(recallQuery)) {
+      await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
+      exit("non_substantive_prompt");
+      return lifecycleOnlyOutput();
+    }
+
     const threshold = recallPointerThreshold();
     // #313: searchVaultNotes scores and ranks across the WHOLE vault, then
     // slices to `limit` before privacy is ever considered (it only drops
@@ -2505,6 +2591,8 @@ export function createHookHandlers(
                   // lets the hook PROCESS exit. Racing a promise alone cannot do that.
                   timeoutMs: remainingMs(),
                   ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+                  passive: true,
+                  updateAccess: false,
                 }),
                 remainingMs(),
                 { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
@@ -3351,6 +3439,8 @@ export function createHookHandlers(
             workspaceId,
             timeoutMs: SUBAGENT_RECALL_BUDGET_MS,
             ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+            passive: true,
+            updateAccess: false,
           }),
           SUBAGENT_RECALL_BUDGET_MS,
           { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },

@@ -94,6 +94,82 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
     page_status = str(params.get("page_status", "accepted"))
     layer = str(params.get("layer", "knowledge"))
 
+    from minni.indexer import (
+        UNEMBEDDED_STATUSES,
+        extract_explicit_frontmatter_status,
+        is_vault_path_excluded,
+    )
+
+    def _retract_existing_if_any() -> bool:
+        try:
+            eng = context.lazy_retrieval()
+            db_obj = getattr(eng, "db", None) if eng is not None else None
+            if db_obj is None:
+                return False
+            retracted_any = False
+            with db_obj.transaction() as c:
+                for p_candidate in {str(full_path), str(rel_path)}:
+                    rows = c.execute(
+                        "SELECT doc_id FROM documents WHERE path = ?",
+                        (p_candidate,),
+                    ).fetchall()
+                    for r in rows:
+                        did = int(r["doc_id"] if hasattr(r, "keys") else r[0])
+                        c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
+                        c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
+                        c.execute(
+                            "DELETE FROM memory_links WHERE source_doc_id = ? OR target_doc_id = ?",
+                            (did, did),
+                        )
+                        c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
+                        retracted_any = True
+            return retracted_any
+        except Exception:
+            return False
+
+    explicit_status = extract_explicit_frontmatter_status(content)
+    path_excluded, path_reason = is_vault_path_excluded(
+        full_path,
+        root_dir=vault_path,
+        explicit_status=explicit_status,
+        is_rpc=True,
+    )
+    if path_excluded:
+        retracted = _retract_existing_if_any()
+        context.record_latency("vault_index_doc", time.perf_counter() - started_at)
+        return context.make_response(
+            {
+                "status": "skipped",
+                "indexed": False,
+                "skipped": True,
+                "retracted": retracted,
+                "reason": "excluded_path",
+                "detail": path_reason,
+                "chunks": 0,
+            },
+            request_id,
+        )
+
+    effective_status = (
+        explicit_status
+        if explicit_status is not None
+        else str(params.get("page_status") or "accepted").strip().lower()
+    )
+    if effective_status in UNEMBEDDED_STATUSES:
+        retracted = _retract_existing_if_any()
+        context.record_latency("vault_index_doc", time.perf_counter() - started_at)
+        return context.make_response(
+            {
+                "status": "skipped",
+                "indexed": False,
+                "skipped": True,
+                "retracted": retracted,
+                "reason": f"excluded_status:{effective_status}",
+                "chunks": 0,
+            },
+            request_id,
+        )
+
     try:
         engine = context.lazy_retrieval()
         result = engine.index_durable_document(

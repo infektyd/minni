@@ -9,6 +9,11 @@ from typing import Any, Callable, Optional
 
 from minni.afm_review_markers import supersede_afm_review
 from minni.db import MinniDB
+from minni.durability import durability_of
+from minni.durable_projection import (
+    evict_learning_to_cold_archive,
+    find_near_duplicate_active_learning,
+)
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
@@ -342,6 +347,30 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                 _cursor=c,
                 canonical_doc_id=canonical_doc_id,
             )
+
+            near_dups = find_near_duplicate_active_learning(
+                c,
+                agent_id=agent_id,
+                category=category,
+                content=content,
+                exclude_learning_id=lid,
+                embedding=emb_bytes,
+            )
+            for dup_lid in near_dups:
+                if supersedes and int(dup_lid) == int(supersedes):
+                    continue
+                evict_learning_to_cold_archive(
+                    c,
+                    None,
+                    dup_lid,
+                    reason=f"superseded_near_duplicate_by:{lid}",
+                    db_path=getattr(wb.config, "db_path", None),
+                    vault_path=getattr(wb.config, "vault_path", None),
+                )
+                try:
+                    context.purge_durable_learning(agent_id, f"learning:{dup_lid}")
+                except Exception:
+                    pass
 
         context.logger.info(
             "Stored learning #%d [%s/%s]: %.60s...",
@@ -839,35 +868,86 @@ def settle_accepted_candidate(
     return indexed_ok
 
 
+_HARVEST_SOURCES = frozenset(
+    {
+        "jev_harvest",
+        "stop_candidates",
+        "compact_distillation",
+        "session_distillation",
+        "hook",
+        "auto_harvest",
+        "harvest",
+        "subagent_harvest",
+        "session_harvest",
+        "stop_harvest",
+    }
+)
+
+_SPRINT_CHATTER_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:pushed|committed|merged|landed)\s+(?:commit\s+|sha\s+|pr\s+#?\d+\b|[0-9a-f]{7,40}\b)"
+    r"|\b\d+\s*/\s*\d+\s+(?:tests?\s+)?(?:passed|green)\b"
+    r"|\b\d+\s+(?:tests?\s+)?passed,\s*0\s+failed\b"
+    r"|\b(?:phase|slice|wave|workstream|sprint)\s+[a-z0-9_.-]+\s+(?:is\s+|are\s+)?(?:complete|completed|done|green|passed|status|shipped|landed)\b"
+    r")"
+)
+
+_INVARIANT_MARKER_RE = re.compile(
+    r"(?i)\b(?:invariant|contract|must\s+never|never\s+run|root\s+cause|operator\s+rule)\b"
+)
+
+
+def non_durable_promotion_blocker(
+    *,
+    content: str,
+    category: str = "general",
+    source: Optional[str] = None,
+    origin: Optional[str] = None,
+) -> Optional[str]:
+    """Return a blocker reason if content fails the Rev 6 durability gate for promotion."""
+    cat = (category or "general").strip().lower()
+    src = (source or "").strip().lower() if source is not None else ""
+    orig = (origin or "").strip().lower() if origin is not None else ""
+    is_sprint_chatter = bool(_SPRINT_CHATTER_RE.search(content or ""))
+    if is_sprint_chatter:
+        return "non_durable:noise"
+    dur = durability_of(
+        {
+            "category": cat,
+            "content": content or "",
+            "source": source,
+            "origin": origin,
+        }
+    )
+    if dur == "noise":
+        return "non_durable:noise"
+    is_harvest_src = bool(src) and (
+        src in _HARVEST_SOURCES
+        or "harvest" in src
+        or any(src.startswith(prefix) for prefix in _HARVEST_SOURCES)
+    )
+    is_harvest_origin = bool(orig) and (
+        orig == "agent" or orig in _HARVEST_SOURCES or "harvest" in orig
+    )
+    has_invariant = bool(_INVARIANT_MARKER_RE.search(content or ""))
+    if cat == "preference" and not has_invariant:
+        return f"non_durable:{dur if dur != 'durable' else 'ordinary'}"
+    if (is_harvest_src or is_harvest_origin) and (dur != "durable" or not has_invariant):
+        return f"non_durable:{dur if dur != 'durable' else 'ordinary'}"
+    return None
+
+
+
 def auto_accept_blockers(
-    content: str, instruction_like: bool, requested_privacy: str = "safe"
+    content: str,
+    instruction_like: bool,
+    requested_privacy: str = "safe",
+    *,
+    category: str = "general",
+    source: Optional[str] = None,
+    origin: Optional[str] = None,
 ) -> list[str]:
-    """Reasons to WITHHOLD #290 auto-acceptance. Empty list == eligible.
-
-    The floor reuses the repo's existing structural gate rather than inventing a
-    score: ``consolidation._quality_blockers`` already describes itself as "reasons
-    to WITHHOLD auto-promotion (the candidate is routed to review, never silently
-    dropped)", which is exactly this decision. Two safety rules from the manual
-    accept path join it:
-
-      * instruction_like — ``resolve_candidate`` refuses to accept flagged content
-        without an explicit ``accept_flagged`` capability. Auto-accept must not
-        become the way around that gate, so flagged content falls back to
-        proposed and a human still sees it.
-      * minimum length — consolidation's own auto-promotion floor; a three-word
-        fragment is not a durable learning.
-      * declared privacy — consolidation refuses to auto-promote anything outside
-        {safe, public, low}. Note this reads the AUTHOR'S declaration, not the
-        clamped value stored on the row: the clamp exists because "learn-only
-        callers are not trusted to create auto-promotable rows", and this knob is
-        the operator lifting THAT distrust. It is not the operator overruling a
-        writer that said "this is sensitive" about its own content — under the
-        old flow a human saw that declaration, and nothing else in the row
-        preserves it.
-
-    Withheld means the candidate stays ``proposed`` for a human. It is never
-    dropped, so the operator loses nothing by opting in.
-    """
+    """Reasons to WITHHOLD #290 auto-acceptance. Empty list == eligible."""
     # Cheap import: consolidation pulls only stdlib + minni.safety.
     from minni.afm_passes.consolidation import (
         _MIN_CONTENT_LEN,
@@ -883,22 +963,19 @@ def auto_accept_blockers(
     if str(requested_privacy or "").strip().lower() not in _SAFE_PRIVACY:
         reasons.append(f"privacy={requested_privacy}")
     reasons.extend(_quality_blockers(content))
+    dur_blocker = non_durable_promotion_blocker(
+        content=content or "",
+        category=category,
+        source=source,
+        origin=origin,
+    )
+    if dur_blocker is not None:
+        reasons.append(dur_blocker)
     return reasons
 
 
 def ensure_content_hash_column(db: Any) -> bool:
-    """Ensure learnings.content_hash + its index exist. No backfill.
-
-    Deliberately NOT consolidation._ensure_dedup_index: that one also backfills
-    every NULL hash in a per-row Python loop inside BEGIN IMMEDIATE. Measured at
-    ~2.9s of exclusive daemon write-lock on a 20k-row table — acceptable in a
-    background pass, not on a user-facing learn. This path only needs to write
-    and query its own hashes; legacy NULL rows simply do not dedup, which is
-    exactly where they already were.
-
-    The PRAGMA -> ALTER window is a TOCTOU across the daemon's thread-local
-    connections, so a losing racer is caught rather than surfaced as -32000.
-    """
+    """Ensure learnings.content_hash + its index exist. No backfill."""
     try:
         with db.cursor() as c:
             c.execute("PRAGMA table_info(learnings)")
@@ -957,18 +1034,25 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     now = time.time()
     ws = params.get("workspace_id") or "default"
     ev = json.dumps(params.get("evidence_refs") or params.get("evidence_doc_ids") or [])
-    df = json.dumps(params.get("derived_from") or {})
+    raw_df = params.get("derived_from")
+    df_dict = dict(raw_df) if isinstance(raw_df, dict) else {}
+    source_param = params.get("source")
+    if source_param is None and isinstance(raw_df, dict):
+        source_param = raw_df.get("source")
+    origin_param = params.get("origin")
+    if origin_param is None and isinstance(raw_df, dict):
+        origin_param = raw_df.get("origin")
+    if source_param is not None and "source" not in df_dict:
+        df_dict["source"] = str(source_param)
+    if origin_param is not None and "origin" not in df_dict:
+        df_dict["origin"] = str(origin_param)
+    df = json.dumps(df_dict if df_dict else (raw_df or {}))
     instr = 1 if (params.get("instruction_like") or is_instruction_like(stored_content)) else 0
     from minni.writeback import CATEGORIES
 
     raw_category = str(params.get("category") or "general").strip().lower()
     category = raw_category if raw_category in CATEGORIES else "general"
 
-    # The governed proposal writer makes privacy explicit. Preserve a caller's
-    # explicit privacy_level; otherwise reuse the M-3 frontmatter bridge used by
-    # durable-document indexing (which conservatively defaults to safe when no
-    # frontmatter is present). The separate Finding 1 clamp below remains in
-    # force: learn-only callers are not trusted to create auto-promotable rows.
     if "privacy_level" in params:
         requested_privacy = params["privacy_level"]
     else:
@@ -989,29 +1073,19 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     else:
         requested_privacy = str(requested_privacy).strip()
 
-    # Only an *explicit* govern / resolve_candidate grant may keep the writer's
-    # privacy decision. Do NOT use is_operator_principal here — that treats
-    # main/operator + any nonempty caps as operator, letting learn-only main
-    # bypass the clamp.
     if explicitly_allowed_operator(principal):
         stored_privacy = requested_privacy
     else:
         stored_privacy = "review"
 
-    # #290: decided BEFORE the write so the promotion lands in the SAME
-    # transaction as the insert. A half-applied promotion — learning written,
-    # candidate still 'proposed' — would be accepted a second time by a later
-    # manual resolve and double-write the learning.
-    #
-    # Read from the STAMPED principal only. `params` was already refused above if
-    # it carried the knob, so there is no path from the wire to this decision.
-    #
-    # Note the privacy clamp above is deliberately NOT an additional gate here.
-    # It stamps 'review' because "learn-only callers are not trusted to create
-    # auto-promotable rows" — and this knob is precisely the operator lifting
-    # that distrust for one principal's own candidates. Gating on it would make
-    # the knob a no-op for exactly the principals it exists to serve.
-    withheld = auto_accept_blockers(stored_content, bool(instr), requested_privacy)
+    withheld = auto_accept_blockers(
+        stored_content,
+        bool(instr),
+        requested_privacy,
+        category=category,
+        source=str(source_param) if source_param is not None else None,
+        origin=str(origin_param) if origin_param is not None else None,
+    )
     auto_accept = bool(getattr(principal, "auto_accept_own", False)) and not withheld
     resolved_by = f"auto_accept_own({principal.agent_id})"
 
@@ -1022,20 +1096,6 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
         chash = None
         emb_bytes = None
         if auto_accept:
-            # detect_contradictions filters `embedding IS NOT NULL`, so a
-            # learning stored without one is invisible to the only guard standing
-            # in front of this channel — and the more the knob writes, the
-            # blinder that guard gets. Consolidation, the other unattended
-            # writer, hashes and embeds for exactly this reason.
-            #
-            # ALL of it is fail-soft. Staging a candidate was pure SQL before
-            # this feature and never touched the embedder; a first pass left the
-            # column check and the `wb.model` property access outside the
-            # try, so a locked DB or an offline model turned a working learn
-            # into -32000 WITH NOTHING STAGED — the learning lost outright
-            # rather than routed to review. An optimisation must never take down
-            # the base path: on any failure the candidate still stages as
-            # proposed, which is exactly where it would have gone anyway.
             try:
                 from minni.afm_passes.consolidation import (
                     content_hash as _content_hash,
@@ -1043,24 +1103,10 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 )
 
                 if not ensure_content_hash_column(db):
-                    # The INSERT below names content_hash unconditionally, so a
-                    # missing column is fatal to the durable write. Raise into
-                    # the handler right below rather than proceeding: a
-                    # transient SQLITE_BUSY on the DDL otherwise reached the
-                    # INSERT and lost the learn outright ("no column named
-                    # content_hash"), which is the exact regression this
-                    # fail-soft block exists to prevent.
                     raise RuntimeError("content_hash column unavailable")
                 chash = _content_hash(stored_content)
                 model = getattr(wb, "model", None)
                 if model is None:
-                    # No embedder means no embedding, and detect_contradictions
-                    # filters `embedding IS NOT NULL` — an active learning
-                    # without one is invisible to the guard in front of this
-                    # channel, which is the F2 defect in a different costume.
-                    # Every other preparation failure stages as proposed; a
-                    # missing model must not be the one exception that writes
-                    # durable memory anyway.
                     raise RuntimeError("embedder unavailable")
                 import numpy as np
 
@@ -1153,17 +1199,6 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             with db.transaction() as c:
                 cid = _stage_proposal(c)
                 if auto_accept and chash is not None:
-                    # Inside the txn: a read-then-insert outside it races another
-                    # auto-accept of the same content.
-                    # Scoped to the caller, matching where the row is written. A
-                    # global probe is an exact-match existence oracle over every
-                    # agent's durable content, and the echoed "duplicate" reason
-                    # confirms the hit — the same class this repo already closed on
-                    # handle_learn's contradiction scan (R5, 2026-07-02 triage).
-                    # status='active' matters: a superseded or rejected row is not
-                    # a live duplicate, and matching it blocked re-learning content
-                    # that no active learning carries any more — the correction
-                    # machinery would have permanently poisoned the hash.
                     if has_active_learning_hash(c, chash, principal.agent_id):
                         auto_accept = False
                         withheld = ["duplicate of an existing learning"]
@@ -1181,12 +1216,6 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         ),
                     )
                     lid = c.lastrowid
-                    # Atomic canonical identity: the node + join share this
-                    # cursor, so a mid-commit failure rolls the learning back
-                    # too. Owner is the proposer (principal), matching the
-                    # learning row. A None return (absent schema) tolerates the
-                    # pre-graph baseline; a raise rolls back and falls through
-                    # to proposal-only staging below.
                     try:
                         ensure_canonical_learning_node(
                             c,
@@ -1198,6 +1227,27 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         )
                     except Exception as exc:
                         raise _CanonicalCommitFailed(exc)
+                    near_dups = find_near_duplicate_active_learning(
+                        c,
+                        agent_id=principal.agent_id,
+                        category=category,
+                        content=stored_content,
+                        exclude_learning_id=lid,
+                        embedding=emb_bytes,
+                    )
+                    for dup_lid in near_dups:
+                        evict_learning_to_cold_archive(
+                            c,
+                            None,
+                            dup_lid,
+                            reason=f"superseded_near_duplicate_by:{lid}",
+                            db_path=getattr(wb.config, "db_path", None),
+                            vault_path=getattr(wb.config, "vault_path", None),
+                        )
+                        try:
+                            context.purge_durable_learning(principal.agent_id, f"learning:{dup_lid}")
+                        except Exception:
+                            pass
                     c.execute(
                         """
                         UPDATE candidate_packets
@@ -1626,6 +1676,17 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                         )
                     else:
                         break
+                raw_sup = params.get("supersede_ids") or params.get("supersedes") or []
+                if isinstance(raw_sup, int):
+                    raw_sup = [raw_sup]
+                if isinstance(raw_sup, (list, tuple)):
+                    for sid in raw_sup:
+                        try:
+                            sid_int = int(sid)
+                            if sid_int not in existing_lids:
+                                existing_lids.append(sid_int)
+                        except (TypeError, ValueError):
+                            pass
                 ins_cols = ["agent_id", "category", "content", "created_at"]
                 ins_vals: list[Any] = [author_agent, cat, content, now]
                 if _have_status_col:
@@ -1640,19 +1701,6 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     ins_vals,
                 )
                 lid = c.lastrowid
-                for ex_lid in existing_lids:
-                    if _have_status_col and "superseded_by" in l_cols:
-                        c.execute(
-                            "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
-                            "WHERE learning_id = ?",
-                            (lid, ex_lid),
-                        )
-                    elif "superseded_by" in l_cols:
-                        c.execute(
-                            "UPDATE learnings SET superseded_by = ? "
-                            "WHERE learning_id = ?",
-                            (lid, ex_lid),
-                        )
                 # Coordinated canonical commit: the join row lands in the same
                 # transaction as the learning + candidate status update, so a
                 # mid-commit failure rolls all three back. Typed edges come
@@ -1665,6 +1713,31 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     vault_path=db.config.vault_path,
                     created_at=now,
                 )
+                near_dups = find_near_duplicate_active_learning(
+                    c,
+                    agent_id=author_agent,
+                    category=cat,
+                    content=content,
+                    exclude_learning_id=lid,
+                )
+                for dup_lid in near_dups:
+                    if dup_lid not in existing_lids:
+                        existing_lids.append(dup_lid)
+                for ex_lid in existing_lids:
+                    if ex_lid == lid:
+                        continue
+                    evict_learning_to_cold_archive(
+                        c,
+                        None,
+                        ex_lid,
+                        reason=f"superseded_by:{lid}",
+                        db_path=getattr(db.config, "db_path", None),
+                        vault_path=getattr(db.config, "vault_path", None),
+                    )
+                    try:
+                        context.purge_durable_learning(author_agent, f"learning:{ex_lid}")
+                    except Exception:
+                        pass
 
             # Migration-015 guard: on a pre-015 schema the candidate_packets
             # CHECK does not admit do_not_store / log_only, so the UPDATE would

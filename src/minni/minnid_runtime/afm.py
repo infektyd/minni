@@ -682,8 +682,42 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
         try:
             verdict = judge_verdicts.get(cid)
             reason = getattr(verdict, "reason", "afm-consolidation")
-            if promote_candidate_durable(cid, reason, context, judge_verdict=verdict):
+            new_lid = promote_candidate_durable(cid, reason, context, judge_verdict=verdict)
+            if new_lid:
                 promoted += 1
+                try:
+                    from minni.durable_projection import (
+                        evict_learning_to_cold_archive,
+                        find_near_duplicate_active_learning,
+                    )
+
+                    wb = context.lazy_writeback()
+                    wb_cfg = getattr(wb, "config", None) or getattr(wb.db, "config", None)
+                    with wb.db.transaction() as c:
+                        l_row = c.execute(
+                            "SELECT agent_id, category, content, embedding FROM learnings WHERE learning_id = ?",
+                            (new_lid,),
+                        ).fetchone()
+                        if l_row is not None:
+                            near_dups = find_near_duplicate_active_learning(
+                                c,
+                                agent_id=str(l_row["agent_id"] or "afm-loop"),
+                                category=str(l_row["category"] or "general"),
+                                content=str(l_row["content"] or ""),
+                                exclude_learning_id=int(new_lid),
+                                embedding=l_row["embedding"],
+                            )
+                            for dup_lid in near_dups:
+                                evict_learning_to_cold_archive(
+                                    c,
+                                    None,
+                                    dup_lid,
+                                    reason=f"superseded_near_duplicate_by:{new_lid}",
+                                    db_path=getattr(wb_cfg, "db_path", None),
+                                    vault_path=getattr(wb_cfg, "vault_path", None),
+                                )
+                except Exception:
+                    pass
         except Exception:
             errors += 1
             context.logger.exception("consolidation: promote candidate %s failed", cid)
@@ -721,6 +755,16 @@ def apply_consolidation_result(result: dict, context: AFMContext) -> None:
     remaining_proposed: list[int] = []
     try:
         wb = context.lazy_writeback()
+        try:
+            from minni.afm_passes.consolidation import expire_and_compact_candidates
+
+            expire_and_compact_candidates(
+                wb.db,
+                config=getattr(wb, "config", None),
+                archive_callback=getattr(context, "maybe_archive_inbox_source", None),
+            )
+        except Exception:
+            pass
         with wb.db.cursor() as c:
             # Promote/dedup/reject/redact targets must leave "proposed". Review routing is
             # intentional leave-proposed + fence; incomplete only when the

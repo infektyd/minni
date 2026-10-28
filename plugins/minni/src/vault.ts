@@ -2490,6 +2490,9 @@ export async function writeVaultPage(
   return { notePath, relativePath, wikilink: wikilinkFor(relativePath) };
 }
 
+// Pillar 3 invariant: vaultFirstLearn writes a candidate note under wiki/sessions/
+// and records the local audit entry only; it must NEVER call vault_index_doc or
+// index wiki/sessions/ notes into daemon documents/chunk_embeddings.
 export async function vaultFirstLearn(
   input: LearnInput,
 ): Promise<VaultWriteResult> {

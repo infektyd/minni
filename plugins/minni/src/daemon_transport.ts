@@ -509,6 +509,10 @@ export interface RecallMemoryInput {
   cross_agent?: boolean;
   sessionId?: string;
   vaultPath?: string;
+  passive?: boolean;
+  updateAccess?: boolean;
+  socketPath?: string;
+  daemonSocketPath?: string;
   /**
    * TOTAL deadline for the recall RPC. Prompt-time hooks pass their remaining
    * budget so a cold daemon (lazy embedder/cross-encoder/FAISS load) degrades to
@@ -547,9 +551,11 @@ export async function recallMemory(
     : typeof requesterOrInput === "function"
       ? requesterOrInput
       : jsonRpcSocketRequest;
-  const requester: JsonRpcRequester = config?.daemonSocketPath
+  const explicitSocketPath =
+    input.socketPath ?? input.daemonSocketPath ?? config?.daemonSocketPath;
+  const requester: JsonRpcRequester = explicitSocketPath
     ? (_sock, method, params, opts) =>
-        baseRequester(config.daemonSocketPath!, method, params, opts)
+        baseRequester(explicitSocketPath, method, params, opts)
     : baseRequester;
 
   const effectiveVaultPath = input.vaultPath ?? config?.vaultPath;
@@ -569,6 +575,8 @@ export async function recallMemory(
       depth: "snippet",
       timeout_ms: timeoutMs,
       ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
+      ...(input.passive !== undefined ? { passive: input.passive } : {}),
+      ...(input.updateAccess !== undefined ? { update_access: input.updateAccess } : {}),
     },
     requester,
     { timeoutMs },
@@ -599,18 +607,33 @@ export async function recallMemory(
   return res;
 }
 
-export async function learnMemory(input: {
-  content: string;
-  category?: string;
-  agentId?: string;
-  workspaceId?: string;
-}): Promise<JsonResult> {
+export async function learnMemory(
+  input: {
+    content: string;
+    category?: string;
+    agentId?: string;
+    workspaceId?: string;
+    source?: string;
+    origin?: string;
+    socketPath?: string;
+  },
+  requester?: JsonRpcRequester,
+): Promise<JsonResult> {
   const body = {
     content: input.content,
     category: input.category ?? "general",
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
+    ...(input.source ? { source: input.source } : {}),
+    ...(input.origin ? { origin: input.origin } : {}),
   };
+  if (input.socketPath || requester) {
+    const baseReq = requester ?? jsonRpcSocketRequest;
+    const effectiveReq: JsonRpcRequester = input.socketPath
+      ? (_sock, method, params, opts) => baseReq(input.socketPath!, method, params, opts)
+      : baseReq;
+    return jsonRpcSocketRequestWithFallbackRequester("learn", body, effectiveReq);
+  }
   // JSON-RPC only; return the daemon's real result/error (no masking HTTP fallback).
   return jsonRpcSocketRequestWithFallback("learn", body);
 }
@@ -716,8 +739,13 @@ export type JsonRpcRequester = (
 ) => Promise<JsonResult>;
 
 function jsonRpcSocketCandidates(): string[] {
-  const envSock = process.env.MINNI_SOCKET_PATH?.trim();
-  return [envSock || SOCKET_PATH];
+  const envSock =
+    process.env.MINNI_SOCKET_PATH?.trim() || process.env.MINNI_DAEMON_SOCKET?.trim();
+  if (envSock) return [envSock];
+  if (process.env.MINNI_HOME?.trim()) {
+    return [path.join(minniHome(), "run", "minnid.sock")];
+  }
+  return [SOCKET_PATH];
 }
 
 /**
