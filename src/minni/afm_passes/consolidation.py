@@ -242,7 +242,10 @@ def has_active_learning_hash(cursor, h: str, agent_id: str) -> bool:
 
 
 def dedup_active_learnings(
-    db, agent_id: Optional[str] = None
+    db,
+    agent_id: Optional[str] = None,
+    *,
+    evict_to_archive: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Evict duplicate active learnings (keeping the newest learning_id per
     (agent_id, content_hash) or near-duplicate cluster) and prune low-signal boot rows."""
@@ -316,27 +319,46 @@ def dedup_active_learnings(
     cfg = getattr(db, "config", None)
     db_path = getattr(cfg, "db_path", None)
     vault_path = getattr(cfg, "vault_path", None)
+    should_evict = (
+        evict_to_archive
+        if evict_to_archive is not None
+        else bool(getattr(cfg, "writeback_enabled", True))
+    )
 
     if dup_updates or low_sig_ids:
         with db.transaction() as c:
-            for winner_id, dup_id in dup_updates:
-                evict_learning_to_cold_archive(
-                    c,
-                    None,
-                    dup_id,
-                    reason=f"dedup_active_learnings:superseded_by:{winner_id}",
-                    db_path=db_path,
-                    vault_path=vault_path,
-                )
-            for low_id in low_sig_ids:
-                evict_learning_to_cold_archive(
-                    c,
-                    None,
-                    low_id,
-                    reason="dedup_active_learnings:low_signal",
-                    db_path=db_path,
-                    vault_path=vault_path,
-                )
+            if should_evict:
+                for winner_id, dup_id in dup_updates:
+                    evict_learning_to_cold_archive(
+                        c,
+                        None,
+                        dup_id,
+                        reason=f"dedup_active_learnings:superseded_by:{winner_id}",
+                        db_path=db_path,
+                        vault_path=vault_path,
+                    )
+                for low_id in low_sig_ids:
+                    evict_learning_to_cold_archive(
+                        c,
+                        None,
+                        low_id,
+                        reason="dedup_active_learnings:low_signal",
+                        db_path=db_path,
+                        vault_path=vault_path,
+                    )
+            else:
+                for winner_id, dup_id in dup_updates:
+                    c.execute(
+                        "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
+                        "WHERE learning_id = ? AND superseded_by IS NULL",
+                        (winner_id, dup_id),
+                    )
+                for low_id in low_sig_ids:
+                    c.execute(
+                        "UPDATE learnings SET status = 'rejected' "
+                        "WHERE learning_id = ? AND superseded_by IS NULL",
+                        (low_id,),
+                    )
 
     return {
         "superseded_duplicates": len(dup_updates),
@@ -868,3 +890,15 @@ def run(db, config, vault_path: Optional[str] = None,
         "triage_advisory": triage_advisory,
         "prompt_version": "consolidation-v2-model-judge",
     }
+
+
+class ConsolidationPass:
+    """Object-oriented wrapper around the consolidation pass runner."""
+
+    def __init__(self, db=None, config=None):
+        self.db = db
+        self.config = config
+
+    @staticmethod
+    def run(db=None, config=None, **kwargs) -> Dict[str, Any]:
+        return run(db=db, config=config, **kwargs)

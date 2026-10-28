@@ -262,9 +262,12 @@ class WikiIndexer:
         self,
         db: MinniDB,
         config: MinniConfig = DEFAULT_CONFIG,
+        *,
+        embed: bool = True,
     ):
         self.db = db
         self.config = config
+        self.embed = embed
         self.parser = WikiPageParser()
         self.chunker = MarkdownChunker(config)
         self.faiss_index = FAISSIndex(config)
@@ -547,7 +550,7 @@ class WikiIndexer:
                         enriched_heading = f"{heading_prefix}{chunk.heading_path}"
 
                         # Encode + store
-                        if self.model and not unendorsed:
+                        if self.embed and self.model and not unendorsed:
                             from minni.models import get_embedder_lock
 
                             with get_embedder_lock():

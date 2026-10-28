@@ -14,6 +14,23 @@ from minni.durable_projection import (
     evict_learning_to_cold_archive,
     find_near_duplicate_active_learning,
 )
+
+
+def find_near_duplicate_learning_ids(
+    conn_or_cursor: Any,
+    agent_id: str,
+    category: str,
+    content: str,
+    embedding: bytes | None = None,
+) -> list[int]:
+    """Positional/keyword wrapper for find_near_duplicate_active_learning."""
+    return find_near_duplicate_active_learning(
+        conn_or_cursor,
+        agent_id=agent_id,
+        category=category,
+        content=content,
+        embedding=embedding,
+    )
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
@@ -1726,14 +1743,27 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 for ex_lid in existing_lids:
                     if ex_lid == lid:
                         continue
-                    evict_learning_to_cold_archive(
-                        c,
-                        None,
-                        ex_lid,
-                        reason=f"superseded_by:{lid}",
-                        db_path=getattr(db.config, "db_path", None),
-                        vault_path=getattr(db.config, "vault_path", None),
-                    )
+                    if getattr(db.config, "writeback_enabled", True):
+                        evict_learning_to_cold_archive(
+                            c,
+                            None,
+                            ex_lid,
+                            reason=f"superseded_by:{lid}",
+                            db_path=getattr(db.config, "db_path", None),
+                            vault_path=getattr(db.config, "vault_path", None),
+                        )
+                    elif _have_status_col and "superseded_by" in l_cols:
+                        c.execute(
+                            "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
+                            "WHERE learning_id = ?",
+                            (lid, ex_lid),
+                        )
+                    elif "superseded_by" in l_cols:
+                        c.execute(
+                            "UPDATE learnings SET superseded_by = ? "
+                            "WHERE learning_id = ?",
+                            (lid, ex_lid),
+                        )
                     try:
                         context.purge_durable_learning(author_agent, f"learning:{ex_lid}")
                     except Exception:

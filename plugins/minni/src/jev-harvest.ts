@@ -764,7 +764,10 @@ export function resolveSessionHandoffsDir(vaultPath: string): string {
   if (typeof envDir === "string" && envDir.trim().length > 0) {
     return path.resolve(envDir.trim());
   }
-  const dotMinni = path.resolve(os.homedir(), ".minni");
+  const dotMinni =
+    typeof process.env.MINNI_HOME === "string" && process.env.MINNI_HOME.trim().length > 0
+      ? path.resolve(process.env.MINNI_HOME.trim())
+      : path.resolve(os.homedir(), ".minni");
   const resolvedVault = path.resolve(vaultPath);
   if (resolvedVault === dotMinni || resolvedVault.startsWith(dotMinni + path.sep)) {
     return path.join(dotMinni, "session_handoffs");
@@ -886,6 +889,7 @@ export async function executeLearnPipeline(input: {
     const handoffRow = {
       timestamp: nowIso,
       agentId: effectivePrincipal,
+      ...(sessionId ? { session_id: sessionId } : {}),
       category,
       source: effectiveSource,
       durability: chatter && dur === "durable" ? "ordinary" : dur,

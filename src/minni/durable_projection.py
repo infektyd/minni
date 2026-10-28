@@ -204,10 +204,13 @@ def evict_learning_to_cold_archive(
     reason: str = "evicted",
     *,
     archive_dir: Path | str | None = None,
+    minni_home: Path | str | None = None,
     db_path: Path | str | None = None,
     vault_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Append a learning tombstone to cold archive and hard-delete all DB/FTS/vector/disk projections."""
+    if archive_dir is None and minni_home is not None:
+        archive_dir = Path(minni_home) / "_archive"
     if learning_id is None and isinstance(engine_or_lid, int):
         engine = None
         lid = int(engine_or_lid)

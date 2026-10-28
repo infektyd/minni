@@ -429,12 +429,28 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
 
     def __init__(
         self,
-        db: MinniDB,
+        db: Optional[MinniDB] = None,
         config: MinniConfig = DEFAULT_CONFIG,
         faiss_index: Optional[FAISSIndex] = None,
+        *,
+        db_path: Optional[os.PathLike | str] = None,
+        vault_path: Optional[os.PathLike | str] = None,
+        load_embedder: bool = True,
     ):
+        if db_path is not None or vault_path is not None:
+            from dataclasses import replace
+
+            overrides = {}
+            if db_path is not None:
+                overrides["db_path"] = str(db_path)
+            if vault_path is not None:
+                overrides["vault_path"] = str(vault_path)
+            config = replace(config, **overrides)
+        if db is None:
+            db = MinniDB(config)
         self.db = db
         self.config = config
+        self._load_embedder = load_embedder
         self.faiss_index = faiss_index or FAISSIndex(config)
         self._model = None
         self._reranker = None
@@ -2937,6 +2953,9 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         if update_access and not self._deadline_skipped_vector():
             self._record_retrieved_access(results)
         return results
+
+    def _bump_result_access_counts(self, results: Sequence[Dict]) -> None:
+        self._record_retrieved_access(results)
 
     def _record_retrieved_access(self, results: Sequence[Dict]) -> None:
         """Increment documents.access_count at most once per unique doc_id per retrieve call."""

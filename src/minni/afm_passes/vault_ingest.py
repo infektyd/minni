@@ -26,6 +26,36 @@ from minni.wiki_indexer import WikiFrontmatter, WikiIndexer
 logger = logging.getLogger("sovereign.afm.vault_ingest")
 
 
+class VaultIngestPass:
+    """Object-oriented wrapper around the vault_ingest pass runner."""
+
+    def __init__(
+        self,
+        db=None,
+        config=None,
+        *,
+        vault_path: Optional[str] = None,
+        embed: bool = True,
+    ):
+        self.db = db
+        self.config = config
+        self.vault_path = vault_path
+        self.embed = embed
+
+    def run(self, **kwargs) -> Dict[str, Any]:
+        if not self.embed and self.vault_path and self.db is not None and self.config is not None:
+            from dataclasses import replace
+
+            cfg = replace(self.config, vault_path=str(self.vault_path))
+            return VaultIndexer(self.db, cfg, embed=False).index_vault()
+        return run(
+            db=self.db,
+            config=self.config,
+            vault_path=self.vault_path,
+            **kwargs,
+        )
+
+
 def _vault_slug(vault: Path) -> Optional[str]:
     name = vault.name
     if not name.endswith("-vault"):

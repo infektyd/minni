@@ -16,7 +16,7 @@ import math
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from minni.config import MinniConfig, DEFAULT_CONFIG, correction_class_page_types
 from minni.db import MinniDB
@@ -121,8 +121,9 @@ def _expand_item_keys(raw_item: Any) -> list[str]:
         num = s.split(":", 1)[1]
         keys.extend([f"learn:{num}", num])
     elif s.startswith("doc:"):
-        num = s.split(":", 1)[1]
-        keys.append(num)
+        parts = s.split(":")
+        num = parts[-1]
+        keys.extend([f"doc:{num}", num])
     elif s.isdigit():
         keys.extend([f"learning:{s}", f"learn:{s}", f"doc:{s}"])
     if "/" in s or s.endswith(".md"):
@@ -170,7 +171,8 @@ def aggregate_use_ledger(*roots: str | Path | None) -> dict[str, UseLedgerStats]
                 continue
 
             session_id = str(
-                entry.get("session_id")
+                entry.get("session_key")
+                or entry.get("session_id")
                 or entry.get("sessionId")
                 or entry.get("sessionKey")
                 or entry.get("session")
@@ -183,6 +185,19 @@ def aggregate_use_ledger(*roots: str | Path | None) -> dict[str, UseLedgerStats]
                 or entry.get("action")
                 or ""
             ).strip().lower()
+
+            # Real use-ledger format: {"kind": "exposure", "session_key": ..., "mkey": ..., "outcome": ..., "credits": [...]}
+            if kind == "exposure" and entry.get("mkey"):
+                outcome = str(entry.get("outcome") or "").strip().lower()
+                credits = entry.get("credits")
+                was_used = outcome == "used" or (isinstance(credits, list) and len(credits) > 0)
+                for k in _expand_item_keys(entry.get("mkey")):
+                    st = _touch(k)
+                    st.surfaces += 1
+                    st.sessions.add(session_id)
+                    if was_used:
+                        st.uses += 1
+                continue
 
             # Format A: {"kind": "exposure", "sessionKey": ..., "surfaced": [...], "used": [...]}
             if kind == "exposure" or isinstance(entry.get("surfaced"), list) or isinstance(entry.get("used"), list):
@@ -324,14 +339,26 @@ class MemoryDecay:
 
     def __init__(
         self,
-        db: MinniDB,
+        db: Optional[MinniDB] = None,
         config: MinniConfig = DEFAULT_CONFIG,
+        *,
+        db_path: Optional[os.PathLike | str] = None,
     ):
+        if db_path is not None:
+            from dataclasses import replace
+
+            config = replace(config, db_path=str(db_path))
+        if db is None:
+            db = MinniDB(config)
         self.db = db
         self.config = config
 
-    def _ledger_roots(self) -> list[Path]:
+    def _ledger_roots(self, minni_home: Optional[os.PathLike | str] = None) -> list[Path]:
         roots: list[Path] = []
+        if minni_home is not None:
+            roots.append(Path(minni_home))
+        elif os.environ.get("MINNI_HOME"):
+            roots.append(Path(os.environ["MINNI_HOME"]))
         vault_path = getattr(self.config, "vault_path", None)
         if vault_path:
             roots.append(Path(vault_path))
@@ -339,9 +366,11 @@ class MemoryDecay:
         if db_path:
             db_parent = Path(db_path).parent
             roots.append(db_parent)
+            if db_parent.name == ".index" and db_parent.parent.name.endswith("-vault"):
+                roots.append(db_parent.parent.parent)
         return roots
 
-    def run_decay(self) -> Dict:
+    def run_decay(self, *, minni_home: Optional[os.PathLike | str] = None) -> Dict:
         """
         Update decay_score for all documents and apply use-ledger demotion/eviction.
         Should be called daily (cron at 04:00).
@@ -356,9 +385,11 @@ class MemoryDecay:
             "updated": 0, "reinforced": 0,
             "bad_indexed_at": 0, "bad_last_accessed": 0,
             "demoted": 0, "evicted": 0,
+            "evicted_learnings": 0, "penalized_learnings": 0,
+            "evicted_documents": 0, "penalized_documents": 0,
         }
 
-        ledger_map = aggregate_use_ledger(*self._ledger_roots())
+        ledger_map = aggregate_use_ledger(*self._ledger_roots(minni_home))
         db_path_val = getattr(self.db, "db_path", None) or getattr(self.config, "db_path", None)
         vault_path_val = getattr(self.config, "vault_path", None)
 
@@ -431,6 +462,7 @@ class MemoryDecay:
                             vault_path=vault_path_val,
                         )
                         evicted_learning_ids.add(linked_lid)
+                        stats["evicted_learnings"] += 1
                         for edid in ev_res.get("doc_ids", []):
                             evicted_doc_ids.add(int(edid))
                     else:
@@ -443,6 +475,7 @@ class MemoryDecay:
                             vault_path=vault_path_val,
                         )
                         evicted_doc_ids.add(int(doc_id))
+                        stats["evicted_documents"] += 1
                     stats["evicted"] += 1
                     continue
 
@@ -481,6 +514,7 @@ class MemoryDecay:
                 if ledger_st is not None and ledger_st.should_demote:
                     new_score = round(new_score * DEMOTE_MULTIPLIER, 4)
                     stats["demoted"] += 1
+                    stats["penalized_documents"] += 1
 
                 old_score = row["decay_score"] or 1.0
                 if abs(new_score - old_score) > 0.001:
@@ -541,6 +575,7 @@ class MemoryDecay:
                         )
                         evicted_learning_ids.add(lid)
                         stats["evicted"] += 1
+                        stats["evicted_learnings"] += 1
                     elif l_st.should_demote:
                         old_conf = float(
                             l_row["confidence"] if l_row["confidence"] is not None else 1.0
@@ -552,6 +587,7 @@ class MemoryDecay:
                                 (new_conf, lid),
                             )
                             stats["demoted"] += 1
+                            stats["penalized_learnings"] += 1
 
         if stats["bad_indexed_at"]:
             logger.warning(
@@ -623,7 +659,7 @@ def run_decay_all_indexes(
 
     db = MinniDB(config)
     try:
-        results["shared"] = MemoryDecay(db, config).run_decay()
+        results["shared"] = MemoryDecay(db, config).run_decay(minni_home=minni_home)
     except Exception as exc:
         logger.exception("Decay pass failed for the shared index")
         results["shared"] = {"error": str(exc)}
@@ -639,7 +675,7 @@ def run_decay_all_indexes(
             # exactly like a failed pass is.
             vault_config = build_vault_index_config(vault, base_config=config)
             vault_db = MinniDB(vault_config)
-            results[name] = MemoryDecay(vault_db, vault_config).run_decay()
+            results[name] = MemoryDecay(vault_db, vault_config).run_decay(minni_home=minni_home)
         except Exception as exc:
             logger.warning("Decay pass failed for vault %s: %s", name, exc)
             results[name] = {"error": str(exc)}

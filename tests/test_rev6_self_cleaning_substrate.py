@@ -1005,3 +1005,72 @@ def test_pillar3_vault_and_wiki_indexers_enforce_allowlist(tmp_path: Path, monke
     finally:
         db.close()
 
+
+def test_real_use_ledger_mkey_exposure_and_root_log_exclusion(tmp_path: Path):
+    from minni.indexer import is_curated_indexable_path
+
+    for excluded_root in ("log.md", "log.1.md", "index.md", "distill/note.md", "mailbox/msg.md", "journal/day.md"):
+        assert is_curated_indexable_path(excluded_root) is False
+    assert is_curated_indexable_path("wiki/decisions/arch.md") is True
+
+    db, cfg, vault_dir = _make_isolated_db(tmp_path)
+    now = time.time()
+    try:
+        with db.transaction() as c:
+            c.execute(
+                """INSERT INTO learnings
+                   (learning_id, agent_id, category, content, confidence, created_at, status)
+                   VALUES (501, 'main', 'architecture', 'Penalized via mkey exposure row', 0.8, ?, 'active')""",
+                (now,),
+            )
+            c.execute(
+                """INSERT INTO learnings
+                   (learning_id, agent_id, category, content, confidence, created_at, status)
+                   VALUES (502, 'main', 'architecture', 'Evicted via mkey exposure row', 0.9, ?, 'active')""",
+                (now,),
+            )
+        ledger_dir = vault_dir / ".runtime" / "use-ledger" / "main"
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for i in range(16):
+            rows.append(
+                json.dumps(
+                    {
+                        "kind": "exposure",
+                        "session_key": f"s_{i % 6}",
+                        "mkey": "learning:501",
+                        "outcome": "ignored",
+                        "credits": [],
+                    }
+                )
+            )
+        for i in range(26):
+            rows.append(
+                json.dumps(
+                    {
+                        "kind": "exposure",
+                        "session_key": f"s_{i % 9}",
+                        "mkey": "learning:502",
+                        "outcome": "ignored",
+                        "credits": [],
+                    }
+                )
+            )
+        (ledger_dir / "exposures.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+        decay = MemoryDecay(db, cfg)
+        stats1 = decay.run_decay(minni_home=tmp_path)
+        assert stats1["evicted_learnings"] >= 1
+        assert stats1["penalized_learnings"] >= 1
+
+        # Second run must be idempotent (no compounding 0.5^N penalty)
+        decay.run_decay(minni_home=tmp_path)
+        with db.cursor() as c:
+            conf_501 = c.execute("SELECT confidence FROM learnings WHERE learning_id = 501").fetchone()[0]
+            cnt_502 = c.execute("SELECT COUNT(*) FROM learnings WHERE learning_id = 502").fetchone()[0]
+        assert pytest.approx(float(conf_501), rel=1e-2) == 0.4
+        assert cnt_502 == 0
+    finally:
+        db.close()
+
+

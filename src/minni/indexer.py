@@ -66,10 +66,14 @@ EXCLUDED_PATH_SEGMENTS: frozenset[str] = frozenset(
         ".runtime",
         ".obsidian",
         "raw",
+        "journal",
+        "distill",
+        "mailbox",
     }
 )
 
 _SESSION_DATED_FILE_RE = re.compile(r"^\d{8}-")
+_LOG_ROTATED_FILENAME_RE = re.compile(r"^log(?:\.\d+)?\.md$", re.IGNORECASE)
 
 
 def extract_explicit_frontmatter_status(content: str) -> Optional[str]:
@@ -85,6 +89,38 @@ def extract_explicit_frontmatter_status(content: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def explicit_frontmatter_status(content: Optional[str]) -> Optional[str]:
+    return extract_explicit_frontmatter_status(content or "")
+
+
+def is_curated_indexable_path(
+    rel_path: str | Path,
+    content: Optional[str] = None,
+) -> bool:
+    explicit_st = extract_explicit_frontmatter_status(content or "") if content else None
+    excluded, _ = is_vault_path_excluded(
+        rel_path,
+        None,
+        explicit_status=explicit_st,
+        allow_artifact_retraction=(explicit_st == "complete"),
+    )
+    if excluded:
+        return False
+    if content is not None:
+        match = VaultIndexer.FRONTMATTER_BLOCK_RE.match(content)
+        if match:
+            try:
+                data = yaml.safe_load(match.group(1))
+                if isinstance(data, dict):
+                    fm_type = str(data.get("type") or "").strip().lower()
+                    fm_sec = str(data.get("section") or "").strip().lower()
+                    if fm_type in {"session", "task", "handoff"} or fm_sec in EXCLUDED_PATH_SEGMENTS:
+                        return False
+            except Exception:
+                pass
+    return True
 
 
 def is_vault_path_excluded(
@@ -120,7 +156,11 @@ def is_vault_path_excluded(
     fname = rel_parts[-1].lower()
     dir_segments = [seg.lower() for seg in rel_parts[:-1]]
 
-    if fname.endswith(".log.md"):
+    if (
+        fname == "index.md"
+        or fname.endswith(".log.md")
+        or bool(_LOG_ROTATED_FILENAME_RE.match(fname))
+    ):
         return True, "excluded_log_md"
     if "-compact-" in fname and fname.endswith(".md"):
         return True, "excluded_compact_md"
@@ -152,9 +192,12 @@ class VaultIndexer:
         self,
         db: MinniDB,
         config: MinniConfig = DEFAULT_CONFIG,
+        *,
+        embed: bool = True,
     ):
         self.db = db
         self.config = config
+        self.embed = embed
         self.chunker = MarkdownChunker(config)
         self.faiss_index = FAISSIndex(config)
         self._model = None
@@ -550,7 +593,7 @@ class VaultIndexer:
                     or explicit_status == "candidate"
                 )
                 prepared = []
-                if self.model and not unendorsed:
+                if self.embed and self.model and not unendorsed:
                     from minni.models import get_embedder_lock
 
                     for chunk in self.chunker.chunk_document(content):
