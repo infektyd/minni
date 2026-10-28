@@ -377,6 +377,22 @@ class WikiIndexer:
                         ) or 0.0
                     ) if row else 0.0
                     if row and last_modified >= mtime:
+                        from minni.indexer import is_vault_path_excluded
+
+                        fast_excluded, _ = is_vault_path_excluded(
+                            path,
+                            root_dir=wiki_root_resolved,
+                            is_rpc=False,
+                            allow_artifact_retraction=True,
+                        )
+                        if not is_meta and fast_excluded and "artifacts" not in [seg.lower() for seg in Path(path).parts]:
+                            doc_id = row["doc_id"]
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                            stats["deleted"] += 1
+                            stats["excluded"] = stats.get("excluded", 0) + 1
+                            continue
                         stats["skipped"] += 1
                         continue
 
@@ -389,10 +405,12 @@ class WikiIndexer:
                     from minni.indexer import is_vault_path_excluded
 
                     explicit_status = page.frontmatter.raw.get("status") if page.frontmatter.raw else None
+                    explicit_page_id = page.frontmatter.raw.get("page_id") if page.frontmatter.raw else None
                     path_excluded, _ = is_vault_path_excluded(
                         path,
                         root_dir=wiki_root_resolved,
                         explicit_status=explicit_status,
+                        explicit_page_id=str(explicit_page_id) if explicit_page_id is not None else None,
                         is_rpc=False,
                         allow_artifact_retraction=bool(row),
                     )

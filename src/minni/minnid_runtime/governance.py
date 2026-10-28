@@ -901,11 +901,13 @@ _HARVEST_SOURCES = frozenset(
 )
 
 _SPRINT_CHATTER_RE = re.compile(
-    r"(?i)(?:"
+    r"(?im)(?:"
     r"\b(?:pushed|committed|merged|landed)\s+(?:commit\s+|sha\s+|pr\s+#?\d+\b|[0-9a-f]{7,40}\b)"
     r"|\b\d+\s*/\s*\d+\s+(?:tests?\s+)?(?:passed|green)\b"
     r"|\b\d+\s+(?:tests?\s+)?passed,\s*0\s+failed\b"
     r"|\b(?:phase|slice|wave|workstream|sprint)\s+[a-z0-9_.-]+\s+(?:is\s+|are\s+)?(?:complete|completed|done|green|passed|status|shipped|landed)\b"
+    r"|^\s*Compaction summary\s*[—–-]"
+    r"|Test failure recovered after edit:\s*Created At:\s*\d{4}-\d{2}-\d{2}"
     r")"
 )
 
@@ -938,19 +940,25 @@ def non_durable_promotion_blocker(
     )
     if dur == "noise":
         return "non_durable:noise"
-    is_harvest_src = bool(src) and (
-        src in _HARVEST_SOURCES
-        or "harvest" in src
-        or any(src.startswith(prefix) for prefix in _HARVEST_SOURCES)
-    )
-    is_harvest_origin = bool(orig) and (
-        orig == "agent" or orig in _HARVEST_SOURCES or "harvest" in orig
+    is_harvest_src = (
+        bool(src)
+        and (
+            src in _HARVEST_SOURCES
+            or "harvest" in src
+            or any(src.startswith(prefix) for prefix in _HARVEST_SOURCES)
+        )
+    ) or (
+        bool(orig)
+        and (orig in _HARVEST_SOURCES or "harvest" in orig)
     )
     has_invariant = bool(_INVARIANT_MARKER_RE.search(content or ""))
     if cat == "preference" and not has_invariant:
         return f"non_durable:{dur if dur != 'durable' else 'ordinary'}"
-    if (is_harvest_src or is_harvest_origin) and (dur != "durable" or not has_invariant):
-        return f"non_durable:{dur if dur != 'durable' else 'ordinary'}"
+    if is_harvest_src:
+        if dur != "durable" or not has_invariant:
+            return f"non_durable:{dur if dur != 'durable' else 'ordinary'}"
+    elif orig == "agent" and dur != "durable":
+        return f"non_durable:{dur}"
     return None
 
 

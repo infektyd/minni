@@ -862,6 +862,13 @@ server.registerTool(
     // #132 P1: an identity-recovery denial must never read as "learned" —
     // name it distinctly so the remediation route (in store.data) is acted on.
     const storeRecovery = recoveryRouteFrom(store.data);
+    const storeData =
+      store.ok && store.data !== null && typeof store.data === "object"
+        ? (store.data as Record<string, unknown>)
+        : undefined;
+    const isPromoted = storeData?.status === "accepted";
+    const promotedLearningId =
+      typeof storeData?.learning_id === "number" ? storeData.learning_id : undefined;
     return textResult(
       JSON.stringify(
         {
@@ -870,6 +877,14 @@ server.registerTool(
             : storeRecovery
               ? "identity-recovery-required"
               : "vault-written-memory-store-failed",
+          ...(isPromoted
+            ? {
+                promotion_status: "accepted",
+                ...(promotedLearningId !== undefined
+                  ? { learning_id: promotedLearningId }
+                  : {}),
+              }
+            : {}),
           quality,
           note,
           store,

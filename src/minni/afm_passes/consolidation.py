@@ -87,6 +87,9 @@ _RAW_TEST_OUTPUT_RE = re.compile(
     r"(?:^\s*=+\s*\d+\s+(?:passed|failed|skipped|error|errors|deselected)\b.*=+\s*$|^\s*(?:ran\s+\d+\s+tests?\s+in\s+[\d.]+s|test\s+suites?:\s+\d+\s+passed(?:\b.*)?|\d+\s+passed(?:,\s+\d+\s+\w+)*\s+in\s+[\d.]+s)\s*$)",
     re.IGNORECASE | re.MULTILINE,
 )
+_BOOT_CHATTER_LEAK_RE = re.compile(
+    r"(?im)(?:^\s*Compaction summary\s*[—–-]|Test failure recovered after edit:\s*Created At:\s*\d{4}-\d{2}-\d{2})"
+)
 
 
 def is_low_signal_boot_learning(content: str) -> bool:
@@ -95,7 +98,11 @@ def is_low_signal_boot_learning(content: str) -> bool:
     text = (content or "").strip() if isinstance(content, str) else ""
     if not text:
         return True
-    if _RAW_PROMPT_ECHO_RE.search(content) or _RAW_TEST_OUTPUT_RE.search(content):
+    if (
+        _RAW_PROMPT_ECHO_RE.search(content)
+        or _RAW_TEST_OUTPUT_RE.search(content)
+        or _BOOT_CHATTER_LEAK_RE.search(content)
+    ):
         return True
     from minni.afm_passes.inbox_ingest import is_audit_echo
 

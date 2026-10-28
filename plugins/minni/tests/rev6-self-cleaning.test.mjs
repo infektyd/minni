@@ -497,3 +497,113 @@ test("Pillar 1 & 3: executeLearnPipeline gates out session status chatter and or
   });
 });
 
+// --- Rev 6.1 3-Part Surgical Fix Tests ---
+import os from "node:os";
+
+const { fitEnvelope } = await import("../dist/agent_envelope.js");
+const { vaultFirstLearn } = await import("../dist/vault.js");
+
+test("Part 1: fitEnvelope unconditionally trims recent_learnings (10 -> 3 durable items) even when total tokens (~2,400) are below tokenLimit: 4000 and charLimit: 10000", () => {
+  const tenBullets = [
+    "## Learnings (claude-code)",
+    "  - [candidate] Unverified candidate note 1 (conf=0.5)",
+    "  - [general] Ordinary compaction item 1 (conf=1.0)",
+    "  - [general] Ordinary compaction item 2 (conf=1.0)",
+    "  - [general] Ordinary compaction item 3 (conf=1.0)",
+    "  - [decision] Durable architectural decision A (conf=1.0)",
+    "  - [general] Ordinary compaction item 4 (conf=1.0)",
+    "  - [fix] Durable fix B for socket timeout (conf=1.0)",
+    "  - [general] Ordinary compaction item 5 (conf=1.0)",
+    "  - [invariant] Durable invariant C on fail-closed indexing (conf=1.0)",
+    "  - [architecture] Fourth durable item D that should be sliced after top 3 (conf=1.0)",
+  ].join("\n");
+
+  const body = {
+    contract: "MEMORY CONTRACT",
+    recent_learnings: {
+      ok: true,
+      context: tenBullets,
+    },
+    audit_tail: [{ tool: "hook_session_start", summary: "boot ok" }],
+  };
+
+  const fitted = fitEnvelope(body, { tokenLimit: 4000, charLimit: 10_000 });
+  const resultContext = fitted.recent_learnings.context;
+  const resultBullets = resultContext
+    .split("\n")
+    .filter((line) => /^\s*-\s/.test(line));
+
+  assert.equal(
+    resultBullets.length,
+    3,
+    `expected recent_learnings to be trimmed to 3 bullets even under tokenLimit=4000, got ${resultBullets.length}:\n${resultContext}`,
+  );
+  assert.ok(resultBullets[0].includes("[decision] Durable architectural decision A"));
+  assert.ok(resultBullets[1].includes("[fix] Durable fix B"));
+  assert.ok(resultBullets[2].includes("[invariant] Durable invariant C"));
+  assert.deepEqual(fitted.trimmed?.recent_learnings, { from: 10, to: 3 });
+  assert.equal(
+    fitted.audit_tail.length,
+    1,
+    "audit_tail must NOT be dropped when total tokens are well below tokenLimit",
+  );
+});
+
+test("Part 1b: fitEnvelope drops [candidate] lines from recent_learnings even when total bullets <= 3 and under budget", () => {
+  const body = {
+    contract: "MEMORY CONTRACT",
+    recent_learnings: {
+      ok: true,
+      context: [
+        "## Learnings (claude-code)",
+        "  - [candidate] Unverified candidate line",
+        "  - [decision] Durable decision 1",
+        "  - [fix] Durable fix 2",
+      ].join("\n"),
+    },
+  };
+
+  const fitted = fitEnvelope(body, { tokenLimit: 4000, charLimit: 10_000 });
+  const resultContext = fitted.recent_learnings.context;
+  assert.ok(
+    !resultContext.includes("[candidate] Unverified candidate line"),
+    "expected [candidate] line to be dropped unconditionally in pre-pass",
+  );
+  assert.ok(resultContext.includes("[decision] Durable decision 1"));
+  assert.ok(resultContext.includes("[fix] Durable fix 2"));
+  assert.deepEqual(fitted.trimmed?.recent_learnings, { from: 3, to: 2 });
+});
+
+test("Part 2: vaultFirstLearn stamps status: accepted and learning_id in frontmatter when storeResult.data.status === 'accepted'", async (t) => {
+  const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "rev6-vault-learn-"));
+  t.after(() => rm(tmpRoot, { recursive: true, force: true }));
+
+  const note = await vaultFirstLearn({
+    vaultPath: tmpRoot,
+    title: "Coordinator Synchronous Promotion",
+    content: "Decision: promote coordinator durable learnings synchronously.",
+    category: "decision",
+    agentId: "claude-code",
+    storeResult: {
+      ok: true,
+      data: {
+        status: "accepted",
+        candidate_id: 9200,
+        learning_id: 7400,
+        principal: "claude-code",
+      },
+    },
+  });
+
+  const diskText = await readFile(note.notePath, "utf8");
+  assert.match(
+    diskText,
+    /^status:\s*accepted$/m,
+    `expected frontmatter status: accepted when storeResult.data.status === 'accepted', got:\n${diskText}`,
+  );
+  assert.match(
+    diskText,
+    /^learning_id:\s*7400$/m,
+    `expected frontmatter learning_id: 7400 when storeResult.data.learning_id === 7400, got:\n${diskText}`,
+  );
+});

@@ -96,6 +96,7 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
 
     from minni.indexer import (
         UNEMBEDDED_STATUSES,
+        extract_explicit_frontmatter_page_id,
         extract_explicit_frontmatter_status,
         is_vault_path_excluded,
     )
@@ -128,10 +129,12 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
             return False
 
     explicit_status = extract_explicit_frontmatter_status(content)
+    explicit_page_id = extract_explicit_frontmatter_page_id(content)
     path_excluded, path_reason = is_vault_path_excluded(
         full_path,
         root_dir=vault_path,
         explicit_status=explicit_status,
+        explicit_page_id=explicit_page_id,
         is_rpc=True,
     )
     if path_excluded:

@@ -433,6 +433,93 @@ export function fitEnvelope<T extends EnvelopeBody>(
   // before evaluating whether Steps 1–5 need to trim other sections.
   ensureTruncatedShelfBootForm();
 
+  // Pre-pass: recent_learnings -> 3 (durable first; candidate lines dropped unconditionally)
+  if (working.recent_learnings !== undefined) {
+    if (Array.isArray(working.recent_learnings)) {
+      const arr = working.recent_learnings as unknown[];
+      const from = arr.length;
+      const durable: unknown[] = [];
+      const ordinary: unknown[] = [];
+      const candidates: unknown[] = [];
+      for (const item of arr) {
+        const isCand =
+          item !== null &&
+          typeof item === "object" &&
+          ((item as Record<string, unknown>).review_state === "candidate" ||
+            (item as Record<string, unknown>).status === "candidate");
+        const cat =
+          item !== null &&
+          typeof item === "object" &&
+          typeof (item as Record<string, unknown>).category === "string"
+            ? ((item as Record<string, unknown>).category as string).toLowerCase()
+            : "";
+        const isDurable =
+          !isCand &&
+          (CORRECTION_SALIENCE_TAGS.has(cat) ||
+            cat === "decision" ||
+            cat === "architecture" ||
+            cat === "invariant" ||
+            cat === "rule" ||
+            cat === "contract" ||
+            cat === "gate" ||
+            cat === "security");
+        if (isCand) candidates.push(item);
+        else if (isDurable) durable.push(item);
+        else ordinary.push(item);
+      }
+      if (from > 3 || candidates.length > 0) {
+        const kept = [...durable, ...ordinary].slice(0, 3);
+        working.recent_learnings = kept;
+        recordTrim("recent_learnings", from, kept.length);
+      }
+    } else if (
+      working.recent_learnings !== null &&
+      typeof working.recent_learnings === "object"
+    ) {
+      const rl = working.recent_learnings as Record<string, unknown>;
+      if (typeof rl.context === "string") {
+        const lines = rl.context.split("\n");
+        const headerLines: string[] = [];
+        const bullets: string[] = [];
+        const hasTaggedBullets = lines.some((l) => /^\s*-\s+\[[a-z0-9_-]+\]/i.test(l));
+        for (const line of lines) {
+          if (hasTaggedBullets ? /^\s*-\s+\[[a-z0-9_-]+\]/i.test(line) : /^\s*-\s/.test(line)) {
+            bullets.push(line);
+          } else if (bullets.length === 0) {
+            headerLines.push(line);
+          } else if (line.trim().length > 0) {
+            bullets[bullets.length - 1] = `${bullets[bullets.length - 1]}\n${line}`;
+          }
+        }
+        const durableBullets: string[] = [];
+        const ordinaryBullets: string[] = [];
+        const candidateBullets: string[] = [];
+        const candidateTagRe =
+          /^\s*-\s*(?:\[\d{4}-\d{2}-\d{2}\]\s*)?\[candidate\]|\((?:[^\n)]*\b)?(?:review_state|status)\s*[:=]\s*["']?candidate\b|\b(?:review_state|status)\s*[:=]\s*["']?candidate\b/i;
+        for (const b of bullets) {
+          if (candidateTagRe.test(b)) {
+            candidateBullets.push(b);
+          } else if (DURABLE_LEARNING_TAG_RE.test(b)) {
+            durableBullets.push(b);
+          } else {
+            ordinaryBullets.push(b);
+          }
+        }
+        if (bullets.length > 3 || candidateBullets.length > 0) {
+          const keptBullets = [...durableBullets, ...ordinaryBullets].slice(
+            0,
+            3,
+          );
+          working.recent_learnings = {
+            ...rl,
+            context: [...headerLines, ...keptBullets].join("\n"),
+          };
+          recordTrim("recent_learnings", bullets.length, keptBullets.length);
+        }
+      }
+    }
+  }
+
   if (!needsTrim()) {
     return working as T;
   }
@@ -519,90 +606,8 @@ export function fitEnvelope<T extends EnvelopeBody>(
     if (!needsTrim()) return working as T;
   }
 
-  // Step 3: recent_learnings -> 3 (durable first; candidate lines dropped first)
-  if (working.recent_learnings !== undefined && needsTrim()) {
-    if (Array.isArray(working.recent_learnings) && working.recent_learnings.length > 3) {
-      const arr = working.recent_learnings as unknown[];
-      const from = arr.length;
-      const durable: unknown[] = [];
-      const ordinary: unknown[] = [];
-      const candidates: unknown[] = [];
-      for (const item of arr) {
-        const isCand =
-          item !== null &&
-          typeof item === "object" &&
-          ((item as Record<string, unknown>).review_state === "candidate" ||
-            (item as Record<string, unknown>).status === "candidate");
-        const cat =
-          item !== null &&
-          typeof item === "object" &&
-          typeof (item as Record<string, unknown>).category === "string"
-            ? ((item as Record<string, unknown>).category as string).toLowerCase()
-            : "";
-        const isDurable =
-          !isCand &&
-          (CORRECTION_SALIENCE_TAGS.has(cat) ||
-            cat === "decision" ||
-            cat === "architecture" ||
-            cat === "invariant" ||
-            cat === "rule" ||
-            cat === "contract" ||
-            cat === "gate" ||
-            cat === "security");
-        if (isCand) candidates.push(item);
-        else if (isDurable) durable.push(item);
-        else ordinary.push(item);
-      }
-      const kept = [...durable, ...ordinary, ...candidates].slice(0, 3);
-      working.recent_learnings = kept;
-      recordTrim("recent_learnings", from, kept.length);
-    } else if (
-      working.recent_learnings !== null &&
-      typeof working.recent_learnings === "object"
-    ) {
-      const rl = working.recent_learnings as Record<string, unknown>;
-      if (typeof rl.context === "string") {
-        const lines = rl.context.split("\n");
-        const headerLines: string[] = [];
-        const bullets: string[] = [];
-        for (const line of lines) {
-          if (/^\s*-\s/.test(line)) {
-            bullets.push(line);
-          } else if (bullets.length === 0) {
-            headerLines.push(line);
-          } else if (line.trim().length > 0) {
-            bullets[bullets.length - 1] = `${bullets[bullets.length - 1]}\n${line}`;
-          }
-        }
-        if (bullets.length > 3) {
-          const durableBullets: string[] = [];
-          const ordinaryBullets: string[] = [];
-          const candidateBullets: string[] = [];
-          const candidateTagRe =
-            /^\s*-\s*(?:\[\d{4}-\d{2}-\d{2}\]\s*)?\[candidate\]|\((?:[^\n)]*\b)?(?:review_state|status)\s*[:=]\s*["']?candidate\b|\b(?:review_state|status)\s*[:=]\s*["']?candidate\b/i;
-          for (const b of bullets) {
-            if (candidateTagRe.test(b)) {
-              candidateBullets.push(b);
-            } else if (DURABLE_LEARNING_TAG_RE.test(b)) {
-              durableBullets.push(b);
-            } else {
-              ordinaryBullets.push(b);
-            }
-          }
-          const keptBullets = [...durableBullets, ...ordinaryBullets, ...candidateBullets].slice(
-            0,
-            3,
-          );
-          working.recent_learnings = {
-            ...rl,
-            context: [...headerLines, ...keptBullets].join("\n"),
-          };
-          recordTrim("recent_learnings", bullets.length, keptBullets.length);
-        }
-      }
-    }
-    if (!needsTrim()) return working as T;
-  }
+  // Step 3: recent_learnings -> already capped at 3 durable/ordinary items in pre-pass
+  if (!needsTrim()) return working as T;
 
   // Step 4: handoff_context -> refs only (strip inline note bodies)
   if (working.handoff_context !== undefined && needsTrim()) {
@@ -777,8 +782,9 @@ export function fitEnvelope<T extends EnvelopeBody>(
           const lines = rl.context.split("\n");
           const headerLines: string[] = [];
           const bullets: string[] = [];
+          const hasTaggedBullets = lines.some((l) => /^\s*-\s+\[[a-z0-9_-]+\]/i.test(l));
           for (const line of lines) {
-            if (/^\s*-\s/.test(line)) bullets.push(line);
+            if (hasTaggedBullets ? /^\s*-\s+\[[a-z0-9_-]+\]/i.test(line) : /^\s*-\s/.test(line)) bullets.push(line);
             else if (bullets.length === 0) headerLines.push(line);
             else if (line.trim().length > 0) bullets[bullets.length - 1] = `${bullets[bullets.length - 1]}\n${line}`;
           }
