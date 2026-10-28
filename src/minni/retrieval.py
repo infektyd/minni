@@ -429,12 +429,28 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
 
     def __init__(
         self,
-        db: MinniDB,
+        db: Optional[MinniDB] = None,
         config: MinniConfig = DEFAULT_CONFIG,
         faiss_index: Optional[FAISSIndex] = None,
+        *,
+        db_path: Optional[os.PathLike | str] = None,
+        vault_path: Optional[os.PathLike | str] = None,
+        load_embedder: bool = True,
     ):
+        if db_path is not None or vault_path is not None:
+            from dataclasses import replace
+
+            overrides = {}
+            if db_path is not None:
+                overrides["db_path"] = str(db_path)
+            if vault_path is not None:
+                overrides["vault_path"] = str(vault_path)
+            config = replace(config, **overrides)
+        if db is None:
+            db = MinniDB(config)
         self.db = db
         self.config = config
+        self._load_embedder = load_embedder
         self.faiss_index = faiss_index or FAISSIndex(config)
         self._model = None
         self._reranker = None
@@ -2458,16 +2474,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 deadline_monotonic=deadline_monotonic,
             )
         if update_access and not self._deadline_skipped_vector():
-            with self.db.cursor() as c:
-                for result in results:
-                    if result.get("doc_id") is None:
-                        continue
-                    c.execute(
-                        """UPDATE documents
-                           SET access_count = access_count + 1, last_accessed = ?
-                           WHERE doc_id = ?""",
-                        (time.time(), result["doc_id"]),
-                    )
+            self._record_retrieved_access(results)
         try:
             expanded_trace = {
                 "query": query,
@@ -2943,15 +2950,32 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             projected["query_variants"] = query_variants
             results.append(projected)
 
-            if update_access and not self._deadline_skipped_vector():
-                with self.db.cursor() as c:
-                    c.execute(
-                        """UPDATE documents
-                           SET access_count = access_count + 1, last_accessed = ?
-                           WHERE doc_id = ?""",
-                        (time.time(), r["doc_id"]),
-                    )
+        if update_access and not self._deadline_skipped_vector():
+            self._record_retrieved_access(results)
         return results
+
+    def _bump_result_access_counts(self, results: Sequence[Dict]) -> None:
+        self._record_retrieved_access(results)
+
+    def _record_retrieved_access(self, results: Sequence[Dict]) -> None:
+        """Increment documents.access_count at most once per unique doc_id per retrieve call."""
+        seen_doc_ids: set[int] = set()
+        now = time.time()
+        with self.db.cursor() as c:
+            for item in results:
+                did = item.get("doc_id")
+                if did is None:
+                    continue
+                did_int = int(did)
+                if did_int in seen_doc_ids:
+                    continue
+                seen_doc_ids.add(did_int)
+                c.execute(
+                    """UPDATE documents
+                       SET access_count = access_count + 1, last_accessed = ?
+                       WHERE doc_id = ?""",
+                    (now, did_int),
+                )
 
     def search(self, *args, **kwargs) -> List[Dict]:
         """Backward-compatible alias for callers that use search() terminology."""

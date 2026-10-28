@@ -2490,6 +2490,9 @@ export async function writeVaultPage(
   return { notePath, relativePath, wikilink: wikilinkFor(relativePath) };
 }
 
+// Pillar 3 invariant: vaultFirstLearn writes a candidate note under wiki/sessions/
+// and records the local audit entry only; it must NEVER call vault_index_doc or
+// index wiki/sessions/ notes into daemon documents/chunk_embeddings.
 export async function vaultFirstLearn(
   input: LearnInput,
 ): Promise<VaultWriteResult> {
@@ -4034,9 +4037,191 @@ export async function searchVaultNotes(
   });
 }
 
+const BUILTIN_FAILURE_LESSONS_BY_HANDLE: Readonly<
+  Record<string, { lessonId: string; title: string; lessonText: string }>
+> = {
+  "m:7a11e501": {
+    lessonId: "scar-swift-testing-expectation-failed",
+    title: "Swift Testing Expectation failed (masked exit code)",
+    lessonText:
+      "Never mask `swift test` exit codes with `| tail` or `; echo exit=$?`; run the failing `@Test` filter directly and inspect the exact `Expectation failed:` operand diff.",
+  },
+  "m:7a11e502": {
+    lessonId: "scar-swift-compiler-error",
+    title: "Swift compiler diagnostic error",
+    lessonText:
+      "Fix: check module target imports, visibility modifiers, and `project.pbxproj` target membership before re-running a full build.",
+  },
+  "m:7a11e503": {
+    lessonId: "scar-praxis-verify-source-baseline",
+    title: "Scar #5: unregistered Swift test file in verify_source_baseline.sh",
+    lessonText:
+      "Scar #5: register every new `*Tests.swift` file in `project.pbxproj` (`PBXBuildFile` + `PBXFileReference` + `Sources`) or `membershipExceptions` in `scripts/verify_source_baseline.sh`.",
+  },
+  "m:7a11e504": {
+    lessonId: "scar-xctest-assertion-failed",
+    title: "XCTest assertion failure",
+    lessonText:
+      "Fix: isolate the failing `XCTestCase` method with `-only-testing:` and verify fixture state before running the full test plan.",
+  },
+  "m:7a11e505": {
+    lessonId: "scar-git-cat-file-instead-of-show",
+    title: "Scar #6: use git cat-file -p instead of unbounded git show / git checkout",
+    lessonText:
+      "Scar #6: use `git cat-file -p <rev>:<path>` to read historical file contents and `git diff --stat` or `git diff -- <path>` instead of unbounded `git show` or `git checkout <rev> -- <path>`.",
+  },
+  "m:7a11e506": {
+    lessonId: "scar-jev-guard-destructive-command",
+    title: "Jev guard blocked destructive shell command",
+    lessonText:
+      "Never run `rm -rf` or `git worktree remove` when blocked by the Jev guard; use non-destructive `mv` or explicit single-file operations within the owned worktree.",
+  },
+  "m:7a11e507": {
+    lessonId: "scar-process-wait-until-exit-forbidden",
+    title: "Scar #1: never call blocking waitUntilExit() / waitpid() after bounded timeout",
+    lessonText:
+      "Scar #1: never call blocking `waitUntilExit()` or `waitpid()` on a timed-out subprocess; terminate the process group and drain pipes asynchronously.",
+  },
+  "m:7a11e508": {
+    lessonId: "scar-subagent-update-plan-blocked",
+    title: "Subagent update_plan hook restriction",
+    lessonText:
+      "Subagents cannot call `update_plan`; return structured slice evidence to the parent coordinator, which owns plan state updates.",
+  },
+  "m:7a11e509": {
+    lessonId: "scar-unknown-tool-name",
+    title: "Unknown MCP or host tool name",
+    lessonText:
+      "Verify the exact registered tool name and MCP server prefix before invoking a tool.",
+  },
+  "m:7a11e510": {
+    lessonId: "scar-unchecked-sendable-forbidden",
+    title: "Scar #2: @unchecked Sendable is forbidden in Swift 6 concurrency",
+    lessonText:
+      "Scar #2: never add `@unchecked Sendable` to silence Swift 6 strict concurrency; convert the type to an `actor`, isolate it to `@MainActor`, or make stored properties immutable `Sendable` values.",
+  },
+  "m:7a11e511": {
+    lessonId: "scar-try-optional-swallows-errors",
+    title: "Scar #3: do not silently swallow errors with try?",
+    lessonText:
+      "Scar #3: avoid `try?` on I/O, persistence, or IPC boundaries where failures must be surfaced or logged; handle the error explicitly with `do/catch` or propagate `throws`.",
+  },
+  "m:7a11e512": {
+    lessonId: "scar-task-detached-forbidden",
+    title: "Scar #4: avoid unstructured Task.detached in Swift concurrency",
+    lessonText:
+      "Scar #4: never spawn unstructured `Task.detached` that drops actor context, priority, and cancellation propagation; use structured concurrency (`withTaskGroup`) or actor-isolated `Task`.",
+  },
+  "m:7a11e513": {
+    lessonId: "scar-nslock-in-async-context",
+    title: "Scar #7: avoid NSLock / NSRecursiveLock in Swift async contexts",
+    lessonText:
+      "Scar #7: never use `NSLock` or `NSRecursiveLock` across Swift `async` suspension points; use an `actor` or `Mutex` / `OSAllocatedUnfairLock` strictly inside synchronous critical sections.",
+  },
+};
+
+async function listAllDrillableVaultRelPaths(vaultPath: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const sub of ["wiki", "raw", "layer1"]) {
+    try {
+      const files = await listMarkdownFiles(path.join(vaultPath, sub));
+      for (const file of files) {
+        out.push(path.relative(vaultPath, file).replaceAll("\\", "/"));
+      }
+    } catch {
+      // Directory may not exist.
+    }
+  }
+  return out.sort();
+}
+
+function candidateHandlesForVaultRelPath(relativePath: string, title?: string): Set<string> {
+  const norm = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/^\/+/, "");
+  const noExt = norm.replace(/\.md$/i, "");
+  const strippedTop = norm.replace(/^(?:wiki|raw|layer1)\//i, "");
+  const strippedTopNoExt = strippedTop.replace(/\.md$/i, "");
+  const stem = path.basename(noExt);
+  const rawStrings = [
+    norm,
+    noExt,
+    strippedTop,
+    strippedTopNoExt,
+    stem,
+    `vault:${norm}`,
+    `vault:${noExt}`,
+    `vault:${strippedTop}`,
+    `vault:${strippedTopNoExt}`,
+    `[[${noExt}]]`,
+    `[[${strippedTopNoExt}]]`,
+    `[[${stem}]]`,
+  ];
+  if (typeof title === "string" && title.trim()) {
+    rawStrings.push(title.trim(), title.trim().toLowerCase());
+  }
+  const handles = new Set<string>();
+  for (const s of rawStrings) {
+    if (!s) continue;
+    handles.add(`m:${createHash("sha1").update(s, "utf8").digest("hex").slice(0, 8)}`);
+    handles.add(`m:${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 8)}`);
+  }
+  return handles;
+}
+
+function lookupHandleIndexRelPathSync(vaultPath: string, handle: string): string | null {
+  const tryIndexFile = (indexPath: string): string | null => {
+    try {
+      assertWriteTargetUnder(indexPath, vaultPath);
+      const raw = fs.readFileSync(indexPath, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const mapObj =
+        parsed.handles && typeof parsed.handles === "object" && !Array.isArray(parsed.handles)
+          ? (parsed.handles as Record<string, unknown>)
+          : parsed;
+      const entry = (mapObj[handle] ?? mapObj[handle.toLowerCase()]) as
+        | Record<string, unknown>
+        | undefined;
+      if (!entry || typeof entry !== "object") return null;
+      for (const candidate of [entry.relativePath, entry.source, entry.mkey]) {
+        if (typeof candidate !== "string" || !candidate.trim()) continue;
+        let rel = candidate.trim();
+        if (rel.startsWith("vault:")) rel = rel.slice(6).trim();
+        if (rel.startsWith("[[") && rel.endsWith("]]")) rel = rel.slice(2, -2).trim();
+        rel = rel.replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/^\/+/, "");
+        if ((rel.startsWith("wiki/") || rel.startsWith("raw/") || rel.startsWith("layer1/")) && !rel.endsWith(".md")) {
+          rel = `${rel}.md`;
+        }
+        if (rel.endsWith(".md") && !path.isAbsolute(rel)) {
+          return rel;
+        }
+      }
+    } catch {
+      // Ignore missing or unreadable index file.
+    }
+    return null;
+  };
+
+  const fromRoot = tryIndexFile(path.join(vaultPath, ".handles.json"));
+  if (fromRoot) return fromRoot;
+
+  try {
+    const stateDir = path.join(vaultPath, ".runtime", "recall-state.d");
+    assertWriteTargetUnder(stateDir, vaultPath);
+    for (const name of fs.readdirSync(stateDir)) {
+      if (!name.endsWith(".handles.json")) continue;
+      const found = tryIndexFile(path.join(stateDir, name));
+      if (found) return found;
+    }
+  } catch {
+    // Ignore missing .runtime/recall-state.d.
+  }
+  return null;
+}
+
 /**
  * Resolve a short vault handle (`m:<8hex>`) to a vault-relative path under
- * `wiki/` using the search cache when warm or `listVaultNoteRelPaths`.
+ * `wiki/`, `raw/`, or `layer1/` using `.handles.json`, the search cache, or
+ * directory scan across all handle hash derivations.
  * Returns `null` when the handle is malformed or no matching note exists.
  */
 export async function resolveVaultHandleRelPath(
@@ -4046,20 +4231,47 @@ export async function resolveVaultHandleRelPath(
   if (typeof handle !== "string") return null;
   const trimmed = handle.trim().toLowerCase();
   if (!/^m:[0-9a-f]{8}$/.test(trimmed)) return null;
+
+  const indexedRel = lookupHandleIndexRelPathSync(vaultPath, trimmed);
+  if (indexedRel && (await exists(path.join(vaultPath, indexedRel)))) {
+    return indexedRel;
+  }
+
   const cached = _vaultSearchCache.get(vaultPath);
   if (cached) {
     for (const entry of cached.notes.values()) {
-      if (entry.handle === trimmed && !entry.skipByStatus) {
+      if (
+        (entry.handle === trimmed ||
+          candidateHandlesForVaultRelPath(entry.relativePath, entry.title).has(trimmed)) &&
+        !entry.skipByStatus
+      ) {
         if (await exists(entry.notePath)) {
           return entry.relativePath;
         }
       }
     }
   }
-  const relPaths = await listVaultNoteRelPaths(vaultPath);
+  const relPaths = await listAllDrillableVaultRelPaths(vaultPath);
   for (const rel of relPaths) {
-    if (computeVaultHandleForRelPath(rel) === trimmed) {
+    if (
+      computeVaultHandleForRelPath(rel) === trimmed ||
+      candidateHandlesForVaultRelPath(rel).has(trimmed)
+    ) {
       return rel;
+    }
+  }
+  // Second pass checking frontmatter/heading titles if path hashes didn't match
+  for (const rel of relPaths) {
+    try {
+      const fullPath = path.join(vaultPath, rel);
+      assertUnder(fullPath, vaultPath);
+      const md = await readFile(fullPath, "utf8");
+      const title = titleFromMarkdown(rel, md);
+      if (candidateHandlesForVaultRelPath(rel, title).has(trimmed)) {
+        return rel;
+      }
+    } catch {
+      // Skip unreadable file.
     }
   }
   return null;
@@ -4078,12 +4290,7 @@ export type ResolvedVaultHandleNote =
       reason: "missing" | "unsafe";
     };
 
-/**
- * Resolve a short vault handle (`m:<8hex>`) locally against `vaultPath`,
- * enforcing containment, non-symlink file check, status check, and
- * `filterSafeVaultResults` privacy gating (rev5 §5.2.6 / §5.3).
- */
-export async function resolveSafeVaultHandleNote(
+async function resolveSafeVaultHandleNoteInSingleVault(
   vaultPath: string,
   handle: string,
 ): Promise<ResolvedVaultHandleNote> {
@@ -4100,15 +4307,16 @@ export async function resolveSafeVaultHandleNote(
     }
     const markdown = await readFile(notePath, "utf8");
     const privacy = privacyFromMarkdown(markdown);
-    if (privacy === "blocked" || skippedByStatus(markdown)) {
+    if (privacy === "blocked" || privacy === "private" || skippedByStatus(markdown)) {
       return { status: "unresolved", reason: "unsafe" };
     }
     const normalizedRel = relPath.replaceAll("\\", "/");
     const title = titleFromMarkdown(normalizedRel, markdown);
     const wikilink = wikilinkFor(normalizedRel);
+    const gateRelPath = normalizedRel.replace(/^raw\//, "wiki/");
     const candidate: VaultSearchResult = {
       notePath,
-      relativePath: normalizedRel,
+      relativePath: gateRelPath,
       wikilink,
       title,
       snippet: markdown.slice(0, 520),
@@ -4129,6 +4337,82 @@ export async function resolveSafeVaultHandleNote(
   } catch {
     return { status: "unresolved", reason: "missing" };
   }
+}
+
+/**
+ * Resolve a short vault handle (`m:<8hex>`) locally against `vaultPath`,
+ * enforcing containment, non-symlink file check, status check, and
+ * `filterSafeVaultResults` privacy gating (rev5 §5.2.6 / §5.3). Also resolves
+ * built-in failure-lesson handles (`m:7a11e501`..`m:7a11e513`) and falls back
+ * to sibling vaults under the same Minni home directory when `vaultPath` misses.
+ */
+export async function resolveSafeVaultHandleNote(
+  vaultPath: string,
+  handle: string,
+): Promise<ResolvedVaultHandleNote> {
+  if (typeof handle !== "string") {
+    return { status: "unresolved", reason: "missing" };
+  }
+  const trimmed = handle.trim().toLowerCase();
+  if (!/^m:[0-9a-f]{8}$/.test(trimmed)) {
+    return { status: "unresolved", reason: "missing" };
+  }
+
+  const primary = await resolveSafeVaultHandleNoteInSingleVault(vaultPath, trimmed);
+  if (primary.status === "resolved" || primary.reason === "unsafe") {
+    return primary;
+  }
+
+  // Check built-in failure lessons (`m:7a11e501`..`m:7a11e513`)
+  const builtinLesson = BUILTIN_FAILURE_LESSONS_BY_HANDLE[trimmed];
+  if (builtinLesson) {
+    const rel = `wiki/scars/${builtinLesson.lessonId}.md`;
+    return {
+      status: "resolved",
+      relativePath: rel,
+      title: builtinLesson.title,
+      content: `# ${builtinLesson.title}\n\n${builtinLesson.lessonText}\n`,
+      wikilink: `[[wiki/scars/${builtinLesson.lessonId}]]`,
+    };
+  }
+
+  // Check sibling vaults under the parent directory when vaultPath is a named vault (`vault` or `*-vault`)
+  const vaultBase = path.basename(vaultPath);
+  if (vaultBase === "vault" || vaultBase.endsWith("-vault")) {
+    const parentDir = path.dirname(vaultPath);
+    const siblingNames = new Set<string>([
+      "claudecode-vault",
+      "vault",
+      "codex-vault",
+      "cursor-vault",
+      "gemini-vault",
+    ]);
+    try {
+      for (const entry of fs.readdirSync(parentDir)) {
+        if (entry === "vault" || entry.endsWith("-vault")) {
+          siblingNames.add(entry);
+        }
+      }
+    } catch {
+      // Ignore unreadable parent directory.
+    }
+    for (const siblingName of siblingNames) {
+      const siblingPath = path.join(parentDir, siblingName);
+      if (siblingPath === vaultPath) continue;
+      try {
+        const st = await lstat(siblingPath);
+        if (!st.isDirectory() || st.isSymbolicLink()) continue;
+        const sibRes = await resolveSafeVaultHandleNoteInSingleVault(siblingPath, trimmed);
+        if (sibRes.status === "resolved" || sibRes.reason === "unsafe") {
+          return sibRes;
+        }
+      } catch {
+        // Ignore missing sibling vault.
+      }
+    }
+  }
+
+  return { status: "unresolved", reason: "missing" };
 }
 
 export interface InboxEntry {

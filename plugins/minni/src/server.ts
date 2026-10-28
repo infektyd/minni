@@ -85,6 +85,7 @@ import {
   writeVaultPage,
 } from "./vault.js";
 import { wrapEnvelope } from "./agent_envelope.js";
+import { disarmRecallStateOnConsult } from "./recall-state.js";
 import {
   createAgentPingRequest,
   decideAgentPingRequest,
@@ -636,6 +637,7 @@ server.registerTool(
   },
   async ({ query, layer, limit, workspaceId, scope, cross_agent, includeVault }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
+    await disarmRecallStateOnConsult(effectiveVaultPath).catch(() => false);
     // X5: run the daemon recall FIRST. Its results are workspace/agent-scoped and
     // subject to read policy. The local searchVaultNotes pre-scan is NOT scoped, so
     // it must only be used as an offline fallback (daemon unreachable) — never
@@ -744,6 +746,7 @@ server.registerTool(
     },
   },
   async ({ resultIds, chunkIds, references, handle, wikilink, depth }) => {
+    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH).catch(() => false);
     const result = await drillMemory({
       resultIds,
       chunkIds,
@@ -841,6 +844,7 @@ server.registerTool(
       category,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only
       workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
+      ...(source ? { source } : {}),
     });
     const note = await vaultFirstLearn({
       vaultPath: DEFAULT_VAULT_PATH,
@@ -853,25 +857,8 @@ server.registerTool(
       // SEC-G6: successful learn audit must carry semanticTier (fail-open path).
       quality,
     });
-    // Phase 3: index the session note into the daemon immediately via vault_index_doc
-    // so the note is recallable in the same session even while the learning candidate
-    // is still status='proposed'. Fail-open if the daemon is unreachable.
-    try {
-      const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
-      const fullContent = `---\ntitle: ${title}\nsection: sessions\nstatus: candidate\nprivacy: safe\ncategory: ${category ?? "general"}\n---\n# ${title}\n\n${content}`;
-      await jsonRpcSocketRequestWithFallback("vault_index_doc", {
-        content: fullContent,
-        path: note.relativePath,
-        agent_id: DEFAULT_AGENT_ID,
-        agent: DEFAULT_AGENT_ID,
-        sigil: "📄",
-        privacy_level: "safe",
-        page_status: "candidate",
-        layer: "knowledge",
-      });
-    } catch {
-      // Fail-open: vault note is on disk and will be indexed on next pass
-    }
+    // Pillar 3: do NOT call vault_index_doc on wiki/sessions/*.md candidate notes;
+    // unaccepted session notes must never enter documents/chunk_embeddings.
     // #132 P1: an identity-recovery denial must never read as "learned" —
     // name it distinctly so the remediation route (in store.data) is acted on.
     const storeRecovery = recoveryRouteFrom(store.data);
@@ -1013,12 +1000,14 @@ server.registerTool(
     },
   },
   async ({ title, content, section, source }) => {
+    const NON_INDEXED_SECTIONS = new Set(["raw", "sessions", "artifacts", "handoffs", "tasks"]);
     const note = await writeVaultPage({
       vaultPath: DEFAULT_VAULT_PATH,
       title,
       content,
       section,
       source,
+      status: NON_INDEXED_SECTIONS.has(section) ? "candidate" : "accepted",
     });
 
     // M-4 fix: vault_write was not triggering the recall bridge — the page
@@ -1028,9 +1017,13 @@ server.registerTool(
     // semantics. Fail-open: if the daemon is unavailable or the index fails,
     // the write still succeeds (the page is on disk; recall degrades to lexical
     // until the next VaultIndexer run).
+    if (NON_INDEXED_SECTIONS.has(section)) {
+      return textResult(JSON.stringify({ status: "written", note, indexed: "skipped" }, null, 2));
+    }
+
     try {
       const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
-      const fullContent = `---\ntitle: ${title}\nsection: ${section}\nstatus: candidate\nprivacy: safe\n---\n# ${title}\n\n${content}`;
+      const fullContent = `---\ntitle: ${title}\nsection: ${section}\nstatus: accepted\nprivacy: safe\n---\n# ${title}\n\n${content}`;
       const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
         content: fullContent,
         path: note.relativePath,
@@ -1041,7 +1034,7 @@ server.registerTool(
         agent: DEFAULT_AGENT_ID,
         sigil: "📄",
         privacy_level: "safe",
-        page_status: "candidate",
+        page_status: "accepted",
         layer: "knowledge",
       });
       return textResult(JSON.stringify({

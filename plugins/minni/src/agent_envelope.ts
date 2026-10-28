@@ -757,6 +757,150 @@ export function fitEnvelope<T extends EnvelopeBody>(
     if (!needsTrim()) return working as T;
   }
 
+  // Step 9: Proportional floor scaling for SessionStart budgets when combined
+  // section floors (layer1_shelf + identity_body + recent_learnings + recall +
+  // corrections_reassert + active_thread) still exceed the envelope budget.
+  const effectiveCharLimit = limits.charLimit ?? limits.tokenLimit * 4;
+  if (
+    needsTrim() &&
+    limits.tokenLimit >= 500 &&
+    effectiveCharLimit >= 2000
+  ) {
+    for (const scale of [0.75, 0.5, 0.35, 0.25, 0.15, 0.1]) {
+      if (!needsTrim()) break;
+
+      // 9a. Scale recent_learnings bullet lengths (and count at tighter scales)
+      if (working.recent_learnings && typeof working.recent_learnings === "object" && !Array.isArray(working.recent_learnings)) {
+        const rl = working.recent_learnings as Record<string, unknown>;
+        if (typeof rl.context === "string") {
+          const fromLen = rl.context.length;
+          const lines = rl.context.split("\n");
+          const headerLines: string[] = [];
+          const bullets: string[] = [];
+          for (const line of lines) {
+            if (/^\s*-\s/.test(line)) bullets.push(line);
+            else if (bullets.length === 0) headerLines.push(line);
+            else if (line.trim().length > 0) bullets[bullets.length - 1] = `${bullets[bullets.length - 1]}\n${line}`;
+          }
+          const maxBulletChars = Math.max(90, Math.floor(450 * scale));
+          const maxBullets = scale <= 0.35 ? 1 : scale <= 0.5 ? 2 : 3;
+          const scaledBullets = bullets.slice(0, maxBullets).map((b) =>
+            b.length > maxBulletChars ? `${b.slice(0, maxBulletChars - 3)}...` : b,
+          );
+          const nextContext = [...headerLines, ...scaledBullets].join("\n");
+          if (nextContext.length < fromLen) {
+            working.recent_learnings = { ...rl, context: nextContext };
+            recordTrim("recent_learnings", bullets.length, scaledBullets.length);
+          }
+        }
+      }
+      if (!needsTrim()) return working as T;
+
+      // 9b. Scale layer1_shelf (string content or entries array)
+      if (working.layer1_shelf && typeof working.layer1_shelf === "object") {
+        const shelf = working.layer1_shelf as Record<string, unknown>;
+        const maxShelfChars = Math.max(400, Math.floor(LAYER1_BOOT_FORM_MAX_CHARS * scale));
+        if (typeof shelf.content === "string" && shelf.content.length > maxShelfChars) {
+          const fromChars = shelf.content.length;
+          const bootShelf = applyLayer1BootForm(shelf, limits.vaultPath, maxShelfChars);
+          const toChars = typeof bootShelf.content === "string" ? bootShelf.content.length : fromChars;
+          working.layer1_shelf = bootShelf;
+          recordTrim("layer1_shelf", fromChars, toChars);
+        } else if (Array.isArray(shelf.entries) && shelf.entries.length > 0) {
+          const fromEntries = shelf.entries.length;
+          const maxEntries = Math.max(1, Math.ceil(shelf.entries.length * scale));
+          const maxEntryChars = Math.max(120, Math.floor(700 * scale));
+          const scaledEntries = shelf.entries.slice(0, maxEntries).map((entry) => {
+            if (!entry || typeof entry !== "object") return entry;
+            const eObj = entry as Record<string, unknown>;
+            if (typeof eObj.content === "string" && eObj.content.length > maxEntryChars) {
+              return { ...eObj, content: `${eObj.content.slice(0, maxEntryChars - 3)}...` };
+            }
+            return eObj;
+          });
+          working.layer1_shelf = {
+            ...shelf,
+            inline_trim: true,
+            entries: scaledEntries,
+          };
+          recordTrim("layer1_shelf", fromEntries, scaledEntries.length);
+        }
+      }
+      if (!needsTrim()) return working as T;
+
+      // 9c. Scale recall results count and text length
+      if (working.recall && typeof working.recall === "object") {
+        const rec = { ...(working.recall as Record<string, unknown>) };
+        const resArr = Array.isArray(rec.results) ? [...rec.results] : [];
+        if (resArr.length > 0) {
+          const fromCount = resArr.length;
+          const maxResults = scale <= 0.5 ? 1 : Math.min(resArr.length, 2);
+          const maxTextChars = Math.max(120, Math.floor(500 * scale));
+          const scaledRes = resArr.slice(0, maxResults).map((item) => {
+            if (item !== null && typeof item === "object") {
+              const obj = item as Record<string, unknown>;
+              if (typeof obj.text === "string" && obj.text.length > maxTextChars) {
+                return cloneRecallItemWithText(obj, clipEvidenceText(obj.text, maxTextChars));
+              }
+            }
+            return item;
+          });
+          rec.results = scaledRes;
+          if (typeof rec.count === "number") rec.count = scaledRes.length;
+          working.recall = rec;
+          recordTrim("recall", fromCount, scaledRes.length);
+        }
+      }
+      if (!needsTrim()) return working as T;
+
+      // 9d. Scale identity_body / nativeLayer1
+      const maxIdentityChars = Math.max(300, Math.floor(2000 * scale));
+      const idMarker = `\n...[identity_body trimmed to ${maxIdentityChars} chars]`;
+      if (typeof working.identity_body === "string" && working.identity_body.length > maxIdentityChars) {
+        const fromChars = working.identity_body.length;
+        const clipped = working.identity_body.slice(0, Math.max(0, maxIdentityChars - idMarker.length)) + idMarker;
+        working.identity_body = clipped;
+        recordTrim("identity_body", fromChars, clipped.length);
+      }
+      if (currentNativeLayer1.length > maxIdentityChars && needsTrim()) {
+        const fromChars = currentNativeLayer1.length;
+        currentNativeLayer1 =
+          currentNativeLayer1.slice(0, Math.max(0, maxIdentityChars - idMarker.length)) + idMarker;
+        limits.onNativeLayer1Trimmed?.(currentNativeLayer1);
+        recordTrim("identity_body", fromChars, currentNativeLayer1.length);
+      }
+      if (!needsTrim()) return working as T;
+
+      // 9e. Scale corrections_reassert, active_thread, and contract strings
+      if (Array.isArray(working.corrections_reassert) && working.corrections_reassert.length > 0) {
+        const maxItems = scale <= 0.35 ? 1 : Math.max(1, Math.ceil(working.corrections_reassert.length * scale));
+        const maxCorrChars = Math.max(80, Math.floor(360 * scale));
+        working.corrections_reassert = working.corrections_reassert.slice(0, maxItems).map((item) =>
+          typeof item === "string" && item.length > maxCorrChars
+            ? `${item.slice(0, maxCorrChars - 3)}...`
+            : item,
+        );
+      }
+      if (working.active_thread && typeof working.active_thread === "object" && !Array.isArray(working.active_thread)) {
+        const at = { ...(working.active_thread as Record<string, unknown>) };
+        const maxAtChars = Math.max(80, Math.floor(320 * scale));
+        for (const field of ["next_action", "pull", "title"]) {
+          if (typeof at[field] === "string" && (at[field] as string).length > maxAtChars) {
+            at[field] = `${(at[field] as string).slice(0, maxAtChars - 3)}...`;
+          }
+        }
+        working.active_thread = at;
+      }
+      if (scale <= 0.35 && typeof working.contract === "string") {
+        const maxContractChars = Math.max(160, Math.floor(1200 * scale));
+        if (working.contract.length > maxContractChars) {
+          working.contract = `${working.contract.slice(0, maxContractChars - 3)}...`;
+        }
+      }
+      if (!needsTrim()) return working as T;
+    }
+  }
+
   // Floor reached and still over budget: attach over_budget diagnostic (§6.2.2)
   if (needsTrim()) {
     const limit = limits.charLimit ?? limits.tokenLimit * 4;

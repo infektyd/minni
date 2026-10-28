@@ -147,15 +147,23 @@ const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 /** handleStop truncates its task to 200 chars; a small margin keeps this cheap. */
 const LAST_USER_MESSAGE_MAX = 400;
 
+interface AgyPromptTurn {
+  message: string;
+  stepIndex: number | null;
+  hasModelAfterPrompt: boolean;
+}
+
 /**
- * Mine the last explicit user message from an agy transcript_full.jsonl.
- * Best-effort: any miss (no path, unreadable file, format drift) returns "".
+ * Mine the last explicit user prompt turn from an agy transcript_full.jsonl,
+ * including its `step_index` and whether any MODEL response/tool step has
+ * already been appended after it (indicating a mid-turn PreInvocation step).
+ * Best-effort: any miss (no path, unreadable file, format drift) returns null.
  */
-async function lastUserMessageFromTranscript(transcriptPath: string): Promise<string> {
+async function extractAgyPromptTurn(transcriptPath: string): Promise<AgyPromptTurn | null> {
   let tail: string;
   try {
     const info = await stat(transcriptPath);
-    if (!info.isFile() || info.size === 0) return "";
+    if (!info.isFile() || info.size === 0) return null;
     const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
     const handle = await open(transcriptPath, "r");
     try {
@@ -167,10 +175,11 @@ async function lastUserMessageFromTranscript(transcriptPath: string): Promise<st
       await handle.close();
     }
   } catch {
-    return "";
+    return null;
   }
 
   const lines = tail.split("\n");
+  let hasModelAfterPrompt = false;
   // A mid-file start offset can leave a partial first line; JSON.parse below
   // rejects it naturally, so no special-casing is needed.
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -182,15 +191,42 @@ async function lastUserMessageFromTranscript(transcriptPath: string): Promise<st
     } catch {
       continue;
     }
+    if (
+      entry.source === "MODEL" ||
+      entry.type === "PLANNER_RESPONSE" ||
+      entry.type === "GENERIC"
+    ) {
+      hasModelAfterPrompt = true;
+      continue;
+    }
     if (entry.source !== "USER_EXPLICIT" || entry.type !== "USER_INPUT") continue;
     const content = asString(entry.content);
     if (!content) continue;
     const request = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(content);
     const message = (request?.[1] ?? content).trim();
     if (!message) continue;
-    return message.slice(0, LAST_USER_MESSAGE_MAX);
+    const stepIndex =
+      typeof entry.step_index === "number" &&
+      Number.isSafeInteger(entry.step_index) &&
+      entry.step_index >= 0
+        ? entry.step_index
+        : null;
+    return {
+      message: message.slice(0, LAST_USER_MESSAGE_MAX),
+      stepIndex,
+      hasModelAfterPrompt,
+    };
   }
-  return "";
+  return null;
+}
+
+/**
+ * Mine the last explicit user message from an agy transcript_full.jsonl.
+ * Best-effort: any miss (no path, unreadable file, format drift) returns "".
+ */
+async function lastUserMessageFromTranscript(transcriptPath: string): Promise<string> {
+  const turn = await extractAgyPromptTurn(transcriptPath);
+  return turn?.message ?? "";
 }
 
 /**
@@ -232,9 +268,16 @@ export async function enrichAgyPromptPayload(
   if (asString(payload.prompt) || asString(payload.user_prompt)) {
     return payload;
   }
-  const transcriptPath = asString(payload.transcriptPath);
+  const transcriptPath = asString(payload.transcriptPath) || asString(payload.transcript_path);
   if (!transcriptPath) return payload;
-  const message = await lastUserMessageFromTranscript(transcriptPath);
-  if (!message) return payload;
-  return { ...payload, prompt: message };
+  const turn = await extractAgyPromptTurn(transcriptPath);
+  if (!turn || !turn.message) return payload;
+  return {
+    ...payload,
+    prompt: turn.message,
+    ...(turn.stepIndex !== null && !asString(payload.prompt_id) && !asString(payload.promptId)
+      ? { prompt_id: `agy-step-${turn.stepIndex}`, agy_prompt_step_index: turn.stepIndex }
+      : {}),
+    ...(turn.hasModelAfterPrompt ? { agy_mid_turn: true } : {}),
+  };
 }

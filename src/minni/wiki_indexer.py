@@ -48,17 +48,43 @@ class WikiFrontmatter:
 
     # PR-2: Valid values for validation
     VALID_STATUSES = frozenset({"draft", "candidate", "accepted", "superseded", "rejected", "expired"})
-    # M6 (#229): statuses that are VALID on the vault contract (vault.ts
-    # PageStatus) but are deliberately never indexed. "complete" is the
-    # terminal state plan.ts moves a plan into once every slice resolves; it
-    # is kept out of recallable memory on purpose (H6 — a model-driven
-    # completion must not self-promote its own plan into recall), and it is
-    # NOT in retrieval's skip_statuses, so INDEXING one would make it
-    # recallable. Excluding these is a decision, not a defect: they are
-    # counted as `excluded`, never as `rejected` (malformed) or `errors`.
-    EXCLUDED_STATUSES = frozenset({"complete"})
+    # M6 (#229) + Rev 6: statuses that are VALID on the vault contract but are
+    # deliberately never indexed into recallable memory. Note: retrieval.py
+    # merges EXCLUDED_STATUSES into skip_statuses unconditionally, so statuses
+    # governed by include_drafts/include_expired/include_rejected/include_superseded
+    # or the default 'candidate' column value must NOT be in EXCLUDED_STATUSES.
+    EXCLUDED_STATUSES = frozenset(
+        {
+            "complete",
+            "completed",
+            "archived",
+            "obsolete",
+            "deprecated",
+        }
+    )
+    WIKI_RETRACT_STATUSES = frozenset(
+        {
+            "complete",
+            "completed",
+            "archived",
+            "obsolete",
+            "deprecated",
+            "rejected",
+            "superseded",
+            "expired",
+        }
+    )
     VALID_PRIVACIES = frozenset({"safe", "local-only", "private", "blocked"})
     VALID_TYPES = frozenset({"entity", "concept", "decision", "procedure", "session", "artifact", "handoff", "synthesis", "unknown"})
+
+    @property
+    def is_excluded(self) -> bool:
+        st = (self.status or "").strip().lower()
+        if st in self.WIKI_RETRACT_STATUSES:
+            return True
+        if st == "candidate" and "status" in (self.raw or {}):
+            return True
+        return False
 
 
 @dataclass
@@ -236,9 +262,12 @@ class WikiIndexer:
         self,
         db: MinniDB,
         config: MinniConfig = DEFAULT_CONFIG,
+        *,
+        embed: bool = True,
     ):
         self.db = db
         self.config = config
+        self.embed = embed
         self.parser = WikiPageParser()
         self.chunker = MarkdownChunker(config)
         self.faiss_index = FAISSIndex(config)
@@ -357,31 +386,36 @@ class WikiIndexer:
                         stats["errors"] += 1
                         continue
 
-                    # M6 (#229): excluded by design — checked BEFORE validation
-                    # so a completed plan is neither "rejected" nor an "error",
-                    # and so it never appends a REJECTED block to log.md. It
-                    # used to: a rejected page never gets a documents row, so
-                    # the mtime skip never fires and every run re-appended one,
-                    # growing log.md without bound (and log.md is itself
-                    # watched, so the write re-triggered indexing).
-                    if not is_meta and page.frontmatter.status in WikiFrontmatter.EXCLUDED_STATUSES:
+                    from minni.indexer import is_vault_path_excluded
+
+                    explicit_status = page.frontmatter.raw.get("status") if page.frontmatter.raw else None
+                    path_excluded, _ = is_vault_path_excluded(
+                        path,
+                        root_dir=wiki_root_resolved,
+                        explicit_status=explicit_status,
+                        is_rpc=False,
+                        allow_artifact_retraction=bool(row),
+                    )
+                    if not is_meta and path_excluded:
                         stats["excluded"] = stats.get("excluded", 0) + 1
-                        # Retract an already-indexed page: accepted -> complete
-                        # is the normal plan lifecycle, and leaving the old row
-                        # keeps a finished plan recallable (H6).
                         if row:
-                            # Payload only — deleting the row would CASCADE
-                            # memory_links and mint a new doc_id on the way
-                            # back (accepted -> complete -> accepted is a
-                            # normal plan round trip).
                             doc_id = row["doc_id"]
                             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
-                            # Advance last_modified too: the skip gate is
-                            # `last_modified >= mtime`, so stamping status
-                            # alone re-purged the same page on every run and
-                            # left excluded_purged permanently non-zero — the
-                            # never-returns-to-zero signal this PR removes.
+                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                            stats["deleted"] += 1
+                        else:
+                            stats["skipped"] += 1
+                        continue
+
+                    # M6 (#229) + Rev 6: excluded by design — checked BEFORE validation
+                    if not is_meta and page.frontmatter.is_excluded:
+                        stats["excluded"] = stats.get("excluded", 0) + 1
+                        if row:
+                            was_poisoned_mtime = isinstance(row["last_modified"], str)
+                            doc_id = row["doc_id"]
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                             c.execute(
                                 """UPDATE documents
                                    SET page_status=?, last_modified=?
@@ -389,6 +423,8 @@ class WikiIndexer:
                                 (page.frontmatter.status, mtime, doc_id),
                             )
                             stats["excluded_purged"] = stats.get("excluded_purged", 0) + 1
+                            if was_poisoned_mtime:
+                                stats["indexed"] += 1
                         continue
 
                     # PR-2: Validate frontmatter (reject invalid pages)
@@ -501,12 +537,20 @@ class WikiIndexer:
                     # Chunk the page body
                     chunks = self.chunker.chunk_document(page.body)
 
+                    from minni.indexer import UNEMBEDDED_STATUSES
+
+                    page_st = (page.frontmatter.status or "candidate").strip().lower()
+                    unendorsed = (
+                        page_st in (UNEMBEDDED_STATUSES - {"candidate"})
+                        or (page_st == "candidate" and "status" in (page.frontmatter.raw or {}))
+                    )
+
                     # Enrich each chunk with wiki metadata
                     for chunk in chunks:
                         enriched_heading = f"{heading_prefix}{chunk.heading_path}"
 
                         # Encode + store
-                        if self.model:
+                        if self.embed and self.model and not unendorsed:
                             from minni.models import get_embedder_lock
 
                             with get_embedder_lock():

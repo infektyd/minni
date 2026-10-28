@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -211,3 +212,147 @@ test("drillMemory supports multi-element references array mixing m:<8hex> and d:
     assert.equal(res.data.results[1].source_unverified, true);
   });
 });
+
+test("B2: drillMemory resolves m:<8hex> via .handles.json, raw/ notes, wikilink/sha256/title hashes, failure-lesson handles m:7a11e501..m:7a11e513, sibling vaults, and SQLite minni.db", async () => {
+  await withTempVault(async (vault) => {
+    const root = path.dirname(vault);
+    const deadDaemon = async () => ({ ok: false, error: "daemon unreachable" });
+
+    // 1. Raw note under raw/sessions/raw-session.md
+    const rawRel = "raw/sessions/raw-session.md";
+    await mkdir(path.dirname(path.join(vault, rawRel)), { recursive: true });
+    await writeFile(
+      path.join(vault, rawRel),
+      "---\ntitle: Captured Turn Note\nprivacy: safe\n---\n# Captured Turn Note\n\nBody of captured turn note.\n",
+      "utf8",
+    );
+    const rawHandle = vaultHandleForPath(rawRel);
+    const rawRes = await drillMemory(
+      { references: [rawHandle], vaultPath: vault, sessionId: "sess-b2" },
+      deadDaemon,
+    );
+    assert.equal(rawRes.ok, true, "raw/**/*.md note must resolve via m:<8hex>");
+    assert.equal(rawRes.data.source, rawRel);
+    assert.match(rawRes.data.content, /Body of captured turn note\./);
+
+    // 2. Wikilink without wiki/ prefix or .md suffix (`[[decisions/wikilink-note]]`)
+    const wikiRel = "wiki/decisions/wikilink-note.md";
+    await writeFile(
+      path.join(vault, wikiRel),
+      "---\ntitle: Wikilink Derived Title\nprivacy: safe\n---\n# Wikilink Derived Title\n\nWikilink resolved body.\n",
+      "utf8",
+    );
+    const wikilinkHandle = vaultHandleForPath("[[decisions/wikilink-note]]");
+    const wikiRes = await drillMemory(
+      { references: [wikilinkHandle], vaultPath: vault, sessionId: "sess-b2" },
+      deadDaemon,
+    );
+    assert.equal(wikiRes.ok, true, "wikilink-derived m:<8hex> without wiki/ prefix must resolve");
+    assert.equal(wikiRes.data.source, wikiRel);
+
+    // 3. Explicit <vaultPath>/.handles.json entry
+    const handlesIndex = {
+      "m:abcd1234": {
+        source: wikiRel,
+        title: "Indexed Handle Note",
+      },
+    };
+    await writeFile(path.join(vault, ".handles.json"), JSON.stringify(handlesIndex, null, 2), "utf8");
+    const idxRes = await drillMemory(
+      { references: ["m:abcd1234"], vaultPath: vault, sessionId: "sess-b2" },
+      deadDaemon,
+    );
+    assert.equal(idxRes.ok, true, "<vaultPath>/.handles.json entry must resolve");
+    assert.equal(idxRes.data.source, wikiRel);
+
+    // 4. All 13 approved failure-lesson handles (m:7a11e501 .. m:7a11e513) resolve
+    const lessonHandles = [
+      "m:7a11e501",
+      "m:7a11e502",
+      "m:7a11e503",
+      "m:7a11e504",
+      "m:7a11e505",
+      "m:7a11e506",
+      "m:7a11e507",
+      "m:7a11e508",
+      "m:7a11e509",
+      "m:7a11e510",
+      "m:7a11e511",
+      "m:7a11e512",
+      "m:7a11e513",
+    ];
+    for (const h of lessonHandles) {
+      const lessonRes = await drillMemory(
+        { references: [h], vaultPath: vault, sessionId: "sess-b2" },
+        deadDaemon,
+      );
+      assert.equal(lessonRes.ok, true, `failure lesson handle ${h} must resolve with ok: true`);
+      assert.match(lessonRes.data.content, /<EVIDENCE\b[\s\S]*<\/EVIDENCE>/);
+    }
+
+    // 5. Sibling vault resolution (`claudecode-vault` next to `vault`)
+    const siblingVault = path.join(root, "claudecode-vault");
+    const siblingRel = "wiki/decisions/sibling-only.md";
+    await mkdir(path.dirname(path.join(siblingVault, siblingRel)), { recursive: true });
+    await writeFile(
+      path.join(siblingVault, siblingRel),
+      "---\ntitle: Sibling Vault Note\nprivacy: safe\n---\n# Sibling Vault Note\n\nResolved from sibling claudecode-vault.\n",
+      "utf8",
+    );
+    const siblingHandle = vaultHandleForPath(siblingRel);
+    const sibRes = await drillMemory(
+      { references: [siblingHandle], vaultPath: vault, sessionId: "sess-b2" },
+      deadDaemon,
+    );
+    assert.equal(sibRes.ok, true, "handle in sibling claudecode-vault must resolve when drilling from default vault");
+    assert.match(sibRes.data.content, /Resolved from sibling claudecode-vault\./);
+
+    // 6. SQLite minni.db fallback in temp root (including sha256("learning:" + id) and dynamic *-vault sibling)
+    const customSiblingVault = path.join(root, "grok-vault");
+    const customSiblingRel = "wiki/decisions/grok-sibling.md";
+    await mkdir(path.dirname(path.join(customSiblingVault, customSiblingRel)), { recursive: true });
+    await writeFile(
+      path.join(customSiblingVault, customSiblingRel),
+      "---\ntitle: Grok Sibling Vault Note\nprivacy: safe\n---\n# Grok Sibling Vault Note\n\nResolved from dynamic grok-vault sibling.\n",
+      "utf8",
+    );
+    const customSiblingHandle = vaultHandleForPath(customSiblingRel);
+    const customSibRes = await drillMemory(
+      { references: [customSiblingHandle], vaultPath: vault, sessionId: "sess-b2" },
+      deadDaemon,
+    );
+    assert.equal(customSibRes.ok, true, "handle in dynamically named *-vault sibling (grok-vault) must resolve");
+    assert.match(customSibRes.data.content, /Resolved from dynamic grok-vault sibling\./);
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const dbPath = path.join(root, "minni.db");
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE learnings (id INTEGER PRIMARY KEY, category TEXT, content TEXT, source TEXT)");
+    const sqlSource = "learnings/sqlite-only-entry";
+    db.prepare("INSERT INTO learnings (id, category, content, source) VALUES (?, ?, ?, ?)").run(
+      4242,
+      "decision",
+      "SQLite fallback resolved learning content by learning:id.",
+      sqlSource,
+    );
+    db.close();
+    const learningIdSha256Handle = `m:${createHash("sha256").update("learning:4242", "utf8").digest("hex").slice(0, 8)}`;
+    const sqlRes = await drillMemory(
+      { references: [learningIdSha256Handle], vaultPath: vault, sessionId: "sess-b2" },
+      deadDaemon,
+    );
+    assert.equal(sqlRes.ok, true, "sha256('learning:' + id) handle in minni.db learnings table must resolve");
+    assert.match(sqlRes.data.content, /SQLite fallback resolved learning content by learning:id\./);
+    assert.deepEqual(sqlRes.data.missing, []);
+
+    // Also test unconfigured unknown-vault path under root resolving to sibling claudecode-vault
+    const unconfiguredVault = path.join(root, "unknown-vault");
+    const unconfRes = await drillMemory(
+      { references: [siblingHandle], vaultPath: unconfiguredVault, sessionId: "sess-b2" },
+      deadDaemon,
+    );
+    assert.equal(unconfRes.ok, true, "passing unconfigured unknown-vault path must resolve via sibling claudecode-vault");
+  });
+});
+
+

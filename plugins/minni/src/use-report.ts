@@ -47,8 +47,8 @@ export const USE_REPORT_NOTE = "lower bounds; silent use is invisible";
 /** The recital rule's known blind spot (rev5 §4.7), printed with every report. */
 export const USE_REPORT_CAVEAT =
   "Known undercount: a short rule applied by quoting it word for word reads as recital and is not counted; this affects both windows equally, and the used rate is a floor.";
-/** The wires whose rows feed the rates (Phase 1). */
-export const MEASURED_WIRES: readonly string[] = ["claude-code"];
+/** The wires whose transcripts/stops the detector judges. */
+export const MEASURED_WIRES: readonly string[] = ["claude-code", "gemini", "codex", "grok-build"];
 export const DEFAULT_USE_PRINCIPAL = "claude-code";
 /** `minni_status`'s fixed window. */
 export const STATUS_USE_DAYS = 7;
@@ -494,6 +494,31 @@ function standingExposures(rows: readonly LedgerRow[]): Map<string, ExposureRow>
   return out;
 }
 
+function inferVaultPrincipal(vaultPath: string, since: number, until: number): string {
+  const counts = new Map<string, number>();
+  for (const sessionKey of sessionsInRange(vaultPath, since, until)) {
+    const { rows, refused } = readSessionLedger(vaultPath, sessionKey);
+    if (refused) continue;
+    for (const row of rows) {
+      const ms = msOf(row.ts);
+      if (ms === null || ms < since || ms >= until) continue;
+      if (typeof row.principal === "string" && row.principal.length > 0) {
+        counts.set(row.principal, (counts.get(row.principal) ?? 0) + 1);
+      }
+    }
+  }
+  if (counts.has(DEFAULT_USE_PRINCIPAL)) return DEFAULT_USE_PRINCIPAL;
+  let best = DEFAULT_USE_PRINCIPAL;
+  let bestCount = 0;
+  for (const [candidate, count] of counts.entries()) {
+    if (count > bestCount) {
+      best = candidate;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 /**
  * The use report for a time range (§4.5). Throws only on an unusable range
  * (a bad date, a named window that is not defined); otherwise a missing or
@@ -501,7 +526,10 @@ function standingExposures(rows: readonly LedgerRow[]): Map<string, ExposureRow>
  */
 export function buildUseReport(vaultPath: string, options: UseReportOptions = {}): UseReport {
   const range = resolveRange(vaultPath, options);
-  const principal = typeof options.principal === "string" && options.principal.length > 0 ? options.principal : DEFAULT_USE_PRINCIPAL;
+  const principal =
+    typeof options.principal === "string" && options.principal.length > 0
+      ? options.principal
+      : inferVaultPrincipal(vaultPath, range.since, range.until);
   const memory = typeof options.memory === "string" && options.memory.length > 0 ? options.memory : undefined;
   const report: UseReport = {
     principal,
@@ -538,7 +566,7 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
     typeof row.agent_key === "string" &&
     AGENT_KEY_RE.test(row.agent_key);
 
-  const coverage = new Map<string, { rows: number; sessions: Set<string> }>();
+  const coverage = new Map<string, { rows: number; judged: number; principals: Set<string>; sessions: Set<string> }>();
   const features = new Map<string, { features: string[]; rows: number }>();
   const perMemory = new Map<string, { title: string; surfaced: number; used: number; everUsed: boolean }>();
   const memoryEntry = (mkey: string, title: string) => {
@@ -560,8 +588,10 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
     for (const row of rows) {
       if (!inRange(row.ts)) continue;
       const wire = typeof row.wire === "string" ? row.wire : "unknown";
-      const cov = coverage.get(wire) ?? { rows: 0, sessions: new Set<string>() };
+      const cov = coverage.get(wire) ?? { rows: 0, judged: 0, principals: new Set<string>(), sessions: new Set<string>() };
       cov.rows += 1;
+      if (row.kind === "judged") cov.judged += 1;
+      if (typeof row.principal === "string" && row.principal.length > 0) cov.principals.add(row.principal);
       cov.sessions.add(sessionKey);
       coverage.set(wire, cov);
       if (!measured(row)) continue;
@@ -697,7 +727,11 @@ export function buildUseReport(vaultPath: string, options: UseReportOptions = {}
       wire,
       rows: value.rows,
       sessions: value.sessions.size,
-      status: (MEASURED_WIRES.includes(wire) ? "measured" : "unmeasured") as "measured" | "unmeasured",
+      status: (
+        MEASURED_WIRES.includes(wire) && (wire === principal || value.principals.has(principal) || value.judged > 0)
+          ? "measured"
+          : "unmeasured"
+      ) as "measured" | "unmeasured",
     }))
     .sort((a, b) => a.wire.localeCompare(b.wire));
   if (!options.compact) {

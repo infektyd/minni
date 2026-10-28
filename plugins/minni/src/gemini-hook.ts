@@ -14,6 +14,9 @@
 // The manifest declares agy's OWN event names; AGY_EVENTS maps them onto
 // Minni's internal ones. agy has no UserPromptSubmit — PreInvocation is the
 // analogue and the documented injection point — and no PreCompact at all.
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import {
   GEMINI_AGENT_ID,
@@ -114,14 +117,66 @@ async function main(): Promise<void> {
     // PreInvocation carries no prompt text; mine the transcript or the
     // shared handler returns noIntent and the per-turn recall pointer dies.
     payload = await enrichAgyPromptPayload(payload).catch(() => payload);
+    if (payload.agy_mid_turn === true) {
+      emit(geminiWire.noop());
+      return;
+    }
     const promptText = asString(payload.prompt).trim();
     if (promptText) {
-      const { readRecallState } = await import("./recall-state.js");
+      const { readRecallState, sessionStateKey } = await import("./recall-state.js");
       const { hashTaskSignature } = await import("./agent_envelope.js");
-      const existingState = await readRecallState(CONFIG.vaultPath).catch(() => null);
-      if (existingState && existingState.task_signature === hashTaskSignature(promptText)) {
-        emit({ continue: true });
-        return;
+      const { assertWriteTargetUnder } = await import("./vault.js");
+      const sessionId =
+        asString(payload.session_id) ||
+        asString(payload.sessionId) ||
+        asString(payload.conversationId);
+      const taskSig = hashTaskSignature(promptText);
+      const hasStepIdx =
+        typeof payload.agy_prompt_step_index === "number" &&
+        Number.isSafeInteger(payload.agy_prompt_step_index);
+      const turnKey = hasStepIdx
+        ? `step:${payload.agy_prompt_step_index}:${taskSig}`
+        : `sig:${taskSig}`;
+      const sKey = sessionStateKey(sessionId);
+      if (sKey) {
+        const turnMarkerPath = path.join(
+          CONFIG.vaultPath,
+          ".runtime",
+          "recall-state.d",
+          `${sKey}.agy-turn.json`,
+        );
+        try {
+          assertWriteTargetUnder(turnMarkerPath, CONFIG.vaultPath);
+          const rawMarker = await readFile(turnMarkerPath, "utf8");
+          const parsedMarker = JSON.parse(rawMarker) as { turn_key?: unknown };
+          if (parsedMarker?.turn_key === turnKey) {
+            emit(geminiWire.noop());
+            return;
+          }
+        } catch {
+          // Marker absent or unreadable.
+        }
+        try {
+          assertWriteTargetUnder(turnMarkerPath, CONFIG.vaultPath);
+          await mkdir(path.dirname(turnMarkerPath), { recursive: true });
+          await writeFile(
+            turnMarkerPath,
+            JSON.stringify({ turn_key: turnKey, ts: new Date().toISOString() }),
+            { encoding: "utf8", mode: 0o600 },
+          );
+        } catch {
+          // Best-effort per-session turn marker write.
+        }
+      }
+      if (!hasStepIdx) {
+        const existingState = await readRecallState(CONFIG.vaultPath, {
+          sessionId: sessionId || undefined,
+          guardV2: true,
+        }).catch(() => null);
+        if (existingState && existingState.task_signature === taskSig) {
+          emit(geminiWire.noop());
+          return;
+        }
       }
     }
   }

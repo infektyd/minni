@@ -371,3 +371,67 @@ test(
     );
   },
 );
+
+test(
+  "B5: fitEnvelope scales floors proportionally under realistic SessionStart budgets (charLimit: 10_000, tokenLimit: 2500) so over_budget is undefined and totalChars <= 10_000",
+  () => {
+    const heavyPayloads = {
+      contract: "MEMORY CONTRACT: ".repeat(120),
+      agent_id: "claude-code",
+      vault_path: "/tmp/vault",
+      layer1_shelf: {
+        inline_trim: false,
+        entries: Array.from({ length: 4 }, (_, i) => ({
+          name: `shelf-${i}.md`,
+          content: `Layer 1 shelf entry ${i}: ` + "durable guidance line ".repeat(60),
+        })),
+      },
+      recent_learnings: {
+        ok: true,
+        context: [
+          "## Learnings (claude-code)",
+          "  - [correction] " + "durable correction detail ".repeat(80),
+          "  - [scar] " + "durable scar detail ".repeat(80),
+          "  - [decision] " + "durable decision detail ".repeat(80),
+        ].join("\n"),
+      },
+      recall: {
+        ok: true,
+        results: Array.from({ length: 4 }, (_, i) => ({
+          title: `Heavy Recall ${i}`,
+          wikilink: `[[wiki/decisions/heavy-${i}]]`,
+          score: 0.95 - i * 0.02,
+          text: `Heavy recall body ${i}: ` + "important recall context ".repeat(90),
+        })),
+      },
+      audit_tail: Array.from({ length: 5 }, (_, i) => ({ ts: `2026-10-26T00:00:0${i}Z`, event: "SessionStart" })),
+    };
+
+    const fitted = fitEnvelope(heavyPayloads, { charLimit: 10_000, tokenLimit: 2500 });
+    assert.equal(fitted.over_budget, undefined, "realistic SessionStart budget must scale floors rather than set over_budget");
+    const serialized = JSON.stringify(fitted);
+    assert.ok(
+      serialized.length <= 10_000,
+      `expected fitted envelope <= 10,000 chars, got ${serialized.length}`,
+    );
+
+    const withReassertAndThread = {
+      ...heavyPayloads,
+      corrections_reassert: Array.from({ length: 4 }, (_, i) => `[correction ${i}] ` + "must preserve boundary ".repeat(30)),
+      active_thread: {
+        slug: "workstream-b",
+        title: "Workstream B Ground Truth Seam Remediation",
+        status: "in_progress",
+        next_action: "Verify all 5 seams with RED->GREEN gates " + "detail ".repeat(40),
+      },
+    };
+    const fittedTighter = fitEnvelope(withReassertAndThread, { charLimit: 3000, tokenLimit: 750 });
+    assert.equal(
+      fittedTighter.over_budget,
+      undefined,
+      "budgets with effectiveCharLimit >= 2000 and tokenLimit >= 500 must scale floors rather than emit over_budget",
+    );
+    assert.ok(JSON.stringify(fittedTighter).length <= 3000);
+  },
+);
+

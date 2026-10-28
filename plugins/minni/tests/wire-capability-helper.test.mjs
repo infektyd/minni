@@ -32,9 +32,17 @@ test("claude-code declares its inline cap, transcript shape, and PreToolUse cont
   assert.deepEqual(wireCapabilities(wireFor("claude-code")), wireCapabilities(claudeCodeWire));
 });
 
-test("every other wire gets the defaults: no known cap, no PreToolUse context", () => {
-  for (const wire of [codexWire, grokBuildWire, kilocodeWire, geminiWire, cursorWire, unprofiledWire("muse")]) {
-    assert.equal(wire.capabilities, undefined, `${wire.id} is not profiled in S1a`);
+test("codex, grok-build, and gemini declare their transcript shape; unprofiled wires get the defaults", () => {
+  for (const [wire, shape] of [
+    [codexWire, "codex"],
+    [grokBuildWire, "grok-build"],
+    [geminiWire, "gemini"],
+  ]) {
+    assert.deepEqual(wireCapabilities(wire), { ...DEFAULTS, transcriptShape: shape }, wire.id);
+    assert.deepEqual(wireCapabilities(wireFor(wire.id)), wireCapabilities(wire), wire.id);
+  }
+  for (const wire of [kilocodeWire, cursorWire, unprofiledWire("muse")]) {
+    assert.equal(wire.capabilities, undefined, `${wire.id} is not profiled`);
     assert.deepEqual(wireCapabilities(wire), DEFAULTS, wire.id);
   }
 });

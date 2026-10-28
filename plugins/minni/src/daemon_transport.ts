@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { existsSync, readFileSync } from "node:fs";
@@ -5,7 +6,7 @@ import { stat, readdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
-import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
+import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, minniHome, resolveActiveVaultPath, SOCKET_PATH } from "./config.js";
 import {
   daemonAfmToProviderHealth,
   daemonEffectiveAfmProvider,
@@ -508,6 +509,10 @@ export interface RecallMemoryInput {
   cross_agent?: boolean;
   sessionId?: string;
   vaultPath?: string;
+  passive?: boolean;
+  updateAccess?: boolean;
+  socketPath?: string;
+  daemonSocketPath?: string;
   /**
    * TOTAL deadline for the recall RPC. Prompt-time hooks pass their remaining
    * budget so a cold daemon (lazy embedder/cross-encoder/FAISS load) degrades to
@@ -546,9 +551,11 @@ export async function recallMemory(
     : typeof requesterOrInput === "function"
       ? requesterOrInput
       : jsonRpcSocketRequest;
-  const requester: JsonRpcRequester = config?.daemonSocketPath
+  const explicitSocketPath =
+    input.socketPath ?? input.daemonSocketPath ?? config?.daemonSocketPath;
+  const requester: JsonRpcRequester = explicitSocketPath
     ? (_sock, method, params, opts) =>
-        baseRequester(config.daemonSocketPath!, method, params, opts)
+        baseRequester(explicitSocketPath, method, params, opts)
     : baseRequester;
 
   const effectiveVaultPath = input.vaultPath ?? config?.vaultPath;
@@ -568,6 +575,8 @@ export async function recallMemory(
       depth: "snippet",
       timeout_ms: timeoutMs,
       ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
+      ...(input.passive !== undefined ? { passive: input.passive } : {}),
+      ...(input.updateAccess !== undefined ? { update_access: input.updateAccess } : {}),
     },
     requester,
     { timeoutMs },
@@ -598,18 +607,33 @@ export async function recallMemory(
   return res;
 }
 
-export async function learnMemory(input: {
-  content: string;
-  category?: string;
-  agentId?: string;
-  workspaceId?: string;
-}): Promise<JsonResult> {
+export async function learnMemory(
+  input: {
+    content: string;
+    category?: string;
+    agentId?: string;
+    workspaceId?: string;
+    source?: string;
+    origin?: string;
+    socketPath?: string;
+  },
+  requester?: JsonRpcRequester,
+): Promise<JsonResult> {
   const body = {
     content: input.content,
     category: input.category ?? "general",
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
+    ...(input.source ? { source: input.source } : {}),
+    ...(input.origin ? { origin: input.origin } : {}),
   };
+  if (input.socketPath || requester) {
+    const baseReq = requester ?? jsonRpcSocketRequest;
+    const effectiveReq: JsonRpcRequester = input.socketPath
+      ? (_sock, method, params, opts) => baseReq(input.socketPath!, method, params, opts)
+      : baseReq;
+    return jsonRpcSocketRequestWithFallbackRequester("learn", body, effectiveReq);
+  }
   // JSON-RPC only; return the daemon's real result/error (no masking HTTP fallback).
   return jsonRpcSocketRequestWithFallback("learn", body);
 }
@@ -715,8 +739,13 @@ export type JsonRpcRequester = (
 ) => Promise<JsonResult>;
 
 function jsonRpcSocketCandidates(): string[] {
-  const envSock = process.env.MINNI_SOCKET_PATH?.trim();
-  return [envSock || SOCKET_PATH];
+  const envSock =
+    process.env.MINNI_SOCKET_PATH?.trim() || process.env.MINNI_DAEMON_SOCKET?.trim();
+  if (envSock) return [envSock];
+  if (process.env.MINNI_HOME?.trim()) {
+    return [path.join(minniHome(), "run", "minnid.sock")];
+  }
+  return [SOCKET_PATH];
 }
 
 /**
@@ -905,6 +934,204 @@ function xmlAttrEscapeDrill(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+async function resolveSqliteHandleNote(
+  effectiveVaultPath: string,
+  hasExplicitVaultPath: boolean,
+  normalizedHandle: string,
+  sessionEntry?: Awaited<ReturnType<typeof readSessionHandle>>,
+): Promise<{ source: string; title: string; content: string } | null> {
+  const candidateDbPaths = [
+    path.join(path.dirname(effectiveVaultPath), "minni.db"),
+    path.join(effectiveVaultPath, "minni.db"),
+    ...(!hasExplicitVaultPath ? [path.join(minniHome(), "minni.db")] : []),
+  ];
+  const matchesHandle = (seed: string | undefined | null): boolean => {
+    if (!seed || typeof seed !== "string") return false;
+    const s = seed.trim();
+    if (!s) return false;
+    const sha1Hex = createHash("sha1").update(s).digest("hex").slice(0, 8);
+    const sha256Hex = createHash("sha256").update(s).digest("hex").slice(0, 8);
+    return `m:${sha1Hex}` === normalizedHandle || `m:${sha256Hex}` === normalizedHandle;
+  };
+  const mkeyStr = typeof sessionEntry?.mkey === "string" ? sessionEntry.mkey.trim() : "";
+  const learningIdMatch = /^learning:(\d+)$/i.exec(mkeyStr);
+  const docMkeyMatch = /^(?:doc|d):[a-z0-9_-]+:(\d+)$/i.exec(mkeyStr);
+  const targetLearningId = learningIdMatch ? Number(learningIdMatch[1]) : undefined;
+  const targetDocId =
+    sessionEntry?.docId !== undefined
+      ? sessionEntry.docId
+      : docMkeyMatch
+        ? Number(docMkeyMatch[1])
+        : undefined;
+
+  const isRowUnsafeOrInactive = (row: Record<string, unknown>): boolean => {
+    const status = String(row.status ?? row.page_status ?? "active").trim().toLowerCase();
+    if (
+      status === "rejected" ||
+      status === "expired" ||
+      status === "superseded" ||
+      status === "draft" ||
+      status === "complete"
+    ) {
+      return true;
+    }
+    const privacy = String(row.privacy ?? row.privacy_level ?? "safe").trim().toLowerCase();
+    if (privacy === "private" || privacy === "blocked") {
+      return true;
+    }
+    const durability = String(row.durability_of ?? "").trim().toLowerCase();
+    if (durability === "noise") {
+      return true;
+    }
+    return false;
+  };
+  for (const dbPath of candidateDbPaths) {
+    if (!existsSync(dbPath)) continue;
+    try {
+      const sqliteMod = (await import("node:sqlite")) as {
+        DatabaseSync?: new (p: string, opts?: { readOnly?: boolean }) => {
+          prepare(sql: string): { all(...args: unknown[]): Array<Record<string, unknown>> };
+          close(): void;
+        };
+      };
+      if (!sqliteMod.DatabaseSync) continue;
+      const db = new sqliteMod.DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const tables = new Set(
+          db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .all()
+            .map((r) => String(r.name ?? "")),
+        );
+        if (tables.has("learnings")) {
+          const learnCols = new Set(
+            db
+              .prepare("PRAGMA table_info(learnings)")
+              .all()
+              .map((r) => String(r.name ?? "")),
+          );
+          const learnIdCol = learnCols.has("learning_id")
+            ? "learning_id"
+            : learnCols.has("id")
+              ? "id"
+              : "rowid";
+          if (targetLearningId !== undefined) {
+            const byId = db
+              .prepare(`SELECT * FROM learnings WHERE ${learnIdCol} = ? LIMIT 1`)
+              .all(targetLearningId);
+            if (byId.length > 0 && !isRowUnsafeOrInactive(byId[0])) {
+              const row = byId[0];
+              const rowId = String(row.learning_id ?? row.id ?? targetLearningId);
+              const key = String(row.key ?? row.title ?? `learning:${rowId}`);
+              const source = String(row.source ?? row.category ?? `learning:${rowId}`);
+              const content = String(row.content ?? row.value ?? row.body ?? "");
+              return { source, title: key || source, content: content || key };
+            }
+          }
+          const rows = db
+            .prepare(`SELECT * FROM learnings ORDER BY ${learnIdCol} DESC LIMIT 5000`)
+            .all();
+          for (const row of rows) {
+            if (isRowUnsafeOrInactive(row)) continue;
+            const rowId = String(row.learning_id ?? row.id ?? "");
+            const key = String(row.key ?? row.title ?? rowId);
+            const source = String(row.source ?? row.category ?? (key ? `learnings/${key}` : "learnings"));
+            const content = String(row.content ?? row.value ?? row.body ?? "");
+            if (
+              (rowId && matchesHandle(`learning:${rowId}`)) ||
+              matchesHandle(source) ||
+              matchesHandle(key) ||
+              matchesHandle(content) ||
+              matchesHandle(`${key}:${content}`)
+            ) {
+              return {
+                source,
+                title: key || source,
+                content: content || key,
+              };
+            }
+          }
+        }
+        if (tables.has("documents")) {
+          const docCols = new Set(
+            db
+              .prepare("PRAGMA table_info(documents)")
+              .all()
+              .map((r) => String(r.name ?? "")),
+          );
+          const docIdCol = docCols.has("doc_id")
+            ? "doc_id"
+            : docCols.has("id")
+              ? "id"
+              : "rowid";
+          const readDocContent = (row: Record<string, unknown>, docIdVal: string): string => {
+            const inline = String(row.content ?? row.body ?? row.text ?? "");
+            if (inline) return inline;
+            if (tables.has("vault_fts") && docIdVal) {
+              try {
+                const ftsRows = db
+                  .prepare("SELECT content FROM vault_fts WHERE doc_id = ? LIMIT 1")
+                  .all(Number(docIdVal) || docIdVal);
+                if (ftsRows.length > 0 && typeof ftsRows[0].content === "string") {
+                  return ftsRows[0].content;
+                }
+              } catch {
+                // Ignore vault_fts lookup failure.
+              }
+            }
+            return "";
+          };
+          if (targetDocId !== undefined) {
+            const byId = db
+              .prepare(`SELECT * FROM documents WHERE ${docIdCol} = ? LIMIT 1`)
+              .all(targetDocId);
+            if (byId.length > 0 && !isRowUnsafeOrInactive(byId[0])) {
+              const row = byId[0];
+              const rowId = String(row.doc_id ?? row.id ?? targetDocId);
+              const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
+              const title = String(row.title ?? source);
+              const content = readDocContent(row, rowId);
+              return { source, title, content: content || title };
+            }
+          }
+          const rows = db
+            .prepare(`SELECT * FROM documents ORDER BY ${docIdCol} DESC LIMIT 5000`)
+            .all();
+          for (const row of rows) {
+            if (isRowUnsafeOrInactive(row)) continue;
+            const rowId = String(row.doc_id ?? row.id ?? "");
+            const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
+            const title = String(row.title ?? source);
+            const content = readDocContent(row, rowId);
+            if (
+              matchesHandle(source) ||
+              matchesHandle(title) ||
+              (content && matchesHandle(content)) ||
+              (rowId &&
+                (matchesHandle(`document:${rowId}`) ||
+                  matchesHandle(`doc:personal:${rowId}`) ||
+                  matchesHandle(`doc:shared:${rowId}`) ||
+                  matchesHandle(`d:personal:${rowId}`) ||
+                  matchesHandle(`d:shared:${rowId}`)))
+            ) {
+              return {
+                source,
+                title,
+                content: content || title,
+              };
+            }
+          }
+        }
+      } finally {
+        db.close();
+      }
+    } catch {
+      // Ignore unavailable node:sqlite or unreadable DB
+    }
+  }
+  return null;
+}
+
 export async function drillMemory(
   inputOrConfig: DrillMemoryInput | TransportConfigLike,
   requesterOrInput?: JsonRpcRequester | DrillMemoryInput,
@@ -935,7 +1162,12 @@ export async function drillMemory(
         baseRequester(config.daemonSocketPath!, method, params, opts)
     : baseRequester;
 
-  const effectiveVaultPath = input.vaultPath ?? config?.vaultPath ?? DEFAULT_VAULT_PATH;
+  const rawVaultInput = input.vaultPath ?? config?.vaultPath;
+  const isUnconfiguredDefault =
+    !rawVaultInput ||
+    (path.basename(rawVaultInput) === "unknown-vault" && !existsSync(rawVaultInput));
+  const hasExplicitVaultPath = Boolean(rawVaultInput) && !isUnconfiguredDefault;
+  const effectiveVaultPath = resolveActiveVaultPath(rawVaultInput);
 
   const rawRefs: unknown[] =
     Array.isArray(input.references) && input.references.length > 0
@@ -977,6 +1209,58 @@ export async function drillMemory(
         const normalizedHandle = trimmed.toLowerCase();
         const resolved = await resolveSafeVaultHandleNote(effectiveVaultPath, normalizedHandle);
         if (resolved.status === "unresolved") {
+          if (resolved.reason === "missing") {
+            const sessionEntry = await readSessionHandle(effectiveVaultPath, input.sessionId, normalizedHandle);
+            const docMkeyMatch =
+              typeof sessionEntry?.mkey === "string"
+                ? /^(?:doc|d):([a-z0-9_-]+):(\d+)$/i.exec(sessionEntry.mkey.trim())
+                : null;
+            const resolvedDocId =
+              sessionEntry?.docId !== undefined
+                ? sessionEntry.docId
+                : docMkeyMatch
+                  ? Number(docMkeyMatch[2])
+                  : undefined;
+            if (resolvedDocId !== undefined) {
+              const src = (sessionEntry?.scope ?? docMkeyMatch?.[1] ?? "personal").toLowerCase();
+              const entrySource = sessionEntry?.source ?? sessionEntry?.relativePath ?? undefined;
+              daemonReferences.push(
+                entrySource
+                  ? { doc_id: resolvedDocId, src, source: entrySource }
+                  : { doc_id: resolvedDocId, src },
+              );
+              daemonMeta.push({
+                handle: normalizedHandle,
+                doc_id: resolvedDocId,
+                src,
+                ...(entrySource ? { source: entrySource } : {}),
+                source_unverified: false,
+                sessionEntry,
+              });
+              continue;
+            }
+            const sqliteResolved = await resolveSqliteHandleNote(
+              effectiveVaultPath,
+              hasExplicitVaultPath,
+              normalizedHandle,
+              sessionEntry,
+            );
+            if (sqliteResolved) {
+              const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${sqliteResolved.content}\n</EVIDENCE>`;
+              localResults.push({
+                handle: normalizedHandle,
+                status: "resolved",
+                found: true,
+                relativePath: sqliteResolved.source,
+                source: sqliteResolved.source,
+                title: sqliteResolved.title,
+                text: wrapped,
+                content: wrapped,
+                raw_content: sqliteResolved.content,
+              });
+              continue;
+            }
+          }
           localResults.push({
             handle: normalizedHandle,
             status: "unresolved",
@@ -1066,6 +1350,7 @@ export async function drillMemory(
         source: "vault-fallback",
         data: {
           ...first,
+          missing: [],
           results: localResults,
           items: localResults,
         },
@@ -1108,6 +1393,7 @@ export async function drillMemory(
         ok: true,
         data: {
           ...rpcRes.data,
+          missing: Array.isArray(rpcRes.data.missing) ? rpcRes.data.missing : [],
           found: true,
           ...(firstMeta.handle ? { handle: firstMeta.handle } : {}),
           ...(firstMeta.doc_id !== undefined ? { doc_id: firstMeta.doc_id } : {}),
@@ -1119,6 +1405,49 @@ export async function drillMemory(
           items: combinedResults,
         },
       };
+    }
+
+    // If daemon RPC failed and all daemonMeta entries are m:<8hex> handles, try SQLite fallback
+    if (daemonMeta.length > 0 && daemonMeta.every((m) => m.handle?.startsWith("m:"))) {
+      let allSqliteResolved = true;
+      for (const meta of daemonMeta) {
+        const sqlHit = meta.handle
+          ? await resolveSqliteHandleNote(
+              effectiveVaultPath,
+              hasExplicitVaultPath,
+              meta.handle,
+              meta.sessionEntry,
+            )
+          : null;
+        if (!sqlHit || !meta.handle) {
+          allSqliteResolved = false;
+          break;
+        }
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqlHit.source)}">\n${sqlHit.content}\n</EVIDENCE>`;
+        localResults.push({
+          handle: meta.handle,
+          status: "resolved",
+          found: true,
+          relativePath: sqlHit.source,
+          source: sqlHit.source,
+          title: sqlHit.title,
+          text: wrapped,
+          content: wrapped,
+          raw_content: sqlHit.content,
+        });
+      }
+      if (allSqliteResolved && localResults.length > 0) {
+        return {
+          ok: true,
+          source: "vault-fallback",
+          data: {
+            ...localResults[0],
+            missing: [],
+            results: localResults,
+            items: localResults,
+          },
+        };
+      }
     }
 
     const firstMeta = daemonMeta[0] ?? {};

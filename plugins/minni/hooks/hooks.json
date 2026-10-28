@@ -96,7 +96,7 @@
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "^(?:Bash|run_terminal_command)$",
+        "matcher": "^(?:Bash|run_terminal_command|Agent|Task|update_plan|mcp__.*|.*)$",
         "hooks": [
           {
             "type": "command",

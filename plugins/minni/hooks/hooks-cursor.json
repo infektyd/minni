@@ -5,6 +5,6 @@
     "beforeSubmitPrompt": [{ "command": "./hooks/minni-cursor.sh beforeSubmitPrompt", "timeout": 30 }],
     "preCompact": [{ "command": "./hooks/minni-cursor.sh preCompact", "timeout": 20 }],
     "stop": [{ "command": "./hooks/minni-cursor.sh stop", "timeout": 20 }],
-    "preToolUse": [{ "command": "./hooks/minni-cursor.sh preToolUse", "matcher": "Read|Grep|Glob|Shell", "timeout": 10 }]
+    "preToolUse": [{ "command": "./hooks/minni-cursor.sh preToolUse", "matcher": "Read|Grep|Glob|Shell|Agent|Task", "timeout": 10 }]
   }
 }

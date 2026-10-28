@@ -113,7 +113,14 @@ def test_recall_replay_cli_entrypoint_writes_s5_and_miner_reports(tmp_path: Path
     env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}"
 
     proc = subprocess.run(
-        [sys.executable, "-m", "scripts.recall_replay", "--private-root", str(private_root)],
+        [
+            sys.executable,
+            "-m",
+            "scripts.recall_replay",
+            "--private-root",
+            str(private_root),
+            "--allow-synthetic-fixture",
+        ],
         cwd=str(repo_root),
         env=env,
         capture_output=True,
@@ -128,3 +135,153 @@ def test_recall_replay_cli_entrypoint_writes_s5_and_miner_reports(tmp_path: Path
     s5_data = json.loads(s5_report.read_text(encoding="utf-8"))
     assert s5_data["pure_replay"]["target"]["all_targets_passed"] is True
     assert "phase1b_miner" in s5_data
+
+
+def test_b1_and_b4_cli_real_corpus_and_mine_failure_lessons_script(tmp_path: Path) -> None:
+    """CLI rejects empty corpus when --allow-synthetic-fixture is omitted, computes real metrics from corpus, and mine_failure_lessons seeds .handles.json."""
+    assert len(DEFAULT_APPROVED_LESSON_RULES) >= 13
+    rule_ids = {r["rule_id"] for r in DEFAULT_APPROVED_LESSON_RULES}
+    for expected in (
+        "unchecked_sendable_forbidden",
+        "try_optional_swallows_errors",
+        "task_detached_forbidden",
+        "nslock_in_async_context",
+    ):
+        assert expected in rule_ids
+
+    private_root = tmp_path / "_private" / "recall-to-use"
+    (private_root / "reports").mkdir(parents=True)
+    empty_home = tmp_path / "empty_minni_home"
+    empty_home.mkdir()
+    repo_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["MINNI_PRIVATE_ROOT"] = str(private_root)
+    env["MINNI_HOME"] = str(empty_home)
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}"
+
+    proc_fail = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.recall_replay",
+            "--private-root",
+            str(private_root),
+            "--minni-home",
+            str(empty_home),
+        ],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_fail.returncode != 0
+    assert "No replay corpus found" in (proc_fail.stderr + proc_fail.stdout)
+
+    # Populate a real corpus JSON file and run CLI
+    corpus_file = tmp_path / "real_corpus.json"
+    corpus_file.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "path": "wiki/decisions/d1.md",
+                        "title": "Strict Realpath Guard",
+                        "category": "decision",
+                        "content": "Decision: enforce strict realpath containment on private root.",
+                    }
+                ]
+                + [
+                    {
+                        "path": f"wiki/notes/filler-{i}.md",
+                        "title": f"Filler {i}",
+                        "category": "general",
+                        "content": f"ordinary filler content {i}",
+                    }
+                    for i in range(30)
+                ],
+                "turns": [
+                    {"prompt": "enforce strict realpath containment on private root", "kind": "human"},
+                    {"prompt": "short casual query", "kind": "human"},
+                    {"prompt": "another casual query", "kind": "human"},
+                ],
+                "surfacings": [
+                    {"sid": "s1", "visible": True, "outcome": "applied", "rank": 1, "durability": "durable"},
+                    {"sid": "s2", "visible": True, "outcome": "ignored", "rank": 2, "durability": "durable"},
+                ],
+                "boot_tokens": [380, 400, 410],
+                "events": [
+                    {
+                        "session_id": "sess-real-1",
+                        "prompt_id": "pid-real-1",
+                        "prompt": "Check strict realpath containment on private root",
+                        "note_rel_path": "wiki/decisions/d1.md",
+                        "note_title": "Strict Realpath Guard",
+                        "note_body": "Decision: enforce strict realpath containment on private root.",
+                        "assistant_reply": "We will enforce strict realpath containment on private root per [[wiki/decisions/d1.md]].",
+                    },
+                    {
+                        "session_id": "sess-real-2",
+                        "prompt_id": "pid-real-2",
+                        "prompt": "Another turn without using the note",
+                        "note_rel_path": "wiki/decisions/d1.md",
+                        "note_title": "Strict Realpath Guard",
+                        "note_body": "Decision: enforce strict realpath containment on private root.",
+                        "reply_text": "Unrelated acknowledgement.",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    proc_ok = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.recall_replay",
+            "--private-root",
+            str(private_root),
+            "--corpus",
+            str(corpus_file),
+        ],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_ok.returncode == 0, f"stderr={proc_ok.stderr}"
+    summary = json.loads(proc_ok.stdout.strip())
+    assert summary["recall_to_use_rate"] == 0.5
+    assert "p_at_3" in summary
+    assert summary["p50_boot_tokens"] == 400
+    s5_written = json.loads((private_root / "reports" / "replay-final-s5.json").read_text(encoding="utf-8"))
+    assert s5_written["handler_replay"]["turns_count"] == 2
+    assert s5_written["handler_replay"]["judged_count"] == 2
+
+    # Test scripts/mine_failure_lessons.py CLI seeding .handles.json
+    vault_dir = empty_home / "claudecode-vault"
+    vault_dir.mkdir(parents=True)
+    proc_mine = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "mine_failure_lessons.py"),
+            "--vault-path",
+            str(vault_dir),
+            "--private-root",
+            str(private_root),
+        ],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_mine.returncode == 0, f"stderr={proc_mine.stderr}"
+    handles_json = json.loads((vault_dir / ".handles.json").read_text(encoding="utf-8"))
+    handles_map = handles_json.get("handles", handles_json)
+    assert "m:7a11e501" in handles_map
+    assert "m:7a11e510" in handles_map
+    assert "m:7a11e513" in handles_map
+

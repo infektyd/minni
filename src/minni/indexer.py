@@ -39,7 +39,150 @@ logger = logging.getLogger("sovereign.indexer")
 # It is therefore DELIBERATELY unembedded — counting it as a missing vector
 # manufactures a permanent gap no backfill can ever close, which is the same
 # phantom-signal class this set already exists to avoid for draft/expired.
-UNEMBEDDED_STATUSES = frozenset({"draft", "expired", "complete"})
+UNEMBEDDED_STATUSES: frozenset[str] = frozenset(
+    {
+        "complete",
+        "completed",
+        "archived",
+        "obsolete",
+        "deprecated",
+        "rejected",
+        "superseded",
+        "candidate",
+        "expired",
+        "draft",
+    }
+)
+
+EXCLUDED_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "sessions",
+        "tasks",
+        "handoffs",
+        "inbox",
+        "archive",
+        "quarantine",
+        "logs",
+        ".runtime",
+        ".obsidian",
+        "raw",
+        "journal",
+        "distill",
+        "mailbox",
+    }
+)
+
+_SESSION_DATED_FILE_RE = re.compile(r"^\d{8}-")
+_LOG_ROTATED_FILENAME_RE = re.compile(r"^log(?:\.\d+)?\.md$", re.IGNORECASE)
+
+
+def extract_explicit_frontmatter_status(content: str) -> Optional[str]:
+    """Return the explicitly declared YAML frontmatter `status` (lowercased), or None if absent."""
+    match = VaultIndexer.FRONTMATTER_BLOCK_RE.match(content or "")
+    if not match:
+        return None
+    try:
+        data = yaml.safe_load(match.group(1))
+        if isinstance(data, dict) and data.get("status") is not None:
+            val = str(data.get("status")).strip().strip("\"'").lower()
+            return val or None
+    except Exception:
+        pass
+    return None
+
+
+def explicit_frontmatter_status(content: Optional[str]) -> Optional[str]:
+    return extract_explicit_frontmatter_status(content or "")
+
+
+def is_curated_indexable_path(
+    rel_path: str | Path,
+    content: Optional[str] = None,
+) -> bool:
+    explicit_st = extract_explicit_frontmatter_status(content or "") if content else None
+    excluded, _ = is_vault_path_excluded(
+        rel_path,
+        None,
+        explicit_status=explicit_st,
+        allow_artifact_retraction=(explicit_st == "complete"),
+    )
+    if excluded:
+        return False
+    if content is not None:
+        match = VaultIndexer.FRONTMATTER_BLOCK_RE.match(content)
+        if match:
+            try:
+                data = yaml.safe_load(match.group(1))
+                if isinstance(data, dict):
+                    fm_type = str(data.get("type") or "").strip().lower()
+                    fm_sec = str(data.get("section") or "").strip().lower()
+                    if fm_type in {"session", "task", "handoff"} or fm_sec in EXCLUDED_PATH_SEGMENTS:
+                        return False
+            except Exception:
+                pass
+    return True
+
+
+def is_vault_path_excluded(
+    file_path: str | Path,
+    root_dir: str | Path | None = None,
+    *,
+    explicit_status: Optional[str] = None,
+    is_rpc: bool = False,
+    allow_artifact_retraction: bool = False,
+) -> tuple[bool, str]:
+    """Return (excluded, reason) for a vault/wiki file path under the Rev 6 fail-closed allowlist."""
+    p = Path(str(file_path).replace("\\", "/"))
+    rel_parts: tuple[str, ...]
+    if root_dir is not None:
+        try:
+            rel_parts = p.resolve().relative_to(Path(root_dir).resolve()).parts
+        except Exception:
+            try:
+                rel_parts = p.relative_to(Path(root_dir)).parts
+            except Exception:
+                rel_parts = p.parts
+    else:
+        parts_lower = [seg.lower() for seg in p.parts]
+        if "wiki" in parts_lower:
+            idx = parts_lower.index("wiki")
+            rel_parts = p.parts[idx:]
+        else:
+            rel_parts = p.parts[-3:] if len(p.parts) >= 3 else p.parts
+
+    if not rel_parts:
+        return False, ""
+
+    fname = rel_parts[-1].lower()
+    dir_segments = [seg.lower() for seg in rel_parts[:-1]]
+
+    if (
+        fname == "index.md"
+        or fname.endswith(".log.md")
+        or bool(_LOG_ROTATED_FILENAME_RE.match(fname))
+    ):
+        return True, "excluded_log_md"
+    if "-compact-" in fname and fname.endswith(".md"):
+        return True, "excluded_compact_md"
+
+    for seg in dir_segments:
+        if seg in EXCLUDED_PATH_SEGMENTS:
+            return True, f"excluded_dir:{seg}"
+
+    if _SESSION_DATED_FILE_RE.match(fname) and "sessions" in dir_segments:
+        return True, "excluded_session_file"
+
+    if "artifacts" in dir_segments:
+        if is_rpc:
+            return True, "excluded_dir:artifacts"
+        st = (explicit_status or "").strip().lower()
+        if st == "accepted":
+            return False, ""
+        if allow_artifact_retraction and st in (UNEMBEDDED_STATUSES - {"candidate"}):
+            return False, ""
+        return True, "excluded_artifact_not_accepted"
+
+    return False, ""
 
 
 class VaultIndexer:
@@ -49,9 +192,12 @@ class VaultIndexer:
         self,
         db: MinniDB,
         config: MinniConfig = DEFAULT_CONFIG,
+        *,
+        embed: bool = True,
     ):
         self.db = db
         self.config = config
+        self.embed = embed
         self.chunker = MarkdownChunker(config)
         self.faiss_index = FAISSIndex(config)
         self._model = None
@@ -124,7 +270,19 @@ class VaultIndexer:
         page_type = _str(data.get("type") or data.get("page_type"), None) or None
 
         # Clamp
-        valid_statuses = {"draft", "candidate", "accepted", "superseded", "rejected", "expired"}
+        valid_statuses = {
+            "draft",
+            "candidate",
+            "accepted",
+            "superseded",
+            "rejected",
+            "expired",
+            "complete",
+            "completed",
+            "archived",
+            "obsolete",
+            "deprecated",
+        }
         valid_privacies = {"safe", "local-only", "private", "blocked"}
         if status not in valid_statuses:
             status = "candidate"
@@ -367,6 +525,26 @@ class VaultIndexer:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
 
+                explicit_status = extract_explicit_frontmatter_status(content)
+                path_excluded, _ = is_vault_path_excluded(
+                    path,
+                    root_dir=vault_root,
+                    explicit_status=explicit_status,
+                    is_rpc=False,
+                    allow_artifact_retraction=bool(row),
+                )
+                if path_excluded:
+                    if row:
+                        doc_id = row["doc_id"]
+                        with self.db.transaction() as c:
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                        stats["deleted"] += 1
+                    else:
+                        stats["skipped"] += 1
+                    continue
+
                 meta = self._extract_frontmatter(content)
                 now = time.time()
 
@@ -383,22 +561,39 @@ class VaultIndexer:
                         stats["skipped"] += 1
                     continue
 
+                retract_statuses = {
+                    "rejected",
+                    "superseded",
+                    "complete",
+                    "completed",
+                    "archived",
+                    "obsolete",
+                    "deprecated",
+                }
+                if explicit_status in retract_statuses or (
+                    explicit_status == "candidate" and row is None
+                ):
+                    if row:
+                        doc_id = row["doc_id"]
+                        with self.db.transaction() as c:
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            c.execute(
+                                "UPDATE documents SET page_status=?, last_modified=?, indexed_at=? WHERE doc_id=?",
+                                (explicit_status, mtime, now, doc_id),
+                            )
+                    stats["skipped"] += 1
+                    continue
+
                 # Markdown-aware chunk embeddings, computed BEFORE the write
                 # transaction opens so model.encode never runs under the lock.
-                #
-                # Unendorsed pages get a document row and an FTS row but NO
-                # embedding. _semantic_search asks FAISS for a fixed limit*5
-                # window and retrieve() drops draft/expired only AFTER that
-                # window is filled, so embedding a vault that is ~95%
-                # unendorsed drafts lets them evict accepted pages from the
-                # candidate set and silently shrink recall. They stay lexically
-                # findable, and endorsing one rewrites the page — the next
-                # sweep sees the new mtime and embeds it.
+                page_status = meta.get("page_status", "candidate")
                 unendorsed = (
-                    meta.get("page_status", "candidate") in UNEMBEDDED_STATUSES
+                    page_status in (UNEMBEDDED_STATUSES - {"candidate"})
+                    or explicit_status == "candidate"
                 )
                 prepared = []
-                if self.model and not unendorsed:
+                if self.embed and self.model and not unendorsed:
                     from minni.models import get_embedder_lock
 
                     for chunk in self.chunker.chunk_document(content):

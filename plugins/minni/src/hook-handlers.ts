@@ -82,6 +82,7 @@ import {
   clearRecallState,
   clearSessionSurfacedOnReset,
   commitSurfacedPointer,
+  disarmRecallStateOnConsult,
   extractStrongRecall,
   markRecallConsumed,
   pruneOldClaimFiles,
@@ -313,11 +314,88 @@ interface SubagentPendingEntry {
   subagent_type: string;
   prompt_hash: string;
   prompt: string;
+  targetPaths?: string[];
   ts: string;
 }
 
+function extractSubagentTargetPaths(toolInput: Record<string, unknown>, prompt: string): string[] {
+  const seen = new Set<string>();
+  const addPath = (raw: unknown): void => {
+    if (typeof raw !== "string") return;
+    const cleaned = raw.trim().replace(/^['"`(]+|[)'"`,.;:]+$/g, "");
+    if (!cleaned || cleaned.includes("\0")) return;
+    seen.add(cleaned);
+  };
+  for (const field of [toolInput.target_paths, toolInput.targetPaths, toolInput.paths, toolInput.files]) {
+    if (Array.isArray(field)) {
+      for (const item of field) addPath(item);
+    }
+  }
+  const combinedText = [
+    prompt,
+    asString(toolInput.prompt),
+    asString(toolInput.description),
+    asString(toolInput.task),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const pathRegex = /[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,10}/g;
+  for (const match of combinedText.matchAll(pathRegex)) {
+    const token = match[0];
+    const lastDot = token.lastIndexOf(".");
+    const stem = lastDot > 0 ? token.slice(0, lastDot) : "";
+    const ext = lastDot > 0 ? token.slice(lastDot + 1) : "";
+    if (/[A-Za-z]/.test(stem) && /[A-Za-z]/.test(ext)) {
+      addPath(token);
+    }
+  }
+  return [...seen].slice(0, 16);
+}
+
+function subagentPendingFallbackDir(vaultPath: string, create = false): string | null {
+  const segments = [".runtime", "subagent-pending.d"];
+  let current = vaultPath;
+  for (const segment of segments) {
+    const next = path.join(current, segment);
+    assertWriteTargetUnder(next, vaultPath);
+    let st: fs.Stats | undefined;
+    try {
+      st = fs.lstatSync(next);
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code !== "ENOENT") throw error;
+    }
+    if (!st) {
+      if (!create) return null;
+      try {
+        fs.mkdirSync(next, { mode: 0o700 });
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code !== "EEXIST") throw error;
+      }
+      st = fs.lstatSync(next);
+    }
+    if (st.isSymbolicLink()) {
+      assertWriteTargetUnder(fs.realpathSync(next), vaultPath);
+      st = fs.statSync(next);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`subagent pending path component is not a directory: ${next}`);
+    }
+    current = next;
+  }
+  return current;
+}
+
+function rawSessionIdFromPayload(payload: Record<string, unknown>): string {
+  return (
+    asString(payload.session_id) ||
+    asString(payload.sessionId) ||
+    asString(payload.conversationId) ||
+    asString(payload.conversation_id)
+  );
+}
+
 function subagentSessionKey(payload: Record<string, unknown>): string {
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const sessionId = rawSessionIdFromPayload(payload);
   if (sessionId) {
     return sessionStateKey(sessionId) ?? createHash("sha256").update(sessionId, "utf8").digest("hex").slice(0, 16);
   }
@@ -394,11 +472,21 @@ function readSubagentPendingList(pendingFile: string, vaultPath: string, nowMs: 
       const subagentType = typeof rec.subagent_type === "string" ? rec.subagent_type : "";
       const promptHash = typeof rec.prompt_hash === "string" ? rec.prompt_hash : "";
       const prompt = typeof rec.prompt === "string" ? rec.prompt : "";
+      const targetPaths = Array.isArray(rec.targetPaths)
+        ? rec.targetPaths.filter((x): x is string => typeof x === "string")
+        : undefined;
       const ts = typeof rec.ts === "string" ? rec.ts : "";
       if (!toolUseId || !ts) continue;
       const parsedMs = Date.parse(ts);
       if (!Number.isFinite(parsedMs) || nowMs - parsedMs > SUBAGENT_PENDING_TTL_MS) continue;
-      out.push({ tool_use_id: toolUseId, subagent_type: subagentType, prompt_hash: promptHash, prompt, ts });
+      out.push({
+        tool_use_id: toolUseId,
+        subagent_type: subagentType,
+        prompt_hash: promptHash,
+        prompt,
+        ...(targetPaths && targetPaths.length > 0 ? { targetPaths } : {}),
+        ts,
+      });
     }
     return out;
   } catch {
@@ -427,6 +515,7 @@ function stashSubagentPending(
     ).trim();
     if (!rawPrompt) return;
     const prompt = rawPrompt.slice(0, 2000);
+    const targetPaths = extractSubagentTargetPaths(toolInput, prompt);
     const subagentType =
       asString(toolInput.subagent_type) ||
       asString(toolInput.subagentType) ||
@@ -439,7 +528,9 @@ function stashSubagentPending(
       asString(payload.toolUseId) ||
       randomUUID();
     const safeToolUseId = rawToolUseId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) || randomUUID();
+    const rawSessionId = (asString(payload.session_id) || asString(payload.sessionId)).trim();
     const sessionKey = subagentSessionKey(payload);
+    const safeKey = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(sessionKey) ? sessionKey : "unlabeled";
     const dir = subagentSessionDir(vaultPath, sessionKey, true);
     if (!dir) return;
     const pendingFile = path.join(dir, "subagent-pending.json");
@@ -453,16 +544,55 @@ function stashSubagentPending(
       subagent_type: subagentType.slice(0, 128),
       prompt_hash: createHash("sha1").update(prompt, "utf8").digest("hex").slice(0, 12),
       prompt,
+      targetPaths,
       ts: new Date(nowMs).toISOString(),
     });
     const bounded = existing.slice(-32);
+    const serialized = `${JSON.stringify({ v: 1, entries: bounded })}\n`;
     const tmpFile = `${pendingFile}.${process.pid}.${randomUUID()}.tmp`;
     assertWriteTargetUnder(tmpFile, vaultPath);
-    fs.writeFileSync(tmpFile, `${JSON.stringify({ v: 1, entries: bounded })}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    fs.renameSync(tmpFile, pendingFile);
+    try {
+      fs.writeFileSync(tmpFile, serialized, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      fs.renameSync(tmpFile, pendingFile);
+    } finally {
+      try {
+        fs.rmSync(tmpFile, { force: true });
+      } catch {
+        // Ignore cleanup failure.
+      }
+    }
+
+    const fallbackDir = subagentPendingFallbackDir(vaultPath, true);
+    if (fallbackDir) {
+      const fallbackFile = path.join(fallbackDir, `${safeKey}.json`);
+      assertWriteTargetUnder(fallbackFile, vaultPath);
+      const fallbackTmp = `${fallbackFile}.${process.pid}.${randomUUID()}.tmp`;
+      assertWriteTargetUnder(fallbackTmp, vaultPath);
+      const fallbackSerialized = `${JSON.stringify({
+        v: 1,
+        session_id: rawSessionId || safeKey,
+        targetPaths,
+        entries: bounded,
+      })}\n`;
+      try {
+        fs.writeFileSync(fallbackTmp, fallbackSerialized, {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx",
+        });
+        fs.renameSync(fallbackTmp, fallbackFile);
+      } finally {
+        try {
+          fs.rmSync(fallbackTmp, { force: true });
+        } catch {
+          // Ignore cleanup failure.
+        }
+      }
+    }
   } catch {
     // Best-effort stash: never blocks Agent/Task PreToolUse.
   }
@@ -474,12 +604,25 @@ function claimSubagentPending(
 ): SubagentPendingEntry | null {
   try {
     const sessionKey = subagentSessionKey(payload);
-    const dir = subagentSessionDir(vaultPath, sessionKey, false);
-    if (!dir) return null;
-    const pendingFile = path.join(dir, "subagent-pending.json");
+    const safeKey = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(sessionKey) ? sessionKey : "unlabeled";
     const nowMs = Date.now();
-    const entries = readSubagentPendingList(pendingFile, vaultPath, nowMs);
-    if (entries.length === 0) return null;
+    let dir = subagentSessionDir(vaultPath, sessionKey, false);
+    let entries: SubagentPendingEntry[] = [];
+    if (dir) {
+      const pendingFile = path.join(dir, "subagent-pending.json");
+      entries = readSubagentPendingList(pendingFile, vaultPath, nowMs);
+    }
+    if (entries.length === 0) {
+      const fallbackDir = subagentPendingFallbackDir(vaultPath, false);
+      if (fallbackDir) {
+        const fallbackFile = path.join(fallbackDir, `${safeKey}.json`);
+        entries = readSubagentPendingList(fallbackFile, vaultPath, nowMs);
+        if (entries.length > 0 && !dir) {
+          dir = subagentSessionDir(vaultPath, sessionKey, true) ?? fallbackDir;
+        }
+      }
+    }
+    if (!dir || entries.length === 0) return null;
     try {
       for (const name of fs.readdirSync(dir)) {
         if (!name.startsWith("subagent-claim-") || !name.endsWith(".claim")) continue;
@@ -831,8 +974,13 @@ export async function handleStopCore(
   return core.output;
 }
 
-/** The transcript shape the use detector parses (use-detector.ts reads Claude Code JSONL). */
-const DETECTOR_TRANSCRIPT_SHAPE = "claude-code";
+/** Transcript shapes the use detector parses (use-detector.ts). */
+const DETECTOR_TRANSCRIPT_SHAPES: ReadonlySet<string> = new Set([
+  "claude-code",
+  "gemini",
+  "codex",
+  "grok-build",
+]);
 
 interface StopCoreResult {
   output: HookOutput;
@@ -846,7 +994,7 @@ interface StopCoreResult {
 
 /**
  * S1b (§8.2): one decision for both ledger reads Stop makes, the receipt's use
- * counts and the detector run. Phase 1 measures only wires whose transcript the
+ * counts and the detector run. Measures wires whose transcript shape the
  * detector parses (`transcriptShape`, hook-platform.ts), and only a Stop that
  * carries a real session id; anything else is unmeasured, so neither runs and
  * its Stop loads no ledger module, as it does with the ledger off (env, or
@@ -864,10 +1012,10 @@ async function stopCore(
   // A Stop with no real session id (the receipt's synthetic "session"
   // fallback) is unmeasured too: its rows would be keyed under a transcript
   // hash no capture used, and the receipt reads no counts on that path.
-  const hasSessionId = Boolean(asString(payload.session_id) || asString(payload.sessionId));
+  const hasSessionId = Boolean(rawSessionIdFromPayload(payload));
   const measured =
     hasSessionId &&
-    wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE &&
+    DETECTOR_TRANSCRIPT_SHAPES.has(wireCapabilities(wire).transcriptShape) &&
     ledgerMayBeOn(config.vaultPath);
   const output = await stopCoreOutput(config, payload, prepareOutcomeFn, measured);
   return { output, measured };
@@ -935,7 +1083,8 @@ function scheduleStopUseDetector(config: StopCoreConfig, payload: Record<string,
   const wireId = (config.wire ?? wireFor(config.agentId)).id;
   const principal = config.agentId;
   const transcriptPath = asString(payload.transcript_path) || asString(payload.transcriptPath) || null;
-  const lastAssistantMessage = asString(payload.last_assistant_message) || null;
+  const lastAssistantMessage =
+    asString(payload.last_assistant_message) || asString(payload.lastAssistantMessage) || null;
   deferUntilDelivered(
     async () => {
       const problem = await runStopUseDetector({ vaultPath, wireId, principal, payload, transcriptPath, lastAssistantMessage });
@@ -961,8 +1110,14 @@ function scheduleSubagentStopUseDetector(config: StopCoreConfig, payload: Record
     asString(payload.transcript_path) ||
     asString(payload.transcriptPath) ||
     null;
-  const lastAssistantMessage = asString(payload.last_assistant_message) || null;
-  const subagentType = asString(payload.agent_type) || asString(payload.subagent_type) || undefined;
+  const lastAssistantMessage =
+    asString(payload.last_assistant_message) || asString(payload.lastAssistantMessage) || null;
+  const subagentType =
+    asString(payload.agent_type) ||
+    asString(payload.agentType) ||
+    asString(payload.subagent_type) ||
+    asString(payload.subagentType) ||
+    undefined;
   const payloadForKey =
     payload.transcript_path || !agentTranscriptPath
       ? payload
@@ -1069,7 +1224,7 @@ async function stopCoreOutput(
   // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime that
   // never labeled any turn with a real session_id still gets a best-effort
   // receipt merged onto the synthetic "session" bucket rather than no receipt.
-  const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const rawSessionId = rawSessionIdFromPayload(payload);
   const sessionId = rawSessionId || "session";
   // On the synthetic fallback, turns that DID stamp a real session_id must
   // still count inside this window — otherwise the receipt reports zeros
@@ -1335,6 +1490,84 @@ function lifecycleFieldsFor(
   return { fields };
 }
 
+const CONVERSATIONAL_PHRASES_RE =
+  /\b(?:what\s+do\s+you\s+(?:suggest|think)|how\s+does\s+that\s+sound|can\s+you\s+explain(?:\s+that)?|could\s+you\s+explain(?:\s+that)?|in\s+plain\s+english|go\s+ahead(?:\s+and\s+do\s+(?:that|it))?|do\s+(?:that|it)|ship\s+it|looks\s+good|sounds\s+good|thank\s+you)\b/gi;
+
+const CONVERSATIONAL_WORDS: ReadonlySet<string> = new Set([
+  "ok",
+  "okay",
+  "k",
+  "yes",
+  "yep",
+  "yeah",
+  "sure",
+  "thanks",
+  "thankx",
+  "thx",
+  "lgtm",
+  "please",
+  "continue",
+  "proceed",
+  "next",
+  "why",
+  "how",
+  "really",
+]);
+
+const CONVERSATIONAL_SLASH_PAIR_RE =
+  /^(?:yes\/no|no\/yes|and\/or|either\/or|true\/false|false\/true|on\/off|off\/on|n\/a|w\/o|c\/o|up\/down|in\/out|pass\/fail|\d+\/\d+)$/i;
+
+const SLASH_PATH_CANDIDATE_RE = /(?:^|[\s"'`(])([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_./-]+)/g;
+
+function hasFilePathAnchor(text: string): boolean {
+  for (const match of text.matchAll(SLASH_PATH_CANDIDATE_RE)) {
+    const candidate = match[1].replace(/[.,;:!?)]+$/, "");
+    if (candidate && !CONVERSATIONAL_SLASH_PAIR_RE.test(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const TECHNICAL_ANCHOR_PATTERNS: ReadonlyArray<RegExp> = [
+  /\b[a-zA-Z0-9_-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|json|jsonl|md|sh|sql|toml|yaml|yml|rs|swift|go|lock)\b/i,
+  /\b[a-zA-Z0-9]+_[a-zA-Z0-9_]+\b/,
+  /\b[a-z]+[A-Z][a-zA-Z0-9]*\b/,
+  /\b[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9]*\b/,
+  /`[^`\n]+`/,
+  /\b(?:minni|minnid|praxis|workbench|jev|faiss|sqlite|fts5|afm|launchd|worktree)\b/i,
+  /(?:^|[\s([{"'])#\d+\b/,
+  /\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b/i,
+  /(?:^|\s)--[a-zA-Z0-9][a-zA-Z0-9-]*/,
+];
+
+export function isSubstantiveRecallPrompt(promptText: string): boolean {
+  if (typeof promptText !== "string") return false;
+  const raw = promptText.trim();
+  if (!raw) return false;
+
+  if (hasFilePathAnchor(raw) || TECHNICAL_ANCHOR_PATTERNS.some((re) => re.test(raw))) {
+    return true;
+  }
+
+  const withoutPhrases = raw.replace(CONVERSATIONAL_PHRASES_RE, " ");
+  const rawTokens = withoutPhrases
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const remainingTokens = rawTokens.filter((tok) => !CONVERSATIONAL_WORDS.has(tok));
+  const nonWsChars = remainingTokens.join("").length;
+  if (nonWsChars < 15) {
+    return false;
+  }
+
+  const substantiveWords = remainingTokens.filter((tok) => tok.length >= 3);
+  return substantiveWords.length >= 3;
+}
+
 export function createHookHandlers(
   config: AgentHookConfig,
   deps: AgentHookDeps = {},
@@ -1385,7 +1618,7 @@ export function createHookHandlers(
     // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
     // conflate into one synthetic thread_id. sessionId keeps the historical
     // defaulted value for envelope identity / inbox filenames / markers.
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const sessionId = rawSessionId || "session";
     const workspaceId = workspaceFor(payload);
     // BOOT BUDGET: platforms kill SessionStart and DISCARD its output — gemini
@@ -1530,6 +1763,8 @@ export function createHookHandlers(
           // lets the hook PROCESS exit. Racing a promise alone cannot do that.
           timeoutMs: remainingMs(),
           ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+          passive: true,
+          updateAccess: false,
         }),
         remainingMs(),
         rpcTimedOut,
@@ -1999,9 +2234,8 @@ export function createHookHandlers(
         ? (bodyForEnvelope.recent_learnings as Record<string, unknown>)
         : undefined;
     const learningsTrimmed =
-      trimmedMap !== undefined &&
-      ("recent_learnings" in trimmedMap ||
-        (bootIdentity === "agent-context" && "identity_body" in trimmedMap));
+      bootIdentity === "agent-context" ||
+      (trimmedMap !== undefined && "recent_learnings" in trimmedMap);
     const survivingLearningsText =
       bootIdentity === "agent-context"
         ? nativeLayer1
@@ -2025,14 +2259,26 @@ export function createHookHandlers(
                     recent_learnings: (
                       (identityRead.data as Record<string, unknown>)
                         .recent_learnings as unknown[]
-                    ).filter((entry) => {
-                      if (!entry || typeof entry !== "object") return false;
-                      const line = (entry as Record<string, unknown>).line;
-                      return (
-                        typeof line === "string" &&
-                        line.length > 0 &&
-                        survivingLearningsText.includes(line)
-                      );
+                    ).flatMap((entry) => {
+                      if (!entry || typeof entry !== "object") return [];
+                      const rec = entry as Record<string, unknown>;
+                      const line = rec.line;
+                      if (typeof line !== "string" || line.length === 0) return [];
+                      if (survivingLearningsText.includes(line)) {
+                        return [entry];
+                      }
+                      // Also match bullets clipped by fitEnvelope Step 9a (`${prefix}...`)
+                      for (const survLine of survivingLearningsText.split("\n")) {
+                        const trimmedSurv = survLine.trimEnd();
+                        if (
+                          trimmedSurv.endsWith("...") &&
+                          trimmedSurv.length >= 20 &&
+                          line.startsWith(trimmedSurv.slice(0, -3))
+                        ) {
+                          return [{ ...rec, line: trimmedSurv }];
+                        }
+                      }
+                      return [];
                     }),
                   }
                 : {}),
@@ -2083,7 +2329,7 @@ export function createHookHandlers(
     // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
     // sessionId keeps the "session" fallback for envelope identity only — see
     // handleSessionStart's comment for why the two must not be conflated.
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const signature = hashTaskSignature(prompt);
 
     // #283 (config.lifecycleEnabled): compute the lifecycle representation
@@ -2220,6 +2466,12 @@ export function createHookHandlers(
       return lifecycleOnlyOutput();
     }
 
+    if (!isSkip && !isSubstantiveRecallPrompt(recallQuery)) {
+      await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
+      exit("non_substantive_prompt");
+      return lifecycleOnlyOutput();
+    }
+
     const threshold = recallPointerThreshold();
     // #313: searchVaultNotes scores and ranks across the WHOLE vault, then
     // slices to `limit` before privacy is ever considered (it only drops
@@ -2339,6 +2591,8 @@ export function createHookHandlers(
                   // lets the hook PROCESS exit. Racing a promise alone cannot do that.
                   timeoutMs: remainingMs(),
                   ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+                  passive: true,
+                  updateAccess: false,
                 }),
                 remainingMs(),
                 { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
@@ -2651,16 +2905,13 @@ export function createHookHandlers(
       payload.tool_input && typeof payload.tool_input === "object"
         ? (payload.tool_input as Record<string, unknown>)
         : {};
-    const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const guardSessionId = rawSessionIdFromPayload(payload);
     const guardAgentId = asString(payload.agent_id) || asString(payload.agentId);
 
     // S2b (§6.4): PreToolUse on Agent / Task stashes the task prompt for SubagentStart
     // and never surfaces or consumes the parent's recall guard arming.
     if (isSubagentSpawnTool(toolName)) {
-      if (
-        canInject(wire, "UserPromptSubmit") &&
-        isFeatureEnabled(config.vaultPath, "MINNI_SUBAGENT_BRIEF")
-      ) {
+      if (isFeatureEnabled(config.vaultPath, "MINNI_SUBAGENT_BRIEF")) {
         stashSubagentPending(config.vaultPath, payload, toolInput);
       }
       return preToolUseAllow();
@@ -2711,21 +2962,14 @@ export function createHookHandlers(
 
     const recallStateOpts = { sessionId: guardSessionId || undefined, guardV2 };
 
-    // S2b (§6.3.5): consult tools (minni_recall, minni_drill) consume the
-    // armed state and claim the arming so a subsequent Read/Grep in the same
-    // turn does not fire the guard after the model already consulted memory.
-    if (guardV2 && isConsultTool(toolName)) {
-      const consultState = await readRecallState(config.vaultPath, recallStateOpts).catch(
-        () => null,
+    // S2b (§6.3.5): consult tools (minni_recall, minni_drill, including lazy
+    // call_mcp_tool wrappers) consume the armed state and claim the arming so a
+    // subsequent Read/Grep/Bash in the same turn does not fire the guard after
+    // the model already consulted memory.
+    if (guardV2 && isConsultTool(toolName, toolInput)) {
+      await disarmRecallStateOnConsult(config.vaultPath, guardSessionId || undefined).catch(
+        () => false,
       );
-      if (consultState && !consultState.consumed) {
-        await claimArming(
-          config.vaultPath,
-          guardSessionId || consultState.session_id,
-          armingKeyFor(consultState),
-        ).catch(() => false);
-        await markRecallConsumed(config.vaultPath, recallStateOpts).catch(() => false);
-      }
       return preToolUseAllow();
     }
 
@@ -2809,7 +3053,7 @@ export function createHookHandlers(
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const tail = await auditTail(config.vaultPath, 60);
     const scarTissue = extractScarTissue(tail.entries);
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    const sessionId = rawSessionIdFromPayload(payload) || "session";
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
@@ -2920,7 +3164,7 @@ export function createHookHandlers(
   // candidates. Injects nothing — there is no model turn to inject into.
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    const sessionId = rawSessionIdFromPayload(payload) || "session";
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     // Same provenance stamp as SessionStart harvest — dual delivery paths
@@ -2958,7 +3202,7 @@ export function createHookHandlers(
   // does the AFM review on its own timer.
   async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    const sessionId = rawSessionIdFromPayload(payload) || "session";
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     const summary = asString(payload.compact_summary);
@@ -3151,7 +3395,7 @@ export function createHookHandlers(
     if (!briefOn) return { continue: true };
 
     await ensureVault(config.vaultPath, { agentId: config.agentId });
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const guardV2 = ledger
       ? ledger.capture.context.features.includes("MINNI_GUARD_V2")
       : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
@@ -3171,7 +3415,13 @@ export function createHookHandlers(
     let safeVaultResults: ReturnType<typeof filterSafeVaultResults> = [];
 
     if (claimedPending && claimedPending.prompt.trim()) {
-      const taskPrompt = claimedPending.prompt.trim();
+      const extraPaths = Array.isArray(claimedPending.targetPaths)
+        ? claimedPending.targetPaths.filter((p) => !claimedPending.prompt.includes(p))
+        : [];
+      const taskPrompt =
+        extraPaths.length > 0
+          ? `${claimedPending.prompt.trim()} ${extraPaths.join(" ")}`
+          : claimedPending.prompt.trim();
       const workspaceId = workspaceFor(payload);
       const [vaultRaw, recall] = await Promise.all([
         withBudget(
@@ -3189,6 +3439,8 @@ export function createHookHandlers(
             workspaceId,
             timeoutMs: SUBAGENT_RECALL_BUDGET_MS,
             ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+            passive: true,
+            updateAccess: false,
           }),
           SUBAGENT_RECALL_BUDGET_MS,
           { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
@@ -3230,10 +3482,10 @@ export function createHookHandlers(
   async function handleSubagentStop(
     payload: Record<string, unknown>,
   ): Promise<SubagentHookOutput> {
-    const hasSessionId = Boolean(asString(payload.session_id) || asString(payload.sessionId));
+    const hasSessionId = Boolean(rawSessionIdFromPayload(payload));
     const measured =
       hasSessionId &&
-      wireCapabilities(wire).transcriptShape === DETECTOR_TRANSCRIPT_SHAPE &&
+      DETECTOR_TRANSCRIPT_SHAPES.has(wireCapabilities(wire).transcriptShape) &&
       ledgerMayBeOn(config.vaultPath);
     if (measured) {
       scheduleSubagentStopUseDetector(config, payload);
@@ -3252,7 +3504,7 @@ export function createHookHandlers(
     if (!wireCapabilities(wire).preToolUseContext) {
       return { continue: true };
     }
-    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
     const lesson = matchPostToolUseFailureLesson({
       vaultPath: config.vaultPath,
       event,

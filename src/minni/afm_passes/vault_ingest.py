@@ -26,6 +26,36 @@ from minni.wiki_indexer import WikiFrontmatter, WikiIndexer
 logger = logging.getLogger("sovereign.afm.vault_ingest")
 
 
+class VaultIngestPass:
+    """Object-oriented wrapper around the vault_ingest pass runner."""
+
+    def __init__(
+        self,
+        db=None,
+        config=None,
+        *,
+        vault_path: Optional[str] = None,
+        embed: bool = True,
+    ):
+        self.db = db
+        self.config = config
+        self.vault_path = vault_path
+        self.embed = embed
+
+    def run(self, **kwargs) -> Dict[str, Any]:
+        if not self.embed and self.vault_path and self.db is not None and self.config is not None:
+            from dataclasses import replace
+
+            cfg = replace(self.config, vault_path=str(self.vault_path))
+            return VaultIndexer(self.db, cfg, embed=False).index_vault()
+        return run(
+            db=self.db,
+            config=self.config,
+            vault_path=self.vault_path,
+            **kwargs,
+        )
+
+
 def _vault_slug(vault: Path) -> Optional[str]:
     name = vault.name
     if not name.endswith("-vault"):
@@ -235,31 +265,22 @@ def _index_changed_pages(
                     stats["errors"] += 1
                     continue
 
-                # Excluded by design (e.g. a completed plan). Checked before
-                # validation so an intentional exclusion is never reported as
-                # bad frontmatter. A page that was ALREADY indexed at an
-                # indexable status (accepted -> complete is the normal plan
-                # lifecycle) must be RETRACTED, not merely skipped: leaving
-                # the old row behind keeps a completed plan recallable, which
-                # is the exact H6 self-promotion the exclusion exists to stop.
-                if page.frontmatter.status in WikiFrontmatter.EXCLUDED_STATUSES:
+                from minni.indexer import is_vault_path_excluded
+
+                explicit_status = page.frontmatter.raw.get("status") if page.frontmatter.raw else None
+                path_excluded, _ = is_vault_path_excluded(
+                    path,
+                    root_dir=wiki_root,
+                    explicit_status=explicit_status,
+                    is_rpc=False,
+                    allow_artifact_retraction=bool(row),
+                )
+
+                # Excluded by design (e.g. a completed plan or excluded path/status).
+                if path_excluded or page.frontmatter.is_excluded:
                     stats["excluded"] += 1
                     if row:
-                        # Retract the PAYLOAD, not the row. Deleting the
-                        # documents row would CASCADE memory_links away and
-                        # mint a new doc_id on the way back — and
-                        # accepted -> complete -> accepted is a normal round
-                        # trip (plan.ts reconciles when a slice reopens), so
-                        # every inbound wikilink and every stored doc_id
-                        # reference would dangle permanently. Keep identity,
-                        # drop the searchable content, and stamp the status
-                        # so retrieval filters it exactly like superseded.
                         doc_id = int(row["doc_id"])
-                        # Searchable payload only — NOT _delete_doc_payload,
-                        # which also drops memory_links in both directions.
-                        # The page still exists, so an inbound edge belongs to
-                        # the OTHER page and deleting it would corrupt that
-                        # page's graph without that page having changed.
                         c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                         c.execute(
                             "DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)

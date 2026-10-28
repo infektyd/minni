@@ -301,21 +301,35 @@ export function handlesForKey(mkey: string): string[] {
 
 type Payload = Record<string, unknown> | null | undefined;
 
-function field(payload: Payload, name: string): unknown {
-  return payload && typeof payload === "object" ? (payload as Record<string, unknown>)[name] : undefined;
+function firstStringField(payload: Payload, names: readonly string[]): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const record = payload as Record<string, unknown>;
+  for (const name of names) {
+    const value = record[name];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
 }
 
 /**
  * `sha256(session_id)[:16]`; else `tx-` plus a hash of the transcript's real
- * path; else `unlabeled` (which stays out of every rate).
+ * path; else `unlabeled` (which stays out of every rate). Accepts both
+ * snake_case and camelCase/host fields (`session_id`, `sessionId`,
+ * `conversationId`, `transcript_path`, `transcriptPath`, `agent_transcript_path`,
+ * `agentTranscriptPath`).
  */
 export function sessionKeyFrom(payload: Payload): string {
-  const sessionId = field(payload, "session_id");
-  if (typeof sessionId === "string" && sessionId.length > 0) {
+  const sessionId = firstStringField(payload, ["session_id", "sessionId", "conversationId", "conversation_id"]);
+  if (sessionId) {
     return hexDigest("sha256", sessionId).slice(0, 16);
   }
-  const transcript = field(payload, "transcript_path");
-  if (typeof transcript === "string" && transcript.length > 0 && !transcript.includes("\0")) {
+  const transcript = firstStringField(payload, [
+    "transcript_path",
+    "transcriptPath",
+    "agent_transcript_path",
+    "agentTranscriptPath",
+  ]);
+  if (transcript && !transcript.includes("\0")) {
     return `tx-${hexDigest("sha256", realish(transcript)).slice(0, 16)}`;
   }
   return "unlabeled";
@@ -339,15 +353,23 @@ function subagentKey(raw: string): string {
 
 /**
  * `main` on the main thread; `a-<sha256(canonicalAgentId(id))[:12]>` for a
- * subagent. A subagent is a payload with `agent_id` (probe P5), or one whose
- * `transcript_path` sits under a `subagents/` directory, in which case the id
- * is the file basename. Both give the same key for the same subagent.
+ * subagent. A subagent is a payload with `agent_id`/`agentId` (probe P5),
+ * `agent_transcript_path`/`agentTranscriptPath`, or one whose
+ * `transcript_path`/`transcriptPath` sits under a `subagents/` directory, in
+ * which case the id is the file basename. Both give the same key for the same
+ * subagent.
  */
 export function agentKeyFrom(payload: Payload): string {
-  const agentId = field(payload, "agent_id");
-  if (typeof agentId === "string" && agentId.length > 0) return subagentKey(agentId);
-  const transcript = field(payload, "transcript_path");
-  if (typeof transcript === "string") {
+  const agentId = firstStringField(payload, ["agent_id", "agentId"]);
+  if (agentId) return subagentKey(agentId);
+  const agentTranscript = firstStringField(payload, ["agent_transcript_path", "agentTranscriptPath"]);
+  if (agentTranscript) {
+    const parts = agentTranscript.split(/[\\/]+/);
+    const base = parts.pop();
+    if (base) return subagentKey(base);
+  }
+  const transcript = firstStringField(payload, ["transcript_path", "transcriptPath"]);
+  if (transcript) {
     const parts = transcript.split(/[\\/]+/);
     const base = parts.pop();
     if (base && parts.includes("subagents")) return subagentKey(base);
@@ -564,9 +586,11 @@ export function ledgerContextFrom(
     principal: options.principal,
     features: options.features ?? featuresInEffect(options.vaultPath),
   };
-  const promptId = shortField(field(payload, "prompt_id"));
+  const promptId = shortField(firstStringField(payload, ["prompt_id", "promptId"]));
   if (promptId) context.prompt_id = promptId;
-  const subagentType = shortField(field(payload, "agent_type") ?? field(payload, "subagent_type"));
+  const subagentType = shortField(
+    firstStringField(payload, ["agent_type", "agentType", "subagent_type", "subagentType"]),
+  );
   if (subagentType) context.subagent_type = subagentType;
   return context;
 }

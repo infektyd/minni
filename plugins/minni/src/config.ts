@@ -84,9 +84,45 @@ export function minniHome(): string {
 
 export const DEFAULT_VAULT_PATH = expandTilde(
   process.env.MINNI_VAULT_PATH ??
+    process.env.MINNI_CLAUDECODE_VAULT_PATH ??
     process.env.MINNI_CODEX_VAULT_PATH ??
-    path.join(os.homedir(), ".minni", "unknown-vault"),
+    path.join(minniHome(), "unknown-vault"),
 );
+
+export function resolveActiveVaultPath(preferredVaultPath?: string): string {
+  if (typeof preferredVaultPath === "string" && preferredVaultPath.trim()) {
+    const expanded = expandTilde(preferredVaultPath.trim());
+    if (path.basename(expanded) !== "unknown-vault" || existsSync(expanded)) {
+      return expanded;
+    }
+    const parent = path.dirname(expanded);
+    for (const sub of ["claudecode-vault", "vault", "codex-vault"]) {
+      const candidate = path.join(parent, sub);
+      try {
+        if (existsSync(candidate)) return candidate;
+      } catch {
+        // Continue checking candidates.
+      }
+    }
+  }
+  const envVault =
+    process.env.MINNI_VAULT_PATH ??
+    process.env.MINNI_CLAUDECODE_VAULT_PATH ??
+    process.env.MINNI_CODEX_VAULT_PATH;
+  if (envVault && envVault.trim()) {
+    return expandTilde(envVault.trim());
+  }
+  const home = minniHome();
+  for (const sub of ["claudecode-vault", "vault", "codex-vault"]) {
+    const candidate = path.join(home, sub);
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      // Continue checking candidates.
+    }
+  }
+  return path.join(home, "vault");
+}
 
 export const SOCKET_PATH = expandTilde(
   process.env.MINNI_SOCKET_PATH ??

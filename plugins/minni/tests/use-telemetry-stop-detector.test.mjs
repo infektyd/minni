@@ -331,25 +331,25 @@ const LEDGER_MODULES = [
   "use-report.js",
 ];
 
-test("an unmeasured wire (codex) with the ledger on: no detector, no receipt counts, no ledger module, today's line", { timeout: 120_000 }, async (t) => {
-  const at = path.join(tmpdir(), `minni-stop-detector-codex-${process.pid}`);
+test("an unmeasured wire (cursor) with the ledger on: no detector, no receipt counts, no ledger module, today's line", { timeout: 120_000 }, async (t) => {
+  const at = path.join(tmpdir(), `minni-stop-detector-cursor-${process.pid}`);
   t.after(() => rm(at, { recursive: true, force: true }));
   const raws = {};
   for (const ledger of ["on", "off"]) {
-    const fixture = await makeFixture(null, "stop-detector-codex", { at });
+    const fixture = await makeFixture(null, "stop-detector-cursor", { at });
     await startFakeDaemon(fixture);
     try {
       // A Claude-shaped transcript the detector could parse: only the wire gate stops it.
       const { payload } = await seedStopTurn(fixture, { at: Date.parse("2026-10-23T10:00:00.000Z") });
       const run = await loadedNames(t, fixture, "Stop", payload, {
-        bin: "codex-hook.js",
-        env: { MINNI_CODEX_VAULT_PATH: fixture.vault, MINNI_USE_LEDGER: ledger },
+        bin: "cursor-hook.js",
+        env: { MINNI_CURSOR_VAULT_PATH: fixture.vault, MINNI_USE_LEDGER: ledger },
       });
       assert.equal(run.code, 0);
       assert.ok(run.names.includes("hook-handlers.js"), "the hook ran");
       raws[ledger] = run.raw;
       if (ledger === "on") {
-        for (const module of LEDGER_MODULES) assert.ok(!run.names.includes(module), `codex Stop loaded ${module}`);
+        for (const module of LEDGER_MODULES) assert.ok(!run.names.includes(module), `cursor Stop loaded ${module}`);
         assert.equal(ledgerRows(fixture.vault, "judged").length, 0, "an unmeasured wire writes no judged rows");
         assert.ok(!(await exists(path.join(fixture.vault, ".runtime", "use-detector"))));
         assert.doesNotMatch(run.raw, / Use: /);

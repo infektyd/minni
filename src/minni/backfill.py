@@ -65,13 +65,15 @@ def _embed_eligible_doc_sql(alias: str = "d") -> str:
     NULL page_status is treated as ``candidate`` — the column default.
     """
     col = f"{alias}.page_status" if alias else "page_status"
-    return f"COALESCE({col}, 'candidate') NOT IN ({_sql_in_literals(UNEMBEDDED_STATUSES)})"
+    skip_set = UNEMBEDDED_STATUSES - {"candidate"}
+    return f"COALESCE({col}, 'candidate') NOT IN ({_sql_in_literals(skip_set)})"
 
 
 def _deliberate_unembed_doc_sql(alias: str = "d") -> str:
     """SQL predicate: document is deliberately left without vectors."""
     col = f"{alias}.page_status" if alias else "page_status"
-    return f"COALESCE({col}, 'candidate') IN ({_sql_in_literals(UNEMBEDDED_STATUSES)})"
+    skip_set = UNEMBEDDED_STATUSES - {"candidate"}
+    return f"COALESCE({col}, 'candidate') IN ({_sql_in_literals(skip_set)})"
 
 
 # grok-review round 3 (finding 1): per-(db, queue) batch cursors. The batch

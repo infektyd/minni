@@ -935,6 +935,91 @@ export async function markRecallConsumed(
   return mirrorOk;
 }
 
+/**
+ * Disarm active recall-state armings when the model consults memory (`minni_recall`
+ * or `minni_drill`), either via `PreToolUse` (when `sessionId` is known) or directly
+ * inside the MCP server handler (where the hook's `sessionId` is not in the RPC args).
+ * Claims the arming id and flips `consumed = true` so subsequent cold search/read
+ * tools in the same turn are not denied after memory was already consulted.
+ */
+export async function disarmRecallStateOnConsult(
+  vaultPath: string,
+  sessionId?: string,
+): Promise<boolean> {
+  const effectiveSessionId =
+    typeof sessionId === "string" && sessionId.trim() && sessionId.trim() !== "session"
+      ? sessionId.trim()
+      : undefined;
+
+  if (effectiveSessionId) {
+    const st = await readRecallState(vaultPath, {
+      sessionId: effectiveSessionId,
+      guardV2: true,
+    }).catch(() => null);
+    if (!st) return false;
+    await claimArming(
+      vaultPath,
+      effectiveSessionId || st.session_id,
+      armingKeyFor(st),
+    ).catch(() => false);
+    if (!st.consumed) {
+      return markRecallConsumed(vaultPath, {
+        sessionId: effectiveSessionId,
+        guardV2: true,
+      }).catch(() => false);
+    }
+    return true;
+  }
+
+  let anyDisarmed = false;
+  const mirrorPath = recallStatePath(vaultPath);
+  const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
+  if (mirror) {
+    await claimArming(vaultPath, mirror.session_id, armingKeyFor(mirror)).catch(() => false);
+    if (!mirror.consumed) {
+      const ok = await markFileConsumed(mirrorPath, vaultPath).catch(() => false);
+      if (ok) anyDisarmed = true;
+    } else {
+      anyDisarmed = true;
+    }
+    if (mirror.session_id) {
+      const sessionFile = recallStateSessionPath(vaultPath, mirror.session_id);
+      if (sessionFile && fileOrLinkExists(sessionFile)) {
+        const ok = await markFileConsumed(sessionFile, vaultPath).catch(() => false);
+        if (ok) anyDisarmed = true;
+      }
+    }
+  }
+
+  try {
+    const dirPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH);
+    assertWriteTargetUnder(dirPath, vaultPath);
+    const dirStat = fs.lstatSync(dirPath);
+    if (dirStat.isDirectory() && !dirStat.isSymbolicLink()) {
+      for (const name of fs.readdirSync(dirPath)) {
+        if (!name.endsWith(".json")) continue;
+        const stem = name.slice(0, -5);
+        if (!HEX16_RE.test(stem)) continue;
+        const filePath = path.join(dirPath, name);
+        const st = await readStateFileAt(filePath, vaultPath).catch(() => null);
+        if (!st) continue;
+        const sid = st.session_id || stem;
+        await claimArming(vaultPath, sid, armingKeyFor(st)).catch(() => false);
+        if (!st.consumed) {
+          const ok = await markFileConsumed(filePath, vaultPath).catch(() => false);
+          if (ok) anyDisarmed = true;
+        } else {
+          anyDisarmed = true;
+        }
+      }
+    }
+  } catch {
+    // Best-effort scan of session-scoped recall-state.d.
+  }
+
+  return anyDisarmed;
+}
+
 export interface BuildRecallPointerOptions {
   /** Maximum number of hits to name in the pointer (default 3). */
   maxHits?: number;
@@ -1309,6 +1394,40 @@ export async function recordSessionHandles(
       const mirrorPath = path.join(ledgerDir, "handles.json");
       writeJsonAtomicSync(mirrorPath, vaultPath, payload);
     }
+
+    // Also merge into <vaultPath>/.handles.json so cross-process MCP minni_drill can resolve handles directly
+    try {
+      const rootHandlesPath = path.join(vaultPath, ".handles.json");
+      assertWriteTargetUnder(rootHandlesPath, vaultPath);
+      let rootMap: Record<string, unknown> = {};
+      try {
+        const rawRoot = fs.readFileSync(rootHandlesPath, "utf8");
+        const parsedRoot = JSON.parse(rawRoot) as unknown;
+        if (parsedRoot && typeof parsedRoot === "object" && !Array.isArray(parsedRoot)) {
+          rootMap = { ...(parsedRoot as Record<string, unknown>) };
+        }
+      } catch {
+        rootMap = {};
+      }
+      for (const [hKey, hVal] of Object.entries(capped)) {
+        rootMap[hKey] = hVal;
+      }
+      const rootKeys = Object.keys(rootMap);
+      if (rootKeys.length > 512) {
+        const pinned = rootKeys.filter((k) => k.startsWith("m:7a11e5"));
+        const unpinned = rootKeys
+          .filter((k) => !k.startsWith("m:7a11e5"))
+          .slice(-(512 - pinned.length));
+        const prunedRoot: Record<string, unknown> = {};
+        for (const k of [...pinned, ...unpinned]) {
+          prunedRoot[k] = rootMap[k];
+        }
+        rootMap = prunedRoot;
+      }
+      writeJsonAtomicSync(rootHandlesPath, vaultPath, rootMap);
+    } catch {
+      // Best-effort root handles mirror.
+    }
   } catch {
     // Best-effort.
   }
@@ -1329,16 +1448,54 @@ export async function readSessionHandle(
   if (sKey) candidateKeys.push(sKey);
   candidateKeys.push("default");
 
+  const coerceEntry = (key: string, val: unknown): SessionHandleEntry | null => {
+    if (!val || typeof val !== "object" || Array.isArray(val)) return null;
+    const obj = val as Record<string, unknown>;
+    const rel =
+      typeof obj.relativePath === "string" && obj.relativePath.trim()
+        ? normalizeVaultRelPath(obj.relativePath)
+        : typeof obj.source === "string" &&
+            obj.source.trim() &&
+            !obj.source.startsWith("session:") &&
+            !path.isAbsolute(obj.source)
+          ? normalizeVaultRelPath(obj.source)
+          : undefined;
+    return {
+      handle: typeof obj.handle === "string" ? obj.handle : key,
+      mkey:
+        typeof obj.mkey === "string"
+          ? obj.mkey
+          : rel
+            ? `vault:${rel}`
+            : `vault:${key}`,
+      wikilink:
+        typeof obj.wikilink === "string"
+          ? obj.wikilink
+          : rel
+            ? `[[${rel.replace(/\.md$/i, "")}]]`
+            : `[[${key}]]`,
+      title: typeof obj.title === "string" ? obj.title : key,
+      ...(rel ? { relativePath: rel } : {}),
+      ...(typeof obj.scope === "string" ? { scope: obj.scope } : {}),
+      ...(typeof obj.docId === "number" ? { docId: obj.docId } : {}),
+      ...(typeof obj.source === "string" ? { source: obj.source } : {}),
+      ...(typeof obj.ts === "number" ? { ts: obj.ts } : {}),
+    };
+  };
+
   const tryReadHandlesFile = (filePath: string): SessionHandleEntry | null => {
     try {
       assertWriteTargetUnder(filePath, vaultPath);
       const raw = fs.readFileSync(filePath, "utf8");
-      const parsed = JSON.parse(raw) as SessionHandlesFile;
-      if (parsed && parsed.v === 1 && parsed.handles && typeof parsed.handles === "object") {
-        const match =
-          parsed.handles[normalizedHandle] ?? parsed.handles[normalizedHandle.toLowerCase()];
-        if (match && typeof match === "object") return match;
-      }
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const mapObj =
+        parsed.handles && typeof parsed.handles === "object" && !Array.isArray(parsed.handles)
+          ? (parsed.handles as Record<string, unknown>)
+          : parsed;
+      const match =
+        mapObj[normalizedHandle] ?? mapObj[normalizedHandle.toLowerCase()];
+      return coerceEntry(normalizedHandle, match);
     } catch {
       // Ignore missing or unreadable file.
     }
@@ -1384,6 +1541,11 @@ export async function readSessionHandle(
   } catch {
     // Ignore scan errors.
   }
+
+  // Also check <vaultPath>/.handles.json
+  const fromRootIndex = tryReadHandlesFile(path.join(vaultPath, ".handles.json"));
+  if (fromRootIndex) return fromRootIndex;
+
   return null;
 }
 

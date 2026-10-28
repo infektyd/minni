@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+import { durabilityOf } from "./durability.js";
 import { asString, inboxPrincipalForVaultPath } from "./hook-utils.js";
 import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial } from "./policy.js";
 import type { LearningQualityReport } from "./policy.js";
@@ -742,76 +744,219 @@ export async function extractJevLearning(
 // Pipeline Execution (Existing minni_learn / handle_learn pipeline)
 // ---------------------------------------------------------------------------
 
+const SESSION_CHATTER_PATTERNS: ReadonlyArray<RegExp> = [
+  /\b\d+\s*\/\s*\d+\s+(?:tests?\s+|specs?\s+|suites?\s+)?(?:pass(?:ed|ing)?|green)\b/i,
+  /\b\d+\s+(?:tests?\s+|specs?\s+|suites?\s+)?(?:pass(?:ed|ing)|green)\b/i,
+  /\ball\s+\d+\s+tests?\s+pass(?:ed|ing)?\b/i,
+  /\b(?:phase|slice|sprint|wave|workstream|step)\s+[a-z0-9._-]+\s+(?:is\s+|are\s+)?(?:complete(?:d)?|done|finished|shipped|landed|green|verified)\b/i,
+  /\b(?:complete(?:d)?|finished|shipped|landed|verified)\s+(?:phase|slice|sprint|wave|workstream|step)\s+[a-z0-9._-]+\b/i,
+  /\b(?:pushed|committed|merged|landed)\s+(?:commit\s+|sha\s+|branch\s+|pr\s+#?\d+\s+)?(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/i,
+  /\bcommit\s+(?=[0-9a-f]*\d)[0-9a-f]{7,40}\s+(?:(?:was|is|has\s+been)\s+)?(?:pushed|merged|landed)\b/i,
+];
+
+export function isSessionStatusChatter(text: string): boolean {
+  if (typeof text !== "string" || !text.trim()) return false;
+  return SESSION_CHATTER_PATTERNS.some((re) => re.test(text));
+}
+
+export function resolveSessionHandoffsDir(vaultPath: string): string {
+  const envDir = process.env.MINNI_SESSION_HANDOFFS_DIR;
+  if (typeof envDir === "string" && envDir.trim().length > 0) {
+    return path.resolve(envDir.trim());
+  }
+  const dotMinni =
+    typeof process.env.MINNI_HOME === "string" && process.env.MINNI_HOME.trim().length > 0
+      ? path.resolve(process.env.MINNI_HOME.trim())
+      : path.resolve(os.homedir(), ".minni");
+  const resolvedVault = path.resolve(vaultPath);
+  if (resolvedVault === dotMinni || resolvedVault.startsWith(dotMinni + path.sep)) {
+    return path.join(dotMinni, "session_handoffs");
+  }
+  return path.join(vaultPath, ".runtime", "session_handoffs");
+}
+
+export type JevTriageVerdict = boolean | { durable?: boolean; accept?: boolean; verdict?: string };
+export type JevTriageFn = (candidate: {
+  title: string;
+  content: string;
+  category: string;
+  source: string;
+}) => Promise<JevTriageVerdict> | JevTriageVerdict;
+
+function parseTriageVerdict(verdict: unknown): boolean {
+  if (typeof verdict === "boolean") return verdict;
+  if (verdict && typeof verdict === "object") {
+    const rec = verdict as Record<string, unknown>;
+    if (typeof rec.durable === "boolean") return rec.durable;
+    if (typeof rec.accept === "boolean") return rec.accept;
+    if (typeof rec.verdict === "string") {
+      const v = rec.verdict.trim().toLowerCase();
+      if (v === "reject" || v === "rejected" || v === "handoff" || v === "ordinary" || v === "noise") {
+        return false;
+      }
+      if (v === "accept" || v === "accepted" || v === "durable") {
+        return true;
+      }
+    }
+  }
+  return true;
+}
+
+async function runStage2JevTriage(
+  candidate: { title: string; content: string; category: string; source: string },
+  triageFn?: JevTriageFn,
+): Promise<boolean> {
+  if (typeof triageFn === "function") {
+    try {
+      const res = await triageFn(candidate);
+      return parseTriageVerdict(res);
+    } catch {
+      return true;
+    }
+  }
+  if (process.env.MINNI_JEV_TRIAGE_CLI === "1") {
+    try {
+      const wbBin = process.env.WB_AGY_BIN || "wb-agy";
+      const { stdout } = await execFileAsync(
+        wbBin,
+        ["jev", "triage", JSON.stringify(candidate)],
+        { timeout: 1500 },
+      );
+      const parsed = JSON.parse(stdout.trim());
+      return parseTriageVerdict(parsed);
+    } catch {
+      // Deterministic fallback so unit tests or offline hosts never block
+      return true;
+    }
+  }
+  return true;
+}
+
 export async function executeLearnPipeline(input: {
   vaultPath: string;
   workspaceId?: string;
   agentId?: string;
   sessionId?: string;
   payload: JevLearnPayload;
+  triage?: JevTriageFn;
+  learnMemoryFn?: typeof learnMemory;
+  socketPath?: string;
 }): Promise<{
   ok: boolean;
   status: string;
   quality?: LearningQualityReport;
   note?: VaultWriteResult;
   store?: JsonResult;
+  handoffPath?: string;
 }> {
   const { vaultPath, workspaceId, agentId, sessionId, payload } = input;
   const { title, content, source } = payload;
+  const effectiveSource = source ?? "jev_harvest";
   const category = normalizeJevCategory(payload.category, payload.triggerKind);
 
   // 1. Credential & secret scan (flagsSensitiveMaterial)
-  const quality = await assessLearningQualityAsync({ title, content, category, source });
+  const quality = await assessLearningQualityAsync({ title, content, category, source: effectiveSource });
   if (flagsSensitiveMaterial(quality) || !quality.ok) {
     await recordAudit(vaultPath, {
       tool: "minni_learn",
       summary: `quality-blocked (credential material): ${auditSafeTitle(title, quality)}`,
-      details: { quality, source, trigger_kind: payload.triggerKind, ...(sessionId ? { session_id: sessionId } : {}) },
+      details: { quality, source: effectiveSource, trigger_kind: payload.triggerKind, ...(sessionId ? { session_id: sessionId } : {}) },
     });
     return { ok: false, status: "quality-blocked", quality };
   }
 
-  // 2. Daemon memory store (learnMemory) - stages candidate or performs durable learn
   const effectivePrincipal = agentId ?? inboxPrincipalForVaultPath(vaultPath) ?? "codex";
-  const store = await learnMemory({
+
+  // 2. Durability + session status chatter + optional Stage-2 triage gate
+  const dur = durabilityOf({
+    content,
+    category,
+    source: effectiveSource,
+    origin: "agent",
+  });
+  const chatter = isSessionStatusChatter(`${title}\n${content}`);
+  const triageAccepted =
+    dur === "durable" && !chatter
+      ? await runStage2JevTriage({ title, content, category, source: effectiveSource }, input.triage)
+      : false;
+
+  if (dur !== "durable" || chatter || !triageAccepted) {
+    const handoffDir = resolveSessionHandoffsDir(vaultPath);
+    const nowIso = new Date().toISOString();
+    const day = nowIso.slice(0, 10);
+    const handoffPath = path.join(handoffDir, `handoffs-${day}.jsonl`);
+    await mkdir(handoffDir, { recursive: true });
+    const handoffRow = {
+      timestamp: nowIso,
+      agentId: effectivePrincipal,
+      ...(sessionId ? { session_id: sessionId } : {}),
+      category,
+      source: effectiveSource,
+      durability: chatter && dur === "durable" ? "ordinary" : dur,
+      title,
+      content,
+    };
+    await appendFile(handoffPath, `${JSON.stringify(handoffRow)}\n`, "utf8");
+    return { ok: true, status: "routed-to-session-handoff", quality, handoffPath };
+  }
+
+  // 3. Daemon memory store (learnMemory) - stages candidate or performs durable learn
+  const dotMinni = path.resolve(os.homedir(), ".minni");
+  const resolvedVault = path.resolve(vaultPath);
+  const isDefaultVault = resolvedVault === dotMinni || resolvedVault.startsWith(dotMinni + path.sep);
+  const effectiveSocketPath =
+    input.socketPath ??
+    process.env.MINNI_SOCKET_PATH?.trim() ??
+    process.env.MINNI_DAEMON_SOCKET?.trim() ??
+    (!isDefaultVault && !process.env.MINNI_HOME?.trim()
+      ? path.join(vaultPath, ".runtime", "minnid.sock")
+      : undefined);
+
+  const doLearnMemory = input.learnMemoryFn ?? learnMemory;
+  const store = await doLearnMemory({
     content,
     category,
     agentId: effectivePrincipal,
     workspaceId: workspaceId ?? "default",
+    source: effectiveSource,
+    origin: "agent",
+    ...(effectiveSocketPath ? { socketPath: effectiveSocketPath } : {}),
   }).catch((err) => ({ ok: false, error: String(err), data: undefined }));
 
-  // 3. Vault Markdown note creation (vaultFirstLearn)
-  const note = await vaultFirstLearn({
-    vaultPath,
-    title,
-    content,
-    category,
-    source,
-    agentId: effectivePrincipal,
-    storeResult: { ok: store.ok, data: store.data, error: store.error },
-    quality,
-    annotation: payload.annotation ?? `${payload.triggerKind}: ${title}`,
-    trigger_kind: payload.triggerKind,
-    sessionId,
-  });
-
-  try {
-    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
-    const fullContent = `---\ntitle: ${title}\nsection: sessions\nstatus: candidate\nprivacy: safe\ncategory: ${category}\n---\n# ${title}\n\n${content}`;
-    await jsonRpcSocketRequestWithFallback("vault_index_doc", {
-      content: fullContent,
-      path: note.relativePath,
-      agent_id: effectivePrincipal,
-      agent: effectivePrincipal,
-      sigil: "📄",
-      privacy_level: "safe",
-      page_status: "candidate",
-      layer: "knowledge",
+  // 4. Only write wiki/sessions/*.md via vaultFirstLearn as offline fallback when daemon is unreachable;
+  // never index wiki/sessions/*.md via vault_index_doc.
+  if (!store.ok) {
+    const note = await vaultFirstLearn({
+      vaultPath,
+      title,
+      content,
+      category,
+      source: effectiveSource,
+      agentId: effectivePrincipal,
+      storeResult: { ok: store.ok, data: store.data, error: store.error },
+      quality,
+      annotation: payload.annotation ?? `${payload.triggerKind}: ${title}`,
+      trigger_kind: payload.triggerKind,
+      sessionId,
     });
-  } catch {
-    // Fail-open: vault note is on disk and will be indexed on next pass
+    return { ok: true, status: "learned", quality, note, store };
   }
 
-  return { ok: true, status: "learned", quality, note, store };
+  await recordAudit(vaultPath, {
+    tool: "minni_learn",
+    summary: title,
+    details: {
+      category,
+      source: effectiveSource,
+      storeResult: { ok: store.ok, data: store.data, error: store.error },
+      ...(sessionId ? { session_id: sessionId } : {}),
+      annotation: payload.annotation ?? `${payload.triggerKind}: ${title}`,
+      ...(payload.triggerKind ? { trigger_kind: payload.triggerKind } : {}),
+      ...(quality ? { quality } : {}),
+    },
+  });
+
+  return { ok: true, status: "learned", quality, store };
 }
 
 // ---------------------------------------------------------------------------

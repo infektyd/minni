@@ -152,13 +152,12 @@ class MinniConfig:
     # Feedback demotion (PR-9)
     feedback_enabled: bool = True
 
-    # Durable recall trace: record every daemon `search` as a TTL'd episodic
-    # event (agent, truncated query, hit count, top score) so operators can
-    # verify memory use via `minni watch`. Default on; MINNI_RECALL_TRACE=off
-    # disables it for perf-sensitive setups.
+    # Durable recall trace: record daemon `search` as a TTL'd episodic event
+    # only when explicitly opted in via MINNI_RECALL_TRACE=1/true/on.
+    # Default off (Rev 6 Pillar 4) to prevent episodic_events / episodic_fts churn.
     recall_trace: bool = field(
         default_factory=lambda: os.environ.get(
-            "MINNI_RECALL_TRACE", "on").lower() not in {"0", "false", "no", "off"}
+            "MINNI_RECALL_TRACE", "off").lower() not in {"0", "false", "no", "off", ""}
     )
 
     # Query expansion (PR-7)

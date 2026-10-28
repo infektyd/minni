@@ -549,6 +549,43 @@ class FtsSearchMixin:
             if not results:
                 results = _match(" OR ".join(lowered))
 
+        if results:
+            try:
+                from minni.decay import (
+                    DEMOTE_MULTIPLIER,
+                    aggregate_use_ledger,
+                    lookup_learning_ledger_stats,
+                )
+
+                cfg = getattr(self, "config", None)
+                db_obj = getattr(self, "db", None)
+                vault_root = getattr(cfg, "vault_path", None)
+                db_path_val = getattr(db_obj, "db_path", None) or getattr(cfg, "db_path", None)
+                db_parent = str(_ret.Path(db_path_val).parent) if db_path_val else None
+                ledger_map = aggregate_use_ledger(vault_root, db_parent)
+                if ledger_map:
+                    filtered_results: list[dict] = []
+                    for r in results:
+                        lid = r.get("learning_id")
+                        st = lookup_learning_ledger_stats(ledger_map, lid) if lid is not None else None
+                        if st is not None and st.should_evict:
+                            continue
+                        if st is not None and st.should_demote:
+                            conf = float(r.get("confidence") if r.get("confidence") is not None else 1.0)
+                            if conf > 0.5:
+                                r["confidence"] = round(conf * DEMOTE_MULTIPLIER, 4)
+                            r["_ledger_demoted"] = True
+                        filtered_results.append(r)
+                    # Stable sort so non-demoted learnings rank ahead of demoted ones
+                    filtered_results.sort(key=lambda item: 1 if item.get("_ledger_demoted") else 0)
+                    for r in filtered_results:
+                        r.pop("_ledger_demoted", None)
+                    results = filtered_results
+            except RequestDeadlineExceeded:
+                raise
+            except Exception:
+                pass
+
         if results and update_access:
             now = _ret.time.time()
             try:
@@ -584,3 +621,4 @@ class FtsSearchMixin:
                 pass
 
         return results
+

@@ -1379,12 +1379,15 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         is_fast_reflex = (mode == "fast") or (
             mode is None and bool(getattr(engine, "_is_large_corpus", lambda: False)())
         )
+        is_passive = bool(params.get("passive", False)) or (
+            params.get("update_access") is False
+        )
         if is_fast_reflex:
             for r in results:
                 if isinstance(r, dict):
                     r.pop("confidence_raw", None)
         elif skip_score_record:
-            if stage_open("document_access"):
+            if not is_passive and stage_open("document_access"):
                 run_document_access()
             if stage_open("score_calibration"):
                 run_score_calibration()
@@ -1393,7 +1396,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
             # ranking contract, not optional tails. A later skipped HyDE
             # or expand variant must not withhold them.
             with allow_expired_sql():
-                run_document_access()
+                if not is_passive:
+                    run_document_access()
                 run_score_calibration()
         results = _normalize_caller_visible_results(results)
 
@@ -1408,7 +1412,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                     cross_agent=learnings_cross_agent,
                     limit=limit,
                     source="minnid.search",
-                    update_access=not (skip_score_record or is_fast_reflex),
+                    update_access=not (skip_score_record or is_fast_reflex or is_passive),
                 )
             except Exception as exc:
                 context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
@@ -2578,6 +2582,18 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                 content_hash as _content_hash,
                 is_low_signal_boot_learning,
             )
+            from minni.decay import (
+                DEMOTE_MULTIPLIER,
+                aggregate_use_ledger,
+                lookup_learning_ledger_stats,
+            )
+            from minni.minnid_runtime.governance import non_durable_promotion_blocker
+
+            cfg = getattr(db, "config", None)
+            vault_root = getattr(cfg, "vault_path", None)
+            db_path_val = getattr(db, "db_path", None) or getattr(cfg, "db_path", None)
+            db_parent = os.path.dirname(str(db_path_val)) if db_path_val else None
+            ledger_map = aggregate_use_ledger(vault_root, db_parent)
 
             rank_enabled = _is_recent_learnings_rank_enabled(context, db)
             seen_hashes: set[str] = set()
@@ -2589,6 +2605,10 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                     if is_low_signal_boot_learning(text):
                         continue
                     row_keys = row.keys() if hasattr(row, "keys") else ()
+                    lid_val = row["learning_id"] if "learning_id" in row_keys else None
+                    st = lookup_learning_ledger_stats(ledger_map, lid_val) if (ledger_map and lid_val is not None) else None
+                    if st is not None and st.should_evict:
+                        continue
                     h = (
                         row["content_hash"]
                         if "content_hash" in row_keys and row["content_hash"]
@@ -2610,17 +2630,33 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                     text = str(row["content"] or "")
                     if is_low_signal_boot_learning(text):
                         continue
+                    row_keys = row.keys() if hasattr(row, "keys") else ()
+                    lid_val = row["learning_id"] if "learning_id" in row_keys else None
+                    st = lookup_learning_ledger_stats(ledger_map, lid_val) if (ledger_map and lid_val is not None) else None
+                    if st is not None and st.should_evict:
+                        continue
                     dur = durability_of(
                         {
                             "category": row["category"],
                             "content": text,
                             "created_at": row["created_at"],
+                            "source": row["source"] if "source" in row_keys else None,
+                            "origin": row["origin"] if "origin" in row_keys else None,
                         },
                         provenance_gate_since=gate_since,
                     )
+                    blocker = non_durable_promotion_blocker(
+                        content=text,
+                        category=str(row["category"] or "general"),
+                        source=row["source"] if "source" in row_keys else None,
+                        origin=row["origin"] if "origin" in row_keys else None,
+                    )
+                    if blocker == "non_durable:noise":
+                        dur = "noise"
+                    elif blocker is not None and dur == "durable":
+                        dur = "ephemeral"
                     if dur == "noise":
                         continue
-                    row_keys = row.keys() if hasattr(row, "keys") else ()
                     h = (
                         row["content_hash"]
                         if "content_hash" in row_keys and row["content_hash"]
@@ -2630,6 +2666,19 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                         continue
                     seen_hashes.add(h)
                     candidates.append((row, dur))
+
+                if ledger_map and candidates:
+                    candidates.sort(
+                        key=lambda pair: (
+                            1
+                            if (
+                                (st := lookup_learning_ledger_stats(ledger_map, pair[0]["learning_id"]))
+                                is not None
+                                and st.should_demote
+                            )
+                            else 0
+                        )
+                    )
 
                 if len(candidates) <= 10:
                     selected_rows = [r for r, _ in candidates]
@@ -2656,7 +2705,14 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
             if selected_rows:
                 lines.append(f"\n## Learnings ({agent_id})")
                 for row in selected_rows:
-                    conf = row["confidence"] if row["confidence"] is not None else 1.0
+                    conf = float(row["confidence"] if row["confidence"] is not None else 1.0)
+                    st = (
+                        lookup_learning_ledger_stats(ledger_map, row["learning_id"])
+                        if ledger_map
+                        else None
+                    )
+                    if st is not None and st.should_demote and conf > 0.5:
+                        conf = round(conf * DEMOTE_MULTIPLIER, 4)
                     learning_line = (
                         f"  - [{row['category']}] {row['content'][:150]} "
                         f"(conf={float(conf):.1f})"

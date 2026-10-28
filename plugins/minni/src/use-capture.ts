@@ -490,7 +490,10 @@ export interface TurnClass {
 }
 
 function promptIdOf(payload: Record<string, unknown>): string | undefined {
-  const raw = payload.prompt_id;
+  const raw =
+    typeof payload.prompt_id === "string" && payload.prompt_id.length > 0
+      ? payload.prompt_id
+      : payload.promptId;
   return typeof raw === "string" && raw.length > 0 && raw.length <= MAX_PID_CHARS ? raw : undefined;
 }
 
@@ -746,6 +749,9 @@ function bootRecallItems(capture: UseCapture, input: BootCaptureInput): Surfaced
     const result = raw as Record<string, unknown>;
     const mkey = memoryKeyFor(daemonRef(result), capture.vaultPath);
     if (!mkey) return;
+    const body = vaultTextForMkey(capture.vaultPath, mkey) || daemonBodyText(result);
+    const shingles = body ? shingleHashes(body) : [];
+    const echo = body ? echoHashes(body) : [];
     items.push({
       mkey,
       handles: handlesForKey(mkey),
@@ -755,6 +761,8 @@ function bootRecallItems(capture: UseCapture, input: BootCaptureInput): Surfaced
       // The envelope serializes each projected result with stableStringify,
       // so this is its exact span in the emitted string.
       locate: stableStringify(raw),
+      ...(shingles.length > 0 ? { shingles } : {}),
+      ...(echo.length > 0 ? { echo } : {}),
     });
   });
   return items;

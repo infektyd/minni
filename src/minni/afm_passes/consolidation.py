@@ -30,6 +30,7 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -241,28 +242,46 @@ def has_active_learning_hash(cursor, h: str, agent_id: str) -> bool:
 
 
 def dedup_active_learnings(
-    db, agent_id: Optional[str] = None
+    db,
+    agent_id: Optional[str] = None,
+    *,
+    evict_to_archive: Optional[bool] = None,
 ) -> Dict[str, int]:
-    """Supersede duplicate active learnings (keeping the newest learning_id per
-    (agent_id, content_hash)) and prune low-signal boot rows."""
-    _ensure_dedup_index(db)
-    query = (
-        "SELECT learning_id, agent_id, content, content_hash "
-        "FROM learnings "
-        "WHERE COALESCE(status, 'active') = 'active' "
-        "  AND superseded_by IS NULL"
+    """Evict duplicate active learnings (keeping the newest learning_id per
+    (agent_id, content_hash) or near-duplicate cluster) and prune low-signal boot rows."""
+    from minni.durable_projection import (
+        _cosine_similarity_blobs,
+        evict_learning_to_cold_archive,
+        five_gram_jaccard,
     )
-    params: list[Any] = []
-    if agent_id is not None:
-        query += " AND agent_id = ?"
-        params.append(agent_id)
-    query += " ORDER BY created_at DESC, learning_id DESC"
 
+    _ensure_dedup_index(db)
     with db.cursor() as c:
+        pragma = c.execute("PRAGMA table_info(learnings)").fetchall()
+        l_cols = {
+            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+            for r in pragma
+        }
+        has_cat = "category" in l_cols
+        has_emb = "embedding" in l_cols
+        cat_sel = "category, " if has_cat else "'general' AS category, "
+        emb_sel = "embedding, " if has_emb else "NULL AS embedding, "
+        query = (
+            f"SELECT learning_id, agent_id, {cat_sel}{emb_sel}content, content_hash "
+            "FROM learnings "
+            "WHERE COALESCE(status, 'active') = 'active' "
+            "  AND superseded_by IS NULL"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        query += " ORDER BY created_at DESC, learning_id DESC"
         c.execute(query, params)
         rows = [dict(r) for r in c.fetchall()]
 
     winners: Dict[tuple[str, str], int] = {}
+    winner_entries_by_group: Dict[tuple[str, str], List[tuple[int, str, Any]]] = {}
     dup_updates: List[tuple[int, int]] = []
     low_sig_ids: List[int] = []
 
@@ -273,27 +292,73 @@ def dedup_active_learnings(
             low_sig_ids.append(lid)
             continue
         owner = str(row.get("agent_id") or "")
+        cat = str(row.get("category") or "general").strip().lower()
+        emb = row.get("embedding")
         h = str(row.get("content_hash") or "") or content_hash(text)
         key = (owner, h)
-        if key not in winners:
-            winners[key] = lid
-        else:
+        if key in winners:
             dup_updates.append((winners[key], lid))
+            continue
+
+        group_key = (owner, cat)
+        matched_winner: Optional[int] = None
+        for w_lid, w_text, w_emb in winner_entries_by_group.get(group_key, []):
+            if five_gram_jaccard(text, w_text) >= 0.65:
+                matched_winner = w_lid
+                break
+            if emb is not None and w_emb is not None and _cosine_similarity_blobs(emb, w_emb) >= 0.88:
+                matched_winner = w_lid
+                break
+        if matched_winner is not None:
+            dup_updates.append((matched_winner, lid))
+            continue
+
+        winners[key] = lid
+        winner_entries_by_group.setdefault(group_key, []).append((lid, text, emb))
+
+    cfg = getattr(db, "config", None)
+    db_path = getattr(cfg, "db_path", None)
+    vault_path = getattr(cfg, "vault_path", None)
+    should_evict = (
+        evict_to_archive
+        if evict_to_archive is not None
+        else bool(getattr(cfg, "writeback_enabled", True))
+    )
 
     if dup_updates or low_sig_ids:
         with db.transaction() as c:
-            for winner_id, dup_id in dup_updates:
-                c.execute(
-                    "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
-                    "WHERE learning_id = ? AND superseded_by IS NULL",
-                    (winner_id, dup_id),
-                )
-            for low_id in low_sig_ids:
-                c.execute(
-                    "UPDATE learnings SET status = 'rejected' "
-                    "WHERE learning_id = ? AND superseded_by IS NULL",
-                    (low_id,),
-                )
+            if should_evict:
+                for winner_id, dup_id in dup_updates:
+                    evict_learning_to_cold_archive(
+                        c,
+                        None,
+                        dup_id,
+                        reason=f"dedup_active_learnings:superseded_by:{winner_id}",
+                        db_path=db_path,
+                        vault_path=vault_path,
+                    )
+                for low_id in low_sig_ids:
+                    evict_learning_to_cold_archive(
+                        c,
+                        None,
+                        low_id,
+                        reason="dedup_active_learnings:low_signal",
+                        db_path=db_path,
+                        vault_path=vault_path,
+                    )
+            else:
+                for winner_id, dup_id in dup_updates:
+                    c.execute(
+                        "UPDATE learnings SET superseded_by = ?, status = 'superseded' "
+                        "WHERE learning_id = ? AND superseded_by IS NULL",
+                        (winner_id, dup_id),
+                    )
+                for low_id in low_sig_ids:
+                    c.execute(
+                        "UPDATE learnings SET status = 'rejected' "
+                        "WHERE learning_id = ? AND superseded_by IS NULL",
+                        (low_id,),
+                    )
 
     return {
         "superseded_duplicates": len(dup_updates),
@@ -315,10 +380,14 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
         pragma = c.execute("PRAGMA table_info(candidate_packets)").fetchall()
         cols = {row["name"] if isinstance(row, dict) else row[1] for row in pragma}
         req_col = "requested_privacy, " if "requested_privacy" in cols else "NULL AS requested_privacy, "
+        cat_col = "category, " if "category" in cols else "NULL AS category, "
+        df_col = "derived_from, " if "derived_from" in cols else "NULL AS derived_from, "
+        src_col = "source, " if "source" in cols else "NULL AS source, "
+        orig_col = "origin, " if "origin" in cols else "NULL AS origin, "
         c.execute(
             f"""
             SELECT candidate_id, principal, workspace_id, layer, privacy_level,
-                   {req_col}
+                   {req_col}{cat_col}{df_col}{src_col}{orig_col}
                    content, instruction_like, proposed_at
             FROM candidate_packets cp
             WHERE cp.status = 'proposed'
@@ -334,6 +403,157 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
             (limit,),
         )
         return [dict(row) for row in c.fetchall()]
+
+
+def _extract_candidate_provenance(cand: Dict[str, Any]) -> tuple[str, Optional[str], Optional[str]]:
+    cat = str(cand.get("category") or "general").strip().lower()
+    source: Optional[str] = cand.get("source")
+    origin: Optional[str] = cand.get("origin")
+    raw_df = cand.get("derived_from")
+    if isinstance(raw_df, str) and raw_df.strip():
+        try:
+            df_obj = json.loads(raw_df)
+        except Exception:
+            df_obj = None
+    elif isinstance(raw_df, dict):
+        df_obj = raw_df
+    else:
+        df_obj = None
+    if isinstance(df_obj, dict):
+        if not source and df_obj.get("source"):
+            source = str(df_obj.get("source"))
+        if not origin and df_obj.get("origin"):
+            origin = str(df_obj.get("origin"))
+    return (
+        cat,
+        str(source).strip() if source is not None and str(source).strip() else None,
+        str(origin).strip() if origin is not None and str(origin).strip() else None,
+    )
+
+
+def expire_and_compact_candidates(
+    db: Any,
+    *,
+    now: Optional[float] = None,
+    retention_seconds: float = 7 * 86400.0,
+    config: Any = None,
+    archive_callback: Optional[Any] = None,
+) -> Dict[str, int]:
+    """Cleanup expired candidates and truncate content on resolved/rejected/expired rows older than 7 days."""
+    from minni.afm_review_markers import supersede_afm_review
+
+    ts_now = float(now if now is not None else time.time())
+    cutoff = ts_now - float(retention_seconds)
+    expired_cleaned = 0
+    truncated_count = 0
+    expired_cids: List[int] = []
+
+    with db.transaction() as c:
+        try:
+            pragma = c.execute("PRAGMA table_info(candidate_packets)").fetchall()
+        except Exception:
+            return {"expired_cleaned": 0, "truncated": 0}
+        if not pragma:
+            return {"expired_cleaned": 0, "truncated": 0}
+        cols = {
+            r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+            for r in pragma
+        }
+        has_content_hash = "content_hash" in cols
+        has_resolved_at = "resolved_at" in cols
+
+        exp_rows = c.execute(
+            "SELECT candidate_id FROM candidate_packets WHERE status = 'expired'"
+        ).fetchall()
+        for r in exp_rows:
+            cid = int(r["candidate_id"] if hasattr(r, "keys") else r[0])
+            expired_cids.append(cid)
+            supersede_afm_review(c, cid)
+            if has_resolved_at:
+                c.execute(
+                    "UPDATE candidate_packets SET resolved_at = COALESCE(resolved_at, ?) WHERE candidate_id = ?",
+                    (ts_now, cid),
+                )
+            expired_cleaned += 1
+
+        terminal_statuses = (
+            "accepted",
+            "rejected",
+            "expired",
+            "redacted",
+            "do_not_store",
+            "log_only",
+            "merged",
+            "superseded",
+        )
+        placeholders = ", ".join("?" * len(terminal_statuses))
+        if has_resolved_at:
+            old_rows = c.execute(
+                f"""
+                SELECT candidate_id, content
+                FROM candidate_packets
+                WHERE status IN ({placeholders})
+                  AND COALESCE(resolved_at, proposed_at, 0) > 0
+                  AND COALESCE(resolved_at, proposed_at, 0) < ?
+                  AND COALESCE(content, '') != ''
+                """,
+                (*terminal_statuses, cutoff),
+            ).fetchall()
+        else:
+            old_rows = c.execute(
+                f"""
+                SELECT candidate_id, content
+                FROM candidate_packets
+                WHERE status IN ({placeholders})
+                  AND COALESCE(proposed_at, 0) > 0
+                  AND COALESCE(proposed_at, 0) < ?
+                  AND COALESCE(content, '') != ''
+                """,
+                (*terminal_statuses, cutoff),
+            ).fetchall()
+
+        for r in old_rows:
+            cid = int(r["candidate_id"] if hasattr(r, "keys") else r[0])
+            raw_text = str((r["content"] if hasattr(r, "keys") else r[1]) or "")
+            if has_content_hash:
+                chash = content_hash(raw_text)
+                c.execute(
+                    """
+                    UPDATE candidate_packets
+                    SET content = '',
+                        content_hash = COALESCE(content_hash, ?)
+                    WHERE candidate_id = ?
+                    """,
+                    (chash, cid),
+                )
+            else:
+                c.execute(
+                    "UPDATE candidate_packets SET content = '' WHERE candidate_id = ?",
+                    (cid,),
+                )
+            truncated_count += 1
+
+    if expired_cids:
+        for cid in expired_cids:
+            if callable(archive_callback):
+                try:
+                    archive_callback(db, cid)
+                except Exception:
+                    pass
+            else:
+                try:
+                    from minni.minnid_runtime.afm import maybe_archive_inbox_source
+
+                    maybe_archive_inbox_source(
+                        db,
+                        cid,
+                        config or getattr(db, "config", None),
+                        logging.getLogger("minnid"),
+                    )
+                except Exception:
+                    pass
+
+    return {"expired_cleaned": expired_cleaned, "truncated": truncated_count}
 
 
 def _total_proposed(db) -> int:
@@ -498,12 +718,16 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
 
 def run(db, config, vault_path: Optional[str] = None,
         dry_run: bool = True, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    from minni.minnid_runtime.governance import non_durable_promotion_blocker
+
     schedule = getattr(config, "afm_loop_schedule", {}) or {}
     pass_cfg = (schedule.get("passes") or {}).get("consolidation", {})
     max_per_run = int(pass_cfg.get("max_per_run", _DEFAULT_MAX_PER_RUN))
     trace_id = trace_id or f"afm-{int(time.time())}"
 
     _ensure_dedup_index(db)
+    if not dry_run:
+        expire_and_compact_candidates(db, config=config)
 
     total = _total_proposed(db)
     candidates = _proposed_candidates(db, max_per_run)
@@ -564,6 +788,17 @@ def run(db, config, vault_path: Optional[str] = None,
         blockers = _quality_blockers(content)
         if blockers:
             _review(cand, "low quality: " + "; ".join(blockers))
+            continue
+
+        cat, source, origin = _extract_candidate_provenance(cand)
+        dur_blocker = non_durable_promotion_blocker(
+            content=content,
+            category=cat,
+            source=source,
+            origin=origin,
+        )
+        if dur_blocker is not None:
+            reject_candidate_ids.append(cand["candidate_id"])
             continue
 
         # If privacy is review, evaluate via authoritative model judge if eligible
@@ -655,3 +890,15 @@ def run(db, config, vault_path: Optional[str] = None,
         "triage_advisory": triage_advisory,
         "prompt_version": "consolidation-v2-model-judge",
     }
+
+
+class ConsolidationPass:
+    """Object-oriented wrapper around the consolidation pass runner."""
+
+    def __init__(self, db=None, config=None):
+        self.db = db
+        self.config = config
+
+    @staticmethod
+    def run(db=None, config=None, **kwargs) -> Dict[str, Any]:
+        return run(db=db, config=config, **kwargs)
