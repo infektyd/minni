@@ -6,7 +6,7 @@ import { stat, readdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
-import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, minniHome, resolveActiveVaultPath, SOCKET_PATH } from "./config.js";
+import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, expandTilde, minniHome, resolveActiveVaultPath, SOCKET_PATH } from "./config.js";
 import {
   daemonAfmToProviderHealth,
   daemonEffectiveAfmProvider,
@@ -738,10 +738,10 @@ export type JsonRpcRequester = (
   options?: JsonRpcRequestOptions,
 ) => Promise<JsonResult>;
 
-function jsonRpcSocketCandidates(): string[] {
+export function jsonRpcSocketCandidates(): string[] {
   const envSock =
     process.env.MINNI_SOCKET_PATH?.trim() || process.env.MINNI_DAEMON_SOCKET?.trim();
-  if (envSock) return [envSock];
+  if (envSock) return [expandTilde(envSock)];
   if (process.env.MINNI_HOME?.trim()) {
     return [path.join(minniHome(), "run", "minnid.sock")];
   }

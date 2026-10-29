@@ -794,7 +794,7 @@ server.registerTool(
     description:
       "Write a vault note first, then store the learning through Minni.",
     inputSchema: {
-      title: z.string().min(1),
+      title: z.string().min(1).optional(),
       content: z.string().min(1),
       category: z.string().optional(),
       source: z.string().optional(),
@@ -805,7 +805,16 @@ server.registerTool(
       requireQuality: z.boolean().optional().default(true),
     },
   },
-  async ({ title, content, category, source, workspaceId, requireQuality }) => {
+  async ({ title: rawTitle, content, category, source, workspaceId, requireQuality }) => {
+    const title =
+      rawTitle?.trim() ||
+      content
+        .trim()
+        .split(/\r?\n/)[0]
+        ?.replace(/^#+\s*/, "")
+        .slice(0, 72)
+        .trim() ||
+      "Untitled learning";
     // Async path includes the #147 AFM inconclusive tier (regex remains fast path).
     const quality = await assessLearningQualityAsync({ title, content, category, source });
     // `requireQuality:false` opts out of the QUALITY FLOOR — a weak-but-clean

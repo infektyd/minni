@@ -4000,3 +4000,26 @@ test("landedAddSlices reports generated ids after applySliceDelta omits them", (
   assert.equal("id" in requestAdds[0], false, "request omitted id; journal must not echo that");
   assert.equal("evidence" in landed[0], false, "ordered journal omits evidence");
 });
+
+test("resolveActivePlanView self-heals dangling _active_plan.json when notePath is deleted (ENOENT)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-dangling-active-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "dangling active pointer self-heal", vaultPath: root },
+      { vaultPath: root },
+    );
+    await setActivePlan(root, plan.plan_id, write.notePath);
+    await rm(write.notePath, { force: true });
+
+    const view = await resolveActivePlanView(root);
+    assert.equal(view, undefined, "dangling notePath must return undefined instead of throwing");
+    assert.equal(
+      await getActivePlan(root),
+      undefined,
+      "resolveActivePlanView must clear the dangling _active_plan.json pointer",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

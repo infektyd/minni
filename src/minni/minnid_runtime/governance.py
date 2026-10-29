@@ -908,6 +908,7 @@ _SPRINT_CHATTER_RE = re.compile(
     r"|\b(?:phase|slice|wave|workstream|sprint)\s+[a-z0-9_.-]+\s+(?:is\s+|are\s+)?(?:complete|completed|done|green|passed|status|shipped|landed)\b"
     r"|^\s*Compaction summary\s*[—–-]"
     r"|Test failure recovered after edit:\s*Created At:\s*\d{4}-\d{2}-\d{2}"
+    r"|\bGIT_BYPASS\s*=\s*1\b(?![^\n]*(?:byte-identical|never\s+bypass))"
     r")"
 )
 

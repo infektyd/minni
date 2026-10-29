@@ -14,7 +14,7 @@ export const PLUGIN_ROOT = path.resolve(__dirname, "..");
  * socket + vault lookups fail. Expand centrally so every consumer gets an
  * absolute path.
  */
-function expandTilde(p: string): string {
+export function expandTilde(p: string): string {
   return p.replace(/^~(?=$|\/)/, os.homedir());
 }
 

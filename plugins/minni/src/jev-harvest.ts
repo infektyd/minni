@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+import { expandTilde } from "./config.js";
 import { durabilityOf } from "./durability.js";
 import { asString, inboxPrincipalForVaultPath } from "./hook-utils.js";
 import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial } from "./policy.js";
@@ -904,13 +905,16 @@ export async function executeLearnPipeline(input: {
   const dotMinni = path.resolve(os.homedir(), ".minni");
   const resolvedVault = path.resolve(vaultPath);
   const isDefaultVault = resolvedVault === dotMinni || resolvedVault.startsWith(dotMinni + path.sep);
-  const effectiveSocketPath =
+  const rawEffectiveSocketPath =
     input.socketPath ??
     process.env.MINNI_SOCKET_PATH?.trim() ??
     process.env.MINNI_DAEMON_SOCKET?.trim() ??
     (!isDefaultVault && !process.env.MINNI_HOME?.trim()
       ? path.join(vaultPath, ".runtime", "minnid.sock")
       : undefined);
+  const effectiveSocketPath = rawEffectiveSocketPath
+    ? expandTilde(rawEffectiveSocketPath)
+    : undefined;
 
   const doLearnMemory = input.learnMemoryFn ?? learnMemory;
   const store = await doLearnMemory({

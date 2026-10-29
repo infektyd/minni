@@ -210,3 +210,129 @@ test("B4: Swift/Praxis antipattern rules (m:7a11e510..m:7a11e513) respect repo-s
   assert.equal(typeof isSwiftOrPraxisContext, "function", "isSwiftOrPraxisContext must be exported");
 });
 
+test("Wave 1 & 2: expandTilde on MINNI_SOCKET_PATH, read-only Bash inspection with quoted pipes/var assignments/cut/sort/cat, and scheduled prompt skip", async (t) => {
+  const os = await import("node:os");
+  const { jsonRpcSocketCandidates } = await import("../dist/daemon_transport.js");
+  const prevSock = process.env.MINNI_SOCKET_PATH;
+  try {
+    process.env.MINNI_SOCKET_PATH = "~/.minni/run/minnid.sock";
+    const cands = jsonRpcSocketCandidates();
+    assert.equal(
+      cands[0],
+      path.join(os.homedir(), ".minni", "run", "minnid.sock"),
+      "MINNI_SOCKET_PATH with leading ~/ must expand to os.homedir()",
+    );
+  } finally {
+    if (prevSock === undefined) delete process.env.MINNI_SOCKET_PATH;
+    else process.env.MINNI_SOCKET_PATH = prevSock;
+  }
+
+  const fixture = await makeFixture(t, "posttooluse-readonly-wave2");
+  await startFakeDaemon(fixture);
+
+  // 1. Quoted alternation pipe in grep + cut must be recognized as read-only
+  const quotedPipeGrep = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-w2-1",
+    cwd: "/workspace/Projects/Praxis",
+    tool_name: "Bash",
+    tool_input: {
+      command: 'grep -rn "func withDeadline\\|func joinWithin" Services/ | cut -c1-170 | head -40',
+    },
+    is_error: false,
+    tool_response: {
+      stdout: "Services/TaskTimeout.swift:28:    _ = try? await group.next()",
+      stderr: "",
+      exit_code: 0,
+    },
+  });
+  assert.deepEqual(
+    quotedPipeGrep.output,
+    { continue: true },
+    "grep with quoted alternation pipe and cut must not false-fire swift_silent_try_question",
+  );
+
+  // 2. Shell variable assignment prefix + grep + sort + uniq on a log file must not false-fire
+  const varAssignLog = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-w2-2",
+    cwd: "/workspace/Projects/Praxis",
+    tool_name: "Bash",
+    tool_input: {
+      command: 'L=/tmp/gate.log; grep "Expectation failed:" "$L" | sort | uniq -c | head -20',
+    },
+    is_error: false,
+    tool_response: {
+      stdout: "   2 Expectation failed: (frame.width → 0.0) == 320.0",
+      stderr: "",
+      exit_code: 0,
+    },
+  });
+  assert.deepEqual(
+    varAssignLog.output,
+    { continue: true },
+    "variable assignment + grep/sort/uniq log inspection must not false-fire swift_testing_expectation_failed",
+  );
+
+  // 3. Read-only cat of a red test log with exit_code=0 must not false-fire test-failure rules
+  const catRedLog = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-w2-3",
+    cwd: "/workspace/Projects/Praxis",
+    tool_name: "Bash",
+    tool_input: { command: "cat /tmp/f230b-red.log" },
+    is_error: false,
+    tool_response: {
+      stdout: "Expectation failed: (count → 0) == 1\nverify_source_baseline.sh: FAIL: unregistered file",
+      stderr: "",
+      exit_code: 0,
+    },
+  });
+  assert.deepEqual(
+    catRedLog.output,
+    { continue: true },
+    "read-only cat of a log file with exit_code=0 must not false-fire failure lessons",
+  );
+
+  // 4. Non-read-only sed -i edit followed by git diff STILL fires m:7a11e511 (true positive preserved)
+  const sedInPlaceDiff = await runHook(fixture, "PostToolUse", {
+    session_id: "sess-w2-4",
+    cwd: "/workspace/Projects/Praxis",
+    tool_name: "Bash",
+    tool_input: {
+      command: "sed -i '' -e 's/foo/bar/' Sources/Worker.swift && git diff -- Sources/Worker.swift | head -50",
+    },
+    is_error: false,
+    tool_response: {
+      stdout: "+    let result = try? decoder.decode(Entry.self, from: data)",
+      stderr: "",
+      exit_code: 0,
+    },
+  });
+  assert.match(
+    additionalContext(sedInPlaceDiff.output),
+    /m:7a11e511/,
+    "sed -i mutation followed by git diff must still fire swift_silent_try_question",
+  );
+
+  // 5. Scheduled / Self-monitor tick prompt skips UserPromptSubmit vault/daemon recall (no recall_pointer / memory_matches)
+  const { writeVaultPage } = await import("../dist/vault.js");
+  await writeVaultPage({
+    vaultPath: fixture.vault,
+    title: "Self monitor tick background job check",
+    content: "Decision: check background job logs and worktree gates on every self-monitor tick.",
+    section: "decisions",
+    source: "test",
+    frontmatter: { privacy: "safe", status: "accepted" },
+  });
+  const scheduledTick = await runHook(fixture, "UserPromptSubmit", {
+    session_id: "sess-w2-5",
+    prompt:
+      "Self-monitor tick (every ~15 min while work is active):\n1. Check every background job and worktree gate.",
+  });
+  const schedCtx = additionalContext(scheduledTick.output);
+  assert.doesNotMatch(
+    schedCtx,
+    /recall_pointer|memory_matches/,
+    "Self-monitor tick prompt must skip UserPromptSubmit vault/daemon recall",
+  );
+});
+
+

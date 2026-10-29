@@ -1359,3 +1359,78 @@ def test_part3_evict_candidate_to_cold_archive(tmp_path: Path) -> None:
             "SELECT COUNT(*) AS n FROM candidate_packets WHERE status='proposed'"
         ).fetchone()["n"]
         assert n == 0
+
+
+def test_wave1_scar_category_preserved_and_hook_bypass_blocked(tmp_path: Path) -> None:
+    from minni.writeback import CATEGORIES
+
+    assert "scar" in CATEGORIES
+    assert "gotcha" in CATEGORIES
+
+    cfg = MinniConfig(
+        db_path=str(tmp_path / "minni.db"),
+        vault_path=str(tmp_path / "vault"),
+        faiss_index_path=str(tmp_path / "faiss.index"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        writeback_enabled=False,
+    )
+    (tmp_path / "vault").mkdir(parents=True, exist_ok=True)
+    db = MinniDB(cfg)
+
+    import numpy as np
+
+    class _DummyModel:
+        def encode(self, text: str, show_progress_bar: bool = False):
+            return np.ones(384, dtype=np.float32)
+
+    class _DummyWB:
+        def __init__(self, d, c):
+            self.db = d
+            self.config = c
+            self.model = _DummyModel()
+
+    wb = _DummyWB(db, cfg)
+    ctx = GovernanceContext(
+        make_error=lambda code, msg, rid: {"error": {"code": code, "message": msg}, "id": rid},
+        make_response=lambda res, rid: {"result": res, "id": rid},
+        handler_principal=lambda params, rid: (
+            EffectivePrincipal(
+                agent_id="claude-code",
+                capabilities=["search", "read", "learn", "resolve_candidate"],
+                auto_accept_own=True,
+            ),
+            None,
+        ),
+        lazy_writeback=lambda: wb,
+        lazy_episodic=lambda: None,
+        record_latency=lambda *a, **k: None,
+        index_durable_learning=lambda *a, **k: True,
+        maybe_archive_inbox_source=lambda *a, **k: None,
+        sovereign_db=lambda: db,
+    )
+    resp = stage_candidate(
+        {
+            "content": "Root cause: unguarded /usr/bin/sample wedges when target pid is stuck in kernel task_suspend.",
+            "category": "scar",
+            "origin": "agent",
+        },
+        request_id=1,
+        context=ctx,
+    )
+    res = resp["result"]
+    assert res["status"] == "accepted"
+    with db.cursor() as c:
+        row = c.execute(
+            "SELECT category FROM learnings WHERE learning_id = ?",
+            (res["learning_id"],),
+        ).fetchone()
+        assert row["category"] == "scar", f"expected category='scar', got {row['category']}"
+
+    # Uncontextualized hook bypass workaround is blocked from auto-promotion
+    bypass_blocker = non_durable_promotion_blocker(
+        content="Fix: set GIT_BYPASS=1 git commit -m 'msg' when pre-commit hook blocks.",
+        category="fix",
+        origin="agent",
+    )
+    assert bypass_blocker == "non_durable:noise"
+

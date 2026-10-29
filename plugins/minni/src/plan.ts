@@ -2676,7 +2676,16 @@ export async function resolveActivePlanView(
         ) {
           return undefined;
         }
-        const plan = await rehydratePlan(active.notePath);
+        let plan: Awaited<ReturnType<typeof rehydratePlan>>;
+        try {
+          plan = await rehydratePlan(active.notePath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+            await clearActivePlan(vaultPath).catch(() => {});
+            return undefined;
+          }
+          throw error;
+        }
         if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
           return undefined;
         }

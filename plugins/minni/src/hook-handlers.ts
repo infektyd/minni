@@ -2438,8 +2438,12 @@ export function createHookHandlers(
       }
     }
 
-    const isSkip = promptEnvelope?.kind === "skip";
     const recallQuery = promptEnvelope ? promptEnvelope.body : prompt;
+    const isSelfMonitorTick = /^Self-monitor tick\s*\(/i.test(recallQuery.trim());
+    const isSkip =
+      promptEnvelope?.kind === "skip" ||
+      promptEnvelope?.kind === "scheduled" ||
+      isSelfMonitorTick;
     const envelopeAuditDetails = promptEnvelope
       ? {
           envelope_kind: promptEnvelope.kind,
