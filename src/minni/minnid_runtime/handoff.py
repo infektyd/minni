@@ -590,10 +590,10 @@ def update_handoff_lease_status(
         with db.cursor() as c:
             c.execute(
                 """UPDATE handoff_leases
-                   SET status = ?,
+                   SET status = CASE WHEN status = 'not_required' THEN 'not_required' ELSE ? END,
                        contradicts_id = COALESCE(?, contradicts_id)
                    WHERE lease_id = ?
-                     AND status = 'pending'
+                     AND status IN ('pending', 'not_required')
                      AND (expires_at IS NULL OR expires_at > ?)""",
                 (status, contradicts_id, lease_id, now),
             )

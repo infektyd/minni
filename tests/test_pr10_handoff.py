@@ -1152,3 +1152,24 @@ def test_h9_ack_is_final(monkeypatch, tmp_path):
     assert "error" in r and st == "accepted", (
         f"second ack overwrote final status -> {st}"
     )
+
+
+def test_p2_2_ack_on_not_required_lease_is_idempotent_noop_success(monkeypatch, tmp_path):
+    """P2-2: an ack on a requires_ack=False (status='not_required') lease must
+    succeed idempotently rather than failing the CAS with -32009."""
+    db, lid = _h9_send(tmp_path, monkeypatch, requires_ack=False)
+    with db.cursor() as c:
+        st0 = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st0 == "not_required"
+
+    r1 = _h9_ack(lid, "accepted")
+    assert "error" not in r1, f"ack on not_required lease errored: {r1}"
+    r2 = _h9_ack(lid, "accepted")
+    assert "error" not in r2, f"second ack on not_required lease was not idempotent: {r2}"
+    with db.cursor() as c:
+        st1 = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st1 == "not_required"
