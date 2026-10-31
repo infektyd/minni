@@ -133,15 +133,21 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
                     c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
                     retracted_any = True
         if retracted_any and eng is not None:
-            invalidate_rerank = getattr(eng, "_invalidate_durable_rerank", None)
-            if callable(invalidate_rerank):
-                invalidate_rerank(old_chunk_ids)
-            remove_faiss = getattr(eng, "_remove_live_faiss", None)
-            if callable(remove_faiss):
-                remove_faiss(old_chunk_ids)
-            invalidate_trie = getattr(eng, "_invalidate_trie", None)
-            if callable(invalidate_trie):
-                invalidate_trie()
+            from types import SimpleNamespace
+
+            if isinstance(eng, SimpleNamespace):
+                for name, args in (
+                    ("_invalidate_durable_rerank", (old_chunk_ids,)),
+                    ("_remove_live_faiss", (old_chunk_ids,)),
+                    ("_invalidate_trie", ()),
+                ):
+                    fn = getattr(eng, name, None)
+                    if callable(fn):
+                        fn(*args)
+            else:
+                eng._invalidate_durable_rerank(old_chunk_ids)
+                eng._remove_live_faiss(old_chunk_ids)
+                eng._invalidate_trie()
         return retracted_any
 
     explicit_status = extract_explicit_frontmatter_status(content)

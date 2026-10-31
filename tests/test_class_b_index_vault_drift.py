@@ -499,3 +499,82 @@ def test_h11_vault_index_doc_retract_invalidates_faiss_trie_and_rerank(
         f"retract must invalidate durable rerank cache: got {rerank_invalidated}, expected {expected_chunks}"
     )
 
+
+def test_h11_retract_engine_cache_invalidation_methods_exist_and_called_directly(
+    tmp_path: Path,
+):
+    """P3 / H11: RetrievalEngine must define _invalidate_durable_rerank,
+    _remove_live_faiss, and _invalidate_trie, and _retract_existing_if_any must
+    call them directly rather than silently no-oping via getattr/callable if one
+    is renamed or missing."""
+    from minni.retrieval import RetrievalEngine
+
+    for method_name in (
+        "_invalidate_durable_rerank",
+        "_remove_live_faiss",
+        "_invalidate_trie",
+    ):
+        assert callable(getattr(RetrievalEngine, method_name, None)), (
+            f"RetrievalEngine missing required retract cache hook {method_name}"
+        )
+
+    cfg, _db, engine = _make_engine(tmp_path)
+    note_rel = "wiki/notes/retract-direct.md"
+    note_full = Path(cfg.vault_path) / note_rel
+    note_full.parent.mkdir(parents=True, exist_ok=True)
+    accepted_text = "---\ntitle: Retract Direct\nstatus: accepted\n---\n\n# Retract Direct\n\nToken retractdirecttoken321.\n"
+    note_full.write_text(accepted_text, encoding="utf-8")
+
+    class BrokenEngineProxy:
+        """Non-SimpleNamespace engine wrapper missing _invalidate_trie to verify
+        retract does not silently swallow a renamed/missing method."""
+
+        def __init__(self, inner):
+            self.db = inner.db
+            self.config = inner.config
+            self.index_durable_document = inner.index_durable_document
+            self._invalidate_durable_rerank = inner._invalidate_durable_rerank
+            self._remove_live_faiss = inner._remove_live_faiss
+
+    proxy = BrokenEngineProxy(engine)
+    ctx = VaultIndexContext(
+        make_error=lambda code, msg, req_id, data=None: {
+            "error": {"code": code, "message": msg},
+            "id": req_id,
+        },
+        make_response=lambda data, req_id: {"result": data, "id": req_id},
+        make_mismatch_error=lambda w, s, r: {"error": "mismatch", "id": r},
+        handler_principal=lambda p, r: (SimpleNamespace(agent_id="claude-code"), None),
+        guard_vault_root=lambda *a, **kw: None,
+        lazy_retrieval=lambda: proxy,
+        agent_vault=lambda aid: (Path(cfg.vault_path), True),
+        record_latency=lambda *_a, **_kw: None,
+        increment_request_count=lambda: None,
+    )
+    resp1 = handle_vault_index_doc(
+        {
+            "path": note_rel,
+            "content": accepted_text,
+            "agent": "claude-code",
+            "page_status": "accepted",
+        },
+        request_id=1,
+        context=ctx,
+    )
+    assert resp1.get("result", {}).get("status") == "ok"
+
+    archived_text = "---\ntitle: Retract Direct\nstatus: archived\n---\n\n# Retract Direct\n\nToken retractdirecttoken321.\n"
+    note_full.write_text(archived_text, encoding="utf-8")
+    resp2 = handle_vault_index_doc(
+        {
+            "path": note_rel,
+            "content": archived_text,
+            "agent": "claude-code",
+            "page_status": "archived",
+        },
+        request_id=2,
+        context=ctx,
+    )
+    assert "error" in resp2 and "_invalidate_trie" in resp2["error"]["message"], (
+        f"missing engine invalidation method was silently ignored by getattr guard: {resp2}"
+    )

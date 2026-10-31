@@ -1191,4 +1191,3 @@ def test_h12_stage_candidate_strips_forged_inbox_source_and_inbox_file(
     df = json.loads(row["derived_from"])
     assert df.get("source") != "inbox", f"forged source='inbox' was not stripped: {df}"
     assert "inbox_file" not in df, f"forged inbox_file was not stripped: {df}"
-
