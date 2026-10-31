@@ -235,22 +235,25 @@ def check_wire_launch_bindings(home: Path) -> tuple[list[str], list[str]]:
     This does not verify host hook/rule registration, process restart, arbitrary
     launcher scripts, or host-level configuration precedence/overrides.
     """
-    wired = home / ".minni/plugin/wired.json"
-    if not wired.exists():
-        return [], ["host launch bindings not checked: no wired.json records"]
-    try:
-        data = json.loads(wired.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not isinstance(data.get("wires", []), list):
-            raise ValueError("invalid wire record shape")
-        entries = data.get("wires", [])
-    except (OSError, ValueError):
-        return ["wired.json unreadable or malformed; host launch bindings unverified"], []
-
     _src = Path(__file__).resolve().parent.parent / "src"
     if _src.is_dir() and str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
+    from minni.wire.health import audit_host_propagation_health
     from minni.wire.platform import config_root_exists, platform_spec
     from minni.wire.verify import _readback_server_path
+
+    wired = home / ".minni/plugin/wired.json"
+    entries: list = []
+    schema_ver = 1
+    if wired.exists():
+        try:
+            data = json.loads(wired.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("wires", []), list):
+                raise ValueError("invalid wire record shape")
+            entries = data.get("wires", [])
+            schema_ver = int(data.get("schema", 1) or 1)
+        except (OSError, ValueError, TypeError):
+            return ["wired.json unreadable or malformed; host launch bindings unverified"], []
 
     latest: dict[str, dict] = {}
     for entry in entries:
@@ -266,10 +269,19 @@ def check_wire_launch_bindings(home: Path) -> tuple[list[str], list[str]]:
 
     problems: list[str] = []
     notes: list[str] = []
+    v1_handled_paths: set[str] = set()
     supported = {"toml", "claude-json", "kilo-json", "mcp-json-only", "antigravity"}
     for platform, record in sorted(latest.items()):
         raw_root = record.get("install_root")
         root = Path(raw_root) if isinstance(raw_root, str) and raw_root else Path()
+        raw_cfg = record.get("config_path")
+        if schema_ver == 1 and isinstance(raw_cfg, str) and raw_cfg and root.name != "current":
+            cfg_p = home / raw_cfg[2:] if raw_cfg.startswith("~/") else Path(raw_cfg)
+            v1_handled_paths.add(str(cfg_p))
+            try:
+                v1_handled_paths.add(str(cfg_p.resolve()))
+            except OSError:
+                pass
         try:
             kind = platform_spec(platform, install_root=str(root), agent="main").config_kind
         except ValueError:
@@ -360,6 +372,38 @@ def check_wire_launch_bindings(home: Path) -> tuple[list[str], list[str]]:
             # Parser errors may embed credential-bearing source lines. Only
             # report the category; never print the exception or config values.
             problems.append(f"{platform}: host config is malformed or unreadable")
+
+    is_legacy_v1_wire_only = (
+        wired.exists()
+        and schema_ver == 1
+        and all(
+            Path(str(e.get("install_root") or "")).name != "current"
+            for e in entries
+            if isinstance(e, dict)
+        )
+    )
+
+    health = audit_host_propagation_health(home=home)
+    for surf in health.drifted_surfaces:
+        spath = str(surf.get("path") or "")
+        reasons = list(surf.get("reasons") or [])
+        if is_legacy_v1_wire_only:
+            reasons = [r for r in reasons if r.startswith("forbidden_env_keys:")]
+        if reasons:
+            problems.append(
+                f"{surf.get('host')}: host propagation drift at {spath} ({', '.join(reasons)})"
+            )
+    for ref in health.uncatalogued_refs:
+        problems.append(
+            f"uncatalogued: {ref.get('path')} ({ref.get('reason')})"
+        )
+    for srv in health.running_stale_servers:
+        problems.append(
+            f"running_stale_server: pid={srv.get('pid')} version={srv.get('version')}"
+        )
+
+    if not wired.exists() and not problems:
+        return [], ["host launch bindings not checked: no wired.json records"]
     return problems, notes
 
 

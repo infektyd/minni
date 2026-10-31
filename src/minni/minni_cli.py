@@ -612,28 +612,74 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  [PASS] models: all {len(EXPECTED_MODELS)} embedding/rerank "
               "models cached")
 
-    # 6. Fleet freshness (WARN): plugin/host lag is the #1 "I merged but agents
-    # still run old hooks" footgun. Never fail doctor on it — customers may be
-    # mid-session — but always name the command that fixes it.
+    # 6. Fleet freshness & host propagation health (FAIL-CLOSED, §4.7 / P1-7):
+    # Fail doctor on daemon deploy lag and on audit_host_propagation_health drift.
     try:
         from minni.minnid_runtime.deploy_honesty import deploy_status
-        deploy = deploy_status()
+        from minni.wire.health import audit_host_propagation_health
+
+        local_deploy = deploy_status()
         rpc_deploy = (
             status.get("daemon", {}).get("deploy")
             if status_ok and isinstance(status, dict)
             else None
         )
-        if isinstance(rpc_deploy, dict) and rpc_deploy.get("stale") is True and deploy.get("stale") is not True:
-            deploy = rpc_deploy
+        if isinstance(rpc_deploy, dict):
+            deploy = dict(rpc_deploy)
+            if "plugin_dist" not in deploy and isinstance(local_deploy.get("plugin_dist"), dict):
+                deploy["plugin_dist"] = local_deploy["plugin_dist"]
+        else:
+            deploy = dict(local_deploy)
+            # When the daemon status RPC did not include a deploy block (e.g. a
+            # minimal test stub), do not conflate an uncommitted local worktree
+            # edit with daemon lag unless start SHA or plugin_dist actually lags.
+            if (
+                deploy.get("stale") is True
+                and deploy.get("started_dirty") is True
+                and deploy.get("started_git_sha") == deploy.get("current_git_sha")
+                and not (deploy.get("plugin_dist") or {}).get("stale")
+            ):
+                deploy["stale"] = False
+
         plugin = (deploy or {}).get("plugin_dist") or {}
-        if deploy.get("stale") is True or plugin.get("stale") is True:
-            reason = deploy.get("reason") or plugin.get("reason") or "deploy lag"
-            print("  [WARN] fleet: install is stale relative to this package/checkout")
+        home_dir = Path.home()
+        current_link = home_dir / ".minni" / "plugin" / "current"
+        health = audit_host_propagation_health(home=home_dir)
+        has_current = current_link.exists() or current_link.is_symlink()
+        health_failed = bool(
+            health.drifted_surfaces
+            or health.uncatalogued_refs
+            or health.running_stale_servers
+            or (has_current and not health.current_valid)
+        )
+        deploy_stale = (
+            deploy.get("stale") is True
+            or plugin.get("stale") is True
+            or bool(deploy.get("running_stale_servers"))
+        )
+        if deploy_stale or health_failed:
+            failures += 1
+            reason = deploy.get("reason") or plugin.get("reason") or "host propagation drift or deploy lag"
+            print("  [FAIL] fleet: install or host surface is stale/drifted relative to this package/checkout")
             print(f"         {reason}")
+            if has_current and not health.current_valid and health.current_error:
+                print(f"         current: {health.current_error}")
+            for surf in health.drifted_surfaces:
+                print(
+                    f"         drifted surface: {surf.get('host')} ({surf.get('path')}): "
+                    f"{', '.join(surf.get('reasons') or [])}"
+                )
+            for ref in health.uncatalogued_refs:
+                print(f"         uncatalogued ref: {ref.get('path')} ({ref.get('reason')})")
+            for srv in health.running_stale_servers:
+                print(
+                    f"         stale MCP server: pid={srv.get('pid')} "
+                    f"version={srv.get('version')} sha={srv.get('git_sha')}"
+                )
             print("         Fix: minni sync          # redeploy plugin to all wired hosts")
             print("              minni sync --full   # editable checkout: also git pull + rebuild")
         else:
-            print("  [PASS] fleet: plugin/daemon not reporting deploy lag")
+            print("  [PASS] fleet: plugin/daemon and host surfaces healthy")
     except Exception as exc:  # pragma: no cover — optional surface
         print(f"  [WARN] fleet: could not read deploy status ({exc})")
 

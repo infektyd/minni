@@ -140,3 +140,124 @@ def test_installed_plugins_tracks_sha_expanded_paths_and_scanner_catches_rogue_f
     out_text = capsys.readouterr().out
     assert "STALE" in out_text
     assert "4242" in out_text
+
+
+def test_doctor_and_check_scripts_fail_closed_on_daemon_stale_and_host_propagation_drift(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """P1-7: minni doctor must fail (exit 1) on daemon deploy lag and on
+    audit_host_propagation_health drift, and both check_deployments.py and
+    check_versions.py must be driven by audit_host_propagation_health.
+    """
+    import importlib.util
+    import sys
+
+    import minni.minni_cli as minni_cli
+    from minni.minnid_runtime import deploy_honesty
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sys, "version_info", (3, 14, 0, "final", 0))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+
+    sock_dir = tmp_path / "sockdir"
+    sock_dir.mkdir()
+    sock_dir.chmod(0o700)
+    sock = sock_dir / "minnid.sock"
+    sock.touch()
+    sock.chmod(0o600)
+
+    # 1. Daemon RPC reports stale=True while local deploy_status() reports stale=False -> doctor must fail (rc == 1)
+    monkeypatch.setattr(
+        deploy_honesty,
+        "deploy_status",
+        lambda: {"stale": False, "plugin_dist": {"stale": False}},
+    )
+
+    def _rpc_stale(sock_path, method, params=None, timeout=30.0):
+        if method == "status":
+            return {
+                "daemon": {
+                    "version": "0.6.0",
+                    "uptime_seconds": 10,
+                    "requests_served": 1,
+                    "deploy": {
+                        "stale": True,
+                        "reason": "daemon started from older commit 11111111",
+                    },
+                },
+                "engine": {"db_ok": True, "faiss_ok": True, "stats": {}},
+            }
+        return {"results": [], "count": 0}
+
+    monkeypatch.setattr(minni_cli, "_rpc", _rpc_stale)
+    rc_stale = minni_cli.main(["--socket", str(sock), "doctor"])
+    out_stale = capsys.readouterr().out
+    assert rc_stale == 1, out_stale
+    assert "[FAIL] fleet:" in out_stale
+    assert "11111111" in out_stale
+
+    # 2. Daemon RPC reports stale=False, but host surface (~/.claude.json) has drift -> doctor must fail (rc == 1)
+    (home / ".claude.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(plugin_dir / "0.5.0+git.oldsha" / "dist" / "server.js")],
+                    "env": {
+                        "MINNI_AGENT_ID": "claude-code",
+                        "MINNI_VAULT_PATH": str(home / ".minni" / "claudecode-vault"),
+                        "MINNI_WORKSPACE_ID": "forbidden-static-id",
+                    },
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    def _rpc_clean(sock_path, method, params=None, timeout=30.0):
+        if method == "status":
+            return {
+                "daemon": {
+                    "version": "0.6.0",
+                    "uptime_seconds": 10,
+                    "requests_served": 1,
+                    "deploy": {"stale": False, "plugin_dist": {"stale": False}},
+                },
+                "engine": {"db_ok": True, "faiss_ok": True, "stats": {}},
+            }
+        return {"results": [], "count": 0}
+
+    monkeypatch.setattr(minni_cli, "_rpc", _rpc_clean)
+    rc_drift = minni_cli.main(["--socket", str(sock), "doctor"])
+    out_drift = capsys.readouterr().out
+    assert rc_drift == 1, out_drift
+    assert "[FAIL] fleet:" in out_drift
+    assert "claude_code" in out_drift or ".claude.json" in out_drift
+
+    # 3. Both check_deployments.py and check_versions.py must report the drifted host via audit_host_propagation_health
+    repo_root = Path(__file__).resolve().parent.parent
+    cd_spec = importlib.util.spec_from_file_location(
+        "_check_deployments_p1_7", repo_root / "scripts" / "check_deployments.py"
+    )
+    cd_mod = importlib.util.module_from_spec(cd_spec)
+    cd_spec.loader.exec_module(cd_mod)
+    cd_problems, _cd_notes = cd_mod.check_wire_launch_bindings(home)
+    assert any("claude_code" in p or ".claude.json" in p for p in cd_problems), cd_problems
+
+    monkeypatch.setenv("MINNI_CHECK_VERSIONS_HOME", str(home))
+    cv_spec = importlib.util.spec_from_file_location(
+        "_check_versions_p1_7", repo_root / "scripts" / "check_versions.py"
+    )
+    cv_mod = importlib.util.module_from_spec(cv_spec)
+    cv_spec.loader.exec_module(cv_mod)
+    cv_mismatches, _cv_notes = cv_mod.check_deployed("0.6.0")
+    assert any("claude_code" in m or ".claude.json" in m for m in cv_mismatches), cv_mismatches
+

@@ -85,9 +85,18 @@ def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...
         str(home / ".minni" / "archive"),
         str(home / ".agents" / "plugins" / "Minni@Minni"),
         str(home / ".agents" / "plugins" / "minni@minni"),
+        str(home / ".agents" / "skills"),
         str(home / ".cursor" / "plugins" / "local" / "minni"),
+        str(home / ".cursor" / "skills"),
         str(home / ".claude" / "plugins" / "marketplaces" / "minni-local"),
+        str(home / ".claude" / "plugins" / "cache"),
         str(home / ".claude" / "local-marketplaces" / "minni"),
+        str(home / ".claude" / "skills"),
+        str(home / ".codex" / "plugins" / "cache"),
+        str(home / ".codex" / "skills"),
+        str(home / ".gemini" / "skills"),
+        str(home / ".grok" / "skills"),
+        str(home / ".config" / "kilo" / "plugins" / "minni"),
     ]
     for hspec in expanded.values():
         for surf in hspec.get("surfaces", []):
