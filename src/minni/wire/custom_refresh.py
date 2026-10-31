@@ -248,6 +248,10 @@ def _refresh(
     replacement = (json.dumps(data, indent=2) + "\n").encode()
     if dry_run:
         return {"platform": platform, "status": "dry-run", "reason": "would refresh registered MCP binding", "notes": notes}
+    from minni.wire.cutover import _check_host_lockfile
+    lock_hit = _check_host_lockfile(home, str(platform), config, retries=3)
+    if lock_hit:
+        raise ValueError(f"DEFERRED_RUNNING_HOST_DELTA: lockfile present for {platform} ({config}): {lock_hit}")
     _check_record(record)
     mode = stat.S_IMODE(config.stat().st_mode)
     if archive_first:

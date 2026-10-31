@@ -683,16 +683,30 @@ def run_fleet_sync(
         steps.append({"name": "payload_gc", "exit_code": 0, "skipped": True,
                       "reason": "deferred: native/custom references may remain on older payloads"})
 
-    # Custom JSON bindings are registered MCP consumers, not native hosts.
+    # Run atomic cutover & per-host reconciliation BEFORE custom_refresh and propagate (P1-2, P1-5).
     from minni.wire.custom_refresh import refresh_custom_wires
-    steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
-    steps.append(
-        _reconcile_all_hosts(
-            from_repo=from_repo,
-            install_root=wire_step.get("install_root"),
-            dry_run=dry_run,
-        )
+
+    reconcile_step = _reconcile_all_hosts(
+        from_repo=from_repo,
+        install_root=wire_step.get("install_root"),
+        dry_run=dry_run,
     )
+    steps.append(reconcile_step)
+    if not reconcile_step.get("skipped") and reconcile_step.get("exit_code", 0) != 0:
+        if reconcile_step.get("exit_code") == 1 and not propagate_hosts:
+            steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
+        return SyncResult(
+            ok=False,
+            install_kind=kind,
+            steps=steps,
+            message=str(
+                reconcile_step.get("message")
+                or f"fleet sync ({kind}): atomic cutover exited {reconcile_step.get('exit_code')} — stopped before propagate"
+            ),
+            next_actions=next_actions,
+        )
+
+    steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
 
     if propagate_hosts and not dry_run:
         for plat in ("antigravity", "cursor"):
