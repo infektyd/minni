@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SessionStart",
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SessionStart",
             "timeout": 600
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js UserPromptSubmit",
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js UserPromptSubmit",
             "timeout": 60
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreToolUse"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreToolUse"
           }
         ]
       }
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreCompact"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreCompact"
           }
         ]
       }
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PostCompact"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PostCompact"
           }
         ]
       }
@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js Stop"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js Stop"
           }
         ]
       }
@@ -68,7 +68,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SubagentStart"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SubagentStart"
           }
         ]
       }
@@ -78,7 +78,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SubagentStop"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SubagentStop"
           }
         ]
       }
@@ -89,7 +89,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PostToolUse"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PostToolUse"
           }
         ]
       }
@@ -100,7 +100,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PostToolUseFailure"
+            "command": "exec node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PostToolUseFailure"
           }
         ]
       }
