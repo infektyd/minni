@@ -117,6 +117,11 @@ import {
   type WorkerUpdateAction,
 } from "./thread-worker.js";
 import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
+import {
+  acknowledgeRelayThroughSeq,
+  acknowledgeSelfAuthoredPrefixInVault,
+  vaultPrincipalSubscriberId,
+} from "./thread-notification-relay.js";
 import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
 import {
   drainStatusForModel,
@@ -1693,6 +1698,12 @@ server.registerTool(
           orderedSnapshot: ordered,
           supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
         });
+        const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          effectiveVaultPath,
+          plan_id,
+          [DEFAULT_AGENT_ID, ...(vp ? [vp] : [])],
+        ).catch(() => {});
         // P10/H6: terminal plans stop being injected.
         if (updated.status === "complete" || updated.status === "accepted") {
           try {
@@ -1789,6 +1800,12 @@ server.registerTool(
           now,
           orderedSnapshot: ordered,
         });
+        const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          effectiveVaultPath,
+          plan_id,
+          [DEFAULT_AGENT_ID, ...(vp ? [vp] : [])],
+        ).catch(() => {});
         return updated;
       },
     );
@@ -2624,6 +2641,14 @@ server.registerTool(
       });
       const journalPath = journalPathFor(notePath, plan_id);
       const result = await readThreadEvents(journalPath, since_seq, limit);
+      const ackSeq = Math.max(result.next_seq, since_seq ?? 0);
+      const vaultPrincipal = vaultPrincipalSubscriberId(DEFAULT_VAULT_PATH);
+      await acknowledgeRelayThroughSeq(
+        DEFAULT_VAULT_PATH,
+        plan_id,
+        ackSeq,
+        [DEFAULT_AGENT_ID, ...(vaultPrincipal ? [vaultPrincipal] : [])],
+      ).catch(() => {});
       return textResult(JSON.stringify({ plan_id, ...result }, null, 2));
     } catch (error) {
       return threadWorkerErrorResult("plan.events", error);

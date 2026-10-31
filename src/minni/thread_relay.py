@@ -89,11 +89,36 @@ HOST_INJECTION_TABLE: dict[str, dict[str, Any]] = {
         "spawned": False,
         "grokWorkerStart": None,
     },
+    "claude-code": {
+        "host": "claude-code",
+        "sessionStart": "injects",
+        "promptSubmit": "injects",
+        "stop": "out",
+        "wire": "SessionStart + UserPromptSubmit; Stop additionalContext wakes stopped turn so relay is out",
+        "wake": "deferred",
+        "wetImmediate": False,
+        "spawned": False,
+        "grokWorkerStart": None,
+    },
 }
+
+RELAY_HOST_ALIASES: dict[str, str] = {
+    "agy": "agy",
+    "gemini": "agy",
+    "antigravity": "agy",
+    "grok": "grok",
+    "grok-build": "grok",
+    "codex": "codex",
+    "cursor": "cursor",
+    "claude": "claude-code",
+    "claude-code": "claude-code",
+}
+
 
 def host_hook_injects(host: str, hook: str) -> bool:
     """Confirm delivery=true only when this host's wire for this hook injects."""
-    row = HOST_INJECTION_TABLE.get(host)
+    canonical = RELAY_HOST_ALIASES.get(host.strip().lower(), host)
+    row = HOST_INJECTION_TABLE.get(canonical)
     if row is None:
         return False
     return row.get(hook) == "injects"
@@ -483,3 +508,24 @@ def ingest_plan_journal_from_disk(
     return ingest_journal_into_vault(
         vault_path, plan_id, events, subscriber_ids, conn=conn, updated_at=updated_at
     )
+
+
+def acknowledge_relay_through_seq(
+    vault_path: str | Path,
+    plan_id: str,
+    through_seq: int,
+    subscriber_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Advance delivery cursors through ``through_seq`` for the given subscribers."""
+    store = load_relay_store(vault_path)
+    if through_seq <= 0:
+        return store
+    seen: set[str] = set()
+    for raw_id in subscriber_ids:
+        sub_id = str(raw_id or "").strip()
+        if not sub_id or sub_id == "unknown-agent" or sub_id in seen:
+            continue
+        seen.add(sub_id)
+        store = confirm_delivery_store(store, sub_id, plan_id, int(through_seq), True)
+    save_relay_store(vault_path, store)
+    return store

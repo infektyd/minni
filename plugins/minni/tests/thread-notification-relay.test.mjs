@@ -35,7 +35,7 @@ import {
   vaultPrincipalSubscriberId,
 } from "../dist/thread-notification-relay.js";
 import { createHookHandlers } from "../dist/hook-handlers.js";
-import { geminiWire, grokBuildWire } from "../dist/hook-platform.js";
+import { claudeCodeWire, geminiWire, grokBuildWire } from "../dist/hook-platform.js";
 import { discardDeliveryCommits, runDeliveryCommits } from "../dist/hook-delivery.js";
 import { appendOrderedEventBatch } from "../dist/thread-events.js";
 import { createPlan } from "../dist/plan.js";
@@ -559,5 +559,68 @@ test("grok SessionStart/UPS confirm does not advance cursor; agy Stop does not; 
       3,
       "grok Stop injects and may confirm true",
     );
+  });
+});
+
+test("Class A: claude-code Stop does not re-inject pending_attention in a loop, SessionStart/UPS confirms, and thread_events acknowledges cursor", { timeout: 60_000 }, async (t) => {
+  assert.equal(deliverySucceededForHostHook("claude-code", "sessionStart"), true);
+  assert.equal(deliverySucceededForHostHook("claude-code", "promptSubmit"), true);
+  assert.equal(deliverySucceededForHostHook("claude-code", "stop"), false);
+
+  await withHookEnv(t, async ({ vaultPath }) => {
+    const { plan } = await createPlan(
+      {
+        goal: "class A stop loop repro",
+        slices: [{ id: "s1", title: "one" }],
+        vaultPath,
+      },
+      { vaultPath },
+    );
+    const planId = plan.plan_id;
+    const seqEvents = [
+      { seq: 1, kind: "slice.assigned", actor: "claude-code", at: "2026-08-20T12:00:00.000Z", slice_id: "s1" },
+      { seq: 2, kind: "slice.completed", actor: "worker-a", at: "2026-08-20T12:01:00.000Z", slice_id: "s1" },
+      { seq: 7, kind: "slice.completed", actor: "worker-b", at: "2026-08-20T12:02:00.000Z", slice_id: "s1" },
+    ];
+    await ingestJournalIntoVault(vaultPath, planId, seqEvents, ["claude-code"]);
+
+    const claude = createHookHandlers(hookConfig(vaultPath, "claude-code", claudeCodeWire));
+    discardDeliveryCommits();
+    const stopOut = await claude.handleStop({ session_id: "class-a-claude-stop" });
+    await runDeliveryCommits();
+    assert.equal(
+      stopOut.hookSpecificOutput,
+      undefined,
+      "claude-code Stop must not inject pending_attention as additionalContext (would wake a stopped turn in an infinite loop)",
+    );
+
+    discardDeliveryCommits();
+    await claude.handleUserPromptSubmit({
+      prompt: "continue working on the active thread",
+      session_id: "class-a-claude-ups",
+    });
+    await runDeliveryCommits();
+    assert.equal(
+      cursorFor(await loadRelayStore(vaultPath), "claude-code", planId).last_delivered_seq,
+      7,
+      "claude-code UserPromptSubmit injects and advances cursor to 7",
+    );
+
+    // Re-seed and verify acknowledgeRelayThroughSeq (used by minni_thread_events) consumes pending
+    const relayMod = await import("../dist/thread-notification-relay.js");
+    assert.equal(typeof relayMod.acknowledgeRelayThroughSeq, "function");
+    await saveRelayStore(vaultPath, emptyRelayStore());
+    await ingestJournalIntoVault(vaultPath, planId, seqEvents, ["claude-code"]);
+    await relayMod.acknowledgeRelayThroughSeq(vaultPath, planId, 7, ["claude-code"]);
+    assert.equal(
+      cursorFor(await loadRelayStore(vaultPath), "claude-code", planId).last_delivered_seq,
+      7,
+    );
+    const pendingAfterAck = await pendingAttentionForHook({
+      vaultPath,
+      subscriberId: "claude-code",
+      planId,
+    });
+    assert.equal(pendingAfterAck, null);
   });
 });

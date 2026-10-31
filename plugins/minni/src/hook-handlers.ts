@@ -3278,7 +3278,7 @@ export function createHookHandlers(
     // SessionStart cannot, and today that is Grok Build; probing canInject
     // keeps the route honest if another wire gains a structural SessionStart
     // drop later.
-    if (canInject(wire, "Stop")) {
+    if (canInject(wire, "Stop") && !canInject(wire, "SessionStart") && payload.stop_hook_active !== true) {
       // Unbudgeted local FS: same as SessionStart reassert. Absence loses data.
       const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3);
       if (parkedPending.length > 0) {
@@ -3345,29 +3345,31 @@ export function createHookHandlers(
     }
 
     let pendingStopText = "";
-    try {
-      const planId = await activePlanIdFromVault(config.vaultPath);
-      const pending = await pendingAttentionForHook({
-        vaultPath: config.vaultPath,
-        subscriberId: config.agentId,
-        planId,
-      });
-      if (pending && planId) {
-        pendingStopText = pending.text;
-        const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
-        if (lastSeq !== undefined) {
-          confirmPendingIfInjects({
-            vaultPath: config.vaultPath,
-            subscriberId: config.agentId,
-            planId,
-            lastSeq,
-            hostId: wire.id,
-            hook: "stop",
-          });
+    if (deliverySucceededForHostHook(wire.id, "stop") && payload.stop_hook_active !== true) {
+      try {
+        const planId = await activePlanIdFromVault(config.vaultPath);
+        const pending = await pendingAttentionForHook({
+          vaultPath: config.vaultPath,
+          subscriberId: config.agentId,
+          planId,
+        });
+        if (pending && planId) {
+          pendingStopText = pending.text;
+          const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
+          if (lastSeq !== undefined) {
+            confirmPendingIfInjects({
+              vaultPath: config.vaultPath,
+              subscriberId: config.agentId,
+              planId,
+              lastSeq,
+              hostId: wire.id,
+              hook: "stop",
+            });
+          }
         }
+      } catch {
+        // Relay is not SoT.
       }
-    } catch {
-      // Relay is not SoT.
     }
 
     if (correctionsEnvelope || pendingStopText) {
