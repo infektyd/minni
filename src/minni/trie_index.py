@@ -101,6 +101,20 @@ class TrieIndexMixin:
             and len(token_map.get(t, ())) <= 500
         ]
 
+    def _invalidate_trie(self) -> None:
+        """Invalidate the in-memory Trie cache after document mutations or evictions."""
+        lock = getattr(self, "_trie_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._trie_lock = lock
+        with lock:
+            self._trie_docs = None
+            self._trie_token_map = {}
+            self._trie_prefix_map = {}
+            self._trie_max_doc_id = -1
+            self._trie_doc_count = -1
+            self._trie_checked_at = 0.0
+
     def _ensure_trie_loaded(self) -> None:
         import minni.retrieval as _ret
 

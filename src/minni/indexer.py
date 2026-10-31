@@ -414,12 +414,17 @@ class VaultIndexer:
         for row in rows:
             stored = row["path"]
             try:
-                resolved = str(Path(stored).resolve())
+                candidate = (
+                    (vault_root / stored)
+                    if (stored and not os.path.isabs(stored) and "://" not in stored)
+                    else Path(stored)
+                )
+                resolved = str(candidate.resolve())
             except Exception:
                 continue
             if resolved == stored:
                 continue
-            if not path_within_root(stored, vault_root):
+            if not path_within_root(candidate, vault_root):
                 continue
             prior = out.get(resolved)
             if prior is not None and prior["doc_id"] != row["doc_id"]:
@@ -747,17 +752,24 @@ class VaultIndexer:
                 # Resolve before the membership test (same as wiki_indexer):
                 # disk_files is keyed on resolved paths, so a row stored under a
                 # non-canonical spelling of a file that DOES exist -- a symlink,
-                # an unnormalized absolute path -- would miss the raw comparison,
-                # pass the ownership check, and be deleted. Compare both forms.
+                # an unnormalized absolute path, or a legacy vault-relative path --
+                # would miss the raw comparison, pass the ownership check, and be
+                # deleted. Compare both forms.
                 try:
-                    resolved = str(Path(path).resolve())
+                    candidate = (
+                        (vault_root / path)
+                        if (path and not os.path.isabs(path) and "://" not in path)
+                        else Path(path)
+                    )
+                    resolved = str(candidate.resolve())
                 except Exception:
+                    candidate = Path(path) if path else Path()
                     resolved = path
                 if path in disk_files or resolved in disk_files:
                     continue
-                if not path_within_root(path, vault_root):
+                if not path_within_root(candidate, vault_root):
                     continue
-                if path_within_root(path, durable_root):
+                if path_within_root(candidate, durable_root):
                     continue
                 to_delete.append((row["doc_id"],))
                 stats["deleted"] += 1

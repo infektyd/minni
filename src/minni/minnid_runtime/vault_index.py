@@ -175,9 +175,24 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
 
     try:
         engine = context.lazy_retrieval()
+        # Retract any legacy relative-path row so canonical full_path does not duplicate it
+        try:
+            db_obj = getattr(engine, "db", None)
+            if db_obj is not None and str(rel_path) != str(full_path):
+                with db_obj.transaction() as c:
+                    rel_rows = c.execute(
+                        "SELECT doc_id FROM documents WHERE path = ?", (rel_path,)
+                    ).fetchall()
+                    for r in rel_rows:
+                        did = int(r["doc_id"] if hasattr(r, "keys") else r[0])
+                        c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
+                        c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
+                        c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
+        except Exception:
+            pass
         result = engine.index_durable_document(
             content=content,
-            path=rel_path,
+            path=str(full_path),
             agent=agent,
             sigil=sigil,
             privacy_level=privacy_level,

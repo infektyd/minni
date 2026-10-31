@@ -376,6 +376,12 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
             for dup_lid in near_dups:
                 if supersedes and int(dup_lid) == int(supersedes):
                     continue
+                dup_row = c.execute(
+                    "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                    (dup_lid,),
+                ).fetchone()
+                dup_agent = str(dup_row["agent_id"]) if dup_row and "agent_id" in dup_row.keys() else agent_id
+                dup_content = str(dup_row["content"]) if dup_row and "content" in dup_row.keys() else f"learning:{dup_lid}"
                 evict_learning_to_cold_archive(
                     c,
                     None,
@@ -385,7 +391,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                     vault_path=getattr(wb.config, "vault_path", None),
                 )
                 try:
-                    context.purge_durable_learning(agent_id, f"learning:{dup_lid}")
+                    context.purge_durable_learning(dup_agent, dup_content, db=wb.db)
                 except Exception:
                     pass
 
@@ -1262,6 +1268,20 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         embedding=emb_bytes,
                     )
                     for dup_lid in near_dups:
+                        dup_row = c.execute(
+                            "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                            (dup_lid,),
+                        ).fetchone()
+                        dup_agent = (
+                            str(dup_row["agent_id"])
+                            if dup_row and "agent_id" in dup_row.keys()
+                            else principal.agent_id
+                        )
+                        dup_content = (
+                            str(dup_row["content"])
+                            if dup_row and "content" in dup_row.keys()
+                            else f"learning:{dup_lid}"
+                        )
                         evict_learning_to_cold_archive(
                             c,
                             None,
@@ -1271,7 +1291,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                             vault_path=getattr(wb.config, "vault_path", None),
                         )
                         try:
-                            context.purge_durable_learning(principal.agent_id, f"learning:{dup_lid}")
+                            context.purge_durable_learning(dup_agent, dup_content, db=wb.db)
                         except Exception:
                             pass
                     c.execute(
@@ -1752,6 +1772,20 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 for ex_lid in existing_lids:
                     if ex_lid == lid:
                         continue
+                    ex_row = c.execute(
+                        "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                        (ex_lid,),
+                    ).fetchone()
+                    ex_agent = (
+                        str(ex_row["agent_id"])
+                        if ex_row and "agent_id" in ex_row.keys()
+                        else author_agent
+                    )
+                    ex_content = (
+                        str(ex_row["content"])
+                        if ex_row and "content" in ex_row.keys()
+                        else f"learning:{ex_lid}"
+                    )
                     if getattr(db.config, "writeback_enabled", True):
                         evict_learning_to_cold_archive(
                             c,
@@ -1774,7 +1808,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                             (lid, ex_lid),
                         )
                     try:
-                        context.purge_durable_learning(author_agent, f"learning:{ex_lid}")
+                        context.purge_durable_learning(ex_agent, ex_content, db=db)
                     except Exception:
                         pass
 

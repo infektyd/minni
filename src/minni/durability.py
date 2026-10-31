@@ -228,17 +228,25 @@ def classify_durability(
 
     # 1. Noise checks
     if content.strip():
-        env = classify_prompt_envelope(content)
-        if env["kind"] == "skip":
-            return {"kind": "noise", "rule_id": "noise.envelope_skip"}
-        if env["kind"] == "wrapped":
-            return {"kind": "noise", "rule_id": "noise.envelope_wrapped"}
-        if (
-            env["kind"] == "human"
-            and env["subkind"] == "empty"
-            and env.get("rule_id") == "block.system_reminder"
-        ):
-            return {"kind": "noise", "rule_id": "noise.envelope_system_reminder"}
+        for probe_text in (content, _strip_frontmatter_and_h1(content)):
+            if not probe_text.strip():
+                continue
+            env = classify_prompt_envelope(probe_text)
+            if env["kind"] == "skip":
+                return {"kind": "noise", "rule_id": "noise.envelope_skip"}
+            if env["kind"] == "wrapped":
+                return {"kind": "noise", "rule_id": "noise.envelope_wrapped"}
+            if (
+                env["kind"] == "human"
+                and env["subkind"] == "empty"
+                and env.get("rule_id") == "block.system_reminder"
+            ):
+                return {"kind": "noise", "rule_id": "noise.envelope_system_reminder"}
+            if (
+                probe_text.lstrip().startswith("<system-reminder")
+                and "</system-reminder>" not in probe_text
+            ):
+                return {"kind": "noise", "rule_id": "noise.envelope_system_reminder"}
 
     if source.startswith("compact_distillation") or "compact_distillation:" in content:
         return {"kind": "noise", "rule_id": "noise.compaction_source"}

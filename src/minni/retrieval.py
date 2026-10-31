@@ -750,6 +750,156 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             return len(self.tokenizer.encode(text))
         return int(len(text.split()) / 0.75)
 
+    def _filter_live_and_active_candidates(
+        self, rows: List[Dict], *, include_superseded: bool = False
+    ) -> List[Dict]:
+        """Drop hits whose backing vault file was deleted on disk (one stat per hit)
+        and drop _durable/ hits whose learnings row is missing or not active (batched).
+        """
+        if not rows:
+            return rows
+        from minni.path_safety import path_within_root
+
+        vault_path = getattr(getattr(self, "config", None), "vault_path", None)
+        vault_root: Optional[Path] = None
+        if vault_path and os.path.isdir(vault_path):
+            try:
+                vault_root = Path(vault_path).resolve()
+            except Exception:
+                vault_root = None
+
+        after_stat: List[Dict] = []
+        durable_rows: List[Dict] = []
+        for r in rows:
+            raw_path = str(r.get("path") or r.get("source") or "")
+            norm_path = raw_path.replace("\\", "/")
+            is_durable = (
+                "/_durable/" in norm_path or norm_path.startswith("_durable/")
+            ) and "://" not in norm_path
+            if is_durable:
+                after_stat.append(r)
+                if not include_superseded and getattr(self, "db", None) is not None:
+                    durable_rows.append(r)
+                continue
+
+            if vault_root is not None and raw_path and "://" not in raw_path:
+                if os.path.isabs(raw_path):
+                    if path_within_root(raw_path, vault_root):
+                        try:
+                            os.stat(raw_path)
+                        except OSError:
+                            continue
+                else:
+                    rel_full = os.path.join(str(vault_root), raw_path)
+                    if not path_within_root(rel_full, vault_root):
+                        continue
+                    try:
+                        os.stat(rel_full)
+                    except OSError:
+                        continue
+            after_stat.append(r)
+
+        if not durable_rows:
+            return after_stat
+
+        mapped_doc_ids: set[int] = set()
+        active_doc_ids: set[int] = set()
+        active_durable_paths: set[str] = set()
+        try:
+            with self.db.cursor() as c:
+                tables = {
+                    row[0]
+                    for row in c.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if "learnings" not in tables:
+                    return after_stat
+
+                doc_ids = [
+                    int(r["doc_id"])
+                    for r in durable_rows
+                    if r.get("doc_id") is not None
+                ]
+                if "learning_documents" in tables and doc_ids:
+                    placeholders = ",".join("?" for _ in doc_ids)
+                    for row in c.execute(
+                        f"""SELECT jd.doc_id,
+                                   MAX(CASE WHEN l.learning_id IS NOT NULL
+                                             AND l.superseded_by IS NULL
+                                             AND (l.status IS NULL OR l.status NOT IN ('rejected', 'expired', 'superseded'))
+                                            THEN 1 ELSE 0 END) AS has_active
+                            FROM learning_documents jd
+                            LEFT JOIN learnings l ON l.learning_id = jd.learning_id
+                            WHERE jd.doc_id IN ({placeholders})
+                            GROUP BY jd.doc_id""",
+                        doc_ids,
+                    ).fetchall():
+                        did = int(row["doc_id"] if hasattr(row, "keys") else row[0])
+                        has_act = bool(
+                            row["has_active"] if hasattr(row, "keys") else row[1]
+                        )
+                        mapped_doc_ids.add(did)
+                        if has_act:
+                            active_doc_ids.add(did)
+
+                unmapped = [
+                    r
+                    for r in durable_rows
+                    if r.get("doc_id") is None or int(r["doc_id"]) not in mapped_doc_ids
+                ]
+                if unmapped and vault_path:
+                    from minni.durable_projection import durable_doc_path
+
+                    agents = sorted(
+                        {str(r.get("agent") or "") for r in unmapped if r.get("agent")}
+                    )
+                    if agents:
+                        ag_placeholders = ",".join("?" for _ in agents)
+                        for lrow in c.execute(
+                            f"""SELECT agent_id, content
+                                FROM learnings
+                                WHERE agent_id IN ({ag_placeholders})
+                                  AND superseded_by IS NULL
+                                  AND (status IS NULL OR status NOT IN ('rejected', 'expired', 'superseded'))""",
+                            agents,
+                        ).fetchall():
+                            ag = str(
+                                lrow["agent_id"] if hasattr(lrow, "keys") else lrow[0]
+                            )
+                            cnt = str(
+                                lrow["content"] if hasattr(lrow, "keys") else lrow[1]
+                            )
+                            dp = durable_doc_path(ag, "", str(vault_path), cnt)
+                            active_durable_paths.add(dp)
+                            try:
+                                active_durable_paths.add(str(Path(dp).resolve()))
+                            except Exception:
+                                pass
+        except Exception:
+            return after_stat
+
+        durable_set = {id(r) for r in durable_rows}
+        out: List[Dict] = []
+        for r in after_stat:
+            if id(r) not in durable_set:
+                out.append(r)
+                continue
+            did = int(r["doc_id"]) if r.get("doc_id") is not None else None
+            if did is not None and did in mapped_doc_ids:
+                if did in active_doc_ids:
+                    out.append(r)
+                continue
+            raw_path = str(r.get("path") or r.get("source") or "")
+            resolved_raw = raw_path
+            try:
+                resolved_raw = str(Path(raw_path).resolve())
+            except Exception:
+                pass
+            if raw_path in active_durable_paths or resolved_raw in active_durable_paths:
+                out.append(r)
+        return out
+
     @staticmethod
     def apply_read_gate(principal, workspace: str, merged: List[Dict]):
         """G19 read gate with P0-A silent-empty suppression diagnostic."""
@@ -1021,6 +1171,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 c.execute("SELECT * FROM documents WHERE path = ?", (path,))
                 row = c.fetchone()
                 if row is None:
+                    self._invalidate_trie()
                     return {"status": "not_found", "path": path}
                 doc_id = row["doc_id"]
                 from minni.durable_projection import projection_row_closed
@@ -1056,6 +1207,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
             self._invalidate_durable_rerank(old_chunk_ids)
             self._remove_live_faiss(old_chunk_ids)
+            self._invalidate_trie()
             return {"status": "ok", "doc_id": doc_id, "chunks": len(old_chunk_ids)}
         except Exception as exc:
             logger.warning(
@@ -1845,12 +1997,23 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
 
         def _eligible(rows: List[Dict]) -> List[Dict]:
             nonlocal saw_authorized
+            from minni.durability import classify_durability
+
             rows = [
                 r
                 for r in rows
                 if (r.get("page_status") or "candidate") not in skip_statuses
                 and (r.get("privacy_level") or "safe") != "blocked"
+                and classify_durability({"content": r.get("chunk_text") or ""}).get("rule_id")
+                not in (
+                    "noise.envelope_system_reminder",
+                    "noise.envelope_skip",
+                    "noise.envelope_wrapped",
+                )
             ]
+            rows = self._filter_live_and_active_candidates(
+                rows, include_superseded=include_superseded
+            )
             rows = self._filter_candidates(rows, layers, start_date, end_date)
             agent_scope = self._normalize_agent_filter(document_agent_filter)
             if agent_scope:

@@ -360,12 +360,23 @@ def evict_learning_to_cold_archive(
             evicted_doc_ids.append(did)
 
         if engine is not None and evicted_doc_ids:
-            faiss_idx = getattr(engine, "_faiss", None)
-            if faiss_idx is not None and hasattr(faiss_idx, "invalidate"):
+            for attr in ("_faiss", "faiss_index"):
+                faiss_idx = getattr(engine, attr, None)
+                if faiss_idx is not None and hasattr(faiss_idx, "invalidate"):
+                    try:
+                        faiss_idx.invalidate()
+                    except Exception:
+                        pass
+            if hasattr(engine, "_invalidate_trie"):
                 try:
-                    faiss_idx.invalidate()
+                    engine._invalidate_trie()
                 except Exception:
                     pass
+            else:
+                engine._trie_docs = None
+                engine._trie_max_doc_id = -1
+                engine._trie_doc_count = -1
+                engine._trie_checked_at = 0.0
 
         return {
             "evicted": True,
@@ -428,6 +439,19 @@ def evict_document_to_cold_archive(
                 (did, did),
             )
         c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
+        if engine is not None:
+            for attr in ("_faiss", "faiss_index"):
+                faiss_idx = getattr(engine, attr, None)
+                if faiss_idx is not None and hasattr(faiss_idx, "invalidate"):
+                    try:
+                        faiss_idx.invalidate()
+                    except Exception:
+                        pass
+            if hasattr(engine, "_invalidate_trie"):
+                try:
+                    engine._invalidate_trie()
+                except Exception:
+                    pass
         return {"evicted": True, "doc_id": did, "tombstone_path": str(tombstone_path)}
 
     return _run_with_cursor(conn_or_cursor, _op)

@@ -209,15 +209,21 @@ export function classifyDurability(
 
   // 1. Noise checks
   if (content.trim()) {
-    const env = classifyPromptEnvelope(content);
-    if (env.kind === "skip") {
-      return { kind: "noise", rule_id: "noise.envelope_skip" };
-    }
-    if (env.kind === "wrapped") {
-      return { kind: "noise", rule_id: "noise.envelope_wrapped" };
-    }
-    if (env.kind === "human" && env.subkind === "empty" && env.rule_id === "block.system_reminder") {
-      return { kind: "noise", rule_id: "noise.envelope_system_reminder" };
+    for (const probeText of [content, stripFrontmatterAndH1(content)]) {
+      if (!probeText.trim()) continue;
+      const env = classifyPromptEnvelope(probeText);
+      if (env.kind === "skip") {
+        return { kind: "noise", rule_id: "noise.envelope_skip" };
+      }
+      if (env.kind === "wrapped") {
+        return { kind: "noise", rule_id: "noise.envelope_wrapped" };
+      }
+      if (env.kind === "human" && env.subkind === "empty" && env.rule_id === "block.system_reminder") {
+        return { kind: "noise", rule_id: "noise.envelope_system_reminder" };
+      }
+      if (probeText.trimStart().startsWith("<system-reminder") && !probeText.includes("</system-reminder>")) {
+        return { kind: "noise", rule_id: "noise.envelope_system_reminder" };
+      }
     }
   }
 
