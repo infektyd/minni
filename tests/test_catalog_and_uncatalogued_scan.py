@@ -260,4 +260,3 @@ def test_doctor_and_check_scripts_fail_closed_on_daemon_stale_and_host_propagati
     cv_spec.loader.exec_module(cv_mod)
     cv_mismatches, _cv_notes = cv_mod.check_deployed("0.6.0")
     assert any("claude_code" in m or ".claude.json" in m for m in cv_mismatches), cv_mismatches
-
