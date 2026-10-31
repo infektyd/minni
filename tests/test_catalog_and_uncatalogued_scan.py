@@ -71,10 +71,10 @@ def test_installed_plugins_tracks_sha_expanded_paths_and_scanner_catches_rogue_f
     )
     assert outcome.exit_code == 0
 
-    # 1. Verify installed_plugins.json tracks version, 40-char gitCommitSha, and expanded paths (no ~)
+    # 1. Verify installed_plugins.json tracks base semver version, 40-char gitCommitSha, and expanded paths (no ~)
     inst_doc = json.loads(inst_path.read_text(encoding="utf-8"))
     entry = inst_doc["plugins"]["minni@minni-local"][0]
-    assert entry["version"] == ver
+    assert entry["version"] == "0.6.0"
     assert entry["gitCommitSha"] == sha
     assert "~" not in entry["installPath"]
     assert "~" not in entry["projectPath"]

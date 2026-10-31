@@ -255,7 +255,14 @@ def render_cursor_container_manifests(
         "version": clean_ver,
         "description": "Minni local plugin for Cursor",
     }
+    pkg_doc = {
+        "name": "minni-multi-plugin",
+        "version": clean_ver,
+        "type": "module",
+        "private": True,
+    }
     return {
+        "package.json": pkg_doc,
         ".mcp.json": mcp_doc,
         ".cursor-plugin/plugin.json": plugin_doc,
     }

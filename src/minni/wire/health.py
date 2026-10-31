@@ -100,6 +100,14 @@ def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...
                     exact_paths.add(str(Path(p).resolve()))
                 except OSError:
                     pass
+            for vp in surf.get("paths") or []:
+                vp_s = str(vp or "")
+                if vp_s:
+                    exact_paths.add(vp_s)
+                    try:
+                        exact_paths.add(str(Path(vp_s).resolve()))
+                    except OSError:
+                        pass
             if surf.get("kind") in ("plugin_container", "claude_marketplace"):
                 if p:
                     container_prefixes.append(p)
@@ -226,6 +234,10 @@ def audit_host_propagation_health(
     except Exception as exc:
         current_error = str(exc)
 
+    import tomllib
+    from minni.wire.registry import _VERSIONED_PLUGIN_RE
+
+    base_semver = current_version.split("+", 1)[0] if current_version else ""
     drifted_surfaces: list[dict[str, Any]] = []
     for host_id, hspec in HOST_SURFACE_CATALOG.items():
         for surf in hspec.get("surfaces", []):
@@ -259,6 +271,114 @@ def audit_host_propagation_health(
                         "path": str(spath),
                         "reasons": diff.reasons,
                     })
+            elif kind == "mcp_view_mirrors":
+                for vp_raw in surf.get("paths") or []:
+                    vpath = Path(expand_for_home(str(vp_raw), home=resolved_home))
+                    if not vpath.is_file():
+                        continue
+                    try:
+                        doc = json.loads(vpath.read_text(encoding="utf-8"))
+                    except Exception as exc:
+                        drifted_surfaces.append({"host": host_id, "path": str(vpath), "reasons": [f"unparseable_json:{exc}"]})
+                        continue
+                    if not isinstance(doc, dict):
+                        continue
+                    servers = doc.get("mcpServers")
+                    if not isinstance(servers, dict) or "minni" not in servers:
+                        continue
+                    view_spec = {
+                        "kind": "mcp_json",
+                        "path": str(vp_raw),
+                        "key": "mcpServers.minni",
+                        "command": surf.get("command"),
+                        "args_prefix": surf.get("args_prefix"),
+                        "entry": surf.get("entry"),
+                        "accepted_entries": [
+                            str(surf.get("entry") or ""),
+                            "~/.agents/plugins/minni@minni/dist/server.js",
+                            "~/.minni/plugin/current/dist/server.js",
+                        ],
+                    }
+                    diff = evaluate_mcp_surface_diff(
+                        servers.get("minni"),
+                        host_id=host_id,
+                        agent_id=str(hspec["agent_id"]),
+                        vault_path=str(hspec["vault_path"]),
+                        surface_spec=view_spec,
+                        home=resolved_home,
+                    )
+                    if diff.has_delta:
+                        drifted_surfaces.append({
+                            "host": host_id,
+                            "path": str(vpath),
+                            "reasons": diff.reasons,
+                        })
+            elif kind == "mcp_toml" and spath.is_file():
+                try:
+                    doc = tomllib.loads(spath.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_toml:{exc}"]})
+                    continue
+                servers = doc.get("mcp_servers")
+                if not isinstance(servers, dict) or "minni" not in servers:
+                    continue
+                diff = evaluate_mcp_surface_diff(
+                    servers.get("minni"),
+                    host_id=host_id,
+                    agent_id=str(hspec["agent_id"]),
+                    vault_path=str(hspec["vault_path"]),
+                    surface_spec=surf,
+                    home=resolved_home,
+                )
+                if diff.has_delta:
+                    drifted_surfaces.append({
+                        "host": host_id,
+                        "path": str(spath),
+                        "reasons": diff.reasons,
+                    })
+            elif kind == "hooks_json" and spath.is_file():
+                try:
+                    raw_text = spath.read_text(encoding="utf-8")
+                    json.loads(raw_text)
+                except Exception as exc:
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_json:{exc}"]})
+                    continue
+                reasons: list[str] = []
+                if _VERSIONED_PLUGIN_RE.search(raw_text):
+                    reasons.append("versioned_sha_in_hooks_json")
+                if "~/" in raw_text:
+                    reasons.append("literal_tilde_in_hooks_json")
+                if surf.get("use_exec") and "node " in raw_text and "exec node " not in raw_text:
+                    reasons.append("missing_exec_in_hooks_json")
+                if reasons:
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": reasons})
+            elif kind in ("launcher_wrapper", "hook_wrapper", "js_bridge", "rules_md", "skill_copy") and spath.is_file():
+                try:
+                    raw_text = spath.read_text(encoding="utf-8")
+                except Exception as exc:
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unreadable:{exc}"]})
+                    continue
+                reasons = []
+                if _VERSIONED_PLUGIN_RE.search(raw_text):
+                    reasons.append(f"versioned_sha_in_{kind}")
+                if "~/" in raw_text:
+                    reasons.append(f"literal_tilde_in_{kind}")
+                if surf.get("use_exec") and "node " in raw_text and "exec node " not in raw_text:
+                    reasons.append(f"missing_exec_in_{kind}")
+                if reasons:
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": reasons})
+            elif kind == "commands_dir" and spath.is_symlink():
+                expected_target = expand_for_home(str(surf.get("entry") or ""), home=resolved_home)
+                try:
+                    actual_target = os.readlink(spath)
+                except OSError:
+                    actual_target = ""
+                if actual_target != expected_target:
+                    drifted_surfaces.append({
+                        "host": host_id,
+                        "path": str(spath),
+                        "reasons": [f"commands_dir_target_mismatch:{actual_target}!={expected_target}"],
+                    })
             elif kind == "claude_plugin_registry" and spath.is_file():
                 try:
                     doc = json.loads(spath.read_text(encoding="utf-8"))
@@ -271,11 +391,11 @@ def audit_host_propagation_health(
                         proj_p = str(item.get("projectPath") or "")
                         ver = str(item.get("version") or "")
                         sha = str(item.get("gitCommitSha") or "")
-                        reasons: list[str] = []
+                        reasons = []
                         if "~" in inst_p or "~" in proj_p:
                             reasons.append("literal_tilde_in_installed_plugins")
-                        if current_version and ver != current_version:
-                            reasons.append(f"version_mismatch:{ver}!={current_version}")
+                        if base_semver and ver != base_semver:
+                            reasons.append(f"version_mismatch:{ver}!={base_semver}")
                         if current_git_sha and sha != current_git_sha:
                             reasons.append(f"sha_mismatch:{sha}!={current_git_sha}")
                         if reasons:
@@ -286,6 +406,15 @@ def audit_host_propagation_health(
                             })
                 except Exception as exc:
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_json:{exc}"]})
+            elif kind == "claude_marketplace" and spath.is_file():
+                try:
+                    raw_text = spath.read_text(encoding="utf-8")
+                    json.loads(raw_text)
+                except Exception as exc:
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_json:{exc}"]})
+                    continue
+                if "~/" in raw_text or _VERSIONED_PLUGIN_RE.search(raw_text):
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": ["stale_or_tilde_in_claude_marketplace"]})
 
     uncatalogued_refs = scan_for_uncatalogued_plugin_refs(resolved_home)
     all_running = inspect_running_mcp_servers(

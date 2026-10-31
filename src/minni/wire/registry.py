@@ -585,6 +585,17 @@ def evaluate_mcp_surface_diff(
                 reasons.append("literal_tilde_or_empty_MINNI_SOCKET_PATH")
             desired_env[k_str] = expanded_sock
             continue
+        if k_str in ("MINNI_CODEX_VAULT_PATH", "MINNI_KILOCODE_VAULT_PATH"):
+            expanded_cv = expand_for_home(v_str, home=home)
+            if "~" in v_str or expanded_cv != expanded_vault:
+                reasons.append(f"vault_mirror_mismatch:{k_str}")
+            desired_env[k_str] = expanded_vault
+            continue
+        if k_str in ("MINNI_CODEX_AGENT_ID", "MINNI_KILOCODE_AGENT_ID"):
+            if v_str != agent_id:
+                reasons.append(f"agent_mirror_mismatch:{k_str}")
+            desired_env[k_str] = agent_id
+            continue
         desired_env[k_str] = v_str
 
     # Required keys: MINNI_AGENT_ID and MINNI_VAULT_PATH
