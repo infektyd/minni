@@ -274,6 +274,18 @@ def cmd_status(args: argparse.Namespace) -> int:
           f"{stats.get('events', 0)} events")
     print(f"  vector index: {'ok' if engine.get('faiss_ok') else 'NOT OK'}")
     print(_format_latency_block(daemon.get("latencies", {})))
+    deploy = daemon.get("deploy")
+    if isinstance(deploy, dict):
+        if deploy.get("stale") is True:
+            print(f"  deploy: STALE — {deploy.get('reason', 'running code or plugin dist lags checkout')}")
+        stale_srvs = deploy.get("running_stale_servers")
+        if isinstance(stale_srvs, list) and stale_srvs:
+            pids_str = ", ".join(
+                f"pid={s.get('pid')} (ppid={s.get('ppid')}, ver={s.get('version')})"
+                for s in stale_srvs
+                if isinstance(s, dict)
+            )
+            print(f"  running_stale_servers: {pids_str}")
     return 0
 
 
@@ -606,10 +618,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     try:
         from minni.minnid_runtime.deploy_honesty import deploy_status
         deploy = deploy_status()
+        rpc_deploy = (
+            status.get("daemon", {}).get("deploy")
+            if status_ok and isinstance(status, dict)
+            else None
+        )
+        if isinstance(rpc_deploy, dict) and rpc_deploy.get("stale") is True and deploy.get("stale") is not True:
+            deploy = rpc_deploy
         plugin = (deploy or {}).get("plugin_dist") or {}
         if deploy.get("stale") is True or plugin.get("stale") is True:
             reason = deploy.get("reason") or plugin.get("reason") or "deploy lag"
-            print(f"  [WARN] fleet: install is stale relative to this package/checkout")
+            print("  [WARN] fleet: install is stale relative to this package/checkout")
             print(f"         {reason}")
             print("         Fix: minni sync          # redeploy plugin to all wired hosts")
             print("              minni sync --full   # editable checkout: also git pull + rebuild")

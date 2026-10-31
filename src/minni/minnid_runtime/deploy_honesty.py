@@ -270,6 +270,15 @@ def deploy_status() -> dict:
             out["stale"] = None
             if "reason" not in out:
                 out["reason"] = "process and/or plugin dist staleness unmeasurable"
+        try:
+            from minni.wire.gc import inspect_running_mcp_servers
+
+            out["running_stale_servers"] = [
+                r for r in inspect_running_mcp_servers(target_sha=checkout_head or "")
+                if r.get("stale")
+            ]
+        except Exception:
+            out["running_stale_servers"] = []
         return out
     except Exception as exc:  # status must never break on this block
         return {"stale": None, "error": f"{type(exc).__name__}: {exc}"}
