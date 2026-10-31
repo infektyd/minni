@@ -205,8 +205,8 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_engine_state(request, tmp_path, monkeypatch):
-    isolated_home = tmp_path / "isolated_home"
+def _isolated_engine_state(request, tmp_path_factory, monkeypatch):
+    isolated_home = tmp_path_factory.mktemp("isolated_home")
     isolated_minni_home = isolated_home / ".minni"
     xdg_config = isolated_home / ".config"
     xdg_data = isolated_home / ".local" / "share"
@@ -223,12 +223,13 @@ def _isolated_engine_state(request, tmp_path, monkeypatch):
         d.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setenv("HOME", os.fspath(isolated_home))
+    monkeypatch.setenv("USERPROFILE", os.fspath(isolated_home))
     monkeypatch.setenv("MINNI_HOME", os.fspath(isolated_minni_home))
     monkeypatch.setenv("XDG_CONFIG_HOME", os.fspath(xdg_config))
     monkeypatch.setenv("XDG_DATA_HOME", os.fspath(xdg_data))
     monkeypatch.setenv("XDG_CACHE_HOME", os.fspath(xdg_cache))
     monkeypatch.setenv("XDG_STATE_HOME", os.fspath(xdg_state))
-    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(tmp_path / "afm-probe-cache.json"))
+    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(isolated_home / "afm-probe-cache.json"))
 
     if "minni.minnid" in sys.modules:
         _minnid = sys.modules["minni.minnid"]
