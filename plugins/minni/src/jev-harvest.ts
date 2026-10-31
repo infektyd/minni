@@ -763,17 +763,17 @@ export function isSessionStatusChatter(text: string): boolean {
 export function resolveSessionHandoffsDir(vaultPath: string): string {
   const envDir = process.env.MINNI_SESSION_HANDOFFS_DIR;
   if (typeof envDir === "string" && envDir.trim().length > 0) {
-    return path.resolve(envDir.trim());
+    return path.resolve(expandTilde(envDir.trim()));
   }
   const dotMinni =
     typeof process.env.MINNI_HOME === "string" && process.env.MINNI_HOME.trim().length > 0
-      ? path.resolve(process.env.MINNI_HOME.trim())
+      ? path.resolve(expandTilde(process.env.MINNI_HOME.trim()))
       : path.resolve(os.homedir(), ".minni");
-  const resolvedVault = path.resolve(vaultPath);
+  const resolvedVault = path.resolve(expandTilde(vaultPath));
   if (resolvedVault === dotMinni || resolvedVault.startsWith(dotMinni + path.sep)) {
     return path.join(dotMinni, "session_handoffs");
   }
-  return path.join(vaultPath, ".runtime", "session_handoffs");
+  return path.join(expandTilde(vaultPath), ".runtime", "session_handoffs");
 }
 
 export type JevTriageVerdict = boolean | { durable?: boolean; accept?: boolean; verdict?: string };

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, writeFile, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
+import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, expandTilde } from "./config.js";
 import { ensureVault, recordAudit } from "./vault.js";
 
 export type AgentPingStatus = "pending" | "approved" | "denied" | "expired";
@@ -232,12 +232,12 @@ function getLeasePath(requestId: string): string {
   // `.json` files. Validate the request-id shape here, at the join site, so no
   // caller can slip a traversal through.
   if (!REQUEST_ID_PATTERN.test(requestId)) throw new Error("Invalid requestId.");
-  const baseHome = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
+  const baseHome = process.env.MINNI_HOME ? expandTilde(process.env.MINNI_HOME) : path.join(os.homedir(), ".minni");
   return path.join(baseHome, "pings", "leases", `${requestId}.json`);
 }
 
 function getLeaseDir(): string {
-  const baseHome = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
+  const baseHome = process.env.MINNI_HOME ? expandTilde(process.env.MINNI_HOME) : path.join(os.homedir(), ".minni");
   return path.join(baseHome, "pings", "leases");
 }
 

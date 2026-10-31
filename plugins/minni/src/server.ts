@@ -9,6 +9,7 @@ import {
   DEFAULT_AGENT_ID,
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
+  resolveSessionWorkspaceId,
 } from "./config.js";
 import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial, routeMemoryIntent } from "./policy.js";
 import {
@@ -319,7 +320,7 @@ server.registerTool(
       useAfm,
       layer,
       limit,
-      workspaceId,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
       agentId: DEFAULT_AGENT_ID, // G11: server-side stamped default; model can no longer supply agentId
       vaultPath: DEFAULT_VAULT_PATH,
       includeVault,
@@ -458,7 +459,7 @@ server.registerTool(
       plan_id,
       agents,
       coordinatorAgentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies coordinator identity)
-      workspaceId,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
       vaultPath: DEFAULT_VAULT_PATH,
       profile,
       limit,
@@ -641,8 +642,8 @@ server.registerTool(
     },
   },
   async ({ query, layer, limit, workspaceId, scope, cross_agent, includeVault }) => {
-    const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    await disarmRecallStateOnConsult(effectiveVaultPath).catch(() => false);
+    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH).catch(() => false);
+    const effectiveWorkspaceId = resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId);
     // X5: run the daemon recall FIRST. Its results are workspace/agent-scoped and
     // subject to read policy. The local searchVaultNotes pre-scan is NOT scoped, so
     // it must only be used as an offline fallback (daemon unreachable) — never
@@ -654,7 +655,7 @@ server.registerTool(
       limit,
       scope,
       crossAgent: cross_agent,
-      workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
+      workspaceId: effectiveWorkspaceId,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
       sessionId: MCP_PROCESS_SESSION_ID,
     });
@@ -685,11 +686,11 @@ server.registerTool(
     // outscoring a safe match still reproduce the crowd-out. See #339 for
     // the durable fix (gate inside searchVaultNotes itself).
     const vaultResultCap = Math.min(limit ?? 5, 8);
-    const noiseLast = isRecallNoiseLastEnabled(effectiveVaultPath);
+    const noiseLast = isRecallNoiseLastEnabled(DEFAULT_VAULT_PATH);
     const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
       ? filterSafeVaultResults(
           await searchVaultNotes(
-            effectiveVaultPath,
+            DEFAULT_VAULT_PATH,
             query,
             vaultResultCap * VAULT_SEARCH_OVERFETCH_MULTIPLIER,
             undefined,
@@ -703,12 +704,12 @@ server.registerTool(
     // through to the normal (reworded, #4b) denial text when the degrade
     // path doesn't apply or the retry itself comes up empty/failed.
     const degradeText = await recallCrossAgentDegrade(
-      { query, layer, limit, workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID, agentId: DEFAULT_AGENT_ID },
+      { query, layer, limit, workspaceId: effectiveWorkspaceId, agentId: DEFAULT_AGENT_ID },
       cross_agent === true,
       denial,
     );
     const responseText = degradeText ?? recallResponseText(query, result, vaultResults);
-    await recordAudit(effectiveVaultPath, {
+    await recordAudit(DEFAULT_VAULT_PATH, {
       tool: "minni_recall",
       summary: query,
       details: {
@@ -786,7 +787,7 @@ server.registerTool(
       budgetTokens,
       cacheKey,
       agentId: DEFAULT_AGENT_ID,
-      workspaceId,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
     });
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -857,7 +858,7 @@ server.registerTool(
       content,
       category,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only
-      workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
       ...(source ? { source } : {}),
     });
     const note = await vaultFirstLearn({

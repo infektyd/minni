@@ -21,6 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { recordActiveSessionWorkspace } from "./config.js";
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
@@ -1572,8 +1573,19 @@ export function createHookHandlers(
   config: AgentHookConfig,
   deps: AgentHookDeps = {},
 ): AgentHookHandlers {
-  const workspaceFor = (payload: Record<string, unknown>): string =>
-    workspaceFromPayload(payload, config.defaultWorkspaceId);
+  const workspaceFor = (payload: Record<string, unknown>): string => {
+    const resolved = workspaceFromPayload(payload, config.defaultWorkspaceId);
+    const hasExplicitPayloadWorkspace = Boolean(
+      asString(payload.workspace_id) ||
+        asString(payload.workspaceId) ||
+        asString(payload.cwd) ||
+        asString(payload.working_directory),
+    );
+    if (hasExplicitPayloadWorkspace && resolved && resolved !== "workspace-unknown") {
+      recordActiveSessionWorkspace(config.vaultPath, resolved, config.agentId);
+    }
+    return resolved;
+  };
   const bootIdentity = config.bootIdentity ?? "agent-context";
   const prepareOutcomeFn = deps.prepareOutcome ?? prepareOutcome;
   const wire = config.wire ?? wireFor(config.agentId);
