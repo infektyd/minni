@@ -1636,6 +1636,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         lid = None
         deduplicated_accept = False
         author_agent = principal.agent_id
+        superseded_docs: list[tuple[str, str]] = []
         with db.transaction() as c:
             c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
             row = c.fetchone()
@@ -1732,6 +1733,76 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 _have_hash_col = "content_hash" in l_cols
                 _have_status_col = "status" in l_cols
                 existing_lids: list[int] = []
+                raw_sup = (
+                    params.get("supersede_ids")
+                    if "supersede_ids" in params
+                    else params.get("supersedes")
+                )
+                if raw_sup is not None:
+                    if isinstance(raw_sup, int) and not isinstance(raw_sup, bool):
+                        raw_sup_list: list[Any] = [raw_sup]
+                    elif isinstance(raw_sup, (list, tuple)):
+                        raw_sup_list = list(raw_sup)
+                    else:
+                        raise ResolveRejected(
+                            context.make_error(
+                                -32602,
+                                "supersede_ids must be a list of integers",
+                                request_id,
+                            )
+                        )
+                    if len(raw_sup_list) > MAX_SUPERSEDE_IDS:
+                        raise ResolveRejected(
+                            context.make_error(
+                                -32602,
+                                f"supersede_ids exceeds maximum batch size ({MAX_SUPERSEDE_IDS})",
+                                request_id,
+                            )
+                        )
+                    for sid in raw_sup_list:
+                        if isinstance(sid, bool) or not isinstance(sid, int):
+                            try:
+                                if isinstance(sid, bool) or not isinstance(sid, (int, str)):
+                                    raise ValueError("not an int")
+                                sid_int = int(sid)
+                            except (TypeError, ValueError):
+                                raise ResolveRejected(
+                                    context.make_error(
+                                        -32602,
+                                        "supersede_ids must be a list of integers",
+                                        request_id,
+                                    )
+                                )
+                        else:
+                            sid_int = sid
+                        srow = c.execute(
+                            "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                            (sid_int,),
+                        ).fetchone()
+                        if not srow:
+                            raise ResolveRejected(
+                                context.make_error(
+                                    -32001, f"learning_not_found: {sid_int}", request_id
+                                )
+                            )
+                        sup_owner = str(srow["agent_id"] or "")
+                        if (
+                            _canonical_principal(sup_owner)
+                            != _canonical_principal(author_agent)
+                            and not explicitly_allowed_operator(principal)
+                        ):
+                            raise ResolveRejected(
+                                context.make_error(
+                                    -32004,
+                                    f"principal_mismatch: learning #{sid_int} is owned by '{sup_owner}'; "
+                                    f"caller principal '{principal.agent_id}' may only supersede its own "
+                                    "learnings (cross-principal supersession requires an "
+                                    "explicitly allowed operator)",
+                                    request_id,
+                                )
+                            )
+                        if sid_int not in existing_lids:
+                            existing_lids.append(sid_int)
                 while True:
                     existing = find_active_learning_by_hash(c, _chash, author_agent)
                     if existing is None:
@@ -1752,17 +1823,6 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                         )
                     else:
                         break
-                raw_sup = params.get("supersede_ids") or params.get("supersedes") or []
-                if isinstance(raw_sup, int):
-                    raw_sup = [raw_sup]
-                if isinstance(raw_sup, (list, tuple)):
-                    for sid in raw_sup:
-                        try:
-                            sid_int = int(sid)
-                            if sid_int not in existing_lids:
-                                existing_lids.append(sid_int)
-                        except (TypeError, ValueError):
-                            pass
                 ins_cols = ["agent_id", "category", "content", "created_at"]
                 ins_vals: list[Any] = [author_agent, cat, content, now]
                 if _have_status_col:
@@ -1837,10 +1897,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                             "WHERE learning_id = ?",
                             (lid, ex_lid),
                         )
-                    try:
-                        context.purge_durable_learning(ex_agent, ex_content, db=db)
-                    except Exception:
-                        pass
+                    superseded_docs.append((ex_agent, ex_content))
 
             # Migration-015 guard: on a pre-015 schema the candidate_packets
             # CHECK does not admit do_not_store / log_only, so the UPDATE would
@@ -1869,6 +1926,13 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 (new_status, now, principal.agent_id, resolution_reason, cid),
             )
             apply_accepted_candidate_effects(c, cid)
+
+        for sup_agent, sup_content in superseded_docs:
+            if sup_content:
+                try:
+                    context.purge_durable_learning(sup_agent, sup_content, db=db)
+                except Exception:
+                    pass
 
         indexed_ok = True
         if lid is not None:
