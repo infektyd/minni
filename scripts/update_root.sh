@@ -296,6 +296,17 @@ elif ! "$VENV_PY" -m minni.wire.custom_refresh --wire-report "$_WIRE_JSON"; then
   echo "update-root: custom MCP refresh failed — continuing" >&2
   REDEPLOY_EXIT=1
 fi
+if [ "$DRY_RUN" = 1 ]; then
+  act "$VENV_PY" -m minni.wire.cutover --repo "$REPO" --dry-run
+else
+  printf 'running:   %s -m minni.wire.cutover --repo %s --apply\n' "$VENV_PY" "$REPO"
+  _CUTOVER_RC=0
+  "$VENV_PY" -m minni.wire.cutover --repo "$REPO" --apply || _CUTOVER_RC=$?
+  if [ "$_CUTOVER_RC" != 0 ]; then
+    echo "update-root: atomic cutover / per-host reconcile exited $_CUTOVER_RC — continuing" >&2
+    REDEPLOY_EXIT=1
+  fi
+fi
 if [ "$DRY_RUN" != 1 ]; then rm -f "$_WIRE_JSON"; fi
 if [ "$DRY_RUN" = 1 ]; then
   act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \

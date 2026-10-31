@@ -562,6 +562,12 @@ def evaluate_mcp_surface_diff(
             expanded_helper = expand_for_home(v_str, home=home)
             if "~" in v_str:
                 reasons.append("literal_tilde_in_MINNI_AFM_NATIVE_HELPER")
+            if _VERSIONED_PLUGIN_RE.search(expanded_helper):
+                reasons.append(f"versioned_sha_in_MINNI_AFM_NATIVE_HELPER:{expanded_helper}")
+                cur_helper = expand_for_home("~/.minni/plugin/current/dist/minni-afm-helper", home=home)
+                if Path(cur_helper).is_file():
+                    desired_env[k_str] = cur_helper
+                continue
             if not Path(expanded_helper).is_file():
                 reasons.append(f"missing_MINNI_AFM_NATIVE_HELPER:{expanded_helper}")
                 continue

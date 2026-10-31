@@ -218,6 +218,30 @@ def _run_wire(
     return step
 
 
+def _reconcile_all_hosts(
+    *,
+    from_repo: Optional[Path],
+    install_root: Optional[str] = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    from minni.wire.cutover import reconcile_all_hosts
+
+    target_version = Path(install_root).name if install_root else None
+    outcome = reconcile_all_hosts(
+        from_repo=from_repo,
+        target_version=target_version,
+        dry_run=dry_run,
+    )
+    if outcome.status in ("SKIPPED", "DRY_RUN"):
+        return {
+            "name": "reconcile_all_hosts",
+            "exit_code": 0,
+            "skipped": True,
+            "reason": outcome.message,
+        }
+    return {"name": "reconcile_all_hosts", **outcome.to_dict()}
+
+
 def _run_propagate(platform: str, repo: Optional[Path], dry_run: bool) -> dict[str, Any]:
     from minni.wire.host_discovery import host_decision
     decision = host_decision(platform, bulk=True)
@@ -662,6 +686,13 @@ def run_fleet_sync(
     # Custom JSON bindings are registered MCP consumers, not native hosts.
     from minni.wire.custom_refresh import refresh_custom_wires
     steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
+    steps.append(
+        _reconcile_all_hosts(
+            from_repo=from_repo,
+            install_root=wire_step.get("install_root"),
+            dry_run=dry_run,
+        )
+    )
 
     if propagate_hosts and not dry_run:
         for plat in ("antigravity", "cursor"):

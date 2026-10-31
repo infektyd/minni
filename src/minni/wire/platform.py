@@ -243,6 +243,7 @@ def default_config_scan_paths(home: Path | None = None) -> dict[str, Path]:
         "devin-hook": base / ".config/devin/scripts/minni-hook.sh",
         "muse-settings": base / ".config/muse/settings.json",
         "muse-mcp": base / ".muse/mcp.json",
+        "muse-config": base / ".muse/config.json",
     }
 
 
