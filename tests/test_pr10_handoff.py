@@ -1092,3 +1092,63 @@ def test_pending_handoff_leases_raises_handoff_store_error(monkeypatch, tmp_path
 
     with pytest.raises(HandoffStoreError, match="listing pending leases"):
         pending_handoff_leases("claude-code", context=broken_ctx)
+
+
+def _h9_send(tmp_path, monkeypatch, **pk):
+    db = _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(tmp_path / "cx"), "claude-code": str(tmp_path / "cc")}),
+    )
+    sent = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "daemon.handoff",
+            "params": {
+                "from_agent": "codex",
+                "to_agent": "claude-code",
+                "packet": _packet(**pk),
+            },
+        }
+    )["result"]
+    return db, sent["lease_id"]
+
+
+def _h9_ack(lid, status):
+    return minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "minni_ack_handoff",
+            "params": {"lease_id": lid, "status": status, "agent_id": "claude-code"},
+        }
+    )
+
+
+def test_h9_ack_after_expiry_must_be_refused(monkeypatch, tmp_path):
+    """H9 / Diagram 32 (NoAckAfterExpiry): an expired handoff lease must refuse acks."""
+    past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+    db, lid = _h9_send(tmp_path, monkeypatch, expires_at=past)
+    r = _h9_ack(lid, "accepted")
+    with db.cursor() as c:
+        st = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert "error" in r and st == "pending", (
+        f"ack accepted on an expired lease: {r} (status={st})"
+    )
+
+
+def test_h9_ack_is_final(monkeypatch, tmp_path):
+    """H9 / Diagram 32 (AckIsFinal): a second ack must not overwrite a resolved lease."""
+    db, lid = _h9_send(tmp_path, monkeypatch)
+    assert "error" not in _h9_ack(lid, "accepted")
+    r = _h9_ack(lid, "rejected_stale")
+    with db.cursor() as c:
+        st = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert "error" in r and st == "accepted", (
+        f"second ack overwrote final status -> {st}"
+    )

@@ -513,9 +513,16 @@ def write_matching_lease_packets(
     context: HandoffContext | None = None,
 ) -> list[str]:
     writer = context.write_json if context is not None else write_json
+    parse_ts = context.parse_iso_ts if context is not None else parse_iso_ts
+    now = time.time()
     changed = []
     for _vault, path, packet in iter_handoff_files(context=context):
         if packet.get("lease_id") != lease_id:
+            continue
+        if packet.get("ack_status"):
+            continue
+        expires_at = parse_ts(packet.get("expires_at"))
+        if expires_at is not None and expires_at <= now:
             continue
         packet.update(updates)
         writer(path, packet)
@@ -578,14 +585,17 @@ def update_handoff_lease_status(
     context: HandoffContext,
 ) -> bool:
     try:
+        now = time.time()
         db = context.lazy_writeback().db
         with db.cursor() as c:
             c.execute(
                 """UPDATE handoff_leases
                    SET status = ?,
                        contradicts_id = COALESCE(?, contradicts_id)
-                   WHERE lease_id = ?""",
-                (status, contradicts_id, lease_id),
+                   WHERE lease_id = ?
+                     AND status = 'pending'
+                     AND (expires_at IS NULL OR expires_at > ?)""",
+                (status, contradicts_id, lease_id, now),
             )
             return c.rowcount > 0
     except Exception as exc:
@@ -702,8 +712,19 @@ def handle_ack_handoff(params: dict, request_id: Any, context: HandoffContext) -
     }
     if contradicts_id is not None:
         updates["contradicts_id"] = contradicts_id
-    changed = write_matching_lease_packets(lease_id, updates, context=context)
     db_changed = update_handoff_lease_status(lease_id, status, contradicts_id, context=context)
+    if not db_changed:
+        try:
+            existing_lease = handoff_lease_status(lease_id, context=context)
+        except HandoffStoreError:
+            existing_lease = None
+        if existing_lease is not None:
+            return context.make_error(
+                -32009,
+                f"handoff lease {lease_id} cannot be acked (status={existing_lease['status']!r} or expired)",
+                request_id,
+            )
+    changed = write_matching_lease_packets(lease_id, updates, context=context)
     if not changed and not db_changed:
         return context.make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
     # B1: an explicit ack is terminal for the file channel — archive the
