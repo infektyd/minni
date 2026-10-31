@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import conftest as _conftest
 from minni.fleet_sync import run_fleet_sync
-from minni.wire.paths import default_home
+from minni.wire.paths import user_home
 from minni.wire.registry import resolve_home
 
 REPO = Path(__file__).resolve().parent.parent
@@ -22,7 +22,7 @@ def test_hermetic_home_guard_never_resolves_real_home() -> None:
     resolved_candidates = {
         "Path.home()": os.path.realpath(str(Path.home())),
         "expanduser('~')": os.path.realpath(os.path.expanduser("~")),
-        "default_home()": os.path.realpath(str(default_home())),
+        "user_home()": os.path.realpath(str(user_home())),
         "resolve_home()": os.path.realpath(str(resolve_home())),
         "env[HOME]": os.path.realpath(os.environ.get("HOME", "")),
         "env[MINNI_HOME]": os.path.realpath(os.environ.get("MINNI_HOME", "")),
