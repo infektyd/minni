@@ -157,11 +157,155 @@ def wired_record(platform: str) -> dict | None:
 
 def wired_install_roots() -> set[str]:
     data = _load_wired(plugin_base() / "wired.json")
-    return {
+    roots = {
         str(w.get("install_root", ""))
         for w in data.get("wires", [])
-        if w.get("install_root")
+        if isinstance(w, dict) and w.get("install_root")
     }
+    active_root = data.get("active_root")
+    if isinstance(active_root, str) and active_root:
+        roots.add(active_root)
+    return roots
+
+
+def build_wired_v2(
+    *,
+    active_version: str,
+    base_semver: str = "0.6.0",
+    git_commit_sha: str = "",
+    home: Path | None = None,
+    existing: dict | None = None,
+) -> dict:
+    """Construct a Schema v2 `wired.json` document with expanded absolute paths (§4.2, `N7`)."""
+    from minni.wire.registry import expand_host_surface_catalog, resolve_home
+
+    resolved_home = resolve_home(home)
+    base = resolved_home / ".minni" / "plugin"
+    prior = existing if isinstance(existing, dict) else _load_wired(base / "wired.json")
+    generation = int(prior.get("generation", 0)) + 1
+    hosts = expand_host_surface_catalog(home=resolved_home, base_semver=base_semver)
+
+    # Preserve any previously recorded ui_scanner_gate or workspace_pinned_by_operator
+    prior_hosts = prior.get("hosts")
+    if isinstance(prior_hosts, dict):
+        for host_id, prior_host in prior_hosts.items():
+            if host_id in hosts and isinstance(prior_host, dict):
+                if "ui_scanner_gate" in prior_host and isinstance(prior_host["ui_scanner_gate"], dict):
+                    hosts[host_id]["ui_scanner_gate"] = dict(prior_host["ui_scanner_gate"])
+                if "workspace_pinned_by_operator" in prior_host:
+                    hosts[host_id]["workspace_pinned_by_operator"] = bool(
+                        prior_host["workspace_pinned_by_operator"]
+                    )
+
+    active_root = str(base / active_version) if active_version else str(prior.get("active_root") or "")
+    stable_root = str(base / "current")
+    return {
+        "schema_version": 2,
+        "schema": 2,
+        "generation": generation,
+        "active_version": active_version,
+        "base_semver": base_semver,
+        "git_commit_sha": git_commit_sha,
+        "active_root": active_root,
+        "stable_root": stable_root,
+        "updated_at": utc_now_iso(),
+        "hosts": hosts,
+        "wires": list(prior.get("wires", [])),
+    }
+
+
+def save_wired_v2(
+    data: dict,
+    *,
+    home: Path | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Atomically persist a Schema v2 `wired.json` document under `wired.lock`."""
+    from minni.wire.registry import resolve_home
+
+    if dry_run:
+        return data
+    base = resolve_home(home) / ".minni" / "plugin"
+    wired_json = base / "wired.json"
+    wired_lock = base / "wired.lock"
+    base.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(wired_lock), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=base, prefix=".wired-", suffix=".json",
+        )
+        os.close(tmp_fd)
+        try:
+            Path(tmp_path).write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8",
+            )
+            os.replace(tmp_path, wired_json)
+        finally:
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink(missing_ok=True)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    return data
+
+
+def record_ui_scanner_gate(
+    host_id: str,
+    *,
+    container_mode: str,
+    evidence: str,
+    verified: bool = True,
+    home: Path | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Record operator UI-scanner verification in `wired.json` v2 (`R4-3`)."""
+    from minni.wire.registry import resolve_home
+
+    if host_id not in ("antigravity", "cursor"):
+        raise ValueError(f"ui_scanner_gate only applies to antigravity or cursor, got {host_id!r}")
+    if container_mode not in ("symlink_subtrees", "staged_copy"):
+        raise ValueError(f"invalid container_mode {container_mode!r}; expected symlink_subtrees or staged_copy")
+
+    resolved_home = resolve_home(home)
+    wired_json = resolved_home / ".minni" / "plugin" / "wired.json"
+    existing = _load_wired(wired_json)
+    if existing.get("schema_version") != 2 or not isinstance(existing.get("hosts"), dict):
+        data = build_wired_v2(
+            active_version=str(existing.get("active_version") or ""),
+            base_semver=str(existing.get("base_semver") or "0.6.0"),
+            git_commit_sha=str(existing.get("git_commit_sha") or ""),
+            home=resolved_home,
+            existing=existing,
+        )
+    else:
+        data = dict(existing)
+        data["generation"] = int(data.get("generation", 0)) + 1
+        data["updated_at"] = utc_now_iso()
+
+    gate_record = {
+        "container_mode": container_mode,
+        "verified": bool(verified),
+        "verified_at": utc_now_iso() if verified else None,
+        "probe_evidence": str(evidence),
+    }
+    host_entry = dict(data["hosts"].get(host_id, {}))
+    host_entry["ui_scanner_gate"] = gate_record
+    surfaces = []
+    for surf in host_entry.get("surfaces", []):
+        if isinstance(surf, dict) and surf.get("kind") == "plugin_container":
+            surf = dict(surf)
+            surf["container_mode"] = container_mode if verified else "staged_copy"
+        surfaces.append(surf)
+    host_entry["surfaces"] = surfaces
+    data["hosts"][host_id] = host_entry
+    return save_wired_v2(data, home=resolved_home, dry_run=dry_run)
+
+
+def effective_container_mode(host_id: str, wired_data: dict | None = None) -> str:
+    from minni.wire.registry import effective_container_mode as _effective_mode
+
+    return _effective_mode(host_id, wired_data)
 
 
 def retire_platform(platform: str, *, dry_run: bool = False) -> tuple[dict, int]:
