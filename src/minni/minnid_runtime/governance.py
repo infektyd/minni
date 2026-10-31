@@ -911,15 +911,36 @@ _SPRINT_CHATTER_RE = re.compile(
     r"\b(?:pushed|committed|merged|landed)\s+(?:commit\s+|sha\s+|pr\s+#?\d+\b|[0-9a-f]{7,40}\b)"
     r"|\b\d+\s*/\s*\d+\s+(?:tests?\s+)?(?:passed|green)\b"
     r"|\b\d+\s+(?:tests?\s+)?passed,\s*0\s+failed\b"
-    r"|\b(?:phase|slice|wave|workstream|sprint)\s+[a-z0-9_.-]+\s+(?:is\s+|are\s+)?(?:complete|completed|done|green|passed|status|shipped|landed)\b"
+    r"|\b(?:phase|slice|wave|workstream|sprint)\s+(?:\d+[a-z0-9_.-]*|[a-z]\d+[a-z0-9_.-]*|[a-z0-9]+[-_][a-z0-9_.-]+)\s+(?:is\s+|are\s+)?(?:complete|completed|done|green|passed|status|shipped|landed)\b"
     r"|^\s*Compaction summary\s*[—–-]"
     r"|Test failure recovered after edit:\s*Created At:\s*\d{4}-\d{2}-\d{2}"
     r"|\bGIT_BYPASS\s*=\s*1\b(?![^\n]*(?:byte-identical|never\s+bypass))"
     r")"
 )
 
+_STRONG_INVARIANT_MARKER_RE = re.compile(
+    r"(?i)\b(?:"
+    r"invariant|contract|must\s+never|never\s+run|root\s+cause|operator\s+rule"
+    r"|never\s+(?:merge|push|commit|bypass|loosen|skip|delete)"
+    r")\b"
+)
+
+_WEAK_INVARIANT_MARKER_RE = re.compile(
+    r"(?i)\b(?:"
+    r"only\s+(?:legitimate|valid|allowed|permitted|safe)\s+(?:with|when|if|after)"
+    r")\b"
+)
+
 _INVARIANT_MARKER_RE = re.compile(
-    r"(?i)\b(?:invariant|contract|must\s+never|never\s+run|root\s+cause|operator\s+rule)\b"
+    r"(?i)\b(?:"
+    r"invariant|contract|must\s+never|never\s+run|root\s+cause|operator\s+rule"
+    r"|only\s+(?:legitimate|valid|allowed|permitted|safe)\s+(?:with|when|if|after)"
+    r"|never\s+(?:merge|push|commit|bypass|loosen|skip|delete)"
+    r")\b"
+)
+
+_EPHEMERAL_TIME_OR_STATUS_RE = re.compile(
+    r"(?i)(?:\b(?:today|tonight|this\s+week|before\s+release)\b|(?<![-\w])now(?![-\w])|\b\d{1,2}(?::\d\d)?\s*(?:am|pm)\b)"
 )
 
 
@@ -958,13 +979,16 @@ def non_durable_promotion_blocker(
         bool(orig)
         and (orig in _HARVEST_SOURCES or "harvest" in orig)
     )
-    has_invariant = bool(_INVARIANT_MARKER_RE.search(content or ""))
+    has_strong_invariant = bool(_STRONG_INVARIANT_MARKER_RE.search(content or ""))
+    has_weak_invariant = bool(_WEAK_INVARIANT_MARKER_RE.search(content or ""))
+    has_ephemeral_time = bool(_EPHEMERAL_TIME_OR_STATUS_RE.search(content or ""))
+    has_invariant = has_strong_invariant or (has_weak_invariant and not has_ephemeral_time)
     if cat == "preference" and not has_invariant:
         return f"non_durable:{dur if dur != 'durable' else 'ordinary'}"
     if is_harvest_src:
         if dur != "durable" or not has_invariant:
             return f"non_durable:{dur if dur != 'durable' else 'ordinary'}"
-    elif orig == "agent" and dur != "durable":
+    elif orig == "agent" and dur != "durable" and not (dur == "ordinary" and has_invariant):
         return f"non_durable:{dur}"
     return None
 
@@ -1080,10 +1104,16 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
         df_dict["origin"] = str(origin_param)
     df = json.dumps(df_dict if df_dict else (raw_df or {}))
     instr = 1 if (params.get("instruction_like") or is_instruction_like(stored_content)) else 0
+    from minni.durability import normalize_category
     from minni.writeback import CATEGORIES
 
     raw_category = str(params.get("category") or "general").strip().lower()
-    category = raw_category if raw_category in CATEGORIES else "general"
+    norm_category = normalize_category(raw_category)
+    category = (
+        raw_category
+        if raw_category in CATEGORIES
+        else (norm_category if norm_category in CATEGORIES else "general")
+    )
 
     if "privacy_level" in params:
         requested_privacy = params["privacy_level"]

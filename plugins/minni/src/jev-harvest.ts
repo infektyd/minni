@@ -749,8 +749,8 @@ const SESSION_CHATTER_PATTERNS: ReadonlyArray<RegExp> = [
   /\b\d+\s*\/\s*\d+\s+(?:tests?\s+|specs?\s+|suites?\s+)?(?:pass(?:ed|ing)?|green)\b/i,
   /\b\d+\s+(?:tests?\s+|specs?\s+|suites?\s+)?(?:pass(?:ed|ing)|green)\b/i,
   /\ball\s+\d+\s+tests?\s+pass(?:ed|ing)?\b/i,
-  /\b(?:phase|slice|sprint|wave|workstream|step)\s+[a-z0-9._-]+\s+(?:is\s+|are\s+)?(?:complete(?:d)?|done|finished|shipped|landed|green|verified)\b/i,
-  /\b(?:complete(?:d)?|finished|shipped|landed|verified)\s+(?:phase|slice|sprint|wave|workstream|step)\s+[a-z0-9._-]+\b/i,
+  /\b(?:phase|slice|sprint|wave|workstream|step)\s+(?:\d+[a-z0-9_.-]*|[a-z]\d+[a-z0-9_.-]*|[a-z0-9]+[-_][a-z0-9_.-]+)\s+(?:is\s+|are\s+)?(?:complete(?:d)?|done|finished|shipped|landed|green|verified)\b/i,
+  /\b(?:complete(?:d)?|finished|shipped|landed|verified)\s+(?:phase|slice|sprint|wave|workstream|step)\s+(?:\d+[a-z0-9_.-]*|[a-z]\d+[a-z0-9_.-]*|[a-z0-9]+[-_][a-z0-9_.-]+)\b/i,
   /\b(?:pushed|committed|merged|landed)\s+(?:commit\s+|sha\s+|branch\s+|pr\s+#?\d+\s+)?(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/i,
   /\bcommit\s+(?=[0-9a-f]*\d)[0-9a-f]{7,40}\s+(?:(?:was|is|has\s+been)\s+)?(?:pushed|merged|landed)\b/i,
 ];
