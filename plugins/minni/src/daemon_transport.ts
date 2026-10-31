@@ -31,7 +31,7 @@ import {
 } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 import { durabilityOf } from "./durability.js";
-import { readSessionHandle } from "./recall-state.js";
+import { readSessionHandle, vaultHandleForPath } from "./recall-state.js";
 
 export interface JsonResult<T = unknown> {
   ok: boolean;
@@ -924,6 +924,7 @@ export interface DrillMemoryInput {
   depth?: "snippet" | "chunk" | "document";
   vaultPath?: string;
   sessionId?: string;
+  agentId?: string;
 }
 
 function xmlAttrEscapeDrill(value: string): string {
@@ -1468,16 +1469,55 @@ export async function drillMemory(
     };
   }
 
-  return jsonRpcSocketRequestWithFallbackRequester(
+  const rpcRes = (await jsonRpcSocketRequestWithFallbackRequester(
     "sm_drill",
     {
       result_ids: input.resultIds,
       chunk_ids: input.chunkIds,
-      references: input.references,
+      references: rawRefs.length > 0 ? rawRefs : input.references,
       depth: input.depth ?? "snippet",
+      ...(input.agentId
+        ? { agent_id: input.agentId }
+        : config?.agentId
+          ? { agent_id: config.agentId }
+          : {}),
     },
     requester,
-  ) as Promise<JsonResult<Record<string, unknown>>>;
+  )) as JsonResult<Record<string, unknown>>;
+
+  if (!rpcRes.ok && rawRefs.length > 0 && rawRefs.every((r) => typeof r === "string")) {
+    const fallbackResults: Array<Record<string, unknown>> = [];
+    for (const rawRef of rawRefs) {
+      const refStr = String(rawRef).trim();
+      const derivedHandle = vaultHandleForPath(refStr);
+      const resolved = await resolveSafeVaultHandleNote(effectiveVaultPath, derivedHandle);
+      if (resolved.status === "resolved") {
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
+        fallbackResults.push({
+          wikilink: resolved.wikilink,
+          relativePath: resolved.relativePath,
+          source: resolved.relativePath,
+          title: resolved.title,
+          status: "resolved",
+          found: true,
+          content: wrapped,
+        });
+      }
+    }
+    if (fallbackResults.length > 0) {
+      return {
+        ok: true,
+        source: "vault-fallback",
+        data: {
+          ...fallbackResults[0],
+          missing: [],
+          results: fallbackResults,
+        },
+      };
+    }
+  }
+
+  return rpcRes;
 }
 
 export async function exportContextPack(

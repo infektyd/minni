@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from copy import deepcopy
@@ -1879,16 +1880,41 @@ def reference_candidates(
     return candidates
 
 
+def _normalize_wikilink_token(value: Any) -> str:
+    s = str(value or "").strip()
+    if s.startswith("[[") and s.endswith("]]"):
+        s = s[2:-2].strip()
+    if s.endswith(".md"):
+        s = s[:-3]
+    return f"[[{s}]]" if s else ""
+
+
 def reference_matches(result: dict, reference: dict) -> bool:
     ref_source = reference.get("source") or reference.get("path")
+    ref_wikilink = reference.get("wikilink")
+    source_matched = False
     if ref_source:
         try:
-            return Path(str(result.get("source") or "")).resolve() == Path(str(ref_source)).resolve()
+            source_matched = (
+                Path(str(result.get("source") or "")).resolve()
+                == Path(str(ref_source)).resolve()
+            )
         except Exception:
-            return str(result.get("source") or "") == str(ref_source)
-    ref_wikilink = reference.get("wikilink")
+            source_matched = str(result.get("source") or "") == str(ref_source)
+    wikilink_matched = False
     if ref_wikilink:
-        return str(result.get("wikilink") or "") == str(ref_wikilink)
+        norm_ref = _normalize_wikilink_token(ref_wikilink)
+        norm_res = _normalize_wikilink_token(result.get("wikilink"))
+        res_stem = Path(str(result.get("source") or "")).stem
+        wikilink_matched = bool(norm_ref) and (
+            norm_res == norm_ref or (bool(res_stem) and norm_ref == f"[[{res_stem}]]")
+        )
+    if ref_source and ref_wikilink:
+        return source_matched or wikilink_matched
+    if ref_source:
+        return source_matched
+    if ref_wikilink:
+        return wikilink_matched
     return True
 
 
@@ -1921,9 +1947,7 @@ def reference_ids_for_engine(reference: dict, retrieval_engine) -> list[int]:
 
     ref_source = reference.get("source") or reference.get("path")
     ref_wikilink = reference.get("wikilink")
-    normalized_wikilink = str(ref_wikilink).strip() if ref_wikilink else ""
-    if normalized_wikilink and not normalized_wikilink.startswith("[["):
-        normalized_wikilink = f"[[{normalized_wikilink.removesuffix('.md')}]]"
+    normalized_wikilink = _normalize_wikilink_token(ref_wikilink) if ref_wikilink else ""
 
     ids = []
     try:
@@ -1943,7 +1967,10 @@ def reference_ids_for_engine(reference: dict, retrieval_engine) -> list[int]:
                     if path_value == str(ref_source):
                         ids.append(int(row["doc_id"]))
                         continue
-            if normalized_wikilink and _path_to_wikilink(path_value) == normalized_wikilink:
+            if normalized_wikilink and (
+                _path_to_wikilink(path_value) == normalized_wikilink
+                or f"[[{Path(path_value).stem}]]" == normalized_wikilink
+            ):
                 ids.append(int(row["doc_id"]))
     except Exception:
         return ids
@@ -2010,6 +2037,18 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
 
     raw_ids = params.get("chunk_ids", params.get("result_ids"))
     raw_references = params.get("references", params.get("refs"))
+    if raw_references is None:
+        extra_refs: list[Any] = []
+        for k in ("wikilink", "handle"):
+            val = params.get(k)
+            if isinstance(val, str) and val.strip():
+                extra_refs.append(val.strip())
+        for k in ("wikilinks", "handles"):
+            val = params.get(k)
+            if isinstance(val, list):
+                extra_refs.extend(val)
+        if extra_refs:
+            raw_references = extra_refs
     if raw_ids is None and raw_references is None:
         return context.make_error(-32602, "chunk_ids, result_ids, references, or refs is required", request_id)
     if raw_ids is not None and not isinstance(raw_ids, list):
@@ -2041,7 +2080,13 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
             references.append(ref)
         elif isinstance(ref, str):
             stripped = ref.strip()
-            references.append({"wikilink": stripped} if stripped.startswith("[[") else {"source": stripped})
+            d_match = re.match(r"^d:([a-z0-9_-]+):(\d+)$", stripped, re.IGNORECASE)
+            if d_match:
+                references.append({"doc_id": int(d_match.group(2)), "src": d_match.group(1).lower()})
+            elif stripped.startswith("[["):
+                references.append({"wikilink": stripped})
+            else:
+                references.append({"source": stripped, "wikilink": stripped})
         else:
             return context.make_error(-32602, "references must be objects or strings", request_id)
 
@@ -2136,6 +2181,15 @@ def handle_sm_export_pack(params: dict, request_id: Any, context: RecallContext)
 
     try:
         engine = context.lazy_retrieval()
+        effective_workspace = (
+            principal.workspace_id
+            if (principal is not None and getattr(principal, "workspace_id", None) not in (None, "", "default"))
+            else (
+                workspace_id
+                or (getattr(principal, "workspace_id", None) if principal is not None else None)
+                or "default"
+            )
+        )
         results = engine.retrieve(
             query=query,
             agent_id=agent_id,
@@ -2143,7 +2197,7 @@ def handle_sm_export_pack(params: dict, request_id: Any, context: RecallContext)
             depth="snippet",
             update_access=False,
             principal=principal,
-            workspace=principal.workspace_id if principal is not None else (workspace_id or "default"),
+            workspace=effective_workspace,
             deadline_monotonic=deadline_monotonic,
         )
         prefix_anchors = []
@@ -2184,7 +2238,7 @@ def handle_sm_export_pack(params: dict, request_id: Any, context: RecallContext)
             "prefix": {
                 "identity": {
                     "agent_id": agent_id,
-                    "workspace_id": workspace_id,
+                    "workspace_id": workspace_id or effective_workspace,
                     "format": "sovereign-context-pack-v1",
                 },
                 "anchors": prefix_anchors,
