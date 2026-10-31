@@ -57,7 +57,6 @@ def _build_payload(home: Path, version: str = "0.2.0") -> tuple[Path, PayloadMan
         encoding="utf-8",
     )
     (dist / "kilocode-hook.js").write_text("// stub kilo hook\n", encoding="utf-8")
-    (root / ".mcp.json").write_text("{}", encoding="utf-8")
 
     files = {
         "dist/server.js": sha256_file(server),
@@ -65,7 +64,6 @@ def _build_payload(home: Path, version: str = "0.2.0") -> tuple[Path, PayloadMan
         "dist/kilocode-hook.js": sha256_file(dist / "kilocode-hook.js"),
         "kilo/minni-plugin.js": sha256_file(root / "kilo/minni-plugin.js"),
         "dist/gemini-hook.js": sha256_file(gemini_hook),
-        ".mcp.json": sha256_file(root / ".mcp.json"),
     }
     manifest = PayloadManifest(
         schema=1,

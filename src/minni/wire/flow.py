@@ -166,9 +166,22 @@ def _wire_platform(
     extras: dict[str, object] = {}
 
     mcp_target = (mcp_root or install_root) / ".mcp.json"
+    pbase = plugin_base()
+    try:
+        is_shared_plugin_root = (
+            mcp_root is None
+            and spec.config_kind != "mcp-json-only"
+            and (
+                install_root.resolve() == pbase.resolve()
+                or pbase.resolve() in install_root.resolve().parents
+            )
+        )
+    except OSError:
+        is_shared_plugin_root = False
+
     pre_doc: dict = {}
     pre_mcp_env: dict = {}
-    if mcp_target.exists():
+    if not is_shared_plugin_root and mcp_target.exists():
         try:
             pre_doc = load_json(mcp_target)
             pre_mcp_env = (
@@ -217,23 +230,28 @@ def _wire_platform(
                        if key not in {"MINNI_WORKSPACE_ID", "MINNI_CODEX_WORKSPACE_ID"}}
 
     if not dry_run:
-        generated = mcp_json(
-            server_path, agent, vault, socket, stamp_workspace,
-            pre_existing_env=pre_mcp_env,
-            explicit_workspace=explicit_workspace,
-            dynamic_workspace=dynamic_workspace,
-            afm_env=afm_env,
-        )
-        # Merge into the existing document: only the minni entry is ours;
-        # unrelated MCP servers and top-level keys must survive a wire.
-        merged = dict(pre_doc) if isinstance(pre_doc, dict) else {}
-        servers = merged.get("mcpServers")
-        if not isinstance(servers, dict):
-            servers = {}
-        servers = dict(servers)
-        servers["minni"] = generated["mcpServers"]["minni"]
-        merged["mcpServers"] = servers
-        write_json(mcp_target, merged)
+        if is_shared_plugin_root:
+            # §4.1 #1 (N2): shared payload under ~/.minni/plugin/<version>/ omits .mcp.json
+            if mcp_target.exists() or mcp_target.is_symlink():
+                mcp_target.unlink(missing_ok=True)
+        else:
+            generated = mcp_json(
+                server_path, agent, vault, socket, stamp_workspace,
+                pre_existing_env=pre_mcp_env,
+                explicit_workspace=explicit_workspace,
+                dynamic_workspace=dynamic_workspace,
+                afm_env=afm_env,
+            )
+            # Merge into the existing document: only the minni entry is ours;
+            # unrelated MCP servers and top-level keys must survive a wire.
+            merged = dict(pre_doc) if isinstance(pre_doc, dict) else {}
+            servers = merged.get("mcpServers")
+            if not isinstance(servers, dict):
+                servers = {}
+            servers = dict(servers)
+            servers["minni"] = generated["mcpServers"]["minni"]
+            merged["mcpServers"] = servers
+            write_json(mcp_target, merged)
 
     config_path: Path | None = spec.config_path
     kind = spec.config_kind

@@ -56,53 +56,59 @@ DEFAULT_IDENTITY_ROOT = Path("~/.minni/identities").expanduser()
 _VERSION_DIR_START = re.compile(r"^\d")
 
 
-def _version_sort_key(name: str) -> tuple[tuple[int, ...], int, str]:
-    """PEP440-shaped ordering key: release numbers, then local segments last."""
-    public, _, local = name.partition("+")
-    release: list[int] = []
-    for chunk in public.split("."):
-        digits = re.match(r"\d+", chunk)
-        release.append(int(digits.group()) if digits else 0)
-    return (tuple(release), 1 if local else 0, local)
+def _newest_built_version_dir(base: Path) -> str | None:
+    """Resolve the most recently built version dir under `base` by `built_at` or `mtime` (§4.1 #6, fixes D3).
 
-
-def max_present_version(base: Path) -> str | None:
-    """Highest-numbered version dir that actually exists under `base`, or None.
-
-    Two properties matter. It only ever names a directory that is really there,
-    and it compares numerically rather than lexically -- a lexical sort puts a
-    two-digit minor behind a one-digit one, and taking the first element of an
-    ascending sort would hand back the oldest install instead of the newest.
+    Never sorts `+git.<sha>` suffixes lexicographically by hex SHA.
     """
     try:
-        names = [
-            p.name for p in base.iterdir()
-            if p.is_dir() and _VERSION_DIR_START.match(p.name)
+        candidates = [
+            p for p in base.iterdir()
+            if p.is_dir() and not p.is_symlink() and _VERSION_DIR_START.match(p.name)
         ]
     except OSError:
         return None
-    return max(names, key=_version_sort_key) if names else None
+    if not candidates:
+        return None
+
+    def _built_key(d: Path) -> tuple[str, float]:
+        manifest_path = d / "payload-manifest.json"
+        built_at = ""
+        if manifest_path.is_file():
+            try:
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    built_at = str(data.get("built_at") or "")
+            except Exception:
+                built_at = ""
+        try:
+            mtime = d.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (built_at, mtime)
+
+    return max(candidates, key=_built_key).name
 
 
 def plugin_version_segment() -> str:
-    """Resolve the wire-managed plugin version, preferring what exists on disk.
-
-    The `current` symlink is authoritative when present, but wire maintains it
-    only for released versions -- on a --from-repo machine it never exists.
-    Falling straight through to the pip metadata version there named a directory
-    that need not exist at all, because the installed wheel and the wired payload
-    legitimately diverge (--use-version rollback, dev builds). So the on-disk
-    maximum is consulted before the package version.
-    """
-    current = Path("~/.minni/plugin/current").expanduser()
+    """Resolve the wire-managed plugin version, validating `current` before trusting it (§4.1 #6, fixes D3)."""
+    base = Path("~/.minni/plugin").expanduser()
+    current = base / "current"
     try:
-        if current.is_symlink():
-            return Path(os.readlink(current)).name
-        if current.exists():
+        if current.is_symlink() and current.exists():
+            target = current.resolve(strict=True)
+            if (
+                target.is_dir()
+                and os.path.samestat(os.stat(target.parent), os.stat(base.resolve(strict=True)))
+                and (target / "payload-manifest.json").is_file()
+                and (target / "dist" / "server.js").is_file()
+            ):
+                return target.name
+        elif current.exists() and not current.is_symlink() and current.is_dir():
             return current.name
     except OSError:
         pass
-    present = max_present_version(Path("~/.minni/plugin").expanduser())
+    present = _newest_built_version_dir(base)
     if present:
         return present
     try:
@@ -116,16 +122,9 @@ def plugin_version_segment() -> str:
 
 
 def codex_install_root() -> Path:
-    """Codex's plugin dir, resolved from the versions that actually exist there.
-
-    Codex keeps its own cache tree, so inheriting the wire tree's version segment
-    can name a directory Codex never had. Resolve against Codex's own dirs, and
-    never substitute a literal `current` segment: no such directory exists under
-    the codex cache, so writing there built a second dead tree rather than
-    updating the live one.
-    """
+    """Codex's plugin dir, resolved from the versions that actually exist there."""
     base = Path("~/.codex/plugins/cache/minni/minni").expanduser()
-    present = max_present_version(base)
+    present = _newest_built_version_dir(base)
     return base / (present or plugin_version_segment())
 
 

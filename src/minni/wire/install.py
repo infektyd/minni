@@ -36,10 +36,56 @@ class HashMismatchError(InstallError):
         )
 
 
+def _sanitize_staged_payload(stage: Path) -> None:
+    """Omit `.mcp.json` and strip `mcpServers` from `.claude-plugin/plugin.json` in staged copy only (§4.1 #1, `N2`)."""
+    import json
+    from minni.wire.manifest import sha256_file
+
+    mcp_file = stage / ".mcp.json"
+    if mcp_file.exists() or mcp_file.is_symlink():
+        mcp_file.unlink(missing_ok=True)
+
+    cplugin_file = stage / ".claude-plugin" / "plugin.json"
+    cplugin_modified = False
+    if cplugin_file.is_file():
+        try:
+            cdata = json.loads(cplugin_file.read_text(encoding="utf-8"))
+            if isinstance(cdata, dict) and "mcpServers" in cdata:
+                cdata.pop("mcpServers", None)
+                cplugin_file.write_text(
+                    json.dumps(cdata, indent=2) + "\n", encoding="utf-8",
+                )
+                cplugin_modified = True
+        except Exception:
+            pass
+
+    pmanifest_file = stage / "payload-manifest.json"
+    if pmanifest_file.is_file():
+        try:
+            mdata = json.loads(pmanifest_file.read_text(encoding="utf-8"))
+            files = mdata.get("files")
+            if isinstance(files, dict):
+                changed = False
+                if ".mcp.json" in files:
+                    files.pop(".mcp.json", None)
+                    changed = True
+                if cplugin_modified and cplugin_file.is_file():
+                    files[".claude-plugin/plugin.json"] = sha256_file(cplugin_file)
+                    changed = True
+                if changed:
+                    mdata["files"] = files
+                    pmanifest_file.write_text(
+                        json.dumps(mdata, indent=2) + "\n", encoding="utf-8",
+                    )
+        except Exception:
+            pass
+
+
 def _copy_tree(src: Path, dest: Path) -> None:
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__"))
+    _sanitize_staged_payload(dest)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -136,6 +182,11 @@ def update_current_symlink(version: str, *, dry_run: bool = False) -> None:
     link = plugin_base() / "current"
     if dry_run:
         return
+    if link.exists() and not link.is_symlink() and link.is_dir():
+        prev_dir = link.parent / f".current.prev_dir.{os.getpid()}"
+        if prev_dir.exists():
+            shutil.rmtree(prev_dir, ignore_errors=True)
+        os.rename(link, prev_dir)
     tmp = link.parent / f".current-{os.getpid()}"
     if tmp.exists() or tmp.is_symlink():
         tmp.unlink()
@@ -159,3 +210,6 @@ def install_payload(
     if update_current and not dry_run:
         update_current_symlink(version)
     return result
+
+
+install_plugin_payload = install_payload
