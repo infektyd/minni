@@ -124,6 +124,8 @@ def _install_locked(
         return InstallResult(install_root=target, version=version, skipped=False)
 
     base.mkdir(parents=True, exist_ok=True)
+    for old_lock in base.glob(".install-*.lock"):
+        old_lock.unlink(missing_ok=True)
 
     lock_path = install_lock_path(version)
     lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)

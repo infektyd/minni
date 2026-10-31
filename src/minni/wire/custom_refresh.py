@@ -145,7 +145,28 @@ def _check_record(record: dict) -> None:
         raise ValueError("registered custom binding changed during validation")
 
 
-def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
+def _archive_dir_for_base(base: Path) -> Path:
+    from datetime import UTC, datetime
+
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    arch = base.parent / "archive" / stamp / "custom_refresh"
+    arch.mkdir(parents=True, exist_ok=True)
+    return arch
+
+
+def _sweep_legacy_minni_backups(config: Path, arch_dir: Path) -> None:
+    for p in config.parent.glob(f"{config.name}.minni-backup-*"):
+        if p.is_file():
+            shutil.move(str(p), str(arch_dir / p.name))
+
+
+def _refresh(
+    record: dict,
+    new_root: Path | None,
+    *,
+    dry_run: bool,
+    archive_first: bool = False,
+) -> dict:
     platform = record.get("platform")
     result = {"platform": platform, "status": "skipped"}
     if platform not in _CUSTOM:
@@ -202,7 +223,10 @@ def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
         except (OSError, ValueError, KeyError, TypeError):
             notes.append("cwd preserved: existing directory is not a verified Minni payload")
         else:
-            entry["cwd"] = str(new_root)
+            if archive_first or new_root.name == "current":
+                entry.pop("cwd", None)
+            else:
+                entry["cwd"] = str(new_root)
     if json.loads(original) == data:
         # Verified binding already the exact target: never rewrite the operator
         # configuration, never write a backup.
@@ -226,7 +250,12 @@ def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
         return {"platform": platform, "status": "dry-run", "reason": "would refresh registered MCP binding", "notes": notes}
     _check_record(record)
     mode = stat.S_IMODE(config.stat().st_mode)
-    backup_fd, backup_name = tempfile.mkstemp(prefix=config.name + ".minni-backup-", dir=config.parent)
+    if archive_first:
+        arch_dir = _archive_dir_for_base(base)
+        _sweep_legacy_minni_backups(config, arch_dir)
+        backup_fd, backup_name = tempfile.mkstemp(prefix=config.name + ".minni-backup-", dir=arch_dir)
+    else:
+        backup_fd, backup_name = tempfile.mkstemp(prefix=config.name + ".minni-backup-", dir=config.parent)
     with os.fdopen(backup_fd, "wb") as backup:
         backup.write(original)
     # Optimistic concurrency check avoids overwriting edits made while validating.
@@ -248,7 +277,12 @@ def _refresh(record: dict, new_root: Path | None, *, dry_run: bool) -> dict:
             "runtime": "not_probed", "native_hooks": "unchanged", "notes": notes}
 
 
-def refresh_custom_wires(*, dry_run: bool = False, new_root: Path | None = None) -> dict:
+def refresh_custom_wires(
+    *,
+    dry_run: bool = False,
+    new_root: Path | None = None,
+    archive_first: bool = False,
+) -> dict:
     base = plugin_base()
     results = []
     try:
@@ -259,14 +293,16 @@ def refresh_custom_wires(*, dry_run: bool = False, new_root: Path | None = None)
             raise ValueError("wire registry malformed")
     except Exception as exc:
         return {"name": "custom_mcp_refresh", "exit_code": 1, "reason": f"wire registry unreadable ({type(exc).__name__})"}
+    use_archive = archive_first or int(data.get("schema_version") or data.get("schema") or 1) >= 2
     target = Path(new_root) if new_root is not None else None
     for record in records:
         if record.get("platform") in CANONICAL_FLEET:
             continue
         try:
-            results.append(_refresh(record, target, dry_run=dry_run))
+            results.append(_refresh(record, target, dry_run=dry_run, archive_first=use_archive))
         except Exception as exc:
             results.append({"platform": record.get("platform"), "status": "failed",
+                            "error": str(exc),
                             "reason": f"custom refresh failed ({type(exc).__name__}); configuration backup retained if a write was attempted"})
     return {"name": "custom_mcp_refresh", "exit_code": int(any(row["status"] == "failed" for row in results)),
             "results": results,

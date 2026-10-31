@@ -26,8 +26,9 @@ def plugin_base() -> Path:
     return user_home() / ".minni" / "plugin"
 
 
-def install_lock_path(version: str) -> Path:
-    return plugin_base() / f".install-{version}.lock"
+def install_lock_path(version: str = "") -> Path:
+    _ = version
+    return plugin_base() / ".install.lock"
 
 
 def staging_dir(version: str) -> Path:
