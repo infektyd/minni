@@ -1091,7 +1091,16 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     ws = params.get("workspace_id") or "default"
     ev = json.dumps(params.get("evidence_refs") or params.get("evidence_doc_ids") or [])
     raw_df = params.get("derived_from")
-    df_dict = dict(raw_df) if isinstance(raw_df, dict) else {}
+    if isinstance(raw_df, dict):
+        df_dict = dict(raw_df)
+    elif isinstance(raw_df, str) and raw_df.strip():
+        try:
+            parsed_df = json.loads(raw_df)
+            df_dict = dict(parsed_df) if isinstance(parsed_df, dict) else {"raw": raw_df}
+        except Exception:
+            df_dict = {"raw": raw_df}
+    else:
+        df_dict = {}
     source_param = params.get("source")
     if source_param is None and isinstance(raw_df, dict):
         source_param = raw_df.get("source")
@@ -1102,7 +1111,10 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
         df_dict["source"] = str(source_param)
     if origin_param is not None and "origin" not in df_dict:
         df_dict["origin"] = str(origin_param)
-    df = json.dumps(df_dict if df_dict else (raw_df or {}))
+    if str(df_dict.get("source") or "").strip().lower() == "inbox":
+        df_dict.pop("source", None)
+    df_dict.pop("inbox_file", None)
+    df = json.dumps(df_dict)
     instr = 1 if (params.get("instruction_like") or is_instruction_like(stored_content)) else 0
     from minni.durability import normalize_category
     from minni.writeback import CATEGORIES
