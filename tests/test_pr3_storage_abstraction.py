@@ -343,3 +343,68 @@ def test_h14_concurrent_mark_dirty_during_upsert_not_clobbered(tmp_path):
         f"concurrent mark_dirty was clobbered to status={state['status']!r} and deleted chunk 1 remained in {remaining}"
     )
 
+
+def test_p2_1_vector_sync_crash_mid_sync_reconciles_on_next_pass(tmp_path):
+    """P2-1: sync_backend sets status='syncing' before deletion reconciliation.
+    If the process crashes or an uncaught error aborts mid-sync leaving
+    status='syncing', both should_sync and the next sync_backend pass must treat
+    'syncing' as dirty so deleted vectors are reconciled."""
+    import pytest
+    from minni.vector_sync import get_backend_state, mark_dirty, should_sync, sync_backend
+
+    db_obj, _cfg = _make_db(tmp_path)
+    now = time.time()
+    vec = np.ones(384, dtype=np.float32)
+    with db_obj.cursor() as c:
+        c.execute(
+            "INSERT INTO documents (path, indexed_at) VALUES (?, ?)",
+            ("wiki/p2_1.md", now),
+        )
+        doc_id = c.lastrowid
+        for i in range(2):
+            c.execute(
+                """INSERT INTO chunk_embeddings
+                   (doc_id, chunk_index, chunk_text, embedding, computed_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (doc_id, i, f"chunk{i}", vec.tobytes(), now),
+            )
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashingRemoveBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.crash_on_remove = False
+
+        def remove(self, chunk_ids):
+            if self.crash_on_remove:
+                raise SimulatedCrash("process died mid-reconcile")
+            super().remove(chunk_ids)
+
+    backend = CrashingRemoveBackend()
+    sync_backend(backend, db_obj)
+    assert {it.chunk_id for it in backend.items} == {1, 2}
+
+    with db_obj.cursor() as c:
+        c.execute("DELETE FROM chunk_embeddings WHERE chunk_id = 1")
+    mark_dirty("fake", db_obj)
+
+    backend.crash_on_remove = True
+    with pytest.raises(SimulatedCrash):
+        sync_backend(backend, db_obj)
+    assert get_backend_state("fake", db_obj)["status"] == "syncing"
+    needs_sync = should_sync("fake", db_obj)
+
+    backend.crash_on_remove = False
+    res_retry = sync_backend(backend, db_obj)
+    assert res_retry["status"] == "ok"
+    assert get_backend_state("fake", db_obj)["status"] == "ok"
+    remaining = {it.chunk_id for it in backend.items}
+    db_obj.close()
+    assert 1 not in remaining, (
+        f"deleted chunk 1 was skipped after mid-sync crash left status='syncing': {remaining}"
+    )
+    assert needs_sync is True, (
+        "should_sync must treat 'syncing' (interrupted sync) as needing sync"
+    )

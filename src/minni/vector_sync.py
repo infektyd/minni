@@ -139,7 +139,7 @@ def sync_backend(
     dim = embedding_dim or backend.dim or cfg.embedding_dim
 
     state = get_backend_state(backend.name, db)
-    is_dirty = state["status"] in ("dirty", "error")
+    is_dirty = state["status"] in ("dirty", "error", "syncing")
     start_rowid = 0 if full_rebuild else state["last_synced_chunk_rowid"]
 
     logger.debug(
@@ -331,7 +331,7 @@ def should_sync(backend_name: str, db) -> bool:
     Return True if this backend needs a sync pass.
 
     Called by the daemon idle hook every 30s.
-    Returns True if status == 'dirty' or 'empty' or 'error'.
+    Returns True if status == 'dirty', 'empty', 'error', or 'syncing'.
     """
     state = get_backend_state(backend_name, db)
-    return state["status"] in ("dirty", "empty", "error")
+    return state["status"] in ("dirty", "empty", "error", "syncing")
