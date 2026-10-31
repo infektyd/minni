@@ -351,3 +351,151 @@ def test_class_b_index_vault_migrates_and_prunes_legacy_relative_path_rows(tmp_p
     assert gone_rel not in paths, f"legacy relative row for deleted file must be pruned, got {paths}"
     assert live_rel not in paths, f"legacy relative row for live file must be migrated, got {paths}"
     assert str(live_full.resolve()) in paths, f"canonical resolved path must exist after index_vault, got {paths}"
+
+
+def test_h11_vault_index_doc_retract_surfaces_db_error_instead_of_swallowing(
+    tmp_path: Path, monkeypatch
+):
+    import sqlite3
+
+    cfg, db, engine = _make_engine(tmp_path)
+    note_rel = "wiki/notes/retract-ghost.md"
+    note_full = Path(cfg.vault_path) / note_rel
+    note_full.parent.mkdir(parents=True, exist_ok=True)
+    accepted_text = "---\ntitle: Retract Ghost\nstatus: accepted\n---\n\n# Retract Ghost\n\nToken retractghosttoken123.\n"
+    note_full.write_text(accepted_text, encoding="utf-8")
+
+    ctx = VaultIndexContext(
+        make_error=lambda code, msg, req_id, data=None: {
+            "error": {"code": code, "message": msg},
+            "id": req_id,
+        },
+        make_response=lambda data, req_id: {"result": data, "id": req_id},
+        make_mismatch_error=lambda w, s, r: {"error": "mismatch", "id": r},
+        handler_principal=lambda p, r: (SimpleNamespace(agent_id="claude-code"), None),
+        guard_vault_root=lambda *a, **kw: None,
+        lazy_retrieval=lambda: engine,
+        agent_vault=lambda aid: (Path(cfg.vault_path), True),
+        record_latency=lambda *_a, **_kw: None,
+        increment_request_count=lambda: None,
+    )
+    resp1 = handle_vault_index_doc(
+        {
+            "path": note_rel,
+            "content": accepted_text,
+            "agent": "claude-code",
+            "page_status": "accepted",
+        },
+        request_id=1,
+        context=ctx,
+    )
+    assert resp1.get("result", {}).get("status") == "ok"
+
+    def broken_transaction():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "transaction", broken_transaction)
+
+    archived_text = "---\ntitle: Retract Ghost\nstatus: archived\n---\n\n# Retract Ghost\n\nToken retractghosttoken123.\n"
+    note_full.write_text(archived_text, encoding="utf-8")
+    resp2 = handle_vault_index_doc(
+        {
+            "path": note_rel,
+            "content": archived_text,
+            "agent": "claude-code",
+            "page_status": "archived",
+        },
+        request_id=2,
+        context=ctx,
+    )
+    assert "error" in resp2, f"retract failure was swallowed as success: {resp2}"
+
+
+def test_h11_vault_index_doc_retract_invalidates_faiss_trie_and_rerank(
+    tmp_path: Path, monkeypatch
+):
+    cfg, db, engine = _make_engine(tmp_path)
+    note_rel = "wiki/notes/retract-cache.md"
+    note_full = Path(cfg.vault_path) / note_rel
+    note_full.parent.mkdir(parents=True, exist_ok=True)
+    accepted_text = "---\ntitle: Retract Cache\nstatus: accepted\n---\n\n# Retract Cache\n\nToken retractcachetoken987.\n"
+    note_full.write_text(accepted_text, encoding="utf-8")
+
+    ctx = VaultIndexContext(
+        make_error=lambda code, msg, req_id, data=None: {
+            "error": {"code": code, "message": msg},
+            "id": req_id,
+        },
+        make_response=lambda data, req_id: {"result": data, "id": req_id},
+        make_mismatch_error=lambda w, s, r: {"error": "mismatch", "id": r},
+        handler_principal=lambda p, r: (SimpleNamespace(agent_id="claude-code"), None),
+        guard_vault_root=lambda *a, **kw: None,
+        lazy_retrieval=lambda: engine,
+        agent_vault=lambda aid: (Path(cfg.vault_path), True),
+        record_latency=lambda *_a, **_kw: None,
+        increment_request_count=lambda: None,
+    )
+    resp1 = handle_vault_index_doc(
+        {
+            "path": note_rel,
+            "content": accepted_text,
+            "agent": "claude-code",
+            "page_status": "accepted",
+        },
+        request_id=1,
+        context=ctx,
+    )
+    assert resp1.get("result", {}).get("status") == "ok"
+
+    # Warm the in-memory Trie cache
+    trie_before = engine.trie_search("retractcachetoken987", limit=5)
+    assert any(r.get("path") == str(note_full.resolve()) for r in trie_before)
+
+    with db.cursor() as c:
+        expected_chunks = [
+            int(r["chunk_id"])
+            for r in c.execute("SELECT chunk_id FROM chunk_embeddings").fetchall()
+        ]
+    assert expected_chunks, "expected chunk_embeddings rows after indexing"
+
+    faiss_removed: list[int] = []
+    rerank_invalidated: list[int] = []
+    orig_faiss = engine._remove_live_faiss
+    orig_rerank = engine._invalidate_durable_rerank
+
+    def spy_faiss(cids):
+        faiss_removed.extend(cids)
+        return orig_faiss(cids)
+
+    def spy_rerank(cids):
+        rerank_invalidated.extend(cids)
+        return orig_rerank(cids)
+
+    monkeypatch.setattr(engine, "_remove_live_faiss", spy_faiss)
+    monkeypatch.setattr(engine, "_invalidate_durable_rerank", spy_rerank)
+
+    archived_text = "---\ntitle: Retract Cache\nstatus: archived\n---\n\n# Retract Cache\n\nToken retractcachetoken987.\n"
+    note_full.write_text(archived_text, encoding="utf-8")
+    resp2 = handle_vault_index_doc(
+        {
+            "path": note_rel,
+            "content": archived_text,
+            "agent": "claude-code",
+            "page_status": "archived",
+        },
+        request_id=2,
+        context=ctx,
+    )
+    assert resp2.get("result", {}).get("retracted") is True
+
+    trie_after = engine.trie_search("retractcachetoken987", limit=5)
+    assert not any(r.get("path") == str(note_full.resolve()) for r in trie_after), (
+        "retract must invalidate in-memory Trie cache"
+    )
+    assert sorted(faiss_removed) == sorted(expected_chunks), (
+        f"retract must remove chunks from live FAISS: got {faiss_removed}, expected {expected_chunks}"
+    )
+    assert sorted(rerank_invalidated) == sorted(expected_chunks), (
+        f"retract must invalidate durable rerank cache: got {rerank_invalidated}, expected {expected_chunks}"
+    )
+
