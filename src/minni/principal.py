@@ -605,7 +605,7 @@ def _stamp_effective_principal(
             and stamped.agent_id in OPERATOR_RESERVED_AGENT_IDS
         ):
             return stamped
-        if strict:
+        if strict and supplied in OPERATOR_RESERVED_AGENT_IDS:
             aliases: list[str] = []
             for name in CANONICAL_PRINCIPAL_NAMES:
                 raw = _load_raw_principal_file(name, d, strict=True)
@@ -629,6 +629,87 @@ def _stamp_effective_principal(
     if supplied == stamped.agent_id:
         return stamped
 
+    _PLATFORM_NO_ROOTS = [PLATFORM_NO_ROOTS_SENTINEL]
+
+    def _default_platform_roots(agent_id: str) -> list[str]:
+        roots = [str(_canonical_live_vault_root(agent_id).resolve())]
+        if agent_id == "gemini":
+            # The installer's vault_for("gemini") deliberately falls
+            # back to the legacy ~/.gemini/minni-vault when it has data
+            # and the canonical vault is missing (propagate.py). A
+            # strict install upgraded without platform_agent_vault_roots
+            # would otherwise stamp MCP with the legacy path while the
+            # daemon principal rejects it via allows_vault_root.
+            roots.append(
+                str(Path("~/.gemini/minni-vault").expanduser().resolve())
+            )
+        return roots
+
+    def _build_mapped_principal(
+        raw: dict,
+        *,
+        cap_keys: tuple[str, ...],
+        root_keys: tuple[str, ...],
+        auto_keys: tuple[str, ...],
+        label: str,
+        strip_operator_caps: bool = False,
+    ) -> EffectivePrincipal:
+        resolved_caps: list[str] = []
+        for k in cap_keys:
+            cap_map = raw.get(k)
+            if isinstance(cap_map, dict) and supplied in cap_map:
+                raw_caps = cap_map[supplied]
+                if isinstance(raw_caps, list):
+                    resolved_caps = [str(c) for c in raw_caps]
+                break
+        if strip_operator_caps:
+            resolved_caps = [
+                c
+                for c in resolved_caps
+                if c not in ("*", "govern", "resolve_candidate")
+            ]
+
+        resolved_roots: Optional[list[str]] = None
+        for k in root_keys:
+            roots_map = raw.get(k)
+            if isinstance(roots_map, dict) and supplied in roots_map:
+                raw_roots = roots_map[supplied]
+                if not isinstance(raw_roots, list) or not raw_roots:
+                    resolved_roots = list(_PLATFORM_NO_ROOTS)
+                else:
+                    resolved_roots = [
+                        str(Path(r).expanduser().resolve())
+                        for r in raw_roots
+                        if isinstance(r, str) and r.strip()
+                    ]
+                    if not resolved_roots:
+                        resolved_roots = list(_PLATFORM_NO_ROOTS)
+                break
+        if resolved_roots is None:
+            resolved_roots = _default_platform_roots(supplied)
+
+        raw_auto: Any = False
+        for k in auto_keys:
+            auto_map = raw.get(k)
+            if isinstance(auto_map, dict) and supplied in auto_map:
+                raw_auto = auto_map[supplied]
+                break
+        resolved_auto = _auto_accept_flag(
+            raw_auto,
+            where=f"{label} {supplied}",
+        )
+        raw_ws = raw.get("workspace_id")
+        resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
+        return EffectivePrincipal(
+            agent_id=supplied,
+            workspace_id=str(resolved_ws),
+            session_id=raw.get("session_id"),
+            transport=transport,
+            capabilities=list(resolved_caps),
+            allowed_vault_roots=resolved_roots,
+            auto_accept_own=resolved_auto,
+        )
+
     # Platform-hosted agents are not legacy aliases: they need their own stamped
     # principal so reads/writes are attributed to the actual surface (e.g. codex)
     # while the operator-controlled local principal file remains the trust root.
@@ -641,99 +722,35 @@ def _stamp_effective_principal(
             platform_ids = [str(a) for a in raw_ids] if isinstance(raw_ids, list) else []
             if supplied not in platform_ids:
                 continue
-            platform_caps = raw.get("platform_agent_capabilities") or {}
-            platform_caps_map = (
-                platform_caps if isinstance(platform_caps, dict) else {}
-            )
-            # Platform agents must NOT inherit the operator wildcard when no per-agent
-            # entry exists — listed ids without an explicit cap map entry default-deny.
-            if supplied in platform_caps_map:
-                resolved_caps = platform_caps_map[supplied]
-            else:
-                resolved_caps = []
-            # Finding 6 residual: never copy the operator stamp's vault roots onto a
-            # platform agent. Optional per-id map; a present-but-empty/malformed entry
-            # → fail-closed sentinel (empty+caps would otherwise vacuous-allow every
-            # path via allows_vault_root; a string value must not be iterated as chars).
-            # A MISSING entry is not a lockout: existing installs using only
-            # platform_agent_ids + platform_agent_capabilities predate the roots map,
-            # and their platform principals must keep pathed access to their own
-            # ~/.minni/<vault_dirname_for(id)> (claude-code → claudecode-vault
-            # from AGENT_VAULT_DIRS, never a synthesized hyphen-stripped alias
-            # such as grokbuild-vault). Never the operator's roots.
-            _PLATFORM_NO_ROOTS = [PLATFORM_NO_ROOTS_SENTINEL]
-
-            def _default_platform_roots(agent_id: str) -> list[str]:
-                roots = [str(_canonical_live_vault_root(agent_id).resolve())]
-                if agent_id == "gemini":
-                    # The installer's vault_for("gemini") deliberately falls
-                    # back to the legacy ~/.gemini/minni-vault when it has data
-                    # and the canonical vault is missing (propagate.py). A
-                    # strict install upgraded without platform_agent_vault_roots
-                    # would otherwise stamp MCP with the legacy path while the
-                    # daemon principal rejects it via allows_vault_root.
-                    roots.append(
-                        str(Path("~/.gemini/minni-vault").expanduser().resolve())
-                    )
-                return roots
-
-            platform_roots = raw.get("platform_agent_vault_roots") or {}
-            platform_roots_map = (
-                platform_roots if isinstance(platform_roots, dict) else {}
-            )
-            if supplied in platform_roots_map:
-                raw_roots = platform_roots_map[supplied]
-                if not isinstance(raw_roots, list) or not raw_roots:
-                    resolved_roots = list(_PLATFORM_NO_ROOTS)
-                else:
-                    resolved_roots = [
-                        str(Path(r).expanduser().resolve())
-                        for r in raw_roots
-                        if isinstance(r, str) and r.strip()
-                    ]
-                    if not resolved_roots:
-                        resolved_roots = list(_PLATFORM_NO_ROOTS)
-            else:
-                resolved_roots = _default_platform_roots(supplied)
-            # #290: per-agent opt-in ONLY. Deliberately does not fall back to
-            # the operator file's top-level auto_accept_own — a hosted or
-            # temporary agent must never inherit the operator's grant, which is
-            # the same rule platform_agent_capabilities already applies to caps.
-            platform_auto = raw.get("platform_agent_auto_accept_own") or {}
-            platform_auto_map = (
-                platform_auto if isinstance(platform_auto, dict) else {}
-            )
-            resolved_auto = _auto_accept_flag(
-                platform_auto_map.get(supplied, False),
-                where=f"platform agent {supplied}",
-            )
-            raw_ws = raw.get("workspace_id")
-            resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
-            return EffectivePrincipal(
-                agent_id=supplied,
-                workspace_id=str(resolved_ws),
-                session_id=raw.get("session_id"),
-                transport=transport,
-                capabilities=list(resolved_caps),
-                allowed_vault_roots=resolved_roots,
-                auto_accept_own=resolved_auto,
+            return _build_mapped_principal(
+                raw,
+                cap_keys=("platform_agent_capabilities",),
+                root_keys=("platform_agent_vault_roots",),
+                auto_keys=("platform_agent_auto_accept_own",),
+                label="platform agent",
             )
 
     # Check legacy aliases declared across ALL principal files that exist (union).
     # No early break: an alias declared in secondary file (e.g. default.json) must be
     # honoured even if the primary (local.json) exists with an empty list.
+    # H7 (NamedAgentNeverOperator): alias callers resolve to their OWN principal
+    # with capabilities from an explicit map, never the operator stamp.
     if strict:
-        aliases: list[str] = []
         for name in CANONICAL_PRINCIPAL_NAMES:
             raw = _load_raw_principal_file(name, d, strict=True)
-            if raw:
-                aliases.extend(
-                    str(a)
-                    for a in (raw.get("legacy_agent_ids") or raw.get("aliases") or [])
-                )
-        if supplied in aliases:
-            # Accepted via migration alias from any principal file; return the stamped one.
-            return stamped
+            if not raw:
+                continue
+            aliases = _principal_aliases(raw)
+            if supplied not in aliases:
+                continue
+            return _build_mapped_principal(
+                raw,
+                cap_keys=("legacy_agent_capabilities", "platform_agent_capabilities"),
+                root_keys=("legacy_agent_vault_roots", "platform_agent_vault_roots"),
+                auto_keys=("legacy_agent_auto_accept_own", "platform_agent_auto_accept_own"),
+                label="legacy alias",
+                strip_operator_caps=True,
+            )
 
     if strict and stamped.agent_id not in OPERATOR_RESERVED_AGENT_IDS:
         raise IdentityMismatchError(supplied, stamped.agent_id)
