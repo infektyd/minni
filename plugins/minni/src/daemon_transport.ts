@@ -935,6 +935,14 @@ function xmlAttrEscapeDrill(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+function formatLocalDrillBody(body: string, depth: DrillMemoryInput["depth"]): string {
+  const effectiveDepth = depth ?? "snippet";
+  if (effectiveDepth === "document") return body;
+  const maxChars = effectiveDepth === "chunk" ? 1600 : 500;
+  if (body.length <= maxChars) return body;
+  return `${body.slice(0, maxChars)}…`;
+}
+
 async function resolveSqliteHandleNote(
   effectiveVaultPath: string,
   hasExplicitVaultPath: boolean,
@@ -1247,7 +1255,8 @@ export async function drillMemory(
               sessionEntry,
             );
             if (sqliteResolved) {
-              const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${sqliteResolved.content}\n</EVIDENCE>`;
+              const clipped = formatLocalDrillBody(sqliteResolved.content, input.depth);
+              const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${clipped}\n</EVIDENCE>`;
               localResults.push({
                 handle: normalizedHandle,
                 status: "resolved",
@@ -1255,9 +1264,7 @@ export async function drillMemory(
                 relativePath: sqliteResolved.source,
                 source: sqliteResolved.source,
                 title: sqliteResolved.title,
-                text: wrapped,
                 content: wrapped,
-                raw_content: sqliteResolved.content,
               });
               continue;
             }
@@ -1270,7 +1277,8 @@ export async function drillMemory(
           });
           continue;
         }
-        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
+        const clipped = formatLocalDrillBody(resolved.content, input.depth);
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${clipped}\n</EVIDENCE>`;
         localResults.push({
           handle: normalizedHandle,
           status: "resolved",
@@ -1279,9 +1287,7 @@ export async function drillMemory(
           relativePath: resolved.relativePath,
           source: resolved.relativePath,
           title: resolved.title,
-          text: wrapped,
           content: wrapped,
-          raw_content: resolved.content,
         });
         continue;
       }
@@ -1342,7 +1348,6 @@ export async function drillMemory(
           data: {
             ...first,
             results: localResults,
-            items: localResults,
           },
         };
       }
@@ -1353,7 +1358,6 @@ export async function drillMemory(
           ...first,
           missing: [],
           results: localResults,
-          items: localResults,
         },
       };
     }
@@ -1403,7 +1407,6 @@ export async function drillMemory(
             ? { source_unverified: firstMeta.source_unverified }
             : {}),
           results: combinedResults,
-          items: combinedResults,
         },
       };
     }
@@ -1424,7 +1427,8 @@ export async function drillMemory(
           allSqliteResolved = false;
           break;
         }
-        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqlHit.source)}">\n${sqlHit.content}\n</EVIDENCE>`;
+        const clipped = formatLocalDrillBody(sqlHit.content, input.depth);
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqlHit.source)}">\n${clipped}\n</EVIDENCE>`;
         localResults.push({
           handle: meta.handle,
           status: "resolved",
@@ -1432,9 +1436,7 @@ export async function drillMemory(
           relativePath: sqlHit.source,
           source: sqlHit.source,
           title: sqlHit.title,
-          text: wrapped,
           content: wrapped,
-          raw_content: sqlHit.content,
         });
       }
       if (allSqliteResolved && localResults.length > 0) {
@@ -1445,7 +1447,6 @@ export async function drillMemory(
             ...localResults[0],
             missing: [],
             results: localResults,
-            items: localResults,
           },
         };
       }
@@ -1464,7 +1465,6 @@ export async function drillMemory(
           ? { source_unverified: firstMeta.source_unverified }
           : {}),
         results: localResults,
-        items: localResults,
       },
     };
   }

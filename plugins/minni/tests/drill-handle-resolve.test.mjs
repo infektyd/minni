@@ -399,5 +399,41 @@ test("Class C: drillMemory forwards input.wikilink and input.handle into sm_dril
   });
 });
 
+test("Class D: drillMemory local handle resolution does not duplicate note body 6x across text, raw_content, and items", async () => {
+  await withTempVault(async (vault) => {
+    const safeRel = "wiki/decisions/bloat-check.md";
+    const distinctMarker = "UNIQUE_DRILL_BODY_MARKER_8812";
+    await writeFile(
+      path.join(vault, safeRel),
+      [
+        "---",
+        "title: Bloat Check Note",
+        "type: decision",
+        "privacy: safe",
+        "status: active",
+        "---",
+        "# Bloat Check Note",
+        "",
+        `${distinctMarker} `.repeat(30),
+      ].join("\n"),
+      "utf8",
+    );
+    const handle = vaultHandleForPath(safeRel);
+    const deadDaemon = async () => ({ ok: false, error: "daemon down" });
+
+    const res = await drillMemory(
+      { references: [handle], depth: "snippet", vaultPath: vault, sessionId: "sess-class-d" },
+      deadDaemon,
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.data.raw_content, undefined, "local drill item must not duplicate un-fenced raw_content");
+    assert.equal(res.data.text, undefined, "local drill item must not duplicate text alongside content");
+    assert.equal(res.data.items, undefined, "local drill response must not duplicate items[] alongside results[]");
+    assert.equal(res.data.results[0].raw_content, undefined);
+    assert.equal(res.data.results[0].text, undefined);
+  });
+});
+
+
 
 

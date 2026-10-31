@@ -1441,3 +1441,74 @@ test("callAfmPrepareTask reduce payload carries task context under the purpose's
   assert.equal(reduce.budgetTokens, 4096);
   assert.ok(reduce.partialBriefs.length > 1);
 });
+
+test("Class D: prepareTask filters compaction/system-reminder noise, bounds daemonLead and recall.evidence, and promotes durable daemon hits into relevantSources", async () => {
+  const compactionNoise = vaultSource({
+    relativePath: "wiki/sessions/20261030-compact-summary.md",
+    wikilink: "[[wiki/sessions/20261030-compact-summary]]",
+    title: "Session compact summary",
+    snippet: "This session is being continued from a previous conversation that ran out of context. ".repeat(20),
+    score: 95,
+    durability: "noise",
+  });
+  const hugeDaemonRow = {
+    doc_id: 501,
+    wikilink: "[[claude-code__9988776655443322]]",
+    source: "wiki/decisions/praxis-gate-rule.md",
+    title: "Praxis Gate Rule",
+    text: `<EVIDENCE source="wiki/decisions/praxis-gate-rule.md">Always check df -h / before running Praxis xcodebuild gates. ${"Detail ".repeat(200)}</EVIDENCE>`,
+    score: 0.94,
+  };
+
+  const packet = await prepareTask(
+    {
+      task: "run Praxis verification gate and check disk headroom",
+      vaultPath: "/tmp/vault",
+      useAfm: false,
+    },
+    {
+      searchVault: async (_vp, _q, _lim, _under, opts) => {
+        // If prepareTask passes rank: "noise_last" or filters noise, compactionNoise must not win top source
+        return opts?.rank === "noise_last" ? [compactionNoise] : [compactionNoise];
+      },
+      recall: async () => ({
+        ok: true,
+        data: {
+          results: [hugeDaemonRow],
+          learnings: [
+            {
+              id: 77,
+              category: "constraint",
+              content: "Do not start a Praxis app xcodebuild under 6 GiB free.",
+              source: "claude-code",
+            },
+          ],
+          agent_id: "claude-code",
+        },
+      }),
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  // 1. Compaction noise note must be excluded from relevantSources
+  assert.equal(
+    packet.relevantSources.some((s) => s.relativePath.includes("-compact-")),
+    false,
+    "compaction summary noise must not enter relevantSources",
+  );
+  // 2. Durable daemon recall hit must be promoted into relevantSources when vault has no non-noise hits
+  assert.ok(
+    packet.relevantSources.some((s) => s.wikilink.includes("claude-code__9988776655443322") || s.relativePath.includes("praxis-gate-rule")),
+    "durable daemon recall hit must be included in relevantSources",
+  );
+  // 3. daemonLead must be concise (< 240 chars), not a full JSON.stringify dump of results[]
+  assert.ok(
+    (packet.recall.daemonLead ?? "").length <= 240,
+    `daemonLead must be <= 240 chars, got ${(packet.recall.daemonLead ?? "").length}`,
+  );
+  // 4. Each recall.evidence entry must be bounded (<= 800 chars)
+  for (const ev of packet.recall.evidence ?? []) {
+    assert.ok(ev.text.length <= 800, `recall.evidence item must be <= 800 chars, got ${ev.text.length}`);
+  }
+});
+

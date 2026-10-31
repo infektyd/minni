@@ -1285,3 +1285,67 @@ test("every Task 6 worker tool resolves plan_id server-side and never accepts a 
     );
   }
 });
+
+test("Class D: minni_thread_update bounds scar_tissue and non-target slice evidence in response and supports compact mode while persisting full plan", async (t) => {
+  await withMcpSession(t, async ({ vaultPath, call }) => {
+    const slices = Array.from({ length: 12 }, (_, idx) => ({
+      id: `s${idx + 1}`,
+      title: `Slice ${idx + 1}`,
+    }));
+    const plan_id = await seedPlan(vaultPath, slices);
+
+    for (let i = 1; i <= 10; i++) {
+      await call("minni_thread_scar", {
+        plan_id,
+        kind: "dead_end",
+        signal: `scar-${i}-${"x".repeat(400)}`,
+        resolution: `res-${i}-${"y".repeat(400)}`,
+      });
+    }
+
+    for (let i = 1; i <= 8; i++) {
+      await call("minni_thread_update", {
+        plan_id,
+        slice_id: `s${i}`,
+        status: "done",
+        evidence: `Verified s${i}: ${"E".repeat(600)}`,
+      });
+    }
+
+    const resDefault = await call("minni_thread_update", {
+      plan_id,
+      slice_id: "s9",
+      status: "done",
+      evidence: `Verified s9 target evidence: ${"T".repeat(300)}`,
+    });
+
+    assert.ok(resDefault.updated_slice, "response should include updated_slice");
+    assert.equal(resDefault.updated_slice.id, "s9");
+    assert.ok(
+      resDefault.plan.scar_tissue.length <= 5,
+      `default minni_thread_update response must cap plan.scar_tissue to <= 5 entries, got ${resDefault.plan.scar_tissue.length}`,
+    );
+    assert.equal(resDefault.plan.scar_tissue_total, 10);
+
+    const resCompact = await call("minni_thread_update", {
+      plan_id,
+      slice_id: "s10",
+      status: "done",
+      evidence: "Verified s10 in compact mode against src/server.ts",
+      compact: true,
+    });
+    assert.equal(resCompact.plan, undefined, "compact: true must omit full plan object");
+    assert.equal(resCompact.updated_slice.id, "s10");
+    assert.equal(resCompact.updated_slice.status, "done");
+
+    const resFull = await call("minni_thread_update", {
+      plan_id,
+      slice_id: "s11",
+      status: "done",
+      evidence: "Verified s11 with include_full_plan: true",
+      include_full_plan: true,
+    });
+    assert.equal(resFull.plan.scar_tissue.length, 10, "include_full_plan: true must return all 10 scars");
+  });
+});
+

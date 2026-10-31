@@ -14,6 +14,7 @@ import { EVIDENCE_AUTHORITY_SENTENCE } from "./agent_envelope.js";
 import { afmHealth, recallMemory, formatDegradation } from "./daemon_transport.js";
 import type { JsonResult, RecallResponse } from "./daemon_transport.js";
 import { isInstructionLike } from "./safety.js";
+import { durabilityOf } from "./durability.js";
 import { recordAudit, searchVaultNotes } from "./vault.js";
 import type { PrivacyLevel, VaultSearchOptions, VaultSearchResult } from "./vault.js";
 
@@ -248,8 +249,155 @@ export function classifyIntent(task: string): string {
 }
 
 function firstLine(text: string | unknown[] | undefined): string | undefined {
-  const raw = Array.isArray(text) ? JSON.stringify(text) : text;
-  return raw?.split("\n").find((line) => line.trim().length > 0)?.trim();
+  if (typeof text === "string") {
+    return text.split("\n").find((line) => line.trim().length > 0)?.trim()?.slice(0, 220);
+  }
+  if (Array.isArray(text)) {
+    for (const row of text) {
+      if (typeof row === "string" && row.trim()) {
+        return row.trim().split("\n")[0]?.slice(0, 220);
+      }
+      if (row && typeof row === "object") {
+        const obj = row as Record<string, unknown>;
+        const wl = typeof obj.wikilink === "string" && obj.wikilink.trim() ? obj.wikilink.trim() : undefined;
+        const src = typeof obj.source === "string" && obj.source.trim() ? obj.source.trim() : undefined;
+        const title = typeof obj.title === "string" && obj.title.trim() ? obj.title.trim() : undefined;
+        const rawBody = typeof obj.text === "string" ? obj.text : typeof obj.content === "string" ? obj.content : "";
+        const cleanBody = rawBody
+          .replace(/<\/?EVIDENCE[^>]*>/gi, "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 140);
+        const label = wl ?? title ?? src;
+        if (label && cleanBody) return `${label}: ${cleanBody}`.slice(0, 220);
+        if (label) return label.slice(0, 220);
+        if (cleanBody) return cleanBody.slice(0, 220);
+      }
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+function isNoiseVaultSource(result: VaultSearchResult): boolean {
+  if (result.durability === "noise") return true;
+  const rel = (result.relativePath ?? "").toLowerCase();
+  const title = (result.title ?? "").toLowerCase();
+  if (rel.includes("-compact-") || title.includes("compact summary")) return true;
+  const d = durabilityOf({
+    content: result.snippet ?? "",
+    title: result.title,
+    path: result.relativePath,
+    status: result.status,
+  });
+  return d === "noise";
+}
+
+function taskSourcesFromDaemonRecall(
+  response: RecallResponse | undefined,
+  budget: BudgetPolicy,
+  existingPaths: Set<string>,
+): TaskSource[] {
+  if (!response) return [];
+  const out: TaskSource[] = [];
+  const docRows = Array.isArray(response.results) ? response.results : [];
+  for (const row of docRows) {
+    if (!row || typeof row !== "object") continue;
+    const obj = row as Record<string, unknown>;
+    const rawText = typeof obj.text === "string" ? obj.text : typeof obj.content === "string" ? obj.content : "";
+    const stripped = rawText.replace(/<\/?EVIDENCE[^>]*>/gi, "").trim();
+    if (!stripped) continue;
+    const rel = String(obj.source ?? obj.path ?? obj.wikilink ?? "daemon/result").trim();
+    if (existingPaths.has(rel)) continue;
+    const title = String(obj.title ?? obj.wikilink ?? rel).trim();
+    const d = durabilityOf({ content: stripped, title, path: rel });
+    if (d === "noise") continue;
+    const wikilink =
+      typeof obj.wikilink === "string" && obj.wikilink.trim()
+        ? obj.wikilink.trim().startsWith("[[")
+          ? obj.wikilink.trim()
+          : `[[${obj.wikilink.trim()}]]`
+        : `[[${rel.replace(/\.md$/i, "")}]]`;
+    const snippet = stripped.replace(/\s+/g, " ").slice(0, budget.snippetLength);
+    const instructionLike = isInstructionLike(snippet);
+    const rawScore = typeof obj.score === "number" ? obj.score : 0.5;
+    const total = Math.round(rawScore * 30) + 18;
+    const evidenceEnvelope = evidenceEnvelopeForSource({
+      relativePath: rel,
+      snippet,
+      score: total,
+      privacyLevel: "safe",
+      status: "active",
+      instructionLike,
+    });
+    existingPaths.add(rel);
+    out.push({
+      title,
+      wikilink,
+      relativePath: rel,
+      snippet: instructionLike ? evidenceEnvelope : snippet,
+      score: total,
+      authority: "daemon",
+      freshness: "unknown",
+      privacyLevel: "safe",
+      reasons: ["daemon recall"],
+      scoreBreakdown: {
+        lexical: Math.round(rawScore * 30),
+        authority: 18,
+        freshness: 0,
+        privacy: 0,
+        total,
+      },
+      instructionLike,
+      evidenceEnvelope,
+    });
+  }
+  const learnRows = Array.isArray(response.learnings) ? response.learnings : [];
+  for (const row of learnRows) {
+    if (!row || typeof row !== "object") continue;
+    const obj = row as Record<string, unknown>;
+    const content = typeof obj.content === "string" ? obj.content.replace(/<\/?EVIDENCE[^>]*>/gi, "").trim() : "";
+    if (!content) continue;
+    const category = typeof obj.category === "string" ? obj.category : "decision";
+    const id = obj.id ?? "rule";
+    const rel = `learnings/${category}-${id}`;
+    if (existingPaths.has(rel)) continue;
+    const d = durabilityOf({ content, category });
+    if (d === "noise") continue;
+    const snippet = content.replace(/\s+/g, " ").slice(0, budget.snippetLength);
+    const instructionLike = isInstructionLike(snippet);
+    const total = 35;
+    const evidenceEnvelope = evidenceEnvelopeForSource({
+      relativePath: rel,
+      snippet,
+      score: total,
+      privacyLevel: "safe",
+      status: "active",
+      instructionLike,
+    });
+    existingPaths.add(rel);
+    out.push({
+      title: `Durable ${category} #${id}`,
+      wikilink: `[[${rel}]]`,
+      relativePath: rel,
+      snippet: instructionLike ? evidenceEnvelope : snippet,
+      score: total,
+      authority: "decision",
+      freshness: "recent",
+      privacyLevel: "safe",
+      reasons: ["daemon durable learning"],
+      scoreBreakdown: {
+        lexical: 15,
+        authority: 20,
+        freshness: 0,
+        privacy: 0,
+        total,
+      },
+      instructionLike,
+      evidenceEnvelope,
+    });
+  }
+  return out;
 }
 
 function constraintsForTask(task: string): string[] {
@@ -422,6 +570,7 @@ function evidenceEnvelopeForSource(source: {
 }
 
 function enhancedSourceFromVault(result: VaultSearchResult, budget: BudgetPolicy): TaskSource | undefined {
+  if (isNoiseVaultSource(result)) return undefined;
   const authority = authorityForSource(result);
   const freshness = freshnessForSource(result);
   const privacy = privacyForSource(result);
@@ -490,6 +639,7 @@ function deterministicPacket(input: {
   task: string;
   budget: BudgetPolicy;
   budgetTokens: number;
+  includeVault?: boolean;
   vaultResults: VaultSearchResult[];
   recallResult: JsonResult<RecallResponse>;
   afmRequested: boolean;
@@ -498,9 +648,19 @@ function deterministicPacket(input: {
   afmError?: string;
 }): PreparedTaskPacket {
   const intent = classifyIntent(input.task);
-  const relevantSources = taskSourcesFromVault(input.vaultResults, input.budget);
-  const daemonLead = input.recallResult.ok ? firstLine(input.recallResult.data?.results) : undefined;
+  const vaultSources = taskSourcesFromVault(input.vaultResults, input.budget);
   const response = input.recallResult.ok ? input.recallResult.data : undefined;
+  const seenPaths = new Set(vaultSources.map((s) => s.relativePath));
+  const daemonSources =
+    input.includeVault !== false &&
+    response?.degraded !== true &&
+    vaultSources.length < input.budget.sourceLimit
+      ? taskSourcesFromDaemonRecall(response, input.budget, seenPaths)
+      : [];
+  const relevantSources = [...vaultSources, ...daemonSources]
+    .sort((a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath))
+    .slice(0, input.budget.sourceLimit);
+  const daemonLead = input.recallResult.ok ? firstLine(input.recallResult.data?.results) : undefined;
   const diagnostic = response ? formatDegradation(response) : undefined;
   // The shared formatter also reports successful authorization filtering.
   // Keep those notices visible without treating them as service degradation.
@@ -512,6 +672,7 @@ function deterministicPacket(input: {
     || Array.isArray(response.learnings) || Array.isArray(response.episodic)
   );
   const evidence: NonNullable<PreparedTaskPacket["recall"]["evidence"]> = [];
+  const maxEvidenceItems = Math.max(4, input.budget.sourceLimit * 2);
   if (response) {
     for (const [kind, value] of [
       ["document", response.results], ["learning", response.learnings],
@@ -519,8 +680,24 @@ function deterministicPacket(input: {
     ] as const) {
       const rows = Array.isArray(value) ? value : typeof value === "string" && value.trim() ? [value] : [];
       for (const row of rows) {
+        if (evidence.length >= maxEvidenceItems) break;
         // Preserve envelopes and provenance; the UI renders only inert text.
-        const text = typeof row === "string" ? row : JSON.stringify(row, null, 2);
+        let text: string;
+        if (typeof row === "string") {
+          text = row.length > 600 ? `${row.slice(0, 600)}…` : row;
+        } else if (row && typeof row === "object") {
+          const obj = row as Record<string, unknown>;
+          const compactObj: Record<string, unknown> = { ...obj };
+          for (const k of ["text", "content", "snippet"] as const) {
+            if (typeof compactObj[k] === "string" && (compactObj[k] as string).length > 480) {
+              compactObj[k] = `${(compactObj[k] as string).slice(0, 480)}…`;
+            }
+          }
+          const serialized = JSON.stringify(compactObj);
+          text = serialized.length > 600 ? `${serialized.slice(0, 600)}…` : serialized;
+        } else {
+          text = "";
+        }
         if (text) evidence.push({ kind, text });
       }
     }
@@ -1086,6 +1263,7 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
     task: input.task,
     budget,
     budgetTokens,
+    includeVault: input.includeVault !== false,
     vaultResults,
     recallResult,
     afmRequested,

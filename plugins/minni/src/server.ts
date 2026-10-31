@@ -1550,9 +1550,11 @@ server.registerTool(
       evidence: z.string().optional(),
       force: z.boolean().optional(),
       force_reason: z.string().optional(),
+      compact: z.boolean().optional(),
+      include_full_plan: z.boolean().optional(),
     },
   },
-  async ({ plan_id: planIdInput, slice_id, status, evidence, force, force_reason }) => {
+  async ({ plan_id: planIdInput, slice_id, status, evidence, force, force_reason, compact, include_full_plan }) => {
     // #291 round-1 cassandra finding 4: force/force_reason were previously
     // absent from the shared-gate details, so an operator/daemon approval
     // channel could not distinguish a routine update from a depends_on
@@ -1721,9 +1723,50 @@ server.registerTool(
     // P3: lead the response with plan-level progress so closing one slice is never misread as
     // closing the whole plan.
     const view = compactPlanView(next);
+    const updated_slice = next.slices.find((s) => s.id === slice_id);
+    if (compact === true) {
+      return textResult(
+        JSON.stringify(
+          {
+            headline: view.headline,
+            progress: view.progress,
+            next_action: next.next_action,
+            rev: next.rev,
+            status: next.status,
+            updated_slice,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    const responsePlan =
+      include_full_plan === true
+        ? next
+        : {
+            ...next,
+            slices: next.slices.map((s) =>
+              s.id === slice_id
+                ? s
+                : {
+                    ...s,
+                    ...(typeof s.evidence === "string" && s.evidence.length > 240
+                      ? { evidence: `${s.evidence.slice(0, 240)}…` }
+                      : {}),
+                  },
+            ),
+            scar_tissue: next.scar_tissue.slice(-5),
+            scar_tissue_total: next.scar_tissue.length,
+          };
     return textResult(
       JSON.stringify(
-        { headline: view.headline, progress: view.progress, next_action: next.next_action, plan: next },
+        {
+          headline: view.headline,
+          progress: view.progress,
+          next_action: next.next_action,
+          updated_slice,
+          plan: responsePlan,
+        },
         null,
         2,
       ),
