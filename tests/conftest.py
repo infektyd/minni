@@ -33,7 +33,13 @@ Three isolation guarantees are established here:
    paper over a wrong-tree pytest environment instead of surfacing it.
 """
 
+import atexit
+import json
 import os
+from pathlib import Path
+import pwd
+import shutil
+import sys
 import tempfile
 
 # --- (0) OMP/BLAS thread pinning: established at IMPORT, before ANY native
@@ -67,16 +73,45 @@ import tempfile
 for _omp_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_omp_var, "1")
 
-# --- (1) MINNI_HOME isolation: established at IMPORT, before engine modules load.
-_LIVE_MINNI_HOME = os.path.abspath(os.path.expanduser("~/.minni"))
+# --- (1) Hermetic HOME, XDG_*, and MINNI_HOME isolation: established at IMPORT
+# and reinforced per-test via the autouse fixture below.
+_PRE_FIXTURE_REAL_HOME = os.path.realpath(
+    os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+)
+# Preserve local read-only HuggingFace model cache so SentenceTransformer
+# offline loads (`local_files_only=True`) still find pre-cached weights
+# after HOME and XDG_CACHE_HOME are redirected to throwaway directories.
+os.environ.setdefault(
+    "HF_HOME", os.path.join(_PRE_FIXTURE_REAL_HOME, ".cache", "huggingface")
+)
+
+_LIVE_MINNI_HOME = os.path.abspath(os.path.join(_PRE_FIXTURE_REAL_HOME, ".minni"))
+_SESSION_HOME = tempfile.mkdtemp(prefix="minni-test-home-")
+atexit.register(shutil.rmtree, _SESSION_HOME, ignore_errors=True)
+
+if (
+    not os.environ.get("HOME")
+    or os.path.realpath(os.environ["HOME"]) == _PRE_FIXTURE_REAL_HOME
+):
+    os.environ["HOME"] = _SESSION_HOME
+
+for _xdg_var, _xdg_rel in (
+    ("XDG_CONFIG_HOME", ".config"),
+    ("XDG_DATA_HOME", os.path.join(".local", "share")),
+    ("XDG_CACHE_HOME", ".cache"),
+    ("XDG_STATE_HOME", os.path.join(".local", "state")),
+):
+    _xdg_val = os.environ.get(_xdg_var)
+    if not _xdg_val or os.path.realpath(_xdg_val).startswith(_PRE_FIXTURE_REAL_HOME):
+        _xdg_dir = os.path.join(_SESSION_HOME, _xdg_rel)
+        os.makedirs(_xdg_dir, exist_ok=True)
+        os.environ[_xdg_var] = _xdg_dir
+
 _configured_home = os.environ.get("MINNI_HOME")
-if not _configured_home or os.path.abspath(_configured_home) == _LIVE_MINNI_HOME:
-    _session_home = tempfile.mkdtemp(prefix="minni-test-home-")
-    os.environ["MINNI_HOME"] = _session_home
-    # Don't leak the throwaway dir in the system tmp folder across runs.
-    import atexit
-    import shutil
-    atexit.register(shutil.rmtree, _session_home, ignore_errors=True)
+if not _configured_home or os.path.realpath(_configured_home) == os.path.realpath(_LIVE_MINNI_HOME):
+    _session_minni_home = os.path.join(_SESSION_HOME, ".minni")
+    os.makedirs(_session_minni_home, exist_ok=True)
+    os.environ["MINNI_HOME"] = _session_minni_home
 
 import pytest  # noqa: E402  (import after MINNI_HOME redirect, by design)
 
@@ -170,8 +205,62 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_engine_state(tmp_path, monkeypatch):
+def _isolated_engine_state(request, tmp_path, monkeypatch):
+    isolated_home = tmp_path / "isolated_home"
+    isolated_minni_home = isolated_home / ".minni"
+    xdg_config = isolated_home / ".config"
+    xdg_data = isolated_home / ".local" / "share"
+    xdg_cache = isolated_home / ".cache"
+    xdg_state = isolated_home / ".local" / "state"
+    for d in (
+        isolated_home,
+        isolated_minni_home,
+        xdg_config,
+        xdg_data,
+        xdg_cache,
+        xdg_state,
+    ):
+        d.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv("HOME", os.fspath(isolated_home))
+    monkeypatch.setenv("MINNI_HOME", os.fspath(isolated_minni_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", os.fspath(xdg_config))
+    monkeypatch.setenv("XDG_DATA_HOME", os.fspath(xdg_data))
+    monkeypatch.setenv("XDG_CACHE_HOME", os.fspath(xdg_cache))
+    monkeypatch.setenv("XDG_STATE_HOME", os.fspath(xdg_state))
     monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(tmp_path / "afm-probe-cache.json"))
+
+    if "minni.minnid" in sys.modules:
+        _minnid = sys.modules["minni.minnid"]
+        monkeypatch.setattr(_minnid, "SECURE_RUN_DIR", isolated_minni_home / "run", raising=False)
+        monkeypatch.setattr(
+            _minnid,
+            "DEFAULT_SOCKET_PATH",
+            isolated_minni_home / "run" / "minnid.sock",
+            raising=False,
+        )
+
+    if (
+        request.node.name
+        == "test_part2_coordinator_durable_learn_promotes_synchronously_while_blocking_harvest_noise"
+    ):
+        pdir = isolated_minni_home / "principals"
+        pdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(pdir, 0o700)
+        for pid in ("claude-code", "local"):
+            pfile = pdir / f"{pid}.json"
+            pfile.write_text(
+                json.dumps(
+                    {
+                        "agent_id": pid if pid != "local" else "main",
+                        "workspace_id": "default",
+                        "capabilities": ["search", "read", "learn", "resolve_candidate"],
+                        "auto_accept_own": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(pfile, 0o600)
 
     # Force schema migrations to re-run for whatever db this test builds. db.py
     # tracks migrated paths in a process-global set; when a tmp db path is reused
@@ -195,4 +284,10 @@ def _isolated_engine_state(tmp_path, monkeypatch):
     except Exception:
         pass
 
+    assert os.path.realpath(os.path.expanduser("~")) != _PRE_FIXTURE_REAL_HOME, (
+        "Hermetic HOME guard failed before test: expanduser('~') resolved to real home"
+    )
     yield
+    assert os.path.realpath(os.path.expanduser("~")) != _PRE_FIXTURE_REAL_HOME, (
+        "Hermetic HOME guard failed after test: expanduser('~') resolved to real home"
+    )
