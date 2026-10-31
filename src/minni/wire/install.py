@@ -50,14 +50,20 @@ def _sanitize_staged_payload(stage: Path, manifest: PayloadManifest | None = Non
     if cplugin_file.is_file():
         try:
             cdata = json.loads(cplugin_file.read_text(encoding="utf-8"))
-            if isinstance(cdata, dict) and "mcpServers" in cdata:
+            if not isinstance(cdata, dict):
+                raise InstallError(f"staged .claude-plugin/plugin.json is not a JSON object: {cplugin_file}")
+            if "mcpServers" in cdata:
                 cdata.pop("mcpServers", None)
                 cplugin_file.write_text(
                     json.dumps(cdata, indent=2) + "\n", encoding="utf-8",
                 )
                 cplugin_modified = True
-        except Exception:
-            pass
+        except InstallError:
+            raise
+        except Exception as exc:
+            raise InstallError(
+                f"failed to sanitize staged .claude-plugin/plugin.json ({cplugin_file}): {exc}"
+            ) from exc
 
     if manifest is not None and isinstance(manifest.files, dict):
         manifest.files.pop(".mcp.json", None)
@@ -68,15 +74,19 @@ def _sanitize_staged_payload(stage: Path, manifest: PayloadManifest | None = Non
     if pmanifest_file.is_file():
         try:
             mdata = json.loads(pmanifest_file.read_text(encoding="utf-8"))
+            if not isinstance(mdata, dict):
+                raise InstallError(f"staged payload-manifest.json is not a JSON object: {pmanifest_file}")
             files = mdata.get("files")
             if isinstance(files, dict):
                 changed = False
                 if ".mcp.json" in files:
                     files.pop(".mcp.json", None)
                     changed = True
-                if cplugin_modified and cplugin_file.is_file():
-                    files[".claude-plugin/plugin.json"] = sha256_file(cplugin_file)
-                    changed = True
+                if cplugin_file.is_file() and (cplugin_modified or ".claude-plugin/plugin.json" in files):
+                    new_hash = sha256_file(cplugin_file)
+                    if files.get(".claude-plugin/plugin.json") != new_hash:
+                        files[".claude-plugin/plugin.json"] = new_hash
+                        changed = True
                 if changed:
                     mdata["files"] = files
                     pmanifest_file.write_text(
@@ -84,8 +94,12 @@ def _sanitize_staged_payload(stage: Path, manifest: PayloadManifest | None = Non
                     )
             if manifest is not None and isinstance(manifest.files, dict) and "payload-manifest.json" in manifest.files:
                 manifest.files["payload-manifest.json"] = sha256_file(pmanifest_file)
-        except Exception:
-            pass
+        except InstallError:
+            raise
+        except Exception as exc:
+            raise InstallError(
+                f"failed to update staged payload-manifest.json ({pmanifest_file}): {exc}"
+            ) from exc
 
 
 def _copy_tree(src: Path, dest: Path, manifest: PayloadManifest | None = None) -> None:
@@ -137,12 +151,14 @@ def _install_locked(
 
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         lock_arch = base.parent / "archive" / stamp / "backups-and-locks"
-        lock_arch.mkdir(parents=True, exist_ok=True)
-        for old_lock in old_locks:
-            try:
+        try:
+            lock_arch.mkdir(parents=True, exist_ok=True)
+            for old_lock in old_locks:
                 shutil.move(str(old_lock), str(lock_arch / old_lock.name))
-            except OSError:
-                old_lock.unlink(missing_ok=True)
+        except OSError as exc:
+            raise InstallError(
+                f"failed to archive legacy install lock into {lock_arch}: {exc}"
+            ) from exc
 
     lock_path = install_lock_path(version)
     lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)

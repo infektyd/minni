@@ -207,3 +207,74 @@ def test_install_payload_archives_legacy_install_locks_before_acquiring_lock(
     archived_locks = list((tmp_path / ".minni" / "archive").rglob(".install-0.5.0+git.deadbeef.lock"))
     assert len(archived_locks) == 1
     assert archived_locks[0].read_text(encoding="utf-8") == "inflight-pid=4242\n"
+
+
+def test_install_payload_fails_closed_on_lock_archive_oserror_and_sanitize_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-9 / New P2 #2 / New P2 #4:
+    - OSError moving `.install-*.lock` to archive must raise InstallError and never unlink the lock.
+    - Corrupt `.claude-plugin/plugin.json` or `payload-manifest.json` during `_sanitize_staged_payload`
+      must raise InstallError rather than swallowing via `except Exception: pass`.
+    """
+    import shutil
+    from minni.wire.install import InstallError, _sanitize_staged_payload, install_payload
+    from minni.wire.manifest import PayloadManifest
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    base = tmp_path / ".minni" / "plugin"
+    base.mkdir(parents=True, exist_ok=True)
+    legacy_lock = base / ".install-0.5.0+git.deadbeef.lock"
+    legacy_lock.write_text("inflight-pid=9999\n", encoding="utf-8")
+
+    src = tmp_path / "src_payload"
+    (src / "dist").mkdir(parents=True, exist_ok=True)
+    (src / "dist" / "server.js").write_text("console.log('ok');\n", encoding="utf-8")
+    manifest = PayloadManifest(
+        schema=1,
+        version="0.6.0+git.12345678",
+        git_sha="12345678" * 5,
+        built_at="2026-10-31T00:00:00Z",
+        node_engine=">=20",
+        files={"dist/server.js": sha256_file(src / "dist" / "server.js")},
+    )
+    (src / "payload-manifest.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "version": manifest.version,
+            "git_sha": manifest.git_sha,
+            "built_at": manifest.built_at,
+            "node_engine": manifest.node_engine,
+            "files": manifest.files,
+        }),
+        encoding="utf-8",
+    )
+
+    real_move = shutil.move
+
+    def _fail_lock_move(src_p: str, dst_p: str, *args, **kwargs):
+        if ".install-" in str(src_p):
+            raise OSError("simulated archive disk full")
+        return real_move(src_p, dst_p, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "move", _fail_lock_move)
+    with pytest.raises(InstallError, match="failed to archive legacy install lock"):
+        install_payload(src, manifest.version, manifest, update_current=False)
+    # Lock file must still exist on disk (never unlinked on archive failure)
+    assert legacy_lock.is_file()
+    assert legacy_lock.read_text(encoding="utf-8") == "inflight-pid=9999\n"
+
+    # Sanitize failure on corrupt .claude-plugin/plugin.json must raise InstallError
+    stage_bad_plugin = tmp_path / "stage_bad_plugin"
+    (stage_bad_plugin / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (stage_bad_plugin / ".claude-plugin" / "plugin.json").write_text("{broken json", encoding="utf-8")
+    with pytest.raises(InstallError, match="plugin.json"):
+        _sanitize_staged_payload(stage_bad_plugin, manifest)
+
+    # Sanitize failure on corrupt payload-manifest.json must raise InstallError
+    stage_bad_manifest = tmp_path / "stage_bad_manifest"
+    stage_bad_manifest.mkdir(parents=True, exist_ok=True)
+    (stage_bad_manifest / "payload-manifest.json").write_text("{broken manifest", encoding="utf-8")
+    with pytest.raises(InstallError, match="payload-manifest.json"):
+        _sanitize_staged_payload(stage_bad_manifest, manifest)
+
