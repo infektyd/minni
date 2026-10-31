@@ -225,3 +225,121 @@ def test_normalize_backend_names_rejects_unknown_backend_loudly(tmp_path):
         raised = str(exc)
 
     assert raised is not None and "unknown backend" in raised, raised
+
+
+def test_h13_vector_sync_dirty_not_lost_on_remove_failure(tmp_path):
+    """H13: if backend.remove fails during a dirty sync (setting status='error'),
+    the next sync_backend pass must still reconcile deletions instead of dropping
+    the dirty obligation forever."""
+    from minni.vector_sync import get_backend_state, mark_dirty, sync_backend
+
+    db_obj, _cfg = _make_db(tmp_path)
+    now = time.time()
+    vec = np.ones(384, dtype=np.float32)
+    with db_obj.cursor() as c:
+        c.execute(
+            "INSERT INTO documents (path, indexed_at) VALUES (?, ?)",
+            ("wiki/h13.md", now),
+        )
+        doc_id = c.lastrowid
+        for i in range(2):
+            c.execute(
+                """INSERT INTO chunk_embeddings
+                   (doc_id, chunk_index, chunk_text, embedding, computed_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (doc_id, i, f"chunk{i}", vec.tobytes(), now),
+            )
+
+    class FlakyRemoveBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.fail_remove = False
+
+        def remove(self, chunk_ids):
+            if self.fail_remove:
+                raise RuntimeError("transient remove failure")
+            super().remove(chunk_ids)
+
+    backend = FlakyRemoveBackend()
+    sync_backend(backend, db_obj)
+    assert {it.chunk_id for it in backend.items} == {1, 2}
+
+    with db_obj.cursor() as c:
+        c.execute("DELETE FROM chunk_embeddings WHERE chunk_id = 1")
+    mark_dirty("fake", db_obj)
+
+    backend.fail_remove = True
+    res_err = sync_backend(backend, db_obj)
+    assert res_err["status"] == "error"
+    assert get_backend_state("fake", db_obj)["status"] == "error"
+
+    backend.fail_remove = False
+    res_retry = sync_backend(backend, db_obj)
+    assert res_retry["status"] == "ok"
+    remaining = {it.chunk_id for it in backend.items}
+    db_obj.close()
+    assert 1 not in remaining, (
+        f"deleted chunk 1 remained in backend after retry following remove error: {remaining}"
+    )
+
+
+def test_h14_concurrent_mark_dirty_during_upsert_not_clobbered(tmp_path):
+    """H14: if a deletion + mark_dirty happens while sync_backend is in the
+    middle of upserting new chunks on a non-dirty pass, sync_backend must
+    either reconcile the deletion immediately or preserve status='dirty'."""
+    from minni.vector_sync import get_backend_state, mark_dirty, sync_backend
+
+    db_obj, _cfg = _make_db(tmp_path)
+    now = time.time()
+    vec = np.ones(384, dtype=np.float32)
+    with db_obj.cursor() as c:
+        c.execute(
+            "INSERT INTO documents (path, indexed_at) VALUES (?, ?)",
+            ("wiki/h14.md", now),
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            """INSERT INTO chunk_embeddings
+               (doc_id, chunk_index, chunk_text, embedding, computed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (doc_id, 0, "c0", vec.tobytes(), now),
+        )
+
+    class HookedBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.on_upsert = None
+
+        def upsert(self, items):
+            super().upsert(items)
+            if self.on_upsert:
+                self.on_upsert()
+
+    backend = HookedBackend()
+    sync_backend(backend, db_obj)
+    assert {it.chunk_id for it in backend.items} == {1}
+
+    with db_obj.cursor() as c:
+        c.execute(
+            """INSERT INTO chunk_embeddings
+               (doc_id, chunk_index, chunk_text, embedding, computed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (doc_id, 1, "c1", vec.tobytes(), now),
+        )
+
+    def concurrent_delete():
+        with db_obj.cursor() as c:
+            c.execute("DELETE FROM chunk_embeddings WHERE chunk_id = 1")
+        mark_dirty("fake", db_obj)
+
+    backend.on_upsert = concurrent_delete
+    sync_backend(backend, db_obj)
+    backend.on_upsert = None
+
+    state = get_backend_state("fake", db_obj)
+    remaining = {it.chunk_id for it in backend.items}
+    db_obj.close()
+    assert state["status"] == "dirty" or 1 not in remaining, (
+        f"concurrent mark_dirty was clobbered to status={state['status']!r} and deleted chunk 1 remained in {remaining}"
+    )
+
