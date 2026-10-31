@@ -3797,6 +3797,7 @@ test("final-fix-2: block and completion lifecycle events are single-shot on retr
     idempotencyKey: "lifecycle-claim",
     now: new Date(THREAD_START),
   });
+  await startClaimedSlice(fixture, claim, "a");
   await workerUpdate({
     ...fixture,
     sliceId: "a",
