@@ -768,3 +768,81 @@ def test_resolve_contradiction_non_integer_ids_rejected_without_leak(monkeypatch
         assert "InterfaceError" not in err.get("message", "")
     row, _ = _learning_row(tmp_path, lid)
     assert row["status"] == "active"
+
+
+def test_h8_resolve_candidate_accept_must_not_retire_other_agents_learning(
+    monkeypatch, tmp_path
+):
+    """H8 / Diagram 31 (OtherMemoryUntouched): resolve_candidate(accept) with
+    supersede_ids must enforce the same ownership guard as resolve_contradiction
+    inside the transaction."""
+    db = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    victim = _insert_learning(db, "grok-build", "grok-build's unrelated durable rule")
+    cid = _stage_candidate_as(
+        monkeypatch, "codex", "codex candidate, fully unrelated text about ports"
+    )
+    _stamp_principal(monkeypatch, "codex", capabilities=["*"])
+    resp = minnid._resolve_candidate(
+        {"candidate_id": cid, "decision": "accept", "supersede_ids": [victim]}, 3
+    )
+    row, count = _learning_row(tmp_path, victim)
+    still_active = row is not None and row["status"] == "active"
+    assert "error" in resp and still_active, (
+        f"other agent's learning retired (row={None if row is None else dict(row)}) "
+        f"resp={resp.get('result')}"
+    )
+    assert resp["error"]["code"] == -32004
+    assert "principal_mismatch" in resp["error"]["message"]
+    assert count == 1, "rejected resolution must not leave an orphan new learning"
+
+
+def test_h8_resolve_candidate_nonexistent_supersede_id_rejected(monkeypatch, tmp_path):
+    """H8 / Diagram 31: resolve_candidate(accept) must reject a nonexistent supersede_id."""
+    _patch_wb(monkeypatch, tmp_path)
+    cid = _stage_candidate_as(monkeypatch, "codex", "codex candidate text")
+    _stamp_principal(monkeypatch, "codex", capabilities=["*"])
+    resp = minnid._resolve_candidate(
+        {"candidate_id": cid, "decision": "accept", "supersede_ids": [987654]}, 3
+    )
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == -32001
+    assert "learning_not_found" in resp["error"]["message"]
+
+
+def test_h8_operator_principal_with_resolve_candidate_can_supersede_cross_agent_learning(
+    monkeypatch, tmp_path
+):
+    """P2-3a / H8 positive path: an operator/main principal with
+    resolve_candidate/govern capabilities CAN supersede a cross-agent learning
+    via the real resolve_candidate dispatch call site."""
+    db = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    victim = _insert_learning(db, "grok-build", "grok-build's outdated durable rule")
+    cid = _stage_candidate_as(
+        monkeypatch, "codex", "updated rule superseding grok-build learning"
+    )
+    _stamp_principal(monkeypatch, "main", capabilities=["resolve_candidate", "govern"])
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "resolve_candidate",
+            "params": {
+                "candidate_id": cid,
+                "decision": "accept",
+                "supersede_ids": [victim],
+            },
+        }
+    )
+    assert "error" not in resp, f"operator cross-agent supersede failed: {resp}"
+    assert resp["result"]["status"] == "resolved"
+    assert resp["result"]["new_status"] == "accepted"
+    new_lid = resp["result"]["learning_id"]
+    victim_row, count = _learning_row(tmp_path, victim)
+    assert victim_row is None or victim_row["status"] == "superseded", (
+        f"expected victim learning to be retired/superseded, got {dict(victim_row)}"
+    )
+    new_row, _ = _learning_row(tmp_path, new_lid)
+    assert new_row is not None and new_row["status"] == "active"
+    assert count == 1

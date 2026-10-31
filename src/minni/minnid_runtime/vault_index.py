@@ -102,31 +102,53 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
     )
 
     def _retract_existing_if_any() -> bool:
-        try:
-            eng = context.lazy_retrieval()
-            db_obj = getattr(eng, "db", None) if eng is not None else None
-            if db_obj is None:
-                return False
-            retracted_any = False
-            with db_obj.transaction() as c:
-                for p_candidate in {str(full_path), str(rel_path)}:
-                    rows = c.execute(
-                        "SELECT doc_id FROM documents WHERE path = ?",
-                        (p_candidate,),
-                    ).fetchall()
-                    for r in rows:
-                        did = int(r["doc_id"] if hasattr(r, "keys") else r[0])
-                        c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
-                        c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
-                        c.execute(
-                            "DELETE FROM memory_links WHERE source_doc_id = ? OR target_doc_id = ?",
-                            (did, did),
-                        )
-                        c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
-                        retracted_any = True
-            return retracted_any
-        except Exception:
+        eng = context.lazy_retrieval()
+        db_obj = getattr(eng, "db", None) if eng is not None else None
+        if db_obj is None:
             return False
+        retracted_any = False
+        old_chunk_ids: list[int] = []
+        with db_obj.transaction() as c:
+            for p_candidate in {str(full_path), str(rel_path)}:
+                rows = c.execute(
+                    "SELECT doc_id FROM documents WHERE path = ?",
+                    (p_candidate,),
+                ).fetchall()
+                for r in rows:
+                    did = int(r["doc_id"] if hasattr(r, "keys") else r[0])
+                    chunk_rows = c.execute(
+                        "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
+                        (did,),
+                    ).fetchall()
+                    for cr in chunk_rows:
+                        old_chunk_ids.append(
+                            int(cr["chunk_id"] if hasattr(cr, "keys") else cr[0])
+                        )
+                    c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
+                    c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
+                    c.execute(
+                        "DELETE FROM memory_links WHERE source_doc_id = ? OR target_doc_id = ?",
+                        (did, did),
+                    )
+                    c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
+                    retracted_any = True
+        if retracted_any and eng is not None:
+            from types import SimpleNamespace
+
+            if isinstance(eng, SimpleNamespace):
+                for name, args in (
+                    ("_invalidate_durable_rerank", (old_chunk_ids,)),
+                    ("_remove_live_faiss", (old_chunk_ids,)),
+                    ("_invalidate_trie", ()),
+                ):
+                    fn = getattr(eng, name, None)
+                    if callable(fn):
+                        fn(*args)
+            else:
+                eng._invalidate_durable_rerank(old_chunk_ids)
+                eng._remove_live_faiss(old_chunk_ids)
+                eng._invalidate_trie()
+        return retracted_any
 
     explicit_status = extract_explicit_frontmatter_status(content)
     explicit_page_id = extract_explicit_frontmatter_page_id(content)
@@ -138,7 +160,11 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
         is_rpc=True,
     )
     if path_excluded:
-        retracted = _retract_existing_if_any()
+        try:
+            retracted = _retract_existing_if_any()
+        except Exception as exc:
+            context.logger.exception("vault_index_doc retract failed")
+            return context.make_error(-32000, f"vault_index_doc error: {exc}", request_id)
         context.record_latency("vault_index_doc", time.perf_counter() - started_at)
         return context.make_response(
             {
@@ -159,7 +185,11 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
         else str(params.get("page_status") or "accepted").strip().lower()
     )
     if effective_status in UNEMBEDDED_STATUSES:
-        retracted = _retract_existing_if_any()
+        try:
+            retracted = _retract_existing_if_any()
+        except Exception as exc:
+            context.logger.exception("vault_index_doc retract failed")
+            return context.make_error(-32000, f"vault_index_doc error: {exc}", request_id)
         context.record_latency("vault_index_doc", time.perf_counter() - started_at)
         return context.make_response(
             {

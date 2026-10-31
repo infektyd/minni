@@ -1092,3 +1092,122 @@ def test_pending_handoff_leases_raises_handoff_store_error(monkeypatch, tmp_path
 
     with pytest.raises(HandoffStoreError, match="listing pending leases"):
         pending_handoff_leases("claude-code", context=broken_ctx)
+
+
+def _h9_send(tmp_path, monkeypatch, **pk):
+    db = _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(tmp_path / "cx"), "claude-code": str(tmp_path / "cc")}),
+    )
+    sent = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "daemon.handoff",
+            "params": {
+                "from_agent": "codex",
+                "to_agent": "claude-code",
+                "packet": _packet(**pk),
+            },
+        }
+    )["result"]
+    return db, sent["lease_id"]
+
+
+def _h9_ack(lid, status):
+    return minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "minni_ack_handoff",
+            "params": {"lease_id": lid, "status": status, "agent_id": "claude-code"},
+        }
+    )
+
+
+def test_h9_ack_after_expiry_must_be_refused(monkeypatch, tmp_path):
+    """H9 / Diagram 32 (NoAckAfterExpiry): an expired handoff lease must refuse acks."""
+    past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+    db, lid = _h9_send(tmp_path, monkeypatch, expires_at=past)
+    r = _h9_ack(lid, "accepted")
+    with db.cursor() as c:
+        st = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert "error" in r and st == "pending", (
+        f"ack accepted on an expired lease: {r} (status={st})"
+    )
+
+
+def test_h9_ack_is_final(monkeypatch, tmp_path):
+    """H9 / Diagram 32 (AckIsFinal): a second ack must not overwrite a resolved lease."""
+    db, lid = _h9_send(tmp_path, monkeypatch)
+    assert "error" not in _h9_ack(lid, "accepted")
+    r = _h9_ack(lid, "rejected_stale")
+    with db.cursor() as c:
+        st = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert "error" in r and st == "accepted", (
+        f"second ack overwrote final status -> {st}"
+    )
+
+
+def test_p2_2_ack_on_not_required_lease_is_idempotent_noop_success(monkeypatch, tmp_path):
+    """P2-2: an ack on a requires_ack=False (status='not_required') lease must
+    succeed idempotently rather than failing the CAS with -32009."""
+    db, lid = _h9_send(tmp_path, monkeypatch, requires_ack=False)
+    with db.cursor() as c:
+        st0 = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st0 == "not_required"
+
+    r1 = _h9_ack(lid, "accepted")
+    assert "error" not in r1, f"ack on not_required lease errored: {r1}"
+    r2 = _h9_ack(lid, "accepted")
+    assert "error" not in r2, f"second ack on not_required lease was not idempotent: {r2}"
+    with db.cursor() as c:
+        st1 = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st1 == "not_required"
+
+
+def test_h9_resend_after_ack_rearms_lease_to_pending_and_fresh_ack_succeeds(
+    monkeypatch, tmp_path
+):
+    """P2-3b / H9 + #231 positive path: re-sending a handoff reusing an already-acked
+    lease_id re-arms the lease to 'pending' and allows a fresh ack to succeed."""
+    db, lid = _h9_send(tmp_path, monkeypatch, lease_id="lease-231-resend")
+    assert lid == "lease-231-resend"
+    assert "error" not in _h9_ack(lid, "accepted")
+    assert "error" in _h9_ack(lid, "rejected_stale")
+
+    resent = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "daemon.handoff",
+            "params": {
+                "from_agent": "codex",
+                "to_agent": "claude-code",
+                "packet": _packet(lease_id=lid, task="follow-up resend on same lease_id"),
+            },
+        }
+    )
+    assert "error" not in resent, resent
+    with db.cursor() as c:
+        st_rearmed = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st_rearmed == "pending"
+
+    r_fresh = _h9_ack(lid, "rejected_stale")
+    assert "error" not in r_fresh, f"fresh ack after resend failed: {r_fresh}"
+    with db.cursor() as c:
+        st_final = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st_final == "rejected_stale"

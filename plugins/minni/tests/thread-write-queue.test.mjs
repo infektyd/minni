@@ -997,6 +997,78 @@ test("claimed pending complete without start/stamp/ticket cannot persist done", 
   assert.equal(leftover.length, 0);
 });
 
+test("H10: claimed blocked never-started slice cannot complete to done without start", async (t) => {
+  const fixture = await burstFixture(t, 1);
+  const [claim] = await assignAndClaimAll(fixture);
+  const blocked = await updateClaimedSlice({
+    vaultPath: fixture.vaultPath,
+    notePath: fixture.notePath,
+    planId: fixture.planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "block-before-start",
+    action: {
+      action: "block",
+      evidence: "Blocked before any start was recorded",
+    },
+    now: new Date("2026-08-18T12:01:00.000Z"),
+  });
+  if (isAcceptedWorkerWrite(blocked)) {
+    await drainWorkerWrites({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+    });
+  }
+  const planAfterBlock = await rehydratePlan(fixture.notePath);
+  assert.equal(planAfterBlock.slices[0].status, "blocked");
+
+  await assert.rejects(
+    updateClaimedSlice({
+      vaultPath: fixture.vaultPath,
+      notePath: fixture.notePath,
+      planId: fixture.planId,
+      sliceId: "s0",
+      workerAgentId: "worker-0",
+      token: claim.token,
+      idempotencyKey: "complete-blocked-no-start",
+      action: {
+        action: "complete",
+        evidence: "Verification: slice s0 done via test ID T-blocked-no-start",
+      },
+      now: new Date("2026-08-18T12:02:00.000Z"),
+    }),
+    /complete cannot persist done without start/,
+  );
+
+  await withThreadLock(fixture.vaultPath, fixture.planId, "hold-blocked-complete", async () => {
+    await assert.rejects(
+      updateClaimedSlice({
+        vaultPath: fixture.vaultPath,
+        notePath: fixture.notePath,
+        planId: fixture.planId,
+        sliceId: "s0",
+        workerAgentId: "worker-0",
+        token: claim.token,
+        idempotencyKey: "complete-blocked-no-start-busy",
+        action: {
+          action: "complete",
+          evidence: "Verification: slice s0 done via test ID T-blocked-no-start-busy",
+        },
+        now: new Date("2026-08-18T12:02:30.000Z"),
+      }),
+      /complete cannot persist done without start/,
+    );
+  });
+
+  const plan = await rehydratePlan(fixture.notePath);
+  assert.equal(plan.slices[0].status, "blocked");
+  const journal = await journalState(fixture);
+  assert.equal(journal.started.length, 0);
+  assert.equal(journal.completed.length, 0);
+});
+
 test("busy claimed pending complete is refused without queuing an undrainable ticket", async (t) => {
   const fixture = await burstFixture(t, 1);
   const [claim] = await assignAndClaimAll(fixture);

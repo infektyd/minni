@@ -287,6 +287,67 @@ async function hasAcceptedStartStamp(
   );
 }
 
+function hasJournaledStartForCurrentGeneration(
+  events: OrderedThreadEvent[],
+  sliceId: string,
+): boolean {
+  let started = false;
+  for (const event of events) {
+    if (event.slice_id !== sliceId) continue;
+    if (
+      event.kind === "slice.assigned" ||
+      event.kind === "slice.lease_expired"
+    ) {
+      started = false;
+    } else if (
+      event.kind === "slice.started" ||
+      event.kind === "slice.progressed"
+    ) {
+      started = true;
+    }
+  }
+  return started;
+}
+
+async function requireJournaledStartBeforeComplete(options: {
+  vaultPath: string;
+  notePath: string;
+  planId: string;
+  sliceId: string;
+  workerAgentId: string;
+  slice: PlanSlice;
+  orderedSnapshot?: OrderedThreadEvent[];
+}): Promise<void> {
+  const { vaultPath, notePath, planId, sliceId, workerAgentId, slice } = options;
+  if (slice.status === "in_progress") return;
+  const queuedNow = await listQueuedWorkerWrites(vaultPath, planId);
+  const startTicket = queuedNow.some(
+    (item) =>
+      item.sliceId === sliceId &&
+      queuedWriteActionName(item) === "start" &&
+      queuedWriteMatchesLiveGeneration(item, slice),
+  );
+  const startStamp = await hasAcceptedStartStamp(
+    vaultPath,
+    planId,
+    sliceId,
+    workerAgentId,
+    slice,
+  );
+  if (startTicket || startStamp) {
+    throw new Error("start must apply before complete");
+  }
+  if (slice.status === "pending") {
+    throw new Error("complete cannot persist done without start");
+  }
+  const ordered =
+    options.orderedSnapshot ??
+    (await readOrderedThreadEvents(journalPathFor(notePath, planId)));
+  if (!hasJournaledStartForCurrentGeneration(ordered, sliceId)) {
+    throw new Error("complete cannot persist done without start");
+  }
+}
+
 /**
  * Complete must not dump-and-return past a pending start stamp/ticket when
  * the persist lock is busy or exclusive replan is reserved. Same refuse as
@@ -312,27 +373,14 @@ async function refuseCompleteUntilStartApplied(
   if (slice.status === "superseded") {
     throw new Error(`slice "${sliceId}" is not worker-updatable`);
   }
-  if (slice.status === "in_progress") return;
-  const queuedNow = await listQueuedWorkerWrites(input.vaultPath, planId);
-  const startTicket = queuedNow.some(
-    (item) =>
-      item.sliceId === sliceId &&
-      queuedWriteActionName(item) === "start" &&
-      queuedWriteMatchesLiveGeneration(item, slice),
-  );
-  const startStamp = await hasAcceptedStartStamp(
-    input.vaultPath,
+  await requireJournaledStartBeforeComplete({
+    vaultPath: input.vaultPath,
+    notePath: input.notePath,
     planId,
     sliceId,
     workerAgentId,
     slice,
-  );
-  if (startTicket || startStamp) {
-    throw new Error("start must apply before complete");
-  }
-  if (slice.status === "pending") {
-    throw new Error("complete cannot persist done without start");
-  }
+  });
 }
 
 async function enqueueAcceptedWorkerWrite(
@@ -2804,29 +2852,16 @@ async function applyClaimedSliceWithClaimFs(
         throw new Error(`slice "${sliceId}" is not worker-updatable`);
       }
 
-      if (input.action.action === "complete" && slice.status !== "in_progress") {
-        const queuedNow = await listQueuedWorkerWrites(input.vaultPath, planId);
-        const startTicket = queuedNow.some(
-          (item) =>
-            item.sliceId === sliceId &&
-            queuedWriteActionName(item) === "start" &&
-            queuedWriteMatchesLiveGeneration(item, slice),
-        );
-        const startStamp = await hasAcceptedStartStamp(
-          input.vaultPath,
+      if (input.action.action === "complete") {
+        await requireJournaledStartBeforeComplete({
+          vaultPath: input.vaultPath,
+          notePath: input.notePath,
           planId,
           sliceId,
           workerAgentId,
           slice,
-        );
-        if (startTicket || startStamp) {
-          throw new Error("start must apply before complete");
-        }
-        // Claimed pending, no slice.started, no stamp, no start ticket:
-        // the old apply path persisted done. Complete cannot.
-        if (slice.status === "pending") {
-          throw new Error("complete cannot persist done without start");
-        }
+          orderedSnapshot: ordered,
+        });
       }
 
       const planBefore = plan;

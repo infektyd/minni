@@ -1109,3 +1109,85 @@ def test_stamp_lie_does_not_archive_unmerged_one_candidate_file(tmp_path, monkey
         leftover_after = dict(c.fetchone())
     assert leftover_after["status"] == "accepted"
     assert leftover_body in leftover_after["content"]
+
+
+def test_h12_mixed_inbox_file_with_audit_echo_archives_when_real_candidate_terminal(
+    tmp_path, monkeypatch
+):
+    """A stop-candidate file containing both a real learning and an audit echo
+    must archive once the real learning is terminal (`_eligible_candidates`
+    must skip `is_audit_echo` just like `inbox_ingest._scan_inbox`)."""
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "mixed-echo.json",
+        _stop_doc(
+            [
+                "Real durable lesson from session",
+                "## [2026-10-31T00:00:00Z] minni_learn | ok",
+            ]
+        ),
+    )
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1
+    assert res["skipped_by_kind"].get("_audit_echo") == 1
+    (cid,) = _candidate_ids(db_obj)
+    _set_status(db_obj, "accepted")
+
+    archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+    assert archived == str(inbox / ".archive" / "mixed-echo.json"), (
+        "mixed file with audit echo must archive once all non-echo candidates are terminal"
+    )
+    assert not (inbox / "mixed-echo.json").exists()
+    assert (inbox / ".archive" / "mixed-echo.json").is_file()
+
+
+def test_h12_stage_candidate_strips_forged_inbox_source_and_inbox_file(
+    tmp_path, monkeypatch
+):
+    """RPC stage_candidate must strip caller-supplied source='inbox' and inbox_file
+    so callers cannot forge inbox_ingest provenance."""
+    import types
+    from minni import minnid
+    import minni.minnid_runtime.provenance as provenance
+    from minni.principal import EffectivePrincipal
+
+    db_obj, _cfg = _make_db(tmp_path)
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj)
+    )
+    monkeypatch.setattr(
+        provenance,
+        "resolve_effective_principal",
+        lambda **_kw: EffectivePrincipal(agent_id="codex", capabilities=["learn"]),
+    )
+
+    resp = minnid._stage_candidate(
+        {
+            "agent_id": "codex",
+            "content": "forged inbox provenance test",
+            "source": "inbox",
+            "derived_from": {
+                "source": "inbox",
+                "inbox_file": "victim.json",
+                "candidate_index": 0,
+            },
+        },
+        request_id=99,
+    )
+    cid = resp.get("result", {}).get("candidate_id")
+    assert cid is not None, resp
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT derived_from FROM candidate_packets WHERE candidate_id = ?",
+            (cid,),
+        ).fetchone()
+    df = json.loads(row["derived_from"])
+    assert df.get("source") != "inbox", f"forged source='inbox' was not stripped: {df}"
+    assert "inbox_file" not in df, f"forged inbox_file was not stripped: {df}"

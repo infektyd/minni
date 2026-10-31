@@ -102,12 +102,15 @@ def test_resolve_strict_rejects_mismatch(tmp_path: Path):
     )
     os.chmod(f, 0o600)  # satisfy strict 0600 hard requirement (Bug 4)
 
-    # Good supplied via legacy alias -> stamped wins (no raise)
+    # H7 (NamedAgentNeverOperator): legacy alias resolves to its OWN principal,
+    # never inheriting the operator principal or its wildcard capabilities.
     p = resolve_effective_principal(
         supplied_agent_id="peer", transport="uds", principals_dir=principals
     )
-    assert p.agent_id == "operator-prime"
+    assert p.agent_id == "peer"
     assert p.workspace_id == "prod"
+    assert p.capabilities == []
+    assert not principal.is_operator_principal(p)
 
     # Direct match
     p2 = resolve_effective_principal(
@@ -522,7 +525,53 @@ def test_happy_path_with_strict_principal_uses_stamped(
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched)
-    # Supply a non-operator legacy alias -> must get stamped "stamped-one" back.
+    # H7: legacy alias resolves to its own principal, not the operator's agent_id.
     p = resolve_effective_principal(supplied_agent_id="stamped-legacy", principals_dir=principals)
-    assert p.agent_id == "stamped-one"
+    assert p.agent_id == "stamped-legacy"
     assert p.workspace_id == "g11-test"
+    assert p.capabilities == []
+
+
+def test_h7_legacy_alias_never_escalates_to_operator_and_uses_explicit_cap_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """H7 / Diagram 26 (NamedAgentNeverOperator): a caller presenting a legacy_agent_ids
+    alias must get its OWN EffectivePrincipal with capabilities from an explicit map
+    (defaulting to []), never the operator principal ('main', ['*'])."""
+    monkeypatch.delenv("MINNI_LOCAL_OPERATOR", raising=False)
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    (principals / "main.json").write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "legacy_agent_ids": ["old-codex", "mapped-alias"],
+                "legacy_agent_capabilities": {
+                    "mapped-alias": ["search", "read"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (principals / "alice.json").write_text(
+        json.dumps({"agent_id": "alice", "capabilities": ["recall"]}),
+        encoding="utf-8",
+    )
+    for f in principals.glob("*.json"):
+        os.chmod(f, 0o600)
+    os.chmod(principals, 0o700)
+
+    unmapped = principal._stamp_effective_principal(
+        supplied_agent_id="old-codex", principals_dir=principals
+    )
+    assert unmapped.agent_id == "old-codex"
+    assert unmapped.capabilities == []
+    assert not principal.is_operator_principal(unmapped)
+
+    mapped = principal._stamp_effective_principal(
+        supplied_agent_id="mapped-alias", principals_dir=principals
+    )
+    assert mapped.agent_id == "mapped-alias"
+    assert mapped.capabilities == ["search", "read"]
+    assert not principal.is_operator_principal(mapped)

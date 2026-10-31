@@ -73,9 +73,15 @@ def _upsert_backend_state(
     last_synced_chunk_rowid: int,
     vector_count: int,
     status: str = "ok",
+    preserve_dirty: bool = False,
 ) -> None:
     """Insert or replace a vector_backends row."""
     now = int(time.time())
+    status_expr = (
+        "CASE WHEN vector_backends.status = 'dirty' THEN 'dirty' ELSE excluded.status END"
+        if preserve_dirty
+        else "excluded.status"
+    )
     with db.cursor() as c:
         c.execute(
             "INSERT INTO vector_backends "
@@ -85,7 +91,7 @@ def _upsert_backend_state(
             "  last_synced_chunk_rowid = excluded.last_synced_chunk_rowid,"
             "  last_synced_at = excluded.last_synced_at,"
             "  vector_count = excluded.vector_count,"
-            "  status = excluded.status",
+            f"  status = {status_expr}",
             (backend_name, last_synced_chunk_rowid, now, vector_count, status),
         )
 
@@ -133,7 +139,7 @@ def sync_backend(
     dim = embedding_dim or backend.dim or cfg.embedding_dim
 
     state = get_backend_state(backend.name, db)
-    is_dirty = state["status"] == "dirty"
+    is_dirty = state["status"] in ("dirty", "error", "syncing")
     start_rowid = 0 if full_rebuild else state["last_synced_chunk_rowid"]
 
     logger.debug(
@@ -206,11 +212,18 @@ def sync_backend(
 
     # Reconcile deletions. The incremental cursor above only catches INSERTs
     # (chunk_id > start_rowid); a deleted chunk leaves a stale vector in the
-    # backend forever. On a dirty (post-delete) or full_rebuild pass, drop any
-    # vector whose chunk_id is no longer present in chunk_embeddings — otherwise
-    # deleted memories keep surfacing in recall (index-to-DB deletion drift).
-    if is_dirty or full_rebuild:
-        prior_max = state["last_synced_chunk_rowid"]
+    # backend forever. On a dirty (post-delete), error-retry, or full_rebuild
+    # pass — or if mark_dirty arrived concurrently during upsert — drop any
+    # vector whose chunk_id is no longer present in chunk_embeddings.
+    post_upsert_status = get_backend_state(backend.name, db)["status"]
+    if is_dirty or post_upsert_status == "dirty" or full_rebuild:
+        with db.cursor() as c:
+            c.execute(
+                "UPDATE vector_backends SET status = 'syncing' "
+                "WHERE name = ? AND status = 'dirty'",
+                (backend.name,),
+            )
+        prior_max = max(state["last_synced_chunk_rowid"], last_rowid)
         if prior_max > 0:
             with db.cursor() as c:
                 c.execute(
@@ -256,14 +269,16 @@ def sync_backend(
         last_synced_chunk_rowid=last_rowid,
         vector_count=vector_count,
         status="ok",
+        preserve_dirty=True,
     )
+    final_status = get_backend_state(backend.name, db)["status"]
 
     return {
         "backend": backend.name,
         "upserted": upserted,
         "last_rowid": last_rowid,
         "vector_count": vector_count,
-        "status": "ok",
+        "status": final_status if final_status == "dirty" else "ok",
     }
 
 
@@ -316,7 +331,7 @@ def should_sync(backend_name: str, db) -> bool:
     Return True if this backend needs a sync pass.
 
     Called by the daemon idle hook every 30s.
-    Returns True if status == 'dirty' or 'empty' or 'error'.
+    Returns True if status == 'dirty', 'empty', 'error', or 'syncing'.
     """
     state = get_backend_state(backend_name, db)
-    return state["status"] in ("dirty", "empty", "error")
+    return state["status"] in ("dirty", "empty", "error", "syncing")

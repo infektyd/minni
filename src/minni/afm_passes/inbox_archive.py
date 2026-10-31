@@ -233,6 +233,8 @@ def _eligible_candidates(doc: Any) -> Optional[dict]:
             continue
         if cand in log_only or cand in dns:
             continue
+        if is_audit_echo(cand):
+            continue
         out[idx] = cand.strip()[:CONTENT_CAP]
     return out
 
