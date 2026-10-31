@@ -2496,16 +2496,28 @@ export async function writeVaultPage(
 export async function vaultFirstLearn(
   input: LearnInput,
 ): Promise<VaultWriteResult> {
+  const storeData =
+    input.storeResult?.ok &&
+    input.storeResult.data !== null &&
+    typeof input.storeResult.data === "object"
+      ? (input.storeResult.data as Record<string, unknown>)
+      : undefined;
+  const isAccepted = storeData?.status === "accepted";
+  const learningId =
+    typeof storeData?.learning_id === "number" ? storeData.learning_id : undefined;
+
   const result = await writeVaultPage({
     vaultPath: input.vaultPath,
     title: input.title,
     content: input.content,
     section: "sessions",
     source: input.source,
+    ...(isAccepted ? { status: "accepted" } : {}),
     frontmatter: {
       agent: resolveEffectiveVaultAgent(input.vaultPath, input.agentId) ?? "agent",
       category: input.category ?? "general",
       minni_learning: true,
+      ...(isAccepted && learningId !== undefined ? { learning_id: learningId } : {}),
     },
   });
 

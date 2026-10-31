@@ -995,6 +995,8 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
       );
       const mkey = (detailIdx >= 0 ? details[detailIdx]?.mkey : undefined) ?? hit.mkey ?? null;
       if (!mkey) continue;
+      const body = detailIdx >= 0 ? details[detailIdx]?.body : undefined;
+      const shingles = body ? shingleHashes(body) : undefined;
       pointerItems.push({
         mkey,
         handles: handlesForKey(mkey),
@@ -1002,6 +1004,7 @@ export function capturePromptPointer(use: UpsCapture | undefined, input: Pointer
         rank: i + 1,
         score: hit.score,
         locate: locateText(input.emitted, input.pointer),
+        ...(shingles && shingles.length > 0 ? { shingles } : {}),
       });
     }
     if (pointerItems.length === 0) return;
@@ -1068,8 +1071,16 @@ export function captureGuardDeny(capture: UseCapture | undefined, state: RecallS
       );
       if (at < 0) return;
       used.add(at);
-      const mkey = (keys[at] as HitKey).mkey;
+      const hitKey = keys[at] as HitKey;
+      const mkey = hitKey.mkey;
       if (!mkey) return;
+      const fallbackBody = !hitKey.shingles?.length ? vaultTextForMkey(capture.vaultPath, mkey) : "";
+      const shingles =
+        hitKey.shingles && hitKey.shingles.length > 0
+          ? hitKey.shingles
+          : fallbackBody
+            ? shingleHashes(fallbackBody)
+            : undefined;
       items.push({
         mkey,
         handles: handlesForKey(mkey),
@@ -1078,6 +1089,7 @@ export function captureGuardDeny(capture: UseCapture | undefined, state: RecallS
         score: finiteOrUndefined(hit.score),
         // The deny lists each hit by its sanitized wikilink.
         locate: sanitizeRecallField(hit.wikilink),
+        ...(shingles && shingles.length > 0 ? { shingles } : {}),
       });
     });
     record(capture, "guard", items, reason, currentTurnIndex(capture));

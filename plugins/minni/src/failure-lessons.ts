@@ -696,18 +696,99 @@ export function isSwiftOrPraxisContext(
   return false;
 }
 
+function splitUnquotedShellSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  let parenDepth = 0;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "\\" && !inSingle && i + 1 < command.length) {
+      current += ch + command[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      current += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      current += ch;
+      continue;
+    }
+    if (!inSingle) {
+      if (ch === "$" && command[i + 1] === "(") {
+        parenDepth++;
+        current += "$(";
+        i++;
+        continue;
+      }
+      if (ch === "(" && parenDepth > 0) {
+        parenDepth++;
+        current += ch;
+        continue;
+      }
+      if (ch === ")" && parenDepth > 0) {
+        parenDepth--;
+        current += ch;
+        continue;
+      }
+    }
+    if (!inSingle && !inDouble && parenDepth === 0) {
+      if ((ch === "&" && command[i + 1] === "&") || (ch === "|" && command[i + 1] === "|")) {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+      if (ch === ";" || ch === "|" || ch === "\n" || ch === "\r") {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        continue;
+      }
+    }
+    current += ch;
+  }
+  if (current.trim()) segments.push(current.trim());
+  return segments;
+}
+
 function isReadOnlyInspectionCommand(command: string): boolean {
   const trimmed = command.trim();
   if (!trimmed) return false;
-  // Split compound shell commands (including newlines) and check whether every segment is a read-only search/diff/view command
-  const segments = trimmed
-    .split(/(?:&&|\|\||;|\||\r?\n)/)
-    .map((s) => s.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)+/, ""))
-    .filter(Boolean);
-  if (segments.length === 0) return false;
+  // Split compound shell commands on unquoted operators and check whether every segment is a read-only search/diff/view command
+  const rawSegments = splitUnquotedShellSegments(trimmed);
+  if (rawSegments.length === 0) return false;
   const readOnlyRe =
-    /^(?:(?:\/usr\/bin\/|\/bin\/|\/opt\/homebrew\/bin\/)?(?:rg|ripgrep|grep|egrep|fgrep|git\s+(?:-C\s+\S+\s+)?(?:diff|log|show|status|grep|cat-file|blame|branch|rev-parse)|cat|head|tail|sed(?!\s+-i\b)|awk|find|fd|ls|wc|stat|file|echo|printf|true|cd|pwd))\b/i;
-  return segments.every((seg) => readOnlyRe.test(seg));
+    /^(?:(?:\/usr\/bin\/|\/bin\/|\/opt\/homebrew\/bin\/)?(?:rg|ripgrep|grep|egrep|fgrep|git\s+(?:-C\s+\S+\s+)?(?:diff|log|show|status|grep|cat-file|blame|branch|rev-parse)|cat|head|tail|sed(?!\s+-i\b)|awk|find|fd|ls|wc|stat|file|echo|printf|true|cd|pwd|cut|sort|uniq|tr|jq|diff|comm|paste|column))\b/i;
+
+  for (const rawSeg of rawSegments) {
+    // Strip leading variable assignments (e.g. `f=Services/Foo.swift` or `n=$(grep -c ...)`),
+    // verifying any `$(...)` command substitution inside the assignment is itself read-only.
+    let rest = rawSeg.trim();
+    let hadAssignment = false;
+    while (true) {
+      const assignMatch = rest.match(
+        /^[A-Za-z_][A-Za-z0-9_]*=(?:\$\(([^()]*)\)|"[^"]*"|'[^']*'|[^\s;|&\r\n]*)\s*/,
+      );
+      if (!assignMatch) break;
+      if (assignMatch[1] !== undefined && !isReadOnlyInspectionCommand(assignMatch[1])) {
+        return false;
+      }
+      hadAssignment = true;
+      rest = rest.slice(assignMatch[0].length).trim();
+    }
+    if (!rest) {
+      if (hadAssignment) continue;
+      return false;
+    }
+    if (!readOnlyRe.test(rest)) return false;
+  }
+  return true;
 }
 
 function stripCommentOnlyLines(text: string): string {
@@ -890,9 +971,9 @@ export function matchPostToolUseFailureLesson(args: {
     for (const rule of APPROVED_FAILURE_LESSON_RULES) {
       if (rule.stage !== "PostToolUse") continue;
       if (!ruleMatchesScope(rule, effectiveCwd, command, outputText, projectKey)) continue;
+      if (args.event === "PostToolUse" && readOnlyCleanExit) continue;
       const isCodeAntipattern = CODE_ANTIPATTERN_RULE_IDS.has(rule.ruleId);
       if (isCodeAntipattern) {
-        if (readOnlyCleanExit) continue;
         if (!nonCommentText.trim() || !rule.pattern.test(nonCommentText)) continue;
       } else if (!rule.pattern.test(outputText)) {
         continue;

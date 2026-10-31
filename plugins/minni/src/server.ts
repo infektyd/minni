@@ -9,6 +9,7 @@ import {
   DEFAULT_AGENT_ID,
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
+  resolveSessionWorkspaceId,
 } from "./config.js";
 import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial, routeMemoryIntent } from "./policy.js";
 import {
@@ -117,6 +118,11 @@ import {
   type WorkerUpdateAction,
 } from "./thread-worker.js";
 import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
+import {
+  acknowledgeRelayThroughSeq,
+  acknowledgeSelfAuthoredPrefixInVault,
+  vaultPrincipalSubscriberId,
+} from "./thread-notification-relay.js";
 import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
 import {
   drainStatusForModel,
@@ -314,7 +320,7 @@ server.registerTool(
       useAfm,
       layer,
       limit,
-      workspaceId,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
       agentId: DEFAULT_AGENT_ID, // G11: server-side stamped default; model can no longer supply agentId
       vaultPath: DEFAULT_VAULT_PATH,
       includeVault,
@@ -453,7 +459,7 @@ server.registerTool(
       plan_id,
       agents,
       coordinatorAgentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies coordinator identity)
-      workspaceId,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
       vaultPath: DEFAULT_VAULT_PATH,
       profile,
       limit,
@@ -636,8 +642,8 @@ server.registerTool(
     },
   },
   async ({ query, layer, limit, workspaceId, scope, cross_agent, includeVault }) => {
-    const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    await disarmRecallStateOnConsult(effectiveVaultPath).catch(() => false);
+    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH).catch(() => false);
+    const effectiveWorkspaceId = resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId);
     // X5: run the daemon recall FIRST. Its results are workspace/agent-scoped and
     // subject to read policy. The local searchVaultNotes pre-scan is NOT scoped, so
     // it must only be used as an offline fallback (daemon unreachable) — never
@@ -649,7 +655,7 @@ server.registerTool(
       limit,
       scope,
       crossAgent: cross_agent,
-      workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
+      workspaceId: effectiveWorkspaceId,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
       sessionId: MCP_PROCESS_SESSION_ID,
     });
@@ -680,11 +686,11 @@ server.registerTool(
     // outscoring a safe match still reproduce the crowd-out. See #339 for
     // the durable fix (gate inside searchVaultNotes itself).
     const vaultResultCap = Math.min(limit ?? 5, 8);
-    const noiseLast = isRecallNoiseLastEnabled(effectiveVaultPath);
+    const noiseLast = isRecallNoiseLastEnabled(DEFAULT_VAULT_PATH);
     const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
       ? filterSafeVaultResults(
           await searchVaultNotes(
-            effectiveVaultPath,
+            DEFAULT_VAULT_PATH,
             query,
             vaultResultCap * VAULT_SEARCH_OVERFETCH_MULTIPLIER,
             undefined,
@@ -698,12 +704,12 @@ server.registerTool(
     // through to the normal (reworded, #4b) denial text when the degrade
     // path doesn't apply or the retry itself comes up empty/failed.
     const degradeText = await recallCrossAgentDegrade(
-      { query, layer, limit, workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID, agentId: DEFAULT_AGENT_ID },
+      { query, layer, limit, workspaceId: effectiveWorkspaceId, agentId: DEFAULT_AGENT_ID },
       cross_agent === true,
       denial,
     );
     const responseText = degradeText ?? recallResponseText(query, result, vaultResults);
-    await recordAudit(effectiveVaultPath, {
+    await recordAudit(DEFAULT_VAULT_PATH, {
       tool: "minni_recall",
       summary: query,
       details: {
@@ -781,7 +787,7 @@ server.registerTool(
       budgetTokens,
       cacheKey,
       agentId: DEFAULT_AGENT_ID,
-      workspaceId,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
     });
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -794,7 +800,7 @@ server.registerTool(
     description:
       "Write a vault note first, then store the learning through Minni.",
     inputSchema: {
-      title: z.string().min(1),
+      title: z.string().min(1).optional(),
       content: z.string().min(1),
       category: z.string().optional(),
       source: z.string().optional(),
@@ -805,7 +811,16 @@ server.registerTool(
       requireQuality: z.boolean().optional().default(true),
     },
   },
-  async ({ title, content, category, source, workspaceId, requireQuality }) => {
+  async ({ title: rawTitle, content, category, source, workspaceId, requireQuality }) => {
+    const title =
+      rawTitle?.trim() ||
+      content
+        .trim()
+        .split(/\r?\n/)[0]
+        ?.replace(/^#+\s*/, "")
+        .slice(0, 72)
+        .trim() ||
+      "Untitled learning";
     // Async path includes the #147 AFM inconclusive tier (regex remains fast path).
     const quality = await assessLearningQualityAsync({ title, content, category, source });
     // `requireQuality:false` opts out of the QUALITY FLOOR — a weak-but-clean
@@ -843,7 +858,7 @@ server.registerTool(
       content,
       category,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only
-      workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
+      workspaceId: resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId),
       ...(source ? { source } : {}),
     });
     const note = await vaultFirstLearn({
@@ -862,6 +877,13 @@ server.registerTool(
     // #132 P1: an identity-recovery denial must never read as "learned" —
     // name it distinctly so the remediation route (in store.data) is acted on.
     const storeRecovery = recoveryRouteFrom(store.data);
+    const storeData =
+      store.ok && store.data !== null && typeof store.data === "object"
+        ? (store.data as Record<string, unknown>)
+        : undefined;
+    const isPromoted = storeData?.status === "accepted";
+    const promotedLearningId =
+      typeof storeData?.learning_id === "number" ? storeData.learning_id : undefined;
     return textResult(
       JSON.stringify(
         {
@@ -870,6 +892,14 @@ server.registerTool(
             : storeRecovery
               ? "identity-recovery-required"
               : "vault-written-memory-store-failed",
+          ...(isPromoted
+            ? {
+                promotion_status: "accepted",
+                ...(promotedLearningId !== undefined
+                  ? { learning_id: promotedLearningId }
+                  : {}),
+              }
+            : {}),
           quality,
           note,
           store,
@@ -1521,9 +1551,11 @@ server.registerTool(
       evidence: z.string().optional(),
       force: z.boolean().optional(),
       force_reason: z.string().optional(),
+      compact: z.boolean().optional(),
+      include_full_plan: z.boolean().optional(),
     },
   },
-  async ({ plan_id: planIdInput, slice_id, status, evidence, force, force_reason }) => {
+  async ({ plan_id: planIdInput, slice_id, status, evidence, force, force_reason, compact, include_full_plan }) => {
     // #291 round-1 cassandra finding 4: force/force_reason were previously
     // absent from the shared-gate details, so an operator/daemon approval
     // channel could not distinguish a routine update from a depends_on
@@ -1669,6 +1701,12 @@ server.registerTool(
           orderedSnapshot: ordered,
           supplementalEvents: supplemental.length > 0 ? supplemental : undefined,
         });
+        const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          effectiveVaultPath,
+          plan_id,
+          [DEFAULT_AGENT_ID, ...(vp ? [vp] : [])],
+        ).catch(() => {});
         // P10/H6: terminal plans stop being injected.
         if (updated.status === "complete" || updated.status === "accepted") {
           try {
@@ -1686,9 +1724,50 @@ server.registerTool(
     // P3: lead the response with plan-level progress so closing one slice is never misread as
     // closing the whole plan.
     const view = compactPlanView(next);
+    const updated_slice = next.slices.find((s) => s.id === slice_id);
+    if (compact === true) {
+      return textResult(
+        JSON.stringify(
+          {
+            headline: view.headline,
+            progress: view.progress,
+            next_action: next.next_action,
+            rev: next.rev,
+            status: next.status,
+            updated_slice,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    const responsePlan =
+      include_full_plan === true
+        ? next
+        : {
+            ...next,
+            slices: next.slices.map((s) =>
+              s.id === slice_id
+                ? s
+                : {
+                    ...s,
+                    ...(typeof s.evidence === "string" && s.evidence.length > 240
+                      ? { evidence: `${s.evidence.slice(0, 240)}…` }
+                      : {}),
+                  },
+            ),
+            scar_tissue: next.scar_tissue.slice(-5),
+            scar_tissue_total: next.scar_tissue.length,
+          };
     return textResult(
       JSON.stringify(
-        { headline: view.headline, progress: view.progress, next_action: next.next_action, plan: next },
+        {
+          headline: view.headline,
+          progress: view.progress,
+          next_action: next.next_action,
+          updated_slice,
+          plan: responsePlan,
+        },
         null,
         2,
       ),
@@ -1765,6 +1844,12 @@ server.registerTool(
           now,
           orderedSnapshot: ordered,
         });
+        const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          effectiveVaultPath,
+          plan_id,
+          [DEFAULT_AGENT_ID, ...(vp ? [vp] : [])],
+        ).catch(() => {});
         return updated;
       },
     );
@@ -2600,6 +2685,14 @@ server.registerTool(
       });
       const journalPath = journalPathFor(notePath, plan_id);
       const result = await readThreadEvents(journalPath, since_seq, limit);
+      const ackSeq = Math.max(result.next_seq, since_seq ?? 0);
+      const vaultPrincipal = vaultPrincipalSubscriberId(DEFAULT_VAULT_PATH);
+      await acknowledgeRelayThroughSeq(
+        DEFAULT_VAULT_PATH,
+        plan_id,
+        ackSeq,
+        [DEFAULT_AGENT_ID, ...(vaultPrincipal ? [vaultPrincipal] : [])],
+      ).catch(() => {});
       return textResult(JSON.stringify({ plan_id, ...result }, null, 2));
     } catch (error) {
       return threadWorkerErrorResult("plan.events", error);

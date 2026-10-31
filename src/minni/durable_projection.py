@@ -360,12 +360,23 @@ def evict_learning_to_cold_archive(
             evicted_doc_ids.append(did)
 
         if engine is not None and evicted_doc_ids:
-            faiss_idx = getattr(engine, "_faiss", None)
-            if faiss_idx is not None and hasattr(faiss_idx, "invalidate"):
+            for attr in ("_faiss", "faiss_index"):
+                faiss_idx = getattr(engine, attr, None)
+                if faiss_idx is not None and hasattr(faiss_idx, "invalidate"):
+                    try:
+                        faiss_idx.invalidate()
+                    except Exception:
+                        pass
+            if hasattr(engine, "_invalidate_trie"):
                 try:
-                    faiss_idx.invalidate()
+                    engine._invalidate_trie()
                 except Exception:
                     pass
+            else:
+                engine._trie_docs = None
+                engine._trie_max_doc_id = -1
+                engine._trie_doc_count = -1
+                engine._trie_checked_at = 0.0
 
         return {
             "evicted": True,
@@ -428,7 +439,118 @@ def evict_document_to_cold_archive(
                 (did, did),
             )
         c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
+        if engine is not None:
+            for attr in ("_faiss", "faiss_index"):
+                faiss_idx = getattr(engine, attr, None)
+                if faiss_idx is not None and hasattr(faiss_idx, "invalidate"):
+                    try:
+                        faiss_idx.invalidate()
+                    except Exception:
+                        pass
+            if hasattr(engine, "_invalidate_trie"):
+                try:
+                    engine._invalidate_trie()
+                except Exception:
+                    pass
         return {"evicted": True, "doc_id": did, "tombstone_path": str(tombstone_path)}
+
+    return _run_with_cursor(conn_or_cursor, _op)
+
+
+def evict_candidate_to_cold_archive(
+    conn_or_cursor: Any,
+    engine_or_cid: Any = None,
+    candidate_id: int | str | None = None,
+    reason: str = "evicted_candidate",
+    *,
+    archive_dir: Path | str | None = None,
+    minni_home: Path | str | None = None,
+    db_path: Path | str | None = None,
+    vault_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Append a candidate packet tombstone to cold archive and remove its proposed/review DB rows."""
+    if archive_dir is None and minni_home is not None:
+        archive_dir = Path(minni_home) / "_archive"
+    if candidate_id is None and isinstance(engine_or_cid, int):
+        engine = None
+        cid = int(engine_or_cid)
+    elif isinstance(engine_or_cid, int) and isinstance(candidate_id, str) and not str(candidate_id).isdigit():
+        engine = None
+        cid = int(engine_or_cid)
+        reason = str(candidate_id)
+    else:
+        engine = engine_or_cid
+        if candidate_id is None:
+            raise ValueError("candidate_id is required")
+        cid = int(candidate_id)
+
+    def _op(c: Any) -> dict[str, Any]:
+        if not _table_exists(c, "candidate_packets"):
+            return {"evicted": False, "candidate_id": cid, "tombstone_path": None}
+        row = c.execute(
+            "SELECT * FROM candidate_packets WHERE candidate_id = ?", (cid,)
+        ).fetchone()
+        if row is None:
+            return {"evicted": False, "candidate_id": cid, "tombstone_path": None}
+        row_dict = {k: row[k] for k in row.keys()} if hasattr(row, "keys") else {}
+        target_archive = _resolve_archive_dir(
+            c,
+            engine,
+            archive_dir=archive_dir,
+            db_path=db_path,
+            vault_path=vault_path,
+            conn_or_cursor=conn_or_cursor,
+        )
+        tombstone_payload = {
+            "kind": "candidate_tombstone",
+            "candidate_id": cid,
+            "principal": str(row_dict.get("principal") or ""),
+            "workspace_id": str(row_dict.get("workspace_id") or "default"),
+            "privacy_level": str(row_dict.get("privacy_level") or "review"),
+            "status": str(row_dict.get("status") or "proposed"),
+            "content": str(row_dict.get("content") or ""),
+            "proposed_at": row_dict.get("proposed_at"),
+            "reason": str(reason),
+            "evicted_at": time.time(),
+        }
+        tombstone_path = _append_tombstone(target_archive, tombstone_payload)
+
+        if _table_exists(c, "consolidation_actions"):
+            c.execute(
+                "DELETE FROM consolidation_actions WHERE action_type = 'afm_review' AND claim = ?",
+                (str(cid),),
+            )
+        c.execute(
+            "UPDATE candidate_packets SET status = 'rejected', resolved_at = ?, "
+            "resolved_by = 'cold_archive' WHERE candidate_id = ?",
+            (time.time(), cid),
+        )
+        try:
+            from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+            from minni.config import Config
+
+            db_wrapper = engine if hasattr(engine, "cursor") else None
+            if db_wrapper is None:
+                class _CursorWrapper:
+                    def __init__(self, cur: Any) -> None:
+                        self._cur = cur
+                    def cursor(self) -> Any:
+                        from contextlib import contextmanager
+                        @contextmanager
+                        def _cm():
+                            yield self._cur
+                        return _cm()
+                db_wrapper = _CursorWrapper(c)
+            cfg = getattr(engine, "config", None) or Config()
+            maybe_archive_for_candidate(db_wrapper, cfg, cid)
+        except Exception:
+            pass
+        c.execute("DELETE FROM candidate_packets WHERE candidate_id = ?", (cid,))
+        return {
+            "evicted": True,
+            "candidate_id": cid,
+            "tombstone_path": str(tombstone_path),
+        }
 
     return _run_with_cursor(conn_or_cursor, _op)
 

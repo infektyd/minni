@@ -38,7 +38,7 @@ export const SPAWNED = false as const;
 
 export const RELAY_STORE_VERSION = 1 as const;
 
-export type RelayHost = "agy" | "grok" | "codex" | "cursor";
+export type RelayHost = "agy" | "grok" | "codex" | "cursor" | "claude-code";
 export type RelayHook = "sessionStart" | "promptSubmit" | "stop";
 export type WakeMode = "immediate" | "deferred" | "unsupported";
 export type InjectionCapability = "injects" | "ignored" | "rejects" | "cannot" | "out";
@@ -52,6 +52,8 @@ const RELAY_HOST_ALIASES: Record<string, RelayHost> = {
   "grok-build": "grok",
   codex: "codex",
   cursor: "cursor",
+  claude: "claude-code",
+  "claude-code": "claude-code",
 };
 
 export function relayHostFor(id: string): RelayHost | undefined {
@@ -133,6 +135,17 @@ export const HOST_INJECTION_TABLE: Record<RelayHost, HostInjectionRow> = {
     stop: "out",
     wire: "out",
     wake: "unsupported",
+    wetImmediate: false,
+    spawned: false,
+    grokWorkerStart: null,
+  },
+  "claude-code": {
+    host: "claude-code",
+    sessionStart: "injects",
+    promptSubmit: "injects",
+    stop: "out",
+    wire: "SessionStart + UserPromptSubmit; Stop additionalContext wakes stopped turn so relay is out",
+    wake: "deferred",
     wetImmediate: false,
     spawned: false,
     grokWorkerStart: null,
@@ -459,6 +472,69 @@ export async function confirmDeliveryInVault(
   const next = confirmDelivery(store, subscriberId, planId, deliveredThroughSeq, deliverySucceeded);
   await saveRelayStore(vaultPath, next);
   return cursorFor(next, subscriberId, planId);
+}
+
+/**
+ * Acknowledge relay notifications through `throughSeq` for the given subscribers
+ * (e.g. when a reader consumes events via `minni_thread_events`).
+ */
+export async function acknowledgeRelayThroughSeq(
+  vaultPath: string,
+  planId: string,
+  throughSeq: number,
+  subscriberIds: readonly string[],
+): Promise<RelayStore> {
+  let store = await loadRelayStore(vaultPath);
+  if (throughSeq <= 0) return store;
+  const seen = new Set<string>();
+  for (const rawId of subscriberIds) {
+    const id = rawId.trim();
+    if (!id || id === "unknown-agent" || seen.has(id)) continue;
+    seen.add(id);
+    store = confirmDelivery(store, id, planId, throughSeq, true);
+  }
+  await saveRelayStore(vaultPath, store);
+  return store;
+}
+
+/**
+ * Advance a subscriber's cursor past any contiguous leading self-authored
+ * events (`item.actor === subscriberId`) so an orchestrator's own mutations
+ * do not queue self-notifications while still preserving events authored by
+ * any other worker/subscriber.
+ */
+export async function acknowledgeSelfAuthoredPrefixInVault(
+  vaultPath: string,
+  planId: string,
+  subscriberIds: readonly string[],
+): Promise<RelayStore> {
+  let store = await loadRelayStore(vaultPath);
+  let changed = false;
+  const seen = new Set<string>();
+  for (const rawId of subscriberIds) {
+    const subscriberId = rawId.trim();
+    if (!subscriberId || subscriberId === "unknown-agent" || seen.has(subscriberId)) continue;
+    seen.add(subscriberId);
+    const items = store.pending
+      .filter((item) => item.subscriber_id === subscriberId && item.plan_id === planId)
+      .sort((a, b) => a.seq - b.seq);
+    let ackSeq = 0;
+    for (const item of items) {
+      if (item.actor === subscriberId) {
+        ackSeq = item.seq;
+      } else {
+        break;
+      }
+    }
+    if (ackSeq > 0) {
+      store = confirmDelivery(store, subscriberId, planId, ackSeq, true);
+      changed = true;
+    }
+  }
+  if (changed) {
+    await saveRelayStore(vaultPath, store);
+  }
+  return store;
 }
 
 /**

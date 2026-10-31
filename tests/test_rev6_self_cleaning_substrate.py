@@ -1,6 +1,5 @@
 """Tests for Rev 6 Self-Cleaning Memory Substrate (Pillars 1-5)."""
 
-from __future__ import annotations
 
 import json
 import struct
@@ -1073,4 +1072,365 @@ def test_real_use_ledger_mkey_exposure_and_root_log_exclusion(tmp_path: Path):
     finally:
         db.close()
 
+
+# --- Rev 6.1 3-Part Surgical Fix Tests ---
+
+
+from minni.afm_passes.consolidation import is_low_signal_boot_learning
+from minni.afm_passes.vault_ingest import VaultIngestPass
+import minni.durable_projection as durable_projection
+from minni.principal import EffectivePrincipal, resolve_effective_principal
+from minni.wiki_indexer import WikiIndexer
+
+
+def test_part2_coordinator_durable_learn_promotes_synchronously_while_blocking_harvest_noise(
+    tmp_path: Path,
+) -> None:
+    # 1. Explicit non-harvest durable learning without literal word "invariant" or "contract"
+    # must NOT be blocked by non_durable_promotion_blocker even when origin="agent".
+    blocker = non_durable_promotion_blocker(
+        content="Checked by claude-code on 2026-10-28: Minni origin/main = 0b867d88.",
+        category="decision",
+        source="claude-code:test",
+        origin="agent",
+    )
+    assert blocker is None, f"expected None blocker for explicit durable decision, got {blocker}"
+
+    # 2. Non-harvest ordinary learning from origin="agent" IS still blocked from auto-accept
+    ord_blocker = non_durable_promotion_blocker(
+        content="Just a casual observation without durable category or prefix.",
+        category="general",
+        source="claude-code:test",
+        origin="agent",
+    )
+    assert ord_blocker == "non_durable:ordinary"
+
+    # 3. Harvest source (jev_harvest / compact_distillation) without invariant IS blocked
+    harvest_blocker = non_durable_promotion_blocker(
+        content="Decision: use fast path for local calls.",
+        category="decision",
+        source="jev_harvest",
+        origin="agent",
+    )
+    assert harvest_blocker is not None
+
+    # 4. Live principals/claude-code.json and principals/local.json resolve auto_accept_own=True
+    import os
+
+    live_principals = Path(os.path.expanduser("~/.minni/principals"))
+    p_cc = resolve_effective_principal(
+        supplied_agent_id="claude-code",
+        transport="uds",
+        principals_dir=live_principals,
+    )
+    assert p_cc.agent_id == "claude-code"
+    assert p_cc.auto_accept_own is True
+
+    # 5. stage_candidate with auto_accept_own=True promotes synchronously
+    cfg = MinniConfig(
+        db_path=str(tmp_path / "minni.db"),
+        vault_path=str(tmp_path / "vault"),
+        faiss_index_path=str(tmp_path / "faiss.index"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        writeback_enabled=False,
+    )
+    (tmp_path / "vault").mkdir(parents=True, exist_ok=True)
+    db = MinniDB(cfg)
+
+    import numpy as np
+
+    class _DummyModel:
+        def encode(self, text: str, show_progress_bar: bool = False):
+            return np.ones(384, dtype=np.float32)
+
+    class _DummyWB:
+        def __init__(self, d, c):
+            self.db = d
+            self.config = c
+            self.model = _DummyModel()
+
+    wb = _DummyWB(db, cfg)
+    ctx = GovernanceContext(
+        make_error=lambda code, msg, rid: {"error": {"code": code, "message": msg}, "id": rid},
+        make_response=lambda res, rid: {"result": res, "id": rid},
+        handler_principal=lambda params, rid: (
+            EffectivePrincipal(
+                agent_id="claude-code",
+                capabilities=["search", "read", "learn", "resolve_candidate"],
+                auto_accept_own=True,
+            ),
+            None,
+        ),
+        lazy_writeback=lambda: wb,
+        lazy_episodic=lambda: None,
+        record_latency=lambda *a, **k: None,
+        index_durable_learning=lambda *a, **k: True,
+        maybe_archive_inbox_source=lambda *a, **k: None,
+        sovereign_db=lambda: db,
+    )
+    resp = stage_candidate(
+        {
+            "content": "Decision: keep SessionStart recent_learnings capped at 3 durable items.",
+            "category": "decision",
+            "origin": "agent",
+        },
+        request_id=1,
+        context=ctx,
+    )
+    res = resp["result"]
+    assert res["status"] == "accepted"
+    assert isinstance(res.get("learning_id"), int)
+
+
+def test_part3_compaction_summary_and_test_failure_chatter_blocked() -> None:
+    compaction_text = (
+        "Compaction summary — Key Technical Concepts: - Strict gate "
+        "`Tools/Scripts/local_merge_gate.sh --strict`."
+    )
+    failure_text = (
+        "Test failure recovered after edit: Created At: 2026-10-26T20:11:16-04:00\n"
+        "Completed At: 2026-10-26T20:11:20-04:00"
+    )
+
+    assert (
+        non_durable_promotion_blocker(content=compaction_text, category="general")
+        == "non_durable:noise"
+    )
+    assert (
+        non_durable_promotion_blocker(content=failure_text, category="pattern")
+        == "non_durable:noise"
+    )
+    assert is_low_signal_boot_learning(compaction_text) is True
+    assert is_low_signal_boot_learning(failure_text) is True
+
+
+def test_part3_needs_review_and_consolidation_review_stubs_excluded_across_all_4_indexers(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "claudecode-vault"
+    concepts = vault / "wiki" / "concepts"
+    concepts.mkdir(parents=True, exist_ok=True)
+
+    stub_file = (
+        concepts
+        / "20261028-candidate-9167-needs-review-afm-judge-inconclusive-model-unavailable-or-timed-ou-bc43b7.md"
+    )
+    stub_content = (
+        "---\n"
+        "title: Candidate #9167 needs review (afm_judge_inconclusive)\n"
+        "page_id: consolidation-review-9167-afm-123\n"
+        "type: concept\n"
+        "status: draft\n"
+        "privacy: review\n"
+        "---\n\n"
+        "# Candidate #9167 needs review\n\n"
+        "- Candidate #9167 held for operator review.\n"
+    )
+    stub_file.write_text(stub_content, encoding="utf-8")
+
+    good_file = concepts / "valid-architecture-concept.md"
+    good_file.write_text(
+        "---\n"
+        "title: Valid Architecture Concept\n"
+        "type: concept\n"
+        "status: accepted\n"
+        "privacy: safe\n"
+        "---\n\n"
+        "# Valid Architecture Concept\n\n"
+        "This is a legitimate concept page.\n",
+        encoding="utf-8",
+    )
+
+    cfg = MinniConfig(
+        db_path=str(tmp_path / "minni.db"),
+        vault_path=str(vault),
+        faiss_index_path=str(tmp_path / "faiss.index"),
+        graph_export_dir=str(tmp_path / "graphs"),
+    )
+    db = MinniDB(cfg)
+
+    # 1. VaultIndexer excludes stub and evicts any pre-existing row
+    with db.transaction() as c:
+        c.execute(
+            "INSERT INTO documents (path, agent, sigil, last_modified, indexed_at, page_status, privacy_level, page_type, layer) "
+            "VALUES (?, 'afm-loop', '❓', 1.0, 1.0, 'draft', 'review', 'concept', 'knowledge')",
+            (str(stub_file.resolve()),),
+        )
+        stale_doc_id = c.lastrowid
+        c.execute(
+            "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) VALUES (?, ?, 'stale', 'afm-loop', '❓')",
+            (stale_doc_id, str(stub_file.resolve())),
+        )
+
+    v_indexer = VaultIndexer(db, cfg, embed=False)
+    v_indexer.index_vault()
+
+    with db.cursor() as c:
+        paths = [r["path"] for r in c.execute("SELECT path FROM documents").fetchall()]
+        fts_paths = [r["path"] for r in c.execute("SELECT path FROM vault_fts").fetchall()]
+    assert not any("needs-review" in p for p in paths), f"VaultIndexer leaked stub: {paths}"
+    assert not any("needs-review" in p for p in fts_paths), f"VaultIndexer FTS leaked stub: {fts_paths}"
+    assert any("valid-architecture-concept.md" in p for p in paths)
+
+    # 2. WikiIndexer excludes stub
+    w_db = MinniDB(
+        MinniConfig(
+            db_path=str(tmp_path / "wiki.db"),
+            vault_path=str(vault),
+            faiss_index_path=str(tmp_path / "w_faiss.index"),
+            graph_export_dir=str(tmp_path / "graphs"),
+        )
+    )
+    w_indexer = WikiIndexer(w_db, w_db.config, embed=False)
+    w_indexer.index_wiki(str(vault / "wiki"))
+    with w_db.cursor() as c:
+        w_paths = [r["path"] for r in c.execute("SELECT path FROM documents").fetchall()]
+    assert not any("needs-review" in p for p in w_paths), f"WikiIndexer leaked stub: {w_paths}"
+    assert any("valid-architecture-concept.md" in p for p in w_paths)
+
+    # 3. VaultIngestPass excludes stub
+    vi_pass = VaultIngestPass(db=w_db, config=w_db.config, vault_path=str(vault), embed=True)
+    vi_res = vi_pass.run()
+    assert vi_res["status"] == "ok"
+    import sqlite3
+
+    v_idx_conn = sqlite3.connect(vi_res["index_db_path"])
+    try:
+        vi_paths = [r[0] for r in v_idx_conn.execute("SELECT path FROM documents").fetchall()]
+    finally:
+        v_idx_conn.close()
+    assert not any("needs-review" in p for p in vi_paths), f"VaultIngestPass leaked stub: {vi_paths}"
+
+    # 4. handle_vault_index_doc excludes stub
+    vi_ctx = VaultIndexContext(
+        make_error=lambda code, msg, rid: {"error": {"code": code, "message": msg}},
+        make_response=lambda res, rid: {"result": res},
+        make_mismatch_error=lambda s, st, rid: {"error": "mismatch"},
+        handler_principal=lambda p, rid: (EffectivePrincipal(agent_id="claude-code"), None),
+        guard_vault_root=lambda p, fp, rid, label="": None,
+        lazy_retrieval=lambda: None,
+        agent_vault=lambda aid: (vault, True),
+        record_latency=lambda *a, **k: None,
+    )
+    rpc_res = handle_vault_index_doc(
+        {
+            "content": stub_content,
+            "path": "wiki/concepts/20261028-candidate-9167-needs-review-afm-judge-inconclusive.md",
+            "vault_path": str(vault),
+        },
+        request_id=1,
+        context=vi_ctx,
+    )
+    assert rpc_res["result"]["status"] == "skipped"
+    assert rpc_res["result"]["indexed"] is False
+
+
+def test_part3_evict_candidate_to_cold_archive(tmp_path: Path) -> None:
+    cfg = MinniConfig(
+        db_path=str(tmp_path / "minni.db"),
+        vault_path=str(tmp_path / "vault"),
+        faiss_index_path=str(tmp_path / "faiss.index"),
+        graph_export_dir=str(tmp_path / "graphs"),
+    )
+    db = MinniDB(cfg)
+    with db.transaction() as c:
+        c.execute(
+            "INSERT INTO candidate_packets (principal, workspace_id, privacy_level, content, instruction_like, status, proposed_at) "
+            "VALUES ('claude-code', 'default', 'safe', '<cross-session-message from=\"peer\">probe</cross-session-message>', 1, 'proposed', 1700000000.0)"
+        )
+        cid = c.lastrowid
+        c.execute(
+            "INSERT INTO consolidation_actions (action_type, claim, category, status, detail, created_at) "
+            "VALUES ('afm_review', ?, 'general', 'pending', 'afm-consolidation review', 1700000001.0)",
+            (str(cid),),
+        )
+
+    assert hasattr(durable_projection, "evict_candidate_to_cold_archive")
+    out = durable_projection.evict_candidate_to_cold_archive(
+        db,
+        candidate_id=cid,
+        reason="rev6_noisy_proposed_cleanup",
+        archive_dir=tmp_path / "_archive",
+    )
+    assert out["evicted"] is True
+    assert Path(out["tombstone_path"]).exists()
+    with db.cursor() as c:
+        n = c.execute(
+            "SELECT COUNT(*) AS n FROM candidate_packets WHERE status='proposed'"
+        ).fetchone()["n"]
+        assert n == 0
+
+
+def test_wave1_scar_category_preserved_and_hook_bypass_blocked(tmp_path: Path) -> None:
+    from minni.writeback import CATEGORIES
+
+    assert "scar" in CATEGORIES
+    assert "gotcha" in CATEGORIES
+
+    cfg = MinniConfig(
+        db_path=str(tmp_path / "minni.db"),
+        vault_path=str(tmp_path / "vault"),
+        faiss_index_path=str(tmp_path / "faiss.index"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        writeback_enabled=False,
+    )
+    (tmp_path / "vault").mkdir(parents=True, exist_ok=True)
+    db = MinniDB(cfg)
+
+    import numpy as np
+
+    class _DummyModel:
+        def encode(self, text: str, show_progress_bar: bool = False):
+            return np.ones(384, dtype=np.float32)
+
+    class _DummyWB:
+        def __init__(self, d, c):
+            self.db = d
+            self.config = c
+            self.model = _DummyModel()
+
+    wb = _DummyWB(db, cfg)
+    ctx = GovernanceContext(
+        make_error=lambda code, msg, rid: {"error": {"code": code, "message": msg}, "id": rid},
+        make_response=lambda res, rid: {"result": res, "id": rid},
+        handler_principal=lambda params, rid: (
+            EffectivePrincipal(
+                agent_id="claude-code",
+                capabilities=["search", "read", "learn", "resolve_candidate"],
+                auto_accept_own=True,
+            ),
+            None,
+        ),
+        lazy_writeback=lambda: wb,
+        lazy_episodic=lambda: None,
+        record_latency=lambda *a, **k: None,
+        index_durable_learning=lambda *a, **k: True,
+        maybe_archive_inbox_source=lambda *a, **k: None,
+        sovereign_db=lambda: db,
+    )
+    resp = stage_candidate(
+        {
+            "content": "Root cause: unguarded /usr/bin/sample wedges when target pid is stuck in kernel task_suspend.",
+            "category": "scar",
+            "origin": "agent",
+        },
+        request_id=1,
+        context=ctx,
+    )
+    res = resp["result"]
+    assert res["status"] == "accepted"
+    with db.cursor() as c:
+        row = c.execute(
+            "SELECT category FROM learnings WHERE learning_id = ?",
+            (res["learning_id"],),
+        ).fetchone()
+        assert row["category"] == "scar", f"expected category='scar', got {row['category']}"
+
+    # Uncontextualized hook bypass workaround is blocked from auto-promotion
+    bypass_blocker = non_durable_promotion_blocker(
+        content="Fix: set GIT_BYPASS=1 git commit -m 'msg' when pre-commit hook blocks.",
+        category="fix",
+        origin="agent",
+    )
+    assert bypass_blocker == "non_durable:noise"
 

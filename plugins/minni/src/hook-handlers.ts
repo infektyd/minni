@@ -21,6 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { recordActiveSessionWorkspace } from "./config.js";
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
@@ -1572,8 +1573,19 @@ export function createHookHandlers(
   config: AgentHookConfig,
   deps: AgentHookDeps = {},
 ): AgentHookHandlers {
-  const workspaceFor = (payload: Record<string, unknown>): string =>
-    workspaceFromPayload(payload, config.defaultWorkspaceId);
+  const workspaceFor = (payload: Record<string, unknown>): string => {
+    const resolved = workspaceFromPayload(payload, config.defaultWorkspaceId);
+    const hasExplicitPayloadWorkspace = Boolean(
+      asString(payload.workspace_id) ||
+        asString(payload.workspaceId) ||
+        asString(payload.cwd) ||
+        asString(payload.working_directory),
+    );
+    if (hasExplicitPayloadWorkspace && resolved && resolved !== "workspace-unknown") {
+      recordActiveSessionWorkspace(config.vaultPath, resolved, config.agentId);
+    }
+    return resolved;
+  };
   const bootIdentity = config.bootIdentity ?? "agent-context";
   const prepareOutcomeFn = deps.prepareOutcome ?? prepareOutcome;
   const wire = config.wire ?? wireFor(config.agentId);
@@ -2438,8 +2450,12 @@ export function createHookHandlers(
       }
     }
 
-    const isSkip = promptEnvelope?.kind === "skip";
     const recallQuery = promptEnvelope ? promptEnvelope.body : prompt;
+    const isSelfMonitorTick = /^Self-monitor tick\s*\(/i.test(recallQuery.trim());
+    const isSkip =
+      promptEnvelope?.kind === "skip" ||
+      promptEnvelope?.kind === "scheduled" ||
+      isSelfMonitorTick;
     const envelopeAuditDetails = promptEnvelope
       ? {
           envelope_kind: promptEnvelope.kind,
@@ -3270,11 +3286,11 @@ export function createHookHandlers(
   async function stopOutput(payload: Record<string, unknown>, result: HookOutput): Promise<HookOutput> {
 
     let correctionsEnvelope = "";
-    // Only attempt when Stop can actually inject — parking only happens when
-    // SessionStart cannot, and today that is Grok Build; probing canInject
-    // keeps the route honest if another wire gains a structural SessionStart
-    // drop later.
-    if (canInject(wire, "Stop")) {
+    // Only attempt when Stop can actually inject — parking happens when
+    // SessionStart cannot (e.g. Grok Build), or when a parked correction entry
+    // is already waiting in inbox/.undeliverable. Guarding against
+    // stop_hook_active prevents re-injecting on a Stop continuation loop.
+    if (canInject(wire, "Stop") && payload.stop_hook_active !== true) {
       // Unbudgeted local FS: same as SessionStart reassert. Absence loses data.
       const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3);
       if (parkedPending.length > 0) {
@@ -3341,29 +3357,31 @@ export function createHookHandlers(
     }
 
     let pendingStopText = "";
-    try {
-      const planId = await activePlanIdFromVault(config.vaultPath);
-      const pending = await pendingAttentionForHook({
-        vaultPath: config.vaultPath,
-        subscriberId: config.agentId,
-        planId,
-      });
-      if (pending && planId) {
-        pendingStopText = pending.text;
-        const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
-        if (lastSeq !== undefined) {
-          confirmPendingIfInjects({
-            vaultPath: config.vaultPath,
-            subscriberId: config.agentId,
-            planId,
-            lastSeq,
-            hostId: wire.id,
-            hook: "stop",
-          });
+    if (deliverySucceededForHostHook(wire.id, "stop") && payload.stop_hook_active !== true) {
+      try {
+        const planId = await activePlanIdFromVault(config.vaultPath);
+        const pending = await pendingAttentionForHook({
+          vaultPath: config.vaultPath,
+          subscriberId: config.agentId,
+          planId,
+        });
+        if (pending && planId) {
+          pendingStopText = pending.text;
+          const lastSeq = pending.notifications[pending.notifications.length - 1]?.seq;
+          if (lastSeq !== undefined) {
+            confirmPendingIfInjects({
+              vaultPath: config.vaultPath,
+              subscriberId: config.agentId,
+              planId,
+              lastSeq,
+              hostId: wire.id,
+              hook: "stop",
+            });
+          }
         }
+      } catch {
+        // Relay is not SoT.
       }
-    } catch {
-      // Relay is not SoT.
     }
 
     if (correctionsEnvelope || pendingStopText) {

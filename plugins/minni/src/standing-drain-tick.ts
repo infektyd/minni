@@ -7,6 +7,7 @@
  * Standing drain must not apply a live start in the accept→reserve window
  * while the acceptor is live — that yield lives on the apply entry.
  */
+import { expandTilde } from "./config.js";
 import { drainPendingWorkerWritesForVault } from "./thread-worker.js";
 
 export const STANDING_DRAIN_TRIGGER = "minnid tick" as const;
@@ -14,7 +15,7 @@ export const STANDING_DRAIN_TRIGGER = "minnid tick" as const;
 export async function minnidStandingDrainTick(
   vaultPath: string,
 ): Promise<{ planIds: string[] }> {
-  return drainPendingWorkerWritesForVault(vaultPath);
+  return drainPendingWorkerWritesForVault(expandTilde(vaultPath));
 }
 
 function invokedAsCli(): boolean {

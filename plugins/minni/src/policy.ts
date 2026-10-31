@@ -371,6 +371,21 @@ export function detectSecretMaterial(content: string): string | null {
     const spans = slashes >= 2 ? rawSpan.split("/") : [rawSpan];
     for (const span of spans) {
       if (span.length < 24) continue;
+      // Hyphenated date-prefixed filenames/slugs (e.g. `2026-10-28-gate-stability-HANDOFF`)
+      // or multi-hyphen identifier slugs where each hyphen-separated word is short and
+      // lacks mixed-case+digit entropy within a single segment are prose identifiers, not secrets.
+      const hyphenParts = span.split("-");
+      if (
+        hyphenParts.length >= 4 &&
+        hyphenParts.every(
+          (part) =>
+            part.length > 0 &&
+            part.length < 20 &&
+            !(/[a-z]/.test(part) && /[A-Z]/.test(part) && /[0-9]/.test(part)),
+        )
+      ) {
+        continue;
+      }
       const hasLower = /[a-z]/.test(span);
       const hasUpper = /[A-Z]/.test(span);
       const hasDigit = /[0-9]/.test(span);

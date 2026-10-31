@@ -74,6 +74,9 @@ EXCLUDED_PATH_SEGMENTS: frozenset[str] = frozenset(
 
 _SESSION_DATED_FILE_RE = re.compile(r"^\d{8}-")
 _LOG_ROTATED_FILENAME_RE = re.compile(r"^log(?:\.\d+)?\.md$", re.IGNORECASE)
+_CANDIDATE_NEEDS_REVIEW_FILENAME_RE = re.compile(
+    r"(?:^|-)candidate-\d+-needs-review-", re.IGNORECASE
+)
 
 
 def extract_explicit_frontmatter_status(content: str) -> Optional[str]:
@@ -91,6 +94,21 @@ def extract_explicit_frontmatter_status(content: str) -> Optional[str]:
     return None
 
 
+def extract_explicit_frontmatter_page_id(content: str) -> Optional[str]:
+    """Return the explicitly declared YAML frontmatter `page_id` (lowercased), or None if absent."""
+    match = VaultIndexer.FRONTMATTER_BLOCK_RE.match(content or "")
+    if not match:
+        return None
+    try:
+        data = yaml.safe_load(match.group(1))
+        if isinstance(data, dict) and data.get("page_id") is not None:
+            val = str(data.get("page_id")).strip().strip("\"'").lower()
+            return val or None
+    except Exception:
+        pass
+    return None
+
+
 def explicit_frontmatter_status(content: Optional[str]) -> Optional[str]:
     return extract_explicit_frontmatter_status(content or "")
 
@@ -100,10 +118,12 @@ def is_curated_indexable_path(
     content: Optional[str] = None,
 ) -> bool:
     explicit_st = extract_explicit_frontmatter_status(content or "") if content else None
+    explicit_pid = extract_explicit_frontmatter_page_id(content or "") if content else None
     excluded, _ = is_vault_path_excluded(
         rel_path,
         None,
         explicit_status=explicit_st,
+        explicit_page_id=explicit_pid,
         allow_artifact_retraction=(explicit_st == "complete"),
     )
     if excluded:
@@ -128,6 +148,7 @@ def is_vault_path_excluded(
     root_dir: str | Path | None = None,
     *,
     explicit_status: Optional[str] = None,
+    explicit_page_id: Optional[str] = None,
     is_rpc: bool = False,
     allow_artifact_retraction: bool = False,
 ) -> tuple[bool, str]:
@@ -164,6 +185,15 @@ def is_vault_path_excluded(
         return True, "excluded_log_md"
     if "-compact-" in fname and fname.endswith(".md"):
         return True, "excluded_compact_md"
+    if (
+        bool(_CANDIDATE_NEEDS_REVIEW_FILENAME_RE.search(fname))
+        or fname.startswith("consolidation-review-")
+        or (
+            explicit_page_id is not None
+            and explicit_page_id.strip().lower().startswith("consolidation-review-")
+        )
+    ):
+        return True, "excluded_consolidation_review_stub"
 
     for seg in dir_segments:
         if seg in EXCLUDED_PATH_SEGMENTS:
@@ -384,12 +414,17 @@ class VaultIndexer:
         for row in rows:
             stored = row["path"]
             try:
-                resolved = str(Path(stored).resolve())
+                candidate = (
+                    (vault_root / stored)
+                    if (stored and not os.path.isabs(stored) and "://" not in stored)
+                    else Path(stored)
+                )
+                resolved = str(candidate.resolve())
             except Exception:
                 continue
             if resolved == stored:
                 continue
-            if not path_within_root(stored, vault_root):
+            if not path_within_root(candidate, vault_root):
                 continue
             prior = out.get(resolved)
             if prior is not None and prior["doc_id"] != row["doc_id"]:
@@ -493,6 +528,15 @@ class VaultIndexer:
                     ) or 0.0
                 ) if row else 0.0
                 if row and last_modified >= mtime:
+                    fast_excluded, _ = is_vault_path_excluded(
+                        path,
+                        root_dir=vault_root,
+                        is_rpc=False,
+                        allow_artifact_retraction=True,
+                    )
+                    if fast_excluded and "artifacts" not in [seg.lower() for seg in Path(path).parts]:
+                        stats["deleted"] += self._delete_doc_rows(row["doc_id"])
+                        continue
                     # The FILE is unchanged, but that does not mean the row
                     # satisfies the no-embed invariant. An install that ever
                     # hand-ran the old index_all embedded every page, drafts
@@ -526,10 +570,12 @@ class VaultIndexer:
                     content = f.read()
 
                 explicit_status = extract_explicit_frontmatter_status(content)
+                explicit_page_id = extract_explicit_frontmatter_page_id(content)
                 path_excluded, _ = is_vault_path_excluded(
                     path,
                     root_dir=vault_root,
                     explicit_status=explicit_status,
+                    explicit_page_id=explicit_page_id,
                     is_rpc=False,
                     allow_artifact_retraction=bool(row),
                 )
@@ -706,17 +752,24 @@ class VaultIndexer:
                 # Resolve before the membership test (same as wiki_indexer):
                 # disk_files is keyed on resolved paths, so a row stored under a
                 # non-canonical spelling of a file that DOES exist -- a symlink,
-                # an unnormalized absolute path -- would miss the raw comparison,
-                # pass the ownership check, and be deleted. Compare both forms.
+                # an unnormalized absolute path, or a legacy vault-relative path --
+                # would miss the raw comparison, pass the ownership check, and be
+                # deleted. Compare both forms.
                 try:
-                    resolved = str(Path(path).resolve())
+                    candidate = (
+                        (vault_root / path)
+                        if (path and not os.path.isabs(path) and "://" not in path)
+                        else Path(path)
+                    )
+                    resolved = str(candidate.resolve())
                 except Exception:
+                    candidate = Path(path) if path else Path()
                     resolved = path
                 if path in disk_files or resolved in disk_files:
                     continue
-                if not path_within_root(path, vault_root):
+                if not path_within_root(candidate, vault_root):
                     continue
-                if path_within_root(path, durable_root):
+                if path_within_root(candidate, durable_root):
                     continue
                 to_delete.append((row["doc_id"],))
                 stats["deleted"] += 1

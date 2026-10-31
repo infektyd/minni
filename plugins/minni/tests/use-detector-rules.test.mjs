@@ -624,3 +624,63 @@ test("tokenisation matches the ledger exactly (lowercase, then match): İstanbul
   });
   assert.equal(finalJudged(s.vault, row.sid).outcome, "applied", "every shingle spans the dotted capital");
 });
+
+test("Class G: daemon _durable/ hit (doc:personal:<id>) cited via [[agent__<16hex>]] or bare stem or m:<8hex> handle is detected as cited_handle, and minni_drill opens it", async (t) => {
+  const durableStem = "claude-code__21e233a9a944a28a";
+  const mHandle = vaultHandle(`_durable/${durableStem}.md`);
+
+  for (const reply of [
+    `Per [[${durableStem}]], we must verify the gate before promoting.`,
+    `Per ${durableStem}, we must verify the gate before promoting.`,
+    `Per (${mHandle}), we must verify the gate before promoting.`,
+  ]) {
+    const s = await setup(t);
+    const [row] = await turn(s, 1, {
+      prompt: "Check the promotion rules.",
+      rows: (p) => [
+        surfacedRow({
+          mkey: "doc:personal:42",
+          title: durableStem,
+          handles: ["d:personal:42"],
+          promptId: p,
+          ts: s.clock.next(10),
+        }),
+      ],
+      replies: [reply],
+    });
+    const judged = finalJudged(s.vault, row.sid);
+    assert.equal(
+      judged.outcome,
+      "cited_handle",
+      `Class G: daemon _durable/ hit must detect handle citation for: ${reply} (got ${judged.outcome})`,
+    );
+    assert.ok(judged.evidence.includes("handle"));
+  }
+
+  for (const drillArgs of [
+    { wikilink: `[[${durableStem}]]`, depth: "snippet" },
+    { handle: mHandle, depth: "snippet" },
+  ]) {
+    const s = await setup(t);
+    const [row] = await turn(s, 1, {
+      prompt: "Check the promotion rules.",
+      rows: (p) => [
+        surfacedRow({
+          mkey: "doc:personal:42",
+          title: durableStem,
+          handles: ["d:personal:42"],
+          promptId: p,
+          ts: s.clock.next(10),
+        }),
+      ],
+      tools: [["mcp__minni__minni_drill", drillArgs]],
+      replies: ["Checked the durable note."],
+    });
+    const judged = finalJudged(s.vault, row.sid);
+    assert.equal(
+      judged.outcome,
+      "opened",
+      `Class G: minni_drill(${JSON.stringify(drillArgs)}) must open daemon _durable/ hit (got ${judged.outcome})`,
+    );
+  }
+});

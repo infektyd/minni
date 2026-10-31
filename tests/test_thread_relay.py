@@ -311,3 +311,19 @@ def test_worker_only_journal_seeds_vault_principal_or_stays_empty(tmp_path):
     worker_pending = [item for item in closed_store["pending"] if item["subscriber_id"] == worker]
     assert worker_pending, "writer is still seeded as the append actor"
 
+
+def test_class_a_claude_code_host_table_and_acknowledge_through_seq(tmp_path: Path):
+    assert host_hook_injects("claude-code", "sessionStart") is True
+    assert host_hook_injects("claude-code", "promptSubmit") is True
+    assert host_hook_injects("claude-code", "stop") is False
+    assert host_hook_injects("claude", "sessionStart") is True
+    assert host_hook_injects("claude", "stop") is False
+
+    plan_id = "plan-g3-relay"
+    ingest_journal_into_vault(tmp_path, plan_id, EVENTS, ["claude-code"])
+    ack_fn = getattr(thread_relay, "acknowledge_relay_through_seq", None)
+    assert callable(ack_fn)
+    updated = ack_fn(tmp_path, plan_id, 3, ["claude-code"])
+    cursor = next(c for c in updated["cursors"] if c["subscriber_id"] == "claude-code")
+    assert cursor["last_delivered_seq"] == 3
+    assert [p for p in updated["pending"] if p["subscriber_id"] == "claude-code"] == []

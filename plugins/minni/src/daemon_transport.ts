@@ -6,7 +6,7 @@ import { stat, readdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
-import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, minniHome, resolveActiveVaultPath, SOCKET_PATH } from "./config.js";
+import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, expandTilde, minniHome, resolveActiveVaultPath, SOCKET_PATH } from "./config.js";
 import {
   daemonAfmToProviderHealth,
   daemonEffectiveAfmProvider,
@@ -31,7 +31,7 @@ import {
 } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 import { durabilityOf } from "./durability.js";
-import { readSessionHandle } from "./recall-state.js";
+import { readSessionHandle, vaultHandleForPath } from "./recall-state.js";
 
 export interface JsonResult<T = unknown> {
   ok: boolean;
@@ -738,10 +738,10 @@ export type JsonRpcRequester = (
   options?: JsonRpcRequestOptions,
 ) => Promise<JsonResult>;
 
-function jsonRpcSocketCandidates(): string[] {
+export function jsonRpcSocketCandidates(): string[] {
   const envSock =
     process.env.MINNI_SOCKET_PATH?.trim() || process.env.MINNI_DAEMON_SOCKET?.trim();
-  if (envSock) return [envSock];
+  if (envSock) return [expandTilde(envSock)];
   if (process.env.MINNI_HOME?.trim()) {
     return [path.join(minniHome(), "run", "minnid.sock")];
   }
@@ -924,6 +924,7 @@ export interface DrillMemoryInput {
   depth?: "snippet" | "chunk" | "document";
   vaultPath?: string;
   sessionId?: string;
+  agentId?: string;
 }
 
 function xmlAttrEscapeDrill(value: string): string {
@@ -932,6 +933,14 @@ function xmlAttrEscapeDrill(value: string): string {
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function formatLocalDrillBody(body: string, depth: DrillMemoryInput["depth"]): string {
+  const effectiveDepth = depth ?? "snippet";
+  if (effectiveDepth === "document") return body;
+  const maxChars = effectiveDepth === "chunk" ? 1600 : 500;
+  if (body.length <= maxChars) return body;
+  return `${body.slice(0, maxChars)}…`;
 }
 
 async function resolveSqliteHandleNote(
@@ -1246,7 +1255,8 @@ export async function drillMemory(
               sessionEntry,
             );
             if (sqliteResolved) {
-              const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${sqliteResolved.content}\n</EVIDENCE>`;
+              const clipped = formatLocalDrillBody(sqliteResolved.content, input.depth);
+              const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqliteResolved.source)}">\n${clipped}\n</EVIDENCE>`;
               localResults.push({
                 handle: normalizedHandle,
                 status: "resolved",
@@ -1254,9 +1264,7 @@ export async function drillMemory(
                 relativePath: sqliteResolved.source,
                 source: sqliteResolved.source,
                 title: sqliteResolved.title,
-                text: wrapped,
                 content: wrapped,
-                raw_content: sqliteResolved.content,
               });
               continue;
             }
@@ -1269,7 +1277,8 @@ export async function drillMemory(
           });
           continue;
         }
-        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
+        const clipped = formatLocalDrillBody(resolved.content, input.depth);
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${clipped}\n</EVIDENCE>`;
         localResults.push({
           handle: normalizedHandle,
           status: "resolved",
@@ -1278,9 +1287,7 @@ export async function drillMemory(
           relativePath: resolved.relativePath,
           source: resolved.relativePath,
           title: resolved.title,
-          text: wrapped,
           content: wrapped,
-          raw_content: resolved.content,
         });
         continue;
       }
@@ -1341,7 +1348,6 @@ export async function drillMemory(
           data: {
             ...first,
             results: localResults,
-            items: localResults,
           },
         };
       }
@@ -1352,7 +1358,6 @@ export async function drillMemory(
           ...first,
           missing: [],
           results: localResults,
-          items: localResults,
         },
       };
     }
@@ -1402,7 +1407,6 @@ export async function drillMemory(
             ? { source_unverified: firstMeta.source_unverified }
             : {}),
           results: combinedResults,
-          items: combinedResults,
         },
       };
     }
@@ -1423,7 +1427,8 @@ export async function drillMemory(
           allSqliteResolved = false;
           break;
         }
-        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqlHit.source)}">\n${sqlHit.content}\n</EVIDENCE>`;
+        const clipped = formatLocalDrillBody(sqlHit.content, input.depth);
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(sqlHit.source)}">\n${clipped}\n</EVIDENCE>`;
         localResults.push({
           handle: meta.handle,
           status: "resolved",
@@ -1431,9 +1436,7 @@ export async function drillMemory(
           relativePath: sqlHit.source,
           source: sqlHit.source,
           title: sqlHit.title,
-          text: wrapped,
           content: wrapped,
-          raw_content: sqlHit.content,
         });
       }
       if (allSqliteResolved && localResults.length > 0) {
@@ -1444,7 +1447,6 @@ export async function drillMemory(
             ...localResults[0],
             missing: [],
             results: localResults,
-            items: localResults,
           },
         };
       }
@@ -1463,21 +1465,59 @@ export async function drillMemory(
           ? { source_unverified: firstMeta.source_unverified }
           : {}),
         results: localResults,
-        items: localResults,
       },
     };
   }
 
-  return jsonRpcSocketRequestWithFallbackRequester(
+  const rpcRes = (await jsonRpcSocketRequestWithFallbackRequester(
     "sm_drill",
     {
       result_ids: input.resultIds,
       chunk_ids: input.chunkIds,
-      references: input.references,
+      references: rawRefs.length > 0 ? rawRefs : input.references,
       depth: input.depth ?? "snippet",
+      ...(input.agentId
+        ? { agent_id: input.agentId }
+        : config?.agentId
+          ? { agent_id: config.agentId }
+          : {}),
     },
     requester,
-  ) as Promise<JsonResult<Record<string, unknown>>>;
+  )) as JsonResult<Record<string, unknown>>;
+
+  if (!rpcRes.ok && rawRefs.length > 0 && rawRefs.every((r) => typeof r === "string")) {
+    const fallbackResults: Array<Record<string, unknown>> = [];
+    for (const rawRef of rawRefs) {
+      const refStr = String(rawRef).trim();
+      const derivedHandle = vaultHandleForPath(refStr);
+      const resolved = await resolveSafeVaultHandleNote(effectiveVaultPath, derivedHandle);
+      if (resolved.status === "resolved") {
+        const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
+        fallbackResults.push({
+          wikilink: resolved.wikilink,
+          relativePath: resolved.relativePath,
+          source: resolved.relativePath,
+          title: resolved.title,
+          status: "resolved",
+          found: true,
+          content: wrapped,
+        });
+      }
+    }
+    if (fallbackResults.length > 0) {
+      return {
+        ok: true,
+        source: "vault-fallback",
+        data: {
+          ...fallbackResults[0],
+          missing: [],
+          results: fallbackResults,
+        },
+      };
+    }
+  }
+
+  return rpcRes;
 }
 
 export async function exportContextPack(

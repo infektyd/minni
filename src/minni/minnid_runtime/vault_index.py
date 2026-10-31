@@ -96,6 +96,7 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
 
     from minni.indexer import (
         UNEMBEDDED_STATUSES,
+        extract_explicit_frontmatter_page_id,
         extract_explicit_frontmatter_status,
         is_vault_path_excluded,
     )
@@ -128,10 +129,12 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
             return False
 
     explicit_status = extract_explicit_frontmatter_status(content)
+    explicit_page_id = extract_explicit_frontmatter_page_id(content)
     path_excluded, path_reason = is_vault_path_excluded(
         full_path,
         root_dir=vault_path,
         explicit_status=explicit_status,
+        explicit_page_id=explicit_page_id,
         is_rpc=True,
     )
     if path_excluded:
@@ -172,9 +175,24 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
 
     try:
         engine = context.lazy_retrieval()
+        # Retract any legacy relative-path row so canonical full_path does not duplicate it
+        try:
+            db_obj = getattr(engine, "db", None)
+            if db_obj is not None and str(rel_path) != str(full_path):
+                with db_obj.transaction() as c:
+                    rel_rows = c.execute(
+                        "SELECT doc_id FROM documents WHERE path = ?", (rel_path,)
+                    ).fetchall()
+                    for r in rel_rows:
+                        did = int(r["doc_id"] if hasattr(r, "keys") else r[0])
+                        c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (did,))
+                        c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (did,))
+                        c.execute("DELETE FROM documents WHERE doc_id = ?", (did,))
+        except Exception:
+            pass
         result = engine.index_durable_document(
             content=content,
-            path=rel_path,
+            path=str(full_path),
             agent=agent,
             sigil=sigil,
             privacy_level=privacy_level,

@@ -75,6 +75,7 @@ import {
   readSessionLedger,
   shingleHashOf,
   SHINGLE_WORDS,
+  vaultHandle,
   type EvidenceKind,
   type LedgerContext,
   type LedgerRow,
@@ -1706,7 +1707,32 @@ function profileFor(core: MemoryCore, df: DfSnapshot | null): Profile {
     profile.names.push(new RegExp(`\\blearning\\s*#\\s*${escapeRegExp(id)}(?![\\p{L}\\p{N}])`, "iu"));
   } else {
     const doc = /^doc:([^:]+):(.+)$/.exec(core.mkey);
-    if (doc) profile.doc = { src: doc[1] as string, id: doc[2] as string };
+    if (doc) {
+      profile.doc = { src: doc[1] as string, id: doc[2] as string };
+      // Class G: daemon `_durable/` projections and slug-titled daemon hits are
+      // surfaced in another vault (e.g. `~/.minni/claudecode-vault`) as
+      // `doc:<src>:<id>` with `title` set to the durable stem (e.g.
+      // `claude-code__21e233a9a944a28a` or `<id>-<slug>`). Agents cite them as
+      // `[[claude-code__21e233a9a944a28a]]`, bare stem, or `m:<8hex>`.
+      const cleanStem = fullTitle.replace(/^\[\[|\]\]$/g, "").replace(/\.md$/i, "").trim();
+      if (
+        cleanStem.length >= MIN_SLUG_CHARS &&
+        /^[A-Za-z0-9][A-Za-z0-9_/-]*(?:__[0-9a-f]{8,64}|[-_][A-Za-z0-9_-]+)$/i.test(cleanStem)
+      ) {
+        const bareStem = path.posix.basename(cleanStem);
+        profile.names.push(boundedName(cleanStem, "(?:\\.md)?"));
+        if (bareStem !== cleanStem && bareStem.length >= MIN_SLUG_CHARS) {
+          profile.names.push(boundedName(bareStem, "(?:\\.md)?"));
+        }
+        for (const relCandidate of [
+          `${cleanStem}.md`,
+          `_durable/${bareStem}.md`,
+          `wiki/${cleanStem}.md`,
+        ]) {
+          profile.names.push(boundedName(vaultHandle(relCandidate)));
+        }
+      }
+    }
   }
   return profile;
 }

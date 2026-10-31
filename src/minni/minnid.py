@@ -499,6 +499,26 @@ def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:
             content=content,
         )
         engine.purge_durable_document(path)
+        if isinstance(content, str) and content.startswith("learning:"):
+            lid_tail = content.split(":", 1)[1].strip()
+            if lid_tail.isdigit():
+                try:
+                    with db.cursor() as c:
+                        row = c.execute(
+                            "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                            (int(lid_tail),),
+                        ).fetchone()
+                        if row is not None and row["content"]:
+                            alt_path = _durable_doc_path(
+                                str(row["agent_id"] or agent_id),
+                                f"learning:{row['content']}",
+                                vault_path=engine.config.vault_path,
+                                content=str(row["content"]),
+                            )
+                            if alt_path != path:
+                                engine.purge_durable_document(alt_path)
+                except Exception:
+                    pass
     except Exception as exc:
         logger.warning(
             "durable purge: synthetic-doc purge failed for agent=%s (%s) — "

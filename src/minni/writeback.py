@@ -49,6 +49,8 @@ CATEGORIES = {
     "procedure":    "Step-by-step procedures that worked",
     "architecture": "Architectural invariants, boundaries, and structural decisions",
     "codebase":     "Codebase structure, file locations, and module layouts",
+    "scar":         "Operational failure modes, regressions, and debugging scars",
+    "gotcha":       "Subtle traps, edge cases, and non-obvious failure modes",
     "general":      "Uncategorized learning",
 }
 

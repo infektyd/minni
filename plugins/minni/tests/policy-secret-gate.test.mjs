@@ -106,6 +106,8 @@ test("high-entropy opaque strings block; SHAs, digests, paths, URLs do not", () 
     "run github.com/Infektyd/Minni/actions/runs/28714837391",
     // Codex P2 round 5 (PR #146): pypi- kebab slugs are vocabulary, not tokens.
     "see pypi-trusted-publisher-lowercase-claim and pypi-token-rotation-runbook-entry",
+    // Date-prefixed hyphenated handoff/artifact filenames are not opaque secrets.
+    "see handoff note 2026-10-28-gate-stability-HANDOFF.md and 2026-10-28-gate-stability-part3.sh",
   ];
   for (const content of benign) {
     assert.equal(detectSecretMaterial(content), null, content.slice(0, 50));

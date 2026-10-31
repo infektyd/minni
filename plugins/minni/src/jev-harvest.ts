@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+import { expandTilde } from "./config.js";
 import { durabilityOf } from "./durability.js";
 import { asString, inboxPrincipalForVaultPath } from "./hook-utils.js";
 import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial } from "./policy.js";
@@ -748,8 +749,8 @@ const SESSION_CHATTER_PATTERNS: ReadonlyArray<RegExp> = [
   /\b\d+\s*\/\s*\d+\s+(?:tests?\s+|specs?\s+|suites?\s+)?(?:pass(?:ed|ing)?|green)\b/i,
   /\b\d+\s+(?:tests?\s+|specs?\s+|suites?\s+)?(?:pass(?:ed|ing)|green)\b/i,
   /\ball\s+\d+\s+tests?\s+pass(?:ed|ing)?\b/i,
-  /\b(?:phase|slice|sprint|wave|workstream|step)\s+[a-z0-9._-]+\s+(?:is\s+|are\s+)?(?:complete(?:d)?|done|finished|shipped|landed|green|verified)\b/i,
-  /\b(?:complete(?:d)?|finished|shipped|landed|verified)\s+(?:phase|slice|sprint|wave|workstream|step)\s+[a-z0-9._-]+\b/i,
+  /\b(?:phase|slice|sprint|wave|workstream|step)\s+(?:\d+[a-z0-9_.-]*|[a-z]\d+[a-z0-9_.-]*|[a-z0-9]+[-_][a-z0-9_.-]+)\s+(?:is\s+|are\s+)?(?:complete(?:d)?|done|finished|shipped|landed|green|verified)\b/i,
+  /\b(?:complete(?:d)?|finished|shipped|landed|verified)\s+(?:phase|slice|sprint|wave|workstream|step)\s+(?:\d+[a-z0-9_.-]*|[a-z]\d+[a-z0-9_.-]*|[a-z0-9]+[-_][a-z0-9_.-]+)\b/i,
   /\b(?:pushed|committed|merged|landed)\s+(?:commit\s+|sha\s+|branch\s+|pr\s+#?\d+\s+)?(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/i,
   /\bcommit\s+(?=[0-9a-f]*\d)[0-9a-f]{7,40}\s+(?:(?:was|is|has\s+been)\s+)?(?:pushed|merged|landed)\b/i,
 ];
@@ -762,17 +763,17 @@ export function isSessionStatusChatter(text: string): boolean {
 export function resolveSessionHandoffsDir(vaultPath: string): string {
   const envDir = process.env.MINNI_SESSION_HANDOFFS_DIR;
   if (typeof envDir === "string" && envDir.trim().length > 0) {
-    return path.resolve(envDir.trim());
+    return path.resolve(expandTilde(envDir.trim()));
   }
   const dotMinni =
     typeof process.env.MINNI_HOME === "string" && process.env.MINNI_HOME.trim().length > 0
-      ? path.resolve(process.env.MINNI_HOME.trim())
+      ? path.resolve(expandTilde(process.env.MINNI_HOME.trim()))
       : path.resolve(os.homedir(), ".minni");
-  const resolvedVault = path.resolve(vaultPath);
+  const resolvedVault = path.resolve(expandTilde(vaultPath));
   if (resolvedVault === dotMinni || resolvedVault.startsWith(dotMinni + path.sep)) {
     return path.join(dotMinni, "session_handoffs");
   }
-  return path.join(vaultPath, ".runtime", "session_handoffs");
+  return path.join(expandTilde(vaultPath), ".runtime", "session_handoffs");
 }
 
 export type JevTriageVerdict = boolean | { durable?: boolean; accept?: boolean; verdict?: string };
@@ -904,13 +905,16 @@ export async function executeLearnPipeline(input: {
   const dotMinni = path.resolve(os.homedir(), ".minni");
   const resolvedVault = path.resolve(vaultPath);
   const isDefaultVault = resolvedVault === dotMinni || resolvedVault.startsWith(dotMinni + path.sep);
-  const effectiveSocketPath =
+  const rawEffectiveSocketPath =
     input.socketPath ??
     process.env.MINNI_SOCKET_PATH?.trim() ??
     process.env.MINNI_DAEMON_SOCKET?.trim() ??
     (!isDefaultVault && !process.env.MINNI_HOME?.trim()
       ? path.join(vaultPath, ".runtime", "minnid.sock")
       : undefined);
+  const effectiveSocketPath = rawEffectiveSocketPath
+    ? expandTilde(rawEffectiveSocketPath)
+    : undefined;
 
   const doLearnMemory = input.learnMemoryFn ?? learnMemory;
   const store = await doLearnMemory({

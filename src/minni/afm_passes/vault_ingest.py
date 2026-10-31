@@ -257,6 +257,22 @@ def _index_changed_pages(
                     ) or 0.0
                 ) if row else 0.0
                 if row and mtime <= indexed_at:
+                    from minni.indexer import is_vault_path_excluded
+
+                    fast_excluded, fast_reason = is_vault_path_excluded(
+                        path,
+                        root_dir=wiki_root,
+                        is_rpc=False,
+                        allow_artifact_retraction=True,
+                    )
+                    if fast_excluded and fast_reason == "excluded_consolidation_review_stub":
+                        doc_id = int(row["doc_id"])
+                        _delete_doc_payload(c, doc_id)
+                        c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                        stats["excluded"] += 1
+                        stats.setdefault("pruned", 0)
+                        stats["pruned"] += 1
+                        continue
                     stats["skipped_unchanged"] += 1
                     continue
 
@@ -268,10 +284,12 @@ def _index_changed_pages(
                 from minni.indexer import is_vault_path_excluded
 
                 explicit_status = page.frontmatter.raw.get("status") if page.frontmatter.raw else None
-                path_excluded, _ = is_vault_path_excluded(
+                explicit_page_id = page.frontmatter.raw.get("page_id") if page.frontmatter.raw else None
+                path_excluded, path_reason = is_vault_path_excluded(
                     path,
                     root_dir=wiki_root,
                     explicit_status=explicit_status,
+                    explicit_page_id=str(explicit_page_id) if explicit_page_id is not None else None,
                     is_rpc=False,
                     allow_artifact_retraction=bool(row),
                 )
@@ -281,16 +299,20 @@ def _index_changed_pages(
                     stats["excluded"] += 1
                     if row:
                         doc_id = int(row["doc_id"])
-                        c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
-                        c.execute(
-                            "DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
-                        )
-                        c.execute(
-                            """UPDATE documents
-                               SET page_status=?, last_modified=?, indexed_at=?
-                               WHERE doc_id=?""",
-                            (page.frontmatter.status, mtime, time.time(), doc_id),
-                        )
+                        if path_reason == "excluded_consolidation_review_stub":
+                            _delete_doc_payload(c, doc_id)
+                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                        else:
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute(
+                                "DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
+                            )
+                            c.execute(
+                                """UPDATE documents
+                                   SET page_status=?, last_modified=?, indexed_at=?
+                                   WHERE doc_id=?""",
+                                (page.frontmatter.status, mtime, time.time(), doc_id),
+                            )
                         stats.setdefault("excluded_purged", 0)
                         stats["excluded_purged"] += 1
                     continue

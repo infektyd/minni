@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ export const PLUGIN_ROOT = path.resolve(__dirname, "..");
  * socket + vault lookups fail. Expand centrally so every consumer gets an
  * absolute path.
  */
-function expandTilde(p: string): string {
+export function expandTilde(p: string): string {
   return p.replace(/^~(?=$|\/)/, os.homedir());
 }
 
@@ -24,7 +24,7 @@ function expandTilde(p: string): string {
  * - If a filesystem path, extract basename, lowercase, prepend 'workspace-'.
  * - Empty/undefined returns empty string.
  */
-function normalizeWorkspaceId(value: string | undefined): string {
+export function normalizeWorkspaceId(value: string | undefined): string {
   if (!value) return "";
   value = value.trim();
   if (!value) return "";
@@ -34,6 +34,198 @@ function normalizeWorkspaceId(value: string | undefined): string {
   const basename = path.basename(value.replace(/\/$/, ""));
   if (!basename) return "";
   return "workspace-" + basename.toLowerCase();
+}
+
+export const ACTIVE_SESSION_TTL_MS = 30 * 60 * 1000;
+export const ACTIVE_SESSION_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
+
+export interface ActiveSessionWorkspaceOptions {
+  agentId?: string;
+  hostPid?: number;
+  nowMs?: number;
+}
+
+export interface ResolveSessionWorkspaceOptions {
+  agentId?: string;
+  hostPid?: number;
+  ttlMs?: number;
+  nowMs?: number;
+}
+
+function sanitizeSessionKeyPart(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-") || "unknown-agent";
+}
+
+function activeSessionFilename(agentId: string, hostPid: number): string {
+  return `active-session-${sanitizeSessionKeyPart(agentId)}-${hostPid}.json`;
+}
+
+export function recordActiveSessionWorkspace(
+  vaultPath: string | undefined,
+  workspaceIdOrPath: string | undefined,
+  agentIdOrOptions?: string | ActiveSessionWorkspaceOptions,
+  options?: ActiveSessionWorkspaceOptions,
+): void {
+  if (!vaultPath || !workspaceIdOrPath) return;
+  const normalized = normalizeWorkspaceId(workspaceIdOrPath);
+  if (!normalized || normalized === "workspace-unknown") return;
+  const opts: ActiveSessionWorkspaceOptions =
+    typeof agentIdOrOptions === "object" && agentIdOrOptions !== null
+      ? agentIdOrOptions
+      : { ...options, ...(typeof agentIdOrOptions === "string" ? { agentId: agentIdOrOptions } : {}) };
+  const resolvedAgentId = (opts.agentId ?? DEFAULT_AGENT_ID).trim() || DEFAULT_AGENT_ID;
+  const resolvedHostPid =
+    typeof opts.hostPid === "number" && Number.isInteger(opts.hostPid) && opts.hostPid > 0
+      ? opts.hostPid
+      : process.ppid;
+  const nowMs = typeof opts.nowMs === "number" && Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+  try {
+    const resolvedVault = expandTilde(vaultPath);
+    const runtimeDir = path.join(resolvedVault, ".runtime");
+    mkdirSync(runtimeDir, { recursive: true });
+    const targetName = activeSessionFilename(resolvedAgentId, resolvedHostPid);
+    const target = path.join(runtimeDir, targetName);
+    const tmp = `${target}.${process.pid}.tmp`;
+    writeFileSync(
+      tmp,
+      `${JSON.stringify(
+        {
+          workspace_id: normalized,
+          agent_id: resolvedAgentId,
+          host_pid: resolvedHostPid,
+          updated_at: new Date(nowMs).toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    renameSync(tmp, target);
+    try {
+      const prefix = `active-session-${sanitizeSessionKeyPart(resolvedAgentId)}-`;
+      for (const entry of readdirSync(runtimeDir)) {
+        if (entry === targetName || !entry.startsWith(prefix) || !entry.endsWith(".json")) {
+          continue;
+        }
+        const pidPart = entry.slice(prefix.length, -".json".length);
+        if (!/^\d+$/.test(pidPart)) continue;
+        const candidatePath = path.join(runtimeDir, entry);
+        try {
+          let updatedAtMs = Number.NaN;
+          try {
+            const parsed = JSON.parse(readFileSync(candidatePath, "utf8")) as Record<string, unknown>;
+            if (typeof parsed?.agent_id === "string" && parsed.agent_id !== resolvedAgentId) {
+              continue;
+            }
+            if (typeof parsed?.updated_at === "string") {
+              updatedAtMs = Date.parse(parsed.updated_at);
+            }
+          } catch {
+            // Corrupt JSON falls back to mtime check.
+          }
+          const mtimeMs = statSync(candidatePath).mtimeMs;
+          const isStaleByUpdatedAt =
+            Number.isFinite(updatedAtMs) && nowMs - updatedAtMs > ACTIVE_SESSION_PRUNE_AGE_MS;
+          const isStaleByMtime =
+            (!Number.isFinite(updatedAtMs) || updatedAtMs - mtimeMs > ACTIVE_SESSION_PRUNE_AGE_MS) &&
+            nowMs - mtimeMs > ACTIVE_SESSION_PRUNE_AGE_MS;
+          if (isStaleByUpdatedAt || isStaleByMtime) {
+            unlinkSync(candidatePath);
+          }
+        } catch {
+          // Best-effort pruning; never fail a hook.
+        }
+      }
+    } catch {
+      // Best-effort pruning; never fail a hook.
+    }
+  } catch {
+    // Best-effort runtime hint; never fail a hook.
+  }
+}
+
+let warnedSessionPpidMismatch = false;
+
+export function resolveSessionWorkspaceId(
+  vaultPath: string = DEFAULT_VAULT_PATH,
+  explicitWorkspaceId?: string,
+  options: ResolveSessionWorkspaceOptions = {},
+): string {
+  if (typeof explicitWorkspaceId === "string" && explicitWorkspaceId.trim()) {
+    return normalizeWorkspaceId(explicitWorkspaceId.trim()) || DEFAULT_WORKSPACE_ID;
+  }
+  const resolvedAgentId = (options.agentId ?? DEFAULT_AGENT_ID).trim() || DEFAULT_AGENT_ID;
+  const resolvedHostPid =
+    typeof options.hostPid === "number" && Number.isInteger(options.hostPid) && options.hostPid > 0
+      ? options.hostPid
+      : process.ppid;
+  const ttlMs =
+    typeof options.ttlMs === "number" && Number.isFinite(options.ttlMs) && options.ttlMs > 0
+      ? options.ttlMs
+      : ACTIVE_SESSION_TTL_MS;
+  const nowMs = typeof options.nowMs === "number" && Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+  if (vaultPath && typeof vaultPath === "string") {
+    try {
+      const runtimeDir = path.join(expandTilde(vaultPath), ".runtime");
+      const targetName = activeSessionFilename(resolvedAgentId, resolvedHostPid);
+      const target = path.join(runtimeDir, targetName);
+      if (existsSync(target)) {
+        const parsed = JSON.parse(readFileSync(target, "utf8")) as Record<string, unknown>;
+        if (parsed?.agent_id !== resolvedAgentId || parsed?.host_pid !== resolvedHostPid) {
+          return DEFAULT_WORKSPACE_ID;
+        }
+        const updatedAtRaw = typeof parsed?.updated_at === "string" ? parsed.updated_at : "";
+        const updatedAtMs = updatedAtRaw ? Date.parse(updatedAtRaw) : Number.NaN;
+        if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs > ttlMs || updatedAtMs - nowMs > 60_000) {
+          return DEFAULT_WORKSPACE_ID;
+        }
+        const activeWs = typeof parsed?.workspace_id === "string" ? normalizeWorkspaceId(parsed.workspace_id) : "";
+        if (activeWs && activeWs !== "workspace-unknown") {
+          return activeWs;
+        }
+      } else if (!warnedSessionPpidMismatch && existsSync(runtimeDir)) {
+        const prefix = `active-session-${sanitizeSessionKeyPart(resolvedAgentId)}-`;
+        for (const entry of readdirSync(runtimeDir)) {
+          if (entry === targetName || !entry.startsWith(prefix) || !entry.endsWith(".json")) {
+            continue;
+          }
+          const pidPart = entry.slice(prefix.length, -".json".length);
+          if (!/^\d+$/.test(pidPart)) continue;
+          try {
+            const parsed = JSON.parse(
+              readFileSync(path.join(runtimeDir, entry), "utf8"),
+            ) as Record<string, unknown>;
+            if (
+              parsed?.agent_id !== resolvedAgentId ||
+              typeof parsed?.host_pid !== "number" ||
+              parsed.host_pid === resolvedHostPid
+            ) {
+              continue;
+            }
+            const updatedAtRaw = typeof parsed?.updated_at === "string" ? parsed.updated_at : "";
+            const updatedAtMs = updatedAtRaw ? Date.parse(updatedAtRaw) : Number.NaN;
+            if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs > ttlMs || updatedAtMs - nowMs > 60_000) {
+              continue;
+            }
+            const otherWs =
+              typeof parsed?.workspace_id === "string" ? normalizeWorkspaceId(parsed.workspace_id) : "";
+            if (otherWs && otherWs !== "workspace-unknown") {
+              warnedSessionPpidMismatch = true;
+              process.stderr.write(
+                `[minni] active-session hint missing for agent=${resolvedAgentId} host_pid=${resolvedHostPid}, but fresh hint exists for host_pid=${parsed.host_pid}; falling back to ${DEFAULT_WORKSPACE_ID}\n`,
+              );
+              break;
+            }
+          } catch {
+            // Ignore unreadable candidate file.
+          }
+        }
+      }
+    } catch {
+      // Fall back to DEFAULT_WORKSPACE_ID.
+    }
+  }
+  return DEFAULT_WORKSPACE_ID;
 }
 
 /**
