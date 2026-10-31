@@ -3286,11 +3286,11 @@ export function createHookHandlers(
   async function stopOutput(payload: Record<string, unknown>, result: HookOutput): Promise<HookOutput> {
 
     let correctionsEnvelope = "";
-    // Only attempt when Stop can actually inject — parking only happens when
-    // SessionStart cannot, and today that is Grok Build; probing canInject
-    // keeps the route honest if another wire gains a structural SessionStart
-    // drop later.
-    if (canInject(wire, "Stop") && !canInject(wire, "SessionStart") && payload.stop_hook_active !== true) {
+    // Only attempt when Stop can actually inject — parking happens when
+    // SessionStart cannot (e.g. Grok Build), or when a parked correction entry
+    // is already waiting in inbox/.undeliverable. Guarding against
+    // stop_hook_active prevents re-injecting on a Stop continuation loop.
+    if (canInject(wire, "Stop") && payload.stop_hook_active !== true) {
       // Unbudgeted local FS: same as SessionStart reassert. Absence loses data.
       const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3);
       if (parkedPending.length > 0) {

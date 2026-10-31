@@ -68,3 +68,35 @@ test("a weak turn names nothing and records no surfaced row", { timeout: 60_000 
   assert.equal(rows.filter((row) => row.kind === "surfaced").length, 0);
   assert.equal(rows.filter((row) => row.kind === "turn").length, 1);
 });
+
+test("Class G: prompt_pointer row records body shingles so applying a pointer-surfaced memory is detected", { timeout: 60_000 }, async (t) => {
+  const fixture = await makeFixture(t, "pointer-shingles");
+  await startFakeDaemon(fixture, {
+    search: () => ({
+      agent_id: "claude-code",
+      results: [
+        daemonResult({
+          source: "/elsewhere/claude-code__21e233a9a944a28a.md",
+          docId: 42,
+          wikilink: "[[claude-code__21e233a9a944a28a]]",
+          title: "claude-code__21e233a9a944a28a",
+          text: "Always drain the quartz queue before rotating the lattice keys at midnight.",
+          confidence: 0.96,
+        }),
+      ],
+    }),
+  });
+  await runHook(fixture, "UserPromptSubmit", {
+    session_id: "pointer-shingles-session",
+    prompt_id: "strong-shingles-1",
+    prompt: "how do we rotate the lattice keys",
+  });
+  const rows = await readLedger(fixture.vault);
+  const surfaced = rows.filter((row) => row.kind === "surfaced" && row.channel === "prompt_pointer");
+  assert.equal(surfaced.length, 1);
+  assert.ok(
+    Array.isArray(surfaced[0].shingles) && surfaced[0].shingles.length > 0,
+    "Class G: prompt_pointer surfaced row must carry body shingles for applied detection",
+  );
+});
+

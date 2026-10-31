@@ -190,7 +190,13 @@ def aggregate_use_ledger(*roots: str | Path | None) -> dict[str, UseLedgerStats]
             if kind == "exposure" and entry.get("mkey"):
                 outcome = str(entry.get("outcome") or "").strip().lower()
                 credits = entry.get("credits")
-                was_used = outcome == "used" or (isinstance(credits, list) and len(credits) > 0)
+                was_used = outcome in (
+                    "used",
+                    "cited",
+                    "cited_handle",
+                    "applied",
+                    "opened",
+                ) or (isinstance(credits, list) and len(credits) > 0)
                 for k in _expand_item_keys(entry.get("mkey")):
                     st = _touch(k)
                     st.surfaces += 1
