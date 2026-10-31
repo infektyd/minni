@@ -223,7 +223,7 @@ def _refresh(
         except (OSError, ValueError, KeyError, TypeError):
             notes.append("cwd preserved: existing directory is not a verified Minni payload")
         else:
-            if archive_first or new_root.name == "current":
+            if archive_first:
                 entry.pop("cwd", None)
             else:
                 entry["cwd"] = str(new_root)

@@ -92,8 +92,6 @@ def sha256_file(path: Path) -> str:
 # cascades into payload-manifest.json, and excluding THAT would gut the check.
 _INSTALL_MUTABLE_PATHS = frozenset({
     ".mcp.json",
-    ".claude-plugin/plugin.json",
-    "payload-manifest.json",
 })
 
 

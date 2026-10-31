@@ -36,7 +36,7 @@ class HashMismatchError(InstallError):
         )
 
 
-def _sanitize_staged_payload(stage: Path) -> None:
+def _sanitize_staged_payload(stage: Path, manifest: PayloadManifest | None = None) -> None:
     """Omit `.mcp.json` and strip `mcpServers` from `.claude-plugin/plugin.json` in staged copy only (§4.1 #1, `N2`)."""
     import json
     from minni.wire.manifest import sha256_file
@@ -59,6 +59,11 @@ def _sanitize_staged_payload(stage: Path) -> None:
         except Exception:
             pass
 
+    if manifest is not None and isinstance(manifest.files, dict):
+        manifest.files.pop(".mcp.json", None)
+        if cplugin_file.is_file() and (cplugin_modified or ".claude-plugin/plugin.json" in manifest.files):
+            manifest.files[".claude-plugin/plugin.json"] = sha256_file(cplugin_file)
+
     pmanifest_file = stage / "payload-manifest.json"
     if pmanifest_file.is_file():
         try:
@@ -77,15 +82,17 @@ def _sanitize_staged_payload(stage: Path) -> None:
                     pmanifest_file.write_text(
                         json.dumps(mdata, indent=2) + "\n", encoding="utf-8",
                     )
+            if manifest is not None and isinstance(manifest.files, dict) and "payload-manifest.json" in manifest.files:
+                manifest.files["payload-manifest.json"] = sha256_file(pmanifest_file)
         except Exception:
             pass
 
 
-def _copy_tree(src: Path, dest: Path) -> None:
+def _copy_tree(src: Path, dest: Path, manifest: PayloadManifest | None = None) -> None:
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__"))
-    _sanitize_staged_payload(dest)
+    _sanitize_staged_payload(dest, manifest)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -124,8 +131,18 @@ def _install_locked(
         return InstallResult(install_root=target, version=version, skipped=False)
 
     base.mkdir(parents=True, exist_ok=True)
-    for old_lock in base.glob(".install-*.lock"):
-        old_lock.unlink(missing_ok=True)
+    old_locks = list(base.glob(".install-*.lock"))
+    if old_locks:
+        from datetime import UTC, datetime
+
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        lock_arch = base.parent / "archive" / stamp / "backups-and-locks"
+        lock_arch.mkdir(parents=True, exist_ok=True)
+        for old_lock in old_locks:
+            try:
+                shutil.move(str(old_lock), str(lock_arch / old_lock.name))
+            except OSError:
+                old_lock.unlink(missing_ok=True)
 
     lock_path = install_lock_path(version)
     lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
@@ -145,7 +162,7 @@ def _install_locked(
 
         stage = staging_dir(version)
         try:
-            _copy_tree(src_root, stage)
+            _copy_tree(src_root, stage, manifest)
             _fsync_dir(stage)
             try:
                 os.rename(stage, target)

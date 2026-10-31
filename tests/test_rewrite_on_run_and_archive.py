@@ -118,3 +118,92 @@ def test_cas_aborts_on_concurrent_mutation_and_custom_refresh_deletes_plugin_cwd
     assert json.loads(config.read_text(encoding="utf-8"))["concurrentHostKey"] == "live-session-edit"
     # Zero .minni-backup-* files in host config directory!
     assert list(config.parent.glob("*.minni-backup-*")) == []
+
+
+def test_custom_refresh_single_archive_first_predicate_never_keys_off_current_dirname_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-8 regression: v1 refresh to a dir named `current` must not strip `cwd` while writing a sibling backup."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(refresh.shutil, "which", lambda command: f"/bin/{command}")
+
+    base = tmp_path / ".minni" / "plugin"
+    old_root = _seed_payload(base, "0.6.0+git.11111111")
+    current_dir_root = _seed_payload(base, "current")
+
+    config = tmp_path / refresh._CUSTOM["muse"]
+    config.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "command": "node",
+        "args": [str(old_root / "dist/server.js")],
+        "cwd": str(old_root),
+        "env": {"MINNI_AGENT_ID": "muse"},
+        "enabled": True,
+    }
+    config.write_text(json.dumps({"mcpServers": {"minni": entry}}), encoding="utf-8")
+    (base / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "generation": 0,
+            "wires": [
+                {
+                    "platform": "muse",
+                    "config_path": str(config),
+                    "install_root": str(old_root),
+                    "version": old_root.name,
+                    "workspace": "registry-ws",
+                    "wired_at": "2026-10-31T00:00:00Z",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    res_v1 = refresh.refresh_custom_wires(new_root=current_dir_root, archive_first=False)
+    assert res_v1["exit_code"] == 0
+    doc_v1 = json.loads(config.read_text(encoding="utf-8"))
+    # Under v1 (archive_first=False), cwd is updated to new_root, never stripped with a sibling backup
+    assert doc_v1["mcpServers"]["minni"].get("cwd") == str(current_dir_root)
+
+
+def test_install_payload_archives_legacy_install_locks_before_acquiring_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-9 regression: `.install-*.lock` files must be moved into `~/.minni/archive/<ts>/`, not unlinked."""
+    from minni.wire.install import install_payload
+    from minni.wire.manifest import PayloadManifest
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    base = tmp_path / ".minni" / "plugin"
+    base.mkdir(parents=True, exist_ok=True)
+    legacy_lock = base / ".install-0.5.0+git.deadbeef.lock"
+    legacy_lock.write_text("inflight-pid=4242\n", encoding="utf-8")
+
+    src = tmp_path / "src_payload"
+    (src / "dist").mkdir(parents=True, exist_ok=True)
+    (src / "dist" / "server.js").write_text("console.log('ok');\n", encoding="utf-8")
+    manifest = PayloadManifest(
+        schema=1,
+        version="0.6.0+git.12345678",
+        git_sha="12345678" * 5,
+        built_at="2026-10-31T00:00:00Z",
+        node_engine=">=20",
+        files={"dist/server.js": sha256_file(src / "dist" / "server.js")},
+    )
+    (src / "payload-manifest.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "version": manifest.version,
+            "git_sha": manifest.git_sha,
+            "built_at": manifest.built_at,
+            "node_engine": manifest.node_engine,
+            "files": manifest.files,
+        }),
+        encoding="utf-8",
+    )
+
+    install_payload(src, manifest.version, manifest, update_current=False)
+    assert not legacy_lock.exists()
+    archived_locks = list((tmp_path / ".minni" / "archive").rglob(".install-0.5.0+git.deadbeef.lock"))
+    assert len(archived_locks) == 1
+    assert archived_locks[0].read_text(encoding="utf-8") == "inflight-pid=4242\n"
