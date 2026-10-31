@@ -1511,4 +1511,3 @@ test("Class D: prepareTask filters compaction/system-reminder noise, bounds daem
     assert.ok(ev.text.length <= 800, `recall.evidence item must be <= 800 chars, got ${ev.text.length}`);
   }
 });
-

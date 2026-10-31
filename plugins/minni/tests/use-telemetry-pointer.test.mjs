@@ -99,4 +99,3 @@ test("Class G: prompt_pointer row records body shingles so applying a pointer-su
     "Class G: prompt_pointer surfaced row must carry body shingles for applied detection",
   );
 });
-

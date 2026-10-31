@@ -327,5 +327,3 @@ def test_class_a_claude_code_host_table_and_acknowledge_through_seq(tmp_path: Pa
     cursor = next(c for c in updated["cursors"] if c["subscriber_id"] == "claude-code")
     assert cursor["last_delivered_seq"] == 3
     assert [p for p in updated["pending"] if p["subscriber_id"] == "claude-code"] == []
-
-

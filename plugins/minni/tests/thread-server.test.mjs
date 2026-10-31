@@ -1348,4 +1348,3 @@ test("Class D: minni_thread_update bounds scar_tissue and non-target slice evide
     assert.equal(resFull.plan.scar_tissue.length, 10, "include_full_plan: true must return all 10 scars");
   });
 });
-

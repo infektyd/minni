@@ -684,4 +684,3 @@ test("Class G: daemon _durable/ hit (doc:personal:<id>) cited via [[agent__<16he
     );
   }
 });
-

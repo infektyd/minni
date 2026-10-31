@@ -433,7 +433,3 @@ test("Class D: drillMemory local handle resolution does not duplicate note body 
     assert.equal(res.data.results[0].text, undefined);
   });
 });
-
-
-
-
