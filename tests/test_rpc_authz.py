@@ -808,3 +808,41 @@ def test_h8_resolve_candidate_nonexistent_supersede_id_rejected(monkeypatch, tmp
     assert "error" in resp, resp
     assert resp["error"]["code"] == -32001
     assert "learning_not_found" in resp["error"]["message"]
+
+
+def test_h8_operator_principal_with_resolve_candidate_can_supersede_cross_agent_learning(
+    monkeypatch, tmp_path
+):
+    """P2-3a / H8 positive path: an operator/main principal with
+    resolve_candidate/govern capabilities CAN supersede a cross-agent learning
+    via the real resolve_candidate dispatch call site."""
+    db = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    victim = _insert_learning(db, "grok-build", "grok-build's outdated durable rule")
+    cid = _stage_candidate_as(
+        monkeypatch, "codex", "updated rule superseding grok-build learning"
+    )
+    _stamp_principal(monkeypatch, "main", capabilities=["resolve_candidate", "govern"])
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "resolve_candidate",
+            "params": {
+                "candidate_id": cid,
+                "decision": "accept",
+                "supersede_ids": [victim],
+            },
+        }
+    )
+    assert "error" not in resp, f"operator cross-agent supersede failed: {resp}"
+    assert resp["result"]["status"] == "resolved"
+    assert resp["result"]["new_status"] == "accepted"
+    new_lid = resp["result"]["learning_id"]
+    victim_row, count = _learning_row(tmp_path, victim)
+    assert victim_row is None or victim_row["status"] == "superseded", (
+        f"expected victim learning to be retired/superseded, got {dict(victim_row)}"
+    )
+    new_row, _ = _learning_row(tmp_path, new_lid)
+    assert new_row is not None and new_row["status"] == "active"
+    assert count == 1

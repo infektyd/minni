@@ -1173,3 +1173,41 @@ def test_p2_2_ack_on_not_required_lease_is_idempotent_noop_success(monkeypatch, 
             "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
         ).fetchone()["status"]
     assert st1 == "not_required"
+
+
+def test_h9_resend_after_ack_rearms_lease_to_pending_and_fresh_ack_succeeds(
+    monkeypatch, tmp_path
+):
+    """P2-3b / H9 + #231 positive path: re-sending a handoff reusing an already-acked
+    lease_id re-arms the lease to 'pending' and allows a fresh ack to succeed."""
+    db, lid = _h9_send(tmp_path, monkeypatch, lease_id="lease-231-resend")
+    assert lid == "lease-231-resend"
+    assert "error" not in _h9_ack(lid, "accepted")
+    assert "error" in _h9_ack(lid, "rejected_stale")
+
+    resent = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "daemon.handoff",
+            "params": {
+                "from_agent": "codex",
+                "to_agent": "claude-code",
+                "packet": _packet(lease_id=lid, task="follow-up resend on same lease_id"),
+            },
+        }
+    )
+    assert "error" not in resent, resent
+    with db.cursor() as c:
+        st_rearmed = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st_rearmed == "pending"
+
+    r_fresh = _h9_ack(lid, "rejected_stale")
+    assert "error" not in r_fresh, f"fresh ack after resend failed: {r_fresh}"
+    with db.cursor() as c:
+        st_final = c.execute(
+            "SELECT status FROM handoff_leases WHERE lease_id=?", (lid,)
+        ).fetchone()["status"]
+    assert st_final == "rejected_stale"
