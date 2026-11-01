@@ -83,8 +83,7 @@ def test_cutover_preflip_abort_real_dir_current_rollback_cas_restore_and_exit_3(
     v1_sha = "1" * 40
     _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
 
-    real_current = plugin_dir / "current"
-    real_current.mkdir(parents=True)
+    real_current = _seed_plugin_version(plugin_dir, "current", v1_sha)
     (real_current / "legacy_marker.txt").write_text("real-dir-current", encoding="utf-8")
 
     # Seed an existing Cursor container with real dist/ directory
@@ -1269,7 +1268,7 @@ def test_r5_p1_1_missing_commands_dir_is_drift_in_health_and_delta_in_reconcile(
     assert rb_res.rolled_back is True
     assert not cmd_link.exists() and not cmd_link.is_symlink()
 
-    # 4. Non-symlink (real directory) at `commands_dir` is flagged by health and aborts Step 5
+    # 4. Non-symlink (real directory) at `commands_dir` is flagged by health and aborts pre-flip (H16)
     cmd_link.mkdir(parents=True)
     health_non_sym = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
     assert health_non_sym.ok is False
@@ -1282,7 +1281,8 @@ def test_r5_p1_1_missing_commands_dir_is_drift_in_health_and_delta_in_reconcile(
         running_hosts=set(),
     )
     assert bad_res.exit_code == 1
-    assert bad_res.rolled_back is True
+    assert bad_res.aborted_pre_flip is True
+    assert bad_res.rolled_back is False
 
 
 def test_h15_commands_dir_symlink_matching_catalog_with_missing_payload_commands_fails_step5(
@@ -2315,12 +2315,42 @@ def test_r9_payload_staging_failed_keeps_only_exception_type_never_text(
     assert "secret" not in out_cutover.message
 
 
+def _snapshot_tree(root: Path) -> dict[str, tuple[str, str | bytes]]:
+    snap: dict[str, tuple[str, str | bytes]] = {}
+    if not root.exists() and not root.is_symlink():
+        return snap
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        dpath = Path(dirpath)
+        rel_d = dpath.relative_to(root).as_posix()
+        snap[rel_d] = ("dir", "")
+        for dname in list(dirnames):
+            dp = dpath / dname
+            if dp.is_symlink():
+                snap[dp.relative_to(root).as_posix()] = ("symlink", os.readlink(dp))
+        for fname in filenames:
+            fp = dpath / fname
+            rel_f = fp.relative_to(root).as_posix()
+            if fp.is_symlink():
+                snap[rel_f] = ("symlink", os.readlink(fp))
+            elif fp.is_file():
+                snap[rel_f] = ("file", fp.read_bytes())
+    return snap
+
+
 def test_r10_h16_dry_run_and_apply_parity_on_real_commands_dir(tmp_path: Path) -> None:
-    """R10 Item 1 (H16):
-    Plan-mode dry run must report a commands_dir that exists as a REAL directory (not a symlink),
-    e.g. ~/.gemini/commands/minni holding old .toml files, as `would_abort` with host and path.
-    The dry run and --apply must agree on every such case.
+    """R10/R11 Item 1 (H16):
+    - Plan-mode dry run must report a commands_dir that exists as a REAL directory (not a symlink),
+      e.g. ~/.gemini/commands/minni holding old .toml files, as `would_abort` with host and path,
+      return a non-zero exit_code, and not present other surfaces as a plan that would be committed.
+    - `--apply` must run the real (non-symlink) commands_dir check in the pre-flip phase BEFORE
+      Step 4 flips `current` and BEFORE any container/marketplace/config convergence, returning
+      non-zero with `would_abort` and leaving `current`, every container, every host config, and
+      the real directory byte-identical to before.
     """
+    import minni.wire.cutover as cutover_mod
+
     home = tmp_path / "home"
     plugin_dir = home / ".minni" / "plugin"
     plugin_dir.mkdir(parents=True)
@@ -2333,11 +2363,42 @@ def test_r10_h16_dry_run_and_apply_parity_on_real_commands_dir(tmp_path: Path) -
     _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
     (plugin_dir / "current").symlink_to(plugin_dir / v1_ver)
 
+    # Seed containers, marketplace, and host config with delta so they would be written if cutover did not abort pre-flip
+    ag_container = home / ".agents" / "plugins" / "Minni@Minni"
+    (ag_container / "dist").mkdir(parents=True)
+    (ag_container / "dist" / "server.js").write_text("// stale v1 container\n", encoding="utf-8")
+    cursor_container = home / ".cursor" / "plugins" / "local" / "minni"
+    (cursor_container / "dist").mkdir(parents=True)
+    (cursor_container / "dist" / "server.js").write_text("// stale v1 cursor container\n", encoding="utf-8")
+    claude_plugins = home / ".claude" / "plugins"
+    claude_plugins.mkdir(parents=True)
+    (claude_plugins / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {}}) + "\n", encoding="utf-8"
+    )
+    claude_json = home / ".claude.json"
+    claude_json.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": [str(plugin_dir / v1_ver / "dist" / "server.js")],
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     # Seed a REAL directory at ~/.gemini/commands/minni holding old .toml files
     cmd_dir = home / ".gemini" / "commands" / "minni"
     cmd_dir.mkdir(parents=True)
     old_toml = cmd_dir / "learn.toml"
     old_toml.write_text('description = "legacy command"\n', encoding="utf-8")
+
+    before_snapshot = _snapshot_tree(home)
+    before_current_ino = (plugin_dir / "current").lstat().st_ino
 
     dry_res = execute_atomic_cutover(
         home=home,
@@ -2346,12 +2407,19 @@ def test_r10_h16_dry_run_and_apply_parity_on_real_commands_dir(tmp_path: Path) -
         dry_run=True,
         running_hosts=set(),
     )
-    assert dry_res.status == "DRY_RUN"
+    assert dry_res.exit_code != 0
+    assert dry_res.exit_code == 1
+    assert dry_res.aborted_pre_flip is True
     plan = dry_res.to_dict()["plan"]
-    assert not any(w["path"] == str(cmd_dir) for w in plan["would_write"]), (
-        f"real commands_dir must not be reported as would_write in dry-run: {plan['would_write']}"
+    assert plan["would_write"] == [], (
+        f"dry-run abort must not present other surfaces as would_write: {plan['would_write']}"
     )
-    assert f"antigravity:{cmd_dir}" not in dry_res.updated_surfaces
+    assert plan["would-write"] == []
+    assert plan["would_create"] == []
+    assert plan["would-create"] == []
+    assert plan["would_archive"] == []
+    assert plan["would-archive"] == []
+    assert dry_res.updated_surfaces == []
     assert len(dry_res.would_abort) == 1
     abort_entry = dry_res.would_abort[0]
     assert abort_entry["host"] == "antigravity"
@@ -2363,39 +2431,67 @@ def test_r10_h16_dry_run_and_apply_parity_on_real_commands_dir(tmp_path: Path) -
     assert plan["hosts"]["antigravity"]["would_abort"] == dry_res.would_abort
     assert "would_abort=1" in dry_res.message
     assert f"antigravity:{cmd_dir}" in dry_res.message
+    assert _snapshot_tree(home) == before_snapshot
 
-    # --apply must agree with dry-run: aborts with host and path, leaving real dir untouched
-    apply_res = execute_atomic_cutover(
-        home=home,
-        target_version=v2_ver,
-        target_git_sha=v2_sha,
-        dry_run=False,
-        running_hosts=set(),
-    )
+    # --apply must abort in pre-flip BEFORE Step 4 flips `current` and BEFORE any write
+    flip_calls: list[str] = []
+    orig_flip = cutover_mod.flip_current_pointer
+
+    def _spy_flip(target_ver: str, **kw):
+        flip_calls.append(target_ver)
+        return orig_flip(target_ver, **kw)
+
+    cutover_mod.flip_current_pointer = _spy_flip
+    try:
+        apply_res = execute_atomic_cutover(
+            home=home,
+            target_version=v2_ver,
+            target_git_sha=v2_sha,
+            dry_run=False,
+            running_hosts=set(),
+        )
+    finally:
+        cutover_mod.flip_current_pointer = orig_flip
+
     assert apply_res.exit_code == 1
-    assert apply_res.rolled_back is True
+    assert apply_res.status == "ABORTED_PRE_FLIP"
+    assert apply_res.aborted_pre_flip is True
+    assert apply_res.rolled_back is False
+    assert flip_calls == [], f"flip_current_pointer must not run before H16 pre-flip abort: {flip_calls}"
+    assert apply_res.updated_surfaces == []
     assert len(apply_res.would_abort) == 1
     assert apply_res.would_abort[0]["host"] == "antigravity"
     assert apply_res.would_abort[0]["path"] == str(cmd_dir)
     assert "antigravity" in apply_res.message
     assert str(cmd_dir) in apply_res.message
+    assert (plugin_dir / "current").lstat().st_ino == before_current_ino
+    assert os.readlink(plugin_dir / "current") == str(plugin_dir / v1_ver)
     assert cmd_dir.is_dir() and not cmd_dir.is_symlink()
     assert old_toml.read_text(encoding="utf-8") == 'description = "legacy command"\n'
+    assert _snapshot_tree(home) == before_snapshot
 
 
 def test_r10_h17_single_sanitization_path_wire_all_force_reinstall_and_cutover_containers_zero_delta(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """R10 Item 2 (H17):
-    After `wire all --force-reinstall` (install_payload with force_reinstall=True), the installed
-    payload and host containers must not carry `mcpServers` in `.claude-plugin/plugin.json` or
-    `.cursor-plugin/plugin.json` where the catalog forbids it, and cutover's post-flip health check
-    reports zero delta for those containers.
+    """R10/R11 Item 2 (H17):
+    - After `wire all --force-reinstall` (install_payload with force_reinstall=True), the installed
+      payload and host containers must not carry `mcpServers` in `.claude-plugin/plugin.json` or
+      `.cursor-plugin/plugin.json` where the catalog forbids it, and cutover's post-flip health check
+      reports zero delta for those containers.
+    - When `sanitize_staged_payload` runs with `remove_mcp_json=False`, `payload-manifest.json` hashes
+      are still updated for sanitized manifests.
+    - In `propagate.py:copy_tree` and `claude_plugin.py:sync_local_marketplace`, a sanitization failure
+      (e.g. an unparseable `plugin.json`) must abort that copy, never publish the tree, and surface the error.
     """
+    import sys
+    import pytest
+    from minni.wire.claude_plugin import ClaudePluginError, local_marketplace_root, sync_local_marketplace
     from minni.wire.cutover import _container_has_delta
     from minni.wire.from_repo import _git_sha
     from minni.wire.health import audit_host_propagation_health
-    from minni.wire.manifest import dev_version
+    from minni.wire.install import InstallError, sanitize_staged_payload
+    from minni.wire.manifest import dev_version, sha256_file
 
     repo_root = Path(__file__).resolve().parent.parent
     ver = dev_version(repo_root)
@@ -2488,20 +2584,88 @@ def test_r10_h17_single_sanitization_path_wire_all_force_reinstall_and_cutover_c
     health = audit_host_propagation_health(home=home, expected_git_sha=sha)
     assert health.ok is True, health.drifted_surfaces
     assert health.drifted_surfaces == []
-    from minni.wire.install import sanitize_staged_payload
 
-    assert callable(sanitize_staged_payload)
+    # 1. `remove_mcp_json=False` must still update `payload-manifest.json` hash when plugin.json changes
+    stage_keep_mcp = tmp_path / "stage_keep_mcp"
+    (stage_keep_mcp / ".claude-plugin").mkdir(parents=True)
+    (stage_keep_mcp / ".mcp.json").write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    pjson_keep = stage_keep_mcp / ".claude-plugin" / "plugin.json"
+    pjson_keep.write_text(
+        json.dumps({"name": "minni", "version": "0.6.0+git.abcd1234", "mcpServers": {"minni": {}}}) + "\n",
+        encoding="utf-8",
+    )
+    pmanifest_keep = stage_keep_mcp / "payload-manifest.json"
+    pmanifest_keep.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "version": "0.6.0+git.abcd1234",
+                "files": {
+                    ".mcp.json": sha256_file(stage_keep_mcp / ".mcp.json"),
+                    ".claude-plugin/plugin.json": sha256_file(pjson_keep),
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    sanitize_staged_payload(stage_keep_mcp, version="0.6.0+git.abcd1234", remove_mcp_json=False)
+    assert (stage_keep_mcp / ".mcp.json").is_file()
+    updated_mdata = json.loads(pmanifest_keep.read_text(encoding="utf-8"))
+    assert updated_mdata["files"][".claude-plugin/plugin.json"] == sha256_file(pjson_keep)
+    assert ".mcp.json" in updated_mdata["files"]
+
+    # 2. `propagate.py:copy_tree` must abort and publish nothing when sanitization raises
+    scripts_dir = str(repo_root / "plugins" / "minni" / "skills" / "minni-install" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import propagate
+
+    bad_src = tmp_path / "bad_plugin_src"
+    (bad_src / ".claude-plugin").mkdir(parents=True)
+    (bad_src / ".claude-plugin" / "plugin.json").write_text("{corrupt_plugin_json", encoding="utf-8")
+    (bad_src / "dist").mkdir(parents=True)
+    (bad_src / "dist" / "server.js").write_text("// server\n", encoding="utf-8")
+
+    prop_dest_new = tmp_path / "prop_dest_new"
+    with pytest.raises(InstallError, match="failed to sanitize staged"):
+        propagate.copy_tree(bad_src, prop_dest_new)
+    assert not prop_dest_new.exists(), "copy_tree must not publish tree when sanitization fails"
+
+    prop_dest_existing = tmp_path / "prop_dest_existing"
+    (prop_dest_existing / "dist").mkdir(parents=True)
+    (prop_dest_existing / "dist" / "server.js").write_text("// prior clean server\n", encoding="utf-8")
+    prior_snap = _snapshot_tree(prop_dest_existing)
+    with pytest.raises(InstallError, match="failed to sanitize staged"):
+        propagate.copy_tree(bad_src, prop_dest_existing)
+    assert _snapshot_tree(prop_dest_existing) == prior_snap
+
+    # 3. `sync_local_marketplace` must abort and publish nothing when sanitization raises
+    mkt_home = tmp_path / "mkt_home"
+    mkt_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(mkt_home))
+    with pytest.raises(ClaudePluginError, match="failed to sanitize staged"):
+        sync_local_marketplace(bad_src, "0.6.0")
+    mkt_root = local_marketplace_root()
+    assert not (mkt_root / "plugins" / "minni-0.6.0").exists()
+    assert not (mkt_root / ".claude-plugin" / "marketplace.json").exists()
 
 
 def test_r10_h18_rollback_cas_conflict_never_leaves_dangling_current_pointer(
     tmp_path: Path,
 ) -> None:
-    """R10 Item 3 (H18):
-    If rollback cannot restore a host config (CAS conflict, e.g. ~/.claude.json rewritten by Claude Code
-    mid-cutover) and that config points at ~/.minni/plugin/current/..., rollback must NOT remove `current`;
-    keep it, or repoint it at the versioned dir the live config can still resolve, and report the
-    host+path in the result.
+    """R10/R11 Item 3 (H18):
+    - In Step 7a, decide the `current` target BEFORE restoring host config bytes, using the same
+      live-path check for every case: symlink `current`, real-directory `current`, and absent `current`.
+    - Rule: after rollback, every host config that references `~/.minni/plugin/current/...` resolves,
+      and a restored config that points at `current/...` runs the version it was written for whenever
+      that version is still on disk. If none qualifies, keep the version the live configs can resolve
+      and report host+path.
     """
+    import shutil
+
+    # --- Case 0: `current` was absent before cutover ---
     home = tmp_path / "home"
     plugin_dir = home / ".minni" / "plugin"
     plugin_dir.mkdir(parents=True)
@@ -2513,7 +2677,6 @@ def test_r10_h18_rollback_cas_conflict_never_leaves_dangling_current_pointer(
     _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
     _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
 
-    # Prior to cutover, `current` does NOT exist; live ~/.claude.json points directly at v1_ver
     assert not (plugin_dir / "current").exists()
     claude_json = home / ".claude.json"
     claude_json.write_text(
@@ -2536,8 +2699,6 @@ def test_r10_h18_rollback_cas_conflict_never_leaves_dangling_current_pointer(
     )
 
     def _concurrent_claude_edit_then_fail(_home: Path) -> bool:
-        # Step 5 updated ~/.claude.json to point at ~/.minni/plugin/current/dist/server.js;
-        # now Claude Code concurrently rewrites ~/.claude.json before Step 6 fails.
         live_doc = json.loads(claude_json.read_text(encoding="utf-8"))
         assert live_doc["mcpServers"]["minni"]["args"] == [
             str(plugin_dir / "current" / "dist" / "server.js")
@@ -2556,7 +2717,6 @@ def test_r10_h18_rollback_cas_conflict_never_leaves_dangling_current_pointer(
     assert rb_res.exit_code == 1
     assert rb_res.rolled_back is True
 
-    # Live ~/.claude.json preserved concurrent edit AND its args[0] path resolves on disk!
     after_doc = json.loads(claude_json.read_text(encoding="utf-8"))
     assert after_doc["cachedGrowthBookFeatures"] == {"concurrent_write": True}
     args_path = Path(after_doc["mcpServers"]["minni"]["args"][0])
@@ -2564,8 +2724,214 @@ def test_r10_h18_rollback_cas_conflict_never_leaves_dangling_current_pointer(
     assert (plugin_dir / "current").is_symlink()
     assert args_path.is_file(), f"dangling args[0] path after rollback: {args_path}"
     assert args_path.resolve().is_file()
-
-    # Result reports the conflict with host and path
     assert any("claude-code" in c and str(claude_json) in c for c in rb_res.cas_conflicts), rb_res.cas_conflicts
     assert "claude-code" in rb_res.message
     assert str(claude_json) in rb_res.message
+
+    # --- Case (a): `current` was a REAL directory and the conflicted config references a path only the new tree has ---
+    home_a = tmp_path / "home_real_current"
+    plugin_dir_a = home_a / ".minni" / "plugin"
+    plugin_dir_a.mkdir(parents=True)
+    _seed_plugin_version(plugin_dir_a, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir_a, v2_ver, v2_sha)
+    # Seed `current` as a REAL directory copied from v1_ver (lacks dist/new_only_v2.js)
+    shutil.copytree(plugin_dir_a / v1_ver, plugin_dir_a / "current")
+    assert (plugin_dir_a / "current").is_dir() and not (plugin_dir_a / "current").is_symlink()
+    # Add a path only the new tree (v2_ver) has
+    new_only_rel = "dist/new_only_v2.js"
+    (plugin_dir_a / v2_ver / new_only_rel).write_text("// v2 only entrypoint\n", encoding="utf-8")
+    assert not (plugin_dir_a / "current" / new_only_rel).exists()
+
+    claude_json_a = home_a / ".claude.json"
+    claude_json_a.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": [str(plugin_dir_a / v1_ver / "dist" / "server.js")],
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Also seed a second host config (`~/.cursor/mcp.json`) that references `current/dist/server.js` (with `~/` so Step 5 updates it, and no CAS conflict)
+    cursor_mcp_a = home_a / ".cursor" / "mcp.json"
+    cursor_mcp_a.parent.mkdir(parents=True, exist_ok=True)
+    cursor_mcp_a.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": ["~/.minni/plugin/current/dist/server.js"],
+                        "env": {
+                            "MINNI_AGENT_ID": "cursor",
+                            "MINNI_VAULT_PATH": str(home_a / ".minni" / "cursor-vault"),
+                        },
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def _conflict_real_dir_new_only(_home: Path) -> bool:
+        doc_a = json.loads(claude_json_a.read_text(encoding="utf-8"))
+        doc_a["mcpServers"]["minni"]["args"] = [str(plugin_dir_a / "current" / new_only_rel)]
+        doc_a["concurrentRealDirEdit"] = True
+        claude_json_a.write_text(json.dumps(doc_a, indent=2) + "\n", encoding="utf-8")
+        return False
+
+    rb_a = execute_atomic_cutover(
+        home=home_a,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+        post_flip_verifier=_conflict_real_dir_new_only,
+    )
+    assert rb_a.exit_code == 1
+    assert rb_a.rolled_back is True
+    # Conflicted ~/.claude.json references current/dist/new_only_v2.js -> MUST resolve on disk!
+    after_a = json.loads(claude_json_a.read_text(encoding="utf-8"))
+    conflicted_arg_a = Path(after_a["mcpServers"]["minni"]["args"][0])
+    assert conflicted_arg_a == plugin_dir_a / "current" / new_only_rel
+    assert conflicted_arg_a.is_file(), f"real-dir current restored over conflicted path left dangling: {conflicted_arg_a}"
+    assert (plugin_dir_a / "current").resolve() == (plugin_dir_a / v2_ver).resolve()
+    # Restored ~/.cursor/mcp.json must resolve and run the version it was written for (not v2_ver)
+    restored_cursor_a = json.loads(cursor_mcp_a.read_text(encoding="utf-8"))
+    cursor_arg_a = Path(os.path.expanduser(restored_cursor_a["mcpServers"]["minni"]["args"][0]))
+    assert cursor_arg_a.is_file()
+    assert cursor_arg_a.resolve() != (plugin_dir_a / v2_ver / "dist" / "server.js").resolve()
+    assert any("claude-code" in c and str(claude_json_a) in c for c in rb_a.cas_conflicts), rb_a.cas_conflicts
+    assert "claude-code" in rb_a.message
+    assert str(claude_json_a) in rb_a.message
+
+    # --- Case (b): symlink `current` -> v1_ver lacks a path the conflicted file references ---
+    home_b = tmp_path / "home_symlink_prev_lacks"
+    plugin_dir_b = home_b / ".minni" / "plugin"
+    plugin_dir_b.mkdir(parents=True)
+    _seed_plugin_version(plugin_dir_b, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir_b, v2_ver, v2_sha)
+    (plugin_dir_b / "current").symlink_to(v1_ver)
+    (plugin_dir_b / v2_ver / new_only_rel).write_text("// v2 only entrypoint\n", encoding="utf-8")
+    assert not (plugin_dir_b / v1_ver / new_only_rel).exists()
+
+    claude_json_b = home_b / ".claude.json"
+    claude_json_b.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": [str(plugin_dir_b / v1_ver / "dist" / "server.js")],
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Restorable config that pointed at `current/dist/server.js` (written for v1_ver, which IS still on disk)
+    cursor_mcp_b = home_b / ".cursor" / "mcp.json"
+    cursor_mcp_b.parent.mkdir(parents=True, exist_ok=True)
+    cursor_mcp_b.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": ["~/.minni/plugin/current/dist/server.js"],
+                        "env": {
+                            "MINNI_AGENT_ID": "cursor",
+                            "MINNI_VAULT_PATH": str(home_b / ".minni" / "cursor-vault"),
+                        },
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def _conflict_prev_lacks_path(_home: Path) -> bool:
+        doc_b = json.loads(claude_json_b.read_text(encoding="utf-8"))
+        doc_b["mcpServers"]["minni"]["args"] = [str(plugin_dir_b / "current" / new_only_rel)]
+        claude_json_b.write_text(json.dumps(doc_b, indent=2) + "\n", encoding="utf-8")
+        return False
+
+    rb_b = execute_atomic_cutover(
+        home=home_b,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+        post_flip_verifier=_conflict_prev_lacks_path,
+    )
+    assert rb_b.exit_code == 1
+    assert rb_b.rolled_back is True
+    # Conflicted ~/.claude.json resolves current/dist/new_only_v2.js via current -> v2_ver
+    after_b = json.loads(claude_json_b.read_text(encoding="utf-8"))
+    conflicted_arg_b = Path(after_b["mcpServers"]["minni"]["args"][0])
+    assert conflicted_arg_b == plugin_dir_b / "current" / new_only_rel
+    assert conflicted_arg_b.is_file()
+    assert (plugin_dir_b / "current").resolve() == (plugin_dir_b / v2_ver).resolve()
+    # Restored ~/.cursor/mcp.json runs v1_ver (the version it was written for), NOT v2_ver!
+    restored_cursor_b = json.loads(cursor_mcp_b.read_text(encoding="utf-8"))
+    cursor_arg_b = Path(os.path.expanduser(restored_cursor_b["mcpServers"]["minni"]["args"][0]))
+    assert cursor_arg_b.is_file()
+    assert cursor_arg_b.resolve() == (plugin_dir_b / v1_ver / "dist" / "server.js").resolve()
+    assert any("claude-code" in c and str(claude_json_b) in c for c in rb_b.cas_conflicts), rb_b.cas_conflicts
+    assert "claude-code" in rb_b.message
+    assert str(claude_json_b) in rb_b.message
+
+    # --- Case (b2): when the previous version is no longer on disk (none qualifies for the restored config's original version) ---
+    def _conflict_prev_removed_and_lacks(_home: Path) -> bool:
+        doc_b2 = json.loads(claude_json_b.read_text(encoding="utf-8"))
+        doc_b2["mcpServers"]["minni"]["args"] = [str(plugin_dir_b / "current" / new_only_rel)]
+        claude_json_b.write_text(json.dumps(doc_b2, indent=2) + "\n", encoding="utf-8")
+        shutil.rmtree(plugin_dir_b / v1_ver)
+        return False
+
+    # Reset current -> v1_ver and cursor_mcp_b before running Case (b2)
+    (plugin_dir_b / "current").unlink()
+    (plugin_dir_b / "current").symlink_to(v1_ver)
+    cursor_mcp_b.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": ["~/.minni/plugin/current/dist/server.js"],
+                        "env": {
+                            "MINNI_AGENT_ID": "cursor",
+                            "MINNI_VAULT_PATH": str(home_b / ".minni" / "cursor-vault"),
+                        },
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rb_b2 = execute_atomic_cutover(
+        home=home_b,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+        post_flip_verifier=_conflict_prev_removed_and_lacks,
+    )
+    assert rb_b2.exit_code == 1
+    assert rb_b2.rolled_back is True
+    # Since v1_ver is gone, none qualifies for v1_ver; keep the version live configs can resolve (v2_ver) and report host+path
+    restored_cursor_b2 = json.loads(cursor_mcp_b.read_text(encoding="utf-8"))
+    cursor_arg_b2 = Path(
+        restored_cursor_b2["mcpServers"]["minni"]["args"][0].replace("~", str(home_b))
+    )
+    assert cursor_arg_b2.is_file()
+    assert cursor_arg_b2.resolve() == (plugin_dir_b / v2_ver / "dist" / "server.js").resolve()
+    assert any("cursor" in c and str(cursor_mcp_b) in c for c in rb_b2.cas_conflicts), rb_b2.cas_conflicts
+    assert "cursor" in rb_b2.message
+    assert str(cursor_mcp_b) in rb_b2.message

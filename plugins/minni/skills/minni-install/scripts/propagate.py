@@ -426,54 +426,58 @@ GENERATED_INSTALL_FILES = ("gemini-extension.json",)
 def _sanitize_copied_manifests(dest: Path) -> None:
     try:
         from minni.wire.install import sanitize_staged_payload
+    except ImportError:
+        src_root = Path(__file__).resolve().parents[5] / "src"
+        if src_root.is_dir() and str(src_root) not in sys.path:
+            sys.path.insert(0, str(src_root))
+        from minni.wire.install import sanitize_staged_payload
 
-        sanitize_staged_payload(dest, remove_mcp_json=False)
-        return
-    except Exception:
-        pass
-    for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
-        pjson_file = dest / rel_pjson
-        if pjson_file.is_file():
-            try:
-                pdata = json.loads(pjson_file.read_text(encoding="utf-8"))
-                if isinstance(pdata, dict) and "mcpServers" in pdata:
-                    pdata.pop("mcpServers", None)
-                    pjson_file.write_text(json.dumps(pdata, indent=2) + "\n", encoding="utf-8")
-            except Exception:
-                pass
+    sanitize_staged_payload(dest, remove_mcp_json=False)
 
 
 def copy_tree(source: Path, dest: Path) -> None:
     if not source.exists():
         raise SystemExit(f"Missing plugin source: {source}")
+    parent_existed = dest.parent.exists()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    rsync = shutil.which("rsync")
-    if rsync:
-        cmd = [rsync, "-a", "--delete", "--exclude", "node_modules"]
-        for name in GENERATED_INSTALL_FILES:
-            # The exclude MUST be /-anchored. A bare basename matches at any
-            # depth, which also excluded the SOURCE file
-            # .gemini-plugin/gemini-extension.json — so the deployed hidden
-            # manifest was copied once at install and never refreshed (#359).
-            # Anchored, the pattern only shields the root-level generated file
-            # (verified on macOS openrsync and per GNU rsync docs), and the
-            # exclusion also protects it from --delete no matter how the copy
-            # exits — no restore step to lose in a crash.
-            cmd += ["--exclude", f"/{name}"]
-        run(cmd + [f"{source}/", f"{dest}/"])
-        _sanitize_copied_manifests(dest)
-        return
-    preserved = {
-        name: (dest / name).read_bytes()
-        for name in GENERATED_INSTALL_FILES
-        if (dest / name).exists()
-    }
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(source, dest, ignore=shutil.ignore_patterns("node_modules", ".git"))
-    for name, blob in preserved.items():
-        (dest / name).write_bytes(blob)
-    _sanitize_copied_manifests(dest)
+    staging_parent = Path(tempfile.mkdtemp(prefix=f".{dest.name}.stage-", dir=str(dest.parent)))
+    try:
+        staged = staging_parent / dest.name
+        shutil.copytree(source, staged, ignore=shutil.ignore_patterns("node_modules", ".git"))
+        try:
+            _sanitize_copied_manifests(staged)
+        except Exception:
+            shutil.rmtree(staging_parent, ignore_errors=True)
+            if not parent_existed and dest.parent.is_dir() and not any(dest.parent.iterdir()):
+                dest.parent.rmdir()
+            raise
+        rsync = shutil.which("rsync")
+        if rsync:
+            cmd = [rsync, "-a", "--delete", "--exclude", "node_modules"]
+            for name in GENERATED_INSTALL_FILES:
+                # The exclude MUST be /-anchored. A bare basename matches at any
+                # depth, which also excluded the SOURCE file
+                # .gemini-plugin/gemini-extension.json — so the deployed hidden
+                # manifest was copied once at install and never refreshed (#359).
+                # Anchored, the pattern only shields the root-level generated file
+                # (verified on macOS openrsync and per GNU rsync docs), and the
+                # exclusion also protects it from --delete no matter how the copy
+                # exits — no restore step to lose in a crash.
+                cmd += ["--exclude", f"/{name}"]
+            run(cmd + [f"{staged}/", f"{dest}/"])
+            return
+        preserved = {
+            name: (dest / name).read_bytes()
+            for name in GENERATED_INSTALL_FILES
+            if (dest / name).exists()
+        }
+        if dest.exists():
+            shutil.rmtree(dest)
+        os.replace(staged, dest)
+        for name, blob in preserved.items():
+            (dest / name).write_bytes(blob)
+    finally:
+        shutil.rmtree(staging_parent, ignore_errors=True)
 
 
 def write_json(path: Path, data: dict) -> None:

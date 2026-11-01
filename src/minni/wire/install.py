@@ -99,39 +99,38 @@ def sanitize_staged_payload(
             if pjson_file.is_file() and (pjson_modified or rel_pjson in manifest.files):
                 manifest.files[rel_pjson] = sha256_file(pjson_file)
 
-    if remove_mcp_json:
-        pmanifest_file = stage / "payload-manifest.json"
-        if pmanifest_file.is_file():
-            try:
-                mdata = json.loads(pmanifest_file.read_text(encoding="utf-8"))
-                if not isinstance(mdata, dict):
-                    raise InstallError(f"staged payload-manifest.json is not a JSON object: {pmanifest_file}")
-                files = mdata.get("files")
-                if isinstance(files, dict):
-                    changed = False
-                    if ".mcp.json" in files:
-                        files.pop(".mcp.json", None)
-                        changed = True
-                    for rel_pjson, pjson_modified in modified_manifests.items():
-                        pjson_file = stage / rel_pjson
-                        if pjson_file.is_file() and (pjson_modified or rel_pjson in files):
-                            new_hash = sha256_file(pjson_file)
-                            if files.get(rel_pjson) != new_hash:
-                                files[rel_pjson] = new_hash
-                                changed = True
-                    if changed:
-                        mdata["files"] = files
-                        pmanifest_file.write_text(
-                            json.dumps(mdata, indent=2) + "\n", encoding="utf-8",
-                        )
-                if manifest is not None and isinstance(manifest.files, dict) and "payload-manifest.json" in manifest.files:
-                    manifest.files["payload-manifest.json"] = sha256_file(pmanifest_file)
-            except InstallError:
-                raise
-            except Exception as exc:
-                raise InstallError(
-                    f"failed to update staged payload-manifest.json ({pmanifest_file}): {exc}"
-                ) from exc
+    pmanifest_file = stage / "payload-manifest.json"
+    if pmanifest_file.is_file():
+        try:
+            mdata = json.loads(pmanifest_file.read_text(encoding="utf-8"))
+            if not isinstance(mdata, dict):
+                raise InstallError(f"staged payload-manifest.json is not a JSON object: {pmanifest_file}")
+            files = mdata.get("files")
+            if isinstance(files, dict):
+                changed = False
+                if remove_mcp_json and ".mcp.json" in files:
+                    files.pop(".mcp.json", None)
+                    changed = True
+                for rel_pjson, pjson_modified in modified_manifests.items():
+                    pjson_file = stage / rel_pjson
+                    if pjson_file.is_file() and (pjson_modified or rel_pjson in files):
+                        new_hash = sha256_file(pjson_file)
+                        if files.get(rel_pjson) != new_hash:
+                            files[rel_pjson] = new_hash
+                            changed = True
+                if changed:
+                    mdata["files"] = files
+                    pmanifest_file.write_text(
+                        json.dumps(mdata, indent=2) + "\n", encoding="utf-8",
+                    )
+            if manifest is not None and isinstance(manifest.files, dict) and "payload-manifest.json" in manifest.files:
+                manifest.files["payload-manifest.json"] = sha256_file(pmanifest_file)
+        except InstallError:
+            raise
+        except Exception as exc:
+            raise InstallError(
+                f"failed to update staged payload-manifest.json ({pmanifest_file}): {exc}"
+            ) from exc
 
 
 _sanitize_staged_payload = sanitize_staged_payload
