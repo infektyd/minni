@@ -474,7 +474,10 @@ def converge_host_container(
     else:
         raise ValueError(f"unsupported container host {host_id!r}")
 
+    from minni.wire.install import sanitize_staged_payload
+
     _write_container_manifests(container_dir, manifests, archive_dir=archive_dir)
+    sanitize_staged_payload(container_dir, version=base_semver, remove_mcp_json=False)
     return swap_container_subtrees(
         container_dir,
         stable_current_root=stable_current,
@@ -492,6 +495,8 @@ def stage_scratch_containers(
     container_modes: dict[str, str] | None = None,
 ) -> tuple[Path, dict[str, Path]]:
     """Build disposable pre-flip scratch containers `<mkdtemp>/Minni@Minni` and `local/minni` (§4.1 #3, `N3`)."""
+    from minni.wire.install import sanitize_staged_payload
+
     resolved_home = resolve_home(home)
     modes = container_modes or {}
     scratch_root = Path(tempfile.mkdtemp(prefix="minni-scratch-containers-"))
@@ -505,10 +510,12 @@ def stage_scratch_containers(
         ag_scratch,
         render_antigravity_container_manifests(resolved_home, base_semver=base_semver),
     )
+    sanitize_staged_payload(ag_scratch, version=base_semver, remove_mcp_json=False)
     _write_container_manifests(
         cu_scratch,
         render_cursor_container_manifests(resolved_home, base_semver=base_semver),
     )
+    sanitize_staged_payload(cu_scratch, version=base_semver, remove_mcp_json=False)
 
     ag_mode = modes.get("antigravity", "symlink_subtrees")
     cu_mode = modes.get("cursor", "symlink_subtrees")

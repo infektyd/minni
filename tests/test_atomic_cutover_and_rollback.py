@@ -2313,3 +2313,259 @@ def test_r9_payload_staging_failed_keeps_only_exception_type_never_text(
     assert out_cutover.message == "payload_staging_failed: JSONDecodeError"
     assert "SENSITIVE_MANIFEST_TOKEN_XYZ_987" not in out_cutover.message
     assert "secret" not in out_cutover.message
+
+
+def test_r10_h16_dry_run_and_apply_parity_on_real_commands_dir(tmp_path: Path) -> None:
+    """R10 Item 1 (H16):
+    Plan-mode dry run must report a commands_dir that exists as a REAL directory (not a symlink),
+    e.g. ~/.gemini/commands/minni holding old .toml files, as `would_abort` with host and path.
+    The dry run and --apply must agree on every such case.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+
+    v1_ver = "0.6.0+git.11111111"
+    v1_sha = "1" * 40
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / v1_ver)
+
+    # Seed a REAL directory at ~/.gemini/commands/minni holding old .toml files
+    cmd_dir = home / ".gemini" / "commands" / "minni"
+    cmd_dir.mkdir(parents=True)
+    old_toml = cmd_dir / "learn.toml"
+    old_toml.write_text('description = "legacy command"\n', encoding="utf-8")
+
+    dry_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_res.status == "DRY_RUN"
+    plan = dry_res.to_dict()["plan"]
+    assert not any(w["path"] == str(cmd_dir) for w in plan["would_write"]), (
+        f"real commands_dir must not be reported as would_write in dry-run: {plan['would_write']}"
+    )
+    assert f"antigravity:{cmd_dir}" not in dry_res.updated_surfaces
+    assert len(dry_res.would_abort) == 1
+    abort_entry = dry_res.would_abort[0]
+    assert abort_entry["host"] == "antigravity"
+    assert abort_entry["path"] == str(cmd_dir)
+    assert abort_entry["action"] == "would_abort"
+    assert abort_entry["reason"] == "broken_or_non_symlink_commands_dir"
+    assert plan["would_abort"] == dry_res.would_abort
+    assert plan["would-abort"] == dry_res.would_abort
+    assert plan["hosts"]["antigravity"]["would_abort"] == dry_res.would_abort
+    assert "would_abort=1" in dry_res.message
+    assert f"antigravity:{cmd_dir}" in dry_res.message
+
+    # --apply must agree with dry-run: aborts with host and path, leaving real dir untouched
+    apply_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_res.exit_code == 1
+    assert apply_res.rolled_back is True
+    assert len(apply_res.would_abort) == 1
+    assert apply_res.would_abort[0]["host"] == "antigravity"
+    assert apply_res.would_abort[0]["path"] == str(cmd_dir)
+    assert "antigravity" in apply_res.message
+    assert str(cmd_dir) in apply_res.message
+    assert cmd_dir.is_dir() and not cmd_dir.is_symlink()
+    assert old_toml.read_text(encoding="utf-8") == 'description = "legacy command"\n'
+
+
+def test_r10_h17_single_sanitization_path_wire_all_force_reinstall_and_cutover_containers_zero_delta(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R10 Item 2 (H17):
+    After `wire all --force-reinstall` (install_payload with force_reinstall=True), the installed
+    payload and host containers must not carry `mcpServers` in `.claude-plugin/plugin.json` or
+    `.cursor-plugin/plugin.json` where the catalog forbids it, and cutover's post-flip health check
+    reports zero delta for those containers.
+    """
+    from minni.wire.cutover import _container_has_delta
+    from minni.wire.from_repo import _git_sha
+    from minni.wire.health import audit_host_propagation_health
+    from minni.wire.manifest import dev_version
+
+    repo_root = Path(__file__).resolve().parent.parent
+    ver = dev_version(repo_root)
+    sha = _git_sha(repo_root)
+    base_semver = ver.split("+", 1)[0]
+
+    home = tmp_path / "home"
+    plugin_root = home / ".minni" / "plugin"
+    plugin_root.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    wrapper = home / ".agents" / "bin" / "mcp-env-run"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"minni": {"command": "node", "args": ["old/dist/server.js"]}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    # Seed pre-existing antigravity and cursor containers with forbidden `mcpServers` in both manifests
+    ag_container = home / ".agents" / "plugins" / "Minni@Minni"
+    cursor_container = home / ".cursor" / "plugins" / "local" / "minni"
+    for cdir in (ag_container, cursor_container):
+        for sub in (".claude-plugin", ".cursor-plugin"):
+            pjson = cdir / sub / "plugin.json"
+            pjson.parent.mkdir(parents=True, exist_ok=True)
+            pjson.write_text(
+                json.dumps(
+                    {
+                        "name": "minni",
+                        "version": "0.5.0",
+                        "mcpServers": {"minni": {"command": "node", "args": ["dist/server.js"]}},
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+    # Run wire-all (`minni wire all --force-reinstall --from-repo`) into temp HOME
+    from argparse import Namespace
+    from minni.wire.flow import run_wire
+
+    wire_ns = Namespace(
+        platform="all",
+        agent=None,
+        workspace=None,
+        install_root=None,
+        dry_run=False,
+        verify_payload=False,
+        prune=False,
+        no_prune=True,
+        force_reinstall=True,
+        from_repo=str(repo_root),
+        use_version=None,
+        socket=str(home / ".minni" / "run" / "minnid.sock"),
+    )
+    run_wire(wire_ns)
+
+    vdir = plugin_root / ver
+    assert vdir.is_dir()
+
+    # Installed payload and existing containers must have `mcpServers` stripped in both plugin.json files
+    for root_dir in (vdir, ag_container, cursor_container):
+        for rel_manifest in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+            m_path = root_dir / rel_manifest
+            assert m_path.is_file(), f"missing {m_path}"
+            m_doc = json.loads(m_path.read_text(encoding="utf-8"))
+            assert "mcpServers" not in m_doc, f"forbidden mcpServers remained in {m_path}"
+    for root_dir in (vdir, ag_container, cursor_container):
+        for rel_manifest in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+            m_path = root_dir / rel_manifest
+            m_doc = json.loads(m_path.read_text(encoding="utf-8"))
+            assert m_doc["version"] == base_semver
+
+    # Cutover's post-flip health check & container delta check report zero delta after cutover
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0, cut_res.message
+    assert cut_res.status == "CONVERGED"
+    assert _container_has_delta(ag_container, vdir, base_semver) is False
+    assert _container_has_delta(cursor_container, vdir, base_semver) is False
+
+    health = audit_host_propagation_health(home=home, expected_git_sha=sha)
+    assert health.ok is True, health.drifted_surfaces
+    assert health.drifted_surfaces == []
+    from minni.wire.install import sanitize_staged_payload
+
+    assert callable(sanitize_staged_payload)
+
+
+def test_r10_h18_rollback_cas_conflict_never_leaves_dangling_current_pointer(
+    tmp_path: Path,
+) -> None:
+    """R10 Item 3 (H18):
+    If rollback cannot restore a host config (CAS conflict, e.g. ~/.claude.json rewritten by Claude Code
+    mid-cutover) and that config points at ~/.minni/plugin/current/..., rollback must NOT remove `current`;
+    keep it, or repoint it at the versioned dir the live config can still resolve, and report the
+    host+path in the result.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+
+    v1_ver = "0.6.0+git.644bb381"
+    v1_sha = "6" * 40
+    v2_ver = "0.6.0+git.0dc63030"
+    v2_sha = "0" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+
+    # Prior to cutover, `current` does NOT exist; live ~/.claude.json points directly at v1_ver
+    assert not (plugin_dir / "current").exists()
+    claude_json = home / ".claude.json"
+    claude_json.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": [str(plugin_dir / v1_ver / "dist" / "server.js")],
+                        "env": {
+                            "MINNI_AGENT_ID": "claude-code",
+                            "MINNI_VAULT_PATH": str(home / ".minni" / "claudecode-vault"),
+                        },
+                    }
+                },
+                "cachedGrowthBookFeatures": {"initial": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _concurrent_claude_edit_then_fail(_home: Path) -> bool:
+        # Step 5 updated ~/.claude.json to point at ~/.minni/plugin/current/dist/server.js;
+        # now Claude Code concurrently rewrites ~/.claude.json before Step 6 fails.
+        live_doc = json.loads(claude_json.read_text(encoding="utf-8"))
+        assert live_doc["mcpServers"]["minni"]["args"] == [
+            str(plugin_dir / "current" / "dist" / "server.js")
+        ]
+        live_doc["cachedGrowthBookFeatures"] = {"concurrent_write": True}
+        claude_json.write_text(json.dumps(live_doc, indent=2) + "\n", encoding="utf-8")
+        return False
+
+    rb_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+        post_flip_verifier=_concurrent_claude_edit_then_fail,
+    )
+    assert rb_res.exit_code == 1
+    assert rb_res.rolled_back is True
+
+    # Live ~/.claude.json preserved concurrent edit AND its args[0] path resolves on disk!
+    after_doc = json.loads(claude_json.read_text(encoding="utf-8"))
+    assert after_doc["cachedGrowthBookFeatures"] == {"concurrent_write": True}
+    args_path = Path(after_doc["mcpServers"]["minni"]["args"][0])
+    assert args_path == plugin_dir / "current" / "dist" / "server.js"
+    assert (plugin_dir / "current").is_symlink()
+    assert args_path.is_file(), f"dangling args[0] path after rollback: {args_path}"
+    assert args_path.resolve().is_file()
+
+    # Result reports the conflict with host and path
+    assert any("claude-code" in c and str(claude_json) in c for c in rb_res.cas_conflicts), rb_res.cas_conflicts
+    assert "claude-code" in rb_res.message
+    assert str(claude_json) in rb_res.message

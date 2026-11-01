@@ -353,17 +353,12 @@ def sync_local_marketplace(
                 shutil.copytree(
                     install_root, staged, symlinks=False, ignore_dangling_symlinks=True,
                 )
-                staged_cplugin = staged / ".claude-plugin" / "plugin.json"
-                if staged_cplugin.is_file():
-                    try:
-                        cdata = json.loads(staged_cplugin.read_text(encoding="utf-8"))
-                        if isinstance(cdata, dict) and "mcpServers" in cdata:
-                            cdata.pop("mcpServers", None)
-                            staged_cplugin.write_text(
-                                json.dumps(cdata, indent=2) + "\n", encoding="utf-8",
-                            )
-                    except Exception:
-                        pass
+                from minni.wire.install import sanitize_staged_payload
+
+                try:
+                    sanitize_staged_payload(staged, remove_mcp_json=False)
+                except Exception:
+                    pass
                 if target.exists():
                     shutil.rmtree(target)
                 os.replace(staged, target)

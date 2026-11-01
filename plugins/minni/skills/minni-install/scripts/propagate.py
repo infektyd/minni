@@ -423,6 +423,26 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
 GENERATED_INSTALL_FILES = ("gemini-extension.json",)
 
 
+def _sanitize_copied_manifests(dest: Path) -> None:
+    try:
+        from minni.wire.install import sanitize_staged_payload
+
+        sanitize_staged_payload(dest, remove_mcp_json=False)
+        return
+    except Exception:
+        pass
+    for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+        pjson_file = dest / rel_pjson
+        if pjson_file.is_file():
+            try:
+                pdata = json.loads(pjson_file.read_text(encoding="utf-8"))
+                if isinstance(pdata, dict) and "mcpServers" in pdata:
+                    pdata.pop("mcpServers", None)
+                    pjson_file.write_text(json.dumps(pdata, indent=2) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+
 def copy_tree(source: Path, dest: Path) -> None:
     if not source.exists():
         raise SystemExit(f"Missing plugin source: {source}")
@@ -441,6 +461,7 @@ def copy_tree(source: Path, dest: Path) -> None:
             # exits — no restore step to lose in a crash.
             cmd += ["--exclude", f"/{name}"]
         run(cmd + [f"{source}/", f"{dest}/"])
+        _sanitize_copied_manifests(dest)
         return
     preserved = {
         name: (dest / name).read_bytes()
@@ -452,6 +473,7 @@ def copy_tree(source: Path, dest: Path) -> None:
     shutil.copytree(source, dest, ignore=shutil.ignore_patterns("node_modules", ".git"))
     for name, blob in preserved.items():
         (dest / name).write_bytes(blob)
+    _sanitize_copied_manifests(dest)
 
 
 def write_json(path: Path, data: dict) -> None:

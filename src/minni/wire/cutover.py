@@ -93,6 +93,7 @@ class CutoverOutcome:
     updated_surfaces: list[str] = field(default_factory=list)
     skipped_surfaces: list[str] = field(default_factory=list)
     cas_conflicts: list[str] = field(default_factory=list)
+    would_abort: list[dict[str, Any]] = field(default_factory=list)
     gc_result: dict[str, Any] = field(default_factory=dict)
     message: str = ""
     plan: dict[str, Any] = field(default_factory=dict)
@@ -111,6 +112,8 @@ class CutoverOutcome:
             "updated_surfaces": list(self.updated_surfaces),
             "skipped_surfaces": list(self.skipped_surfaces),
             "cas_conflicts": list(self.cas_conflicts),
+            "would_abort": copy.deepcopy(self.would_abort),
+            "would-abort": copy.deepcopy(self.would_abort),
             "gc_result": dict(self.gc_result),
             "findings": copy.deepcopy(self.findings),
             "stale_locks": copy.deepcopy(self.stale_locks),
@@ -131,6 +134,8 @@ class CutoverOutcome:
                 "would_archive",
                 "would-skip",
                 "would_skip",
+                "would-abort",
+                "would_abort",
                 "findings",
                 "stale_locks",
                 "gc",
@@ -973,6 +978,8 @@ def _converge_claude_local_marketplace(
             pid=pid,
         )
 
+        from minni.wire.install import sanitize_staged_payload
+
         cplugin_dir = mkt_plugin_dir / ".claude-plugin"
         cplugin_dir.mkdir(parents=True, exist_ok=True)
         src_pjson = version_dir / ".claude-plugin" / "plugin.json"
@@ -993,6 +1000,7 @@ def _converge_claude_local_marketplace(
                         host=host,
                         ts=ts,
                     )
+        sanitize_staged_payload(mkt_plugin_dir, version=base_semver, remove_mcp_json=True)
         src_pkg = version_dir / "package.json"
         if src_pkg.is_file():
             dest_pkg = mkt_plugin_dir / "package.json"
@@ -1246,6 +1254,8 @@ def _stage_repo_payload_to_temp(
                         f"esbuild bundling failed (rc={exc.returncode}): {(exc.stderr or '').strip()}"
                     ) from exc
 
+        from minni.wire.install import sanitize_staged_payload
+
         for rel in MANIFEST_STAMP_PATHS:
             p = tmp / rel
             if not p.is_file():
@@ -1253,11 +1263,9 @@ def _stage_repo_payload_to_temp(
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 data["version"] = version
-                if rel == ".claude-plugin/plugin.json":
-                    data.pop("mcpServers", None)
                 p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
-        (tmp / ".mcp.json").unlink(missing_ok=True)
+        sanitize_staged_payload(tmp, version=version)
 
         files: dict[str, str] = {}
         for path in sorted(tmp.rglob("*")):
@@ -1477,6 +1485,8 @@ def _build_dry_run_plan_with_ref(
             "would-defer": [],
             "would-archive": [],
             "would-skip": [],
+            "would-abort": [],
+            "would_abort": [],
             "stale_locks": [],
         }
 
@@ -1485,6 +1495,7 @@ def _build_dry_run_plan_with_ref(
     would_defer: list[dict[str, Any]] = []
     would_archive: list[dict[str, Any]] = []
     would_skip: list[dict[str, Any]] = []
+    would_abort: list[dict[str, Any]] = []
     stale_findings: list[dict[str, Any]] = []
     all_surface_plans: list[dict[str, Any]] = []
     updated_surfaces: list[str] = []
@@ -1534,11 +1545,12 @@ def _build_dry_run_plan_with_ref(
         reason: str = "",
         archive_dest: str | None = None,
     ) -> None:
+        norm_action = "would_abort" if action in ("would-abort", "would_abort") else action
         item: dict[str, Any] = {
             "host": host,
             "kind": kind,
             "path": str(cfg_path),
-            "action": action,
+            "action": norm_action,
         }
         if diff is not None:
             item["diff"] = diff
@@ -1558,10 +1570,16 @@ def _build_dry_run_plan_with_ref(
                 "would-defer": [],
                 "would-archive": [],
                 "would-skip": [],
+                "would-abort": [],
+                "would_abort": [],
             },
         )
         h_bucket["surfaces"].append(item)
-        if action in h_bucket:
+        if action in ("would-abort", "would_abort"):
+            would_abort.append(item)
+            h_bucket.setdefault("would-abort", []).append(item)
+            h_bucket.setdefault("would_abort", []).append(item)
+        elif action in h_bucket:
             h_bucket[action].append(item)
         if action == "would-write":
             would_write.append(item)
@@ -1800,7 +1818,7 @@ def _build_dry_run_plan_with_ref(
                 "after": after_entry,
                 "reasons": ["broken_or_non_symlink_commands_dir"],
             }
-            _record_surface(host, kind, cfg_path, "would-write", diff=diff_obj, reason="broken_or_non_symlink_commands_dir")
+            _record_surface(host, kind, cfg_path, "would_abort", diff=diff_obj, reason="broken_or_non_symlink_commands_dir")
             continue
 
         if kind in ("mcp_json", "mcp_toml"):
@@ -2006,6 +2024,8 @@ def _build_dry_run_plan_with_ref(
         "would_archive": would_archive,
         "would-skip": would_skip,
         "would_skip": would_skip,
+        "would-abort": would_abort,
+        "would_abort": would_abort,
         "findings": stale_findings,
         "stale_locks": stale_findings,
         "gc": {
@@ -2014,12 +2034,17 @@ def _build_dry_run_plan_with_ref(
         },
     }
 
+    abort_suffix = ""
+    if would_abort:
+        abort_items = ", ".join(f"{a.get('host')}:{a.get('path')}" for a in would_abort)
+        abort_suffix = f", would_abort={len(would_abort)} ({abort_items})"
+
     msg = (
         f"dry-run: would cut over {home} to {target_version}: "
         f"would-write={len(would_write)}, would-create={len(would_create)}, "
         f"would-defer={len(would_defer)}, would-archive={len(would_archive)}, "
         f"would-skip={len(would_skip)}, would-prune={len(gc_out.would_prune)}, "
-        f"would-keep={len(would_keep_paths)}"
+        f"would-keep={len(would_keep_paths)}{abort_suffix}"
     )
     return CutoverOutcome(
         exit_code=0,
@@ -2029,6 +2054,7 @@ def _build_dry_run_plan_with_ref(
         deferred_running_hosts=deferred_running_hosts,
         updated_surfaces=updated_surfaces,
         skipped_surfaces=skipped_surfaces,
+        would_abort=would_abort,
         gc_result=gc_dict,
         message=msg,
         plan=plan_doc,
@@ -2236,6 +2262,7 @@ def execute_atomic_cutover(
     prev_installed_plugins_list: list[tuple[Path, bytes | None, int, int, str]] = []
     step5_error: str = ""
     cas_conflicts: list[str] = []
+    would_abort: list[dict[str, Any]] = []
 
     # Step 5 — Reconcile Host Surfaces Across All Catalog Surface Kinds (`delta != 0` only, Lock/Running Guard & CAS)
     for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
@@ -2333,6 +2360,15 @@ def execute_atomic_cutover(
 
         if kind == "commands_dir":
             if cfg_path.exists() and not cfg_path.is_symlink():
+                would_abort.append(
+                    {
+                        "host": host,
+                        "kind": kind,
+                        "path": str(cfg_path),
+                        "action": "would_abort",
+                        "reason": "broken_or_non_symlink_commands_dir",
+                    }
+                )
                 step5_error = f"broken or non-symlink commands_dir surface for {host} ({cfg_path})"
                 break
             expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
@@ -2728,9 +2764,7 @@ def execute_atomic_cutover(
             )
 
     if not step6_ok:
-        # 1. Restore `current` (handles real-dir `current` via unlink+rename without ENOTDIR, R4-1)
-        rollback_current_pointer(flip_state)
-        # 2. Restore container subtrees and commands_dir symlinks with CAS tuple check (New P2 #1)
+        # 1. Restore container subtrees and commands_dir symlinks with CAS tuple check (New P2 #1)
         rollback_container_subtrees(all_container_swaps)
         for cmd_link, prev_target, post_ino, post_mtime_ns, post_target in reversed(commands_symlink_rollbacks):
             try:
@@ -2772,12 +2806,14 @@ def execute_atomic_cutover(
                     cpath.write_bytes(cur_bytes)
                     cas_conflicts.append(str(cpath))
 
-        # 3. Restore modified host config files with CAS check on EVERY record; leave live bytes on CAS mismatch (P1-3, New P3 #1)
+        # 2. Restore modified host config files with CAS check on EVERY record; leave live bytes on CAS mismatch (P1-3, New P3 #1, H18)
+        conflicted_records: list[_ConfigRollbackRecord] = []
         for rec in reversed(rollback_records):
             try:
                 cur_ino, cur_mtime_ns, cur_sha256, cur_bytes = _file_cas_tuple(rec.path)
             except OSError:
-                cas_conflicts.append(str(rec.path))
+                cas_conflicts.append(f"{rec.host}:{rec.path}")
+                conflicted_records.append(rec)
                 continue
             if (cur_ino, cur_mtime_ns, cur_sha256) == (rec.post_step5_ino, rec.post_step5_mtime_ns, rec.post_step5_sha256):
                 if rec.pre_bytes is None:
@@ -2786,12 +2822,80 @@ def execute_atomic_cutover(
                     _atomic_write_bytes(rec.path, rec.pre_bytes, mode=rec.pre_mode)
             else:
                 # Concurrent mutation happened between Step 5 and Step 7a rollback:
-                # Leave live bytes untouched on disk, archive conflict under rollback-conflict, and record in cas_conflicts!
+                # Leave live bytes untouched on disk, archive conflict under rollback-conflict, and record host+path in cas_conflicts!
                 conflict_dir = _archive_dir(home, ts) / "rollback-conflict"
                 conflict_dir.mkdir(parents=True, exist_ok=True)
                 cpath = conflict_dir / rec.path.name
                 cpath.write_bytes(cur_bytes)
-                cas_conflicts.append(str(cpath))
+                cas_conflicts.append(f"{rec.host}:{rec.path} ({cpath})")
+                conflicted_records.append(rec)
+
+        # 3. Restore `current` pointer (R4-1 & H18: never leave a live host config referencing `~/.minni/plugin/current/...` dangling)
+        if flip_state.prev_dir_path is not None:
+            rollback_current_pointer(flip_state)
+        else:
+            current_abs_prefix = str(plugin_dir / "current")
+            live_current_rel_paths: set[str] = set()
+            live_refs_current = False
+            candidate_cfg_paths: list[Path] = [rec.path for rec in conflicted_records]
+            for _h, _k, spath, _spec, _rw in all_surfaces:
+                if _k != "plugin_container" and spath not in candidate_cfg_paths:
+                    candidate_cfg_paths.append(spath)
+            for cpath_chk in candidate_cfg_paths:
+                if not cpath_chk.is_file():
+                    continue
+                try:
+                    txt = cpath_chk.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if current_abs_prefix in txt or "~/.minni/plugin/current" in txt:
+                    live_refs_current = True
+                    for m in re.finditer(re.escape(current_abs_prefix) + r"/([^\s\"'\],]+)", txt):
+                        live_current_rel_paths.add(m.group(1))
+                    for m in re.finditer(r"~/.minni/plugin/current/([^\s\"'\],]+)", txt):
+                        live_current_rel_paths.add(m.group(1))
+            if live_refs_current and not live_current_rel_paths:
+                live_current_rel_paths.add("dist/server.js")
+
+            def _version_satisfies_live_refs(ver_name: str | None) -> bool:
+                if not ver_name:
+                    return False
+                cand_dir = Path(ver_name) if Path(ver_name).is_absolute() else (plugin_dir / ver_name)
+                if not cand_dir.is_dir():
+                    return False
+                for rel_p in live_current_rel_paths:
+                    if not (cand_dir / rel_p).exists():
+                        return False
+                return (cand_dir / "dist" / "server.js").is_file()
+
+            if not live_refs_current or _version_satisfies_live_refs(flip_state.prev_link_target):
+                rollback_current_pointer(flip_state)
+            else:
+                chosen_ver: str | None = None
+                for rec in conflicted_records:
+                    if rec.pre_bytes:
+                        pre_txt = rec.pre_bytes.decode("utf-8", errors="ignore")
+                        for v_cand in sorted(_extract_referenced_versions(pre_txt, plugin_dir)):
+                            if _version_satisfies_live_refs(v_cand):
+                                chosen_ver = v_cand
+                                break
+                    if chosen_ver:
+                        break
+                if not chosen_ver:
+                    active_v = str(wired_doc.get("active_version") or "")
+                    if _version_satisfies_live_refs(active_v):
+                        chosen_ver = active_v
+                if not chosen_ver:
+                    chosen_ver = target_version
+                tmp_rb_link = plugin_dir / f".current.rb.{pid}"
+                if tmp_rb_link.exists() or tmp_rb_link.is_symlink():
+                    tmp_rb_link.unlink(missing_ok=True)
+                os.symlink(chosen_ver, tmp_rb_link)
+                os.replace(tmp_rb_link, flip_state.current_path)
+
+        rb_msg = step6_reason or "rolled back after Step 6 failure"
+        if cas_conflicts:
+            rb_msg = f"{rb_msg}; cas_conflicts: {', '.join(cas_conflicts)}"
 
         return CutoverOutcome(
             exit_code=1,
@@ -2802,7 +2906,8 @@ def execute_atomic_cutover(
             updated_surfaces=updated_surfaces,
             skipped_surfaces=skipped_surfaces,
             cas_conflicts=cas_conflicts,
-            message=step6_reason or "rolled back after Step 6 failure",
+            would_abort=would_abort,
+            message=rb_msg,
             findings=stale_findings,
             stale_locks=stale_findings,
         )
