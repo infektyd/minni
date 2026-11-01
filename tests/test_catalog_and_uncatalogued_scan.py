@@ -345,3 +345,84 @@ def test_doctor_and_check_scripts_fail_closed_on_daemon_stale_and_host_propagati
         "cursor: host propagation drift" in p and "container_dist_server_js_mismatch" in p
         for p in container_problems
     ), container_problems
+
+
+def test_uncatalogued_scanner_ignores_backups_and_conversations_but_fails_unknown_configs(
+    tmp_path: Path,
+) -> None:
+    """R6 Item 2: Backup, history, conversation, file-history, and worker workspace files
+    referencing .minni/plugin are NOT drift; unknown config-shaped files at host config depths ARE.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    # Seed excluded history, backup, conversation, session, and worker workspace stores referencing .minni/plugin
+    noise_files = [
+        home / ".gemini" / "antigravity" / "brain" / "conv-1" / ".system_generated" / "messages" / "m1.json",
+        home / ".gemini" / "antigravity-cli" / "brain" / "conv-2" / "scratch" / "bench.mjs",
+        home / ".gemini" / "antigravity-ide" / "brain" / "conv-3" / "notes.md",
+        home / ".gemini" / "antigravity-backup" / "mcp_config.json",
+        home / ".gemini" / "tmp" / "user" / "chats" / "session-1.json",
+        home / ".agents" / "backups" / "20260520-085707" / ".gemini__config__mcp_config.json",
+        home / ".agents" / "workflows" / "plan.md",
+        home / ".codex" / "muse-code-worker" / "e3fd8d37" / "workspace" / "eval" / "public_repo.json",
+        home / ".codex" / "grok-build-peer" / "970c9701" / "workspace" / "contract.md",
+        home / ".codex" / "backups" / "20260925" / "config.toml",
+        home / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions" / "a" / "b" / "local_1.json",
+        home / "Library" / "Application Support" / "Claude" / "claude-code-sessions" / "a" / "b" / "local_2.json",
+        home / ".claude" / "file-history" / "fc405a96" / "5782a9a8@v24",
+        home / ".claude" / "backups" / "2026-09-24" / "installed_plugins.json",
+        home / ".grok" / "memory-v2" / "workspaces" / "w1" / "topics" / "topic.md",
+        home / ".grok" / "scratch" / "audit" / "ledger.md",
+        home / ".cursor" / "plans" / "rewrite.plan.md",
+        home / ".cursor" / "legacy-plugins" / "minni-old" / "skills" / "s" / "SKILL.md",
+    ]
+    for nf in noise_files:
+        nf.parent.mkdir(parents=True, exist_ok=True)
+        nf.write_text(json.dumps({"ref": stale_ref}), encoding="utf-8")
+
+    # Converge the catalogued surfaces on home so only uncatalogued refs could fail health
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    assert scan_for_uncatalogued_plugin_refs(home) == []
+    clean_report = audit_host_propagation_health(home=home, expected_git_sha=sha)
+    assert clean_report.ok is True, clean_report.to_dict()
+    assert clean_report.uncatalogued_refs == []
+
+    # Now plant unknown config-shaped files at host config depths -> MUST fail closed
+    unknown_json = home / ".gemini" / "unknown_mcp_config.json"
+    unknown_toml = home / ".codex" / "rogue_config.toml"
+    unknown_skill = home / ".codex" / "skills" / "rogue-minni-skill" / "SKILL.md"
+    for uf in (unknown_json, unknown_toml, unknown_skill):
+        uf.parent.mkdir(parents=True, exist_ok=True)
+        uf.write_text(f"# config referencing {stale_ref}\n", encoding="utf-8")
+
+    hits = scan_for_uncatalogued_plugin_refs(home)
+    hit_paths = {Path(h["path"]) for h in hits}
+    assert unknown_json in hit_paths, hits
+    assert unknown_toml in hit_paths, hits
+    assert unknown_skill in hit_paths, hits
+    for nf in noise_files:
+        assert nf not in hit_paths
+
+    dirty_report = audit_host_propagation_health(home=home, expected_git_sha=sha)
+    assert dirty_report.ok is False
+    assert {Path(h["path"]) for h in dirty_report.uncatalogued_refs} >= {
+        unknown_json,
+        unknown_toml,
+        unknown_skill,
+    }

@@ -93,9 +93,10 @@ class CutoverOutcome:
     cas_conflicts: list[str] = field(default_factory=list)
     gc_result: dict[str, Any] = field(default_factory=dict)
     message: str = ""
+    plan: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "exit_code": self.exit_code,
             "status": self.status,
             "target_version": self.target_version,
@@ -109,6 +110,26 @@ class CutoverOutcome:
             "gc_result": dict(self.gc_result),
             "message": self.message,
         }
+        if self.plan:
+            out["plan"] = copy.deepcopy(self.plan)
+            for k in (
+                "hosts",
+                "surfaces",
+                "would-write",
+                "would_write",
+                "would-create",
+                "would_create",
+                "would-defer",
+                "would_defer",
+                "would-archive",
+                "would_archive",
+                "would-skip",
+                "would_skip",
+                "gc",
+            ):
+                if k in self.plan:
+                    out[k] = copy.deepcopy(self.plan[k])
+        return out
 
 
 def _file_stat_and_sha256(path: Path) -> tuple[int, str, bytes]:
@@ -458,7 +479,7 @@ def _validate_scratch_containers(
     for host, sdir in scratch_dirs.items():
         if not sdir.is_dir():
             return False, f"scratch container missing for {host}: {sdir}"
-        for sub in ("dist", "skills", "commands", "hooks"):
+        for sub in ("dist", "skills", "hooks"):
             sub_path = sdir / sub
             if not sub_path.exists():
                 return False, f"scratch container {host} missing subtree {sub}"
@@ -921,6 +942,641 @@ def _reconcile_text_surface(
     return (updated != raw_text), updated
 
 
+_SENSITIVE_KEY_RE = re.compile(r"(?i)(token|secret|key|password|passwd|credential|auth|bearer|private)")
+_SAFE_MINNI_ENV_KEYS: frozenset[str] = frozenset({
+    "MINNI_AGENT_ID",
+    "MINNI_VAULT_PATH",
+    "MINNI_WORKSPACE_ID",
+    "MINNI_SOCKET_PATH",
+    "MINNI_LOG_LEVEL",
+})
+
+
+def _default_repo_root() -> Path | None:
+    """Resolve the checkout repo root containing `src/minni/wire/cutover.py` when present."""
+    try:
+        cand = Path(__file__).resolve().parents[3]
+        if (cand / "pyproject.toml").is_file() and (cand / "plugins" / "minni").is_dir():
+            return cand
+    except Exception:
+        pass
+    return None
+
+
+def _redact_minni_entry(entry: Any) -> Any:
+    """Return a copy of a `minni` entry with secrets/non-Minni env values redacted to `<REDACTED>`."""
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        redacted: dict[str, Any] = {}
+        for k, v in entry.items():
+            k_str = str(k)
+            if k_str == "env" and isinstance(v, dict):
+                env_out: dict[str, Any] = {}
+                for ek, ev in v.items():
+                    ek_str = str(ek)
+                    if ek_str in _SAFE_MINNI_ENV_KEYS and not _SENSITIVE_KEY_RE.search(ek_str):
+                        env_out[ek_str] = str(ev)
+                    else:
+                        env_out[ek_str] = "<REDACTED>"
+                redacted[k_str] = env_out
+            elif _SENSITIVE_KEY_RE.search(k_str):
+                redacted[k_str] = "<REDACTED>"
+            elif isinstance(v, dict):
+                redacted[k_str] = _redact_minni_entry(v)
+            else:
+                redacted[k_str] = copy.deepcopy(v)
+        return redacted
+    return copy.deepcopy(entry)
+
+
+def _build_dry_run_plan(
+    *,
+    home: Path,
+    target_version: str,
+    target_git_sha: str,
+    running_hosts: set[str] | None,
+    repo_root: Path | None,
+    ts: str,
+    base_semver: str,
+) -> CutoverOutcome:
+    """Compute lossless per-surface plan (`would-write`, `would-create`, `would-defer`, `would-archive`, `would-skip`, and GC `would-prune`/`would-keep`) with zero disk writes."""
+    plugin_dir = home / ".minni" / "plugin"
+    vdir = plugin_dir / target_version
+    if vdir.is_dir():
+        ref_vdir = vdir
+    elif repo_root is not None and (repo_root / "plugins" / "minni").is_dir():
+        ref_vdir = repo_root / "plugins" / "minni"
+    else:
+        def_repo = _default_repo_root()
+        if def_repo is not None and (def_repo / "plugins" / "minni").is_dir():
+            ref_vdir = def_repo / "plugins" / "minni"
+        elif (plugin_dir / "current").is_dir():
+            ref_vdir = plugin_dir / "current"
+        else:
+            ref_vdir = vdir
+
+    wired_doc = _load_wired(plugin_dir / "wired.json")
+    active_running = (
+        set(running_hosts)
+        if running_hosts is not None
+        else _detect_running_rewrite_hosts()
+    )
+
+    hosts_plan: dict[str, dict[str, Any]] = {}
+    for host_id, hspec in HOST_SURFACE_CATALOG.items():
+        hosts_plan[host_id] = {
+            "agent_id": str(hspec.get("agent_id") or host_id),
+            "running": host_id in active_running,
+            "surfaces": [],
+            "would-write": [],
+            "would-create": [],
+            "would-defer": [],
+            "would-archive": [],
+            "would-skip": [],
+        }
+
+    would_write: list[dict[str, Any]] = []
+    would_create: list[dict[str, Any]] = []
+    would_defer: list[dict[str, Any]] = []
+    would_archive: list[dict[str, Any]] = []
+    would_skip: list[dict[str, Any]] = []
+    all_surface_plans: list[dict[str, Any]] = []
+    updated_surfaces: list[str] = []
+    skipped_surfaces: list[str] = []
+    deferred_running_hosts: list[str] = []
+    deferred_protected_versions: set[str] = set()
+
+    archive_base = home / ".minni" / "archive" / f"{ts}-dry-run"
+
+    def _preview_archive_dest(path: Path) -> str:
+        try:
+            rel = path.relative_to(home)
+        except ValueError:
+            rel = Path(path.name)
+        return str(archive_base / rel)
+
+    def _check_defer(host: str, cfg_path: Path, raw_text: str) -> str | None:
+        lock_hit = _check_host_lockfile(home, host, cfg_path, retries=1)
+        is_running_rewrite_host = (
+            host in ("muse", "claude-desktop", "grok-build", "devin", "cursor")
+            and host in active_running
+        )
+        if lock_hit or is_running_rewrite_host:
+            if host not in deferred_running_hosts:
+                deferred_running_hosts.append(host)
+            deferred_protected_versions.update(_extract_referenced_versions(raw_text, plugin_dir))
+            if lock_hit and is_running_rewrite_host:
+                return f"host {host} is running and lockfile is present ({lock_hit})"
+            if lock_hit:
+                return f"host {host} lockfile present ({lock_hit})"
+            return f"host {host} is running (rewrite-on-run hazard)"
+        return None
+
+    def _record_surface(
+        host: str,
+        kind: str,
+        cfg_path: Path,
+        action: str,
+        *,
+        diff: dict[str, Any] | None = None,
+        reason: str = "",
+        archive_dest: str | None = None,
+    ) -> None:
+        item: dict[str, Any] = {
+            "host": host,
+            "kind": kind,
+            "path": str(cfg_path),
+            "action": action,
+        }
+        if diff is not None:
+            item["diff"] = diff
+        if reason:
+            item["reason"] = reason
+        if archive_dest:
+            item["archive_dest"] = archive_dest
+        all_surface_plans.append(item)
+        h_bucket = hosts_plan.setdefault(
+            host,
+            {
+                "agent_id": host,
+                "running": host in active_running,
+                "surfaces": [],
+                "would-write": [],
+                "would-create": [],
+                "would-defer": [],
+                "would-archive": [],
+                "would-skip": [],
+            },
+        )
+        h_bucket["surfaces"].append(item)
+        if action in h_bucket:
+            h_bucket[action].append(item)
+        if action == "would-write":
+            would_write.append(item)
+            updated_surfaces.append(f"{host}:{cfg_path}")
+        elif action == "would-create":
+            would_create.append(item)
+            updated_surfaces.append(f"{host}:{cfg_path}")
+        elif action == "would-defer":
+            would_defer.append(item)
+        elif action == "would-skip":
+            would_skip.append(item)
+            skipped_surfaces.append(f"{host}:{cfg_path}")
+        if archive_dest:
+            arch_item = {
+                "host": host,
+                "kind": kind,
+                "path": str(cfg_path),
+                "archive_dest": archive_dest,
+                "reason": "pre_write_backup",
+            }
+            would_archive.append(arch_item)
+            h_bucket["would-archive"].append(arch_item)
+
+    container_and_registry_surfaces: list[tuple[str, str, Path, dict[str, Any], bool]] = []
+    config_and_file_surfaces: list[tuple[str, str, Path, dict[str, Any], bool]] = []
+    for host_id, hspec in HOST_SURFACE_CATALOG.items():
+        rewrite_hazard = str(hspec.get("rewrite_on_run_hazard") or "none") != "none"
+        for surf in hspec.get("surfaces", []):
+            if not isinstance(surf, dict):
+                continue
+            kind = str(surf.get("kind") or "")
+            if kind == "mcp_view_mirrors":
+                for vp_raw in surf.get("paths") or []:
+                    vp = Path(expand_for_home(str(vp_raw), home=home))
+                    view_spec = {
+                        "kind": "mcp_json",
+                        "path": str(vp_raw),
+                        "key": "mcpServers.minni",
+                        "command": surf.get("command"),
+                        "args_prefix": surf.get("args_prefix"),
+                        "entry": surf.get("entry"),
+                        "accepted_entries": [
+                            str(surf.get("entry") or ""),
+                            "~/.agents/plugins/minni@minni/dist/server.js",
+                            "~/.minni/plugin/current/dist/server.js",
+                        ],
+                    }
+                    config_and_file_surfaces.append((host_id, "mcp_json", vp, view_spec, rewrite_hazard))
+                continue
+            p_raw = str(surf.get("path") or "").replace("{base_semver}", base_semver)
+            p = Path(expand_for_home(p_raw, home=home))
+            if kind in ("plugin_container", "claude_plugin_registry"):
+                container_and_registry_surfaces.append((host_id, kind, p, surf, rewrite_hazard))
+            else:
+                config_and_file_surfaces.append((host_id, kind, p, surf, rewrite_hazard))
+
+    all_surfaces: list[tuple[str, str, Path, dict[str, Any], bool]] = (
+        container_and_registry_surfaces + config_and_file_surfaces
+    )
+    muse_legacy_cfg = home / ".muse" / "config.json"
+    if muse_legacy_cfg.is_file():
+        all_surfaces.append(
+            (
+                "muse",
+                "mcp_json",
+                muse_legacy_cfg,
+                {
+                    "kind": "mcp_json",
+                    "path": "~/.muse/config.json",
+                    "key": "mcpServers.minni",
+                    "command": "node",
+                    "entry": "~/.minni/plugin/current/dist/server.js",
+                },
+                True,
+            )
+        )
+
+    for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
+        if kind == "plugin_container":
+            exists = cfg_path.exists() or cfg_path.is_symlink()
+            should_converge = exists or cfg_path.parent.exists()
+            mode = effective_container_mode(host, wired_doc)
+            after_entry = {
+                "kind": "plugin_container",
+                "container_mode": mode,
+                "target_version": target_version,
+                "subtrees": ["dist", "node_modules", "skills", "commands", "hooks"],
+            }
+            if not should_converge:
+                _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta (host root absent)")
+                continue
+            has_c_delta = _container_has_delta(cfg_path, ref_vdir, base_semver)
+            if not has_c_delta:
+                _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
+                continue
+            c_ref_text = _extract_container_referenced_text(cfg_path)
+            defer_reason = _check_defer(host, cfg_path, c_ref_text)
+            before_entry = {
+                "kind": "plugin_container",
+                "exists": exists,
+                "referenced_versions": sorted(_extract_referenced_versions(c_ref_text, plugin_dir)),
+            }
+            diff_obj = {"before": before_entry, "after": after_entry, "reasons": ["container_delta"]}
+            if defer_reason:
+                _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
+            elif not exists:
+                _record_surface(host, kind, cfg_path, "would-create", diff=diff_obj, reason="create_container")
+            else:
+                _record_surface(
+                    host,
+                    kind,
+                    cfg_path,
+                    "would-write",
+                    diff=diff_obj,
+                    reason="container_delta",
+                    archive_dest=str(archive_base / "containers" / host),
+                )
+            continue
+
+        if kind == "claude_plugin_registry":
+            claude_plugins_dir = home / ".claude" / "plugins"
+            mkt_root = claude_plugins_dir / "marketplaces" / "minni-local"
+            mkt_plugin_dir = mkt_root / "plugins" / "minni"
+            exists = cfg_path.is_file()
+            should_converge = exists or claude_plugins_dir.is_dir() or mkt_root.exists()
+            expected_install = str(mkt_plugin_dir)
+            expected_project = str(mkt_root)
+            after_entry = {
+                "scope": "user",
+                "installPath": expected_install,
+                "projectPath": expected_project,
+                "version": base_semver,
+                "gitCommitSha": target_git_sha,
+            }
+            if not should_converge:
+                _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta (host root absent)")
+                continue
+            before_entry = None
+            inst_has_delta = True
+            raw_text = ""
+            if exists:
+                try:
+                    raw_text = cfg_path.read_text(encoding="utf-8", errors="replace")
+                    doc = json.loads(raw_text) if raw_text.strip() else {}
+                    plugins = doc.get("plugins", {}) if isinstance(doc, dict) else {}
+                    entries = plugins.get("minni@minni-local") if isinstance(plugins, dict) else None
+                    if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+                        before_entry = dict(entries[0])
+                        if (
+                            before_entry.get("version") == base_semver
+                            and before_entry.get("gitCommitSha") == target_git_sha
+                            and before_entry.get("installPath") == expected_install
+                            and before_entry.get("projectPath") == expected_project
+                            and "~" not in str(before_entry.get("installPath") or "")
+                            and "~" not in str(before_entry.get("projectPath") or "")
+                        ):
+                            inst_has_delta = False
+                except Exception:
+                    inst_has_delta = True
+            mkt_has_delta = _container_has_delta(mkt_plugin_dir, ref_vdir, base_semver)
+            if not inst_has_delta and not mkt_has_delta:
+                _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
+                continue
+            defer_reason = _check_defer(host, cfg_path, raw_text)
+            reasons: list[str] = []
+            if inst_has_delta:
+                reasons.append("installed_plugins_delta")
+            if mkt_has_delta:
+                reasons.append("marketplace_container_delta")
+            diff_obj = {
+                "before": _redact_minni_entry(before_entry),
+                "after": _redact_minni_entry(after_entry),
+                "reasons": reasons,
+            }
+            if defer_reason:
+                _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
+            elif not exists:
+                _record_surface(host, kind, cfg_path, "would-create", diff=diff_obj, reason=",".join(reasons))
+            else:
+                _record_surface(
+                    host,
+                    kind,
+                    cfg_path,
+                    "would-write",
+                    diff=diff_obj,
+                    reason=",".join(reasons),
+                    archive_dest=_preview_archive_dest(cfg_path),
+                )
+            continue
+
+        if kind == "commands_dir":
+            expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
+            after_entry = {"kind": "commands_dir", "symlink_target": expected_target}
+            if cfg_path.is_symlink():
+                try:
+                    cur_target = os.readlink(cfg_path)
+                except OSError:
+                    cur_target = ""
+                target_ok = (ref_vdir / "commands").is_dir() and cfg_path.exists()
+                if cur_target == expected_target and target_ok:
+                    _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
+                    continue
+                defer_reason = _check_defer(host, cfg_path, cur_target)
+                reason_code = (
+                    "commands_dir_target_mismatch"
+                    if cur_target != expected_target
+                    else "broken_commands_dir_symlink"
+                )
+                diff_obj = {
+                    "before": {"kind": "commands_dir", "symlink_target": cur_target},
+                    "after": after_entry,
+                    "reasons": [reason_code],
+                }
+                if defer_reason:
+                    _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
+                else:
+                    _record_surface(host, kind, cfg_path, "would-write", diff=diff_obj, reason=reason_code)
+                continue
+            if not cfg_path.exists():
+                if not _commands_dir_expected_on_home(home, cfg_path):
+                    _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta (host root absent)")
+                    continue
+                defer_reason = _check_defer(host, cfg_path, "")
+                diff_obj = {
+                    "before": None,
+                    "after": after_entry,
+                    "reasons": ["missing_commands_dir"],
+                }
+                if defer_reason:
+                    _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
+                else:
+                    _record_surface(host, kind, cfg_path, "would-create", diff=diff_obj, reason="missing_commands_dir")
+                continue
+            diff_obj = {
+                "before": {"kind": "non_symlink_commands_dir"},
+                "after": after_entry,
+                "reasons": ["broken_or_non_symlink_commands_dir"],
+            }
+            _record_surface(host, kind, cfg_path, "would-write", diff=diff_obj, reason="broken_or_non_symlink_commands_dir")
+            continue
+
+        if kind in ("mcp_json", "mcp_toml"):
+            hspec = HOST_SURFACE_CATALOG.get(host) or {}
+            base_diff = evaluate_mcp_surface_diff(
+                None,
+                host_id=host,
+                agent_id=str(hspec.get("agent_id") or host),
+                vault_path=str(hspec.get("vault_path") or f"~/.minni/{host}-vault"),
+                surface_spec=surf_spec,
+                home=home,
+            )
+            after_entry = base_diff.desired_entry
+            if not cfg_path.exists() and not cfg_path.is_symlink():
+                if not _mcp_surface_expected_on_home(home, host, cfg_path, wired_doc):
+                    _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta (host root absent)")
+                    continue
+                defer_reason = _check_defer(host, cfg_path, "")
+                diff_obj = {
+                    "before": None,
+                    "after": _redact_minni_entry(after_entry),
+                    "reasons": ["missing_mcp_surface"],
+                }
+                if defer_reason:
+                    _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
+                else:
+                    _record_surface(host, kind, cfg_path, "would-create", diff=diff_obj, reason="missing_mcp_surface")
+                continue
+            if not cfg_path.is_file():
+                diff_obj = {
+                    "before": {"error": "non_regular_or_broken_symlink"},
+                    "after": _redact_minni_entry(after_entry),
+                    "reasons": ["broken_or_non_regular_surface"],
+                }
+                _record_surface(host, kind, cfg_path, "would-write", diff=diff_obj, reason="broken_or_non_regular_surface")
+                continue
+            try:
+                raw_text = cfg_path.read_text(encoding="utf-8")
+            except OSError:
+                raw_text = ""
+            cur_entry: Any = None
+            has_delta = True
+            reasons = []
+            try:
+                if kind == "mcp_json":
+                    doc = json.loads(raw_text) if raw_text.strip() else {}
+                    container_key = "mcp" if surf_spec.get("key") == "mcp.minni" else "mcpServers"
+                    mcp_map = doc.get(container_key) if isinstance(doc, dict) else None
+                    cur_entry = copy.deepcopy(mcp_map.get("minni")) if isinstance(mcp_map, dict) else None
+                else:
+                    doc = tomllib.loads(raw_text) if raw_text.strip() else {}
+                    mcp_map = doc.get("mcp_servers") if isinstance(doc, dict) else None
+                    cur_entry = copy.deepcopy(mcp_map.get("minni")) if isinstance(mcp_map, dict) else None
+                mcp_diff = evaluate_mcp_surface_diff(
+                    cur_entry if isinstance(cur_entry, dict) else None,
+                    host_id=host,
+                    agent_id=str(hspec.get("agent_id") or host),
+                    vault_path=str(hspec.get("vault_path") or f"~/.minni/{host}-vault"),
+                    surface_spec=surf_spec,
+                    home=home,
+                )
+                has_delta = mcp_diff.has_delta
+                reasons = list(mcp_diff.reasons)
+                after_entry = mcp_diff.desired_entry
+                if kind == "mcp_toml" and not has_delta and isinstance(cur_entry, dict) and cur_entry.get("enabled") is not True:
+                    has_delta = True
+                    reasons = ["missing_enabled_true"]
+            except Exception as exc:
+                has_delta = True
+                reasons = [f"parse_error:{exc}"]
+            if not has_delta:
+                _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
+                continue
+            defer_reason = _check_defer(host, cfg_path, raw_text)
+            diff_obj = {
+                "before": _redact_minni_entry(cur_entry),
+                "after": _redact_minni_entry(after_entry),
+                "reasons": reasons,
+            }
+            if defer_reason:
+                _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
+            else:
+                _record_surface(
+                    host,
+                    kind,
+                    cfg_path,
+                    "would-write",
+                    diff=diff_obj,
+                    reason=",".join(reasons),
+                    archive_dest=_preview_archive_dest(cfg_path),
+                )
+            continue
+
+        # Text / hook / launcher / bridge / skill / rules surfaces
+        if not cfg_path.exists() and not cfg_path.is_symlink():
+            _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta (surface absent)")
+            continue
+        if not cfg_path.is_file():
+            _record_surface(host, kind, cfg_path, "would-write", reason="broken_or_non_regular_surface")
+            continue
+        try:
+            raw_text = cfg_path.read_text(encoding="utf-8")
+        except OSError:
+            raw_text = ""
+        try:
+            has_delta, _updated_text = _reconcile_text_surface(
+                raw_text,
+                kind=kind,
+                surf_spec=surf_spec,
+                home=home,
+            )
+        except Exception:
+            has_delta = True
+        if not has_delta:
+            _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
+            continue
+        defer_reason = _check_defer(host, cfg_path, raw_text)
+        canonical_entry = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
+        before_refs = sorted({m.group(0) for m in _VERSIONED_PLUGIN_RE.finditer(raw_text)})
+        diff_obj = {
+            "before": {
+                "kind": kind,
+                "versioned_refs": before_refs,
+                "has_tilde": ("~/" in raw_text),
+            },
+            "after": {
+                "kind": kind,
+                "entry": canonical_entry,
+                "has_tilde": False,
+            },
+            "reasons": [f"versioned_or_tilde_in_{kind}"],
+        }
+        if defer_reason:
+            _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
+        else:
+            _record_surface(
+                host,
+                kind,
+                cfg_path,
+                "would-write",
+                diff=diff_obj,
+                reason=f"versioned_or_tilde_in_{kind}",
+                archive_dest=_preview_archive_dest(cfg_path),
+            )
+
+    # Check if `current` is a real directory that Step 4/7b would archive
+    current_path = plugin_dir / "current"
+    if current_path.exists() and not current_path.is_symlink() and current_path.is_dir():
+        would_archive.append({
+            "host": "minni-plugin",
+            "kind": "current_real_dir",
+            "path": str(current_path),
+            "archive_dest": str(archive_base / "previous-current-real-dir"),
+            "reason": "replace_real_dir_with_current_symlink",
+        })
+
+    # Compute GC would-prune and would-keep without deleting anything
+    prev_link_target: str | None = None
+    if current_path.is_symlink():
+        try:
+            prev_link_target = Path(os.readlink(current_path)).name
+        except OSError:
+            prev_link_target = None
+    gc_out = collect_garbage(
+        home=home,
+        keep_last=2,
+        prune=False,
+        dry_run=True,
+        prev_target=prev_link_target,
+        extra_protected=deferred_protected_versions | {target_version},
+    )
+    would_keep_paths = list(gc_out.retained_in_use)
+    target_vdir_str = str(plugin_dir / target_version)
+    if target_version and target_vdir_str not in would_keep_paths and target_vdir_str not in gc_out.would_prune:
+        would_keep_paths.append(target_vdir_str)
+
+    gc_dict: dict[str, Any] = {
+        "would-prune": list(gc_out.would_prune),
+        "would_prune": list(gc_out.would_prune),
+        "would-keep": would_keep_paths,
+        "would_keep": list(would_keep_paths),
+        "retained_in_use": list(gc_out.retained_in_use),
+        "pruned": [],
+    }
+
+    plan_doc: dict[str, Any] = {
+        "target_version": target_version,
+        "target_git_sha": target_git_sha,
+        "hosts": hosts_plan,
+        "surfaces": all_surface_plans,
+        "would-write": would_write,
+        "would_write": would_write,
+        "would-create": would_create,
+        "would_create": would_create,
+        "would-defer": would_defer,
+        "would_defer": would_defer,
+        "would-archive": would_archive,
+        "would_archive": would_archive,
+        "would-skip": would_skip,
+        "would_skip": would_skip,
+        "gc": {
+            "would-prune": list(gc_out.would_prune),
+            "would-keep": would_keep_paths,
+        },
+    }
+
+    msg = (
+        f"dry-run: would cut over {home} to {target_version}: "
+        f"would-write={len(would_write)}, would-create={len(would_create)}, "
+        f"would-defer={len(would_defer)}, would-archive={len(would_archive)}, "
+        f"would-skip={len(would_skip)}, would-prune={len(gc_out.would_prune)}, "
+        f"would-keep={len(would_keep_paths)}"
+    )
+    return CutoverOutcome(
+        exit_code=0,
+        status="DRY_RUN",
+        target_version=target_version,
+        target_git_sha=target_git_sha,
+        deferred_running_hosts=deferred_running_hosts,
+        updated_surfaces=updated_surfaces,
+        skipped_surfaces=skipped_surfaces,
+        gc_result=gc_dict,
+        message=msg,
+        plan=plan_doc,
+    )
+
+
 def execute_atomic_cutover(
     *,
     home: Path,
@@ -929,6 +1585,7 @@ def execute_atomic_cutover(
     dry_run: bool = False,
     running_hosts: set[str] | None = None,
     post_flip_verifier: Callable[[Path], bool] | None = None,
+    repo_root: Path | None = None,
 ) -> CutoverOutcome:
     """Execute the 7-step atomic cutover with pre-flip probes and CAS rollback (§4.3)."""
     plugin_dir = home / ".minni" / "plugin"
@@ -936,6 +1593,17 @@ def execute_atomic_cutover(
     pid = os.getpid()
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     base_semver = target_version.split("+", 1)[0] if target_version else "0.6.0"
+
+    if dry_run:
+        return _build_dry_run_plan(
+            home=home,
+            target_version=target_version,
+            target_git_sha=target_git_sha,
+            running_hosts=running_hosts,
+            repo_root=repo_root,
+            ts=ts,
+            base_semver=base_semver,
+        )
 
     if not vdir.is_dir():
         return CutoverOutcome(
@@ -945,15 +1613,6 @@ def execute_atomic_cutover(
             target_git_sha=target_git_sha,
             aborted_pre_flip=True,
             message=f"target payload directory does not exist: {vdir}",
-        )
-
-    if dry_run:
-        return CutoverOutcome(
-            exit_code=0,
-            status="DRY_RUN",
-            target_version=target_version,
-            target_git_sha=target_git_sha,
-            message=f"dry-run: would cut over {home} to {target_version}",
         )
 
     # Step 2 — Pre-Flip Scratch Container Stage (R4-2)
@@ -1089,6 +1748,20 @@ def execute_atomic_cutover(
             )
         )
 
+    # H15 (Grok r5 P3): if any active/expected commands_dir surface has a missing payload commands/
+    # directory, fail Step 5 with that host and path before any other surface write.
+    for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
+        if kind != "commands_dir":
+            continue
+        if cfg_path.is_symlink() or _commands_dir_expected_on_home(home, cfg_path):
+            expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
+            if not (vdir / "commands").is_dir() or not Path(expected_target).is_dir():
+                step5_error = (
+                    f"broken commands_dir symlink for {host} ({cfg_path}): "
+                    f"payload commands/ directory missing at {expected_target}"
+                )
+                break
+
     for host, kind, cfg_path, surf_spec, rewrite_on_run in all_surfaces:
         if step5_error:
             break
@@ -1217,6 +1890,12 @@ def execute_atomic_cutover(
                     step5_error = f"failed to read symlink for {host} ({cfg_path}): {exc}"
                     break
                 if cur_target == expected_target:
+                    if not (vdir / "commands").is_dir() or not cfg_path.exists() or not cfg_path.is_dir():
+                        step5_error = (
+                            f"broken commands_dir symlink for {host} ({cfg_path}): "
+                            f"payload commands/ directory missing at {expected_target}"
+                        )
+                        break
                     skipped_surfaces.append(f"{host}:{cfg_path}")
                     continue
                 if _should_defer_host_write(host, cfg_path, cur_target):
@@ -1713,13 +2392,33 @@ def reconcile_all_hosts(
     resolved_home = Path(home) if home is not None else Path(os.environ.get("HOME") or Path.home())
     plugin_dir = resolved_home / ".minni" / "plugin"
 
-    if target_version is None and from_repo is not None:
-        pkg_dir = Path(from_repo) / "plugins" / "minni"
-        if (pkg_dir / "dist" / "server.js").is_file() and not dry_run:
-            vdir = install_payload(pkg_dir)
-            manifest = PayloadManifest.load(vdir / "payload-manifest.json")
-            target_version = manifest.version
-            target_git_sha = manifest.git_sha
+    resolved_repo: Path | None = None
+    if from_repo is not None:
+        resolved_repo = Path(from_repo).expanduser().resolve()
+    elif dry_run and target_version is None:
+        resolved_repo = _default_repo_root()
+
+    if target_version is None and resolved_repo is not None:
+        pkg_dir = resolved_repo / "plugins" / "minni"
+        if not dry_run:
+            if (pkg_dir / "dist" / "server.js").is_file():
+                vdir = install_payload(pkg_dir)
+                manifest = PayloadManifest.load(vdir / "payload-manifest.json")
+                target_version = manifest.version
+                target_git_sha = manifest.git_sha
+        elif (resolved_repo / "pyproject.toml").is_file() and pkg_dir.is_dir():
+            from minni.wire.from_repo import _git_sha
+            from minni.wire.manifest import dev_version
+
+            try:
+                target_version = dev_version(resolved_repo)
+            except Exception:
+                target_version = None
+            if target_git_sha is None:
+                try:
+                    target_git_sha = _git_sha(resolved_repo)
+                except Exception:
+                    target_git_sha = None
 
     if target_version is None:
         current = plugin_dir / "current"
@@ -1764,6 +2463,7 @@ def reconcile_all_hosts(
         dry_run=dry_run,
         running_hosts=running_hosts,
         post_flip_verifier=post_flip_verifier,
+        repo_root=resolved_repo,
     )
 
 

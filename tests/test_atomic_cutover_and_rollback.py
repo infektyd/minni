@@ -1274,3 +1274,201 @@ def test_r5_p1_1_missing_commands_dir_is_drift_in_health_and_delta_in_reconcile(
     )
     assert bad_res.exit_code == 1
     assert bad_res.rolled_back is True
+
+
+def test_h15_commands_dir_symlink_matching_catalog_with_missing_payload_commands_fails_step5(
+    tmp_path: Path,
+) -> None:
+    """R6 Item 3 (H15 / Grok r5 P3): a commands_dir symlink whose target equals the catalog entry
+    but whose payload commands/ is missing must fail Step 5 with the host and path.
+    """
+    import shutil
+    from minni.wire.health import audit_host_propagation_health
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v1_sha = "1" * 40
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / v1_ver)
+
+    ag_cmds = home / ".gemini" / "commands"
+    ag_cmds.mkdir(parents=True)
+    cmd_link = ag_cmds / "minni"
+    expected_target = str(plugin_dir / "current" / "commands")
+    os.symlink(expected_target, cmd_link)
+
+    # Remove payload commands/ directory from v2 (and v1) so the symlink target is missing
+    shutil.rmtree(plugin_dir / v2_ver / "commands")
+    shutil.rmtree(plugin_dir / v1_ver / "commands")
+
+    health = audit_host_propagation_health(home=home, expected_git_sha=v1_sha)
+    assert health.ok is False
+    cmd_drift = [d for d in health.drifted_surfaces if d["path"] == str(cmd_link)]
+    assert cmd_drift, health.drifted_surfaces
+    assert cmd_drift[0]["host"] == "antigravity"
+    assert "broken_commands_dir_symlink" in cmd_drift[0]["reasons"]
+
+    res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res.exit_code == 1
+    assert res.rolled_back is True
+    assert f"antigravity:{cmd_link}" not in res.skipped_surfaces
+    assert "antigravity" in res.message
+    assert str(cmd_link) in res.message
+    assert os.readlink(plugin_dir / "current") == str(plugin_dir / v1_ver)
+
+
+def test_dry_run_plan_mode_lists_every_catalogued_host_targets_repo_head_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """R6 Item 1: --dry-run computes and prints the full per-surface plan against repo HEAD:
+    would-write (with redacted before->after diff), would-create, would-defer (and why),
+    would-archive, would-skip, and GC would-prune/would-keep, listing every catalogued host
+    and performing zero writes.
+    """
+    from minni.wire.from_repo import _git_sha
+    from minni.wire.manifest import dev_version
+    from minni.wire.registry import HOST_SURFACE_CATALOG
+
+    repo_root = Path(__file__).resolve().parent.parent
+    expected_head_ver = dev_version(repo_root)
+    expected_head_sha = _git_sha(repo_root)
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+
+    # Seed 3 historical versions so GC has both would-keep (keep_last=2) and would-prune
+    old_v0 = "0.5.0+git.00000001"
+    old_v1 = "0.5.1+git.00000002"
+    installed_v2 = "0.6.0+git.644bb381"
+    _seed_plugin_version(plugin_dir, old_v0, "0" * 40)
+    _seed_plugin_version(plugin_dir, old_v1, "a" * 40)
+    _seed_plugin_version(plugin_dir, installed_v2, "6" * 40)
+    (plugin_dir / "current").symlink_to(plugin_dir / installed_v2)
+
+    # 1. Seed a drifted surface (claude-code ~/.claude.json) with a secret env var and forbidden MINNI_WORKSPACE_ID
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True)
+    claude_cfg = home / ".claude.json"
+    claude_cfg.write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(plugin_dir / installed_v2 / "dist" / "server.js")],
+                    "env": {
+                        "MINNI_AGENT_ID": "claude-code",
+                        "MINNI_VAULT_PATH": str(home / ".minni" / "claudecode-vault"),
+                        "MINNI_WORKSPACE_ID": "legacy-static-ws",
+                        "SECRET_API_TOKEN": "super-secret-value-xyz987",
+                    },
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    # 2. Seed an already-converged surface (grok-build ~/.grok/config.toml) -> would-skip
+    grok_dir = home / ".grok"
+    grok_dir.mkdir(parents=True)
+    grok_cfg = grok_dir / "config.toml"
+    grok_cfg.write_text(
+        f'[mcp_servers.minni]\n'
+        f'command = "node"\n'
+        f'args = ["{plugin_dir / "current" / "dist" / "server.js"}"]\n'
+        f'enabled = true\n\n'
+        f'[mcp_servers.minni.env]\n'
+        f'MINNI_AGENT_ID = "grok-build"\n'
+        f'MINNI_VAULT_PATH = "{home / ".minni" / "grok-build-vault"}"\n',
+        encoding="utf-8",
+    )
+
+    # 3. Seed ~/.codex directory WITHOUT config.toml -> would-create
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True)
+
+    # 4. Seed drifted muse surface + lockfile / running host -> would-defer
+    muse_dir = home / ".config" / "muse"
+    muse_dir.mkdir(parents=True)
+    muse_cfg = muse_dir / "settings.json"
+    muse_cfg.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    muse_lock = muse_dir / ".settings.json.lock"
+    muse_lock.write_text("locked-by-muse", encoding="utf-8")
+
+    def _snapshot_tree(root: Path) -> dict[str, tuple[str, int, str]]:
+        snap: dict[str, tuple[str, int, str]] = {}
+        for p in sorted(root.rglob("*")):
+            rel = str(p.relative_to(root))
+            if p.is_symlink():
+                snap[rel] = ("symlink", 0, os.readlink(p))
+            elif p.is_file():
+                snap[rel] = ("file", p.stat().st_mtime_ns, sha256_file(p))
+            elif p.is_dir():
+                snap[rel] = ("dir", 0, "")
+        return snap
+
+    before_snap = _snapshot_tree(home)
+
+    outcome = reconcile_all_hosts(
+        home=home,
+        from_repo=repo_root,
+        dry_run=True,
+        running_hosts={"muse"},
+    )
+    after_snap = _snapshot_tree(home)
+
+    # Zero writes to disk!
+    assert after_snap == before_snap
+
+    assert outcome.exit_code == 0
+    assert outcome.status == "DRY_RUN"
+    assert outcome.target_version == expected_head_ver
+    assert outcome.target_git_sha == expected_head_sha
+
+    doc = outcome.to_dict()
+    serialized = json.dumps(doc)
+    assert "super-secret-value-xyz987" not in serialized
+    assert "<REDACTED>" in serialized
+
+    plan = doc.get("plan") or doc
+    assert set(plan["hosts"].keys()) == set(HOST_SURFACE_CATALOG.keys())
+
+    would_write = plan["would-write"]
+    claude_write = next((w for w in would_write if w["path"] == str(claude_cfg)), None)
+    assert claude_write is not None, would_write
+    assert claude_write["host"] == "claude-code"
+    assert claude_write["diff"]["before"]["env"]["SECRET_API_TOKEN"] == "<REDACTED>"
+    assert claude_write["diff"]["before"]["env"]["MINNI_WORKSPACE_ID"] == "legacy-static-ws"
+    assert "MINNI_WORKSPACE_ID" not in claude_write["diff"]["after"]["env"]
+    assert claude_write["diff"]["after"]["args"] == [str(plugin_dir / "current" / "dist" / "server.js")]
+
+    would_create = plan["would-create"]
+    codex_create = next((c for c in would_create if c["path"] == str(codex_dir / "config.toml")), None)
+    assert codex_create is not None, would_create
+    assert codex_create["host"] == "codex"
+
+    would_defer = plan["would-defer"]
+    muse_defer = next((d for d in would_defer if d["path"] == str(muse_cfg)), None)
+    assert muse_defer is not None, would_defer
+    assert muse_defer["host"] == "muse"
+    assert "lock" in muse_defer["reason"].lower() or "running" in muse_defer["reason"].lower()
+
+    would_archive = plan["would-archive"]
+    assert any(a["path"] == str(claude_cfg) for a in would_archive), would_archive
+
+    would_skip = plan["would-skip"]
+    assert any(s["path"] == str(grok_cfg) and s["host"] == "grok-build" for s in would_skip), would_skip
+
+    gc_res = doc["gc_result"]
+    assert str(plugin_dir / old_v0) in gc_res["would-prune"]
+    assert str(plugin_dir / installed_v2) in gc_res["would-keep"]

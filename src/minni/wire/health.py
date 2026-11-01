@@ -35,32 +35,104 @@ _SCAN_DIR_RELATIVES: tuple[str, ...] = (
     "Library/Application Support/Claude",
 )
 
-_EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
+# Explicit, documented deny-list of directory names inside host roots that hold
+# conversation stores, file-history, backups, worker sandboxes, or runtime caches
+# rather than launch configs (§4.7 R6 Item 2).
+UNCATALOGUED_SCAN_DENYLIST_DIRS: frozenset[str] = frozenset({
+    # Conversation, brain, chat, session, and agent memory stores
+    "antigravity",
+    "antigravity-ide",
+    "brain",
+    "chats",
+    "conversations",
+    "sessions",
+    "local-agent-mode-sessions",
+    "claude-code-sessions",
+    "memory",
+    "memory-v2",
+    "paste-cache",
+    "todos",
+    "plans",
+    "workflows",
+    # Backup, archive, and file-history stores
+    "backups",
+    "backup",
+    "antigravity-backup",
+    "file-history",
+    "history",
+    "archive",
+    "legacy-plugins",
+    "trash",
+    # Ephemeral worker workspaces and scratch sandboxes
+    "muse-code-worker",
+    "grok-build-peer",
+    "scratch",
+    "tmp",
+    "temp",
+    "projects",
+    "worktrees",
+    "workspaces",
+    # Runtime/browser caches and telemetry
     "node_modules",
     ".git",
     "Cache",
     "GPUCache",
     "Code Cache",
     "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
     "logs",
-    "projects",
-    "sessions",
     "shell-snapshots",
     "statsig",
     "telemetry",
-    "archive",
     "crashpad",
     "blob_storage",
     "Local Storage",
     "Session Storage",
+    "IndexedDB",
+    "Service Worker",
+    "WebStorage",
+    "Network",
+    "Dictionaries",
 })
 
-_EXCLUDED_FILE_NAMES: frozenset[str] = frozenset({
+# Explicit, documented deny-list of home-relative path prefixes for history,
+# backup, conversation, file-history, and worker workspace stores (§4.7 R6 Item 2).
+UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES: tuple[str, ...] = (
+    ".gemini/antigravity",
+    ".gemini/antigravity-ide",
+    ".gemini/antigravity-backup",
+    ".gemini/antigravity-cli/brain",
+    ".gemini/tmp",
+    ".agents/backups",
+    ".agents/workflows",
+    ".codex/muse-code-worker",
+    ".codex/grok-build-peer",
+    ".codex/backups",
+    ".claude/file-history",
+    ".claude/backups",
+    "Library/Application Support/Claude/local-agent-mode-sessions",
+    "Library/Application Support/Claude/claude-code-sessions",
+    ".grok/memory-v2",
+    ".grok/scratch",
+    ".cursor/plans",
+    ".cursor/legacy-plugins",
+)
+
+UNCATALOGUED_SCAN_DENYLIST_FILES: frozenset[str] = frozenset({
     "history.jsonl",
     ".DS_Store",
+    "LOCK",
+    "LOG",
+    "Cookies",
+    "Preferences",
 })
 
-_ALLOWED_SCAN_SUFFIXES: frozenset[str] = frozenset({
+_EXCLUDED_DIR_NAMES: frozenset[str] = UNCATALOGUED_SCAN_DENYLIST_DIRS
+_EXCLUDED_FILE_NAMES: frozenset[str] = UNCATALOGUED_SCAN_DENYLIST_FILES
+
+# Known config-file extensions in host config locations
+_CONFIG_FILE_SUFFIXES: frozenset[str] = frozenset({
     ".json",
     ".toml",
     ".yaml",
@@ -69,12 +141,17 @@ _ALLOWED_SCAN_SUFFIXES: frozenset[str] = frozenset({
     ".zsh",
     ".js",
     ".mjs",
-    ".md",
-    "",
 })
 
+# Known config depth ceiling relative to each scan root (e.g. ~/.codex/skills/<name>/SKILL.md is depth 3)
+_DEFAULT_MAX_CONFIG_DEPTH = 4
+_MAX_CONFIG_REL_DEPTH_BY_ROOT: dict[str, int] = {
+    "Library/Application Support/Claude": 2,
+    ".local/bin": 1,
+}
+
 _MAX_SCAN_FILE_BYTES = 2 * 1024 * 1024
-_PLUGIN_REF_RE = re.compile(r"(\.minni/plugin|sovereign-memory)")
+_PLUGIN_REF_RE = re.compile(r"(\.minni/plugin)")
 
 
 def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...]]:
@@ -85,17 +162,11 @@ def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...
         str(home / ".minni" / "archive"),
         str(home / ".agents" / "plugins" / "Minni@Minni"),
         str(home / ".agents" / "plugins" / "minni@minni"),
-        str(home / ".agents" / "skills"),
         str(home / ".cursor" / "plugins" / "local" / "minni"),
-        str(home / ".cursor" / "skills"),
         str(home / ".claude" / "plugins" / "marketplaces" / "minni-local"),
         str(home / ".claude" / "plugins" / "cache"),
         str(home / ".claude" / "local-marketplaces" / "minni"),
-        str(home / ".claude" / "skills"),
         str(home / ".codex" / "plugins" / "cache"),
-        str(home / ".codex" / "skills"),
-        str(home / ".gemini" / "skills"),
-        str(home / ".grok" / "skills"),
         str(home / ".config" / "kilo" / "plugins" / "minni"),
     ]
     for hspec in expanded.values():
@@ -125,8 +196,55 @@ def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...
     return exact_paths, tuple(container_prefixes)
 
 
+def _is_denylisted_rel_path(rel_to_home: str) -> bool:
+    norm = rel_to_home.strip("/")
+    for pref in UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES:
+        if norm == pref or norm.startswith(pref + "/"):
+            return True
+    parts = Path(norm).parts
+    for part in parts[:-1]:
+        if part in UNCATALOGUED_SCAN_DENYLIST_DIRS:
+            return True
+        lower = part.lower()
+        if lower.endswith("-backup") or lower.endswith("_backup") or lower.startswith("backup-"):
+            return True
+    return False
+
+
+def _is_config_shaped_file(fpath: Path, root_dir: Path, rel_root: str) -> bool:
+    """Return True if `fpath` is a config-shaped file (json/toml/yaml/js/sh/md skill copy) at a known config depth."""
+    name = fpath.name
+    if name in UNCATALOGUED_SCAN_DENYLIST_FILES:
+        return False
+    lower_name = name.lower()
+    if lower_name.endswith((".jsonl", ".log", ".bak", ".orig", ".tmp", ".lock", ".sqlite", ".db")):
+        return False
+    if ".backup" in lower_name or ".minni-backup-" in lower_name:
+        return False
+
+    try:
+        rel_parts = fpath.relative_to(root_dir).parts
+    except ValueError:
+        return False
+
+    max_depth = _MAX_CONFIG_REL_DEPTH_BY_ROOT.get(rel_root, _DEFAULT_MAX_CONFIG_DEPTH)
+    if len(rel_parts) > max_depth:
+        return False
+
+    suffix = fpath.suffix.lower()
+    if suffix in _CONFIG_FILE_SUFFIXES:
+        return True
+    if suffix == ".md":
+        parent_dirs = {p.lower() for p in rel_parts[:-1]}
+        return name == "SKILL.md" or bool(parent_dirs & {"skills", "rules"})
+    if suffix == "":
+        parent_dirs = {p.lower() for p in rel_parts[:-1]}
+        return rel_root == ".local/bin" or bool(parent_dirs & {"bin", "scripts", "hooks"})
+    return False
+
+
 def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str, str]]:
-    """Scan host config directories for any uncatalogued file referencing `.minni/plugin` (§4.7)."""
+    """Scan host config directories for any uncatalogued config-shaped file referencing `.minni/plugin` (§4.7)."""
     resolved_home = resolve_home(home)
     exact_paths, container_prefixes = _catalogued_paths_and_prefixes(resolved_home)
     findings: list[dict[str, str]] = []
@@ -146,10 +264,14 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
                 return True
         return False
 
-    def _inspect_file(fpath: Path) -> None:
-        if fpath.name in _EXCLUDED_FILE_NAMES or fpath.name.endswith(".jsonl"):
+    def _inspect_file(fpath: Path, root_dir: Path, rel_root: str) -> None:
+        try:
+            rel_to_home = str(fpath.relative_to(resolved_home))
+        except ValueError:
+            rel_to_home = ""
+        if rel_to_home and _is_denylisted_rel_path(rel_to_home):
             return
-        if fpath.suffix.lower() not in _ALLOWED_SCAN_SUFFIXES:
+        if not _is_config_shaped_file(fpath, root_dir, rel_root):
             return
         if _is_catalogued(fpath):
             return
@@ -171,23 +293,42 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
     # Check top-level ~/.claude.json
     claude_top = resolved_home / ".claude.json"
     if claude_top.is_file():
-        _inspect_file(claude_top)
+        _inspect_file(claude_top, resolved_home, "")
 
     for rel in _SCAN_DIR_RELATIVES:
         root_dir = resolved_home / rel
         if not root_dir.is_dir():
             continue
+        max_depth = _MAX_CONFIG_REL_DEPTH_BY_ROOT.get(rel, _DEFAULT_MAX_CONFIG_DEPTH)
         for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
             dp = Path(dirpath)
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _EXCLUDED_DIR_NAMES and not _is_catalogued(dp / d)
-            ]
+            try:
+                cur_depth = len(dp.relative_to(root_dir).parts)
+            except ValueError:
+                cur_depth = 0
+            if cur_depth >= max_depth:
+                dirnames[:] = []
+            else:
+                kept_dirs: list[str] = []
+                for d in dirnames:
+                    cand = dp / d
+                    if d in UNCATALOGUED_SCAN_DENYLIST_DIRS:
+                        continue
+                    if _is_catalogued(cand):
+                        continue
+                    try:
+                        cand_rel = str(cand.relative_to(resolved_home))
+                    except ValueError:
+                        cand_rel = ""
+                    if cand_rel and _is_denylisted_rel_path(cand_rel + "/x"):
+                        continue
+                    kept_dirs.append(d)
+                dirnames[:] = kept_dirs
             for fn in filenames:
                 fp = dp / fn
                 if fp.is_symlink():
                     continue
-                _inspect_file(fp)
+                _inspect_file(fp, root_dir, rel)
 
     return findings
 
@@ -539,17 +680,16 @@ def audit_host_propagation_health(
                         actual_target = os.readlink(spath)
                     except OSError:
                         actual_target = ""
+                    cmd_reasons: list[str] = []
                     if actual_target != expected_target:
+                        cmd_reasons.append(f"commands_dir_target_mismatch:{actual_target}!={expected_target}")
+                    if not spath.exists() or not spath.is_dir() or (target is not None and not (target / "commands").is_dir()):
+                        cmd_reasons.append("broken_commands_dir_symlink")
+                    if cmd_reasons:
                         drifted_surfaces.append({
                             "host": host_id,
                             "path": str(spath),
-                            "reasons": [f"commands_dir_target_mismatch:{actual_target}!={expected_target}"],
-                        })
-                    elif not spath.exists():
-                        drifted_surfaces.append({
-                            "host": host_id,
-                            "path": str(spath),
-                            "reasons": ["broken_commands_dir_symlink"],
+                            "reasons": cmd_reasons,
                         })
                 elif spath.exists():
                     drifted_surfaces.append({
