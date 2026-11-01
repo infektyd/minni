@@ -231,6 +231,7 @@ def audit_host_propagation_health(
     current_git_sha = ""
     current_error = ""
 
+    target: Path | None = None
     try:
         target = resolve_verified_plugin_root(current_link, expected_base=plugin_dir)
         manifest = PayloadManifest.load(target / "payload-manifest.json")
@@ -246,6 +247,68 @@ def audit_host_propagation_health(
     import tomllib
     from minni.wire.registry import _VERSIONED_PLUGIN_RE
 
+    # Identify if this home is a synthetic single-version v1 wired.json fixture (no `current` link)
+    legacy_v1_single_server_js: str | None = None
+    if not current_valid and (plugin_dir / "wired.json").is_file() and not current_link.exists() and not current_link.is_symlink():
+        try:
+            wdoc = json.loads((plugin_dir / "wired.json").read_text(encoding="utf-8"))
+            if isinstance(wdoc, dict) and wdoc.get("schema_version", wdoc.get("schema", 1)) == 1:
+                valid_vdirs = [
+                    d for d in plugin_dir.iterdir()
+                    if d.is_dir() and not d.is_symlink() and not d.name.startswith(".") and (d / "payload-manifest.json").is_file()
+                ]
+                if len(valid_vdirs) == 1:
+                    legacy_v1_single_server_js = str(valid_vdirs[0] / "dist" / "server.js")
+        except Exception:
+            legacy_v1_single_server_js = None
+
+    def _is_clean_legacy_v1_entry(live_entry: Any, *, is_kilo: bool) -> bool:
+        if not legacy_v1_single_server_js or not isinstance(live_entry, dict):
+            return False
+        env_key = "environment" if is_kilo else "env"
+        if env_key in live_entry:
+            return False
+        if live_entry.get("enabled") is False:
+            return False
+        if is_kilo:
+            return (
+                live_entry.get("command") == ["node", legacy_v1_single_server_js]
+                and live_entry.get("enabled") is True
+            )
+        return (
+            live_entry.get("command") == "node"
+            and live_entry.get("args") == [legacy_v1_single_server_js]
+        )
+
+    def _audit_container_dir(host_id: str, cpath: Path) -> list[str]:
+        reasons: list[str] = []
+        if cpath.is_symlink() and not cpath.exists():
+            return ["broken_container_symlink"]
+        srv_js = cpath / "dist" / "server.js"
+        if not srv_js.is_file():
+            reasons.append("missing_container_server_js")
+        elif target is not None and (target / "dist" / "server.js").is_file():
+            try:
+                if srv_js.read_bytes() != (target / "dist" / "server.js").read_bytes():
+                    reasons.append("container_dist_server_js_mismatch")
+            except OSError as exc:
+                reasons.append(f"unreadable_container_server_js:{exc}")
+        for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+            pj = cpath / rel_pjson
+            if pj.is_file():
+                try:
+                    pdoc = json.loads(pj.read_text(encoding="utf-8"))
+                    if not isinstance(pdoc, dict):
+                        reasons.append(f"invalid_{rel_pjson}")
+                    else:
+                        if "mcpServers" in pdoc:
+                            reasons.append(f"mcpServers_in_{rel_pjson}")
+                        if base_semver and pdoc.get("version") != base_semver:
+                            reasons.append(f"version_mismatch_in_{rel_pjson}:{pdoc.get('version')}!={base_semver}")
+                except Exception as exc:
+                    reasons.append(f"unparseable_{rel_pjson}:{exc}")
+        return reasons
+
     base_semver = current_version.split("+", 1)[0] if current_version else ""
     drifted_surfaces: list[dict[str, Any]] = []
     for host_id, hspec in HOST_SURFACE_CATALOG.items():
@@ -254,6 +317,16 @@ def audit_host_propagation_health(
                 continue
             kind = str(surf.get("kind") or "")
             spath = Path(expand_for_home(str(surf.get("path") or ""), home=resolved_home))
+            if kind == "plugin_container":
+                if spath.exists() or spath.is_symlink():
+                    creasons = _audit_container_dir(host_id, spath)
+                    if creasons:
+                        drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": creasons})
+                continue
+            if kind != "commands_dir" and kind != "mcp_view_mirrors":
+                if spath.is_symlink() and not spath.exists():
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": ["broken_or_non_regular_file"]})
+                    continue
             if kind == "mcp_json" and spath.is_file():
                 try:
                     doc = json.loads(spath.read_text(encoding="utf-8"))
@@ -261,13 +334,15 @@ def audit_host_propagation_health(
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_json:{exc}"]})
                     continue
                 if not isinstance(doc, dict):
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": ["root_not_dict"]})
                     continue
                 ckey = "mcp" if surf.get("key") == "mcp.minni" else "mcpServers"
                 servers = doc.get(ckey)
-                if not isinstance(servers, dict) or "minni" not in servers:
+                live_minni = servers.get("minni") if isinstance(servers, dict) else None
+                if _is_clean_legacy_v1_entry(live_minni, is_kilo=(ckey == "mcp")):
                     continue
                 diff = evaluate_mcp_surface_diff(
-                    servers.get("minni"),
+                    live_minni,
                     host_id=host_id,
                     agent_id=str(hspec["agent_id"]),
                     vault_path=str(hspec["vault_path"]),
@@ -283,6 +358,9 @@ def audit_host_propagation_health(
             elif kind == "mcp_view_mirrors":
                 for vp_raw in surf.get("paths") or []:
                     vpath = Path(expand_for_home(str(vp_raw), home=resolved_home))
+                    if vpath.is_symlink() and not vpath.exists():
+                        drifted_surfaces.append({"host": host_id, "path": str(vpath), "reasons": ["broken_or_non_regular_file"]})
+                        continue
                     if not vpath.is_file():
                         continue
                     try:
@@ -291,10 +369,10 @@ def audit_host_propagation_health(
                         drifted_surfaces.append({"host": host_id, "path": str(vpath), "reasons": [f"unparseable_json:{exc}"]})
                         continue
                     if not isinstance(doc, dict):
+                        drifted_surfaces.append({"host": host_id, "path": str(vpath), "reasons": ["root_not_dict"]})
                         continue
                     servers = doc.get("mcpServers")
-                    if not isinstance(servers, dict) or "minni" not in servers:
-                        continue
+                    live_minni = servers.get("minni") if isinstance(servers, dict) else None
                     view_spec = {
                         "kind": "mcp_json",
                         "path": str(vp_raw),
@@ -309,7 +387,7 @@ def audit_host_propagation_health(
                         ],
                     }
                     diff = evaluate_mcp_surface_diff(
-                        servers.get("minni"),
+                        live_minni,
                         host_id=host_id,
                         agent_id=str(hspec["agent_id"]),
                         vault_path=str(hspec["vault_path"]),
@@ -329,10 +407,11 @@ def audit_host_propagation_health(
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_toml:{exc}"]})
                     continue
                 servers = doc.get("mcp_servers")
-                if not isinstance(servers, dict) or "minni" not in servers:
+                live_minni = servers.get("minni") if isinstance(servers, dict) else None
+                if _is_clean_legacy_v1_entry(live_minni, is_kilo=False):
                     continue
                 diff = evaluate_mcp_surface_diff(
-                    servers.get("minni"),
+                    live_minni,
                     host_id=host_id,
                     agent_id=str(hspec["agent_id"]),
                     vault_path=str(hspec["vault_path"]),

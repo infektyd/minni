@@ -146,11 +146,12 @@ def test_cutover_preflip_abort_real_dir_current_rollback_cas_restore_and_exit_3(
     # Cursor container `dist` restored to real directory with old.txt!
     assert (cursor_container / "dist").is_dir() and not (cursor_container / "dist").is_symlink()
     assert (cursor_container / "dist" / "old.txt").read_text(encoding="utf-8") == "old-cursor-dist"
-    # `~/.claude.json` preserved concurrent `oauthAccount` while restoring `mcpServers.minni`!
+    # `~/.claude.json` was NOT overwritten on rollback CAS mismatch; live bytes stay intact and conflict is archived!
     restored_claude = json.loads(claude_json.read_text(encoding="utf-8"))
     assert restored_claude["oauthAccount"] == "concurrently-updated-by-live-session"
     assert restored_claude["numStartups"] == 99
-    assert restored_claude["mcpServers"]["minni"] == old_minni_entry
+    assert rb_res.cas_conflicts
+    assert any("rollback-conflict" in c for c in rb_res.cas_conflicts)
 
     # Part D: Running rewrite-on-run host (`muse`) with `delta != 0` defers write and exits 3 (R4-4)
     muse_cfg = home / ".muse" / "config.json"
@@ -547,3 +548,259 @@ def test_claude_installed_plugins_writes_base_semver_and_is_zero_delta_idempoten
     assert res2.exit_code == 0
     assert inst_path.read_bytes() == bytes1
     assert inst_path.stat().st_mtime_ns == mtime1
+
+
+def test_r3_p1_1_plugin_container_only_and_missing_minni_key_reconciled_and_audited(
+    tmp_path: Path,
+) -> None:
+    """P1-1:
+    1. A host with only a `plugin_container` surface (e.g. cursor container) is scored in
+       `updated_surfaces` / `skipped_surfaces` and audited by `audit_host_propagation_health`.
+    2. An existing host config file (`mcp_json`, `mcp_view_mirrors`, `mcp_toml`) where `"minni"`
+       was deleted/absent is flagged as drifted by `audit_host_propagation_health` and converged
+       (never skipped) by `execute_atomic_cutover`.
+    """
+    from minni.wire.health import audit_host_propagation_health
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, "1" * 40)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / v2_ver)
+
+    # 1. Host with ONLY a plugin_container surface (cursor container with stale v1 dist)
+    cursor_container = home / ".cursor" / "plugins" / "local" / "minni"
+    (cursor_container / "dist").mkdir(parents=True)
+    (cursor_container / "dist" / "server.js").write_text("// stale v1 container\n", encoding="utf-8")
+
+    # Health check must flag drifted plugin_container before cutover
+    health_pre = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_pre.ok is False
+    assert any(d["host"] == "cursor" and "plugins/local/minni" in d["path"] for d in health_pre.drifted_surfaces)
+
+    res_container = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_container.exit_code == 0, res_container.message
+    assert any("cursor:" in s and "plugins/local/minni" in s for s in res_container.updated_surfaces)
+    health_post_container = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_post_container.ok is True, health_post_container.to_dict()
+
+    # 2. Existing host configs where "minni" key is absent must be flagged by health and converged by cutover
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {}, "oauthAccount": "keep"}), encoding="utf-8")
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    (home / ".codex" / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
+
+    health_missing_key = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_missing_key.ok is False
+    drifted_hosts = {d["host"] for d in health_missing_key.drifted_surfaces}
+    assert "claude-code" in drifted_hosts
+    assert "codex" in drifted_hosts
+
+    res_missing_key = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_missing_key.exit_code == 0, res_missing_key.message
+    assert any("claude-code:" in s for s in res_missing_key.updated_surfaces)
+    assert any("codex:" in s for s in res_missing_key.updated_surfaces)
+    claude_doc = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+    assert "minni" in claude_doc["mcpServers"]
+    assert claude_doc["oauthAccount"] == "keep"
+    assert "[mcp_servers.minni]" in (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+
+
+def test_r3_p1_2_running_or_locked_cursor_defers_before_step4_and_gc_retains_tilde_old_version(
+    tmp_path: Path,
+) -> None:
+    """P1-2, New P1 #2, New P1 #3:
+    - Running/locked `cursor` with a container or config delta defers BEFORE Step 4 (exit 3,
+      `DEFERRED_RUNNING_HOST_DELTA`), leaving `~/.cursor/plugins/local/minni` and `~/.cursor/mcp.json`
+      completely untouched.
+    - When a deferred host config references an old version via tilde (`~/.minni/plugin/<old_ver>/...`),
+      Step 7 GC retains `<old_ver>` even when `keep_last=2` is exceeded by newer versions.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+
+    v_old = "0.5.0+git.00000000"
+    v_mid1 = "0.6.0+git.11111111"
+    v_mid2 = "0.6.0+git.22222222"
+    v_new = "0.6.0+git.33333333"
+    v_new_sha = "3" * 40
+    _seed_plugin_version(plugin_dir, v_old, "0" * 40)
+    _seed_plugin_version(plugin_dir, v_mid1, "1" * 40)
+    _seed_plugin_version(plugin_dir, v_mid2, "2" * 40)
+    _seed_plugin_version(plugin_dir, v_new, v_new_sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / v_mid2)
+
+    # Seed Cursor container and ~/.cursor/mcp.json referencing v_old via ~ tilde path
+    cursor_container = home / ".cursor" / "plugins" / "local" / "minni"
+    (cursor_container / "dist").mkdir(parents=True)
+    (cursor_container / "dist" / "server.js").write_text("// old cursor container\n", encoding="utf-8")
+    cursor_mcp = home / ".cursor" / "mcp.json"
+    cursor_mcp_orig = json.dumps({
+        "mcpServers": {
+            "minni": {
+                "command": "node",
+                "args": [f"~/.minni/plugin/{v_old}/dist/server.js"],
+                "env": {
+                    "MINNI_AGENT_ID": "cursor",
+                    "MINNI_VAULT_PATH": "~/.minni/cursor-vault",
+                },
+            }
+        }
+    })
+    cursor_mcp.write_text(cursor_mcp_orig, encoding="utf-8")
+
+    # Run cutover with cursor in running_hosts
+    res = execute_atomic_cutover(
+        home=home,
+        target_version=v_new,
+        target_git_sha=v_new_sha,
+        running_hosts={"cursor"},
+    )
+    assert res.exit_code == 3
+    assert res.status == "DEFERRED_RUNNING_HOST_DELTA"
+    assert "cursor" in res.deferred_running_hosts
+    # Step 4 MUST NOT have mutated Cursor's container while Cursor was running!
+    assert (cursor_container / "dist" / "server.js").read_text(encoding="utf-8") == "// old cursor container\n"
+    assert cursor_mcp.read_text(encoding="utf-8") == cursor_mcp_orig
+    # Step 7 GC MUST retain v_old even though keep_last=2 (v_new, v_mid2) would otherwise prune v_old!
+    assert (plugin_dir / v_old).is_dir(), f"v_old was pruned: {res.gc_result}"
+
+
+def test_r3_p1_3_rollback_never_rewrites_on_conflict_and_forward_cas_covers_all_surfaces(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P1-3, New P2 #1, New P3 #1:
+    - Step 7a rollback leaves live bytes untouched on CAS mismatch (including mcp_json on claude-code).
+    - Forward CAS protects commands_dir symlink replacement against concurrent modification.
+    """
+    import minni.wire.cutover as cutover_mod
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, "1" * 40)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+
+    claude_json = home / ".claude.json"
+    claude_json.write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(plugin_dir / v1_ver / "dist" / "server.js")],
+                    "env": {
+                        "MINNI_AGENT_ID": "claude-code",
+                        "MINNI_VAULT_PATH": str(home / ".minni" / "claudecode-vault"),
+                    },
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    concurrent_live_payload = '{"mcpServers":{"minni":{"custom":"live-user-edit"}},"concurrent":true}\n'
+
+    def _mutate_claude_then_fail(_home: Path) -> bool:
+        claude_json.write_text(concurrent_live_payload, encoding="utf-8")
+        return False
+
+    rb_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+        post_flip_verifier=_mutate_claude_then_fail,
+    )
+    assert rb_res.exit_code == 1
+    assert rb_res.rolled_back is True
+    assert rb_res.cas_conflicts
+    # Live file MUST be byte-identical to concurrent_live_payload (never re-merged or overwritten on conflict!)
+    assert claude_json.read_text(encoding="utf-8") == concurrent_live_payload
+
+    # Forward CAS on commands_dir symlink: if symlink target changes concurrently before replace, abort & roll back
+    ag_cmds = home / ".gemini" / "commands"
+    ag_cmds.mkdir(parents=True)
+    cmd_link = ag_cmds / "minni"
+    os.symlink(str(plugin_dir / v1_ver / "commands"), cmd_link)
+
+    real_check_lock = cutover_mod._check_host_lockfile
+
+    def _mutate_symlink_during_check(h: Path, host: str, spath: Path, **kw):
+        res_lock = real_check_lock(h, host, spath, **kw)
+        if spath == cmd_link and os.readlink(cmd_link) == str(plugin_dir / v1_ver / "commands"):
+            cmd_link.unlink()
+            os.symlink("/concurrent/user/commands", cmd_link)
+        return res_lock
+
+    monkeypatch.setattr(cutover_mod, "_check_host_lockfile", _mutate_symlink_during_check)
+    sym_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert sym_res.exit_code == 1
+    assert sym_res.rolled_back is True
+    assert os.readlink(cmd_link) == "/concurrent/user/commands"
+
+
+def test_r3_p1_4_probe_fixed_path_lang_and_catalog_wrapper_launcher_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P1-4, New P3 #2:
+    - `_minimal_probe_env` uses a fixed PATH and `LANG=C.UTF-8` rather than inheriting parent PATH/LANG.
+    - Step 3 pre-flip probe invokes catalog host wrapper launchers (`~/.agents/bin/mcp-env-run`) when present
+      and aborts pre-flip if the launcher fails.
+    """
+    from minni.wire.cutover import _minimal_probe_env
+
+    monkeypatch.setenv("LANG", "POISONED_LOCALE.INVALID")
+    monkeypatch.setenv("PATH", f"/poisoned/ attacker/path:{os.environ.get('PATH', '')}")
+    probe_env = _minimal_probe_env(tmp_path / "probe_home")
+    assert probe_env["LANG"] == "C.UTF-8"
+    assert "/poisoned/ attacker/path" not in probe_env["PATH"]
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+
+    # Seed a broken antigravity wrapper `~/.agents/bin/mcp-env-run`
+    wrapper = home / ".agents" / "bin" / "mcp-env-run"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("#!/usr/bin/env bash\nexit 42\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    (home / ".gemini").mkdir(parents=True, exist_ok=True)
+    (home / ".gemini" / "settings.json").write_text(
+        json.dumps({"mcpServers": {"minni": {"command": "node", "args": []}}}),
+        encoding="utf-8",
+    )
+
+    res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res.exit_code == 1
+    assert res.aborted_pre_flip is True
+

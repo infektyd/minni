@@ -279,6 +279,8 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/cursor-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "cas_on_delta",
+        "lock_glob": "~/.cursor/.mcp.json.lock",
+        "process_match": {"process_names": ["Cursor"]},
         "ui_scanner_gate": {
             "container_mode": "staged_copy",
             "verified": False,

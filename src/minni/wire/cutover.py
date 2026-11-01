@@ -28,7 +28,6 @@ from minni.wire.containers import (
     archive_container_prev_subtrees,
     converge_host_container,
     flip_current_pointer,
-    resolve_antigravity_container_dir,
     resolve_verified_plugin_root,
     rollback_container_subtrees,
     rollback_current_pointer,
@@ -251,15 +250,92 @@ def _cas_write_surface(
     return post_ino, post_mtime_ns, post_sha256
 
 
+def _cas_write_or_create_surface(
+    path: Path,
+    pre_tuple: tuple[int, int, str] | None,
+    new_bytes: bytes,
+    *,
+    home: Path,
+    host: str,
+    ts: str,
+    mode: int | None = None,
+) -> tuple[int, int, str]:
+    """CAS-protected write for both existing files (`pre_tuple` not None) and newly created files (`pre_tuple` is None)."""
+    if pre_tuple is not None:
+        return _cas_write_surface(
+            path,
+            pre_tuple[0],
+            pre_tuple[1],
+            pre_tuple[2],
+            new_bytes,
+            home=home,
+            host=host,
+            ts=ts,
+            mode=mode,
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.minni-cas.{os.getpid()}"
+    try:
+        tmp.write_bytes(new_bytes)
+        if mode is not None:
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
+        lock_hit = _check_host_lockfile(home, host, path, retries=1)
+        if lock_hit:
+            cdir = _archive_dir(home, ts) / "cas-conflict"
+            cdir.mkdir(parents=True, exist_ok=True)
+            cpath = cdir / path.name
+            cpath.write_bytes(new_bytes)
+            raise _CasConflictError(host, path, f"lockfile present before replace: {lock_hit}", str(cpath))
+        if path.exists() or path.is_symlink():
+            cdir = _archive_dir(home, ts) / "cas-conflict"
+            cdir.mkdir(parents=True, exist_ok=True)
+            cpath = cdir / path.name
+            try:
+                cpath.write_bytes(path.read_bytes())
+            except OSError:
+                cpath.write_bytes(new_bytes)
+            raise _CasConflictError(
+                host,
+                path,
+                "concurrent file creation detected before os.replace",
+                str(cpath),
+            )
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists() or tmp.is_symlink():
+            tmp.unlink(missing_ok=True)
+
+    post_ino, post_mtime_ns, post_sha256, post_bytes = _file_cas_tuple(path)
+    if post_bytes != new_bytes:
+        cdir = _archive_dir(home, ts) / "cas-conflict"
+        cdir.mkdir(parents=True, exist_ok=True)
+        cpath = cdir / path.name
+        cpath.write_bytes(post_bytes)
+        raise _CasConflictError(host, path, "post-replace readback mismatch", str(cpath))
+    return post_ino, post_mtime_ns, post_sha256
+
+
+_FIXED_BASE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+_INITIAL_NODE_BIN = shutil.which("node")
+_FIXED_PROBE_PATH = (
+    f"{_FIXED_BASE_PATH}:{Path(_INITIAL_NODE_BIN).parent}"
+    if _INITIAL_NODE_BIN and str(Path(_INITIAL_NODE_BIN).parent) not in _FIXED_BASE_PATH.split(":")
+    else _FIXED_BASE_PATH
+)
+
+
 def _minimal_probe_env(probe_home: Path, extra_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Construct a minimal environment for pre-flip probes without parent secret leakage (P3-12)."""
+    """Construct a minimal environment for pre-flip probes with fixed PATH/LANG and no parent secret leakage (P3-12)."""
     tmp_dir = probe_home / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     env: dict[str, str] = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"),
+        "PATH": _FIXED_PROBE_PATH,
         "HOME": str(probe_home),
         "TMPDIR": str(tmp_dir),
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LANG": "C.UTF-8",
         "MINNI_HOME": str(probe_home / ".minni"),
         "MINNI_VAULT_PATH": str(probe_home / "vault"),
         "MINNI_AGENT_ID": "probe",
@@ -374,7 +450,11 @@ def run_behavioral_probe(
     return True, "ok"
 
 
-def _validate_scratch_containers(scratch_dirs: dict[str, Path]) -> tuple[bool, str]:
+def _validate_scratch_containers(
+    scratch_dirs: dict[str, Path],
+    *,
+    home: Path | None = None,
+) -> tuple[bool, str]:
     for host, sdir in scratch_dirs.items():
         if not sdir.is_dir():
             return False, f"scratch container missing for {host}: {sdir}"
@@ -384,9 +464,54 @@ def _validate_scratch_containers(scratch_dirs: dict[str, Path]) -> tuple[bool, s
                 return False, f"scratch container {host} missing subtree {sub}"
         if not (sdir / "dist" / "server.js").is_file():
             return False, f"scratch container {host} missing dist/server.js"
-        ok, msg = run_behavioral_probe(sdir, probe_hooks=False)
+        hspec = HOST_SURFACE_CATALOG.get(host) or {}
+        host_env = {
+            "MINNI_AGENT_ID": str(hspec.get("agent_id") or host),
+            "MINNI_VAULT_PATH": expand_for_home(
+                str(hspec.get("vault_path") or f"~/.minni/{host}-vault"), home=home
+            ),
+        }
+        ok, msg = run_behavioral_probe(sdir, extra_env=host_env, probe_hooks=False)
         if not ok:
             return False, f"scratch container {host} behavioral probe failed: {msg}"
+    return True, "ok"
+
+
+def _probe_catalog_host_launchers(vdir: Path, home: Path) -> tuple[bool, str]:
+    """Probe catalog host wrapper launchers (`command` / `args_prefix` / `MINNI_AGENT_ID`) when present on `home` (P1-4)."""
+    probed: set[tuple[str, tuple[str, ...], str]] = set()
+    for host_id, hspec in HOST_SURFACE_CATALOG.items():
+        agent_id = str(hspec.get("agent_id") or host_id)
+        vault_path = expand_for_home(str(hspec.get("vault_path") or f"~/.minni/{host_id}-vault"), home=home)
+        host_env = {
+            "MINNI_AGENT_ID": agent_id,
+            "MINNI_VAULT_PATH": vault_path,
+        }
+        for surf in hspec.get("surfaces", []):
+            if not isinstance(surf, dict):
+                continue
+            if surf.get("kind") not in ("mcp_json", "mcp_toml", "mcp_view_mirrors"):
+                continue
+            raw_cmd = str(surf.get("command") or "node")
+            expanded_cmd = expand_for_home(raw_cmd, home=home)
+            raw_prefix = [expand_for_home(str(a), home=home) for a in (surf.get("args_prefix") or [])]
+            if expanded_cmd != "node":
+                cmd_path = Path(expanded_cmd)
+                if not cmd_path.exists() and not cmd_path.is_symlink():
+                    continue
+                key = (expanded_cmd, tuple(raw_prefix), agent_id)
+                if key in probed:
+                    continue
+                probed.add(key)
+                ok, msg = run_behavioral_probe(
+                    vdir,
+                    extra_env=host_env,
+                    command=expanded_cmd,
+                    args_prefix=raw_prefix,
+                    probe_hooks=False,
+                )
+                if not ok:
+                    return False, f"catalog launcher probe failed for {host_id} ({expanded_cmd}): {msg}"
     return True, "ok"
 
 
@@ -397,6 +522,7 @@ def _detect_running_rewrite_hosts() -> set[str]:
         "claude-desktop": ["pgrep", "-x", "Claude"],
         "grok-build": ["pgrep", "-x", "grok"],
         "devin": ["pgrep", "-x", "devin"],
+        "cursor": ["pgrep", "-x", "Cursor"],
     }
     for host, cmd in checks.items():
         try:
@@ -408,6 +534,41 @@ def _detect_running_rewrite_hosts() -> set[str]:
     return running
 
 
+def _container_has_delta(
+    container_dir: Path,
+    version_dir: Path,
+    base_semver: str,
+    *,
+    forbid_mcp_json: bool = False,
+) -> bool:
+    if not container_dir.is_dir() or container_dir.is_symlink():
+        return True
+    if forbid_mcp_json and ((container_dir / ".mcp.json").exists() or (container_dir / ".mcp.json").is_symlink()):
+        return True
+    srv_js = container_dir / "dist" / "server.js"
+    target_srv_js = version_dir / "dist" / "server.js"
+    if not srv_js.is_file() or not target_srv_js.is_file():
+        return True
+    try:
+        if srv_js.read_bytes() != target_srv_js.read_bytes():
+            return True
+    except OSError:
+        return True
+    for sub in ("dist", "skills", "commands", "hooks"):
+        if not (container_dir / sub).exists():
+            return True
+    for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+        pj = container_dir / rel_pjson
+        if pj.is_file():
+            try:
+                pdoc = json.loads(pj.read_text(encoding="utf-8"))
+                if not isinstance(pdoc, dict) or "mcpServers" in pdoc or pdoc.get("version") != base_semver:
+                    return True
+            except Exception:
+                return True
+    return False
+
+
 def _converge_claude_local_marketplace(
     home: Path,
     version_dir: Path,
@@ -415,13 +576,17 @@ def _converge_claude_local_marketplace(
     target_git_sha: str,
     *,
     pid: int,
-) -> tuple[list[SubtreeSwapRecord], tuple[Path, bytes | None, int, int, str] | None]:
+    ts: str,
+) -> tuple[list[SubtreeSwapRecord], tuple[Path, bytes | None, int, int, str] | None, list[str], list[str]]:
     claude_plugins = home / ".claude" / "plugins"
     if not claude_plugins.is_dir():
-        return [], None
+        return [], None, [], []
 
+    updated: list[str] = []
+    skipped: list[str] = []
     base_semver = target_version.split("+", 1)[0] if target_version else "0.6.0"
     mkt_plugin_dir = claude_plugins / "marketplaces" / "minni-local" / "plugins" / "minni"
+    mkt_has_delta = _container_has_delta(mkt_plugin_dir, version_dir, base_semver, forbid_mcp_json=True)
     mkt_plugin_dir.mkdir(parents=True, exist_ok=True)
     stable_current = home / ".minni" / "plugin" / "current"
     swaps = swap_container_subtrees(
@@ -442,26 +607,52 @@ def _converge_claude_local_marketplace(
             data["version"] = base_semver
             desired_pjson = (json.dumps(data, indent=2) + "\n").encode("utf-8")
             dest_pjson = cplugin_dir / "plugin.json"
-            if not dest_pjson.is_file() or dest_pjson.read_bytes() != desired_pjson:
-                _atomic_write_bytes(dest_pjson, desired_pjson)
+            pre_pjson_tuple = _file_cas_tuple(dest_pjson)[:3] if dest_pjson.is_file() else None
+            if pre_pjson_tuple is None or dest_pjson.read_bytes() != desired_pjson:
+                _cas_write_or_create_surface(
+                    dest_pjson,
+                    pre_pjson_tuple,
+                    desired_pjson,
+                    home=home,
+                    host="claude-code",
+                    ts=ts,
+                )
+                mkt_has_delta = True
     src_pkg = version_dir / "package.json"
     if src_pkg.is_file():
         dest_pkg = mkt_plugin_dir / "package.json"
         src_pkg_bytes = src_pkg.read_bytes()
-        if not dest_pkg.is_file() or dest_pkg.read_bytes() != src_pkg_bytes:
-            shutil.copy2(src_pkg, dest_pkg)
+        pre_pkg_tuple = _file_cas_tuple(dest_pkg)[:3] if dest_pkg.is_file() else None
+        if pre_pkg_tuple is None or dest_pkg.read_bytes() != src_pkg_bytes:
+            _cas_write_or_create_surface(
+                dest_pkg,
+                pre_pkg_tuple,
+                src_pkg_bytes,
+                home=home,
+                host="claude-code",
+                ts=ts,
+            )
+            mkt_has_delta = True
+
+    if mkt_has_delta:
+        updated.append(f"claude-code:{mkt_plugin_dir}")
+    else:
+        skipped.append(f"claude-code:{mkt_plugin_dir}")
 
     inst_path = claude_plugins / "installed_plugins.json"
-    prev_raw = inst_path.read_bytes() if inst_path.is_file() else None
+    pre_inst_tuple: tuple[int, int, str] | None = None
+    prev_raw: bytes | None = None
     doc: dict[str, Any] = {"version": 2, "plugins": {}}
     if inst_path.is_file():
-        parsed = json.loads(inst_path.read_text(encoding="utf-8"))
+        inst_ino, inst_mtime_ns, inst_sha256, prev_raw = _file_cas_tuple(inst_path)
+        pre_inst_tuple = (inst_ino, inst_mtime_ns, inst_sha256)
+        parsed = json.loads(prev_raw.decode("utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError(f"installed_plugins.json at {inst_path} is not a JSON object")
         doc = parsed
 
     plugins_map = doc.setdefault("plugins", {})
-    needs_write = not inst_path.is_file()
+    needs_write = pre_inst_tuple is None
     if isinstance(plugins_map, dict):
         expanded_install_path = str(mkt_plugin_dir)
         expanded_project_path = str(home / ".claude" / "plugins" / "marketplaces" / "minni-local")
@@ -506,11 +697,20 @@ def _converge_claude_local_marketplace(
             needs_write = True
 
     if not needs_write:
-        return swaps, None
+        skipped.append(f"claude-code:{inst_path}")
+        return swaps, None, updated, skipped
 
-    _atomic_write_bytes(inst_path, (json.dumps(doc, indent=2) + "\n").encode("utf-8"))
-    post_ino, post_mtime_ns, post_sha256, _ = _file_cas_tuple(inst_path)
-    return swaps, (inst_path, prev_raw, post_ino, post_mtime_ns, post_sha256)
+    new_inst_bytes = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+    post_ino, post_mtime_ns, post_sha256 = _cas_write_or_create_surface(
+        inst_path,
+        pre_inst_tuple,
+        new_inst_bytes,
+        home=home,
+        host="claude-code",
+        ts=ts,
+    )
+    updated.append(f"claude-code:{inst_path}")
+    return swaps, (inst_path, prev_raw, post_ino, post_mtime_ns, post_sha256), updated, skipped
 
 
 def _extract_referenced_versions(text: str, plugin_dir: Path) -> set[str]:
@@ -519,7 +719,7 @@ def _extract_referenced_versions(text: str, plugin_dir: Path) -> set[str]:
         return found
     for child in plugin_dir.iterdir():
         if child.is_dir() and not child.is_symlink() and not child.name.startswith("."):
-            if str(child) in text:
+            if str(child) in text or f".minni/plugin/{child.name}" in text:
                 found.add(child.name)
     return found
 
@@ -651,7 +851,7 @@ def execute_atomic_cutover(
     scratch_root, scratch_dirs = stage_scratch_containers(vdir, home=home, base_semver=base_semver)
     try:
         # Step 3 — Pre-Flip Behavioral Probe (R4-2, P1-4)
-        scratch_ok, scratch_msg = _validate_scratch_containers(scratch_dirs)
+        scratch_ok, scratch_msg = _validate_scratch_containers(scratch_dirs, home=home)
         if not scratch_ok:
             return CutoverOutcome(
                 exit_code=1,
@@ -671,45 +871,20 @@ def execute_atomic_cutover(
                 aborted_pre_flip=True,
                 message=probe_msg,
             )
+        launchers_ok, launchers_msg = _probe_catalog_host_launchers(vdir, home)
+        if not launchers_ok:
+            return CutoverOutcome(
+                exit_code=1,
+                status="ABORTED_PRE_FLIP",
+                target_version=target_version,
+                target_git_sha=target_git_sha,
+                aborted_pre_flip=True,
+                message=launchers_msg,
+            )
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)
 
     wired_doc = _load_wired(plugin_dir / "wired.json")
-    # Step 4 — Flip `current` & Swap Real Per-Host Containers (P2-6, R4-1)
-    flip_state: CurrentFlipState = flip_current_pointer(target_version, home=home, pid=pid)
-    all_container_swaps: list[SubtreeSwapRecord] = []
-    prev_installed_plugins: tuple[Path, bytes | None, int, int, str] | None = None
-    step5_error: str = ""
-    cas_conflicts: list[str] = []
-
-    try:
-        for chost in ("antigravity", "cursor"):
-            if chost == "antigravity":
-                ag_plugins_dir = home / ".agents" / "plugins"
-                should_converge = ag_plugins_dir.exists()
-            else:
-                cu_dir = home / ".cursor" / "plugins" / "local" / "minni"
-                should_converge = cu_dir.exists() or cu_dir.parent.exists()
-            if should_converge:
-                mode = effective_container_mode(chost, wired_doc)
-                swaps = converge_host_container(
-                    chost,
-                    home=home,
-                    container_mode=mode,
-                    target_version_root=vdir,
-                    base_semver=base_semver,
-                    pid=pid,
-                )
-                all_container_swaps.extend(swaps)
-
-        mkt_swaps, prev_installed_plugins = _converge_claude_local_marketplace(
-            home, vdir, target_version, target_git_sha, pid=pid
-        )
-        all_container_swaps.extend(mkt_swaps)
-    except Exception as exc:
-        step5_error = f"Step 4 container/marketplace convergence failed for claude-code: {exc}"
-
-    # Step 5 — Reconcile Host Configs Across All Catalog Surface Kinds (`delta != 0` only, Lock/Running Guard & CAS)
     active_running = (
         set(running_hosts)
         if running_hosts is not None
@@ -723,6 +898,72 @@ def execute_atomic_cutover(
     deferred_details: list[str] = []
     deferred_protected_versions: set[str] = set()
 
+    def _should_defer_host_write(host: str, cfg_path: Path, raw_text: str) -> bool:
+        lock_hit = _check_host_lockfile(home, host, cfg_path, retries=3)
+        is_running_rewrite_host = (
+            host in ("muse", "claude-desktop", "grok-build", "devin", "cursor")
+            and host in active_running
+        )
+        if lock_hit or is_running_rewrite_host:
+            if host not in deferred_running_hosts:
+                deferred_running_hosts.append(host)
+            detail = f"{host} ({cfg_path})" + (f" [lock: {lock_hit}]" if lock_hit else "")
+            if detail not in deferred_details:
+                deferred_details.append(detail)
+            deferred_protected_versions.update(_extract_referenced_versions(raw_text, plugin_dir))
+            return True
+        return False
+
+    # Step 4 — Flip `current` & Swap Real Per-Host Containers (P2-6, R4-1, P1-1, P1-2)
+    flip_state: CurrentFlipState = flip_current_pointer(target_version, home=home, pid=pid)
+    all_container_swaps: list[SubtreeSwapRecord] = []
+    prev_installed_plugins: tuple[Path, bytes | None, int, int, str] | None = None
+    step5_error: str = ""
+    cas_conflicts: list[str] = []
+
+    try:
+        for chost in ("antigravity", "cursor"):
+            if chost == "antigravity":
+                ag_plugins_dir = home / ".agents" / "plugins"
+                should_converge = ag_plugins_dir.exists()
+                cpath = ag_plugins_dir / "Minni@Minni"
+            else:
+                cu_dir = home / ".cursor" / "plugins" / "local" / "minni"
+                should_converge = cu_dir.exists() or cu_dir.parent.exists()
+                cpath = cu_dir
+            if should_converge:
+                has_c_delta = _container_has_delta(cpath, vdir, base_semver)
+                if not has_c_delta:
+                    skipped_surfaces.append(f"{chost}:{cpath}")
+                    continue
+                if _should_defer_host_write(chost, cpath, ""):
+                    continue
+                mode = effective_container_mode(chost, wired_doc)
+                swaps = converge_host_container(
+                    chost,
+                    home=home,
+                    container_mode=mode,
+                    target_version_root=vdir,
+                    base_semver=base_semver,
+                    pid=pid,
+                )
+                all_container_swaps.extend(swaps)
+                updated_surfaces.append(f"{chost}:{cpath}")
+
+        mkt_swaps, prev_installed_plugins, claude_upd, claude_skp = _converge_claude_local_marketplace(
+            home, vdir, target_version, target_git_sha, pid=pid, ts=ts
+        )
+        all_container_swaps.extend(mkt_swaps)
+        updated_surfaces.extend(claude_upd)
+        skipped_surfaces.extend(claude_skp)
+    except _CasConflictError as exc:
+        if exc.conflict_artifact:
+            cas_conflicts.append(exc.conflict_artifact)
+        step5_error = str(exc)
+    except Exception as exc:
+        step5_error = f"Step 4 container/marketplace convergence failed: {exc}"
+
+    # Step 5 — Reconcile Host Configs Across All Catalog Surface Kinds (`delta != 0` only, Lock/Running Guard & CAS)
     # Flatten all catalog surfaces + legacy ~/.muse/config.json
     all_surfaces: list[tuple[str, str, Path, dict[str, Any], bool]] = []
     for host_id, hspec in HOST_SURFACE_CATALOG.items():
@@ -731,7 +972,7 @@ def execute_atomic_cutover(
             if not isinstance(surf, dict):
                 continue
             kind = str(surf.get("kind") or "")
-            if kind == "plugin_container" or kind == "claude_plugin_registry":
+            if kind in ("plugin_container", "claude_plugin_registry"):
                 continue
             if kind == "mcp_view_mirrors":
                 for vp_raw in surf.get("paths") or []:
@@ -773,21 +1014,6 @@ def execute_atomic_cutover(
             )
         )
 
-    def _should_defer_host_write(host: str, cfg_path: Path, raw_text: str) -> bool:
-        lock_hit = _check_host_lockfile(home, host, cfg_path, retries=3)
-        is_running_rewrite_host = (
-            host in ("muse", "claude-desktop", "grok-build", "devin") and host in active_running
-        )
-        if lock_hit or is_running_rewrite_host:
-            if host not in deferred_running_hosts:
-                deferred_running_hosts.append(host)
-            detail = f"{host} ({cfg_path})" + (f" [lock: {lock_hit}]" if lock_hit else "")
-            if detail not in deferred_details:
-                deferred_details.append(detail)
-            deferred_protected_versions.update(_extract_referenced_versions(raw_text, plugin_dir))
-            return True
-        return False
-
     for host, kind, cfg_path, surf_spec, rewrite_on_run in all_surfaces:
         if step5_error:
             break
@@ -798,6 +1024,7 @@ def execute_atomic_cutover(
             expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
             if cfg_path.is_symlink():
                 try:
+                    pre_lstat = cfg_path.lstat()
                     cur_target = os.readlink(cfg_path)
                 except OSError as exc:
                     step5_error = f"failed to read symlink for {host} ({cfg_path}): {exc}"
@@ -808,14 +1035,39 @@ def execute_atomic_cutover(
                 if _should_defer_host_write(host, cfg_path, cur_target):
                     continue
                 tmp_link = cfg_path.parent / f".{cfg_path.name}.tmp.{pid}"
-                if tmp_link.exists() or tmp_link.is_symlink():
-                    tmp_link.unlink(missing_ok=True)
-                os.symlink(expected_target, tmp_link)
-                os.replace(tmp_link, cfg_path)
+                try:
+                    if tmp_link.exists() or tmp_link.is_symlink():
+                        tmp_link.unlink(missing_ok=True)
+                    os.symlink(expected_target, tmp_link)
+                    lock_hit = _check_host_lockfile(home, host, cfg_path, retries=1)
+                    if lock_hit:
+                        raise _CasConflictError(host, cfg_path, f"lockfile present before symlink replace: {lock_hit}")
+                    now_lstat = cfg_path.lstat()
+                    now_target = os.readlink(cfg_path)
+                    if (now_lstat.st_ino, now_lstat.st_mtime_ns, now_target) != (
+                        pre_lstat.st_ino,
+                        pre_lstat.st_mtime_ns,
+                        cur_target,
+                    ):
+                        raise _CasConflictError(
+                            host, cfg_path, "concurrent modification of commands_dir symlink before replace"
+                        )
+                    os.replace(tmp_link, cfg_path)
+                except _CasConflictError as exc:
+                    if exc.conflict_artifact:
+                        cas_conflicts.append(exc.conflict_artifact)
+                    step5_error = str(exc)
+                    break
+                finally:
+                    if tmp_link.exists() or tmp_link.is_symlink():
+                        tmp_link.unlink(missing_ok=True)
                 commands_symlink_rollbacks.append((cfg_path, cur_target))
                 updated_surfaces.append(f"{host}:{cfg_path}")
             continue
 
+        if cfg_path.is_symlink() and not cfg_path.exists():
+            step5_error = f"broken symlink surface for {host} ({cfg_path})"
+            break
         if not cfg_path.is_file():
             continue
 
@@ -839,11 +1091,9 @@ def execute_atomic_cutover(
                 break
             container_key = "mcp" if surf_spec.get("key") == "mcp.minni" else "mcpServers"
             servers = doc.get(container_key)
-            if not isinstance(servers, dict) or "minni" not in servers:
-                skipped_surfaces.append(f"{host}:{cfg_path}")
-                continue
+            live_minni = servers.get("minni") if isinstance(servers, dict) else None
             diff = evaluate_mcp_surface_diff(
-                servers.get("minni"),
+                live_minni,
                 host_id=host,
                 agent_id=str(hspec["agent_id"]),
                 vault_path=str(hspec["vault_path"]),
@@ -855,9 +1105,11 @@ def execute_atomic_cutover(
                 continue
             if _should_defer_host_write(host, cfg_path, raw_text):
                 continue
-            prev_minni = copy.deepcopy(servers.get("minni"))
+            prev_minni = copy.deepcopy(live_minni)
             new_doc = copy.deepcopy(doc)
-            new_doc.setdefault(container_key, {})["minni"] = diff.desired_entry
+            if not isinstance(new_doc.get(container_key), dict):
+                new_doc[container_key] = {}
+            new_doc[container_key]["minni"] = diff.desired_entry
             new_bytes = (json.dumps(new_doc, indent=2) + "\n").encode("utf-8")
             try:
                 _archive_file_before_write(home, cfg_path, ts)
@@ -903,11 +1155,9 @@ def execute_atomic_cutover(
                 step5_error = f"unparseable TOML surface for {host} ({cfg_path}): {exc}"
                 break
             servers = doc.get("mcp_servers")
-            if not isinstance(servers, dict) or "minni" not in servers:
-                skipped_surfaces.append(f"{host}:{cfg_path}")
-                continue
+            live_minni = servers.get("minni") if isinstance(servers, dict) else None
             diff = evaluate_mcp_surface_diff(
-                servers.get("minni"),
+                live_minni,
                 host_id=host,
                 agent_id=str(hspec["agent_id"]),
                 vault_path=str(hspec["vault_path"]),
@@ -919,7 +1169,7 @@ def execute_atomic_cutover(
                 continue
             if _should_defer_host_write(host, cfg_path, raw_text):
                 continue
-            prev_minni = copy.deepcopy(servers.get("minni"))
+            prev_minni = copy.deepcopy(live_minni)
             new_text = _render_toml_with_updated_minni(raw_text, diff.desired_entry)
             new_bytes = new_text.encode("utf-8")
             try:
@@ -1078,63 +1328,40 @@ def execute_atomic_cutover(
                 os.replace(tmp_l, cmd_link)
         if prev_installed_plugins is not None:
             inst_path, prev_raw, post_ino, post_mtime_ns, post_sha256 = prev_installed_plugins
-            if prev_raw is None:
-                inst_path.unlink(missing_ok=True)
+            try:
+                cur_ino, cur_mtime_ns, cur_sha256, cur_bytes = _file_cas_tuple(inst_path)
+            except OSError:
+                cas_conflicts.append(str(inst_path))
             else:
-                try:
-                    cur_ino, cur_mtime_ns, cur_sha256, cur_bytes = _file_cas_tuple(inst_path)
-                    if (cur_ino, cur_mtime_ns, cur_sha256) == (post_ino, post_mtime_ns, post_sha256):
-                        _atomic_write_bytes(inst_path, prev_raw)
+                if (cur_ino, cur_mtime_ns, cur_sha256) == (post_ino, post_mtime_ns, post_sha256):
+                    if prev_raw is None:
+                        inst_path.unlink(missing_ok=True)
                     else:
-                        cdir = _archive_dir(home, ts) / "rollback-conflict"
-                        cdir.mkdir(parents=True, exist_ok=True)
-                        cpath = cdir / inst_path.name
-                        cpath.write_bytes(cur_bytes)
-                        cas_conflicts.append(str(cpath))
-                except OSError:
-                    _atomic_write_bytes(inst_path, prev_raw)
+                        _atomic_write_bytes(inst_path, prev_raw)
+                else:
+                    cdir = _archive_dir(home, ts) / "rollback-conflict"
+                    cdir.mkdir(parents=True, exist_ok=True)
+                    cpath = cdir / inst_path.name
+                    cpath.write_bytes(cur_bytes)
+                    cas_conflicts.append(str(cpath))
 
-        # 3. Restore modified host config files with CAS check on EVERY record (P1-3)
+        # 3. Restore modified host config files with CAS check on EVERY record; leave live bytes on CAS mismatch (P1-3, New P3 #1)
         for rec in reversed(rollback_records):
             try:
                 cur_ino, cur_mtime_ns, cur_sha256, cur_bytes = _file_cas_tuple(rec.path)
             except OSError:
-                _atomic_write_bytes(rec.path, rec.pre_bytes, mode=rec.pre_mode)
+                cas_conflicts.append(str(rec.path))
                 continue
             if (cur_ino, cur_mtime_ns, cur_sha256) == (rec.post_step5_ino, rec.post_step5_mtime_ns, rec.post_step5_sha256):
                 _atomic_write_bytes(rec.path, rec.pre_bytes, mode=rec.pre_mode)
             else:
-                # Concurrent mutation happened between Step 5 and Step 7a rollback!
+                # Concurrent mutation happened between Step 5 and Step 7a rollback:
+                # Leave live bytes untouched on disk, archive conflict under rollback-conflict, and record in cas_conflicts!
                 conflict_dir = _archive_dir(home, ts) / "rollback-conflict"
                 conflict_dir.mkdir(parents=True, exist_ok=True)
                 cpath = conflict_dir / rec.path.name
                 cpath.write_bytes(cur_bytes)
                 cas_conflicts.append(str(cpath))
-                if rec.surface_kind == "mcp_json":
-                    try:
-                        live_doc = json.loads(cur_bytes.decode("utf-8"))
-                        if not isinstance(live_doc, dict):
-                            raise ValueError("not a JSON object")
-                        ckey = "mcp" if rec.host == "kilocode" else "mcpServers"
-                        srv = live_doc.setdefault(ckey, {})
-                        if isinstance(srv, dict):
-                            if rec.previous_minni_entry is None:
-                                srv.pop("minni", None)
-                            else:
-                                srv["minni"] = rec.previous_minni_entry
-                        _cas_write_surface(
-                            rec.path,
-                            cur_ino,
-                            cur_mtime_ns,
-                            cur_sha256,
-                            (json.dumps(live_doc, indent=2) + "\n").encode("utf-8"),
-                            home=home,
-                            host=rec.host,
-                            ts=ts,
-                            mode=rec.pre_mode,
-                        )
-                    except Exception:
-                        pass
 
         return CutoverOutcome(
             exit_code=1,
@@ -1166,11 +1393,12 @@ def execute_atomic_cutover(
     )
     save_wired_v2(new_wired, home=home)
 
-    # Step 7 — Reference-Aware GC (§4.5)
+    # Step 7 — Reference-Aware GC (§4.5, New P1 #3)
     gc_obj = collect_garbage(
         home=home,
         keep_last=2,
         prev_target=flip_state.prev_link_target,
+        extra_protected=deferred_protected_versions,
     )
     gc_res = {
         "pruned": list(gc_obj.pruned),
@@ -1237,7 +1465,11 @@ def reconcile_all_hosts(
         elif plugin_dir.is_dir():
             candidates = [
                 d for d in plugin_dir.iterdir()
-                if d.is_dir() and not d.is_symlink() and not d.name.startswith(".") and (d / "payload-manifest.json").is_file()
+                if d.is_dir()
+                and not d.is_symlink()
+                and not d.name.startswith(".")
+                and (d / "payload-manifest.json").is_file()
+                and all((d / sub).exists() for sub in ("dist", "skills", "commands", "hooks"))
             ]
             if candidates:
                 candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)

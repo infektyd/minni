@@ -280,19 +280,36 @@ def _discover_live_server_pids_for_home(base: Path, home: Path | None = None) ->
 
 def _config_references_dir(version_dir: Path, home: Path | None = None) -> bool:
     needle = str(version_dir)
+    rel_needle = f".minni/plugin/{version_dir.name}"
     effective_home = _resolve_home_from_base(version_dir.parent, home)
     try:
         scan_map = default_config_scan_paths(home=effective_home)
     except TypeError:
         scan_map = default_config_scan_paths()
-    for path in scan_map.values():
-        if not path.exists():
+    paths_to_scan: list[Path] = list(scan_map.values())
+    try:
+        from minni.wire.registry import expand_host_surface_catalog
+
+        expanded = expand_host_surface_catalog(home=effective_home)
+        for hspec in expanded.values():
+            for surf in hspec.get("surfaces", []):
+                if not isinstance(surf, dict):
+                    continue
+                if surf.get("path"):
+                    paths_to_scan.append(Path(str(surf["path"])))
+                for vp in surf.get("paths") or []:
+                    paths_to_scan.append(Path(str(vp)))
+        paths_to_scan.append(effective_home / ".muse" / "config.json")
+    except Exception:
+        pass
+    for path in paths_to_scan:
+        if not path.is_file():
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if needle in text:
+        if needle in text or rel_needle in text:
             return True
     return False
 
@@ -303,8 +320,13 @@ def _protected_versions(
     home: Path | None = None,
     prev_target: str | None = None,
     legacy_unpinned_lstarts: list[float] | None = None,
+    extra_protected: set[str] | list[str] | None = None,
 ) -> set[str]:
     protected = wired_install_roots()
+    if extra_protected:
+        for ep in extra_protected:
+            if ep:
+                protected.add(Path(str(ep)).name)
     current_link = base / "current"
     if current_link.is_symlink():
         try:
@@ -352,6 +374,7 @@ def _retention_set(
     keep_last: int = 0,
     prev_target: str | None = None,
     legacy_unpinned_lstarts: list[float] | None = None,
+    extra_protected: set[str] | list[str] | None = None,
 ) -> set[str]:
     release = _release_version_dirs(base)
     keep: set[str] = set()
@@ -367,6 +390,7 @@ def _retention_set(
         home=home,
         prev_target=prev_target,
         legacy_unpinned_lstarts=legacy_unpinned_lstarts,
+        extra_protected=extra_protected,
     )
     return keep
 
@@ -398,6 +422,7 @@ def run_gc(
     keep_last: int = 0,
     prev_target: str | None = None,
     legacy_unpinned_lstarts: list[float] | None = None,
+    extra_protected: set[str] | list[str] | None = None,
 ) -> GcResult:
     result = GcResult()
     base = _resolve_base(home)
@@ -407,6 +432,7 @@ def run_gc(
         keep_last=keep_last,
         prev_target=prev_target,
         legacy_unpinned_lstarts=legacy_unpinned_lstarts,
+        extra_protected=extra_protected,
     )
     candidates: list[Path] = []
     if base.is_dir():
@@ -485,6 +511,7 @@ def collect_garbage(
     dry_run: bool = False,
     prev_target: str | None = None,
     legacy_unpinned_lstarts: list[float] | None = None,
+    extra_protected: set[str] | list[str] | None = None,
 ) -> GcResult:
     """Execute §4.5 safe garbage collection protecting `keep_last=2`, open FDs, leases, and bounded `lstart`."""
     return run_gc(
@@ -495,6 +522,7 @@ def collect_garbage(
         keep_last=keep_last,
         prev_target=prev_target,
         legacy_unpinned_lstarts=legacy_unpinned_lstarts,
+        extra_protected=extra_protected,
     )
 
 
