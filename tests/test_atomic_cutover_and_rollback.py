@@ -2122,4 +2122,3 @@ def test_r8_tmp_lock_without_pid_open_process_check_and_grok_dot_lock_probe(
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-

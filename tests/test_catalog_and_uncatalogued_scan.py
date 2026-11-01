@@ -586,4 +586,3 @@ def test_r8_scanner_prefix_only_denylist_scans_extensions_cache_node_modules_and
         assert by_path[unreadable_dir]["reason"] == "unreadable_config_dir"
     finally:
         unreadable_dir.chmod(0o700)
-
