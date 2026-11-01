@@ -300,6 +300,11 @@ def audit_host_propagation_health(
             return spath.parent.is_dir() and not (resolved_home / ".muse" / "config.json").is_file()
         return spath.parent.is_dir()
 
+    def _commands_dir_expected_on_home(spath: Path) -> bool:
+        if not current_valid:
+            return False
+        return spath.parent.is_dir() or (spath.parent.parent != resolved_home and spath.parent.parent.is_dir())
+
     def _is_clean_legacy_v1_entry(live_entry: Any, *, is_kilo: bool) -> bool:
         if not legacy_v1_single_server_js or not isinstance(live_entry, dict):
             return False
@@ -527,17 +532,36 @@ def audit_host_propagation_health(
                     reasons.append(f"missing_exec_in_{kind}")
                 if reasons:
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": reasons})
-            elif kind == "commands_dir" and spath.is_symlink():
-                expected_target = expand_for_home(str(surf.get("entry") or ""), home=resolved_home)
-                try:
-                    actual_target = os.readlink(spath)
-                except OSError:
-                    actual_target = ""
-                if actual_target != expected_target:
+            elif kind == "commands_dir":
+                if spath.is_symlink():
+                    expected_target = expand_for_home(str(surf.get("entry") or ""), home=resolved_home)
+                    try:
+                        actual_target = os.readlink(spath)
+                    except OSError:
+                        actual_target = ""
+                    if actual_target != expected_target:
+                        drifted_surfaces.append({
+                            "host": host_id,
+                            "path": str(spath),
+                            "reasons": [f"commands_dir_target_mismatch:{actual_target}!={expected_target}"],
+                        })
+                    elif not spath.exists():
+                        drifted_surfaces.append({
+                            "host": host_id,
+                            "path": str(spath),
+                            "reasons": ["broken_commands_dir_symlink"],
+                        })
+                elif spath.exists():
                     drifted_surfaces.append({
                         "host": host_id,
                         "path": str(spath),
-                        "reasons": [f"commands_dir_target_mismatch:{actual_target}!={expected_target}"],
+                        "reasons": ["broken_or_non_symlink_commands_dir"],
+                    })
+                elif _commands_dir_expected_on_home(spath):
+                    drifted_surfaces.append({
+                        "host": host_id,
+                        "path": str(spath),
+                        "reasons": ["missing_commands_dir"],
                     })
             elif kind == "claude_plugin_registry" and spath.is_file():
                 try:

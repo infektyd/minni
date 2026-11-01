@@ -1184,3 +1184,93 @@ def test_r4_new_p2_commands_dir_rollback_cas_pgrep_fail_closed_and_new_p3_path_d
     assert path_filter_res.exit_code == 1
     assert path_filter_res.rolled_back is True
     assert str(muse_s1) in path_filter_res.message
+
+
+def test_r5_p1_1_missing_commands_dir_is_drift_in_health_and_delta_in_reconcile(
+    tmp_path: Path,
+) -> None:
+    """R5 P1-1:
+    - An absent catalogued `commands_dir` symlink (`~/.gemini/commands/minni`) when `~/.gemini` or
+      `~/.gemini/commands` exists is scored as drift (`missing_commands_dir`) by `audit_host_propagation_health`
+      and created/converged as a delta by `execute_atomic_cutover` (never silently `continue`d).
+    - Rollback unlinks a newly created `commands_dir` symlink if Step 6 fails.
+    - A non-symlink (e.g. a real directory) at `commands_dir` is flagged as drift by health and aborts Step 5.
+    """
+    import shutil
+    from minni.wire.health import audit_host_propagation_health
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / v2_ver)
+
+    # 1. `~/.gemini/commands` exists but `minni` symlink is absent -> drift in health & delta in reconcile
+    ag_cmds = home / ".gemini" / "commands"
+    ag_cmds.mkdir(parents=True)
+    cmd_link = ag_cmds / "minni"
+
+    health_pre = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_pre.ok is False
+    cmd_drift = [d for d in health_pre.drifted_surfaces if d["path"] == str(cmd_link)]
+    assert cmd_drift, health_pre.drifted_surfaces
+    assert "missing_commands_dir" in cmd_drift[0]["reasons"]
+
+    res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res.exit_code == 0, res.message
+    assert cmd_link.is_symlink()
+    assert os.readlink(cmd_link) == str(plugin_dir / "current" / "commands")
+    assert f"antigravity:{cmd_link}" in res.updated_surfaces
+    health_post = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_post.ok is True, health_post.to_dict()
+
+    # 2. `~/.gemini` exists without `commands/` subdir -> still drift in health & created by reconcile
+    shutil.rmtree(ag_cmds)
+    health_no_subdir = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_no_subdir.ok is False
+    assert any(d["path"] == str(cmd_link) for d in health_no_subdir.drifted_surfaces)
+
+    res_create_subdir = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_create_subdir.exit_code == 0, res_create_subdir.message
+    assert cmd_link.is_symlink()
+    assert os.readlink(cmd_link) == str(plugin_dir / "current" / "commands")
+
+    # 3. Rollback of newly created `commands_dir` symlink unlinks it on Step 6 failure
+    cmd_link.unlink()
+    rb_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+        post_flip_verifier=lambda _h: False,
+    )
+    assert rb_res.exit_code == 1
+    assert rb_res.rolled_back is True
+    assert not cmd_link.exists() and not cmd_link.is_symlink()
+
+    # 4. Non-symlink (real directory) at `commands_dir` is flagged by health and aborts Step 5
+    cmd_link.mkdir(parents=True)
+    health_non_sym = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_non_sym.ok is False
+    assert any(d["path"] == str(cmd_link) for d in health_non_sym.drifted_surfaces)
+
+    bad_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert bad_res.exit_code == 1
+    assert bad_res.rolled_back is True

@@ -599,6 +599,10 @@ def _mcp_surface_expected_on_home(
     return spath.parent.is_dir()
 
 
+def _commands_dir_expected_on_home(home: Path, spath: Path) -> bool:
+    return spath.parent.is_dir() or (spath.parent.parent != home and spath.parent.parent.is_dir())
+
+
 def _container_has_delta(
     container_dir: Path,
     version_dir: Path,
@@ -1167,9 +1171,44 @@ def execute_atomic_cutover(
             continue
 
         if kind == "commands_dir":
-            if not cfg_path.exists() and not cfg_path.is_symlink():
-                continue
+            if cfg_path.exists() and not cfg_path.is_symlink():
+                step5_error = f"broken or non-symlink commands_dir surface for {host} ({cfg_path})"
+                break
             expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
+            if not cfg_path.exists() and not cfg_path.is_symlink():
+                if not _commands_dir_expected_on_home(home, cfg_path):
+                    continue
+                if _should_defer_host_write(host, cfg_path, ""):
+                    continue
+                cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_link = cfg_path.parent / f".{cfg_path.name}.tmp.{pid}"
+                try:
+                    if tmp_link.exists() or tmp_link.is_symlink():
+                        tmp_link.unlink(missing_ok=True)
+                    os.symlink(expected_target, tmp_link)
+                    lock_hit = _check_host_lockfile(home, host, cfg_path, retries=1)
+                    if lock_hit:
+                        raise _CasConflictError(host, cfg_path, f"lockfile present before symlink create: {lock_hit}")
+                    if cfg_path.exists() or cfg_path.is_symlink():
+                        raise _CasConflictError(
+                            host, cfg_path, "concurrent creation of commands_dir symlink before replace"
+                        )
+                    os.replace(tmp_link, cfg_path)
+                    post_lstat = cfg_path.lstat()
+                    post_target = os.readlink(cfg_path)
+                except _CasConflictError as exc:
+                    if exc.conflict_artifact:
+                        cas_conflicts.append(exc.conflict_artifact)
+                    step5_error = str(exc)
+                    break
+                finally:
+                    if tmp_link.exists() or tmp_link.is_symlink():
+                        tmp_link.unlink(missing_ok=True)
+                commands_symlink_rollbacks.append(
+                    (cfg_path, None, post_lstat.st_ino, post_lstat.st_mtime_ns, post_target)
+                )
+                updated_surfaces.append(f"{host}:{cfg_path}")
+                continue
             if cfg_path.is_symlink():
                 try:
                     pre_lstat = cfg_path.lstat()
@@ -1527,20 +1566,22 @@ def execute_atomic_cutover(
         # 2. Restore container subtrees and commands_dir symlinks with CAS tuple check (New P2 #1)
         rollback_container_subtrees(all_container_swaps)
         for cmd_link, prev_target, post_ino, post_mtime_ns, post_target in reversed(commands_symlink_rollbacks):
-            if prev_target is not None:
-                try:
-                    cur_lstat = cmd_link.lstat()
-                    cur_target = os.readlink(cmd_link)
-                except OSError:
-                    cas_conflicts.append(str(cmd_link))
-                    continue
-                if (cur_lstat.st_ino, cur_lstat.st_mtime_ns, cur_target) != (
-                    post_ino,
-                    post_mtime_ns,
-                    post_target,
-                ):
-                    cas_conflicts.append(str(cmd_link))
-                    continue
+            try:
+                cur_lstat = cmd_link.lstat()
+                cur_target = os.readlink(cmd_link)
+            except OSError:
+                cas_conflicts.append(str(cmd_link))
+                continue
+            if (cur_lstat.st_ino, cur_lstat.st_mtime_ns, cur_target) != (
+                post_ino,
+                post_mtime_ns,
+                post_target,
+            ):
+                cas_conflicts.append(str(cmd_link))
+                continue
+            if prev_target is None:
+                cmd_link.unlink(missing_ok=True)
+            else:
                 tmp_l = cmd_link.parent / f".{cmd_link.name}.rb.{pid}"
                 if tmp_l.exists() or tmp_l.is_symlink():
                     tmp_l.unlink(missing_ok=True)
