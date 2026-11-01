@@ -92,6 +92,12 @@ def _seed_full_9_host_fleet(home: Path) -> tuple[str, str, str]:
 
     stale_srv = str(plugin_dir / v1 / "dist" / "server.js")
 
+    # Seed catalog wrapper launcher ~/.agents/bin/mcp-env-run required by claude-desktop surface probe
+    wrapper = home / ".agents" / "bin" / "mcp-env-run"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
     # 1. claude-code
     (home / ".claude.json").write_text(
         json.dumps({"mcpServers": {"minni": {"command": "node", "args": [stale_srv], "env": {"MINNI_AGENT_ID": "claude-code", "MINNI_VAULT_PATH": "~/.minni/claudecode-vault"}}}}),
@@ -250,7 +256,7 @@ def test_fleet_sync_and_update_root_stop_on_cutover_exit_1_or_3_without_continui
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("MINNI_HOME", str(fake_home / ".minni"))
 
-    _, v2, _ = _seed_full_9_host_fleet(fake_home)
+    _, v2, v2_sha = _seed_full_9_host_fleet(fake_home)
     v2_root = str(fake_home / ".minni" / "plugin" / v2)
 
     # 1. fleet_sync with running host (exit 3) MUST stop before propagate!
@@ -319,6 +325,9 @@ def test_fleet_sync_and_update_root_stop_on_cutover_exit_1_or_3_without_continui
     npm_shim = bin_dir / "npm"
     npm_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     npm_shim.chmod(0o755)
+    pgrep_shim = bin_dir / "pgrep"
+    pgrep_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    pgrep_shim.chmod(0o755)
 
     venv_bin = tmp_repo / ".venv" / "bin"
     venv_bin.mkdir(parents=True, exist_ok=True)
@@ -387,3 +396,27 @@ def test_fleet_sync_and_update_root_stop_on_cutover_exit_1_or_3_without_continui
     assert "AFTER_CUTOVER:" not in logged3
     assert "custom_refresh" not in logged3
     assert "propagate.py" not in logged3
+
+    # 3c. Clean 9-host fleet: update_root.sh must reconcile all 9 catalog hosts before running custom_refresh/propagate.
+    # Omitting any catalog host from the reconcile loop leaves that host drifted, causing Step 6 or post-health check to fail.
+    from minni.wire.health import audit_host_propagation_health
+    from minni.wire.registry import HOST_SURFACE_CATALOG
+
+    (fake_home / ".config" / "muse" / ".settings.json.lock").unlink()
+    call_log.write_text("", encoding="utf-8")
+    proc_clean = subprocess.run(
+        ["bash", str(REPO / "scripts" / "update_root.sh"), "--repo", str(tmp_repo)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    logged_clean = call_log.read_text(encoding="utf-8")
+    assert "AFTER_CUTOVER:-m minni.wire.custom_refresh" in logged_clean, (proc_clean.stdout, proc_clean.stderr, logged_clean)
+    assert "propagate.py" in logged_clean
+    post_health = audit_host_propagation_health(home=fake_home, expected_git_sha=v2_sha)
+    assert post_health.ok is True, post_health.to_dict()
+    assert set(HOST_SURFACE_CATALOG.keys()) == {
+        "claude-code", "claude-desktop", "codex", "grok-build",
+        "antigravity", "cursor", "kilocode", "devin", "muse",
+    }

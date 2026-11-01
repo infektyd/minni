@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -63,6 +64,12 @@ def _seed_plugin_version(base: Path, ver: str, sha: str, *, broken_server: bool 
         }),
         encoding="utf-8",
     )
+    home_dir = base.parent.parent
+    wrapper = home_dir / ".agents" / "bin" / "mcp-env-run"
+    if not wrapper.exists() and not wrapper.is_symlink():
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
     return vdir
 
 
@@ -803,3 +810,378 @@ def test_r3_p1_4_probe_fixed_path_lang_and_catalog_wrapper_launcher_probe(
     )
     assert res.exit_code == 1
     assert res.aborted_pre_flip is True
+
+
+def test_r4_p1_1_missing_catalog_mcp_files_scored_and_converged_and_non_file_aborts(
+    tmp_path: Path,
+) -> None:
+    """R4 P1-1:
+    - When a host directory exists (e.g. `~/.codex` or `~/.cursor`), a missing `mcp_toml` / `mcp_json`
+      file is flagged as drift by `audit_host_propagation_health` and created/converged by
+      `execute_atomic_cutover` (never silently `continue`d).
+    - A non-regular file (e.g. a directory at `.codex/config.toml`) aborts Step 5 and rolls back.
+    """
+    from minni.wire.health import audit_host_propagation_health
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / v2_ver)
+
+    # Create ~/.codex and ~/.cursor directories with NO config.toml / mcp.json yet
+    (home / ".codex").mkdir(parents=True)
+    (home / ".cursor").mkdir(parents=True)
+
+    # Health audit must score the absent catalog mcp_toml and mcp_json files as drift
+    health_pre = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_pre.ok is False
+    drifted_paths = {d["path"] for d in health_pre.drifted_surfaces}
+    assert str(home / ".codex" / "config.toml") in drifted_paths
+    assert str(home / ".cursor" / "mcp.json") in drifted_paths
+
+    # Cutover must create and converge the missing files
+    res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res.exit_code == 0, res.message
+    assert (home / ".codex" / "config.toml").is_file()
+    assert (home / ".cursor" / "mcp.json").is_file()
+    health_post = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert health_post.ok is True, health_post.to_dict()
+
+    # Non-regular file (directory at .codex/config.toml) must abort and roll back
+    (home / ".codex" / "config.toml").unlink()
+    (home / ".codex" / "config.toml").mkdir()
+    bad_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert bad_res.exit_code == 1
+    assert bad_res.rolled_back is True
+
+
+def test_r4_p1_2_claude_marketplace_respects_lock_defer_and_skips_no_delta_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R4 P1-2 & New P1 #2:
+    - When `~/.claude/plugins` exists and `~/.claude.json.tmp.*` lockfile is present,
+      `claude-code` marketplace and `installed_plugins.json` are deferred (`exit 3`) BEFORE
+      any marketplace `mkdir`, `swap_container_subtrees`, or `installed_plugins.json` write.
+    - When the marketplace container has no delta (`mkt_has_delta` is False), `swap_container_subtrees`
+      is NOT called.
+    """
+    import minni.wire.cutover as cutover_mod
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+
+    claude_plugins = home / ".claude" / "plugins"
+    claude_plugins.mkdir(parents=True)
+    lock_file = home / ".claude.json.tmp.77777"
+    lock_file.write_text("in-flight-claude-write", encoding="utf-8")
+
+    res_locked = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_locked.exit_code == 3
+    assert "claude-code" in res_locked.deferred_running_hosts
+    # Marketplace directory and installed_plugins.json MUST NOT have been created while locked!
+    mkt_dir = claude_plugins / "marketplaces" / "minni-local" / "plugins" / "minni"
+    assert not mkt_dir.exists()
+    assert not (claude_plugins / "installed_plugins.json").exists()
+
+    # Remove lockfile -> first cutover converges marketplace and installed_plugins.json
+    lock_file.unlink()
+    res_ok = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_ok.exit_code == 0, res_ok.message
+    assert mkt_dir.is_dir()
+    assert (claude_plugins / "installed_plugins.json").is_file()
+
+    # Second cutover with zero delta MUST NOT call swap_container_subtrees
+    swap_calls: list[Path] = []
+    orig_swap = cutover_mod.swap_container_subtrees
+
+    def _spy_swap(cdir: Path, **kw):
+        swap_calls.append(cdir)
+        return orig_swap(cdir, **kw)
+
+    monkeypatch.setattr(cutover_mod, "swap_container_subtrees", _spy_swap)
+    res_noop = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_noop.exit_code == 0
+    assert swap_calls == []
+
+
+def test_r4_new_p1_gc_retains_deferred_container_symlink_target_when_mcp_json_already_current(
+    tmp_path: Path,
+) -> None:
+    """R4 New P1 GC / New P1 #3:
+    Cursor is running, `~/.cursor/mcp.json` already points to `current` (`delta == 0`, skipped before defer),
+    while `~/.cursor/plugins/local/minni/dist` is a symlink pointing to `~/.minni/plugin/<v_old>/dist`.
+    Cutover defers the container swap (`exit 3`) and MUST readlink the deferred container subtrees so
+    `collect_garbage(..., keep_last=2)` does not delete `<v_old>`.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+
+    v_old = "0.5.0+git.00000000"
+    v_mid1 = "0.6.0+git.11111111"
+    v_mid2 = "0.6.0+git.22222222"
+    v_new = "0.6.0+git.33333333"
+    v_new_sha = "3" * 40
+    _seed_plugin_version(plugin_dir, v_old, "0" * 40)
+    _seed_plugin_version(plugin_dir, v_mid1, "1" * 40)
+    _seed_plugin_version(plugin_dir, v_mid2, "2" * 40)
+    _seed_plugin_version(plugin_dir, v_new, v_new_sha)
+    # Write a unique server.js into v_old so container has delta vs v_new
+    (plugin_dir / v_old / "dist" / "server.js").write_text("// old-v0-container-server\n", encoding="utf-8")
+    (plugin_dir / "current").symlink_to(plugin_dir / v_mid2)
+
+    cursor_container = home / ".cursor" / "plugins" / "local" / "minni"
+    cursor_container.mkdir(parents=True)
+    os.symlink(str(plugin_dir / v_old / "dist"), cursor_container / "dist")
+    for sub in ("skills", "commands", "hooks"):
+        os.symlink(str(plugin_dir / v_old / sub), cursor_container / sub)
+
+    # mcp.json already uses stable current (zero delta on mcp.json!)
+    cursor_mcp = home / ".cursor" / "mcp.json"
+    cursor_mcp.write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(plugin_dir / "current" / "dist" / "server.js")],
+                    "env": {
+                        "MINNI_AGENT_ID": "cursor",
+                        "MINNI_VAULT_PATH": str(home / ".minni" / "cursor-vault"),
+                    },
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    res = execute_atomic_cutover(
+        home=home,
+        target_version=v_new,
+        target_git_sha=v_new_sha,
+        running_hosts={"cursor"},
+    )
+    assert res.exit_code == 3
+    assert "cursor" in res.deferred_running_hosts
+    assert os.readlink(cursor_container / "dist") == str(plugin_dir / v_old / "dist")
+    # v_old MUST be retained by GC even though mcp.json already pointed to `current`!
+    assert (plugin_dir / v_old).is_dir(), f"v_old was pruned despite deferred container symlink: {res.gc_result}"
+
+
+def test_r4_p1_4_and_new_p2_missing_launcher_fails_and_node_args_prefix_probed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R4 P1-4 & New P2 #2:
+    - When a catalog surface's non-node launcher (`~/.agents/bin/mcp-env-run`) is absent,
+      `_probe_catalog_host_launchers` / `execute_atomic_cutover` fails pre-flip instead of `continue`.
+    - When a catalog surface has `command: "node"` with `args_prefix`, `args_prefix` is passed to
+      the pre-flip probe and fails if the flag is invalid.
+    """
+    import minni.wire.cutover as cutover_mod
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+
+    # 1. Remove `~/.agents/bin/mcp-env-run` if present -> pre-flip probe must fail!
+    wrapper = home / ".agents" / "bin" / "mcp-env-run"
+    if wrapper.exists() or wrapper.is_symlink():
+        wrapper.unlink()
+    res_missing = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_missing.exit_code == 1
+    assert res_missing.aborted_pre_flip is True
+    assert "antigravity" in res_missing.message or "mcp-env-run" in res_missing.message
+
+    # 2. Restore valid wrapper, but add an invalid args_prefix to a `command: "node"` surface -> must fail pre-flip!
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    patched_catalog = copy.deepcopy(cutover_mod.HOST_SURFACE_CATALOG)
+    patched_catalog["codex"]["surfaces"][0]["args_prefix"] = ["--definitely-invalid-node-flag-xyz"]
+    monkeypatch.setattr(cutover_mod, "HOST_SURFACE_CATALOG", patched_catalog)
+
+    res_bad_node_prefix = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert res_bad_node_prefix.exit_code == 1
+    assert res_bad_node_prefix.aborted_pre_flip is True
+    assert "codex" in res_bad_node_prefix.message
+
+
+def test_r4_new_p2_commands_dir_rollback_cas_pgrep_fail_closed_and_new_p3_path_defer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R4 New P2 #1, New P2 #3, New P3 #1:
+    - Rollback of `commands_dir` checks `(st_ino, st_mtime_ns, os.readlink)` and leaves live symlink if changed.
+    - `_detect_running_rewrite_hosts()` treats `pgrep` raising or returning error status (e.g. 2) as running (defer).
+    - Step 6 filters `post_health.drifted_surfaces` by deferred path (not host), so an undeferred drifted
+      surface on the same host triggers Step 7a rollback (`exit 1`) instead of `exit 3`.
+    """
+    import subprocess
+    import minni.wire.cutover as cutover_mod
+    from minni.wire.cutover import _detect_running_rewrite_hosts
+
+    # 1. _detect_running_rewrite_hosts fails closed when pgrep raises or returns rc=2
+    def _boom_pgrep(*args, **kwargs):
+        raise OSError("pgrep unavailable")
+
+    with monkeypatch.context() as m:
+        m.setattr(subprocess, "run", _boom_pgrep)
+        detected_exc = _detect_running_rewrite_hosts()
+    assert {"muse", "claude-desktop", "grok-build", "devin", "cursor"} <= detected_exc
+
+    def _rc2_pgrep(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 2, stdout=b"", stderr=b"pgrep error")
+
+    with monkeypatch.context() as m:
+        m.setattr(subprocess, "run", _rc2_pgrep)
+        detected_rc2 = _detect_running_rewrite_hosts()
+    assert {"muse", "claude-desktop", "grok-build", "devin", "cursor"} <= detected_rc2
+
+    # 2. commands_dir rollback CAS: concurrent relink between Step 5 and Step 6 failure is preserved
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, "1" * 40)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+
+    ag_cmds = home / ".gemini" / "commands"
+    ag_cmds.mkdir(parents=True)
+    cmd_link = ag_cmds / "minni"
+    os.symlink(str(plugin_dir / v1_ver / "commands"), cmd_link)
+
+    def _relink_commands_then_fail(_h: Path) -> bool:
+        cmd_link.unlink()
+        os.symlink("/concurrent/post-step5/commands", cmd_link)
+        return False
+
+    rb_cmd_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+        post_flip_verifier=_relink_commands_then_fail,
+    )
+    assert rb_cmd_res.exit_code == 1
+    assert rb_cmd_res.rolled_back is True
+    assert os.readlink(cmd_link) == "/concurrent/post-step5/commands"
+    assert any(str(cmd_link) in c for c in rb_cmd_res.cas_conflicts)
+
+    # 3. New P3 #1: Deferral filtered by path, not host.
+    # Muse has two surfaces: ~/.config/muse/settings.json (converged in Step 5, then corrupted before Step 6)
+    # and ~/.muse/mcp.json (locked via .mcp.json.lock so it is deferred).
+    # Step 6 must catch the drift on ~/.config/muse/settings.json and roll back (exit 1), NOT return exit 3!
+    home2 = tmp_path / "home2"
+    pdir2 = home2 / ".minni" / "plugin"
+    pdir2.mkdir(parents=True)
+    _seed_plugin_version(pdir2, v1_ver, "1" * 40)
+    _seed_plugin_version(pdir2, v2_ver, v2_sha)
+
+    muse_s1 = home2 / ".config" / "muse" / "settings.json"
+    muse_s1.parent.mkdir(parents=True)
+    muse_s1.write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(pdir2 / v1_ver / "dist" / "server.js")],
+                    "env": {"MINNI_AGENT_ID": "muse", "MINNI_VAULT_PATH": "~/.minni/muse-vault"},
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    muse_s2 = home2 / ".muse" / "mcp.json"
+    muse_s2.parent.mkdir(parents=True)
+    muse_s2.write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(pdir2 / v1_ver / "dist" / "server.js")],
+                    "env": {"MINNI_AGENT_ID": "muse", "MINNI_VAULT_PATH": "~/.minni/muse-vault"},
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    # Lock only muse_s2 via sibling lockfile `.mcp.json.lock`
+    (home2 / ".muse" / ".mcp.json.lock").write_text("locked", encoding="utf-8")
+
+    # Corrupt muse_s1 after Step 5 writes it so Step 6 health audit sees drift on muse_s1
+    orig_health = cutover_mod.audit_host_propagation_health if hasattr(cutover_mod, "audit_host_propagation_health") else None
+    from minni.wire import health as health_mod
+    real_audit = health_mod.audit_host_propagation_health
+
+    def _corrupt_s1_before_audit(*args, **kwargs):
+        muse_s1.write_text(
+            json.dumps({
+                "mcpServers": {
+                    "minni": {
+                        "command": "node",
+                        "args": [str(pdir2 / v1_ver / "dist" / "server.js")],
+                        "env": {"MINNI_AGENT_ID": "muse", "MINNI_VAULT_PATH": "~/.minni/muse-vault"},
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+        return real_audit(*args, **kwargs)
+
+    monkeypatch.setattr(health_mod, "audit_host_propagation_health", _corrupt_s1_before_audit)
+    path_filter_res = execute_atomic_cutover(
+        home=home2,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        running_hosts=set(),
+    )
+    assert path_filter_res.exit_code == 1
+    assert path_filter_res.rolled_back is True
+    assert str(muse_s1) in path_filter_res.message
+

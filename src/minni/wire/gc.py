@@ -300,9 +300,30 @@ def _config_references_dir(version_dir: Path, home: Path | None = None) -> bool:
                 for vp in surf.get("paths") or []:
                     paths_to_scan.append(Path(str(vp)))
         paths_to_scan.append(effective_home / ".muse" / "config.json")
+        paths_to_scan.append(
+            effective_home / ".claude" / "plugins" / "marketplaces" / "local-desktop-app-uploads" / "plugins" / "minni"
+        )
     except Exception:
         pass
     for path in paths_to_scan:
+        if path.is_symlink():
+            try:
+                link_target = os.readlink(path)
+                if needle in link_target or rel_needle in link_target:
+                    return True
+            except OSError:
+                pass
+        if path.is_dir() and not path.is_symlink():
+            for sub in ("dist", "node_modules", "skills", "commands", "hooks"):
+                sub_p = path / sub
+                if sub_p.is_symlink():
+                    try:
+                        sub_target = os.readlink(sub_p)
+                        if needle in sub_target or rel_needle in sub_target:
+                            return True
+                    except OSError:
+                        pass
+            continue
         if not path.is_file():
             continue
         try:

@@ -315,3 +315,34 @@ def test_doctor_and_check_scripts_fail_closed_on_daemon_stale_and_host_propagati
     )
     v1_problems, _ = cd_mod.check_wire_launch_bindings(home_v1)
     assert any("versioned_sha_in_args" in p or "entry_or_args_mismatch" in p for p in v1_problems), v1_problems
+
+    # 6. R4 New P1 #1: check_deployments.py must NOT skip plugin_container directory drift!
+    home_c = tmp_path / "home_container_drift"
+    pdir_c = home_c / ".minni" / "plugin"
+    pdir_c.mkdir(parents=True)
+    _seed_plugin_version(pdir_c, new_ver, "2" * 40)
+    (pdir_c / "current").symlink_to(pdir_c / new_ver)
+    cursor_c = home_c / ".cursor" / "plugins" / "local" / "minni"
+    (cursor_c / "dist").mkdir(parents=True)
+    (cursor_c / "dist" / "server.js").write_text("// stale container server.js\n", encoding="utf-8")
+    (home_c / ".cursor" / "mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(pdir_c / "current" / "dist" / "server.js")],
+                    "env": {
+                        "MINNI_AGENT_ID": "cursor",
+                        "MINNI_VAULT_PATH": str(home_c / ".minni" / "cursor-vault"),
+                    },
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    container_problems, _ = cd_mod.check_wire_launch_bindings(home_c)
+    assert any(
+        "cursor: host propagation drift" in p and "container_dist_server_js_mismatch" in p
+        for p in container_problems
+    ), container_problems
+

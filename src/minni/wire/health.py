@@ -231,28 +231,50 @@ def audit_host_propagation_health(
     current_git_sha = ""
     current_error = ""
 
+    current_has_files = False
     target: Path | None = None
     try:
-        target = resolve_verified_plugin_root(current_link, expected_base=plugin_dir)
-        manifest = PayloadManifest.load(target / "payload-manifest.json")
+        verified_target = resolve_verified_plugin_root(current_link, expected_base=plugin_dir)
+        manifest = PayloadManifest.load(verified_target / "payload-manifest.json")
+        target = verified_target
         current_version = manifest.version
         current_git_sha = manifest.git_sha
+        current_has_files = bool(manifest.files)
         if expected_git_sha and current_git_sha and not current_git_sha.startswith(expected_git_sha) and not expected_git_sha.startswith(current_git_sha):
             current_error = f"current git_sha {current_git_sha} != expected {expected_git_sha}"
         else:
             current_valid = True
     except Exception as exc:
+        target = None
         current_error = str(exc)
 
     import tomllib
     from minni.wire.registry import _VERSIONED_PLUGIN_RE
 
+    wired_doc: dict[str, Any] | None = None
+    if (plugin_dir / "wired.json").is_file():
+        try:
+            loaded_w = json.loads((plugin_dir / "wired.json").read_text(encoding="utf-8"))
+            if isinstance(loaded_w, dict):
+                wired_doc = loaded_w
+        except Exception:
+            wired_doc = None
+
+    if (
+        isinstance(wired_doc, dict)
+        and wired_doc.get("schema_version", wired_doc.get("schema", 1)) == 1
+        and wired_doc.get("wires") == []
+        and "hosts" not in wired_doc
+        and not current_has_files
+    ):
+        current_valid = False
+        target = None
+
     # Identify if this home is a synthetic single-version v1 wired.json fixture (no valid `current` link)
     legacy_v1_single_server_js: str | None = None
-    if not current_valid and (plugin_dir / "wired.json").is_file():
+    if not current_valid and isinstance(wired_doc, dict):
         try:
-            wdoc = json.loads((plugin_dir / "wired.json").read_text(encoding="utf-8"))
-            if isinstance(wdoc, dict) and wdoc.get("schema_version", wdoc.get("schema", 1)) == 1:
+            if wired_doc.get("schema_version", wired_doc.get("schema", 1)) == 1:
                 valid_vdirs = [
                     d for d in plugin_dir.iterdir()
                     if d.is_dir() and not d.is_symlink() and not d.name.startswith(".") and (d / "payload-manifest.json").is_file()
@@ -261,6 +283,22 @@ def audit_host_propagation_health(
                     legacy_v1_single_server_js = str(valid_vdirs[0] / "dist" / "server.js")
         except Exception:
             legacy_v1_single_server_js = None
+
+    def _mcp_surface_expected_on_home(host_id: str, spath: Path) -> bool:
+        if not current_valid:
+            return False
+        if spath.name == ".claude.json":
+            return (resolved_home / ".claude").is_dir()
+        if spath.name == "kilo.json":
+            return (resolved_home / ".config" / "kilo").is_dir() and (
+                (resolved_home / ".config" / "kilo" / "plugin").is_dir()
+                or not (resolved_home / ".config" / "kilo" / "plugins" / "minni").is_dir()
+            )
+        if spath == resolved_home / ".muse" / "mcp.json":
+            return spath.parent.is_dir() and not (spath.parent / "config.json").is_file()
+        if spath == resolved_home / ".config" / "muse" / "settings.json":
+            return spath.parent.is_dir() and not (resolved_home / ".muse" / "config.json").is_file()
+        return spath.parent.is_dir()
 
     def _is_clean_legacy_v1_entry(live_entry: Any, *, is_kilo: bool) -> bool:
         if not legacy_v1_single_server_js or not isinstance(live_entry, dict):
@@ -296,20 +334,21 @@ def audit_host_propagation_health(
                     reasons.append("container_dist_server_js_mismatch")
             except OSError as exc:
                 reasons.append(f"unreadable_container_server_js:{exc}")
-        for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
-            pj = cpath / rel_pjson
-            if pj.is_file():
-                try:
-                    pdoc = json.loads(pj.read_text(encoding="utf-8"))
-                    if not isinstance(pdoc, dict):
-                        reasons.append(f"invalid_{rel_pjson}")
-                    else:
-                        if "mcpServers" in pdoc:
-                            reasons.append(f"mcpServers_in_{rel_pjson}")
-                        if base_semver and pdoc.get("version") != base_semver:
-                            reasons.append(f"version_mismatch_in_{rel_pjson}:{pdoc.get('version')}!={base_semver}")
-                except Exception as exc:
-                    reasons.append(f"unparseable_{rel_pjson}:{exc}")
+        if target is not None:
+            for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+                pj = cpath / rel_pjson
+                if pj.is_file():
+                    try:
+                        pdoc = json.loads(pj.read_text(encoding="utf-8"))
+                        if not isinstance(pdoc, dict):
+                            reasons.append(f"invalid_{rel_pjson}")
+                        else:
+                            if "mcpServers" in pdoc:
+                                reasons.append(f"mcpServers_in_{rel_pjson}")
+                            if base_semver and pdoc.get("version") != base_semver:
+                                reasons.append(f"version_mismatch_in_{rel_pjson}:{pdoc.get('version')}!={base_semver}")
+                    except Exception as exc:
+                        reasons.append(f"unparseable_{rel_pjson}:{exc}")
         return reasons
 
     base_semver = current_version.split("+", 1)[0] if current_version else ""
@@ -327,7 +366,7 @@ def audit_host_propagation_health(
                         drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": creasons})
                 continue
             if kind != "commands_dir" and kind != "mcp_view_mirrors":
-                if spath.is_symlink() and not spath.exists():
+                if (spath.exists() or spath.is_symlink()) and not spath.is_file():
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": ["broken_or_non_regular_file"]})
                     continue
             if kind == "mcp_json" and spath.is_file():
@@ -358,10 +397,25 @@ def audit_host_propagation_health(
                         "path": str(spath),
                         "reasons": diff.reasons,
                     })
+            elif kind == "mcp_json" and _mcp_surface_expected_on_home(host_id, spath):
+                diff = evaluate_mcp_surface_diff(
+                    None,
+                    host_id=host_id,
+                    agent_id=str(hspec["agent_id"]),
+                    vault_path=str(hspec["vault_path"]),
+                    surface_spec=surf,
+                    home=resolved_home,
+                )
+                if diff.has_delta:
+                    drifted_surfaces.append({
+                        "host": host_id,
+                        "path": str(spath),
+                        "reasons": diff.reasons,
+                    })
             elif kind == "mcp_view_mirrors":
                 for vp_raw in surf.get("paths") or []:
                     vpath = Path(expand_for_home(str(vp_raw), home=resolved_home))
-                    if vpath.is_symlink() and not vpath.exists():
+                    if (vpath.exists() or vpath.is_symlink()) and not vpath.is_file():
                         drifted_surfaces.append({"host": host_id, "path": str(vpath), "reasons": ["broken_or_non_regular_file"]})
                         continue
                     if not vpath.is_file():
@@ -427,6 +481,21 @@ def audit_host_propagation_health(
                         "path": str(spath),
                         "reasons": diff.reasons,
                     })
+            elif kind == "mcp_toml" and _mcp_surface_expected_on_home(host_id, spath):
+                diff = evaluate_mcp_surface_diff(
+                    None,
+                    host_id=host_id,
+                    agent_id=str(hspec["agent_id"]),
+                    vault_path=str(hspec["vault_path"]),
+                    surface_spec=surf,
+                    home=resolved_home,
+                )
+                if diff.has_delta:
+                    drifted_surfaces.append({
+                        "host": host_id,
+                        "path": str(spath),
+                        "reasons": diff.reasons,
+                    })
             elif kind == "hooks_json" and spath.is_file():
                 try:
                     raw_text = spath.read_text(encoding="utf-8")
@@ -475,6 +544,12 @@ def audit_host_propagation_health(
                     doc = json.loads(spath.read_text(encoding="utf-8"))
                     plugins = doc.get("plugins", {}) if isinstance(doc, dict) else {}
                     entries = plugins.get("minni@minni-local") or plugins.get("minni@minni") or []
+                    if not isinstance(entries, list) or not entries:
+                        drifted_surfaces.append({
+                            "host": host_id,
+                            "path": str(spath),
+                            "reasons": ["missing_minni_in_installed_plugins"],
+                        })
                     for item in entries if isinstance(entries, list) else []:
                         if not isinstance(item, dict):
                             continue
@@ -497,6 +572,17 @@ def audit_host_propagation_health(
                             })
                 except Exception as exc:
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_json:{exc}"]})
+            elif (
+                kind == "claude_plugin_registry"
+                and current_valid
+                and spath.parent.is_dir()
+                and not (spath.parent / "cache").is_dir()
+            ):
+                drifted_surfaces.append({
+                    "host": host_id,
+                    "path": str(spath),
+                    "reasons": ["missing_claude_plugin_registry"],
+                })
             elif kind == "claude_marketplace" and spath.is_file():
                 try:
                     raw_text = spath.read_text(encoding="utf-8")

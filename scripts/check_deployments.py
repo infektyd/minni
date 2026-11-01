@@ -383,9 +383,6 @@ def check_wire_launch_bindings(home: Path) -> tuple[list[str], list[str]]:
         if host_id in already_reported_hosts:
             continue
         spath = str(surf.get("path") or "")
-        if spath and Path(spath).is_dir():
-            # Container directories are audited directly by discover_active() + compare_content().
-            continue
         reasons = [
             r.split(":", 1)[0] if r.startswith("unreadable_or_corrupt") else r
             for r in (surf.get("reasons") or [])
