@@ -345,4 +345,3 @@ def test_doctor_and_check_scripts_fail_closed_on_daemon_stale_and_host_propagati
         "cursor: host propagation drift" in p and "container_dist_server_js_mismatch" in p
         for p in container_problems
     ), container_problems
-

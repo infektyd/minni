@@ -1184,4 +1184,3 @@ def test_r4_new_p2_commands_dir_rollback_cas_pgrep_fail_closed_and_new_p3_path_d
     assert path_filter_res.exit_code == 1
     assert path_filter_res.rolled_back is True
     assert str(muse_s1) in path_filter_res.message
-
