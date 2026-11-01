@@ -93,6 +93,7 @@ class CutoverOutcome:
     updated_surfaces: list[str] = field(default_factory=list)
     skipped_surfaces: list[str] = field(default_factory=list)
     cas_conflicts: list[str] = field(default_factory=list)
+    would_abort: list[dict[str, Any]] = field(default_factory=list)
     gc_result: dict[str, Any] = field(default_factory=dict)
     message: str = ""
     plan: dict[str, Any] = field(default_factory=dict)
@@ -111,6 +112,8 @@ class CutoverOutcome:
             "updated_surfaces": list(self.updated_surfaces),
             "skipped_surfaces": list(self.skipped_surfaces),
             "cas_conflicts": list(self.cas_conflicts),
+            "would_abort": copy.deepcopy(self.would_abort),
+            "would-abort": copy.deepcopy(self.would_abort),
             "gc_result": dict(self.gc_result),
             "findings": copy.deepcopy(self.findings),
             "stale_locks": copy.deepcopy(self.stale_locks),
@@ -131,6 +134,8 @@ class CutoverOutcome:
                 "would_archive",
                 "would-skip",
                 "would_skip",
+                "would-abort",
+                "would_abort",
                 "findings",
                 "stale_locks",
                 "gc",
@@ -972,41 +977,47 @@ def _converge_claude_local_marketplace(
             container_mode="symlink_subtrees",
             pid=pid,
         )
+        try:
+            from minni.wire.install import sanitize_staged_payload
 
-        cplugin_dir = mkt_plugin_dir / ".claude-plugin"
-        cplugin_dir.mkdir(parents=True, exist_ok=True)
-        src_pjson = version_dir / ".claude-plugin" / "plugin.json"
-        if src_pjson.is_file():
-            data = json.loads(src_pjson.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.pop("mcpServers", None)
-                data["version"] = base_semver
-                desired_pjson = (json.dumps(data, indent=2) + "\n").encode("utf-8")
-                dest_pjson = cplugin_dir / "plugin.json"
-                pre_pjson_tuple = _file_cas_tuple(dest_pjson)[:3] if dest_pjson.is_file() else None
-                if pre_pjson_tuple is None or dest_pjson.read_bytes() != desired_pjson:
+            cplugin_dir = mkt_plugin_dir / ".claude-plugin"
+            cplugin_dir.mkdir(parents=True, exist_ok=True)
+            src_pjson = version_dir / ".claude-plugin" / "plugin.json"
+            if src_pjson.is_file():
+                data = json.loads(src_pjson.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data.pop("mcpServers", None)
+                    data["version"] = base_semver
+                    desired_pjson = (json.dumps(data, indent=2) + "\n").encode("utf-8")
+                    dest_pjson = cplugin_dir / "plugin.json"
+                    pre_pjson_tuple = _file_cas_tuple(dest_pjson)[:3] if dest_pjson.is_file() else None
+                    if pre_pjson_tuple is None or dest_pjson.read_bytes() != desired_pjson:
+                        _cas_write_or_create_surface(
+                            dest_pjson,
+                            pre_pjson_tuple,
+                            desired_pjson,
+                            home=home,
+                            host=host,
+                            ts=ts,
+                        )
+            sanitize_staged_payload(mkt_plugin_dir, version=base_semver, remove_mcp_json=True)
+            src_pkg = version_dir / "package.json"
+            if src_pkg.is_file():
+                dest_pkg = mkt_plugin_dir / "package.json"
+                src_pkg_bytes = src_pkg.read_bytes()
+                pre_pkg_tuple = _file_cas_tuple(dest_pkg)[:3] if dest_pkg.is_file() else None
+                if pre_pkg_tuple is None or dest_pkg.read_bytes() != src_pkg_bytes:
                     _cas_write_or_create_surface(
-                        dest_pjson,
-                        pre_pjson_tuple,
-                        desired_pjson,
+                        dest_pkg,
+                        pre_pkg_tuple,
+                        src_pkg_bytes,
                         home=home,
                         host=host,
                         ts=ts,
                     )
-        src_pkg = version_dir / "package.json"
-        if src_pkg.is_file():
-            dest_pkg = mkt_plugin_dir / "package.json"
-            src_pkg_bytes = src_pkg.read_bytes()
-            pre_pkg_tuple = _file_cas_tuple(dest_pkg)[:3] if dest_pkg.is_file() else None
-            if pre_pkg_tuple is None or dest_pkg.read_bytes() != src_pkg_bytes:
-                _cas_write_or_create_surface(
-                    dest_pkg,
-                    pre_pkg_tuple,
-                    src_pkg_bytes,
-                    home=home,
-                    host=host,
-                    ts=ts,
-                )
+        except Exception:
+            rollback_container_subtrees(swaps)
+            raise
         updated.append(f"{host}:{mkt_plugin_dir}")
     else:
         skipped.append(f"{host}:{mkt_plugin_dir}")
@@ -1246,6 +1257,8 @@ def _stage_repo_payload_to_temp(
                         f"esbuild bundling failed (rc={exc.returncode}): {(exc.stderr or '').strip()}"
                     ) from exc
 
+        from minni.wire.install import sanitize_staged_payload
+
         for rel in MANIFEST_STAMP_PATHS:
             p = tmp / rel
             if not p.is_file():
@@ -1253,11 +1266,9 @@ def _stage_repo_payload_to_temp(
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 data["version"] = version
-                if rel == ".claude-plugin/plugin.json":
-                    data.pop("mcpServers", None)
                 p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
-        (tmp / ".mcp.json").unlink(missing_ok=True)
+        sanitize_staged_payload(tmp, version=version)
 
         files: dict[str, str] = {}
         for path in sorted(tmp.rglob("*")):
@@ -1477,6 +1488,8 @@ def _build_dry_run_plan_with_ref(
             "would-defer": [],
             "would-archive": [],
             "would-skip": [],
+            "would-abort": [],
+            "would_abort": [],
             "stale_locks": [],
         }
 
@@ -1485,6 +1498,7 @@ def _build_dry_run_plan_with_ref(
     would_defer: list[dict[str, Any]] = []
     would_archive: list[dict[str, Any]] = []
     would_skip: list[dict[str, Any]] = []
+    would_abort: list[dict[str, Any]] = []
     stale_findings: list[dict[str, Any]] = []
     all_surface_plans: list[dict[str, Any]] = []
     updated_surfaces: list[str] = []
@@ -1534,11 +1548,12 @@ def _build_dry_run_plan_with_ref(
         reason: str = "",
         archive_dest: str | None = None,
     ) -> None:
+        norm_action = "would_abort" if action in ("would-abort", "would_abort") else action
         item: dict[str, Any] = {
             "host": host,
             "kind": kind,
             "path": str(cfg_path),
-            "action": action,
+            "action": norm_action,
         }
         if diff is not None:
             item["diff"] = diff
@@ -1558,10 +1573,16 @@ def _build_dry_run_plan_with_ref(
                 "would-defer": [],
                 "would-archive": [],
                 "would-skip": [],
+                "would-abort": [],
+                "would_abort": [],
             },
         )
         h_bucket["surfaces"].append(item)
-        if action in h_bucket:
+        if action in ("would-abort", "would_abort"):
+            would_abort.append(item)
+            h_bucket.setdefault("would-abort", []).append(item)
+            h_bucket.setdefault("would_abort", []).append(item)
+        elif action in h_bucket:
             h_bucket[action].append(item)
         if action == "would-write":
             would_write.append(item)
@@ -1637,6 +1658,82 @@ def _build_dry_run_plan_with_ref(
                 },
                 True,
             )
+        )
+
+    # H16 pre-flip abort check in dry-run: if any commands_dir exists as a non-symlink (real directory/file),
+    # report the abort as a non-zero result and do not present other surfaces as a plan that would be committed.
+    for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
+        if kind == "commands_dir" and cfg_path.exists() and not cfg_path.is_symlink():
+            expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
+            after_entry = {"kind": "commands_dir", "symlink_target": expected_target}
+            diff_obj = {
+                "before": {"kind": "non_symlink_commands_dir"},
+                "after": after_entry,
+                "reasons": ["broken_or_non_symlink_commands_dir"],
+            }
+            _record_surface(
+                host,
+                kind,
+                cfg_path,
+                "would_abort",
+                diff=diff_obj,
+                reason="broken_or_non_symlink_commands_dir",
+            )
+
+    if would_abort:
+        abort_items = ", ".join(f"{a.get('host')}:{a.get('path')}" for a in would_abort)
+        empty_gc: dict[str, Any] = {
+            "would-prune": [],
+            "would_prune": [],
+            "would-keep": [],
+            "would_keep": [],
+            "retained_in_use": [],
+            "pruned": [],
+        }
+        abort_plan_doc: dict[str, Any] = {
+            "target_version": target_version,
+            "target_git_sha": target_git_sha,
+            "hosts": hosts_plan,
+            "surfaces": all_surface_plans,
+            "would-write": [],
+            "would_write": [],
+            "would-create": [],
+            "would_create": [],
+            "would-defer": [],
+            "would_defer": [],
+            "would-archive": [],
+            "would_archive": [],
+            "would-skip": [],
+            "would_skip": [],
+            "would-abort": would_abort,
+            "would_abort": would_abort,
+            "findings": stale_findings,
+            "stale_locks": stale_findings,
+            "gc": {
+                "would-prune": [],
+                "would-keep": [],
+            },
+        }
+        abort_msg = (
+            f"dry-run: would abort cutover on {home} to {target_version}: "
+            f"would_abort={len(would_abort)} ({abort_items})"
+        )
+        return CutoverOutcome(
+            exit_code=1,
+            status="ABORTED_PRE_FLIP",
+            target_version=target_version,
+            target_git_sha=target_git_sha,
+            aborted_pre_flip=True,
+            rolled_back=False,
+            deferred_running_hosts=[],
+            updated_surfaces=[],
+            skipped_surfaces=[],
+            would_abort=would_abort,
+            gc_result=empty_gc,
+            message=abort_msg,
+            plan=abort_plan_doc,
+            findings=stale_findings,
+            stale_locks=stale_findings,
         )
 
     for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
@@ -1800,7 +1897,7 @@ def _build_dry_run_plan_with_ref(
                 "after": after_entry,
                 "reasons": ["broken_or_non_symlink_commands_dir"],
             }
-            _record_surface(host, kind, cfg_path, "would-write", diff=diff_obj, reason="broken_or_non_symlink_commands_dir")
+            _record_surface(host, kind, cfg_path, "would_abort", diff=diff_obj, reason="broken_or_non_symlink_commands_dir")
             continue
 
         if kind in ("mcp_json", "mcp_toml"):
@@ -2006,6 +2103,8 @@ def _build_dry_run_plan_with_ref(
         "would_archive": would_archive,
         "would-skip": would_skip,
         "would_skip": would_skip,
+        "would-abort": would_abort,
+        "would_abort": would_abort,
         "findings": stale_findings,
         "stale_locks": stale_findings,
         "gc": {
@@ -2014,12 +2113,17 @@ def _build_dry_run_plan_with_ref(
         },
     }
 
+    abort_suffix = ""
+    if would_abort:
+        abort_items = ", ".join(f"{a.get('host')}:{a.get('path')}" for a in would_abort)
+        abort_suffix = f", would_abort={len(would_abort)} ({abort_items})"
+
     msg = (
         f"dry-run: would cut over {home} to {target_version}: "
         f"would-write={len(would_write)}, would-create={len(would_create)}, "
         f"would-defer={len(would_defer)}, would-archive={len(would_archive)}, "
         f"would-skip={len(would_skip)}, would-prune={len(gc_out.would_prune)}, "
-        f"would-keep={len(would_keep_paths)}"
+        f"would-keep={len(would_keep_paths)}{abort_suffix}"
     )
     return CutoverOutcome(
         exit_code=0,
@@ -2029,6 +2133,7 @@ def _build_dry_run_plan_with_ref(
         deferred_running_hosts=deferred_running_hosts,
         updated_surfaces=updated_surfaces,
         skipped_surfaces=skipped_surfaces,
+        would_abort=would_abort,
         gc_result=gc_dict,
         message=msg,
         plan=plan_doc,
@@ -2065,6 +2170,40 @@ def execute_atomic_cutover(
             ts=ts,
             base_semver=base_semver,
             payload_ref_dir=payload_ref_dir,
+        )
+
+    # H16 pre-flip abort check before any write or probe: if any commands_dir is a non-symlink, abort immediately.
+    early_would_abort: list[dict[str, Any]] = []
+    for _host_id, _hspec in HOST_SURFACE_CATALOG.items():
+        for _surf in _hspec.get("surfaces", []):
+            if not isinstance(_surf, dict) or str(_surf.get("kind") or "") != "commands_dir":
+                continue
+            _p_raw = str(_surf.get("path") or "").replace("{base_semver}", base_semver)
+            _cfg_path = Path(expand_for_home(_p_raw, home=home))
+            if _cfg_path.exists() and not _cfg_path.is_symlink():
+                early_would_abort.append(
+                    {
+                        "host": _host_id,
+                        "kind": "commands_dir",
+                        "path": str(_cfg_path),
+                        "action": "would_abort",
+                        "reason": "broken_or_non_symlink_commands_dir",
+                    }
+                )
+    if early_would_abort:
+        _first_abort = early_would_abort[0]
+        return CutoverOutcome(
+            exit_code=1,
+            status="ABORTED_PRE_FLIP",
+            target_version=target_version,
+            target_git_sha=target_git_sha,
+            aborted_pre_flip=True,
+            rolled_back=False,
+            would_abort=early_would_abort,
+            message=(
+                f"broken or non-symlink commands_dir surface for "
+                f"{_first_abort['host']} ({_first_abort['path']})"
+            ),
         )
 
     if not vdir.is_dir():
@@ -2170,11 +2309,23 @@ def execute_atomic_cutover(
             )
         )
 
-    # H15 (Grok r5 P3 & r6 P2): BEFORE Step 4 (`flip_current_pointer`), verify that any active or
-    # expected commands_dir surface has a valid payload commands/ directory; never flip `current` if missing.
+    # H15 & H16: BEFORE Step 4 (`flip_current_pointer`) and BEFORE any container/marketplace/config convergence,
+    # abort pre-flip if any commands_dir surface is a non-symlink (real directory/file) or has a missing payload commands/ directory.
+    would_abort: list[dict[str, Any]] = []
     current_prefix = str(plugin_dir / "current")
     for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
         if kind != "commands_dir":
+            continue
+        if cfg_path.exists() and not cfg_path.is_symlink():
+            would_abort.append(
+                {
+                    "host": host,
+                    "kind": kind,
+                    "path": str(cfg_path),
+                    "action": "would_abort",
+                    "reason": "broken_or_non_symlink_commands_dir",
+                }
+            )
             continue
         if cfg_path.is_symlink() or _commands_dir_expected_on_home(home, cfg_path):
             expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
@@ -2196,6 +2347,21 @@ def execute_atomic_cutover(
                         f"payload commands/ directory missing at {expected_target}"
                     ),
                 )
+    if would_abort:
+        first_abort = would_abort[0]
+        return CutoverOutcome(
+            exit_code=1,
+            status="ABORTED_PRE_FLIP",
+            target_version=target_version,
+            target_git_sha=target_git_sha,
+            aborted_pre_flip=True,
+            rolled_back=False,
+            would_abort=would_abort,
+            message=(
+                f"broken or non-symlink commands_dir surface for "
+                f"{first_abort['host']} ({first_abort['path']})"
+            ),
+        )
 
     wired_doc = _load_wired(plugin_dir / "wired.json")
     active_running = (
@@ -2333,6 +2499,15 @@ def execute_atomic_cutover(
 
         if kind == "commands_dir":
             if cfg_path.exists() and not cfg_path.is_symlink():
+                would_abort.append(
+                    {
+                        "host": host,
+                        "kind": kind,
+                        "path": str(cfg_path),
+                        "action": "would_abort",
+                        "reason": "broken_or_non_symlink_commands_dir",
+                    }
+                )
                 step5_error = f"broken or non-symlink commands_dir surface for {host} ({cfg_path})"
                 break
             expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
@@ -2728,9 +2903,7 @@ def execute_atomic_cutover(
             )
 
     if not step6_ok:
-        # 1. Restore `current` (handles real-dir `current` via unlink+rename without ENOTDIR, R4-1)
-        rollback_current_pointer(flip_state)
-        # 2. Restore container subtrees and commands_dir symlinks with CAS tuple check (New P2 #1)
+        # 1. Restore container subtrees and commands_dir symlinks with CAS tuple check (New P2 #1)
         rollback_container_subtrees(all_container_swaps)
         for cmd_link, prev_target, post_ino, post_mtime_ns, post_target in reversed(commands_symlink_rollbacks):
             try:
@@ -2772,26 +2945,192 @@ def execute_atomic_cutover(
                     cpath.write_bytes(cur_bytes)
                     cas_conflicts.append(str(cpath))
 
-        # 3. Restore modified host config files with CAS check on EVERY record; leave live bytes on CAS mismatch (P1-3, New P3 #1)
+        # 2. Classify modified host config files by CAS check BEFORE restoring config bytes (H18)
+        conflicted_entries: list[tuple[_ConfigRollbackRecord, bytes | None]] = []
+        restorable_records: list[_ConfigRollbackRecord] = []
         for rec in reversed(rollback_records):
             try:
                 cur_ino, cur_mtime_ns, cur_sha256, cur_bytes = _file_cas_tuple(rec.path)
             except OSError:
-                cas_conflicts.append(str(rec.path))
+                cas_conflicts.append(f"{rec.host}:{rec.path}")
+                conflicted_entries.append((rec, None))
                 continue
-            if (cur_ino, cur_mtime_ns, cur_sha256) == (rec.post_step5_ino, rec.post_step5_mtime_ns, rec.post_step5_sha256):
-                if rec.pre_bytes is None:
-                    rec.path.unlink(missing_ok=True)
-                else:
-                    _atomic_write_bytes(rec.path, rec.pre_bytes, mode=rec.pre_mode)
+            if (cur_ino, cur_mtime_ns, cur_sha256) == (
+                rec.post_step5_ino,
+                rec.post_step5_mtime_ns,
+                rec.post_step5_sha256,
+            ):
+                restorable_records.append(rec)
             else:
                 # Concurrent mutation happened between Step 5 and Step 7a rollback:
-                # Leave live bytes untouched on disk, archive conflict under rollback-conflict, and record in cas_conflicts!
+                # Leave live bytes untouched on disk, archive conflict under rollback-conflict, and record host+path in cas_conflicts!
                 conflict_dir = _archive_dir(home, ts) / "rollback-conflict"
                 conflict_dir.mkdir(parents=True, exist_ok=True)
                 cpath = conflict_dir / rec.path.name
                 cpath.write_bytes(cur_bytes)
-                cas_conflicts.append(str(cpath))
+                cas_conflicts.append(f"{rec.host}:{rec.path} ({cpath})")
+                conflicted_entries.append((rec, cur_bytes))
+
+        # 3. Decide and restore `current` pointer BEFORE restoring host config bytes, using the same
+        # live-path check for symlink `current`, real-directory `current`, and absent `current` (R4-1 & H18).
+        current_abs_prefix = str(plugin_dir / "current")
+
+        def _extract_current_rel_paths(txt: str) -> tuple[bool, set[str]]:
+            refs = False
+            rels: set[str] = set()
+            if current_abs_prefix in txt or "~/.minni/plugin/current" in txt:
+                refs = True
+                for m in re.finditer(re.escape(current_abs_prefix) + r"/([^\s\"'\],]+)", txt):
+                    rels.add(m.group(1))
+                for m in re.finditer(r"~/.minni/plugin/current/([^\s\"'\],]+)", txt):
+                    rels.add(m.group(1))
+            return refs, rels
+
+        def _dir_satisfies_refs(cand_dir: Path | None, req_rel_paths: set[str]) -> bool:
+            if cand_dir is None or not cand_dir.is_dir():
+                return False
+            for rel_p in req_rel_paths:
+                if not (cand_dir / rel_p).exists():
+                    return False
+            return (cand_dir / "dist" / "server.js").is_file()
+
+        unrestorable_refs_current = False
+        unrestorable_rel_paths: set[str] = set()
+        for _crec, cbytes in conflicted_entries:
+            if cbytes is not None:
+                c_refs, c_rels = _extract_current_rel_paths(cbytes.decode("utf-8", errors="ignore"))
+                if c_refs:
+                    unrestorable_refs_current = True
+                    unrestorable_rel_paths.update(c_rels)
+
+        rollback_paths_set = {r.path for r in rollback_records}
+        for _h, _k, spath, _spec, _rw in all_surfaces:
+            if _k != "plugin_container" and spath not in rollback_paths_set and spath.is_file():
+                try:
+                    utxt = spath.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                u_refs, u_rels = _extract_current_rel_paths(utxt)
+                if u_refs:
+                    unrestorable_refs_current = True
+                    unrestorable_rel_paths.update(u_rels)
+
+        restorable_refs_current = False
+        restorable_rel_paths: set[str] = set()
+        for rrec in restorable_records:
+            if rrec.pre_bytes is not None:
+                r_refs, r_rels = _extract_current_rel_paths(rrec.pre_bytes.decode("utf-8", errors="ignore"))
+                if r_refs:
+                    restorable_refs_current = True
+                    restorable_rel_paths.update(r_rels)
+
+        if unrestorable_refs_current and not unrestorable_rel_paths:
+            unrestorable_rel_paths.add("dist/server.js")
+        if restorable_refs_current and not restorable_rel_paths:
+            restorable_rel_paths.add("dist/server.js")
+
+        live_refs_current = unrestorable_refs_current or restorable_refs_current
+        live_current_rel_paths = set(unrestorable_rel_paths) | set(restorable_rel_paths)
+
+        prev_current_dir: Path | None = None
+        if flip_state.prev_dir_path is not None:
+            prev_current_dir = flip_state.prev_dir_path
+        elif flip_state.prev_link_target is not None:
+            prev_current_dir = (
+                Path(flip_state.prev_link_target)
+                if Path(flip_state.prev_link_target).is_absolute()
+                else (plugin_dir / flip_state.prev_link_target)
+            )
+
+        chosen_ver: str | None = None
+        if not live_refs_current or _dir_satisfies_refs(prev_current_dir, live_current_rel_paths):
+            rollback_current_pointer(flip_state)
+            current_matches_prev = True
+            effective_prev_dir_on_disk = prev_current_dir
+        else:
+            current_matches_prev = False
+            if flip_state.prev_dir_path is not None and flip_state.prev_dir_path.exists():
+                arch_prev_current = _archive_dir(home, ts) / "current_prev_dir"
+                if arch_prev_current.exists():
+                    shutil.rmtree(arch_prev_current, ignore_errors=True)
+                shutil.move(str(flip_state.prev_dir_path), str(arch_prev_current))
+                effective_prev_dir_on_disk = arch_prev_current
+            else:
+                effective_prev_dir_on_disk = prev_current_dir
+
+            required_for_current = (
+                unrestorable_rel_paths if unrestorable_refs_current else live_current_rel_paths
+            )
+            for crec, _cbytes in conflicted_entries:
+                if crec.pre_bytes:
+                    pre_txt = crec.pre_bytes.decode("utf-8", errors="ignore")
+                    for v_cand in sorted(_extract_referenced_versions(pre_txt, plugin_dir)):
+                        cand_d = Path(v_cand) if Path(v_cand).is_absolute() else (plugin_dir / v_cand)
+                        if _dir_satisfies_refs(cand_d, required_for_current):
+                            chosen_ver = v_cand
+                            break
+                if chosen_ver:
+                    break
+            if not chosen_ver and flip_state.prev_link_target:
+                cand_d = (
+                    Path(flip_state.prev_link_target)
+                    if Path(flip_state.prev_link_target).is_absolute()
+                    else (plugin_dir / flip_state.prev_link_target)
+                )
+                if _dir_satisfies_refs(cand_d, required_for_current):
+                    chosen_ver = flip_state.prev_link_target
+            if not chosen_ver:
+                active_v = str(wired_doc.get("active_version") or "")
+                if active_v and _dir_satisfies_refs(plugin_dir / active_v, required_for_current):
+                    chosen_ver = active_v
+            if not chosen_ver:
+                chosen_ver = target_version
+            tmp_rb_link = plugin_dir / f".current.rb.{pid}"
+            if tmp_rb_link.exists() or tmp_rb_link.is_symlink():
+                tmp_rb_link.unlink(missing_ok=True)
+            os.symlink(chosen_ver, tmp_rb_link)
+            if (
+                flip_state.current_path.exists()
+                and not flip_state.current_path.is_symlink()
+                and flip_state.current_path.is_dir()
+            ):
+                shutil.rmtree(flip_state.current_path, ignore_errors=True)
+            os.replace(tmp_rb_link, flip_state.current_path)
+
+        # 4. Restore restorable host config bytes after `current` pointer is decided.
+        # If `current` could not roll back to its previous target, ensure any restored config that
+        # points at `current/...` runs the version it was written for whenever still on disk;
+        # otherwise keep `current/...` (which resolves to `chosen_ver`) and report host+path.
+        for rec in restorable_records:
+            if rec.pre_bytes is None:
+                rec.path.unlink(missing_ok=True)
+                continue
+            bytes_to_restore = rec.pre_bytes
+            if not current_matches_prev:
+                pre_txt = rec.pre_bytes.decode("utf-8", errors="ignore")
+                rec_refs_cur, rec_rels = _extract_current_rel_paths(pre_txt)
+                if rec_refs_cur:
+                    if not rec_rels:
+                        rec_rels = {"dist/server.js"}
+                    intended_dir: Path | None = effective_prev_dir_on_disk
+                    if intended_dir is None or not intended_dir.is_dir():
+                        active_v = str(wired_doc.get("active_version") or "")
+                        if active_v and (plugin_dir / active_v).is_dir():
+                            intended_dir = plugin_dir / active_v
+                    if _dir_satisfies_refs(intended_dir, rec_rels) and intended_dir is not None:
+                        rewritten_txt = pre_txt.replace(current_abs_prefix, str(intended_dir)).replace(
+                            "~/.minni/plugin/current", str(intended_dir)
+                        )
+                        bytes_to_restore = rewritten_txt.encode("utf-8")
+                    else:
+                        entry_tag = f"{rec.host}:{rec.path} (current_repointed:{chosen_ver})"
+                        if not any(c.startswith(f"{rec.host}:{rec.path}") for c in cas_conflicts):
+                            cas_conflicts.append(entry_tag)
+            _atomic_write_bytes(rec.path, bytes_to_restore, mode=rec.pre_mode)
+
+        rb_msg = step6_reason or "rolled back after Step 6 failure"
+        if cas_conflicts:
+            rb_msg = f"{rb_msg}; cas_conflicts: {', '.join(cas_conflicts)}"
 
         return CutoverOutcome(
             exit_code=1,
@@ -2802,7 +3141,8 @@ def execute_atomic_cutover(
             updated_surfaces=updated_surfaces,
             skipped_surfaces=skipped_surfaces,
             cas_conflicts=cas_conflicts,
-            message=step6_reason or "rolled back after Step 6 failure",
+            would_abort=would_abort,
+            message=rb_msg,
             findings=stale_findings,
             stale_locks=stale_findings,
         )
@@ -2908,7 +3248,22 @@ def reconcile_all_hosts(
                     if target_git_sha is None:
                         target_git_sha = manifest.git_sha
                     if not dry_run:
-                        _install_staged_payload_to_home(staged_tmp, manifest, resolved_home)
+                        base_sv = str(target_version).split("+", 1)[0] if target_version else "0.6.0"
+                        has_cmd_abort = False
+                        for _hid, _hspec in HOST_SURFACE_CATALOG.items():
+                            for _surf in _hspec.get("surfaces", []):
+                                if isinstance(_surf, dict) and str(_surf.get("kind") or "") == "commands_dir":
+                                    _cp = Path(
+                                        expand_for_home(
+                                            str(_surf.get("path") or "").replace("{base_semver}", base_sv),
+                                            home=resolved_home,
+                                        )
+                                    )
+                                    if _cp.exists() and not _cp.is_symlink():
+                                        has_cmd_abort = True
+                                        break
+                        if not has_cmd_abort:
+                            _install_staged_payload_to_home(staged_tmp, manifest, resolved_home)
                 except Exception as exc:
                     if staged_tmp is not None:
                         shutil.rmtree(staged_tmp, ignore_errors=True)

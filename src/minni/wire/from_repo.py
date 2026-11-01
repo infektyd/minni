@@ -65,16 +65,15 @@ def build_from_repo(repo_root: Path) -> tuple[Path, PayloadManifest]:
                 shutil.copy2(src, dest)
 
         import json
+        from minni.wire.install import sanitize_staged_payload
 
         for rel in MANIFEST_STAMP_PATHS:
             path = tmp / rel
             data = json.loads(path.read_text(encoding="utf-8"))
             data["version"] = version
-            if rel == ".claude-plugin/plugin.json":
-                data.pop("mcpServers", None)
             path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
-        (tmp / ".mcp.json").unlink(missing_ok=True)
+        sanitize_staged_payload(tmp, version=version)
 
         files: dict[str, str] = {}
         for path in sorted(tmp.rglob("*")):

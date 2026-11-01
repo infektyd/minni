@@ -308,11 +308,27 @@ def sync_local_marketplace(
         }],
     }
 
+    def _is_sanitized_tree(root: Path) -> bool:
+        for rel_p in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+            pf = root / rel_p
+            if pf.is_file():
+                try:
+                    pdoc = json.loads(pf.read_text(encoding="utf-8"))
+                except Exception:
+                    return False
+                if not isinstance(pdoc, dict) or "mcpServers" in pdoc:
+                    return False
+                if isinstance(pdoc.get("version"), str) and "+" in pdoc["version"]:
+                    return False
+        return True
+
     if target.is_symlink():
         raise ClaudePluginError(f"{target} is a symlink; refusing to replace it")
     copy_current = (
         install_root.is_dir()
         and target.is_dir()
+        and _is_sanitized_tree(install_root)
+        and _is_sanitized_tree(target)
         and _tree_digest(target) == _tree_digest(install_root)
     )
 
@@ -344,6 +360,8 @@ def sync_local_marketplace(
     if dry_run or not result["changed"]:
         return result
 
+    stub_existed = stub.exists()
+    plugins_dir_existed = plugins_dir.exists()
     try:
         plugins_dir.mkdir(parents=True, exist_ok=True)
         if not copy_current:
@@ -353,17 +371,19 @@ def sync_local_marketplace(
                 shutil.copytree(
                     install_root, staged, symlinks=False, ignore_dangling_symlinks=True,
                 )
-                staged_cplugin = staged / ".claude-plugin" / "plugin.json"
-                if staged_cplugin.is_file():
-                    try:
-                        cdata = json.loads(staged_cplugin.read_text(encoding="utf-8"))
-                        if isinstance(cdata, dict) and "mcpServers" in cdata:
-                            cdata.pop("mcpServers", None)
-                            staged_cplugin.write_text(
-                                json.dumps(cdata, indent=2) + "\n", encoding="utf-8",
-                            )
-                    except Exception:
-                        pass
+                from minni.wire.install import InstallError, sanitize_staged_payload
+
+                try:
+                    sanitize_staged_payload(staged, version=version, remove_mcp_json=False)
+                except InstallError as exc:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    if not stub_existed:
+                        shutil.rmtree(stub, ignore_errors=True)
+                    elif not plugins_dir_existed:
+                        shutil.rmtree(plugins_dir, ignore_errors=True)
+                    raise ClaudePluginError(
+                        f"cannot refresh local marketplace {stub}: {exc}"
+                    ) from exc
                 if target.exists():
                     shutil.rmtree(target)
                 os.replace(staged, target)

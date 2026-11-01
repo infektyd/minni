@@ -36,39 +36,68 @@ class HashMismatchError(InstallError):
         )
 
 
-def _sanitize_staged_payload(stage: Path, manifest: PayloadManifest | None = None) -> None:
-    """Omit `.mcp.json` and strip `mcpServers` from `.claude-plugin/plugin.json` in staged copy only (§4.1 #1, `N2`)."""
+def sanitize_staged_payload(
+    stage: Path,
+    manifest: PayloadManifest | None = None,
+    *,
+    version: str | None = None,
+    remove_mcp_json: bool = True,
+) -> None:
+    """Single canonical sanitization path for staged/installed payloads and host containers (H17, §4.1 #1, `N2`).
+
+    - Omits `.mcp.json` when `remove_mcp_json=True` (shared payload / Claude marketplace).
+    - Strips `mcpServers` and normalizes `version` to `base_semver` in both
+      `.claude-plugin/plugin.json` and `.cursor-plugin/plugin.json`.
+    - Updates `manifest.files` and `payload-manifest.json` hashes accordingly.
+    """
     import json
     from minni.wire.manifest import sha256_file
 
-    mcp_file = stage / ".mcp.json"
-    if mcp_file.exists() or mcp_file.is_symlink():
-        mcp_file.unlink(missing_ok=True)
+    if remove_mcp_json:
+        mcp_file = stage / ".mcp.json"
+        if mcp_file.exists() or mcp_file.is_symlink():
+            mcp_file.unlink(missing_ok=True)
 
-    cplugin_file = stage / ".claude-plugin" / "plugin.json"
-    cplugin_modified = False
-    if cplugin_file.is_file():
-        try:
-            cdata = json.loads(cplugin_file.read_text(encoding="utf-8"))
-            if not isinstance(cdata, dict):
-                raise InstallError(f"staged .claude-plugin/plugin.json is not a JSON object: {cplugin_file}")
-            if "mcpServers" in cdata:
-                cdata.pop("mcpServers", None)
-                cplugin_file.write_text(
-                    json.dumps(cdata, indent=2) + "\n", encoding="utf-8",
-                )
-                cplugin_modified = True
-        except InstallError:
-            raise
-        except Exception as exc:
-            raise InstallError(
-                f"failed to sanitize staged .claude-plugin/plugin.json ({cplugin_file}): {exc}"
-            ) from exc
+    raw_ver = version or (manifest.version if manifest is not None else None)
+    base_semver = str(raw_ver).split("+", 1)[0] if raw_ver else None
+
+    modified_manifests: dict[str, bool] = {}
+    for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+        pjson_file = stage / rel_pjson
+        pjson_modified = False
+        if pjson_file.is_file():
+            try:
+                cdata = json.loads(pjson_file.read_text(encoding="utf-8"))
+                if not isinstance(cdata, dict):
+                    raise InstallError(f"staged {rel_pjson} is not a JSON object: {pjson_file}")
+                if "mcpServers" in cdata:
+                    cdata.pop("mcpServers", None)
+                    pjson_modified = True
+                effective_semver = base_semver
+                if not effective_semver and isinstance(cdata.get("version"), str) and "+" in cdata["version"]:
+                    effective_semver = cdata["version"].split("+", 1)[0]
+                if effective_semver and cdata.get("version") != effective_semver:
+                    cdata["version"] = effective_semver
+                    pjson_modified = True
+                if pjson_modified:
+                    pjson_file.write_text(
+                        json.dumps(cdata, indent=2) + "\n", encoding="utf-8",
+                    )
+            except InstallError:
+                raise
+            except Exception as exc:
+                raise InstallError(
+                    f"failed to sanitize staged {rel_pjson} ({pjson_file}): {exc}"
+                ) from exc
+        modified_manifests[rel_pjson] = pjson_modified
 
     if manifest is not None and isinstance(manifest.files, dict):
-        manifest.files.pop(".mcp.json", None)
-        if cplugin_file.is_file() and (cplugin_modified or ".claude-plugin/plugin.json" in manifest.files):
-            manifest.files[".claude-plugin/plugin.json"] = sha256_file(cplugin_file)
+        if remove_mcp_json:
+            manifest.files.pop(".mcp.json", None)
+        for rel_pjson, pjson_modified in modified_manifests.items():
+            pjson_file = stage / rel_pjson
+            if pjson_file.is_file() and (pjson_modified or rel_pjson in manifest.files):
+                manifest.files[rel_pjson] = sha256_file(pjson_file)
 
     pmanifest_file = stage / "payload-manifest.json"
     if pmanifest_file.is_file():
@@ -79,14 +108,16 @@ def _sanitize_staged_payload(stage: Path, manifest: PayloadManifest | None = Non
             files = mdata.get("files")
             if isinstance(files, dict):
                 changed = False
-                if ".mcp.json" in files:
+                if remove_mcp_json and ".mcp.json" in files:
                     files.pop(".mcp.json", None)
                     changed = True
-                if cplugin_file.is_file() and (cplugin_modified or ".claude-plugin/plugin.json" in files):
-                    new_hash = sha256_file(cplugin_file)
-                    if files.get(".claude-plugin/plugin.json") != new_hash:
-                        files[".claude-plugin/plugin.json"] = new_hash
-                        changed = True
+                for rel_pjson, pjson_modified in modified_manifests.items():
+                    pjson_file = stage / rel_pjson
+                    if pjson_file.is_file() and (pjson_modified or rel_pjson in files):
+                        new_hash = sha256_file(pjson_file)
+                        if files.get(rel_pjson) != new_hash:
+                            files[rel_pjson] = new_hash
+                            changed = True
                 if changed:
                     mdata["files"] = files
                     pmanifest_file.write_text(
@@ -102,11 +133,14 @@ def _sanitize_staged_payload(stage: Path, manifest: PayloadManifest | None = Non
             ) from exc
 
 
+_sanitize_staged_payload = sanitize_staged_payload
+
+
 def _copy_tree(src: Path, dest: Path, manifest: PayloadManifest | None = None) -> None:
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__"))
-    _sanitize_staged_payload(dest, manifest)
+    sanitize_staged_payload(dest, manifest)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -242,8 +276,19 @@ def install_payload(
         payload_src, version, manifest,
         force_reinstall=force_reinstall, dry_run=dry_run,
     )
-    if update_current and not dry_run:
-        update_current_symlink(version)
+    if not dry_run:
+        if update_current:
+            update_current_symlink(version)
+        home_dir = plugin_base().parent.parent
+        for rel_c, drop_mcp in (
+            (Path(".agents") / "plugins" / "Minni@Minni", False),
+            (Path(".agents") / "plugins" / "minni@minni", False),
+            (Path(".cursor") / "plugins" / "local" / "minni", False),
+            (Path(".claude") / "plugins" / "marketplaces" / "minni-local" / "plugins" / "minni", True),
+        ):
+            cdir = home_dir / rel_c
+            if cdir.is_dir() and not cdir.is_symlink():
+                sanitize_staged_payload(cdir, version=version, remove_mcp_json=drop_mcp)
     return result
 
 
