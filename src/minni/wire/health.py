@@ -247,9 +247,9 @@ def audit_host_propagation_health(
     import tomllib
     from minni.wire.registry import _VERSIONED_PLUGIN_RE
 
-    # Identify if this home is a synthetic single-version v1 wired.json fixture (no `current` link)
+    # Identify if this home is a synthetic single-version v1 wired.json fixture (no valid `current` link)
     legacy_v1_single_server_js: str | None = None
-    if not current_valid and (plugin_dir / "wired.json").is_file() and not current_link.exists() and not current_link.is_symlink():
+    if not current_valid and (plugin_dir / "wired.json").is_file():
         try:
             wdoc = json.loads((plugin_dir / "wired.json").read_text(encoding="utf-8"))
             if isinstance(wdoc, dict) and wdoc.get("schema_version", wdoc.get("schema", 1)) == 1:
@@ -275,10 +275,13 @@ def audit_host_propagation_health(
                 live_entry.get("command") == ["node", legacy_v1_single_server_js]
                 and live_entry.get("enabled") is True
             )
-        return (
-            live_entry.get("command") == "node"
-            and live_entry.get("args") == [legacy_v1_single_server_js]
-        )
+        cmd = live_entry.get("command")
+        args = live_entry.get("args")
+        if cmd == "node" and args == [legacy_v1_single_server_js]:
+            return True
+        if isinstance(cmd, str) and cmd.endswith("mcp-env-run") and args == ["node", legacy_v1_single_server_js]:
+            return True
+        return False
 
     def _audit_container_dir(host_id: str, cpath: Path) -> list[str]:
         reasons: list[str] = []

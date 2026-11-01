@@ -373,25 +373,26 @@ def check_wire_launch_bindings(home: Path) -> tuple[list[str], list[str]]:
             # report the category; never print the exception or config values.
             problems.append(f"{platform}: host config is malformed or unreadable")
 
-    is_legacy_v1_wire_only = (
-        wired.exists()
-        and schema_ver == 1
-        and all(
-            Path(str(e.get("install_root") or "")).name != "current"
-            for e in entries
-            if isinstance(e, dict)
-        )
-    )
+    already_reported_hosts = {p.split(":", 1)[0] for p in problems if ":" in p}
+    if "grok" in already_reported_hosts:
+        already_reported_hosts.add("grok-build")
 
     health = audit_host_propagation_health(home=home)
     for surf in health.drifted_surfaces:
+        host_id = str(surf.get("host") or "")
+        if host_id in already_reported_hosts:
+            continue
         spath = str(surf.get("path") or "")
-        reasons = list(surf.get("reasons") or [])
-        if is_legacy_v1_wire_only:
-            reasons = [r for r in reasons if r.startswith("forbidden_env_keys:")]
+        if spath and Path(spath).is_dir():
+            # Container directories are audited directly by discover_active() + compare_content().
+            continue
+        reasons = [
+            r.split(":", 1)[0] if r.startswith("unreadable_or_corrupt") else r
+            for r in (surf.get("reasons") or [])
+        ]
         if reasons:
             problems.append(
-                f"{surf.get('host')}: host propagation drift at {spath} ({', '.join(reasons)})"
+                f"{host_id}: host propagation drift at {spath} ({', '.join(reasons)})"
             )
     for ref in health.uncatalogued_refs:
         problems.append(

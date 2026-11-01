@@ -260,3 +260,58 @@ def test_doctor_and_check_scripts_fail_closed_on_daemon_stale_and_host_propagati
     cv_spec.loader.exec_module(cv_mod)
     cv_mismatches, _cv_notes = cv_mod.check_deployed("0.6.0")
     assert any("claude_code" in m or ".claude.json" in m for m in cv_mismatches), cv_mismatches
+
+    # 4. New P1 #4: minni doctor must fail closed (rc == 1, [FAIL] fleet:) if audit_host_propagation_health raises
+    def _boom_health(*args, **kwargs):
+        raise RuntimeError("corrupt health state")
+
+    with patch("minni.wire.health.audit_host_propagation_health", side_effect=_boom_health):
+        rc_exc = minni_cli.main(["--socket", str(sock), "doctor"])
+    out_exc = capsys.readouterr().out
+    assert rc_exc == 1, out_exc
+    assert "[FAIL] fleet:" in out_exc
+
+    # 5. New P2 #3: check_deployments.py must fail on legacy v1 wired.json when a newer payload is staged in ~/.minni/plugin
+    home_v1 = tmp_path / "home_v1_stale"
+    pdir_v1 = home_v1 / ".minni" / "plugin"
+    pdir_v1.mkdir(parents=True)
+    old_ver = "0.5.0+git.11111111"
+    new_ver = "0.6.0+git.22222222"
+    _seed_plugin_version(pdir_v1, old_ver, "1" * 40)
+    _seed_plugin_version(pdir_v1, new_ver, "2" * 40)
+    old_root = pdir_v1 / old_ver
+    claude_cfg = home_v1 / ".claude.json"
+    claude_cfg.write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(old_root / "dist" / "server.js")],
+                    "env": {
+                        "MINNI_AGENT_ID": "claude-code",
+                        "MINNI_VAULT_PATH": "~/.minni/claudecode-vault",
+                    },
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    (pdir_v1 / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [
+                {
+                    "platform": "claude-code",
+                    "agent": "claude-code",
+                    "workspace": "global",
+                    "config_path": str(claude_cfg),
+                    "install_root": str(old_root),
+                    "version": old_ver,
+                    "wired_at": "2026-10-31T00:00:00Z",
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    v1_problems, _ = cd_mod.check_wire_launch_bindings(home_v1)
+    assert any("versioned_sha_in_args" in p or "entry_or_args_mismatch" in p for p in v1_problems), v1_problems

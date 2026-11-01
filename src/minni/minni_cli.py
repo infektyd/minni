@@ -680,8 +680,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print("              minni sync --full   # editable checkout: also git pull + rebuild")
         else:
             print("  [PASS] fleet: plugin/daemon and host surfaces healthy")
-    except Exception as exc:  # pragma: no cover — optional surface
-        print(f"  [WARN] fleet: could not read deploy status ({exc})")
+    except Exception as exc:
+        failures += 1
+        print(f"  [FAIL] fleet: could not read deploy status ({exc})")
 
     if failures:
         print(f"\n{failures} check(s) failed. If the daemon is not running, "
