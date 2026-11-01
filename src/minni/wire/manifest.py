@@ -90,7 +90,9 @@ def sha256_file(path: Path) -> str:
 # payload manifest embeds that file's hash in its files map, so excluding the
 # leaf alone cannot absorb a built_from path difference — the mismatch just
 # cascades into payload-manifest.json, and excluding THAT would gut the check.
-_INSTALL_MUTABLE_PATHS = frozenset({".mcp.json"})
+_INSTALL_MUTABLE_PATHS = frozenset({
+    ".mcp.json",
+})
 
 
 def verify_manifest_hashes(manifest: PayloadManifest, root: Path) -> list[str]:

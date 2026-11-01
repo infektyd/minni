@@ -23,8 +23,10 @@ import { claudeCodeWire } from "./hook-platform.js";
  * bug this bounds (killed mid-boot, output discarded).
  *
  * 600s is Claude Code's DOCUMENTED PLATFORM default for a `command` hook.
- * SessionStart does not lower it (the events that do are UserPromptSubmit at
- * 30s, MessageDisplay at 10s and SessionEnd's shared 1.5s budget) — so 600 is
+ * SessionStart does not lower it (unlike events with tighter platform defaults
+ * such as UserPromptSubmit at 30s; `hooks/hooks.json` registers the 10 events
+ * SessionStart, UserPromptSubmit, PreToolUse, PreCompact, PostCompact, Stop,
+ * SubagentStart, SubagentStop, PostToolUse, and PostToolUseFailure) — so 600 is
  * what this entry inherits when the manifest is silent. Those are the
  * platform's numbers, not ours: `hooks.json` separately sets UserPromptSubmit
  * to 60, which is OUR choice and unrelated to this constant.

@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -136,6 +138,81 @@ import {
 // slice only, so asking for more than the final cap costs nothing extra.
 // See minni_recall below for why the multiplier exists.
 const VAULT_SEARCH_OVERFETCH_MULTIPLIER = 3;
+
+// §4.5 (P1-3, N4): Keep an open read-only file descriptor to resolved server.js
+// for the lifetime of the process so `lsof -Fn -p <pid>` deterministically lists
+// the loaded version directory, and write a runtime lease file in
+// ~/.minni/run/mcp-servers/<pid>.json.
+const selfRealpath = realpathSync(fileURLToPath(import.meta.url));
+const versionRoot = path.dirname(path.dirname(selfRealpath));
+const pinFd = openSync(selfRealpath, "r");
+(globalThis as Record<string, unknown>).__minniSelfPinFd = pinFd;
+
+function resolveServerGitSha(verRoot: string): string {
+  for (const rel of ["payload-manifest.json", "dist/build-manifest.json"]) {
+    try {
+      const parsed = JSON.parse(readFileSync(path.join(verRoot, rel), "utf8")) as Record<string, unknown>;
+      if (typeof parsed.git_sha === "string" && parsed.git_sha) {
+        return parsed.git_sha;
+      }
+    } catch {
+      // ignore missing/unreadable manifest
+    }
+  }
+  return "";
+}
+
+function registerRuntimeServerLease(): void {
+  try {
+    const homeDir = process.env.HOME || os.homedir();
+    const vaultEnv = process.env.MINNI_VAULT_PATH || "";
+    let leaseDir = process.env.MINNI_RUNTIME_LEASE_DIR || "";
+    if (!leaseDir) {
+      if (
+        vaultEnv &&
+        homeDir &&
+        !path.resolve(vaultEnv).startsWith(path.resolve(homeDir) + path.sep)
+      ) {
+        leaseDir = path.join(vaultEnv, ".runtime", "mcp-servers");
+      } else if (homeDir) {
+        leaseDir = path.join(homeDir, ".minni", "run", "mcp-servers");
+      }
+    }
+    if (!leaseDir) return;
+    mkdirSync(leaseDir, { recursive: true });
+    const leasePath = path.join(leaseDir, `${process.pid}.json`);
+    const payload = {
+      pid: process.pid,
+      ppid: process.ppid,
+      agent_id: DEFAULT_AGENT_ID,
+      realpath: selfRealpath,
+      version_root: versionRoot,
+      git_sha: resolveServerGitSha(versionRoot),
+      started_at: new Date().toISOString(),
+    };
+    writeFileSync(leasePath, JSON.stringify(payload, null, 2) + "\n", "utf8");
+    const cleanupLease = () => {
+      try {
+        unlinkSync(leasePath);
+      } catch {
+        // ignore
+      }
+    };
+    process.once("exit", cleanupLease);
+    process.once("SIGTERM", () => {
+      cleanupLease();
+      process.exit(0);
+    });
+    process.once("SIGINT", () => {
+      cleanupLease();
+      process.exit(0);
+    });
+  } catch {
+    // Non-fatal in read-only environments
+  }
+}
+
+registerRuntimeServerLease();
 
 function textResult(text: string) {
   return {

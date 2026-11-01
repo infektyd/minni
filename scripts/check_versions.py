@@ -297,12 +297,34 @@ def _is_legacy_marketplace_cache_root(root: Path, home: Path) -> bool:
 
 
 def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
-    """(mismatches, notes). Every deployed plugin manifest under $HOME."""
+    """(mismatches, notes). Every deployed plugin manifest and catalog host surface under $HOME."""
     mismatches: list[str] = []
     notes: list[str] = []
     home = _home()
+    _src = Path(__file__).resolve().parent.parent / "src"
+    if _src.is_dir() and str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+    from minni.wire.health import audit_host_propagation_health
+
+    health = audit_host_propagation_health(home=home)
+    for surf in health.drifted_surfaces:
+        mismatches.append(
+            f"deployed: host surface drift on {surf.get('host')} ({surf.get('path')}): "
+            f"{', '.join(surf.get('reasons') or [])}"
+        )
+    for ref in health.uncatalogued_refs:
+        mismatches.append(
+            f"deployed: uncatalogued .minni/plugin reference in {ref.get('path')} ({ref.get('reason')})"
+        )
+    for srv in health.running_stale_servers:
+        mismatches.append(
+            f"deployed: stale running MCP server pid={srv.get('pid')} version={srv.get('version')}"
+        )
+
     roots = deployment_roots()
     if not roots:
+        if mismatches:
+            return mismatches, notes
         return [], ["deployed: no deployments discovered under $HOME"]
     active_wire, active_platforms = _active_wire_plugin_state(home)
     for root in roots:

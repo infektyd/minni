@@ -39,6 +39,26 @@ export function normalizeWorkspaceId(value: string | undefined): string {
 export const ACTIVE_SESSION_TTL_MS = 30 * 60 * 1000;
 export const ACTIVE_SESSION_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
 
+export type HintMissReason =
+  | "hint_file_missing"
+  | "hint_pid_not_alive"
+  | "hint_agent_mismatch"
+  | "hint_expired_ttl"
+  | "hint_clock_skew"
+  | "hint_workspace_invalid"
+  | "hint_parse_error";
+
+export interface WorkspaceResolutionDiag {
+  event: "workspace_resolution_diag";
+  agent_id: string;
+  host_pid: number;
+  resolved_workspace_id: string;
+  source: "explicit_or_pinned" | "active_session_hint" | "cwd_git_walk" | "unknown_fallback";
+  hint_miss_reason: HintMissReason | null;
+  candidate_other_pids?: number[];
+  timestamp: string;
+}
+
 export interface ActiveSessionWorkspaceOptions {
   agentId?: string;
   hostPid?: number;
@@ -50,6 +70,44 @@ export interface ResolveSessionWorkspaceOptions {
   hostPid?: number;
   ttlMs?: number;
   nowMs?: number;
+  checkHostPidAlive?: boolean;
+  onDiagnostic?: (diag: WorkspaceResolutionDiag) => void;
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === "EPERM";
+  }
+}
+
+function isDisallowedHintPath(rawInput: string): boolean {
+  const trimmed = rawInput.trim();
+  if (!trimmed || trimmed.startsWith("workspace-")) return false;
+  const expanded = expandTilde(trimmed);
+  if (!path.isAbsolute(expanded)) return false;
+  const resolved = path.resolve(expanded);
+  const home = os.homedir();
+  if (home) {
+    const pluginPrefixes = [
+      path.join(home, ".minni", "plugin"),
+      path.join(home, ".cursor", "plugins"),
+      path.join(home, ".agents", "plugins"),
+    ];
+    for (const prefix of pluginPrefixes) {
+      if (resolved === prefix || resolved.startsWith(prefix + path.sep)) {
+        return true;
+      }
+    }
+    if (resolved === path.resolve(home) && !existsSync(path.join(resolved, ".git"))) {
+      return true;
+    }
+  }
+  return resolved.includes(`${path.sep}.minni${path.sep}plugin`);
 }
 
 function sanitizeSessionKeyPart(value: string): string {
@@ -67,6 +125,7 @@ export function recordActiveSessionWorkspace(
   options?: ActiveSessionWorkspaceOptions,
 ): void {
   if (!vaultPath || !workspaceIdOrPath) return;
+  if (isDisallowedHintPath(workspaceIdOrPath)) return;
   const normalized = normalizeWorkspaceId(workspaceIdOrPath);
   if (!normalized || normalized === "workspace-unknown") return;
   const opts: ActiveSessionWorkspaceOptions =
@@ -144,16 +203,37 @@ export function recordActiveSessionWorkspace(
   }
 }
 
+export const writeActiveSessionHint = recordActiveSessionWorkspace;
+
 let warnedSessionPpidMismatch = false;
 
-export function resolveSessionWorkspaceId(
+export function resolveSessionWorkspaceWithDiag(
   vaultPath: string = DEFAULT_VAULT_PATH,
   explicitWorkspaceId?: string,
   options: ResolveSessionWorkspaceOptions = {},
-): string {
-  if (typeof explicitWorkspaceId === "string" && explicitWorkspaceId.trim()) {
-    return normalizeWorkspaceId(explicitWorkspaceId.trim()) || DEFAULT_WORKSPACE_ID;
+): {
+  workspace_id: string;
+  source: "explicit_or_pinned" | "active_session_hint" | "cwd_git_walk" | "unknown_fallback";
+  hint_miss_reason: HintMissReason | null;
+  diag?: WorkspaceResolutionDiag;
+} {
+  // Step 1: Explicit caller argument or operator pin (MINNI_PINNED_WORKSPACE_ID)
+  const pinnedRaw =
+    typeof explicitWorkspaceId === "string" && explicitWorkspaceId.trim()
+      ? explicitWorkspaceId.trim()
+      : typeof process.env.MINNI_PINNED_WORKSPACE_ID === "string" &&
+          process.env.MINNI_PINNED_WORKSPACE_ID.trim()
+        ? process.env.MINNI_PINNED_WORKSPACE_ID.trim()
+        : "";
+  if (pinnedRaw) {
+    const ws = normalizeWorkspaceId(pinnedRaw) || DEFAULT_WORKSPACE_ID;
+    return {
+      workspace_id: ws,
+      source: "explicit_or_pinned",
+      hint_miss_reason: null,
+    };
   }
+
   const resolvedAgentId = (options.agentId ?? DEFAULT_AGENT_ID).trim() || DEFAULT_AGENT_ID;
   const resolvedHostPid =
     typeof options.hostPid === "number" && Number.isInteger(options.hostPid) && options.hostPid > 0
@@ -164,68 +244,140 @@ export function resolveSessionWorkspaceId(
       ? options.ttlMs
       : ACTIVE_SESSION_TTL_MS;
   const nowMs = typeof options.nowMs === "number" && Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+
+  let missReason: HintMissReason = "hint_file_missing";
+  const otherFreshPids: number[] = [];
+
   if (vaultPath && typeof vaultPath === "string") {
     try {
       const runtimeDir = path.join(expandTilde(vaultPath), ".runtime");
       const targetName = activeSessionFilename(resolvedAgentId, resolvedHostPid);
       const target = path.join(runtimeDir, targetName);
       if (existsSync(target)) {
-        const parsed = JSON.parse(readFileSync(target, "utf8")) as Record<string, unknown>;
-        if (parsed?.agent_id !== resolvedAgentId || parsed?.host_pid !== resolvedHostPid) {
-          return DEFAULT_WORKSPACE_ID;
-        }
-        const updatedAtRaw = typeof parsed?.updated_at === "string" ? parsed.updated_at : "";
-        const updatedAtMs = updatedAtRaw ? Date.parse(updatedAtRaw) : Number.NaN;
-        if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs > ttlMs || updatedAtMs - nowMs > 60_000) {
-          return DEFAULT_WORKSPACE_ID;
-        }
-        const activeWs = typeof parsed?.workspace_id === "string" ? normalizeWorkspaceId(parsed.workspace_id) : "";
-        if (activeWs && activeWs !== "workspace-unknown") {
-          return activeWs;
-        }
-      } else if (!warnedSessionPpidMismatch && existsSync(runtimeDir)) {
-        const prefix = `active-session-${sanitizeSessionKeyPart(resolvedAgentId)}-`;
-        for (const entry of readdirSync(runtimeDir)) {
-          if (entry === targetName || !entry.startsWith(prefix) || !entry.endsWith(".json")) {
-            continue;
+        let parsed: Record<string, unknown> | null = null;
+        try {
+          const rawObj: unknown = JSON.parse(readFileSync(target, "utf8"));
+          if (rawObj !== null && typeof rawObj === "object" && !Array.isArray(rawObj)) {
+            parsed = rawObj as Record<string, unknown>;
+          } else {
+            missReason = "hint_parse_error";
           }
-          const pidPart = entry.slice(prefix.length, -".json".length);
-          if (!/^\d+$/.test(pidPart)) continue;
-          try {
-            const parsed = JSON.parse(
-              readFileSync(path.join(runtimeDir, entry), "utf8"),
-            ) as Record<string, unknown>;
-            if (
-              parsed?.agent_id !== resolvedAgentId ||
-              typeof parsed?.host_pid !== "number" ||
-              parsed.host_pid === resolvedHostPid
-            ) {
-              continue;
-            }
-            const updatedAtRaw = typeof parsed?.updated_at === "string" ? parsed.updated_at : "";
+        } catch {
+          missReason = "hint_parse_error";
+        }
+
+        if (parsed !== null) {
+          if (parsed.agent_id !== resolvedAgentId) {
+            missReason = "hint_agent_mismatch";
+          } else if (
+            parsed.host_pid !== resolvedHostPid ||
+            (options.checkHostPidAlive === true && !isPidAlive(resolvedHostPid))
+          ) {
+            missReason = "hint_pid_not_alive";
+          } else {
+            const updatedAtRaw = typeof parsed.updated_at === "string" ? parsed.updated_at : "";
             const updatedAtMs = updatedAtRaw ? Date.parse(updatedAtRaw) : Number.NaN;
-            if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs > ttlMs || updatedAtMs - nowMs > 60_000) {
+            if (!Number.isFinite(updatedAtMs)) {
+              missReason = "hint_parse_error";
+            } else if (updatedAtMs - nowMs > 60_000) {
+              missReason = "hint_clock_skew";
+            } else if (nowMs - updatedAtMs > ttlMs) {
+              missReason = "hint_expired_ttl";
+            } else {
+              const activeWs =
+                typeof parsed.workspace_id === "string" ? normalizeWorkspaceId(parsed.workspace_id) : "";
+              if (activeWs && activeWs !== "workspace-unknown") {
+                return {
+                  workspace_id: activeWs,
+                  source: "active_session_hint",
+                  hint_miss_reason: null,
+                };
+              }
+              missReason = "hint_workspace_invalid";
+            }
+          }
+        }
+      } else {
+        missReason = "hint_file_missing";
+        if (existsSync(runtimeDir)) {
+          const prefix = `active-session-${sanitizeSessionKeyPart(resolvedAgentId)}-`;
+          for (const entry of readdirSync(runtimeDir)) {
+            if (entry === targetName || !entry.startsWith(prefix) || !entry.endsWith(".json")) {
               continue;
             }
-            const otherWs =
-              typeof parsed?.workspace_id === "string" ? normalizeWorkspaceId(parsed.workspace_id) : "";
-            if (otherWs && otherWs !== "workspace-unknown") {
-              warnedSessionPpidMismatch = true;
-              process.stderr.write(
-                `[minni] active-session hint missing for agent=${resolvedAgentId} host_pid=${resolvedHostPid}, but fresh hint exists for host_pid=${parsed.host_pid}; falling back to ${DEFAULT_WORKSPACE_ID}\n`,
-              );
-              break;
+            const pidPart = entry.slice(prefix.length, -".json".length);
+            if (!/^\d+$/.test(pidPart)) continue;
+            try {
+              const parsed = JSON.parse(
+                readFileSync(path.join(runtimeDir, entry), "utf8"),
+              ) as Record<string, unknown>;
+              if (
+                parsed?.agent_id !== resolvedAgentId ||
+                typeof parsed?.host_pid !== "number" ||
+                parsed.host_pid === resolvedHostPid
+              ) {
+                continue;
+              }
+              const updatedAtRaw = typeof parsed?.updated_at === "string" ? parsed.updated_at : "";
+              const updatedAtMs = updatedAtRaw ? Date.parse(updatedAtRaw) : Number.NaN;
+              if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs > ttlMs || updatedAtMs - nowMs > 60_000) {
+                continue;
+              }
+              const otherWs =
+                typeof parsed?.workspace_id === "string" ? normalizeWorkspaceId(parsed.workspace_id) : "";
+              if (otherWs && otherWs !== "workspace-unknown") {
+                otherFreshPids.push(parsed.host_pid);
+                if (!warnedSessionPpidMismatch) {
+                  warnedSessionPpidMismatch = true;
+                  process.stderr.write(
+                    `[minni] active-session hint missing for agent=${resolvedAgentId} host_pid=${resolvedHostPid}, but fresh hint exists for host_pid=${parsed.host_pid}; falling back to ${DEFAULT_WORKSPACE_ID}\n`,
+                  );
+                }
+              }
+            } catch {
+              // Ignore unreadable candidate file.
             }
-          } catch {
-            // Ignore unreadable candidate file.
           }
         }
       }
     } catch {
-      // Fall back to DEFAULT_WORKSPACE_ID.
+      missReason = "hint_parse_error";
     }
   }
-  return DEFAULT_WORKSPACE_ID;
+
+  const fallbackWs = DEFAULT_WORKSPACE_ID;
+  const fallbackSource = fallbackWs === "workspace-unknown" ? "unknown_fallback" : "cwd_git_walk";
+  const diag: WorkspaceResolutionDiag = {
+    event: "workspace_resolution_diag",
+    agent_id: resolvedAgentId,
+    host_pid: resolvedHostPid,
+    resolved_workspace_id: fallbackWs,
+    source: fallbackSource,
+    hint_miss_reason: missReason,
+    ...(otherFreshPids.length > 0 ? { candidate_other_pids: otherFreshPids } : {}),
+    timestamp: new Date(nowMs).toISOString(),
+  };
+  if (typeof options.onDiagnostic === "function") {
+    try {
+      options.onDiagnostic(diag);
+    } catch {
+      // Never throw from diagnostic hook.
+    }
+  }
+  return {
+    workspace_id: fallbackWs,
+    source: fallbackSource,
+    hint_miss_reason: missReason,
+    diag,
+  };
+}
+
+export function resolveSessionWorkspaceId(
+  vaultPath: string = DEFAULT_VAULT_PATH,
+  explicitWorkspaceId?: string,
+  options: ResolveSessionWorkspaceOptions = {},
+): string {
+  return resolveSessionWorkspaceWithDiag(vaultPath, explicitWorkspaceId, options).workspace_id;
 }
 
 /**
@@ -242,7 +394,7 @@ export function resolveSessionWorkspaceId(
  * Fail closed to `workspace-unknown` when cwd cannot identify a project, so a
  * missing signal stays visibly missing instead of masquerading as a scope.
  */
-function deriveWorkspaceIdFromCwd(cwd: string = process.cwd()): string {
+export function deriveWorkspaceIdFromCwd(cwd: string = process.cwd()): string {
   const resolved = path.resolve(cwd);
   const filesystemRoot = path.parse(resolved).root;
 
@@ -529,7 +681,8 @@ export const DEFAULT_AGENT_ID =
 // was current when that config was written.
 export const DEFAULT_WORKSPACE_ID =
   normalizeWorkspaceId(
-    process.env.MINNI_WORKSPACE_ID ??
+    process.env.MINNI_PINNED_WORKSPACE_ID ??
+      process.env.MINNI_WORKSPACE_ID ??
       process.env.MINNI_CODEX_WORKSPACE_ID ??
       deriveWorkspaceIdFromCwd()
   );

@@ -38,10 +38,11 @@ def test_new_codex_is_dynamic_and_idempotent(surface):
     home, root, wire = surface
     path, _ = wire()
     first = path.read_text()
-    for values in (env(path), json.loads((root / '.mcp.json').read_text())['mcpServers']['minni']['env']):
-        assert 'MINNI_WORKSPACE_ID' not in values
-        assert 'MINNI_CODEX_WORKSPACE_ID' not in values
-        assert values['MINNI_AGENT_ID'] == values['MINNI_CODEX_AGENT_ID'] == 'codex'
+    assert (root / '.mcp.json').exists() is False
+    values = env(path)
+    assert 'MINNI_WORKSPACE_ID' not in values
+    assert 'MINNI_CODEX_WORKSPACE_ID' not in values
+    assert values['MINNI_AGENT_ID'] == values['MINNI_CODEX_AGENT_ID'] == 'codex'
     wire()
     assert path.read_text() == first
 
@@ -83,24 +84,26 @@ def test_shared_root_does_not_transplant_other_host_workspace(surface):
     grok_path = home / '.grok/config.toml'
     original = grok_path.read_text()
     wire()
-    stamp = json.loads((root / '.mcp.json').read_text())['mcpServers']['minni']['env']
-    assert 'MINNI_WORKSPACE_ID' not in stamp
-    assert 'MINNI_CODEX_WORKSPACE_ID' not in stamp
+    assert (root / '.mcp.json').exists() is False
     assert grok_path.read_text() == original
     wire('grok')
     assert env(grok_path)['MINNI_WORKSPACE_ID'] == 'workspace-grok-project'
     assert env(home / '.codex/config.toml').get('MINNI_WORKSPACE_ID') is None
 
 
-def test_shared_codex_stamp_reset_preserves_custom_env(surface):
+def test_legacy_shared_mcp_json_is_removed_on_wire_while_preserving_codex_custom_env(surface):
     home, root, wire = surface
-    wire(workspace=home / 'old')
     stamp_path = root / '.mcp.json'
-    stamp = json.loads(stamp_path.read_text())
-    stamp['mcpServers']['minni']['env']['CUSTOM_OPTION'] = 'keep'
-    stamp_path.write_text(json.dumps(stamp))
+    stamp_path.write_text(json.dumps({'mcpServers': {'minni': {'env': {
+        'MINNI_AGENT_ID': 'grok-build',
+        'MINNI_WORKSPACE_ID': 'workspace-grok-legacy',
+    }}}}))
+    config = home / '.codex/config.toml'
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[mcp_servers.minni.env]\nMINNI_AGENT_ID = "codex"\nCUSTOM_OPTION = "keep"\n')
     wire(dynamic=True)
-    values = json.loads(stamp_path.read_text())['mcpServers']['minni']['env']
+    assert stamp_path.exists() is False
+    values = env(config)
     assert values['CUSTOM_OPTION'] == 'keep'
     assert not any(k in values for k in ('MINNI_WORKSPACE_ID', 'MINNI_CODEX_WORKSPACE_ID'))
 
@@ -158,18 +161,3 @@ def test_invalid_host_env_type_fails_before_shared_stamp_write(surface, value):
         wire(dynamic=True)
     assert config.read_text() == original
     assert not (root / '.mcp.json').exists()
-
-
-@pytest.mark.parametrize('identity', [{'MINNI_CODEX_AGENT_ID': 'codex'}, {}])
-def test_legacy_shared_codex_pin_is_not_mistaken_for_other_host(surface, identity):
-    home, root, wire = surface
-    stamp_path = root / '.mcp.json'
-    stamp_path.write_text(json.dumps({'mcpServers': {'minni': {'env': {
-        **identity, 'MINNI_CODEX_WORKSPACE_ID': 'workspace-legacy',
-    }}}}))
-    wire()
-    values = json.loads(stamp_path.read_text())['mcpServers']['minni']['env']
-    assert values['MINNI_WORKSPACE_ID'] == values['MINNI_CODEX_WORKSPACE_ID'] == 'workspace-legacy'
-    wire(dynamic=True)
-    values = json.loads(stamp_path.read_text())['mcpServers']['minni']['env']
-    assert 'MINNI_WORKSPACE_ID' not in values and 'MINNI_CODEX_WORKSPACE_ID' not in values

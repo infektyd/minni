@@ -218,6 +218,30 @@ def _run_wire(
     return step
 
 
+def _reconcile_all_hosts(
+    *,
+    from_repo: Optional[Path],
+    install_root: Optional[str] = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    from minni.wire.cutover import reconcile_all_hosts
+
+    target_version = Path(install_root).name if install_root else None
+    outcome = reconcile_all_hosts(
+        from_repo=from_repo,
+        target_version=target_version,
+        dry_run=dry_run,
+    )
+    if outcome.status in ("SKIPPED", "DRY_RUN"):
+        return {
+            "name": "reconcile_all_hosts",
+            "exit_code": 0,
+            "skipped": True,
+            "reason": outcome.message,
+        }
+    return {"name": "reconcile_all_hosts", **outcome.to_dict()}
+
+
 def _run_propagate(platform: str, repo: Optional[Path], dry_run: bool) -> dict[str, Any]:
     from minni.wire.host_discovery import host_decision
     decision = host_decision(platform, bulk=True)
@@ -659,8 +683,27 @@ def run_fleet_sync(
         steps.append({"name": "payload_gc", "exit_code": 0, "skipped": True,
                       "reason": "deferred: native/custom references may remain on older payloads"})
 
-    # Custom JSON bindings are registered MCP consumers, not native hosts.
+    # Run atomic cutover & per-host reconciliation BEFORE custom_refresh and propagate (P1-2, P1-5).
     from minni.wire.custom_refresh import refresh_custom_wires
+
+    reconcile_step = _reconcile_all_hosts(
+        from_repo=from_repo,
+        install_root=wire_step.get("install_root"),
+        dry_run=dry_run,
+    )
+    steps.append(reconcile_step)
+    if not reconcile_step.get("skipped") and reconcile_step.get("exit_code", 0) != 0:
+        return SyncResult(
+            ok=False,
+            install_kind=kind,
+            steps=steps,
+            message=str(
+                reconcile_step.get("message")
+                or f"fleet sync ({kind}): atomic cutover exited {reconcile_step.get('exit_code')} — stopped before propagate"
+            ),
+            next_actions=next_actions,
+        )
+
     steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
 
     if propagate_hosts and not dry_run:

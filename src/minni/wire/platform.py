@@ -183,7 +183,10 @@ def platform_spec(
     )
 
 
-def default_config_scan_paths() -> dict[str, Path]:
+from minni.wire.registry import HOST_SURFACE_CATALOG, expand_host_surface_catalog
+
+
+def default_config_scan_paths(home: Path | None = None) -> dict[str, Path]:
     """Known per-platform default config locations for GC belt-and-braces scan.
 
     `claude-code-plugins` is the plugin registry, not an MCP config: it is what
@@ -197,35 +200,50 @@ def default_config_scan_paths() -> dict[str, Path]:
     same reason: it holds a literal versioned path into the tree wire manages,
     and GC retaining that version is what keeps Desktop launchable.
     """
+    base = Path(home) if home is not None else Path(
+        os.environ.get("HOME") or Path.home()
+    )
     return {
-        "codex": Path("~/.codex/config.toml").expanduser(),
-        "claude-code": Path("~/.claude.json").expanduser(),
-        "claude-code-plugins": Path(
-            "~/.claude/plugins/installed_plugins.json",
-        ).expanduser(),
-        "claude-desktop": Path(
-            "~/Library/Application Support/Claude/claude_desktop_config.json",
-        ).expanduser(),
-        "kilocode": Path("~/.config/kilo/kilo.json").expanduser(),
+        "codex": base / ".codex/config.toml",
+        "codex-hooks": base / ".codex/hooks.json",
+        "codex-skills": base / ".codex/skills/astra-minni/SKILL.md",
+        "claude-code": base / ".claude.json",
+        "claude-code-plugins": base / ".claude/plugins/installed_plugins.json",
+        "claude-marketplace": base / ".claude/local-marketplaces/minni/.claude-plugin/marketplace.json",
+        "claude-desktop": base / "Library/Application Support/Claude/claude_desktop_config.json",
+        "kilocode": base / ".config/kilo/kilo.json",
         # The native Kilo bridge holds a literal versioned hook path. Bulk
         # wiring deliberately preserves a customized bridge while moving the
         # MCP config and wired record to the new root; without this entry GC
         # would prune the payload the still-active native hook loads.
-        "kilocode-bridge": Path("~/.config/kilo/plugin/minni.js").expanduser(),
-        "grok": Path("~/.grok/config.toml").expanduser(),
+        "kilocode-bridge": base / ".config/kilo/plugin/minni.js",
+        "grok": base / ".grok/config.toml",
+        "grok-hooks-minni": base / ".grok/hooks/minni.json",
+        "grok-hooks": base / ".grok/hooks.json",
+        "grok-rules": base / ".grok/rules/minni.md",
         # Gemini/antigravity MCP views hold versioned install paths. D11
         # hard-fail can leave views rewritten without a wired.json row;
         # scan them so GC cannot orphan a live MCP pointer.
-        "gemini-mcp": Path("~/.gemini/config/mcp_config.json").expanduser(),
-        "antigravity-mcp": Path(
-            "~/.gemini/antigravity/mcp_config.json",
-        ).expanduser(),
-        "antigravity-ide-mcp": Path(
-            "~/.gemini/antigravity-ide/mcp_config.json",
-        ).expanduser(),
-        "antigravity-cli-mcp": Path(
-            "~/.gemini/antigravity-cli/plugins/minni/mcp_config.json",
-        ).expanduser(),
+        "gemini-settings": base / ".gemini/settings.json",
+        "gemini-mcp": base / ".gemini/config/mcp_config.json",
+        "antigravity-mcp": base / ".gemini/antigravity/mcp_config.json",
+        "antigravity-ide-mcp": base / ".gemini/antigravity-ide/mcp_config.json",
+        "antigravity-cli-mcp": base / ".gemini/antigravity-cli/plugins/minni/mcp_config.json",
+        "antigravity-hooks": base / ".gemini/config/plugins/minni/hooks.json",
+        "antigravity-view-config": base / ".agents/mcp-servers/views/.gemini__config__mcp_config.json.json",
+        "antigravity-view-agy": base / ".agents/mcp-servers/views/.gemini__antigravity__mcp_config.json.json",
+        "antigravity-view-ide": base / ".agents/mcp-servers/views/.gemini__antigravity-ide__mcp_config.json.json",
+        "antigravity-view-cli": base / ".agents/mcp-servers/views/.gemini__antigravity-cli__plugins__minni__mcp_config.json.json",
+        "cursor-mcp": base / ".cursor/mcp.json",
+        "cursor-launcher": base / ".local/bin/minni-mcp",
+        "cursor-hooks": base / ".cursor/hooks.json",
+        "cursor-hook-wrapper": base / ".cursor/hooks/minni-cursor.sh",
+        "devin-mcp": base / ".config/devin/mcp_config.json",
+        "devin-config": base / ".config/devin/config.json",
+        "devin-hook": base / ".config/devin/scripts/minni-hook.sh",
+        "muse-settings": base / ".config/muse/settings.json",
+        "muse-mcp": base / ".muse/mcp.json",
+        "muse-config": base / ".muse/config.json",
     }
 
 

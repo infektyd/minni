@@ -86,11 +86,8 @@ def _build_manifest_tree(tmp_path: Path) -> tuple[Path, PayloadManifest]:
     dist.mkdir(parents=True)
     server = dist / "server.js"
     server.write_text("ok\n", encoding="utf-8")
-    mcp = root / ".mcp.json"
-    mcp.write_text("{}\n", encoding="utf-8")
     files = {
         "dist/server.js": sha256_file(server),
-        ".mcp.json": sha256_file(mcp),
     }
     manifest = PayloadManifest(
         schema=1,
@@ -115,7 +112,64 @@ def test_verify_manifest_hashes_mismatch(tmp_path):
     assert any("hash mismatch: dist/server.js" in e for e in errors)
 
 
-def test_verify_manifest_hashes_excludes_mcp_json(tmp_path):
+def test_staged_payload_omits_mcp_json_and_strips_claude_plugin_mcp_servers_while_preserving_repo_source(
+    tmp_path, monkeypatch,
+):
+    import json
+    from minni.wire.install import install_payload
+    from minni.wire.manifest import _INSTALL_MUTABLE_PATHS, hash_mismatches
+
+    assert _INSTALL_MUTABLE_PATHS == frozenset({".mcp.json"})
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
     root, manifest = _build_manifest_tree(tmp_path)
-    (root / ".mcp.json").write_text('{"tampered": true}\n', encoding="utf-8")
-    assert verify_manifest_hashes(manifest, root) == []
+    (root / ".mcp.json").write_text('{"mcpServers": {"minni": {"command": "node"}}}\n', encoding="utf-8")
+    cplugin_dir = root / ".claude-plugin"
+    cplugin_dir.mkdir(parents=True, exist_ok=True)
+    cplugin_file = cplugin_dir / "plugin.json"
+    cplugin_file.write_text(
+        json.dumps({"name": "minni", "version": "0.2.0", "mcpServers": {"minni": {"command": "node"}}}) + "\n",
+        encoding="utf-8",
+    )
+    manifest.files[".claude-plugin/plugin.json"] = sha256_file(cplugin_file)
+    (root / "payload-manifest.json").write_text(
+        json.dumps({
+            "schema": manifest.schema,
+            "version": manifest.version,
+            "git_sha": manifest.git_sha,
+            "built_at": manifest.built_at,
+            "node_engine": manifest.node_engine,
+            "files": manifest.files,
+        }, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    res = install_payload(root, "0.2.0", manifest, update_current=False)
+    staged_root = res.install_root
+    assert (staged_root / ".mcp.json").exists() is False
+    assert "mcpServers" not in json.loads(
+        (staged_root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+
+    staged_manifest = PayloadManifest.load(staged_root / "payload-manifest.json")
+    assert verify_manifest_hashes(staged_manifest, staged_root) == []
+    assert hash_mismatches(staged_manifest, staged_root) == []
+
+    # P2-10 regression: a staged plugin.json that still contains mcpServers must fail hash verification
+    (staged_root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": "0.2.0", "mcpServers": {"minni": {"command": "node"}}}) + "\n",
+        encoding="utf-8",
+    )
+    assert any(".claude-plugin/plugin.json" in e for e in verify_manifest_hashes(staged_manifest, staged_root))
+    assert ".claude-plugin/plugin.json" in hash_mismatches(staged_manifest, staged_root)
+
+    repo_root = Path(__file__).resolve().parent.parent
+    assert "mcpServers" in json.loads(
+        (repo_root / "plugins" / "minni" / ".mcp.json").read_text(encoding="utf-8")
+    )
+    assert "mcpServers" in json.loads(
+        (repo_root / "plugins" / "minni" / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
