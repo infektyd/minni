@@ -231,6 +231,7 @@ def _reconcile_all_hosts(
         from_repo=from_repo,
         target_version=target_version,
         dry_run=dry_run,
+        allow_default_repo=(from_repo is not None),
     )
     if outcome.status in ("SKIPPED", "DRY_RUN"):
         return {

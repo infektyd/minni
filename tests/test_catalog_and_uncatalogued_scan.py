@@ -345,3 +345,309 @@ def test_doctor_and_check_scripts_fail_closed_on_daemon_stale_and_host_propagati
         "cursor: host propagation drift" in p and "container_dist_server_js_mismatch" in p
         for p in container_problems
     ), container_problems
+
+
+def test_uncatalogued_scanner_ignores_backups_and_conversations_but_fails_unknown_configs(
+    tmp_path: Path,
+) -> None:
+    """R6 Item 2: Backup, history, conversation, file-history, and worker workspace files
+    referencing .minni/plugin are NOT drift; unknown config-shaped files at host config depths ARE.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    # Seed excluded history, backup, conversation, session, and worker workspace stores referencing .minni/plugin
+    noise_files = [
+        home / ".gemini" / "antigravity" / "brain" / "conv-1" / ".system_generated" / "messages" / "m1.json",
+        home / ".gemini" / "antigravity-cli" / "brain" / "conv-2" / "scratch" / "bench.mjs",
+        home / ".gemini" / "antigravity-ide" / "brain" / "conv-3" / "notes.md",
+        home / ".gemini" / "antigravity-backup" / "mcp_config.json",
+        home / ".gemini" / "tmp" / "user" / "chats" / "session-1.json",
+        home / ".agents" / "backups" / "20260520-085707" / ".gemini__config__mcp_config.json",
+        home / ".codex" / "muse-code-worker" / "e3fd8d37" / "workspace" / "eval" / "public_repo.json",
+        home / ".codex" / "grok-build-peer" / "970c9701" / "workspace" / "contract.md",
+        home / ".codex" / "backups" / "20260925" / "config.toml",
+        home / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions" / "a" / "b" / "local_1.json",
+        home / "Library" / "Application Support" / "Claude" / "claude-code-sessions" / "a" / "b" / "local_2.json",
+        home / ".claude" / "file-history" / "fc405a96" / "5782a9a8@v24",
+        home / ".claude" / "backups" / "2026-09-24" / "installed_plugins.json",
+        home / ".grok" / "memory-v2" / "workspaces" / "w1" / "topics" / "topic.md",
+        home / ".grok" / "scratch" / "audit" / "ledger.md",
+        home / ".cursor" / "plans" / "rewrite.plan.md",
+        home / ".cursor" / "legacy-plugins" / "minni-old" / "skills" / "s" / "SKILL.md",
+    ]
+    for nf in noise_files:
+        nf.parent.mkdir(parents=True, exist_ok=True)
+        nf.write_text(json.dumps({"ref": stale_ref}), encoding="utf-8")
+
+    # Converge the catalogued surfaces on home so only uncatalogued refs could fail health
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    assert scan_for_uncatalogued_plugin_refs(home) == []
+    clean_report = audit_host_propagation_health(home=home, expected_git_sha=sha)
+    assert clean_report.ok is True, clean_report.to_dict()
+    assert clean_report.uncatalogued_refs == []
+
+    # Now plant unknown config-shaped files at host config depths -> MUST fail closed
+    unknown_json = home / ".gemini" / "unknown_mcp_config.json"
+    unknown_toml = home / ".codex" / "rogue_config.toml"
+    unknown_skill = home / ".codex" / "skills" / "rogue-minni-skill" / "SKILL.md"
+    for uf in (unknown_json, unknown_toml, unknown_skill):
+        uf.parent.mkdir(parents=True, exist_ok=True)
+        uf.write_text(f"# config referencing {stale_ref}\n", encoding="utf-8")
+
+    hits = scan_for_uncatalogued_plugin_refs(home)
+    hit_paths = {Path(h["path"]) for h in hits}
+    assert unknown_json in hit_paths, hits
+    assert unknown_toml in hit_paths, hits
+    assert unknown_skill in hit_paths, hits
+    for nf in noise_files:
+        assert nf not in hit_paths
+
+    dirty_report = audit_host_propagation_health(home=home, expected_git_sha=sha)
+    assert dirty_report.ok is False
+    assert {Path(h["path"]) for h in dirty_report.uncatalogued_refs} >= {
+        unknown_json,
+        unknown_toml,
+        unknown_skill,
+    }
+
+
+def test_r7_scanner_denylist_narrowing_symlinks_and_unreadable_or_oversized_findings(
+    tmp_path: Path,
+) -> None:
+    """R7 Input 1 (P1 & P3):
+    - P1: Scanner deny-list only denies data-store subtrees (brain, conversations, file-history,
+      backups, muse-code-worker, session stores); keeps mcp_config.json siblings (~/.gemini/antigravity,
+      ~/.gemini/antigravity-ide), workflows/, and projects/ scannable; follows symlinks that resolve to
+      config-shaped files.
+    - P3: Unreadable config files and config files over the size cap are reported as findings, not silent skips.
+    """
+    import os
+    from minni.wire.health import _MAX_SCAN_FILE_BYTES
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    # 1. Previously hidden config roots (~/.gemini/antigravity, -ide, workflows, projects) are now scannable
+    ag_sibling = home / ".gemini" / "antigravity" / "extra_mcp_config.json"
+    ag_ide_sibling = home / ".gemini" / "antigravity-ide" / "extra_mcp_config.json"
+    agents_workflow = home / ".agents" / "workflows" / "plan.md"
+    grok_workflow = home / ".grok" / "workflows" / "deploy.md"
+    claude_project_cfg = home / ".claude" / "projects" / "demo" / "mcp.json"
+
+    for p in (ag_sibling, ag_ide_sibling, agents_workflow, grok_workflow, claude_project_cfg):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f'{{"ref": "{stale_ref}"}}\n', encoding="utf-8")
+
+    # 2. Symlink resolving to an external config-shaped file referencing .minni/plugin is followed
+    external_dir = tmp_path / "external_configs"
+    external_dir.mkdir(parents=True, exist_ok=True)
+    external_cfg = external_dir / "shared_mcp.json"
+    external_cfg.write_text(f'{{"mcpServers": {{"minni": "{stale_ref}"}}}}\n', encoding="utf-8")
+    symlink_cfg = home / ".gemini" / "antigravity" / "linked_mcp.json"
+    os.symlink(external_cfg, symlink_cfg)
+
+    # Symlink to a directory containing a config-shaped file is also followed (cycle-safe)
+    external_subdir = external_dir / "linked_workflows"
+    external_subdir.mkdir(parents=True, exist_ok=True)
+    linked_wf_file = external_subdir / "sync.md"
+    linked_wf_file.write_text(f"Run `{stale_ref}`\n", encoding="utf-8")
+    symlink_dir = home / ".agents" / "workflows" / "external"
+    os.symlink(external_subdir, symlink_dir)
+
+    # 3. Unreadable config-shaped file and oversized config-shaped file (> 2 MiB) are reported as findings
+    unreadable_cfg = home / ".codex" / "unreadable_config.toml"
+    unreadable_cfg.parent.mkdir(parents=True, exist_ok=True)
+    unreadable_cfg.write_text("# secret\n", encoding="utf-8")
+    unreadable_cfg.chmod(0o000)
+
+    oversized_cfg = home / ".gemini" / "oversized_mcp.json"
+    oversized_cfg.parent.mkdir(parents=True, exist_ok=True)
+    oversized_cfg.write_bytes(b" " * (_MAX_SCAN_FILE_BYTES + 1024))
+
+    try:
+        findings = scan_for_uncatalogued_plugin_refs(home)
+        by_path = {Path(f["path"]): f for f in findings}
+
+        for expected_p in (
+            ag_sibling,
+            ag_ide_sibling,
+            agents_workflow,
+            grok_workflow,
+            claude_project_cfg,
+            symlink_cfg,
+            symlink_dir / "sync.md",
+        ):
+            assert expected_p in by_path, f"Missing expected scan hit for {expected_p}: {findings}"
+            assert by_path[expected_p]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert unreadable_cfg in by_path, f"Missing unreadable config finding: {findings}"
+        assert by_path[unreadable_cfg]["reason"] == "unreadable_config_file"
+
+        assert oversized_cfg in by_path, f"Missing oversized config finding: {findings}"
+        assert by_path[oversized_cfg]["reason"] == "config_file_exceeds_size_cap"
+
+        report = audit_host_propagation_health(home=home, expected_git_sha=sha)
+        assert report.ok is False
+    finally:
+        unreadable_cfg.chmod(0o600)
+
+
+def test_r8_scanner_prefix_only_denylist_scans_extensions_cache_node_modules_and_reports_unreadable_dirs(
+    tmp_path: Path,
+) -> None:
+    """R8 P2: Deny data stores by HOME-RELATIVE PREFIX, not directory name.
+    extensions/, cache/ and node_modules/ under host config roots stay scannable unless an
+    explicit prefix lists them (~/.cursor/extensions/**, ~/.claude/plugins/cache/** etc.
+    may hold launch files). Unreadable directories become findings.
+    """
+    from minni.wire.health import UNCATALOGUED_SCAN_DENYLIST_DIRS
+
+    assert UNCATALOGUED_SCAN_DENYLIST_DIRS == frozenset(), (
+        "Scanner must deny data stores by home-relative prefix, not directory name"
+    )
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    cursor_ext = home / ".cursor" / "extensions" / "custom.minni-ext-1.0.0" / "package.json"
+    ag_ext = home / ".gemini" / "antigravity" / "extensions" / "minni-helper" / "mcp.json"
+    ag_ide_ext = home / ".gemini" / "antigravity-ide" / "extensions" / "minni-helper" / "mcp.json"
+    claude_cache_launch = (
+        home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0" / ".claude-plugin" / "plugin.json"
+    )
+    kilo_nm_launch = home / ".config" / "kilo" / "node_modules" / "minni-launcher" / "package.json"
+
+    for p in (cursor_ext, ag_ext, ag_ide_ext, claude_cache_launch, kilo_nm_launch):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f'{{"launch": "{stale_ref}"}}\n', encoding="utf-8")
+
+    unreadable_dir = home / ".claude" / "locked_config_subdir"
+    unreadable_dir.mkdir(parents=True, exist_ok=True)
+    (unreadable_dir / "hidden.json").write_text(f'{{"ref": "{stale_ref}"}}\n', encoding="utf-8")
+    unreadable_dir.chmod(0o000)
+
+    try:
+        findings = scan_for_uncatalogued_plugin_refs(home)
+        by_path = {Path(f["path"]): f for f in findings}
+
+        for expected_p in (cursor_ext, ag_ext, ag_ide_ext, claude_cache_launch, kilo_nm_launch):
+            assert expected_p in by_path, f"Expected launch file under {expected_p} to be scanned: {findings}"
+            assert by_path[expected_p]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert unreadable_dir in by_path, f"Expected unreadable directory {unreadable_dir} to be a finding: {findings}"
+        assert by_path[unreadable_dir]["reason"] == "unreadable_config_dir"
+    finally:
+        unreadable_dir.chmod(0o700)
+
+
+def test_r9_unreadable_scan_root_eacces_and_plugins_cache_skill_md_config_shaped(
+    tmp_path: Path,
+) -> None:
+    """R9 Items 2 & 3:
+    - Item 2 (P2): An unreadable scan root (EACCES on lstat, e.g. under a chmod 000 dir in HOME)
+      must be a finding (`unreadable_config_dir`), not skipped.
+    - Item 3 (P3): `SKILL.md` and `.md` skill copies under `plugins/**/cache/**` are config-shaped.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    # Item 3: SKILL.md and .md skill copies under plugins/**/cache/**
+    claude_cache_skill = (
+        home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0" / "skills" / "minni" / "SKILL.md"
+    )
+    codex_cache_skill_doc = (
+        home / ".codex" / "plugins" / "cache" / "minni" / "minni" / "0.3.0" / "skills" / "minni" / "guide.md"
+    )
+    for p in (claude_cache_skill, codex_cache_skill_doc):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"# Skill\nRun `{stale_ref}`\n", encoding="utf-8")
+
+    # Item 2: chmod 000 on ~/.config so lstat on scan roots ~/.config/kilo, ~/.config/muse, ~/.config/devin
+    # fails with kernel EACCES, AND chmod 000 on ~/.grok scan root itself.
+    (home / ".config" / "kilo").mkdir(parents=True, exist_ok=True)
+    (home / ".grok").mkdir(parents=True, exist_ok=True)
+    (home / ".config").chmod(0o000)
+    (home / ".grok").chmod(0o000)
+
+    try:
+        findings = scan_for_uncatalogued_plugin_refs(home)
+        by_path = {Path(f["path"]): f for f in findings}
+
+        assert claude_cache_skill in by_path, f"Missing claude cache SKILL.md finding: {findings}"
+        assert by_path[claude_cache_skill]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert codex_cache_skill_doc in by_path, f"Missing codex cache .md skill finding: {findings}"
+        assert by_path[codex_cache_skill_doc]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert (home / ".config" / "kilo") in by_path, f"Missing EACCES lstat scan root finding: {findings}"
+        assert by_path[home / ".config" / "kilo"]["reason"] == "unreadable_config_dir"
+
+        assert (home / ".grok") in by_path, f"Missing chmod 000 scan root finding: {findings}"
+        assert by_path[home / ".grok"]["reason"] == "unreadable_config_dir"
+    finally:
+        (home / ".config").chmod(0o700)
+        (home / ".grok").chmod(0o700)

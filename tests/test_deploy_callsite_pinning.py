@@ -218,10 +218,18 @@ def test_lockfile_and_running_process_guards_defer_with_exit_3_before_any_byte_c
 
     _, v2, v2_sha = _seed_full_9_host_fleet(fake_home)
 
-    # Create active lockfiles for claude-code, grok-build, and muse
-    (fake_home / ".claude.json.tmp.99999").write_text("in-flight", encoding="utf-8")
-    (fake_home / ".grok" / ".config.toml.lock").write_text("locked", encoding="utf-8")
-    (fake_home / ".config" / "muse" / ".settings.json.lock").write_text("locked", encoding="utf-8")
+    import fcntl
+
+    # Create active lockfiles for claude-code (tmp_pid), grok-build (flock), and muse (flock)
+    (fake_home / f".claude.json.tmp.{os.getpid()}").write_text("in-flight", encoding="utf-8")
+    grok_lock = fake_home / ".grok" / ".config.toml.lock"
+    muse_lock = fake_home / ".config" / "muse" / ".settings.json.lock"
+    grok_lock.write_text("locked", encoding="utf-8")
+    muse_lock.write_text("locked", encoding="utf-8")
+    grok_lock_fd = os.open(str(grok_lock), os.O_RDWR)
+    muse_lock_fd = os.open(str(muse_lock), os.O_RDWR)
+    fcntl.flock(grok_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(muse_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     protected_paths = {
         "claude-code": fake_home / ".claude.json",
@@ -231,12 +239,18 @@ def test_lockfile_and_running_process_guards_defer_with_exit_3_before_any_byte_c
     }
     before_bytes = {h: p.read_bytes() for h, p in protected_paths.items()}
 
-    outcome = execute_atomic_cutover(
-        home=fake_home,
-        target_version=v2,
-        target_git_sha=v2_sha,
-        running_hosts={"devin"},
-    )
+    try:
+        outcome = execute_atomic_cutover(
+            home=fake_home,
+            target_version=v2,
+            target_git_sha=v2_sha,
+            running_hosts={"devin"},
+        )
+    finally:
+        fcntl.flock(grok_lock_fd, fcntl.LOCK_UN)
+        os.close(grok_lock_fd)
+        fcntl.flock(muse_lock_fd, fcntl.LOCK_UN)
+        os.close(muse_lock_fd)
     assert outcome.exit_code == 3
     assert outcome.status == "DEFERRED_RUNNING_HOST_DELTA"
     for h, p in protected_paths.items():
@@ -380,16 +394,25 @@ def test_fleet_sync_and_update_root_stop_on_cutover_exit_1_or_3_without_continui
     assert "propagate.py" not in logged1
 
     # 3b. Cutover exit 3 (locked muse host): update_root.sh must exit 3, name muse + path, and stop before custom_refresh/propagate
+    import fcntl
+
     _seed_full_9_host_fleet(fake_home)
-    (fake_home / ".config" / "muse" / ".settings.json.lock").write_text("locked", encoding="utf-8")
+    muse_lock_3b = fake_home / ".config" / "muse" / ".settings.json.lock"
+    muse_lock_3b.write_text("locked", encoding="utf-8")
+    muse_lock_3b_fd = os.open(str(muse_lock_3b), os.O_RDWR)
+    fcntl.flock(muse_lock_3b_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     call_log.write_text("", encoding="utf-8")
-    proc3 = subprocess.run(
-        ["bash", str(REPO / "scripts" / "update_root.sh"), "--repo", str(tmp_repo)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    try:
+        proc3 = subprocess.run(
+            ["bash", str(REPO / "scripts" / "update_root.sh"), "--repo", str(tmp_repo)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        fcntl.flock(muse_lock_3b_fd, fcntl.LOCK_UN)
+        os.close(muse_lock_3b_fd)
     assert proc3.returncode == 3, (proc3.stdout, proc3.stderr)
     assert "muse" in proc3.stderr and str(fake_home / ".config" / "muse" / ".settings.json.lock") in proc3.stderr
     logged3 = call_log.read_text(encoding="utf-8")
@@ -402,7 +425,7 @@ def test_fleet_sync_and_update_root_stop_on_cutover_exit_1_or_3_without_continui
     from minni.wire.health import audit_host_propagation_health
     from minni.wire.registry import HOST_SURFACE_CATALOG
 
-    (fake_home / ".config" / "muse" / ".settings.json.lock").unlink()
+    muse_lock_3b.unlink()
     call_log.write_text("", encoding="utf-8")
     proc_clean = subprocess.run(
         ["bash", str(REPO / "scripts" / "update_root.sh"), "--repo", str(tmp_repo)],

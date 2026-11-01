@@ -42,8 +42,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -z "$REPO" ]; then
-  REPO="$(cd "$(dirname "$0")/.." && pwd)"
+  REPO="$SCRIPT_ROOT"
 fi
 cd "$REPO"
 
@@ -71,96 +72,99 @@ refuse() { printf 'update-root: REFUSING: %s\n' "$*" >&2; exit 1; }
 # dir aside (atomic rename), verify the moved pid was still dead/empty, then
 # claim and re-read `$LOCKDIR/pid` must equal `$$`. EXIT releases only if we
 # still own the lock (so concurrent reclaimers cannot wipe a winner).
-LOCKDIR="${MINNI_SYNC_LOCKDIR:-$HOME/.minni/run/sync-root.lockdir}"
-# Token written into the lock so a reused PID that is *not* this script does
-# not brick unattended sync forever (kill -0 alone is insufficient).
-_LOCK_MARKER="update_root.sh"
-mkdir -p "$(dirname "$LOCKDIR")"
-_claim_lock() {
-  if mkdir "$LOCKDIR" 2>/dev/null; then
-    printf '%s\n' "$$" >"$LOCKDIR/pid"
-    printf '%s\n' "$_LOCK_MARKER" >"$LOCKDIR/cmd"
-    return 0
-  fi
-  return 1
-}
-_own_lock() {
-  [ -f "$LOCKDIR/pid" ] || return 1
-  [ "$(cat "$LOCKDIR/pid" 2>/dev/null || true)" = "$$" ]
-}
-_release_lock() {
-  if _own_lock; then
-    rm -rf "$LOCKDIR" 2>/dev/null || true
-  fi
-}
-# True when pid is alive *and* looks like a real sync-root holder.
-# A live PID whose argv is not update_root.sh is treated as PID reuse (stale).
-_lock_holder_is_live_sync() {
-  local pid="$1"
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  # Prefer the marker we wrote; fall back to ps argv fingerprint.
-  local marker
-  marker="$(cat "$LOCKDIR/cmd" 2>/dev/null || true)"
-  if [ -n "$marker" ] && [ "$marker" != "$_LOCK_MARKER" ]; then
+# Under --dry-run, take no lock directory (zero writes under --dry-run).
+if [ "$DRY_RUN" != 1 ]; then
+  LOCKDIR="${MINNI_SYNC_LOCKDIR:-$HOME/.minni/run/sync-root.lockdir}"
+  # Token written into the lock so a reused PID that is *not* this script does
+  # not brick unattended sync forever (kill -0 alone is insufficient).
+  _LOCK_MARKER="update_root.sh"
+  mkdir -p "$(dirname "$LOCKDIR")"
+  _claim_lock() {
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+      printf '%s\n' "$$" >"$LOCKDIR/pid"
+      printf '%s\n' "$_LOCK_MARKER" >"$LOCKDIR/cmd"
+      return 0
+    fi
     return 1
-  fi
-  local cmd
-  # portable: macOS/BSD and Linux both accept -p/-o command=
-  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  case "$cmd" in
-    *update_root.sh*|*sync-root*) return 0 ;;
-    "")
-      # ps failed (permission / race): if marker matches and pid lives, assume holder
-      [ "$marker" = "$_LOCK_MARKER" ]
-      return $?
-      ;;
-    *) return 1 ;;
-  esac
-}
-if ! _claim_lock; then
-  old_pid=""
-  if [ -f "$LOCKDIR/pid" ]; then
-    old_pid="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
-  fi
-  if _lock_holder_is_live_sync "$old_pid"; then
-    refuse "another sync-root is already running (pid $old_pid, lock $LOCKDIR)"
-  fi
-  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-    echo "update-root: reclaiming stale sync lock (pid $old_pid live but not update_root.sh — PID reuse) at $LOCKDIR" >&2
-  else
-    echo "update-root: reclaiming stale sync lock${old_pid:+ (dead pid $old_pid)} at $LOCKDIR" >&2
-  fi
-  # Atomic rename beats rm-then-mkdir: only one reclaimer moves the dir;
-  # the other either claims the free name or sees the winner's live pid.
-  stale_bak="${LOCKDIR}.reclaim.$$"
-  if [ -d "$LOCKDIR" ]; then
-    if mv "$LOCKDIR" "$stale_bak" 2>/dev/null; then
-      moved_pid="$(cat "$stale_bak/pid" 2>/dev/null || true)"
-      # If we accidentally moved a live holder's lock (TOCTOU after the
-      # kill -0 check), put it back and refuse.
-      if [ -n "$moved_pid" ] && [ "$moved_pid" != "$$" ]; then
-        # Temporarily restore path so _lock_holder_is_live_sync can read marker
-        if mv "$stale_bak" "$LOCKDIR" 2>/dev/null; then
-          if _lock_holder_is_live_sync "$moved_pid"; then
-            refuse "another sync-root is already running (pid $moved_pid, lock $LOCKDIR)"
+  }
+  _own_lock() {
+    [ -f "$LOCKDIR/pid" ] || return 1
+    [ "$(cat "$LOCKDIR/pid" 2>/dev/null || true)" = "$$" ]
+  }
+  _release_lock() {
+    if _own_lock; then
+      rm -rf "$LOCKDIR" 2>/dev/null || true
+    fi
+  }
+  # True when pid is alive *and* looks like a real sync-root holder.
+  # A live PID whose argv is not update_root.sh is treated as PID reuse (stale).
+  _lock_holder_is_live_sync() {
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    # Prefer the marker we wrote; fall back to ps argv fingerprint.
+    local marker
+    marker="$(cat "$LOCKDIR/cmd" 2>/dev/null || true)"
+    if [ -n "$marker" ] && [ "$marker" != "$_LOCK_MARKER" ]; then
+      return 1
+    fi
+    local cmd
+    # portable: macOS/BSD and Linux both accept -p/-o command=
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$cmd" in
+      *update_root.sh*|*sync-root*) return 0 ;;
+      "")
+        # ps failed (permission / race): if marker matches and pid lives, assume holder
+        [ "$marker" = "$_LOCK_MARKER" ]
+        return $?
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  if ! _claim_lock; then
+    old_pid=""
+    if [ -f "$LOCKDIR/pid" ]; then
+      old_pid="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+    fi
+    if _lock_holder_is_live_sync "$old_pid"; then
+      refuse "another sync-root is already running (pid $old_pid, lock $LOCKDIR)"
+    fi
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      echo "update-root: reclaiming stale sync lock (pid $old_pid live but not update_root.sh — PID reuse) at $LOCKDIR" >&2
+    else
+      echo "update-root: reclaiming stale sync lock${old_pid:+ (dead pid $old_pid)} at $LOCKDIR" >&2
+    fi
+    # Atomic rename beats rm-then-mkdir: only one reclaimer moves the dir;
+    # the other either claims the free name or sees the winner's live pid.
+    stale_bak="${LOCKDIR}.reclaim.$$"
+    if [ -d "$LOCKDIR" ]; then
+      if mv "$LOCKDIR" "$stale_bak" 2>/dev/null; then
+        moved_pid="$(cat "$stale_bak/pid" 2>/dev/null || true)"
+        # If we accidentally moved a live holder's lock (TOCTOU after the
+        # kill -0 check), put it back and refuse.
+        if [ -n "$moved_pid" ] && [ "$moved_pid" != "$$" ]; then
+          # Temporarily restore path so _lock_holder_is_live_sync can read marker
+          if mv "$stale_bak" "$LOCKDIR" 2>/dev/null; then
+            if _lock_holder_is_live_sync "$moved_pid"; then
+              refuse "another sync-root is already running (pid $moved_pid, lock $LOCKDIR)"
+            fi
+            # Not a real holder — re-move and reclaim
+            mv "$LOCKDIR" "$stale_bak" 2>/dev/null || true
           fi
-          # Not a real holder — re-move and reclaim
-          mv "$LOCKDIR" "$stale_bak" 2>/dev/null || true
         fi
+        rm -rf "$stale_bak" 2>/dev/null || true
       fi
-      rm -rf "$stale_bak" 2>/dev/null || true
+    fi
+    if ! _claim_lock; then
+      refuse "another sync-root is already running (lock $LOCKDIR)"
+    fi
+    if ! _own_lock; then
+      refuse "failed to confirm sync lock ownership at $LOCKDIR"
     fi
   fi
-  if ! _claim_lock; then
-    refuse "another sync-root is already running (lock $LOCKDIR)"
-  fi
-  if ! _own_lock; then
-    refuse "failed to confirm sync lock ownership at $LOCKDIR"
-  fi
+  # shellcheck disable=SC2064
+  trap '_release_lock' EXIT INT TERM
 fi
-# shellcheck disable=SC2064
-trap '_release_lock' EXIT INT TERM
 
 VENV_PY="$REPO/.venv/bin/python"
 [ -x "$VENV_PY" ] || VENV_PY="python3"
@@ -169,13 +173,6 @@ say "sync $REPO -> origin/main$([ "$DRY_RUN" = 1 ] && echo '  [DRY RUN]')"
 
 # ── 1. fetch + fast-forward, refusing to touch local state ───────────────────
 say "step 1/6: git fetch + fast-forward"
-# fetch runs even under --dry-run: it only updates remote-tracking refs (never
-# the local branch or worktree), and without it the LOCAL/REMOTE comparison
-# below reads stale refs — a behind clone would print a plan that omits the
-# merge step entirely.
-printf 'running:   git fetch origin\n'
-git fetch origin
-
 if [ -n "$(git status --porcelain)" ]; then
   git status --short >&2
   refuse "working tree is dirty — commit, stash, or clean it first"
@@ -186,14 +183,33 @@ if [ "$BRANCH" != "main" ]; then
   refuse "checkout is on branch '$BRANCH', not main — switch branches yourself"
 fi
 
-LOCAL="$(git rev-parse HEAD)"
-REMOTE="$(git rev-parse origin/main)"
-if [ "$LOCAL" = "$REMOTE" ]; then
-  echo "already at origin/main ($(git rev-parse --short HEAD)) — continuing to redeploy/verify (idempotent)"
-elif [ "$(git merge-base HEAD origin/main)" != "$LOCAL" ]; then
-  refuse "local main has commits origin/main lacks (diverged) — reconcile yourself; this script never rewrites local history"
+if [ "$DRY_RUN" = 1 ]; then
+  # R8 P3: `--dry-run` must NOT run `git fetch` (no ref writes); it plans
+  # against the local HEAD and says so.
+  echo "dry-run: skipping git fetch (no ref writes); planning against local HEAD ($(git rev-parse --short HEAD))"
+  act git fetch origin
+  LOCAL="$(git rev-parse HEAD)"
+  REMOTE="$(git rev-parse origin/main 2>/dev/null || echo "$LOCAL")"
+  if [ "$LOCAL" = "$REMOTE" ]; then
+    echo "already at origin/main ($(git rev-parse --short HEAD)) — continuing to redeploy/verify (idempotent)"
+  elif [ "$(git merge-base HEAD origin/main)" != "$LOCAL" ]; then
+    refuse "local main has commits origin/main lacks (diverged) — reconcile yourself; this script never rewrites local history"
+  else
+    act git merge --ff-only origin/main
+  fi
 else
-  act git merge --ff-only origin/main
+  printf 'running:   git fetch origin\n'
+  git fetch origin
+
+  LOCAL="$(git rev-parse HEAD)"
+  REMOTE="$(git rev-parse origin/main)"
+  if [ "$LOCAL" = "$REMOTE" ]; then
+    echo "already at origin/main ($(git rev-parse --short HEAD)) — continuing to redeploy/verify (idempotent)"
+  elif [ "$(git merge-base HEAD origin/main)" != "$LOCAL" ]; then
+    refuse "local main has commits origin/main lacks (diverged) — reconcile yourself; this script never rewrites local history"
+  else
+    act git merge --ff-only origin/main
+  fi
 fi
 
 # ── 2. dependency + editable install refresh ─────────────────────────────────
@@ -290,13 +306,21 @@ else:
   fi
 fi
 # Execute 7-step atomic cutover and per-host reconciliation BEFORE custom_refresh and propagate (P1-2, P1-5).
+_CUTOVER_PY="$VENV_PY"
+if [ ! -x "$_CUTOVER_PY" ] && [ -x "$SCRIPT_ROOT/.venv/bin/python" ]; then
+  _CUTOVER_PY="$SCRIPT_ROOT/.venv/bin/python"
+fi
 if [ "$DRY_RUN" = 1 ]; then
-  act "$VENV_PY" -m minni.wire.cutover --repo "$REPO" --dry-run
+  printf 'running:   %s -m minni.wire.cutover --repo %s --dry-run\n' "$_CUTOVER_PY" "$REPO"
+  PYTHONPATH="$REPO/src:$SCRIPT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+    "$_CUTOVER_PY" -m minni.wire.cutover --repo "$REPO" \
+    ${MINNI_CHECK_VERSIONS_HOME:+--home "$MINNI_CHECK_VERSIONS_HOME"} --dry-run
 else
   printf 'running:   %s -m minni.wire.cutover --repo %s --apply\n' "$VENV_PY" "$REPO"
   _CUTOVER_JSON="$(mktemp "${TMPDIR:-/tmp}/minni-cutover.XXXXXX")"
   _CUTOVER_RC=0
-  "$VENV_PY" -m minni.wire.cutover --repo "$REPO" --apply >"$_CUTOVER_JSON" || _CUTOVER_RC=$?
+  PYTHONPATH="$REPO/src:$SCRIPT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+    "$VENV_PY" -m minni.wire.cutover --repo "$REPO" --apply >"$_CUTOVER_JSON" || _CUTOVER_RC=$?
   cat "$_CUTOVER_JSON" || true
   if [ "$_CUTOVER_RC" = 3 ]; then
     _CUTOVER_MSG="$("$VENV_PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('message',''))" "$_CUTOVER_JSON" 2>/dev/null || true)"

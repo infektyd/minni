@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,32 +36,97 @@ _SCAN_DIR_RELATIVES: tuple[str, ...] = (
     "Library/Application Support/Claude",
 )
 
-_EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
-    "node_modules",
-    ".git",
-    "Cache",
-    "GPUCache",
-    "Code Cache",
-    "DawnCache",
-    "logs",
-    "projects",
-    "sessions",
-    "shell-snapshots",
-    "statsig",
-    "telemetry",
-    "archive",
-    "crashpad",
-    "blob_storage",
-    "Local Storage",
-    "Session Storage",
-})
+# Scanner denies data stores ONLY by explicit home-relative path prefixes
+# (`UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES`), NEVER by directory name (§4.7 R8 P2).
+# `extensions/`, `cache/`, and `node_modules/` under host config roots stay
+# scannable unless an explicit home-relative prefix lists them.
+UNCATALOGUED_SCAN_DENYLIST_DIRS: frozenset[str] = frozenset()
 
-_EXCLUDED_FILE_NAMES: frozenset[str] = frozenset({
+# Explicit, documented deny-list of home-relative path prefixes for data-store
+# subtrees only (brain, conversations, file-history, backups, muse-code-worker,
+# session stores, Electron/Chromium browser caches) (§4.7 R8 P2).
+UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES: tuple[str, ...] = (
+    ".gemini/antigravity/brain",
+    ".gemini/antigravity/conversations",
+    ".gemini/antigravity/html_artifacts",
+    ".gemini/antigravity/scratch",
+    ".gemini/antigravity/worktrees",
+    ".gemini/antigravity-ide/brain",
+    ".gemini/antigravity-ide/conversations",
+    ".gemini/antigravity-ide/browser_recordings",
+    ".gemini/antigravity-ide/html_artifacts",
+    ".gemini/antigravity-ide/scratch",
+    ".gemini/antigravity-cli/brain",
+    ".gemini/antigravity-cli/conversations",
+    ".gemini/antigravity-cli/scratch",
+    ".gemini/antigravity-backup",
+    ".gemini/antigravity-browser-profile",
+    ".gemini/tmp",
+    ".gemini/history",
+    ".agents/backups",
+    ".agents/archive-20260925-agents-md",
+    ".codex/muse-code-worker",
+    ".codex/grok-build-peer",
+    ".codex/antigravity-peer",
+    ".codex/cursor-peer",
+    ".codex/backups",
+    ".codex/sessions",
+    ".codex/archived_sessions",
+    ".codex/memories",
+    ".codex/memories_v2",
+    ".claude/file-history",
+    ".claude/backups",
+    ".claude/session-env",
+    ".claude/sessions",
+    ".claude/shell-snapshots",
+    ".claude/paste-cache",
+    "Library/Application Support/Claude/local-agent-mode-sessions",
+    "Library/Application Support/Claude/claude-code-sessions",
+    "Library/Application Support/Claude/Cache",
+    "Library/Application Support/Claude/Code Cache",
+    "Library/Application Support/Claude/GPUCache",
+    "Library/Application Support/Claude/GPUPersistentCache",
+    "Library/Application Support/Claude/DawnGraphiteCache",
+    "Library/Application Support/Claude/DawnWebGPUCache",
+    "Library/Application Support/Claude/GraphiteDawnCache",
+    "Library/Application Support/Claude/IndexedDB",
+    "Library/Application Support/Claude/Local Storage",
+    "Library/Application Support/Claude/Session Storage",
+    "Library/Application Support/Claude/WebStorage",
+    "Library/Application Support/Claude/blob_storage",
+    "Library/Application Support/Claude/Crashpad",
+    "Library/Application Support/Claude/Partitions",
+    ".grok/memory",
+    ".grok/memory-v2",
+    ".grok/memtrace",
+    ".grok/sessions",
+    ".grok/relocations",
+    ".grok/scratch",
+    ".grok/worktrees",
+    ".cursor/legacy-plugins",
+    ".cursor/chats",
+    ".cursor/acp-sessions",
+    ".cursor/ai-tracking",
+    ".cursor/browser-logs",
+    ".cursor/plans",
+    ".cursor/worktrees",
+)
+
+UNCATALOGUED_SCAN_DENYLIST_FILES: frozenset[str] = frozenset({
     "history.jsonl",
+    "plugin-directory-cache-v2.json",
     ".DS_Store",
+    "LOCK",
+    "LOG",
+    "Cookies",
+    "Preferences",
 })
 
-_ALLOWED_SCAN_SUFFIXES: frozenset[str] = frozenset({
+_EXCLUDED_DIR_NAMES: frozenset[str] = UNCATALOGUED_SCAN_DENYLIST_DIRS
+_EXCLUDED_FILE_NAMES: frozenset[str] = UNCATALOGUED_SCAN_DENYLIST_FILES
+
+# Known config-file extensions in host config locations
+_CONFIG_FILE_SUFFIXES: frozenset[str] = frozenset({
     ".json",
     ".toml",
     ".yaml",
@@ -69,12 +135,26 @@ _ALLOWED_SCAN_SUFFIXES: frozenset[str] = frozenset({
     ".zsh",
     ".js",
     ".mjs",
-    ".md",
-    "",
 })
 
+_BINARY_MAGIC_PREFIXES: tuple[bytes, ...] = (
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xca\xfe\xba\xbe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\x7fELF",
+)
+
+# Known config depth ceiling relative to each scan root (e.g. ~/.claude/plugins/cache/<mkt>/<pkg>/<ver>/skills/<skill>/SKILL.md is depth 8)
+_DEFAULT_MAX_CONFIG_DEPTH = 10
+_MAX_CONFIG_REL_DEPTH_BY_ROOT: dict[str, int] = {
+    "Library/Application Support/Claude": 4,
+    ".local/bin": 2,
+}
+
 _MAX_SCAN_FILE_BYTES = 2 * 1024 * 1024
-_PLUGIN_REF_RE = re.compile(r"(\.minni/plugin|sovereign-memory)")
+_PLUGIN_REF_RE = re.compile(r"(\.minni/plugin)")
 
 
 def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...]]:
@@ -85,17 +165,9 @@ def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...
         str(home / ".minni" / "archive"),
         str(home / ".agents" / "plugins" / "Minni@Minni"),
         str(home / ".agents" / "plugins" / "minni@minni"),
-        str(home / ".agents" / "skills"),
         str(home / ".cursor" / "plugins" / "local" / "minni"),
-        str(home / ".cursor" / "skills"),
         str(home / ".claude" / "plugins" / "marketplaces" / "minni-local"),
-        str(home / ".claude" / "plugins" / "cache"),
         str(home / ".claude" / "local-marketplaces" / "minni"),
-        str(home / ".claude" / "skills"),
-        str(home / ".codex" / "plugins" / "cache"),
-        str(home / ".codex" / "skills"),
-        str(home / ".gemini" / "skills"),
-        str(home / ".grok" / "skills"),
         str(home / ".config" / "kilo" / "plugins" / "minni"),
     ]
     for hspec in expanded.values():
@@ -125,8 +197,64 @@ def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...
     return exact_paths, tuple(container_prefixes)
 
 
+def _is_denylisted_rel_path(rel_to_home: str) -> bool:
+    norm = rel_to_home.strip("/")
+    for pref in UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES:
+        if norm == pref or norm.startswith(pref + "/"):
+            return True
+    return False
+
+
+def _is_native_binary_file(fpath: Path) -> bool:
+    """Return True if `fpath` starts with Mach-O or ELF executable binary magic bytes."""
+    try:
+        with fpath.open("rb") as f:
+            head = f.read(4)
+        return len(head) == 4 and head.startswith(_BINARY_MAGIC_PREFIXES)
+    except OSError:
+        return False
+
+
+def _is_config_shaped_file(fpath: Path, root_dir: Path, rel_root: str) -> bool:
+    """Return True if `fpath` is a config-shaped file (json/toml/yaml/js/sh/md skill/workflow/rule) at a known config depth."""
+    name = fpath.name
+    if name in UNCATALOGUED_SCAN_DENYLIST_FILES:
+        return False
+    lower_name = name.lower()
+    if lower_name.endswith((".jsonl", ".log", ".bak", ".orig", ".tmp", ".lock", ".sqlite", ".db", ".par", ".headers")):
+        return False
+    if ".backup" in lower_name or ".minni-backup-" in lower_name or lower_name.startswith(".muse-launcher."):
+        return False
+
+    try:
+        rel_parts = fpath.relative_to(root_dir).parts
+    except ValueError:
+        return False
+
+    max_depth = _MAX_CONFIG_REL_DEPTH_BY_ROOT.get(rel_root, _DEFAULT_MAX_CONFIG_DEPTH)
+    if len(rel_parts) > max_depth:
+        return False
+
+    suffix = fpath.suffix.lower()
+    if suffix in _CONFIG_FILE_SUFFIXES:
+        return True
+    if suffix == ".md":
+        parent_dirs = {p.lower() for p in rel_parts[:-1]}
+        return name == "SKILL.md" or bool(parent_dirs & {"skills", "rules", "workflows", "commands"})
+    if suffix == "":
+        parent_dirs = {p.lower() for p in rel_parts[:-1]}
+        if not (rel_root == ".local/bin" or bool(parent_dirs & {"bin", "scripts", "hooks"})):
+            return False
+        if fpath.is_symlink() and not fpath.exists():
+            return "minni" in lower_name
+        if _is_native_binary_file(fpath):
+            return False
+        return True
+    return False
+
+
 def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str, str]]:
-    """Scan host config directories for any uncatalogued file referencing `.minni/plugin` (§4.7)."""
+    """Scan host config directories for any uncatalogued config-shaped file referencing `.minni/plugin` (§4.7)."""
     resolved_home = resolve_home(home)
     exact_paths, container_prefixes = _catalogued_paths_and_prefixes(resolved_home)
     findings: list[dict[str, str]] = []
@@ -146,19 +274,70 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
                 return True
         return False
 
-    def _inspect_file(fpath: Path) -> None:
-        if fpath.name in _EXCLUDED_FILE_NAMES or fpath.name.endswith(".jsonl"):
-            return
-        if fpath.suffix.lower() not in _ALLOWED_SCAN_SUFFIXES:
+    def _is_symlink_to_config_shaped(fpath: Path, root_dir: Path, rel_root: str) -> bool:
+        if not fpath.is_symlink():
+            return False
+        try:
+            resolved_target = fpath.resolve(strict=True)
+        except OSError:
+            return False
+        if not resolved_target.is_file():
+            return False
+        if _is_config_shaped_file(fpath, root_dir, rel_root):
+            return True
+        return _is_config_shaped_file(resolved_target, resolved_target.parent, "")
+
+    def _inspect_file(fpath: Path, root_dir: Path, rel_root: str) -> None:
+        try:
+            rel_to_home = str(fpath.relative_to(resolved_home))
+        except ValueError:
+            rel_to_home = ""
+        if rel_to_home and _is_denylisted_rel_path(rel_to_home):
             return
         if _is_catalogued(fpath):
             return
+        is_cfg = _is_config_shaped_file(fpath, root_dir, rel_root) or _is_symlink_to_config_shaped(
+            fpath, root_dir, rel_root
+        )
+        if not is_cfg:
+            if fpath.is_symlink():
+                try:
+                    link_target = os.readlink(fpath)
+                except OSError:
+                    link_target = ""
+                m_link = _PLUGIN_REF_RE.search(link_target)
+                if m_link:
+                    findings.append({
+                        "path": str(fpath),
+                        "matched": m_link.group(1),
+                        "reason": "uncatalogued_file_references_minni_plugin",
+                    })
+            return
         try:
             st = fpath.stat()
-            if st.st_size > _MAX_SCAN_FILE_BYTES:
-                return
-            text = fpath.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            findings.append({
+                "path": str(fpath),
+                "matched": "<unreadable>",
+                "reason": "unreadable_config_file",
+            })
+            return
+        if st.st_size > _MAX_SCAN_FILE_BYTES:
+            findings.append({
+                "path": str(fpath),
+                "matched": f"<{st.st_size}_bytes>",
+                "reason": "config_file_exceeds_size_cap",
+            })
+            return
+        try:
+            with fpath.open("r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            findings.append({
+                "path": str(fpath),
+                "matched": "<unreadable>",
+                "reason": "unreadable_config_file",
+            })
             return
         m = _PLUGIN_REF_RE.search(text)
         if m:
@@ -170,24 +349,89 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
 
     # Check top-level ~/.claude.json
     claude_top = resolved_home / ".claude.json"
-    if claude_top.is_file():
-        _inspect_file(claude_top)
+    if claude_top.exists() or claude_top.is_symlink():
+        _inspect_file(claude_top, resolved_home, "")
 
     for rel in _SCAN_DIR_RELATIVES:
         root_dir = resolved_home / rel
-        if not root_dir.is_dir():
+        try:
+            os.lstat(root_dir)
+        except FileNotFoundError:
             continue
-        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        except OSError:
+            if not any(f.get("path") == str(root_dir) and f.get("reason") == "unreadable_config_dir" for f in findings):
+                findings.append({
+                    "path": str(root_dir),
+                    "matched": "<unreadable_dir>",
+                    "reason": "unreadable_config_dir",
+                })
+            continue
+        try:
+            root_st = os.stat(root_dir)
+        except OSError:
+            if not any(f.get("path") == str(root_dir) and f.get("reason") == "unreadable_config_dir" for f in findings):
+                findings.append({
+                    "path": str(root_dir),
+                    "matched": "<unreadable_dir>",
+                    "reason": "unreadable_config_dir",
+                })
+            continue
+        if not stat.S_ISDIR(root_st.st_mode):
+            continue
+        max_depth = _MAX_CONFIG_REL_DEPTH_BY_ROOT.get(rel, _DEFAULT_MAX_CONFIG_DEPTH)
+        visited_real_dirs: set[tuple[int, int]] = {(root_st.st_dev, root_st.st_ino)}
+
+        def _on_walk_error(err: OSError, _fallback_root: Path = root_dir) -> None:
+            err_path = str(getattr(err, "filename", None) or _fallback_root)
+            if not any(f.get("path") == err_path and f.get("reason") == "unreadable_config_dir" for f in findings):
+                findings.append({
+                    "path": err_path,
+                    "matched": "<unreadable_dir>",
+                    "reason": "unreadable_config_dir",
+                })
+
+        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=True, onerror=_on_walk_error):
             dp = Path(dirpath)
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _EXCLUDED_DIR_NAMES and not _is_catalogued(dp / d)
-            ]
+            try:
+                cur_depth = len(dp.relative_to(root_dir).parts)
+            except ValueError:
+                cur_depth = 0
+            if cur_depth >= max_depth:
+                dirnames[:] = []
+            else:
+                kept_dirs: list[str] = []
+                for d in dirnames:
+                    cand = dp / d
+                    if _is_catalogued(cand):
+                        continue
+                    try:
+                        cand_rel = str(cand.relative_to(resolved_home))
+                    except ValueError:
+                        cand_rel = ""
+                    if cand_rel and _is_denylisted_rel_path(cand_rel):
+                        continue
+                    if cand.is_symlink() and not cand.exists():
+                        _inspect_file(cand, root_dir, rel)
+                        continue
+                    try:
+                        cst = cand.stat()
+                        key = (cst.st_dev, cst.st_ino)
+                        if key in visited_real_dirs:
+                            continue
+                        visited_real_dirs.add(key)
+                    except OSError:
+                        if not any(f.get("path") == str(cand) and f.get("reason") == "unreadable_config_dir" for f in findings):
+                            findings.append({
+                                "path": str(cand),
+                                "matched": "<unreadable_dir>",
+                                "reason": "unreadable_config_dir",
+                            })
+                        continue
+                    kept_dirs.append(d)
+                dirnames[:] = kept_dirs
             for fn in filenames:
                 fp = dp / fn
-                if fp.is_symlink():
-                    continue
-                _inspect_file(fp)
+                _inspect_file(fp, root_dir, rel)
 
     return findings
 
@@ -539,17 +783,16 @@ def audit_host_propagation_health(
                         actual_target = os.readlink(spath)
                     except OSError:
                         actual_target = ""
+                    cmd_reasons: list[str] = []
                     if actual_target != expected_target:
+                        cmd_reasons.append(f"commands_dir_target_mismatch:{actual_target}!={expected_target}")
+                    if not spath.exists() or not spath.is_dir() or (target is not None and not (target / "commands").is_dir()):
+                        cmd_reasons.append("broken_commands_dir_symlink")
+                    if cmd_reasons:
                         drifted_surfaces.append({
                             "host": host_id,
                             "path": str(spath),
-                            "reasons": [f"commands_dir_target_mismatch:{actual_target}!={expected_target}"],
-                        })
-                    elif not spath.exists():
-                        drifted_surfaces.append({
-                            "host": host_id,
-                            "path": str(spath),
-                            "reasons": ["broken_commands_dir_symlink"],
+                            "reasons": cmd_reasons,
                         })
                 elif spath.exists():
                     drifted_surfaces.append({
@@ -618,6 +861,22 @@ def audit_host_propagation_health(
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": ["stale_or_tilde_in_claude_marketplace"]})
 
     uncatalogued_refs = scan_for_uncatalogued_plugin_refs(resolved_home)
+    if legacy_v1_single_server_js and isinstance(wired_doc, dict):
+        v1_plats = {
+            str(w.get("platform") or "")
+            for w in (wired_doc.get("wires") or [])
+            if isinstance(w, dict)
+        }
+        v1_skip_prefixes: list[str] = []
+        if "claude-code" in v1_plats:
+            v1_skip_prefixes.append(str(resolved_home / ".claude" / "plugins" / "cache") + "/")
+        if "codex" in v1_plats:
+            v1_skip_prefixes.append(str(resolved_home / ".codex" / "plugins" / "cache") + "/")
+        if v1_skip_prefixes:
+            uncatalogued_refs = [
+                r for r in uncatalogued_refs
+                if not any(str(r.get("path") or "").startswith(p) for p in v1_skip_prefixes)
+            ]
     all_running = inspect_running_mcp_servers(
         home=resolved_home,
         target_version=current_version or "",
