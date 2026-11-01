@@ -586,3 +586,68 @@ def test_r8_scanner_prefix_only_denylist_scans_extensions_cache_node_modules_and
         assert by_path[unreadable_dir]["reason"] == "unreadable_config_dir"
     finally:
         unreadable_dir.chmod(0o700)
+
+
+def test_r9_unreadable_scan_root_eacces_and_plugins_cache_skill_md_config_shaped(
+    tmp_path: Path,
+) -> None:
+    """R9 Items 2 & 3:
+    - Item 2 (P2): An unreadable scan root (EACCES on lstat, e.g. under a chmod 000 dir in HOME)
+      must be a finding (`unreadable_config_dir`), not skipped.
+    - Item 3 (P3): `SKILL.md` and `.md` skill copies under `plugins/**/cache/**` are config-shaped.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    # Item 3: SKILL.md and .md skill copies under plugins/**/cache/**
+    claude_cache_skill = (
+        home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0" / "skills" / "minni" / "SKILL.md"
+    )
+    codex_cache_skill_doc = (
+        home / ".codex" / "plugins" / "cache" / "minni" / "minni" / "0.3.0" / "skills" / "minni" / "guide.md"
+    )
+    for p in (claude_cache_skill, codex_cache_skill_doc):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"# Skill\nRun `{stale_ref}`\n", encoding="utf-8")
+
+    # Item 2: chmod 000 on ~/.config so lstat on scan roots ~/.config/kilo, ~/.config/muse, ~/.config/devin
+    # fails with kernel EACCES, AND chmod 000 on ~/.grok scan root itself.
+    (home / ".config" / "kilo").mkdir(parents=True, exist_ok=True)
+    (home / ".grok").mkdir(parents=True, exist_ok=True)
+    (home / ".config").chmod(0o000)
+    (home / ".grok").chmod(0o000)
+
+    try:
+        findings = scan_for_uncatalogued_plugin_refs(home)
+        by_path = {Path(f["path"]): f for f in findings}
+
+        assert claude_cache_skill in by_path, f"Missing claude cache SKILL.md finding: {findings}"
+        assert by_path[claude_cache_skill]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert codex_cache_skill_doc in by_path, f"Missing codex cache .md skill finding: {findings}"
+        assert by_path[codex_cache_skill_doc]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert (home / ".config" / "kilo") in by_path, f"Missing EACCES lstat scan root finding: {findings}"
+        assert by_path[home / ".config" / "kilo"]["reason"] == "unreadable_config_dir"
+
+        assert (home / ".grok") in by_path, f"Missing chmod 000 scan root finding: {findings}"
+        assert by_path[home / ".grok"]["reason"] == "unreadable_config_dir"
+    finally:
+        (home / ".config").chmod(0o700)
+        (home / ".grok").chmod(0o700)

@@ -1920,19 +1920,19 @@ def test_r8_flock_probe_fail_closed_on_open_flock_errors_non_regular_and_timeout
     sym_lock.symlink_to(reg)
     assert _is_flock_held(sym_lock) is True
 
-    # 4. Hung filesystem / dead mount exceeding probe timeout returns True within time bound
-    real_lstat = os.lstat
+    # 4. Probe runs in-process without spawning a worker thread
+    import threading
+    seen_threads: list[threading.Thread] = []
+    real_open2 = os.open
 
-    def _slow_lstat(path):
-        if str(path) == str(reg):
-            time.sleep(2.0)
-        return real_lstat(path)
+    def _track_thread_open(path, flags, *args, **kwargs):
+        seen_threads.append(threading.current_thread())
+        return real_open2(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(os, "lstat", _slow_lstat)
-    t0 = time.monotonic()
-    assert cutover_mod._is_flock_held(reg, timeout_s=0.1) is True
-    assert (time.monotonic() - t0) < 1.0
-    monkeypatch.setattr(os, "lstat", real_lstat)
+    monkeypatch.setattr(os, "open", _track_thread_open)
+    assert cutover_mod._is_flock_held(reg) is False
+    assert seen_threads and all(t is threading.main_thread() for t in seen_threads)
+    monkeypatch.setattr(os, "open", real_open2)
 
 
 def test_r8_dry_run_staging_failure_and_esbuild_nonzero_fail_closed(
@@ -1965,8 +1965,8 @@ def test_r8_dry_run_staging_failure_and_esbuild_nonzero_fail_closed(
         running_hosts=set(),
     )
     assert out.exit_code != 0, f"dry-run must fail when staging fails, got: {out}"
-    assert "payload_staging_failed" in out.message
-    assert "simulated esbuild/staging explosion" in out.message
+    assert out.message == "payload_staging_failed: RuntimeError"
+    assert "simulated esbuild/staging explosion" not in out.message
 
     # Also test _build_dry_run_plan directly when vdir does not exist and staging fails
     out_plan = execute_atomic_cutover(
@@ -2122,3 +2122,194 @@ def test_r8_tmp_lock_without_pid_open_process_check_and_grok_dot_lock_probe(
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+def test_r9_flock_probe_in_process_child_holder_reacquirable_and_fifo(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R9 Item 1 (P2):
+    - No worker thread in _is_flock_held.
+    - Child process holds flock -> probe says held (True) without blocking.
+    - No holder -> probe says not held (False), and lock is free afterwards (re-acquirable at once), fd closed.
+    - FIFO at lock path -> probe says held (True) without blocking.
+    """
+    import fcntl
+    import subprocess
+    import sys
+    import threading
+    import time
+    from minni.wire.cutover import _is_flock_held
+
+    def _forbid_thread(*args, **kwargs):
+        raise AssertionError("_is_flock_held must probe in-process without spawning a thread")
+
+    monkeypatch.setattr(threading, "Thread", _forbid_thread)
+
+    lock_path = tmp_path / "host.lock"
+    lock_path.write_text("", encoding="utf-8")
+
+    # 1. Child process holds the flock -> probe says held without blocking
+    child_code = (
+        "import fcntl, os, sys\n"
+        "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "sys.stdout.write('LOCKED\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stdin.read()\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        ready = proc.stdout.readline().strip()
+        assert ready == "LOCKED"
+        t0 = time.monotonic()
+        assert _is_flock_held(lock_path) is True
+        assert (time.monotonic() - t0) < 0.5, "flock probe must not block when child holds lock"
+    finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
+        proc.wait(timeout=5)
+
+    # 2. No holder -> probe says not held, and lock is free afterwards (re-acquirable at once), fd closed
+    real_open = os.open
+    real_close = os.close
+    opened_fds: list[int] = []
+    closed_fds: list[int] = []
+
+    def _spy_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        opened_fds.append(fd)
+        return fd
+
+    def _spy_close(fd):
+        closed_fds.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "open", _spy_open)
+    monkeypatch.setattr(os, "close", _spy_close)
+    assert _is_flock_held(lock_path) is False
+    monkeypatch.setattr(os, "open", real_open)
+    monkeypatch.setattr(os, "close", real_close)
+    assert opened_fds and opened_fds == closed_fds, f"Every opened fd must be closed: {opened_fds} vs {closed_fds}"
+
+    check_fd = os.open(str(lock_path), os.O_RDWR)
+    try:
+        fcntl.flock(check_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(check_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(check_fd)
+
+    # 3. FIFO at the lock path is held without blocking
+    fifo_path = tmp_path / "fifo.lock"
+    os.mkfifo(fifo_path)
+    t0 = time.monotonic()
+    assert _is_flock_held(fifo_path) is True
+    assert (time.monotonic() - t0) < 0.5, "FIFO probe must not block"
+
+
+def test_r9_tmp_lock_with_dead_pid_old_mtime_still_lsofed_and_lsof_failure_held(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R9 Item 4 (P3):
+    - A tmp lock whose name has a pid: if the pid is dead and the mtime is old, still lsof it;
+      if any process has it open, it is held.
+    - lsof exit 1 with empty output means not open; any other lsof failure means held.
+    """
+    import subprocess
+    import time
+    from minni.wire.cutover import _is_file_open_by_any_process, _probe_tmp_lock
+
+    codex_dir = tmp_path / "home" / ".codex"
+    codex_dir.mkdir(parents=True)
+
+    # Dead PID (999999) + old mtime (>= 600s), but file is still open by a process -> MUST be held
+    dead_pid_tmp = codex_dir / "config.toml.tmp.999999"
+    dead_pid_tmp.write_text("in-flight", encoding="utf-8")
+    old_ts = time.time() - 1800.0
+    os.utime(dead_pid_tmp, (old_ts, old_ts))
+
+    with dead_pid_tmp.open("r", encoding="utf-8") as _open_fh:
+        os.utime(dead_pid_tmp, (old_ts, old_ts))
+        active_open, finding_open = _probe_tmp_lock(dead_pid_tmp, "codex")
+        assert active_open is True, "tmp lock with dead pid + old mtime but still open must be held"
+        assert finding_open is None
+
+    # Closed + dead pid + old mtime -> not held (lsof exits 1 with empty output)
+    active_closed, finding_closed = _probe_tmp_lock(dead_pid_tmp, "codex")
+    assert active_closed is False
+    assert finding_closed is not None
+    assert finding_closed["reason"] == "stale_tmp_lock"
+
+    # lsof exit 1 with non-empty stderr or stdout must be treated as a failure (= held)
+    def _lsof_exit1_with_stderr(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="lsof: status error on path: Permission denied\n")
+
+    monkeypatch.setattr(subprocess, "run", _lsof_exit1_with_stderr)
+    assert _is_file_open_by_any_process(dead_pid_tmp) is True
+    active_err, finding_err = _probe_tmp_lock(dead_pid_tmp, "codex")
+    assert active_err is True
+    assert finding_err is None
+
+    def _lsof_exit1_with_stdout(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="unexpected output\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _lsof_exit1_with_stdout)
+    assert _is_file_open_by_any_process(dead_pid_tmp) is True
+
+    def _lsof_exit1_empty(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _lsof_exit1_empty)
+    assert _is_file_open_by_any_process(dead_pid_tmp) is False
+
+
+def test_r9_payload_staging_failed_keeps_only_exception_type_never_text(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R9 Item 5 (P3):
+    `payload_staging_failed` keeps only the exception TYPE, never its text (cutover.py:1438, :2936).
+    """
+    import minni.wire.cutover as cutover_mod
+
+    repo_root = Path(__file__).resolve().parent.parent
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    _seed_plugin_version(plugin_dir, "0.6.0+git.11111111", "1" * 40)
+    (plugin_dir / "current").symlink_to(plugin_dir / "0.6.0+git.11111111")
+
+    def _boom_json_decode(*args, **kwargs):
+        raise json.JSONDecodeError("SENSITIVE_MANIFEST_TOKEN_XYZ_987", '{"secret": "val"}', 0)
+
+    monkeypatch.setattr(cutover_mod, "_stage_repo_payload_to_temp", _boom_json_decode)
+
+    out_reconcile = reconcile_all_hosts(
+        home=home,
+        from_repo=repo_root,
+        target_version=None,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert out_reconcile.exit_code == 1
+    assert out_reconcile.message == "payload_staging_failed: JSONDecodeError"
+    assert "SENSITIVE_MANIFEST_TOKEN_XYZ_987" not in out_reconcile.message
+    assert "secret" not in out_reconcile.message
+
+    out_cutover = execute_atomic_cutover(
+        home=home,
+        target_version="0.6.0+git.99999999",
+        target_git_sha="9" * 40,
+        dry_run=True,
+        running_hosts=set(),
+        repo_root=repo_root,
+    )
+    assert out_cutover.exit_code == 1
+    assert out_cutover.message == "payload_staging_failed: JSONDecodeError"
+    assert "SENSITIVE_MANIFEST_TOKEN_XYZ_987" not in out_cutover.message
+    assert "secret" not in out_cutover.message

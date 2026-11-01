@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -145,8 +146,8 @@ _BINARY_MAGIC_PREFIXES: tuple[bytes, ...] = (
     b"\x7fELF",
 )
 
-# Known config depth ceiling relative to each scan root (e.g. ~/.claude/plugins/cache/<mkt>/<pkg>/<ver>/.claude-plugin/plugin.json is depth 7)
-_DEFAULT_MAX_CONFIG_DEPTH = 8
+# Known config depth ceiling relative to each scan root (e.g. ~/.claude/plugins/cache/<mkt>/<pkg>/<ver>/skills/<skill>/SKILL.md is depth 8)
+_DEFAULT_MAX_CONFIG_DEPTH = 10
 _MAX_CONFIG_REL_DEPTH_BY_ROOT: dict[str, int] = {
     "Library/Application Support/Claude": 4,
     ".local/bin": 2,
@@ -239,8 +240,6 @@ def _is_config_shaped_file(fpath: Path, root_dir: Path, rel_root: str) -> bool:
         return True
     if suffix == ".md":
         parent_dirs = {p.lower() for p in rel_parts[:-1]}
-        if "cache" in parent_dirs and "plugins" in parent_dirs:
-            return False
         return name == "SKILL.md" or bool(parent_dirs & {"skills", "rules", "workflows", "commands"})
     if suffix == "":
         parent_dirs = {p.lower() for p in rel_parts[:-1]}
@@ -355,22 +354,32 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
 
     for rel in _SCAN_DIR_RELATIVES:
         root_dir = resolved_home / rel
-        if not root_dir.exists() and not root_dir.is_symlink():
+        try:
+            os.lstat(root_dir)
+        except FileNotFoundError:
             continue
-        if not root_dir.is_dir():
+        except OSError:
+            if not any(f.get("path") == str(root_dir) and f.get("reason") == "unreadable_config_dir" for f in findings):
+                findings.append({
+                    "path": str(root_dir),
+                    "matched": "<unreadable_dir>",
+                    "reason": "unreadable_config_dir",
+                })
+            continue
+        try:
+            root_st = os.stat(root_dir)
+        except OSError:
+            if not any(f.get("path") == str(root_dir) and f.get("reason") == "unreadable_config_dir" for f in findings):
+                findings.append({
+                    "path": str(root_dir),
+                    "matched": "<unreadable_dir>",
+                    "reason": "unreadable_config_dir",
+                })
+            continue
+        if not stat.S_ISDIR(root_st.st_mode):
             continue
         max_depth = _MAX_CONFIG_REL_DEPTH_BY_ROOT.get(rel, _DEFAULT_MAX_CONFIG_DEPTH)
-        visited_real_dirs: set[tuple[int, int]] = set()
-        try:
-            root_st = root_dir.stat()
-            visited_real_dirs.add((root_st.st_dev, root_st.st_ino))
-        except OSError:
-            findings.append({
-                "path": str(root_dir),
-                "matched": "<unreadable_dir>",
-                "reason": "unreadable_config_dir",
-            })
-            continue
+        visited_real_dirs: set[tuple[int, int]] = {(root_st.st_dev, root_st.st_ino)}
 
         def _on_walk_error(err: OSError, _fallback_root: Path = root_dir) -> None:
             err_path = str(getattr(err, "filename", None) or _fallback_root)
@@ -852,6 +861,22 @@ def audit_host_propagation_health(
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": ["stale_or_tilde_in_claude_marketplace"]})
 
     uncatalogued_refs = scan_for_uncatalogued_plugin_refs(resolved_home)
+    if legacy_v1_single_server_js and isinstance(wired_doc, dict):
+        v1_plats = {
+            str(w.get("platform") or "")
+            for w in (wired_doc.get("wires") or [])
+            if isinstance(w, dict)
+        }
+        v1_skip_prefixes: list[str] = []
+        if "claude-code" in v1_plats:
+            v1_skip_prefixes.append(str(resolved_home / ".claude" / "plugins" / "cache") + "/")
+        if "codex" in v1_plats:
+            v1_skip_prefixes.append(str(resolved_home / ".codex" / "plugins" / "cache") + "/")
+        if v1_skip_prefixes:
+            uncatalogued_refs = [
+                r for r in uncatalogued_refs
+                if not any(str(r.get("path") or "").startswith(p) for p in v1_skip_prefixes)
+            ]
     all_running = inspect_running_mcp_servers(
         home=resolved_home,
         target_version=current_version or "",

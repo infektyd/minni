@@ -16,7 +16,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import tomllib
 from collections.abc import Callable
@@ -187,7 +186,6 @@ def _atomic_write_bytes(path: Path, data: bytes, mode: int | None = None) -> Non
 
 _TMP_LOCK_MAX_AGE_SECONDS = 600.0
 _TMP_LOCK_PID_RE = re.compile(r"\.tmp\.(\d+)(?:\..+)?$")
-_FLOCK_PROBE_TIMEOUT_SECONDS = 1.0
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -204,12 +202,16 @@ def _is_pid_alive(pid: int) -> bool:
 
 
 def _is_file_open_by_any_process(cand: Path, *, timeout_s: float = 2.0) -> bool:
-    """Return True if any OS process currently holds `cand` open (bounded lsof probe, fail-closed on timeout/error)."""
+    """Return True if any OS process currently holds `cand` open (bounded lsof probe, fail-closed on timeout/error).
+
+    `lsof` exit 1 with empty stdout and stderr means not open; any other outcome means held.
+    """
     lsof_bin = shutil.which("lsof") or ("/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else "lsof")
     targets: list[str] = [str(cand)]
     try:
-        resolved = str(cand.resolve())
-        if resolved not in targets:
+        resolved_path = cand.resolve()
+        resolved = str(resolved_path)
+        if resolved_path.exists() and resolved not in targets:
             targets.append(resolved)
     except OSError:
         pass
@@ -225,21 +227,17 @@ def _is_file_open_by_any_process(cand: Path, *, timeout_s: float = 2.0) -> bool:
         return True
     except OSError:
         return True
-    if proc.returncode not in (0, 1):
-        return True
-    if proc.returncode == 0 and any(
-        line.startswith("p") and line[1:].strip().isdigit()
-        for line in (proc.stdout or "").splitlines()
-    ):
-        return True
-    return False
+    if proc.returncode == 1 and not (proc.stdout or "").strip() and not (proc.stderr or "").strip():
+        return False
+    return True
 
 
 def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | None]:
     """Evaluate a tmp-style lock (`<surface>.tmp[.<pid>[.<hex>]]`).
 
-    - With an embedded `<pid>`: counts as active ONLY if `<pid>` is alive OR
-      its `mtime` is under 10 minutes (`600` seconds) old.
+    - With an embedded `<pid>`: counts as active if `<pid>` is alive, OR its
+      `mtime` is under 10 minutes (`600` seconds) old, OR any process still has
+      the file open (`lsof` check).
     - Without an embedded `<pid>`: counts as active while any process has the
       file open (bounded `lsof` check), else by `mtime` (`< 600` seconds).
     Returns `(is_active, stale_finding_or_None)`. Never deletes a stale file.
@@ -259,8 +257,10 @@ def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | No
     mtime_fresh = age_s < _TMP_LOCK_MAX_AGE_SECONDS
     if embedded_pid is not None:
         pid_alive = _is_pid_alive(embedded_pid)
-        open_by_proc = False
         if pid_alive or mtime_fresh:
+            return True, None
+        open_by_proc = _is_file_open_by_any_process(cand)
+        if open_by_proc:
             return True, None
     else:
         pid_alive = False
@@ -286,67 +286,48 @@ def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | No
     return False, finding
 
 
-def _is_flock_held(cand: Path, *, timeout_s: float = _FLOCK_PROBE_TIMEOUT_SECONDS) -> bool:
-    """Return True if `cand` is held or cannot be cleanly acquired (fail-closed R8 P2).
+def _is_flock_held(cand: Path) -> bool:
+    """Return True if `cand` is held or cannot be cleanly acquired (fail-closed R9 P2).
 
+    - Probes in-process (no worker thread).
     - Opens with `O_RDONLY | O_NONBLOCK | O_NOFOLLOW`.
-    - Refuses non-regular files (FIFOs, symlinks, directories, sockets, device nodes -> HELD).
-    - Bounds the probe in time (`timeout_s`).
-    - ANY `open` or `flock` error other than `ENOENT` (absent file) or a clean
-      `LOCK_EX | LOCK_NB` acquisition (`EMFILE`, `EIO`, `ENOTSUP`, `EACCES`, timeout, etc.)
-      returns `True` (HELD -> defer).
+    - `fstat`s the descriptor and refuses a non-regular file (= held).
+    - Probes with `flock(LOCK_EX | LOCK_NB)`. On success, immediately calls
+      `flock(LOCK_UN)` and closes `fd`, and reports not held (`False`).
+    - On `EWOULDBLOCK` / `EAGAIN` or any other error (other than `ENOENT` on open),
+      reports held (`True`). Every path closes `fd` before returning.
     """
-    outcome: list[bool] = []
-
-    def _probe_worker() -> None:
-        try:
-            lst = os.lstat(str(cand))
-        except FileNotFoundError:
-            outcome.append(False)
-            return
-        except Exception:
-            outcome.append(True)
-            return
-        if not stat.S_ISREG(lst.st_mode):
-            outcome.append(True)
-            return
-        open_flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(str(cand), open_flags)
-        except Exception:
-            outcome.append(True)
-            return
-        try:
-            try:
-                fst = os.fstat(fd)
-            except Exception:
-                outcome.append(True)
-                return
-            if not stat.S_ISREG(fst.st_mode):
-                outcome.append(True)
-                return
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except Exception:
-                outcome.append(True)
-                return
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            outcome.append(False)
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-    worker = threading.Thread(target=_probe_worker, daemon=True)
-    worker.start()
-    worker.join(timeout=max(0.01, timeout_s))
-    if worker.is_alive() or not outcome:
+    open_flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(cand), open_flags)
+    except FileNotFoundError:
+        return False
+    except Exception:
         return True
-    return outcome[0]
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                return True
+            return True
+        except Exception:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            return True
+        return False
+    except Exception:
+        return True
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _record_stale_finding(
@@ -1437,7 +1418,7 @@ def _build_dry_run_plan(
                     target_version=target_version,
                     target_git_sha=target_git_sha,
                     aborted_pre_flip=True,
-                    message=f"payload_staging_failed: {type(exc).__name__}: {exc}",
+                    message=f"payload_staging_failed: {type(exc).__name__}",
                 )
         else:
             return CutoverOutcome(
@@ -2938,7 +2919,7 @@ def reconcile_all_hosts(
                         target_version=target_version or "",
                         target_git_sha=target_git_sha or "",
                         aborted_pre_flip=True,
-                        message=f"payload_staging_failed: {type(exc).__name__}: {exc}",
+                        message=f"payload_staging_failed: {type(exc).__name__}",
                     )
 
         if target_version is None:
