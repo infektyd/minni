@@ -693,8 +693,6 @@ def run_fleet_sync(
     )
     steps.append(reconcile_step)
     if not reconcile_step.get("skipped") and reconcile_step.get("exit_code", 0) != 0:
-        if reconcile_step.get("exit_code") == 1 and not propagate_hosts:
-            steps.append(refresh_custom_wires(dry_run=dry_run, new_root=wire_step.get("install_root")))
         return SyncResult(
             ok=False,
             install_kind=kind,

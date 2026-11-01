@@ -65,7 +65,7 @@ def _seed_full_9_host_fleet(home: Path) -> tuple[str, str, str]:
         "  }\n"
         "});\n"
     )
-    for ver, sha in ((v1, "1" * 40), (v2, v2_sha)):
+    for idx, (ver, sha) in enumerate(((v1, "1" * 40), (v2, v2_sha)), start=1):
         vdir = plugin_dir / ver
         (vdir / "dist").mkdir(parents=True, exist_ok=True)
         (vdir / "dist" / "server.js").write_text(server_code, encoding="utf-8")
@@ -88,6 +88,7 @@ def _seed_full_9_host_fleet(home: Path) -> tuple[str, str, str]:
             }),
             encoding="utf-8",
         )
+        os.utime(vdir, (1_700_000_000 + idx * 100, 1_700_000_000 + idx * 100))
 
     stale_srv = str(plugin_dir / v1 / "dist" / "server.js")
 
@@ -285,7 +286,104 @@ def test_fleet_sync_and_update_root_stop_on_cutover_exit_1_or_3_without_continui
     rec_step1 = next(s for s in res1.steps if s.get("name") == "reconcile_all_hosts")
     assert rec_step1["exit_code"] == 1
 
-    # 3. scripts/update_root.sh must exit 3 on cutover exit 3 and exit 1 on cutover exit 1 without "continuing"
-    update_root_text = (REPO / "scripts" / "update_root.sh").read_text(encoding="utf-8")
-    assert "atomic cutover / per-host reconcile exited $_CUTOVER_RC — continuing" not in update_root_text
-    assert "exit 3" in update_root_text
+    # 2b. fleet_sync with propagate_hosts=False (--wire-only) on exit 1 MUST NOT run custom_mcp_refresh (New P1 #1)!
+    with (
+        patch("minni.fleet_sync._detect_install_kind", return_value=("packaged", None)),
+        patch("minni.fleet_sync._run_wire", return_value={"name": "wire_all", "exit_code": 0, "status": "ok", "install_root": v2_root}),
+        patch("minni.fleet_sync._kickstart_daemon", return_value={"name": "restart_daemon", "exit_code": 0}),
+        patch("minni.fleet_sync._audit_deploy_symlinks", return_value={"name": "deploy_symlink_audit", "exit_code": 0}),
+    ):
+        res1_no_prop = run_fleet_sync(dry_run=False, propagate_hosts=False)
+    assert res1_no_prop.ok is False
+    assert "custom_mcp_refresh" not in [s.get("name") for s in res1_no_prop.steps]
+
+    # 3. Execute scripts/update_root.sh directly via subprocess on cutover exit 3 and exit 1
+    import sys
+
+    bare_origin = tmp_path / "origin.git"
+    tmp_repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_origin)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-b", "main", str(tmp_repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(tmp_repo), "config", "user.name", "Test"], check=True)
+    (tmp_repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    (tmp_repo / "README.md").write_text("test\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_repo), "add", ".gitignore", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(tmp_repo), "commit", "-q", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", str(tmp_repo), "remote", "add", "origin", str(bare_origin)], check=True)
+    subprocess.run(["git", "-C", str(tmp_repo), "push", "-q", "-u", "origin", "main"], check=True)
+
+    call_log = tmp_path / "update_root_calls.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    npm_shim = bin_dir / "npm"
+    npm_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    npm_shim.chmod(0o755)
+
+    venv_bin = tmp_repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    py_shim = venv_bin / "python"
+    py_shim.write_text(
+        f"#!/bin/sh\n"
+        f'if [ "$1" = "-c" ]; then\n'
+        f'  exec "{sys.executable}" "$@"\n'
+        f'fi\n'
+        f'echo "$*" >> "{call_log}"\n'
+        f'case "$*" in\n'
+        f'  *"-m minni.wire.cutover"*)\n'
+        f'    PYTHONPATH="{REPO / "src"}" exec "{sys.executable}" "$@"\n'
+        f'    ;;\n'
+        f'  *"-m minni.minni_cli wire all"*)\n'
+        f'    echo \'{{"schema": 1, "status": "ok", "results": []}}\'\n'
+        f'    exit 0\n'
+        f'    ;;\n'
+        f'  *"-m pip"*)\n'
+        f'    exit 0\n'
+        f'    ;;\n'
+        f'  *)\n'
+        f'    echo "AFTER_CUTOVER:$*" >> "{call_log}"\n'
+        f'    exit 0\n'
+        f'    ;;\n'
+        f'esac\n',
+        encoding="utf-8",
+    )
+    py_shim.chmod(0o755)
+
+    env = dict(os.environ)
+    env["HOME"] = str(fake_home)
+    env["MINNI_HOME"] = str(fake_home / ".minni")
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+
+    # 3a. Cutover exit 1 (corrupt .codex/config.toml): update_root.sh must exit 1, name codex + path, and stop before custom_refresh/propagate
+    call_log.write_text("", encoding="utf-8")
+    proc1 = subprocess.run(
+        ["bash", str(REPO / "scripts" / "update_root.sh"), "--repo", str(tmp_repo)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc1.returncode == 1, (proc1.stdout, proc1.stderr)
+    assert "codex" in proc1.stderr and str(fake_home / ".codex" / "config.toml") in proc1.stderr
+    logged1 = call_log.read_text(encoding="utf-8")
+    assert "AFTER_CUTOVER:" not in logged1
+    assert "custom_refresh" not in logged1
+    assert "propagate.py" not in logged1
+
+    # 3b. Cutover exit 3 (locked muse host): update_root.sh must exit 3, name muse + path, and stop before custom_refresh/propagate
+    _seed_full_9_host_fleet(fake_home)
+    (fake_home / ".config" / "muse" / ".settings.json.lock").write_text("locked", encoding="utf-8")
+    call_log.write_text("", encoding="utf-8")
+    proc3 = subprocess.run(
+        ["bash", str(REPO / "scripts" / "update_root.sh"), "--repo", str(tmp_repo)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc3.returncode == 3, (proc3.stdout, proc3.stderr)
+    assert "muse" in proc3.stderr and str(fake_home / ".config" / "muse" / ".settings.json.lock") in proc3.stderr
+    logged3 = call_log.read_text(encoding="utf-8")
+    assert "AFTER_CUTOVER:" not in logged3
+    assert "custom_refresh" not in logged3
+    assert "propagate.py" not in logged3
