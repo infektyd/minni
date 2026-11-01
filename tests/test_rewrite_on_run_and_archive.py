@@ -277,4 +277,3 @@ def test_install_payload_fails_closed_on_lock_archive_oserror_and_sanitize_error
     (stage_bad_manifest / "payload-manifest.json").write_text("{broken manifest", encoding="utf-8")
     with pytest.raises(InstallError, match="payload-manifest.json"):
         _sanitize_staged_payload(stage_bad_manifest, manifest)
-

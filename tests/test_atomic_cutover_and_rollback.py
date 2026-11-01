@@ -803,4 +803,3 @@ def test_r3_p1_4_probe_fixed_path_lang_and_catalog_wrapper_launcher_probe(
     )
     assert res.exit_code == 1
     assert res.aborted_pre_flip is True
-
