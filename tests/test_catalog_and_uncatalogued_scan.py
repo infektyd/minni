@@ -371,7 +371,6 @@ def test_uncatalogued_scanner_ignores_backups_and_conversations_but_fails_unknow
         home / ".gemini" / "antigravity-backup" / "mcp_config.json",
         home / ".gemini" / "tmp" / "user" / "chats" / "session-1.json",
         home / ".agents" / "backups" / "20260520-085707" / ".gemini__config__mcp_config.json",
-        home / ".agents" / "workflows" / "plan.md",
         home / ".codex" / "muse-code-worker" / "e3fd8d37" / "workspace" / "eval" / "public_repo.json",
         home / ".codex" / "grok-build-peer" / "970c9701" / "workspace" / "contract.md",
         home / ".codex" / "backups" / "20260925" / "config.toml",
@@ -426,3 +425,100 @@ def test_uncatalogued_scanner_ignores_backups_and_conversations_but_fails_unknow
         unknown_toml,
         unknown_skill,
     }
+
+
+def test_r7_scanner_denylist_narrowing_symlinks_and_unreadable_or_oversized_findings(
+    tmp_path: Path,
+) -> None:
+    """R7 Input 1 (P1 & P3):
+    - P1: Scanner deny-list only denies data-store subtrees (brain, conversations, file-history,
+      backups, muse-code-worker, session stores); keeps mcp_config.json siblings (~/.gemini/antigravity,
+      ~/.gemini/antigravity-ide), workflows/, and projects/ scannable; follows symlinks that resolve to
+      config-shaped files.
+    - P3: Unreadable config files and config files over the size cap are reported as findings, not silent skips.
+    """
+    import os
+    from minni.wire.health import _MAX_SCAN_FILE_BYTES
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    # 1. Previously hidden config roots (~/.gemini/antigravity, -ide, workflows, projects) are now scannable
+    ag_sibling = home / ".gemini" / "antigravity" / "extra_mcp_config.json"
+    ag_ide_sibling = home / ".gemini" / "antigravity-ide" / "extra_mcp_config.json"
+    agents_workflow = home / ".agents" / "workflows" / "plan.md"
+    grok_workflow = home / ".grok" / "workflows" / "deploy.md"
+    claude_project_cfg = home / ".claude" / "projects" / "demo" / "mcp.json"
+
+    for p in (ag_sibling, ag_ide_sibling, agents_workflow, grok_workflow, claude_project_cfg):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f'{{"ref": "{stale_ref}"}}\n', encoding="utf-8")
+
+    # 2. Symlink resolving to an external config-shaped file referencing .minni/plugin is followed
+    external_dir = tmp_path / "external_configs"
+    external_dir.mkdir(parents=True, exist_ok=True)
+    external_cfg = external_dir / "shared_mcp.json"
+    external_cfg.write_text(f'{{"mcpServers": {{"minni": "{stale_ref}"}}}}\n', encoding="utf-8")
+    symlink_cfg = home / ".gemini" / "antigravity" / "linked_mcp.json"
+    os.symlink(external_cfg, symlink_cfg)
+
+    # Symlink to a directory containing a config-shaped file is also followed (cycle-safe)
+    external_subdir = external_dir / "linked_workflows"
+    external_subdir.mkdir(parents=True, exist_ok=True)
+    linked_wf_file = external_subdir / "sync.md"
+    linked_wf_file.write_text(f"Run `{stale_ref}`\n", encoding="utf-8")
+    symlink_dir = home / ".agents" / "workflows" / "external"
+    os.symlink(external_subdir, symlink_dir)
+
+    # 3. Unreadable config-shaped file and oversized config-shaped file (> 2 MiB) are reported as findings
+    unreadable_cfg = home / ".codex" / "unreadable_config.toml"
+    unreadable_cfg.parent.mkdir(parents=True, exist_ok=True)
+    unreadable_cfg.write_text("# secret\n", encoding="utf-8")
+    unreadable_cfg.chmod(0o000)
+
+    oversized_cfg = home / ".gemini" / "oversized_mcp.json"
+    oversized_cfg.parent.mkdir(parents=True, exist_ok=True)
+    oversized_cfg.write_bytes(b" " * (_MAX_SCAN_FILE_BYTES + 1024))
+
+    try:
+        findings = scan_for_uncatalogued_plugin_refs(home)
+        by_path = {Path(f["path"]): f for f in findings}
+
+        for expected_p in (
+            ag_sibling,
+            ag_ide_sibling,
+            agents_workflow,
+            grok_workflow,
+            claude_project_cfg,
+            symlink_cfg,
+            symlink_dir / "sync.md",
+        ):
+            assert expected_p in by_path, f"Missing expected scan hit for {expected_p}: {findings}"
+            assert by_path[expected_p]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert unreadable_cfg in by_path, f"Missing unreadable config finding: {findings}"
+        assert by_path[unreadable_cfg]["reason"] == "unreadable_config_file"
+
+        assert oversized_cfg in by_path, f"Missing oversized config finding: {findings}"
+        assert by_path[oversized_cfg]["reason"] == "config_file_exceeds_size_cap"
+
+        report = audit_host_propagation_health(home=home, expected_git_sha=sha)
+        assert report.ok is False
+    finally:
+        unreadable_cfg.chmod(0o600)

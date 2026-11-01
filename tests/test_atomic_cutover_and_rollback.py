@@ -1151,8 +1151,13 @@ def test_r4_new_p2_commands_dir_rollback_cas_pgrep_fail_closed_and_new_p3_path_d
         }),
         encoding="utf-8",
     )
-    # Lock only muse_s2 via sibling lockfile `.mcp.json.lock`
-    (home2 / ".muse" / ".mcp.json.lock").write_text("locked", encoding="utf-8")
+    # Lock only muse_s2 via sibling lockfile `.mcp.json.lock` (held with flock per R7 Input 2)
+    import fcntl
+
+    muse_s2_lock = home2 / ".muse" / ".mcp.json.lock"
+    muse_s2_lock.write_text("", encoding="utf-8")
+    muse_s2_lock_fd = os.open(str(muse_s2_lock), os.O_RDWR)
+    fcntl.flock(muse_s2_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     # Corrupt muse_s1 after Step 5 writes it so Step 6 health audit sees drift on muse_s1
     orig_health = cutover_mod.audit_host_propagation_health if hasattr(cutover_mod, "audit_host_propagation_health") else None
@@ -1175,12 +1180,16 @@ def test_r4_new_p2_commands_dir_rollback_cas_pgrep_fail_closed_and_new_p3_path_d
         return real_audit(*args, **kwargs)
 
     monkeypatch.setattr(health_mod, "audit_host_propagation_health", _corrupt_s1_before_audit)
-    path_filter_res = execute_atomic_cutover(
-        home=home2,
-        target_version=v2_ver,
-        target_git_sha=v2_sha,
-        running_hosts=set(),
-    )
+    try:
+        path_filter_res = execute_atomic_cutover(
+            home=home2,
+            target_version=v2_ver,
+            target_git_sha=v2_sha,
+            running_hosts=set(),
+        )
+    finally:
+        fcntl.flock(muse_s2_lock_fd, fcntl.LOCK_UN)
+        os.close(muse_s2_lock_fd)
     assert path_filter_res.exit_code == 1
     assert path_filter_res.rolled_back is True
     assert str(muse_s1) in path_filter_res.message
@@ -1313,14 +1322,31 @@ def test_h15_commands_dir_symlink_matching_catalog_with_missing_payload_commands
     assert cmd_drift[0]["host"] == "antigravity"
     assert "broken_commands_dir_symlink" in cmd_drift[0]["reasons"]
 
-    res = execute_atomic_cutover(
-        home=home,
-        target_version=v2_ver,
-        target_git_sha=v2_sha,
-        running_hosts=set(),
-    )
+    import minni.wire.cutover as cutover_mod
+
+    flip_calls: list[str] = []
+    orig_flip = cutover_mod.flip_current_pointer
+
+    def _spy_flip(target_ver: str, **kw):
+        flip_calls.append(target_ver)
+        return orig_flip(target_ver, **kw)
+
+    cutover_mod.flip_current_pointer = _spy_flip
+    try:
+        res = execute_atomic_cutover(
+            home=home,
+            target_version=v2_ver,
+            target_git_sha=v2_sha,
+            running_hosts=set(),
+        )
+    finally:
+        cutover_mod.flip_current_pointer = orig_flip
+
     assert res.exit_code == 1
-    assert res.rolled_back is True
+    assert res.status == "ABORTED_PRE_FLIP"
+    assert res.aborted_pre_flip is True
+    assert res.rolled_back is False
+    assert flip_calls == [], f"flip_current_pointer must never be called when H15 fails: {flip_calls}"
     assert f"antigravity:{cmd_link}" not in res.skipped_surfaces
     assert "antigravity" in res.message
     assert str(cmd_link) in res.message
@@ -1330,11 +1356,12 @@ def test_h15_commands_dir_symlink_matching_catalog_with_missing_payload_commands
 def test_dry_run_plan_mode_lists_every_catalogued_host_targets_repo_head_and_writes_nothing(
     tmp_path: Path,
 ) -> None:
-    """R6 Item 1: --dry-run computes and prints the full per-surface plan against repo HEAD:
-    would-write (with redacted before->after diff), would-create, would-defer (and why),
-    would-archive, would-skip, and GC would-prune/would-keep, listing every catalogued host
-    and performing zero writes.
+    """R6 Item 1 & R7 P2: --dry-run computes and prints the full per-surface plan against repo HEAD:
+    would-write (with redacted before->after diff where EVERY env value is redacted), would-create,
+    would-defer (and why), would-archive, would-skip, and GC would-prune/would-keep, listing every
+    catalogued host and performing zero writes.
     """
+    import fcntl
     from minni.wire.from_repo import _git_sha
     from minni.wire.manifest import dev_version
     from minni.wire.registry import HOST_SURFACE_CATALOG
@@ -1397,13 +1424,15 @@ def test_dry_run_plan_mode_lists_every_catalogued_host_targets_repo_head_and_wri
     codex_dir = home / ".codex"
     codex_dir.mkdir(parents=True)
 
-    # 4. Seed drifted muse surface + lockfile / running host -> would-defer
+    # 4. Seed drifted muse surface + held flock lockfile / running host -> would-defer
     muse_dir = home / ".config" / "muse"
     muse_dir.mkdir(parents=True)
     muse_cfg = muse_dir / "settings.json"
     muse_cfg.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
     muse_lock = muse_dir / ".settings.json.lock"
     muse_lock.write_text("locked-by-muse", encoding="utf-8")
+    muse_lock_fd = os.open(str(muse_lock), os.O_RDWR)
+    fcntl.flock(muse_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def _snapshot_tree(root: Path) -> dict[str, tuple[str, int, str]]:
         snap: dict[str, tuple[str, int, str]] = {}
@@ -1419,12 +1448,17 @@ def test_dry_run_plan_mode_lists_every_catalogued_host_targets_repo_head_and_wri
 
     before_snap = _snapshot_tree(home)
 
-    outcome = reconcile_all_hosts(
-        home=home,
-        from_repo=repo_root,
-        dry_run=True,
-        running_hosts={"muse"},
-    )
+    try:
+        outcome = reconcile_all_hosts(
+            home=home,
+            from_repo=repo_root,
+            dry_run=True,
+            running_hosts={"muse"},
+        )
+    finally:
+        fcntl.flock(muse_lock_fd, fcntl.LOCK_UN)
+        os.close(muse_lock_fd)
+
     after_snap = _snapshot_tree(home)
 
     # Zero writes to disk!
@@ -1438,6 +1472,7 @@ def test_dry_run_plan_mode_lists_every_catalogued_host_targets_repo_head_and_wri
     doc = outcome.to_dict()
     serialized = json.dumps(doc)
     assert "super-secret-value-xyz987" not in serialized
+    assert "legacy-static-ws" not in serialized
     assert "<REDACTED>" in serialized
 
     plan = doc.get("plan") or doc
@@ -1447,8 +1482,17 @@ def test_dry_run_plan_mode_lists_every_catalogued_host_targets_repo_head_and_wri
     claude_write = next((w for w in would_write if w["path"] == str(claude_cfg)), None)
     assert claude_write is not None, would_write
     assert claude_write["host"] == "claude-code"
-    assert claude_write["diff"]["before"]["env"]["SECRET_API_TOKEN"] == "<REDACTED>"
-    assert claude_write["diff"]["before"]["env"]["MINNI_WORKSPACE_ID"] == "legacy-static-ws"
+    assert claude_write["diff"]["before"]["env"] == {
+        "MINNI_AGENT_ID": "<REDACTED>",
+        "MINNI_VAULT_PATH": "<REDACTED>",
+        "MINNI_WORKSPACE_ID": "<REDACTED>",
+        "SECRET_API_TOKEN": "<REDACTED>",
+    }
+    assert claude_write["diff"]["after"]["env"] == {
+        "MINNI_AGENT_ID": "<REDACTED>",
+        "MINNI_VAULT_PATH": "<REDACTED>",
+        "SECRET_API_TOKEN": "<REDACTED>",
+    }
     assert "MINNI_WORKSPACE_ID" not in claude_write["diff"]["after"]["env"]
     assert claude_write["diff"]["after"]["args"] == [str(plugin_dir / "current" / "dist" / "server.js")]
 
@@ -1472,3 +1516,329 @@ def test_dry_run_plan_mode_lists_every_catalogued_host_targets_repo_head_and_wri
     gc_res = doc["gc_result"]
     assert str(plugin_dir / old_v0) in gc_res["would-prune"]
     assert str(plugin_dir / installed_v2) in gc_res["would-keep"]
+
+
+def test_r7_stale_vs_live_tmp_lock_and_unheld_vs_held_flock(
+    tmp_path: Path,
+) -> None:
+    """R7 Input 2 (P1 STALE TMP LOCK & P1 FLOCK-STYLE LOCK):
+    - Stale tmp lock (~/.claude.json.tmp.<dead_pid>.<hex> with mtime > 10m old) does NOT defer;
+      it is reported as a stale_tmp_lock finding and never deleted.
+    - Live-pid tmp lock (~/.claude.json.tmp.<live_pid>.<hex> even with old mtime) DOES defer.
+    - Unheld flock file (~/.config/muse/.settings.json.lock existing with 0 bytes and no flock holder)
+      does NOT defer.
+    - Held flock file (~/.config/muse/.settings.json.lock held via flock from a child process)
+      DOES defer.
+    """
+    import subprocess
+    import sys
+    import time
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v1_sha = "1" * 40
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / v1_ver)
+
+    claude_cfg = home / ".claude.json"
+    drifted_claude = json.dumps({
+        "mcpServers": {
+            "minni": {
+                "command": "node",
+                "args": [str(plugin_dir / v1_ver / "dist" / "server.js")],
+                "env": {"MINNI_AGENT_ID": "claude-code", "MINNI_VAULT_PATH": "~/.minni/claudecode-vault"},
+            }
+        }
+    })
+    claude_cfg.write_text(drifted_claude, encoding="utf-8")
+
+    # 1. Stale tmp lock: dead PID (999999991) and mtime 30 days old -> does NOT defer, reported as finding, never deleted
+    stale_tmp = home / ".claude.json.tmp.999999991.1753459790501"
+    stale_tmp.write_bytes(b"")
+    old_mtime = time.time() - (30 * 86400)
+    os.utime(stale_tmp, (old_mtime, old_mtime))
+
+    dry_stale = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_stale.exit_code == 0
+    assert "claude-code" not in dry_stale.deferred_running_hosts
+    assert any(
+        f["host"] == "claude-code"
+        and f["path"] == str(stale_tmp)
+        and f["reason"] == "stale_tmp_lock"
+        and f["pid"] == 999999991
+        and f["pid_alive"] is False
+        for f in dry_stale.findings
+    ), dry_stale.findings
+    assert stale_tmp.exists(), "Stale tmp lock must never be deleted"
+
+    apply_stale = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_stale.exit_code == 0, apply_stale.message
+    assert "claude-code" not in apply_stale.deferred_running_hosts
+    assert f"claude-code:{claude_cfg}" in apply_stale.updated_surfaces
+    assert any(f["path"] == str(stale_tmp) for f in apply_stale.findings)
+    assert stale_tmp.exists(), "Stale tmp lock must never be deleted on apply"
+    stale_tmp.unlink()
+
+    # 2. Live-pid tmp lock: child process is alive -> DOES defer (even if mtime is old)
+    claude_cfg.write_text(drifted_claude, encoding="utf-8")
+    child_holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    live_tmp = home / f".claude.json.tmp.{child_holder.pid}.deadbeef"
+    try:
+        live_tmp.write_bytes(b"")
+        os.utime(live_tmp, (old_mtime, old_mtime))
+        apply_live_tmp = execute_atomic_cutover(
+            home=home,
+            target_version=v2_ver,
+            target_git_sha=v2_sha,
+            dry_run=False,
+            running_hosts=set(),
+        )
+        assert apply_live_tmp.exit_code == 3, apply_live_tmp.message
+        assert "claude-code" in apply_live_tmp.deferred_running_hosts
+        assert claude_cfg.read_text(encoding="utf-8") == drifted_claude
+    finally:
+        child_holder.terminate()
+        child_holder.wait(timeout=5)
+        live_tmp.unlink(missing_ok=True)
+
+    # Converge claude-code so only muse has delta for the flock checks
+    conv_claude = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert conv_claude.exit_code == 0
+
+    # 3. Unheld flock file (~/.config/muse/.settings.json.lock, 0 bytes, no flock holder) -> does NOT defer
+    muse_dir = home / ".config" / "muse"
+    muse_dir.mkdir(parents=True, exist_ok=True)
+    muse_cfg = muse_dir / "settings.json"
+    drifted_muse = json.dumps({
+        "mcpServers": {
+            "minni": {
+                "command": "node",
+                "args": [str(plugin_dir / v1_ver / "dist" / "server.js")],
+                "env": {"MINNI_AGENT_ID": "muse", "MINNI_VAULT_PATH": "~/.minni/muse-vault"},
+            }
+        }
+    })
+    muse_cfg.write_text(drifted_muse, encoding="utf-8")
+    muse_lock = muse_dir / ".settings.json.lock"
+    muse_lock.write_bytes(b"")
+    os.utime(muse_lock, (old_mtime, old_mtime))
+
+    apply_unheld_flock = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_unheld_flock.exit_code == 0, apply_unheld_flock.message
+    assert "muse" not in apply_unheld_flock.deferred_running_hosts
+    assert f"muse:{muse_cfg}" in apply_unheld_flock.updated_surfaces
+    assert muse_lock.exists(), "Unheld flock file must not be deleted"
+
+    # 4. Held flock file (child process holds flock on ~/.config/muse/.settings.json.lock) -> DOES defer
+    muse_cfg.write_text(drifted_muse, encoding="utf-8")
+    flock_child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, os, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "sys.stdout.write('LOCKED\\n')\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(60)\n"
+            ),
+            str(muse_lock),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert flock_child.stdout is not None
+        ready_line = flock_child.stdout.readline().strip()
+        assert ready_line == "LOCKED"
+        apply_held_flock = execute_atomic_cutover(
+            home=home,
+            target_version=v2_ver,
+            target_git_sha=v2_sha,
+            dry_run=False,
+            running_hosts=set(),
+        )
+        assert apply_held_flock.exit_code == 3, apply_held_flock.message
+        assert "muse" in apply_held_flock.deferred_running_hosts
+        assert muse_cfg.read_text(encoding="utf-8") == drifted_muse
+    finally:
+        flock_child.terminate()
+        flock_child.wait(timeout=5)
+
+
+def test_r7_plan_diff_redacts_every_env_value_and_tokens_in_lists_and_strings(
+    tmp_path: Path,
+) -> None:
+    """R7 Input 1 (P2): redact EVERY env value in the plan diff, and walk lists and strings
+    for token-shaped values.
+    """
+    from minni.wire.cutover import _redact_minni_entry
+
+    fake_gh_tok = "gh" + "p_" + "1234567890abcdefghijklmnopqrstuvwx"
+    fake_ant_tok = "sk-" + "ant-" + "api03-1234567890abcdefghijklmnopqrstuvwx"
+    fake_env_kv = "MINNI_CONSOLE_" + "TOKEN" + "=my_console_secret_value"
+
+    sample_entry = {
+        "command": "node",
+        "args": [
+            "/path/to/server.js",
+            "--api-key",
+            "raw-cli-secret-998877",
+            "--auth=supersecretvalue123",
+            fake_gh_tok,
+            fake_ant_tok,
+            "-e",
+            fake_env_kv,
+        ],
+        "url": "https://admin:hunter2password@mcp.example.internal/v1?access_token=querysecret999&mode=stdio",
+        "headers": {
+            "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig",
+            "X-Custom": "token=inline_secret_abc123",
+        },
+        "env": {
+            "MINNI_AGENT_ID": "claude-code",
+            "MINNI_VAULT_PATH": "/Users/test/.minni/claudecode-vault",
+            "MINNI_WORKSPACE_ID": "my-private-workspace",
+            "PLAIN_FLAG": "1",
+        },
+    }
+
+    redacted = _redact_minni_entry(sample_entry)
+    serialized = json.dumps(redacted)
+
+    # Every env value is redacted
+    for k, v in redacted["env"].items():
+        assert v == "<REDACTED>", f"Env key {k} was not redacted: {v}"
+
+    # No secret or token-shaped value from args, url, headers, or env appears in serialized output
+    for forbidden in (
+        "claude-code",
+        "claudecode-vault",
+        "my-private-workspace",
+        "raw-cli-secret-998877",
+        "supersecretvalue123",
+        fake_gh_tok,
+        fake_ant_tok,
+        "my_console_secret_value",
+        "hunter2password",
+        "querysecret999",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "inline_secret_abc123",
+    ):
+        assert forbidden not in serialized, f"Leaked {forbidden!r} in {serialized}"
+
+    # Non-secret structural fields remain intact
+    assert redacted["command"] == "node"
+    assert redacted["args"][0] == "/path/to/server.js"
+    assert redacted["args"][1] == "--api-key"
+    assert redacted["args"][2] == "<REDACTED>"
+
+
+def test_r7_single_repo_root_rule_and_dry_run_diffs_built_payload_without_installing(
+    tmp_path: Path,
+) -> None:
+    """R7 Input 1 (P2):
+    - One repo-root rule for dry-run and apply when from_repo is omitted and target_version is None.
+    - Dry-run diffs against the payload that apply would build (sanitized .claude-plugin/plugin.json,
+      omitted .mcp.json, generated payload-manifest.json) without installing it under ~/.minni/plugin.
+    """
+    from minni.wire.from_repo import _git_sha
+    from minni.wire.manifest import dev_version
+
+    repo_root = Path(__file__).resolve().parent.parent
+    expected_ver = dev_version(repo_root)
+    expected_sha = _git_sha(repo_root)
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    # Seed ~/.agents/bin/mcp-env-run wrapper and a drifted claude-code config so reconcile has work to do
+    wrapper = home / ".agents" / "bin" / "mcp-env-run"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+
+    # 1. Dry-run with from_repo=None, target_version=None targets repo HEAD without installing into ~/.minni/plugin
+    dry_out = reconcile_all_hosts(
+        home=home,
+        from_repo=None,
+        target_version=None,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_out.exit_code == 0
+    assert dry_out.status == "DRY_RUN"
+    assert dry_out.target_version == expected_ver
+    assert dry_out.target_git_sha == expected_sha
+    assert not (home / ".minni" / "plugin" / expected_ver).exists(), (
+        "dry-run must not install the built payload under ~/.minni/plugin"
+    )
+
+    # 2. Apply with identical flags (from_repo=None, target_version=None) targets the exact same repo HEAD
+    # and installs + converges all surfaces cleanly, then a subsequent dry-run reports zero would-write
+    apply_out = reconcile_all_hosts(
+        home=home,
+        from_repo=None,
+        target_version=None,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_out.exit_code == 0, apply_out.message
+    assert apply_out.status == "CONVERGED"
+    assert apply_out.target_version == expected_ver
+    assert apply_out.target_git_sha == expected_sha
+    assert (home / ".minni" / "plugin" / expected_ver / "payload-manifest.json").is_file()
+
+    # Delete the installed version dir from ~/.minni/plugin (leaving converged containers on home)
+    # to prove that dry-run builds/stages the reference payload in a temp dir and sees zero false container delta!
+    import shutil
+
+    shutil.rmtree(home / ".minni" / "plugin" / expected_ver)
+    dry_after = reconcile_all_hosts(
+        home=home,
+        from_repo=None,
+        target_version=None,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_after.exit_code == 0
+    plan_after = dry_after.plan or {}
+    # Because dry-run diffs against the sanitized built payload (not raw plugins/minni),
+    # the converged claude_plugin_registry has zero false delta!
+    claude_reg_writes = [
+        w for w in plan_after.get("would-write", [])
+        if w.get("kind") == "claude_plugin_registry"
+    ]
+    assert claude_reg_writes == [], f"Unexpected false delta on claude_plugin_registry: {claude_reg_writes}"
+    assert not (home / ".minni" / "plugin" / expected_ver).exists()

@@ -56,12 +56,25 @@ def _expand_obj(obj: Any, home: Path | None = None, base_semver: str = "0.6.0") 
 # Declarative catalog of all 28 host surface groups across the fleet (§2 & §4.2).
 # Literal `~` here is expanded via `expand_host_surface_catalog(home)` before any
 # disk read, diff, or write (`N7`).
+#
+# Lock styles per catalog entry (R7 Coordinator Findings):
+# - "tmp_pid": Atomic temp-sibling lock (`<surface>.tmp.<pid>[.<hex>]`). Counts as
+#   held ONLY if the embedded `<pid>` is alive (`kill(pid, 0)`) OR its `mtime` is
+#   under 10 minutes (`600` seconds) old. Stale `.tmp.*` files (dead pid and
+#   mtime >= 10 minutes old) do not defer and are reported as findings (never deleted).
+# - "flock": Advisory POSIX `flock(2)` lock file (`<surface>.lock` / `.<surface>.lock`).
+#   File existence alone is not holding (e.g. `~/.config/muse/.settings.json.lock`
+#   always exists at 0 bytes). Probed via non-blocking `fcntl.flock(fd, LOCK_EX | LOCK_NB)`
+#   and released immediately; held = locked (defer), acquirable = not locked.
+LOCK_STYLES: frozenset[str] = frozenset({"tmp_pid", "flock"})
+
 HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
     "claude-code": {
         "agent_id": "claude-code",
         "vault_path": "~/.minni/claudecode-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "continuous_cas",
+        "lock_style": "tmp_pid",
         "lock_glob": "~/.claude.json.tmp.*",
         "surfaces": [
             {
@@ -90,6 +103,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/claudecode-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "rewrite_while_running_and_quit_zero_delta",
+        "lock_style": "tmp_pid",
         "process_match": {
             "bundle_id": "com.anthropic.claudefordesktop",
             "process_names": ["Claude"],
@@ -112,6 +126,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/codex-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "cas_on_delta",
+        "lock_style": "tmp_pid",
         "surfaces": [
             {
                 "kind": "mcp_toml",
@@ -138,6 +153,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/grok-build-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "lock_and_cas_on_delta",
+        "lock_style": "flock",
         "lock_glob": "~/.grok/.config.toml.lock",
         "process_match": {"process_names": ["grok"]},
         "surfaces": [
@@ -172,6 +188,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/gemini-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "cas_on_delta",
+        "lock_style": "tmp_pid",
         "ui_scanner_gate": {
             "container_mode": "staged_copy",
             "verified": False,
@@ -279,6 +296,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/cursor-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "cas_on_delta",
+        "lock_style": "flock",
         "lock_glob": "~/.cursor/.mcp.json.lock",
         "process_match": {"process_names": ["Cursor"]},
         "ui_scanner_gate": {
@@ -329,6 +347,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/kilocode-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "cas_on_delta",
+        "lock_style": "tmp_pid",
         "surfaces": [
             {
                 "kind": "mcp_json",
@@ -349,6 +368,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/devin-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "cas_on_delta",
+        "lock_style": "tmp_pid",
         "process_match": {"process_names": ["devin"]},
         "surfaces": [
             {
@@ -376,6 +396,7 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "vault_path": "~/.minni/muse-vault",
         "status": "wired",
         "rewrite_on_run_hazard": "lockfile_and_cas_on_delta",
+        "lock_style": "flock",
         "lock_glob": "~/.config/muse/.settings.json.lock",
         "process_match": {"process_names": ["muse"]},
         "surfaces": [

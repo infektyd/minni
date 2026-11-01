@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
+import fcntl
 import glob
 import hashlib
 import json
@@ -94,6 +96,8 @@ class CutoverOutcome:
     gc_result: dict[str, Any] = field(default_factory=dict)
     message: str = ""
     plan: dict[str, Any] = field(default_factory=dict)
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    stale_locks: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -108,6 +112,8 @@ class CutoverOutcome:
             "skipped_surfaces": list(self.skipped_surfaces),
             "cas_conflicts": list(self.cas_conflicts),
             "gc_result": dict(self.gc_result),
+            "findings": copy.deepcopy(self.findings),
+            "stale_locks": copy.deepcopy(self.stale_locks),
             "message": self.message,
         }
         if self.plan:
@@ -125,6 +131,8 @@ class CutoverOutcome:
                 "would_archive",
                 "would-skip",
                 "would_skip",
+                "findings",
+                "stale_locks",
                 "gc",
             ):
                 if k in self.plan:
@@ -176,33 +184,151 @@ def _atomic_write_bytes(path: Path, data: bytes, mode: int | None = None) -> Non
     os.replace(tmp, path)
 
 
-def _check_host_lockfile(home: Path, host_id: str, surface_path: Path, *, retries: int = 3) -> str | None:
-    """Return lock/temp path string if a host lockfile or temp sibling is present after short backoff."""
+_TMP_LOCK_MAX_AGE_SECONDS = 600.0
+_TMP_LOCK_PID_RE = re.compile(r"\.tmp\.(\d+)(?:\..+)?$")
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if `pid` is a currently running OS process."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | None]:
+    """Evaluate a tmp-style lock (`<surface>.tmp.<pid>[.<hex>]`).
+
+    Counts as active ONLY if its embedded pid is alive OR its mtime is under
+    10 minutes (`600` seconds) old. Returns `(is_active, stale_finding_or_None)`.
+    Never deletes a stale file.
+    """
+    name = cand.name
+    if name.endswith(f".minni-cas.{os.getpid()}") or name == f".minni.tmp.{os.getpid()}":
+        return False, None
+    m = _TMP_LOCK_PID_RE.search(name)
+    embedded_pid: int | None = int(m.group(1)) if m else None
+    try:
+        st = os.lstat(cand)
+    except OSError:
+        return False, None
+    age_s = max(0.0, time.time() - st.st_mtime)
+    pid_alive = _is_pid_alive(embedded_pid) if embedded_pid is not None else False
+    mtime_fresh = age_s < _TMP_LOCK_MAX_AGE_SECONDS
+    if pid_alive or mtime_fresh:
+        return True, None
+    finding: dict[str, Any] = {
+        "host": host_id,
+        "path": str(cand),
+        "kind": "stale_tmp_lock",
+        "reason": "stale_tmp_lock",
+        "pid": embedded_pid,
+        "pid_alive": pid_alive,
+        "mtime": st.st_mtime,
+        "age_seconds": round(age_s, 1),
+        "detail": f"stale_tmp_lock (pid={embedded_pid} dead, age={int(age_s)}s >= 600s)",
+    }
+    return False, finding
+
+
+def _is_flock_held(cand: Path) -> bool:
+    """Return True if `cand` exists and an advisory `flock` is currently held on it.
+
+    Existence alone is not holding (e.g. `~/.config/muse/.settings.json.lock`
+    always exists at 0 bytes). Tries a non-blocking exclusive flock (`LOCK_EX | LOCK_NB`,
+    which blocks against both shared and exclusive holders) and releases immediately.
+    Never creates or modifies `cand`.
+    """
+    if not cand.exists():
+        return False
+    try:
+        fd = os.open(str(cand), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                return True
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _record_stale_finding(
+    stale_findings: list[dict[str, Any]] | None,
+    finding: dict[str, Any] | None,
+) -> None:
+    if stale_findings is None or finding is None:
+        return
+    fpath = finding.get("path")
+    if not any(f.get("path") == fpath for f in stale_findings):
+        stale_findings.append(finding)
+
+
+def _check_host_lockfile(
+    home: Path,
+    host_id: str,
+    surface_path: Path,
+    *,
+    retries: int = 3,
+    stale_findings: list[dict[str, Any]] | None = None,
+) -> str | None:
+    """Return active lock/temp path string if a host lockfile or temp sibling is held after short backoff."""
     hspec = HOST_SURFACE_CATALOG.get(host_id) or {}
     lock_glob_raw = str(hspec.get("lock_glob") or "")
+    lock_style = str(
+        hspec.get("lock_style")
+        or ("flock" if lock_glob_raw.endswith(".lock") else "tmp_pid")
+    )
     expanded_glob = expand_for_home(lock_glob_raw, home=home) if lock_glob_raw else ""
 
     def _scan_once() -> str | None:
         if expanded_glob:
-            matches = [
-                m for m in glob.glob(expanded_glob)
-                if not m.endswith(f".minni-cas.{os.getpid()}") and not m.endswith(f".tmp.{os.getpid()}")
-            ]
-            if matches:
-                return matches[0]
+            for m_str in sorted(glob.glob(expanded_glob)):
+                m_path = Path(m_str)
+                if lock_style == "flock" or m_path.name.endswith(".lock"):
+                    if _is_flock_held(m_path):
+                        return m_str
+                else:
+                    active, finding = _probe_tmp_lock(m_path, host_id)
+                    _record_stale_finding(stale_findings, finding)
+                    if active:
+                        return m_str
         parent = surface_path.parent
         if parent.is_dir():
             for cand in (
                 parent / f".{surface_path.name}.lock",
                 parent / f"{surface_path.name}.lock",
             ):
-                if cand.exists() or cand.is_symlink():
+                if _is_flock_held(cand):
                     return str(cand)
             for pat in (f"{surface_path.name}.tmp.*", f".{surface_path.name}.tmp.*"):
-                for m in parent.glob(pat):
-                    if m.name.endswith(f".tmp.{os.getpid()}"):
-                        continue
-                    return str(m)
+                for m_path in sorted(parent.glob(pat)):
+                    active, finding = _probe_tmp_lock(m_path, host_id)
+                    _record_stale_finding(stale_findings, finding)
+                    if active:
+                        return str(m_path)
         return None
 
     found = _scan_once()
@@ -942,14 +1068,35 @@ def _reconcile_text_surface(
     return (updated != raw_text), updated
 
 
-_SENSITIVE_KEY_RE = re.compile(r"(?i)(token|secret|key|password|passwd|credential|auth|bearer|private)")
-_SAFE_MINNI_ENV_KEYS: frozenset[str] = frozenset({
-    "MINNI_AGENT_ID",
-    "MINNI_VAULT_PATH",
-    "MINNI_WORKSPACE_ID",
-    "MINNI_SOCKET_PATH",
-    "MINNI_LOG_LEVEL",
-})
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(token|secret|key|password|passwd|credential|auth|bearer|private|cookie|session)"
+)
+_SENSITIVE_ARG_FLAG_RE = re.compile(
+    r"(?i)^(--?(?:token|api[-_]?key|secret|password|passwd|credential|auth|bearer|header)|-e|--env)$"
+)
+_TOKEN_PREFIX_RE = re.compile(
+    r"(?:"
+    r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}"
+    r"|\b(?:gh[pousr])_[A-Za-z0-9]{12,}"
+    r"|\bgithub[_]pat[_][A-Za-z0-9_]{12,}"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|\bgl[p]at-[A-Za-z0-9_-]{10,}"
+    r"|\bAIza[A-Za-z0-9_-]{20,}"
+    r"|\b(?:npm|pypi)[_-][A-Za-z0-9_-]{12,}"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"
+    r")"
+)
+_BEARER_BASIC_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}")
+_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s@]+)@")
+_INLINE_SENSITIVE_KV_RE = re.compile(
+    r"(?i)(--?(?:token|api[-_]?key|secret|password|passwd|credential|auth|bearer)[=:])(\S+)"
+)
+_URL_QUERY_SENSITIVE_RE = re.compile(
+    r"(?i)([?&](?:token|api[-_]?key|secret|password|passwd|credential|auth|key|access_token)=)([^&#\s]+)"
+)
+_ENV_ASSIGN_SENSITIVE_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Za-z0-9_]*=)(\S+)"
+)
 
 
 def _default_repo_root() -> Path | None:
@@ -963,29 +1110,199 @@ def _default_repo_root() -> Path | None:
     return None
 
 
+def _stage_repo_payload_to_temp(
+    repo_root: Path,
+    *,
+    version_override: str | None = None,
+    sha_override: str | None = None,
+) -> tuple[Path, PayloadManifest]:
+    """Build and sanitize the staged payload tree that `install_payload` would install, in a temp dir outside HOME."""
+    from minni.wire.from_repo import JUNK, MANIFEST_STAMP_PATHS, PAYLOAD_ITEMS, _git_sha
+    from minni.wire.install import _sanitize_staged_payload
+    from minni.wire.manifest import deterministic_built_at, dev_version, sha256_file
+
+    repo_root = repo_root.expanduser().resolve()
+    plugin_src = repo_root / "plugins" / "minni"
+    version = version_override or dev_version(repo_root)
+    git_sha = sha_override or _git_sha(repo_root)
+    tmp = Path(tempfile.mkdtemp(prefix="minni-cutover-payload-"))
+    try:
+        for item in PAYLOAD_ITEMS:
+            src = plugin_src / item
+            if not src.exists():
+                continue
+            dest = tmp / item
+            if src.is_dir():
+                shutil.copytree(src, dest, ignore=shutil.ignore_patterns(*JUNK))
+            else:
+                shutil.copy2(src, dest)
+
+        staged_server = tmp / "dist" / "server.js"
+        if staged_server.is_file() and (plugin_src / "node_modules" / "esbuild").exists():
+            try:
+                srv_txt = staged_server.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                srv_txt = ""
+            if "@modelcontextprotocol/sdk" in srv_txt:
+                subprocess.run(
+                    [
+                        "node",
+                        "--input-type=module",
+                        "-e",
+                        (
+                            'import * as esbuild from "esbuild";'
+                            "await esbuild.build({"
+                            "entryPoints:[process.argv[1]],"
+                            "bundle:true,"
+                            'platform:"node",'
+                            'format:"esm",'
+                            "outfile:process.argv[1],"
+                            "allowOverwrite:true,"
+                            'external:["node:*"],'
+                            "nodePaths:[process.argv[2]],"
+                            'logLevel:"silent"'
+                            "});"
+                        ),
+                        str(staged_server),
+                        str(plugin_src / "node_modules"),
+                    ],
+                    cwd=str(plugin_src),
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+
+        for rel in MANIFEST_STAMP_PATHS:
+            p = tmp / rel
+            if not p.is_file():
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data["version"] = version
+                    if rel == ".claude-plugin/plugin.json":
+                        data.pop("mcpServers", None)
+                    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+        (tmp / ".mcp.json").unlink(missing_ok=True)
+
+        files: dict[str, str] = {}
+        for path in sorted(tmp.rglob("*")):
+            if path.is_file() and not any(part in JUNK for part in path.parts):
+                rel_p = path.relative_to(tmp).as_posix()
+                files[rel_p] = sha256_file(path)
+
+        manifest_path = tmp / "payload-manifest.json"
+        built_at = deterministic_built_at(repo_root)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "version": version,
+                    "git_sha": git_sha,
+                    "built_at": built_at,
+                    "node_engine": ">=20",
+                    "files": files,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        files["payload-manifest.json"] = sha256_file(manifest_path)
+        manifest = PayloadManifest(
+            schema=1,
+            version=version,
+            git_sha=git_sha,
+            built_at=built_at,
+            node_engine=">=20",
+            files=files,
+            path=manifest_path,
+        )
+        _sanitize_staged_payload(tmp, manifest)
+        return tmp, manifest
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def _install_staged_payload_to_home(
+    staged_dir: Path,
+    manifest: PayloadManifest,
+    home: Path,
+) -> Path:
+    """Install a built staged payload tree into `<home>/.minni/plugin/<version>` without flipping `current` yet."""
+    from minni.wire.install import _copy_tree
+    from minni.wire.manifest import hash_mismatches
+
+    base = home / ".minni" / "plugin"
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / manifest.version
+    if target.is_dir():
+        try:
+            mismatched = hash_mismatches(manifest, target)
+            if not mismatched:
+                return target
+        except Exception:
+            pass
+    stage = base / f".staging-{manifest.version}-{os.getpid()}"
+    try:
+        _copy_tree(staged_dir, stage, manifest)
+        if target.exists():
+            qdir = base / f".quarantine-{manifest.version}-{os.getpid()}"
+            if qdir.exists():
+                shutil.rmtree(qdir, ignore_errors=True)
+            target.rename(qdir)
+        os.rename(stage, target)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+    return target
+
+
+def _redact_string(val: str) -> str:
+    """Redact token-shaped substrings, credentials, and sensitive inline assignments within a string."""
+    out = _BEARER_BASIC_RE.sub(r"\1 <REDACTED>", val)
+    out = _URL_USERINFO_RE.sub(r"\1<REDACTED>@", out)
+    out = _INLINE_SENSITIVE_KV_RE.sub(r"\1<REDACTED>", out)
+    out = _URL_QUERY_SENSITIVE_RE.sub(r"\1<REDACTED>", out)
+    out = _ENV_ASSIGN_SENSITIVE_RE.sub(r"\1<REDACTED>", out)
+    out = _TOKEN_PREFIX_RE.sub("<REDACTED>", out)
+    return out
+
+
 def _redact_minni_entry(entry: Any) -> Any:
-    """Return a copy of a `minni` entry with secrets/non-Minni env values redacted to `<REDACTED>`."""
+    """Return a copy of a `minni` entry with EVERY env value redacted to `<REDACTED>` and lists/strings walked for tokens."""
     if entry is None:
         return None
+    if isinstance(entry, str):
+        return _redact_string(entry)
+    if isinstance(entry, list):
+        out_list: list[Any] = []
+        skip_next = False
+        for idx, item in enumerate(entry):
+            if skip_next:
+                out_list.append("<REDACTED>")
+                skip_next = False
+                continue
+            if isinstance(item, str) and _SENSITIVE_ARG_FLAG_RE.match(item.strip()) and idx + 1 < len(entry):
+                out_list.append(item)
+                skip_next = True
+                continue
+            out_list.append(_redact_minni_entry(item))
+        return out_list
     if isinstance(entry, dict):
         redacted: dict[str, Any] = {}
         for k, v in entry.items():
             k_str = str(k)
             if k_str == "env" and isinstance(v, dict):
-                env_out: dict[str, Any] = {}
-                for ek, ev in v.items():
-                    ek_str = str(ek)
-                    if ek_str in _SAFE_MINNI_ENV_KEYS and not _SENSITIVE_KEY_RE.search(ek_str):
-                        env_out[ek_str] = str(ev)
-                    else:
-                        env_out[ek_str] = "<REDACTED>"
-                redacted[k_str] = env_out
+                redacted[k_str] = {str(ek): "<REDACTED>" for ek in v}
             elif _SENSITIVE_KEY_RE.search(k_str):
                 redacted[k_str] = "<REDACTED>"
-            elif isinstance(v, dict):
-                redacted[k_str] = _redact_minni_entry(v)
             else:
-                redacted[k_str] = copy.deepcopy(v)
+                redacted[k_str] = _redact_minni_entry(v)
         return redacted
     return copy.deepcopy(entry)
 
@@ -999,23 +1316,66 @@ def _build_dry_run_plan(
     repo_root: Path | None,
     ts: str,
     base_semver: str,
+    payload_ref_dir: Path | None = None,
 ) -> CutoverOutcome:
     """Compute lossless per-surface plan (`would-write`, `would-create`, `would-defer`, `would-archive`, `would-skip`, and GC `would-prune`/`would-keep`) with zero disk writes."""
     plugin_dir = home / ".minni" / "plugin"
     vdir = plugin_dir / target_version
-    if vdir.is_dir():
+    ephemeral_staged_dir: Path | None = None
+    if payload_ref_dir is not None and payload_ref_dir.is_dir():
+        ref_vdir = payload_ref_dir
+    elif vdir.is_dir():
         ref_vdir = vdir
-    elif repo_root is not None and (repo_root / "plugins" / "minni").is_dir():
-        ref_vdir = repo_root / "plugins" / "minni"
     else:
-        def_repo = _default_repo_root()
-        if def_repo is not None and (def_repo / "plugins" / "minni").is_dir():
-            ref_vdir = def_repo / "plugins" / "minni"
+        eff_repo = (
+            repo_root
+            if (repo_root is not None and (repo_root / "plugins" / "minni").is_dir())
+            else _default_repo_root()
+        )
+        if eff_repo is not None and (eff_repo / "plugins" / "minni").is_dir():
+            try:
+                ephemeral_staged_dir, _ = _stage_repo_payload_to_temp(
+                    eff_repo,
+                    version_override=target_version or None,
+                    sha_override=target_git_sha or None,
+                )
+                ref_vdir = ephemeral_staged_dir
+            except Exception:
+                ref_vdir = eff_repo / "plugins" / "minni"
         elif (plugin_dir / "current").is_dir():
             ref_vdir = plugin_dir / "current"
         else:
             ref_vdir = vdir
 
+    try:
+        return _build_dry_run_plan_with_ref(
+            home=home,
+            plugin_dir=plugin_dir,
+            vdir=vdir,
+            ref_vdir=ref_vdir,
+            target_version=target_version,
+            target_git_sha=target_git_sha,
+            running_hosts=running_hosts,
+            ts=ts,
+            base_semver=base_semver,
+        )
+    finally:
+        if ephemeral_staged_dir is not None:
+            shutil.rmtree(ephemeral_staged_dir, ignore_errors=True)
+
+
+def _build_dry_run_plan_with_ref(
+    *,
+    home: Path,
+    plugin_dir: Path,
+    vdir: Path,
+    ref_vdir: Path,
+    target_version: str,
+    target_git_sha: str,
+    running_hosts: set[str] | None,
+    ts: str,
+    base_semver: str,
+) -> CutoverOutcome:
     wired_doc = _load_wired(plugin_dir / "wired.json")
     active_running = (
         set(running_hosts)
@@ -1034,6 +1394,7 @@ def _build_dry_run_plan(
             "would-defer": [],
             "would-archive": [],
             "would-skip": [],
+            "stale_locks": [],
         }
 
     would_write: list[dict[str, Any]] = []
@@ -1041,6 +1402,7 @@ def _build_dry_run_plan(
     would_defer: list[dict[str, Any]] = []
     would_archive: list[dict[str, Any]] = []
     would_skip: list[dict[str, Any]] = []
+    stale_findings: list[dict[str, Any]] = []
     all_surface_plans: list[dict[str, Any]] = []
     updated_surfaces: list[str] = []
     skipped_surfaces: list[str] = []
@@ -1057,7 +1419,13 @@ def _build_dry_run_plan(
         return str(archive_base / rel)
 
     def _check_defer(host: str, cfg_path: Path, raw_text: str) -> str | None:
-        lock_hit = _check_host_lockfile(home, host, cfg_path, retries=1)
+        lock_hit = _check_host_lockfile(
+            home,
+            host,
+            cfg_path,
+            retries=1,
+            stale_findings=stale_findings,
+        )
         is_running_rewrite_host = (
             host in ("muse", "claude-desktop", "grok-build", "devin", "cursor")
             and host in active_running
@@ -1263,14 +1631,14 @@ def _build_dry_run_plan(
                             before_entry.get("version") == base_semver
                             and before_entry.get("gitCommitSha") == target_git_sha
                             and before_entry.get("installPath") == expected_install
-                            and before_entry.get("projectPath") == expected_project
+                            and ("projectPath" not in before_entry or before_entry.get("projectPath") == expected_project)
                             and "~" not in str(before_entry.get("installPath") or "")
                             and "~" not in str(before_entry.get("projectPath") or "")
                         ):
                             inst_has_delta = False
                 except Exception:
                     inst_has_delta = True
-            mkt_has_delta = _container_has_delta(mkt_plugin_dir, ref_vdir, base_semver)
+            mkt_has_delta = _container_has_delta(mkt_plugin_dir, ref_vdir, base_semver, forbid_mcp_json=True)
             if not inst_has_delta and not mkt_has_delta:
                 _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
                 continue
@@ -1535,6 +1903,11 @@ def _build_dry_run_plan(
         "pruned": [],
     }
 
+    for sf in stale_findings:
+        sf_host = str(sf.get("host") or "")
+        if sf_host in hosts_plan:
+            hosts_plan[sf_host].setdefault("stale_locks", []).append(sf)
+
     plan_doc: dict[str, Any] = {
         "target_version": target_version,
         "target_git_sha": target_git_sha,
@@ -1550,6 +1923,8 @@ def _build_dry_run_plan(
         "would_archive": would_archive,
         "would-skip": would_skip,
         "would_skip": would_skip,
+        "findings": stale_findings,
+        "stale_locks": stale_findings,
         "gc": {
             "would-prune": list(gc_out.would_prune),
             "would-keep": would_keep_paths,
@@ -1574,6 +1949,8 @@ def _build_dry_run_plan(
         gc_result=gc_dict,
         message=msg,
         plan=plan_doc,
+        findings=stale_findings,
+        stale_locks=stale_findings,
     )
 
 
@@ -1586,6 +1963,7 @@ def execute_atomic_cutover(
     running_hosts: set[str] | None = None,
     post_flip_verifier: Callable[[Path], bool] | None = None,
     repo_root: Path | None = None,
+    payload_ref_dir: Path | None = None,
 ) -> CutoverOutcome:
     """Execute the 7-step atomic cutover with pre-flip probes and CAS rollback (§4.3)."""
     plugin_dir = home / ".minni" / "plugin"
@@ -1603,6 +1981,7 @@ def execute_atomic_cutover(
             repo_root=repo_root,
             ts=ts,
             base_semver=base_semver,
+            payload_ref_dir=payload_ref_dir,
         )
 
     if not vdir.is_dir():
@@ -1652,46 +2031,6 @@ def execute_atomic_cutover(
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)
 
-    wired_doc = _load_wired(plugin_dir / "wired.json")
-    active_running = (
-        set(running_hosts)
-        if running_hosts is not None
-        else _detect_running_rewrite_hosts()
-    )
-    rollback_records: list[_ConfigRollbackRecord] = []
-    commands_symlink_rollbacks: list[tuple[Path, str | None, int, int, str]] = []
-    updated_surfaces: list[str] = []
-    skipped_surfaces: list[str] = []
-    deferred_running_hosts: list[str] = []
-    deferred_details: list[str] = []
-    deferred_surface_paths: set[str] = set()
-    deferred_protected_versions: set[str] = set()
-
-    def _should_defer_host_write(host: str, cfg_path: Path, raw_text: str) -> bool:
-        lock_hit = _check_host_lockfile(home, host, cfg_path, retries=3)
-        is_running_rewrite_host = (
-            host in ("muse", "claude-desktop", "grok-build", "devin", "cursor")
-            and host in active_running
-        )
-        if lock_hit or is_running_rewrite_host:
-            if host not in deferred_running_hosts:
-                deferred_running_hosts.append(host)
-            deferred_surface_paths.add(str(cfg_path))
-            detail = f"{host} ({cfg_path})" + (f" [lock: {lock_hit}]" if lock_hit else "")
-            if detail not in deferred_details:
-                deferred_details.append(detail)
-            deferred_protected_versions.update(_extract_referenced_versions(raw_text, plugin_dir))
-            return True
-        return False
-
-    # Step 4 — Flip `current` Pointer (P2-6, R4-1, P1-1, P1-2)
-    flip_state: CurrentFlipState = flip_current_pointer(target_version, home=home, pid=pid)
-    all_container_swaps: list[SubtreeSwapRecord] = []
-    prev_installed_plugins_list: list[tuple[Path, bytes | None, int, int, str]] = []
-    step5_error: str = ""
-    cas_conflicts: list[str] = []
-
-    # Step 5 — Reconcile Host Surfaces Across All Catalog Surface Kinds (`delta != 0` only, Lock/Running Guard & CAS)
     # Flatten all catalog surfaces (containers & plugin registries first, then config/hook/wrapper surfaces) + legacy ~/.muse/config.json
     container_and_registry_surfaces: list[tuple[str, str, Path, dict[str, Any], bool]] = []
     config_and_file_surfaces: list[tuple[str, str, Path, dict[str, Any], bool]] = []
@@ -1748,8 +2087,74 @@ def execute_atomic_cutover(
             )
         )
 
-    # H15 (Grok r5 P3): if any active/expected commands_dir surface has a missing payload commands/
-    # directory, fail Step 5 with that host and path before any other surface write.
+    # H15 (Grok r5 P3 & r6 P2): BEFORE Step 4 (`flip_current_pointer`), verify that any active or
+    # expected commands_dir surface has a valid payload commands/ directory; never flip `current` if missing.
+    current_prefix = str(plugin_dir / "current")
+    for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
+        if kind != "commands_dir":
+            continue
+        if cfg_path.is_symlink() or _commands_dir_expected_on_home(home, cfg_path):
+            expected_target = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
+            if expected_target == current_prefix or expected_target.startswith(current_prefix + "/"):
+                rel_sub = expected_target[len(current_prefix):].lstrip("/")
+                post_flip_target_dir = (vdir / rel_sub) if rel_sub else vdir
+            else:
+                post_flip_target_dir = Path(expected_target)
+            if not (vdir / "commands").is_dir() or not post_flip_target_dir.is_dir():
+                return CutoverOutcome(
+                    exit_code=1,
+                    status="ABORTED_PRE_FLIP",
+                    target_version=target_version,
+                    target_git_sha=target_git_sha,
+                    aborted_pre_flip=True,
+                    rolled_back=False,
+                    message=(
+                        f"broken commands_dir symlink for {host} ({cfg_path}): "
+                        f"payload commands/ directory missing at {expected_target}"
+                    ),
+                )
+
+    wired_doc = _load_wired(plugin_dir / "wired.json")
+    active_running = (
+        set(running_hosts)
+        if running_hosts is not None
+        else _detect_running_rewrite_hosts()
+    )
+    rollback_records: list[_ConfigRollbackRecord] = []
+    commands_symlink_rollbacks: list[tuple[Path, str | None, int, int, str]] = []
+    updated_surfaces: list[str] = []
+    skipped_surfaces: list[str] = []
+    deferred_running_hosts: list[str] = []
+    deferred_details: list[str] = []
+    deferred_surface_paths: set[str] = set()
+    deferred_protected_versions: set[str] = set()
+    stale_findings: list[dict[str, Any]] = []
+
+    def _should_defer_host_write(host: str, cfg_path: Path, raw_text: str) -> bool:
+        lock_hit = _check_host_lockfile(home, host, cfg_path, retries=3, stale_findings=stale_findings)
+        is_running_rewrite_host = (
+            host in ("muse", "claude-desktop", "grok-build", "devin", "cursor")
+            and host in active_running
+        )
+        if lock_hit or is_running_rewrite_host:
+            if host not in deferred_running_hosts:
+                deferred_running_hosts.append(host)
+            deferred_surface_paths.add(str(cfg_path))
+            detail = f"{host} ({cfg_path})" + (f" [lock: {lock_hit}]" if lock_hit else "")
+            if detail not in deferred_details:
+                deferred_details.append(detail)
+            deferred_protected_versions.update(_extract_referenced_versions(raw_text, plugin_dir))
+            return True
+        return False
+
+    # Step 4 — Flip `current` Pointer (P2-6, R4-1, P1-1, P1-2)
+    flip_state: CurrentFlipState = flip_current_pointer(target_version, home=home, pid=pid)
+    all_container_swaps: list[SubtreeSwapRecord] = []
+    prev_installed_plugins_list: list[tuple[Path, bytes | None, int, int, str]] = []
+    step5_error: str = ""
+    cas_conflicts: list[str] = []
+
+    # Step 5 — Reconcile Host Surfaces Across All Catalog Surface Kinds (`delta != 0` only, Lock/Running Guard & CAS)
     for host, kind, cfg_path, surf_spec, _rewrite_on_run in all_surfaces:
         if kind != "commands_dir":
             continue
@@ -2315,6 +2720,8 @@ def execute_atomic_cutover(
             skipped_surfaces=skipped_surfaces,
             cas_conflicts=cas_conflicts,
             message=step6_reason or "rolled back after Step 6 failure",
+            findings=stale_findings,
+            stale_locks=stale_findings,
         )
 
     # Step 6 succeeded: archive `.prev.<pid>` and `.current.prev_dir.<pid>` into `~/.minni/archive/<ts>/`
@@ -2364,6 +2771,8 @@ def execute_atomic_cutover(
                 f"DEFERRED_RUNNING_HOST_DELTA: deferred config rewrite for running/locked host(s) "
                 f"[{details_str}] to prevent rewrite-on-exit clobber; quit [{hosts_str}] and re-run `minni sync`."
             ),
+            findings=stale_findings,
+            stale_locks=stale_findings,
         )
 
     return CutoverOutcome(
@@ -2375,6 +2784,8 @@ def execute_atomic_cutover(
         skipped_surfaces=skipped_surfaces,
         gc_result=gc_res,
         message=f"converged all active surfaces to {target_version}",
+        findings=stale_findings,
+        stale_locks=stale_findings,
     )
 
 
@@ -2387,84 +2798,88 @@ def reconcile_all_hosts(
     dry_run: bool = True,
     running_hosts: set[str] | None = None,
     post_flip_verifier: Callable[[Path], bool] | None = None,
+    allow_default_repo: bool = True,
 ) -> CutoverOutcome:
     """High-level entry point for host reconciliation and migration (`--dry-run` default per §5)."""
     resolved_home = Path(home) if home is not None else Path(os.environ.get("HOME") or Path.home())
     plugin_dir = resolved_home / ".minni" / "plugin"
 
+    # Single repo-root resolution rule for both --dry-run and --apply (R7 P2)
     resolved_repo: Path | None = None
     if from_repo is not None:
         resolved_repo = Path(from_repo).expanduser().resolve()
-    elif dry_run and target_version is None:
+    elif allow_default_repo and target_version is None:
         resolved_repo = _default_repo_root()
 
-    if target_version is None and resolved_repo is not None:
-        pkg_dir = resolved_repo / "plugins" / "minni"
-        if not dry_run:
-            if (pkg_dir / "dist" / "server.js").is_file():
-                vdir = install_payload(pkg_dir)
-                manifest = PayloadManifest.load(vdir / "payload-manifest.json")
-                target_version = manifest.version
-                target_git_sha = manifest.git_sha
-        elif (resolved_repo / "pyproject.toml").is_file() and pkg_dir.is_dir():
-            from minni.wire.from_repo import _git_sha
-            from minni.wire.manifest import dev_version
-
-            try:
-                target_version = dev_version(resolved_repo)
-            except Exception:
-                target_version = None
-            if target_git_sha is None:
+    staged_tmp: Path | None = None
+    try:
+        if target_version is None and resolved_repo is not None:
+            pkg_dir = resolved_repo / "plugins" / "minni"
+            if (resolved_repo / "pyproject.toml").is_file() and (pkg_dir / "dist" / "server.js").is_file():
                 try:
-                    target_git_sha = _git_sha(resolved_repo)
+                    staged_tmp, manifest = _stage_repo_payload_to_temp(
+                        resolved_repo,
+                        sha_override=target_git_sha,
+                    )
+                    target_version = manifest.version
+                    if target_git_sha is None:
+                        target_git_sha = manifest.git_sha
+                    if not dry_run:
+                        _install_staged_payload_to_home(staged_tmp, manifest, resolved_home)
                 except Exception:
-                    target_git_sha = None
+                    if staged_tmp is not None:
+                        shutil.rmtree(staged_tmp, ignore_errors=True)
+                        staged_tmp = None
 
-    if target_version is None:
-        current = plugin_dir / "current"
-        if current.is_symlink() and current.exists():
-            target_version = current.resolve().name
-        elif plugin_dir.is_dir():
-            candidates = [
-                d for d in plugin_dir.iterdir()
-                if d.is_dir()
-                and not d.is_symlink()
-                and not d.name.startswith(".")
-                and (d / "payload-manifest.json").is_file()
-                and all((d / sub).exists() for sub in ("dist", "skills", "commands", "hooks"))
-            ]
-            if candidates:
-                candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                target_version = candidates[0].name
+        if target_version is None:
+            current = plugin_dir / "current"
+            if current.is_symlink() and current.exists():
+                target_version = current.resolve().name
+            elif plugin_dir.is_dir():
+                candidates = [
+                    d for d in plugin_dir.iterdir()
+                    if d.is_dir()
+                    and not d.is_symlink()
+                    and not d.name.startswith(".")
+                    and (d / "payload-manifest.json").is_file()
+                    and all((d / sub).exists() for sub in ("dist", "skills", "commands", "hooks"))
+                ]
+                if candidates:
+                    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    target_version = candidates[0].name
 
-    if target_version is None:
-        return CutoverOutcome(
-            exit_code=0,
-            status="SKIPPED",
-            target_version="",
-            target_git_sha="",
-            message="no staged plugin payload found",
-        )
+        if target_version is None:
+            return CutoverOutcome(
+                exit_code=0,
+                status="SKIPPED",
+                target_version="",
+                target_git_sha="",
+                message="no staged plugin payload found",
+            )
 
-    vdir = plugin_dir / target_version
-    if target_git_sha is None:
-        if (vdir / "payload-manifest.json").is_file():
-            try:
-                target_git_sha = PayloadManifest.load(vdir / "payload-manifest.json").git_sha
-            except Exception:
+        vdir = plugin_dir / target_version
+        if target_git_sha is None:
+            if (vdir / "payload-manifest.json").is_file():
+                try:
+                    target_git_sha = PayloadManifest.load(vdir / "payload-manifest.json").git_sha
+                except Exception:
+                    target_git_sha = "unknown"
+            else:
                 target_git_sha = "unknown"
-        else:
-            target_git_sha = "unknown"
 
-    return execute_atomic_cutover(
-        home=resolved_home,
-        target_version=target_version,
-        target_git_sha=target_git_sha,
-        dry_run=dry_run,
-        running_hosts=running_hosts,
-        post_flip_verifier=post_flip_verifier,
-        repo_root=resolved_repo,
-    )
+        return execute_atomic_cutover(
+            home=resolved_home,
+            target_version=target_version,
+            target_git_sha=target_git_sha,
+            dry_run=dry_run,
+            running_hosts=running_hosts,
+            post_flip_verifier=post_flip_verifier,
+            repo_root=resolved_repo,
+            payload_ref_dir=staged_tmp,
+        )
+    finally:
+        if staged_tmp is not None:
+            shutil.rmtree(staged_tmp, ignore_errors=True)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -36,53 +36,39 @@ _SCAN_DIR_RELATIVES: tuple[str, ...] = (
 )
 
 # Explicit, documented deny-list of directory names inside host roots that hold
-# conversation stores, file-history, backups, worker sandboxes, or runtime caches
-# rather than launch configs (§4.7 R6 Item 2).
+# data stores (brain, conversations, file-history, backups, muse-code-worker,
+# session stores) or runtime caches rather than launch configs (§4.7 R7 P1).
+# Host config roots (`antigravity`, `antigravity-ide`, `workflows`, `projects`, etc.)
+# are NEVER denylisted here so `mcp_config.json` siblings and `workflows/` stay scannable.
 UNCATALOGUED_SCAN_DENYLIST_DIRS: frozenset[str] = frozenset({
-    # Conversation, brain, chat, session, and agent memory stores
-    "antigravity",
-    "antigravity-ide",
+    # Data-store subtrees (brain, conversations, file-history, backups, worker sandboxes, session stores)
     "brain",
-    "chats",
     "conversations",
-    "sessions",
-    "local-agent-mode-sessions",
-    "claude-code-sessions",
-    "memory",
-    "memory-v2",
-    "paste-cache",
-    "todos",
-    "plans",
-    "workflows",
-    # Backup, archive, and file-history stores
-    "backups",
-    "backup",
-    "antigravity-backup",
     "file-history",
-    "history",
-    "archive",
-    "legacy-plugins",
-    "trash",
-    # Ephemeral worker workspaces and scratch sandboxes
+    "backups",
+    "antigravity-backup",
     "muse-code-worker",
     "grok-build-peer",
-    "scratch",
-    "tmp",
-    "temp",
-    "projects",
-    "worktrees",
-    "workspaces",
+    "local-agent-mode-sessions",
+    "claude-code-sessions",
+    "session-env",
+    "shell-snapshots",
+    "subagents",
+    "tool-results",
+    "memory-v2",
+    "legacy-plugins",
     # Runtime/browser caches and telemetry
     "node_modules",
     ".git",
+    "cache",
     "Cache",
     "GPUCache",
     "Code Cache",
     "DawnCache",
     "DawnGraphiteCache",
     "DawnWebGPUCache",
-    "logs",
-    "shell-snapshots",
+    "antigravity-browser-profile",
+    "extensions",
     "statsig",
     "telemetry",
     "crashpad",
@@ -94,33 +80,37 @@ UNCATALOGUED_SCAN_DENYLIST_DIRS: frozenset[str] = frozenset({
     "WebStorage",
     "Network",
     "Dictionaries",
+    "paste-cache",
 })
 
-# Explicit, documented deny-list of home-relative path prefixes for history,
-# backup, conversation, file-history, and worker workspace stores (§4.7 R6 Item 2).
+# Explicit, documented deny-list of home-relative path prefixes for data-store
+# subtrees only (brain, conversations, file-history, backups, muse-code-worker,
+# session stores) (§4.7 R7 P1).
 UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES: tuple[str, ...] = (
-    ".gemini/antigravity",
-    ".gemini/antigravity-ide",
-    ".gemini/antigravity-backup",
+    ".gemini/antigravity/brain",
+    ".gemini/antigravity/conversations",
+    ".gemini/antigravity-ide/brain",
+    ".gemini/antigravity-ide/conversations",
     ".gemini/antigravity-cli/brain",
+    ".gemini/antigravity-backup",
     ".gemini/tmp",
     ".agents/backups",
-    ".agents/workflows",
     ".codex/muse-code-worker",
     ".codex/grok-build-peer",
     ".codex/backups",
+    ".codex/sessions",
     ".claude/file-history",
     ".claude/backups",
     "Library/Application Support/Claude/local-agent-mode-sessions",
     "Library/Application Support/Claude/claude-code-sessions",
     ".grok/memory-v2",
-    ".grok/scratch",
-    ".cursor/plans",
+    ".grok/sessions",
     ".cursor/legacy-plugins",
 )
 
 UNCATALOGUED_SCAN_DENYLIST_FILES: frozenset[str] = frozenset({
     "history.jsonl",
+    "plugin-directory-cache-v2.json",
     ".DS_Store",
     "LOCK",
     "LOG",
@@ -142,6 +132,15 @@ _CONFIG_FILE_SUFFIXES: frozenset[str] = frozenset({
     ".js",
     ".mjs",
 })
+
+_BINARY_MAGIC_PREFIXES: tuple[bytes, ...] = (
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xca\xfe\xba\xbe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\x7fELF",
+)
 
 # Known config depth ceiling relative to each scan root (e.g. ~/.codex/skills/<name>/SKILL.md is depth 3)
 _DEFAULT_MAX_CONFIG_DEPTH = 4
@@ -205,21 +204,28 @@ def _is_denylisted_rel_path(rel_to_home: str) -> bool:
     for part in parts[:-1]:
         if part in UNCATALOGUED_SCAN_DENYLIST_DIRS:
             return True
-        lower = part.lower()
-        if lower.endswith("-backup") or lower.endswith("_backup") or lower.startswith("backup-"):
-            return True
     return False
 
 
+def _is_native_binary_file(fpath: Path) -> bool:
+    """Return True if `fpath` starts with Mach-O or ELF executable binary magic bytes."""
+    try:
+        with fpath.open("rb") as f:
+            head = f.read(4)
+        return len(head) == 4 and head.startswith(_BINARY_MAGIC_PREFIXES)
+    except OSError:
+        return False
+
+
 def _is_config_shaped_file(fpath: Path, root_dir: Path, rel_root: str) -> bool:
-    """Return True if `fpath` is a config-shaped file (json/toml/yaml/js/sh/md skill copy) at a known config depth."""
+    """Return True if `fpath` is a config-shaped file (json/toml/yaml/js/sh/md skill/workflow/rule) at a known config depth."""
     name = fpath.name
     if name in UNCATALOGUED_SCAN_DENYLIST_FILES:
         return False
     lower_name = name.lower()
-    if lower_name.endswith((".jsonl", ".log", ".bak", ".orig", ".tmp", ".lock", ".sqlite", ".db")):
+    if lower_name.endswith((".jsonl", ".log", ".bak", ".orig", ".tmp", ".lock", ".sqlite", ".db", ".par", ".headers")):
         return False
-    if ".backup" in lower_name or ".minni-backup-" in lower_name:
+    if ".backup" in lower_name or ".minni-backup-" in lower_name or lower_name.startswith(".muse-launcher."):
         return False
 
     try:
@@ -236,10 +242,16 @@ def _is_config_shaped_file(fpath: Path, root_dir: Path, rel_root: str) -> bool:
         return True
     if suffix == ".md":
         parent_dirs = {p.lower() for p in rel_parts[:-1]}
-        return name == "SKILL.md" or bool(parent_dirs & {"skills", "rules"})
+        return name == "SKILL.md" or bool(parent_dirs & {"skills", "rules", "workflows", "commands"})
     if suffix == "":
         parent_dirs = {p.lower() for p in rel_parts[:-1]}
-        return rel_root == ".local/bin" or bool(parent_dirs & {"bin", "scripts", "hooks"})
+        if not (rel_root == ".local/bin" or bool(parent_dirs & {"bin", "scripts", "hooks"})):
+            return False
+        if fpath.is_symlink() and not fpath.exists():
+            return "minni" in lower_name
+        if _is_native_binary_file(fpath):
+            return False
+        return True
     return False
 
 
@@ -264,6 +276,19 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
                 return True
         return False
 
+    def _is_symlink_to_config_shaped(fpath: Path, root_dir: Path, rel_root: str) -> bool:
+        if not fpath.is_symlink():
+            return False
+        try:
+            resolved_target = fpath.resolve(strict=True)
+        except OSError:
+            return False
+        if not resolved_target.is_file():
+            return False
+        if _is_config_shaped_file(fpath, root_dir, rel_root):
+            return True
+        return _is_config_shaped_file(resolved_target, resolved_target.parent, "")
+
     def _inspect_file(fpath: Path, root_dir: Path, rel_root: str) -> None:
         try:
             rel_to_home = str(fpath.relative_to(resolved_home))
@@ -271,16 +296,50 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
             rel_to_home = ""
         if rel_to_home and _is_denylisted_rel_path(rel_to_home):
             return
-        if not _is_config_shaped_file(fpath, root_dir, rel_root):
-            return
         if _is_catalogued(fpath):
+            return
+        is_cfg = _is_config_shaped_file(fpath, root_dir, rel_root) or _is_symlink_to_config_shaped(
+            fpath, root_dir, rel_root
+        )
+        if not is_cfg:
+            if fpath.is_symlink():
+                try:
+                    link_target = os.readlink(fpath)
+                except OSError:
+                    link_target = ""
+                m_link = _PLUGIN_REF_RE.search(link_target)
+                if m_link:
+                    findings.append({
+                        "path": str(fpath),
+                        "matched": m_link.group(1),
+                        "reason": "uncatalogued_file_references_minni_plugin",
+                    })
             return
         try:
             st = fpath.stat()
-            if st.st_size > _MAX_SCAN_FILE_BYTES:
-                return
-            text = fpath.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            findings.append({
+                "path": str(fpath),
+                "matched": "<unreadable>",
+                "reason": "unreadable_config_file",
+            })
+            return
+        if st.st_size > _MAX_SCAN_FILE_BYTES:
+            findings.append({
+                "path": str(fpath),
+                "matched": f"<{st.st_size}_bytes>",
+                "reason": "config_file_exceeds_size_cap",
+            })
+            return
+        try:
+            with fpath.open("r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            findings.append({
+                "path": str(fpath),
+                "matched": "<unreadable>",
+                "reason": "unreadable_config_file",
+            })
             return
         m = _PLUGIN_REF_RE.search(text)
         if m:
@@ -292,7 +351,7 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
 
     # Check top-level ~/.claude.json
     claude_top = resolved_home / ".claude.json"
-    if claude_top.is_file():
+    if claude_top.exists() or claude_top.is_symlink():
         _inspect_file(claude_top, resolved_home, "")
 
     for rel in _SCAN_DIR_RELATIVES:
@@ -300,7 +359,13 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
         if not root_dir.is_dir():
             continue
         max_depth = _MAX_CONFIG_REL_DEPTH_BY_ROOT.get(rel, _DEFAULT_MAX_CONFIG_DEPTH)
-        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        visited_real_dirs: set[tuple[int, int]] = set()
+        try:
+            root_st = root_dir.stat()
+            visited_real_dirs.add((root_st.st_dev, root_st.st_ino))
+        except OSError:
+            pass
+        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=True):
             dp = Path(dirpath)
             try:
                 cur_depth = len(dp.relative_to(root_dir).parts)
@@ -322,12 +387,18 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
                         cand_rel = ""
                     if cand_rel and _is_denylisted_rel_path(cand_rel + "/x"):
                         continue
+                    try:
+                        cst = cand.stat()
+                        key = (cst.st_dev, cst.st_ino)
+                        if key in visited_real_dirs:
+                            continue
+                        visited_real_dirs.add(key)
+                    except OSError:
+                        continue
                     kept_dirs.append(d)
                 dirnames[:] = kept_dirs
             for fn in filenames:
                 fp = dp / fn
-                if fp.is_symlink():
-                    continue
                 _inspect_file(fp, root_dir, rel)
 
     return findings

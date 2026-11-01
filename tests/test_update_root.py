@@ -216,7 +216,7 @@ def test_refuses_when_another_sync_holds_the_lock(cloned, tmp_path):
     try:
         (lockdir / "pid").write_text(str(holder.pid), encoding="utf-8")
         (lockdir / "cmd").write_text("update_root.sh\n", encoding="utf-8")
-        proc = _run(clone, "--dry-run", lockdir=lockdir,
+        proc = _run(clone, lockdir=lockdir,
                     path_prefix=_fake_launchctl(tmp_path, loaded=True))
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "already running" in (proc.stdout + proc.stderr)
@@ -228,13 +228,14 @@ def test_refuses_when_another_sync_holds_the_lock(cloned, tmp_path):
 def test_reclaims_stale_lock_from_dead_pid(cloned, tmp_path):
     """Round-5 Med: a SIGKILL'd run must not freeze all future syncs."""
     _origin, clone = cloned
+    (clone / "f.txt").write_text("dirty after lock gate\n", encoding="utf-8")
     lockdir = tmp_path / "stale-lock"
     lockdir.mkdir()
     (lockdir / "pid").write_text("999999999", encoding="utf-8")  # not a live pid
     (lockdir / "cmd").write_text("update_root.sh\n", encoding="utf-8")
-    proc = _run(clone, "--dry-run", lockdir=lockdir,
+    proc = _run(clone, lockdir=lockdir,
                 path_prefix=_fake_launchctl(tmp_path, loaded=True))
-    # Gets past the lock gate (may still fail later for other dry-run reasons).
+    # Gets past the lock gate (stops at Step 1 dirty-tree guard).
     assert "already running" not in (proc.stdout + proc.stderr)
     assert "reclaiming stale sync lock" in (proc.stdout + proc.stderr)
 
@@ -242,17 +243,43 @@ def test_reclaims_stale_lock_from_dead_pid(cloned, tmp_path):
 def test_reclaims_lock_when_live_pid_is_not_update_root(cloned, tmp_path):
     """PID reuse: live process that is not update_root.sh must not brick sync."""
     _origin, clone = cloned
+    (clone / "f.txt").write_text("dirty after lock gate\n", encoding="utf-8")
     lockdir = tmp_path / "reused-pid-lock"
     lockdir.mkdir()
     # This test process is live but is not update_root.sh.
     (lockdir / "pid").write_text(str(os.getpid()), encoding="utf-8")
     (lockdir / "cmd").write_text("update_root.sh\n", encoding="utf-8")
-    proc = _run(clone, "--dry-run", lockdir=lockdir,
+    proc = _run(clone, lockdir=lockdir,
                 path_prefix=_fake_launchctl(tmp_path, loaded=True))
     combined = proc.stdout + proc.stderr
     assert "already running" not in combined
     assert "reclaiming stale sync lock" in combined
     assert "PID reuse" in combined or "not update_root" in combined
+
+
+def test_dry_run_takes_no_lock_directory_and_runs_cutover_dry_run(cloned, tmp_path):
+    """R7 Input 1 (P2): `update_root.sh --dry-run` runs `cutover --dry-run` for real,
+    and takes no lock directory.
+    """
+    _origin, clone = cloned
+    lockdir = tmp_path / "nested-uncreated" / "sync-root.lockdir"
+    proc = _run(
+        clone,
+        "--dry-run",
+        lockdir=lockdir,
+        path_prefix=_fake_launchctl(tmp_path, loaded=True),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not lockdir.exists()
+    assert not lockdir.parent.exists(), "dry-run must not even mkdir the lockdir parent"
+    assert "would run:" not in [
+        line for line in proc.stdout.splitlines() if "minni.wire.cutover" in line
+    ]
+    assert any(
+        "running:" in line and "-m minni.wire.cutover" in line and "--dry-run" in line
+        for line in proc.stdout.splitlines()
+    ), proc.stdout
+    assert '"target_version":' in proc.stdout and '"status":' in proc.stdout
 
 
 def test_refuses_non_git_directory(tmp_path):
