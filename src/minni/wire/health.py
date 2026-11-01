@@ -35,77 +35,80 @@ _SCAN_DIR_RELATIVES: tuple[str, ...] = (
     "Library/Application Support/Claude",
 )
 
-# Explicit, documented deny-list of directory names inside host roots that hold
-# data stores (brain, conversations, file-history, backups, muse-code-worker,
-# session stores) or runtime caches rather than launch configs (§4.7 R7 P1).
-# Host config roots (`antigravity`, `antigravity-ide`, `workflows`, `projects`, etc.)
-# are NEVER denylisted here so `mcp_config.json` siblings and `workflows/` stay scannable.
-UNCATALOGUED_SCAN_DENYLIST_DIRS: frozenset[str] = frozenset({
-    # Data-store subtrees (brain, conversations, file-history, backups, worker sandboxes, session stores)
-    "brain",
-    "conversations",
-    "file-history",
-    "backups",
-    "antigravity-backup",
-    "muse-code-worker",
-    "grok-build-peer",
-    "local-agent-mode-sessions",
-    "claude-code-sessions",
-    "session-env",
-    "shell-snapshots",
-    "subagents",
-    "tool-results",
-    "memory-v2",
-    "legacy-plugins",
-    # Runtime/browser caches and telemetry
-    "node_modules",
-    ".git",
-    "cache",
-    "Cache",
-    "GPUCache",
-    "Code Cache",
-    "DawnCache",
-    "DawnGraphiteCache",
-    "DawnWebGPUCache",
-    "antigravity-browser-profile",
-    "extensions",
-    "statsig",
-    "telemetry",
-    "crashpad",
-    "blob_storage",
-    "Local Storage",
-    "Session Storage",
-    "IndexedDB",
-    "Service Worker",
-    "WebStorage",
-    "Network",
-    "Dictionaries",
-    "paste-cache",
-})
+# Scanner denies data stores ONLY by explicit home-relative path prefixes
+# (`UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES`), NEVER by directory name (§4.7 R8 P2).
+# `extensions/`, `cache/`, and `node_modules/` under host config roots stay
+# scannable unless an explicit home-relative prefix lists them.
+UNCATALOGUED_SCAN_DENYLIST_DIRS: frozenset[str] = frozenset()
 
 # Explicit, documented deny-list of home-relative path prefixes for data-store
 # subtrees only (brain, conversations, file-history, backups, muse-code-worker,
-# session stores) (§4.7 R7 P1).
+# session stores, Electron/Chromium browser caches) (§4.7 R8 P2).
 UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES: tuple[str, ...] = (
     ".gemini/antigravity/brain",
     ".gemini/antigravity/conversations",
+    ".gemini/antigravity/html_artifacts",
+    ".gemini/antigravity/scratch",
+    ".gemini/antigravity/worktrees",
     ".gemini/antigravity-ide/brain",
     ".gemini/antigravity-ide/conversations",
+    ".gemini/antigravity-ide/browser_recordings",
+    ".gemini/antigravity-ide/html_artifacts",
+    ".gemini/antigravity-ide/scratch",
     ".gemini/antigravity-cli/brain",
+    ".gemini/antigravity-cli/conversations",
+    ".gemini/antigravity-cli/scratch",
     ".gemini/antigravity-backup",
+    ".gemini/antigravity-browser-profile",
     ".gemini/tmp",
+    ".gemini/history",
     ".agents/backups",
+    ".agents/archive-20260925-agents-md",
     ".codex/muse-code-worker",
     ".codex/grok-build-peer",
+    ".codex/antigravity-peer",
+    ".codex/cursor-peer",
     ".codex/backups",
     ".codex/sessions",
+    ".codex/archived_sessions",
+    ".codex/memories",
+    ".codex/memories_v2",
     ".claude/file-history",
     ".claude/backups",
+    ".claude/session-env",
+    ".claude/sessions",
+    ".claude/shell-snapshots",
+    ".claude/paste-cache",
     "Library/Application Support/Claude/local-agent-mode-sessions",
     "Library/Application Support/Claude/claude-code-sessions",
+    "Library/Application Support/Claude/Cache",
+    "Library/Application Support/Claude/Code Cache",
+    "Library/Application Support/Claude/GPUCache",
+    "Library/Application Support/Claude/GPUPersistentCache",
+    "Library/Application Support/Claude/DawnGraphiteCache",
+    "Library/Application Support/Claude/DawnWebGPUCache",
+    "Library/Application Support/Claude/GraphiteDawnCache",
+    "Library/Application Support/Claude/IndexedDB",
+    "Library/Application Support/Claude/Local Storage",
+    "Library/Application Support/Claude/Session Storage",
+    "Library/Application Support/Claude/WebStorage",
+    "Library/Application Support/Claude/blob_storage",
+    "Library/Application Support/Claude/Crashpad",
+    "Library/Application Support/Claude/Partitions",
+    ".grok/memory",
     ".grok/memory-v2",
+    ".grok/memtrace",
     ".grok/sessions",
+    ".grok/relocations",
+    ".grok/scratch",
+    ".grok/worktrees",
     ".cursor/legacy-plugins",
+    ".cursor/chats",
+    ".cursor/acp-sessions",
+    ".cursor/ai-tracking",
+    ".cursor/browser-logs",
+    ".cursor/plans",
+    ".cursor/worktrees",
 )
 
 UNCATALOGUED_SCAN_DENYLIST_FILES: frozenset[str] = frozenset({
@@ -142,11 +145,11 @@ _BINARY_MAGIC_PREFIXES: tuple[bytes, ...] = (
     b"\x7fELF",
 )
 
-# Known config depth ceiling relative to each scan root (e.g. ~/.codex/skills/<name>/SKILL.md is depth 3)
-_DEFAULT_MAX_CONFIG_DEPTH = 4
+# Known config depth ceiling relative to each scan root (e.g. ~/.claude/plugins/cache/<mkt>/<pkg>/<ver>/.claude-plugin/plugin.json is depth 7)
+_DEFAULT_MAX_CONFIG_DEPTH = 8
 _MAX_CONFIG_REL_DEPTH_BY_ROOT: dict[str, int] = {
-    "Library/Application Support/Claude": 2,
-    ".local/bin": 1,
+    "Library/Application Support/Claude": 4,
+    ".local/bin": 2,
 }
 
 _MAX_SCAN_FILE_BYTES = 2 * 1024 * 1024
@@ -163,9 +166,7 @@ def _catalogued_paths_and_prefixes(home: Path) -> tuple[set[str], tuple[str, ...
         str(home / ".agents" / "plugins" / "minni@minni"),
         str(home / ".cursor" / "plugins" / "local" / "minni"),
         str(home / ".claude" / "plugins" / "marketplaces" / "minni-local"),
-        str(home / ".claude" / "plugins" / "cache"),
         str(home / ".claude" / "local-marketplaces" / "minni"),
-        str(home / ".codex" / "plugins" / "cache"),
         str(home / ".config" / "kilo" / "plugins" / "minni"),
     ]
     for hspec in expanded.values():
@@ -199,10 +200,6 @@ def _is_denylisted_rel_path(rel_to_home: str) -> bool:
     norm = rel_to_home.strip("/")
     for pref in UNCATALOGUED_SCAN_DENYLIST_REL_PREFIXES:
         if norm == pref or norm.startswith(pref + "/"):
-            return True
-    parts = Path(norm).parts
-    for part in parts[:-1]:
-        if part in UNCATALOGUED_SCAN_DENYLIST_DIRS:
             return True
     return False
 
@@ -242,6 +239,8 @@ def _is_config_shaped_file(fpath: Path, root_dir: Path, rel_root: str) -> bool:
         return True
     if suffix == ".md":
         parent_dirs = {p.lower() for p in rel_parts[:-1]}
+        if "cache" in parent_dirs and "plugins" in parent_dirs:
+            return False
         return name == "SKILL.md" or bool(parent_dirs & {"skills", "rules", "workflows", "commands"})
     if suffix == "":
         parent_dirs = {p.lower() for p in rel_parts[:-1]}
@@ -356,6 +355,8 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
 
     for rel in _SCAN_DIR_RELATIVES:
         root_dir = resolved_home / rel
+        if not root_dir.exists() and not root_dir.is_symlink():
+            continue
         if not root_dir.is_dir():
             continue
         max_depth = _MAX_CONFIG_REL_DEPTH_BY_ROOT.get(rel, _DEFAULT_MAX_CONFIG_DEPTH)
@@ -364,8 +365,23 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
             root_st = root_dir.stat()
             visited_real_dirs.add((root_st.st_dev, root_st.st_ino))
         except OSError:
-            pass
-        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=True):
+            findings.append({
+                "path": str(root_dir),
+                "matched": "<unreadable_dir>",
+                "reason": "unreadable_config_dir",
+            })
+            continue
+
+        def _on_walk_error(err: OSError, _fallback_root: Path = root_dir) -> None:
+            err_path = str(getattr(err, "filename", None) or _fallback_root)
+            if not any(f.get("path") == err_path and f.get("reason") == "unreadable_config_dir" for f in findings):
+                findings.append({
+                    "path": err_path,
+                    "matched": "<unreadable_dir>",
+                    "reason": "unreadable_config_dir",
+                })
+
+        for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=True, onerror=_on_walk_error):
             dp = Path(dirpath)
             try:
                 cur_depth = len(dp.relative_to(root_dir).parts)
@@ -377,15 +393,16 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
                 kept_dirs: list[str] = []
                 for d in dirnames:
                     cand = dp / d
-                    if d in UNCATALOGUED_SCAN_DENYLIST_DIRS:
-                        continue
                     if _is_catalogued(cand):
                         continue
                     try:
                         cand_rel = str(cand.relative_to(resolved_home))
                     except ValueError:
                         cand_rel = ""
-                    if cand_rel and _is_denylisted_rel_path(cand_rel + "/x"):
+                    if cand_rel and _is_denylisted_rel_path(cand_rel):
+                        continue
+                    if cand.is_symlink() and not cand.exists():
+                        _inspect_file(cand, root_dir, rel)
                         continue
                     try:
                         cst = cand.stat()
@@ -394,6 +411,12 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
                             continue
                         visited_real_dirs.add(key)
                     except OSError:
+                        if not any(f.get("path") == str(cand) and f.get("reason") == "unreadable_config_dir" for f in findings):
+                            findings.append({
+                                "path": str(cand),
+                                "matched": "<unreadable_dir>",
+                                "reason": "unreadable_config_dir",
+                            })
                         continue
                     kept_dirs.append(d)
                 dirnames[:] = kept_dirs

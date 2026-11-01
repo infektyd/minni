@@ -522,3 +522,68 @@ def test_r7_scanner_denylist_narrowing_symlinks_and_unreadable_or_oversized_find
         assert report.ok is False
     finally:
         unreadable_cfg.chmod(0o600)
+
+
+def test_r8_scanner_prefix_only_denylist_scans_extensions_cache_node_modules_and_reports_unreadable_dirs(
+    tmp_path: Path,
+) -> None:
+    """R8 P2: Deny data stores by HOME-RELATIVE PREFIX, not directory name.
+    extensions/, cache/ and node_modules/ under host config roots stay scannable unless an
+    explicit prefix lists them (~/.cursor/extensions/**, ~/.claude/plugins/cache/** etc.
+    may hold launch files). Unreadable directories become findings.
+    """
+    from minni.wire.health import UNCATALOGUED_SCAN_DENYLIST_DIRS
+
+    assert UNCATALOGUED_SCAN_DENYLIST_DIRS == frozenset(), (
+        "Scanner must deny data stores by home-relative prefix, not directory name"
+    )
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    cut_res = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert cut_res.exit_code == 0
+
+    stale_ref = f"node {plugin_dir}/0.5.0+git.deadbeef/dist/server.js"
+
+    cursor_ext = home / ".cursor" / "extensions" / "custom.minni-ext-1.0.0" / "package.json"
+    ag_ext = home / ".gemini" / "antigravity" / "extensions" / "minni-helper" / "mcp.json"
+    ag_ide_ext = home / ".gemini" / "antigravity-ide" / "extensions" / "minni-helper" / "mcp.json"
+    claude_cache_launch = (
+        home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0" / ".claude-plugin" / "plugin.json"
+    )
+    kilo_nm_launch = home / ".config" / "kilo" / "node_modules" / "minni-launcher" / "package.json"
+
+    for p in (cursor_ext, ag_ext, ag_ide_ext, claude_cache_launch, kilo_nm_launch):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f'{{"launch": "{stale_ref}"}}\n', encoding="utf-8")
+
+    unreadable_dir = home / ".claude" / "locked_config_subdir"
+    unreadable_dir.mkdir(parents=True, exist_ok=True)
+    (unreadable_dir / "hidden.json").write_text(f'{{"ref": "{stale_ref}"}}\n', encoding="utf-8")
+    unreadable_dir.chmod(0o000)
+
+    try:
+        findings = scan_for_uncatalogued_plugin_refs(home)
+        by_path = {Path(f["path"]): f for f in findings}
+
+        for expected_p in (cursor_ext, ag_ext, ag_ide_ext, claude_cache_launch, kilo_nm_launch):
+            assert expected_p in by_path, f"Expected launch file under {expected_p} to be scanned: {findings}"
+            assert by_path[expected_p]["reason"] == "uncatalogued_file_references_minni_plugin"
+
+        assert unreadable_dir in by_path, f"Expected unreadable directory {unreadable_dir} to be a finding: {findings}"
+        assert by_path[unreadable_dir]["reason"] == "unreadable_config_dir"
+    finally:
+        unreadable_dir.chmod(0o700)
+

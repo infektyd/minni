@@ -173,13 +173,6 @@ say "sync $REPO -> origin/main$([ "$DRY_RUN" = 1 ] && echo '  [DRY RUN]')"
 
 # ── 1. fetch + fast-forward, refusing to touch local state ───────────────────
 say "step 1/6: git fetch + fast-forward"
-# fetch runs even under --dry-run: it only updates remote-tracking refs (never
-# the local branch or worktree), and without it the LOCAL/REMOTE comparison
-# below reads stale refs — a behind clone would print a plan that omits the
-# merge step entirely.
-printf 'running:   git fetch origin\n'
-git fetch origin
-
 if [ -n "$(git status --porcelain)" ]; then
   git status --short >&2
   refuse "working tree is dirty — commit, stash, or clean it first"
@@ -190,14 +183,33 @@ if [ "$BRANCH" != "main" ]; then
   refuse "checkout is on branch '$BRANCH', not main — switch branches yourself"
 fi
 
-LOCAL="$(git rev-parse HEAD)"
-REMOTE="$(git rev-parse origin/main)"
-if [ "$LOCAL" = "$REMOTE" ]; then
-  echo "already at origin/main ($(git rev-parse --short HEAD)) — continuing to redeploy/verify (idempotent)"
-elif [ "$(git merge-base HEAD origin/main)" != "$LOCAL" ]; then
-  refuse "local main has commits origin/main lacks (diverged) — reconcile yourself; this script never rewrites local history"
+if [ "$DRY_RUN" = 1 ]; then
+  # R8 P3: `--dry-run` must NOT run `git fetch` (no ref writes); it plans
+  # against the local HEAD and says so.
+  echo "dry-run: skipping git fetch (no ref writes); planning against local HEAD ($(git rev-parse --short HEAD))"
+  act git fetch origin
+  LOCAL="$(git rev-parse HEAD)"
+  REMOTE="$(git rev-parse origin/main 2>/dev/null || echo "$LOCAL")"
+  if [ "$LOCAL" = "$REMOTE" ]; then
+    echo "already at origin/main ($(git rev-parse --short HEAD)) — continuing to redeploy/verify (idempotent)"
+  elif [ "$(git merge-base HEAD origin/main)" != "$LOCAL" ]; then
+    refuse "local main has commits origin/main lacks (diverged) — reconcile yourself; this script never rewrites local history"
+  else
+    act git merge --ff-only origin/main
+  fi
 else
-  act git merge --ff-only origin/main
+  printf 'running:   git fetch origin\n'
+  git fetch origin
+
+  LOCAL="$(git rev-parse HEAD)"
+  REMOTE="$(git rev-parse origin/main)"
+  if [ "$LOCAL" = "$REMOTE" ]; then
+    echo "already at origin/main ($(git rev-parse --short HEAD)) — continuing to redeploy/verify (idempotent)"
+  elif [ "$(git merge-base HEAD origin/main)" != "$LOCAL" ]; then
+    refuse "local main has commits origin/main lacks (diverged) — reconcile yourself; this script never rewrites local history"
+  else
+    act git merge --ff-only origin/main
+  fi
 fi
 
 # ── 2. dependency + editable install refresh ─────────────────────────────────

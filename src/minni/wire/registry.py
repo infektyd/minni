@@ -154,7 +154,16 @@ HOST_SURFACE_CATALOG: dict[str, dict[str, Any]] = {
         "status": "wired",
         "rewrite_on_run_hazard": "lock_and_cas_on_delta",
         "lock_style": "flock",
+        # Read-only Grok CLI layout evidence (`ls -la ~/.grok`, `strings ~/.grok/bin/grok` -> `grok-1.0.70`,
+        # `crates/codegen/xai-grok-config/src/load_context.rs`): Grok uses `.config-init.lock` and `grok.lock`
+        # alongside per-file `%s.lock` files. We also probe `~/.grok/.Lock` and `~/.grok/.config.toml.lock` (R8 P3).
         "lock_glob": "~/.grok/.config.toml.lock",
+        "lock_globs": [
+            "~/.grok/.config.toml.lock",
+            "~/.grok/.config-init.lock",
+            "~/.grok/grok.lock",
+            "~/.grok/.Lock",
+        ],
         "process_match": {"process_names": ["grok"]},
         "surfaces": [
             {

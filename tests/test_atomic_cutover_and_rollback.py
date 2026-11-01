@@ -1842,3 +1842,284 @@ def test_r7_single_repo_root_rule_and_dry_run_diffs_built_payload_without_instal
     ]
     assert claude_reg_writes == [], f"Unexpected false delta on claude_plugin_registry: {claude_reg_writes}"
     assert not (home / ".minni" / "plugin" / expected_ver).exists()
+
+
+def test_r8_flock_probe_fail_closed_on_open_flock_errors_non_regular_and_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R8 P2: _is_flock_held must fail closed (return True = HELD) on ANY open/flock error
+    other than a clean acquisition (EMFILE, EIO, ENOTSUP, a FIFO, symlink, directory, or timeout).
+    Must open with O_NONBLOCK, refuse non-regular files, and bound the probe in time.
+    """
+    import errno
+    import fcntl
+    import time
+    import minni.wire.cutover as cutover_mod
+    from minni.wire.cutover import _is_flock_held
+
+    missing = tmp_path / "missing.lock"
+    assert _is_flock_held(missing) is False
+
+    reg = tmp_path / "regular.lock"
+    reg.write_text("", encoding="utf-8")
+    assert _is_flock_held(reg) is False
+
+    # 1. Verify O_NONBLOCK is passed to os.open and EMFILE / EIO on os.open return True (HELD)
+    seen_flags: list[int] = []
+    real_open = os.open
+
+    def _spy_open(path, flags, *args, **kwargs):
+        seen_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _spy_open)
+    assert _is_flock_held(reg) is False
+    assert seen_flags and (seen_flags[-1] & os.O_NONBLOCK) != 0, "os.open must include O_NONBLOCK"
+
+    def _open_emfile(path, flags, *args, **kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(os, "open", _open_emfile)
+    assert _is_flock_held(reg) is True
+
+    def _open_eio(path, flags, *args, **kwargs):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(os, "open", _open_eio)
+    assert _is_flock_held(reg) is True
+    monkeypatch.setattr(os, "open", real_open)
+
+    # 2. fcntl.flock raising ENOTSUP or EIO returns True (HELD)
+    real_flock = fcntl.flock
+
+    def _flock_enotsup(fd, op):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(fcntl, "flock", _flock_enotsup)
+    assert _is_flock_held(reg) is True
+
+    def _flock_eio(fd, op):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(fcntl, "flock", _flock_eio)
+    assert _is_flock_held(reg) is True
+    monkeypatch.setattr(fcntl, "flock", real_flock)
+
+    # 3. Non-regular files (FIFO, directory, symlink) are refused and return True without blocking
+    fifo_path = tmp_path / "fifo.lock"
+    os.mkfifo(fifo_path)
+    t0 = time.monotonic()
+    assert _is_flock_held(fifo_path) is True
+    assert (time.monotonic() - t0) < 1.0, "FIFO probe must not block"
+
+    dir_lock = tmp_path / "dir.lock"
+    dir_lock.mkdir()
+    assert _is_flock_held(dir_lock) is True
+
+    sym_lock = tmp_path / "sym.lock"
+    sym_lock.symlink_to(reg)
+    assert _is_flock_held(sym_lock) is True
+
+    # 4. Hung filesystem / dead mount exceeding probe timeout returns True within time bound
+    real_lstat = os.lstat
+
+    def _slow_lstat(path):
+        if str(path) == str(reg):
+            time.sleep(2.0)
+        return real_lstat(path)
+
+    monkeypatch.setattr(os, "lstat", _slow_lstat)
+    t0 = time.monotonic()
+    assert cutover_mod._is_flock_held(reg, timeout_s=0.1) is True
+    assert (time.monotonic() - t0) < 1.0
+    monkeypatch.setattr(os, "lstat", real_lstat)
+
+
+def test_r8_dry_run_staging_failure_and_esbuild_nonzero_fail_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R8 P2: A staging failure in dry-run must FAIL the dry-run (non-zero, with a reason)
+    and never fall back to diffing the source or installed tree. esbuild return code must be checked.
+    """
+    import subprocess
+    import minni.wire.cutover as cutover_mod
+
+    repo_root = Path(__file__).resolve().parent.parent
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    # Seed an installed `current` tree so a buggy fallback would have something to diff against
+    _seed_plugin_version(plugin_dir, "0.6.0+git.11111111", "1" * 40)
+    (plugin_dir / "current").symlink_to(plugin_dir / "0.6.0+git.11111111")
+
+    # 1. When _stage_repo_payload_to_temp raises, reconcile_all_hosts(dry_run=True) must fail non-zero
+    def _boom_stage(*args, **kwargs):
+        raise RuntimeError("simulated esbuild/staging explosion")
+
+    monkeypatch.setattr(cutover_mod, "_stage_repo_payload_to_temp", _boom_stage)
+    out = reconcile_all_hosts(
+        home=home,
+        from_repo=repo_root,
+        target_version=None,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert out.exit_code != 0, f"dry-run must fail when staging fails, got: {out}"
+    assert "payload_staging_failed" in out.message
+    assert "simulated esbuild/staging explosion" in out.message
+
+    # Also test _build_dry_run_plan directly when vdir does not exist and staging fails
+    out_plan = execute_atomic_cutover(
+        home=home,
+        target_version="0.6.0+git.99999999",
+        target_git_sha="9" * 40,
+        dry_run=True,
+        running_hosts=set(),
+        repo_root=repo_root,
+    )
+    assert out_plan.exit_code != 0
+    assert "payload_staging_failed" in out_plan.message
+
+    # 2. Verify esbuild non-zero return code in _stage_repo_payload_to_temp raises
+    monkeypatch.undo()
+    fake_repo = tmp_path / "fake_repo"
+    fake_plugin = fake_repo / "plugins" / "minni"
+    for sub in ("dist", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin", ".kilocode-plugin", "commands", "hooks", "skills", "frontend", "kilo", "node_modules/esbuild"):
+        (fake_plugin / sub).mkdir(parents=True, exist_ok=True)
+    (fake_repo / "pyproject.toml").write_text('[project]\nname = "minni"\nversion = "0.6.0"\n', encoding="utf-8")
+    (fake_plugin / "dist" / "server.js").write_text('import "@modelcontextprotocol/sdk";\n', encoding="utf-8")
+    (fake_plugin / "README.md").write_text("# minni\n", encoding="utf-8")
+    (fake_plugin / "package.json").write_text('{"name":"minni","version":"0.6.0"}\n', encoding="utf-8")
+    (fake_plugin / ".mcp.json").write_text("{}\n", encoding="utf-8")
+    for rel in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json", ".cursor-plugin/plugin.json", ".kilocode-plugin/plugin.json", ".gemini-plugin/gemini-extension.json"):
+        (fake_plugin / rel).write_text('{"name":"minni","version":"0.6.0"}\n', encoding="utf-8")
+
+    real_run = subprocess.run
+
+    def _fail_esbuild(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "node" and any("esbuild" in str(c) for c in cmd):
+            if kwargs.get("check"):
+                raise subprocess.CalledProcessError(1, cmd, stderr="esbuild syntax error")
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="esbuild syntax error")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _fail_esbuild)
+    out_esbuild = reconcile_all_hosts(
+        home=home,
+        from_repo=fake_repo,
+        target_version=None,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert out_esbuild.exit_code != 0
+    assert "payload_staging_failed" in out_esbuild.message
+
+
+def test_r8_plan_parse_error_keeps_only_reason_code_without_exception_text(
+    tmp_path: Path,
+) -> None:
+    """R8 P2: Parse errors keep only the reason code in the plan (`parse_error:JSONDecodeError`),
+    never exception text or file fragments.
+    """
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    ver = "0.6.0+git.cafebabe"
+    sha = "c" * 40
+    _seed_plugin_version(plugin_dir, ver, sha)
+    (plugin_dir / "current").symlink_to(plugin_dir / ver)
+
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude.json").write_text(
+        '{"mcpServers": {"minni": UNQUOTED_RAW_TOKEN_FRAGMENT_XYZ_987654}}',
+        encoding="utf-8",
+    )
+    (home / ".codex").mkdir(parents=True)
+    (home / ".codex" / "config.toml").write_text(
+        '[mcp_servers.minni]\ncommand = UNQUOTED_TOML_SECRET_FRAGMENT_123456\n',
+        encoding="utf-8",
+    )
+
+    out = execute_atomic_cutover(
+        home=home,
+        target_version=ver,
+        target_git_sha=sha,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert out.exit_code == 0
+    plan_json = json.dumps(out.to_dict())
+    assert "UNQUOTED_RAW_TOKEN_FRAGMENT_XYZ_987654" not in plan_json
+    assert "UNQUOTED_TOML_SECRET_FRAGMENT_123456" not in plan_json
+
+    claude_writes = (out.plan or {}).get("hosts", {}).get("claude-code", {}).get("would-write", [])
+    claude_mcp = next(w for w in claude_writes if w["kind"] == "mcp_json")
+    assert claude_mcp["diff"]["reasons"] == ["parse_error:JSONDecodeError"]
+    assert claude_mcp["reason"] == "parse_error:JSONDecodeError"
+
+    codex_writes = (out.plan or {}).get("hosts", {}).get("codex", {}).get("would-write", [])
+    codex_mcp = next(w for w in codex_writes if w["kind"] == "mcp_toml")
+    assert codex_mcp["diff"]["reasons"] == ["parse_error:TOMLDecodeError"]
+    assert codex_mcp["reason"] == "parse_error:TOMLDecodeError"
+
+
+def test_r8_tmp_lock_without_pid_open_process_check_and_grok_dot_lock_probe(
+    tmp_path: Path,
+) -> None:
+    """R8 P3:
+    1. A tmp-style lock with no embedded pid counts as held while any process has it open
+       (lsof-style check, bounded), else by mtime.
+    2. Probe ~/.grok/.Lock as well as ~/.grok/.config.toml.lock.
+    """
+    import fcntl
+    import time
+    from minni.wire.cutover import _check_host_lockfile, _probe_tmp_lock
+
+    home = tmp_path / "home"
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True)
+    codex_cfg = codex_dir / "config.toml"
+    codex_cfg.write_text("", encoding="utf-8")
+
+    # Create a pid-less .tmp file and backdate its mtime to 20 minutes ago (>= 600s)
+    pidless_tmp = codex_dir / "config.toml.tmp"
+    pidless_tmp.write_text("in-flight-write", encoding="utf-8")
+    old_ts = time.time() - 1200.0
+    os.utime(pidless_tmp, (old_ts, old_ts))
+
+    # While kept open by a process, it MUST count as held even though mtime >= 600s!
+    with pidless_tmp.open("r", encoding="utf-8") as _open_handle:
+        os.utime(pidless_tmp, (old_ts, old_ts))
+        active_open, finding_open = _probe_tmp_lock(pidless_tmp, "codex")
+        assert active_open is True, "pid-less .tmp held open by a process must count as active"
+        assert finding_open is None
+        lock_hit = _check_host_lockfile(home, "codex", codex_cfg, retries=1)
+        assert lock_hit == str(pidless_tmp)
+
+    # Once closed and mtime >= 600s, it counts as stale (not active) and emits a finding
+    active_closed, finding_closed = _probe_tmp_lock(pidless_tmp, "codex")
+    assert active_closed is False
+    assert finding_closed is not None
+    assert finding_closed["reason"] == "stale_tmp_lock"
+
+    # Grok ~/.grok/.Lock probe: when flock-held, _check_host_lockfile defers grok-build
+    grok_dir = home / ".grok"
+    grok_dir.mkdir(parents=True)
+    grok_cfg = grok_dir / "config.toml"
+    grok_cfg.write_text("", encoding="utf-8")
+    grok_dot_lock = grok_dir / ".Lock"
+    grok_dot_lock.write_text("", encoding="utf-8")
+
+    # Unheld ~/.grok/.Lock does not defer
+    assert _check_host_lockfile(home, "grok-build", grok_cfg, retries=1) is None
+
+    # Held ~/.grok/.Lock defers
+    fd = os.open(str(grok_dot_lock), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        hit = _check_host_lockfile(home, "grok-build", grok_cfg, retries=1)
+        assert hit is not None and Path(hit).name == ".Lock"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+

@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from collections.abc import Callable
@@ -186,6 +187,7 @@ def _atomic_write_bytes(path: Path, data: bytes, mode: int | None = None) -> Non
 
 _TMP_LOCK_MAX_AGE_SECONDS = 600.0
 _TMP_LOCK_PID_RE = re.compile(r"\.tmp\.(\d+)(?:\..+)?$")
+_FLOCK_PROBE_TIMEOUT_SECONDS = 1.0
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -201,12 +203,46 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
-def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | None]:
-    """Evaluate a tmp-style lock (`<surface>.tmp.<pid>[.<hex>]`).
+def _is_file_open_by_any_process(cand: Path, *, timeout_s: float = 2.0) -> bool:
+    """Return True if any OS process currently holds `cand` open (bounded lsof probe, fail-closed on timeout/error)."""
+    lsof_bin = shutil.which("lsof") or ("/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else "lsof")
+    targets: list[str] = [str(cand)]
+    try:
+        resolved = str(cand.resolve())
+        if resolved not in targets:
+            targets.append(resolved)
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(
+            [lsof_bin, "-F", "p", "--", *targets],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    except OSError:
+        return True
+    if proc.returncode not in (0, 1):
+        return True
+    if proc.returncode == 0 and any(
+        line.startswith("p") and line[1:].strip().isdigit()
+        for line in (proc.stdout or "").splitlines()
+    ):
+        return True
+    return False
 
-    Counts as active ONLY if its embedded pid is alive OR its mtime is under
-    10 minutes (`600` seconds) old. Returns `(is_active, stale_finding_or_None)`.
-    Never deletes a stale file.
+
+def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | None]:
+    """Evaluate a tmp-style lock (`<surface>.tmp[.<pid>[.<hex>]]`).
+
+    - With an embedded `<pid>`: counts as active ONLY if `<pid>` is alive OR
+      its `mtime` is under 10 minutes (`600` seconds) old.
+    - Without an embedded `<pid>`: counts as active while any process has the
+      file open (bounded `lsof` check), else by `mtime` (`< 600` seconds).
+    Returns `(is_active, stale_finding_or_None)`. Never deletes a stale file.
     """
     name = cand.name
     if name.endswith(f".minni-cas.{os.getpid()}") or name == f".minni.tmp.{os.getpid()}":
@@ -215,13 +251,22 @@ def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | No
     embedded_pid: int | None = int(m.group(1)) if m else None
     try:
         st = os.lstat(cand)
-    except OSError:
+    except FileNotFoundError:
         return False, None
-    age_s = max(0.0, time.time() - st.st_mtime)
-    pid_alive = _is_pid_alive(embedded_pid) if embedded_pid is not None else False
-    mtime_fresh = age_s < _TMP_LOCK_MAX_AGE_SECONDS
-    if pid_alive or mtime_fresh:
+    except OSError:
         return True, None
+    age_s = max(0.0, time.time() - st.st_mtime)
+    mtime_fresh = age_s < _TMP_LOCK_MAX_AGE_SECONDS
+    if embedded_pid is not None:
+        pid_alive = _is_pid_alive(embedded_pid)
+        open_by_proc = False
+        if pid_alive or mtime_fresh:
+            return True, None
+    else:
+        pid_alive = False
+        open_by_proc = _is_file_open_by_any_process(cand)
+        if open_by_proc or mtime_fresh:
+            return True, None
     finding: dict[str, Any] = {
         "host": host_id,
         "path": str(cand),
@@ -229,50 +274,79 @@ def _probe_tmp_lock(cand: Path, host_id: str) -> tuple[bool, dict[str, Any] | No
         "reason": "stale_tmp_lock",
         "pid": embedded_pid,
         "pid_alive": pid_alive,
+        "open_by_process": open_by_proc,
         "mtime": st.st_mtime,
         "age_seconds": round(age_s, 1),
-        "detail": f"stale_tmp_lock (pid={embedded_pid} dead, age={int(age_s)}s >= 600s)",
+        "detail": (
+            f"stale_tmp_lock (pid={embedded_pid} dead, age={int(age_s)}s >= 600s)"
+            if embedded_pid is not None
+            else f"stale_tmp_lock (pid=None not open, age={int(age_s)}s >= 600s)"
+        ),
     }
     return False, finding
 
 
-def _is_flock_held(cand: Path) -> bool:
-    """Return True if `cand` exists and an advisory `flock` is currently held on it.
+def _is_flock_held(cand: Path, *, timeout_s: float = _FLOCK_PROBE_TIMEOUT_SECONDS) -> bool:
+    """Return True if `cand` is held or cannot be cleanly acquired (fail-closed R8 P2).
 
-    Existence alone is not holding (e.g. `~/.config/muse/.settings.json.lock`
-    always exists at 0 bytes). Tries a non-blocking exclusive flock (`LOCK_EX | LOCK_NB`,
-    which blocks against both shared and exclusive holders) and releases immediately.
-    Never creates or modifies `cand`.
+    - Opens with `O_RDONLY | O_NONBLOCK | O_NOFOLLOW`.
+    - Refuses non-regular files (FIFOs, symlinks, directories, sockets, device nodes -> HELD).
+    - Bounds the probe in time (`timeout_s`).
+    - ANY `open` or `flock` error other than `ENOENT` (absent file) or a clean
+      `LOCK_EX | LOCK_NB` acquisition (`EMFILE`, `EIO`, `ENOTSUP`, `EACCES`, timeout, etc.)
+      returns `True` (HELD -> defer).
     """
-    if not cand.exists():
-        return False
-    try:
-        fd = os.open(str(cand), os.O_RDONLY)
-    except FileNotFoundError:
-        return False
-    except PermissionError:
+    outcome: list[bool] = []
+
+    def _probe_worker() -> None:
+        try:
+            lst = os.lstat(str(cand))
+        except FileNotFoundError:
+            outcome.append(False)
+            return
+        except Exception:
+            outcome.append(True)
+            return
+        if not stat.S_ISREG(lst.st_mode):
+            outcome.append(True)
+            return
+        open_flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(str(cand), open_flags)
+        except Exception:
+            outcome.append(True)
+            return
+        try:
+            try:
+                fst = os.fstat(fd)
+            except Exception:
+                outcome.append(True)
+                return
+            if not stat.S_ISREG(fst.st_mode):
+                outcome.append(True)
+                return
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except Exception:
+                outcome.append(True)
+                return
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            outcome.append(False)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    worker = threading.Thread(target=_probe_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=max(0.01, timeout_s))
+    if worker.is_alive() or not outcome:
         return True
-    except OSError:
-        return False
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
-                return True
-            return False
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        return False
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    return outcome[0]
 
 
 def _record_stale_finding(
@@ -297,17 +371,22 @@ def _check_host_lockfile(
     """Return active lock/temp path string if a host lockfile or temp sibling is held after short backoff."""
     hspec = HOST_SURFACE_CATALOG.get(host_id) or {}
     lock_glob_raw = str(hspec.get("lock_glob") or "")
+    raw_globs: list[str] = [
+        str(g) for g in (hspec.get("lock_globs") or ([lock_glob_raw] if lock_glob_raw else [])) if g
+    ]
     lock_style = str(
         hspec.get("lock_style")
         or ("flock" if lock_glob_raw.endswith(".lock") else "tmp_pid")
     )
-    expanded_glob = expand_for_home(lock_glob_raw, home=home) if lock_glob_raw else ""
+    expanded_globs = [expand_for_home(g, home=home) for g in raw_globs]
 
     def _scan_once() -> str | None:
-        if expanded_glob:
-            for m_str in sorted(glob.glob(expanded_glob)):
+        for exp_glob in expanded_globs:
+            has_wildcard = any(ch in exp_glob for ch in ("*", "?", "["))
+            matched_paths = sorted(glob.glob(exp_glob)) if has_wildcard else [exp_glob]
+            for m_str in matched_paths:
                 m_path = Path(m_str)
-                if lock_style == "flock" or m_path.name.endswith(".lock"):
+                if lock_style == "flock" or m_path.name.endswith(".lock") or m_path.name == ".Lock":
                     if _is_flock_held(m_path):
                         return m_str
                 else:
@@ -320,10 +399,16 @@ def _check_host_lockfile(
             for cand in (
                 parent / f".{surface_path.name}.lock",
                 parent / f"{surface_path.name}.lock",
+                parent / ".Lock",
             ):
                 if _is_flock_held(cand):
                     return str(cand)
-            for pat in (f"{surface_path.name}.tmp.*", f".{surface_path.name}.tmp.*"):
+            for pat in (
+                f"{surface_path.name}.tmp",
+                f".{surface_path.name}.tmp",
+                f"{surface_path.name}.tmp.*",
+                f".{surface_path.name}.tmp.*",
+            ):
                 for m_path in sorted(parent.glob(pat)):
                     active, finding = _probe_tmp_lock(m_path, host_id)
                     _record_stale_finding(stale_findings, finding)
@@ -1123,6 +1208,8 @@ def _stage_repo_payload_to_temp(
 
     repo_root = repo_root.expanduser().resolve()
     plugin_src = repo_root / "plugins" / "minni"
+    if not (repo_root / "pyproject.toml").is_file() or not (plugin_src / "dist" / "server.js").is_file():
+        raise ValueError(f"repo payload missing pyproject.toml or plugins/minni/dist/server.js under {repo_root}")
     version = version_override or dev_version(repo_root)
     git_sha = sha_override or _git_sha(repo_root)
     tmp = Path(tempfile.mkdtemp(prefix="minni-cutover-payload-"))
@@ -1130,7 +1217,7 @@ def _stage_repo_payload_to_temp(
         for item in PAYLOAD_ITEMS:
             src = plugin_src / item
             if not src.exists():
-                continue
+                raise ValueError(f"missing payload item: {src}")
             dest = tmp / item
             if src.is_dir():
                 shutil.copytree(src, dest, ignore=shutil.ignore_patterns(*JUNK))
@@ -1138,53 +1225,56 @@ def _stage_repo_payload_to_temp(
                 shutil.copy2(src, dest)
 
         staged_server = tmp / "dist" / "server.js"
-        if staged_server.is_file() and (plugin_src / "node_modules" / "esbuild").exists():
+        if staged_server.is_file():
             try:
                 srv_txt = staged_server.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                srv_txt = ""
+            except OSError as exc:
+                raise RuntimeError(f"failed to read staged server.js ({staged_server}): {exc}") from exc
             if "@modelcontextprotocol/sdk" in srv_txt:
-                subprocess.run(
-                    [
-                        "node",
-                        "--input-type=module",
-                        "-e",
-                        (
-                            'import * as esbuild from "esbuild";'
-                            "await esbuild.build({"
-                            "entryPoints:[process.argv[1]],"
-                            "bundle:true,"
-                            'platform:"node",'
-                            'format:"esm",'
-                            "outfile:process.argv[1],"
-                            "allowOverwrite:true,"
-                            'external:["node:*"],'
-                            "nodePaths:[process.argv[2]],"
-                            'logLevel:"silent"'
-                            "});"
-                        ),
-                        str(staged_server),
-                        str(plugin_src / "node_modules"),
-                    ],
-                    cwd=str(plugin_src),
-                    check=False,
-                    capture_output=True,
-                    timeout=30,
-                )
+                try:
+                    subprocess.run(
+                        [
+                            "node",
+                            "--input-type=module",
+                            "-e",
+                            (
+                                'import * as esbuild from "esbuild";'
+                                "await esbuild.build({"
+                                "entryPoints:[process.argv[1]],"
+                                "bundle:true,"
+                                'platform:"node",'
+                                'format:"esm",'
+                                "outfile:process.argv[1],"
+                                "allowOverwrite:true,"
+                                'external:["node:*"],'
+                                "nodePaths:[process.argv[2]],"
+                                'logLevel:"silent"'
+                                "});"
+                            ),
+                            str(staged_server),
+                            str(plugin_src / "node_modules"),
+                        ],
+                        cwd=str(plugin_src),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    raise RuntimeError(
+                        f"esbuild bundling failed (rc={exc.returncode}): {(exc.stderr or '').strip()}"
+                    ) from exc
 
         for rel in MANIFEST_STAMP_PATHS:
             p = tmp / rel
             if not p.is_file():
                 continue
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    data["version"] = version
-                    if rel == ".claude-plugin/plugin.json":
-                        data.pop("mcpServers", None)
-                    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-            except Exception:
-                pass
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data["version"] = version
+                if rel == ".claude-plugin/plugin.json":
+                    data.pop("mcpServers", None)
+                p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
         (tmp / ".mcp.json").unlink(missing_ok=True)
 
@@ -1340,12 +1430,24 @@ def _build_dry_run_plan(
                     sha_override=target_git_sha or None,
                 )
                 ref_vdir = ephemeral_staged_dir
-            except Exception:
-                ref_vdir = eff_repo / "plugins" / "minni"
-        elif (plugin_dir / "current").is_dir():
-            ref_vdir = plugin_dir / "current"
+            except Exception as exc:
+                return CutoverOutcome(
+                    exit_code=1,
+                    status="ABORTED_PRE_FLIP",
+                    target_version=target_version,
+                    target_git_sha=target_git_sha,
+                    aborted_pre_flip=True,
+                    message=f"payload_staging_failed: {type(exc).__name__}: {exc}",
+                )
         else:
-            ref_vdir = vdir
+            return CutoverOutcome(
+                exit_code=1,
+                status="ABORTED_PRE_FLIP",
+                target_version=target_version,
+                target_git_sha=target_git_sha,
+                aborted_pre_flip=True,
+                message=f"payload_staging_failed: target payload directory does not exist ({vdir}) and no repo payload available to stage",
+            )
 
     try:
         return _build_dry_run_plan_with_ref(
@@ -1787,7 +1889,7 @@ def _build_dry_run_plan_with_ref(
                     reasons = ["missing_enabled_true"]
             except Exception as exc:
                 has_delta = True
-                reasons = [f"parse_error:{exc}"]
+                reasons = [f"parse_error:{type(exc).__name__}"]
             if not has_delta:
                 _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
                 continue
@@ -2815,7 +2917,7 @@ def reconcile_all_hosts(
     try:
         if target_version is None and resolved_repo is not None:
             pkg_dir = resolved_repo / "plugins" / "minni"
-            if (resolved_repo / "pyproject.toml").is_file() and (pkg_dir / "dist" / "server.js").is_file():
+            if (resolved_repo / "pyproject.toml").is_file() or pkg_dir.is_dir():
                 try:
                     staged_tmp, manifest = _stage_repo_payload_to_temp(
                         resolved_repo,
@@ -2826,10 +2928,18 @@ def reconcile_all_hosts(
                         target_git_sha = manifest.git_sha
                     if not dry_run:
                         _install_staged_payload_to_home(staged_tmp, manifest, resolved_home)
-                except Exception:
+                except Exception as exc:
                     if staged_tmp is not None:
                         shutil.rmtree(staged_tmp, ignore_errors=True)
                         staged_tmp = None
+                    return CutoverOutcome(
+                        exit_code=1,
+                        status="ABORTED_PRE_FLIP",
+                        target_version=target_version or "",
+                        target_git_sha=target_git_sha or "",
+                        aborted_pre_flip=True,
+                        message=f"payload_staging_failed: {type(exc).__name__}: {exc}",
+                    )
 
         if target_version is None:
             current = plugin_dir / "current"

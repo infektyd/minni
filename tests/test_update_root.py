@@ -163,14 +163,14 @@ def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     # plan exits 0 (would kickstart, not "would fail").
     proc = _run(clone, "--dry-run", path_prefix=_fake_launchctl(tmp_path, loaded=True))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    # Round-1 finding: fetch must run even in dry-run (it never touches the
-    # local branch/worktree) so the plan for a BEHIND clone truthfully shows
-    # the merge step instead of "already at origin/main" off stale refs.
-    assert "would run: git merge --ff-only origin/main" in proc.stdout
-    assert "already at origin/main" not in proc.stdout
+    # R8 P3: `update_root.sh --dry-run` must NOT run `git fetch` (no ref writes);
+    # it plans against the local HEAD and says so.
+    assert "planning against local HEAD" in proc.stdout
+    assert "would run: git fetch origin" in proc.stdout
+    assert "running:   git fetch origin" not in proc.stdout
     assert _git(clone, "rev-parse", "HEAD") == before, "dry run must not move HEAD"
     remote_ref = _git(clone, "rev-parse", "origin/main")
-    assert remote_ref != before, "fetch must have updated the remote-tracking ref"
+    assert remote_ref == before, "dry-run must not run git fetch or write remote-tracking refs"
     # D7: redeploy plan must wire the fleet + explicit antigravity/cursor,
     # not a bulk propagate --platform all (sync-root uses explicit targets).
     assert "wire all" in proc.stdout
