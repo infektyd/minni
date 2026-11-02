@@ -88,6 +88,9 @@ COMPARED_SUBTREES = (
 NOT_COMPARED = {
     ".mcp.json": "host-materialized (absolute paths + per-agent env), not a copy"
                  " — but its agent stamp and recorded paths ARE validated",
+    ".gemini-plugin/gemini-extension.json": (
+        "host-materialized (per-host MCP args + env rendered by container sync), not a copy"
+    ),
 }
 
 # D14 (#234): which MINNI_AGENT_ID stamps are legitimate for each deployment
@@ -571,13 +574,21 @@ def _ignored(rel: Path) -> bool:
 
 
 def _digest(path: Path, rel: Path) -> str:
-    """Content hash, with the version field normalized out of plugin manifests.
+    """Content hash, with the version field and H17 sanitizer normalized out of plugin manifests.
 
     ``rel`` is the path within the compared subtree (e.g. ``plugin.json`` for
     ``.claude-plugin/plugin.json``), which is what scopes the strip to the
     manifest files by name -- not to every ``.json`` under the subtree, which
     would also strip hooks/hooks-cursor.json's unrelated schema-version field.
     """
+    _src = Path(__file__).resolve().parent.parent / "src"
+    if _src.is_dir() and str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+    from minni.wire.install import (
+        SANITIZED_PLUGIN_MANIFEST_RELPATHS,
+        sanitize_plugin_manifest_dict,
+    )
+
     data = path.read_bytes()
     if rel.parent == Path(".") and rel.name in VERSION_NORMALIZED_RELPATHS:
         try:
@@ -585,9 +596,14 @@ def _digest(path: Path, rel: Path) -> str:
         except (UnicodeDecodeError, json.JSONDecodeError):
             pass
         else:
-            if isinstance(parsed, dict) and "version" in parsed:
-                parsed = {k: v for k, v in parsed.items() if k != "version"}
-                data = json.dumps(parsed, sort_keys=True).encode("utf-8")
+            if isinstance(parsed, dict):
+                subtree_rel = f"{path.parent.name}/{rel.as_posix()}"
+                in_sanitized = subtree_rel in SANITIZED_PLUGIN_MANIFEST_RELPATHS
+                if in_sanitized:
+                    parsed, _ = sanitize_plugin_manifest_dict(parsed)
+                if "version" in parsed or in_sanitized:
+                    parsed = {k: v for k, v in parsed.items() if k != "version"}
+                    data = json.dumps(parsed, sort_keys=True).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
 
 
@@ -600,6 +616,8 @@ def _hash_tree(root: Path) -> tuple[dict[str, str], list[str]]:
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root)
         if _ignored(rel):
+            continue
+        if rel.as_posix() in NOT_COMPARED or f"{root.name}/{rel.as_posix()}" in NOT_COMPARED:
             continue
         if not path.is_file():
             continue

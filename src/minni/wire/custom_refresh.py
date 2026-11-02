@@ -18,6 +18,42 @@ from minni.wire.platform import CANONICAL_FLEET
 from minni.wire.wired import WireRecord, upsert_wire
 
 _CUSTOM = {"muse": ".muse/mcp.json", "devin": ".config/devin/mcp_config.json"}
+_CUSTOM_ALLOWED = {
+    "muse": (".muse/mcp.json", ".muse/config.json", ".config/muse/settings.json"),
+    "devin": (".config/devin/mcp_config.json", ".config/devin/config.json"),
+}
+
+
+def _args_resolve_to_target(entry: dict, target_root: Path | None, base: Path) -> bool:
+    """Return True if preserved custom args already resolve to target_root/dist/server.js."""
+    if target_root is None:
+        return False
+    args = entry.get("args")
+    if not isinstance(args, list) or not args or not all(isinstance(a, str) for a in args):
+        return False
+    script_arg = Path(args[-1]).expanduser()
+    target_server = target_root / "dist/server.js"
+    if script_arg == target_server:
+        return True
+    if script_arg == base / "current/dist/server.js":
+        current_target = _installer_current_target(base)
+        if current_target is not None and target_root.exists():
+            try:
+                return current_target.resolve() == target_root.resolve()
+            except OSError:
+                return False
+        return False
+    try:
+        if (
+            script_arg.name == "server.js"
+            and script_arg.parent.name == "dist"
+            and script_arg.exists()
+            and target_server.exists()
+        ):
+            return script_arg.resolve() == target_server.resolve()
+    except OSError:
+        return False
+    return False
 
 
 def wire_report_root(text: str) -> Path | None:
@@ -173,7 +209,8 @@ def _refresh(
         return {**result, "reason": "unsupported custom host/config format"}
     home = Path(os.environ.get("HOME") or Path.home())
     config = Path(str(record.get("config_path", "")))
-    if config != home / _CUSTOM[platform] or config.is_symlink():
+    allowed_configs = {home / rel for rel in _CUSTOM_ALLOWED.get(platform, (_CUSTOM[platform],))}
+    if config not in allowed_configs or config.is_symlink():
         return {**result, "reason": "unsupported custom config location or symlink"}
     if not config.is_file():
         return {**result, "reason": "registered custom config absent"}
@@ -201,9 +238,41 @@ def _refresh(
         raise ValueError("custom MCP node launcher unavailable")
     base = plugin_base()
     old_root = Path(str(record.get("install_root", "")))
-    _payload(old_root, base)
     if entry.get("args") != [str(old_root / "dist/server.js")]:
+        if old_root.exists() or old_root.is_symlink():
+            _payload(old_root, base)
+        target_root = new_root if new_root is not None else _installer_current_target(base)
+        if _args_resolve_to_target(entry, target_root, base):
+            assert target_root is not None
+            manifest = _payload(target_root, base)
+            if old_root == target_root and record.get("version") == manifest.version:
+                return {**result, "reason": "custom MCP arguments already resolve to current payload; preserved"}
+            if dry_run:
+                return {
+                    "platform": platform,
+                    "status": "dry-run",
+                    "reason": "custom MCP arguments already resolve to target payload; registry record would be updated",
+                    "notes": [],
+                }
+            _check_record(record)
+            upsert_wire(
+                WireRecord(
+                    platform=platform,
+                    config_path=str(config),
+                    install_root=str(target_root),
+                    version=manifest.version,
+                    workspace=record.get("workspace"),
+                    wired_at=utc_now_iso(),
+                ),
+                expected_record=record,
+            )
+            return {
+                **result,
+                "reason": "custom MCP arguments differ from registered payload; preserved and registry record updated",
+            }
+        _payload(old_root, base)
         return {**result, "reason": "custom MCP arguments differ from registered payload; preserved"}
+    _payload(old_root, base)
     if new_root is None:
         # Custom-only fleet (wire skipped: nothing to wire) is not a redeploy
         # failure. The binding was verified against its registered root above;

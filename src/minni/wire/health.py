@@ -217,6 +217,54 @@ def _is_native_binary_file(fpath: Path) -> bool:
         return False
 
 
+def _is_real_host_config_for_size_cap(fpath: Path, root_dir: Path) -> bool:
+    """Return True if an oversized file is a real host config (not an extension/cache/node_modules bundle)."""
+    try:
+        rel_parts = fpath.relative_to(root_dir).parts
+    except ValueError:
+        rel_parts = (fpath.name,)
+    parent_dirs = {p.lower() for p in rel_parts[:-1]}
+    if parent_dirs & {
+        "extensions",
+        "cache",
+        "marketplace-cache",
+        "marketplaces",
+        "bundled-marketplaces",
+        "node_modules",
+        ".tmp",
+        "dist",
+        "assets",
+        "vendor",
+        "webview",
+        "out",
+        "third_party",
+    }:
+        return False
+    suffix = fpath.suffix.lower()
+    if suffix not in {".json", ".toml", ".yaml", ".yml"}:
+        return False
+    lower_name = fpath.name.lower()
+    if lower_name in {
+        ".claude.json",
+        "claude_desktop_config.json",
+        "installed_plugins.json",
+        "marketplace.json",
+        "mcp.json",
+        "mcp_config.json",
+        "hooks.json",
+        "minni.json",
+        "settings.json",
+        "config.json",
+        "kilo.json",
+        "config.toml",
+        "gemini-extension.json",
+        "plugin.json",
+    }:
+        return True
+    stem = fpath.stem.lower()
+    return any(tok in stem for tok in ("mcp", "hook", "setting", "config", "minni", "claude", "kilo"))
+
+
 def _is_config_shaped_file(fpath: Path, root_dir: Path, rel_root: str) -> bool:
     """Return True if `fpath` is a config-shaped file (json/toml/yaml/js/sh/md skill/workflow/rule) at a known config depth."""
     name = fpath.name
@@ -325,11 +373,12 @@ def scan_for_uncatalogued_plugin_refs(home: Path | None = None) -> list[dict[str
             })
             return
         if st.st_size > _MAX_SCAN_FILE_BYTES:
-            findings.append({
-                "path": str(fpath),
-                "matched": f"<{st.st_size}_bytes>",
-                "reason": "config_file_exceeds_size_cap",
-            })
+            if _is_real_host_config_for_size_cap(fpath, root_dir):
+                findings.append({
+                    "path": str(fpath),
+                    "matched": f"<{st.st_size}_bytes>",
+                    "reason": "config_file_exceeds_size_cap",
+                })
             return
         try:
             with fpath.open("r", encoding="utf-8", errors="replace") as f:

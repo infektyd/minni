@@ -1224,7 +1224,13 @@ def _stage_repo_payload_to_temp(
                 srv_txt = staged_server.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
                 raise RuntimeError(f"failed to read staged server.js ({staged_server}): {exc}") from exc
-            if "@modelcontextprotocol/sdk" in srv_txt:
+            if re.search(r"(?m)^\s*import\b[^;\n]*@modelcontextprotocol/sdk", srv_txt):
+                tmp_nm = tmp / "node_modules"
+                src_nm = plugin_src / "node_modules"
+                created_nm_link = False
+                if src_nm.is_dir() and not tmp_nm.exists() and not tmp_nm.is_symlink():
+                    os.symlink(src_nm, tmp_nm)
+                    created_nm_link = True
                 try:
                     subprocess.run(
                         [
@@ -1246,9 +1252,9 @@ def _stage_repo_payload_to_temp(
                                 "});"
                             ),
                             str(staged_server),
-                            str(plugin_src / "node_modules"),
+                            str(src_nm),
                         ],
-                        cwd=str(plugin_src),
+                        cwd=str(tmp),
                         check=True,
                         capture_output=True,
                         text=True,
@@ -1258,6 +1264,9 @@ def _stage_repo_payload_to_temp(
                     raise RuntimeError(
                         f"esbuild bundling failed (rc={exc.returncode}): {(exc.stderr or '').strip()}"
                     ) from exc
+                finally:
+                    if created_nm_link and tmp_nm.is_symlink():
+                        tmp_nm.unlink(missing_ok=True)
 
         from minni.wire.install import sanitize_staged_payload
 
@@ -1803,7 +1812,19 @@ def _build_dry_run_plan_with_ref(
             raw_text = ""
             if exists:
                 try:
-                    raw_text = cfg_path.read_text(encoding="utf-8", errors="replace")
+                    raw_text = cfg_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    abort_reason = f"unreadable_{kind}:{type(exc).__name__}"
+                    _record_surface(
+                        host,
+                        kind,
+                        cfg_path,
+                        "would_abort",
+                        diff={"before": {"kind": kind}, "after": None, "reasons": [abort_reason]},
+                        reason=abort_reason,
+                    )
+                    continue
+                try:
                     doc = json.loads(raw_text) if raw_text.strip() else {}
                     plugins = doc.get("plugins", {}) if isinstance(doc, dict) else {}
                     entries = plugins.get("minni@minni-local") if isinstance(plugins, dict) else None
@@ -1938,8 +1959,17 @@ def _build_dry_run_plan_with_ref(
                 continue
             try:
                 raw_text = cfg_path.read_text(encoding="utf-8")
-            except OSError:
-                raw_text = ""
+            except (OSError, UnicodeDecodeError) as exc:
+                abort_reason = f"unreadable_{kind}:{type(exc).__name__}"
+                _record_surface(
+                    host,
+                    kind,
+                    cfg_path,
+                    "would_abort",
+                    diff={"before": {"kind": kind}, "after": None, "reasons": [abort_reason]},
+                    reason=abort_reason,
+                )
+                continue
             cur_entry: Any = None
             has_delta = True
             reasons = []
@@ -2000,6 +2030,19 @@ def _build_dry_run_plan_with_ref(
         if not cfg_path.is_file():
             _record_surface(host, kind, cfg_path, "would-write", reason="broken_or_non_regular_surface")
             continue
+        try:
+            raw_text = cfg_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            abort_reason = f"unreadable_{kind}:{type(exc).__name__}"
+            _record_surface(
+                host,
+                kind,
+                cfg_path,
+                "would_abort",
+                diff={"before": {"kind": kind}, "after": None, "reasons": [abort_reason]},
+                reason=abort_reason,
+            )
+            continue
         if kind in ("launcher_wrapper", "hook_wrapper"):
             chk = subprocess.run(["bash", "-n", str(cfg_path)], capture_output=True, text=True, check=False)
             if chk.returncode != 0:
@@ -2012,10 +2055,6 @@ def _build_dry_run_plan_with_ref(
                     reason="unparseable_shell_wrapper",
                 )
                 continue
-        try:
-            raw_text = cfg_path.read_text(encoding="utf-8")
-        except OSError:
-            raw_text = ""
         from minni.wire.health import evaluate_text_surface_health
 
         pre_health_reasons = evaluate_text_surface_health(raw_text, kind=kind, surf_spec=surf_spec)
