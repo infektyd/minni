@@ -15,9 +15,11 @@ from minni.wire.gc import inspect_running_mcp_servers
 from minni.wire.manifest import PayloadManifest
 from minni.wire.registry import (
     HOST_SURFACE_CATALOG,
+    _VERSIONED_PLUGIN_RE,
     evaluate_mcp_surface_diff,
     expand_for_home,
     expand_host_surface_catalog,
+    node_invocation_lacks_exec,
     resolve_home,
 )
 
@@ -460,6 +462,38 @@ class HostPropagationHealthReport:
         }
 
 
+def evaluate_text_surface_health(
+    raw_text: str,
+    *,
+    kind: str,
+    surf_spec: dict[str, Any],
+) -> list[str]:
+    """Evaluate post-flip health predicates on a text surface's content (`H23`)."""
+    if kind == "claude_marketplace":
+        try:
+            json.loads(raw_text)
+        except Exception as exc:
+            return [f"unparseable_json:{exc}"]
+        if "~/" in raw_text or _VERSIONED_PLUGIN_RE.search(raw_text):
+            return ["stale_or_tilde_in_claude_marketplace"]
+        return []
+    if kind == "hooks_json":
+        try:
+            doc = json.loads(raw_text)
+        except Exception as exc:
+            return [f"unparseable_json:{exc}"]
+        if not isinstance(doc, dict):
+            return ["unparseable_json:hooks_json is not a JSON object"]
+    reasons: list[str] = []
+    if _VERSIONED_PLUGIN_RE.search(raw_text):
+        reasons.append(f"versioned_sha_in_{kind}")
+    if "~/" in raw_text:
+        reasons.append(f"literal_tilde_in_{kind}")
+    if surf_spec.get("use_exec") and node_invocation_lacks_exec(raw_text, kind):
+        reasons.append(f"missing_exec_in_{kind}")
+    return reasons
+
+
 def audit_host_propagation_health(
     *,
     home: Path | None = None,
@@ -748,17 +782,10 @@ def audit_host_propagation_health(
             elif kind == "hooks_json" and spath.is_file():
                 try:
                     raw_text = spath.read_text(encoding="utf-8")
-                    json.loads(raw_text)
                 except Exception as exc:
-                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_json:{exc}"]})
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unreadable:{exc}"]})
                     continue
-                reasons: list[str] = []
-                if _VERSIONED_PLUGIN_RE.search(raw_text):
-                    reasons.append("versioned_sha_in_hooks_json")
-                if "~/" in raw_text:
-                    reasons.append("literal_tilde_in_hooks_json")
-                if surf.get("use_exec") and "node " in raw_text and "exec node " not in raw_text:
-                    reasons.append("missing_exec_in_hooks_json")
+                reasons = evaluate_text_surface_health(raw_text, kind=kind, surf_spec=surf)
                 if reasons:
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": reasons})
             elif kind in ("launcher_wrapper", "hook_wrapper", "js_bridge", "rules_md", "skill_copy") and spath.is_file():
@@ -767,13 +794,7 @@ def audit_host_propagation_health(
                 except Exception as exc:
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unreadable:{exc}"]})
                     continue
-                reasons = []
-                if _VERSIONED_PLUGIN_RE.search(raw_text):
-                    reasons.append(f"versioned_sha_in_{kind}")
-                if "~/" in raw_text:
-                    reasons.append(f"literal_tilde_in_{kind}")
-                if surf.get("use_exec") and "node " in raw_text and "exec node " not in raw_text:
-                    reasons.append(f"missing_exec_in_{kind}")
+                reasons = evaluate_text_surface_health(raw_text, kind=kind, surf_spec=surf)
                 if reasons:
                     drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": reasons})
             elif kind == "commands_dir":
@@ -853,12 +874,12 @@ def audit_host_propagation_health(
             elif kind == "claude_marketplace" and spath.is_file():
                 try:
                     raw_text = spath.read_text(encoding="utf-8")
-                    json.loads(raw_text)
                 except Exception as exc:
-                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unparseable_json:{exc}"]})
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": [f"unreadable:{exc}"]})
                     continue
-                if "~/" in raw_text or _VERSIONED_PLUGIN_RE.search(raw_text):
-                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": ["stale_or_tilde_in_claude_marketplace"]})
+                reasons = evaluate_text_surface_health(raw_text, kind=kind, surf_spec=surf)
+                if reasons:
+                    drifted_surfaces.append({"host": host_id, "path": str(spath), "reasons": reasons})
 
     uncatalogued_refs = scan_for_uncatalogued_plugin_refs(resolved_home)
     if legacy_v1_single_server_js and isinstance(wired_doc, dict):

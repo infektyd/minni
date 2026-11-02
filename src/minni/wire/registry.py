@@ -648,3 +648,186 @@ def evaluate_mcp_surface_diff(
         reasons=reasons,
         desired_entry=desired_entry,
     )
+
+
+_NODE_VAR_NAME_RE = re.compile(
+    r"(?i)^(?:node|node_(?:bin|binary|exe|exec|cmd|path)|[a-z0-9_]*_node(?:_bin|_binary|_exe|_exec|_cmd|_path)?)$"
+)
+_NODE_ASSIGN_RE = re.compile(
+    r"(?m)^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)="
+    r"(?:[^\n#]*?(?:/node\b|command\s+-v\s+node\b|which\s+node\b)|['\"]?node['\"]?(?:\s|$))"
+)
+_HEREDOC_START_RE = re.compile(
+    r"<<[-~]?\s*(?:(['\"])([A-Za-z_][A-Za-z0-9_]*)\1|([A-Za-z_][A-Za-z0-9_]*))"
+)
+_JSON_COMMAND_FIELD_RE = re.compile(r'("command"\s*:\s*)("(?:[^"\\]|\\.)*")')
+
+
+def _is_unexeced_node_command_line(rest: str, node_vars: set[str]) -> bool:
+    """Return True if `rest` (a stripped top-level shell line) invokes node without leading `exec`."""
+    if not rest or rest.startswith("#"):
+        return False
+    if re.match(r"^exec(?:[ \t]|$)", rest):
+        return False
+    m_cmd = re.match(r'^("[^"\n]+"|\'[^\'\n]+\'|[^\s"\';|&()#]+)[ \t]+(.+)$', rest)
+    if not m_cmd:
+        return False
+    first_word = m_cmd.group(1)
+    after_cmd = m_cmd.group(2).lstrip(" \t")
+    if not after_cmd or after_cmd[0] in ("#", ";", "|", "&", ")"):
+        return False
+    if len(first_word) >= 2 and first_word[0] == first_word[-1] and first_word[0] in ('"', "'"):
+        quote_char = first_word[0]
+        unquoted = first_word[1:-1]
+    else:
+        quote_char = ""
+        unquoted = first_word
+
+    if unquoted == "node":
+        return True
+    if unquoted.endswith("/node") and not any(ch in unquoted for ch in (" ", "\t", ";", "|", "&", "(", ")")):
+        return True
+    if quote_char != "'":
+        m_var = re.match(r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$", unquoted)
+        if m_var:
+            var_name = m_var.group(1) or m_var.group(2) or ""
+            if var_name in node_vars or _NODE_VAR_NAME_RE.match(var_name):
+                return True
+    return False
+
+
+def _advance_shell_line_state(
+    line: str,
+    *,
+    in_single_quote: bool,
+    in_double_quote: bool,
+    heredoc_delim: str | None,
+) -> tuple[bool, bool, str | None, bool]:
+    """Advance multi-line quote, heredoc, and backslash-continuation state across `line`."""
+    i = 0
+    n = len(line)
+    ended_in_comment = False
+    while i < n:
+        ch = line[i]
+        if in_single_quote:
+            if ch == "'":
+                in_single_quote = False
+            i += 1
+        elif in_double_quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+            elif ch == '"':
+                in_double_quote = False
+                i += 1
+            else:
+                i += 1
+        else:
+            if ch == "#" and (i == 0 or line[i - 1] in (" ", "\t", ";", "&", "|", "(")):
+                ended_in_comment = True
+                break
+            if ch == "\\" and i + 1 < n:
+                i += 2
+            elif ch == "'":
+                in_single_quote = True
+                i += 1
+            elif ch == '"':
+                in_double_quote = True
+                i += 1
+            elif ch == "<" and line[i : i + 2] == "<<" and heredoc_delim is None:
+                m_hd = _HEREDOC_START_RE.match(line[i:])
+                if m_hd:
+                    heredoc_delim = m_hd.group(2) or m_hd.group(3)
+                    i += m_hd.end()
+                else:
+                    i += 1
+            else:
+                i += 1
+
+    prev_backslash = False
+    if not in_single_quote and not ended_in_comment and line.endswith("\\"):
+        bs_count = len(line) - len(line.rstrip("\\"))
+        prev_backslash = (bs_count % 2) == 1
+    return in_single_quote, in_double_quote, heredoc_delim, prev_backslash
+
+
+def _rewrite_shell_node_invocations_with_exec(text: str) -> str:
+    """Prepend `exec ` to top-level shell lines whose first command word invokes node without `exec`."""
+    node_vars: set[str] = {m.group(1) for m in _NODE_ASSIGN_RE.finditer(text)}
+    in_single_quote = False
+    in_double_quote = False
+    heredoc_delim: str | None = None
+    prev_backslash = False
+    out_lines: list[str] = []
+
+    for full_line in text.splitlines(keepends=True):
+        if full_line.endswith("\r\n"):
+            line = full_line[:-2]
+            ending = "\r\n"
+        elif full_line.endswith("\n") or full_line.endswith("\r"):
+            line = full_line[:-1]
+            ending = full_line[-1]
+        else:
+            line = full_line
+            ending = ""
+
+        if heredoc_delim is not None:
+            if line.strip() == heredoc_delim:
+                heredoc_delim = None
+            out_lines.append(full_line)
+            continue
+
+        at_command_start = not in_single_quote and not in_double_quote and not prev_backslash
+        rewritten_line = full_line
+        if at_command_start:
+            m_ws = re.match(r"^([ \t]*)(.*)$", line)
+            if m_ws:
+                indent, rest = m_ws.group(1), m_ws.group(2)
+                if _is_unexeced_node_command_line(rest, node_vars):
+                    rewritten_line = f"{indent}exec {rest}{ending}"
+
+        in_single_quote, in_double_quote, heredoc_delim, prev_backslash = _advance_shell_line_state(
+            line,
+            in_single_quote=in_single_quote,
+            in_double_quote=in_double_quote,
+            heredoc_delim=heredoc_delim,
+        )
+        out_lines.append(rewritten_line)
+
+    return "".join(out_lines)
+
+
+def _rewrite_node_invocations_with_exec(text: str, kind: str = "launcher_wrapper") -> str:
+    """Rewrite un-`exec`ed node invocations in `text` for surface `kind`."""
+    if not text:
+        return text
+    if kind == "hooks_json":
+        import json
+
+        if _JSON_COMMAND_FIELD_RE.search(text):
+            def _replace_cmd(match: re.Match[str]) -> str:
+                prefix = match.group(1)
+                raw_json_str = match.group(2)
+                try:
+                    cmd_str = json.loads(raw_json_str)
+                except Exception:
+                    return match.group(0)
+                if not isinstance(cmd_str, str):
+                    return match.group(0)
+                updated_cmd = _rewrite_shell_node_invocations_with_exec(cmd_str)
+                if updated_cmd == cmd_str:
+                    return match.group(0)
+                return f"{prefix}{json.dumps(updated_cmd)}"
+
+            return _JSON_COMMAND_FIELD_RE.sub(_replace_cmd, text)
+        if text.lstrip().startswith(("{", "[")):
+            return text
+    return _rewrite_shell_node_invocations_with_exec(text)
+
+
+def node_invocation_lacks_exec(text: str, kind: str = "launcher_wrapper") -> bool:
+    """Return True iff `text` has a node command invocation lacking a leading `exec` (`H23`).
+
+    Shared by health and reconcile so health reports `missing_exec_in_{kind}`
+    if and only if reconcile would rewrite the surface.
+    """
+    return _rewrite_node_invocations_with_exec(text, kind) != text

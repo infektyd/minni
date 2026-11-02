@@ -2935,3 +2935,420 @@ def test_r10_h18_rollback_cas_conflict_never_leaves_dangling_current_pointer(
     assert any("cursor" in c and str(cursor_mcp_b) in c for c in rb_b2.cas_conflicts), rb_b2.cas_conflicts
     assert "cursor" in rb_b2.message
     assert str(cursor_mcp_b) in rb_b2.message
+
+
+_OPERATOR_EXACT_MINNI_MCP_TEMPLATE = """#!/usr/bin/env bash
+# Dual-environment Minni MCP launcher (Mac Cursor + Sand box).
+set -euo pipefail
+export PATH="{home}/.local/bin:/home/user/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${{PATH:-}}"
+NODE_BIN="/opt/homebrew/bin/node"
+if [[ ! -x "$NODE_BIN" ]]; then
+  NODE_BIN="$(command -v node || true)"
+fi
+if [[ -z "${{NODE_BIN}}" ]]; then
+  echo "minni-mcp: node not found" >&2
+  exit 1
+fi
+
+LANE="cursor"
+if [[ "${{1:-}}" == "--lane" ]]; then
+  LANE="${{2:?--lane requires a name}}"
+  shift 2
+fi
+
+# On the Grok Bot Linux box, prefer the box launcher (avoids Mac-only paths).
+if [[ "$(uname -s)" == "Linux" ]] && [[ -x /home/user/.minni/bin/minni-mcp ]]; then
+  exec /home/user/.minni/bin/minni-mcp --lane "$LANE" "$@"
+fi
+
+case "$LANE" in
+  cursor|auto|default|minni)
+    export MINNI_AGENT_ID="${{MINNI_AGENT_ID:-cursor}}"
+    export MINNI_VAULT_PATH="${{MINNI_VAULT_PATH:-$HOME/.minni/cursor-vault}}"
+    export MINNI_SOCKET_PATH="${{MINNI_SOCKET_PATH:-$HOME/.minni/run/minnid.sock}}"
+    export MINNI_WORKSPACE_ID="${{MINNI_WORKSPACE_ID:-workspace-user}}"
+    export MINNI_AFM_PROVIDER_MODE="${{MINNI_AFM_PROVIDER_MODE:-native}}"
+    if [[ -z "${{MINNI_AFM_NATIVE_HELPER:-}}" ]]; then
+      for helper in \\
+        "$HOME/Projects/Minni/src/minni/native_afm_helper" \\
+        "$HOME/Projects/minni-worktrees/cursor-hooks/src/minni/native_afm_helper"
+      do
+        if [[ -x "$helper" ]] || [[ -f "$helper" ]]; then
+          export MINNI_AFM_NATIVE_HELPER="$helper"
+          break
+        fi
+      done
+    fi
+    PLUGIN="$HOME/.cursor/plugins/local/minni"
+    SERVER="$PLUGIN/dist/server.js"
+    if [[ ! -f "$SERVER" ]]; then
+      echo "minni-mcp(mac): missing $SERVER" >&2
+      exit 1
+    fi
+    cd "$PLUGIN"
+    exec "$NODE_BIN" "$SERVER" "$@"
+    ;;
+  *)
+    case "$LANE" in
+      chief-of-staff|cos) AID=58b543f1-3e6d-467a-97e7-a7d05f3e2803 ;;
+      minniagents-w5|w5) AID=1299d460-de0a-4f0c-bbcc-206345a7843f ;;
+      swift-native|swift) AID=40de43bb-0706-42cf-97f8-954dbc125558 ;;
+      shop-floor|shop) AID=a389984b-e931-42d5-a2c1-e56a996ed3ed ;;
+      inbox-triage|inbox) AID=bc2d4f99-0933-4433-b732-f69fae41ab42 ;;
+      grok-widget|widget) AID=ba6906d1-dec9-4dce-b99e-e37c3b5d86ad ;;
+      minni-agent) AID=c1f88056-0bc2-490d-a23d-30f04f1f5dca ;;
+      *)
+        echo "minni-mcp(mac): unknown lane '$LANE'" >&2
+        exit 1
+        ;;
+    esac
+    SLUG="${{AID//-/}}"
+    VAULT="$HOME/.minni/${{SLUG}}-vault"
+    mkdir -p "$VAULT"
+    export MINNI_AGENT_ID="$AID"
+    export MINNI_VAULT_PATH="$VAULT"
+    export MINNI_SOCKET_PATH="${{MINNI_SOCKET_PATH:-$HOME/.minni/run/minnid.sock}}"
+    export MINNI_WORKSPACE_ID="${{MINNI_WORKSPACE_ID:-default}}"
+    export MINNI_AFM_PROVIDER_MODE="${{MINNI_AFM_PROVIDER_MODE:-native}}"
+    PLUGIN="$HOME/.cursor/plugins/local/minni"
+    cd "$PLUGIN"
+    exec "$NODE_BIN" "$PLUGIN/dist/server.js" "$@"
+    ;;
+esac
+"""
+
+
+def test_r12_h23_a_operator_exact_launcher_wrapper_no_missing_exec_no_delta_no_rollback(
+    tmp_path: Path,
+) -> None:
+    """R12 H23 (a): operator's exact ~/.local/bin/minni-mcp wrapper has no missing_exec, no delta, no rollback."""
+    from minni.wire.health import audit_host_propagation_health
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v1_sha = "1" * 40
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(v1_ver)
+
+    minni_mcp = home / ".local" / "bin" / "minni-mcp"
+    minni_mcp.parent.mkdir(parents=True, exist_ok=True)
+    wrapper_body = _OPERATOR_EXACT_MINNI_MCP_TEMPLATE.format(home=home)
+    minni_mcp.write_text(wrapper_body, encoding="utf-8")
+    minni_mcp.chmod(0o755)
+
+    pre_health = audit_host_propagation_health(home=home, expected_git_sha=v1_sha)
+    assert pre_health.ok is True, pre_health.drifted_surfaces
+    assert pre_health.drifted_surfaces == []
+
+    dry_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_res.exit_code == 0, dry_res.message
+    assert dry_res.would_abort == []
+    assert dry_res.plan is not None
+    assert dry_res.plan["would-write"] == []
+    cursor_surf = [
+        s for s in dry_res.plan["surfaces"] if s.get("host") == "cursor" and s.get("path") == str(minni_mcp)
+    ]
+    assert len(cursor_surf) == 1
+    assert cursor_surf[0]["action"] == "would-skip"
+    assert cursor_surf[0]["reason"] == "no_delta"
+
+    apply_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_res.exit_code == 0, apply_res.message
+    assert apply_res.rolled_back is False
+    assert apply_res.status == "CONVERGED"
+    assert f"cursor:{minni_mcp}" in apply_res.skipped_surfaces
+    assert minni_mcp.read_text(encoding="utf-8") == wrapper_body
+
+    post_health = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert post_health.ok is True, post_health.drifted_surfaces
+    assert post_health.drifted_surfaces == []
+
+    from minni.wire.registry import node_invocation_lacks_exec
+
+    assert node_invocation_lacks_exec(wrapper_body, "launcher_wrapper") is False
+
+
+def test_r12_h23_b_bare_node_wrapper_flagged_rewritten_to_exec_node_and_health_clean(
+    tmp_path: Path,
+) -> None:
+    """R12 H23 (b): wrapper with a bare `node "$SERVER"` launch line is flagged, rewritten to `exec node`, health clean after."""
+    from minni.wire.health import audit_host_propagation_health
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v1_sha = "1" * 40
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(v1_ver)
+
+    minni_mcp = home / ".local" / "bin" / "minni-mcp"
+    minni_mcp.parent.mkdir(parents=True, exist_ok=True)
+    # Include a comment containing "exec node " to ensure comments are ignored and bare `node "$SERVER"` is still flagged
+    bare_wrapper = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "# Note: callers expect exec node \"$SERVER\" semantics\n"
+        f'SERVER="{home}/.cursor/plugins/local/minni/dist/server.js"\n'
+        'node "$SERVER" "$@"\n'
+    )
+    minni_mcp.write_text(bare_wrapper, encoding="utf-8")
+    minni_mcp.chmod(0o755)
+
+    pre_health = audit_host_propagation_health(home=home, expected_git_sha=v1_sha)
+    assert pre_health.ok is False
+    assert any(
+        d.get("host") == "cursor"
+        and d.get("path") == str(minni_mcp)
+        and "missing_exec_in_launcher_wrapper" in (d.get("reasons") or [])
+        for d in pre_health.drifted_surfaces
+    ), pre_health.drifted_surfaces
+
+    dry_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_res.exit_code == 0, dry_res.message
+    assert dry_res.would_abort == []
+    assert dry_res.plan is not None
+    assert any(
+        w.get("host") == "cursor"
+        and w.get("path") == str(minni_mcp)
+        and "missing_exec_in_launcher_wrapper" in str(w.get("reason") or "")
+        for w in dry_res.plan["would-write"]
+    ), dry_res.plan["would-write"]
+
+    apply_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_res.exit_code == 0, apply_res.message
+    assert apply_res.rolled_back is False
+    assert f"cursor:{minni_mcp}" in apply_res.updated_surfaces
+
+    rewritten = minni_mcp.read_text(encoding="utf-8")
+    assert '\nexec node "$SERVER" "$@"\n' in rewritten
+
+    post_health = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert post_health.ok is True, post_health.drifted_surfaces
+    assert post_health.drifted_surfaces == []
+
+    from minni.wire.registry import node_invocation_lacks_exec
+
+    assert node_invocation_lacks_exec(bare_wrapper, "launcher_wrapper") is True
+    assert node_invocation_lacks_exec(rewritten, "launcher_wrapper") is False
+
+
+def test_r12_h23_c_node_bin_var_wrapper_without_exec_flagged_and_reconciled(
+    tmp_path: Path,
+) -> None:
+    """R12 H23 (c): wrapper with `"$NODE_BIN" "$SERVER"` without exec is flagged and reconciled cleanly."""
+    from minni.wire.health import audit_host_propagation_health
+
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v1_sha = "1" * 40
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(v1_ver)
+
+    minni_mcp = home / ".local" / "bin" / "minni-mcp"
+    minni_mcp.parent.mkdir(parents=True, exist_ok=True)
+    no_exec_var_wrapper = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'NODE_BIN="/opt/homebrew/bin/node"\n'
+        'if [[ ! -x "$NODE_BIN" ]]; then\n'
+        '  NODE_BIN="$(command -v node || true)"\n'
+        "fi\n"
+        'if [[ -z "${NODE_BIN}" ]]; then\n'
+        '  echo "minni-mcp: node not found" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        f'SERVER="{home}/.cursor/plugins/local/minni/dist/server.js"\n'
+        '  "$NODE_BIN" "$SERVER" "$@"\n'
+    )
+    minni_mcp.write_text(no_exec_var_wrapper, encoding="utf-8")
+    minni_mcp.chmod(0o755)
+
+    pre_health = audit_host_propagation_health(home=home, expected_git_sha=v1_sha)
+    assert pre_health.ok is False
+    assert any(
+        d.get("host") == "cursor"
+        and d.get("path") == str(minni_mcp)
+        and "missing_exec_in_launcher_wrapper" in (d.get("reasons") or [])
+        for d in pre_health.drifted_surfaces
+    ), pre_health.drifted_surfaces
+
+    dry_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_res.exit_code == 0, dry_res.message
+    assert dry_res.would_abort == []
+    assert dry_res.plan is not None
+    assert any(
+        w.get("host") == "cursor"
+        and w.get("path") == str(minni_mcp)
+        and "missing_exec_in_launcher_wrapper" in str(w.get("reason") or "")
+        for w in dry_res.plan["would-write"]
+    ), dry_res.plan["would-write"]
+
+    apply_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_res.exit_code == 0, apply_res.message
+    assert apply_res.rolled_back is False
+    assert f"cursor:{minni_mcp}" in apply_res.updated_surfaces
+
+    rewritten = minni_mcp.read_text(encoding="utf-8")
+    assert '\n  exec "$NODE_BIN" "$SERVER" "$@"\n' in rewritten
+
+    post_health = audit_host_propagation_health(home=home, expected_git_sha=v2_sha)
+    assert post_health.ok is True, post_health.drifted_surfaces
+    assert post_health.drifted_surfaces == []
+
+    from minni.wire.registry import _rewrite_node_invocations_with_exec, node_invocation_lacks_exec
+
+    assert node_invocation_lacks_exec(no_exec_var_wrapper, "launcher_wrapper") is True
+    assert node_invocation_lacks_exec(rewritten, "launcher_wrapper") is False
+
+    # Explicit path `/opt/homebrew/bin/node` without and with `exec`
+    path_no_exec = '#!/usr/bin/env bash\n/opt/homebrew/bin/node "$SERVER" "$@"\n'
+    assert node_invocation_lacks_exec(path_no_exec, "hook_wrapper") is True
+    path_rewritten = _rewrite_node_invocations_with_exec(path_no_exec, "hook_wrapper")
+    assert path_rewritten == '#!/usr/bin/env bash\nexec /opt/homebrew/bin/node "$SERVER" "$@"\n'
+    assert node_invocation_lacks_exec(path_rewritten, "hook_wrapper") is False
+
+    # Multi-line double-quoted string and heredoc containing `node ` must not be flagged
+    multiline_safe = (
+        "#!/usr/bin/env bash\n"
+        'echo "multi-line\n'
+        'node $SERVER inside echo"\n'
+        "cat <<'EOF'\n"
+        "node $SERVER inside heredoc\n"
+        "EOF\n"
+        'exec "$NODE_BIN" "$SERVER" "$@"\n'
+    )
+    assert node_invocation_lacks_exec(multiline_safe, "launcher_wrapper") is False
+
+    # hooks_json: non-command `"node "` text with `"exec /opt/homebrew/bin/node ..."` command is not flagged;
+    # un-execed `/opt/homebrew/bin/node` command in hooks_json is flagged and rewritten cleanly.
+    hooks_clean = json.dumps(
+        {
+            "description": "node hook runner",
+            "hooks": {"SessionStart": [{"command": f"exec /opt/homebrew/bin/node {home}/hook.js"}]},
+        }
+    )
+    assert node_invocation_lacks_exec(hooks_clean, "hooks_json") is False
+    hooks_unexec = json.dumps(
+        {
+            "description": "node hook runner",
+            "hooks": {"SessionStart": [{"command": f"/opt/homebrew/bin/node {home}/hook.js"}]},
+        }
+    )
+    assert node_invocation_lacks_exec(hooks_unexec, "hooks_json") is True
+    hooks_fixed = _rewrite_node_invocations_with_exec(hooks_unexec, "hooks_json")
+    assert node_invocation_lacks_exec(hooks_fixed, "hooks_json") is False
+    assert f"exec /opt/homebrew/bin/node {home}/hook.js" in hooks_fixed
+
+
+def test_r12_h23_d_dry_run_parity_post_flip_delta_reported_as_would_abort(
+    tmp_path: Path,
+) -> None:
+    """R12 H23 (d): any case whose apply would roll back on a post-flip delta appears as would_abort in the dry run."""
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    plugin_dir.mkdir(parents=True)
+    v1_ver = "0.6.0+git.11111111"
+    v1_sha = "1" * 40
+    v2_ver = "0.6.0+git.22222222"
+    v2_sha = "2" * 40
+    _seed_plugin_version(plugin_dir, v1_ver, v1_sha)
+    _seed_plugin_version(plugin_dir, v2_ver, v2_sha)
+    (plugin_dir / "current").symlink_to(v1_ver)
+
+    minni_mcp = home / ".local" / "bin" / "minni-mcp"
+    minni_mcp.parent.mkdir(parents=True, exist_ok=True)
+    # Double-tilde `~~/` expands one `~/` to `/{home}/`, leaving `~/{home}/...` after reconcile,
+    # which triggers `literal_tilde_in_launcher_wrapper` in post-flip health.
+    residual_tilde_wrapper = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'NODE_BIN="/opt/homebrew/bin/node"\n'
+        'SERVER="~~/.cursor/plugins/local/minni/dist/server.js"\n'
+        'exec "$NODE_BIN" "$SERVER" "$@"\n'
+    )
+    minni_mcp.write_text(residual_tilde_wrapper, encoding="utf-8")
+    minni_mcp.chmod(0o755)
+
+    dry_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=True,
+        running_hosts=set(),
+    )
+    assert dry_res.exit_code == 1, dry_res.message
+    assert dry_res.status == "ABORTED_PRE_FLIP"
+    assert dry_res.aborted_pre_flip is True
+    assert any(
+        a.get("host") == "cursor"
+        and a.get("path") == str(minni_mcp)
+        and "literal_tilde_in_launcher_wrapper" in str(a.get("reason") or "")
+        for a in dry_res.would_abort
+    ), dry_res.would_abort
+    assert dry_res.plan is not None
+    assert dry_res.plan["would-abort"] == dry_res.would_abort
+
+    apply_res = execute_atomic_cutover(
+        home=home,
+        target_version=v2_ver,
+        target_git_sha=v2_sha,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert apply_res.exit_code == 1
+    assert apply_res.rolled_back is True
+    assert "cursor" in apply_res.message
+    assert str(minni_mcp) in apply_res.message
+    assert "literal_tilde_in_launcher_wrapper" in apply_res.message
+    assert minni_mcp.read_text(encoding="utf-8") == residual_tilde_wrapper
+    assert os.readlink(plugin_dir / "current") == v1_ver

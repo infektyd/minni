@@ -42,9 +42,11 @@ from minni.wire.manifest import PayloadManifest
 from minni.wire.registry import (
     _VERSIONED_PLUGIN_RE,
     HOST_SURFACE_CATALOG,
+    _rewrite_node_invocations_with_exec,
     effective_container_mode,
     evaluate_mcp_surface_diff,
     expand_for_home,
+    node_invocation_lacks_exec,
 )
 from minni.wire.wired import (
     _load_wired,
@@ -1117,8 +1119,8 @@ def _reconcile_text_surface(
                 canonical_entry,
                 updated,
             )
-        if use_exec:
-            updated = re.sub(r'(?<!exec )\bnode\s+([^\s"\']*?' + re.escape(entry_basename) + r')', r'exec node \1', updated)
+        if use_exec and node_invocation_lacks_exec(updated, "hooks_json"):
+            updated = _rewrite_node_invocations_with_exec(updated, "hooks_json")
         # Re-validate JSON
         json.loads(updated)
     elif kind in ("launcher_wrapper", "hook_wrapper"):
@@ -1129,8 +1131,8 @@ def _reconcile_text_surface(
                 canonical_entry,
                 updated,
             )
-        if use_exec:
-            updated = re.sub(r"(?m)^(\s*)node\s+", r"\1exec node ", updated)
+        if use_exec and node_invocation_lacks_exec(updated, kind):
+            updated = _rewrite_node_invocations_with_exec(updated, kind)
     elif kind == "js_bridge":
         entry_basename = Path(canonical_entry).name
         if entry_basename:
@@ -1998,25 +2000,72 @@ def _build_dry_run_plan_with_ref(
         if not cfg_path.is_file():
             _record_surface(host, kind, cfg_path, "would-write", reason="broken_or_non_regular_surface")
             continue
+        if kind in ("launcher_wrapper", "hook_wrapper"):
+            chk = subprocess.run(["bash", "-n", str(cfg_path)], capture_output=True, text=True, check=False)
+            if chk.returncode != 0:
+                _record_surface(
+                    host,
+                    kind,
+                    cfg_path,
+                    "would_abort",
+                    diff={"before": {"kind": kind}, "after": None, "reasons": ["unparseable_shell_wrapper"]},
+                    reason="unparseable_shell_wrapper",
+                )
+                continue
         try:
             raw_text = cfg_path.read_text(encoding="utf-8")
         except OSError:
             raw_text = ""
+        from minni.wire.health import evaluate_text_surface_health
+
+        pre_health_reasons = evaluate_text_surface_health(raw_text, kind=kind, surf_spec=surf_spec)
+        reconcile_failed = False
+        _updated_text = raw_text
         try:
             has_delta, _updated_text = _reconcile_text_surface(
                 raw_text,
-                kind=kind,
+                kind="hooks_json" if kind == "claude_marketplace" else kind,
                 surf_spec=surf_spec,
                 home=home,
             )
-        except Exception:
+        except Exception as exc:
+            reconcile_failed = True
             has_delta = True
+            abort_reasons = pre_health_reasons or [f"unparseable_{kind}:{type(exc).__name__}"]
+            _record_surface(
+                host,
+                kind,
+                cfg_path,
+                "would_abort",
+                diff={"before": {"kind": kind}, "after": None, "reasons": abort_reasons},
+                reason=",".join(abort_reasons),
+            )
+            continue
+
+        # Evaluate the same post-flip health predicates against the projected state (H23 Seam Parity)
+        post_health_reasons = evaluate_text_surface_health(_updated_text, kind=kind, surf_spec=surf_spec)
+        defer_reason = _check_defer(host, cfg_path, raw_text)
+        if post_health_reasons and not defer_reason and not reconcile_failed:
+            _record_surface(
+                host,
+                kind,
+                cfg_path,
+                "would_abort",
+                diff={
+                    "before": {"kind": kind},
+                    "after": {"kind": kind},
+                    "reasons": post_health_reasons,
+                },
+                reason=",".join(post_health_reasons),
+            )
+            continue
+
         if not has_delta:
             _record_surface(host, kind, cfg_path, "would-skip", reason="no_delta")
             continue
-        defer_reason = _check_defer(host, cfg_path, raw_text)
         canonical_entry = expand_for_home(str(surf_spec.get("entry") or ""), home=home)
         before_refs = sorted({m.group(0) for m in _VERSIONED_PLUGIN_RE.finditer(raw_text)})
+        surface_reasons = list(pre_health_reasons) if pre_health_reasons else [f"versioned_or_tilde_in_{kind}"]
         diff_obj = {
             "before": {
                 "kind": kind,
@@ -2028,8 +2077,9 @@ def _build_dry_run_plan_with_ref(
                 "entry": canonical_entry,
                 "has_tilde": False,
             },
-            "reasons": [f"versioned_or_tilde_in_{kind}"],
+            "reasons": surface_reasons,
         }
+        reason_str = ",".join(surface_reasons)
         if defer_reason:
             _record_surface(host, kind, cfg_path, "would-defer", diff=diff_obj, reason=defer_reason)
         else:
@@ -2039,9 +2089,65 @@ def _build_dry_run_plan_with_ref(
                 cfg_path,
                 "would-write",
                 diff=diff_obj,
-                reason=f"versioned_or_tilde_in_{kind}",
+                reason=reason_str,
                 archive_dest=_preview_archive_dest(cfg_path),
             )
+
+    if would_abort:
+        abort_items = ", ".join(f"{a.get('host')}:{a.get('path')}" for a in would_abort)
+        empty_gc_post: dict[str, Any] = {
+            "would-prune": [],
+            "would_prune": [],
+            "would-keep": [],
+            "would_keep": [],
+            "retained_in_use": [],
+            "pruned": [],
+        }
+        abort_plan_doc_post: dict[str, Any] = {
+            "target_version": target_version,
+            "target_git_sha": target_git_sha,
+            "hosts": hosts_plan,
+            "surfaces": all_surface_plans,
+            "would-write": [],
+            "would_write": [],
+            "would-create": [],
+            "would_create": [],
+            "would-defer": [],
+            "would_defer": [],
+            "would-archive": [],
+            "would_archive": [],
+            "would-skip": [],
+            "would_skip": [],
+            "would-abort": would_abort,
+            "would_abort": would_abort,
+            "findings": stale_findings,
+            "stale_locks": stale_findings,
+            "gc": {
+                "would-prune": [],
+                "would-keep": [],
+            },
+        }
+        abort_msg_post = (
+            f"dry-run: would abort cutover on {home} to {target_version}: "
+            f"would_abort={len(would_abort)} ({abort_items})"
+        )
+        return CutoverOutcome(
+            exit_code=1,
+            status="ABORTED_PRE_FLIP",
+            target_version=target_version,
+            target_git_sha=target_git_sha,
+            aborted_pre_flip=True,
+            rolled_back=False,
+            deferred_running_hosts=[],
+            updated_surfaces=[],
+            skipped_surfaces=[],
+            would_abort=would_abort,
+            gc_result=empty_gc_post,
+            message=abort_msg_post,
+            plan=abort_plan_doc_post,
+            findings=stale_findings,
+            stale_locks=stale_findings,
+        )
 
     # Check if `current` is a real directory that Step 4/7b would archive
     current_path = plugin_dir / "current"
