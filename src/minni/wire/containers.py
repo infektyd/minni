@@ -57,6 +57,14 @@ def flip_current_pointer(
             prev_link_target = os.readlink(current_path)
         except OSError:
             prev_link_target = None
+        if prev_link_target == version:
+            return CurrentFlipState(
+                current_path=current_path,
+                new_version=version,
+                pid=proc_pid,
+                prev_link_target=prev_link_target,
+                prev_dir_path=None,
+            )
     elif current_path.exists() and current_path.is_dir():
         prev_dir_path = base / f".current.prev_dir.{proc_pid}"
         if prev_dir_path.exists():

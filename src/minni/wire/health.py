@@ -955,7 +955,9 @@ def audit_host_propagation_health(
     )
     running_stale = [r for r in all_running if r.get("stale")]
 
-    ok = current_valid and not drifted_surfaces and not uncatalogued_refs and not running_stale
+    # Running stale servers started before sync only require a host-app restart (H36)
+    # and must be reported separately rather than failing verification.
+    ok = current_valid and not drifted_surfaces and not uncatalogued_refs
     return HostPropagationHealthReport(
         ok=ok,
         current_valid=current_valid,

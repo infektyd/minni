@@ -471,10 +471,16 @@ def check_wire_launch_bindings(home: Path) -> tuple[list[str], list[str]]:
         problems.append(
             f"uncatalogued: {ref.get('path')} ({ref.get('reason')})"
         )
-    for srv in health.running_stale_servers:
-        problems.append(
-            f"running_stale_server: pid={srv.get('pid')} version={srv.get('version')}"
-        )
+    if health.running_stale_servers:
+        from minni.wire.gc import format_restart_host_apps_notice
+
+        notice = format_restart_host_apps_notice(health.running_stale_servers)
+        notes.append(notice)
+        for srv in health.running_stale_servers:
+            notes.append(
+                f"running_stale_server: host={srv.get('host')} "
+                f"pid={srv.get('pid')} version={srv.get('version') or srv.get('loaded_version')}"
+            )
 
     if not wired.exists() and not problems:
         return [], ["host launch bindings not checked: no wired.json records"]

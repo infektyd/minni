@@ -269,6 +269,12 @@ def update_current_symlink(version: str, *, dry_run: bool = False) -> None:
     link = plugin_base() / "current"
     if dry_run:
         return
+    if link.is_symlink():
+        try:
+            if os.readlink(link) == version:
+                return
+        except OSError:
+            pass
     if link.exists() and not link.is_symlink() and link.is_dir():
         prev_dir = link.parent / f".current.prev_dir.{os.getpid()}"
         if prev_dir.exists():
