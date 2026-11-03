@@ -304,6 +304,7 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     _src = Path(__file__).resolve().parent.parent / "src"
     if _src.is_dir() and str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
+    from minni.wire.gc import format_restart_host_apps_notice
     from minni.wire.health import audit_host_propagation_health
 
     health = audit_host_propagation_health(home=home)
@@ -316,10 +317,14 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
         mismatches.append(
             f"deployed: uncatalogued .minni/plugin reference in {ref.get('path')} ({ref.get('reason')})"
         )
-    for srv in health.running_stale_servers:
-        mismatches.append(
-            f"deployed: stale running MCP server pid={srv.get('pid')} version={srv.get('version')}"
-        )
+    if health.running_stale_servers:
+        notice = format_restart_host_apps_notice(health.running_stale_servers)
+        notes.append(f"deployed: {notice}")
+        for srv in health.running_stale_servers:
+            notes.append(
+                f"deployed: running_stale_server host={srv.get('host')} "
+                f"pid={srv.get('pid')} version={srv.get('version') or srv.get('loaded_version')}"
+            )
 
     roots = deployment_roots()
     if not roots:

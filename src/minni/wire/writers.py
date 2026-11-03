@@ -332,6 +332,18 @@ def update_kilo_config(
     return path
 
 
+def _is_plugin_container_cwd(cwd_path: Path) -> bool:
+    parts = cwd_path.parts
+    for i in range(len(parts) - 1):
+        if (parts[i], parts[i + 1]) in {
+            (".minni", "plugin"),
+            (".cursor", "plugins"),
+            (".agents", "plugins"),
+        }:
+            return True
+    return False
+
+
 def gemini_minni_entry(
     server_path: Path,
     agent: str,
@@ -346,22 +358,29 @@ def gemini_minni_entry(
     entry: dict = {}
     if type_name:
         entry["$typeName"] = type_name
+    default_env_run = Path("~/.agents/bin/mcp-env-run").expanduser()
+    env_run = (
+        default_env_run
+        if str(GEMINI_MCP_ENV_RUN).endswith("/.agents/bin/mcp-env-run")
+        else GEMINI_MCP_ENV_RUN
+    )
     use_wrapper = (
         not launcher_fallback
-        and (shutil.which("mcp-env-run") or GEMINI_MCP_ENV_RUN.exists())
+        and (shutil.which("mcp-env-run") or env_run.exists())
     )
     if use_wrapper:
-        entry["command"] = str(GEMINI_MCP_ENV_RUN)
+        entry["command"] = str(env_run)
         entry["args"] = ["node", str(server_path)]
     else:
         entry["command"] = "node"
         entry["args"] = [str(server_path)]
-    entry["cwd"] = str(Path(server_path).parent.parent)
+    cwd_dir = Path(server_path).parent.parent
+    if not _is_plugin_container_cwd(cwd_dir):
+        entry["cwd"] = str(cwd_dir)
     entry["env"] = {
         "MINNI_AGENT_ID": agent,
         "MINNI_VAULT_PATH": str(vault),
         "MINNI_SOCKET_PATH": str(socket_path),
-        "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
         **(afm_env or {}),
     }
     return entry

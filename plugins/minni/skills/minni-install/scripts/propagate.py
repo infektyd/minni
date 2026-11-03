@@ -456,6 +456,38 @@ def _sanitize_copied_manifests(dest: Path) -> None:
     sanitize_staged_payload(dest, remove_mcp_json=False)
 
 
+def _trees_match_excluding_generated(staged: Path, dest: Path) -> bool:
+    if not dest.is_dir() or dest.is_symlink():
+        return False
+
+    def _collect(root: Path) -> dict[str, Path] | None:
+        files: dict[str, Path] = {}
+        for p in root.rglob("*"):
+            if "node_modules" in p.parts:
+                continue
+            rel = p.relative_to(root).as_posix()
+            if "/" not in rel and (rel in GENERATED_INSTALL_FILES or rel == ".mcp.json"):
+                continue
+            if p.is_symlink():
+                return None
+            if p.is_file():
+                files[rel] = p
+        return files
+
+    s_files = _collect(staged)
+    d_files = _collect(dest)
+    if s_files is None or d_files is None or set(s_files) != set(d_files):
+        return False
+    for rel, sp in s_files.items():
+        dp = d_files[rel]
+        try:
+            if sp.stat().st_size != dp.stat().st_size or sp.read_bytes() != dp.read_bytes():
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def copy_tree(source: Path, dest: Path) -> None:
     if not source.exists():
         raise SystemExit(f"Missing plugin source: {source}")
@@ -468,6 +500,9 @@ def copy_tree(source: Path, dest: Path) -> None:
         shutil.copytree(source, staged, ignore=shutil.ignore_patterns("node_modules", ".git"))
         if cur_srv is not None and (staged / "dist").is_dir():
             shutil.copy2(cur_srv, staged / "dist" / "server.js")
+            cur_bm = cur_srv.parent / "build-manifest.json"
+            if cur_bm.is_file():
+                shutil.copy2(cur_bm, staged / "dist" / "build-manifest.json")
         try:
             _sanitize_copied_manifests(staged)
         except Exception:
@@ -475,6 +510,8 @@ def copy_tree(source: Path, dest: Path) -> None:
             if not parent_existed and dest.parent.is_dir() and not any(dest.parent.iterdir()):
                 dest.parent.rmdir()
             raise
+        if _trees_match_excluding_generated(staged, dest):
+            return
         rsync = shutil.which("rsync")
         if rsync:
             cmd = [rsync, "-a", "--delete", "--exclude", "node_modules"]
@@ -513,8 +550,15 @@ def write_json(path: Path, data: dict) -> None:
     config on next launch. Serialize first, then rename over the target: the
     rename is atomic, so a reader sees either the old file or the new one.
     """
+    rendered = json.dumps(data, indent=2) + "\n"
+    if path.is_file() and not path.is_symlink():
+        try:
+            if path.read_text(encoding="utf-8") == rendered:
+                return
+        except (OSError, UnicodeDecodeError):
+            pass
     path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(path, json.dumps(data, indent=2) + "\n")
+    _atomic_write(path, rendered)
 
 
 def _atomic_write(path: Path, text: str, *, mode: int | None = None) -> None:
@@ -776,6 +820,18 @@ def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_p
     )
 
 
+def _is_plugin_container_cwd(cwd_path: Path) -> bool:
+    parts = cwd_path.parts
+    for i in range(len(parts) - 1):
+        if (parts[i], parts[i + 1]) in {
+            (".minni", "plugin"),
+            (".cursor", "plugins"),
+            (".agents", "plugins"),
+        }:
+            return True
+    return False
+
+
 def gemini_minni_entry(
     server_path: Path,
     agent: str,
@@ -794,14 +850,21 @@ def gemini_minni_entry(
     entry: dict = {}
     if type_name:
         entry["$typeName"] = type_name
-    entry["command"] = str(GEMINI_MCP_ENV_RUN)
+    default_env_run = Path("~/.agents/bin/mcp-env-run").expanduser()
+    env_run = (
+        default_env_run
+        if str(GEMINI_MCP_ENV_RUN).endswith("/.agents/bin/mcp-env-run")
+        else GEMINI_MCP_ENV_RUN
+    )
+    entry["command"] = str(env_run)
     entry["args"] = ["node", str(server_path)]
-    entry["cwd"] = str(Path(server_path).parent.parent)
+    cwd_dir = Path(server_path).parent.parent
+    if not _is_plugin_container_cwd(cwd_dir):
+        entry["cwd"] = str(cwd_dir)
     entry["env"] = {
         "MINNI_AGENT_ID": agent,
         "MINNI_VAULT_PATH": str(vault),
         "MINNI_SOCKET_PATH": str(socket_path),
-        "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
         **(afm_env or {}),
     }
     return entry
@@ -1063,6 +1126,14 @@ def update_claude_desktop_config(
 
 def _native_hook_plan(platform: str, install_root: Path) -> dict[str, object]:
     """Validate and plan an existing-only refresh without creating host state."""
+    if platform == "grok":
+        cur_link = Path("~/.minni/plugin/current").expanduser()
+        if cur_link.exists():
+            try:
+                if cur_link.resolve() == install_root.expanduser().resolve():
+                    install_root = cur_link
+            except OSError:
+                pass
     paths = {
         "grok": ("~/.grok/hooks/minni.json", "grok-hook.js"),
         "cursor": ("~/.cursor/hooks.json", "cursor-hook.js"),
@@ -1128,8 +1199,10 @@ def _native_hook_plan(platform: str, install_root: Path) -> dict[str, object]:
                 or not tokens[node_idx + 1].endswith("/dist/" + entrypoint)
             ):
                 raise ValueError("unrecognized owned hook command needs explicit repair")
-            tokens[node_idx + 1] = str(install_root / "dist" / entrypoint)
-            result["command"] = shlex.join(tokens)
+            desired_script = str(install_root / "dist" / entrypoint)
+            if tokens[node_idx + 1] != desired_script:
+                tokens[node_idx + 1] = desired_script
+                result["command"] = shlex.join(tokens)
             count += 1
             return result
         refreshed = dict(data)
@@ -1644,6 +1717,13 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         raise SystemExit("generic update-plugin requires --agent so it cannot inherit another agent's vault")
     agent = args.agent or str(spec["agent"])
     install_root = Path(args.install_root).expanduser() if args.install_root else Path(spec["install"]).expanduser()
+    if not args.install_root and install_root.name.lower() == "minni@minni" and install_root.parent.is_dir():
+        try:
+            entries = os.listdir(install_root.parent)
+            if "Minni@Minni" in entries and "minni@minni" not in entries:
+                install_root = install_root.parent / "Minni@Minni"
+        except OSError:
+            pass
     existing_only = getattr(args, "platform", platform) == "all" or getattr(args, "existing_only", False)
     native_platform = canonical_platform(platform)
     if existing_only:

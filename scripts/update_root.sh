@@ -406,9 +406,15 @@ try:
         root = max(grok_entries, key=lambda t: t[0])[1]
 except Exception:
     root = None
+current = base / "current"
 if root is None:
-    current = base / "current"
-    root = current.resolve() if current.exists() else None
+    root = current if current.exists() else None
+elif current.exists():
+    try:
+        if current.resolve() == root.resolve():
+            root = current
+    except OSError:
+        pass
 if root is None:
     # No usable grok wire install root (and no current). Leftover ~/.grok
     # alone is not enough to require hooks refresh — skip loud, do not fail

@@ -628,6 +628,8 @@ def inspect_running_mcp_servers(
             "pid": pid,
             "ppid": ppid,
             "version_root": ver_root_str,
+            "version": loaded_version,
+            "git_sha": loaded_sha,
             "loaded_version": loaded_version,
             "loaded_sha": loaded_sha,
             "target_version": target_version,
@@ -636,6 +638,27 @@ def inspect_running_mcp_servers(
             "backing_dir_exists": backing_exists,
         })
     return records
+
+
+def stale_server_host_names(records: list[dict[str, Any]]) -> list[str]:
+    """Return sorted deduplicated human host names for running stale MCP servers."""
+    stale = [r for r in records if r.get("stale", True)]
+    names: list[str] = []
+    for rec in stale:
+        host = str(rec.get("host") or "").strip()
+        parent_name = str(rec.get("parent_name") or "").strip()
+        label = host if (host and host != "unknown") else (parent_name if (parent_name and parent_name != "unknown") else f"pid:{rec.get('pid')}")
+        if label not in names:
+            names.append(label)
+    return names
+
+
+def format_restart_host_apps_notice(records: list[dict[str, Any]]) -> str:
+    """Format the operator-facing restart notice for running stale MCP servers (H36)."""
+    names = stale_server_host_names(records)
+    if not names:
+        return ""
+    return f"restart these host apps: {', '.join(names)}"
 
 
 def format_running_stale_servers(records: list[dict[str, Any]]) -> str:

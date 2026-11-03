@@ -306,14 +306,19 @@ def _grok_install_root() -> Optional[Path]:
             and str(w.get("platform") or "") == "grok"
         ]
     entries = [(when, path) for when, path in entries if path.is_dir()]
-    if entries:
-        return max(entries, key=lambda e: e[0])[1]
     current = base / "current"
+    if entries:
+        root = max(entries, key=lambda e: e[0])[1]
+        if current.exists():
+            with contextlib.suppress(OSError):
+                if current.resolve() == root.resolve():
+                    return current
+        return root
     if current.exists():
         with contextlib.suppress(OSError):
             resolved = current.resolve()
             if resolved.is_dir():
-                return resolved
+                return current
     return None
 
 

@@ -413,6 +413,7 @@ def run_wire(args) -> int:
             install_root = plugin_base() / version
             out.install_root = str(install_root)
 
+            already_cutover_wires: dict[str, dict] = {}
             if use_version is None:
                 if verify_payload:
                     errors = verify_manifest_hashes(manifest, payload_root)
@@ -435,6 +436,42 @@ def run_wire(args) -> int:
                         raise WireError(str(exc)) from exc
                     except InstallError as exc:
                         raise WireError(str(exc)) from exc
+                    if (
+                        result.skipped
+                        and not args.install_root
+                        and args.workspace is None
+                        and not dynamic_workspace
+                    ):
+                        try:
+                            from minni.wire.health import audit_host_propagation_health
+                            from minni.wire.wired import _load_wired
+
+                            wdoc = _load_wired(plugin_base() / "wired.json")
+                            if (
+                                isinstance(wdoc, dict)
+                                and wdoc.get("schema_version") == 2
+                                and wdoc.get("active_version") == version
+                                and (plugin_base() / "current").is_symlink()
+                            ):
+                                health = audit_host_propagation_health(
+                                    home=Path.home(),
+                                    expected_git_sha=manifest.git_sha,
+                                )
+                                if (
+                                    health.current_valid
+                                    and not health.drifted_surfaces
+                                    and not health.uncatalogued_refs
+                                ):
+                                    for w in wdoc.get("wires", []):
+                                        if (
+                                            isinstance(w, dict)
+                                            and w.get("install_root") == str(install_root)
+                                            and w.get("version") == version
+                                            and w.get("platform")
+                                        ):
+                                            already_cutover_wires[str(w["platform"])] = w
+                        except Exception:
+                            already_cutover_wires = {}
                 else:
                     install_payload(
                         payload_root, version, manifest,
@@ -480,6 +517,25 @@ def run_wire(args) -> int:
                         extra={"host": host_decisions[platform]["host"]},
                     ))
                     continue
+
+                if platform in already_cutover_wires:
+                    wrec = already_cutover_wires[platform]
+                    cfg_str = str(wrec.get("config_path") or "")
+                    if cfg_str and Path(cfg_str).is_file():
+                        out.results.append(PlatformResult(
+                            platform, "wired",
+                            config_path=cfg_str,
+                            server_path=str(install_root / "dist" / "server.js"),
+                            agent=spec.agent,
+                            workspace=wrec.get("workspace"),
+                            verify={
+                                "handshake": True,
+                                "hook_dry_run": True,
+                                "config_readback": True,
+                            },
+                            extra={"host": host_decisions[platform]["host"]},
+                        ))
+                        continue
 
                 mcp_root = None
                 if args.install_root:

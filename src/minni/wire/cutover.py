@@ -3301,14 +3301,27 @@ def execute_atomic_cutover(
             shutil.rmtree(dest_prev_current, ignore_errors=True)
         shutil.move(str(flip_state.prev_dir_path), str(dest_prev_current))
 
-    # Write wired.json v2
+    # Write wired.json v2 (skip when already converged with zero surface changes)
     new_wired = build_wired_v2(
         active_version=target_version,
         git_commit_sha=target_git_sha,
         home=home,
         existing=wired_doc,
     )
-    save_wired_v2(new_wired, home=home)
+    already_wired_v2_identical = (
+        not updated_surfaces
+        and not all_container_swaps
+        and flip_state.prev_link_target == target_version
+        and flip_state.prev_dir_path is None
+        and isinstance(wired_doc, dict)
+        and wired_doc.get("schema_version") == 2
+        and wired_doc.get("active_version") == target_version
+        and wired_doc.get("git_commit_sha") == target_git_sha
+        and wired_doc.get("hosts") == new_wired.get("hosts")
+        and wired_doc.get("wires") == new_wired.get("wires")
+    )
+    if not already_wired_v2_identical:
+        save_wired_v2(new_wired, home=home)
 
     # Step 7 — Reference-Aware GC (§4.5, New P1 #3)
     gc_obj = collect_garbage(
