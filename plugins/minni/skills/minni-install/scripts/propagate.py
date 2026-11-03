@@ -425,26 +425,23 @@ GENERATED_INSTALL_FILES = ("gemini-extension.json",)
 
 def _verified_current_server_js(dest: Path) -> Path | None:
     """Return verified ~/.minni/plugin/current/dist/server.js when dest is under HOME (H30)."""
-    try:
-        home = Path.home().expanduser().resolve()
-        if not dest.expanduser().resolve().is_relative_to(home):
-            return None
-        plugin_dir = home / ".minni" / "plugin"
-        current = plugin_dir / "current"
-        if not (current.exists() or current.is_symlink()):
-            return None
-        try:
-            from minni.wire.containers import resolve_verified_plugin_root
-        except ImportError:
-            src_root = Path(__file__).resolve().parents[5] / "src"
-            if src_root.is_dir() and str(src_root) not in sys.path:
-                sys.path.insert(0, str(src_root))
-            from minni.wire.containers import resolve_verified_plugin_root
-        verified_root = resolve_verified_plugin_root(current, expected_base=plugin_dir)
-        srv = verified_root / "dist" / "server.js"
-        return srv if srv.is_file() else None
-    except Exception:
+    home = Path.home().expanduser().resolve()
+    if not dest.expanduser().resolve().is_relative_to(home):
         return None
+    plugin_dir = home / ".minni" / "plugin"
+    current = plugin_dir / "current"
+    if not (current.exists() or current.is_symlink()):
+        return None
+    try:
+        from minni.wire.containers import resolve_verified_plugin_root
+    except ImportError:
+        src_root = Path(__file__).resolve().parents[5] / "src"
+        if src_root.is_dir() and str(src_root) not in sys.path:
+            sys.path.insert(0, str(src_root))
+        from minni.wire.containers import resolve_verified_plugin_root
+    verified_root = resolve_verified_plugin_root(current, expected_base=plugin_dir)
+    srv = verified_root / "dist" / "server.js"
+    return srv if srv.is_file() else None
 
 
 def _sanitize_copied_manifests(dest: Path) -> None:
@@ -462,13 +459,13 @@ def _sanitize_copied_manifests(dest: Path) -> None:
 def copy_tree(source: Path, dest: Path) -> None:
     if not source.exists():
         raise SystemExit(f"Missing plugin source: {source}")
+    cur_srv = _verified_current_server_js(dest)
     parent_existed = dest.parent.exists()
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{dest.name}.stage-", dir=str(dest.parent)))
     try:
         staged = staging_parent / dest.name
         shutil.copytree(source, staged, ignore=shutil.ignore_patterns("node_modules", ".git"))
-        cur_srv = _verified_current_server_js(dest)
         if cur_srv is not None and (staged / "dist").is_dir():
             shutil.copy2(cur_srv, staged / "dist" / "server.js")
         try:

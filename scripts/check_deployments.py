@@ -90,6 +90,7 @@ NOT_COMPARED = {
                  " — but its agent stamp and recorded paths ARE validated",
     ".gemini-plugin/gemini-extension.json": (
         "host-materialized (per-host MCP args + env rendered by container sync), not a copy"
+        " — but its agent stamp and recorded paths ARE validated"
     ),
 }
 
@@ -120,34 +121,19 @@ def _expected_agents(rel_root: str) -> frozenset[str] | None:
     return None
 
 
-def check_mcp_config(root: Path, home: Path) -> list[str]:
-    """D14 (#234): validate a deployment's .mcp.json stamp and recorded paths.
-
-    Returns problem strings. An unparseable .mcp.json is a problem (never
-    assumed fine); a missing one is not (not every root materializes it).
-    """
-    mcp = root / ".mcp.json"
-    if not mcp.is_file():
-        return []
-    try:
-        data = json.loads(mcp.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return [f".mcp.json unreadable/unparseable: {type(exc).__name__}: {exc}"]
-    entry = (data.get("mcpServers") or {}).get("minni")
-    if not isinstance(entry, dict):
-        return []
+def _validate_mcp_server_entry(
+    entry: dict,
+    *,
+    source_label: str,
+    expected: frozenset[str] | None,
+    require_abs_cwd: bool = False,
+) -> list[str]:
     problems: list[str] = []
-
-    try:
-        rel_root = str(root.relative_to(home))
-    except ValueError:
-        rel_root = str(root)
-    expected = _expected_agents(rel_root + "/")
     env_raw = entry.get("env")
     if env_raw is None:
         env: dict = {}
     elif not isinstance(env_raw, dict):
-        problems.append(".mcp.json env is not an object")
+        problems.append(f"{source_label} env is not an object")
         env = {}
     else:
         env = env_raw
@@ -157,12 +143,12 @@ def check_mcp_config(root: Path, home: Path) -> list[str]:
             # A wiped/partial config is as wrong as a cross-stamped one: the
             # server would run with no identity, or inherit one ambiently.
             problems.append(
-                ".mcp.json has a minni entry but no MINNI_AGENT_ID stamp "
+                f"{source_label} has a minni entry but no MINNI_AGENT_ID stamp "
                 f"(expected one of {sorted(expected)})"
             )
         elif agent not in expected:
             problems.append(
-                f".mcp.json agent stamp {agent!r} is wrong for this root "
+                f"{source_label} agent stamp {agent!r} is wrong for this root "
                 f"(expected one of {sorted(expected)})"
             )
 
@@ -171,8 +157,9 @@ def check_mcp_config(root: Path, home: Path) -> list[str]:
         if isinstance(arg, str) and os.path.isabs(arg) and not Path(arg).exists():
             dead.append(f"args: {arg}")
     cwd = entry.get("cwd")
-    if isinstance(cwd, str) and cwd and not Path(cwd).is_dir():
-        dead.append(f"cwd: {cwd}")
+    if isinstance(cwd, str) and cwd:
+        if (not require_abs_cwd or os.path.isabs(cwd)) and not Path(cwd).is_dir():
+            dead.append(f"cwd: {cwd}")
     for key in PATH_ENV_KEYS:
         val = env.get(key)
         if not isinstance(val, str) or not val:
@@ -185,7 +172,93 @@ def check_mcp_config(root: Path, home: Path) -> list[str]:
                 dead.append(f"env {key}: {val}")
         elif not p.exists():
             dead.append(f"env {key}: {val}")
-    problems.extend(f".mcp.json dead path — {entry_}" for entry_ in dead)
+    problems.extend(f"{source_label} dead path — {entry_}" for entry_ in dead)
+    return problems
+
+
+def check_gemini_extension_config(root: Path, home: Path) -> list[str]:
+    """Validate a deployment's .gemini-plugin/gemini-extension.json stamp and recorded paths."""
+    _ = home
+    rel_label = ".gemini-plugin/gemini-extension.json"
+    gem = root / ".gemini-plugin" / "gemini-extension.json"
+    if not gem.is_file():
+        return []
+    try:
+        data = json.loads(gem.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"{rel_label} unreadable/unparseable: {type(exc).__name__}: {exc}"]
+    if not isinstance(data, dict):
+        return [f"{rel_label} is not a JSON object"]
+    mcp_servers = data.get("mcpServers")
+    entry = mcp_servers.get("minni") if isinstance(mcp_servers, dict) else None
+    expected = frozenset({"gemini"})
+    problems: list[str] = []
+    if isinstance(entry, dict):
+        problems.extend(
+            _validate_mcp_server_entry(
+                entry,
+                source_label=rel_label,
+                expected=expected,
+                require_abs_cwd=True,
+            )
+        )
+    elif mcp_servers is not None:
+        problems.append(f"{rel_label} missing mcpServers.minni object")
+    if "env" in data:
+        top_env = data.get("env")
+        if not isinstance(top_env, dict):
+            msg = f"{rel_label} env is not an object"
+            if msg not in problems:
+                problems.append(msg)
+        else:
+            top_agent = top_env.get("MINNI_AGENT_ID")
+            if not top_agent:
+                msg = (
+                    f"{rel_label} has a minni entry but no MINNI_AGENT_ID stamp "
+                    f"(expected one of {sorted(expected)})"
+                )
+                if msg not in problems:
+                    problems.append(msg)
+            elif top_agent not in expected:
+                msg = (
+                    f"{rel_label} agent stamp {top_agent!r} is wrong for this root "
+                    f"(expected one of {sorted(expected)})"
+                )
+                if msg not in problems:
+                    problems.append(msg)
+    return problems
+
+
+def check_mcp_config(root: Path, home: Path) -> list[str]:
+    """D14 (#234): validate a deployment's .mcp.json and .gemini-plugin/gemini-extension.json stamps and recorded paths.
+
+    Returns problem strings. An unparseable config is a problem (never
+    assumed fine); a missing one is not (not every root materializes it).
+    """
+    problems: list[str] = []
+    mcp = root / ".mcp.json"
+    if mcp.is_file():
+        try:
+            data = json.loads(mcp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            problems.append(f".mcp.json unreadable/unparseable: {type(exc).__name__}: {exc}")
+        else:
+            entry = (data.get("mcpServers") or {}).get("minni") if isinstance(data, dict) else None
+            if isinstance(entry, dict):
+                try:
+                    rel_root = str(root.relative_to(home))
+                except ValueError:
+                    rel_root = str(root)
+                expected = _expected_agents(rel_root + "/")
+                problems.extend(
+                    _validate_mcp_server_entry(
+                        entry,
+                        source_label=".mcp.json",
+                        expected=expected,
+                        require_abs_cwd=False,
+                    )
+                )
+    problems.extend(check_gemini_extension_config(root, home))
     return problems
 
 # Editor/interpreter droppings. Excluded because they are not part of the

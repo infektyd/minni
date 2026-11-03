@@ -219,6 +219,28 @@ def _is_native_binary_file(fpath: Path) -> bool:
 
 def _is_real_host_config_for_size_cap(fpath: Path, root_dir: Path) -> bool:
     """Return True if an oversized file is a real host config (not an extension/cache/node_modules bundle)."""
+    suffix = fpath.suffix.lower()
+    if suffix not in {".json", ".toml", ".yaml", ".yml"}:
+        return False
+    lower_name = fpath.name.lower()
+    if lower_name in {
+        ".claude.json",
+        "claude_desktop_config.json",
+        "installed_plugins.json",
+        "marketplace.json",
+        ".mcp.json",
+        "mcp.json",
+        "mcp_config.json",
+        "hooks.json",
+        "minni.json",
+        "settings.json",
+        "config.json",
+        "kilo.json",
+        "config.toml",
+        "gemini-extension.json",
+        "plugin.json",
+    }:
+        return True
     try:
         rel_parts = fpath.relative_to(root_dir).parts
     except ValueError:
@@ -240,27 +262,6 @@ def _is_real_host_config_for_size_cap(fpath: Path, root_dir: Path) -> bool:
         "third_party",
     }:
         return False
-    suffix = fpath.suffix.lower()
-    if suffix not in {".json", ".toml", ".yaml", ".yml"}:
-        return False
-    lower_name = fpath.name.lower()
-    if lower_name in {
-        ".claude.json",
-        "claude_desktop_config.json",
-        "installed_plugins.json",
-        "marketplace.json",
-        "mcp.json",
-        "mcp_config.json",
-        "hooks.json",
-        "minni.json",
-        "settings.json",
-        "config.json",
-        "kilo.json",
-        "config.toml",
-        "gemini-extension.json",
-        "plugin.json",
-    }:
-        return True
     stem = fpath.stem.lower()
     return any(tok in stem for tok in ("mcp", "hook", "setting", "config", "minni", "claude", "kilo"))
 

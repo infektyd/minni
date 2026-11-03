@@ -655,3 +655,209 @@ def test_h24_dry_run_unreadable_and_non_utf8_surfaces_report_would_abort(tmp_pat
     assert rules_abort["host"] == "grok-build"
     assert rules_abort["reason"]
     assert "UnicodeDecodeError" in rules_abort["reason"]
+
+
+def test_h30b_corrupted_current_server_js_fails_cursor_propagate_and_leaves_container_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H30b: A verification failure on current (corrupted current/dist/server.js or bad manifest) fails cursor propagate loudly without falling back to bundle_server.mjs or touching the container."""
+    from minni.wire.containers import converge_host_container, flip_current_pointer
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    version = "0.6.0+git.3509b49e"
+    git_sha = "3509b49e4256f6129a74f9af38e1891fbc4f9059"
+    vdir = home / ".minni" / "plugin" / version
+    _write_verified_payload(
+        vdir,
+        version=version,
+        git_sha=git_sha,
+        server_body="// dist/server.js\n// good-verified-payload\n",
+    )
+    flip_current_pointer(version, home=home)
+
+    converge_host_container(
+        "cursor",
+        home=home,
+        base_semver="0.6.0",
+        container_mode="staged_copy",
+        target_version_root=vdir,
+    )
+    cursor_container = home / ".cursor" / "plugins" / "local" / "minni"
+    before_snapshot = {
+        p.relative_to(cursor_container).as_posix(): p.read_bytes()
+        for p in sorted(cursor_container.rglob("*"))
+        if p.is_file()
+    }
+    assert "dist/server.js" in before_snapshot
+
+    # Corrupt current/dist/server.js so resolve_verified_plugin_root raises hash mismatch
+    (vdir / "dist" / "server.js").write_bytes(b"// dist/server.js\n// CORRUPTED-SERVER-JS\n")
+
+    propagate = _load_propagate()
+    monkeypatch.setattr(propagate, "bootstrap_vault", lambda _args: 0)
+    monkeypatch.setattr(propagate, "native_afm_env", lambda _repo: {})
+    run_calls: list[object] = []
+    monkeypatch.setattr(propagate, "run", lambda cmd, **kw: run_calls.append((cmd, kw)))
+
+    args = argparse.Namespace(
+        repo=str(REPO),
+        workspace=str(REPO),
+        no_build=True,
+        install_root=str(cursor_container),
+        agent="cursor",
+        socket=str(home / ".minni" / "run" / "minnid.sock"),
+        existing_only=True,
+    )
+    with pytest.raises(ValueError, match="dist/server.js hash mismatch"):
+        propagate.update_one_plugin("cursor", args)
+
+    assert run_calls == [], f"must not fall back to bundle_server.mjs or rsync on verification failure: {run_calls}"
+    after_snapshot = {
+        p.relative_to(cursor_container).as_posix(): p.read_bytes()
+        for p in sorted(cursor_container.rglob("*"))
+        if p.is_file()
+    }
+    assert after_snapshot == before_snapshot, "cursor container must remain completely untouched on verification failure"
+
+    # Also verify a corrupt payload-manifest.json fails loudly and leaves the container untouched
+    (vdir / "payload-manifest.json").write_text("{corrupt-json", encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable payload-manifest.json"):
+        propagate.update_one_plugin("cursor", args)
+    assert run_calls == []
+    after_snapshot_2 = {
+        p.relative_to(cursor_container).as_posix(): p.read_bytes()
+        for p in sorted(cursor_container.rglob("*"))
+        if p.is_file()
+    }
+    assert after_snapshot_2 == before_snapshot
+
+
+def test_h31b_check_deployments_validates_gemini_extension_stamp_and_paths(tmp_path: Path) -> None:
+    """H31b: check_deployments.py validates .gemini-plugin/gemini-extension.json stamp (MINNI_AGENT_ID) and absolute args/cwd paths without byte-hashing the host-rendered body."""
+    from minni.wire.containers import (
+        _write_container_manifests,
+        render_antigravity_container_manifests,
+    )
+    from minni.wire.install import sanitize_staged_payload
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "plugins").symlink_to(REPO / "plugins")
+
+    ag_root = home / ".agents" / "plugins" / "Minni@Minni"
+    _write_verified_payload(ag_root, version="0.6.0", git_sha="unknown")
+    _write_container_manifests(
+        ag_root,
+        render_antigravity_container_manifests(home, base_semver="0.6.0"),
+    )
+    sanitize_staged_payload(ag_root, version="0.6.0", remove_mcp_json=False)
+
+    env = {
+        **os.environ,
+        "MINNI_CHECK_DEPLOYMENTS_HOME": str(home),
+        "MINNI_CHECK_DEPLOYMENTS_REPO_ROOT": str(repo_root),
+    }
+
+    # 1. Correct host-rendered .gemini-plugin/gemini-extension.json passes --strict
+    proc_ok = subprocess.run(
+        [sys.executable, str(CHECK_DEPLOYMENTS_PATH), "--strict"],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_ok.returncode == 0, proc_ok.stdout + proc_ok.stderr
+    assert "BADCONFIG" not in proc_ok.stdout, proc_ok.stdout
+    assert "DRIFT" not in proc_ok.stdout, proc_ok.stdout
+
+    gem_ext = ag_root / ".gemini-plugin" / "gemini-extension.json"
+    good_doc = json.loads(gem_ext.read_text(encoding="utf-8"))
+
+    # 2. Wrong agent id in .gemini-plugin/gemini-extension.json fails --strict
+    wrong_agent_doc = json.loads(json.dumps(good_doc))
+    wrong_agent_doc["mcpServers"]["minni"]["env"]["MINNI_AGENT_ID"] = "cursor"
+    gem_ext.write_text(json.dumps(wrong_agent_doc, indent=2) + "\n", encoding="utf-8")
+
+    proc_wrong_agent = subprocess.run(
+        [sys.executable, str(CHECK_DEPLOYMENTS_PATH), "--strict"],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_wrong_agent.returncode == 1, proc_wrong_agent.stdout
+    assert "BADCONFIG" in proc_wrong_agent.stdout, proc_wrong_agent.stdout
+    assert ".gemini-plugin/gemini-extension.json" in proc_wrong_agent.stdout
+    assert "agent stamp 'cursor'" in proc_wrong_agent.stdout
+
+    # 3. Missing server.js path in .gemini-plugin/gemini-extension.json fails --strict
+    dead_args_doc = json.loads(json.dumps(good_doc))
+    dead_args_doc["mcpServers"]["minni"]["args"] = [str(ag_root / "dist" / "missing-server.js")]
+    gem_ext.write_text(json.dumps(dead_args_doc, indent=2) + "\n", encoding="utf-8")
+
+    proc_dead_args = subprocess.run(
+        [sys.executable, str(CHECK_DEPLOYMENTS_PATH), "--strict"],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_dead_args.returncode == 1, proc_dead_args.stdout
+    assert "BADCONFIG" in proc_dead_args.stdout, proc_dead_args.stdout
+    assert ".gemini-plugin/gemini-extension.json" in proc_dead_args.stdout
+    assert "dead path — args:" in proc_dead_args.stdout
+
+    # 4. Missing absolute cwd path in .gemini-plugin/gemini-extension.json fails --strict
+    dead_cwd_doc = json.loads(json.dumps(good_doc))
+    dead_cwd_doc["mcpServers"]["minni"]["cwd"] = str(home / "nonexistent-cwd")
+    gem_ext.write_text(json.dumps(dead_cwd_doc, indent=2) + "\n", encoding="utf-8")
+
+    proc_dead_cwd = subprocess.run(
+        [sys.executable, str(CHECK_DEPLOYMENTS_PATH), "--strict"],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_dead_cwd.returncode == 1, proc_dead_cwd.stdout
+    assert "BADCONFIG" in proc_dead_cwd.stdout, proc_dead_cwd.stdout
+    assert ".gemini-plugin/gemini-extension.json" in proc_dead_cwd.stdout
+    assert "dead path — cwd:" in proc_dead_cwd.stdout
+
+
+def test_h32b_health_scanner_allowlists_real_config_names_before_parent_dir_deny(tmp_path: Path) -> None:
+    """H32b: health.py applies the real-config filename allowlist BEFORE the parent-directory deny."""
+    from minni.wire.health import _MAX_SCAN_FILE_BYTES, scan_for_uncatalogued_plugin_refs
+
+    home = tmp_path / "home"
+    home.mkdir()
+    oversized_blob = "x" * (_MAX_SCAN_FILE_BYTES + 1024)
+
+    non_config_bundles = [
+        home / ".cursor" / "extensions" / "acme" / "dist" / "extension.js",
+        home / ".gemini" / "antigravity" / "Mcp" / "cache" / "deadbeef1234567890.json",
+        home / ".config" / "kilo" / "node_modules" / "some-pkg" / "mcp-bundle.json",
+    ]
+    for p in non_config_bundles:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(oversized_blob, encoding="utf-8")
+
+    real_configs_in_denied_parents = [
+        home / ".cursor" / "extensions" / "acme" / "mcp.json",
+        home / ".cursor" / "extensions" / "acme" / "hooks.json",
+        home / ".gemini" / "antigravity" / "Mcp" / "cache" / "settings.json",
+        home / ".codex" / "cache" / "config.toml",
+    ]
+    for p in real_configs_in_denied_parents:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(oversized_blob, encoding="utf-8")
+
+    findings = scan_for_uncatalogued_plugin_refs(home=home)
+    size_cap_paths = {Path(f["path"]).resolve() for f in findings if f.get("reason") == "config_file_exceeds_size_cap"}
+    assert size_cap_paths == {p.resolve() for p in real_configs_in_denied_parents}
