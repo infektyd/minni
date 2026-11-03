@@ -423,6 +423,27 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
 GENERATED_INSTALL_FILES = ("gemini-extension.json",)
 
 
+def _verified_current_server_js(dest: Path) -> Path | None:
+    """Return verified ~/.minni/plugin/current/dist/server.js when dest is under HOME (H30)."""
+    home = Path.home().expanduser().resolve()
+    if not dest.expanduser().resolve().is_relative_to(home):
+        return None
+    plugin_dir = home / ".minni" / "plugin"
+    current = plugin_dir / "current"
+    if not (current.exists() or current.is_symlink()):
+        return None
+    try:
+        from minni.wire.containers import resolve_verified_plugin_root
+    except ImportError:
+        src_root = Path(__file__).resolve().parents[5] / "src"
+        if src_root.is_dir() and str(src_root) not in sys.path:
+            sys.path.insert(0, str(src_root))
+        from minni.wire.containers import resolve_verified_plugin_root
+    verified_root = resolve_verified_plugin_root(current, expected_base=plugin_dir)
+    srv = verified_root / "dist" / "server.js"
+    return srv if srv.is_file() else None
+
+
 def _sanitize_copied_manifests(dest: Path) -> None:
     try:
         from minni.wire.install import sanitize_staged_payload
@@ -438,12 +459,15 @@ def _sanitize_copied_manifests(dest: Path) -> None:
 def copy_tree(source: Path, dest: Path) -> None:
     if not source.exists():
         raise SystemExit(f"Missing plugin source: {source}")
+    cur_srv = _verified_current_server_js(dest)
     parent_existed = dest.parent.exists()
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{dest.name}.stage-", dir=str(dest.parent)))
     try:
         staged = staging_parent / dest.name
         shutil.copytree(source, staged, ignore=shutil.ignore_patterns("node_modules", ".git"))
+        if cur_srv is not None and (staged / "dist").is_dir():
+            shutil.copy2(cur_srv, staged / "dist" / "server.js")
         try:
             _sanitize_copied_manifests(staged)
         except Exception:
@@ -1097,9 +1121,14 @@ def _native_hook_plan(platform: str, install_root: Path) -> dict[str, object]:
                 else:
                     notes.append("missing or custom Cursor wrapper preserved; explicit repair required")
                 return result
-            if len(tokens) < 2 or Path(tokens[0]).name not in {"node", "nodejs"} or not tokens[1].endswith("/dist/" + entrypoint):
+            node_idx = 1 if tokens and tokens[0] == "exec" else 0
+            if (
+                len(tokens) < node_idx + 2
+                or Path(tokens[node_idx]).name not in {"node", "nodejs"}
+                or not tokens[node_idx + 1].endswith("/dist/" + entrypoint)
+            ):
                 raise ValueError("unrecognized owned hook command needs explicit repair")
-            tokens[1] = str(install_root / "dist" / entrypoint)
+            tokens[node_idx + 1] = str(install_root / "dist" / entrypoint)
             result["command"] = shlex.join(tokens)
             count += 1
             return result
@@ -1665,10 +1694,12 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
                     "file, then re-run."
                 ) from exc
 
-    # Install roots deliberately exclude node_modules. Bundle the MCP server
-    # before copying, including --no-build callers whose current dist came
-    # from ordinary tsc output rather than wire's bundled build.
-    run(["node", str((source / "scripts" / "bundle_server.mjs").resolve())], cwd=source)
+    # Install roots deliberately exclude node_modules. Prefer the already-bundled
+    # verified payload at ~/.minni/plugin/current when available so containers
+    # receive the exact same server.js bytes as current (H30); otherwise bundle
+    # the source tree first.
+    if _verified_current_server_js(install_root) is None:
+        run(["node", str((source / "scripts" / "bundle_server.mjs").resolve())], cwd=source)
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
     write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env, afm_env=afm_env))

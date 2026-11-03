@@ -36,6 +36,32 @@ class HashMismatchError(InstallError):
         )
 
 
+SANITIZED_PLUGIN_MANIFEST_RELPATHS: tuple[str, ...] = (
+    ".claude-plugin/plugin.json",
+    ".cursor-plugin/plugin.json",
+)
+
+
+def sanitize_plugin_manifest_dict(
+    cdata: dict[str, object],
+    *,
+    base_semver: str | None = None,
+) -> tuple[dict[str, object], bool]:
+    """Apply canonical H17 sanitization to a parsed `.claude-plugin/plugin.json` or `.cursor-plugin/plugin.json` dict."""
+    out = dict(cdata)
+    modified = False
+    if "mcpServers" in out:
+        out.pop("mcpServers", None)
+        modified = True
+    effective_semver = base_semver
+    if not effective_semver and isinstance(out.get("version"), str) and "+" in str(out["version"]):
+        effective_semver = str(out["version"]).split("+", 1)[0]
+    if effective_semver and out.get("version") != effective_semver:
+        out["version"] = effective_semver
+        modified = True
+    return out, modified
+
+
 def sanitize_staged_payload(
     stage: Path,
     manifest: PayloadManifest | None = None,
@@ -62,7 +88,7 @@ def sanitize_staged_payload(
     base_semver = str(raw_ver).split("+", 1)[0] if raw_ver else None
 
     modified_manifests: dict[str, bool] = {}
-    for rel_pjson in (".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+    for rel_pjson in SANITIZED_PLUGIN_MANIFEST_RELPATHS:
         pjson_file = stage / rel_pjson
         pjson_modified = False
         if pjson_file.is_file():
@@ -70,15 +96,7 @@ def sanitize_staged_payload(
                 cdata = json.loads(pjson_file.read_text(encoding="utf-8"))
                 if not isinstance(cdata, dict):
                     raise InstallError(f"staged {rel_pjson} is not a JSON object: {pjson_file}")
-                if "mcpServers" in cdata:
-                    cdata.pop("mcpServers", None)
-                    pjson_modified = True
-                effective_semver = base_semver
-                if not effective_semver and isinstance(cdata.get("version"), str) and "+" in cdata["version"]:
-                    effective_semver = cdata["version"].split("+", 1)[0]
-                if effective_semver and cdata.get("version") != effective_semver:
-                    cdata["version"] = effective_semver
-                    pjson_modified = True
+                cdata, pjson_modified = sanitize_plugin_manifest_dict(cdata, base_semver=base_semver)
                 if pjson_modified:
                     pjson_file.write_text(
                         json.dumps(cdata, indent=2) + "\n", encoding="utf-8",
