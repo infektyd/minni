@@ -9,7 +9,7 @@
     - **(b)** thread notification relay delivery cursors keyed solely by `subscriber_id = <agent_id>` (`<vault>/.runtime/thread-relay/cursors.json`, plus dormant `src/minni/migrations/020_thread_delivery_cursors.sql`), where one session's hook or poll ack prunes notifications before the second session sees them,
     - **(c)** `<vault>/.runtime/recall-state.json` (the unkeyed legacy mirror) and cross-session `disarmRecallStateOnConsult` in the MCP server (`plugins/minni/src/server.ts:722,832`), which disarms **every** session's `.runtime/recall-state.d/<sessionKey>.json` when `minni_recall` or `minni_drill` is called without a `sessionId`,
     - **(d)** `<vault>/.runtime/active-session-<agent>-<hostPid>.json` workspace hints and `<vault>/.runtime/lifecycle-state.json`.
-  - **H5 (Context only — closed):** A session whose `cwd` is outside a git repository receives no workspace hint by design and files learnings under `workspace_id = "unknown"`.
+  - **H5 (Context only — closed):** A session whose `cwd` is outside a git repository receives no workspace hint by design and files learnings under `workspace_id = "workspace-unknown"`.
 
 ---
 
@@ -529,3 +529,24 @@ Everything in slices S1–S4 has a clear technical default. There are **two beha
 
 - **(Recommended) Option A — Yes, notify the other open window:** If Window A and Window B are both attached to the same plan and Window A records a scar or updates a slice, Window B gets a notification on its next turn so both windows stay in sync (while Window A does not notify itself).
 - **Option B — No, only notify on updates from a different agent (like Codex or Grok):** Treat all `claude-code` windows as "self" so one `claude-code` window never notifies another `claude-code` window.
+
+---
+
+## 9. Coordinator Review Amendments (binding on implementation)
+
+Review of commit 3d321f28. Code claims spot-checked (`server.ts:356`, `plan.ts:2469`, `thread-notification-relay.ts:33,201`, `recall-state.ts:999-1014`): they hold. Two changes are binding:
+
+### R1. Write the session record even when the workspace is unknown (blocks S1)
+
+`recordActiveSessionWorkspace` (`config.ts:126-129`) returns early when the workspace normalizes to `workspace-unknown` or the path is a disallowed hint path (for example the home directory). Under §2.2.2 the session identity rides in that same file. So a session started outside a git repository never writes a session record. Then:
+- Priority 2 (`pid_exact`) misses.
+- Priority 3 (`single_live_session`) adopts **another** live session's `session_key` when exactly one other session is live. That is exactly the collision this design exists to prevent.
+
+Required:
+1. Split the write. The session record (`agent_id`, `host_pid`, `process_start_marker`, `session_id`, `session_key`, `updated_at`) is always written when the hook has a session id or a usable host pid. `workspace_id` becomes optional in that record and is omitted (never `workspace-unknown`) when unknown. Workspace resolution keeps its current fail-closed rule.
+2. Priority 3 applies only to hosts known to run the MCP server under a different parent than the hooks (today: Cursor), behind an explicit per-host allowlist. For every other host, a miss falls through to Priority 4 (`ppid_derived`). Never borrow another session's key.
+3. S1's concurrency test adds this case: session A is started in a repository, session B is started outside any repository, and B's MCP server must not resolve to A's `session_key`.
+
+### R2. Host session environment variables are trusted only for the matching agent
+
+Child processes inherit the environment. A Gemini or Codex CLI launched from a Claude Code shell inherits `CLAUDE_CODE_SESSION_ID`. Priority 1 therefore reads only the variable for the resolved agent (`CLAUDE_CODE_SESSION_ID` only for `claude-code`, `CODEX_SESSION_ID` only for `codex`, and so on) plus the generic `MINNI_SESSION_ID`. A foreign host's variable is ignored and logged once at debug level.
