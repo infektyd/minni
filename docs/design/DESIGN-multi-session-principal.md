@@ -550,3 +550,8 @@ Required:
 ### R2. Host session environment variables are trusted only for the matching agent
 
 Child processes inherit the environment. A Gemini or Codex CLI launched from a Claude Code shell inherits `CLAUDE_CODE_SESSION_ID`. Priority 1 therefore reads only the variable for the resolved agent (`CLAUDE_CODE_SESSION_ID` only for `claude-code`, `CODEX_SESSION_ID` only for `codex`, and so on) plus the generic `MINNI_SESSION_ID`. A foreign host's variable is ignored and logged once at debug level.
+
+### Decisions (operator, 2026-11-03)
+- §8.2 Question 1: Option A (clean slate with a one-line heads-up).
+- §8.2 Question 2: Option A (notify the other open session of the same agent; never self-notify).
+- Design approved. Implementation (S1-S4, with R1 and R2) is scheduled after the current Praxis batch lands.
