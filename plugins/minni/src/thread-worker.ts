@@ -999,6 +999,7 @@ export async function recordThreadMutationEvents(input: {
   planId: string;
   rev: number;
   actor: string;
+  actorSessionKey?: string;
   operationKey: string;
   kind: string;
   sliceId?: string;
@@ -1061,6 +1062,7 @@ export async function recordThreadMutationEvents(input: {
         planId: input.planId,
         rev: input.rev,
         actor: input.actor,
+        actorSessionKey: input.actorSessionKey,
         at,
         events,
         orderedSnapshot: input.orderedSnapshot,

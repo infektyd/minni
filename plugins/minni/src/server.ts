@@ -124,6 +124,8 @@ import { deriveSystemEventKey, readThreadEvents } from "./thread-events.js";
 import {
   acknowledgeRelayThroughSeq,
   acknowledgeSelfAuthoredPrefixInVault,
+  ensureSessionRelayCursor,
+  formatSessionSubscriberId,
   vaultPrincipalSubscriberId,
 } from "./thread-notification-relay.js";
 import { withExclusiveReplanReservation, withThreadLock } from "./thread-lock.js";
@@ -1578,6 +1580,21 @@ server.registerTool(
       },
       { vaultPath: effectiveVaultPath },
     );
+    if (activate !== false && mcpSession.sessionKey) {
+      const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+      await ensureSessionRelayCursor(
+        effectiveVaultPath,
+        plan.plan_id,
+        formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+      ).catch(() => {});
+      if (vp && vp !== DEFAULT_AGENT_ID) {
+        await ensureSessionRelayCursor(
+          effectiveVaultPath,
+          plan.plan_id,
+          formatSessionSubscriberId(vp, mcpSession.sessionKey),
+        ).catch(() => {});
+      }
+    }
     return textResult(
       JSON.stringify(
         {
@@ -1778,11 +1795,13 @@ server.registerTool(
             payload: { slice_id },
           });
         }
+        const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
         await recordThreadMutationEvents({
           journalPath,
           planId: plan_id,
           rev: updated.rev,
           actor: DEFAULT_AGENT_ID,
+          actorSessionKey: mcpSession.sessionKey,
           operationKey: deriveSystemEventKey(
             "status_changed",
             plan_id,
@@ -1804,12 +1823,16 @@ server.registerTool(
         await acknowledgeSelfAuthoredPrefixInVault(
           effectiveVaultPath,
           plan_id,
-          [DEFAULT_AGENT_ID, ...(vp ? [vp] : [])],
+          [
+            formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+            DEFAULT_AGENT_ID,
+            ...(vp ? [formatSessionSubscriberId(vp, mcpSession.sessionKey), vp] : []),
+          ],
+          { actorSessionKey: mcpSession.sessionKey },
         ).catch(() => {});
         // P10/H6: terminal plans stop being injected.
         if (updated.status === "complete" || updated.status === "accepted") {
           try {
-            const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
             const active = await getActivePlan(effectiveVaultPath, {
               sessionKey: mcpSession.sessionKey,
             });
@@ -1934,11 +1957,13 @@ server.registerTool(
         // dependencies, so the ready set is provably unchanged here and
         // recordThreadMutationEvents's own before/after equality check
         // never emits a ready.changed for a scar — no special-casing needed.
+        const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
         await recordThreadMutationEvents({
           journalPath,
           planId: plan_id,
           rev: updated.rev,
           actor: DEFAULT_AGENT_ID,
+          actorSessionKey: mcpSession.sessionKey,
           operationKey: deriveSystemEventKey("scar_added", plan_id, String(updated.rev)),
           kind: "scar_added",
           payload: { kind },
@@ -1952,7 +1977,12 @@ server.registerTool(
         await acknowledgeSelfAuthoredPrefixInVault(
           effectiveVaultPath,
           plan_id,
-          [DEFAULT_AGENT_ID, ...(vp ? [vp] : [])],
+          [
+            formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+            DEFAULT_AGENT_ID,
+            ...(vp ? [formatSessionSubscriberId(vp, mcpSession.sessionKey), vp] : []),
+          ],
+          { actorSessionKey: mcpSession.sessionKey },
         ).catch(() => {});
         return updated;
       },
@@ -2434,6 +2464,21 @@ server.registerTool(
     if (!activated.ok) {
       return textResult(JSON.stringify({ error: activated.error }, null, 2));
     }
+    if (mcpSession.sessionKey) {
+      const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+      await ensureSessionRelayCursor(
+        effectiveVaultPath,
+        plan_id,
+        formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+      ).catch(() => {});
+      if (vp && vp !== DEFAULT_AGENT_ID) {
+        await ensureSessionRelayCursor(
+          effectiveVaultPath,
+          plan_id,
+          formatSessionSubscriberId(vp, mcpSession.sessionKey),
+        ).catch(() => {});
+      }
+    }
     return textResult(JSON.stringify({ active: plan_id }, null, 2));
   },
 );
@@ -2802,12 +2847,19 @@ server.registerTool(
       const journalPath = journalPathFor(notePath, plan_id);
       const result = await readThreadEvents(journalPath, since_seq, limit);
       const ackSeq = Math.max(result.next_seq, since_seq ?? 0);
+      const mcpSession = resolveMcpSessionIdentity(DEFAULT_VAULT_PATH);
       const vaultPrincipal = vaultPrincipalSubscriberId(DEFAULT_VAULT_PATH);
       await acknowledgeRelayThroughSeq(
         DEFAULT_VAULT_PATH,
         plan_id,
         ackSeq,
-        [DEFAULT_AGENT_ID, ...(vaultPrincipal ? [vaultPrincipal] : [])],
+        [
+          formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+          DEFAULT_AGENT_ID,
+          ...(vaultPrincipal
+            ? [formatSessionSubscriberId(vaultPrincipal, mcpSession.sessionKey), vaultPrincipal]
+            : []),
+        ],
       ).catch(() => {});
       return textResult(JSON.stringify({ plan_id, ...result }, null, 2));
     } catch (error) {

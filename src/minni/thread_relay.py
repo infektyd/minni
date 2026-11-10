@@ -17,6 +17,9 @@ stays None. Default agy install stays CANNOT. Codex stays UNPROVEN.
 from __future__ import annotations
 
 import json
+import os
+import re
+import uuid
 from pathlib import Path
 
 from typing import Any, Iterable, Mapping, Sequence
@@ -144,6 +147,37 @@ def store_holds_graph_state(payload: Mapping[str, Any]) -> bool:
     return any(key in payload for key in GRAPH_KEYS)
 
 
+_SESSION_KEY_HEX_RE = re.compile(r"^[0-9a-f]{16}$")
+_SAFE_AGENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$", re.IGNORECASE)
+
+
+def format_session_subscriber_id(
+    agent_id: str,
+    session_key: str | None = None,
+) -> str:
+    clean_agent = str(agent_id or "").strip()
+    if not clean_agent:
+        return ""
+    clean_key = str(session_key or "").strip()
+    if (
+        clean_key
+        and clean_key != "default"
+        and _SESSION_KEY_HEX_RE.match(clean_key)
+        and _SAFE_AGENT_ID_RE.match(clean_agent)
+    ):
+        return f"{clean_agent}:{clean_key}"
+    return clean_agent
+
+
+def parse_subscriber_principal(subscriber_id: str) -> tuple[str, str | None]:
+    trimmed = str(subscriber_id or "").strip()
+    if trimmed.count(":") == 1:
+        agent_id, session_key = trimmed.split(":", 1)
+        if _SAFE_AGENT_ID_RE.match(agent_id) and _SESSION_KEY_HEX_RE.match(session_key):
+            return agent_id, session_key
+    return trimmed, None
+
+
 def format_state_delta(event: Mapping[str, Any], plan_id: str) -> str:
     slice_id = event.get("slice_id")
     slice_bit = f" slice={slice_id}" if slice_id else ""
@@ -174,6 +208,9 @@ def rebuild_queue_from_journal(
         }
         if subscriber_id is not None:
             item["subscriber_id"] = subscriber_id
+        actor_sk = event.get("actor_session_key")
+        if isinstance(actor_sk, str) and _SESSION_KEY_HEX_RE.match(actor_sk):
+            item["actor_session_key"] = actor_sk
         if event.get("slice_id"):
             item["slice_id"] = event["slice_id"]
         pending.append(item)
@@ -295,6 +332,10 @@ def parse_journal_events_from_log(raw: str) -> list[dict[str, Any]]:
                 "actor": row.get("actor") if isinstance(row.get("actor"), str) else "",
                 "at": row.get("at") if isinstance(row.get("at"), str) else "",
             }
+            if isinstance(row.get("actor_session_key"), str) and _SESSION_KEY_HEX_RE.match(
+                row["actor_session_key"]
+            ):
+                event["actor_session_key"] = row["actor_session_key"]
             if isinstance(row.get("slice_id"), str) and row["slice_id"]:
                 event["slice_id"] = row["slice_id"]
             events.append(event)
@@ -302,11 +343,28 @@ def parse_journal_events_from_log(raw: str) -> list[dict[str, Any]]:
     return events
 
 
-def _cursor_for(store: Mapping[str, Any], subscriber_id: str, plan_id: str) -> dict[str, Any]:
+def fork_session_cursor(
+    store: Mapping[str, Any],
+    subscriber_id: str,
+    plan_id: str,
+) -> dict[str, Any]:
     for cursor in store.get("cursors") or []:
         if cursor.get("subscriber_id") == subscriber_id and cursor.get("plan_id") == plan_id:
             return dict(cursor)
+    agent_id, session_key = parse_subscriber_principal(subscriber_id)
+    if session_key:
+        for cursor in store.get("cursors") or []:
+            if cursor.get("subscriber_id") == agent_id and cursor.get("plan_id") == plan_id:
+                return {
+                    "subscriber_id": subscriber_id,
+                    "plan_id": plan_id,
+                    "last_delivered_seq": int(cursor.get("last_delivered_seq") or 0),
+                }
     return {"subscriber_id": subscriber_id, "plan_id": plan_id, "last_delivered_seq": 0}
+
+
+def _cursor_for(store: Mapping[str, Any], subscriber_id: str, plan_id: str) -> dict[str, Any]:
+    return fork_session_cursor(store, subscriber_id, plan_id)
 
 
 def vault_principal_subscriber_id(vault_path: str | Path) -> str | None:
@@ -332,6 +390,7 @@ def vault_principal_subscriber_id(vault_path: str | Path) -> str | None:
 def seed_relay_subscribers(
     *,
     actor: str | None = None,
+    actor_session_key: str | None = None,
     plan_id: str,
     cursors: Sequence[Mapping[str, Any]] | None = None,
     events: Sequence[Mapping[str, Any]] | None = None,
@@ -351,11 +410,17 @@ def seed_relay_subscribers(
             ids.add(value.strip())
 
     add(actor)
+    if actor and actor_session_key:
+        add(format_session_subscriber_id(actor, actor_session_key))
     for cursor in cursors or ():
         if cursor.get("plan_id") == plan_id:
             add(cursor.get("subscriber_id"))
     for event in events or ():
-        add(event.get("actor"))
+        ev_actor = event.get("actor")
+        add(ev_actor)
+        ev_sk = event.get("actor_session_key")
+        if isinstance(ev_actor, str) and isinstance(ev_sk, str):
+            add(format_session_subscriber_id(ev_actor, ev_sk))
     for extra in extra_ids or ():
         add(extra)
     return list(ids)
@@ -463,7 +528,15 @@ def save_relay_store(vault_path: str | Path, store: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(store)
     payload["graph"] = False
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    serialized = json.dumps(payload, indent=2) + "\n"
+    tmp_path = path.with_name(f"cursors.json.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, serialized.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, path)
 
 
 def ingest_journal_into_vault(

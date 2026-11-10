@@ -327,3 +327,30 @@ def test_class_a_claude_code_host_table_and_acknowledge_through_seq(tmp_path: Pa
     cursor = next(c for c in updated["cursors"] if c["subscriber_id"] == "claude-code")
     assert cursor["last_delivered_seq"] == 3
     assert [p for p in updated["pending"] if p["subscriber_id"] == "claude-code"] == []
+
+
+def test_session_scoped_subscriber_id_and_cursor_fork():
+    fmt = thread_relay.format_session_subscriber_id
+    parse = thread_relay.parse_subscriber_principal
+    fork = thread_relay.fork_session_cursor
+
+    key_a = "a1b2c3d4e5f60718"
+    assert fmt("claude-code", key_a) == f"claude-code:{key_a}"
+    assert fmt("claude-code", "default") == "claude-code"
+    assert fmt("claude-code", "../../bad") == "claude-code"
+    assert parse(f"claude-code:{key_a}") == ("claude-code", key_a)
+    assert parse("claude-code") == ("claude-code", None)
+
+    store = empty_relay_store()
+    store["cursors"].append(
+        {"subscriber_id": "claude-code", "plan_id": "plan-1", "last_delivered_seq": 4}
+    )
+    forked = fork(store, f"claude-code:{key_a}", "plan-1")
+    assert forked["last_delivered_seq"] == 4
+    seeded = seed_relay_subscribers(
+        actor="claude-code",
+        actor_session_key=key_a,
+        plan_id="plan-1",
+    )
+    assert f"claude-code:{key_a}" in seeded
+    assert "claude-code" in seeded

@@ -73,6 +73,7 @@ import {
   activePlanIdFromVault,
   confirmDeliveryInVault,
   deliverySucceededForHostHook,
+  formatSessionSubscriberId,
   pendingAttentionForHook,
 } from "./thread-notification-relay.js";
 import type { RelayHook } from "./thread-notification-relay.js";
@@ -2173,7 +2174,7 @@ export function createHookHandlers(
     }
     await attachPendingAttention({
       vaultPath: config.vaultPath,
-      subscriberId: config.agentId,
+      subscriberId: formatSessionSubscriberId(config.agentId, sessionKeyForPlan),
       planId: activePlan?.plan_id,
       envelopeBody,
       hostId: wire.id,
@@ -2879,7 +2880,7 @@ export function createHookHandlers(
     }
     await attachPendingAttention({
       vaultPath: config.vaultPath,
-      subscriberId: config.agentId,
+      subscriberId: formatSessionSubscriberId(config.agentId, upsSessionKey),
       planId: activePlan?.plan_id,
       envelopeBody,
       hostId: wire.id,
@@ -3413,9 +3414,10 @@ export function createHookHandlers(
         const planId =
           activeForStop?.plan_id ??
           (stopSessionKey ? undefined : await activePlanIdFromVault(config.vaultPath));
+        const stopSubscriberId = formatSessionSubscriberId(config.agentId, stopSessionKey);
         const pending = await pendingAttentionForHook({
           vaultPath: config.vaultPath,
-          subscriberId: config.agentId,
+          subscriberId: stopSubscriberId,
           planId,
         });
         if (pending && planId) {
@@ -3424,7 +3426,7 @@ export function createHookHandlers(
           if (lastSeq !== undefined) {
             confirmPendingIfInjects({
               vaultPath: config.vaultPath,
-              subscriberId: config.agentId,
+              subscriberId: stopSubscriberId,
               planId,
               lastSeq,
               hostId: wire.id,
