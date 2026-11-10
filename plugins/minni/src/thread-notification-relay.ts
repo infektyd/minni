@@ -272,8 +272,19 @@ export function rebuildQueueFromJournal(
   events: readonly JournalEvent[],
   cursor: DeliveryCursor,
 ): RelayNotification[] {
+  const parsedSub = parseSubscriberPrincipal(cursor.subscriber_id);
   return events
-    .filter((event) => event.seq > cursor.last_delivered_seq)
+    .filter((event) => {
+      if (event.seq <= cursor.last_delivered_seq) return false;
+      if (
+        parsedSub.sessionKey &&
+        (event.actor === cursor.subscriber_id || event.actor === parsedSub.agentId) &&
+        event.actor_session_key === parsedSub.sessionKey
+      ) {
+        return false;
+      }
+      return true;
+    })
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .map((event) => {
@@ -522,14 +533,21 @@ export function readPendingAttention(
   planId: string,
 ): PendingAttention {
   const cursor = cursorFor(store, subscriberId, planId);
+  const parsed = parseSubscriberPrincipal(subscriberId);
+  const isSelfSessionAuthored = (item: RelayNotification): boolean =>
+    Boolean(
+      parsed.sessionKey &&
+        (item.actor === subscriberId || item.actor === parsed.agentId) &&
+        item.actor_session_key === parsed.sessionKey,
+    );
   let notifications = store.pending.filter(
     (item) =>
       item.subscriber_id === subscriberId &&
       item.plan_id === planId &&
-      item.seq > cursor.last_delivered_seq,
+      item.seq > cursor.last_delivered_seq &&
+      !isSelfSessionAuthored(item),
   );
   if (notifications.length === 0) {
-    const parsed = parseSubscriberPrincipal(subscriberId);
     const hasOwnCursor = store.cursors.some(
       (c) => c.subscriber_id === subscriberId && c.plan_id === planId,
     );
@@ -539,7 +557,8 @@ export function readPendingAttention(
           (item) =>
             item.subscriber_id === parsed.agentId &&
             item.plan_id === planId &&
-            item.seq > cursor.last_delivered_seq,
+            item.seq > cursor.last_delivered_seq &&
+            !isSelfSessionAuthored(item),
         )
         .map((item) => ({ ...item, subscriber_id: subscriberId }));
     }
@@ -948,10 +967,10 @@ export async function acknowledgeSelfAuthoredPrefixInVault(
       let ackSeq = 0;
       for (const item of items) {
         const actorMatches = item.actor === subscriberId || item.actor === parsed.agentId;
-        const sessionMatches =
-          !actorSessionKey ||
-          !item.actor_session_key ||
-          item.actor_session_key === actorSessionKey;
+        const effectiveSessionKey = actorSessionKey ?? parsed.sessionKey;
+        const sessionMatches = effectiveSessionKey
+          ? item.actor_session_key === effectiveSessionKey
+          : !item.actor_session_key;
         if (actorMatches && sessionMatches) {
           ackSeq = item.seq;
         } else {

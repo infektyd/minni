@@ -2206,11 +2206,13 @@ server.registerTool(
             sliceId: slice.id,
             payload: { slice_id: slice.id },
           }));
+        const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
         await recordThreadMutationEvents({
           journalPath,
           planId: plan_id,
           rev: updated.rev,
           actor: DEFAULT_AGENT_ID,
+          actorSessionKey: mcpSession.sessionKey,
           operationKey: deriveSystemEventKey("replan", plan_id, String(updated.rev)),
           kind: "replan",
           payload: Object.keys(replanPayload).length > 0 ? replanPayload : undefined,
@@ -2222,6 +2224,17 @@ server.registerTool(
           supplementalEvents:
             replanSupplemental.length > 0 ? replanSupplemental : undefined,
         });
+        const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          effectiveVaultPath,
+          plan_id,
+          [
+            formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+            DEFAULT_AGENT_ID,
+            ...(vp ? [formatSessionSubscriberId(vp, mcpSession.sessionKey), vp] : []),
+          ],
+          { actorSessionKey: mcpSession.sessionKey },
+        ).catch(() => {});
         return updated;
       },
     ),
@@ -2408,11 +2421,13 @@ server.registerTool(
             sliceId: slice.id,
             payload: { slice_id: slice.id },
           }));
+        const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
         await recordThreadMutationEvents({
           journalPath,
           planId: plan_id,
           rev: restored.rev,
           actor: DEFAULT_AGENT_ID,
+          actorSessionKey: mcpSession.sessionKey,
           operationKey: deriveSystemEventKey("restored", plan_id, String(restored.rev)),
           kind: "restored",
           payload: { from_rev: rev },
@@ -2424,6 +2439,17 @@ server.registerTool(
           supplementalEvents:
             restoreSupplemental.length > 0 ? restoreSupplemental : undefined,
         });
+        const vp = vaultPrincipalSubscriberId(effectiveVaultPath);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          effectiveVaultPath,
+          plan_id,
+          [
+            formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+            DEFAULT_AGENT_ID,
+            ...(vp ? [formatSessionSubscriberId(vp, mcpSession.sessionKey), vp] : []),
+          ],
+          { actorSessionKey: mcpSession.sessionKey },
+        ).catch(() => {});
         return restored;
       },
     );
@@ -2578,6 +2604,7 @@ server.registerTool(
       const target = await resolvePlanTarget(planIdInput);
       if (!target.ok) return target.result;
       const { plan_id, notePath } = target;
+      const mcpSession = resolveMcpSessionIdentity(DEFAULT_VAULT_PATH);
       const result = await assignSlice({
         vaultPath: DEFAULT_VAULT_PATH,
         notePath,
@@ -2588,8 +2615,20 @@ server.registerTool(
         // input schema above has no actor-like field, so there is nothing
         // for a caller to override here.
         actorAgentId: DEFAULT_AGENT_ID,
+        actorSessionKey: mcpSession.sessionKey,
         assignmentProfile: assignment_profile,
       });
+      const vp = vaultPrincipalSubscriberId(DEFAULT_VAULT_PATH);
+      await acknowledgeSelfAuthoredPrefixInVault(
+        DEFAULT_VAULT_PATH,
+        plan_id,
+        [
+          formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+          DEFAULT_AGENT_ID,
+          ...(vp ? [formatSessionSubscriberId(vp, mcpSession.sessionKey), vp] : []),
+        ],
+        { actorSessionKey: mcpSession.sessionKey },
+      ).catch(() => {});
       return textResult(
         JSON.stringify(
           {
@@ -2651,6 +2690,7 @@ server.registerTool(
       const target = await resolvePlanTarget(planIdInput);
       if (!target.ok) return target.result;
       const { plan_id, notePath } = target;
+      const mcpSession = resolveMcpSessionIdentity(DEFAULT_VAULT_PATH);
       // claimSlice already returns thread-claims.ts's ThreadClaimResponse —
       // the one shape in this whole surface that is allowed to carry a
       // secret (the scoped lease token). It never carries the envelope's
@@ -2661,9 +2701,23 @@ server.registerTool(
         planId: plan_id,
         sliceId: slice_id,
         workerAgentId: worker_agent_id,
+        actorSessionKey: mcpSession.sessionKey,
         idempotencyKey: idempotency_key,
         ttlSeconds: ttl_seconds,
       });
+      if (worker_agent_id === DEFAULT_AGENT_ID) {
+        const vp = vaultPrincipalSubscriberId(DEFAULT_VAULT_PATH);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          DEFAULT_VAULT_PATH,
+          plan_id,
+          [
+            formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+            DEFAULT_AGENT_ID,
+            ...(vp ? [formatSessionSubscriberId(vp, mcpSession.sessionKey), vp] : []),
+          ],
+          { actorSessionKey: mcpSession.sessionKey },
+        ).catch(() => {});
+      }
       return textResult(JSON.stringify(response, null, 2));
     } catch (error) {
       return threadWorkerErrorResult("plan.claim", error);
@@ -2795,16 +2849,31 @@ server.registerTool(
       const target = await resolvePlanTarget(planIdInput);
       if (!target.ok) return target.result;
       const { plan_id, notePath } = target;
+      const mcpSession = resolveMcpSessionIdentity(DEFAULT_VAULT_PATH);
       const result = await updateClaimedSlice({
         vaultPath: DEFAULT_VAULT_PATH,
         notePath,
         planId: plan_id,
         sliceId: slice_id,
         workerAgentId: worker_agent_id,
+        actorSessionKey: mcpSession.sessionKey,
         token: claim_token,
         idempotencyKey: idempotency_key,
         action: parsedAction.data as WorkerUpdateAction,
       });
+      if (worker_agent_id === DEFAULT_AGENT_ID) {
+        const vp = vaultPrincipalSubscriberId(DEFAULT_VAULT_PATH);
+        await acknowledgeSelfAuthoredPrefixInVault(
+          DEFAULT_VAULT_PATH,
+          plan_id,
+          [
+            formatSessionSubscriberId(DEFAULT_AGENT_ID, mcpSession.sessionKey),
+            DEFAULT_AGENT_ID,
+            ...(vp ? [formatSessionSubscriberId(vp, mcpSession.sessionKey), vp] : []),
+          ],
+          { actorSessionKey: mcpSession.sessionKey },
+        ).catch(() => {});
+      }
       return textResult(JSON.stringify(workerUpdateMcpPayload(result), null, 2));
     } catch (error) {
       return threadWorkerErrorResult("plan.worker_update", error);

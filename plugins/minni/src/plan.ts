@@ -2722,6 +2722,12 @@ export async function sweepDeadActiveThreadPointers(
       ) {
         continue;
       }
+      const rel = path.relative(path.resolve(vaultPath), path.resolve(raw.notePath));
+      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+        await unlink(filePath).catch(() => {});
+        prunedPointers += 1;
+        continue;
+      }
       const updatedIso = typeof raw.updated_at === "string" ? raw.updated_at : raw.set_at;
       const updatedMs = Date.parse(updatedIso);
       const ageMs = Number.isFinite(updatedMs) ? nowMs - updatedMs : 0;
@@ -3015,6 +3021,45 @@ export async function getActivePlan(
           `minni: getActivePlan rejected a notePath outside the vault root (${vaultPath}): ${parsed.notePath}`,
         );
         return undefined;
+      }
+      if (sessionKey) {
+        if (
+          typeof parsed.owner_session_key === "string" &&
+          parsed.owner_session_key !== sessionKey
+        ) {
+          if (
+            typeof parsed.owner_host_pid === "number" &&
+            isHostPidAlive(parsed.owner_host_pid)
+          ) {
+            return undefined;
+          }
+          if (options?.strictSessionOnly) {
+            return undefined;
+          }
+        }
+        if (
+          !options?.strictSessionOnly &&
+          typeof parsed.owner_session_key === "string" &&
+          parsed.owner_session_key.length > 0
+        ) {
+          try {
+            const scalars = await rehydratePlanScalars(parsed.notePath);
+            if (!TERMINAL_PLAN_STATUSES.has(scalars.status) && !allSlicesResolved(scalars.slices)) {
+              await setActivePlan(vaultPath, parsed.plan_id, parsed.notePath, {
+                ...options,
+                sessionKey,
+                hostPid:
+                  typeof options?.hostPid === "number"
+                    ? options.hostPid
+                    : process.ppid > 1
+                      ? process.ppid
+                      : undefined,
+              });
+            }
+          } catch {
+            // Best-effort adoption write; do not fail the read if note is missing/unreadable.
+          }
+        }
       }
       return parsed;
     }

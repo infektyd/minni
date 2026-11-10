@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +12,9 @@ import test from "node:test";
 import { recordActiveSessionWorkspace } from "../dist/config.js";
 import { createHookHandlers } from "../dist/hook-handlers.js";
 import { claudeCodeWire } from "../dist/hook-platform.js";
+import { activeThreadSessionPath, createPlan, getActivePlan, setActivePlan } from "../dist/plan.js";
+import { sessionStateKey } from "../dist/recall-state.js";
+import { ensureVault } from "../dist/vault.js";
 
 const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
 
@@ -268,4 +272,77 @@ test("Slice S2 (H4, Q1 = Option A): concurrent MCP sessions maintain independent
   });
   assert.ok(updateC.error, "serverC id-less update must return an error");
   assert.match(updateC.error, new RegExp(planA), "disambiguation error must name live planA");
+});
+
+test("Slice S2 regression: single-session resume adopting _active_plan.json persists per-session pointer and honors strictSessionOnly", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-s2-resume-"));
+  const vault = path.join(root, "claudecode-vault");
+  await ensureVault(vault, { agentId: "claude-code" });
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const deadSessionId = "sess-dead-prior";
+  const deadKey = sessionStateKey(deadSessionId);
+  const created = await createPlan(
+    {
+      goal: "Resumed After Crash Plan",
+      slices: [{ id: "s1", title: "Resume Slice" }],
+      sessionKey: deadKey,
+      sessionId: deadSessionId,
+      hostPid: 999_999,
+      vaultPath: vault,
+    },
+    { vaultPath: vault },
+  );
+  const planId = created.plan.plan_id;
+
+  // Simulate prior session having exited (its pointer file was swept or has dead PID 999_999),
+  // leaving _active_plan.json pointing to planId.
+  const deadPointer = activeThreadSessionPath(vault, deadKey);
+  if (deadPointer) await rm(deadPointer, { force: true });
+
+  const resumedSessionId = "sess-resumed-live";
+  const resumedKey = sessionStateKey(resumedSessionId);
+
+  // strictSessionOnly: true must NOT adopt _active_plan.json owned by deadKey
+  const strictLookup = await getActivePlan(vault, {
+    sessionKey: resumedKey,
+    sessionId: resumedSessionId,
+    hostPid: process.pid,
+    strictSessionOnly: true,
+  });
+  assert.equal(
+    strictLookup,
+    undefined,
+    "strictSessionOnly lookup must return undefined when _active_plan.json belongs to another session",
+  );
+
+  // Normal single-session resume adopts _active_plan.json AND persists .runtime/active-thread.d/<resumedKey>.json
+  const adoptedLookup = await getActivePlan(vault, {
+    sessionKey: resumedKey,
+    sessionId: resumedSessionId,
+    hostPid: process.pid,
+  });
+  assert.ok(adoptedLookup, "single-session resume must adopt non-terminal _active_plan.json");
+  assert.equal(adoptedLookup.plan_id, planId);
+  const resumedPointer = activeThreadSessionPath(vault, resumedKey);
+  assert.ok(
+    resumedPointer && existsSync(resumedPointer),
+    "adopting _active_plan.json on resume must persist .runtime/active-thread.d/<resumedKey>.json",
+  );
+
+  // Now a second concurrent session starting while resumedSessionId is live sees it as a live peer!
+  const secondSessionId = "sess-second-concurrent";
+  const secondKey = sessionStateKey(secondSessionId);
+  const secondLookup = await getActivePlan(vault, {
+    sessionKey: secondKey,
+    sessionId: secondSessionId,
+    hostPid: process.pid,
+  });
+  assert.equal(
+    secondLookup,
+    undefined,
+    "second concurrent session must NOT hijack the plan adopted by the live resumed session",
+  );
 });

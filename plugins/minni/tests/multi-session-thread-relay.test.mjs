@@ -316,5 +316,54 @@ test(
         bodyAfterScarB.pending_attention.some((item) => item.kind === "scar_added"),
       `Q2 = Option A: sessionB must receive scar_added authored by sibling sessionA! Got: ${JSON.stringify(bodyAfterScarB.pending_attention)}`,
     );
+
+    // 7. Regression check (Finding 2):
+    // - serverA calls minni_thread_replan (stamps actor_session_key and auto-acks for sessionA).
+    // - Before sessionB runs UserPromptSubmit, serverB records its own scar via minni_thread_scar.
+    //   serverB's auto-ack of its own scar must NOT wipe out serverA's unconfirmed replan notification in sessionB's queue!
+    const replanRes = await serverA.callToolJson("minni_thread_replan", {
+      plan_id: planA,
+      reason: "split s2 into verification sub-steps",
+      add_slices: [{ id: "s3", title: "Sub-step S3" }],
+    });
+    assert.ok(replanRes.rev >= 3, `expected replan rev >= 3, got: ${JSON.stringify(replanRes)}`);
+
+    const scarBRes = await serverB.callToolJson("minni_thread_scar", {
+      plan_id: planA,
+      kind: "dead_end",
+      signal: "sessionB noted local dead_end",
+      resolution: "preserve sibling replan event in queue",
+    });
+    assert.ok(scarBRes.rev >= 4);
+
+    // sessionA must NOT self-notify on its own replan, bit SHOULD receive sessionB's scar_added
+    discardDeliveryCommits();
+    const upsAfterReplanA = await handlers.handleUserPromptSubmit({
+      session_id: sessionA,
+      prompt: "sessionA turn after replan and sessionB scar",
+    });
+    await runDeliveryCommits();
+    const bodyAfterReplanA = extractEnvelopeBody(upsAfterReplanA);
+    assert.ok(
+      Array.isArray(bodyAfterReplanA.pending_attention) &&
+        bodyAfterReplanA.pending_attention.some((item) => item.kind === "scar_added") &&
+        !bodyAfterReplanA.pending_attention.some((item) => item.kind === "replan"),
+      `sessionA must auto-ack its own replan while receiving sessionB's scar_added! Got: ${JSON.stringify(bodyAfterReplanA.pending_attention)}`,
+    );
+
+    // sessionB must receive sessionA's replan (not wiped by sessionB's subsequent scar auto-ack) and NOT self-notify on its own scar
+    discardDeliveryCommits();
+    const upsAfterReplanB = await handlers.handleUserPromptSubmit({
+      session_id: sessionB,
+      prompt: "sessionB turn after sessionA replan and own scar",
+    });
+    await runDeliveryCommits();
+    const bodyAfterReplanB = extractEnvelopeBody(upsAfterReplanB);
+    assert.ok(
+      Array.isArray(bodyAfterReplanB.pending_attention) &&
+        bodyAfterReplanB.pending_attention.some((item) => item.kind === "replan") &&
+        !bodyAfterReplanB.pending_attention.some((item) => item.kind === "scar_added"),
+      `sessionB must receive sessionA's replan and auto-ack its own scar! Got: ${JSON.stringify(bodyAfterReplanB.pending_attention)}`,
+    );
   },
 );

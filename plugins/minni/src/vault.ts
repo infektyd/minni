@@ -4628,8 +4628,8 @@ export async function readReassertPending(
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
       payload: parsed,
     };
-    if (callerSessionKey && entrySessionKey) {
-      if (entrySessionKey === callerSessionKey) {
+    if (entrySessionKey) {
+      if (callerSessionKey && entrySessionKey === callerSessionKey) {
         matched.push(entry);
         continue;
       }

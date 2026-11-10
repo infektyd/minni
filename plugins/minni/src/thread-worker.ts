@@ -418,6 +418,7 @@ interface ThreadPlanTarget {
 
 interface ThreadMutationTarget extends ThreadPlanTarget {
   sliceId: string;
+  actorSessionKey?: string;
   now?: Date | (() => Date);
 }
 
@@ -1565,6 +1566,7 @@ export async function assignSlice(
         planId,
         rev: next.rev,
         actor: actorAgentId,
+        actorSessionKey: input.actorSessionKey,
         operationKey: deriveSystemEventKey(
           "slice.assigned",
           planId,
@@ -1875,6 +1877,7 @@ export async function claimSlice(
         planId,
         rev: next.rev,
         actor: workerAgentId,
+        actorSessionKey: input.actorSessionKey,
         operationKey: claimOperationKey,
         kind: "slice.claimed",
         sliceId,
@@ -3008,6 +3011,7 @@ async function applyClaimedSliceWithClaimFs(
         planId,
         rev: next.rev,
         actor: workerAgentId,
+        actorSessionKey: input.actorSessionKey,
         operationKey: workerOperationKey,
         kind,
         sliceId,

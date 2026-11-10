@@ -161,6 +161,14 @@ test("Slice S4 (V3): Session B SessionStart does not steal Session A's fresh Pre
     undefined,
     "Session B must not steal Session A's fresh PreCompact reassert stash",
   );
+
+  // 2b. Unlabeled SessionStart (no session_id) within 10m TTL must ALSO NOT steal Session A's fresh stash!
+  const unlabeledPending = await readReassertPending(vaultPath, 3);
+  assert.equal(
+    unlabeledPending.length,
+    0,
+    "Unlabeled SessionStart must not steal a fresh (<10m) session-tagged PreCompact stash",
+  );
   const filesAfterBootB = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
   assert.equal(
     filesAfterBootB.length,
