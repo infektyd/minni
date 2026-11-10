@@ -21,6 +21,7 @@ import {
   readOrderedThreadEvents,
   reconcileThreadJournal,
 } from "./thread-events.js";
+import { sweepDeadRelayCursors } from "./thread-notification-relay.js";
 
 // ---------------------------------------------------------------------------
 // Types (exported per spec)
@@ -1067,6 +1068,7 @@ export async function createPlan(
 
   const journalPath = journalPathFor(writeRes.notePath, plan.plan_id);
   await appendJournal(journalPath, { kind: "rehydrated", at: plan.created });
+  await maybeSweepDeadActiveThreadPointers(vaultPath).catch(() => {});
 
   return { plan, write: writeRes, ...(displaced_active ? { displaced_active } : {}) };
 }
@@ -2489,6 +2491,8 @@ export function structuralProposalDelta(
 
 const SESSION_KEY_HEX16_RE = /^[0-9a-f]{16}$/;
 const ACTIVE_THREAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const ACTIVE_THREAD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const ACTIVE_THREAD_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
 export interface ActivePlanSessionOptions {
   sessionKey?: string;
@@ -2657,6 +2661,170 @@ export async function getConcurrentActiveThreads(
     }
   }
   return out;
+}
+
+/**
+ * §5.1.2 & §5.2 (Slice S4): Dead-session GC sweep for `.runtime/active-thread.d/`
+ * and `.runtime/thread-relay/cursors.json`.
+ *
+ * Prunes `.runtime/active-thread.d/<sessionKey>.json` when:
+ *  - the referenced plan is terminal or missing, OR
+ *  - `host_pid` is dead (`ESRCH`) AND `updated_at > 24h`, OR
+ *  - `updated_at > 7d`.
+ * Before deleting a non-terminal session pointer, if `wiki/artifacts/_active_plan.json`
+ * is absent, preserves the last non-terminal `plan_id` in `_active_plan.json`.
+ *
+ * STRICT NEVER-DELETE INVARIANT (§5.2): Never touches `wiki/artifacts/plan-*.md`,
+ * `*.log.md`, or `*.history.jsonl`.
+ */
+export async function sweepDeadActiveThreadPointers(
+  vaultPath: string,
+  nowMs: number = Date.now(),
+): Promise<{ prunedPointers: number; prunedCursors: number }> {
+  const dir = activeThreadSessionDir(vaultPath);
+  let entries: string[] = [];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    entries = [];
+  }
+  let prunedPointers = 0;
+  const prunedSessionKeys = new Set<string>();
+  let lastNonTerminalPreserved = false;
+
+  for (const name of entries) {
+    if (name.endsWith(".detached")) {
+      const stem = name.slice(0, -".detached".length);
+      if (!SESSION_KEY_HEX16_RE.test(stem)) continue;
+      const detachedPath = path.join(dir, name);
+      try {
+        const raw = JSON.parse(await readFile(detachedPath, "utf8")) as { detached_at?: string };
+        const ts = Date.parse(raw.detached_at ?? "");
+        if (Number.isFinite(ts) && nowMs - ts > ACTIVE_THREAD_SESSION_TTL_MS) {
+          await unlink(detachedPath).catch(() => {});
+        }
+      } catch {
+        // Ignore unreadable detached marker.
+      }
+      continue;
+    }
+    if (!name.endsWith(".json") || name === ".sweep.json") continue;
+    const stem = name.slice(0, -".json".length);
+    if (!SESSION_KEY_HEX16_RE.test(stem)) continue;
+    const filePath = path.join(dir, name);
+    try {
+      const raw = JSON.parse(await readFile(filePath, "utf8")) as Partial<ActiveThreadBinding>;
+      if (
+        !raw ||
+        typeof raw.plan_id !== "string" ||
+        typeof raw.notePath !== "string" ||
+        typeof raw.set_at !== "string"
+      ) {
+        continue;
+      }
+      const updatedIso = typeof raw.updated_at === "string" ? raw.updated_at : raw.set_at;
+      const updatedMs = Date.parse(updatedIso);
+      const ageMs = Number.isFinite(updatedMs) ? nowMs - updatedMs : 0;
+      const pidAlive = typeof raw.host_pid === "number" ? isHostPidAlive(raw.host_pid) : true;
+
+      let isTerminalOrMissing = false;
+      try {
+        const scalars = await rehydratePlanScalars(raw.notePath);
+        if (TERMINAL_PLAN_STATUSES.has(scalars.status) || allSlicesResolved(scalars.slices)) {
+          isTerminalOrMissing = true;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+          isTerminalOrMissing = true;
+        }
+      }
+
+      const deadSessionExpired = !pidAlive && ageMs > ACTIVE_THREAD_SESSION_TTL_MS;
+      const hardMaxAgeExpired = ageMs > ACTIVE_THREAD_MAX_AGE_MS;
+      if (!isTerminalOrMissing && !deadSessionExpired && !hardMaxAgeExpired) {
+        continue;
+      }
+
+      if (!isTerminalOrMissing && !lastNonTerminalPreserved) {
+        const pointerPath = activePointerPath(vaultPath);
+        let fallbackExists = false;
+        try {
+          await readFile(pointerPath, "utf8");
+          fallbackExists = true;
+        } catch {
+          fallbackExists = false;
+        }
+        if (!fallbackExists) {
+          try {
+            await mkdir(path.dirname(pointerPath), { recursive: true });
+            await writeFileAtomic(
+              pointerPath,
+              JSON.stringify(
+                {
+                  plan_id: raw.plan_id,
+                  notePath: raw.notePath,
+                  set_at: raw.set_at,
+                },
+                null,
+                2,
+              ),
+            );
+            lastNonTerminalPreserved = true;
+          } catch {
+            // Best-effort preservation.
+          }
+        }
+      }
+
+      await unlink(filePath).catch(() => {});
+      const detachedPath = activeThreadDetachedPath(vaultPath, stem);
+      if (detachedPath) {
+        await unlink(detachedPath).catch(() => {});
+      }
+      prunedPointers += 1;
+      if (deadSessionExpired || hardMaxAgeExpired) {
+        prunedSessionKeys.add(stem);
+      }
+    } catch {
+      // Ignore unreadable session pointer.
+    }
+  }
+
+  const { prunedCursors } = await sweepDeadRelayCursors(
+    vaultPath,
+    nowMs,
+    prunedSessionKeys,
+  ).catch(() => ({ prunedCursors: 0 }));
+
+  return { prunedPointers, prunedCursors };
+}
+
+export async function maybeSweepDeadActiveThreadPointers(
+  vaultPath: string,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  const dir = activeThreadSessionDir(vaultPath);
+  const sweepGatePath = path.join(dir, ".sweep.json");
+  try {
+    const raw = JSON.parse(await readFile(sweepGatePath, "utf8")) as { last_sweep_ms?: number };
+    if (
+      typeof raw.last_sweep_ms === "number" &&
+      Number.isFinite(raw.last_sweep_ms) &&
+      nowMs - raw.last_sweep_ms < ACTIVE_THREAD_SWEEP_INTERVAL_MS
+    ) {
+      return;
+    }
+  } catch {
+    // Missing or unreadable gate -> proceed with sweep.
+  }
+  try {
+    await mkdir(dir, { recursive: true });
+    assertWriteTargetUnder(sweepGatePath, vaultPath);
+    await writeFileAtomic(sweepGatePath, JSON.stringify({ last_sweep_ms: nowMs }));
+  } catch {
+    // Best-effort gate write.
+  }
+  await sweepDeadActiveThreadPointers(vaultPath, nowMs);
 }
 
 export async function setActivePlan(
@@ -3031,6 +3199,7 @@ export async function resolveActivePlanView(
   shelf_drift?: ReturnType<typeof shelfDrift>;
 } | undefined> {
   try {
+    await maybeSweepDeadActiveThreadPointers(vaultPath).catch(() => {});
     const active = await getActivePlan(vaultPath, options);
     if (!active) return undefined;
     return await withThreadLock(

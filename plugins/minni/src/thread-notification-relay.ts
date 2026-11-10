@@ -1106,6 +1106,7 @@ export async function ingestPlanJournalFromDisk(
 export async function sweepDeadRelayCursors(
   vaultPath: string,
   nowMs = Date.now(),
+  prunedSessionKeys?: ReadonlySet<string>,
 ): Promise<{ prunedCursors: number }> {
   return withRelayStoreLock(vaultPath, async () => {
     const store = await loadRelayStore(vaultPath);
@@ -1143,7 +1144,10 @@ export async function sweepDeadRelayCursors(
       const parsed = parseSubscriberPrincipal(cursor.subscriber_id);
       if (parsed.sessionKey && !liveSessionKeys.has(parsed.sessionKey)) {
         const updatedTs = cursor.updated_at ? Date.parse(cursor.updated_at) : Number.NaN;
-        if (Number.isFinite(updatedTs) && nowMs - updatedTs > RELAY_CURSOR_PRUNE_AGE_MS) {
+        const expiredByAge =
+          Number.isFinite(updatedTs) && nowMs - updatedTs > RELAY_CURSOR_PRUNE_AGE_MS;
+        const expiredBySessionSweep = prunedSessionKeys?.has(parsed.sessionKey) ?? false;
+        if (expiredByAge || expiredBySessionSweep) {
           prunedSubPlans.add(`${cursor.subscriber_id}\0${cursor.plan_id}`);
           continue;
         }

@@ -1892,7 +1892,11 @@ export function createHookHandlers(
     //
     // Deliberately UNBUDGETED: this is cheap local FS, and it is the one read
     // whose absence loses data rather than context.
-    const reassertPending = await readReassertPending(config.vaultPath, 3);
+    const sessionKeyForPlan = sessionStateKey(rawSessionId || undefined) ?? undefined;
+    const reassertPending = await readReassertPending(config.vaultPath, 3, {
+      sessionKey: sessionKeyForPlan,
+      sessionId: rawSessionId || undefined,
+    });
     // Layer 1 shelf inline (operator scar: an envelope carrying only identity
     // keys + a pointer meant every agent re-hit scars already recorded in
     // layer1/core.md). SessionStart ONLY — UserPromptSubmit's envelope stays
@@ -1999,7 +2003,6 @@ export function createHookHandlers(
     // No try/catch around resolveActivePlanView: withBudget turns rejection
     // into its fallback. A budget cut still surfaces via planRead.ok === false
     // -> degraded.sections.
-    const sessionKeyForPlan = sessionStateKey(rawSessionId || undefined) ?? undefined;
     const planBudgetMs = remainingMs();
     planRead = planBudgetMs <= 0 ? { ok: false, view: undefined } : await withBudget(
       resolveActivePlanView(
@@ -3115,7 +3118,9 @@ export function createHookHandlers(
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const tail = await auditTail(config.vaultPath, 60);
     const scarTissue = extractScarTissue(tail.entries);
-    const sessionId = rawSessionIdFromPayload(payload) || "session";
+    const rawSessionId = rawSessionIdFromPayload(payload);
+    const sessionId = rawSessionId || "session";
+    const sessionKey = sessionStateKey(rawSessionId || undefined) ?? undefined;
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
@@ -3162,6 +3167,8 @@ export function createHookHandlers(
           kind: config.precompactKind,
           agent_id: config.agentId,
           workspace_id: workspaceId,
+          ...(rawSessionId ? { session_id: rawSessionId } : {}),
+          ...(sessionKey ? { session_key: sessionKey } : {}),
           scar_tissue: scarTissue,
           stale_belief_events: staleBeliefEvents,
           audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
@@ -3174,6 +3181,7 @@ export function createHookHandlers(
       : await stashPrecompactReassert({
           vaultPath: config.vaultPath,
           sessionId,
+          sessionKey,
           agentId: config.agentId,
           staleBeliefEvents,
           trigger: transcript,

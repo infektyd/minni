@@ -31,7 +31,7 @@ import {
 } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 import { durabilityOf } from "./durability.js";
-import { readSessionHandle, vaultHandleForPath } from "./recall-state.js";
+import { readSessionHandle, sessionStateKey, vaultHandleForPath } from "./recall-state.js";
 
 export interface JsonResult<T = unknown> {
   ok: boolean;
@@ -1625,14 +1625,22 @@ export async function fetchStaleBeliefEvents(
 export async function stashPrecompactReassert(input: {
   vaultPath: string;
   sessionId: string;
+  sessionKey?: string;
   agentId: string;
   staleBeliefEvents: unknown[];
   trigger?: string;
 }): Promise<string | undefined> {
   if (input.staleBeliefEvents.length === 0) return undefined;
+  const effectiveSessionKey =
+    input.sessionKey ??
+    (input.sessionId && input.sessionId !== "session"
+      ? (sessionStateKey(input.sessionId) ?? undefined)
+      : undefined);
   const entry = await writeInbox(input.vaultPath, input.sessionId, {
     kind: "precompact_reassert",
     agent_id: input.agentId,
+    ...(input.sessionId && input.sessionId !== "session" ? { session_id: input.sessionId } : {}),
+    ...(effectiveSessionKey ? { session_key: effectiveSessionKey } : {}),
     stale_belief_events: input.staleBeliefEvents,
     compaction_trigger: input.trigger || "compaction in progress",
   });
