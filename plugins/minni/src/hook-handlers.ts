@@ -63,7 +63,12 @@ import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
 import { canInject, renderIntent, wireCapabilities, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
-import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
+import {
+  compactPlanPointer,
+  getActivePlan,
+  getConcurrentActiveThreads,
+  resolveActivePlanView,
+} from "./plan.js";
 import {
   activePlanIdFromVault,
   confirmDeliveryInVault,
@@ -1581,8 +1586,20 @@ export function createHookHandlers(
         asString(payload.cwd) ||
         asString(payload.working_directory),
     );
-    if (hasExplicitPayloadWorkspace && resolved && resolved !== "workspace-unknown") {
-      recordActiveSessionWorkspace(config.vaultPath, resolved, config.agentId);
+    const rawSessionId = rawSessionIdFromPayload(payload);
+    if (
+      (hasExplicitPayloadWorkspace && resolved && resolved !== "workspace-unknown") ||
+      rawSessionId
+    ) {
+      recordActiveSessionWorkspace(
+        config.vaultPath,
+        hasExplicitPayloadWorkspace ? resolved : undefined,
+        {
+          agentId: config.agentId,
+          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+          ...(typeof payload.host_pid === "number" ? { hostPid: payload.host_pid } : {}),
+        },
+      );
     }
     return resolved;
   };
@@ -1723,10 +1740,14 @@ export function createHookHandlers(
     // emphasis on a fresh session, so the situational focus can fire again
     // this session. Best-effort — a state-write failure must not break boot.
     if (config.lifecycleEnabled) {
-      await writeLifecycleState(config.vaultPath, {
-        session_id: sessionId,
-        emphasized: [],
-      }).catch(() => {});
+      await writeLifecycleState(
+        config.vaultPath,
+        {
+          session_id: sessionId,
+          emphasized: [],
+        },
+        { sessionId: rawSessionId || sessionId },
+      ).catch(() => {});
     }
     await clearSessionSurfacedOnReset(config.vaultPath, rawSessionId || sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, rawSessionId || sessionId);
@@ -1977,12 +1998,19 @@ export function createHookHandlers(
     // No try/catch around resolveActivePlanView: withBudget turns rejection
     // into its fallback. A budget cut still surfaces via planRead.ok === false
     // -> degraded.sections.
+    const sessionKeyForPlan = sessionStateKey(rawSessionId || undefined) ?? undefined;
     const planBudgetMs = remainingMs();
     planRead = planBudgetMs <= 0 ? { ok: false, view: undefined } : await withBudget(
       resolveActivePlanView(
         config.vaultPath,
         layer1Shelf.ok && !layer1Shelf.truncated ? layer1Shelf.content : undefined,
-        { lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS) },
+        {
+          lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS),
+          sessionKey: sessionKeyForPlan,
+          sessionId: rawSessionId || undefined,
+          hostPid: typeof payload.host_pid === "number" ? payload.host_pid : process.ppid,
+          workspaceId,
+        },
       ).then((view) => ({ ok: true, view })),
       remainingMs(),
       { ok: false, view: undefined },
@@ -2134,6 +2162,14 @@ export function createHookHandlers(
 
     if (activePlan !== undefined) {
       envelopeBody.active_thread = activePlan;
+    } else if (sessionKeyForPlan) {
+      const concurrent = await getConcurrentActiveThreads(
+        config.vaultPath,
+        sessionKeyForPlan,
+      ).catch(() => []);
+      if (concurrent.length > 0) {
+        envelopeBody.concurrent_active_threads = concurrent;
+      }
     }
     await attachPendingAttention({
       vaultPath: config.vaultPath,
@@ -2351,16 +2387,22 @@ export function createHookHandlers(
     // on every other platform.
     let lifecycleFields: { lifecycle?: string; lifecycle_focus?: string } = {};
     if (config.lifecycleEnabled) {
-      const lifecycleStatePrev = await readLifecycleState(config.vaultPath);
+      const lifecycleStatePrev = await readLifecycleState(config.vaultPath, {
+        sessionId: rawSessionId || undefined,
+      });
       const emphasizedSurfaces = new Set(lifecycleStatePrev?.emphasized ?? []);
       const computed = lifecycleFieldsFor(prompt, emphasizedSurfaces);
       lifecycleFields = computed.fields;
       if (computed.emphasizedSurface) {
         emphasizedSurfaces.add(computed.emphasizedSurface);
-        await writeLifecycleState(config.vaultPath, {
-          session_id: lifecycleStatePrev?.session_id ?? "session",
-          emphasized: [...emphasizedSurfaces],
-        }).catch(() => {});
+        await writeLifecycleState(
+          config.vaultPath,
+          {
+            session_id: rawSessionId || lifecycleStatePrev?.session_id || "session",
+            emphasized: [...emphasizedSurfaces],
+          },
+          { sessionId: rawSessionId || undefined },
+        ).catch(() => {});
       }
     }
 
@@ -2741,10 +2783,13 @@ export function createHookHandlers(
     // Do not start it once the budget is spent (same degraded outcome), and
     // make its lock wait give up PLAN_LOCK_SLACK_MS before the deadline, so
     // the THREAD_BUSY audit lands inside the budget rather than after it.
+    const upsSessionKey = sessionStateKey(rawSessionId || undefined) ?? undefined;
     const planBudgetMs = remainingMs();
     const planRead = planBudgetMs <= 0 ? { ok: false as const, view: undefined } : await withBudget(
       resolveActivePlanView(config.vaultPath, undefined, {
         lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS),
+        sessionKey: upsSessionKey,
+        strictSessionOnly: Boolean(upsSessionKey),
       })
         .then((view) => ({ ok: true as const, view }))
         .catch(async (error: unknown) => {
@@ -3359,7 +3404,15 @@ export function createHookHandlers(
     let pendingStopText = "";
     if (deliverySucceededForHostHook(wire.id, "stop") && payload.stop_hook_active !== true) {
       try {
-        const planId = await activePlanIdFromVault(config.vaultPath);
+        const stopSessionKey =
+          sessionStateKey(rawSessionIdFromPayload(payload) || undefined) ?? undefined;
+        const activeForStop = await getActivePlan(config.vaultPath, {
+          sessionKey: stopSessionKey,
+          strictSessionOnly: Boolean(stopSessionKey),
+        });
+        const planId =
+          activeForStop?.plan_id ??
+          (stopSessionKey ? undefined : await activePlanIdFromVault(config.vaultPath));
         const pending = await pendingAttentionForHook({
           vaultPath: config.vaultPath,
           subscriberId: config.agentId,

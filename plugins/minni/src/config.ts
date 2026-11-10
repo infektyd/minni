@@ -1,3 +1,5 @@
+import { createHash, randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -63,6 +65,8 @@ export interface ActiveSessionWorkspaceOptions {
   agentId?: string;
   hostPid?: number;
   nowMs?: number;
+  sessionId?: string;
+  sessionKey?: string;
 }
 
 export interface ResolveSessionWorkspaceOptions {
@@ -72,6 +76,63 @@ export interface ResolveSessionWorkspaceOptions {
   nowMs?: number;
   checkHostPidAlive?: boolean;
   onDiagnostic?: (diag: WorkspaceResolutionDiag) => void;
+}
+
+export interface McpSessionIdentity {
+  sessionId?: string;
+  sessionKey: string;
+  hostPid: number;
+  matchedHintPid?: number;
+}
+
+export interface ResolveMcpSessionIdentityOptions {
+  agentId?: string;
+  hostPid?: number;
+  sessionId?: string;
+  ttlMs?: number;
+  nowMs?: number;
+  checkHostPidAlive?: boolean;
+  parentPidResolver?: (pid: number) => number | undefined;
+}
+
+function deriveSessionKeyFromId(sessionId: string | undefined): string | undefined {
+  if (typeof sessionId !== "string") return undefined;
+  const trimmed = sessionId.trim();
+  if (!trimmed || trimmed === "session") return undefined;
+  return createHash("sha256").update(trimmed).digest("hex").slice(0, 16);
+}
+
+function defaultParentPidResolver(pid: number): number | undefined {
+  if (!Number.isInteger(pid) || pid <= 1) return undefined;
+  try {
+    const procStat = `/proc/${pid}/stat`;
+    if (existsSync(procStat)) {
+      const raw = readFileSync(procStat, "utf8");
+      const closeParen = raw.lastIndexOf(")");
+      if (closeParen >= 0) {
+        const fields = raw
+          .slice(closeParen + 1)
+          .trim()
+          .split(/\s+/);
+        const ppid = Number(fields[1]);
+        if (Number.isInteger(ppid) && ppid > 1 && ppid !== pid) return ppid;
+      }
+    }
+  } catch {
+    // Fall back to ps below.
+  }
+  try {
+    const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 500,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const ppid = Number(out);
+    if (Number.isInteger(ppid) && ppid > 1 && ppid !== pid) return ppid;
+  } catch {
+    // Ignore ps failure.
+  }
+  return undefined;
 }
 
 function isPidAlive(pid: number): boolean {
@@ -118,20 +179,53 @@ function activeSessionFilename(agentId: string, hostPid: number): string {
   return `active-session-${sanitizeSessionKeyPart(agentId)}-${hostPid}.json`;
 }
 
+const AGENT_SESSION_ENV_VARS: Record<string, readonly string[]> = {
+  "claude-code": ["CLAUDE_CODE_SESSION_ID"],
+  codex: ["CODEX_SESSION_ID"],
+  gemini: ["GEMINI_SESSION_ID", "ANTIGRAVITY_SESSION_ID"],
+  "grok-build": ["GROK_SESSION_ID"],
+  cursor: ["CURSOR_SESSION_ID"],
+  kilocode: ["KILOCODE_SESSION_ID"],
+};
+
+const SINGLE_LIVE_SESSION_ALLOWLIST: ReadonlySet<string> = new Set(["cursor"]);
+
+function resolveAgentScopedEnvSessionId(agentId: string): string | undefined {
+  const generic = process.env.MINNI_SESSION_ID?.trim();
+  if (generic && generic !== "session") return generic;
+  const allowedVars = AGENT_SESSION_ENV_VARS[agentId] ?? [];
+  for (const envName of allowedVars) {
+    const val = process.env[envName]?.trim();
+    if (val && val !== "session") return val;
+  }
+  return undefined;
+}
+
 export function recordActiveSessionWorkspace(
   vaultPath: string | undefined,
   workspaceIdOrPath: string | undefined,
   agentIdOrOptions?: string | ActiveSessionWorkspaceOptions,
   options?: ActiveSessionWorkspaceOptions,
 ): void {
-  if (!vaultPath || !workspaceIdOrPath) return;
-  if (isDisallowedHintPath(workspaceIdOrPath)) return;
-  const normalized = normalizeWorkspaceId(workspaceIdOrPath);
-  if (!normalized || normalized === "workspace-unknown") return;
+  if (!vaultPath) return;
   const opts: ActiveSessionWorkspaceOptions =
     typeof agentIdOrOptions === "object" && agentIdOrOptions !== null
       ? agentIdOrOptions
       : { ...options, ...(typeof agentIdOrOptions === "string" ? { agentId: agentIdOrOptions } : {}) };
+  const hasValidWorkspaceInput = Boolean(
+    workspaceIdOrPath && !isDisallowedHintPath(workspaceIdOrPath),
+  );
+  const normalized = hasValidWorkspaceInput ? normalizeWorkspaceId(workspaceIdOrPath) : "";
+  const validWorkspace =
+    normalized && normalized !== "workspace-unknown" ? normalized : undefined;
+  const hasExplicitSession =
+    (typeof opts.sessionId === "string" &&
+      opts.sessionId.trim() !== "" &&
+      opts.sessionId.trim() !== "session") ||
+    (typeof opts.sessionKey === "string" && /^[0-9a-f]{16}$/.test(opts.sessionKey));
+  // R1 (§9): write the session record whenever a valid workspace OR a session
+  // identity is present; omit workspace_id when the workspace is unknown/disallowed.
+  if (!validWorkspace && !hasExplicitSession) return;
   const resolvedAgentId = (opts.agentId ?? DEFAULT_AGENT_ID).trim() || DEFAULT_AGENT_ID;
   const resolvedHostPid =
     typeof opts.hostPid === "number" && Number.isInteger(opts.hostPid) && opts.hostPid > 0
@@ -142,16 +236,51 @@ export function recordActiveSessionWorkspace(
     const resolvedVault = expandTilde(vaultPath);
     const runtimeDir = path.join(resolvedVault, ".runtime");
     mkdirSync(runtimeDir, { recursive: true });
+    const realVault = realpathSync(resolvedVault);
+    const realRuntime = realpathSync(runtimeDir);
+    const relRuntime = path.relative(realVault, realRuntime);
+    if (relRuntime.startsWith("..") || path.isAbsolute(relRuntime)) return;
     const targetName = activeSessionFilename(resolvedAgentId, resolvedHostPid);
     const target = path.join(runtimeDir, targetName);
-    const tmp = `${target}.${process.pid}.tmp`;
+    let existingSessionId: string | undefined;
+    let existingSessionKey: string | undefined;
+    let existingWorkspaceId: string | undefined;
+    try {
+      const prior = JSON.parse(readFileSync(target, "utf8")) as Record<string, unknown>;
+      if (typeof prior?.session_id === "string" && prior.session_id.trim()) {
+        existingSessionId = prior.session_id.trim();
+      }
+      if (typeof prior?.session_key === "string" && /^[0-9a-f]{16}$/.test(prior.session_key)) {
+        existingSessionKey = prior.session_key;
+      }
+      if (typeof prior?.workspace_id === "string") {
+        const priorWs = normalizeWorkspaceId(prior.workspace_id);
+        if (priorWs && priorWs !== "workspace-unknown") {
+          existingWorkspaceId = priorWs;
+        }
+      }
+    } catch {
+      // No existing hint file or unreadable.
+    }
+    const rawSessionId =
+      typeof opts.sessionId === "string" && opts.sessionId.trim() && opts.sessionId.trim() !== "session"
+        ? opts.sessionId.trim()
+        : existingSessionId;
+    const resolvedSessionKey =
+      typeof opts.sessionKey === "string" && /^[0-9a-f]{16}$/.test(opts.sessionKey)
+        ? opts.sessionKey
+        : deriveSessionKeyFromId(rawSessionId) ?? existingSessionKey;
+    const effectiveWorkspace = validWorkspace ?? existingWorkspaceId;
+    const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     writeFileSync(
       tmp,
       `${JSON.stringify(
         {
-          workspace_id: normalized,
+          ...(effectiveWorkspace ? { workspace_id: effectiveWorkspace } : {}),
           agent_id: resolvedAgentId,
           host_pid: resolvedHostPid,
+          ...(rawSessionId ? { session_id: rawSessionId } : {}),
+          ...(resolvedSessionKey ? { session_key: resolvedSessionKey } : {}),
           updated_at: new Date(nowMs).toISOString(),
         },
         null,
@@ -204,6 +333,193 @@ export function recordActiveSessionWorkspace(
 }
 
 export const writeActiveSessionHint = recordActiveSessionWorkspace;
+
+export function resolveMcpSessionIdentity(
+  vaultPath: string = DEFAULT_VAULT_PATH,
+  options: ResolveMcpSessionIdentityOptions = {},
+): McpSessionIdentity {
+  const resolvedAgentId = (options.agentId ?? DEFAULT_AGENT_ID).trim() || DEFAULT_AGENT_ID;
+  const resolvedHostPid =
+    typeof options.hostPid === "number" && Number.isInteger(options.hostPid) && options.hostPid > 0
+      ? options.hostPid
+      : process.ppid;
+  const explicitSessionId =
+    typeof options.sessionId === "string" &&
+    options.sessionId.trim() &&
+    options.sessionId.trim() !== "session"
+      ? options.sessionId.trim()
+      : resolveAgentScopedEnvSessionId(resolvedAgentId);
+  if (explicitSessionId) {
+    const key = deriveSessionKeyFromId(explicitSessionId);
+    if (key) {
+      return {
+        sessionId: explicitSessionId,
+        sessionKey: key,
+        hostPid: resolvedHostPid,
+      };
+    }
+  }
+
+  const ttlMs =
+    typeof options.ttlMs === "number" && Number.isFinite(options.ttlMs) && options.ttlMs > 0
+      ? options.ttlMs
+      : ACTIVE_SESSION_TTL_MS;
+  const nowMs =
+    typeof options.nowMs === "number" && Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+  const checkAlive = options.checkHostPidAlive !== false;
+  const resolveParent = options.parentPidResolver ?? defaultParentPidResolver;
+
+  if (vaultPath) {
+    try {
+      const resolvedVault = expandTilde(vaultPath);
+      const runtimeDir = path.join(resolvedVault, ".runtime");
+      if (existsSync(runtimeDir)) {
+        const realVault = realpathSync(resolvedVault);
+        const realRuntime = realpathSync(runtimeDir);
+        const relRuntime = path.relative(realVault, realRuntime);
+        if (!relRuntime.startsWith("..") && !path.isAbsolute(relRuntime)) {
+          const MAX_ANCESTOR_HOPS = 3;
+          let candidatePid: number | undefined = resolvedHostPid;
+          for (
+            let hop = 0;
+            hop <= MAX_ANCESTOR_HOPS && candidatePid && candidatePid > 1;
+            hop++
+          ) {
+            const candidateHintPaths: string[] = [
+              path.join(runtimeDir, activeSessionFilename(resolvedAgentId, candidatePid)),
+            ];
+            if (resolvedAgentId === "unknown-agent") {
+              try {
+                const suffix = `-${candidatePid}.json`;
+                for (const entry of readdirSync(runtimeDir)) {
+                  if (entry.startsWith("active-session-") && entry.endsWith(suffix)) {
+                    const p = path.join(runtimeDir, entry);
+                    if (!candidateHintPaths.includes(p)) candidateHintPaths.push(p);
+                  }
+                }
+              } catch {
+                // Ignore readdir failure.
+              }
+            }
+            for (const hintPath of candidateHintPaths) {
+              if (!existsSync(hintPath)) continue;
+              try {
+                const parsed = JSON.parse(readFileSync(hintPath, "utf8")) as Record<string, unknown>;
+                const sameAgent =
+                  resolvedAgentId === "unknown-agent" ||
+                  typeof parsed?.agent_id !== "string" ||
+                  parsed.agent_id === resolvedAgentId;
+                const samePid =
+                  typeof parsed?.host_pid !== "number" || parsed.host_pid === candidatePid;
+                const aliveOk = !checkAlive || isPidAlive(candidatePid);
+                const updatedAtMs =
+                  typeof parsed?.updated_at === "string"
+                    ? Date.parse(parsed.updated_at)
+                    : Number.NaN;
+                const freshOk =
+                  !Number.isFinite(updatedAtMs) ||
+                  (nowMs - updatedAtMs <= ttlMs && updatedAtMs - nowMs <= 60_000);
+                if (sameAgent && samePid && aliveOk && freshOk) {
+                  const sid =
+                    typeof parsed?.session_id === "string" &&
+                    parsed.session_id.trim() &&
+                    parsed.session_id.trim() !== "session"
+                      ? parsed.session_id.trim()
+                      : undefined;
+                  const skey =
+                    typeof parsed?.session_key === "string" &&
+                    /^[0-9a-f]{16}$/.test(parsed.session_key)
+                      ? parsed.session_key
+                      : deriveSessionKeyFromId(sid);
+                  if (skey) {
+                    return {
+                      ...(sid ? { sessionId: sid } : {}),
+                      sessionKey: skey,
+                      hostPid: resolvedHostPid,
+                      matchedHintPid: candidatePid,
+                    };
+                  }
+                }
+              } catch {
+                // Ignore corrupt hint file and continue ancestor walk.
+              }
+            }
+            if (hop < MAX_ANCESTOR_HOPS) {
+              candidatePid = resolveParent(candidatePid);
+            }
+          }
+
+          // Priority 3 (R1 item 2): single-live-session fallback is allowed ONLY
+          // for hosts on SINGLE_LIVE_SESSION_ALLOWLIST (today: Cursor). Every other
+          // host falls straight through to Priority 4 (ppid_derived) so it never
+          // borrows another live session's key.
+          if (SINGLE_LIVE_SESSION_ALLOWLIST.has(resolvedAgentId)) {
+            const prefix = `active-session-${sanitizeSessionKeyPart(resolvedAgentId)}-`;
+            const liveMatches: Array<{ sid?: string; skey: string; pid: number }> = [];
+            const seenKeys = new Set<string>();
+            for (const entry of readdirSync(runtimeDir)) {
+              if (!entry.startsWith(prefix) || !entry.endsWith(".json")) continue;
+              const pidPart = entry.slice(prefix.length, -".json".length);
+              if (!/^\d+$/.test(pidPart)) continue;
+              const pid = Number(pidPart);
+              if (checkAlive && !isPidAlive(pid)) continue;
+              try {
+                const parsed = JSON.parse(
+                  readFileSync(path.join(runtimeDir, entry), "utf8"),
+                ) as Record<string, unknown>;
+                const updatedAtMs =
+                  typeof parsed?.updated_at === "string"
+                    ? Date.parse(parsed.updated_at)
+                    : Number.NaN;
+                const freshOk =
+                  !Number.isFinite(updatedAtMs) ||
+                  (nowMs - updatedAtMs <= ttlMs && updatedAtMs - nowMs <= 60_000);
+                if (!freshOk) continue;
+                const sid =
+                  typeof parsed?.session_id === "string" &&
+                  parsed.session_id.trim() &&
+                  parsed.session_id.trim() !== "session"
+                    ? parsed.session_id.trim()
+                    : undefined;
+                const skey =
+                  typeof parsed?.session_key === "string" &&
+                  /^[0-9a-f]{16}$/.test(parsed.session_key)
+                    ? parsed.session_key
+                    : deriveSessionKeyFromId(sid);
+                if (skey && !seenKeys.has(skey)) {
+                  seenKeys.add(skey);
+                  liveMatches.push({ sid, skey, pid });
+                }
+              } catch {
+                // Ignore unreadable entry.
+              }
+            }
+            if (liveMatches.length === 1) {
+              return {
+                ...(liveMatches[0].sid ? { sessionId: liveMatches[0].sid } : {}),
+                sessionKey: liveMatches[0].skey,
+                hostPid: resolvedHostPid,
+                matchedHintPid: liveMatches[0].pid,
+              };
+            }
+          }
+        }
+      }
+    } catch {
+      // Best-effort hint resolution; fall back to synthetic pid key below.
+    }
+  }
+
+  const syntheticSessionId = `pid-${resolvedHostPid}`;
+  const syntheticKey =
+    deriveSessionKeyFromId(syntheticSessionId) ??
+    createHash("sha256").update(syntheticSessionId).digest("hex").slice(0, 16);
+  return {
+    sessionId: syntheticSessionId,
+    sessionKey: syntheticKey,
+    hostPid: resolvedHostPid,
+  };
+}
 
 let warnedSessionPpidMismatch = false;
 

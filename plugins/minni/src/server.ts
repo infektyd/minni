@@ -11,6 +11,7 @@ import {
   DEFAULT_AGENT_ID,
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
+  resolveMcpSessionIdentity,
   resolveSessionWorkspaceId,
 } from "./config.js";
 import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial, routeMemoryIntent } from "./policy.js";
@@ -719,7 +720,8 @@ server.registerTool(
     },
   },
   async ({ query, layer, limit, workspaceId, scope, cross_agent, includeVault }) => {
-    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH).catch(() => false);
+    const mcpSession = resolveMcpSessionIdentity(DEFAULT_VAULT_PATH);
+    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH, mcpSession).catch(() => false);
     const effectiveWorkspaceId = resolveSessionWorkspaceId(DEFAULT_VAULT_PATH, workspaceId);
     // X5: run the daemon recall FIRST. Its results are workspace/agent-scoped and
     // subject to read policy. The local searchVaultNotes pre-scan is NOT scoped, so
@@ -734,7 +736,7 @@ server.registerTool(
       crossAgent: cross_agent,
       workspaceId: effectiveWorkspaceId,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
-      sessionId: MCP_PROCESS_SESSION_ID,
+      sessionId: mcpSession.sessionId ?? MCP_PROCESS_SESSION_ID,
     });
     const daemonOk = result.ok && !!result.data;
     // W5 (punch-list #1): a daemon that ANSWERED with zero hits is still
@@ -806,7 +808,7 @@ server.registerTool(
         crossAgentDegraded: degradeText !== undefined,
         // Same id the daemon trace receives, so MCP recalls attribute in
         // audit-based session receipts too.
-        session_id: MCP_PROCESS_SESSION_ID,
+        session_id: mcpSession.sessionId ?? MCP_PROCESS_SESSION_ID,
       },
     });
     return textResult(responseText);
@@ -829,7 +831,8 @@ server.registerTool(
     },
   },
   async ({ resultIds, chunkIds, references, handle, wikilink, depth }) => {
-    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH).catch(() => false);
+    const mcpSession = resolveMcpSessionIdentity(DEFAULT_VAULT_PATH);
+    await disarmRecallStateOnConsult(DEFAULT_VAULT_PATH, mcpSession).catch(() => false);
     const result = await drillMemory({
       resultIds,
       chunkIds,
@@ -838,7 +841,7 @@ server.registerTool(
       wikilink,
       depth,
       vaultPath: DEFAULT_VAULT_PATH,
-      sessionId: MCP_PROCESS_SESSION_ID,
+      sessionId: mcpSession.sessionId ?? mcpSession.sessionKey ?? MCP_PROCESS_SESSION_ID,
     });
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -1546,19 +1549,33 @@ server.registerTool(
       open_questions: z.array(z.string()).optional(),
       seed_scar_from_audit: z.boolean().optional(),
       shelf_ref: planShelfRefInputSchema.optional(),
+      activate: z.boolean().optional(),
     },
   },
-  async ({ goal, constraints, slices, open_questions, seed_scar_from_audit, shelf_ref }) => {
+  async ({ goal, constraints, slices, open_questions, seed_scar_from_audit, shelf_ref, activate }) => {
     const gated = await requireSharedGate("plan.create", { slices: slices?.length ?? 0 });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
+    const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
     let scar_tissue: ScarTissueEntry[] | undefined;
     if (seed_scar_from_audit) {
       const tail = await auditTail(effectiveVaultPath, 60);
       scar_tissue = extractScarTissue(tail.entries);
     }
     const { plan, write, displaced_active } = await createPlan(
-      { goal, constraints, slices, open_questions, scar_tissue, shelf_ref, vaultPath: effectiveVaultPath },
+      {
+        goal,
+        constraints,
+        slices,
+        open_questions,
+        scar_tissue,
+        shelf_ref,
+        vaultPath: effectiveVaultPath,
+        activate,
+        sessionKey: mcpSession.sessionKey,
+        sessionId: mcpSession.sessionId,
+        hostPid: mcpSession.hostPid,
+      },
       { vaultPath: effectiveVaultPath },
     );
     return textResult(
@@ -1594,7 +1611,12 @@ async function resolvePlanTarget(
   | { ok: false; result: ReturnType<typeof textResult> }
 > {
   try {
-    const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput);
+    const mcpSession = resolveMcpSessionIdentity(DEFAULT_VAULT_PATH);
+    const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput, {
+      sessionKey: mcpSession.sessionKey,
+      sessionId: mcpSession.sessionId,
+      hostPid: mcpSession.hostPid,
+    });
     if ("error" in resolved) {
       return { ok: false, result: textResult(JSON.stringify({ error: resolved.error }, null, 2)) };
     }
@@ -1787,9 +1809,14 @@ server.registerTool(
         // P10/H6: terminal plans stop being injected.
         if (updated.status === "complete" || updated.status === "accepted") {
           try {
-            const active = await getActivePlan(effectiveVaultPath);
+            const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
+            const active = await getActivePlan(effectiveVaultPath, {
+              sessionKey: mcpSession.sessionKey,
+            });
             if (active && active.plan_id === plan_id) {
-              await clearActivePlan(effectiveVaultPath);
+              await clearActivePlan(effectiveVaultPath, {
+                sessionKey: mcpSession.sessionKey,
+              });
             }
           } catch {
             // active pointer maintenance is advisory
@@ -1964,7 +1991,10 @@ server.registerTool(
         planId: plan_id,
         actor: DEFAULT_AGENT_ID,
       });
-      const activePointer = await getActivePlan(effectiveVaultPath);
+      const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
+      const activePointer = await getActivePlan(effectiveVaultPath, {
+        sessionKey: mcpSession.sessionKey,
+      });
       const active = activePointer?.plan_id === plan_id;
       const view = compactPlanView(plan);
       const drift = live_shelf_content
@@ -2395,7 +2425,12 @@ server.registerTool(
     }
     // #122 F-PLAN-ACTIVATE-NO-TERMINAL-GUARD: refuse to re-activate a plan in a
     // terminal status (mirrors resolveActivePlanView's suppression set).
-    const activated = await activatePlanChecked(effectiveVaultPath, plan_id, notePath);
+    const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
+    const activated = await activatePlanChecked(effectiveVaultPath, plan_id, notePath, {
+      sessionKey: mcpSession.sessionKey,
+      sessionId: mcpSession.sessionId,
+      hostPid: mcpSession.hostPid,
+    });
     if (!activated.ok) {
       return textResult(JSON.stringify({ error: activated.error }, null, 2));
     }
@@ -2414,7 +2449,11 @@ server.registerTool(
     const gated = await requireSharedGate("plan.deactivate");
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    await clearActivePlan(effectiveVaultPath);
+    const mcpSession = resolveMcpSessionIdentity(effectiveVaultPath);
+    await clearActivePlan(effectiveVaultPath, {
+      sessionKey: mcpSession.sessionKey,
+      sessionOnly: true,
+    });
     return textResult(JSON.stringify({ active: null }, null, 2));
   },
 );
