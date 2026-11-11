@@ -13,6 +13,7 @@ from minni.afm_review_markers import supersede_afm_review
 from minni.config import DEFAULT_CONFIG
 from minni.db import MinniDB
 from minni.durable_projection import projection_row_closed
+from minni.today_digest import refresh_today_digest_safe
 from minni.graph_commit import ensure_canonical_learning_node
 from minni.graph_coordinator import (
     GraphCommitAborted,
@@ -739,6 +740,13 @@ def promote_candidate_durable(
 
     context.logger.info("AFM consolidation promoted candidate #%d -> learning #%d", candidate_id, lid)
     context.maybe_archive_inbox_source(wb.db, candidate_id)
+    refresh_today_digest_safe(
+        daemon_running=True,
+        db_path=(
+            getattr(wb_config, "db_path", None) if wb_config is not None else None
+        )
+        or getattr(getattr(wb.db, "config", None), "db_path", None),
+    )
     return lid
 
 

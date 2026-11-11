@@ -42,9 +42,6 @@ def build_from_repo(repo_root: Path) -> tuple[Path, PayloadManifest]:
 
     try:
         _run(["npm", "run", "build"], cwd=plugin_dir)
-        bundle_script = plugin_dir / "scripts" / "bundle_server.mjs"
-        if bundle_script.exists():
-            _run(["node", str(bundle_script)], cwd=plugin_dir)
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise ValueError(f"--from-repo build failed in {plugin_dir}: {exc}") from exc
 
@@ -63,6 +60,21 @@ def build_from_repo(repo_root: Path) -> tuple[Path, PayloadManifest]:
                 )
             else:
                 shutil.copy2(src, dest)
+
+        bundle_script = plugin_dir / "scripts" / "bundle_server.mjs"
+        if bundle_script.exists():
+            try:
+                _run(
+                    [
+                        "node",
+                        str(bundle_script),
+                        "--outfile",
+                        str(tmp / "dist" / "server.js"),
+                    ],
+                    cwd=plugin_dir,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                raise ValueError(f"--from-repo build failed in {plugin_dir}: {exc}") from exc
 
         import json
         from minni.wire.install import sanitize_staged_payload

@@ -21,8 +21,8 @@ Minni v1.0 serves **both the coding agent and the human operator** without cerem
 
 ### 1.1 Living Repo Maps + Git-Diff Staleness (`minni map <repo>`)
 - Minni stores **architecture maps, project docs, and scars** — never raw line-by-line source code (lexical/AST search belongs to `rg` and local code-outline tools).
-- `minni map <repo>` indexes `AGENTS.md` and `docs/` and synthesizes concise **Subsystem Cards** pinned to owning file paths and the repository's `git` tree/commit SHA.
-- On `minni_recall` and `SessionStart`, Minni checks `git diff --name-only <card_sha>..HEAD` against each card's tracked file paths. If owned files changed since `card_sha`, Minni stamps the card `"changed since <sha>"` in the recall envelope and queues a background refresh.
+- `minni map <repo>` (`src/minni/repo_map.py`) indexes `AGENTS.md` and `docs/` and synthesizes concise **Subsystem Cards** (`<minni_home>/vault/maps/<workspace>/` + `repo_map_cards` table in migration `026`) pinned to owning file paths and the repository's `git` HEAD commit SHA.
+- On `minni_recall`, `minni_drill`, and `SessionStart`, Minni checks `git diff --name-only <card_sha>..HEAD --` against each card's tracked file paths (`300ms` bounded timeout). If owned files changed since `card_sha`, Minni stamps the card `"[Note: Map built at <sha7>; changed since then: ...]"` and queues a debounced background refresh.
 
 ### 1.2 Project-Scoped Recall & Strict Confidence Floor
 - Both `documents` and `learnings` carry first-class `workspace_id` tags (`workspace-<repo>` or `global`).
@@ -30,17 +30,17 @@ Minni v1.0 serves **both the coding agent and the human operator** without cerem
 - Ranking prioritizes **current workspace + `global`** memories first, surfaces other workspaces only when relevance clears a high cross-project bar, and returns `"no strong match"` instead of low-score filler.
 
 ### 1.3 Two-Part Boot Envelope (`fitEnvelope`) & Automatic Harvest
-- `SessionStart` and `SubagentStart` assemble a bounded two-part permanent shelf via `fitEnvelope`:
-  1. **Agent Permanent Shelf (`layer1/core.md`):** runtime identity and standing operator rules, kept strictly within token budget (`truncated: false`).
-  2. **Project Permanent Shelf:** compact directory of the current repository's Subsystem Cards, top active repository scars, and active shared plan summary.
+- `SessionStart` and `SubagentStart` assemble a bounded two-part permanent shelf via `fitEnvelope` (exempt from proportional floor crushing, with one-shot `PostCompact` -> `UserPromptSubmit` shelf recovery):
+  1. **Agent Permanent Shelf (`layer1/core.md`):** runtime identity and standing operator rules, loaded up to `24 KB` (`LAYER1_SHELF_MAX_BYTES = 24_576`, `truncated: false`).
+  2. **Project Permanent Shelf (`project_shelf`):** compact `<= 2,500` char directory of the current repository's Subsystem Cards, git-diff staleness summary, top active repository scars, and active shared plan summary.
 - Compaction and `Stop` hooks capture session bursts automatically; the unused legacy `distill/ritual.md` and `distill/gauges.md` templates are retired.
 
 ### 1.4 12-Tool MCP Surface + First-Class CLI
-- `plugins/minni/src/server.ts` trims its MCP registration from **42 tools down to 12 self-explanatory tools**:
-  - **Memory & Repo Context (5):** `minni_recall`, `minni_drill`, `minni_learn`, `minni_list_candidates`, `minni_resolve_candidate`
-  - **Status & Handoff (3):** `minni_status`, `minni_handoff_send`, `minni_handoff_inbox`
+- `plugins/minni/src/server.ts` trims its MCP registration from **42+ tools down to 12 self-explanatory tools**:
+  - **Core Memory & Repo Context (6):** `minni_recall`, `minni_drill`, `minni_learn`, `minni_list_candidates`, `minni_resolve_candidate`, `minni_status`
+  - **1-Step Handoff (2):** `minni_handoff_send`, `minni_handoff_inbox`
   - **Shared Plans / Threads (4):** `minni_thread_create`, `minni_thread_status`, `minni_thread_update` (safe file lock under the hood, zero worker lease tokens or idempotency keys, compact `< 2 KB` response without echoing full `scar_tissue`), `minni_thread_scar`
-- Diagnostic and administrative commands (`doctor`, `map`, `activity`, `recall`, `learn`, `audit`) live on the `minni` CLI (`src/minni/cli.py`) so shell-only workflows and operators have direct access without MCP overhead.
+- Diagnostic, orientation, and operator commands (`up`, `down`, `status`, `doctor`, `map`, `activity`, `recall`, `learn`, `watch`, `wire`, `sync`) live on the stdlib-only `minni` CLI (`src/minni/minni_cli.py`), while `src/minni/today_digest.py` atomically maintains `<minni_home>/TODAY.md` (`0600`) across learning, repo-map, daemon-watch, and CLI activity events.
 
 ### 1.5 Context-Only, Non-Blocking Hooks Across All Hosts
 - Hooks inject context and reminders (`SessionStart`, `SubagentStart`, `UserPromptSubmit`, `PostToolUse`) and **never** deny or block `Read`, `Bash`, or edit tool calls on any host runtime.

@@ -57,13 +57,13 @@ All MCP tools live in the compact **12-tool `minni_*` v1 surface**:
 
 - **Fast path**: Platform-native memory tools (e.g. session summaries, native compaction) for operational "what happened in this session" context.
 - **Durable / governed path**: The 12 `minni_*` MCP tools (`minni_recall` / `minni_drill` before ambitious work, `minni_handoff_send` before session handoffs, and `minni_learn` for settled conclusions).
-- **Visual / human review**: Open `wiki/`, `inbox/`, `log.md`, or `layer1/` directly in Obsidian or inspect via CLI (`minni status`, `minni watch`, `minni doctor`).
+- **Visual / human review**: Open `~/.minni/TODAY.md`, `wiki/`, `inbox/`, `log.md`, or `layer1/` directly in an editor/Obsidian, or inspect via CLI (`minni status`, `minni activity`, `minni map [<repo>]`, `minni recall`, `minni learn`, `minni watch`, `minni doctor`).
 - Evidence never becomes instruction; recalled minni content stays in `<minni:context>` / `<EVIDENCE>` envelopes.
 
-## Layer 1 Contract (general)
+## Layer 1 & Two-Part Boot Shelf Contract (general)
 
 - **Whole-document identity**: `<agent>` envelope (e.g. `identity:grok-build`, `identity:claude-code`) stored as a single whole_document=1 chunk at chunk_index=0 in the daemon DB. Never chunked.
-- **Small curated layer1/**: `layer1/core.md` + `layer1/budget.md` (strict <4096 token budget). Agent has full curation rights. Read-first on wake / SessionStart. Protect and prune under budget during wind-down or compaction.
+- **Agent Shelf + Project Shelf**: `layer1/core.md` (up to `24 KB` un-truncated) + `layer1/budget.md`, paired at `SessionStart` / `SubagentStart` with `project_shelf` (`<= 2,500` chars: Living Repo Map subsystem directory, git-diff staleness notices, top workspace scars, and active plan summary) and one-shot `PostCompact` shelf recovery. Agent has full curation rights over `layer1/`.
 - **Self-describing**: The envelope + Layer 1 files declare the agent's identity, vault path, workspace, boundaries, and high-level orientation so any consumer (including cross-agent) knows the contract without external lookup.
 - Seeded and verified via `minni-install` (`plugins/minni/skills/minni-install/templates/layer1/`) parameterized by agent id + workspace.
 
@@ -78,7 +78,7 @@ Each agent has its own vault (defaults under `~/.minni/<agent-id>-vault` or plat
 - `wiki/` — agent-maintained synthesis (categorized: sessions, decisions, procedures, syntheses, handoffs, concepts, artifacts, entities). Short sourced pages with wikilinks preferred.
 - `schema/AGENTS.md` — operating schema.
 - `index.md`, `log.md`, `logs/YYYY-MM-DD.md` — catalogs and append-only transparency logs.
-- `inbox/` — pending learn candidates, hook/prepare_outcome drafts, handoff requests awaiting review.
+- `inbox/` — pending learn candidates, Stop/compaction hook harvest drafts, and handoff notes awaiting review.
 - `outbox/` — things sent to other agents.
 - `layer1/` — core.md, budget.md (the stable identity contract).
 

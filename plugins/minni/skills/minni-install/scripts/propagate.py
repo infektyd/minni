@@ -1780,11 +1780,21 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     # Install roots deliberately exclude node_modules. Prefer the already-bundled
     # verified payload at ~/.minni/plugin/current when available so containers
     # receive the exact same server.js bytes as current (H30); otherwise bundle
-    # the source tree first.
-    if _verified_current_server_js(install_root) is None:
-        run(["node", str((source / "scripts" / "bundle_server.mjs").resolve())], cwd=source)
+    # directly into the destination copy after copy_tree so plugins/minni/dist/server.js
+    # stays modular in-tree (BUG-06/BUG-47).
+    cur_srv = _verified_current_server_js(install_root)
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
+    if cur_srv is None:
+        run(
+            [
+                "node",
+                str((source / "scripts" / "bundle_server.mjs").resolve()),
+                "--outfile",
+                str(server_path.resolve()),
+            ],
+            cwd=source,
+        )
     write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env, afm_env=afm_env))
 
     if config_kind == "toml":

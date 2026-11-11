@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Stage the Minni plugin payload into src/minni/plugin_payload/ for wheel shipping.
 
-Release-time only: runs npm build + esbuild bundle (via Makefile), copies the §4.1
-file set, stamps versions, hashes files, and fails hard on glob-coverage gaps.
+Release-time only: copies the §4.1 file set from a freshly `npm run build`
+plugin tree, bundles `dist/server.js` directly into `PAYLOAD_ROOT/dist/server.js`
+without clobbering `plugins/minni/dist/server.js` (BUG-06), stamps versions,
+hashes files, and fails hard on glob-coverage gaps.
 """
 
 from __future__ import annotations
@@ -138,6 +140,20 @@ def copy_payload_tree(version: str) -> dict[str, str]:
             )
         else:
             shutil.copy2(src, dest)
+
+    bundle_script = PLUGIN_DIR / "scripts" / "bundle_server.mjs"
+    if bundle_script.is_file():
+        subprocess.run(
+            [
+                "node",
+                str(bundle_script),
+                "--outfile",
+                str(PAYLOAD_ROOT / "dist" / "server.js"),
+            ],
+            cwd=str(PLUGIN_DIR),
+            check=True,
+            stdout=sys.stderr,
+        )
 
     for rel in MANIFEST_STAMP_PATHS:
         stamp_version(PAYLOAD_ROOT / rel, version)

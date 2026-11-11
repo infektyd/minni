@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from minni import today_digest
+
 RUN_DIR = Path.home() / ".minni" / "run"
 LOG_DIR = Path.home() / ".minni" / "logs"
 DEFAULT_SOCKET = RUN_DIR / "minnid.sock"
@@ -274,6 +276,31 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"minnid {daemon.get('version', '?')} — running "
           f"(up {uptime // 3600}h {uptime % 3600 // 60}m, "
           f"{daemon.get('requests_served', 0)} requests served)")
+    minni_home = _minni_home_dir()
+    db_override = (os.environ.get("MINNI_DB_PATH") or "").strip()
+    db_path = Path(db_override).expanduser() if db_override else (minni_home / "minni.db")
+    if db_path.is_file():
+        today_digest.refresh_today_digest_safe(
+            minni_home, daemon_running=True, db_path=db_path, bypass_cache=True
+        )
+    try:
+        overview = today_digest.collect_today_digest_data(
+            minni_home, daemon_running=True, db_path=db_path
+        )
+    except Exception:
+        overview = {}
+    active_plans_cnt = int(overview.get("active_plans_count") or 0)  # type: ignore[arg-type]
+    mapped_cnt = int(overview.get("mapped_projects_count") or 0)  # type: ignore[arg-type]
+    conflicts_cnt = int(overview.get("conflicts_count") or 0)  # type: ignore[arg-type]
+    call_text = (
+        "nothing waiting on you"
+        if conflicts_cnt == 0
+        else f"{conflicts_cnt} unresolved conflict{'s' if conflicts_cnt != 1 else ''}"
+    )
+    print(f"  Active plans: {active_plans_cnt}")
+    print(f"  Mapped projects: {mapped_cnt}")
+    print(f"  Needs your call: {call_text}")
+    print(f"  Daily digest: {minni_home / 'TODAY.md'}")
     print(f"  database: {'ok' if engine.get('db_ok') else 'NOT OK'} — "
           f"{stats.get('documents', 0)} documents, "
           f"{stats.get('learnings', 0)} learnings, "
@@ -985,7 +1012,8 @@ def cmd_map(args: argparse.Namespace) -> int:
     refresh = bool(getattr(args, "refresh", False))
     agent_id = _explicit_cli_agent(args)
 
-    if _daemon_alive(sock):
+    daemon_used = _daemon_alive(sock)
+    if daemon_used:
         params: dict[str, object] = {
             "repo_path": target_path,
             "refresh": refresh,
@@ -1011,6 +1039,14 @@ def cmd_map(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"minni map: {exc}", file=sys.stderr)
             return 1
+
+    minni_home = _minni_home_dir()
+    db_override = (os.environ.get("MINNI_DB_PATH") or "").strip()
+    db_path = Path(db_override).expanduser() if db_override else (minni_home / "minni.db")
+    if db_path.is_file() or (minni_home / "vault" / "maps").is_dir():
+        today_digest.refresh_today_digest_safe(
+            minni_home, daemon_running=daemon_used, db_path=db_path, bypass_cache=True
+        )
 
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2))
@@ -1195,9 +1231,11 @@ def _discover_active_threads(
         note_path_raw = data.get("notePath") or data.get("note_path")
         if isinstance(note_path_raw, str) and note_path_raw.strip():
             np = Path(note_path_raw)
-            if not np.is_absolute() and vault_dir is not None:
-                np = vault_dir / np
-            note_meta = _parse_plan_note_metadata(np)
+            containment_root = vault_dir if vault_dir is not None else minni_home
+            if not np.is_absolute():
+                np = containment_root / np
+            if today_digest._is_safe_contained_file(np, home=containment_root):
+                note_meta = _parse_plan_note_metadata(np)
         status = str(
             note_meta.get("status") or data.get("status") or "active"
         ).strip().lower()
@@ -1359,29 +1397,39 @@ def _read_sqlite_activity(
                 str(r["name"])
                 for r in conn.execute("PRAGMA table_info(learnings)").fetchall()
             }
-            ws_col = "COALESCE(workspace_id, 'default')" if "workspace_id" in l_cols else "'default'"
-            status_clause = (
-                "AND COALESCE(status, 'active') = 'active'"
-                if "status" in l_cols
-                else ""
+            doc_cols = (
+                {
+                    str(r["name"])
+                    for r in conn.execute("PRAGMA table_info(documents)").fetchall()
+                }
+                if "documents" in tables
+                else set()
+            )
+            ws_col = "COALESCE(l.workspace_id, 'default')" if "workspace_id" in l_cols else "'default'"
+            priv_col = "l.privacy_level" if "privacy_level" in l_cols else "NULL"
+            l_filter = today_digest._learning_active_and_unblocked_sql(
+                "l", tables, doc_cols, l_cols
             )
             l_rows = conn.execute(
-                f"""SELECT learning_id, agent_id, category, content, confidence,
-                           created_at, {ws_col} AS ws
-                    FROM learnings
-                    WHERE created_at >= ? {status_clause}
-                    ORDER BY created_at DESC
+                f"""SELECT l.learning_id, l.agent_id, l.category, l.content, l.confidence,
+                           l.created_at, {ws_col} AS ws, {priv_col} AS priv
+                    FROM learnings l
+                    WHERE l.created_at >= ? {l_filter}
+                    ORDER BY l.created_at DESC
                     LIMIT 100""",
                 (cutoff_epoch,),
             ).fetchall()
             recent_learnings: list[dict[str, object]] = []
             recent_scars: list[dict[str, object]] = []
             for r in l_rows:
+                raw_content = str(r["content"] or "")
+                if today_digest._is_wrapper_or_blocked(raw_content, r["priv"]):
+                    continue
                 norm_ws = _normalize_cli_workspace(str(r["ws"] or "default")) or "default"
                 if workspace_filter and norm_ws != workspace_filter:
                     continue
                 cat = _cli_term_safe(str(r["category"] or "general"))
-                text = _strip_evidence_tags(str(r["content"] or ""))
+                text = _strip_evidence_tags(raw_content)
                 item = {
                     "learning_id": r["learning_id"],
                     "agent_id": _cli_term_safe(str(r["agent_id"] or "main")),
@@ -1543,6 +1591,15 @@ def cmd_activity(args: argparse.Namespace) -> int:
         "recent_scars_count": len(recent_scars),
     }
 
+    digest_path: Path | None = None
+    if not getattr(args, "no_refresh", False):
+        digest_path = today_digest.refresh_today_digest_safe(
+            minni_home,
+            daemon_running=bool(daemon_block.get("reachable")),
+            db_path=db_path,
+            bypass_cache=True,
+        )
+
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2))
         return 0
@@ -1616,6 +1673,8 @@ def cmd_activity(args: argparse.Namespace) -> int:
                     else f"scar ({s_item.get('category', 'scar')})"
                 )
                 print(f"    ! {label}: {s_text}")
+    if digest_path is not None:
+        print(f"\nDigest updated: {digest_path}")
     return 0
 
 
@@ -1674,6 +1733,8 @@ def main(argv: list[str] | None = None) -> int:
                             help="lookback window in hours (default: %(default)s)")
     activity_p.add_argument("--workspace", "-w",
                             help="filter output to a specific workspace")
+    activity_p.add_argument("--no-refresh", action="store_true",
+                            help="do not refresh TODAY.md")
     activity_p.add_argument("--json", action="store_true",
                             help="emit structured JSON")
 

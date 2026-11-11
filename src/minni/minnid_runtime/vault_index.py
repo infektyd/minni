@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from minni.today_digest import refresh_today_digest_safe
+
 
 logger = logging.getLogger("minnid")
 
@@ -468,6 +470,12 @@ def handle_repo_map(params: dict, request_id: Any, context: VaultIndexContext) -
             refresh=refresh,
             db=getattr(engine, "db", None),
             engine=engine,
+        )
+        engine_db = getattr(engine, "db", None)
+        refresh_today_digest_safe(
+            daemon_running=True,
+            db_path=getattr(getattr(engine_db, "config", None), "db_path", None)
+            or getattr(getattr(engine, "config", None), "db_path", None),
         )
         context.record_latency("repo_map", time.perf_counter() - started_at)
         return context.make_response(result, request_id)

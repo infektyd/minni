@@ -30,6 +30,7 @@ from minni.config import (
     normalize_workspace_scope,
 )
 from minni.db import MinniDB
+from minni.today_digest import refresh_today_digest_safe
 
 logger = logging.getLogger("sovereign.repo_map")
 
@@ -851,7 +852,11 @@ def _prune_stale_workspace_cards(
     return pruned
 
 
-def _effective_minni_home(minni_home: Optional[str | Path] = None, engine: Optional[Any] = None) -> Path:
+def _effective_minni_home(
+    minni_home: Optional[str | Path] = None,
+    engine: Optional[Any] = None,
+    db: Optional[MinniDB] = None,
+) -> Path:
     if minni_home is not None and str(minni_home).strip():
         return Path(minni_home).expanduser().resolve()
     env_home = (os.environ.get("MINNI_HOME") or "").strip()
@@ -859,6 +864,10 @@ def _effective_minni_home(minni_home: Optional[str | Path] = None, engine: Optio
         return Path(env_home).expanduser().resolve()
     if engine is not None and getattr(engine, "config", None) is not None:
         db_path = getattr(engine.config, "db_path", "")
+        if db_path:
+            return Path(db_path).expanduser().resolve().parent
+    if db is not None and getattr(db, "config", None) is not None:
+        db_path = getattr(db.config, "db_path", "")
         if db_path:
             return Path(db_path).expanduser().resolve().parent
     return Path(CANONICAL_SOVEREIGN_HOME).expanduser().resolve()
@@ -884,7 +893,7 @@ def build_and_index_repo_map(
         ws_id = normalize_workspace_scope(repo_root.name, default="workspace-repo")
     ws_slug = workspace_slug_from_id(ws_id)
 
-    home_dir = _effective_minni_home(minni_home, engine=engine)
+    home_dir = _effective_minni_home(minni_home, engine=engine, db=db)
     vault_dir = home_dir / "vault"
     maps_root = vault_dir / "maps"
     if vault_dir.is_symlink() or maps_root.is_symlink():
@@ -924,6 +933,20 @@ def build_and_index_repo_map(
                     ).fetchone()
                 expected_cards = len(cached_subs) + 1  # subsystems + overview
                 if cnt_row and int(cnt_row["cnt"]) == expected_cards:
+                    digest_home = (
+                        Path(minni_home).expanduser()
+                        if minni_home is not None and str(minni_home).strip()
+                        else home_dir
+                    )
+                    refresh_today_digest_safe(
+                        digest_home,
+                        db_path=getattr(getattr(db, "config", None), "db_path", None),
+                    )
+                    if own_db and db is not None:
+                        try:
+                            db.close()
+                        except Exception:
+                            pass
                     return {
                         "status": "up_to_date",
                         "workspace_id": ws_id,
@@ -1166,6 +1189,16 @@ def build_and_index_repo_map(
         workspace_id=ws_id,
         active_slugs=active_slugs,
         active_resolved_paths=active_resolved_paths,
+    )
+
+    digest_home = (
+        Path(minni_home).expanduser()
+        if minni_home is not None and str(minni_home).strip()
+        else home_dir
+    )
+    refresh_today_digest_safe(
+        digest_home,
+        db_path=getattr(getattr(db, "config", None), "db_path", None),
     )
 
     if own_db and db is not None:

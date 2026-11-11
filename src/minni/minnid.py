@@ -85,6 +85,7 @@ if str(_ENGINE_DIR) not in sys.path:
 import minni.obs as obs                                                  # noqa: E402  # centralized logging + metrics counters
 from minni.config import DEFAULT_CONFIG          # noqa: E402
 from minni.db import MinniDB                                  # noqa: E402
+from minni.today_digest import refresh_today_digest_safe  # noqa: E402
 from minni.principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
     agent_scope_for,
@@ -1257,6 +1258,11 @@ def _vault_watch_sweep_once() -> dict:
                 break
     except Exception:
         logger.exception("Vault watch: shared vault sweep failed")
+    refresh_today_digest_safe(
+        daemon_running=True,
+        db_path=getattr(DEFAULT_CONFIG, "db_path", None),
+        min_interval_sec=60.0,
+    )
     return stats
 
 

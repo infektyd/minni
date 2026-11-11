@@ -12,6 +12,7 @@ from minni.afm_review_markers import supersede_afm_review
 from minni.config import normalize_workspace_scope
 from minni.db import MinniDB
 from minni.durability import durability_of
+from minni.today_digest import refresh_today_digest_safe
 from minni.durable_projection import (
     evict_learning_to_cold_archive,
     find_near_duplicate_active_learning,
@@ -671,6 +672,12 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                 context, agent_id, content, key=f"learning:{lid}", db=wb.db, workspace_id=ws
             )
 
+        refresh_today_digest_safe(
+            daemon_running=True,
+            db_path=getattr(wb.config, "db_path", None)
+            or getattr(getattr(wb.db, "config", None), "db_path", None),
+        )
+
         result = {
             "status": "ok",
             "learning_id": lid,
@@ -935,6 +942,12 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
             wb._write_to_disk(
                 new_lid, agent_id, category, new_content, now, workspace_id=resolved_ws
             )
+
+        refresh_today_digest_safe(
+            daemon_running=True,
+            db_path=getattr(wb.config, "db_path", None)
+            or getattr(getattr(wb.db, "config", None), "db_path", None),
+        )
 
         return context.make_response({
             "status": "ok",
@@ -2094,6 +2107,10 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 "(operator-enabled; resolved_by=%s) (G15 audit)",
                 cid, lid, principal.agent_id, resolved_by,
             )
+            refresh_today_digest_safe(
+                daemon_running=True,
+                db_path=getattr(getattr(db, "config", None), "db_path", None),
+            )
         else:
             if getattr(principal, "auto_accept_own", False):
                 # Observable, not silent: the operator enabled the knob and this
@@ -2885,6 +2902,10 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         context.logger.warning(
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
             principal.agent_id, cid, decision, new_status, reason[:80],
+        )
+        refresh_today_digest_safe(
+            daemon_running=True,
+            db_path=getattr(getattr(db, "config", None), "db_path", None),
         )
 
         result = {

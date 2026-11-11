@@ -581,7 +581,7 @@ def run_behavioral_probe(
     probe_hooks: bool = True,
     timeout: float = 20.0,
 ) -> tuple[bool, str]:
-    """Run pre-flip MCP stdio `initialize` + `tools/list` (>=40 tools) and `SessionStart` hook probe."""
+    """Run pre-flip MCP stdio `initialize` + `tools/list` (>=12 tools) and `SessionStart` hook probe."""
     server_js = version_dir / "dist" / "server.js"
     hook_js = version_dir / "dist" / "hook.js"
     if not server_js.is_file():
