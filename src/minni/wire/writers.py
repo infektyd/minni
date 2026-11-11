@@ -24,19 +24,20 @@ GEMINI_SURFACE_CONFIGS = (
 # Intentional migration literal: strip pre-rename MCP permission grants during sync.
 GEMINI_LEGACY_GRANT_MARKERS = ("mcp(sovereign-memory", "mcp(sovereign_memory", "sovereign_")
 MINNI_READONLY_TOOLS = (
-    "minni_recall", "minni_drill", "minni_status", "minni_audit_tail",
-    "minni_audit_report", "minni_route", "minni_list_pending_handoffs",
-    "minni_ping_agent_inbox", "minni_ping_agent_status",
+    "minni_recall", "minni_drill", "minni_status",
+    "minni_list_candidates", "minni_handoff_inbox", "minni_thread_status",
 )
 MINNI_READONLY_GRANTS = tuple(f"mcp(minni/{tool})" for tool in MINNI_READONLY_TOOLS)
 MINNI_WILDCARD_GRANT = "mcp(minni/*)"
-# Worker allowlist is post-claim only. One tool: minni_thread_worker_update
-# (actions already include start/progress/block/scar/propose_structure/complete).
-# Do not merge these into MINNI_READONLY_GRANTS. Claim stays orchestrator-side.
+# Worker allowlist from the 12-tool v1 surface. Do not merge these into
+# MINNI_READONLY_GRANTS; thread creation stays orchestrator-side.
 MINNI_WORKER_TOOLS = (
-    "minni_thread_worker_update",
+    "minni_thread_update",
+    "minni_thread_scar",
+    "minni_learn",
 )
 MINNI_WORKER_GRANTS = tuple(f"mcp(minni/{tool})" for tool in MINNI_WORKER_TOOLS)
+MINNI_KNOWN_AUTO_GRANTS = frozenset((*MINNI_READONLY_GRANTS, *MINNI_WORKER_GRANTS))
 AGY_PLUGIN_NAME = "minni"
 AGY_PLUGINS_DIR = "~/.gemini/config/plugins"
 AGY_DIST_TOKEN = "__MINNI_GEMINI_DIST__"
@@ -470,6 +471,7 @@ def ensure_permission_grant(
         g for g in allow
         if str(g) != MINNI_WILDCARD_GRANT
         and not any(marker in str(g) for marker in legacy_markers)
+        and (not str(g).startswith("mcp(minni/") or str(g) in MINNI_KNOWN_AUTO_GRANTS or str(g) in grants)
     ]
     for grant in grants:
         if grant not in filtered:

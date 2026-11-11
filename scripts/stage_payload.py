@@ -35,7 +35,6 @@ PAYLOAD_ITEMS = (
     "hooks",
     "skills",
     "README.md",
-    "frontend",
     "kilo",
     "package.json",
 )

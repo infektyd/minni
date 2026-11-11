@@ -123,44 +123,57 @@ def test_cross_agent_search_allowed_with_wildcard_cap(monkeypatch, tmp_path):
     assert "error" not in resp, resp
 
 
-def test_ax_snapshot_store_uses_stamped_principal_not_wire_agent(monkeypatch, tmp_path):
-    _patch_db(monkeypatch, tmp_path)
-    # ax_snapshot_store is a WRITE op (PR91-6): it requires the "learn" cap, so a
-    # principal that can store snapshots needs it alongside "read".
-    _stamp(monkeypatch, "codex", ["read", "learn"])
+def test_learn_uses_stamped_principal_not_wire_agent(monkeypatch, tmp_path):
+    db_obj = _patch_db(monkeypatch, tmp_path)
     captured = {}
 
-    class _FakeAx:
-        def add_snapshot(self, **kwargs):
-            captured.update(kwargs)
-            return "snap-1"
+    def _fake_detect_contradictions(**kwargs):
+        captured.update(kwargs)
+        return []
 
-    import minni.ax_memory as ax_memory
-
-    monkeypatch.setattr(ax_memory, "AXMemory", lambda db: _FakeAx())
+    monkeypatch.setattr(
+        minnid,
+        "_lazy_writeback",
+        lambda: types.SimpleNamespace(
+            db=db_obj, detect_contradictions=_fake_detect_contradictions
+        ),
+    )
+    # learn is a WRITE op requiring the "learn" cap; stamped principal overrides wire agent_id.
+    _stamp(monkeypatch, "codex", ["read", "learn"])
     resp = _rpc(
-        "ax_snapshot_store",
+        "learn",
         {
             "agent_id": "victim",
-            "app_name": "Finder",
-            "tree_json": "{}",
+            "content": "stamped principal overrides wire agent_id on learn",
         },
     )
     assert "error" not in resp, resp
+    result = resp.get("result", {})
+    assert result.get("principal") == "codex"
     assert captured.get("agent_id") == "codex"
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT principal FROM candidate_packets WHERE candidate_id = ?",
+            (result["candidate_id"],),
+        ).fetchone()
+    assert row is not None
+    assert row["principal"] == "codex"
 
 
-def test_read_only_principal_denied_ax_snapshot_store(monkeypatch, tmp_path):
-    """PR91-6: a read-only principal must NOT be able to write an AX snapshot."""
-    _patch_db(monkeypatch, tmp_path)
+def test_read_only_principal_denied_learn(monkeypatch, tmp_path):
+    """PR91-6: a read-only principal must NOT be able to write via learn."""
+    db_obj = _patch_db(monkeypatch, tmp_path)
     _stamp(monkeypatch, "codex", ["read"])
     resp = _rpc(
-        "ax_snapshot_store",
-        {"agent_id": "codex", "app_name": "Finder", "tree_json": "{}"},
+        "learn",
+        {"agent_id": "codex", "content": "read-only principal write attempt"},
     )
     err = resp.get("error", {})
     assert err.get("code") == -32004, resp
     assert "learn" in err.get("message", "")
+    with db_obj.cursor() as c:
+        count = c.execute("SELECT COUNT(*) FROM candidate_packets").fetchone()[0]
+    assert count == 0
 
 
 def test_read_only_principal_denied_resolve_contradiction(monkeypatch, tmp_path):

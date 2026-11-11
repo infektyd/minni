@@ -70,7 +70,6 @@ REPO_DEPLOYMENTS = ["src/minni/plugin_payload/dist"]
 # Subtrees copied verbatim into every deployment. These are what the runtimes
 # actually execute and read; none of them is ever symlinked.
 COMPARED_SUBTREES = (
-    "frontend",
     "hooks",
     "commands",
     "skills",
@@ -84,7 +83,7 @@ COMPARED_SUBTREES = (
 # Not compared, with the reason, so the gap is stated rather than silent:
 #   .mcp.json    materialized per host (absolute paths, per-agent MINNI_AGENT_ID
 #                and vault), so it is a template output, not a copy.
-#   node_modules/frontend/src/tests/scripts  build inputs, not runtime surface.
+#   node_modules/src/tests/scripts  build inputs, not runtime surface.
 NOT_COMPARED = {
     ".mcp.json": "host-materialized (absolute paths + per-agent env), not a copy"
                  " — but its agent stamp and recorded paths ARE validated",

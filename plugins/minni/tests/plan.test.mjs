@@ -669,15 +669,11 @@ test("resolvePlanIdOrActive returns a clear error when nothing is active", async
   }
 });
 
-test("minni_thread_status/_update/_history accept an OPTIONAL plan_id (C5 schema pin)", async () => {
-  // The acceptance spec requires the id-less form VERBATIM on these three
+test("minni_thread_status/_update/_scar accept an OPTIONAL plan_id (C5 schema pin)", async () => {
+  // The acceptance spec requires the id-less form VERBATIM on the v1 thread
   // tools; pin the schemas so a refactor cannot quietly re-require plan_id.
   const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
-  // minni_thread_replan and minni_thread_scar are beyond the verbatim spec but
-  // pinned too (review panel): a hookless agent must be able to replan or
-  // record a dead-end against "the active plan" without round-tripping the id
-  // through minni_thread_status.
-  for (const tool of ["minni_thread_status", "minni_thread_update", "minni_thread_history", "minni_thread_replan", "minni_thread_scar"]) {
+  for (const tool of ["minni_thread_status", "minni_thread_update", "minni_thread_scar"]) {
     const start = source.indexOf(`"${tool}"`);
     assert.ok(start >= 0, `${tool} must be registered`);
     const block = source.slice(start, source.indexOf("server.registerTool", start + 1));
@@ -805,8 +801,6 @@ test("every id-less plan tool returns the no-active-plan error end-to-end throug
     const calls = [
       ["minni_thread_status", {}],
       ["minni_thread_update", { slice_id: "slice-1", status: "in_progress" }],
-      ["minni_thread_history", {}],
-      ["minni_thread_replan", { new_slices: [] }],
       ["minni_thread_scar", { kind: "dead_end", signal: "tried the obvious thing" }],
     ];
     let id = 2;
@@ -3562,7 +3556,8 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
     });
     assert.ok(created.result && !created.result.isError, JSON.stringify(created));
     const createdBody = JSON.parse(created.result.content[0].text);
-    const notePath = createdBody.notePath;
+    const notePath = await findPlanNote(root, createdBody.plan_id);
+    assert.ok(notePath, `expected notePath for ${createdBody.plan_id}`);
 
     // 1. No force: the tool must refuse, not silently accept.
     const blocked = await call("minni_thread_update", {
@@ -3624,7 +3619,7 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
     });
     assert.ok(forced.result && !forced.result.isError, JSON.stringify(forced));
     const forcedBody = JSON.parse(forced.result.content[0].text);
-    assert.equal(forcedBody.plan.slices.find((s) => s.id === "b").status, "done");
+    assert.equal(forcedBody.updated_slice.status, "done");
 
     const journalPath = path.join(path.dirname(notePath), `${createdBody.plan_id}.log.md`);
     const journalText = await readFile(journalPath, "utf8");
@@ -3685,7 +3680,9 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       force_reason: "force set defensively even though a is already done",
     });
     assert.ok(forcedButMet.result && !forcedButMet.result.isError, JSON.stringify(forcedButMet));
-    const journalPath1b = path.join(path.dirname(created1bBody.notePath), `${created1bBody.plan_id}.log.md`);
+    const notePath1b = await findPlanNote(root, created1bBody.plan_id);
+    assert.ok(notePath1b);
+    const journalPath1b = path.join(path.dirname(notePath1b), `${created1bBody.plan_id}.log.md`);
     const events1b = parseJournal(await readFile(journalPath1b, "utf8"));
     const bDoneEvent1b = events1b.find((e) => e.kind === "status_changed" && e.slice_id === "b" && e.to === "done");
     assert.ok(bDoneEvent1b, "expected b's done status_changed event");
@@ -3716,7 +3713,9 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
     });
     assert.ok(doneB.result && !doneB.result.isError, JSON.stringify(doneB));
 
-    const journalPath2 = path.join(path.dirname(created2Body.notePath), `${created2Body.plan_id}.log.md`);
+    const notePath2 = await findPlanNote(root, created2Body.plan_id);
+    assert.ok(notePath2);
+    const journalPath2 = path.join(path.dirname(notePath2), `${created2Body.plan_id}.log.md`);
     const journalText2 = await readFile(journalPath2, "utf8");
     const events2 = parseJournal(journalText2);
     assert.ok(
@@ -3724,13 +3723,7 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       "resolving the dependency first must not produce a depends_on_override record",
     );
 
-    // 5. round-1 cassandra finding 1 (HIGH): replan() can silently rewrite
-    // an existing slice's depends_on to [] — I independently reproduced
-    // this against the real compiled server before trusting the review.
-    // Without this fix, the exploit is: replan away the dependency, then
-    // mark done with no force, no reason, no journal trail at all. The fix
-    // does not re-gate the edit; it makes it visible via a depends_on_changed
-    // entry on the replan event, so it can never be silent.
+    // 5. Internal replan() erasing depends_on + MCP minni_thread_update verification
     const created3 = await call("minni_thread_create", {
       goal: "#291 replan depends_on erasure e2e",
       slices: [
@@ -3739,19 +3732,21 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       ],
     });
     const created3Body = JSON.parse(created3.result.content[0].text);
-    const replanned = await call("minni_thread_replan", {
-      plan_id: created3Body.plan_id,
-      new_slices: [
-        { id: "a", title: "Slice A" },
-        { id: "b", title: "Slice B", depends_on: [] }, // erases the dependency
-      ],
+    const notePath3 = await findPlanNote(root, created3Body.plan_id);
+    assert.ok(notePath3);
+    const before3 = await rehydratePlan(notePath3);
+    const next3 = replan(before3, [
+      { id: "a", title: "Slice A" },
+      { id: "b", title: "Slice B", depends_on: [] },
+    ]);
+    await persistPlan(next3, { vaultPath: root, notePath: notePath3 });
+    const journalPath3 = journalPathFor(notePath3, created3Body.plan_id);
+    await appendJournal(journalPath3, {
+      kind: "replan",
+      depends_on_changed: diffDependsOn(before3, next3),
+      at: new Date().toISOString(),
     });
-    assert.ok(replanned.result && !replanned.result.isError, JSON.stringify(replanned));
-    const replannedBody = JSON.parse(replanned.result.content[0].text);
-    assert.deepEqual(replannedBody.slices.find((s) => s.id === "b").depends_on, [], "sanity: the dependency really was erased");
-    // The erasure itself no longer requires force — that's an intentional
-    // scope boundary (see the comment on minni_thread_replan in server.ts)
-    // — but it must be journaled, unlike before this fix.
+    assert.deepEqual(next3.slices.find((s) => s.id === "b").depends_on, [], "sanity: the dependency really was erased");
     const doneBAfterReplan = await call("minni_thread_update", {
       plan_id: created3Body.plan_id,
       slice_id: "b",
@@ -3759,22 +3754,12 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       evidence: "B is finished, verified via logs/b.log",
     });
     assert.ok(doneBAfterReplan.result && !doneBAfterReplan.result.isError, JSON.stringify(doneBAfterReplan));
-    const journalPath3 = path.join(path.dirname(created3Body.notePath), `${created3Body.plan_id}.log.md`);
     const events3 = parseJournal(await readFile(journalPath3, "utf8"));
     const replanEvent = events3.find((e) => e.kind === "replan");
     assert.ok(replanEvent, "expected a replan journal event");
-    assert.ok(replanEvent.depends_on_changed, `expected depends_on_changed on the replan event, got: ${JSON.stringify(replanEvent)}`);
     assert.deepEqual(replanEvent.depends_on_changed, [{ slice_id: "b", from: ["a"], to: [] }]);
 
-    // 6. round-2 cassandra finding HIGH-1 (confirmed by independent
-    // reproduction against dist/plan.js before trusting the review): the
-    // depends_on ARRAY isn't the only way to satisfy a dependency for
-    // free. Omitting the dependency slice from new_slices (the ordinary,
-    // more common way to replan than editing depends_on directly)
-    // supersedes it, which unmetDependencies already treats as resolved —
-    // and before this round's fix, that produced ZERO journal trail at
-    // all (b's depends_on array is untouched, so diffDependsOn alone sees
-    // nothing). Must now show up as depends_on_superseded.
+    // 6. Internal replan() superseding a live dependency + MCP minni_thread_update verification
     const created4 = await call("minni_thread_create", {
       goal: "#291 replan supersedes a live dependency e2e",
       slices: [
@@ -3783,13 +3768,18 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       ],
     });
     const created4Body = JSON.parse(created4.result.content[0].text);
-    const replannedAway = await call("minni_thread_replan", {
-      plan_id: created4Body.plan_id,
-      new_slices: [{ id: "b", title: "Slice B", depends_on: ["a"] }], // a omitted -> superseded
+    const notePath4 = await findPlanNote(root, created4Body.plan_id);
+    assert.ok(notePath4);
+    const before4 = await rehydratePlan(notePath4);
+    const next4 = replan(before4, [{ id: "b", title: "Slice B", depends_on: ["a"] }]);
+    await persistPlan(next4, { vaultPath: root, notePath: notePath4 });
+    const journalPath4 = journalPathFor(notePath4, created4Body.plan_id);
+    await appendJournal(journalPath4, {
+      kind: "replan",
+      depends_on_superseded: diffSupersededDependencies(before4, next4),
+      at: new Date().toISOString(),
     });
-    assert.ok(replannedAway.result && !replannedAway.result.isError, JSON.stringify(replannedAway));
-    const replannedAwayBody = JSON.parse(replannedAway.result.content[0].text);
-    assert.equal(replannedAwayBody.slices.find((s) => s.id === "a").status, "superseded", "sanity: a really was superseded");
+    assert.equal(next4.slices.find((s) => s.id === "a").status, "superseded", "sanity: a really was superseded");
     const doneBAfterSupersede = await call("minni_thread_update", {
       plan_id: created4Body.plan_id,
       slice_id: "b",
@@ -3797,20 +3787,12 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       evidence: "B is finished, verified via logs/b.log",
     });
     assert.ok(doneBAfterSupersede.result && !doneBAfterSupersede.result.isError, JSON.stringify(doneBAfterSupersede));
-    const journalPath4 = path.join(path.dirname(created4Body.notePath), `${created4Body.plan_id}.log.md`);
     const events4 = parseJournal(await readFile(journalPath4, "utf8"));
     const replanEvent4 = events4.find((e) => e.kind === "replan");
     assert.ok(replanEvent4, "expected a replan journal event");
-    assert.ok(replanEvent4.depends_on_superseded, `expected depends_on_superseded on the replan event, got: ${JSON.stringify(replanEvent4)}`);
     assert.deepEqual(replanEvent4.depends_on_superseded, [{ slice_id: "a", depended_on_by: ["b"] }]);
 
-    // 7. round-2 cassandra finding HIGH-2 (confirmed by independent
-    // reproduction, and matching a real shape already present in two live
-    // vaults): dropping a slice and re-adding an explicit slice with the
-    // SAME id in the same replan call used to create a duplicate id, and
-    // enforcement resolved against whichever instance was found first —
-    // silently satisfying a dependency against the SUPERSEDED instance
-    // while the live one became unreachable. Must now be refused outright.
+    // 7. Duplicate slice id rejection in applySliceDelta leaves persisted plan unchanged
     const created5 = await call("minni_thread_create", {
       goal: "#291 duplicate slice id rejection e2e",
       slices: [
@@ -3819,20 +3801,18 @@ test("depends_on hard block end-to-end: minni_thread_update refuses without forc
       ],
     });
     const created5Body = JSON.parse(created5.result.content[0].text);
-    const dupIdAttempt = await call("minni_thread_replan", {
-      plan_id: created5Body.plan_id,
-      drop_slice_ids: ["a"],
-      add_slices: [{ id: "a", title: "A retry" }],
-    });
-    assert.ok(dupIdAttempt.result && !dupIdAttempt.result.isError, `expected typed JSON error, got: ${JSON.stringify(dupIdAttempt)}`);
-    const dupIdBody = JSON.parse(dupIdAttempt.result.content[0].text);
-    assert.equal(dupIdBody.status, "error");
-    assert.equal(dupIdBody.operation, "plan.replan");
-    assert.match(dupIdBody.error, /cannot add slice with id "a"/);
-    // And the plan itself must be unchanged on disk — the rejected replan
-    // (thrown before persistPlan is ever called) must not have partially
-    // applied (a is still live, pending, exactly one slice with that id).
-    const planAfterRejected = await rehydratePlan(created5Body.notePath);
+    const notePath5 = await findPlanNote(root, created5Body.plan_id);
+    assert.ok(notePath5);
+    const before5 = await rehydratePlan(notePath5);
+    assert.throws(
+      () =>
+        applySliceDelta(before5, {
+          drop_slice_ids: ["a"],
+          add_slices: [{ id: "a", title: "A retry" }],
+        }),
+      /cannot add slice with id "a"/,
+    );
+    const planAfterRejected = await rehydratePlan(notePath5);
     assert.equal(planAfterRejected.slices.filter((s) => s.id === "a").length, 1, "no duplicate id must have been written");
     assert.equal(planAfterRejected.slices.find((s) => s.id === "a").status, "pending", "the rejected replan must not have partially applied");
   } finally {

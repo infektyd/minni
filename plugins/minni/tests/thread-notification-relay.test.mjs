@@ -200,8 +200,11 @@ test("hooks read pending attention and do not poll minni_thread_events", async (
   assert.match(dispatchSrc, /GROK_WORKER_START:\s*null\s*=\s*null/);
   assert.match(dispatchSrc, /outcome:\s*"CANNOT"/);
   const readonlyBlock = writers.match(/MINNI_READONLY_TOOLS = \(([\s\S]*?)\)/)[1];
-  assert.doesNotMatch(readonlyBlock, /minni_thread_worker_update/);
-  assert.match(writers, /MINNI_WORKER_TOOLS = \(\s*"minni_thread_worker_update",?\s*\)/);
+  assert.doesNotMatch(readonlyBlock, /minni_thread_update/);
+  assert.match(
+    writers,
+    /MINNI_WORKER_TOOLS = \(\s*"minni_thread_update",\s*"minni_thread_scar",\s*"minni_learn",?\s*\)/,
+  );
   assert.match(writers, /MINNI_WILDCARD_GRANT = "mcp\(minni\/\*\)"/);
 });
 

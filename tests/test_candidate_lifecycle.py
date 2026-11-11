@@ -537,16 +537,3 @@ def test_new_tool_schema_has_no_spoof_surfaces():
     # Positive: the real decisions are still present
     for kept in ("accept", "reject", "redact"):
         assert f'"{kept}"' in text
-
-
-def test_ui_server_candidates_routes_exist():
-    """UI smoke: the two new G17 Candidates endpoints are registered in ui-server (no import/syntax error + string presence)."""
-    import re
-    src = Path(__file__).parent.parent / "plugins/minni/src/ui-server.ts"
-    if not src.exists():
-        pytest.skip("ui-server.ts not present")
-    text = src.read_text()
-    assert "/api/candidates" in text
-    assert "/api/resolve-candidate" in text
-    # The routes return JSON even on RPC error (200 + {error:...}) — acceptable for local console
-    assert "jsonRpcSocketRequestWithFallback" in text or "resolve_candidate" in text

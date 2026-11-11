@@ -115,14 +115,22 @@ test("Pillar 1 & Invariant 2: executeLearnPipeline gates non-durable session cha
       "jev-harvest.ts must not call vault_index_doc on session notes",
     );
 
-    // 3. Verify server.ts skips vault_index_doc for sessions/raw in minni_vault_write and minni_learn
+    // 3. Verify server.ts never calls vault_index_doc on minni_learn, while curated writeAndIndexVaultPage in vault.ts guards NON_INDEXED_VAULT_SECTIONS
     const serverSrc = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
-    const matches = serverSrc.match(/"vault_index_doc"/g) ?? [];
+    const serverMatches = serverSrc.match(/"vault_index_doc"/g) ?? [];
     assert.equal(
-      matches.length,
-      1,
-      "server.ts must only call vault_index_doc in minni_vault_write (for curated sections), not in minni_learn",
+      serverMatches.length,
+      0,
+      "server.ts must not call vault_index_doc directly on minni_learn (daemon indexes curated candidates; writeAndIndexVaultPage lives in vault.ts)",
     );
+    const vaultSrc = await readFile(new URL("../src/vault.ts", import.meta.url), "utf8");
+    const vaultMatches = vaultSrc.match(/"vault_index_doc"/g) ?? [];
+    assert.equal(
+      vaultMatches.length,
+      1,
+      "vault.ts writeAndIndexVaultPage must own the single curated vault_index_doc call site",
+    );
+    assert.match(vaultSrc, /NON_INDEXED_VAULT_SECTIONS\.has\(/);
   } finally {
     if (prevHome === undefined) {
       delete process.env.MINNI_HOME;

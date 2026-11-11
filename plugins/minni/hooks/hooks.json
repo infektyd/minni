@@ -85,7 +85,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(?:Bash|run_terminal_command)$",
+        "matcher": "^(?:Bash|run_terminal_command|Edit|Write|MultiEdit|NotebookEdit|edit_file|write_file|apply_patch)$",
         "hooks": [
           {
             "type": "command",

@@ -17,14 +17,14 @@ curate) **is your agent-controlled durable Layer 1 workspace**.
 - The whole-document envelope (`identity:{{agent}}`) points every wake here first.
 - You edit these files directly — terminal, editor, or `minni_vault_write` under
   this directory. No proposal pipeline, no review gate.
-- Distinct from `wiki/` (long-form governed pages), `distill/` (ritual meter),
-  `inbox/` (proposals), `logs/` (transcripts).
+- Distinct from `wiki/` (long-form governed pages), `inbox/` (proposals),
+  `logs/` (transcripts).
 
 **On wake / after envelope load**: read `layer1/core.md`, then `layer1/budget.md`,
 before any other recall.
 
-**During the distill ritual**: review and prune `layer1/` under the budget in
-`budget.md`. Protecting this workspace is part of the ritual, not an extra.
+**During wind-down / compaction**: review and prune `layer1/` under the budget in
+`budget.md`. Protecting this workspace is part of session hygiene, not an extra.
 
 ## Role
 

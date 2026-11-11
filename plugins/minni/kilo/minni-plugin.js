@@ -716,9 +716,7 @@ const MinniPlugin = async ({ directory, client }) => ({
       tool_input: output.args,
       workspace_id: directory,
     });
-    if (result?.hookSpecificOutput?.permissionDecision === "deny") {
-      throw new Error(result.hookSpecificOutput.permissionDecisionReason || "Minni recall guard denied tool call");
-    }
+    queueContext(input.sessionID, result);
   },
   "experimental.session.compacting": async (input, output) => {
     const result = await runHookFailOpen("PreCompact", { session_id: input.sessionID, workspace_id: directory });

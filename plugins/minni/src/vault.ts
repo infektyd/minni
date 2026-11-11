@@ -2490,6 +2490,62 @@ export async function writeVaultPage(
   return { notePath, relativePath, wikilink: wikilinkFor(relativePath) };
 }
 
+const NON_INDEXED_VAULT_SECTIONS: ReadonlySet<string> = new Set([
+  "raw",
+  "sessions",
+  "artifacts",
+  "handoffs",
+  "tasks",
+]);
+
+export async function writeAndIndexVaultPage(
+  input: WriteVaultPageInput & { agentId?: string },
+  deps: WriteVaultPageDeps = {},
+): Promise<{
+  status: "written";
+  note: VaultWriteResult;
+  indexed: "ok" | "degraded" | "skipped";
+  index_detail?: unknown;
+}> {
+  const isNonIndexed = NON_INDEXED_VAULT_SECTIONS.has(input.section);
+  const note = await writeVaultPage(
+    {
+      ...input,
+      status: input.status ?? (isNonIndexed ? "candidate" : "accepted"),
+    },
+    deps,
+  );
+  if (isNonIndexed) {
+    return { status: "written", note, indexed: "skipped" };
+  }
+  try {
+    const { jsonRpcSocketRequestWithFallback } = await import("./daemon_transport.js");
+    const effectiveAgent = input.agentId ?? DEFAULT_AGENT_ID;
+    const fullContent = `---\ntitle: ${input.title}\nsection: ${input.section}\nstatus: accepted\nprivacy: safe\n---\n# ${input.title}\n\n${input.content}`;
+    const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
+      content: fullContent,
+      path: note.relativePath,
+      // agent_id is the field the daemon's provenance_claim() reads; without
+      // it the request resolves to the default principal and the ownership
+      // check degrades indexing (P0-D, 2026-07-19 recall blackout).
+      agent_id: effectiveAgent,
+      agent: effectiveAgent,
+      sigil: "📄",
+      privacy_level: "safe",
+      page_status: "accepted",
+      layer: "knowledge",
+    });
+    return {
+      status: "written",
+      note,
+      indexed: indexResult.ok ? "ok" : "degraded",
+      index_detail: indexResult.ok ? indexResult.data : indexResult.error,
+    };
+  } catch {
+    return { status: "written", note, indexed: "degraded" };
+  }
+}
+
 // Pillar 3 invariant: vaultFirstLearn writes a candidate note under wiki/sessions/
 // and records the local audit entry only; it must NEVER call vault_index_doc or
 // index wiki/sessions/ notes into daemon documents/chunk_embeddings.

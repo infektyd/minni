@@ -1,16 +1,15 @@
-// S3a (§5.2.1, §5.3): UserPromptSubmit skip-class envelope handling.
-// A `<task-notification>` prompt on UserPromptSubmit:
-// - issues zero daemon recall / vault search queries
-// - emits no `recall_pointer`
-// - neither writes nor clears `recall-state`
-// - still emits the active plan pointer (`active_thread_ref`) and `lifecycle` line
-// - records `envelope_kind: "skip"` and `subkind: "task_notification"` in audit details
+// Wave 1 (§2.2): Early return & paired envelope skip rules for <task-notification> / system wakeups.
+// When isSkip === true (<task-notification>, <SYSTEM_MESSAGE>, The following is a <SYSTEM_MESSAGE>,
+// [Message] timestamp=, <background-task), handleUserPromptSubmit returns { continue: true }
+// IMMEDIATELY before resolveActivePlanView (withThreadLock), recordAudit (hook_user_prompt_submit),
+// or <minni:context> / <MINNI_ENVELOPE> injection, and leaves armed recall-state untouched.
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createPlan } from "../dist/plan.js";
 import { readRecallState, writeRecallState } from "../dist/recall-state.js";
+import { withThreadLock } from "../dist/thread-lock.js";
 import { auditTail } from "../dist/vault.js";
 import {
   additionalContext,
@@ -21,14 +20,7 @@ import {
   startFakeDaemon,
 } from "./use-telemetry-hook-fixture.mjs";
 
-function parseEnvelopeBody(output) {
-  const ctx = additionalContext(output);
-  const match = /<minni:context\b[^>]*>\s*([\s\S]*?)\s*<\/minni:context>/.exec(ctx);
-  assert.ok(match, `expected <minni:context> in additionalContext, got: ${ctx}`);
-  return JSON.parse(match[1]);
-}
-
-test("UPS skip envelope: no recall, no recall_pointer, no recall-state write/clear, plan pointer + lifecycle still ride", { timeout: 120_000 }, async (t) => {
+test("UPS skip wakeups return { continue: true } immediately with zero plan lock, zero audit spam, and zero envelope injection", { timeout: 120_000 }, async (t) => {
   const fixture = await makeFixture(t, "ups-envelope-skip");
   let searchCalls = 0;
   await startFakeDaemon(fixture, {
@@ -49,32 +41,50 @@ test("UPS skip envelope: no recall, no recall_pointer, no recall-state write/cle
     },
   });
 
-  // Create an active plan in the vault so active_thread_ref must ride on UPS.
-  const { plan } = await createPlan({
-    goal: "Ship S3a classifier actions without breaking plan pointer",
-    slices: [{ id: "s3a", title: "Wire UPS classifier actions" }],
-    vaultPath: fixture.vault,
-  });
+  // Create an active plan in the vault so non-skip prompts would touch the plan lock + emit active_thread_ref.
+  const { plan } = await createPlan(
+    {
+      goal: "Ship Wave 1 wakeup skip early return without touching plan lock",
+      slices: [{ id: "s1b", title: "Immediate return on system wakeups" }],
+      vaultPath: fixture.vault,
+    },
+    { vaultPath: fixture.vault },
+  );
 
   const sessionId = "skip-session-1";
-  const taskNotificationPrompt =
-    "<task-notification>\n<task-id>task-77</task-id>\n<status>completed</status>\n<summary>Deploy procedure check completed</summary>\n</task-notification>";
+  const wakeupPayloads = [
+    "<task-notification>\n<task-id>task-77</task-id>\n<status>completed</status>\n<summary>Deploy procedure check completed</summary>\n</task-notification>",
+    "Result ready:\n<task-notification>\n<task-id>task-79</task-id>\n<status>completed</status>\n</task-notification>",
+    "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-11T02:24:21Z sender=subagent-1 content=done\n</SYSTEM_MESSAGE>",
+    "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n<SYSTEM_MESSAGE>Task finished</SYSTEM_MESSAGE>",
+    "[Message] timestamp=2026-11-11T02:24:21Z sender=worker-2 priority=HIGH content=Completed check",
+    "<background-task id=\"bg-42\" status=\"completed\">All checks green</background-task>",
+  ];
 
-  // Case A: no pre-existing recall-state on disk -> no recall-state file created, zero search calls, no recall_pointer.
-  const resA = await runHook(fixture, "UserPromptSubmit", {
-    session_id: sessionId,
-    prompt_id: "pid-skip-a",
-    prompt: taskNotificationPrompt,
+  // Case A: Hold the active plan lock exclusively while firing all wakeup skip variants!
+  // If handleUserPromptSubmit attempted resolveActivePlanView (withThreadLock), it would stall/contend.
+  await withThreadLock(fixture.vault, plan.plan_id, "ups-skip-lock-test", async () => {
+    for (let i = 0; i < wakeupPayloads.length; i += 1) {
+      const res = await runHook(fixture, "UserPromptSubmit", {
+        session_id: sessionId,
+        prompt_id: `pid-skip-${i}`,
+        prompt: wakeupPayloads[i],
+      });
+      assert.equal(res.code, 0);
+      assert.deepEqual(res.output, { continue: true }, `wakeup variant ${i} must return bare { continue: true }`);
+      assert.equal(additionalContext(res.output), "", `wakeup variant ${i} must inject zero envelope`);
+    }
   });
-  assert.equal(resA.code, 0);
-  assert.equal(searchCalls, 0, "skip prompt must not call daemon search");
 
-  const bodyA = parseEnvelopeBody(resA.output);
-  assert.equal(bodyA.recall_pointer, undefined, "skip prompt must emit no recall_pointer");
-  assert.equal(bodyA.recall_state, undefined, "skip prompt must emit no recall_state");
-  assert.ok(bodyA.active_thread_ref, "active_thread_ref must still ride on skip prompt");
-  assert.equal(bodyA.active_thread_ref.plan_id, plan.plan_id);
-  assert.equal(typeof bodyA.lifecycle, "string", "lifecycle line must still ride on skip prompt");
+  assert.equal(searchCalls, 0, "skip wakeups must make zero daemon search calls");
+  const logAfterA = (await exists(`${fixture.vault}/log.md`))
+    ? await readFile(`${fixture.vault}/log.md`, "utf8")
+    : "";
+  assert.doesNotMatch(
+    logAfterA,
+    /hook_user_prompt_submit/,
+    "skip wakeups must emit zero hook_user_prompt_submit audit spam",
+  );
 
   const stateAfterA = await readRecallState(fixture.vault, { sessionId, guardV2: true });
   assert.equal(stateAfterA, null, "skip prompt must not create recall-state when none existed");
@@ -108,13 +118,12 @@ test("UPS skip envelope: no recall, no recall_pointer, no recall-state write/cle
     prompt: taskNotificationWithWriteWords,
   });
   assert.equal(resB.code, 0);
+  assert.deepEqual(resB.output, { continue: true });
   assert.equal(searchCalls, 0, "skip prompt must still make zero daemon search calls");
-
-  const bodyB = parseEnvelopeBody(resB.output);
-  assert.equal(bodyB.recall_pointer, undefined, "skip prompt must not emit recall_pointer even when prior state exists");
-  assert.ok(bodyB.active_thread_ref, "active_thread_ref still rides");
-  assert.equal(bodyB.active_thread_ref.plan_id, plan.plan_id);
-  assert.equal(typeof bodyB.lifecycle, "string", "lifecycle line still rides");
+  const logAfterB = (await exists(`${fixture.vault}/log.md`))
+    ? await readFile(`${fixture.vault}/log.md`, "utf8")
+    : "";
+  assert.doesNotMatch(logAfterB, /hook_user_prompt_submit/, "still zero hook_user_prompt_submit audit spam after Case B");
 
   const stateAfterB = await readRecallState(fixture.vault, { sessionId, guardV2: true });
   assert.ok(stateAfterB, "pre-existing armed recall-state must NOT be cleared by a skip prompt");
@@ -122,28 +131,7 @@ test("UPS skip envelope: no recall, no recall_pointer, no recall-state write/cle
   assert.equal(stateAfterB.task_signature, "t-armed-prior", "pre-existing recall-state signature must be untouched");
   assert.equal(stateAfterB.prompt_id, "pid-prior-human", "pre-existing recall-state prompt_id must be untouched");
 
-  // Audit check: envelope_kind: "skip", subkind: "task_notification"
-  const logRaw = await readFile(`${fixture.vault}/log.md`, "utf8");
-  assert.match(logRaw, /"envelope_kind":\s*"skip"/);
-  assert.match(logRaw, /"subkind":\s*"task_notification"/);
-
-  // Also verify with MINNI_USE_LEDGER=off: identical behavior.
-  const resOff = await runHook(
-    fixture,
-    "UserPromptSubmit",
-    {
-      session_id: sessionId,
-      prompt_id: "pid-skip-ledger-off",
-      prompt: taskNotificationPrompt,
-    },
-    { env: { MINNI_USE_LEDGER: "off" } },
-  );
-  assert.equal(resOff.code, 0);
-  assert.equal(searchCalls, 0, "skip prompt with MINNI_USE_LEDGER=off must also make zero daemon search calls");
-  const stateAfterOff = await readRecallState(fixture.vault, { sessionId, guardV2: true });
-  assert.ok(stateAfterOff && stateAfterOff.consumed === false, "armed state still untouched with ledger off");
-
-  // Kill switch control: MINNI_PROMPT_CLASSES=off restores recall on the prompt.
+  // Kill switch control: MINNI_PROMPT_CLASSES=off restores full recall, envelope, and audit on the prompt.
   const resKillSwitch = await runHook(
     fixture,
     "UserPromptSubmit",
@@ -156,6 +144,7 @@ test("UPS skip envelope: no recall, no recall_pointer, no recall-state write/cle
   );
   assert.equal(resKillSwitch.code, 0);
   assert.ok(searchCalls > 0, "with MINNI_PROMPT_CLASSES=off, daemon search runs as before");
+  assert.match(additionalContext(resKillSwitch.output), /<minni:context/);
 
   // Suspicious prefix audit check: human prompt starting like a harness tag stamps suspicious_prefix: true
   const resSuspicious = await runHook(fixture, "UserPromptSubmit", {

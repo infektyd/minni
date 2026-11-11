@@ -177,21 +177,23 @@ GEMINI_LEGACY_GRANT_MARKERS = (f"mcp({_LEGACY_MCP_KEY}", "mcp(sovereign_memory",
 # so those would run without per-call confirmation. These names are verified
 # against the server.registerTool(...) registrations in src/server.ts. Write and
 # export tools are intentionally omitted so they still require a session prompt.
-# minni_audit_report: aggregate-only by default (X10; no full `latest` body).
-# minni_audit_tail: FULL entry bodies by design — not an aggregate tool; keep
-# in RO grants for operators who need the trail, but do not confuse with X10.
 MINNI_READONLY_TOOLS = (
     "minni_recall",
     "minni_drill",
     "minni_status",
-    "minni_audit_tail",
-    "minni_audit_report",
-    "minni_route",
-    "minni_list_pending_handoffs",
-    "minni_ping_agent_inbox",
-    "minni_ping_agent_status",
+    "minni_list_candidates",
+    "minni_handoff_inbox",
+    "minni_thread_status",
 )
 MINNI_READONLY_GRANTS = tuple(f"mcp(minni/{tool})" for tool in MINNI_READONLY_TOOLS)
+MINNI_WORKER_TOOLS = (
+    "minni_thread_update",
+    "minni_thread_scar",
+    "minni_learn",
+)
+MINNI_KNOWN_AUTO_GRANTS = frozenset(
+    f"mcp(minni/{tool})" for tool in (*MINNI_READONLY_TOOLS, *MINNI_WORKER_TOOLS)
+)
 # The old blanket wildcard is now a LEGACY grant to be stripped on sight, so an
 # earlier install that wrote it gets narrowed to the per-tool set on the next run.
 MINNI_WILDCARD_GRANT = "mcp(minni/*)"
@@ -970,12 +972,13 @@ def ensure_permission_grant(
     allow = owner.get(leaf)
     if not isinstance(allow, list):
         allow = []
-    # Drop legacy pre-rebrand grants AND the over-broad minni wildcard.
+    # Drop legacy pre-rebrand grants, retired pre-v1 minni tool grants, AND the over-broad wildcard.
     filtered = [
         g
         for g in allow
         if str(g) != MINNI_WILDCARD_GRANT
         and not any(marker in str(g) for marker in legacy_markers)
+        and (not str(g).startswith("mcp(minni/") or str(g) in MINNI_KNOWN_AUTO_GRANTS or str(g) in grants)
     ]
     for grant in grants:
         if grant not in filtered:
@@ -1734,7 +1737,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     if not args.no_build:
         run(["npm", "run", "build"], cwd=source)
     vault = vault_for(agent)
-    bootstrap_args = argparse.Namespace(agent=agent)
+    bootstrap_args = argparse.Namespace(agent=agent, workspace=getattr(args, "workspace", None))
     bootstrap_vault(bootstrap_args)
 
     # Snapshot any pre-existing surface env from the target's .mcp.json *before* copy_tree,
@@ -1955,9 +1958,6 @@ def update_plugin(args: argparse.Namespace) -> int:
     return 0 if overall in {"updated", "skipped"} else 1
 
 
-DISTILL_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "distill"
-DISTILL_FILES = ("mode", "gauges.md", "ritual.md")
-
 LAYER1_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "layer1"
 LAYER1_FILES = ("core.md", "budget.md")
 
@@ -1972,7 +1972,7 @@ def seed_layer1(vault: Path, agent: str, workspace: str | None = None) -> dict[s
     hand-seeded vaults had one.
 
     Idempotent by contract: these files are agent-owned living state that the
-    agent edits every distill, so an existing file is never overwritten -- only
+    agent curates directly, so an existing file is never overwritten -- only
     missing ones are written.
     """
     layer1 = vault / "layer1"
@@ -2008,137 +2008,6 @@ def seed_layer1(vault: Path, agent: str, workspace: str | None = None) -> dict[s
     result["status"] = "ok"
     result["created"] = created
     result["kept"] = kept
-    return result
-
-
-def _layer1_identity_fields(vault: Path) -> tuple[str, str]:
-    """Return (identity_present, summary) from disk for gauges templating."""
-    layer1_core = vault / "layer1" / "core.md"
-    if layer1_core.exists():
-        identity_present = f'"{layer1_core.relative_to(vault)} present"'
-        summary = (
-            "Layer 1 workspace present at layer1/ (core.md + budget.md, strict "
-            "<4096 token budget). Protect it during every distill."
-        )
-    else:
-        identity_present = '"not seeded"'
-        summary = (
-            "No layer1/core.md in this vault yet -- seed Layer 1 via minni-install "
-            "before relying on identity protection during a distill."
-        )
-    return identity_present, summary
-
-
-# Frozen "not seeded" claim that contradicts disk once layer1/core.md appears.
-# Issue #254: seed_distill is write-if-missing, so a gauges.md stamped before
-# layer1 seeding permanently misreports a vault that is in fact seeded.
-_GAUGES_IDENTITY_NOT_SEEDED = re.compile(
-    r'^(- identity_present:\s*)"not seeded"\s*$',
-    re.MULTILINE,
-)
-_GAUGES_LAYER1_SUMMARY = re.compile(
-    r'^(- last_layer1_context_summary:\s*).*$',
-    re.MULTILINE,
-)
-
-
-def _refresh_gauges_layer1_identity(gauges_path: Path, vault: Path) -> bool:
-    """Heal a frozen identity_present lie when layer1/core.md is on disk.
-
-    Gate: only runs when gauges claim `identity_present: "not seeded"` *and*
-    `layer1/core.md` exists. When healing, rewrites both Layer 1 Reference
-    lines — the identity_present claim *and* its companion
-    `last_layer1_context_summary` — to the present-form template text so the
-    meter stays consistent. Other operator/agent-owned content is left alone.
-    One-way heal only (not seeded → present); never downgrades a present claim.
-    """
-    layer1_core = vault / "layer1" / "core.md"
-    if not gauges_path.is_file() or not layer1_core.exists():
-        return False
-
-    body = gauges_path.read_text(encoding="utf-8")
-    if not _GAUGES_IDENTITY_NOT_SEEDED.search(body):
-        return False
-
-    identity_present, summary = _layer1_identity_fields(vault)
-    updated = _GAUGES_IDENTITY_NOT_SEEDED.sub(
-        rf"\1{identity_present}",
-        body,
-        count=1,
-    )
-    # Keep the companion summary honest when we just un-froze the identity line.
-    if _GAUGES_LAYER1_SUMMARY.search(updated):
-        updated = _GAUGES_LAYER1_SUMMARY.sub(
-            rf"\1{summary}",
-            updated,
-            count=1,
-        )
-    if updated == body:
-        return False
-    gauges_path.write_text(updated, encoding="utf-8")
-    return True
-
-
-def seed_distill(vault: Path, agent: str) -> dict[str, object]:
-    """Seed `<vault>/distill/` with the Distill Ritual V1 artifacts.
-
-    The ritual (see the `minni` SKILL, "Minni Distill Ritual V1") requires the
-    agent to read `distill/gauges.md` FIRST at any wind-down signal and to take
-    its explicit|auto|disabled toggle from `distill/mode`. Nothing used to
-    create those files, so every vault ran the ritual blind.
-
-    Idempotent by contract: `mode` and `gauges.md` are operator/agent-owned
-    living state, and `ritual.md` accumulates traces, so an existing file is
-    never wholesale-overwritten -- only missing ones are written.
-
-    Exception (issue #254): if an existing `gauges.md` still claims
-    `identity_present: "not seeded"` while `layer1/core.md` is on disk, the
-    Layer 1 Reference lines (`identity_present` + companion
-    `last_layer1_context_summary`) are surgically refreshed so the meter does
-    not permanently freeze a health signal that contradicts disk. JSON may
-    include ``refreshed: ["gauges.md:layer1_identity"]``.
-    """
-    distill = vault / "distill"
-    result: dict[str, object] = {"path": str(distill)}
-    if not DISTILL_TEMPLATE_DIR.is_dir():
-        # Non-fatal: a stripped install tree must not break vault bootstrap.
-        result["status"] = "skipped"
-        result["reason"] = f"template dir missing: {DISTILL_TEMPLATE_DIR}"
-        return result
-
-    distill.mkdir(exist_ok=True)
-    identity_present, summary = _layer1_identity_fields(vault)
-    values = {
-        "agent": agent,
-        "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "layer1_identity_present": identity_present,
-        "layer1_summary": summary,
-    }
-
-    created: list[str] = []
-    kept: list[str] = []
-    refreshed: list[str] = []
-    for name in DISTILL_FILES:
-        target = distill / name
-        if target.exists():
-            kept.append(name)
-            continue
-        body = (DISTILL_TEMPLATE_DIR / name).read_text(encoding="utf-8")
-        for key, value in values.items():
-            body = body.replace("{{" + key + "}}", value)
-        target.write_text(body, encoding="utf-8")
-        created.append(name)
-
-    # Heal frozen "not seeded" after layer1 arrives (write-if-missing residual).
-    gauges_path = distill / "gauges.md"
-    if "gauges.md" in kept and _refresh_gauges_layer1_identity(gauges_path, vault):
-        refreshed.append("gauges.md:layer1_identity")
-
-    result["status"] = "ok"
-    result["created"] = created
-    result["kept"] = kept
-    if refreshed:
-        result["refreshed"] = refreshed
     return result
 
 
@@ -2209,11 +2078,8 @@ def bootstrap_vault(args: argparse.Namespace) -> int:
     )
     _seed_exclusive_file(vault / "index.md", f"# {agent} Vault Index\n\n")
     _seed_exclusive_file(vault / "log.md", f"# {agent} Vault Log\n\n")
-    # Layer 1 first: seed_distill reports whether layer1/core.md exists, and the
-    # gauges must read "present" on a freshly bootstrapped vault.
     layer1 = seed_layer1(vault, agent, getattr(args, "workspace", None))
-    distill = seed_distill(vault, agent)
-    print(json.dumps({"status": "ok", "agent": agent, "vault": str(vault), "symlink": vault.is_symlink(), "layer1": layer1, "distill": distill}, indent=2))
+    print(json.dumps({"status": "ok", "agent": agent, "vault": str(vault), "symlink": vault.is_symlink(), "layer1": layer1}, indent=2))
     return 0
 
 

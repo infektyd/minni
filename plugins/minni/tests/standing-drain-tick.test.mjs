@@ -14,6 +14,8 @@ import { readThreadEvents } from "../dist/thread-events.js";
 import { withThreadLock } from "../dist/thread-lock.js";
 import {
   START_ACCEPTED_RECEIPT_KIND,
+  assignSlice,
+  claimSlice,
   startAcceptedReceiptKey,
 } from "../dist/thread-worker.js";
 import { readWorkerUpdateReceipt } from "../dist/thread-claims.js";
@@ -192,46 +194,21 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
   const planId = created.plan.plan_id;
   const notePath = created.write.notePath;
 
-  const mcp = spawn(process.execPath, [SERVER_PATH], {
-    env: {
-      ...process.env,
-      MINNI_HOME: home,
-      MINNI_SOCKET_PATH: socketPath,
-      MINNI_VAULT_PATH: vaultPath,
-      MINNI_CLAUDECODE_VAULT_PATH: vaultPath,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
+  await assignSlice({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    actorAgentId: "orchestrator",
   });
-  // A failed assertion before the explicit kill must not leave the MCP and
-  // its stdio pipes alive, hiding the failure behind an unfinished test file.
-  t.after(() => {
-    if (mcp.exitCode === null && mcp.signalCode === null) mcp.kill("SIGKILL");
-  });
-  const { send, awaitResponse, call, allocId } = attachMcpClient(mcp);
-  const initId = allocId();
-  send({
-    jsonrpc: "2.0",
-    id: initId,
-    method: "initialize",
-    params: {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "standing-drain-test", version: "0.0.0" },
-    },
-  });
-  await awaitResponse(initId);
-  send({ jsonrpc: "2.0", method: "notifications/initialized" });
-
-  await call("minni_thread_assign", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-  });
-  const claim = await call("minni_thread_claim", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    idempotency_key: "claim-0",
+  const claim = await claimSlice({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    idempotencyKey: "claim-0",
   });
   assert.ok(claim.token, `claim must return a token: ${JSON.stringify(claim)}`);
 
@@ -247,13 +224,64 @@ test("accept start, kill that MCP, minnid tick journals slice.started with no la
   });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  const started = await call("minni_thread_worker_update", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    claim_token: claim.token,
-    idempotency_key: "start-0",
-    action: "start",
+  const workerJsUrl = new URL("../dist/thread-worker.js", import.meta.url).href;
+  const acceptScript = [
+    `const mod = await import(${JSON.stringify(workerJsUrl)});`,
+    `const input = JSON.parse(process.argv[1]);`,
+    `const res = await mod.updateClaimedSlice(input);`,
+    `process.stdout.write(JSON.stringify(mod.workerUpdateMcpPayload(res)) + "\\n");`,
+    `setInterval(() => {}, 60_000);`,
+  ].join(" ");
+  const mcp = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      acceptScript,
+      JSON.stringify({
+        vaultPath,
+        notePath,
+        planId,
+        sliceId: "s0",
+        workerAgentId: "worker-0",
+        token: claim.token,
+        idempotencyKey: "start-0",
+        action: { action: "start" },
+      }),
+    ],
+    {
+      env: {
+        ...process.env,
+        MINNI_HOME: home,
+        MINNI_SOCKET_PATH: socketPath,
+        MINNI_VAULT_PATH: vaultPath,
+        MINNI_CLAUDECODE_VAULT_PATH: vaultPath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  t.after(() => {
+    if (mcp.exitCode === null && mcp.signalCode === null) mcp.kill("SIGKILL");
+  });
+  const started = await new Promise((resolve, reject) => {
+    let out = "";
+    let err = "";
+    const timer = setTimeout(() => reject(new Error(`timeout waiting for acceptor: ${err}`)), 15_000);
+    mcp.stderr.setEncoding("utf8");
+    mcp.stderr.on("data", (c) => { err += c; });
+    mcp.stdout.setEncoding("utf8");
+    mcp.stdout.on("data", (c) => {
+      out += c;
+      const nl = out.indexOf("\n");
+      if (nl >= 0) {
+        clearTimeout(timer);
+        resolve(JSON.parse(out.slice(0, nl)));
+      }
+    });
+    mcp.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`acceptor exited early (${code}): ${err}`));
+    });
   });
   assert.equal(started.status, "accepted");
   assert.equal(started.applied, false);

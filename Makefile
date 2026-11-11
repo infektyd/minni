@@ -8,7 +8,7 @@
 #   make setup   - create .venv + install deps (editable minni package), npm ci the plugin
 #   make lint    - ruff (engine) + eslint (plugin)
 #   make typecheck - tsc --noEmit (plugin)
-#   make build   - build the plugin (tsc + vite)
+#   make build   - build the plugin (tsc)
 #   make test    - full engine pytest + plugin test suite (heavy)
 #   make check   - fast validation gate (lint + typecheck + plugin build/test
 #                  + scoped engine pytest); stamps .git/.proven-shas for pre-push
@@ -47,7 +47,7 @@ help:
 	@echo "  setup      .venv + deps + editable minni package, plugin npm ci"
 	@echo "  lint       ruff (engine) + eslint (plugin)"
 	@echo "  typecheck  tsc --noEmit (plugin)"
-	@echo "  build      build the plugin (tsc + vite)"
+	@echo "  build      build the plugin (tsc)"
 	@echo "  test       full engine pytest + plugin test (heavy)"
 	@echo "  test-engine  full engine pytest suite (override ENGINE_PYTEST)"
 	@echo "  check      fast gate: lint + typecheck + plugin build/test + scoped engine pytest"

@@ -49,7 +49,8 @@ def default_agent_vault(agent_id: str) -> Path:
         "grok": "grok",
     }
     slug = aliases.get(agent_id, re.sub(r"[^a-z0-9]+", "", agent_id.lower()) or "agent")
-    return Path(CANONICAL_SOVEREIGN_HOME) / f"{slug}-vault"
+    home_raw = os.environ.get("MINNI_HOME") or CANONICAL_SOVEREIGN_HOME
+    return Path(os.path.expanduser(str(home_raw))) / f"{slug}-vault"
 
 
 def agent_vault(agent_id: str) -> tuple[Path, bool]:
@@ -335,10 +336,20 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
     if context.increment_request_count is not None:
         context.increment_request_count()
 
+    from minni.principal import (
+        _canonical_live_vault_root,
+        from_operator_config,
+        validate_agent_id,
+    )
+
     from_agent = str(params.get("from_agent", "")).strip()
     to_agent = str(params.get("to_agent", "")).strip()
     if not from_agent or not to_agent:
         return context.make_error(-32602, "from_agent and to_agent are required", request_id)
+    try:
+        validate_agent_id(to_agent)
+    except ValueError as exc:
+        return context.make_error(-32602, f"invalid to_agent: {exc}", request_id)
 
     # G11: EffectivePrincipal stamp for the handoff path (from_agent is the identity
     # claim for the packet originator). Mismatch is rejected before any vault creation,
@@ -360,18 +371,51 @@ def handle_daemon_handoff(params: dict, request_id: Any, context: HandoffContext
     sender_vault, sender_explicit = context.agent_vault(from_agent)
     recipient_vault, recipient_explicit = context.agent_vault(to_agent)
 
-    # G12: after G11 principal stamp, verify both derived vaults are inside allowed_vault_roots
-    # (covers handoff across agents; realpath denies .. and symlink escapes to outside roots)
-    for vlabel, vpath in (("sender", sender_vault), ("recipient", recipient_vault)):
-        if not principal.allows_vault_root(vpath):
-            context.logger.warning(
-                "vault_root_denied handoff label=%s principal=%s", vlabel, principal.agent_id
-            )
-            return context.make_error(
-                -32003,
-                f"vault_root_denied: {vlabel} vault outside principal.allowed_vault_roots",
-                request_id,
-            )
+    # G12: after G11 principal stamp, verify sender_vault is inside the sender's
+    # allowed_vault_roots, and verify recipient_vault is authorized for to_agent
+    # (either inside sender's allowed_vault_roots for same-agent/operator, or
+    # inside to_agent's authored principal allowed_vault_roots, or non-symlinked
+    # under to_agent's canonical vault root when unauthored). Realpath denies
+    # .. and symlink escapes to outside roots in every branch.
+    if sender_vault.is_symlink() or not principal.allows_vault_root(sender_vault):
+        context.logger.warning(
+            "vault_root_denied handoff label=sender principal=%s", principal.agent_id
+        )
+        return context.make_error(
+            -32003,
+            "vault_root_denied: sender vault outside principal.allowed_vault_roots",
+            request_id,
+        )
+
+    def _recipient_vault_authorized(vpath: Path) -> bool:
+        if vpath.is_symlink():
+            return False
+        if principal.allows_vault_root(vpath):
+            return True
+        recipient_principal = from_operator_config(to_agent)
+        if recipient_principal is not None:
+            return recipient_principal.allows_vault_root(vpath)
+        if recipient_explicit:
+            home_raw = os.environ.get("MINNI_HOME") or CANONICAL_SOVEREIGN_HOME
+            minni_root = Path(os.path.expanduser(str(home_raw))).resolve()
+            return vpath.resolve().is_relative_to(minni_root)
+        expected = {
+            default_agent_vault(to_agent).resolve(),
+            _canonical_live_vault_root(to_agent).resolve(),
+        }
+        return vpath.resolve() in expected
+
+    if not _recipient_vault_authorized(recipient_vault):
+        context.logger.warning(
+            "vault_root_denied handoff label=recipient principal=%s to_agent=%s",
+            principal.agent_id,
+            to_agent,
+        )
+        return context.make_error(
+            -32003,
+            "vault_root_denied: recipient vault outside principal.allowed_vault_roots",
+            request_id,
+        )
 
     # G23: harden wikilink_refs containment — no traversal out of sender's allowed vault/wiki
     # (realpath + is_relative_to + allows_vault_root; symlink-aware)

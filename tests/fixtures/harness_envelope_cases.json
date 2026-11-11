@@ -24,6 +24,31 @@
         "subkind": "task_notification"
       },
       {
+        "rule_id": "skip.task_notification_block",
+        "block_tag": "task-notification",
+        "subkind": "task_notification"
+      },
+      {
+        "rule_id": "skip.system_message",
+        "prefix": "<SYSTEM_MESSAGE",
+        "subkind": "system_message"
+      },
+      {
+        "rule_id": "skip.system_message_preamble",
+        "prefix": "The following is a <SYSTEM_MESSAGE>",
+        "subkind": "system_message"
+      },
+      {
+        "rule_id": "skip.agent_message",
+        "prefix": "[Message] timestamp=",
+        "subkind": "system_message"
+      },
+      {
+        "rule_id": "skip.background_task",
+        "prefix": "<background-task",
+        "subkind": "background_task"
+      },
+      {
         "rule_id": "skip.side_sessions_event",
         "prefix": "<side-sessions-event>",
         "subkind": "side_sessions_event"
@@ -692,12 +717,12 @@
     {
       "id": "classify-41",
       "note": "non-breaking space ahead of a skip prefix is not whitespace",
-      "input": "\u00a0<task-notification>x</task-notification>",
+      "input": "\u00a0<side-sessions-event>x</side-sessions-event>",
       "expected": {
         "kind": "human",
         "subkind": "typed",
         "rule_id": null,
-        "body": "\u00a0<task-notification>x</task-notification>",
+        "body": "\u00a0<side-sessions-event>x</side-sessions-event>",
         "suspicious_prefix": false
       }
     },
@@ -914,6 +939,78 @@
         "subkind": "typed",
         "rule_id": null,
         "body": "\ud800 lone",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-60",
+      "note": "task-notification wrapper block after preamble classifies as skip",
+      "input": "Background task finished:\n<task-notification>\n<task-id>t9</task-id>\n<status>completed</status>\n</task-notification>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "task_notification",
+        "rule_id": "skip.task_notification_block",
+        "body": "Background task finished:\n<task-notification>\n<task-id>t9</task-id>\n<status>completed</status>\n</task-notification>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-61",
+      "note": "task-notification wrapper block preceded by nbsp matches block skip rule",
+      "input": "\u00a0<task-notification>x</task-notification>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "task_notification",
+        "rule_id": "skip.task_notification_block",
+        "body": "\u00a0<task-notification>x</task-notification>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-62",
+      "note": "SYSTEM_MESSAGE tag classifies as skip",
+      "input": "<SYSTEM_MESSAGE>\nSubagent completed.\n</SYSTEM_MESSAGE>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "system_message",
+        "rule_id": "skip.system_message",
+        "body": "<SYSTEM_MESSAGE>\nSubagent completed.\n</SYSTEM_MESSAGE>",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-63",
+      "note": "The following is a <SYSTEM_MESSAGE> preamble classifies as skip",
+      "input": "The following is a <SYSTEM_MESSAGE>:\nWakeup notification.",
+      "expected": {
+        "kind": "skip",
+        "subkind": "system_message",
+        "rule_id": "skip.system_message_preamble",
+        "body": "The following is a <SYSTEM_MESSAGE>:\nWakeup notification.",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-64",
+      "note": "agent [Message] timestamp= wakeup classifies as skip",
+      "input": "[Message] timestamp=2026-11-10T22:00:00Z sender=worker content=done",
+      "expected": {
+        "kind": "skip",
+        "subkind": "system_message",
+        "rule_id": "skip.agent_message",
+        "body": "[Message] timestamp=2026-11-10T22:00:00Z sender=worker content=done",
+        "suspicious_prefix": false
+      }
+    },
+    {
+      "id": "classify-65",
+      "note": "background-task tag classifies as skip",
+      "input": "<background-task id=\"bg-1\" status=\"completed\">ok</background-task>",
+      "expected": {
+        "kind": "skip",
+        "subkind": "background_task",
+        "rule_id": "skip.background_task",
+        "body": "<background-task id=\"bg-1\" status=\"completed\">ok</background-task>",
         "suspicious_prefix": false
       }
     }

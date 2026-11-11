@@ -3,7 +3,7 @@ import { assessLearningQualityAsync, flagsSensitiveMaterial, routeMemoryIntent }
 import { readAgentContext, statusAndAudit } from "./daemon_transport.js";
 import { prepareOutcome, prepareTask } from "./task.js";
 import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "./team.js";
-import { auditReport, auditTail, ensureVault, vaultFirstLearn, writeVaultPage } from "./vault.js";
+import { auditReport, auditTail, ensureVault, vaultFirstLearn, writeAndIndexVaultPage } from "./vault.js";
 import { finalizeIdleSessions } from "./use-detector.js";
 import { buildUseReport, type UseReportOptions } from "./use-report.js";
 
@@ -330,7 +330,7 @@ async function main() {
     if (!section || !title || contentParts.length === 0) throw new Error("write requires section, title, and content");
     console.log(
       JSON.stringify(
-        await writeVaultPage({
+        await writeAndIndexVaultPage({
           vaultPath: DEFAULT_VAULT_PATH,
           section: section as never,
           title,

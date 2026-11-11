@@ -38,6 +38,15 @@ export const HARNESS_ENVELOPE_RULES = {
    */
   skip: [
     { rule_id: "skip.task_notification", prefix: "<task-notification", subkind: "task_notification" },
+    { rule_id: "skip.task_notification_block", block_tag: "task-notification", subkind: "task_notification" },
+    { rule_id: "skip.system_message", prefix: "<SYSTEM_MESSAGE", subkind: "system_message" },
+    {
+      rule_id: "skip.system_message_preamble",
+      prefix: "The following is a <SYSTEM_MESSAGE>",
+      subkind: "system_message",
+    },
+    { rule_id: "skip.agent_message", prefix: "[Message] timestamp=", subkind: "system_message" },
+    { rule_id: "skip.background_task", prefix: "<background-task", subkind: "background_task" },
     { rule_id: "skip.side_sessions_event", prefix: "<side-sessions-event>", subkind: "side_sessions_event" },
     { rule_id: "skip.ci_monitor_event", prefix: "<ci-monitor-event>", subkind: "ci_monitor_event" },
     { rule_id: "skip.command_name", prefix: "<command-name>", subkind: "slash_command" },
@@ -417,7 +426,11 @@ export function classifyPromptEnvelope(text: string, ctx?: PromptTemplateContext
   }
 
   for (const rule of RULES.skip) {
-    if (stripped.startsWith(rule.prefix)) {
+    const matched =
+      "prefix" in rule
+        ? stripped.startsWith(rule.prefix)
+        : stripBlockTag(stripped, rule.block_tag).stripped;
+    if (matched) {
       return {
         kind: "skip",
         subkind: rule.subkind,

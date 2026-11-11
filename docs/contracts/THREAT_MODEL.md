@@ -21,8 +21,9 @@ Minni is a local-first memory system for AI coding agents. The Python engine
 stores runtime truth in SQLite (`~/.minni/minni.db`), indexes vault Markdown into
 FTS5/embeddings/FAISS, and exposes recall, learning, handoff, candidate review,
 status, and AFM compile over JSON-RPC. The TypeScript plugin exposes MCP tools,
-hooks, a loopback console, vault helpers, handoff/task packets, and AFM bridge
-calls.
+hooks, vault helpers, handoff/task packets, and AFM bridge calls (the legacy
+localhost React web console `ui-server` on port `8765` was retired in favor of
+CLI and plain-markdown status surfaces).
 
 **Production boundary:** the local macOS user account — not an internet-facing
 multi-tenant service.
@@ -47,7 +48,8 @@ learnings.
   operator-gated
 - AFM drafts are review-oriented; non-loopback model targets need allowlist +
   HTTPS
-- Console binds loopback, Host/Origin/Sec-Fetch checks, bearer by default
+- Localhost web console (`ui-server` / port `8765`) retired; observability uses
+  CLI (`minni status`, `minni watch`, `minni doctor`) and plain-markdown receipts
 - Audit/frontmatter parsing hardened (leading YAML only; writeback rejects
   forged `---`)
 
@@ -72,8 +74,8 @@ flowchart TB
   subgraph layer4 [Layer4_Plugin_Local]
     WVP["writeVaultPage / recordAudit"]
   end
-  subgraph layer5 [Layer5_Console]
-    UI["loopback UI + bearer"]
+  subgraph layer5 [Layer5_CLI_Status]
+    CLI["CLI + markdown status (web console retired)"]
   end
   subgraph layer6 [Layer6_Optional_HTTP]
     HTTP["--port unauth operator RPC"]
@@ -83,7 +85,7 @@ flowchart TB
   layer2 --> layer3
   Plugin --> layer3
   Plugin --> layer4
-  Browser --> layer5
+  Operator --> layer5
   layer5 --> layer3
   HTTP --> layer3
 ```
@@ -107,10 +109,10 @@ flowchart TB
    `EffectivePrincipal`; safety is schema-pinned vault path (SEC-003/G12).
    `gate.shared` is **attribution, not authorization**. Daemon-down: gated tools
    fail closed; local vault writes proceed. See `docs/security.md`.
-5. **Console** — Loopback-only bind; Host/Origin/Sec-Fetch; bearer default
-   (auto-gen if unset). Residuals: token printed into URL query string
-   (history/scrollback leak); `/api/health` unauthenticated;
-   `MINNI_CONSOLE_NO_AUTH=1` disables auth on local bind.
+5. **Console (retired)** — The localhost React web console (`ui-server` / port
+   `8765`) was retired in favor of CLI (`minni status`, `minni watch`,
+   `minni doctor`) and plain-markdown status surfaces; treat any still-installed
+   `ui-server.js` copy as an unmaintained legacy surface.
 6. **Optional HTTP (`--port`)** — No auth, no body limit, same `_dispatch` as
    UDS, default `transport="uds"` → local operator stamp. `--host` can be
    non-loopback. **Critical when enabled** — not mere configuration theater.
@@ -167,7 +169,7 @@ evidence/citation never system/developer/user instruction.
 | Vault path traversal | Read/write outside configured vault. | Daemon vault-root guard + TS `assertUnder` / realpath. | Vacuous under zero-config empty roots; symlink/race; legacy bridge installs. |
 | AFM provider / SSRF | Context to nonlocal endpoint; confused summaries. | Allowlist + HTTPS for non-loopback; draft/review oriented. | `0.0.0.0` loopback quirk; consolidation auto-accept when loop on. |
 | Vector / learnings leakage | Private/blocked via semantic or learning search. | Retrieval filters `privacy_level`/`lifecycle`; FAISS post-filters via SQLite. | Missing privacy → `safe`; `handle_read` hardcodes safe meta; `search_learnings` has no privacy dimension; frontmatter `page_type`/`agent` substring cross-share. |
-| Console | Local browser or process drives privileged actions. | Loopback bind, Host/Origin/Sec-Fetch, bearer by default (`deep_research_agent` routes removed in v0.6.0). | Token-in-URL leak; `/api/health` unauth; `NO_AUTH=1`. |
+| Console (retired) | Legacy loopback UI (`ui-server` / port `8765`) retired on `main`. | Observability moved to CLI (`minni status`, `minni watch`, `minni doctor`) and plain-markdown status surfaces. | Stale out-of-tree `ui-server.js` copies if not synced. |
 | Plugin-local vault writes | Durable notes without daemon gate. | Schema-pinned vault path (SEC-003/G12). | `gate.shared` attribution only; proceeds when daemon down. |
 | Secret redaction gaps | Tokens leave process in audit/status/ping/DR output. | Label-oriented + common bare prefixes (`sk-`, `ghp_`, `github_pat_`, `AKIA`, Slack `xox*`) + PEM + common absolute paths. | Unknown-prefix high-entropy blobs still missed — incomplete Medium control. |
 

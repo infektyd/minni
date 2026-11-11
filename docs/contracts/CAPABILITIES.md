@@ -47,8 +47,6 @@ before retrying a governed operation.
 | `stage_candidate` | agent | Persists a candidate packet, not an accepted learning. | G14/G16 candidate pipeline: stage a candidate packet (default learn path) for operator review. |
 | `list_candidates` | agent | None | G14/G17: list staged candidates for the stamped principal (console/governance view). Defaults to `status=proposed`; responses are POLICY §2 redacted and include `total`/`has_more` — when `has_more` is true, `total` is the `LIMIT n+1` lower bound (`len(page)+1`), not an exact count. |
 | `resolve_candidate` | decision-dependent | Accept commits a shared learning; indexing can fail afterward. | Accept/learn require operator authority. Owners can resolve their own rows with non-accept decisions; merge/supersede change candidate status and do not themselves merge learning content. Authorization is checked inside the transaction. |
-| `ax_snapshot_store` | agent | Writes an accessibility-tree snapshot (TTL-bounded, default 3600s). | OmniSense: persist an AX/app snapshot (`agent_id`, `app_name`, `tree_json`). Returns `snapshot_id`. |
-| `ax_snapshot_get` | agent | None | OmniSense: retrieve a stored AX/app snapshot by `agent_id` / `app_name`. |
 
 ---
 

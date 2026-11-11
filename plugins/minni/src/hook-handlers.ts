@@ -114,7 +114,6 @@ import {
   isSubagentSpawnTool,
   preToolUseAllow,
   preToolUseContext,
-  preToolUseDeny,
   recallGuardMode as resolveRecallGuardModeFromEnv,
 } from "./recall-guard.js";
 import type {
@@ -2391,77 +2390,13 @@ export function createHookHandlers(
       return render(noIntent);
     }
 
-    // Awaited, not raced: the budget clock already counts it (deadline set at
-    // entry), and a raced ensureVault that lost the race kept seeding vault
-    // files after this handler answered. Same as every other handler here.
-    await ensureVault(config.vaultPath, { agentId: config.agentId });
-
-    const workspaceId = workspaceFor(payload);
     // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
     // sessionId keeps the "session" fallback for envelope identity only — see
     // handleSessionStart's comment for why the two must not be conflated.
     const rawSessionId = rawSessionIdFromPayload(payload);
-    const signature = hashTaskSignature(prompt);
-
-    // #283 (config.lifecycleEnabled): compute the lifecycle representation
-    // once for this turn, BEFORE the early-return gates, so the persistent
-    // line survives them. Read the once-per-session emphasis set and persist
-    // any newly-emphasized surface. `lifecycleFields` stays `{}` — a no-op —
-    // on every other platform.
-    let lifecycleFields: { lifecycle?: string; lifecycle_focus?: string } = {};
-    if (config.lifecycleEnabled) {
-      const lifecycleStatePrev = await readLifecycleState(config.vaultPath, {
-        sessionId: rawSessionId || undefined,
-      });
-      const emphasizedSurfaces = new Set(lifecycleStatePrev?.emphasized ?? []);
-      const computed = lifecycleFieldsFor(prompt, emphasizedSurfaces);
-      lifecycleFields = computed.fields;
-      if (computed.emphasizedSurface) {
-        emphasizedSurfaces.add(computed.emphasizedSurface);
-        await writeLifecycleState(
-          config.vaultPath,
-          {
-            session_id: rawSessionId || lifecycleStatePrev?.session_id || "session",
-            emphasized: [...emphasizedSurfaces],
-          },
-          { sessionId: rawSessionId || undefined },
-        ).catch(() => {});
-      }
-    }
-
-    // #283: emit an envelope carrying the lifecycle representation only —
-    // used at this handler's two early-returns (write-intent and
-    // nothing-salient gates) so the 4 surfaces survive turns that would
-    // otherwise inject nothing. Degrades to a plain no-op when
-    // `lifecycleFields` is empty (lifecycleEnabled is off, feature mode is
-    // "off", or no fields were computed this turn) — safe to call
-    // unconditionally on every platform.
-    const lifecycleOnlyOutput = (): Promise<HookOutput> => {
-      if (lifecycleFields.lifecycle === undefined && lifecycleFields.lifecycle_focus === undefined) {
-        return render(noIntent);
-      }
-      const envelope = wrapEnvelope({
-        event: "UserPromptSubmit",
-        agent: config.agentId,
-        body: {
-          identity: {
-            agent: config.agentId,
-            workspace: workspaceId,
-            task_signature: signature,
-          },
-          ...lifecycleFields,
-        },
-      });
-      return render(injectIntent("UserPromptSubmit", envelope));
-    };
-
-    const guardV2 = use
-      ? use.capture.context.features.includes("MINNI_GUARD_V2")
-      : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
     const promptClassesOn = use
       ? use.capture.context.features.includes("MINNI_PROMPT_CLASSES")
       : isFeatureEnabled(config.vaultPath, "MINNI_PROMPT_CLASSES");
-    const recallStateOpts = { sessionId: rawSessionId || undefined, guardV2 };
     const promptAgentId = asString(payload.agent_id) || asString(payload.agentId) || undefined;
     const promptId = asString(payload.prompt_id) || asString(payload.promptId) || undefined;
 
@@ -2521,6 +2456,80 @@ export function createHookHandlers(
       promptEnvelope?.kind === "skip" ||
       promptEnvelope?.kind === "scheduled" ||
       isSelfMonitorTick;
+
+    // Early return on system wakeups / `<task-notification>` / `<SYSTEM_MESSAGE>` /
+    // scheduled ticks: zero plan lock acquisition, zero audit spam, zero envelope injection,
+    // and pre-existing recall-state remains untouched.
+    if (isSkip) {
+      exit("skip");
+      return render(noIntent);
+    }
+
+    // Awaited, not raced: the budget clock already counts it (deadline set at
+    // entry), and a raced ensureVault that lost the race kept seeding vault
+    // files after this handler answered. Same as every other handler here.
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
+
+    const workspaceId = workspaceFor(payload);
+    const signature = hashTaskSignature(prompt);
+
+    // #283 (config.lifecycleEnabled): compute the lifecycle representation
+    // once for this turn, BEFORE the early-return gates, so the persistent
+    // line survives them. Read the once-per-session emphasis set and persist
+    // any newly-emphasized surface. `lifecycleFields` stays `{}` — a no-op —
+    // on every other platform.
+    let lifecycleFields: { lifecycle?: string; lifecycle_focus?: string } = {};
+    if (config.lifecycleEnabled) {
+      const lifecycleStatePrev = await readLifecycleState(config.vaultPath, {
+        sessionId: rawSessionId || undefined,
+      });
+      const emphasizedSurfaces = new Set(lifecycleStatePrev?.emphasized ?? []);
+      const computed = lifecycleFieldsFor(prompt, emphasizedSurfaces);
+      lifecycleFields = computed.fields;
+      if (computed.emphasizedSurface) {
+        emphasizedSurfaces.add(computed.emphasizedSurface);
+        await writeLifecycleState(
+          config.vaultPath,
+          {
+            session_id: rawSessionId || lifecycleStatePrev?.session_id || "session",
+            emphasized: [...emphasizedSurfaces],
+          },
+          { sessionId: rawSessionId || undefined },
+        ).catch(() => {});
+      }
+    }
+
+    // #283: emit an envelope carrying the lifecycle representation only —
+    // used at this handler's two early-returns (write-intent and
+    // nothing-salient gates) so the 4 surfaces survive turns that would
+    // otherwise inject nothing. Degrades to a plain no-op when
+    // `lifecycleFields` is empty (lifecycleEnabled is off, feature mode is
+    // "off", or no fields were computed this turn) — safe to call
+    // unconditionally on every platform.
+    const lifecycleOnlyOutput = (): Promise<HookOutput> => {
+      if (lifecycleFields.lifecycle === undefined && lifecycleFields.lifecycle_focus === undefined) {
+        return render(noIntent);
+      }
+      const envelope = wrapEnvelope({
+        event: "UserPromptSubmit",
+        agent: config.agentId,
+        body: {
+          identity: {
+            agent: config.agentId,
+            workspace: workspaceId,
+            task_signature: signature,
+          },
+          ...lifecycleFields,
+        },
+      });
+      return render(injectIntent("UserPromptSubmit", envelope));
+    };
+
+    const guardV2 = use
+      ? use.capture.context.features.includes("MINNI_GUARD_V2")
+      : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
+    const recallStateOpts = { sessionId: rawSessionId || undefined, guardV2 };
+
     const envelopeAuditDetails = promptEnvelope
       ? {
           envelope_kind: promptEnvelope.kind,
@@ -2529,13 +2538,11 @@ export function createHookHandlers(
         }
       : {};
 
-    const intent = routeMemoryIntent(isSkip ? prompt : recallQuery);
+    const intent = routeMemoryIntent(recallQuery);
     // Explicit WRITE intents (learn/vault_write carry automaticAllowed:false) are
     // the user dictating memory, not asking the agent to recall — inject no
     // pointer and write no state. (s5 parity with the claude-code hook.)
-    // S3a (§5.2.2): `skip` envelopes never clear or write `recall-state` and
-    // must still carry `active_thread_ref` when a plan is active.
-    if (!isSkip && !intent.automaticAllowed) {
+    if (!intent.automaticAllowed) {
       // Clear any stale strong state from a previous turn BEFORE returning: an
       // unconsumed pointer must not leak into this write-intent turn and let the
       // s6 guard deny an unrelated read/search here (parity with the weak-turn
@@ -2547,7 +2554,7 @@ export function createHookHandlers(
       return lifecycleOnlyOutput();
     }
 
-    if (!isSkip && !isSubstantiveRecallPrompt(recallQuery)) {
+    if (!isSubstantiveRecallPrompt(recallQuery)) {
       await clearRecallState(config.vaultPath, recallStateOpts).catch(() => {});
       exit("non_substantive_prompt");
       return lifecycleOnlyOutput();
@@ -3121,7 +3128,7 @@ export function createHookHandlers(
     // — never invent a "session" placeholder on this path.
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_pretooluse_guard`,
-      summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
+      summary: `recall guard ${consumed ? "observed (non-blocking)" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
       details: {
         tool: toolName,
         mode,
@@ -3133,20 +3140,18 @@ export function createHookHandlers(
       },
     }).catch(() => {});
     if (!consumed) return preToolUseAllow();
-    const deliveryOverride = (process.env.MINNI_RECALL_GUARD_DELIVERY ?? "").trim().toLowerCase();
-    const useContextDelivery =
-      guardV2 && deliveryOverride !== "deny" && wireCapabilities(wire).preToolUseContext;
-    const surfacing = useContextDelivery ? preToolUseContext(state!) : preToolUseDeny(state!);
-    if (options.recordDeny) {
+    // Strictly non-blocking across all hosts: attach additionalContext when the
+    // host wire supports preToolUseContext; otherwise return bare allow.
+    const useContextDelivery = wireCapabilities(wire).preToolUseContext;
+    const surfacing = useContextDelivery ? preToolUseContext(state!) : preToolUseAllow();
+    if (options.recordDeny && useContextDelivery) {
       // S1a-2: only a guard surfacing actually returned is recorded, one row per
       // listed hit; the capture loads here, so an allowed call never pays for it.
       const opened = await openLedger(PRE_TOOL_USE_EVENT, payload);
       opened?.ledger?.api.captureGuardDeny(
         opened.ledger.capture,
         state!,
-        surfacing.hookSpecificOutput?.additionalContext ??
-          surfacing.hookSpecificOutput?.permissionDecisionReason ??
-          "",
+        surfacing.hookSpecificOutput?.additionalContext ?? "",
       );
       await opened?.settle();
     }

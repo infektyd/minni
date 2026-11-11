@@ -8,16 +8,16 @@
 // <vault>/.runtime/recall-state.d/<session_key>.json (and legacy mirror
 // <vault>/.runtime/recall-state.json); this module reads it and decides.
 //
-// CONTRACT (S2b §6.3.3, verified against CC docs):
+// CONTRACT (Wave 1 non-blocking guard):
+//   - PreToolUse hooks NEVER emit `permissionDecision: "deny"` on any host,
+//     regardless of `MINNI_RECALL_GUARD_DELIVERY` or `MINNI_GUARD_V2`.
 //   - On hosts whose wire declares `preToolUseContext: true` (Claude Code), we
 //     surface the recall non-blockingly via `hookSpecificOutput.additionalContext`:
 //       {"continue":true,"hookSpecificOutput":{"hookEventName":"PreToolUse",
 //         "additionalContext":"<text>"}}
 //     with NO `permissionDecision`, so the tool call proceeds without a retry.
-//   - On hosts without `preToolUseContext` (or when `MINNI_RECALL_GUARD_DELIVERY=deny`
-//     or `MINNI_GUARD_V2=off`), we fall back to `permissionDecision: "deny"`:
-//       {"continue":true,"hookSpecificOutput":{"hookEventName":"PreToolUse",
-//         "permissionDecision":"deny","permissionDecisionReason":"<text>"}}
+//   - On hosts without `preToolUseContext`, we record non-blocking telemetry and
+//     return `{continue:true}` (allow).
 //   - To ALLOW/no-op we emit a bare {continue:true} (NO permissionDecision) so
 //     the user's normal permission flow proceeds. We NEVER emit
 //     permissionDecision: "allow" (that would skip the user's prompt).
@@ -216,8 +216,8 @@ export interface PreToolUseDecisionOutput {
   continue: boolean;
   hookSpecificOutput?: {
     hookEventName: "PreToolUse";
-    permissionDecision?: "deny";
-    permissionDecisionReason?: string;
+    permissionDecision?: never;
+    permissionDecisionReason?: never;
     additionalContext?: string;
   };
 }
@@ -288,14 +288,7 @@ export function buildGuardDenyReason(state: RecallState): string {
 }
 
 export function preToolUseDeny(state: RecallState): PreToolUseDecisionOutput {
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: buildGuardDenyReason(state),
-    },
-  };
+  return preToolUseContext(state);
 }
 
 /**

@@ -140,7 +140,7 @@ the receiver acks before the sender releases it...
 
 Prefer a container? The eval image runs the daemon with zero local setup: `docker run --rm -it -v minni-data:/home/minni ghcr.io/infektyd/minni:latest` (see [docs/install.md](docs/install.md)).
 
-Want proof agents are actually using memory? `minni watch` tails every recall, learn, and guard decision live in the terminal ([docs](docs/runtime-integration.md#observability-minni-watch)), and the web console (`npm run console` in `plugins/minni`) serves the Memory Board — an infinite canvas over live daemon data: staged learnings, session receipts, traffic pulses ([docs](docs/runtime-integration.md#console-observability)).
+Want proof agents are actually using memory? `minni watch` tails every recall, learn, and guard decision live in the terminal ([docs](docs/runtime-integration.md#observability-minni-watch)), alongside `minni status` and plain-markdown vault receipts (`log.md`). The legacy localhost React web console (`ui-server` / port `8765`) was retired in favor of CLI and plain-markdown status surfaces.
 
 ### Keep the live install current
 
@@ -158,7 +158,7 @@ flowchart TD
     Agents["Agent runtimes<br/>Claude Code · Codex · Gemini/Antigravity · Grok · Cursor · Kilo Code<br/>+ any MCP client"]
     Hooks["Host hooks<br/>session start · prompt submit · compaction · stop"]
     Plugin["minni MCP plugin<br/>typed minni_* tools"]
-    Console["Web console — Memory Board<br/>HTTP, localhost only"]
+    CLI["minni CLI<br/>status · watch · doctor · wire"]
     Daemon["minnid daemon<br/>Unix socket · EffectivePrincipal identity gate"]
 
     Retrieval["Recall — scope: personal · combined · both"]
@@ -173,7 +173,7 @@ flowchart TD
     Agents -->|agent calls MCP tools| Plugin
     Hooks -->|recall, returned as injected context| Daemon
     Plugin -->|JSON-RPC over the socket| Daemon
-    Console -->|HTTP /api, same socket| Daemon
+    CLI -->|JSON-RPC over the socket| Daemon
 
     Daemon --> Retrieval
     Daemon --> Governance
@@ -190,7 +190,7 @@ flowchart TD
     Handoff --> Shared
 ```
 
-Two things reach the daemon that are not the same thing. **Agents call** MCP tools; **hosts fire** hooks (dashed) on session start, prompt submit, and compaction, and the recall they return is injected as context. The console is a third surface — HTTP, localhost — over that one socket. Plans and vault notes are plugin-local writes the daemon then indexes. The remaining surfaces (CLI, teams, and the compaction-harvest ingestion path) are mapped in [docs/architecture.md](docs/architecture.md); concepts in [docs/concepts.md](docs/concepts.md).
+Two things reach the daemon from agent sessions that are not the same thing. **Agents call** MCP tools; **hosts fire** hooks (dashed) on session start, prompt submit, and compaction, and the recall they return is injected as context. The `minni` CLI is the operator surface over that same socket (`status`, `watch`, `doctor`, `wire`). Plans and vault notes are plugin-local writes the daemon then indexes. The remaining surfaces (teams and the compaction-harvest ingestion path) are mapped in [docs/architecture.md](docs/architecture.md); concepts in [docs/concepts.md](docs/concepts.md).
 
 ## Status
 

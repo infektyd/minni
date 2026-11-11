@@ -20,7 +20,27 @@ export const POST_TOOL_USE_EVENTS: ReadonlySet<string> = new Set([
   "PostToolUseFailure",
 ]);
 
-export const POST_TOOL_USE_MATCHER = "^(?:Bash|run_terminal_command)$";
+export const POST_TOOL_USE_MATCHER =
+  "^(?:Bash|run_terminal_command|Edit|Write|MultiEdit|NotebookEdit|edit_file|write_file|apply_patch)$";
+
+export const FILE_EDIT_TOOLS: ReadonlySet<string> = new Set([
+  "Edit",
+  "Write",
+  "MultiEdit",
+  "NotebookEdit",
+  "edit_file",
+  "write_file",
+  "apply_patch",
+]);
+
+export function isFileEditTool(toolName: string): boolean {
+  if (typeof toolName !== "string") return false;
+  const trimmed = toolName.trim();
+  if (FILE_EDIT_TOOLS.has(trimmed)) return true;
+  return /(?:^|__)(?:Edit|Write|MultiEdit|NotebookEdit|edit_file|write_file|apply_patch)$/.test(
+    trimmed,
+  );
+}
 
 export interface FailureLessonRule {
   readonly ruleId: string;
@@ -696,99 +716,51 @@ export function isSwiftOrPraxisContext(
   return false;
 }
 
-function splitUnquotedShellSegments(command: string): string[] {
-  const segments: string[] = [];
-  let current = "";
-  let inSingle = false;
-  let inDouble = false;
-  let parenDepth = 0;
-
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    if (ch === "\\" && !inSingle && i + 1 < command.length) {
-      current += ch + command[i + 1];
-      i++;
-      continue;
+function extractFileEditTargetAndContent(payload: Record<string, unknown>): {
+  targetPath: string;
+  contentText: string;
+} {
+  const toolInput =
+    payload.tool_input && typeof payload.tool_input === "object" && !Array.isArray(payload.tool_input)
+      ? (payload.tool_input as Record<string, unknown>)
+      : payload.toolInput && typeof payload.toolInput === "object" && !Array.isArray(payload.toolInput)
+        ? (payload.toolInput as Record<string, unknown>)
+        : {};
+  let targetPath = "";
+  for (const key of ["file_path", "filePath", "Path", "path", "notebook_path", "target_file"]) {
+    if (typeof toolInput[key] === "string" && (toolInput[key] as string).trim()) {
+      targetPath = (toolInput[key] as string).trim();
+      break;
     }
-    if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
-      current += ch;
-      continue;
-    }
-    if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
-      current += ch;
-      continue;
-    }
-    if (!inSingle) {
-      if (ch === "$" && command[i + 1] === "(") {
-        parenDepth++;
-        current += "$(";
-        i++;
-        continue;
-      }
-      if (ch === "(" && parenDepth > 0) {
-        parenDepth++;
-        current += ch;
-        continue;
-      }
-      if (ch === ")" && parenDepth > 0) {
-        parenDepth--;
-        current += ch;
-        continue;
-      }
-    }
-    if (!inSingle && !inDouble && parenDepth === 0) {
-      if ((ch === "&" && command[i + 1] === "&") || (ch === "|" && command[i + 1] === "|")) {
-        if (current.trim()) segments.push(current.trim());
-        current = "";
-        i++;
-        continue;
-      }
-      if (ch === ";" || ch === "|" || ch === "\n" || ch === "\r") {
-        if (current.trim()) segments.push(current.trim());
-        current = "";
-        continue;
-      }
-    }
-    current += ch;
   }
-  if (current.trim()) segments.push(current.trim());
-  return segments;
-}
-
-function isReadOnlyInspectionCommand(command: string): boolean {
-  const trimmed = command.trim();
-  if (!trimmed) return false;
-  // Split compound shell commands on unquoted operators and check whether every segment is a read-only search/diff/view command
-  const rawSegments = splitUnquotedShellSegments(trimmed);
-  if (rawSegments.length === 0) return false;
-  const readOnlyRe =
-    /^(?:(?:\/usr\/bin\/|\/bin\/|\/opt\/homebrew\/bin\/)?(?:rg|ripgrep|grep|egrep|fgrep|git\s+(?:-C\s+\S+\s+)?(?:diff|log|show|status|grep|cat-file|blame|branch|rev-parse)|cat|head|tail|sed(?!\s+-i\b)|awk|find|fd|ls|wc|stat|file|echo|printf|true|cd|pwd|cut|sort|uniq|tr|jq|diff|comm|paste|column))\b/i;
-
-  for (const rawSeg of rawSegments) {
-    // Strip leading variable assignments (e.g. `f=Services/Foo.swift` or `n=$(grep -c ...)`),
-    // verifying any `$(...)` command substitution inside the assignment is itself read-only.
-    let rest = rawSeg.trim();
-    let hadAssignment = false;
-    while (true) {
-      const assignMatch = rest.match(
-        /^[A-Za-z_][A-Za-z0-9_]*=(?:\$\(([^()]*)\)|"[^"]*"|'[^']*'|[^\s;|&\r\n]*)\s*/,
-      );
-      if (!assignMatch) break;
-      if (assignMatch[1] !== undefined && !isReadOnlyInspectionCommand(assignMatch[1])) {
-        return false;
-      }
-      hadAssignment = true;
-      rest = rest.slice(assignMatch[0].length).trim();
+  const chunks: string[] = [];
+  for (const key of ["new_string", "newString", "content", "Content", "Replacement", "replacement", "patch", "new_source"]) {
+    if (typeof toolInput[key] === "string" && (toolInput[key] as string).length > 0) {
+      chunks.push((toolInput[key] as string).slice(0, MAX_OUTPUT_SCAN_CHARS));
     }
-    if (!rest) {
-      if (hadAssignment) continue;
-      return false;
-    }
-    if (!readOnlyRe.test(rest)) return false;
   }
-  return true;
+  if (Array.isArray(toolInput.edits)) {
+    for (const edit of toolInput.edits.slice(0, 32)) {
+      if (edit && typeof edit === "object" && !Array.isArray(edit)) {
+        const obj = edit as Record<string, unknown>;
+        for (const key of ["new_string", "newString", "content", "Replacement", "replacement"]) {
+          if (typeof obj[key] === "string" && (obj[key] as string).length > 0) {
+            chunks.push((obj[key] as string).slice(0, MAX_OUTPUT_SCAN_CHARS));
+          }
+        }
+      }
+    }
+  }
+  if (!targetPath && typeof toolInput.patch === "string") {
+    const patchFileMatch = /\*\*\*\s+(?:Update|Add)\s+File:\s+([^\r\n]+)/.exec(toolInput.patch);
+    if (patchFileMatch?.[1]) {
+      targetPath = patchFileMatch[1].trim();
+    }
+  }
+  return {
+    targetPath,
+    contentText: chunks.join("\n").slice(0, MAX_OUTPUT_SCAN_CHARS),
+  };
 }
 
 function stripCommentOnlyLines(text: string): string {
@@ -929,9 +901,15 @@ function extractCommandAndExitState(
 }
 
 /**
- * Match a PostToolUse or PostToolUseFailure payload against recurring error
- * signatures. Inspects `tool_response` output text on EVERY Bash call even when
- * `is_error === false` (solving the 350/352 exit-code masking blocker).
+ * Match a PostToolUse or PostToolUseFailure payload against recurring error and
+ * code-antipattern signatures.
+ *
+ * Strictly scoped to:
+ *   (a) file-edit tools (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `edit_file`,
+ *       `write_file`, `apply_patch`), OR
+ *   (b) commands/tools that actually failed (`isError === true || (exitCode !== null && exitCode !== 0)`).
+ * Clean-exit shell commands (`exitCode === 0` or `exitCode === null && !isError`)
+ * return `null` immediately without scanning stdout for scar keywords.
  */
 export function matchPostToolUseFailureLesson(args: {
   vaultPath: string;
@@ -949,16 +927,27 @@ export function matchPostToolUseFailureLesson(args: {
         : typeof args.payload.toolName === "string"
           ? args.payload.toolName
           : "";
-    if (args.event === "PostToolUse" && toolName && !isBashLikeTool(toolName)) {
-      return null;
-    }
-    const outputText = extractToolResponseText(args.payload);
-    if (!outputText.trim()) return null;
+    const fileEdit = isFileEditTool(toolName);
 
-    const { command, isError, exitCode } = extractCommandAndExitState(args.event, args.payload);
-    const readOnlyCleanExit =
-      !isError && (exitCode === 0 || exitCode === null) && isReadOnlyInspectionCommand(command);
-    const nonCommentText = stripCommentOnlyLines(outputText);
+    let scopeHint = "";
+    let scanText = "";
+    if (fileEdit) {
+      const { targetPath, contentText } = extractFileEditTargetAndContent(args.payload);
+      const responseText = extractToolResponseText(args.payload);
+      scopeHint = targetPath;
+      scanText = [contentText, responseText].filter(Boolean).join("\n").slice(0, MAX_OUTPUT_SCAN_CHARS);
+    } else {
+      const { command, isError, exitCode } = extractCommandAndExitState(args.event, args.payload);
+      const commandFailed = isError === true || (exitCode !== null && exitCode !== 0);
+      if (!commandFailed) {
+        return null;
+      }
+      scopeHint = command;
+      scanText = extractToolResponseText(args.payload);
+    }
+    if (!scanText.trim()) return null;
+
+    const nonCommentText = stripCommentOnlyLines(scanText);
 
     const effectiveCwd =
       typeof args.cwd === "string" && args.cwd.trim()
@@ -970,12 +959,11 @@ export function matchPostToolUseFailureLesson(args: {
 
     for (const rule of APPROVED_FAILURE_LESSON_RULES) {
       if (rule.stage !== "PostToolUse") continue;
-      if (!ruleMatchesScope(rule, effectiveCwd, command, outputText, projectKey)) continue;
-      if (args.event === "PostToolUse" && readOnlyCleanExit) continue;
+      if (!ruleMatchesScope(rule, effectiveCwd, scopeHint, scanText, projectKey)) continue;
       const isCodeAntipattern = CODE_ANTIPATTERN_RULE_IDS.has(rule.ruleId);
       if (isCodeAntipattern) {
         if (!nonCommentText.trim() || !rule.pattern.test(nonCommentText)) continue;
-      } else if (!rule.pattern.test(outputText)) {
+      } else if (!rule.pattern.test(scanText)) {
         continue;
       }
       if (hasFailureLessonFired(args.vaultPath, args.sessionId, rule.lessonId)) {

@@ -306,37 +306,7 @@ Pass `--workspace` to record the agent's primary workspace (defaults to
 
 Seeding is idempotent — these files are agent-owned living state, so an existing
 file is never overwritten. The JSON output reports `layer1.created` /
-`layer1.kept`. Layer 1 is seeded before `distill/`, so a fresh vault's gauges
-report the identity workspace as present.
-
-### Distill ritual seeding
-
-`bootstrap-vault` (also run implicitly by `update-plugin`) seeds
-`<vault>/distill/` with `mode`, `gauges.md`, and `ritual.md` from
-`templates/distill/`, parameterized by agent id. Without them the Minni Distill
-Ritual V1 runs blind: the agent is told to read `distill/gauges.md` first at any
-wind-down signal and to take its toggle from `distill/mode`.
-
-Seeding is idempotent — `mode` and `gauges.md` are operator/agent-owned living
-state and `ritual.md` accumulates traces, so an existing file is never
-wholesale-overwritten. To backfill a vault installed before this existed, just
-re-run:
-
-```bash
-python3 plugins/minni/skills/minni-install/scripts/propagate.py bootstrap-vault --agent claude-code
-```
-
-The JSON output reports `distill.created` / `distill.kept`.
-
-**Exception (issue #254):** if an existing `gauges.md` still claims
-`identity_present: "not seeded"` while `layer1/core.md` is on disk, re-running
-`bootstrap-vault` / `update-plugin` surgically refreshes the Layer 1 Reference
-lines (`identity_present` and its companion `last_layer1_context_summary`) so
-the meter does not permanently freeze a health signal that contradicts disk.
-Other gauges content (pressure, decision aids, frontmatter, etc.) is left alone.
-When the heal runs, JSON may include `distill.refreshed` (e.g.
-`["gauges.md:layer1_identity"]`). One-way only — never downgrades a present
-claim.
+`layer1.kept`.
 
 ## Common Mistakes
 

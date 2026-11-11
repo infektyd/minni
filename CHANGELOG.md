@@ -8,7 +8,7 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
-**v0.7.0 candidate milestone.** This unreleased wave isolates concurrent live sessions sharing one agent principal (`agent_id` + `session_key`), introduces hermetic 9-host update propagation with 7-step atomic cutover, lands the Rev 6 self-cleaning substrate and recall-to-use telemetry pipeline, hardens governance/handoff/index boundaries, and aligns episodic FTS5 and compaction harvest surfaces. Package metadata stays at `0.6.0` until `v0.7.0` is tagged after live multi-window soak across open host applications, reserving **v1.0.0** for the post-soak final release cut.
+**v0.7.0 / v1.0.0 Wave 1 milestone.** This unreleased wave lands Wave 1 of the 6-wave Minni v1.0 blueprint (`docs/design/DESIGN-minni-v1.md`): consolidating the MCP surface from 43 tools to 12 essentials, retiring dead runtime/UI/ritual surfaces, and switching all host hooks to strictly non-blocking context injection, on top of multi-session principal isolation (`agent_id` + `session_key`), hermetic 9-host update propagation, and the Rev 6 self-cleaning substrate. Package metadata stays at `0.6.0` until `v1.0.0` (or an interim `v0.7.0` checkpoint) is tagged after Waves 2–6 and live cold-agent verification complete.
 
 ### Added
 
@@ -29,7 +29,10 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Changed
 
-- Bounded MCP tool payload sizes across `minni_drill`, `minni_thread_update`, and `minni_prepare_task` to prevent context-window response bloat, while honoring `wikilink` and `handle` parameters end-to-end.
+- **Wave 1 v1.0 surface consolidation (43 → 12 MCP tools):**
+  - Consolidated `plugins/minni/src/server.ts` from 43 MCP tools to the 12-tool v1 surface: core memory (`minni_recall`, `minni_drill`, `minni_learn`, `minni_list_candidates`, `minni_resolve_candidate`, `minni_status`), 1-step cross-session/cross-agent handoff (`minni_handoff_send`, `minni_handoff_inbox`), and 4 compact `< 2 KB` Thread tools (`minni_thread_create`, `minni_thread_status`, `minni_thread_update`, `minni_thread_scar`), updating host propagation allowlists, worker grants, cutover probes, slash commands, and skills in lockstep.
+  - Enforced strictly non-blocking `PreToolUse` hooks across Claude Code, Gemini/Antigravity, Codex, Cursor, Grok Build, and KiloCode (attaching non-blocking `additionalContext` where supported and never denying tool calls), immediate early-return skip handling on `<task-notification>`, `<SYSTEM_MESSAGE>`, `[Message] timestamp=`, and `<background-task>` wakeups with paired TS/Python envelope rules, and restricted `PostToolUse` failure-lesson checks strictly to file-edit tools and failed commands.
+- Bounded MCP tool payload sizes across `minni_drill` and `minni_thread_update` to prevent context-window response bloat, while honoring `wikilink` and `handle` parameters end-to-end.
 - Enforced suite-wide hermetic `HOME` / `XDG_*` / `MINNI_HOME` isolation across Python (`tests/conftest.py`) and Node plugin tests so test runs never touch live operator state.
 
 ### Fixed
@@ -48,6 +51,7 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Removed
 
+- Retired experimental `ax_memory` package modules, the localhost React web console (`ui-server` and `plugins/minni/frontend`), legacy `distill/` ritual templates, and retired orchestration/audit slash commands (`prepare-task`, `prepare-outcome`, `team-runtime`, `team-evidence`, `team-promotion`, `team-mode`, `audit`) in favor of CLI/markdown status surfaces (`minni status`, `minni watch`, `minni doctor`) and the 12-tool v1 MCP surface.
 - Retired the Grok CI review and mechanical-approve gate, disabled since August for cost: the `Grok`, `Grok Code Review`, `Grok Mechanical Approve Gate` and `Grok Boundary Test` workflows, `.github/scripts/` (`grok_approve_gate.py`, `parse_grok_verdict.py`, `check-no-credential-leak.py`), their tests, and the `docs/ops/grok-reviewer-app.md` runbook. Merge trust on `main` is now required status checks only. Grok Build as a Minni runtime (hooks, adapter, `grok-build` principal, `docs/runtimes/grok.md`) is unaffected.
 
 ## [0.6.0] - 2026-10-14

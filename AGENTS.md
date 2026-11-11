@@ -79,6 +79,6 @@ Durable, non-obvious notes for agents working in the Cloud Agent VM. Standard co
 - First recall performs a one-time ~320 MB HuggingFace embedding-model download (cached under the HF cache). `minni doctor` may emit a non-blocking `[WARN] models: 2/3 in cache` for the optional cross-encoder rerank model — that is expected, not a failure.
 
 ### Optional surfaces
-- Web console / Memory Board: `cd plugins/minni && MINNI_CONSOLE_TOKEN=<token> node dist/ui-server.js` (build first via `make build`). Serves on `127.0.0.1:8765`; every data route requires `Authorization: Bearer <token>` (a token is auto-generated and printed if `MINNI_CONSOLE_TOKEN` is unset). Open `http://127.0.0.1:8765/?token=<token>`.
-- The AFM bridge (`127.0.0.1:11437`) is **not** running by default. The console/daemon logging `[Errno 111] Connection refused` for AFM is expected and optional (see `.env.example` / `MINNI_AFM_PROVIDER_MODE`); it does not affect the core memory loop.
+- CLI & plain-markdown status surfaces: use `.venv/bin/minni status`, `.venv/bin/minni watch`, and `.venv/bin/minni doctor` (plus `node dist/cli.js status` in `plugins/minni` and vault `log.md`). The legacy localhost React web console (`ui-server` / port `8765`) is retired.
+- The AFM bridge (`127.0.0.1:11437`) is **not** running by default. The daemon logging `[Errno 111] Connection refused` for AFM is expected and optional (see `.env.example` / `MINNI_AFM_PROVIDER_MODE`); it does not affect the core memory loop.
 - PyYAML is a runtime dependency for YAML frontmatter parsing (indexer, AFM writer); CI also uses it for `scripts/check-public-boundary.sh`.

@@ -36,7 +36,6 @@ bench/tests/test_run_bench.py	home-path	/[U]sers/secret/path/leak	synthetic non-
 bench/tests/test_run_bench.py	home-path	/[U]sers/operator/vault	synthetic user in a skip-id normalisation test
 plugins/minni/tests/slice-g-hardening.test.mjs	home-path	/[U]sers/secret/(op/\.minni/auth\.json|seed-path\.json)	synthetic user in an error-detail redaction test
 plugins/minni/tests/team-harvest.test.mjs	home-path	/[U]sers/foo/bar\.fmadapter	synthetic user in a harvest redaction test
-plugins/minni/tests/ui-server.test.mjs	home-path	/[U]sers/notme/external-secret-project/vault	synthetic foreign user in a console vault-path test
 scripts/afm-minni-scenarios.mjs	home-path	/[U]sers/operator/\.adapters/harvest_v3\.fmadapter	synthetic user in an AFM scenario prompt
 tests/test_compact_distillation.py	home-path	/[U]sers/someone/(x\.log|secret/token\.log)	synthetic user in a distillation redaction test
 tests/test_policy_redaction_contract_237.py	home-path	redact_text[(]"path=/[U]sers/operator/\.minni/auth\.json"[)]	synthetic user fed to the redaction engine

@@ -643,7 +643,7 @@ def run_behavioral_probe(
                 if isinstance(tools, list):
                     tools_count = len(tools)
 
-        if proc.returncode != 0 or not init_ok or tools_count < 40:
+        if proc.returncode != 0 or not init_ok or tools_count < 12:
             return (
                 False,
                 f"MCP stdio probe failed on {server_js} (rc={proc.returncode}, init_ok={init_ok}, tools={tools_count})",

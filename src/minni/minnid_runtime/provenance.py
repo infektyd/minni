@@ -59,9 +59,6 @@ RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "minni_await_handoff": "handoff",
     "stage_candidate": "learn",
     "list_candidates": "learn",
-    # ax_snapshot_store WRITES an accessibility snapshot — a write op, not read.
-    "ax_snapshot_store": "learn",
-    "ax_snapshot_get": "read",
     "vault_index_doc": "learn",
     "daemon.compile": "read",
     "daemon.endorse": "govern",

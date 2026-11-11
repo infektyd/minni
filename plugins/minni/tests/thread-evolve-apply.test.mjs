@@ -9,12 +9,37 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { randomUUID } from "node:crypto";
 import {
+  applySliceDelta,
   createPlan,
+  diffDependsOn,
   findPlanNote,
+  journalPathFor,
+  landedReplanTopology,
+  persistPlan,
   rehydratePlan,
+  replan,
   structuralProposalDelta,
 } from "../dist/plan.js";
+import { buildTeamRuntime } from "../dist/team.js";
+import { deriveSystemEventKey, readThreadEvents } from "../dist/thread-events.js";
+import { withExclusiveReplanReservation } from "../dist/thread-lock.js";
+import {
+  assignSlice,
+  claimSlice,
+  deleteClaimSecretsBestEffort,
+  prepareThreadMutation,
+  pruneSliceReceiptsAfterPlanMutation,
+  readyIds,
+  recordThreadMutationEvents,
+  revokedClaimIds,
+  synchronizeExpiredClaimsAndReadReady,
+  threadWorkerErrorText,
+  updateClaimedSlice,
+  withThreadPlanLock,
+  workerUpdateMcpPayload,
+} from "../dist/thread-worker.js";
 
 const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
 
@@ -97,7 +122,7 @@ async function withMcpSession(t, fn) {
       });
     });
 
-  const call = async (name, args) => {
+  const mcpCall = async (name, args) => {
     const id = nextId++;
     send({
       jsonrpc: "2.0",
@@ -113,6 +138,167 @@ async function withMcpSession(t, fn) {
       throw new Error(`${name}: ${reply.result.content?.[0]?.text}`);
     }
     return JSON.parse(reply.result.content[0].text);
+  };
+
+  // Wave 1 retired internal worker/topology MCP tools while preserving plan.ts + thread-worker.ts library functions.
+  const call = async (name, args) => {
+    const vaultPath = root;
+    const plan_id = args.plan_id;
+    if (name === "minni_thread_assign") {
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      return assignSlice({
+        vaultPath,
+        notePath,
+        planId: plan_id,
+        sliceId: args.slice_id,
+        workerAgentId: args.worker_agent_id,
+        actorAgentId: "claude-code",
+      });
+    }
+    if (name === "minni_thread_claim") {
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      const res = await claimSlice({
+        vaultPath,
+        notePath,
+        planId: plan_id,
+        sliceId: args.slice_id,
+        workerAgentId: args.worker_agent_id,
+        idempotencyKey: args.idempotency_key,
+      });
+      const { filePath: _fp, ...pub } = res;
+      return pub;
+    }
+    if (name === "minni_thread_worker_update") {
+      const validActions = ["start", "progress", "block", "scar", "propose_structure", "complete"];
+      if (!validActions.includes(args.action)) {
+        throw new Error(
+          `expected one of "start"|"progress"|"block"|"scar"|"propose_structure"|"complete" at action`,
+        );
+      }
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      const actionObj = { action: args.action };
+      if (args.action === "progress") actionObj.note = args.note;
+      if (args.action === "block") actionObj.reason = args.reason;
+      if (args.action === "scar") {
+        actionObj.kind = args.kind;
+        actionObj.signal = args.signal;
+        if (args.resolution) actionObj.resolution = args.resolution;
+      }
+      if (args.action === "propose_structure") actionObj.proposal = args.proposal;
+      if (args.action === "complete") actionObj.evidence = args.evidence;
+      const res = await updateClaimedSlice({
+        vaultPath,
+        notePath,
+        planId: plan_id,
+        sliceId: args.slice_id,
+        workerAgentId: args.worker_agent_id,
+        token: args.claim_token,
+        idempotencyKey: args.idempotency_key,
+        action: actionObj,
+      });
+      return workerUpdateMcpPayload(res);
+    }
+    if (name === "minni_thread_ready") {
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      const readyRes = await synchronizeExpiredClaimsAndReadReady({
+        vaultPath,
+        notePath,
+        planId: plan_id,
+        actor: "claude-code",
+      });
+      return { plan_id, ready: readyRes.ready };
+    }
+    if (name === "minni_thread_events") {
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      const journalPath = journalPathFor(notePath, plan_id);
+      return readThreadEvents(journalPath, args.since_seq ?? 0, args.limit ?? 100);
+    }
+    if (name === "minni_team_runtime") {
+      return buildTeamRuntime({
+        task: args.task,
+        plan_id: args.plan_id,
+        vaultPath,
+        coordinatorAgentId: "claude-code",
+      });
+    }
+    if (name === "minni_thread_replan") {
+      const notePath = await findPlanNote(vaultPath, plan_id);
+      try {
+        return await withExclusiveReplanReservation(vaultPath, plan_id, `replan:${randomUUID()}`, async () =>
+          withThreadPlanLock(
+            { vaultPath, notePath, planId: plan_id, operationId: `replan-lock:${randomUUID()}` },
+            async (before) => {
+              const now = new Date();
+              const { journalPath, ordered } = await prepareThreadMutation(
+                { vaultPath, notePath, planId: plan_id, actor: "claude-code" },
+                before,
+                now,
+              );
+              const readyBefore = readyIds(before, now);
+              const next = Array.isArray(args.new_slices)
+                ? replan(before, args.new_slices)
+                : applySliceDelta(before, {
+                    add_slices: args.add_slices,
+                    drop_slice_ids: args.drop_slice_ids,
+                    set_depends_on: args.set_depends_on,
+                  });
+              await persistPlan(next, { vaultPath, notePath });
+              const updated = await rehydratePlan(notePath);
+              const revoked = revokedClaimIds(before, updated);
+              await pruneSliceReceiptsAfterPlanMutation(vaultPath, plan_id, before, updated);
+              await deleteClaimSecretsBestEffort(vaultPath, plan_id, revoked);
+              const landed = landedReplanTopology(before, updated);
+              const depChanges = diffDependsOn(before, updated);
+              const payload = {
+                ...landed,
+                ...(depChanges.length > 0 ? { depends_on_changed: depChanges } : {}),
+              };
+              const supplementalEvents = [];
+              for (const sliceBefore of before.slices) {
+                if (sliceBefore.claim && revoked.includes(sliceBefore.claim.claim_id)) {
+                  supplementalEvents.push({
+                    idempotencyKey: deriveSystemEventKey(
+                      "slice.claim_revoked",
+                      plan_id,
+                      sliceBefore.id,
+                      sliceBefore.claim.claim_id,
+                      String(updated.rev),
+                    ),
+                    kind: "slice.claim_revoked",
+                    sliceId: sliceBefore.id,
+                    payload: { claim_id: sliceBefore.claim.claim_id, reason: "superseded" },
+                  });
+                }
+              }
+              await recordThreadMutationEvents({
+                journalPath,
+                planId: plan_id,
+                rev: updated.rev,
+                actor: "claude-code",
+                operationKey: deriveSystemEventKey("replan", plan_id, String(updated.rev)),
+                kind: "replan",
+                payload,
+                readyBefore,
+                readyAfter: readyIds(updated, now),
+                plan: updated,
+                planBefore: before,
+                now,
+                orderedSnapshot: ordered,
+                supplementalEvents: supplementalEvents.length > 0 ? supplementalEvents : undefined,
+              });
+              return { plan_id, rev: updated.rev, slices: updated.slices };
+            },
+          ),
+        );
+      } catch (error) {
+        return {
+          status: "error",
+          operation: "plan.replan",
+          error: threadWorkerErrorText(error),
+        };
+      }
+    }
+    return mcpCall(name, args);
   };
 
   send({
@@ -1038,7 +1224,7 @@ test("wet: worker cannot replan; live worker tool stays worker_update only", asy
   );
   assert.match(
     writers,
-    /MINNI_WORKER_TOOLS = \(\s*"minni_thread_worker_update",\s*\)/,
+    /MINNI_WORKER_TOOLS = \(\s*"minni_thread_update",\s*"minni_thread_scar",\s*"minni_learn",\s*\)/,
   );
   assert.equal(writers.includes("minni_thread_replan"), false);
   assert.equal(writers.includes("minni_thread_create"), false);
@@ -1049,16 +1235,10 @@ test("wet: worker cannot replan; live worker tool stays worker_update only", asy
     new URL("../src/server.ts", import.meta.url),
     "utf8",
   );
-  const workerBlockStart = serverSource.indexOf('"minni_thread_worker_update"');
-  const workerBlock = serverSource.slice(
-    workerBlockStart,
-    serverSource.indexOf("server.registerTool", workerBlockStart + 1),
-  );
-  assert.match(workerBlock, /propose_structure/);
-  assert.doesNotMatch(
-    workerBlock,
-    /action: z\.enum\(\[[^\]]*replan/,
-    "worker_update action enum must not include replan",
+  assert.equal(
+    serverSource.includes("minni_thread_replan"),
+    false,
+    "replan is retired from MCP worker/model surface",
   );
   assert.equal(
     serverSource.includes('server.registerTool(\n  "minni_thread_propose'),

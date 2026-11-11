@@ -10,29 +10,10 @@ The plugin exposes recall, prepare-task packets, proposal-first learning,
 learning quality checks, structured vault notes, compile dry-runs, handoffs,
 information request contracts, candidate resolution, audit tools, and temporary
 team runtime packets. On Claude Code and KiloCode, hooks wire memory in as a
-session spine.
-
-The Vite/React console starts on **Memory Board**. From this directory run
-`npm run console`, then open the token-bearing localhost URL printed at startup.
-The bearer token protects HTTP access; daemon operations still use the console's
-stamped principal. Use the navigation rail to open:
-
-- **Memory Board** — live agent/catalogue state, owner-scoped pending suggestions,
-  log-only/quarantine views, and recent recall. A limited page is a lower bound,
-  not a fleet-wide total. Refresh and update-time labels expose freshness.
-- **Recall / Prepare Packet** — `/api/prepare-task` results and the exact context
-  packet. Token allowance is not a measured usage percentage.
-- **Dry-run Review** — `/api/prepare-outcome` drafts candidate/log-only/do-not-store
-  suggestions; preview decisions do not resolve staged candidates.
-- **Handoffs, Vaults, Policy & AFM, Sessions** — live route-backed views with empty,
-  unavailable, and error states; these are not placeholder screens. Host delivery
-  and actual model availability still need their own verification.
-- **Audit / Settings** — activity and runtime status. Observability differs from
-  Board candidate resolution: **Approve/Reject performs a real governed decision**.
-  Acceptance requires operator authority; owners can reject/redact their own
-  candidates under daemon policy.
-
-Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris accents) and **Phosphor** (CRT operator board with telemetry rail and live activity stream). Toggle from the gear button bottom-right. Layout sizes and theme persist to `localStorage`.
+session spine. Operator status and observability run via CLI (`minni status`,
+`minni watch`, `minni doctor`, and `node dist/cli.js status`) plus plain-markdown
+vault logs (`log.md`); the legacy localhost React web console (`ui-server` on
+port `8765`) is retired.
 
 ## macOS Thread claim storage
 
@@ -279,39 +260,17 @@ Disable hooks without uninstalling: `export MINNI_KILOCODE_HOOKS=off`.
 
 The Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gemini extension (`.gemini-plugin/`), and other integrations (Grok Build, Kilo Code) are unaffected — they share the daemon, not the vault.
 
-## Local Console
-
-```bash
-npm run console            # tsc + vite build + node dist/ui-server.js
-npm run dev:frontend       # vite dev server with /api proxy to :8765 (HMR)
-```
-
-The console exposes only local HTTP endpoints:
-
-- `GET /api/health`
-- `GET /api/status`
-- `GET /api/audit-tail?limit=20`
-- `POST /api/prepare-task`
-- `POST /api/prepare-outcome`
-- `GET /api/candidates`
-- `POST /api/resolve-candidate`
-
-The server binds to `127.0.0.1`, refuses non-local bind hosts, rejects non-local host/origin/fetch-metadata requests, requires JSON POST bodies, caps JSON request bodies, redacts machine-local paths in browser-facing status/audit/candidate responses, and does not expose learn or vault-write endpoints. Browser requests cannot override the server-owned vault path or AFM target. `prepare-task` keeps its existing audit behavior; `prepare-outcome` remains dry-run only.
-
-The bridge defaults to the active vault resolved from `MINNI_VAULT_PATH` (or legacy fallback `MINNI_CODEX_VAULT_PATH`). Override with `MINNI_VAULT_PATH=~/.minni/claudecode-vault npm run console` to point Recall at a different vault.
-
 ## Development
 
 ```bash
 npm ci                   # deterministic install from package-lock.json
 npm run build            # writes dist/server.js for MCP/plugin manifests
 npm test                 # full pipeline: build + node --test suite
-npm run test:server      # builds server, board test bundle, frontend, then Node tests
+npm run test:server      # builds server, then runs Node tests
 npm run test:file tests/hook-behavior.test.mjs   # single test file
 npm run typecheck        # tsc --noEmit
-npm run lint             # eslint . — lints src/, tests/, and frontend-src/ (built frontend/ is ignored)
+npm run lint             # eslint . — lints src/, tests/, and scripts/
 npm run coverage         # node --test coverage with line/branch/function floors
-npm run console
 npm run design:lint      # validate ../../DESIGN.md via the pinned @google/design.md dev dependency
 npm run test:live:prepare
 ```

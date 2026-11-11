@@ -12,7 +12,7 @@ point-in-time record, not current guidance. Report vulnerabilities per
 
 This page is the orientation layer: what the local-first boundary actually
 means in code. For the full multi-layer threat model (same-uid FS vs socket vs
-daemon RPC vs plugin-local writes vs console/HTTP), read the threat model
+daemon RPC vs plugin-local writes vs optional HTTP), read the threat model
 contract first.
 
 ## Local-first boundaries
@@ -24,10 +24,9 @@ contract first.
 - Vaults, per-vault `.index` stores, and the shared daemon DB are local
   filesystem paths. Nothing syncs anywhere. Same-uid processes can open those
   files directly; daemon authz does not apply on that plane.
-- The local console/API surface binds to **loopback only** by default; a
-  **bearer token is required by default** (`MINNI_CONSOLE_TOKEN`, or an
-  auto-generated session token if unset). `MINNI_CONSOLE_NO_AUTH=1` is the
-  local-only opt-out. Deep Research is opt-in (`MINNI_CONSOLE_DEEP_RESEARCH=1`).
+- The localhost React web console (`ui-server` on `127.0.0.1:8765`) was retired
+  in favor of CLI (`minni status`, `minni watch`, `minni doctor`) and
+  plain-markdown status surfaces; no loopback web server ships on `main`.
 - Optional daemon HTTP (`--port`) is off by default; enabling it is a Critical
   surface (no auth, unbounded body, local-operator stamp) — not mere
   configuration risk. See the threat model.

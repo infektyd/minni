@@ -2498,22 +2498,90 @@ test("live MCP: accept kick yields before orch reserve (process stays up)", { ti
     return { child, ...client };
   }
 
+  const workerJsUrl = new URL("../dist/thread-worker.js", import.meta.url).href;
+  async function bootWorkerAcceptor() {
+    const script = [
+      `import readline from "node:readline";`,
+      `const mod = await import(${JSON.stringify(workerJsUrl)});`,
+      `const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });`,
+      `process.stdout.write(JSON.stringify({ ready: true }) + "\\n");`,
+      `for await (const line of rl) {`,
+      `  if (!line.trim()) continue;`,
+      `  const { id, input } = JSON.parse(line);`,
+      `  try {`,
+      `    const res = await mod.updateClaimedSlice(input);`,
+      `    process.stdout.write(JSON.stringify({ id, result: mod.workerUpdateMcpPayload(res) }) + "\\n");`,
+      `  } catch (err) {`,
+      `    process.stdout.write(JSON.stringify({ id, result: { status: "error", error: mod.threadWorkerErrorText(err) } }) + "\\n");`,
+      `  }`,
+      `}`,
+    ].join(" ");
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      env: {
+        ...process.env,
+        MINNI_HOME: home,
+        MINNI_SOCKET_PATH: socketPath,
+        MINNI_VAULT_PATH: vaultPath,
+        MINNI_CLAUDECODE_VAULT_PATH: vaultPath,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const waiters = new Map();
+    let readyResolve;
+    const readyPromise = new Promise((resolve) => { readyResolve = resolve; });
+    let buf = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        if (msg.ready) readyResolve();
+        else if (msg.id !== undefined) waiters.get(msg.id)?.(msg.result);
+      }
+    });
+    await readyPromise;
+    let reqId = 1;
+    return {
+      child,
+      update: (input) =>
+        new Promise((resolve, reject) => {
+          const id = reqId++;
+          const timer = setTimeout(() => reject(new Error(`timeout workeracceptor ${id}`)), 15_000);
+          waiters.set(id, (res) => {
+            clearTimeout(timer);
+            waiters.delete(id);
+            resolve(res);
+          });
+          child.stdin.write(`${JSON.stringify({ id, input })}\n`);
+        }),
+    };
+  }
+
   const orch = await bootMcp();
   t.after(() => {
     if (orch.child.exitCode === null && orch.child.signalCode === null) {
       orch.child.kill("SIGTERM");
     }
   });
-  await orch.call("minni_thread_assign", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
+  await assignSlice({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    actorAgentId: "orchestrator",
   });
-  const claim = await orch.call("minni_thread_claim", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    idempotency_key: "claim-0",
+  const claim = await claimSlice({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    idempotencyKey: "claim-0",
   });
   assert.ok(claim.token);
 
@@ -2526,19 +2594,21 @@ test("live MCP: accept kick yields before orch reserve (process stays up)", { ti
   });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  const worker = await bootMcp();
+  const worker = await bootWorkerAcceptor();
   t.after(() => {
     if (worker.child.exitCode === null && worker.child.signalCode === null) {
       worker.child.kill("SIGTERM");
     }
   });
-  const started = await worker.call("minni_thread_worker_update", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    claim_token: claim.token,
-    idempotency_key: "start-0",
-    action: "start",
+  const started = await worker.update({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
   });
   assert.equal(started.status, "accepted");
   assert.equal(started.applied, false);
@@ -2547,8 +2617,8 @@ test("live MCP: accept kick yields before orch reserve (process stays up)", { ti
     false,
     "reservation must not be live at accept return",
   );
-  assert.equal(worker.child.exitCode, null, "accepting MCP must stay up");
-  assert.equal(worker.child.signalCode, null, "accepting MCP must stay up (no SIGKILL)");
+  assert.equal(worker.child.exitCode, null, "accepting worker must stay up");
+  assert.equal(worker.child.signalCode, null, "accepting worker must stay up (no SIGKILL)");
 
   const queued = await listQueuedWorkerWrites(vaultPath, planId);
   assert.ok(
@@ -2569,15 +2639,25 @@ test("live MCP: accept kick yields before orch reserve (process stays up)", { ti
   );
   assert.equal(worker.child.exitCode, null, "process stays up after lock free");
 
-  const replan = await orch.call("minni_thread_replan", {
-    plan_id: planId,
-    drop_slice_ids: ["s0"],
-    add_slices: [
-      { id: "child-a", title: "Child A" },
-      { id: "child-b", title: "Child B" },
-    ],
+  await withExclusiveReplanReservation(vaultPath, planId, "live-replan-split", async () => {
+    await withThreadPlanLock(
+      { vaultPath, notePath, planId, operationId: "live-replan-split-lock" },
+      async (before) => {
+        const next = applySliceDelta(before, {
+          drop_slice_ids: ["s0"],
+          add_slices: [
+            { id: "child-a", title: "Child A" },
+            { id: "child-b", title: "Child B" },
+          ],
+        });
+        await persistPlan(next, { vaultPath, notePath });
+        await pruneSliceReceiptsAfterPlanMutation(vaultPath, planId, before, next);
+        await deleteClaimSecretsBestEffort(vaultPath, planId, revokedClaimIds(before, next));
+      },
+    );
   });
-  assert.ok(replan.plan_id === planId || replan.plan?.plan_id === planId || replan.slices);
+  const orchStatus = await orch.call("minni_thread_status", { plan_id: planId });
+  assert.equal(orchStatus.plan_id ?? planId, planId);
 
   await drainWorkerWrites({ vaultPath, notePath, planId });
   const leftover = await listQueuedWorkerWrites(vaultPath, planId);
@@ -2594,21 +2674,25 @@ test("live MCP: accept kick yields before orch reserve (process stays up)", { ti
     false,
     `live MCP GO: no slice.started on superseded s0: ${JSON.stringify(journal.started)}`,
   );
-  assert.equal(worker.child.exitCode, null, "accepting MCP still up at end (no SIGKILL)");
+  assert.equal(worker.child.exitCode, null, "accepting worker still up at end (no SIGKILL)");
 
-  const complete = await worker.call("minni_thread_worker_update", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    claim_token: claim.token,
-    idempotency_key: "complete-s0-after-live-split",
-    action: "complete",
-    evidence: "Verification: slice s0 done via live MCP after split",
-  }).catch((error) => ({ status: "error", error: String(error) }));
+  const complete = await worker.update({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "complete-s0-after-live-split",
+    action: {
+      action: "complete",
+      evidence: "Verification: slice s0 done via live MCP after split",
+    },
+  });
   assert.equal(
     complete.status,
     "error",
-    `complete on superseded s0 must error (MCP returns status:error, not transport isError): ${JSON.stringify(complete)}`,
+    `complete on superseded s0 must error: ${JSON.stringify(complete)}`,
   );
   const after = await rehydratePlan(notePath);
   assert.equal(after.slices.find((slice) => slice.id === "s0")?.status, "superseded");
@@ -2744,22 +2828,90 @@ test("live MCP: standing tick yields before orch reserve (process stays up)", { 
     return { child, ...client };
   }
 
+  const workerJsUrl = new URL("../dist/thread-worker.js", import.meta.url).href;
+  async function bootWorkerAcceptor() {
+    const script = [
+      `import readline from "node:readline";`,
+      `const mod = await import(${JSON.stringify(workerJsUrl)});`,
+      `const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });`,
+      `process.stdout.write(JSON.stringify({ ready: true }) + "\\n");`,
+      `for await (const line of rl) {`,
+      `  if (!line.trim()) continue;`,
+      `  const { id, input } = JSON.parse(line);`,
+      `  try {`,
+      `    const res = await mod.updateClaimedSlice(input);`,
+      `    process.stdout.write(JSON.stringify({ id, result: mod.workerUpdateMcpPayload(res) }) + "\\n");`,
+      `  } catch (err) {`,
+      `    process.stdout.write(JSON.stringify({ id, result: { status: "error", error: mod.threadWorkerErrorText(err) } }) + "\\n");`,
+      `  }`,
+      `}`,
+    ].join(" ");
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      env: {
+        ...process.env,
+        MINNI_HOME: home,
+        MINNI_SOCKET_PATH: socketPath,
+        MINNI_VAULT_PATH: vaultPath,
+        MINNI_CLAUDECODE_VAULT_PATH: vaultPath,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const waiters = new Map();
+    let readyResolve;
+    const readyPromise = new Promise((resolve) => { readyResolve = resolve; });
+    let buf = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        if (msg.ready) readyResolve();
+        else if (msg.id !== undefined) waiters.get(msg.id)?.(msg.result);
+      }
+    });
+    await readyPromise;
+    let reqId = 1;
+    return {
+      child,
+      update: (input) =>
+        new Promise((resolve, reject) => {
+          const id = reqId++;
+          const timer = setTimeout(() => reject(new Error(`timeout workeracceptor ${id}`)), 15_000);
+          waiters.set(id, (res) => {
+            clearTimeout(timer);
+            waiters.delete(id);
+            resolve(res);
+          });
+          child.stdin.write(`${JSON.stringify({ id, input })}\n`);
+        }),
+    };
+  }
+
   const orch = await bootMcp();
   t.after(() => {
     if (orch.child.exitCode === null && orch.child.signalCode === null) {
       orch.child.kill("SIGTERM");
     }
   });
-  await orch.call("minni_thread_assign", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
+  await assignSlice({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    actorAgentId: "orchestrator",
   });
-  const claim = await orch.call("minni_thread_claim", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    idempotency_key: "claim-0",
+  const claim = await claimSlice({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    idempotencyKey: "claim-0",
   });
   assert.ok(claim.token);
 
@@ -2772,19 +2924,21 @@ test("live MCP: standing tick yields before orch reserve (process stays up)", { 
   });
   await new Promise((resolve) => setTimeout(resolve, 20));
 
-  const worker = await bootMcp();
+  const worker = await bootWorkerAcceptor();
   t.after(() => {
     if (worker.child.exitCode === null && worker.child.signalCode === null) {
       worker.child.kill("SIGTERM");
     }
   });
-  const started = await worker.call("minni_thread_worker_update", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    claim_token: claim.token,
-    idempotency_key: "start-0",
-    action: "start",
+  const started = await worker.update({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "start-0",
+    action: { action: "start" },
   });
   assert.equal(started.status, "accepted");
   assert.equal(started.applied, false);
@@ -2793,8 +2947,8 @@ test("live MCP: standing tick yields before orch reserve (process stays up)", { 
     false,
     "reservation must not be live at accept return",
   );
-  assert.equal(worker.child.exitCode, null, "accepting MCP must stay up");
-  assert.equal(worker.child.signalCode, null, "accepting MCP must stay up (no SIGKILL)");
+  assert.equal(worker.child.exitCode, null, "accepting worker must stay up");
+  assert.equal(worker.child.signalCode, null, "accepting worker must stay up (no SIGKILL)");
 
   const queued = await listQueuedWorkerWrites(vaultPath, planId);
   assert.ok(
@@ -2848,15 +3002,25 @@ test("live MCP: standing tick yields before orch reserve (process stays up)", { 
     `standing tick child must not apply start while worker is live: ${JSON.stringify(afterTick.started)}`,
   );
 
-  const replan = await orch.call("minni_thread_replan", {
-    plan_id: planId,
-    drop_slice_ids: ["s0"],
-    add_slices: [
-      { id: "child-a", title: "Child A" },
-      { id: "child-b", title: "Child B" },
-    ],
+  await withExclusiveReplanReservation(vaultPath, planId, "standing-live-replan-split", async () => {
+    await withThreadPlanLock(
+      { vaultPath, notePath, planId, operationId: "standing-live-replan-split-lock" },
+      async (before) => {
+        const next = applySliceDelta(before, {
+          drop_slice_ids: ["s0"],
+          add_slices: [
+            { id: "child-a", title: "Child A" },
+            { id: "child-b", title: "Child B" },
+          ],
+        });
+        await persistPlan(next, { vaultPath, notePath });
+        await pruneSliceReceiptsAfterPlanMutation(vaultPath, planId, before, next);
+        await deleteClaimSecretsBestEffort(vaultPath, planId, revokedClaimIds(before, next));
+      },
+    );
   });
-  assert.ok(replan.plan_id === planId || replan.plan?.plan_id === planId || replan.slices);
+  const orchStatus = await orch.call("minni_thread_status", { plan_id: planId });
+  assert.equal(orchStatus.plan_id ?? planId, planId);
 
   await drainWorkerWrites({ vaultPath, notePath, planId });
   const leftover = await listQueuedWorkerWrites(vaultPath, planId);
@@ -2873,21 +3037,25 @@ test("live MCP: standing tick yields before orch reserve (process stays up)", { 
     false,
     `live MCP standing GO: no slice.started on superseded s0: ${JSON.stringify(journal.started)}`,
   );
-  assert.equal(worker.child.exitCode, null, "accepting MCP still up at end (no SIGKILL)");
+  assert.equal(worker.child.exitCode, null, "accepting worker still up at end (no SIGKILL)");
 
-  const complete = await worker.call("minni_thread_worker_update", {
-    plan_id: planId,
-    slice_id: "s0",
-    worker_agent_id: "worker-0",
-    claim_token: claim.token,
-    idempotency_key: "complete-s0-after-standing-live-split",
-    action: "complete",
-    evidence: "Verification: slice s0 done via live MCP standing tick after split",
-  }).catch((error) => ({ status: "error", error: String(error) }));
+  const complete = await worker.update({
+    vaultPath,
+    notePath,
+    planId,
+    sliceId: "s0",
+    workerAgentId: "worker-0",
+    token: claim.token,
+    idempotencyKey: "complete-s0-after-standing-live-split",
+    action: {
+      action: "complete",
+      evidence: "Verification: slice s0 done via live MCP standing tick after split",
+    },
+  });
   assert.equal(
     complete.status,
     "error",
-    `complete on superseded s0 must error (MCP returns status:error, not transport isError): ${JSON.stringify(complete)}`,
+    `complete on superseded s0 must error: ${JSON.stringify(complete)}`,
   );
   const after = await rehydratePlan(notePath);
   assert.equal(after.slices.find((slice) => slice.id === "s0")?.status, "superseded");

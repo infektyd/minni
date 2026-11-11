@@ -15,41 +15,15 @@ function toolBlock(source, toolName) {
 test("shared model-facing tools gate before local shared work", async () => {
   const source = await readFile(sourcePath, "utf8");
   const expected = new Map([
-    ["minni_team_runtime", "team.runtime"],
-    ["minni_team_evidence", "team.evidence"],
-    ["minni_team_promotion", "team.promotion"],
     ["minni_status", "audit.status"],
-    ["minni_route", "audit.route"],
     ["minni_list_candidates", "candidates.list"],
     ["minni_resolve_candidate", "candidates.resolve"],
-    ["minni_learning_quality", "audit.learning_quality"],
-    ["minni_audit_report", "audit.report"],
-    ["minni_audit_tail", "audit.tail"],
-    ["minni_negotiate_handoff", "handoff.negotiate"],
-    ["minni_ping_agent_request", "ping.request"],
-    ["minni_ping_agent_inbox", "ping.inbox"],
-    ["minni_ping_agent_decide", "ping.decide"],
-    ["minni_ping_agent_status", "ping.status"],
-    ["minni_ack_handoff", "handoff.ack"],
-    ["minni_list_pending_handoffs", "handoff.pending"],
-    ["minni_await_handoff", "handoff.await"],
-    ["minni_subscribe_contradictions", "contradictions.subscribe"],
+    ["minni_handoff_send", "handoff.send"],
+    ["minni_handoff_inbox", "handoff.inbox"],
     ["minni_thread_create", "plan.create"],
+    ["minni_thread_status", "plan.status"],
     ["minni_thread_update", "plan.update"],
     ["minni_thread_scar", "plan.scar"],
-    ["minni_thread_status", "plan.status"],
-    ["minni_thread_replan", "plan.replan"],
-    ["minni_thread_history", "plan.history"],
-    ["minni_thread_revision", "plan.revision"],
-    ["minni_thread_diff", "plan.diff"],
-    ["minni_thread_restore", "plan.restore"],
-    ["minni_thread_activate", "plan.activate"],
-    ["minni_thread_deactivate", "plan.deactivate"],
-    ["minni_thread_ready", "plan.ready"],
-    ["minni_thread_assign", "plan.assign"],
-    ["minni_thread_claim", "plan.claim"],
-    ["minni_thread_worker_update", "plan.worker_update"],
-    ["minni_thread_events", "plan.events"],
   ]);
 
   for (const [toolName, operation] of expected) {
@@ -58,14 +32,12 @@ test("shared model-facing tools gate before local shared work", async () => {
   }
 });
 
-test("personal-vault and prefilter tools stay plugin-local", async () => {
+test("personal-vault recall/drill/learn tools stay plugin-local", async () => {
   const source = await readFile(sourcePath, "utf8");
   for (const toolName of [
-    "minni_prepare_task",
-    "minni_prepare_outcome",
     "minni_recall",
+    "minni_drill",
     "minni_learn",
-    "minni_vault_write",
   ]) {
     assert.doesNotMatch(toolBlock(source, toolName), /requireSharedGate\(/, toolName);
   }

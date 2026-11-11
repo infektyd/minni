@@ -105,11 +105,6 @@ from minni.minnid_runtime.afm import (  # noqa: E402
     promote_candidate_durable as _runtime_promote_candidate_durable,
     reject_candidate_dedup as _runtime_reject_candidate_dedup,
 )
-from minni.minnid_runtime.ax import (  # noqa: E402
-    AXContext,
-    handle_ax_snapshot_get as _runtime_handle_ax_snapshot_get,
-    handle_ax_snapshot_store as _runtime_handle_ax_snapshot_store,
-)
 from minni.minnid_runtime.dispatch import DispatchContext, dispatch_request  # noqa: E402
 from minni.minnid_runtime.governance import (  # noqa: E402
     GovernanceContext,
@@ -1785,24 +1780,6 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
     return _runtime_resolve_candidate(params, request_id, _governance_context())
 
 
-def _ax_context() -> AXContext:
-    return AXContext(
-        make_error=_make_error,
-        make_response=_make_response,
-        handler_principal=_handler_principal,
-        lazy_writeback=_lazy_writeback,
-        logger=logger,
-    )
-
-
-def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
-    return _runtime_handle_ax_snapshot_store(params, request_id, _ax_context())
-
-
-def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
-    return _runtime_handle_ax_snapshot_get(params, request_id, _ax_context())
-
-
 def _vault_index_context() -> VaultIndexContext:
     return VaultIndexContext(
         make_error=_make_error,
@@ -1867,8 +1844,6 @@ _METHODS: Dict[str, callable] = {
     "stage_candidate":        _stage_candidate,
     "list_candidates":        _list_candidates,
     "resolve_candidate":      _resolve_candidate,
-    "ax_snapshot_store":      _handle_ax_snapshot_store,
-    "ax_snapshot_get":        _handle_ax_snapshot_get,
     # M-4 fix: vault_write now triggers immediate semantic indexing via this RPC.
     "vault_index_doc":        _handle_vault_index_doc,
     "status":                 _handle_status,

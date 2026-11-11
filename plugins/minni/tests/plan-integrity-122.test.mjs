@@ -76,13 +76,14 @@ test("#122/1: restore path heals a digest-bricked note via bare-scalar rehydrate
   }
 });
 
-test("#122/1: minni_thread_restore handler falls back to rehydratePlanScalars (source pin)", () => {
-  const block = handlerBlock("minni_thread_restore");
+test("#122/1: plan.ts exports rehydratePlanScalars for corrupt-note recovery while minni_thread_restore is retired from MCP", async () => {
+  const planSource = await readFile(new URL("../src/plan.ts", import.meta.url), "utf8");
   assert.match(
-    block,
-    /rehydratePlanScalars/,
-    "restore handler must not be gated on strict rehydrate of the corrupt current note",
+    planSource,
+    /export async function rehydratePlanScalars/,
+    "rehydratePlanScalars must stay exported in plan.ts for corrupt-note recovery",
   );
+  assert.doesNotMatch(serverSource, /"minni_thread_restore"/, "retired minni_thread_restore must not remain on MCP");
 });
 
 // ---- 2. F-PLAN-CREATE-OVERWRITES-ACTIVE --------------------------------------
@@ -286,9 +287,9 @@ test("#122/3: terminal set mirrors resolveActivePlanView's suppression set", () 
   );
 });
 
-test("#122/3: minni_thread_activate handler routes through the guard (source pin)", () => {
-  const block = handlerBlock("minni_thread_activate");
-  assert.match(block, /activatePlanChecked/, "activate handler must use the terminal-status guard");
+test("#122/3: minni_thread_update activate path routes through activatePlanChecked guard (source pin)", () => {
+  const block = handlerBlock("minni_thread_update");
+  assert.match(block, /activatePlanChecked/, "minni_thread_update(activate: true) must use the terminal-status guard");
 });
 
 // ---- 4. F-PLAN-DIGEST-CROSSPROC ----------------------------------------------
@@ -678,11 +679,11 @@ test("#122/4: dual declaration that AGREES ('v3:' prefix + plan_digest_v: 3) sti
   }
 });
 
-test("#122/4: minni_thread_restore handler re-throws PlanDigestVersionError (source pin)", () => {
-  const block = handlerBlock("minni_thread_restore");
+test("#122/4: assertAndResolveDigest in plan.ts throws PlanDigestVersionError (source pin)", async () => {
+  const planSource = await readFile(new URL("../src/plan.ts", import.meta.url), "utf8");
   assert.match(
-    block,
-    /PlanDigestVersionError/,
-    "restore fallback must not swallow the newer-version error and downgrade-write the note",
+    planSource,
+    /throw new PlanDigestVersionError\(/,
+    "newer digest version check must throw typed PlanDigestVersionError",
   );
 });

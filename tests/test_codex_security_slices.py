@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 import types
 from pathlib import Path
 
@@ -96,16 +95,6 @@ def test_inbox_ingest_rejects_forged_agent_id(monkeypatch, tmp_path):
     candidates, skipped = _scan_inbox(inbox, "codex")
     assert candidates == []
     assert skipped.get("_agent_mismatch") == 1
-
-
-def test_ax_snapshot_ttl_expires(monkeypatch, tmp_path):
-    from minni.ax_memory import AXMemory
-
-    db_obj, _ = _patch_db(monkeypatch, tmp_path)
-    ax = AXMemory(db_obj)
-    ax.add_snapshot("codex", "Finder", "{}", ttl_seconds=1)
-    time.sleep(1.1)
-    assert ax.get_latest_snapshot("codex", "Finder") is None
 
 
 def test_path_within_root_blocks_symlink_escape(tmp_path):

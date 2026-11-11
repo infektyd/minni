@@ -17,8 +17,8 @@ def _seed_plugin_version(base: Path, ver: str, sha: str, *, broken_server: bool 
     if broken_server:
         (vdir / "dist" / "server.js").write_text("process.exit(42);\n", encoding="utf-8")
     else:
-        # Minimal stdio MCP responder for initialize + tools/list (>= 40 tools)
-        tools_json = json.dumps([{"name": f"minni_tool_{i}"} for i in range(44)])
+        # Minimal stdio MCP responder for initialize + tools/list (exact 12 v1 tools)
+        tools_json = json.dumps([{"name": f"minni_tool_{i}"} for i in range(12)])
         (vdir / "dist" / "server.js").write_text(
             "import readline from 'node:readline';\n"
             f"const TOOLS = {tools_json};\n"
@@ -1984,7 +1984,7 @@ def test_r8_dry_run_staging_failure_and_esbuild_nonzero_fail_closed(
     monkeypatch.undo()
     fake_repo = tmp_path / "fake_repo"
     fake_plugin = fake_repo / "plugins" / "minni"
-    for sub in ("dist", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin", ".kilocode-plugin", "commands", "hooks", "skills", "frontend", "kilo", "node_modules/esbuild"):
+    for sub in ("dist", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin", ".kilocode-plugin", "commands", "hooks", "skills", "kilo", "node_modules/esbuild"):
         (fake_plugin / sub).mkdir(parents=True, exist_ok=True)
     (fake_repo / "pyproject.toml").write_text('[project]\nname = "minni"\nversion = "0.6.0"\n', encoding="utf-8")
     (fake_plugin / "dist" / "server.js").write_text('import "@modelcontextprotocol/sdk";\n', encoding="utf-8")
@@ -3352,3 +3352,50 @@ def test_r12_h23_d_dry_run_parity_post_flip_delta_reported_as_would_abort(
     assert "literal_tilde_in_launcher_wrapper" in apply_res.message
     assert minni_mcp.read_text(encoding="utf-8") == residual_tilde_wrapper
     assert os.readlink(plugin_dir / "current") == v1_ver
+
+
+def test_cutover_behavioral_probe_requires_at_least_12_tools(tmp_path):
+    """Wave 1: behavioral probe accepts 12 MCP tools and rejects < 12 tools."""
+    home = tmp_path / "home"
+    plugin_dir = home / ".minni" / "plugin"
+    v_ok = "0.6.0+git.12121212"
+    v_under = "0.6.0+git.11111111"
+    _seed_plugin_version(plugin_dir, v_ok, "1" * 40)
+    under_dir = _seed_plugin_version(plugin_dir, v_under, "2" * 40)
+    under_tools = json.dumps([{"name": f"minni_tool_{i}"} for i in range(11)])
+    (under_dir / "dist" / "server.js").write_text(
+        "import readline from 'node:readline';\n"
+        f"const TOOLS = {under_tools};\n"
+        "const rl = readline.createInterface({ input: process.stdin });\n"
+        "rl.on('line', (line) => {\n"
+        "  if (!line.trim()) return;\n"
+        "  const msg = JSON.parse(line);\n"
+        "  if (msg.method === 'initialize') {\n"
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'minni', version: '0.6.0' } } }) + '\\n');\n"
+        "  } else if (msg.method === 'tools/list') {\n"
+        "    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } }) + '\\n');\n"
+        "    process.exit(0);\n"
+        "  }\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    res_under = execute_atomic_cutover(
+        home=home,
+        target_version=v_under,
+        target_git_sha="2" * 40,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert res_under.exit_code == 1
+    assert "tools=11" in res_under.message
+
+    res_ok = execute_atomic_cutover(
+        home=home,
+        target_version=v_ok,
+        target_git_sha="1" * 40,
+        dry_run=False,
+        running_hosts=set(),
+    )
+    assert res_ok.exit_code == 0, res_ok.message
+    assert os.readlink(plugin_dir / "current") == v_ok
