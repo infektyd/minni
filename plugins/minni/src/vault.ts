@@ -4179,7 +4179,11 @@ function candidateHandlesForVaultRelPath(relativePath: string, title?: string): 
   return handles;
 }
 
-function lookupHandleIndexRelPathSync(vaultPath: string, handle: string): string | null {
+function lookupHandleIndexRelPathSync(
+  vaultPath: string,
+  handle: string,
+  sessionId?: string,
+): string | null {
   const tryIndexFile = (indexPath: string): string | null => {
     try {
       assertWriteTargetUnder(indexPath, vaultPath);
@@ -4213,6 +4217,17 @@ function lookupHandleIndexRelPathSync(vaultPath: string, handle: string): string
     return null;
   };
 
+  const trimmedSession = typeof sessionId === "string" ? sessionId.trim() : "";
+  if (trimmedSession && trimmedSession !== "session") {
+    const callerKey = /^[0-9a-f]{16}$/.test(trimmedSession)
+      ? trimmedSession
+      : createHash("sha256").update(trimmedSession, "utf8").digest("hex").slice(0, 16);
+    const fromCallerState = tryIndexFile(
+      path.join(vaultPath, ".runtime", "recall-state.d", `${callerKey}.handles.json`),
+    );
+    if (fromCallerState) return fromCallerState;
+  }
+
   const fromRoot = tryIndexFile(path.join(vaultPath, ".handles.json"));
   if (fromRoot) return fromRoot;
 
@@ -4239,12 +4254,13 @@ function lookupHandleIndexRelPathSync(vaultPath: string, handle: string): string
 export async function resolveVaultHandleRelPath(
   vaultPath: string,
   handle: string,
+  sessionId?: string,
 ): Promise<string | null> {
   if (typeof handle !== "string") return null;
   const trimmed = handle.trim().toLowerCase();
   if (!/^m:[0-9a-f]{8}$/.test(trimmed)) return null;
 
-  const indexedRel = lookupHandleIndexRelPathSync(vaultPath, trimmed);
+  const indexedRel = lookupHandleIndexRelPathSync(vaultPath, trimmed, sessionId);
   if (indexedRel && (await exists(path.join(vaultPath, indexedRel)))) {
     return indexedRel;
   }
@@ -4305,8 +4321,9 @@ export type ResolvedVaultHandleNote =
 async function resolveSafeVaultHandleNoteInSingleVault(
   vaultPath: string,
   handle: string,
+  sessionId?: string,
 ): Promise<ResolvedVaultHandleNote> {
-  const relPath = await resolveVaultHandleRelPath(vaultPath, handle);
+  const relPath = await resolveVaultHandleRelPath(vaultPath, handle, sessionId);
   if (!relPath) {
     return { status: "unresolved", reason: "missing" };
   }
@@ -4361,6 +4378,7 @@ async function resolveSafeVaultHandleNoteInSingleVault(
 export async function resolveSafeVaultHandleNote(
   vaultPath: string,
   handle: string,
+  sessionId?: string,
 ): Promise<ResolvedVaultHandleNote> {
   if (typeof handle !== "string") {
     return { status: "unresolved", reason: "missing" };
@@ -4370,7 +4388,7 @@ export async function resolveSafeVaultHandleNote(
     return { status: "unresolved", reason: "missing" };
   }
 
-  const primary = await resolveSafeVaultHandleNoteInSingleVault(vaultPath, trimmed);
+  const primary = await resolveSafeVaultHandleNoteInSingleVault(vaultPath, trimmed, sessionId);
   if (primary.status === "resolved" || primary.reason === "unsafe") {
     return primary;
   }
@@ -4564,9 +4582,32 @@ export async function readPendingInbox(
  * here; they survive on disk for inspection (collectCorrectionsReassert's
  * all-malformed branch already refuses to consume them).
  */
+/** Orphan threshold for cross-session PreCompact reassert stashes (10 minutes). */
+export const REASSERT_ORPHAN_TTL_MS = 10 * 60 * 1000;
+
+export interface ReadReassertPendingOptions {
+  sessionKey?: string;
+  sessionId?: string;
+  nowMs?: number;
+}
+
+function resolveReassertSessionKey(
+  sessionKey?: string,
+  sessionId?: string,
+): string | undefined {
+  const trimmedKey = typeof sessionKey === "string" ? sessionKey.trim() : "";
+  if (trimmedKey && trimmedKey !== "default") return trimmedKey;
+  const trimmedId = typeof sessionId === "string" ? sessionId.trim() : "";
+  if (trimmedId && trimmedId !== "session") {
+    return createHash("sha256").update(trimmedId).digest("hex").slice(0, 16);
+  }
+  return undefined;
+}
+
 export async function readReassertPending(
   vaultPath: string,
   limit = 3,
+  options?: ReadReassertPendingOptions,
 ): Promise<InboxEntry[]> {
   const dir = path.join(vaultPath, "inbox");
   let names: string[] = [];
@@ -4579,9 +4620,12 @@ export async function readReassertPending(
   stamped.sort(
     (a, b) => (b.ts ?? 0) - (a.ts ?? 0) || b.name.localeCompare(a.name),
   );
-  const eligible: InboxEntry[] = [];
-  for (const { name } of stamped) {
-    if (eligible.length >= limit) break;
+  const callerSessionKey = resolveReassertSessionKey(options?.sessionKey, options?.sessionId);
+  const nowMs = options?.nowMs ?? Date.now();
+  const matched: InboxEntry[] = [];
+  const fallback: InboxEntry[] = [];
+  for (const { name, ts } of stamped) {
+    if (matched.length >= limit) break;
     const filePath = path.join(dir, name);
     let parsed: Record<string, unknown>;
     try {
@@ -4592,14 +4636,34 @@ export async function readReassertPending(
     const stashed = parsed.stale_belief_events;
     const emptyStash = Array.isArray(stashed) && stashed.length === 0;
     if (!emptyStash && !payloadHasValidStaleBeliefEvent(parsed)) continue;
-    eligible.push({
+    const entrySessionKey = resolveReassertSessionKey(
+      typeof parsed.session_key === "string" ? parsed.session_key : undefined,
+      typeof parsed.session_id === "string" ? parsed.session_id : undefined,
+    );
+    const entry: InboxEntry = {
       slug: typeof parsed.slug === "string" ? parsed.slug : name,
       filePath,
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
       payload: parsed,
-    });
+    };
+    if (entrySessionKey) {
+      if (callerSessionKey && entrySessionKey === callerSessionKey) {
+        matched.push(entry);
+        continue;
+      }
+      const createdMs = typeof parsed.createdAt === "string" ? Date.parse(parsed.createdAt) : Number.NaN;
+      const effectiveTs = Number.isFinite(createdMs) ? createdMs : ts;
+      const ageMs = effectiveTs !== undefined ? nowMs - effectiveTs : Number.POSITIVE_INFINITY;
+      if (ageMs <= REASSERT_ORPHAN_TTL_MS) {
+        // Fresh stash from another session: do not steal it before that session re-boots.
+        continue;
+      }
+    }
+    if (fallback.length < limit) {
+      fallback.push(entry);
+    }
   }
-  return eligible;
+  return [...matched, ...fallback].slice(0, limit);
 }
 
 /** Hard cap on re-asserted events per boot: the inbox is plain JSON on disk,
@@ -5242,6 +5306,7 @@ export async function parkUndeliverableInboxEntries(
 export async function readParkedUndeliverablePending(
   vaultPath: string,
   limit = 3,
+  options?: ReadReassertPendingOptions,
 ): Promise<InboxEntry[]> {
   const parkDir = path.join(vaultPath, "inbox", ".undeliverable");
   let names: string[] = [];
@@ -5254,9 +5319,12 @@ export async function readParkedUndeliverablePending(
   stamped.sort(
     (a, b) => (b.ts ?? 0) - (a.ts ?? 0) || b.name.localeCompare(a.name),
   );
-  const eligible: InboxEntry[] = [];
-  for (const { name } of stamped) {
-    if (eligible.length >= limit) break;
+  const callerSessionKey = resolveReassertSessionKey(options?.sessionKey, options?.sessionId);
+  const nowMs = options?.nowMs ?? Date.now();
+  const matched: InboxEntry[] = [];
+  const fallback: InboxEntry[] = [];
+  for (const { name, ts } of stamped) {
+    if (matched.length >= limit) break;
     const filePath = path.join(parkDir, name);
     let parsed: Record<string, unknown>;
     try {
@@ -5267,14 +5335,42 @@ export async function readParkedUndeliverablePending(
     const stashed = parsed.stale_belief_events;
     const emptyStash = Array.isArray(stashed) && stashed.length === 0;
     if (!emptyStash && !payloadHasValidStaleBeliefEvent(parsed)) continue;
-    eligible.push({
+    const entrySessionKey = resolveReassertSessionKey(
+      typeof parsed.session_key === "string" ? parsed.session_key : undefined,
+      typeof parsed.session_id === "string" ? parsed.session_id : undefined,
+    );
+    const entry: InboxEntry = {
       slug: typeof parsed.slug === "string" ? parsed.slug : name,
       filePath,
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
       payload: parsed,
-    });
+    };
+    if (entrySessionKey) {
+      if (callerSessionKey && entrySessionKey === callerSessionKey) {
+        matched.push(entry);
+        continue;
+      }
+      const createdMs =
+        typeof parsed.createdAt === "string" ? Date.parse(parsed.createdAt) : Number.NaN;
+      let effectiveTs = Number.isFinite(createdMs) ? createdMs : ts;
+      if (effectiveTs === undefined) {
+        try {
+          effectiveTs = (await stat(filePath)).mtimeMs;
+        } catch {
+          effectiveTs = undefined;
+        }
+      }
+      const ageMs = effectiveTs !== undefined ? nowMs - effectiveTs : Number.POSITIVE_INFINITY;
+      if (ageMs <= REASSERT_ORPHAN_TTL_MS) {
+        // Fresh parked entry from another session: wait for the 10-minute orphan window.
+        continue;
+      }
+    }
+    if (fallback.length < limit) {
+      fallback.push(entry);
+    }
   }
-  return eligible;
+  return [...matched, ...fallback].slice(0, limit);
 }
 
 /**

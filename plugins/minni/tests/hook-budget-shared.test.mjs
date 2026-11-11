@@ -90,10 +90,11 @@ function sharedConfig(vaultPath, overrides = {}) {
   };
 }
 
-async function writeStaleState(vaultPath, title) {
+async function writeStaleState(vaultPath, title, sessionId = "shared-budget-fixture") {
   await writeFile(
     path.join(vaultPath, ".runtime", "recall-state.json"),
     JSON.stringify({
+      session_id: sessionId,
       task_signature: "previous-turn",
       intent: "recall",
       top_hits: [{ title, wikilink: `[[wiki/decisions/${title.replace(/\s+/g, "-")}]]`, score: 0.9 }],

@@ -993,12 +993,16 @@ test("PreToolUse guard audit stamps session_id only when the payload carries one
 
     // Re-seed a fresh unconsumed state and re-run with a real session_id: this
     // time the guard audit must stamp the RAW id verbatim.
-    await writeRecallState(vault, {
-      task_signature: "sig-guard-2",
-      intent: "recall",
-      top_hits: [{ title: "Guard hit 2", wikilink: "[[guard-hit-2]]", score: 0.9 }],
-      top_score: 0.9,
-    });
+    await writeRecallState(
+      vault,
+      {
+        task_signature: "sig-guard-2",
+        intent: "recall",
+        top_hits: [{ title: "Guard hit 2", wikilink: "[[guard-hit-2]]", score: 0.9 }],
+        top_score: 0.9,
+      },
+      { sessionId: "guard-session-9" },
+    );
     const deniedWithSession = await handlers.handlePreToolUse({
       tool_name: "Read",
       tool_input: { file_path: "/tmp/example2.txt" },

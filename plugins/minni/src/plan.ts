@@ -1,9 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, readdir, unlink } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
-import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
-import { writeVaultPage, appendFileWithFsync, writeFileAtomic, type VaultWriteResult } from "./vault.js";
+import {
+  DEFAULT_AGENT_ID,
+  DEFAULT_VAULT_PATH,
+  isLiveMatchingProcess,
+} from "./config.js";
+import {
+  assertWriteTargetUnder,
+  writeVaultPage,
+  appendFileWithFsync,
+  writeFileAtomic,
+  type VaultWriteResult,
+} from "./vault.js";
 import type { PageStatus } from "./vault.js";
 import type { ScarTissueEntry } from "./task.js";
 import { stableStringify } from "./agent_envelope.js";
@@ -15,6 +25,7 @@ import {
   readOrderedThreadEvents,
   reconcileThreadJournal,
 } from "./thread-events.js";
+import { sweepDeadRelayCursors } from "./thread-notification-relay.js";
 
 // ---------------------------------------------------------------------------
 // Types (exported per spec)
@@ -180,6 +191,11 @@ export interface CreatePlanInput {
   shelf_ref?: Partial<ShelfRef> & { shelf_content?: string };
   vaultPath?: string;
   next_action?: string;
+  activate?: boolean;
+  sessionKey?: string;
+  sessionId?: string;
+  hostPid?: number;
+  workspaceId?: string;
 }
 
 export interface CreatePlanDeps {
@@ -564,6 +580,10 @@ export const TERMINAL_PLAN_STATUSES: ReadonlySet<string> = new Set([
   "rejected",
   "superseded",
 ]);
+
+export function isTerminalPlanStatus(status: string | undefined): boolean {
+  return typeof status === "string" && (TERMINAL_PLAN_STATUSES.has(status) || status === "abandoned");
+}
 
 /**
  * All-resolved predicate: every slice terminal (done/superseded) on a non-empty
@@ -1021,32 +1041,44 @@ export async function createPlan(
   // wrong plan without notice. First-plan and terminal-incumbent cases stay
   // silent. An unreadable incumbent note is treated as in-flight (warn).
   let displaced_active: string | undefined;
-  const incumbent = await getActivePlan(vaultPath);
-  if (incumbent && incumbent.plan_id !== plan.plan_id) {
-    // Effectively-terminal predicate shared with resolveActivePlanView and
-    // activatePlanChecked (codex round 4): a terminal status OR a stale
-    // all-resolved shape (status scalar stuck at draft/candidate with every
-    // slice done/superseded) is a finished plan — displace it silently rather
-    // than warn the user toward re-activating it.
-    let incumbentTerminal = false;
-    try {
-      const scalars = await rehydratePlanScalars(incumbent.notePath);
-      incumbentTerminal =
-        TERMINAL_PLAN_STATUSES.has(scalars.status) || allSlicesResolved(scalars.slices);
-    } catch {
-      // unreadable incumbent: conservatively report the displacement
+  const shouldActivate = input.activate !== false;
+  if (shouldActivate) {
+    const incumbent = await getActivePlan(vaultPath, {
+      sessionKey: input.sessionKey,
+      strictSessionOnly: Boolean(input.sessionKey),
+    });
+    if (incumbent && incumbent.plan_id !== plan.plan_id) {
+      // Effectively-terminal predicate shared with resolveActivePlanView and
+      // activatePlanChecked (codex round 4): a terminal status OR a stale
+      // all-resolved shape (status scalar stuck at draft/candidate with every
+      // slice done/superseded) is a finished plan — displace it silently rather
+      // than warn the user toward re-activating it.
+      let incumbentTerminal = false;
+      try {
+        const scalars = await rehydratePlanScalars(incumbent.notePath);
+        incumbentTerminal =
+          TERMINAL_PLAN_STATUSES.has(scalars.status) || allSlicesResolved(scalars.slices);
+      } catch {
+        // unreadable incumbent: conservatively report the displacement
+      }
+      if (!incumbentTerminal) {
+        displaced_active = incumbent.plan_id;
+      }
     }
-    if (!incumbentTerminal) {
-      displaced_active = incumbent.plan_id;
-    }
-  }
 
-  await setActivePlan(vaultPath, plan.plan_id, writeRes.notePath);
+    await setActivePlan(vaultPath, plan.plan_id, writeRes.notePath, {
+      sessionKey: input.sessionKey,
+      sessionId: input.sessionId,
+      hostPid: input.hostPid,
+      workspaceId: input.workspaceId,
+    });
+  }
 
   const journalPath = journalPathFor(writeRes.notePath, plan.plan_id);
   await appendJournal(journalPath, { kind: "rehydrated", at: plan.created });
+  await maybeSweepDeadActiveThreadPointers(vaultPath).catch(() => {});
 
-  return { plan, write: writeRes, displaced_active };
+  return { plan, write: writeRes, ...(displaced_active ? { displaced_active } : {}) };
 }
 
 // #294 (June audit N7): history.jsonl stored one full plan snapshot per
@@ -2465,24 +2497,521 @@ export function structuralProposalDelta(
   throw new Error("structuralProposalDelta: unknown proposal kind");
 }
 
+const SESSION_KEY_HEX16_RE = /^[0-9a-f]{16}$/;
+const ACTIVE_THREAD_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const ACTIVE_THREAD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const ACTIVE_THREAD_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+
+export interface ActivePlanSessionOptions {
+  sessionKey?: string;
+  sessionId?: string;
+  hostPid?: number;
+  workspaceId?: string;
+  strictSessionOnly?: boolean;
+  sessionOnly?: boolean;
+  markDetached?: boolean;
+  expectedPlanId?: string;
+}
+
+export interface ActiveThreadBinding {
+  plan_id: string;
+  notePath: string;
+  session_key: string;
+  session_id?: string;
+  host_pid?: number;
+  workspace_id?: string;
+  set_at: string;
+  updated_at: string;
+}
+
+function isHostPidAlive(pid: number | undefined): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
 export function activePointerPath(vaultPath: string): string {
   return path.join(vaultPath, "wiki", "artifacts", "_active_plan.json");
+}
+
+export function activeThreadSessionDir(vaultPath: string): string {
+  return path.join(vaultPath, ".runtime", "active-thread.d");
+}
+
+export function activeThreadSessionPath(
+  vaultPath: string,
+  sessionKey: string | undefined,
+): string | null {
+  if (typeof sessionKey !== "string" || !SESSION_KEY_HEX16_RE.test(sessionKey)) {
+    return null;
+  }
+  return path.join(activeThreadSessionDir(vaultPath), `${sessionKey}.json`);
+}
+
+function activeThreadDetachedPath(
+  vaultPath: string,
+  sessionKey: string | undefined,
+): string | null {
+  if (typeof sessionKey !== "string" || !SESSION_KEY_HEX16_RE.test(sessionKey)) {
+    return null;
+  }
+  return path.join(activeThreadSessionDir(vaultPath), `${sessionKey}.detached`);
+}
+
+export async function listLiveActiveThreadBindings(
+  vaultPath: string,
+  excludeSessionKey?: string,
+  nowMs: number = Date.now(),
+): Promise<ActiveThreadBinding[]> {
+  const dir = activeThreadSessionDir(vaultPath);
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const results: ActiveThreadBinding[] = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const stem = name.slice(0, -5);
+    if (!SESSION_KEY_HEX16_RE.test(stem) || stem === excludeSessionKey) continue;
+    const filePath = path.join(dir, name);
+    try {
+      const raw = await readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw) as Partial<ActiveThreadBinding>;
+      if (
+        !parsed ||
+        typeof parsed.plan_id !== "string" ||
+        typeof parsed.notePath !== "string" ||
+        typeof parsed.set_at !== "string"
+      ) {
+        continue;
+      }
+      const rel = path.relative(path.resolve(vaultPath), path.resolve(parsed.notePath));
+      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
+      const updatedIso = typeof parsed.updated_at === "string" ? parsed.updated_at : parsed.set_at;
+      const updatedMs = Date.parse(updatedIso);
+      if (Number.isFinite(updatedMs) && nowMs - updatedMs > ACTIVE_THREAD_SESSION_TTL_MS) {
+        continue;
+      }
+      if (typeof parsed.host_pid === "number" && !isHostPidAlive(parsed.host_pid)) {
+        continue;
+      }
+      try {
+        const scalars = await rehydratePlanScalars(parsed.notePath);
+        if (TERMINAL_PLAN_STATUSES.has(scalars.status) || allSlicesResolved(scalars.slices)) {
+          continue;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+      }
+      results.push({
+        plan_id: parsed.plan_id,
+        notePath: parsed.notePath,
+        session_key: stem,
+        ...(typeof parsed.session_id === "string" ? { session_id: parsed.session_id } : {}),
+        ...(typeof parsed.host_pid === "number" ? { host_pid: parsed.host_pid } : {}),
+        ...(typeof parsed.workspace_id === "string" ? { workspace_id: parsed.workspace_id } : {}),
+        set_at: parsed.set_at,
+        updated_at: updatedIso,
+      });
+    } catch {
+      // Ignore unreadable session binding.
+    }
+  }
+  return results;
+}
+
+export async function hasOtherLiveSessionOnPlan(
+  vaultPath: string,
+  planId: string,
+  callerSessionKey?: string,
+): Promise<boolean> {
+  const live = await listLiveActiveThreadBindings(vaultPath, callerSessionKey);
+  return live.some((b) => b.plan_id === planId);
+}
+
+export async function getConcurrentActiveThreads(
+  vaultPath: string,
+  excludeSessionKey?: string,
+): Promise<
+  Array<{
+    plan_id: string;
+    goal: string;
+    status: string;
+    owner_session_key: string;
+  }>
+> {
+  const live = await listLiveActiveThreadBindings(vaultPath, excludeSessionKey);
+  const seenPlans = new Set<string>();
+  const out: Array<{
+    plan_id: string;
+    goal: string;
+    status: string;
+    owner_session_key: string;
+  }> = [];
+  for (const b of live) {
+    if (seenPlans.has(b.plan_id)) continue;
+    seenPlans.add(b.plan_id);
+    try {
+      const plan = await rehydratePlan(b.notePath);
+      if (TERMINAL_PLAN_STATUSES.has(plan.status) || allSlicesResolved(plan.slices)) continue;
+      out.push({
+        plan_id: plan.plan_id,
+        goal: plan.goal,
+        status: plan.status,
+        owner_session_key: b.session_key,
+      });
+    } catch {
+      // Skip unreadable plan note.
+    }
+  }
+  return out;
+}
+
+/**
+ * §5.1.2 & §5.2 (Slice S4): Dead-session GC sweep for `.runtime/active-thread.d/`
+ * and `.runtime/thread-relay/cursors.json`.
+ *
+ * Prunes `.runtime/active-thread.d/<sessionKey>.json` when:
+ *  - the referenced plan is terminal or missing, OR
+ *  - `host_pid` is dead (`ESRCH`) AND `updated_at > 24h`, OR
+ *  - `updated_at > 7d`.
+ * Before deleting a non-terminal session pointer, if `wiki/artifacts/_active_plan.json`
+ * is absent, preserves the last non-terminal `plan_id` in `_active_plan.json`.
+ *
+ * STRICT NEVER-DELETE INVARIANT (§5.2): Never touches `wiki/artifacts/plan-*.md`,
+ * `*.log.md`, or `*.history.jsonl`.
+ */
+export async function sweepDeadActiveThreadPointers(
+  vaultPath: string,
+  nowMs: number = Date.now(),
+): Promise<{ prunedPointers: number; prunedCursors: number }> {
+  const dir = activeThreadSessionDir(vaultPath);
+  let entries: string[] = [];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    entries = [];
+  }
+  let prunedPointers = 0;
+  const prunedSessionKeys = new Set<string>();
+  let lastNonTerminalPreserved = false;
+
+  for (const name of entries) {
+    if (name.endsWith(".detached")) {
+      const stem = name.slice(0, -".detached".length);
+      if (!SESSION_KEY_HEX16_RE.test(stem)) continue;
+      const detachedPath = path.join(dir, name);
+      try {
+        const raw = JSON.parse(await readFile(detachedPath, "utf8")) as { detached_at?: string };
+        const ts = Date.parse(raw.detached_at ?? "");
+        if (Number.isFinite(ts) && nowMs - ts > ACTIVE_THREAD_SESSION_TTL_MS) {
+          await unlink(detachedPath).catch(() => {});
+        }
+      } catch {
+        // Ignore unreadable detached marker.
+      }
+      continue;
+    }
+    if (!name.endsWith(".json") || name === ".sweep.json") continue;
+    const stem = name.slice(0, -".json".length);
+    if (!SESSION_KEY_HEX16_RE.test(stem)) continue;
+    const filePath = path.join(dir, name);
+    try {
+      const raw = JSON.parse(await readFile(filePath, "utf8")) as Partial<ActiveThreadBinding>;
+      if (
+        !raw ||
+        typeof raw.plan_id !== "string" ||
+        typeof raw.notePath !== "string" ||
+        typeof raw.set_at !== "string"
+      ) {
+        continue;
+      }
+      const rel = path.relative(path.resolve(vaultPath), path.resolve(raw.notePath));
+      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+        await unlink(filePath).catch(() => {});
+        prunedPointers += 1;
+        continue;
+      }
+      const updatedIso = typeof raw.updated_at === "string" ? raw.updated_at : raw.set_at;
+      const updatedMs = Date.parse(updatedIso);
+      const ageMs = Number.isFinite(updatedMs) ? nowMs - updatedMs : 0;
+      const pidAlive = typeof raw.host_pid === "number" ? isHostPidAlive(raw.host_pid) : true;
+
+      let isTerminalOrMissing = false;
+      try {
+        const scalars = await rehydratePlanScalars(raw.notePath);
+        if (TERMINAL_PLAN_STATUSES.has(scalars.status) || allSlicesResolved(scalars.slices)) {
+          isTerminalOrMissing = true;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+          isTerminalOrMissing = true;
+        }
+      }
+
+      const deadSessionExpired = !pidAlive && ageMs > ACTIVE_THREAD_SESSION_TTL_MS;
+      const hardMaxAgeExpired = ageMs > ACTIVE_THREAD_MAX_AGE_MS;
+      if (!isTerminalOrMissing && !deadSessionExpired && !hardMaxAgeExpired) {
+        continue;
+      }
+
+      if (!isTerminalOrMissing && !lastNonTerminalPreserved) {
+        const pointerPath = activePointerPath(vaultPath);
+        let fallbackExists = false;
+        try {
+          await readFile(pointerPath, "utf8");
+          fallbackExists = true;
+        } catch {
+          fallbackExists = false;
+        }
+        if (!fallbackExists) {
+          try {
+            await mkdir(path.dirname(pointerPath), { recursive: true });
+            await writeFileAtomic(
+              pointerPath,
+              JSON.stringify(
+                {
+                  plan_id: raw.plan_id,
+                  notePath: raw.notePath,
+                  set_at: raw.set_at,
+                },
+                null,
+                2,
+              ),
+            );
+            lastNonTerminalPreserved = true;
+          } catch {
+            // Best-effort preservation.
+          }
+        }
+      }
+
+      await unlink(filePath).catch(() => {});
+      const detachedPath = activeThreadDetachedPath(vaultPath, stem);
+      if (detachedPath) {
+        await unlink(detachedPath).catch(() => {});
+      }
+      prunedPointers += 1;
+      // Always record expired/dead session keys for relay cursor GC, even when the
+      // referenced plan had already transitioned to complete/terminal.
+      if (!pidAlive || deadSessionExpired || hardMaxAgeExpired) {
+        prunedSessionKeys.add(stem);
+      }
+    } catch {
+      // Ignore unreadable session pointer.
+    }
+  }
+
+  // Sweep expired (>24h) dead/recycled active-session-*.json files and collect live session keys.
+  const runtimeDir = path.join(vaultPath, ".runtime");
+  const liveRuntimeSessionKeys = new Set<string>();
+  for (const name of entries) {
+    if (!name.endsWith(".json") || name === ".sweep.json") continue;
+    const stem = name.slice(0, -".json".length);
+    if (SESSION_KEY_HEX16_RE.test(stem) && !prunedSessionKeys.has(stem)) {
+      liveRuntimeSessionKeys.add(stem);
+    }
+  }
+  try {
+    const runtimeEntries = await readdir(runtimeDir);
+    for (const entry of runtimeEntries) {
+      if (!entry.startsWith("active-session-") || !entry.endsWith(".json")) continue;
+      const candidatePath = path.join(runtimeDir, entry);
+      try {
+        const rawHint = JSON.parse(await readFile(candidatePath, "utf8")) as {
+          host_pid?: number;
+          process_start_marker?: string;
+          session_key?: string;
+          updated_at?: string;
+        };
+        const updatedMs =
+          typeof rawHint?.updated_at === "string" ? Date.parse(rawHint.updated_at) : Number.NaN;
+        const mtimeMs = (await stat(candidatePath)).mtimeMs;
+        const effectiveAgeMs = Number.isFinite(updatedMs)
+          ? nowMs - updatedMs
+          : nowMs - mtimeMs;
+        const pidLive =
+          typeof rawHint?.host_pid === "number"
+            ? isLiveMatchingProcess(
+                rawHint.host_pid,
+                typeof rawHint.process_start_marker === "string"
+                  ? rawHint.process_start_marker
+                  : undefined,
+              )
+            : false;
+        if (pidLive) {
+          if (typeof rawHint?.session_key === "string" && SESSION_KEY_HEX16_RE.test(rawHint.session_key)) {
+            liveRuntimeSessionKeys.add(rawHint.session_key);
+          }
+        } else if (effectiveAgeMs > ACTIVE_THREAD_SESSION_TTL_MS) {
+          await unlink(candidatePath).catch(() => {});
+          if (typeof rawHint?.session_key === "string" && SESSION_KEY_HEX16_RE.test(rawHint.session_key)) {
+            prunedSessionKeys.add(rawHint.session_key);
+          }
+        }
+      } catch {
+        // Best-effort active-session sweep.
+      }
+    }
+  } catch {
+    // Missing .runtime dir.
+  }
+
+  // Sweep expired (>24h and not live) .runtime/lifecycle-state.d/*.json files.
+  const lifecycleDir = path.join(runtimeDir, "lifecycle-state.d");
+  try {
+    const lcEntries = await readdir(lifecycleDir);
+    for (const lcName of lcEntries) {
+      if (!lcName.endsWith(".json")) continue;
+      const stem = lcName.slice(0, -".json".length);
+      if (liveRuntimeSessionKeys.has(stem)) continue;
+      const lcPath = path.join(lifecycleDir, lcName);
+      try {
+        let updatedMs = Number.NaN;
+        try {
+          const rawLc = JSON.parse(await readFile(lcPath, "utf8")) as {
+            updated_at?: string;
+            ts?: string;
+          };
+          const stamp = rawLc?.updated_at ?? rawLc?.ts;
+          if (typeof stamp === "string") updatedMs = Date.parse(stamp);
+        } catch {
+          // Fall back to mtimeMs below.
+        }
+        const mtimeMs = (await stat(lcPath)).mtimeMs;
+        const effectiveAgeMs = Number.isFinite(updatedMs) ? nowMs - updatedMs : nowMs - mtimeMs;
+        if (prunedSessionKeys.has(stem) || effectiveAgeMs > ACTIVE_THREAD_SESSION_TTL_MS) {
+          assertWriteTargetUnder(lcPath, vaultPath);
+          await unlink(lcPath).catch(() => {});
+        }
+      } catch {
+        // Ignore missing/unreadable lifecycle state file.
+      }
+    }
+  } catch {
+    // Missing lifecycle-state.d dir.
+  }
+
+  const { prunedCursors } = await sweepDeadRelayCursors(
+    vaultPath,
+    nowMs,
+    prunedSessionKeys,
+  ).catch(() => ({ prunedCursors: 0 }));
+
+  return { prunedPointers, prunedCursors };
+}
+
+export const sweepDeadSessionState = sweepDeadActiveThreadPointers;
+
+export async function maybeSweepDeadActiveThreadPointers(
+  vaultPath: string,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  const dir = activeThreadSessionDir(vaultPath);
+  const sweepGatePath = path.join(dir, ".sweep.json");
+  try {
+    const raw = JSON.parse(await readFile(sweepGatePath, "utf8")) as { last_sweep_ms?: number };
+    if (
+      typeof raw.last_sweep_ms === "number" &&
+      Number.isFinite(raw.last_sweep_ms) &&
+      nowMs - raw.last_sweep_ms < ACTIVE_THREAD_SWEEP_INTERVAL_MS
+    ) {
+      return;
+    }
+  } catch {
+    // Missing or unreadable gate -> proceed with sweep.
+  }
+  try {
+    await mkdir(dir, { recursive: true });
+    assertWriteTargetUnder(sweepGatePath, vaultPath);
+    await writeFileAtomic(sweepGatePath, JSON.stringify({ last_sweep_ms: nowMs }));
+  } catch {
+    // Best-effort gate write.
+  }
+  await sweepDeadActiveThreadPointers(vaultPath, nowMs);
 }
 
 export async function setActivePlan(
   vaultPath: string,
   plan_id: string,
-  notePath: string
+  notePath: string,
+  options?: ActivePlanSessionOptions,
 ): Promise<void> {
+  const nowIso = new Date().toISOString();
+  const sessionPath = activeThreadSessionPath(vaultPath, options?.sessionKey);
+  if (sessionPath && options?.sessionKey) {
+    const dir = activeThreadSessionDir(vaultPath);
+    await mkdir(dir, { recursive: true });
+    assertWriteTargetUnder(sessionPath, vaultPath);
+    const sessionData = JSON.stringify(
+      {
+        version: 1,
+        plan_id,
+        notePath,
+        session_key: options.sessionKey,
+        ...(options.sessionId ? { session_id: options.sessionId } : {}),
+        ...(typeof options.hostPid === "number" ? { host_pid: options.hostPid } : {}),
+        ...(options.workspaceId ? { workspace_id: options.workspaceId } : {}),
+        set_at: nowIso,
+        updated_at: nowIso,
+      },
+      null,
+      2,
+    );
+    await writeFileAtomic(sessionPath, sessionData);
+    const detachedPath = activeThreadDetachedPath(vaultPath, options.sessionKey);
+    if (detachedPath) {
+      await unlink(detachedPath).catch(() => {});
+    }
+  }
+
   const pointerPath = activePointerPath(vaultPath);
+  if (options?.sessionKey && SESSION_KEY_HEX16_RE.test(options.sessionKey)) {
+    try {
+      const existingRaw = await readFile(pointerPath, "utf8");
+      const existing = JSON.parse(existingRaw) as {
+        plan_id?: string;
+        owner_session_key?: string;
+      };
+      if (
+        existing &&
+        typeof existing.plan_id === "string" &&
+        existing.plan_id !== plan_id &&
+        existing.owner_session_key !== options.sessionKey
+      ) {
+        const otherLive = await hasOtherLiveSessionOnPlan(
+          vaultPath,
+          existing.plan_id,
+          options.sessionKey,
+        );
+        if (otherLive) {
+          // Preserve _active_plan.json for the other live session's active thread.
+          return;
+        }
+      }
+    } catch {
+      // Missing or unreadable _active_plan.json -> proceed to write.
+    }
+  }
+
   const data = JSON.stringify(
     {
       plan_id,
       notePath,
-      set_at: new Date().toISOString(),
+      set_at: nowIso,
+      ...(options?.sessionKey && SESSION_KEY_HEX16_RE.test(options.sessionKey)
+        ? { owner_session_key: options.sessionKey }
+        : {}),
+      ...(typeof options?.hostPid === "number" ? { owner_host_pid: options.hostPid } : {}),
     },
     null,
-    2
+    2,
   );
   // PLUMB-T4 / #231: atomic temp+rename so a crash mid-write cannot leave a
   // truncated active-thread pointer. writeFileAtomic already lives in vault.ts.
@@ -2502,6 +3031,7 @@ export async function activatePlanChecked(
   vaultPath: string,
   plan_id: string,
   notePath: string,
+  options?: ActivePlanSessionOptions,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const scalars = await rehydratePlanScalars(notePath);
   if (TERMINAL_PLAN_STATUSES.has(scalars.status)) {
@@ -2516,13 +3046,80 @@ export async function activatePlanChecked(
       error: `plan ${plan_id} has every slice resolved (done/superseded) and is effectively complete despite its '${scalars.status}' status; it cannot be re-activated — create a new plan (minni_thread_create) or restore a prior revision (minni_thread_restore) instead`,
     };
   }
-  await setActivePlan(vaultPath, plan_id, notePath);
+  await setActivePlan(vaultPath, plan_id, notePath, options);
   return { ok: true };
 }
 
 export async function getActivePlan(
-  vaultPath: string
+  vaultPath: string,
+  options?: ActivePlanSessionOptions,
 ): Promise<{ plan_id: string; notePath: string; set_at: string } | undefined> {
+  const sessionKey =
+    typeof options?.sessionKey === "string" && SESSION_KEY_HEX16_RE.test(options.sessionKey)
+      ? options.sessionKey
+      : undefined;
+  if (sessionKey) {
+    const sessionPath = activeThreadSessionPath(vaultPath, sessionKey);
+    if (sessionPath) {
+      try {
+        assertWriteTargetUnder(sessionPath, vaultPath);
+        const raw = await readFile(sessionPath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          typeof parsed.plan_id === "string" &&
+          typeof parsed.notePath === "string" &&
+          typeof parsed.set_at === "string"
+        ) {
+          const rel = path.relative(path.resolve(vaultPath), path.resolve(parsed.notePath));
+          if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+            console.error(
+              `minni: getActivePlan rejected a session notePath outside the vault root (${vaultPath}): ${parsed.notePath}`,
+            );
+            return undefined;
+          }
+          let sessionPlanTerminalOrMissing = false;
+          try {
+            const scalars = await rehydratePlanScalars(parsed.notePath);
+            if (isTerminalPlanStatus(scalars.status)) {
+              sessionPlanTerminalOrMissing = true;
+            }
+          } catch (scalarErr) {
+            if ((scalarErr as NodeJS.ErrnoException)?.code === "ENOENT") {
+              sessionPlanTerminalOrMissing = true;
+            }
+          }
+          if (sessionPlanTerminalOrMissing) {
+            await clearActivePlan(vaultPath, {
+              sessionKey,
+              expectedPlanId: parsed.plan_id,
+              markDetached: false,
+            }).catch(() => {});
+            return undefined;
+          }
+          return parsed;
+        }
+      } catch (err) {
+        const errno = activePlanErrnoCode(err);
+        if (errno && errno !== "ENOENT") {
+          throw new ActivePlanReadError(errno, err);
+        }
+      }
+    }
+    const detachedPath = activeThreadDetachedPath(vaultPath, sessionKey);
+    if (detachedPath) {
+      try {
+        await readFile(detachedPath, "utf8");
+        return undefined;
+      } catch {
+        // Not explicitly detached.
+      }
+    }
+    const liveOthers = await listLiveActiveThreadBindings(vaultPath, sessionKey);
+    if (liveOthers.length > 0) {
+      return undefined;
+    }
+  }
   const pointerPath = activePointerPath(vaultPath);
   try {
     const raw = await readFile(pointerPath, "utf8");
@@ -2548,6 +3145,57 @@ export async function getActivePlan(
         );
         return undefined;
       }
+      if (sessionKey) {
+        if (
+          typeof parsed.owner_session_key === "string" &&
+          parsed.owner_session_key !== sessionKey
+        ) {
+          if (
+            typeof parsed.owner_host_pid === "number" &&
+            isHostPidAlive(parsed.owner_host_pid)
+          ) {
+            return undefined;
+          }
+          if (options?.strictSessionOnly) {
+            return undefined;
+          }
+        }
+        let mirrorTerminalOrMissing = false;
+        try {
+          const scalars = await rehydratePlanScalars(parsed.notePath);
+          if (isTerminalPlanStatus(scalars.status)) {
+            mirrorTerminalOrMissing = true;
+          } else if (
+            !options?.strictSessionOnly &&
+            typeof parsed.owner_session_key === "string" &&
+            parsed.owner_session_key.length > 0 &&
+            !allSlicesResolved(scalars.slices)
+          ) {
+            await setActivePlan(vaultPath, parsed.plan_id, parsed.notePath, {
+              ...options,
+              sessionKey,
+              hostPid:
+                typeof options?.hostPid === "number"
+                  ? options.hostPid
+                  : process.ppid > 1
+                    ? process.ppid
+                    : undefined,
+            });
+          }
+        } catch (scalarErr) {
+          if ((scalarErr as NodeJS.ErrnoException)?.code === "ENOENT") {
+            mirrorTerminalOrMissing = true;
+          }
+        }
+        if (mirrorTerminalOrMissing) {
+          await clearActivePlan(vaultPath, {
+            sessionKey,
+            expectedPlanId: parsed.plan_id,
+            markDetached: false,
+          }).catch(() => {});
+          return undefined;
+        }
+      }
       return parsed;
     }
   } catch (error) {
@@ -2565,12 +3213,123 @@ export async function getActivePlan(
   return undefined;
 }
 
-export async function clearActivePlan(vaultPath: string): Promise<void> {
+export async function clearActivePlan(
+  vaultPath: string,
+  options?: ActivePlanSessionOptions,
+): Promise<void> {
+  const sessionKey =
+    typeof options?.sessionKey === "string" && SESSION_KEY_HEX16_RE.test(options.sessionKey)
+      ? options.sessionKey
+      : undefined;
+  const expectedPlanId =
+    typeof options?.expectedPlanId === "string" && options.expectedPlanId.trim()
+      ? options.expectedPlanId.trim()
+      : undefined;
+  const shouldMarkDetached =
+    typeof options?.markDetached === "boolean"
+      ? options.markDetached
+      : Boolean(options?.sessionOnly);
+
+  let clearedPlanId: string | undefined;
+  if (sessionKey) {
+    const sessionPath = activeThreadSessionPath(vaultPath, sessionKey);
+    if (sessionPath) {
+      let existingSessionPlanId: string | undefined;
+      try {
+        const raw = await readFile(sessionPath, "utf8");
+        const parsed = JSON.parse(raw) as { plan_id?: string };
+        if (typeof parsed?.plan_id === "string") {
+          existingSessionPlanId = parsed.plan_id;
+        }
+      } catch {
+        // Ignore missing session file.
+      }
+      if (!expectedPlanId || !existingSessionPlanId || existingSessionPlanId === expectedPlanId) {
+        clearedPlanId = existingSessionPlanId;
+        try {
+          await unlink(sessionPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+        }
+      }
+    }
+    if (shouldMarkDetached) {
+      const detachedPath = activeThreadDetachedPath(vaultPath, sessionKey);
+      if (detachedPath) {
+        try {
+          await mkdir(activeThreadSessionDir(vaultPath), { recursive: true });
+          assertWriteTargetUnder(detachedPath, vaultPath);
+          await writeFileAtomic(
+            detachedPath,
+            JSON.stringify({ detached_at: new Date().toISOString() }),
+          );
+        } catch {
+          // Best-effort detached marker.
+        }
+      }
+    }
+  }
+
   const pointerPath = activePointerPath(vaultPath);
+  const targetPlan = expectedPlanId ?? clearedPlanId;
+  if (sessionKey || expectedPlanId) {
+    try {
+      const raw = await readFile(pointerPath, "utf8");
+      const parsed = JSON.parse(raw) as {
+        plan_id?: string;
+        owner_session_key?: string;
+        owner_host_pid?: number;
+      };
+      if (targetPlan && parsed?.plan_id && parsed.plan_id !== targetPlan) {
+        // _active_plan.json points to another plan (e.g. sibling session's planA); preserve it.
+        return;
+      }
+      if (
+        !targetPlan &&
+        sessionKey &&
+        parsed?.owner_session_key &&
+        parsed.owner_session_key !== sessionKey &&
+        typeof parsed.owner_host_pid === "number" &&
+        isHostPidAlive(parsed.owner_host_pid)
+      ) {
+        return;
+      }
+      const liveOthers = await listLiveActiveThreadBindings(vaultPath, sessionKey);
+      if (parsed?.plan_id && liveOthers.some((b) => b.plan_id === parsed.plan_id)) {
+        // Another live session still holds this active plan; keep _active_plan.json intact.
+        return;
+      }
+      if (liveOthers.length > 0) {
+        const remaining = liveOthers[0];
+        await writeFileAtomic(
+          pointerPath,
+          JSON.stringify(
+            {
+              plan_id: remaining.plan_id,
+              notePath: remaining.notePath,
+              set_at: remaining.set_at,
+              owner_session_key: remaining.session_key,
+              ...(typeof remaining.host_pid === "number"
+                ? { owner_host_pid: remaining.host_pid }
+                : {}),
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+      await unlink(pointerPath).catch(() => {});
+    } catch {
+      // Ignore missing or corrupt mirror on read.
+    }
+    return;
+  }
+
   try {
     await unlink(pointerPath);
-  } catch (err: any) {
-    if (err.code !== "ENOENT") {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
       throw err;
     }
   }
@@ -2622,11 +3381,21 @@ export function compactPlanPointer(active: {
 export async function resolvePlanIdOrActive(
   vaultPath: string,
   planId?: string,
+  options?: ActivePlanSessionOptions,
 ): Promise<{ plan_id: string } | { error: string }> {
   const explicit = planId?.trim();
   if (explicit) return { plan_id: explicit };
-  const active = await getActivePlan(vaultPath);
+  const active = await getActivePlan(vaultPath, options);
   if (!active) {
+    if (options?.sessionKey && SESSION_KEY_HEX16_RE.test(options.sessionKey)) {
+      const liveOthers = await listLiveActiveThreadBindings(vaultPath, options.sessionKey);
+      if (liveOthers.length > 0) {
+        const other = liveOthers[0];
+        return {
+          error: `no plan_id provided and no active plan is bound to this session (another live session is working on ${other.plan_id}); pass plan_id explicitly or activate one with minni_thread_activate`,
+        };
+      }
+    }
     return {
       error:
         "no plan_id provided and no active plan is set; pass plan_id explicitly or activate one with minni_thread_activate",
@@ -2651,7 +3420,7 @@ export async function resolvePlanIdOrActive(
 export async function resolveActivePlanView(
   vaultPath: string,
   liveShelfContent?: string,
-  options: { lockWaitMs?: number } = {},
+  options: { lockWaitMs?: number } & ActivePlanSessionOptions = {},
 ): Promise<{
   plan_id: string;
   rev: number;
@@ -2659,7 +3428,8 @@ export async function resolveActivePlanView(
   shelf_drift?: ReturnType<typeof shelfDrift>;
 } | undefined> {
   try {
-    const active = await getActivePlan(vaultPath);
+    await maybeSweepDeadActiveThreadPointers(vaultPath).catch(() => {});
+    const active = await getActivePlan(vaultPath, options);
     if (!active) return undefined;
     return await withThreadLock(
       vaultPath,
@@ -2668,7 +3438,7 @@ export async function resolveActivePlanView(
       async () => {
         // The active pointer can change while this reader queues. Never use a
         // stale pointer after acquiring the old plan's lock.
-        const lockedActive = await getActivePlan(vaultPath);
+        const lockedActive = await getActivePlan(vaultPath, options);
         if (
           !lockedActive ||
           lockedActive.plan_id !== active.plan_id ||
@@ -2681,12 +3451,21 @@ export async function resolveActivePlanView(
           plan = await rehydratePlan(active.notePath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-            await clearActivePlan(vaultPath).catch(() => {});
+            await clearActivePlan(vaultPath, {
+              ...options,
+              expectedPlanId: active.plan_id,
+              markDetached: false,
+            }).catch(() => {});
             return undefined;
           }
           throw error;
         }
-        if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
+        if (isTerminalPlanStatus(plan.status)) {
+          await clearActivePlan(vaultPath, {
+            ...options,
+            expectedPlanId: active.plan_id,
+            markDetached: false,
+          }).catch(() => {});
           return undefined;
         }
         // Honest-health self-heal (audit C4): plans completed under a stale
@@ -2766,6 +3545,11 @@ export async function resolveActivePlanView(
           } catch {
             // journal is advisory; the persisted status is the durable fix
           }
+          await clearActivePlan(vaultPath, {
+            ...options,
+            expectedPlanId: active.plan_id,
+            markDetached: false,
+          }).catch(() => {});
           return undefined;
         }
         return {

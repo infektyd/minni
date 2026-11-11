@@ -793,7 +793,7 @@ export async function writeRecallState(
       await writeStateFileAtomic(sessionFile, vaultPath, payload);
     }
   }
-  await writeFile(mirrorPath, JSON.stringify(payload, null, 2), "utf8");
+  await writeStateFileAtomic(mirrorPath, vaultPath, payload);
   return mirrorPath;
 }
 
@@ -817,8 +817,8 @@ export async function readRecallState(
     const mirror = await readStateFileAt(recallStatePath(vaultPath), vaultPath);
     if (
       mirror &&
-      (!mirror.session_id ||
-        mirror.session_id === sessionId ||
+      mirror.session_id &&
+      (mirror.session_id === sessionId ||
         sessionStateKey(mirror.session_id) === sessionStateKey(sessionId))
     ) {
       return mirror;
@@ -916,8 +916,8 @@ export async function markRecallConsumed(
     let mirrorOk = false;
     if (
       mirror &&
-      (!mirror.session_id ||
-        mirror.session_id === sessionId ||
+      mirror.session_id &&
+      (mirror.session_id === sessionId ||
         sessionStateKey(mirror.session_id) === sessionStateKey(sessionId))
     ) {
       mirrorOk = await markFileConsumed(mirrorPath, vaultPath);
@@ -942,33 +942,74 @@ export async function markRecallConsumed(
  * Claims the arming id and flips `consumed = true` so subsequent cold search/read
  * tools in the same turn are not denied after memory was already consulted.
  */
+export interface DisarmRecallStateOptions {
+  sessionId?: string;
+  sessionKey?: string;
+}
+
 export async function disarmRecallStateOnConsult(
   vaultPath: string,
-  sessionId?: string,
+  sessionIdOrOptions?: string | DisarmRecallStateOptions,
 ): Promise<boolean> {
-  const effectiveSessionId =
-    typeof sessionId === "string" && sessionId.trim() && sessionId.trim() !== "session"
-      ? sessionId.trim()
+  const rawSessionId =
+    typeof sessionIdOrOptions === "string"
+      ? sessionIdOrOptions
+      : sessionIdOrOptions?.sessionId;
+  const rawSessionKey =
+    typeof sessionIdOrOptions === "object" && sessionIdOrOptions !== null
+      ? sessionIdOrOptions.sessionKey
       : undefined;
+  const effectiveSessionId =
+    typeof rawSessionId === "string" && rawSessionId.trim() && rawSessionId.trim() !== "session"
+      ? rawSessionId.trim()
+      : undefined;
+  const effectiveSessionKey =
+    typeof rawSessionKey === "string" && HEX16_RE.test(rawSessionKey)
+      ? rawSessionKey
+      : sessionStateKey(effectiveSessionId) ?? undefined;
 
-  if (effectiveSessionId) {
-    const st = await readRecallState(vaultPath, {
-      sessionId: effectiveSessionId,
-      guardV2: true,
-    }).catch(() => null);
+  if (effectiveSessionId || effectiveSessionKey) {
+    const sessionFile = effectiveSessionKey
+      ? path.join(vaultPath, RECALL_STATE_DIR_RELPATH, `${effectiveSessionKey}.json`)
+      : effectiveSessionId
+        ? recallStateSessionPath(vaultPath, effectiveSessionId)
+        : null;
+    const scoped = sessionFile
+      ? await readStateFileAt(sessionFile, vaultPath).catch(() => null)
+      : null;
+    const mirrorPath = recallStatePath(vaultPath);
+    const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
+    const mirrorMatches =
+      mirror !== null &&
+      Boolean(mirror.session_id) &&
+      ((effectiveSessionId !== undefined && mirror.session_id === effectiveSessionId) ||
+        (effectiveSessionKey !== undefined &&
+          sessionStateKey(mirror.session_id) === effectiveSessionKey));
+    const st = scoped ?? (mirrorMatches ? mirror : null);
     if (!st) return false;
     await claimArming(
       vaultPath,
-      effectiveSessionId || st.session_id,
+      effectiveSessionId || st.session_id || effectiveSessionKey,
       armingKeyFor(st),
     ).catch(() => false);
-    if (!st.consumed) {
-      return markRecallConsumed(vaultPath, {
-        sessionId: effectiveSessionId,
-        guardV2: true,
-      }).catch(() => false);
+    let anyScopedDisarmed = false;
+    if (sessionFile && fileOrLinkExists(sessionFile)) {
+      if (!scoped?.consumed) {
+        const ok = await markFileConsumed(sessionFile, vaultPath).catch(() => false);
+        if (ok) anyScopedDisarmed = true;
+      } else {
+        anyScopedDisarmed = true;
+      }
     }
-    return true;
+    if (mirrorMatches) {
+      if (!mirror?.consumed) {
+        const ok = await markFileConsumed(mirrorPath, vaultPath).catch(() => false);
+        if (ok) anyScopedDisarmed = true;
+      } else {
+        anyScopedDisarmed = true;
+      }
+    }
+    return anyScopedDisarmed;
   }
 
   let anyDisarmed = false;
@@ -989,32 +1030,6 @@ export async function disarmRecallStateOnConsult(
         if (ok) anyDisarmed = true;
       }
     }
-  }
-
-  try {
-    const dirPath = path.join(vaultPath, RECALL_STATE_DIR_RELPATH);
-    assertWriteTargetUnder(dirPath, vaultPath);
-    const dirStat = fs.lstatSync(dirPath);
-    if (dirStat.isDirectory() && !dirStat.isSymbolicLink()) {
-      for (const name of fs.readdirSync(dirPath)) {
-        if (!name.endsWith(".json")) continue;
-        const stem = name.slice(0, -5);
-        if (!HEX16_RE.test(stem)) continue;
-        const filePath = path.join(dirPath, name);
-        const st = await readStateFileAt(filePath, vaultPath).catch(() => null);
-        if (!st) continue;
-        const sid = st.session_id || stem;
-        await claimArming(vaultPath, sid, armingKeyFor(st)).catch(() => false);
-        if (!st.consumed) {
-          const ok = await markFileConsumed(filePath, vaultPath).catch(() => false);
-          if (ok) anyDisarmed = true;
-        } else {
-          anyDisarmed = true;
-        }
-      }
-    }
-  } catch {
-    // Best-effort scan of session-scoped recall-state.d.
   }
 
   return anyDisarmed;
@@ -1444,8 +1459,12 @@ export async function readSessionHandle(
   const normalizedHandle = handle.trim();
   if (!normalizedHandle) return null;
   const candidateKeys: string[] = [];
+  const rawSid = typeof sessionId === "string" ? sessionId.trim() : "";
+  if (rawSid && HEX16_RE.test(rawSid)) {
+    candidateKeys.push(rawSid);
+  }
   const sKey = sessionStateKey(sessionId);
-  if (sKey) candidateKeys.push(sKey);
+  if (sKey && !candidateKeys.includes(sKey)) candidateKeys.push(sKey);
   candidateKeys.push("default");
 
   const coerceEntry = (key: string, val: unknown): SessionHandleEntry | null => {
@@ -1917,6 +1936,7 @@ export function buildStaleRecallPointer(
 
 /** Relative location of the lifecycle-state file under the vault. */
 export const LIFECYCLE_STATE_RELPATH = path.join(".runtime", "lifecycle-state.json");
+export const LIFECYCLE_STATE_DIR_RELPATH = path.join(".runtime", "lifecycle-state.d");
 
 export interface LifecycleState {
   /** session id this emphasis set belongs to (advisory; SessionStart resets). */
@@ -1925,21 +1945,70 @@ export interface LifecycleState {
   emphasized: string[];
 }
 
+export interface LifecycleStateOptions {
+  sessionId?: string;
+}
+
 /** Absolute path to the lifecycle-state file for a vault. */
 export function lifecycleStatePath(vaultPath: string): string {
   return path.join(vaultPath, LIFECYCLE_STATE_RELPATH);
 }
 
+export function lifecycleStateSessionPath(
+  vaultPath: string,
+  sessionId?: string,
+): string | null {
+  const key = sessionStateKey(sessionId);
+  if (!key) return null;
+  return path.join(vaultPath, LIFECYCLE_STATE_DIR_RELPATH, `${key}.json`);
+}
+
 /** Read the lifecycle-state file, or null when absent/malformed. */
-export async function readLifecycleState(vaultPath: string): Promise<LifecycleState | null> {
+export async function readLifecycleState(
+  vaultPath: string,
+  options?: LifecycleStateOptions,
+): Promise<LifecycleState | null> {
+  const sessionId =
+    typeof options?.sessionId === "string" &&
+    options.sessionId.trim() &&
+    options.sessionId.trim() !== "session"
+      ? options.sessionId.trim()
+      : undefined;
+  if (sessionId) {
+    const sessionFile = lifecycleStateSessionPath(vaultPath, sessionId);
+    if (sessionFile) {
+      try {
+        assertWriteTargetUnder(sessionFile, vaultPath);
+        const raw = await readFile(sessionFile, "utf8");
+        const parsed = JSON.parse(raw) as LifecycleState;
+        if (parsed && typeof parsed === "object" && Array.isArray(parsed.emphasized)) {
+          return parsed;
+        }
+      } catch (error) {
+        if (
+          !(error instanceof Error && /symlink|escapes root|containment/i.test(error.message)) &&
+          !shouldIgnoreStateReadError(error)
+        ) {
+          throw error;
+        }
+      }
+    }
+  }
   try {
-    const raw = await readFile(lifecycleStatePath(vaultPath), "utf8");
+    const mirrorPath = lifecycleStatePath(vaultPath);
+    assertWriteTargetUnder(mirrorPath, vaultPath);
+    const raw = await readFile(mirrorPath, "utf8");
     const parsed = JSON.parse(raw) as LifecycleState;
     if (parsed && typeof parsed === "object" && Array.isArray(parsed.emphasized)) {
-      return parsed;
+      if (!sessionId || !parsed.session_id || parsed.session_id === sessionId) {
+        return parsed;
+      }
     }
   } catch (error) {
-    if (!shouldIgnoreStateReadError(error)) {
+    if (
+      !(error instanceof Error && /symlink|escapes root|containment/i.test(error.message)) &&
+      !shouldIgnoreStateReadError(error)
+    ) {
       throw error;
     }
   }
@@ -1950,8 +2019,44 @@ export async function readLifecycleState(vaultPath: string): Promise<LifecycleSt
 export async function writeLifecycleState(
   vaultPath: string,
   state: LifecycleState,
+  options?: LifecycleStateOptions,
 ): Promise<void> {
+  const effectiveSessionId =
+    (typeof options?.sessionId === "string" && options.sessionId.trim()) ||
+    (typeof state.session_id === "string" && state.session_id.trim()) ||
+    undefined;
+  const sessionFile =
+    effectiveSessionId && effectiveSessionId !== "session"
+      ? lifecycleStateSessionPath(vaultPath, effectiveSessionId)
+      : null;
+  if (sessionFile) {
+    ensureContainedDir(vaultPath, [".runtime", "lifecycle-state.d"], true);
+    assertWriteTargetUnder(sessionFile, vaultPath);
+    const tmpPath = `${sessionFile}.tmp-${process.pid}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}`;
+    try {
+      await writeFile(tmpPath, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 });
+      await rename(tmpPath, sessionFile);
+    } catch (err) {
+      await rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
+  }
   const filePath = lifecycleStatePath(vaultPath);
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, JSON.stringify(state, null, 2), "utf8");
+  ensureContainedDir(vaultPath, [".runtime"], true);
+  assertWriteTargetUnder(filePath, vaultPath);
+  const mirrorTmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    await writeFile(mirrorTmpPath, JSON.stringify(state, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await rename(mirrorTmpPath, filePath);
+  } catch (err) {
+    await rm(mirrorTmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
 }

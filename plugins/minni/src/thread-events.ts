@@ -19,6 +19,7 @@ export interface OrderedThreadEvent {
   event_id: string;
   idempotency_key: string;
   actor: string;
+  actor_session_key?: string;
   kind: string;
   at: string;
   slice_id?: string;
@@ -41,6 +42,7 @@ export interface AppendOrderedEventBatchInput {
   planId: string;
   rev: number;
   actor: string;
+  actorSessionKey?: string;
   at?: string;
   orderedSnapshot?: OrderedThreadEvent[];
   events: Array<{
@@ -890,6 +892,9 @@ function materializeBatchEvents(
       event_id: deriveEventId(input.planId, seqCursor, spec.idempotencyKey),
       idempotency_key: spec.idempotencyKey,
       actor: input.actor,
+      ...(input.actorSessionKey && /^[0-9a-f]{16}$/.test(input.actorSessionKey)
+        ? { actor_session_key: input.actorSessionKey }
+        : {}),
       kind: spec.kind,
       at,
       ...(spec.sliceId ? { slice_id: spec.sliceId } : {}),
@@ -908,6 +913,7 @@ async function ingestRelayAfterJournalAppend(input: {
   journalPath: string;
   planId: string;
   actor: string;
+  actorSessionKey?: string;
   events: OrderedThreadEvent[];
 }): Promise<void> {
   const vaultPath = vaultPathFromJournalPath(input.journalPath);
@@ -921,6 +927,7 @@ async function ingestRelayAfterJournalAppend(input: {
         actor: event.actor,
         at: event.at,
       };
+      if (event.actor_session_key) item.actor_session_key = event.actor_session_key;
       if (event.slice_id) item.slice_id = event.slice_id;
       return item;
     });
@@ -928,6 +935,7 @@ async function ingestRelayAfterJournalAppend(input: {
     const extraIds = principal ? [principal] : [];
     const subscriberIds = seedRelaySubscribers({
       actor: input.actor,
+      actorSessionKey: input.actorSessionKey,
       planId: input.planId,
       cursors: store.cursors,
       events,
@@ -991,6 +999,7 @@ export async function appendOrderedEventBatch(
       journalPath: input.journalPath,
       planId: input.planId,
       actor: input.actor,
+      actorSessionKey: input.actorSessionKey,
       events: landed,
     });
     return materialized;

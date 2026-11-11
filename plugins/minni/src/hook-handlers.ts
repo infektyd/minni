@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { recordActiveSessionWorkspace } from "./config.js";
+import { deriveWorkspaceIdFromCwd, recordActiveSessionWorkspace } from "./config.js";
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
@@ -63,11 +63,17 @@ import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
 import { canInject, renderIntent, wireCapabilities, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
-import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
+import {
+  compactPlanPointer,
+  getActivePlan,
+  getConcurrentActiveThreads,
+  resolveActivePlanView,
+} from "./plan.js";
 import {
   activePlanIdFromVault,
   confirmDeliveryInVault,
   deliverySucceededForHostHook,
+  formatSessionSubscriberId,
   pendingAttentionForHook,
 } from "./thread-notification-relay.js";
 import type { RelayHook } from "./thread-notification-relay.js";
@@ -393,6 +399,28 @@ function rawSessionIdFromPayload(payload: Record<string, unknown>): string {
     asString(payload.conversationId) ||
     asString(payload.conversation_id)
   );
+}
+
+function resolveHookHostPid(payload: Record<string, unknown>): number | undefined {
+  if (
+    typeof payload.host_pid === "number" &&
+    Number.isInteger(payload.host_pid) &&
+    payload.host_pid > 1
+  ) {
+    return payload.host_pid;
+  }
+  if (
+    typeof payload.hostPid === "number" &&
+    Number.isInteger(payload.hostPid) &&
+    payload.hostPid > 1
+  ) {
+    return payload.hostPid;
+  }
+  return Number.isInteger(process.ppid) && process.ppid > 1 ? process.ppid : undefined;
+}
+
+function resolveSubagentId(payload: Record<string, unknown>): string {
+  return asString(payload.agent_id) || asString(payload.agentId);
 }
 
 function subagentSessionKey(payload: Record<string, unknown>): string {
@@ -1575,14 +1603,23 @@ export function createHookHandlers(
 ): AgentHookHandlers {
   const workspaceFor = (payload: Record<string, unknown>): string => {
     const resolved = workspaceFromPayload(payload, config.defaultWorkspaceId);
-    const hasExplicitPayloadWorkspace = Boolean(
-      asString(payload.workspace_id) ||
-        asString(payload.workspaceId) ||
-        asString(payload.cwd) ||
-        asString(payload.working_directory),
-    );
-    if (hasExplicitPayloadWorkspace && resolved && resolved !== "workspace-unknown") {
-      recordActiveSessionWorkspace(config.vaultPath, resolved, config.agentId);
+    const explicitWs = asString(payload.workspace_id) || asString(payload.workspaceId);
+    const rawCwd = asString(payload.cwd) || asString(payload.working_directory);
+    const cwdGitWs = rawCwd ? deriveWorkspaceIdFromCwd(rawCwd) : "";
+    const hintWorkspace =
+      explicitWs && explicitWs !== "workspace-unknown"
+        ? resolved
+        : cwdGitWs && cwdGitWs !== "workspace-unknown"
+          ? cwdGitWs
+          : undefined;
+    const rawSessionId = rawSessionIdFromPayload(payload);
+    const hostPid = resolveHookHostPid(payload);
+    if (hintWorkspace || rawSessionId || (typeof hostPid === "number" && hostPid > 1)) {
+      recordActiveSessionWorkspace(config.vaultPath, hintWorkspace, {
+        agentId: config.agentId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+        ...(typeof hostPid === "number" && hostPid > 1 ? { hostPid } : {}),
+      });
     }
     return resolved;
   };
@@ -1723,10 +1760,14 @@ export function createHookHandlers(
     // emphasis on a fresh session, so the situational focus can fire again
     // this session. Best-effort — a state-write failure must not break boot.
     if (config.lifecycleEnabled) {
-      await writeLifecycleState(config.vaultPath, {
-        session_id: sessionId,
-        emphasized: [],
-      }).catch(() => {});
+      await writeLifecycleState(
+        config.vaultPath,
+        {
+          session_id: sessionId,
+          emphasized: [],
+        },
+        { sessionId: rawSessionId || sessionId },
+      ).catch(() => {});
     }
     await clearSessionSurfacedOnReset(config.vaultPath, rawSessionId || sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, rawSessionId || sessionId);
@@ -1870,7 +1911,11 @@ export function createHookHandlers(
     //
     // Deliberately UNBUDGETED: this is cheap local FS, and it is the one read
     // whose absence loses data rather than context.
-    const reassertPending = await readReassertPending(config.vaultPath, 3);
+    const sessionKeyForPlan = sessionStateKey(rawSessionId || undefined) ?? undefined;
+    const reassertPending = await readReassertPending(config.vaultPath, 3, {
+      sessionKey: sessionKeyForPlan,
+      sessionId: rawSessionId || undefined,
+    });
     // Layer 1 shelf inline (operator scar: an envelope carrying only identity
     // keys + a pointer meant every agent re-hit scars already recorded in
     // layer1/core.md). SessionStart ONLY — UserPromptSubmit's envelope stays
@@ -1982,7 +2027,13 @@ export function createHookHandlers(
       resolveActivePlanView(
         config.vaultPath,
         layer1Shelf.ok && !layer1Shelf.truncated ? layer1Shelf.content : undefined,
-        { lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS) },
+        {
+          lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS),
+          sessionKey: sessionKeyForPlan,
+          sessionId: rawSessionId || undefined,
+          hostPid: typeof payload.host_pid === "number" ? payload.host_pid : process.ppid,
+          workspaceId,
+        },
       ).then((view) => ({ ok: true, view })),
       remainingMs(),
       { ok: false, view: undefined },
@@ -2134,10 +2185,18 @@ export function createHookHandlers(
 
     if (activePlan !== undefined) {
       envelopeBody.active_thread = activePlan;
+    } else if (sessionKeyForPlan) {
+      const concurrent = await getConcurrentActiveThreads(
+        config.vaultPath,
+        sessionKeyForPlan,
+      ).catch(() => []);
+      if (concurrent.length > 0) {
+        envelopeBody.concurrent_active_threads = concurrent;
+      }
     }
     await attachPendingAttention({
       vaultPath: config.vaultPath,
-      subscriberId: config.agentId,
+      subscriberId: formatSessionSubscriberId(config.agentId, sessionKeyForPlan),
       planId: activePlan?.plan_id,
       envelopeBody,
       hostId: wire.id,
@@ -2351,16 +2410,22 @@ export function createHookHandlers(
     // on every other platform.
     let lifecycleFields: { lifecycle?: string; lifecycle_focus?: string } = {};
     if (config.lifecycleEnabled) {
-      const lifecycleStatePrev = await readLifecycleState(config.vaultPath);
+      const lifecycleStatePrev = await readLifecycleState(config.vaultPath, {
+        sessionId: rawSessionId || undefined,
+      });
       const emphasizedSurfaces = new Set(lifecycleStatePrev?.emphasized ?? []);
       const computed = lifecycleFieldsFor(prompt, emphasizedSurfaces);
       lifecycleFields = computed.fields;
       if (computed.emphasizedSurface) {
         emphasizedSurfaces.add(computed.emphasizedSurface);
-        await writeLifecycleState(config.vaultPath, {
-          session_id: lifecycleStatePrev?.session_id ?? "session",
-          emphasized: [...emphasizedSurfaces],
-        }).catch(() => {});
+        await writeLifecycleState(
+          config.vaultPath,
+          {
+            session_id: rawSessionId || lifecycleStatePrev?.session_id || "session",
+            emphasized: [...emphasizedSurfaces],
+          },
+          { sessionId: rawSessionId || undefined },
+        ).catch(() => {});
       }
     }
 
@@ -2741,10 +2806,13 @@ export function createHookHandlers(
     // Do not start it once the budget is spent (same degraded outcome), and
     // make its lock wait give up PLAN_LOCK_SLACK_MS before the deadline, so
     // the THREAD_BUSY audit lands inside the budget rather than after it.
+    const upsSessionKey = sessionStateKey(rawSessionId || undefined) ?? undefined;
     const planBudgetMs = remainingMs();
     const planRead = planBudgetMs <= 0 ? { ok: false as const, view: undefined } : await withBudget(
       resolveActivePlanView(config.vaultPath, undefined, {
         lockWaitMs: Math.max(0, planBudgetMs - PLAN_LOCK_SLACK_MS),
+        sessionKey: upsSessionKey,
+        strictSessionOnly: Boolean(upsSessionKey),
       })
         .then((view) => ({ ok: true as const, view }))
         .catch(async (error: unknown) => {
@@ -2834,7 +2902,7 @@ export function createHookHandlers(
     }
     await attachPendingAttention({
       vaultPath: config.vaultPath,
-      subscriberId: config.agentId,
+      subscriberId: formatSessionSubscriberId(config.agentId, upsSessionKey),
       planId: activePlan?.plan_id,
       envelopeBody,
       hostId: wire.id,
@@ -2922,7 +2990,27 @@ export function createHookHandlers(
         ? (payload.tool_input as Record<string, unknown>)
         : {};
     const guardSessionId = rawSessionIdFromPayload(payload);
-    const guardAgentId = asString(payload.agent_id) || asString(payload.agentId);
+    const guardAgentId = resolveSubagentId(payload);
+
+    if (!guardAgentId) {
+      const explicitPreWs = asString(payload.workspace_id) || asString(payload.workspaceId);
+      const rawPreCwd = asString(payload.cwd) || asString(payload.working_directory);
+      const preGitWs = rawPreCwd ? deriveWorkspaceIdFromCwd(rawPreCwd) : "";
+      const preHintWs =
+        explicitPreWs && explicitPreWs !== "workspace-unknown"
+          ? explicitPreWs
+          : preGitWs && preGitWs !== "workspace-unknown"
+            ? preGitWs
+            : undefined;
+      const preHostPid = resolveHookHostPid(payload);
+      if (preHintWs || guardSessionId || (typeof preHostPid === "number" && preHostPid > 1)) {
+        recordActiveSessionWorkspace(config.vaultPath, preHintWs, {
+          agentId: config.agentId,
+          ...(guardSessionId ? { sessionId: guardSessionId } : {}),
+          ...(typeof preHostPid === "number" && preHostPid > 1 ? { hostPid: preHostPid } : {}),
+        });
+      }
+    }
 
     // S2b (§6.4): PreToolUse on Agent / Task stashes the task prompt for SubagentStart
     // and never surfaces or consumes the parent's recall guard arming.
@@ -3069,7 +3157,9 @@ export function createHookHandlers(
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const tail = await auditTail(config.vaultPath, 60);
     const scarTissue = extractScarTissue(tail.entries);
-    const sessionId = rawSessionIdFromPayload(payload) || "session";
+    const rawSessionId = rawSessionIdFromPayload(payload);
+    const sessionId = rawSessionId || "session";
+    const sessionKey = sessionStateKey(rawSessionId || undefined) ?? undefined;
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
@@ -3116,6 +3206,8 @@ export function createHookHandlers(
           kind: config.precompactKind,
           agent_id: config.agentId,
           workspace_id: workspaceId,
+          ...(rawSessionId ? { session_id: rawSessionId } : {}),
+          ...(sessionKey ? { session_key: sessionKey } : {}),
           scar_tissue: scarTissue,
           stale_belief_events: staleBeliefEvents,
           audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
@@ -3128,6 +3220,7 @@ export function createHookHandlers(
       : await stashPrecompactReassert({
           vaultPath: config.vaultPath,
           sessionId,
+          sessionKey,
           agentId: config.agentId,
           staleBeliefEvents,
           trigger: transcript,
@@ -3292,7 +3385,11 @@ export function createHookHandlers(
     // stop_hook_active prevents re-injecting on a Stop continuation loop.
     if (canInject(wire, "Stop") && payload.stop_hook_active !== true) {
       // Unbudgeted local FS: same as SessionStart reassert. Absence loses data.
-      const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3);
+      const stopRawSessionId = rawSessionIdFromPayload(payload);
+      const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3, {
+        sessionId: stopRawSessionId || undefined,
+        sessionKey: sessionStateKey(stopRawSessionId || undefined) ?? undefined,
+      });
       if (parkedPending.length > 0) {
         const {
           events: parkedEvents,
@@ -3359,10 +3456,19 @@ export function createHookHandlers(
     let pendingStopText = "";
     if (deliverySucceededForHostHook(wire.id, "stop") && payload.stop_hook_active !== true) {
       try {
-        const planId = await activePlanIdFromVault(config.vaultPath);
+        const stopSessionKey =
+          sessionStateKey(rawSessionIdFromPayload(payload) || undefined) ?? undefined;
+        const activeForStop = await getActivePlan(config.vaultPath, {
+          sessionKey: stopSessionKey,
+          strictSessionOnly: Boolean(stopSessionKey),
+        });
+        const planId =
+          activeForStop?.plan_id ??
+          (stopSessionKey ? undefined : await activePlanIdFromVault(config.vaultPath));
+        const stopSubscriberId = formatSessionSubscriberId(config.agentId, stopSessionKey);
         const pending = await pendingAttentionForHook({
           vaultPath: config.vaultPath,
-          subscriberId: config.agentId,
+          subscriberId: stopSubscriberId,
           planId,
         });
         if (pending && planId) {
@@ -3371,7 +3477,7 @@ export function createHookHandlers(
           if (lastSeq !== undefined) {
             confirmPendingIfInjects({
               vaultPath: config.vaultPath,
-              subscriberId: config.agentId,
+              subscriberId: stopSubscriberId,
               planId,
               lastSeq,
               hostId: wire.id,
