@@ -1,8 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, unlink } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 
-import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
+import {
+  DEFAULT_AGENT_ID,
+  DEFAULT_VAULT_PATH,
+  isLiveMatchingProcess,
+} from "./config.js";
 import {
   assertWriteTargetUnder,
   writeVaultPage,
@@ -576,6 +580,10 @@ export const TERMINAL_PLAN_STATUSES: ReadonlySet<string> = new Set([
   "rejected",
   "superseded",
 ]);
+
+export function isTerminalPlanStatus(status: string | undefined): boolean {
+  return typeof status === "string" && (TERMINAL_PLAN_STATUSES.has(status) || status === "abandoned");
+}
 
 /**
  * All-resolved predicate: every slice terminal (done/superseded) on a non-empty
@@ -2501,6 +2509,8 @@ export interface ActivePlanSessionOptions {
   workspaceId?: string;
   strictSessionOnly?: boolean;
   sessionOnly?: boolean;
+  markDetached?: boolean;
+  expectedPlanId?: string;
 }
 
 export interface ActiveThreadBinding {
@@ -2788,12 +2798,104 @@ export async function sweepDeadActiveThreadPointers(
         await unlink(detachedPath).catch(() => {});
       }
       prunedPointers += 1;
-      if (deadSessionExpired || hardMaxAgeExpired) {
+      // Always record expired/dead session keys for relay cursor GC, even when the
+      // referenced plan had already transitioned to complete/terminal.
+      if (!pidAlive || deadSessionExpired || hardMaxAgeExpired) {
         prunedSessionKeys.add(stem);
       }
     } catch {
       // Ignore unreadable session pointer.
     }
+  }
+
+  // Sweep expired (>24h) dead/recycled active-session-*.json files and collect live session keys.
+  const runtimeDir = path.join(vaultPath, ".runtime");
+  const liveRuntimeSessionKeys = new Set<string>();
+  for (const name of entries) {
+    if (!name.endsWith(".json") || name === ".sweep.json") continue;
+    const stem = name.slice(0, -".json".length);
+    if (SESSION_KEY_HEX16_RE.test(stem) && !prunedSessionKeys.has(stem)) {
+      liveRuntimeSessionKeys.add(stem);
+    }
+  }
+  try {
+    const runtimeEntries = await readdir(runtimeDir);
+    for (const entry of runtimeEntries) {
+      if (!entry.startsWith("active-session-") || !entry.endsWith(".json")) continue;
+      const candidatePath = path.join(runtimeDir, entry);
+      try {
+        const rawHint = JSON.parse(await readFile(candidatePath, "utf8")) as {
+          host_pid?: number;
+          process_start_marker?: string;
+          session_key?: string;
+          updated_at?: string;
+        };
+        const updatedMs =
+          typeof rawHint?.updated_at === "string" ? Date.parse(rawHint.updated_at) : Number.NaN;
+        const mtimeMs = (await stat(candidatePath)).mtimeMs;
+        const effectiveAgeMs = Number.isFinite(updatedMs)
+          ? nowMs - updatedMs
+          : nowMs - mtimeMs;
+        const pidLive =
+          typeof rawHint?.host_pid === "number"
+            ? isLiveMatchingProcess(
+                rawHint.host_pid,
+                typeof rawHint.process_start_marker === "string"
+                  ? rawHint.process_start_marker
+                  : undefined,
+              )
+            : false;
+        if (pidLive) {
+          if (typeof rawHint?.session_key === "string" && SESSION_KEY_HEX16_RE.test(rawHint.session_key)) {
+            liveRuntimeSessionKeys.add(rawHint.session_key);
+          }
+        } else if (effectiveAgeMs > ACTIVE_THREAD_SESSION_TTL_MS) {
+          await unlink(candidatePath).catch(() => {});
+          if (typeof rawHint?.session_key === "string" && SESSION_KEY_HEX16_RE.test(rawHint.session_key)) {
+            prunedSessionKeys.add(rawHint.session_key);
+          }
+        }
+      } catch {
+        // Best-effort active-session sweep.
+      }
+    }
+  } catch {
+    // Missing .runtime dir.
+  }
+
+  // Sweep expired (>24h and not live) .runtime/lifecycle-state.d/*.json files.
+  const lifecycleDir = path.join(runtimeDir, "lifecycle-state.d");
+  try {
+    const lcEntries = await readdir(lifecycleDir);
+    for (const lcName of lcEntries) {
+      if (!lcName.endsWith(".json")) continue;
+      const stem = lcName.slice(0, -".json".length);
+      if (liveRuntimeSessionKeys.has(stem)) continue;
+      const lcPath = path.join(lifecycleDir, lcName);
+      try {
+        let updatedMs = Number.NaN;
+        try {
+          const rawLc = JSON.parse(await readFile(lcPath, "utf8")) as {
+            updated_at?: string;
+            ts?: string;
+          };
+          const stamp = rawLc?.updated_at ?? rawLc?.ts;
+          if (typeof stamp === "string") updatedMs = Date.parse(stamp);
+        } catch {
+          // Fall back to mtimeMs below.
+        }
+        const mtimeMs = (await stat(lcPath)).mtimeMs;
+        const effectiveAgeMs = Number.isFinite(updatedMs) ? nowMs - updatedMs : nowMs - mtimeMs;
+        if (prunedSessionKeys.has(stem) || effectiveAgeMs > ACTIVE_THREAD_SESSION_TTL_MS) {
+          assertWriteTargetUnder(lcPath, vaultPath);
+          await unlink(lcPath).catch(() => {});
+        }
+      } catch {
+        // Ignore missing/unreadable lifecycle state file.
+      }
+    }
+  } catch {
+    // Missing lifecycle-state.d dir.
   }
 
   const { prunedCursors } = await sweepDeadRelayCursors(
@@ -2804,6 +2906,8 @@ export async function sweepDeadActiveThreadPointers(
 
   return { prunedPointers, prunedCursors };
 }
+
+export const sweepDeadSessionState = sweepDeadActiveThreadPointers;
 
 export async function maybeSweepDeadActiveThreadPointers(
   vaultPath: string,
@@ -2974,6 +3078,25 @@ export async function getActivePlan(
             );
             return undefined;
           }
+          let sessionPlanTerminalOrMissing = false;
+          try {
+            const scalars = await rehydratePlanScalars(parsed.notePath);
+            if (isTerminalPlanStatus(scalars.status)) {
+              sessionPlanTerminalOrMissing = true;
+            }
+          } catch (scalarErr) {
+            if ((scalarErr as NodeJS.ErrnoException)?.code === "ENOENT") {
+              sessionPlanTerminalOrMissing = true;
+            }
+          }
+          if (sessionPlanTerminalOrMissing) {
+            await clearActivePlan(vaultPath, {
+              sessionKey,
+              expectedPlanId: parsed.plan_id,
+              markDetached: false,
+            }).catch(() => {});
+            return undefined;
+          }
           return parsed;
         }
       } catch (err) {
@@ -3037,28 +3160,40 @@ export async function getActivePlan(
             return undefined;
           }
         }
-        if (
-          !options?.strictSessionOnly &&
-          typeof parsed.owner_session_key === "string" &&
-          parsed.owner_session_key.length > 0
-        ) {
-          try {
-            const scalars = await rehydratePlanScalars(parsed.notePath);
-            if (!TERMINAL_PLAN_STATUSES.has(scalars.status) && !allSlicesResolved(scalars.slices)) {
-              await setActivePlan(vaultPath, parsed.plan_id, parsed.notePath, {
-                ...options,
-                sessionKey,
-                hostPid:
-                  typeof options?.hostPid === "number"
-                    ? options.hostPid
-                    : process.ppid > 1
-                      ? process.ppid
-                      : undefined,
-              });
-            }
-          } catch {
-            // Best-effort adoption write; do not fail the read if note is missing/unreadable.
+        let mirrorTerminalOrMissing = false;
+        try {
+          const scalars = await rehydratePlanScalars(parsed.notePath);
+          if (isTerminalPlanStatus(scalars.status)) {
+            mirrorTerminalOrMissing = true;
+          } else if (
+            !options?.strictSessionOnly &&
+            typeof parsed.owner_session_key === "string" &&
+            parsed.owner_session_key.length > 0 &&
+            !allSlicesResolved(scalars.slices)
+          ) {
+            await setActivePlan(vaultPath, parsed.plan_id, parsed.notePath, {
+              ...options,
+              sessionKey,
+              hostPid:
+                typeof options?.hostPid === "number"
+                  ? options.hostPid
+                  : process.ppid > 1
+                    ? process.ppid
+                    : undefined,
+            });
           }
+        } catch (scalarErr) {
+          if ((scalarErr as NodeJS.ErrnoException)?.code === "ENOENT") {
+            mirrorTerminalOrMissing = true;
+          }
+        }
+        if (mirrorTerminalOrMissing) {
+          await clearActivePlan(vaultPath, {
+            sessionKey,
+            expectedPlanId: parsed.plan_id,
+            markDetached: false,
+          }).catch(() => {});
+          return undefined;
         }
       }
       return parsed;
@@ -3086,24 +3221,39 @@ export async function clearActivePlan(
     typeof options?.sessionKey === "string" && SESSION_KEY_HEX16_RE.test(options.sessionKey)
       ? options.sessionKey
       : undefined;
+  const expectedPlanId =
+    typeof options?.expectedPlanId === "string" && options.expectedPlanId.trim()
+      ? options.expectedPlanId.trim()
+      : undefined;
+  const shouldMarkDetached =
+    typeof options?.markDetached === "boolean"
+      ? options.markDetached
+      : Boolean(options?.sessionOnly);
+
   let clearedPlanId: string | undefined;
   if (sessionKey) {
     const sessionPath = activeThreadSessionPath(vaultPath, sessionKey);
     if (sessionPath) {
+      let existingSessionPlanId: string | undefined;
       try {
         const raw = await readFile(sessionPath, "utf8");
         const parsed = JSON.parse(raw) as { plan_id?: string };
-        if (typeof parsed?.plan_id === "string") clearedPlanId = parsed.plan_id;
+        if (typeof parsed?.plan_id === "string") {
+          existingSessionPlanId = parsed.plan_id;
+        }
       } catch {
         // Ignore missing session file.
       }
-      try {
-        await unlink(sessionPath);
-      } catch (err: any) {
-        if (err.code !== "ENOENT") throw err;
+      if (!expectedPlanId || !existingSessionPlanId || existingSessionPlanId === expectedPlanId) {
+        clearedPlanId = existingSessionPlanId;
+        try {
+          await unlink(sessionPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+        }
       }
     }
-    if (options?.sessionOnly) {
+    if (shouldMarkDetached) {
       const detachedPath = activeThreadDetachedPath(vaultPath, sessionKey);
       if (detachedPath) {
         try {
@@ -3117,35 +3267,69 @@ export async function clearActivePlan(
           // Best-effort detached marker.
         }
       }
-      const pointerPath = activePointerPath(vaultPath);
-      try {
-        const raw = await readFile(pointerPath, "utf8");
-        const parsed = JSON.parse(raw) as {
-          plan_id?: string;
-          owner_session_key?: string;
-        };
-        const targetPlan = clearedPlanId ?? parsed?.plan_id;
-        const otherLive = targetPlan
-          ? await hasOtherLiveSessionOnPlan(vaultPath, targetPlan, sessionKey)
-          : false;
-        const canClearMirror =
-          !otherLive &&
-          (!parsed?.owner_session_key || parsed.owner_session_key === sessionKey) &&
-          (!clearedPlanId || parsed?.plan_id === clearedPlanId);
-        if (canClearMirror) {
-          await unlink(pointerPath).catch(() => {});
-        }
-      } catch {
-        // Ignore missing mirror.
-      }
-      return;
     }
   }
+
   const pointerPath = activePointerPath(vaultPath);
+  const targetPlan = expectedPlanId ?? clearedPlanId;
+  if (sessionKey || expectedPlanId) {
+    try {
+      const raw = await readFile(pointerPath, "utf8");
+      const parsed = JSON.parse(raw) as {
+        plan_id?: string;
+        owner_session_key?: string;
+        owner_host_pid?: number;
+      };
+      if (targetPlan && parsed?.plan_id && parsed.plan_id !== targetPlan) {
+        // _active_plan.json points to another plan (e.g. sibling session's planA); preserve it.
+        return;
+      }
+      if (
+        !targetPlan &&
+        sessionKey &&
+        parsed?.owner_session_key &&
+        parsed.owner_session_key !== sessionKey &&
+        typeof parsed.owner_host_pid === "number" &&
+        isHostPidAlive(parsed.owner_host_pid)
+      ) {
+        return;
+      }
+      const liveOthers = await listLiveActiveThreadBindings(vaultPath, sessionKey);
+      if (parsed?.plan_id && liveOthers.some((b) => b.plan_id === parsed.plan_id)) {
+        // Another live session still holds this active plan; keep _active_plan.json intact.
+        return;
+      }
+      if (liveOthers.length > 0) {
+        const remaining = liveOthers[0];
+        await writeFileAtomic(
+          pointerPath,
+          JSON.stringify(
+            {
+              plan_id: remaining.plan_id,
+              notePath: remaining.notePath,
+              set_at: remaining.set_at,
+              owner_session_key: remaining.session_key,
+              ...(typeof remaining.host_pid === "number"
+                ? { owner_host_pid: remaining.host_pid }
+                : {}),
+            },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+      await unlink(pointerPath).catch(() => {});
+    } catch {
+      // Ignore missing or corrupt mirror on read.
+    }
+    return;
+  }
+
   try {
     await unlink(pointerPath);
-  } catch (err: any) {
-    if (err.code !== "ENOENT") {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
       throw err;
     }
   }
@@ -3267,12 +3451,21 @@ export async function resolveActivePlanView(
           plan = await rehydratePlan(active.notePath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-            await clearActivePlan(vaultPath, options).catch(() => {});
+            await clearActivePlan(vaultPath, {
+              ...options,
+              expectedPlanId: active.plan_id,
+              markDetached: false,
+            }).catch(() => {});
             return undefined;
           }
           throw error;
         }
-        if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
+        if (isTerminalPlanStatus(plan.status)) {
+          await clearActivePlan(vaultPath, {
+            ...options,
+            expectedPlanId: active.plan_id,
+            markDetached: false,
+          }).catch(() => {});
           return undefined;
         }
         // Honest-health self-heal (audit C4): plans completed under a stale
@@ -3352,6 +3545,11 @@ export async function resolveActivePlanView(
           } catch {
             // journal is advisory; the persisted status is the durable fix
           }
+          await clearActivePlan(vaultPath, {
+            ...options,
+            expectedPlanId: active.plan_id,
+            markDetached: false,
+          }).catch(() => {});
           return undefined;
         }
         return {

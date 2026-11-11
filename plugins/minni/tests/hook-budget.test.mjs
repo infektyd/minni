@@ -160,6 +160,7 @@ test("a budget overrun serves the STALE recall pointer, marked stale", async () 
     await writeFile(
       path.join(fixture.vault, ".runtime", "recall-state.json"),
       JSON.stringify({
+        session_id: "budget-fixture",
         task_signature: "previous-turn",
         intent: "recall",
         top_hits: [

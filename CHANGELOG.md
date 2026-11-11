@@ -8,9 +8,43 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+**v0.7.0 candidate milestone.** This unreleased wave isolates concurrent live sessions sharing one agent principal (`agent_id` + `session_key`), introduces hermetic 9-host update propagation with 7-step atomic cutover, lands the Rev 6 self-cleaning substrate and recall-to-use telemetry pipeline, hardens governance/handoff/index boundaries, and aligns episodic FTS5 and compaction harvest surfaces. Package metadata stays at `0.6.0` until `v0.7.0` is tagged after live multi-window soak across open host applications, reserving **v1.0.0** for the post-soak final release cut.
+
 ### Added
 
+- **Multi-session principal isolation (`H4`, `H6`, `R1`, `R2`):**
+  - Per-session identity bridge (`<vault>/.runtime/active-session-<agent>-<hostPid>.json`) recording `session_id`, `session_key`, and `process_start_marker` even outside git repositories (`R1`), retaining live-process session records past 30 minutes, and trusting host session environment variables strictly for the matching agent principal (`R2`).
+  - Per-session active thread pointers (`<vault>/.runtime/active-thread.d/<sessionKey>.json`) and `minni_thread_create({ activate })`, giving concurrent windows independent active plans with a clean-slate one-line sibling heads-up on `SessionStart` (`Q1`).
+  - Composite `<agent>:<sessionKey>` thread notification relay cursors in both TypeScript (`plugins/minni/src/thread-notification-relay.ts`) and Python (`src/minni/thread_relay.py`), delivering worker and cross-window same-agent (`Q2`) notifications independently per session, propagating the minimum watermark onto bare `<agent>`, discovering subscribers across `.runtime/active-thread.d/*.json`, and guarding store mutations with fail-closed `cursors.lock`.
+  - Session-scoped recall guard state (`<vault>/.runtime/recall-state.d/<sessionKey>.*`), session-isolated `minni_drill` `m:<8hex>` pointer handle resolution, `PreCompact` reassert session affinity (with `>10m` orphan recovery), and throttled dead-session GC sweeps (`sweepDeadActiveThreadPointers`, `sweepDeadRelayCursors` / `sweep_dead_relay_cursors`) that preserve all durable plan artifacts.
+- **Hermetic 9-host update propagation & 7-step atomic cutover (`H1–H3`, `H5`, `H15–H36`):**
+  - Versioned `~/.minni/plugin/<ver>` installs behind an atomic `current` symlink flip, paired with real per-host container reconciliation across Claude Code, Claude Desktop, Cursor, Antigravity/Gemini, Codex, Grok Build, KiloCode, Devin, and Muse.
+  - Canonical `wired.json` v2 host surface catalog with keyed-subset drift diffs, uncatalogued binding scanner, scratch MCP `initialize` probes before pointer flip, open server FD lease + `lstart` GC protection for live MCP processes, and unified fleet drift gates in `minni doctor` and `scripts/check_deployments.py --strict`.
+- **Rev 6 self-cleaning substrate & recall-to-use telemetry (`S2a–S5`, `B1–B5`):**
+  - Priority-ordered `SessionStart` boot envelope fitting (`fitEnvelope`), `ups_gate` vault ranking with cross-turn duplicate suppression, and multi-hit `m:<8hex>` pointer handles resolved via `minni_drill`.
+  - Multi-host use-detector citation tracking across `m:<8hex>` handles, wikilinks, durable note stems, and subagent briefs, plus `PreToolUse` / `PostToolUse` failure-lesson capture (`S4b–S4d`) and `mkey` use-ledger decay with zero-graveyard storage.
+- **Episodic FTS5 & harvest parity:**
+  - Migration `024` episodic FTS5 rowid rebuild, Codex `PostCompact` harvest support, and Jev inline harvest provenance gating (`S3a`).
 - `minni_recall` audit entries now record the daemon's returned `doc_ids`, `chunk_ids` and `learning_ids` (ids only, no content), so learn→recall lineage can be answered from the audit log instead of raw session transcripts. Previously only local `vaultMatches` paths were logged.
+
+### Changed
+
+- Bounded MCP tool payload sizes across `minni_drill`, `minni_thread_update`, and `minni_prepare_task` to prevent context-window response bloat, while honoring `wikilink` and `handle` parameters end-to-end.
+- Enforced suite-wide hermetic `HOME` / `XDG_*` / `MINNI_HOME` isolation across Python (`tests/conftest.py`) and Node plugin tests so test runs never touch live operator state.
+
+### Fixed
+
+- Synchronous durable projection purge when learnings are superseded or retracted, plus FAISS, Trie, and rerank cache invalidation and explicit DB error surfacing on retract (`H11`).
+- Crash-safe vector index deletion reconciliation that treats interrupted `syncing` rows as dirty and preserves concurrent `mark_dirty` flags across sync errors (`H13`, `H14`).
+- Prevented `Stop` hook relay re-injection loops, tilde-expansion misses on socket/env paths, active-plan terminal self-heal drift, and `PostToolUse` read-only false positives.
+
+### Security
+
+- Explicit legacy alias capability resolution against the caller's own principal (`H7`).
+- Enforced `supersede_ids` ownership and existence checks inside `resolve_candidate` (`H8`).
+- Enforced pending and non-expired compare-and-swap (CAS) checks on handoff lease acknowledgements, with idempotent handling for `not_required` leases (`H9`).
+- Required a journaled slice `start` event before `complete` in shared thread worker helpers (`H10`).
+- Stripped forged inbox provenance in `stage_candidate` and filtered audit echoes from eligible inbox candidates (`H12`), alongside `O_NOFOLLOW` symlink checks on runtime queues and relay locks.
 
 ### Removed
 

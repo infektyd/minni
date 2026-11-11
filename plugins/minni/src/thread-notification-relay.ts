@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { isLiveMatchingProcess } from "./config.js";
 import { inboxPrincipalForVaultPath } from "./hook-utils.js";
 import { GROK_WORKER_START } from "./thread-host-dispatch.js";
+import { assertWriteTargetUnder } from "./vault.js";
 
 /**
  * G3 notification relay — not a second graph authority.
@@ -191,7 +193,10 @@ export interface RelayStore {
 const SESSION_KEY_HEX_RE = /^[0-9a-f]{16}$/;
 const SAFE_AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 export const MAX_RELAY_CURSORS = 256;
-const RELAY_CURSOR_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
+export const DEAD_CURSOR_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const RELAY_CURSOR_PRUNE_AGE_MS = DEAD_CURSOR_MAX_AGE_MS;
+export const RELAY_LOCK_TIMEOUT_MS = 5_000;
+export const RELAY_LOCK_STALE_MS = 10_000;
 
 export function formatSessionSubscriberId(
   agentId: string,
@@ -314,9 +319,16 @@ export function advanceCursor(
   deliveredThroughSeq: number,
   deliverySucceeded: boolean,
 ): DeliveryCursor {
-  if (!deliverySucceeded) return { ...cursor };
-  if (deliveredThroughSeq <= cursor.last_delivered_seq) return { ...cursor };
-  return { ...cursor, last_delivered_seq: deliveredThroughSeq };
+  const fallbackUpdatedAt = cursor.updated_at ?? new Date().toISOString();
+  if (!deliverySucceeded) return { ...cursor, updated_at: fallbackUpdatedAt };
+  if (deliveredThroughSeq <= cursor.last_delivered_seq) {
+    return { ...cursor, updated_at: fallbackUpdatedAt };
+  }
+  return {
+    ...cursor,
+    last_delivered_seq: deliveredThroughSeq,
+    updated_at: new Date().toISOString(),
+  };
 }
 
 /**
@@ -378,10 +390,13 @@ export function forkSessionCursor(
   subscriberId: string,
   planId: string,
 ): DeliveryCursor {
+  const nowIso = new Date().toISOString();
   const existing = store.cursors.find(
     (cursor) => cursor.subscriber_id === subscriberId && cursor.plan_id === planId,
   );
-  if (existing) return { ...existing };
+  if (existing) {
+    return { ...existing, updated_at: existing.updated_at ?? nowIso };
+  }
   const parsed = parseSubscriberPrincipal(subscriberId);
   if (parsed.sessionKey) {
     const bare = store.cursors.find(
@@ -392,10 +407,16 @@ export function forkSessionCursor(
         subscriber_id: subscriberId,
         plan_id: planId,
         last_delivered_seq: bare.last_delivered_seq,
+        updated_at: nowIso,
       };
     }
   }
-  return { subscriber_id: subscriberId, plan_id: planId, last_delivered_seq: 0 };
+  return {
+    subscriber_id: subscriberId,
+    plan_id: planId,
+    last_delivered_seq: 0,
+    updated_at: nowIso,
+  };
 }
 
 export function cursorFor(
@@ -403,11 +424,13 @@ export function cursorFor(
   subscriberId: string,
   planId: string,
 ): DeliveryCursor {
-  return (
-    store.cursors.find(
-      (cursor) => cursor.subscriber_id === subscriberId && cursor.plan_id === planId,
-    ) ?? forkSessionCursor(store, subscriberId, planId)
+  const existing = store.cursors.find(
+    (cursor) => cursor.subscriber_id === subscriberId && cursor.plan_id === planId,
   );
+  if (existing) {
+    return { ...existing, updated_at: existing.updated_at ?? new Date().toISOString() };
+  }
+  return forkSessionCursor(store, subscriberId, planId);
 }
 
 export function ingestJournalEvents(
@@ -416,21 +439,48 @@ export function ingestJournalEvents(
   events: readonly JournalEvent[],
   subscriberIds: readonly string[],
 ): RelayStore {
+  const nowIso = new Date().toISOString();
+  const priorSeqsBySub = new Map<string, string>();
+  for (const item of store.pending) {
+    if (item.plan_id !== planId) continue;
+    const prev = priorSeqsBySub.get(item.subscriber_id);
+    priorSeqsBySub.set(item.subscriber_id, prev ? `${prev},${item.seq}` : String(item.seq));
+  }
   const next = emptyRelayStore();
   next.cursors = store.cursors.map((cursor) => ({ ...cursor }));
   next.pending = store.pending.filter((item) => item.plan_id !== planId);
   const seen = new Set<string>();
   for (const subscriberId of subscriberIds) {
     seen.add(subscriberId);
-    const cursor = cursorFor(next, subscriberId, planId);
-    if (!next.cursors.some((row) => row.subscriber_id === subscriberId && row.plan_id === planId)) {
+    let cursor = next.cursors.find(
+      (row) => row.subscriber_id === subscriberId && row.plan_id === planId,
+    );
+    const rebuilt = rebuildQueueFromJournal(
+      planId,
+      events,
+      cursor ?? forkSessionCursor(next, subscriberId, planId),
+    );
+    const nextSeqSig = rebuilt.map((item) => item.seq).join(",");
+    const queueMutated = (priorSeqsBySub.get(subscriberId) ?? "") !== nextSeqSig;
+    if (!cursor) {
+      cursor = {
+        ...forkSessionCursor(next, subscriberId, planId),
+        updated_at: nowIso,
+      };
       next.cursors.push(cursor);
+    } else if (queueMutated || !cursor.updated_at) {
+      cursor.updated_at = nowIso;
     }
-    next.pending.push(...rebuildQueueFromJournal(planId, events, cursor));
+    next.pending.push(...rebuilt);
   }
   for (const cursor of next.cursors) {
     if (cursor.plan_id === planId && !seen.has(cursor.subscriber_id)) {
-      next.pending.push(...rebuildQueueFromJournal(planId, events, cursor));
+      const rebuilt = rebuildQueueFromJournal(planId, events, cursor);
+      const nextSeqSig = rebuilt.map((item) => item.seq).join(",");
+      if ((priorSeqsBySub.get(cursor.subscriber_id) ?? "") !== nextSeqSig || !cursor.updated_at) {
+        cursor.updated_at = nowIso;
+      }
+      next.pending.push(...rebuilt);
     }
   }
   next.pending.sort(
@@ -449,8 +499,13 @@ export function confirmDelivery(
   deliveredThroughSeq: number,
   deliverySucceeded: boolean,
 ): RelayStore {
+  const nowIso = new Date().toISOString();
   const current = cursorFor(store, subscriberId, planId);
-  const advanced = advanceCursor(current, deliveredThroughSeq, deliverySucceeded);
+  const advancedBase = advanceCursor(current, deliveredThroughSeq, deliverySucceeded);
+  const advanced: DeliveryCursor = {
+    ...advancedBase,
+    updated_at: deliverySucceeded ? nowIso : (advancedBase.updated_at ?? nowIso),
+  };
   const next = emptyRelayStore();
   next.cursors = store.cursors.filter(
     (cursor) => !(cursor.subscriber_id === subscriberId && cursor.plan_id === planId),
@@ -482,8 +537,12 @@ export function confirmDelivery(
         subscriber_id: parsed.agentId,
         plan_id: planId,
         last_delivered_seq: 0,
+        updated_at: nowIso,
       };
-      const bareAdvanced = advanceCursor(bareCurrent, minSeq, true);
+      const bareAdvanced: DeliveryCursor = {
+        ...advanceCursor(bareCurrent, minSeq, true),
+        updated_at: nowIso,
+      };
       next.cursors = next.cursors.filter(
         (c) => !(c.subscriber_id === parsed.agentId && c.plan_id === planId),
       );
@@ -583,9 +642,10 @@ function isProcessLiveForRelayLock(pid: number): boolean {
   }
 }
 
-async function withRelayStoreLock<T>(
+export async function withRelayStoreLock<T>(
   vaultPath: string,
   fn: () => Promise<T>,
+  options?: { timeoutMs?: number },
 ): Promise<T> {
   const resolvedVault = path.resolve(vaultPath);
   const prior = inProcessRelayLocks.get(resolvedVault) ?? Promise.resolve();
@@ -602,10 +662,17 @@ async function withRelayStoreLock<T>(
   const dir = relayDir(vaultPath);
   const lockDir = path.join(dir, "cursors.lock");
   const ownerPath = path.join(lockDir, "owner.json");
+  const timeoutMs =
+    typeof options?.timeoutMs === "number" &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+      ? options.timeoutMs
+      : RELAY_LOCK_TIMEOUT_MS;
   let acquired = false;
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + 2_000;
+    assertWriteTargetUnder(lockDir, vaultPath);
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
         await mkdir(lockDir, { mode: 0o700 });
@@ -617,7 +684,9 @@ async function withRelayStoreLock<T>(
         ).catch(() => {});
         break;
       } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") break;
+        if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
+          throw err;
+        }
         try {
           const rawOwner = JSON.parse(await readFile(ownerPath, "utf8")) as {
             pid?: number;
@@ -628,15 +697,19 @@ async function withRelayStoreLock<T>(
           const ageMs = rawOwner.acquiredAt
             ? Date.now() - Date.parse(rawOwner.acquiredAt)
             : 0;
-          if (ownerDead || (Number.isFinite(ageMs) && ageMs > 10_000)) {
+          if (ownerDead || (Number.isFinite(ageMs) && ageMs > RELAY_LOCK_STALE_MS)) {
             await rm(lockDir, { recursive: true, force: true }).catch(() => {});
             continue;
           }
         } catch {
           // Owner file still being written or unreadable; wait briefly.
         }
-        await new Promise((r) => setTimeout(r, 15));
+        const jitterMs = 10 + Math.floor(Math.random() * 15);
+        await new Promise((r) => setTimeout(r, jitterMs));
       }
+    }
+    if (!acquired) {
+      throw new Error(`Timed out acquiring thread relay store lock: ${lockDir}`);
     }
     return await fn();
   } finally {
@@ -671,7 +744,9 @@ export async function saveRelayStore(vaultPath: string, store: RelayStore): Prom
   const dir = relayDir(vaultPath);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const targetPath = relayStorePath(vaultPath);
+  assertWriteTargetUnder(targetPath, vaultPath);
   const tmpPath = path.join(dir, `cursors.json.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
+  assertWriteTargetUnder(tmpPath, vaultPath);
   const payload = `${JSON.stringify({ ...store, graph: false }, null, 2)}\n`;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
@@ -1117,9 +1192,51 @@ export async function ingestPlanJournalFromDisk(
   return ingestJournalIntoVault(vaultPath, planId, events, subscriberIds);
 }
 
+const RELAY_TERMINAL_PLAN_STATUSES = new Set([
+  "accepted",
+  "complete",
+  "rejected",
+  "superseded",
+  "abandoned",
+]);
+
+async function isRelayPlanMissingOrTerminal(
+  vaultPath: string,
+  planId: string,
+  cache: Map<string, boolean>,
+): Promise<boolean> {
+  const cached = cache.get(planId);
+  if (cached !== undefined) return cached;
+  if (!planId || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(planId)) {
+    cache.set(planId, true);
+    return true;
+  }
+  const notePath = path.join(vaultPath, "wiki", "artifacts", `${planId}.md`);
+  try {
+    const raw = await readFile(notePath, "utf8");
+    const statusMatch = /^status:\s*['"]?([a-z0-9_-]+)['"]?\s*$/im.exec(raw);
+    const status = statusMatch?.[1]?.toLowerCase() ?? "";
+    if (RELAY_TERMINAL_PLAN_STATUSES.has(status)) {
+      cache.set(planId, true);
+      return true;
+    }
+    cache.set(planId, false);
+    return false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      cache.set(planId, true);
+      return true;
+    }
+    cache.set(planId, false);
+    return false;
+  }
+}
+
 /**
  * §5.1.2 (Slice S4): Prune expired session-scoped relay cursors ("<agent>:<sessionKey>")
- * whose session has been dead/inactive > 24h and cap total cursors at MAX_RELAY_CURSORS.
+ * whose session has been dead/inactive > 24h or whose plan is missing/terminal with
+ * empty pending delivery, and cap inactive composite cursors at MAX_RELAY_CURSORS
+ * without ever evicting bare <agent> cursors, liveSessionKeys, or pending queues.
  * Never deletes plan notes, journals, or histories.
  */
 export async function sweepDeadRelayCursors(
@@ -1157,17 +1274,71 @@ export async function sweepDeadRelayCursors(
       // No active-thread.d dir.
     }
 
+    try {
+      const runtimeDir = path.join(vaultPath, ".runtime");
+      const runtimeFiles = await readdir(runtimeDir);
+      for (const f of runtimeFiles) {
+        if (!f.startsWith("active-session-") || !f.endsWith(".json")) continue;
+        try {
+          const raw = JSON.parse(
+            await readFile(path.join(runtimeDir, f), "utf8"),
+          ) as {
+            host_pid?: number;
+            process_start_marker?: string;
+            session_key?: string;
+            updated_at?: string;
+          };
+          if (
+            typeof raw.session_key === "string" &&
+            SESSION_KEY_HEX_RE.test(raw.session_key) &&
+            typeof raw.host_pid === "number" &&
+            isLiveMatchingProcess(raw.host_pid, raw.process_start_marker)
+          ) {
+            const ts = Date.parse(raw.updated_at ?? "");
+            if (!Number.isFinite(ts) || nowMs - ts <= RELAY_CURSOR_PRUNE_AGE_MS) {
+              liveSessionKeys.add(raw.session_key);
+            }
+          }
+        } catch {
+          // Ignore unreadable active-session hint.
+        }
+      }
+    } catch {
+      // No .runtime dir.
+    }
+
+    const pendingCounts = new Map<string, number>();
+    for (const item of store.pending) {
+      const key = `${item.subscriber_id}\0${item.plan_id}`;
+      pendingCounts.set(key, (pendingCounts.get(key) ?? 0) + 1);
+    }
+
+    const planTerminalCache = new Map<string, boolean>();
     const prunedSubPlans = new Set<string>();
     const keptCursors: DeliveryCursor[] = [];
     for (const cursor of store.cursors) {
       const parsed = parseSubscriberPrincipal(cursor.subscriber_id);
+      const subPlanKey = `${cursor.subscriber_id}\0${cursor.plan_id}`;
+      const hasPending = (pendingCounts.get(subPlanKey) ?? 0) > 0;
       if (parsed.sessionKey && !liveSessionKeys.has(parsed.sessionKey)) {
         const updatedTs = cursor.updated_at ? Date.parse(cursor.updated_at) : Number.NaN;
         const expiredByAge =
-          Number.isFinite(updatedTs) && nowMs - updatedTs > RELAY_CURSOR_PRUNE_AGE_MS;
+          Number.isFinite(updatedTs) && nowMs - updatedTs > DEAD_CURSOR_MAX_AGE_MS;
         const expiredBySessionSweep = prunedSessionKeys?.has(parsed.sessionKey) ?? false;
-        if (expiredByAge || expiredBySessionSweep) {
-          prunedSubPlans.add(`${cursor.subscriber_id}\0${cursor.plan_id}`);
+        let expiredWhenQueueEmpty = false;
+        if (!hasPending && !expiredByAge && !expiredBySessionSweep) {
+          if (!Number.isFinite(updatedTs)) {
+            expiredWhenQueueEmpty = true;
+          } else {
+            expiredWhenQueueEmpty = await isRelayPlanMissingOrTerminal(
+              vaultPath,
+              cursor.plan_id,
+              planTerminalCache,
+            );
+          }
+        }
+        if (expiredByAge || expiredBySessionSweep || expiredWhenQueueEmpty) {
+          prunedSubPlans.add(subPlanKey);
           continue;
         }
       }
@@ -1175,14 +1346,31 @@ export async function sweepDeadRelayCursors(
     }
 
     if (keptCursors.length > MAX_RELAY_CURSORS) {
-      keptCursors.sort((a, b) => {
-        const ta = a.updated_at ? Date.parse(a.updated_at) : 0;
-        const tb = b.updated_at ? Date.parse(b.updated_at) : 0;
-        return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
-      });
-      const dropped = keptCursors.splice(MAX_RELAY_CURSORS);
-      for (const d of dropped) {
-        prunedSubPlans.add(`${d.subscriber_id}\0${d.plan_id}`);
+      const protectedCursors: DeliveryCursor[] = [];
+      const evictableCursors: DeliveryCursor[] = [];
+      for (const cursor of keptCursors) {
+        const parsed = parseSubscriberPrincipal(cursor.subscriber_id);
+        const subPlanKey = `${cursor.subscriber_id}\0${cursor.plan_id}`;
+        const hasPending = (pendingCounts.get(subPlanKey) ?? 0) > 0;
+        if (!parsed.sessionKey || liveSessionKeys.has(parsed.sessionKey) || hasPending) {
+          protectedCursors.push(cursor);
+        } else {
+          evictableCursors.push(cursor);
+        }
+      }
+      if (evictableCursors.length > 0) {
+        evictableCursors.sort((a, b) => {
+          const ta = a.updated_at ? Date.parse(a.updated_at) : 0;
+          const tb = b.updated_at ? Date.parse(b.updated_at) : 0;
+          return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
+        });
+        const maxEvictableKeep = Math.max(0, MAX_RELAY_CURSORS - protectedCursors.length);
+        const dropped = evictableCursors.splice(maxEvictableKeep);
+        for (const d of dropped) {
+          prunedSubPlans.add(`${d.subscriber_id}\0${d.plan_id}`);
+        }
+        keptCursors.length = 0;
+        keptCursors.push(...protectedCursors, ...evictableCursors);
       }
     }
 

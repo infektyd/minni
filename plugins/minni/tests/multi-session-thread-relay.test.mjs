@@ -13,7 +13,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -22,6 +22,22 @@ import { recordActiveSessionWorkspace } from "../dist/config.js";
 import { discardDeliveryCommits, runDeliveryCommits } from "../dist/hook-delivery.js";
 import { createHookHandlers } from "../dist/hook-handlers.js";
 import { claudeCodeWire } from "../dist/hook-platform.js";
+import { createPlan } from "../dist/plan.js";
+import {
+  MAX_RELAY_CURSORS,
+  RELAY_LOCK_TIMEOUT_MS,
+  advanceCursor,
+  confirmDelivery,
+  emptyRelayStore,
+  forkSessionCursor,
+  formatSessionSubscriberId,
+  ingestJournalEvents,
+  loadRelayStore,
+  relayDir,
+  saveRelayStore,
+  sweepDeadRelayCursors,
+  withRelayStoreLock,
+} from "../dist/thread-notification-relay.js";
 import { ensureVault } from "../dist/vault.js";
 
 const SERVER_PATH = new URL("../dist/server.js", import.meta.url).pathname;
@@ -367,3 +383,189 @@ test(
     );
   },
 );
+
+test("withRelayStoreLock fails closed on live contention, forkSessionCursor stamps updated_at, and MAX_RELAY_CURSORS protects bare agents + live/pending cursors", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-relay-lock-cap-"));
+  const vault = path.join(root, "claudecode-vault");
+  await ensureVault(vault, { agentId: "claude-code" });
+  t.after(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  // 1. RELAY_LOCK_TIMEOUT_MS is 5_000ms and withRelayStoreLock fails closed (never runs fn unlocked!)
+  assert.equal(RELAY_LOCK_TIMEOUT_MS, 5_000);
+  const initialStore = emptyRelayStore();
+  initialStore.cursors.push(
+    advanceCursor(
+      { subscriber_id: "claude-code", plan_id: "plan-sentinel", last_delivered_seq: 0 },
+      7,
+      true,
+    ),
+  );
+  await saveRelayStore(vault, initialStore);
+
+  const lockDir = path.join(relayDir(vault), "cursors.lock");
+  await mkdir(lockDir, { mode: 0o700 });
+  await writeFile(
+    path.join(lockDir, "owner.json"),
+    JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }),
+    "utf8",
+  );
+
+  let unlockedCallbackRan = false;
+  await assert.rejects(
+    () =>
+      withRelayStoreLock(
+        vault,
+        async () => {
+          unlockedCallbackRan = true;
+          await saveRelayStore(vault, emptyRelayStore());
+        },
+        { timeoutMs: 180 },
+      ),
+    /Timed out acquiring thread relay store lock/,
+  );
+  assert.equal(unlockedCallbackRan, false, "withRelayStoreLock must NEVER run fn() when lock times out");
+  const preservedStore = await loadRelayStore(vault);
+  assert.equal(preservedStore.cursors.length, 1);
+  assert.equal(preservedStore.cursors[0].plan_id, "plan-sentinel");
+
+  // Release simulated lock and verify normal lock acquisition succeeds
+  await rm(lockDir, { recursive: true, force: true });
+
+  // 2. forkSessionCursor, advanceCursor, ingestJournalEvents, and confirmDelivery stamp ISO updated_at
+  const cursorStore = emptyRelayStore();
+  const baseCur = advanceCursor(
+    { subscriber_id: "claude-code", plan_id: "plan-ts", last_delivered_seq: 0 },
+    2,
+    true,
+  );
+  assert.ok(baseCur.updated_at && Number.isFinite(Date.parse(baseCur.updated_at)));
+  cursorStore.cursors.push(baseCur);
+
+  const sessionSub = formatSessionSubscriberId("claude-code", "a1b2c3d4e5f60718");
+  const forkedCur = forkSessionCursor(cursorStore, sessionSub, "plan-ts");
+  assert.ok(
+    forkedCur.updated_at && Number.isFinite(Date.parse(forkedCur.updated_at)),
+    `forkSessionCursor must stamp valid ISO updated_at, got: ${forkedCur.updated_at}`,
+  );
+  cursorStore.cursors.push(forkedCur);
+
+  const ingestedStore = ingestJournalEvents(
+    cursorStore,
+    "plan-ts",
+    [{ seq: 3, kind: "slice_completed", actor: "codex", at: new Date().toISOString(), slice_id: "s1" }],
+    [sessionSub],
+  );
+  const ingestedCur = ingestedStore.cursors.find((c) => c.subscriber_id === sessionSub);
+  assert.ok(ingestedCur?.updated_at && Number.isFinite(Date.parse(ingestedCur.updated_at)));
+
+  const confirmedStore = confirmDelivery(ingestedStore, sessionSub, "plan-ts", 3, true);
+  const confirmedCur = confirmedStore.cursors.find((c) => c.subscriber_id === sessionSub);
+  assert.ok(confirmedCur?.updated_at && Number.isFinite(Date.parse(confirmedCur.updated_at)));
+
+  // 3. MAX_RELAY_CURSORS eviction NEVER drops bare <agent> cursors, liveSessionKeys, or cursors with pending items
+  const created = await createPlan(
+    {
+      goal: "Active Plan For Cap Test",
+      slices: [{ id: "s1", title: "Cap Slice" }],
+      vaultPath: vault,
+    },
+    { vaultPath: vault },
+  );
+  const activePlanId = created.plan.plan_id;
+  const capStore = emptyRelayStore();
+  const oldIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h old (within 24h TTL, oldest for cap)
+  const midIso = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h old
+
+  // Oldest bare <agent> cursors — MUST survive even with oldest timestamps!
+  capStore.cursors.push({
+    subscriber_id: "claude-code",
+    plan_id: activePlanId,
+    last_delivered_seq: 1,
+    updated_at: "2020-01-01T00:00:00.000Z",
+  });
+  capStore.cursors.push({
+    subscriber_id: "codex",
+    plan_id: activePlanId,
+    last_delivered_seq: 1,
+    updated_at: "2020-01-01T00:00:01.000Z",
+  });
+
+  // Live session cursor (backed by live active-thread.d pointer on disk) — MUST survive even with ancient cursor updated_at!
+  const liveKey = "1111222233334444";
+  const liveSub = formatSessionSubscriberId("claude-code", liveKey);
+  const activeThreadDir = path.join(vault, ".runtime", "active-thread.d");
+  await mkdir(activeThreadDir, { recursive: true });
+  await writeFile(
+    path.join(activeThreadDir, `${liveKey}.json`),
+    JSON.stringify({
+      plan_id: activePlanId,
+      path: `wiki/artifacts/${activePlanId}.md`,
+      session_key: liveKey,
+      host_pid: process.pid,
+      set_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+    "utf8",
+  );
+  capStore.cursors.push({
+    subscriber_id: liveSub,
+    plan_id: activePlanId,
+    last_delivered_seq: 1,
+    updated_at: "2020-01-01T00:00:02.000Z",
+  });
+
+  // Inactive session cursor WITH pending notification — MUST survive!
+  const pendingKey = "5555666677778888";
+  const pendingSub = formatSessionSubscriberId("claude-code", pendingKey);
+  capStore.cursors.push({
+    subscriber_id: pendingSub,
+    plan_id: activePlanId,
+    last_delivered_seq: 0,
+    updated_at: oldIso,
+  });
+  capStore.pending.push({
+    id: `${activePlanId}:1:${pendingSub}`,
+    plan_id: activePlanId,
+    seq: 1,
+    subscriber_id: pendingSub,
+    kind: "slice_completed",
+    actor: "codex",
+    created_at: oldIso,
+    summary: "s1 done",
+  });
+
+  // Fill 260 additional inactive composite session cursors (> MAX_RELAY_CURSORS = 256)
+  for (let i = 0; i < 260; i++) {
+    const hexKey = i.toString(16).padStart(16, "a");
+    capStore.cursors.push({
+      subscriber_id: formatSessionSubscriberId("claude-code", hexKey),
+      plan_id: activePlanId,
+      last_delivered_seq: 1,
+      updated_at: midIso,
+    });
+  }
+  await saveRelayStore(vault, capStore);
+
+  await sweepDeadRelayCursors(vault, Date.now());
+
+  const afterCap = await loadRelayStore(vault);
+  assert.equal(afterCap.cursors.length, MAX_RELAY_CURSORS);
+  assert.ok(
+    afterCap.cursors.some((c) => c.subscriber_id === "claude-code"),
+    "bare 'claude-code' cursor must NEVER be evicted by MAX_RELAY_CURSORS",
+  );
+  assert.ok(
+    afterCap.cursors.some((c) => c.subscriber_id === "codex"),
+    "bare 'codex' cursor must NEVER be evicted by MAX_RELAY_CURSORS",
+  );
+  assert.ok(
+    afterCap.cursors.some((c) => c.subscriber_id === liveSub),
+    "liveSessionKeys cursor must NEVER be evicted by MAX_RELAY_CURSORS",
+  );
+  assert.ok(
+    afterCap.cursors.some((c) => c.subscriber_id === pendingSub),
+    "cursor with non-empty pending queue must NEVER be evicted by MAX_RELAY_CURSORS",
+  );
+});

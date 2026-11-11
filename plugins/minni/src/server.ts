@@ -71,6 +71,7 @@ import {
   activatePlanChecked,
   clearActivePlan,
   getActivePlan,
+  isTerminalPlanStatus,
   resolvePlanIdOrActive,
   journalPathFor,
   type PlanArtifact,
@@ -1830,17 +1831,14 @@ server.registerTool(
           ],
           { actorSessionKey: mcpSession.sessionKey },
         ).catch(() => {});
-        // P10/H6: terminal plans stop being injected.
-        if (updated.status === "complete" || updated.status === "accepted") {
+        // P10/H6: terminal plans stop being injected without clobbering sibling _active_plan.json.
+        if (isTerminalPlanStatus(updated.status)) {
           try {
-            const active = await getActivePlan(effectiveVaultPath, {
+            await clearActivePlan(effectiveVaultPath, {
               sessionKey: mcpSession.sessionKey,
+              expectedPlanId: plan_id,
+              markDetached: false,
             });
-            if (active && active.plan_id === plan_id) {
-              await clearActivePlan(effectiveVaultPath, {
-                sessionKey: mcpSession.sessionKey,
-              });
-            }
           } catch {
             // active pointer maintenance is advisory
           }

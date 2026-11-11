@@ -12,8 +12,11 @@ import {
   activePointerPath,
   activeThreadSessionPath,
   createPlan,
+  persistPlan,
   setActivePlan,
   sweepDeadActiveThreadPointers,
+  sweepDeadSessionState,
+  updateSlice,
 } from "../dist/plan.js";
 import { sessionStateKey } from "../dist/recall-state.js";
 import { stashPrecompactReassert } from "../dist/daemon_transport.js";
@@ -23,7 +26,12 @@ import {
   ingestJournalIntoVault,
   loadRelayStore,
 } from "../dist/thread-notification-relay.js";
-import { ensureVault, readReassertPending } from "../dist/vault.js";
+import {
+  ensureVault,
+  parkUndeliverableInboxEntries,
+  readParkedUndeliverablePending,
+  readReassertPending,
+} from "../dist/vault.js";
 
 function startFakeContradictionDaemon(socketPath, events) {
   return new Promise((resolve, reject) => {
@@ -353,4 +361,146 @@ test("Slice S4 (§5.1.2 & §5.2): Dead-session GC sweep prunes expired active-th
   assert.equal(existsSync(notePath), true, "plan-*.md must NEVER be deleted by GC");
   assert.equal(existsSync(logPath), true, "plan-*.log.md must NEVER be deleted by GC");
   assert.equal(existsSync(historyPath), true, "plan-*.history.jsonl must NEVER be deleted by GC");
+});
+
+test("sweepDeadSessionState prunes expired dead-session cursors even on terminal plans, sweeps expired runtime files, and readParkedUndeliverablePending enforces 10m session affinity", async (t) => {
+  const tmpRoot = await mkdtemp(path.join(tmpdir(), "minni-s4-terminal-park-"));
+  const vaultPath = path.join(tmpRoot, "claudecode-vault");
+  await ensureVault(vaultPath, { agentId: "claude-code" });
+  t.after(async () => {
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  const deadSessionId = "sess-dead-terminal";
+  const deadKey = sessionStateKey(deadSessionId);
+
+  // 1. Create a plan and complete its only slice so plan status becomes "complete" (terminal)
+  const created = await createPlan(
+    {
+      goal: "Completed Plan With Dead Session Cursor",
+      slices: [{ id: "s1", title: "Finish Slice", status: "pending" }],
+      sessionKey: deadKey,
+      sessionId: deadSessionId,
+      hostPid: 999_998,
+      vaultPath,
+    },
+    { vaultPath },
+  );
+  const planId = created.plan.plan_id;
+  const completedPlan = updateSlice(
+    created.plan,
+    "s1",
+    "done",
+    "verified in plugins/minni/tests/multi-session-gc-and-reassert.test.mjs",
+  );
+  assert.equal(completedPlan.status, "complete");
+  await persistPlan(completedPlan, { vaultPath, notePath: created.write.notePath });
+
+  // Write expired (>24h) dead-session active-thread pointer, lifecycle-state.d file, active-session hint, and relay cursor
+  const nowMs = Date.now();
+  const twentySixHoursAgoIso = new Date(nowMs - 26 * 60 * 60 * 1000).toISOString();
+
+  const deadThreadFile = activeThreadSessionPath(vaultPath, deadKey);
+  await mkdir(path.dirname(deadThreadFile), { recursive: true });
+  await writeFile(
+    deadThreadFile,
+    JSON.stringify({
+      plan_id: planId,
+      notePath: created.write.notePath,
+      session_key: deadKey,
+      session_id: deadSessionId,
+      host_pid: 999_998,
+      set_at: twentySixHoursAgoIso,
+      updated_at: twentySixHoursAgoIso,
+    }),
+    "utf8",
+  );
+
+  const subDead = formatSessionSubscriberId("claude-code", deadKey);
+  await ensureSessionRelayCursor(vaultPath, planId, subDead);
+  await ingestJournalIntoVault(
+    vaultPath,
+    planId,
+    [{ seq: 1, kind: "slice_completed", actor: "codex", at: new Date(nowMs).toISOString(), slice_id: "s1" }],
+    [subDead],
+  );
+
+  const deadLifecyclePath = path.join(vaultPath, ".runtime", "lifecycle-state.d", `${deadKey}.json`);
+  await mkdir(path.dirname(deadLifecyclePath), { recursive: true });
+  await writeFile(
+    deadLifecyclePath,
+    JSON.stringify({ session_id: deadSessionId, emphasized: ["plan"], updated_at: twentySixHoursAgoIso }),
+    "utf8",
+  );
+
+  const deadHintPath = path.join(vaultPath, ".runtime", "active-session-claude-code-999998.json");
+  await writeFile(
+    deadHintPath,
+    JSON.stringify({
+      agent_id: "claude-code",
+      host_pid: 999_998,
+      session_id: deadSessionId,
+      session_key: deadKey,
+      updated_at: twentySixHoursAgoIso,
+    }),
+    "utf8",
+  );
+
+  const sweep = await sweepDeadSessionState(vaultPath, nowMs);
+  assert.equal(sweep.prunedPointers, 1, "expired dead-session pointer on terminal plan must be pruned");
+  assert.equal(
+    sweep.prunedCursors,
+    1,
+    "expired dead-session relay cursor (even with pending items on a complete plan!) must be pruned via prunedSessionKeys",
+  );
+  assert.equal(existsSync(deadLifecyclePath), false, "expired lifecycle-state.d entry must be swept");
+  assert.equal(existsSync(deadHintPath), false, "expired dead active-session hint must be swept");
+
+  // 2. readParkedUndeliverablePending 10-minute session affinity
+  const sessionAlpha = "sess-park-alpha";
+  const sessionBravo = "sess-park-bravo";
+  const stashPath = await stashPrecompactReassert({
+    vaultPath,
+    sessionId: sessionAlpha,
+    agentId: "grok-build",
+    staleBeliefEvents: [
+      {
+        event_id: 501,
+        superseded_learning_id: 10,
+        new_learning_id: 11,
+        originating_agent: "claude-code",
+      },
+    ],
+  });
+  assert.ok(stashPath);
+  const freshEntries = await readReassertPending(vaultPath, 3, { sessionId: sessionAlpha });
+  assert.equal(freshEntries.length, 1);
+  const parkedPaths = await parkUndeliverableInboxEntries(
+    freshEntries.map((e) => e.filePath),
+  );
+  assert.equal(parkedPaths.length, 1);
+
+  // Sibling sessionBravo within 10m orphan window must NOT steal sessionAlpha's parked item
+  const bravoEarly = await readParkedUndeliverablePending(vaultPath, 3, {
+    sessionId: sessionBravo,
+    sessionKey: sessionStateKey(sessionBravo),
+  });
+  assert.equal(bravoEarly.length, 0, "sibling session must not steal fresh (<10m) parked reassert item");
+
+  // Owner sessionAlpha immediately sees its own parked item
+  const alphaOwn = await readParkedUndeliverablePending(vaultPath, 3, {
+    sessionId: sessionAlpha,
+    sessionKey: sessionStateKey(sessionAlpha),
+  });
+  assert.equal(alphaOwn.length, 1);
+  assert.equal(alphaOwn[0].payload.stale_belief_events[0].event_id, 501);
+
+  // After 10-minute orphan TTL, sessionBravo CAN recover the orphaned parked item
+  const elevenMinLaterMs = Date.now() + 11 * 60 * 1000;
+  const bravoOrphanClaim = await readParkedUndeliverablePending(vaultPath, 3, {
+    sessionId: sessionBravo,
+    sessionKey: sessionStateKey(sessionBravo),
+    nowMs: elevenMinLaterMs,
+  });
+  assert.equal(bravoOrphanClaim.length, 1, "orphaned (>10m) parked item must be claimable by another session");
 });

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,7 +12,14 @@ import test from "node:test";
 import { recordActiveSessionWorkspace } from "../dist/config.js";
 import { createHookHandlers } from "../dist/hook-handlers.js";
 import { claudeCodeWire } from "../dist/hook-platform.js";
-import { activeThreadSessionPath, createPlan, getActivePlan, setActivePlan } from "../dist/plan.js";
+import {
+  activePointerPath,
+  activeThreadSessionDir,
+  activeThreadSessionPath,
+  createPlan,
+  getActivePlan,
+  setActivePlan,
+} from "../dist/plan.js";
 import { sessionStateKey } from "../dist/recall-state.js";
 import { ensureVault } from "../dist/vault.js";
 
@@ -345,4 +352,119 @@ test("Slice S2 regression: single-session resume adopting _active_plan.json pers
     undefined,
     "second concurrent session must NOT hijack the plan adopted by the live resumed session",
   );
+});
+
+test("Sibling terminal minni_thread_update preserves sibling _active_plan.json without .detached and auto-clears terminal session pointers", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-s2-terminal-sibling-"));
+  const home = path.join(root, "home");
+  const vault = path.join(home, "claudecode-vault");
+  const socketPath = path.join(root, "minnid.sock");
+  await ensureVault(vault, { agentId: "claude-code" });
+  const daemon = await startFakeDaemon(socketPath);
+  t.after(async () => {
+    daemon.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const serverA = await spawnHostMcpSession(t, { home, socketPath, vaultPath: vault });
+  const serverB = await spawnHostMcpSession(t, { home, socketPath, vaultPath: vault });
+
+  const sessionA = "sess-term-alpha";
+  const sessionB = "sess-term-bravo";
+  const keyA = sessionStateKey(sessionA);
+  const keyB = sessionStateKey(sessionB);
+
+  recordActiveSessionWorkspace(vault, "/tmp/project-alpha", {
+    agentId: "claude-code",
+    hostPid: serverA.hostPid,
+    sessionId: sessionA,
+  });
+  recordActiveSessionWorkspace(vault, "/tmp/project-bravo", {
+    agentId: "claude-code",
+    hostPid: serverB.hostPid,
+    sessionId: sessionB,
+  });
+
+  // 1. Session A creates & activates planA (_active_plan.json -> planA)
+  const createdA = await serverA.callToolJson("minni_thread_create", {
+    goal: "Long-lived Coordinator Plan A",
+    slices: [{ id: "a1", title: "Slice A1" }],
+  });
+  const planA = createdA.plan_id;
+  assert.ok(planA);
+  const activeBefore = JSON.parse(await readFile(activePointerPath(vault), "utf8"));
+  assert.equal(activeBefore.plan_id, planA);
+
+  // 2. Session B creates & activates planB while _active_plan.json points to planA
+  const createdB = await serverB.callToolJson("minni_thread_create", {
+    goal: "Short Worker Plan B",
+    slices: [{ id: "b1", title: "Slice B1" }],
+    activate: true,
+  });
+  const planB = createdB.plan_id;
+  assert.ok(planB && planB !== planA);
+
+  const sessionBFile = activeThreadSessionPath(vault, keyB);
+  const sessionBDetached = path.join(activeThreadSessionDir(vault), `${keyB}.detached`);
+  assert.ok(sessionBFile && existsSync(sessionBFile), "sessionB pointer must exist");
+
+  // 3. Session B completes planB via minni_thread_update -> planB transitions to terminal "complete"
+  const updatedB = await serverB.callToolJson("minni_thread_update", {
+    plan_id: planB,
+    slice_id: "b1",
+    status: "done",
+    evidence: "Slice B1 completed",
+  });
+  assert.equal(updatedB.plan?.status, "complete");
+
+  // Assert Bug A fixes:
+  // - <sessionB>.json is removed
+  // - NO <sessionB>.detached file is written
+  // - _active_plan.json STILL points to planA!
+  assert.equal(existsSync(sessionBFile), false, "<sessionB>.json must be removed on terminal completion");
+  assert.equal(
+    sessionBDetached ? existsSync(sessionBDetached) : false,
+    false,
+    "terminal auto-clear must NOT write <sessionB>.detached",
+  );
+  assert.equal(existsSync(activePointerPath(vault)), true, "_active_plan.json must NOT be unlinked when pointing to sibling planA");
+  const activeAfterB = JSON.parse(await readFile(activePointerPath(vault), "utf8"));
+  assert.equal(activeAfterB.plan_id, planA, "_active_plan.json must still point to planA");
+
+  // Subsequent id-less getActivePlan for Session B returns undefined (not terminal planB, and does not steal live planA)
+  const lookupBAfter = await getActivePlan(vault, {
+    sessionKey: keyB,
+    sessionId: sessionB,
+    hostPid: serverB.hostPid,
+  });
+  assert.equal(lookupBAfter, undefined);
+  assert.ok((await getActivePlan(vault, { sessionKey: keyA, sessionId: sessionA, hostPid: serverA.hostPid }))?.plan_id === planA);
+
+  // Assert Bug B fix: if a stale <sessionB>.json points to terminal planB on disk, getActivePlan auto-clears it cleanly!
+  await setActivePlan(vault, planB, path.join(vault, "wiki", "artifacts", `${planB}.md`), {
+    sessionKey: keyB,
+    sessionId: sessionB,
+    hostPid: serverB.hostPid,
+  });
+  // Restore _active_plan.json to planA so we simulate a leftover session pointer on Session B while Session A owns _active_plan.json
+  await setActivePlan(vault, planA, path.join(vault, "wiki", "artifacts", `${planA}.md`), {
+    sessionKey: keyA,
+    sessionId: sessionA,
+    hostPid: serverA.hostPid,
+  });
+  assert.equal(existsSync(sessionBFile), true);
+  const autoClearedB = await getActivePlan(vault, {
+    sessionKey: keyB,
+    sessionId: sessionB,
+    hostPid: serverB.hostPid,
+  });
+  assert.equal(autoClearedB, undefined, "getActivePlan must return undefined for terminal session pointer");
+  assert.equal(existsSync(sessionBFile), false, "getActivePlan must auto-remove terminal <sessionB>.json");
+  assert.equal(
+    sessionBDetached ? existsSync(sessionBDetached) : false,
+    false,
+    "auto-clear of terminal session pointer must NOT write .detached",
+  );
+  const activeAfterAutoClear = JSON.parse(await readFile(activePointerPath(vault), "utf8"));
+  assert.equal(activeAfterAutoClear.plan_id, planA, "auto-clear must leave sibling _active_plan.json intact");
 });

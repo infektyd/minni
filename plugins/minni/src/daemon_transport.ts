@@ -1216,7 +1216,11 @@ export async function drillMemory(
           continue;
         }
         const normalizedHandle = trimmed.toLowerCase();
-        const resolved = await resolveSafeVaultHandleNote(effectiveVaultPath, normalizedHandle);
+        const resolved = await resolveSafeVaultHandleNote(
+          effectiveVaultPath,
+          normalizedHandle,
+          input.sessionId,
+        );
         if (resolved.status === "unresolved") {
           if (resolved.reason === "missing") {
             const sessionEntry = await readSessionHandle(effectiveVaultPath, input.sessionId, normalizedHandle);
@@ -1490,7 +1494,11 @@ export async function drillMemory(
     for (const rawRef of rawRefs) {
       const refStr = String(rawRef).trim();
       const derivedHandle = vaultHandleForPath(refStr);
-      const resolved = await resolveSafeVaultHandleNote(effectiveVaultPath, derivedHandle);
+      const resolved = await resolveSafeVaultHandleNote(
+        effectiveVaultPath,
+        derivedHandle,
+        input.sessionId,
+      );
       if (resolved.status === "resolved") {
         const wrapped = `<EVIDENCE source="${xmlAttrEscapeDrill(resolved.relativePath)}">\n${resolved.content}\n</EVIDENCE>`;
         fallbackResults.push({

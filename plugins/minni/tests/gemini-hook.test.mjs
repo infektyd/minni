@@ -204,6 +204,7 @@ test("PreToolUse denies-to-surface through agy's decision vocabulary and flips c
     await writeFile(
       statePath,
       JSON.stringify({
+        session_id: "cfcd2d03-9775-4ff2-8667-ba461998307f",
         task_signature: "t-test",
         intent: "status",
         top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],
@@ -313,6 +314,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
     await writeFile(
       path.join(runtimeDir, "recall-state.json"),
       JSON.stringify({
+        session_id: "cfcd2d03-9775-4ff2-8667-ba461998307f",
         task_signature: "t-default-mode",
         intent: "status",
         top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],
@@ -337,6 +339,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
     await writeFile(
       path.join(runtimeDir, "recall-state.json"),
       JSON.stringify({
+        session_id: "cfcd2d03-9775-4ff2-8667-ba461998307f",
         task_signature: "t-soft-mode",
         intent: "status",
         top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],

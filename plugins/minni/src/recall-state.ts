@@ -793,7 +793,7 @@ export async function writeRecallState(
       await writeStateFileAtomic(sessionFile, vaultPath, payload);
     }
   }
-  await writeFile(mirrorPath, JSON.stringify(payload, null, 2), "utf8");
+  await writeStateFileAtomic(mirrorPath, vaultPath, payload);
   return mirrorPath;
 }
 
@@ -817,8 +817,8 @@ export async function readRecallState(
     const mirror = await readStateFileAt(recallStatePath(vaultPath), vaultPath);
     if (
       mirror &&
-      (!mirror.session_id ||
-        mirror.session_id === sessionId ||
+      mirror.session_id &&
+      (mirror.session_id === sessionId ||
         sessionStateKey(mirror.session_id) === sessionStateKey(sessionId))
     ) {
       return mirror;
@@ -916,8 +916,8 @@ export async function markRecallConsumed(
     let mirrorOk = false;
     if (
       mirror &&
-      (!mirror.session_id ||
-        mirror.session_id === sessionId ||
+      mirror.session_id &&
+      (mirror.session_id === sessionId ||
         sessionStateKey(mirror.session_id) === sessionStateKey(sessionId))
     ) {
       mirrorOk = await markFileConsumed(mirrorPath, vaultPath);
@@ -981,8 +981,8 @@ export async function disarmRecallStateOnConsult(
     const mirror = await readStateFileAt(mirrorPath, vaultPath).catch(() => null);
     const mirrorMatches =
       mirror !== null &&
-      (!mirror.session_id ||
-        (effectiveSessionId !== undefined && mirror.session_id === effectiveSessionId) ||
+      Boolean(mirror.session_id) &&
+      ((effectiveSessionId !== undefined && mirror.session_id === effectiveSessionId) ||
         (effectiveSessionKey !== undefined &&
           sessionStateKey(mirror.session_id) === effectiveSessionKey));
     const st = scoped ?? (mirrorMatches ? mirror : null);
@@ -2046,5 +2046,17 @@ export async function writeLifecycleState(
   const filePath = lifecycleStatePath(vaultPath);
   ensureContainedDir(vaultPath, [".runtime"], true);
   assertWriteTargetUnder(filePath, vaultPath);
-  await writeFile(filePath, JSON.stringify(state, null, 2), "utf8");
+  const mirrorTmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    await writeFile(mirrorTmpPath, JSON.stringify(state, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    await rename(mirrorTmpPath, filePath);
+  } catch (err) {
+    await rm(mirrorTmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
 }

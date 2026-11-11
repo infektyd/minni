@@ -1,6 +1,6 @@
 # DESIGN: Multi-Session Principal (`agent_id` + `session_id`)
 
-- **Status:** Draft (bounded research & design spike — no product-code changes in this revision)
+- **Status:** Implemented (Slices S1–S4 + Amendments R1, R2)
 - **Baseline:** `main` @ `e8b0ed8e`
 - **Defects addressed:**
   - **H4 (One active plan per vault):** `minni_thread_create` unconditionally overwrites the vault's single active-plan pointer (`<vault>/wiki/artifacts/_active_plan.json`) and has no `activate` parameter. A second live session creating a plan silently displaces the first session's active plan; id-less `minni_thread_*` calls and hook injections in the first session then target the wrong plan.
@@ -459,7 +459,7 @@ Each slice below is self-contained, keeps `main` green, and ships with determini
   - `plugins/minni/src/hook-handlers.ts` (pass `rawSessionId` and `processStartMarker` into `recordActiveSessionWorkspace` inside `workspaceFor`)
   - `plugins/minni/src/recall-state.ts` (stop writing/reading `.runtime/recall-state.json` when `sessionKey !== null` and `guardV2 !== false`; stop `disarmRecallStateOnConsult` from looping over all `.runtime/recall-state.d/*.json` when `sessionId` is omitted; scope `lifecycle-state` to `.runtime/recall-state.d/<sessionKey>.lifecycle.json`)
   - `plugins/minni/src/server.ts` (replace static `MCP_PROCESS_SESSION_ID` usage in `minni_recall` and `minni_drill` with `resolveMcpSessionIdentity()`)
-- **Real concurrency test (`plugins/minni/test/multi-session-recall-guard.test.ts`):**
+- **Real concurrency test (`plugins/minni/tests/multi-session-recall-guard.test.mjs`):**
   - Spawn two real MCP server processes (`serverA`, `serverB`) against one temp vault, paired with two hook sessions (`sessionA`, `sessionB`) that arm strong recall guards in `.runtime/recall-state.d/<keyA>.json` and `<keyB>.json`.
   - Call `minni_recall` on `serverB` only.
   - **Assert:** `sessionB`'s recall state is marked `consumed: true` and `PreToolUse` on `sessionB` allows `Read`/`Grep`; `sessionA`'s recall state in `<keyA>.json` remains `consumed: false` (armed), and `PreToolUse` on `sessionA` still blocks `Read`/`Grep` until `serverA` calls `minni_recall`!
@@ -470,7 +470,7 @@ Each slice below is self-contained, keeps `main` green, and ships with determini
   - `plugins/minni/src/plan.ts` (`getSessionActivePlan`, `setSessionActivePlan`, `clearSessionActivePlan`, `resolvePlanIdOrActive`, `resolveActivePlanView`, `createPlan` `activate?: boolean`)
   - `plugins/minni/src/server.ts` (`minni_thread_create` schema + handler, `resolvePlanTarget`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_update` auto-clear)
   - `plugins/minni/src/hook-handlers.ts` (`handleSessionStart`, `handleUserPromptSubmit`, `handleStop` pass `sessionKey` / `hostPid` to `resolveActivePlanView`)
-- **Real concurrency test (`plugins/minni/test/multi-session-active-thread.test.ts`):**
+- **Real concurrency test (`plugins/minni/tests/multi-session-active-thread.test.mjs`):**
   - Spawn two real MCP server processes (`serverA`, `serverB`) against one temp vault.
   - `serverA` calls `minni_thread_create({ goal: "Coordinator Plan A", slices: [...] })` -> creates `planA`.
   - `serverB` calls `minni_thread_create({ goal: "Worker Plan B", slices: [...] })` (with no `activate` flag) -> creates `planB`.
@@ -484,11 +484,11 @@ Each slice below is self-contained, keeps `main` green, and ships with determini
 ### Slice S3: Session-Scoped Thread Notification Relay Cursors & Atomic Store (`H6b`)
 - **Files touched:**
   - `plugins/minni/src/thread-notification-relay.ts` (`formatSessionSubscriberId`, `forkSessionCursor`, atomic lock + `writeFileAtomicWithFsync` in `saveRelayStore`, session-scoped `acknowledgeSelfAuthoredPrefixInVault`, cursor GC)
-  - `src/minni/thread_relay.py` (exact Python parity for `format_session_subscriber_id`, cursor forking, and atomic temp-file rename)
+  - `src/minni/thread_relay.py` (exact Python parity for `format_session_subscriber_id`, `parse_session_subscriber_id`, cursor forking, fail-closed `cursors.lock`, Q2 sibling-session notifications, bare watermark propagation, per-session subscriber discovery, and dead-session cursor GC)
   - `plugins/minni/src/thread-events.ts` (`actor_session_key` on ordered events)
   - `plugins/minni/src/hook-handlers.ts` (`attachPendingAttention` and `handleStop` pass `subscriberId = formatSessionSubscriberId(config.agentId, sessionKey)`)
   - `plugins/minni/src/server.ts` (`minni_thread_events`, `minni_thread_update`, `minni_thread_scar` pass `mcpSession.sessionKey`)
-- **Real concurrency test (`plugins/minni/test/multi-session-thread-relay.test.ts`):**
+- **Real concurrency tests (`plugins/minni/tests/multi-session-thread-relay.test.mjs` and `tests/test_thread_relay.py`):**
   - Spawn two real MCP server processes (`serverA`, `serverB`) sharing one vault and both attached to `planA` via `minni_thread_activate({ plan_id: planA })`.
   - A worker (`codex`) completes slice `S1` on `planA` (`minni_thread_worker_update`), generating a `slice_completed` relay event (`seq = 2`).
   - `sessionA` runs `UserPromptSubmit` (or `serverA` calls `minni_thread_events`), receiving and acknowledging `seq = 2`.
@@ -499,8 +499,8 @@ Each slice below is self-contained, keeps `main` green, and ships with determini
 ### Slice S4: PreCompact Reassert Session Affinity & Dead-Session GC Sweep
 - **Files touched:**
   - `plugins/minni/src/hook-handlers.ts` (tag `precompact-reassert` files with `session_key`; prefer matching `session_key` at `SessionStart` before claiming orphaned `>10m` files)
-  - `plugins/minni/src/plan.ts` & `plugins/minni/src/thread-notification-relay.ts` (dead-session GC sweep gated on `.sweep.json`)
-- **Test (`plugins/minni/test/multi-session-gc-and-reassert.test.ts`):**
+  - `plugins/minni/src/plan.ts`, `plugins/minni/src/thread-notification-relay.ts`, & `src/minni/thread_relay.py` (dead-session GC sweep gated on `.sweep.json`)
+- **Tests (`plugins/minni/tests/multi-session-gc-and-reassert.test.mjs` and `tests/test_thread_relay.py`):**
   - Verify `SessionA` `PreCompact` stash is not stolen when `SessionB` runs `SessionStart` 100ms later, and verify orphaned stashes from dead sessions (`>10m`) are still recovered on the next boot.
   - Verify GC removes expired `.runtime/active-thread.d/<deadKey>.json` and dead session cursors without ever touching `wiki/artifacts/plan-*.md`, `*.log.md`, or `*.history.jsonl`.
 
@@ -554,4 +554,4 @@ Child processes inherit the environment. A Gemini or Codex CLI launched from a C
 ### Decisions (operator, 2026-11-03)
 - §8.2 Question 1: Option A (clean slate with a one-line heads-up).
 - §8.2 Question 2: Option A (notify the other open session of the same agent; never self-notify).
-- Design approved. Implementation (S1-S4, with R1 and R2) is scheduled after the current Praxis batch lands.
+- Design approved. Implemented in S1–S4 with R1 and R2.

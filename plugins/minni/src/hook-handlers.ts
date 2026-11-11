@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { recordActiveSessionWorkspace } from "./config.js";
+import { deriveWorkspaceIdFromCwd, recordActiveSessionWorkspace } from "./config.js";
 import {
   MEMORY_CONTRACT,
   MINNI_LIFECYCLE_LINE,
@@ -399,6 +399,28 @@ function rawSessionIdFromPayload(payload: Record<string, unknown>): string {
     asString(payload.conversationId) ||
     asString(payload.conversation_id)
   );
+}
+
+function resolveHookHostPid(payload: Record<string, unknown>): number | undefined {
+  if (
+    typeof payload.host_pid === "number" &&
+    Number.isInteger(payload.host_pid) &&
+    payload.host_pid > 1
+  ) {
+    return payload.host_pid;
+  }
+  if (
+    typeof payload.hostPid === "number" &&
+    Number.isInteger(payload.hostPid) &&
+    payload.hostPid > 1
+  ) {
+    return payload.hostPid;
+  }
+  return Number.isInteger(process.ppid) && process.ppid > 1 ? process.ppid : undefined;
+}
+
+function resolveSubagentId(payload: Record<string, unknown>): string {
+  return asString(payload.agent_id) || asString(payload.agentId);
 }
 
 function subagentSessionKey(payload: Record<string, unknown>): string {
@@ -1581,26 +1603,23 @@ export function createHookHandlers(
 ): AgentHookHandlers {
   const workspaceFor = (payload: Record<string, unknown>): string => {
     const resolved = workspaceFromPayload(payload, config.defaultWorkspaceId);
-    const hasExplicitPayloadWorkspace = Boolean(
-      asString(payload.workspace_id) ||
-        asString(payload.workspaceId) ||
-        asString(payload.cwd) ||
-        asString(payload.working_directory),
-    );
+    const explicitWs = asString(payload.workspace_id) || asString(payload.workspaceId);
+    const rawCwd = asString(payload.cwd) || asString(payload.working_directory);
+    const cwdGitWs = rawCwd ? deriveWorkspaceIdFromCwd(rawCwd) : "";
+    const hintWorkspace =
+      explicitWs && explicitWs !== "workspace-unknown"
+        ? resolved
+        : cwdGitWs && cwdGitWs !== "workspace-unknown"
+          ? cwdGitWs
+          : undefined;
     const rawSessionId = rawSessionIdFromPayload(payload);
-    if (
-      (hasExplicitPayloadWorkspace && resolved && resolved !== "workspace-unknown") ||
-      rawSessionId
-    ) {
-      recordActiveSessionWorkspace(
-        config.vaultPath,
-        hasExplicitPayloadWorkspace ? resolved : undefined,
-        {
-          agentId: config.agentId,
-          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-          ...(typeof payload.host_pid === "number" ? { hostPid: payload.host_pid } : {}),
-        },
-      );
+    const hostPid = resolveHookHostPid(payload);
+    if (hintWorkspace || rawSessionId || (typeof hostPid === "number" && hostPid > 1)) {
+      recordActiveSessionWorkspace(config.vaultPath, hintWorkspace, {
+        agentId: config.agentId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+        ...(typeof hostPid === "number" && hostPid > 1 ? { hostPid } : {}),
+      });
     }
     return resolved;
   };
@@ -2971,7 +2990,27 @@ export function createHookHandlers(
         ? (payload.tool_input as Record<string, unknown>)
         : {};
     const guardSessionId = rawSessionIdFromPayload(payload);
-    const guardAgentId = asString(payload.agent_id) || asString(payload.agentId);
+    const guardAgentId = resolveSubagentId(payload);
+
+    if (!guardAgentId) {
+      const explicitPreWs = asString(payload.workspace_id) || asString(payload.workspaceId);
+      const rawPreCwd = asString(payload.cwd) || asString(payload.working_directory);
+      const preGitWs = rawPreCwd ? deriveWorkspaceIdFromCwd(rawPreCwd) : "";
+      const preHintWs =
+        explicitPreWs && explicitPreWs !== "workspace-unknown"
+          ? explicitPreWs
+          : preGitWs && preGitWs !== "workspace-unknown"
+            ? preGitWs
+            : undefined;
+      const preHostPid = resolveHookHostPid(payload);
+      if (preHintWs || guardSessionId || (typeof preHostPid === "number" && preHostPid > 1)) {
+        recordActiveSessionWorkspace(config.vaultPath, preHintWs, {
+          agentId: config.agentId,
+          ...(guardSessionId ? { sessionId: guardSessionId } : {}),
+          ...(typeof preHostPid === "number" && preHostPid > 1 ? { hostPid: preHostPid } : {}),
+        });
+      }
+    }
 
     // S2b (§6.4): PreToolUse on Agent / Task stashes the task prompt for SubagentStart
     // and never surfaces or consumes the parent's recall guard arming.
@@ -3346,7 +3385,11 @@ export function createHookHandlers(
     // stop_hook_active prevents re-injecting on a Stop continuation loop.
     if (canInject(wire, "Stop") && payload.stop_hook_active !== true) {
       // Unbudgeted local FS: same as SessionStart reassert. Absence loses data.
-      const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3);
+      const stopRawSessionId = rawSessionIdFromPayload(payload);
+      const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3, {
+        sessionId: stopRawSessionId || undefined,
+        sessionKey: sessionStateKey(stopRawSessionId || undefined) ?? undefined,
+      });
       if (parkedPending.length > 0) {
         const {
           events: parkedEvents,

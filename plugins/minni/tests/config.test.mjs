@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 const CONFIG_ENV_KEYS = [
+  "MINNI_HOME",
   "MINNI_VAULT_PATH",
   "MINNI_CODEX_VAULT_PATH",
   "MINNI_SOCKET_PATH",

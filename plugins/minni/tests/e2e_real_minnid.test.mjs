@@ -92,6 +92,7 @@ test("Real minnid E2E over Unix socket: ping -> learn -> list_candidates -> reso
     env: {
       ...process.env,
       MINNI_HOME: tmpRoot,
+      MINNI_VAULT_PATH: defaultVault,
       PYTHONPATH: path.join(REPO_ROOT, "src"),
       MINNI_WARMUP: "off",
       MINNI_VAULT_WATCH: "off",
