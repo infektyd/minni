@@ -955,12 +955,15 @@ def can_read_document(
         _page_type_early == "session" and _agent_early.lower() == "unknown"
     )
 
-    # Workspace scoping (doc or call can use '*' or 'global' for shared cross-ws;
-    # an unpinned call workspace of 'default'/'' leaves repo relevance to ranking
-    # while owner/privacy/session/vault-root ACLs below remain enforced).
-    # An EMPTY/missing doc workspace is a legacy unstamped row — treat it as
-    # owner-wildcard: the writing agent can still recall it from any named
-    # workspace, but it is NOT '*' for foreign readers when call_ws is pinned.
+    # Workspace scoping:
+    # - Doc can use '*' or 'global' for cross-workspace shared knowledge.
+    # - Call can use '*' for cross-workspace search/drill (used by multi-repo
+    #   recall/expand when the principal stamp itself is unpinned 'default'/'*';
+    #   Repo-First ranking + confidence floors govern tier order).
+    # - Direct gate calls with workspace='default' still enforce strict equality
+    #   against foreign stamped workspaces (preserving G19/short-circuit invariants).
+    # - An EMPTY/missing doc workspace is a legacy unstamped row — treat it as
+    #   owner-wildcard for same_agent, never '*' for foreign readers.
     doc_ws_raw = (
         doc_metadata.get("workspace_id")
         or doc_metadata.get("workspace")
@@ -969,13 +972,6 @@ def can_read_document(
     doc_ws = str(doc_ws_raw or "default").strip() or "default"
     call_ws = str(workspace or "default").strip() or "default"
     p_ws = str(getattr(principal, "workspace_id", "") or "default").strip() or "default"
-    if (
-        doc_ws not in ("*", "global")
-        and call_ws not in ("*", "default")
-        and doc_ws != call_ws
-    ):
-        if not (same_agent and (not doc_ws_raw or doc_ws == "default")):
-            return False
 
     # Shared Living Repo Map cards (Wave 4): strictly under <minni_home>/vault/maps/
     # with symlink rejection, privacy=='safe', concrete doc workspace, and cross-agent
@@ -985,6 +981,8 @@ def can_read_document(
         if _agent_early != "repo-map":
             return False
         if not doc_ws_raw or doc_ws in ("default", "*", "global"):
+            return False
+        if call_ws not in ("*", "default") and call_ws != doc_ws:
             return False
         if p_ws not in ("*", "default", "global") and p_ws != doc_ws:
             return False
@@ -1009,6 +1007,14 @@ def can_read_document(
         if not repo_map_path or not _is_safe_shared_repo_map_path(str(repo_map_path), principal):
             return False
         return True
+
+    if (
+        doc_ws not in ("*", "global")
+        and call_ws != "*"
+        and doc_ws != call_ws
+    ):
+        if not (same_agent and (not doc_ws_raw or doc_ws == "default")):
+            return False
 
     # Foreign sessions are denied independently of their filesystem location.
     # Apply this cheap gate before resolving every candidate path/root during

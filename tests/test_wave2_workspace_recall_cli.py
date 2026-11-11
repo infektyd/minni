@@ -647,8 +647,10 @@ def test_repo_first_ranking_and_search_rpc_non_blackout(tmp_path: Path, monkeypa
     global_doc = {**sample_doc, "workspace_id": "global"}
     beta_doc = {**sample_doc, "workspace_id": "workspace-beta"}
 
-    # Unpinned call workspace ('default') allows reading workspace-tagged docs without blackout
-    assert can_read_document(peer, "default", sample_doc) is True
+    # Cross-ws call wildcard ('*') allows reading workspace-tagged docs without blackout,
+    # while direct 'default' gate calls stay strict against stamped foreign workspaces.
+    assert can_read_document(peer, "*", sample_doc) is True
+    assert can_read_document(peer, "default", sample_doc) is False
     # Pinned call workspace ('workspace-alpha') allows global docs and denies mismatched foreign ws
     assert can_read_document(peer, "workspace-alpha", global_doc) is True
     assert can_read_document(peer, "workspace-alpha", beta_doc) is False

@@ -347,6 +347,13 @@ class SemanticRerankMixin:
         if not reranker or not candidates:
             return candidates
 
+        passaged_indices = [
+            i for i, c in enumerate(candidates) if not c.get("_no_chunk_text")
+        ]
+        if not passaged_indices:
+            return candidates
+        scored_candidates = [candidates[i] for i in passaged_indices]
+
         model_name, model_version = self._reranker_identity(reranker)
         try:
             from minni.rerank_cache import GLOBAL_RERANK_CACHE
@@ -357,11 +364,12 @@ class SemanticRerankMixin:
 
         missing = []
         missing_indexes = []
-        all_scores = [None] * len(candidates)
+        all_scores: List[Optional[float]] = [None] * len(candidates)
         corpus = self._rerank_corpus()
         generation = cache.generation if cache is not None else None
         if cache is not None:
-            for i, c in enumerate(candidates):
+            for i in passaged_indices:
+                c = candidates[i]
                 chunk_id = c.get("chunk_id")
                 if chunk_id is None:
                     missing.append(c)
@@ -381,22 +389,28 @@ class SemanticRerankMixin:
                 else:
                     all_scores[i] = cached
         else:
-            missing = candidates
-            missing_indexes = list(range(len(candidates)))
+            missing = list(scored_candidates)
+            missing_indexes = list(passaged_indices)
+
+        def _effective_sort_score(item: Dict) -> float:
+            rs = item.get("rerank_score")
+            if rs is not None:
+                return float(rs)
+            return float(item.get("final_score", 0.0) or 0.0)
 
         if not missing:
-            for i, c in enumerate(candidates):
-                c["rerank_score"] = float(all_scores[i])
+            for i in passaged_indices:
+                candidates[i]["rerank_score"] = float(all_scores[i] or 0.0)
             if query_workspace:
                 try:
                     self._apply_rerank_score_adjustments(
-                        candidates, query_workspace=query_workspace
+                        scored_candidates, query_workspace=query_workspace
                     )
                 except TypeError:
-                    self._apply_rerank_score_adjustments(candidates)
+                    self._apply_rerank_score_adjustments(scored_candidates)
             else:
-                self._apply_rerank_score_adjustments(candidates)
-            candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+                self._apply_rerank_score_adjustments(scored_candidates)
+            candidates.sort(key=_effective_sort_score, reverse=True)
             return candidates
 
         pairs = [[query, self._rerank_passage(c)] for c in missing]
@@ -457,19 +471,19 @@ class SemanticRerankMixin:
                         expected_generation=generation,
                     )
 
-            for i, c in enumerate(candidates):
-                c["rerank_score"] = float(all_scores[i] or 0.0)
+            for i in passaged_indices:
+                candidates[i]["rerank_score"] = float(all_scores[i] or 0.0)
 
             if query_workspace:
                 try:
                     self._apply_rerank_score_adjustments(
-                        candidates, query_workspace=query_workspace
+                        scored_candidates, query_workspace=query_workspace
                     )
                 except TypeError:
-                    self._apply_rerank_score_adjustments(candidates)
+                    self._apply_rerank_score_adjustments(scored_candidates)
             else:
-                self._apply_rerank_score_adjustments(candidates)
-            candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+                self._apply_rerank_score_adjustments(scored_candidates)
+            candidates.sort(key=_effective_sort_score, reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
             self._current_state().rerank_degraded = str(e)
@@ -490,6 +504,13 @@ class SemanticRerankMixin:
         concrete_qws = is_concrete_project_workspace(norm_qws)
         filtered: List[Dict] = []
         for r in merged:
+            if concrete_qws:
+                doc_ws = normalize_workspace_scope(r.get("workspace_id"), default="")
+                if (
+                    str(r.get("page_type") or "").lower() == "repo_map"
+                    and doc_ws != norm_qws
+                ):
+                    continue
             raw_ce = r.get("raw_rerank_score")
             if raw_ce is not None:
                 ce_val = float(raw_ce)
@@ -588,6 +609,7 @@ class SemanticRerankMixin:
                     "fts_rank": rank,
                     "sem_rank": None,
                     "chunk_text": r.get("chunk_text", ""),
+                    "_no_chunk_text": "chunk_text" not in r,
                     "heading_context": r.get("heading_context", ""),
                     "page_status": r.get("page_status", "candidate"),
                     "privacy_level": r.get("privacy_level", "safe"),
@@ -613,6 +635,7 @@ class SemanticRerankMixin:
                     "fts_rank": None,
                     "sem_rank": rank,
                     "chunk_text": r.get("chunk_text", ""),
+                    "_no_chunk_text": "chunk_text" not in r,
                     "heading_context": r.get("heading_context", ""),
                     "page_status": r.get("page_status", "candidate"),
                     "privacy_level": r.get("privacy_level", "safe"),
@@ -633,6 +656,7 @@ class SemanticRerankMixin:
                 doc_scores[did]["similarity"] = r["similarity"]
             if r.get("chunk_text"):
                 doc_scores[did]["chunk_text"] = r["chunk_text"]
+                doc_scores[did]["_no_chunk_text"] = False
                 doc_scores[did]["heading_context"] = r.get("heading_context", "")
                 if r.get("chunk_id") is not None:
                     doc_scores[did]["chunk_id"] = r["chunk_id"]
@@ -933,6 +957,7 @@ class SemanticRerankMixin:
                         "fts_rank": None,
                         "sem_rank": None,
                         "chunk_text": r.get("chunk_text", ""),
+                        "_no_chunk_text": "chunk_text" not in r,
                         "heading_context": r.get("heading_context", ""),
                         "page_status": r.get("page_status", "candidate"),
                         "privacy_level": r.get("privacy_level", "safe"),
@@ -951,6 +976,7 @@ class SemanticRerankMixin:
                     doc_scores[did]["sem_rank"] = rank
                 if r.get("chunk_text") and not doc_scores[did].get("_sem_chunk"):
                     doc_scores[did]["chunk_text"] = r["chunk_text"]
+                    doc_scores[did]["_no_chunk_text"] = False
                     doc_scores[did]["heading_context"] = r.get("heading_context", "")
                     if stream_label != "fts":
                         doc_scores[did]["_sem_chunk"] = True

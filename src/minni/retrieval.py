@@ -1593,6 +1593,9 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         self._last_graph_contradiction_work = work
         if principal is None:
             return {}
+        db_obj = getattr(self, "db", None)
+        if db_obj is None or not hasattr(db_obj, "_get_conn"):
+            return {}
         ids: List[int] = []
         seen = set()
         for raw in doc_ids:
@@ -1644,7 +1647,10 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         pair_seen: set = set()
         after_id = 0
         ws = workspace or getattr(principal, "workspace_id", "default") or "default"
-        conn = self.db._get_conn()
+        db_obj = getattr(self, "db", None)
+        if db_obj is None or not hasattr(db_obj, "_get_conn"):
+            return {}
+        conn = db_obj._get_conn()
         nested = bool(getattr(conn, "in_transaction", False))
         cur = conn.cursor()
         savepoint = f"minni_graph_contra_{id(cur) & 0xFFFFFFFF:x}"
@@ -2562,15 +2568,28 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 for r in rows
                 if (r.get("page_status") or "candidate") not in skip_statuses
                 and (r.get("privacy_level") or "safe") != "blocked"
-                and bool(
-                    _strip_leading_frontmatter(
-                        str(
-                            r.get("chunk_text")
-                            or r.get("full_document_text")
-                            or r.get("content")
-                            or ""
+                and (
+                    bool(r.get("_no_chunk_text"))
+                    or not any(
+                        k in r
+                        for k in (
+                            "chunk_text",
+                            "raw_chunk_text",
+                            "full_document_text",
+                            "content",
                         )
-                    ).strip()
+                    )
+                    or bool(
+                        _strip_leading_frontmatter(
+                            str(
+                                r.get("chunk_text")
+                                or r.get("raw_chunk_text")
+                                or r.get("full_document_text")
+                                or r.get("content")
+                                or ""
+                            )
+                        ).strip()
+                    )
                 )
                 and classify_durability({"content": r.get("chunk_text") or ""}).get("rule_id")
                 not in (
@@ -3013,15 +3032,20 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
 
         non_empty_merged = []
         for r in merged:
+            has_text_key = (
+                any(k in r for k in ("chunk_text", "raw_chunk_text", "full_document_text", "content"))
+                and not bool(r.get("_no_chunk_text"))
+            )
             txt = _strip_leading_frontmatter(
                 str(
                     r.get("chunk_text")
+                    or r.get("raw_chunk_text")
                     or r.get("full_document_text")
                     or r.get("content")
                     or ""
                 )
             )
-            if not txt.strip():
+            if has_text_key and not txt.strip():
                 continue
             r["raw_chunk_text"] = txt
             non_empty_merged.append(r)
@@ -3414,6 +3438,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         for r in rows:
             doc_ws = normalize_workspace_scope(r.get("workspace_id"), default="")
             if is_concrete_project_workspace(doc_ws) and doc_ws != norm_qws:
+                if str(r.get("page_type") or "").lower() == "repo_map":
+                    continue
                 doc_tokens = set(
                     _tokenize_trie_text(
                         f"{r.get('heading_context') or ''} {r.get('chunk_text') or ''}"
@@ -3720,10 +3746,14 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             ag = r.get("agent", "?")
             st = r.get("page_status", "?")
             pr = r.get("privacy_level", "?")
+            has_chunk_field = (
+                (("raw_chunk_text" in r) or ("chunk_text" in r))
+                and not bool(r.get("_no_chunk_text"))
+            )
             raw_txt = _strip_leading_frontmatter(
                 str(r.get("raw_chunk_text") or r.get("chunk_text") or "")
             )
-            if not raw_txt.strip():
+            if has_chunk_field and not raw_txt.strip():
                 continue
             r["raw_chunk_text"] = raw_txt
             r["evidence_envelope"] = build_evidence_envelope(
@@ -4238,13 +4268,27 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     (time.time(), row["doc_id"]),
                 )
 
-        ws_effective = (
-            workspace or getattr(principal, "workspace_id", "default")
+        p_ws = (
+            str(getattr(principal, "workspace_id", "") or "default").strip() or "default"
             if principal is not None
-            else (workspace or "default")
+            else "default"
+        )
+        ws_effective = (
+            p_ws
+            if (workspace in (None, "", "default") and p_ws not in ("*", "default", "global"))
+            else (
+                workspace or getattr(principal, "workspace_id", "default")
+                if principal is not None
+                else (workspace or "default")
+            )
+        )
+        ws_gate = (
+            "*"
+            if ws_effective in ("default", "") and p_ws in ("*", "default", "global")
+            else ws_effective
         )
         if principal is not None:
-            ws = ws_effective
+            ws = ws_gate
             if not can_read_document(principal, ws, raw):
                 return None
             txt = effective_body
@@ -4295,7 +4339,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         mem_links = self._authorized_memory_links_for_doc(
             int(row["doc_id"]),
             principal=principal,
-            workspace=ws_effective,
+            workspace=ws_gate,
         )
         raw["memory_links"] = mem_links
         if any(mem_links.values()):

@@ -250,17 +250,77 @@ def _record_returned_learning_reads(
             continue
         marks = ",".join("?" * len(doc_ids))
         try:
-            with db.cursor() as c:
-                c.execute(
-                    f"""INSERT OR IGNORE INTO learning_reads
-                        (learning_id, agent_id, read_at, source)
-                        SELECT learning_id, ?, ?, 'minnid.search'
-                        FROM learning_documents
-                        WHERE doc_id IN ({marks})""",
-                    [clean_reader, now, *doc_ids],
-                )
+            # Guard against rolling back a caller's uncommitted transaction on stub
+            # connections (e.g. sqlite3 Connection.__exit__ rolls back the whole
+            # connection when an OperationalError escapes `with conn:`).
+            raw_conn = getattr(db, "conn", None)
+            if raw_conn is None and hasattr(db, "_get_conn"):
+                raw_conn = db._get_conn()
+            if raw_conn is not None:
+                tables = {
+                    r[0]
+                    for r in raw_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name IN ('learning_reads', 'learning_documents')"
+                    ).fetchall()
+                }
+                if len(tables) < 2:
+                    continue
+                sp = f"sp_lreads_{id(raw_conn) & 0xFFFFFFFF:x}"
+                was_in_tx = bool(getattr(raw_conn, "in_transaction", False))
+                raw_conn.execute(f"SAVEPOINT {sp}")
+                try:
+                    raw_conn.execute(
+                        f"""INSERT OR IGNORE INTO learning_reads
+                            (learning_id, agent_id, read_at, source)
+                            SELECT learning_id, ?, ?, 'minnid.search'
+                            FROM learning_documents
+                            WHERE doc_id IN ({marks})""",
+                        [clean_reader, now, *doc_ids],
+                    )
+                    raw_conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except Exception:
+                    raw_conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    raw_conn.execute(f"RELEASE SAVEPOINT {sp}")
+                if not was_in_tx and getattr(raw_conn, "in_transaction", False) and hasattr(db, "_get_conn"):
+                    raw_conn.commit()
+            else:
+                with db.cursor() as c:
+                    tables = {
+                        r[0]
+                        for r in c.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' "
+                            "AND name IN ('learning_reads', 'learning_documents')"
+                        ).fetchall()
+                    }
+                    if len(tables) < 2:
+                        continue
+                    c.execute(
+                        f"""INSERT OR IGNORE INTO learning_reads
+                            (learning_id, agent_id, read_at, source)
+                            SELECT learning_id, ?, ?, 'minnid.search'
+                            FROM learning_documents
+                            WHERE doc_id IN ({marks})""",
+                        [clean_reader, now, *doc_ids],
+                    )
         except Exception:
             pass
+
+
+def _effective_document_gate_workspace(principal: Any) -> str:
+    """Return the workspace passed into ``can_read_document`` for multi-repo RPCs.
+
+    When a principal stamp uses ``workspace_id='default'`` (or ``'*'``/``'global'``),
+    the agent operates across repositories and Repo-First 3-tier ranking governs
+    relevance while privacy/session/vault-root ACLs remain enforced. When a narrow
+    worker stamp explicitly pins ``workspace_id='workspace-foo'``, preserve that pin.
+    """
+    if principal is None:
+        return "default"
+    p_ws = str(getattr(principal, "workspace_id", "") or "default").strip() or "default"
+    if p_ws in ("*", "default", "global"):
+        return "*"
+    return p_ws
 
 
 def _strip_private_search_keys(results: list) -> None:
@@ -368,6 +428,12 @@ def merge_document_results(
                 scoped_merged.append(row)
                 continue
             doc_ws = normalize_workspace_scope(row.get("workspace_id"), default="")
+            if (
+                is_concrete_project_workspace(doc_ws)
+                and doc_ws != norm_qws
+                and str(row.get("page_type") or "").lower() == "repo_map"
+            ):
+                continue
             already_boosted = bool(row.get(_WS_BOOSTED_KEY))
             if not already_boosted:
                 if is_concrete_project_workspace(doc_ws) and doc_ws != norm_qws:
@@ -877,10 +943,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                         cross_agent=learnings_cross_agent,
                         claim=claim,
                         principal=principal_for_documents,
-                        workspace=(
-                            principal_for_documents.workspace_id
-                            if principal_for_documents is not None
-                            else "default"
+                        workspace=_effective_document_gate_workspace(
+                            principal_for_documents
                         ),
                         deadline_monotonic=deadline_monotonic,
                         update_access=False,
@@ -1202,7 +1266,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 ):
                     return True
                 try:
-                    ws = getattr(principal, "workspace_id", "default") or "default"
+                    ws = _effective_document_gate_workspace(principal)
                     vault_cfg = getattr(vault_engine, "config", None)
                     vault_root = getattr(vault_cfg, "vault_path", None)
                     has_explicit_roots = bool(getattr(principal, "allowed_vault_roots", None))
