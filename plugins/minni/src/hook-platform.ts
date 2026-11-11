@@ -80,6 +80,8 @@ export interface WireCapabilities {
   hostInlineCapChars?: number;
   /** Whether PreToolUse can carry `additionalContext` to the model. */
   preToolUseContext?: boolean;
+  /** Whether SubagentStart can carry `additionalContext` to the subagent. */
+  subagentStartContext?: boolean;
   /** Which transcript reader applies (e.g. "claude-code"). */
   transcriptShape?: string;
 }
@@ -106,6 +108,14 @@ export function wireCapabilities(wire: PlatformWire): ResolvedWireCapabilities {
     preToolUseContext: declared?.preToolUseContext === true,
     transcriptShape: typeof shape === "string" && shape.length > 0 ? shape : "unknown",
   };
+}
+
+/**
+ * Whether `wire` supports injecting orientation on `SubagentStart` (`hookSpecificOutput.additionalContext`).
+ * Fail-closed: only true when a wire explicitly declares `capabilities.subagentStartContext === true`.
+ */
+export function supportsSubagentStartContext(wire: PlatformWire): boolean {
+  return wire.capabilities?.subagentStartContext === true;
 }
 
 /** Claude Code's `hookSpecificOutput.additionalContext` envelope. */
@@ -138,7 +148,12 @@ export const claudeCodeWire: PlatformWire = {
   lastTaskText: snakeAssistantMessage,
   // 10,000 chars inline, then a 2,000-char preview (host docs; probe P6).
   // S2b (§6.3.3, §8.1): Claude Code PreToolUse supports hookSpecificOutput.additionalContext.
-  capabilities: { hostInlineCapChars: 10_000, preToolUseContext: true, transcriptShape: "claude-code" },
+  capabilities: {
+    hostInlineCapChars: 10_000,
+    preToolUseContext: true,
+    subagentStartContext: true,
+    transcriptShape: "claude-code",
+  },
 };
 
 // --- Codex -----------------------------------------------------------------

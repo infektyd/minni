@@ -244,6 +244,16 @@ async function exists(filePath: string): Promise<boolean> {
 }
 
 function sectionPath(section: VaultSection, title: string): string {
+  const secStr = String(section ?? "").trim();
+  if (
+    !secStr ||
+    secStr.toLowerCase() === "maps" ||
+    secStr.includes("..") ||
+    secStr.includes("/") ||
+    secStr.includes("\\")
+  ) {
+    throw new Error(`Invalid or reserved vault section: ${secStr}`);
+  }
   const slug = slugify(title);
   if (section === "raw") return path.join("raw", `${compactDate()}-${slug}.md`);
   if (section === "sessions")
@@ -2445,7 +2455,12 @@ export async function writeVaultPage(
   await mkdir(path.dirname(notePath), { recursive: true });
 
   // PR-2: Build structured frontmatter with lifecycle fields
-  const pageType = inferPageType(input.section, input.type);
+  const rawRequestedType = typeof input.type === "string" ? input.type : undefined;
+  const safeInputType =
+    rawRequestedType && rawRequestedType.toLowerCase() === "repo_map"
+      ? undefined
+      : input.type;
+  const pageType = inferPageType(input.section, safeInputType);
   const pageStatus: PageStatus = input.status ?? "candidate";
   const privacyLevel: PrivacyLevel = input.privacy ?? "safe";
 
@@ -2453,6 +2468,16 @@ export async function writeVaultPage(
     input.sources && input.sources.length > 0
       ? `[${input.sources.join(", ")}]`
       : undefined;
+
+  const safeExtraFrontmatter = input.frontmatter ? { ...input.frontmatter } : undefined;
+  if (safeExtraFrontmatter) {
+    for (const k of ["page_type", "type"]) {
+      const v = safeExtraFrontmatter[k];
+      if (typeof v === "string" && v.trim().toLowerCase() === "repo_map") {
+        delete safeExtraFrontmatter[k];
+      }
+    }
+  }
 
   const fm = frontmatter({
     title: input.title,
@@ -2466,7 +2491,7 @@ export async function writeVaultPage(
     immutable: input.section === "raw" ? true : undefined,
     superseded_by: input.supersededBy,
     expires: input.expires,
-    ...input.frontmatter,
+    ...safeExtraFrontmatter,
   });
   const body = `${fm}\n# ${input.title}\n\n${input.content.trim()}\n`;
   // #293 (June audit N6): the plan note this function writes for a plan's
@@ -5486,7 +5511,7 @@ export async function vaultExists(vaultPath: string): Promise<boolean> {
  * pathological or over-curated file. Same posture as compact-harvest's
  * SUMMARY_TEXT_MAX_CHARS: a safety ceiling, not a target.
  */
-export const LAYER1_SHELF_MAX_BYTES = 8192;
+export const LAYER1_SHELF_MAX_BYTES = 24576;
 
 export interface Layer1ShelfResult {
   ok: boolean;

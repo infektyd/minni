@@ -60,6 +60,7 @@ RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "stage_candidate": "learn",
     "list_candidates": "learn",
     "vault_index_doc": "learn",
+    "repo_map": "learn",
     "daemon.compile": "read",
     "daemon.endorse": "govern",
     # W2: in-band cache flush is a mutating admin op — same 'govern' tier as

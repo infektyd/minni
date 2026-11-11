@@ -973,6 +973,69 @@ def cmd_learn(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_map(args: argparse.Namespace) -> int:
+    sock = Path(args.socket)
+    raw_target = getattr(args, "path", None)
+    target_path = (
+        os.path.abspath(os.path.expanduser(raw_target))
+        if raw_target is not None and str(raw_target).strip()
+        else os.getcwd()
+    )
+    ws_arg = (getattr(args, "workspace", None) or "").strip() or None
+    refresh = bool(getattr(args, "refresh", False))
+    agent_id = _explicit_cli_agent(args)
+
+    if _daemon_alive(sock):
+        params: dict[str, object] = {
+            "repo_path": target_path,
+            "refresh": refresh,
+        }
+        if ws_arg:
+            params["workspace_id"] = _normalize_cli_workspace(ws_arg)
+        if agent_id:
+            params["agent_id"] = agent_id
+        try:
+            result = _rpc(sock, "repo_map", params, timeout=120.0)
+        except RpcError as exc:
+            print(f"minni map: {exc}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            from minni.repo_map import build_and_index_repo_map
+
+            result = build_and_index_repo_map(
+                target_path,
+                workspace_id=_normalize_cli_workspace(ws_arg) if ws_arg else None,
+                refresh=refresh,
+            )
+        except Exception as exc:
+            print(f"minni map: {exc}", file=sys.stderr)
+            return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+
+    ws_out = _cli_term_safe(str(result.get("workspace_id") or "default"))
+    sha_out = _cli_term_safe(str(result.get("git_sha") or ""))[:12] or "(uncommitted/non-git)"
+    subs_mapped = result.get("subsystems_mapped", 0)
+    cards_indexed = result.get("cards_indexed", 0)
+    print(f"Workspace:         {ws_out}")
+    print(f"Git SHA:           {sha_out}")
+    print(f"Subsystems mapped: {subs_mapped}")
+    print(f"Cards indexed:     {cards_indexed}")
+    subsystems = result.get("subsystems")
+    if isinstance(subsystems, list) and subsystems:
+        for item in subsystems:
+            if not isinstance(item, dict):
+                continue
+            slug = _cli_term_safe(str(item.get("slug") or "?"))
+            fcount = item.get("file_count", 0)
+            rel = _cli_term_safe(str(item.get("card_rel_path") or ""))
+            print(f"  - {slug} ({fcount} files) -> {rel}")
+    return 0
+
+
 def _pid_alive(pid: object) -> bool:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
         return True
@@ -1614,6 +1677,20 @@ def main(argv: list[str] | None = None) -> int:
     activity_p.add_argument("--json", action="store_true",
                             help="emit structured JSON")
 
+    map_p = sub.add_parser(
+        "map",
+        help="synthesize and index Living Repo Map subsystem cards for a repository")
+    map_p.add_argument("path", nargs="?",
+                       help="repository path (default: git root of current directory)")
+    map_p.add_argument("--workspace", "-w",
+                       help="workspace id override (default: workspace-<repo-name>)")
+    map_p.add_argument("--refresh", action="store_true",
+                       help="force rebuild even when HEAD SHA matches cached map")
+    map_p.add_argument("--agent", "-a",
+                       help="explicit caller agent_id (default: omitted -> main)")
+    map_p.add_argument("--json", action="store_true",
+                       help="print raw JSON response")
+
     wire = sub.add_parser("wire", help="wire plugin payload to an agent platform")
     wire.add_argument("platform", help="codex, claude-code, kilocode, grok, gemini, "
                       "antigravity, generic, or all")
@@ -1716,6 +1793,7 @@ def main(argv: list[str] | None = None) -> int:
     dispatch = {"up": cmd_up, "down": cmd_down,
                 "status": cmd_status, "doctor": cmd_doctor,
                 "recall": cmd_recall, "learn": cmd_learn, "activity": cmd_activity,
+                "map": cmd_map,
                 "wire": cmd_wire, "wire-adopt": cmd_wire_adopt,
                 "sync": cmd_sync, "watch": cmd_watch}
     return dispatch[args.command](args)

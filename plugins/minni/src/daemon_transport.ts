@@ -1119,7 +1119,14 @@ async function resolveSqliteHandleNote(
               const rowId = String(row.doc_id ?? row.id ?? targetDocId);
               const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
               const title = String(row.title ?? source);
-              const content = readDocContent(row, rowId);
+              let content = readDocContent(row, rowId);
+              if (String(row.page_type ?? "").toLowerCase() === "repo_map" || source.includes("/vault/maps/")) {
+                const { computeRepoMapCardStalenessNote } = await import("./project_shelf.js");
+                const note = computeRepoMapCardStalenessNote(source);
+                if (note && !content.includes(note)) {
+                  content = content ? `${note}\n${content}` : note;
+                }
+              }
               return { source, title, content: content || title };
             }
           }
@@ -1131,7 +1138,7 @@ async function resolveSqliteHandleNote(
             const rowId = String(row.doc_id ?? row.id ?? "");
             const source = String(row.path ?? row.source ?? row.uri ?? rowId ?? "documents");
             const title = String(row.title ?? source);
-            const content = readDocContent(row, rowId);
+            let content = readDocContent(row, rowId);
             if (
               matchesHandle(source) ||
               matchesHandle(title) ||
@@ -1143,6 +1150,13 @@ async function resolveSqliteHandleNote(
                   matchesHandle(`d:personal:${rowId}`) ||
                   matchesHandle(`d:shared:${rowId}`)))
             ) {
+              if (String(row.page_type ?? "").toLowerCase() === "repo_map" || source.includes("/vault/maps/")) {
+                const { computeRepoMapCardStalenessNote } = await import("./project_shelf.js");
+                const note = computeRepoMapCardStalenessNote(source);
+                if (note && !content.includes(note)) {
+                  content = content ? `${note}\n${content}` : note;
+                }
+              }
               return {
                 source,
                 title,

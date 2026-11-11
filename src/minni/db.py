@@ -384,6 +384,28 @@ class MinniDB:
             if "no such column: workspace_id" not in str(e).lower():
                 raise
 
+        # === Living Repo Map Cards (Wave 4 / BUG-15) ===
+        # Named repo_map_cards to avoid colliding with legacy document_metadata.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS repo_map_cards (
+                doc_id INTEGER PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                repo_root TEXT NOT NULL,
+                subsystem_slug TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary_line TEXT NOT NULL DEFAULT '',
+                owned_files_json TEXT NOT NULL DEFAULT '[]',
+                git_sha TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_repo_map_cards_ws ON repo_map_cards(workspace_id)")
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_map_cards_ws_slug "
+            "ON repo_map_cards(workspace_id, subsystem_slug)"
+        )
+
         # === Chunk Embeddings (one doc → many chunks) ===
         # V3.1: No more 'compressed' or 'norm' columns.
         # All embeddings are raw float32[384] = 1536 bytes.

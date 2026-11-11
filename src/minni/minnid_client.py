@@ -289,6 +289,14 @@ def _cmd_activity(args):
         sys.exit(rc)
 
 
+def _cmd_map(args):
+    from minni.minni_cli import cmd_map
+
+    rc = cmd_map(args)
+    if rc != 0:
+        sys.exit(rc)
+
+
 def _cmd_log(args):
     params = {
         "event_type": args.event,
@@ -341,6 +349,13 @@ def main():
     sp.add_argument("--workspace", "-w")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("map", help="Synthesize and index Living Repo Map subsystem cards")
+    sp.add_argument("path", nargs="?")
+    sp.add_argument("--workspace", "-w")
+    sp.add_argument("--refresh", action="store_true")
+    sp.add_argument("--agent", "-a")
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("log", help="Log an episodic event")
     sp.add_argument("event", choices=[
         "session_start", "session_end", "task_completed",
@@ -363,6 +378,7 @@ def main():
         "read": _cmd_read,
         "learn": _cmd_learn,
         "activity": _cmd_activity,
+        "map": _cmd_map,
         "log": _cmd_log,
         "ping": _cmd_ping,
     }

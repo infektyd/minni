@@ -67,15 +67,33 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
     if not path:
         return context.make_error(-32602, "path is required", request_id)
 
-    rel_path = str(path).replace("\\", "/").lstrip("/")
-    if not rel_path or ".." in Path(rel_path).parts:
+    raw_rel = str(path).replace("\\", "/").lstrip("/")
+    raw_parts = raw_rel.split("/")
+    if not raw_rel or any(seg == ".." for seg in raw_parts):
         return context.make_error(-32602, "path must be a relative path within the vault", request_id)
+    rel_parts = [seg for seg in raw_parts if seg and seg != "."]
+    if not rel_parts:
+        return context.make_error(-32602, "path must be a relative path within the vault", request_id)
+    if rel_parts[0].lower() == "maps":
+        return context.make_error(
+            -32003,
+            "vault_index_doc cannot write or index into reserved maps/ directory",
+            request_id,
+        )
+    rel_path = "/".join(rel_parts)
 
     vault_path = params.get("vault_path")
     if not vault_path:
         vault_path, _ = context.agent_vault(principal.agent_id)
     vault_path = str(vault_path)
     full_path = Path(vault_path).resolve() / rel_path
+    for idx, seg in enumerate(full_path.parts[:-1]):
+        if seg == "vault" and full_path.parts[idx + 1].lower() == "maps":
+            return context.make_error(
+                -32003,
+                "vault_index_doc cannot write or index into reserved vault/maps/ directory",
+                request_id,
+            )
     root_err = context.guard_vault_root(params, full_path, request_id, label="vault_index_doc")
     if root_err:
         return root_err
@@ -234,3 +252,227 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
     except Exception as exc:
         context.logger.exception("vault_index_doc failed")
         return context.make_error(-32000, f"vault_index_doc error: {exc}", request_id)
+
+
+def _validate_rpc_repo_map_root(
+    repo_root: Path,
+    raw_repo_path: Any,
+    *,
+    minni_home: Path,
+    canonical_home: Path,
+    is_operator: bool,
+    effective_vault_roots: list[str],
+) -> Optional[str]:
+    """Return an error reason string when *repo_root* is unsafe for RPC ``repo_map``."""
+    if raw_repo_path is not None and str(raw_repo_path).strip():
+        raw_expanded = Path(str(raw_repo_path).strip()).expanduser()
+        if any(part.startswith(".") and part not in (".", "..") for part in raw_expanded.parts):
+            return f"Refusing hidden dot-directory repository path: {raw_repo_path}"
+
+    if any(part.startswith(".") and part not in (".", "..") for part in repo_root.parts):
+        return f"Refusing hidden dot-directory repository target: {repo_root}"
+
+    forbidden_exact: set[Path] = {Path("/")}
+    for sys_p in ("~", "/etc", "/var", "/private", "/tmp", "/Users", "/home", "/root", "/System", "/Library"):
+        ep = Path(sys_p).expanduser()
+        forbidden_exact.add(ep)
+        try:
+            forbidden_exact.add(ep.resolve())
+        except OSError:
+            pass
+    if repo_root in forbidden_exact:
+        return f"Refusing sensitive or system root for repo_map: {repo_root}"
+
+    try:
+        etc_real = Path("/etc").resolve()
+        if repo_root.is_relative_to(etc_real) or repo_root.is_relative_to(Path("/etc")):
+            return f"Refusing system configuration directory for repo_map: {repo_root}"
+    except OSError:
+        pass
+
+    for mh in (minni_home, canonical_home):
+        try:
+            mh_real = mh.expanduser().resolve()
+            if repo_root == mh_real or repo_root.is_relative_to(mh_real):
+                return f"Refusing Minni home/vault directory for repo_map: {repo_root}"
+        except OSError:
+            pass
+
+    if not is_operator:
+        for vr in effective_vault_roots:
+            try:
+                vr_real = Path(vr).expanduser().resolve()
+                if repo_root == vr_real or repo_root.is_relative_to(vr_real):
+                    return f"Refusing vault directory for repo_map: {repo_root}"
+            except OSError:
+                continue
+
+    git_marker = repo_root / ".git"
+    try:
+        if not git_marker.exists() or git_marker.is_symlink():
+            return f"Repository target must be a git repository (.git missing): {repo_root}"
+    except OSError:
+        return f"Repository target must be a git repository (.git unreadable): {repo_root}"
+
+    return None
+
+
+def handle_repo_map(params: dict, request_id: Any, context: VaultIndexContext) -> dict:
+    """Synthesize and index Living Repo Map cards into SQLite + live RetrievalEngine."""
+    if context.increment_request_count is not None:
+        context.increment_request_count()
+    started_at = time.perf_counter()
+
+    principal, err = context.handler_principal(params, request_id)
+    if err:
+        return err
+
+    from minni.principal import PLATFORM_NO_ROOTS_SENTINEL, is_operator_principal
+
+    is_op = is_operator_principal(principal)
+    effective_roots = [
+        str(r)
+        for r in (principal.allowed_vault_roots or [])
+        if r and str(r) != PLATFORM_NO_ROOTS_SENTINEL
+    ]
+    if not effective_roots and (not is_op or bool(principal.allowed_vault_roots)):
+        return context.make_error(
+            -32004,
+            f"Principal {principal.agent_id!r} lacks valid allowed_vault_roots for repo_map",
+            request_id,
+        )
+
+    raw_repo_path = params.get("repo_path") or params.get("path")
+    raw_workspace = params.get("workspace_id") or params.get("workspace")
+    refresh = bool(params.get("refresh", False))
+
+    try:
+        from minni.config import CANONICAL_SOVEREIGN_HOME, normalize_workspace_scope
+        from minni.repo_map import (
+            _effective_minni_home,
+            build_and_index_repo_map,
+            resolve_repo_root,
+            workspace_slug_from_id,
+        )
+
+        repo_root = resolve_repo_root(raw_repo_path)
+    except ValueError as exc:
+        return context.make_error(-32602, str(exc), request_id)
+
+    try:
+        engine = context.lazy_retrieval()
+    except Exception as exc:
+        context.logger.exception("repo_map retrieval init failed")
+        return context.make_error(-32000, f"repo_map error: {exc}", request_id)
+
+    resolved_home = _effective_minni_home(engine=engine)
+    canonical_home = Path(CANONICAL_SOVEREIGN_HOME).expanduser()
+    root_violation = _validate_rpc_repo_map_root(
+        repo_root,
+        raw_repo_path,
+        minni_home=resolved_home,
+        canonical_home=canonical_home,
+        is_operator=is_op,
+        effective_vault_roots=effective_roots,
+    )
+    if root_violation is not None:
+        return context.make_error(-32003, root_violation, request_id)
+
+    canonical_ws = normalize_workspace_scope(repo_root.name, default="")
+    if not canonical_ws or canonical_ws in ("default", "global", "*", "workspace-unknown"):
+        return context.make_error(
+            -32602,
+            f"Repository directory name {repo_root.name!r} resolves to a reserved workspace scope",
+            request_id,
+        )
+
+    raw_ws_str = str(raw_workspace).strip() if raw_workspace is not None else ""
+    p_ws = str(getattr(principal, "workspace_id", "") or "default").strip() or "default"
+
+    if not is_op:
+        if raw_ws_str:
+            supplied_ws = normalize_workspace_scope(raw_ws_str, default="")
+            if supplied_ws != canonical_ws:
+                return context.make_error(
+                    -32003,
+                    f"workspace_mismatch: non-operator principal {principal.agent_id!r} cannot override workspace {canonical_ws!r} with {raw_ws_str!r}",
+                    request_id,
+                )
+        target_ws = canonical_ws
+        if p_ws not in ("*", "default", "global") and p_ws != canonical_ws:
+            return context.make_error(
+                -32004,
+                f"Principal {principal.agent_id!r} is pinned to workspace {p_ws!r} and cannot map {canonical_ws!r}",
+                request_id,
+            )
+
+        db_obj = getattr(engine, "db", None)
+        resolved_target_root = repo_root.resolve()
+        if db_obj is not None:
+            with db_obj.cursor() as c:
+                has_tbl = c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='repo_map_cards'"
+                ).fetchone()
+                if has_tbl is not None:
+                    existing_rows = c.execute(
+                        "SELECT DISTINCT repo_root FROM repo_map_cards WHERE workspace_id = ?",
+                        (target_ws,),
+                    ).fetchall()
+                    for r in existing_rows:
+                        existing_raw = str((r["repo_root"] if hasattr(r, "keys") else r[0]) or "").strip()
+                        if not existing_raw:
+                            continue
+                        try:
+                            existing_resolved = Path(existing_raw).expanduser().resolve()
+                        except OSError:
+                            existing_resolved = Path(existing_raw)
+                        if existing_resolved != resolved_target_root:
+                            return context.make_error(
+                                -32003,
+                                f"workspace_clobber_denied: workspace {target_ws!r} is already mapped to a different repository",
+                                request_id,
+                            )
+        idx_file = resolved_home / "vault" / "maps" / workspace_slug_from_id(target_ws) / "_index.json"
+        if idx_file.is_file():
+            try:
+                import json
+
+                idx_data = json.loads(idx_file.read_text(encoding="utf-8"))
+                idx_root = str((idx_data or {}).get("repo_root") or "").strip()
+                if idx_root and Path(idx_root).expanduser().resolve() != resolved_target_root:
+                    return context.make_error(
+                        -32003,
+                        f"workspace_clobber_denied: workspace {target_ws!r} is already mapped to a different repository",
+                        request_id,
+                    )
+            except Exception:
+                pass
+    else:
+        supplied_ws = normalize_workspace_scope(raw_ws_str, default="") if raw_ws_str else ""
+        target_ws = (
+            supplied_ws
+            if supplied_ws and supplied_ws not in ("default", "global", "*")
+            else canonical_ws
+        )
+        if p_ws not in ("*", "default", "global") and p_ws != target_ws:
+            return context.make_error(
+                -32004,
+                f"Principal {principal.agent_id!r} is pinned to workspace {p_ws!r} and cannot map {target_ws!r}",
+                request_id,
+            )
+
+    try:
+        result = build_and_index_repo_map(
+            repo_root,
+            workspace_id=target_ws,
+            refresh=refresh,
+            db=getattr(engine, "db", None),
+            engine=engine,
+        )
+        context.record_latency("repo_map", time.perf_counter() - started_at)
+        return context.make_response(result, request_id)
+    except ValueError as exc:
+        return context.make_error(-32602, str(exc), request_id)
+    except Exception as exc:
+        context.logger.exception("repo_map failed")
+        return context.make_error(-32000, f"repo_map error: {exc}", request_id)

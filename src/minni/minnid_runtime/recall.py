@@ -1238,10 +1238,10 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                             cache_map[cache_key] = (now_m, res_bool)
                             return res_bool
                         c.execute(
-                            "SELECT path, agent, sigil, page_type, privacy_level "
+                            "SELECT path, agent, sigil, page_type, privacy_level, workspace_id "
                             "FROM documents "
                             "WHERE agent = ? OR sigil = ? OR agent = 'unknown' "
-                            "OR LOWER(COALESCE(page_type, '')) IN ('wiki', 'handoff', 'synthesis', 'decision') "
+                            "OR LOWER(COALESCE(page_type, '')) IN ('wiki', 'handoff', 'synthesis', 'decision', 'repo_map') "
                             "OR LOWER(COALESCE(agent, '')) LIKE '%wiki%' "
                             "OR LOWER(COALESCE(agent, '')) LIKE '%handoff%'",
                             (principal.agent_id, principal.agent_id),
@@ -1656,6 +1656,18 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 context.logger.debug("search: recall trace failed: %s", exc)
             finally:
                 stage_open("recall_trace")
+
+        if results:
+            try:
+                from minni.repo_map import annotate_repo_map_results
+
+                annotate_repo_map_results(
+                    results,
+                    db=getattr(engine, "db", None),
+                    engine=engine,
+                )
+            except Exception as exc:
+                context.logger.debug("search: repo_map staleness annotation skipped: %s", exc)
 
         response_payload = {
             "query": query,
@@ -2314,6 +2326,18 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
             for result in results:
                 if isinstance(result, dict) and result.get("attribution_score") is not None:
                     result["trace_id"] = trace_id
+        if results:
+            try:
+                from minni.repo_map import annotate_repo_map_results
+
+                annotate_repo_map_results(
+                    results,
+                    db=getattr(engine, "db", None),
+                    engine=engine,
+                )
+            except Exception as exc:
+                context.logger.debug("sm_drill: repo_map staleness annotation skipped: %s", exc)
+
         return context.make_response({
             "depth": depth,
             "count": len(results),

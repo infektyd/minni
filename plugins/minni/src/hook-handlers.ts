@@ -61,8 +61,19 @@ import { harvestTranscriptDelta } from "./jev-harvest.js";
 import type { JevTrigger, JevLearnPayload } from "./jev-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
-import { canInject, renderIntent, wireCapabilities, wireFor } from "./hook-platform.js";
+import {
+  canInject,
+  renderIntent,
+  supportsSubagentStartContext,
+  wireCapabilities,
+  wireFor,
+} from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
+import {
+  buildProjectPermanentShelf,
+  consumePostCompactReinjectMarker,
+  writePostCompactReinjectMarker,
+} from "./project_shelf.js";
 import {
   compactPlanPointer,
   getActivePlan,
@@ -2064,6 +2075,14 @@ export function createHookHandlers(
       ? ledger.capture.context.features.includes("MINNI_BOOT_FIT")
       : isBootFitEnabled(config.vaultPath);
 
+    const bootCwd = asString(payload.cwd) || asString(payload.working_directory) || undefined;
+    const projectShelf = await buildProjectPermanentShelf({
+      vaultPath: config.vaultPath,
+      workspaceId,
+      cwd: bootCwd,
+      activePlan,
+    });
+
     const envelopeBody: Record<string, unknown> = {
       contract: MEMORY_CONTRACT,
       identity: {
@@ -2126,6 +2145,7 @@ export function createHookHandlers(
       // explicit truncation marker whenever the 8KB cap trimmed it (H5: no
       // silent truncation). See vault.ts readLayer1Shelf / layer1ShelfBody.
       layer1_shelf: layer1ShelfBody(layer1Shelf),
+      ...(projectShelf ? { project_shelf: projectShelf } : {}),
     };
 
     // #283 (config.lifecycleEnabled): the standing 4-surface lifecycle line
@@ -2203,6 +2223,24 @@ export function createHookHandlers(
     });
 
     const budget = envelopeBudgetFor(config.contextWindow);
+    const permanentLayer1Chars =
+      layer1Shelf.ok &&
+      layer1Shelf.truncated !== true &&
+      typeof layer1Shelf.content === "string"
+        ? layer1Shelf.content.length
+        : 0;
+    const permanentProjectChars = typeof projectShelf === "string" ? projectShelf.length : 0;
+    const permanentShelfChars = permanentLayer1Chars + permanentProjectChars;
+    const rawHostInlineCap = wireCapabilities(wire).hostInlineCapChars;
+    const sessionStartCharLimit =
+      rawHostInlineCap !== undefined && permanentShelfChars + 1800 > rawHostInlineCap
+        ? Math.min(36_000, permanentShelfChars + 3200)
+        : rawHostInlineCap;
+    const sessionStartBudget =
+      permanentShelfChars + 2800 > budget * 4
+        ? Math.max(budget, Math.ceil((permanentShelfChars + 3200) / 4))
+        : budget;
+
     if (identityRead.ok && identityRead.data?.context) {
       const identityBody = extractIdentityBody(identityRead.data.context, config.agentId);
       if (identityBody) {
@@ -2220,8 +2258,8 @@ export function createHookHandlers(
 
     const bodyForEnvelope = bootFitOn
       ? fitEnvelope(envelopeBody, {
-          tokenLimit: budget,
-          charLimit: wireCapabilities(wire).hostInlineCapChars,
+          tokenLimit: sessionStartBudget,
+          charLimit: sessionStartCharLimit,
           vaultPath: config.vaultPath,
           event: "SessionStart",
           agent: config.agentId,
@@ -2235,7 +2273,7 @@ export function createHookHandlers(
     const envelope = wrapEnvelope({
       event: "SessionStart",
       agent: config.agentId,
-      budget,
+      budget: sessionStartBudget,
       body: bodyForEnvelope,
       legacyKeySort: !bootFitOn,
     });
@@ -2361,6 +2399,7 @@ export function createHookHandlers(
       emitted: bootText,
       recall: recallForCapture,
       identity: identityForCapture,
+      ...(sessionStartCharLimit !== undefined ? { capChars: sessionStartCharLimit } : {}),
     });
     return render(injectIntent("SessionStart", bootText));
   }
@@ -2473,6 +2512,40 @@ export function createHookHandlers(
     const workspaceId = workspaceFor(payload);
     const signature = hashTaskSignature(prompt);
 
+    // BUG-14: If PostCompact ran on a host whose PostCompact stdout is ignored,
+    // atomically consume the session-scoped recovery marker here (after skipping
+    // <SYSTEM_MESSAGE> / <task-notification> wakeups above) and re-inject the
+    // Two-Part Permanent Shelf once on this user turn.
+    let postCompactShelfFields: Record<string, unknown> | null = null;
+    if (canInject(wire, "UserPromptSubmit")) {
+      const postCompactMarker = await consumePostCompactReinjectMarker(
+        config.vaultPath,
+        rawSessionId || undefined,
+      ).catch(() => null);
+      if (postCompactMarker !== null) {
+        const reinjectLayer1 = await readLayer1Shelf(config.vaultPath);
+        const reinjectSessionKey = sessionStateKey(rawSessionId || undefined) ?? undefined;
+        const reinjectPlan = await resolveActivePlanView(config.vaultPath, undefined, {
+          lockWaitMs: Math.min(400, Math.max(0, remainingMs() - PLAN_LOCK_SLACK_MS)),
+          sessionKey: reinjectSessionKey,
+          strictSessionOnly: Boolean(reinjectSessionKey),
+        }).catch(() => undefined);
+        const upsCwd =
+          asString(payload.cwd) || asString(payload.working_directory) || undefined;
+        const reinjectProjectShelf = await buildProjectPermanentShelf({
+          vaultPath: config.vaultPath,
+          workspaceId: workspaceId || postCompactMarker.workspaceId,
+          cwd: upsCwd,
+          activePlan: reinjectPlan,
+        });
+        postCompactShelfFields = {
+          layer1_shelf: layer1ShelfBody(reinjectLayer1),
+          ...(reinjectProjectShelf ? { project_shelf: reinjectProjectShelf } : {}),
+          ...(reinjectPlan ? { active_thread_ref: compactPlanPointer(reinjectPlan) } : {}),
+        };
+      }
+    }
+
     // #283 (config.lifecycleEnabled): compute the lifecycle representation
     // once for this turn, BEFORE the early-return gates, so the persistent
     // line survives them. Read the once-per-session emphasis set and persist
@@ -2507,7 +2580,11 @@ export function createHookHandlers(
     // "off", or no fields were computed this turn) — safe to call
     // unconditionally on every platform.
     const lifecycleOnlyOutput = (): Promise<HookOutput> => {
-      if (lifecycleFields.lifecycle === undefined && lifecycleFields.lifecycle_focus === undefined) {
+      if (
+        postCompactShelfFields === null &&
+        lifecycleFields.lifecycle === undefined &&
+        lifecycleFields.lifecycle_focus === undefined
+      ) {
         return render(noIntent);
       }
       const envelope = wrapEnvelope({
@@ -2520,6 +2597,7 @@ export function createHookHandlers(
             task_signature: signature,
           },
           ...lifecycleFields,
+          ...(postCompactShelfFields ?? {}),
         },
       });
       return render(injectIntent("UserPromptSubmit", envelope));
@@ -2872,6 +2950,7 @@ export function createHookHandlers(
       // situational focus) rides the salient turn too. `{}` on every other
       // platform.
       ...lifecycleFields,
+      ...(postCompactShelfFields ?? {}),
       identity: {
         agent: config.agentId,
         workspace: workspaceId,
@@ -3317,6 +3396,7 @@ export function createHookHandlers(
   async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath, { agentId: config.agentId });
     const sessionId = rawSessionIdFromPayload(payload) || "session";
+    const workspaceId = workspaceFor(payload);
     await clearSessionSurfacedOnReset(config.vaultPath, sessionId).catch(() => {});
     clearSessionFailureLessonsOnReset(config.vaultPath, sessionId);
     const summary = asString(payload.compact_summary);
@@ -3324,7 +3404,7 @@ export function createHookHandlers(
       await harvestSummaryText(
         {
           vaultPath: config.vaultPath,
-          workspaceId: workspaceFor(payload),
+          workspaceId,
           auditPrefix: config.auditPrefix,
           platform: config.runtime ?? config.agentId,
         },
@@ -3339,7 +3419,7 @@ export function createHookHandlers(
         await harvestCompactSummary(
           {
             vaultPath: config.vaultPath,
-            workspaceId: workspaceFor(payload),
+            workspaceId,
             auditPrefix: config.auditPrefix,
             platform: config.runtime ?? config.agentId,
           },
@@ -3350,6 +3430,44 @@ export function createHookHandlers(
         );
       }
     }
+
+    // BUG-14: When the host wire directly supports PostCompact context output,
+    // emit the Two-Part Permanent Shelf immediately; otherwise persist a
+    // session-scoped recovery marker consumed on the next UserPromptSubmit.
+    if (canInject(wire, "PostCompact")) {
+      const compactLayer1 = await readLayer1Shelf(config.vaultPath);
+      const compactSessionKey = sessionStateKey(sessionId) ?? undefined;
+      const compactPlan = await resolveActivePlanView(config.vaultPath, undefined, {
+        lockWaitMs: 300,
+        sessionKey: compactSessionKey,
+        strictSessionOnly: Boolean(compactSessionKey),
+      }).catch(() => undefined);
+      const compactCwd =
+        asString(payload.cwd) || asString(payload.working_directory) || undefined;
+      const compactProjectShelf = await buildProjectPermanentShelf({
+        vaultPath: config.vaultPath,
+        workspaceId,
+        cwd: compactCwd,
+        activePlan: compactPlan,
+      });
+      const envelope = wrapEnvelope({
+        event: "PostCompact",
+        agent: config.agentId,
+        body: {
+          identity: {
+            agent: config.agentId,
+            workspace: workspaceId,
+            session_id: sessionId,
+          },
+          layer1_shelf: layer1ShelfBody(compactLayer1),
+          ...(compactProjectShelf ? { project_shelf: compactProjectShelf } : {}),
+          ...(compactPlan ? { active_thread_ref: compactPlanPointer(compactPlan) } : {}),
+        },
+      });
+      return render(injectIntent("PostCompact", envelope));
+    }
+
+    await writePostCompactReinjectMarker(config.vaultPath, sessionId, workspaceId).catch(() => {});
     return { continue: true };
   }
 
@@ -3518,90 +3636,110 @@ export function createHookHandlers(
     payload: Record<string, unknown>,
     ledger?: LedgerCapture,
   ): Promise<SubagentHookOutput> {
+    if (!supportsSubagentStartContext(wire)) {
+      return { continue: true };
+    }
     const briefOn = ledger
       ? ledger.capture.context.features.includes("MINNI_SUBAGENT_BRIEF")
       : isFeatureEnabled(config.vaultPath, "MINNI_SUBAGENT_BRIEF");
-    if (!briefOn) return { continue: true };
 
-    await ensureVault(config.vaultPath, { agentId: config.agentId });
-    const rawSessionId = rawSessionIdFromPayload(payload);
-    const guardV2 = ledger
-      ? ledger.capture.context.features.includes("MINNI_GUARD_V2")
-      : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
+    const workspaceId = workspaceFor(payload);
+    const subagentCwd =
+      asString(payload.cwd) || asString(payload.working_directory) || undefined;
+    const projectShelf = await buildProjectPermanentShelf({
+      vaultPath: config.vaultPath,
+      workspaceId,
+      cwd: subagentCwd,
+    });
 
-    const parentState = await readRecallState(config.vaultPath, {
-      sessionId: rawSessionId || undefined,
-      guardV2,
-    }).catch(() => null);
-    const parentHits = Array.isArray(parentState?.top_hits)
-      ? parentState!.top_hits.slice(0, 3)
-      : [];
-
-    const claimedPending = claimSubagentPending(config.vaultPath, payload);
-    const threshold = recallPointerThreshold();
-    let taskStrong: ReturnType<typeof extractStrongRecall> = null;
-    let taskRecallData: Awaited<ReturnType<typeof recallMemory>>["data"] | undefined;
-    let safeVaultResults: ReturnType<typeof filterSafeVaultResults> = [];
-
-    if (claimedPending && claimedPending.prompt.trim()) {
-      const extraPaths = Array.isArray(claimedPending.targetPaths)
-        ? claimedPending.targetPaths.filter((p) => !claimedPending.prompt.includes(p))
-        : [];
-      const taskPrompt =
-        extraPaths.length > 0
-          ? `${claimedPending.prompt.trim()} ${extraPaths.join(" ")}`
-          : claimedPending.prompt.trim();
-      const workspaceId = workspaceFor(payload);
-      const [vaultRaw, recall] = await Promise.all([
-        withBudget(
-          searchVaultNotes(config.vaultPath, taskPrompt, 12, config.agentId, {
-            candidates: "scan",
-          }),
-          SUBAGENT_RECALL_BUDGET_MS,
-          [],
-        ),
-        withBudget(
-          recallMemory({
-            query: taskPrompt,
-            limit: 4,
-            agentId: config.agentId,
-            workspaceId,
-            timeoutMs: SUBAGENT_RECALL_BUDGET_MS,
-            ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-            passive: true,
-            updateAccess: false,
-          }),
-          SUBAGENT_RECALL_BUDGET_MS,
-          { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
-        ),
-      ]);
-      safeVaultResults = filterSafeVaultResults(vaultRaw).slice(0, 4);
-      taskRecallData = recall.ok ? recall.data : undefined;
-      taskStrong = extractStrongRecall(taskRecallData, safeVaultResults, threshold, 2);
-    }
-
-    const taskHits = taskStrong
-      ? enrichTaskHitsWithSnippets(taskStrong.topHits.slice(0, 2), taskRecallData, safeVaultResults, threshold)
-      : [];
-    const brief = buildSubagentBrief(parentHits, taskHits, SUBAGENT_BRIEF_MAX_CHARS);
-    if (!brief) {
+    if (!briefOn && !projectShelf) {
       return { continue: true };
     }
 
-    ledger?.api.captureSubagentBrief(ledger.capture, {
-      emitted: brief,
-      parentState,
-      taskStrong,
-      taskRecall: taskRecallData,
-      taskVaultResults: safeVaultResults,
-      threshold,
-    });
+    await ensureVault(config.vaultPath, { agentId: config.agentId });
+    let brief = "";
+    if (briefOn) {
+      const rawSessionId = rawSessionIdFromPayload(payload);
+      const guardV2 = ledger
+        ? ledger.capture.context.features.includes("MINNI_GUARD_V2")
+        : isFeatureEnabled(config.vaultPath, "MINNI_GUARD_V2");
+
+      const parentState = await readRecallState(config.vaultPath, {
+        sessionId: rawSessionId || undefined,
+        guardV2,
+      }).catch(() => null);
+      const parentHits = Array.isArray(parentState?.top_hits)
+        ? parentState!.top_hits.slice(0, 3)
+        : [];
+
+      const claimedPending = claimSubagentPending(config.vaultPath, payload);
+      const threshold = recallPointerThreshold();
+      let taskStrong: ReturnType<typeof extractStrongRecall> = null;
+      let taskRecallData: Awaited<ReturnType<typeof recallMemory>>["data"] | undefined;
+      let safeVaultResults: ReturnType<typeof filterSafeVaultResults> = [];
+
+      if (claimedPending && claimedPending.prompt.trim()) {
+        const extraPaths = Array.isArray(claimedPending.targetPaths)
+          ? claimedPending.targetPaths.filter((p) => !claimedPending.prompt.includes(p))
+          : [];
+        const taskPrompt =
+          extraPaths.length > 0
+            ? `${claimedPending.prompt.trim()} ${extraPaths.join(" ")}`
+            : claimedPending.prompt.trim();
+        const [vaultRaw, recall] = await Promise.all([
+          withBudget(
+            searchVaultNotes(config.vaultPath, taskPrompt, 12, config.agentId, {
+              candidates: "scan",
+            }),
+            SUBAGENT_RECALL_BUDGET_MS,
+            [],
+          ),
+          withBudget(
+            recallMemory({
+              query: taskPrompt,
+              limit: 4,
+              agentId: config.agentId,
+              workspaceId,
+              timeoutMs: SUBAGENT_RECALL_BUDGET_MS,
+              ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+              passive: true,
+              updateAccess: false,
+            }),
+            SUBAGENT_RECALL_BUDGET_MS,
+            { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
+          ),
+        ]);
+        safeVaultResults = filterSafeVaultResults(vaultRaw).slice(0, 4);
+        taskRecallData = recall.ok ? recall.data : undefined;
+        taskStrong = extractStrongRecall(taskRecallData, safeVaultResults, threshold, 2);
+      }
+
+      const taskHits = taskStrong
+        ? enrichTaskHitsWithSnippets(taskStrong.topHits.slice(0, 2), taskRecallData, safeVaultResults, threshold)
+        : [];
+      brief = buildSubagentBrief(parentHits, taskHits, SUBAGENT_BRIEF_MAX_CHARS);
+      if (brief) {
+        ledger?.api.captureSubagentBrief(ledger.capture, {
+          emitted: brief,
+          parentState,
+          taskStrong,
+          taskRecall: taskRecallData,
+          taskVaultResults: safeVaultResults,
+          threshold,
+        });
+      }
+    }
+
+    const combinedContext = [projectShelf, brief].filter(Boolean).join("\n\n");
+    if (!combinedContext) {
+      return { continue: true };
+    }
 
     return {
       continue: true,
       hookSpecificOutput: {
         hookEventName: "SubagentStart",
-        additionalContext: brief,
+        additionalContext: combinedContext,
       },
     };
   }

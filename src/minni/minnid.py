@@ -190,6 +190,7 @@ from minni.minnid_runtime.transport import SOCKET_BODY_LIMIT as _SOCKET_BODY_LIM
 from minni.minnid_runtime.vault_index import (  # noqa: E402
     MAX_VAULT_PAGE_CHARS as _MAX_VAULT_PAGE_CHARS,
     VaultIndexContext,
+    handle_repo_map as _runtime_handle_repo_map,
     handle_vault_index_doc as _runtime_handle_vault_index_doc,
 )
 
@@ -1887,6 +1888,10 @@ def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
     return _runtime_handle_vault_index_doc(params, request_id, _vault_index_context())
 
 
+def _handle_repo_map(params: dict, request_id: Any) -> dict:
+    return _runtime_handle_repo_map(params, request_id, _vault_index_context())
+
+
 def _handle_cache_reload(params: dict, request_id: Any) -> dict:
     """In-band, govern-gated equivalent of the SIGHUP cache flush (W2).
 
@@ -1934,6 +1939,7 @@ _METHODS: Dict[str, callable] = {
     "resolve_candidate":      _resolve_candidate,
     # M-4 fix: vault_write now triggers immediate semantic indexing via this RPC.
     "vault_index_doc":        _handle_vault_index_doc,
+    "repo_map":               _handle_repo_map,
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,

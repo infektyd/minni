@@ -58,10 +58,11 @@ test(
     await mkdir(path.join(vault, "layer1"), { recursive: true });
 
     const paragraphs = Array.from(
-      { length: 45 },
+      { length: 140 },
       (_, i) => `### Paragraph ${i + 1}\n${"Rule content for paragraph boundary testing. ".repeat(4)}`,
     ).join("\n\n");
-    assert.ok(paragraphs.length > LAYER1_SHELF_MAX_BYTES, "test fixture must exceed 8 KB");
+    assert.equal(LAYER1_SHELF_MAX_BYTES, 24576);
+    assert.ok(paragraphs.length > LAYER1_SHELF_MAX_BYTES, "test fixture must exceed 24 KB");
     await writeFile(path.join(vault, "layer1", "core.md"), paragraphs, "utf8");
 
     // Raw reader still returns 8192 bytes and exact omittedBytes
@@ -104,7 +105,7 @@ test(
     const vault = path.join(root, "claudecode-vault");
     await mkdir(path.join(vault, "layer1"), { recursive: true });
 
-    const bigCore = "Core paragraph.\n\n".repeat(600);
+    const bigCore = "Core paragraph.\n\n".repeat(1600);
     const curatedBoot = "# Curated Boot Shelf\n\nEssential orientation for SessionStart.";
     await writeFile(path.join(vault, "layer1", "core.md"), bigCore, "utf8");
     await writeFile(path.join(vault, "layer1", "boot.md"), curatedBoot, "utf8");

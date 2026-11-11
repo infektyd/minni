@@ -307,7 +307,7 @@ def _path_to_wikilink(path: str) -> Optional[str]:
     if not path:
         return None
     name = os.path.splitext(os.path.basename(path))[0]
-    for marker in ("/wiki/", "/raw/", "/schema/"):
+    for marker in ("/wiki/", "/raw/", "/schema/", "/maps/"):
         idx = path.find(marker)
         if idx >= 0:
             rel = path[idx + 1 :]
@@ -1088,18 +1088,35 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             prepared_chunks: List[Tuple[Any, np.ndarray]] = []
             embed_failed = False
             if self.model:
-                chunks = self.chunker.chunk_document(content)
-                if not chunks:
+                body_for_chunks = _strip_frontmatter(content).strip() or content.strip()
+                if (
+                    str(page_type or "").lower() == "repo_map"
+                    and len(body_for_chunks.split()) <= self.chunker.chunk_size
+                ):
                     from minni.chunker import Chunk
 
+                    first_line = body_for_chunks.splitlines()[0].lstrip("#").strip() if body_for_chunks else ""
                     chunks = [
                         Chunk(
-                            text=content.strip(),
-                            heading="",
-                            heading_path="",
+                            text=body_for_chunks,
+                            heading=first_line,
+                            heading_path=first_line,
                             chunk_index=0,
                         )
                     ]
+                else:
+                    chunks = self.chunker.chunk_document(body_for_chunks)
+                    if not chunks:
+                        from minni.chunker import Chunk
+
+                        chunks = [
+                            Chunk(
+                                text=body_for_chunks,
+                                heading="",
+                                heading_path="",
+                                chunk_index=0,
+                            )
+                        ]
                 for chunk in chunks:
                     try:
                         from minni.models import get_embedder_lock
@@ -1896,6 +1913,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 fields["memory_links"] = result.get("memory_links")
             if result.get("workspace_id"):
                 fields["workspace_id"] = result.get("workspace_id")
+            if result.get("page_type"):
+                fields["page_type"] = result.get("page_type")
             if result.get("full_provenance") is not None:
                 fields["full_provenance"] = result.get("full_provenance")
             if result.get("evidence_envelope") is not None:
@@ -1931,6 +1950,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 out["memory_links"] = result.get("memory_links")
             if result.get("workspace_id"):
                 out["workspace_id"] = result["workspace_id"]
+            if result.get("page_type"):
+                out["page_type"] = result["page_type"]
             if result.get("provenance") is not None:
                 out["provenance"] = result["provenance"]
             return out
@@ -2430,6 +2451,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             document_agent_filter = [
                 principal.agent_id,
                 f"identity:{principal.agent_id}",
+                "repo-map",
             ]
 
         state = self._current_state()
@@ -3843,6 +3865,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             }
             if r.get("workspace_id"):
                 raw["workspace_id"] = r.get("workspace_id")
+            if page_type:
+                raw["page_type"] = page_type
             if r.get("full_provenance") is not None:
                 raw["full_provenance"] = r.get("full_provenance")
             graph_pairs = (

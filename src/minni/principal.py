@@ -817,6 +817,109 @@ def is_operator_principal(p: EffectivePrincipal) -> bool:
     return False
 
 
+def _candidate_minni_homes(principal: EffectivePrincipal) -> List[Path]:
+    """Resolve candidate ``<minni_home>`` roots for shared ``vault/maps/`` validation."""
+    homes: List[Path] = []
+    env_home = (os.environ.get("MINNI_HOME") or "").strip()
+    if env_home:
+        homes.append(Path(env_home).expanduser())
+    env_vault = (os.environ.get("MINNI_VAULT_PATH") or "").strip()
+    if env_vault:
+        vp = Path(env_vault).expanduser()
+        if vp.name == "vault":
+            homes.append(vp.parent)
+    homes.append(PRINCIPALS_DIR.parent)
+    homes.append(Path(CANONICAL_SOVEREIGN_HOME).expanduser())
+    for root in principal.allowed_vault_roots or ():
+        if not root or root == PLATFORM_NO_ROOTS_SENTINEL:
+            continue
+        rp = Path(root).expanduser()
+        if rp.name == "vault" or rp.name.endswith("-vault"):
+            homes.append(rp.parent)
+    deduped: List[Path] = []
+    seen: set[str] = set()
+    for h in homes:
+        key = str(h)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(h)
+    return deduped
+
+
+def is_trusted_repo_map_card_path(
+    path_str: str,
+    candidate_homes: List[Path],
+) -> bool:
+    """Return True iff *path_str* resolves strictly to ``<home>/vault/maps/<ws_slug>/<slug>.md``
+    under one of *candidate_homes* with zero ``..`` segments and zero symlinks at
+    ``vault``, ``maps``, ``<ws_slug>``, or ``<slug>.md``."""
+    if not path_str or not isinstance(path_str, str):
+        return False
+    raw = Path(path_str).expanduser()
+    if not raw.is_absolute() or ".." in raw.parts:
+        return False
+    try:
+        if raw.is_symlink():
+            return False
+    except OSError:
+        return False
+
+    for home in candidate_homes:
+        try:
+            vault_raw = home / "vault"
+            maps_raw = vault_raw / "maps"
+            if vault_raw.is_symlink() or maps_raw.is_symlink():
+                continue
+            home_real = home.resolve()
+            vault_real = home_real / "vault"
+            maps_real = vault_real / "maps"
+            if vault_real.is_symlink() or maps_real.is_symlink():
+                continue
+
+            rel: Optional[Path] = None
+            if raw.is_relative_to(maps_raw):
+                rel = raw.relative_to(maps_raw)
+            elif raw.is_relative_to(maps_real):
+                rel = raw.relative_to(maps_real)
+            if (
+                rel is None
+                or len(rel.parts) != 2
+                or ".." in rel.parts
+                or rel.parts[0].startswith(".")
+                or rel.parts[1].startswith(".")
+                or not rel.parts[1].lower().endswith(".md")
+            ):
+                continue
+
+            cur_raw = maps_raw
+            cur_real = maps_real
+            symlink_found = False
+            for part in rel.parts:
+                cur_raw = cur_raw / part
+                cur_real = cur_real / part
+                if cur_raw.is_symlink() or cur_real.is_symlink():
+                    symlink_found = True
+                    break
+            if symlink_found:
+                return False
+
+            if not raw.resolve().is_relative_to(maps_real.resolve()):
+                return False
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _is_safe_shared_repo_map_path(
+    path_str: str,
+    principal: EffectivePrincipal,
+) -> bool:
+    """Return True iff *path_str* is strictly under ``<minni_home>/vault/maps/<ws>/<slug>.md``
+    with zero ``..`` segments and zero symlinks at ``vault``, ``maps``, or below."""
+    return is_trusted_repo_map_card_path(path_str, _candidate_minni_homes(principal))
+
+
 def can_read_document(
     principal: Optional[EffectivePrincipal],
     workspace: str,
@@ -865,6 +968,7 @@ def can_read_document(
     )
     doc_ws = str(doc_ws_raw or "default").strip() or "default"
     call_ws = str(workspace or "default").strip() or "default"
+    p_ws = str(getattr(principal, "workspace_id", "") or "default").strip() or "default"
     if (
         doc_ws not in ("*", "global")
         and call_ws not in ("*", "default")
@@ -872,6 +976,39 @@ def can_read_document(
     ):
         if not (same_agent and (not doc_ws_raw or doc_ws == "default")):
             return False
+
+    # Shared Living Repo Map cards (Wave 4): strictly under <minni_home>/vault/maps/
+    # with symlink rejection, privacy=='safe', concrete doc workspace, and cross-agent
+    # read permitted ONLY when neither call_ws nor principal.workspace_id is pinned
+    # to a different concrete workspace.
+    if _page_type_early == "repo_map":
+        if _agent_early != "repo-map":
+            return False
+        if not doc_ws_raw or doc_ws in ("default", "*", "global"):
+            return False
+        if p_ws not in ("*", "default", "global") and p_ws != doc_ws:
+            return False
+        if not principal.capabilities or getattr(principal, "deny_reason", None):
+            return False
+        if principal.allowed_vault_roots and all(
+            r == PLATFORM_NO_ROOTS_SENTINEL for r in principal.allowed_vault_roots
+        ):
+            return False
+        repo_map_privacy = str(
+            doc_metadata.get("privacy_level")
+            or doc_metadata.get("privacy")
+            or "safe"
+        ).lower().strip()
+        if repo_map_privacy != "safe":
+            return False
+        repo_map_path = (
+            doc_metadata.get("path")
+            or doc_metadata.get("source")
+            or doc_metadata.get("filename")
+        )
+        if not repo_map_path or not _is_safe_shared_repo_map_path(str(repo_map_path), principal):
+            return False
+        return True
 
     # Foreign sessions are denied independently of their filesystem location.
     # Apply this cheap gate before resolving every candidate path/root during

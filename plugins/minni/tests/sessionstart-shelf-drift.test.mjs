@@ -203,8 +203,8 @@ test(
     t.after(() => rm(fixture.root, { recursive: true, force: true }));
     await mkdir(path.join(fixture.vault, "layer1"), { recursive: true });
 
-    // Oversized core.md (LAYER1_SHELF_MAX_BYTES is 8192; comfortably over it).
-    const oversizedCore = `# Identity\n\n${"x".repeat(9000)}\n`;
+    // Oversized core.md (LAYER1_SHELF_MAX_BYTES is 24576; comfortably over it).
+    const oversizedCore = `# Identity\n\n${"x".repeat(25600)}\n`;
     await writeFile(path.join(fixture.vault, "layer1", "core.md"), oversizedCore, "utf8");
     // The plan's shelf_ref was set against the FULL (oversized) content —
     // exactly what createPlan would receive from a caller that read it

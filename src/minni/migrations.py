@@ -143,6 +143,8 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
             _column_exists(conn, "documents", "workspace_id")
             and _column_exists(conn, "learnings", "workspace_id")
         )
+    if version == 26:
+        return _table_exists(conn, "repo_map_cards")
     return True
 
 
@@ -253,7 +255,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                         version,
                     )
                     continue
-                if version == 25 and not (
+                if version in (25, 26) and not (
                     _table_exists(conn, "documents") and _table_exists(conn, "learnings")
                 ):
                     logger.warning(

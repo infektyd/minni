@@ -212,3 +212,114 @@ def test_resolve_and_gate_roundtrip():
     # Just ensure no crash and bool result
     res = can_read_document(p, p.workspace_id, meta)
     assert isinstance(res, bool)
+
+
+def test_repo_map_cross_agent_same_or_unpinned_workspace_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINNI_HOME", str(tmp_path))
+    maps_dir = tmp_path / "vault" / "maps" / "demo-repo"
+    maps_dir.mkdir(parents=True)
+    card_path = maps_dir / "auth.md"
+    card_path.write_text("# Auth\n", encoding="utf-8")
+
+    # Named agent principal whose allowed_vault_roots points ONLY to its own <agent>-vault
+    codex_vault = tmp_path / "codex-vault"
+    codex_vault.mkdir()
+    codex_p = EffectivePrincipal(
+        agent_id="codex",
+        workspace_id="default",
+        capabilities=["search", "read", "learn"],
+        allowed_vault_roots=[str(codex_vault)],
+    )
+    meta = {
+        "agent": "repo-map",
+        "page_type": "repo_map",
+        "privacy_level": "safe",
+        "workspace_id": "workspace-demo-repo",
+        "path": str(card_path.resolve()),
+    }
+
+    assert can_read_document(codex_p, "workspace-demo-repo", meta) is True
+    assert can_read_document(codex_p, "default", meta) is True
+    assert can_read_document(codex_p, "*", meta) is True
+    # Calling with a DIFFERENT concrete workspace must be denied
+    assert can_read_document(codex_p, "workspace-other-repo", meta) is False
+
+
+def test_repo_map_denies_pinned_worker_other_workspace_and_symlinks(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINNI_HOME", str(tmp_path))
+    maps_dir = tmp_path / "vault" / "maps" / "demo-repo"
+    maps_dir.mkdir(parents=True)
+    card_path = maps_dir / "auth.md"
+    card_path.write_text("# Auth\n", encoding="utf-8")
+
+    worker_vault = tmp_path / "worker-vault"
+    worker_vault.mkdir()
+    pinned_worker = EffectivePrincipal(
+        agent_id="slice-worker",
+        workspace_id="workspace-other",
+        capabilities=["search", "read"],
+        allowed_vault_roots=[str(worker_vault)],
+    )
+    meta = {
+        "agent": "repo-map",
+        "page_type": "repo_map",
+        "privacy_level": "safe",
+        "workspace_id": "workspace-demo-repo",
+        "path": str(card_path),
+    }
+
+    # Narrow worker pinned to workspace-other is denied even if call_ws is 'default' or '*'
+    assert can_read_document(pinned_worker, "workspace-other", meta) is False
+    assert can_read_document(pinned_worker, "default", meta) is False
+    assert can_read_document(pinned_worker, "*", meta) is False
+
+    # Default-deny principal (no capabilities) is denied
+    denied_p = EffectivePrincipal(
+        agent_id="unknown-caller",
+        workspace_id="default",
+        capabilities=[],
+        allowed_vault_roots=[],
+        deny_reason="unknown_identity",
+    )
+    assert can_read_document(denied_p, "workspace-demo-repo", meta) is False
+
+    # Non-safe repo_map card is denied
+    private_meta = {**meta, "privacy_level": "private"}
+    unpinned = EffectivePrincipal(
+        agent_id="claude-code",
+        workspace_id="default",
+        capabilities=["search", "read"],
+        allowed_vault_roots=[str(worker_vault)],
+    )
+    assert can_read_document(unpinned, "workspace-demo-repo", private_meta) is False
+
+    # Forged page_type='repo_map' outside vault/maps/ is denied
+    outside_doc = worker_vault / "forged.md"
+    outside_doc.write_text("secret", encoding="utf-8")
+    outside_parent = tmp_path / "other-agent-vault"
+    outside_parent.mkdir()
+    foreign_secret = outside_parent / "secret.md"
+    foreign_secret.write_text("top secret", encoding="utf-8")
+    assert can_read_document(
+        unpinned,
+        "workspace-demo-repo",
+        {**meta, "path": str(foreign_secret)},
+    ) is False
+
+    # Leaf symlink inside vault/maps/ escaping outside is denied
+    symlink_leaf = maps_dir / "escape.md"
+    symlink_leaf.symlink_to(foreign_secret)
+    assert can_read_document(
+        unpinned,
+        "workspace-demo-repo",
+        {**meta, "path": str(symlink_leaf)},
+    ) is False
+
+    # Symlinked directory inside vault/maps/ escaping outside is denied
+    symlink_dir = tmp_path / "vault" / "maps" / "evil-ws"
+    symlink_dir.symlink_to(outside_parent)
+    assert can_read_document(
+        unpinned,
+        "workspace-demo-repo",
+        {**meta, "path": str(symlink_dir / "secret.md")},
+    ) is False
