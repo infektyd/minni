@@ -6,6 +6,9 @@ Unix socket is.
 
     minni up        start the daemon in the background
     minni status    show daemon and engine health in plain language
+    minni recall    search project-scoped and global memories
+    minni learn     propose or durably record a lesson (--accept)
+    minni activity  summarize daemon status, pending candidates, active threads, and recent lessons
     minni doctor    check local interpreter, socket, daemon, recall, and cache health
     minni wire      wire the plugin payload to an agent platform
     minni wire-adopt cut a platform's plugin surface over to the wire tree
@@ -29,11 +32,14 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 RUN_DIR = Path.home() / ".minni" / "run"
 LOG_DIR = Path.home() / ".minni" / "logs"
@@ -696,12 +702,866 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_EVIDENCE_OPEN_RE = re.compile(r"<EVIDENCE\b[^>]*>", re.IGNORECASE)
+_EVIDENCE_CLOSE_RE = re.compile(r"</EVIDENCE>", re.IGNORECASE)
+_SESSION_HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
+_TERMINAL_THREAD_STATUSES = frozenset(
+    {"completed", "complete", "done", "cancelled", "canceled", "abandoned", "archived"}
+)
+
+
+def _cli_term_safe(text: str) -> str:
+    return _CONTROL_CHARS_RE.sub("", text)
+
+
+def _minni_home_dir() -> Path:
+    override = (os.environ.get("MINNI_HOME") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".minni"
+
+
+def _default_socket_path() -> Path:
+    sock_override = (os.environ.get("MINNI_SOCKET_PATH") or "").strip()
+    if sock_override:
+        return Path(sock_override).expanduser()
+    if (os.environ.get("MINNI_HOME") or "").strip():
+        return _minni_home_dir() / "run" / "minnid.sock"
+    return DEFAULT_SOCKET
+
+
+def _normalize_cli_workspace(raw: str | None) -> str:
+    if not raw:
+        return ""
+    trimmed = raw.strip()
+    if not trimmed:
+        return ""
+    lowered = trimmed.lower()
+    if lowered in ("default", "global", "*", "workspace-unknown"):
+        return lowered
+    if lowered == "workspace-default":
+        return "default"
+    if lowered == "workspace-global":
+        return "global"
+    stripped = trimmed.rstrip("/\\") or trimmed
+    base = os.path.basename(stripped).lower()
+    if base.startswith("workspace-"):
+        base = base[len("workspace-") :]
+    sanitized = re.sub(r"[^a-z0-9_-]", "-", base)
+    sanitized = re.sub(r"-+", "-", sanitized).strip("-")
+    if not sanitized or sanitized == "unknown":
+        return "workspace-unknown" if lowered == "unknown" else "default"
+    if sanitized in ("default", "global"):
+        return sanitized
+    return f"workspace-{sanitized}"
+
+
+def _detect_cli_workspace(
+    explicit_workspace: str | None = None,
+    *,
+    cwd: Path | None = None,
+) -> str:
+    """Resolve workspace_id: --workspace -> MINNI_WORKSPACE_ID -> git root -> 'default'."""
+    if explicit_workspace is not None and explicit_workspace.strip():
+        return _normalize_cli_workspace(explicit_workspace)
+    env_ws = (os.environ.get("MINNI_WORKSPACE_ID") or "").strip()
+    if env_ws:
+        return _normalize_cli_workspace(env_ws)
+    try:
+        start = (cwd or Path.cwd()).resolve()
+    except OSError:
+        return "default"
+    for candidate in (start, *start.parents):
+        try:
+            git_marker = candidate / ".git"
+            if git_marker.exists():
+                norm = _normalize_cli_workspace(candidate.name)
+                return norm if norm and norm != "workspace-unknown" else "default"
+        except OSError:
+            continue
+    return "default"
+
+
+def _explicit_cli_agent(args: argparse.Namespace) -> str | None:
+    """Return agent_id ONLY when explicitly passed via --agent or MINNI_AGENT_ID."""
+    arg_agent = getattr(args, "agent", None)
+    if isinstance(arg_agent, str) and arg_agent.strip():
+        return arg_agent.strip()
+    env_agent = (os.environ.get("MINNI_AGENT_ID") or "").strip()
+    if env_agent:
+        return env_agent
+    return None
+
+
+def _strip_evidence_tags(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _EVIDENCE_OPEN_RE.sub("", text)
+    cleaned = _EVIDENCE_CLOSE_RE.sub("", cleaned)
+    return _cli_term_safe(re.sub(r"\s+", " ", cleaned).strip())
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    sock = Path(args.socket)
+    query_str = " ".join(args.query).strip()
+    if not query_str:
+        print("minni recall: query must not be empty", file=sys.stderr)
+        return 2
+    ws = _detect_cli_workspace(getattr(args, "workspace", None))
+    params: dict[str, object] = {
+        "query": query_str,
+        "limit": max(1, int(getattr(args, "limit", 5) or 5)),
+        "workspace_id": ws,
+    }
+    mode = getattr(args, "mode", None)
+    if mode:
+        params["mode"] = mode
+    agent_id = _explicit_cli_agent(args)
+    if agent_id:
+        params["agent_id"] = agent_id
+
+    try:
+        result = _rpc(sock, "search", params)
+    except RpcError as exc:
+        print(f"minni recall: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+
+    raw_docs = result.get("results") if isinstance(result, dict) else []
+    raw_learnings = result.get("learnings") if isinstance(result, dict) else []
+    cards: list[str] = []
+
+    if isinstance(raw_docs, list):
+        for item in raw_docs:
+            if not isinstance(item, dict):
+                continue
+            snippet = _strip_evidence_tags(
+                str(item.get("text") or item.get("snippet") or item.get("content") or "")
+            )
+            if not snippet:
+                continue
+            if len(snippet) > 220:
+                snippet = snippet[:217] + "..."
+            raw_score = item.get("score", 0.0)
+            try:
+                score_fmt = f"{float(raw_score):.2f}"
+            except (TypeError, ValueError):
+                score_fmt = "0.00"
+            hit_ws = str(item.get("workspace_id") or ws or "default")
+            source = _cli_term_safe(
+                str(
+                    item.get("wikilink")
+                    or item.get("source")
+                    or item.get("filename")
+                    or "doc"
+                )
+            )
+            cards.append(f"[{score_fmt}/{hit_ws}] {source}: {snippet}")
+
+    if isinstance(raw_learnings, list):
+        for item in raw_learnings:
+            if not isinstance(item, dict):
+                continue
+            snippet = _strip_evidence_tags(str(item.get("content") or ""))
+            if not snippet:
+                continue
+            if len(snippet) > 220:
+                snippet = snippet[:217] + "..."
+            raw_conf = item.get("confidence", 0.0)
+            try:
+                conf_fmt = f"{float(raw_conf):.2f}"
+            except (TypeError, ValueError):
+                conf_fmt = "0.00"
+            learn_ws = str(item.get("workspace_id") or "default")
+            lid = item.get("learning_id", "?")
+            cat = _cli_term_safe(str(item.get("category") or "general"))
+            cards.append(f"[{conf_fmt}/{learn_ws}] learning#{lid} ({cat}): {snippet}")
+
+    if not cards:
+        print("No strong match found.")
+        return 0
+
+    for card in cards:
+        print(card)
+    return 0
+
+
+def cmd_learn(args: argparse.Namespace) -> int:
+    sock = Path(args.socket)
+    body = " ".join(args.content).strip()
+    if not body:
+        print("minni learn: content must not be empty", file=sys.stderr)
+        return 2
+    title = (getattr(args, "title", None) or "").strip()
+    if title and not body.lower().startswith(f"{title.lower()}:"):
+        content = f"{title}: {body}"
+    else:
+        content = body
+
+    ws = _detect_cli_workspace(getattr(args, "workspace", None))
+    category = (getattr(args, "category", None) or "general").strip() or "general"
+    params: dict[str, object] = {
+        "content": content,
+        "category": category,
+        "workspace_id": ws,
+    }
+    agent_id = _explicit_cli_agent(args)
+    if agent_id:
+        params["agent_id"] = agent_id
+
+    try:
+        learn_res = _rpc(sock, "learn", params)
+    except RpcError as exc:
+        print(f"minni learn: {exc}", file=sys.stderr)
+        return 1
+
+    output_payload: dict[str, object] = (
+        dict(learn_res) if isinstance(learn_res, dict) else {"result": learn_res}
+    )
+    output_payload.setdefault("workspace_id", ws)
+
+    if (
+        getattr(args, "accept", False)
+        and output_payload.get("status") == "proposed"
+        and output_payload.get("candidate_id") is not None
+    ):
+        resolve_params: dict[str, object] = {
+            "candidate_id": output_payload["candidate_id"],
+            "decision": "accept",
+            "reason": "cli --accept",
+        }
+        if agent_id:
+            resolve_params["agent_id"] = agent_id
+        try:
+            resolve_res = _rpc(sock, "resolve_candidate", resolve_params)
+        except RpcError as exc:
+            print(f"minni learn (--accept): {exc}", file=sys.stderr)
+            return 1
+        if isinstance(resolve_res, dict):
+            output_payload["resolution"] = resolve_res
+            output_payload["status"] = resolve_res.get("status", "accepted")
+            if resolve_res.get("learning_id") is not None:
+                output_payload["learning_id"] = resolve_res["learning_id"]
+
+    if getattr(args, "json", False):
+        print(json.dumps(output_payload, indent=2))
+        return 0
+
+    status = str(output_payload.get("status") or "")
+    cid = output_payload.get("candidate_id")
+    lid = output_payload.get("learning_id")
+    if status in ("accepted", "stored", "ok") or lid is not None:
+        suffix = f" (accepted candidate #{cid})" if cid is not None else ""
+        print(
+            f"Recorded durable learning #{lid if lid is not None else '?'} "
+            f"[{category}] ({ws}){suffix}"
+        )
+    elif status == "proposed":
+        print(
+            f"Staged candidate #{cid if cid is not None else '?'} "
+            f"[{category}] ({ws}) — run with --accept or resolve_candidate to promote."
+        )
+    else:
+        print(
+            f"Learn status={status or 'unknown'} "
+            f"candidate_id={cid} learning_id={lid} ({ws})"
+        )
+    return 0
+
+
+def _pid_alive(pid: object) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _agent_for_vault_dir(vault_dir: Path) -> str:
+    name = vault_dir.name
+    if name.endswith("-vault"):
+        slug = name[: -len("-vault")]
+        if slug in ("claudecode", "claude"):
+            return "claude-code"
+        return slug or "agent"
+    return name or "agent"
+
+
+def _parse_plan_note_metadata(note_path: Path) -> dict[str, object]:
+    """Extract lightweight title/status/workspace_id/scars from a Thread markdown note."""
+    info: dict[str, object] = {}
+    try:
+        raw = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return info
+    lines = raw.splitlines()
+    idx = 0
+    if lines and lines[0].strip() == "---":
+        idx = 1
+        while idx < len(lines):
+            line = lines[idx].strip()
+            if line in ("---", "..."):
+                idx += 1
+                break
+            if ":" in line:
+                key, _, val = line.partition(":")
+                k = key.strip().lower()
+                v = val.strip().strip("'\"")
+                if k in ("title", "status", "workspace_id", "plan_id") and v:
+                    info[k] = v
+            idx += 1
+    for line in lines[idx:]:
+        stripped = line.strip()
+        if stripped.startswith("# ") and "title" not in info:
+            info["title"] = stripped[2:].strip()
+            break
+    # Check embedded JSON plan block or Scar bullet lines if present
+    scars: list[dict[str, object]] = []
+    json_blocks = re.findall(r"```json\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
+    for block in json_blocks:
+        try:
+            parsed = json.loads(block)
+        except ValueError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for key in ("title", "status", "workspace_id", "plan_id"):
+            val = parsed.get(key)
+            if isinstance(val, str) and val.strip() and key not in info:
+                info[key] = val.strip()
+        raw_scars = parsed.get("scars")
+        if isinstance(raw_scars, list):
+            for s in raw_scars:
+                if isinstance(s, dict):
+                    scars.append(s)
+                elif isinstance(s, str) and s.strip():
+                    scars.append({"summary": s.strip()})
+    if scars:
+        info["scars"] = scars
+    return info
+
+
+def _parse_iso_epoch(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        fval = float(value)
+        return fval / 1000.0 if fval > 1e12 else fval
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _discover_active_threads(
+    minni_home: Path,
+    *,
+    cutoff_epoch: float,
+    workspace_filter: str | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Scan *-vault/wiki/artifacts/_active_plan.json & .runtime/active-thread.d/*.json."""
+    vault_dirs: list[Path] = []
+    seen_vaults: set[Path] = set()
+    try:
+        for child in sorted(minni_home.iterdir()):
+            if child.is_dir() and child.name.endswith("-vault"):
+                resolved = child.resolve()
+                if resolved not in seen_vaults:
+                    seen_vaults.add(resolved)
+                    vault_dirs.append(child)
+    except OSError:
+        pass
+
+    env_vaults_raw = (os.environ.get("MINNI_AGENT_VAULTS") or "").strip()
+    if env_vaults_raw:
+        try:
+            env_map = json.loads(env_vaults_raw)
+            if isinstance(env_map, dict):
+                for vpath in env_map.values():
+                    if isinstance(vpath, str) and vpath.strip():
+                        p = Path(vpath).expanduser()
+                        if p.is_dir() and p.resolve() not in seen_vaults:
+                            seen_vaults.add(p.resolve())
+                            vault_dirs.append(p)
+        except ValueError:
+            pass
+
+    # Also check shared runtime active-thread.d under minni_home/.runtime/active-thread.d
+    active_threads: list[dict[str, object]] = []
+    recent_thread_scars: list[dict[str, object]] = []
+    seen_threads: set[tuple[str, str]] = set()
+
+    def _inspect_pointer(
+        pointer_file: Path,
+        vault_dir: Path | None,
+        source_kind: str,
+        session_key: str | None = None,
+    ) -> None:
+        try:
+            data = json.loads(pointer_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        plan_id = str(data.get("plan_id") or data.get("thread_id") or "").strip()
+        if not plan_id:
+            return
+        if not _pid_alive(data.get("host_pid")):
+            return
+        agent_id = str(
+            data.get("agent_id")
+            or (_agent_for_vault_dir(vault_dir) if vault_dir is not None else "main")
+        )
+        note_meta: dict[str, object] = {}
+        note_path_raw = data.get("notePath") or data.get("note_path")
+        if isinstance(note_path_raw, str) and note_path_raw.strip():
+            np = Path(note_path_raw)
+            if not np.is_absolute() and vault_dir is not None:
+                np = vault_dir / np
+            note_meta = _parse_plan_note_metadata(np)
+        status = str(
+            note_meta.get("status") or data.get("status") or "active"
+        ).strip().lower()
+        if status in _TERMINAL_THREAD_STATUSES:
+            return
+        raw_ws = str(
+            data.get("workspace_id")
+            or note_meta.get("workspace_id")
+            or "default"
+        )
+        ws_norm = _normalize_cli_workspace(raw_ws) or "default"
+        if workspace_filter and ws_norm != workspace_filter:
+            return
+        dedup_key = (agent_id, plan_id)
+        if dedup_key not in seen_threads:
+            seen_threads.add(dedup_key)
+            entry: dict[str, object] = {
+                "plan_id": plan_id,
+                "agent_id": agent_id,
+                "status": status,
+                "workspace_id": ws_norm,
+                "source": source_kind,
+            }
+            title = str(note_meta.get("title") or data.get("title") or "").strip()
+            if title:
+                entry["title"] = _cli_term_safe(title)
+            updated = data.get("updated_at") or data.get("set_at")
+            if isinstance(updated, str) and updated.strip():
+                entry["updated_at"] = updated.strip()
+            if session_key:
+                entry["session_key"] = session_key
+            active_threads.append(entry)
+
+        note_scars = note_meta.get("scars")
+        if isinstance(note_scars, list):
+            for scar in note_scars:
+                if not isinstance(scar, dict):
+                    continue
+                scar_ts = _parse_iso_epoch(
+                    scar.get("created_at") or scar.get("ts") or scar.get("timestamp")
+                )
+                if scar_ts is not None and scar_ts < cutoff_epoch:
+                    continue
+                summary = _cli_term_safe(
+                    str(
+                        scar.get("lesson")
+                        or scar.get("summary")
+                        or scar.get("description")
+                        or scar.get("what_failed")
+                        or ""
+                    ).strip()
+                )
+                if summary:
+                    recent_thread_scars.append(
+                        {
+                            "workspace_id": ws_norm,
+                            "plan_id": plan_id,
+                            "agent_id": agent_id,
+                            "summary": summary,
+                            "created_at": scar_ts,
+                        }
+                    )
+
+    for vdir in vault_dirs:
+        active_ptr = vdir / "wiki" / "artifacts" / "_active_plan.json"
+        if active_ptr.is_file():
+            _inspect_pointer(active_ptr, vdir, "_active_plan.json")
+        sess_dir = vdir / ".runtime" / "active-thread.d"
+        try:
+            sess_files = sorted(sess_dir.iterdir())
+        except OSError:
+            sess_files = []
+        for sf in sess_files:
+            if sf.suffix == ".json" and sf.is_file():
+                _inspect_pointer(
+                    sf, vdir, "active-thread.d", session_key=sf.stem
+                )
+
+    shared_sess_dir = minni_home / ".runtime" / "active-thread.d"
+    try:
+        shared_files = sorted(shared_sess_dir.iterdir())
+    except OSError:
+        shared_files = []
+    for sf in shared_files:
+        if sf.suffix == ".json" and sf.is_file():
+            _inspect_pointer(sf, None, "active-thread.d", session_key=sf.stem)
+
+    return active_threads, recent_thread_scars
+
+
+def _read_sqlite_activity(
+    db_path: Path,
+    *,
+    cutoff_epoch: float,
+    workspace_filter: str | None = None,
+) -> dict[str, object]:
+    """Read-only SQLite query for stats, pending candidates, learnings, and scars."""
+    out: dict[str, object] = {
+        "db_available": False,
+        "stats": {},
+        "pending_candidates": 0,
+        "pending_by_workspace": {},
+        "recent_learnings": [],
+        "recent_scars": [],
+    }
+    if not db_path.is_file():
+        return out
+    uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=3.0)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        out["db_error"] = str(exc)
+        return out
+
+    try:
+        out["db_available"] = True
+        tables = {
+            str(r["name"])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        stats: dict[str, int] = {}
+        for tbl, key in (
+            ("documents", "documents"),
+            ("learnings", "learnings"),
+            ("episodic_events", "events"),
+        ):
+            if tbl in tables:
+                row = conn.execute(f"SELECT COUNT(*) AS n FROM {tbl}").fetchone()
+                stats[key] = int(row["n"]) if row else 0
+        out["stats"] = stats
+
+        if "candidate_packets" in tables:
+            cp_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(candidate_packets)").fetchall()
+            }
+            ws_expr = "COALESCE(workspace_id, 'default')" if "workspace_id" in cp_cols else "'default'"
+            rows = conn.execute(
+                f"SELECT {ws_expr} AS ws, COUNT(*) AS n "
+                "FROM candidate_packets WHERE status = 'proposed' GROUP BY ws"
+            ).fetchall()
+            pending_by_ws: dict[str, int] = {}
+            total_pending = 0
+            for r in rows:
+                norm_ws = _normalize_cli_workspace(str(r["ws"] or "default")) or "default"
+                cnt = int(r["n"] or 0)
+                if workspace_filter and norm_ws != workspace_filter:
+                    continue
+                pending_by_ws[norm_ws] = pending_by_ws.get(norm_ws, 0) + cnt
+                total_pending += cnt
+            out["pending_candidates"] = total_pending
+            out["pending_by_workspace"] = pending_by_ws
+
+        if "learnings" in tables:
+            l_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            ws_col = "COALESCE(workspace_id, 'default')" if "workspace_id" in l_cols else "'default'"
+            status_clause = (
+                "AND COALESCE(status, 'active') = 'active'"
+                if "status" in l_cols
+                else ""
+            )
+            l_rows = conn.execute(
+                f"""SELECT learning_id, agent_id, category, content, confidence,
+                           created_at, {ws_col} AS ws
+                    FROM learnings
+                    WHERE created_at >= ? {status_clause}
+                    ORDER BY created_at DESC
+                    LIMIT 100""",
+                (cutoff_epoch,),
+            ).fetchall()
+            recent_learnings: list[dict[str, object]] = []
+            recent_scars: list[dict[str, object]] = []
+            for r in l_rows:
+                norm_ws = _normalize_cli_workspace(str(r["ws"] or "default")) or "default"
+                if workspace_filter and norm_ws != workspace_filter:
+                    continue
+                cat = _cli_term_safe(str(r["category"] or "general"))
+                text = _strip_evidence_tags(str(r["content"] or ""))
+                item = {
+                    "learning_id": r["learning_id"],
+                    "agent_id": _cli_term_safe(str(r["agent_id"] or "main")),
+                    "category": cat,
+                    "content": text,
+                    "confidence": round(float(r["confidence"] or 0.0), 3),
+                    "created_at": r["created_at"],
+                    "workspace_id": norm_ws,
+                }
+                if cat.lower() in ("scar", "gotcha", "correction", "error", "incident"):
+                    recent_scars.append(
+                        {
+                            "workspace_id": norm_ws,
+                            "learning_id": r["learning_id"],
+                            "agent_id": item["agent_id"],
+                            "category": cat,
+                            "summary": text,
+                            "created_at": r["created_at"],
+                        }
+                    )
+                recent_learnings.append(item)
+            out["recent_learnings"] = recent_learnings
+            out["recent_scars"] = recent_scars
+
+        if "episodic_events" in tables:
+            ep_cols = {
+                str(col["name"])
+                for col in conn.execute("PRAGMA table_info(episodic_events)").fetchall()
+            }
+            ts_col = "created_at" if "created_at" in ep_cols else ("timestamp" if "timestamp" in ep_cols else None)
+            e_rows = (
+                conn.execute(
+                    f"""SELECT event_id, agent_id, event_type, content, {ts_col} AS created_at, metadata
+                       FROM episodic_events
+                       WHERE {ts_col} >= ?
+                         AND event_type IN ('scar', 'thread_scar', 'correction', 'error')
+                       ORDER BY {ts_col} DESC
+                       LIMIT 50""",
+                    (cutoff_epoch,),
+                ).fetchall()
+                if ts_col
+                else []
+            )
+            ep_scars = list(out["recent_scars"])  # type: ignore[arg-type]
+            for r in e_rows:
+                ev_ws = "default"
+                raw_meta = r["metadata"]
+                if isinstance(raw_meta, str) and raw_meta.strip():
+                    try:
+                        meta = json.loads(raw_meta)
+                        if isinstance(meta, dict) and meta.get("workspace_id"):
+                            ev_ws = (
+                                _normalize_cli_workspace(str(meta["workspace_id"]))
+                                or "default"
+                            )
+                    except ValueError:
+                        pass
+                if workspace_filter and ev_ws != workspace_filter:
+                    continue
+                ep_scars.append(
+                    {
+                        "workspace_id": ev_ws,
+                        "event_id": r["event_id"],
+                        "agent_id": _cli_term_safe(str(r["agent_id"] or "main")),
+                        "category": str(r["event_type"]),
+                        "summary": _strip_evidence_tags(str(r["content"] or "")),
+                        "created_at": r["created_at"],
+                    }
+                )
+            out["recent_scars"] = ep_scars
+    except sqlite3.Error as exc:
+        out["db_error"] = str(exc)
+    finally:
+        conn.close()
+    return out
+
+
+def cmd_activity(args: argparse.Namespace) -> int:
+    hours = float(getattr(args, "hours", 24.0) or 24.0)
+    if hours <= 0:
+        print("minni activity: --hours must be positive", file=sys.stderr)
+        return 2
+    cutoff_epoch = time.time() - (hours * 3600.0)
+    explicit_ws_arg = getattr(args, "workspace", None)
+    workspace_filter = (
+        _normalize_cli_workspace(explicit_ws_arg)
+        if isinstance(explicit_ws_arg, str) and explicit_ws_arg.strip()
+        else None
+    )
+    detected_ws = _detect_cli_workspace(explicit_ws_arg)
+
+    minni_home = _minni_home_dir()
+    db_override = (os.environ.get("MINNI_DB_PATH") or "").strip()
+    db_path = Path(db_override).expanduser() if db_override else (minni_home / "minni.db")
+
+    sock = Path(args.socket)
+    daemon_block: dict[str, object]
+    try:
+        status_res = _rpc(sock, "status", timeout=5.0)
+        d_info = status_res.get("daemon", {}) if isinstance(status_res, dict) else {}
+        e_info = status_res.get("engine", {}) if isinstance(status_res, dict) else {}
+        daemon_block = {
+            "reachable": True,
+            "mode": "rpc",
+            "version": d_info.get("version", "?"),
+            "uptime_seconds": d_info.get("uptime_seconds", 0),
+            "requests_served": d_info.get("requests_served", 0),
+            "db_ok": bool(e_info.get("db_ok", True)),
+            "stats": e_info.get("stats", {}),
+        }
+    except RpcError as exc:
+        daemon_block = {
+            "reachable": False,
+            "mode": "sqlite-readonly",
+            "reason": str(exc),
+        }
+
+    sql_data = _read_sqlite_activity(
+        db_path, cutoff_epoch=cutoff_epoch, workspace_filter=workspace_filter
+    )
+    if not daemon_block.get("reachable"):
+        daemon_block["stats"] = sql_data.get("stats", {})
+        daemon_block["db_available"] = sql_data.get("db_available", False)
+
+    active_threads, thread_scars = _discover_active_threads(
+        minni_home, cutoff_epoch=cutoff_epoch, workspace_filter=workspace_filter
+    )
+
+    recent_learnings: list[dict[str, object]] = list(
+        sql_data.get("recent_learnings") or []  # type: ignore[arg-type]
+    )
+    recent_scars: list[dict[str, object]] = [
+        *list(sql_data.get("recent_scars") or []),  # type: ignore[arg-type]
+        *thread_scars,
+    ]
+
+    by_workspace: dict[str, dict[str, list[dict[str, object]]]] = {}
+    for item in recent_learnings:
+        ws_key = str(item.get("workspace_id") or "default")
+        by_workspace.setdefault(ws_key, {"learnings": [], "scars": []})[
+            "learnings"
+        ].append(item)
+    for scar in recent_scars:
+        ws_key = str(scar.get("workspace_id") or "default")
+        by_workspace.setdefault(ws_key, {"learnings": [], "scars": []})[
+            "scars"
+        ].append(scar)
+
+    payload = {
+        "window_hours": hours,
+        "detected_workspace": detected_ws,
+        "workspace_filter": workspace_filter,
+        "daemon": daemon_block,
+        "pending_candidates": sql_data.get("pending_candidates", 0),
+        "pending_by_workspace": sql_data.get("pending_by_workspace", {}),
+        "active_threads": active_threads,
+        "by_workspace": by_workspace,
+        "recent_learnings_count": len(recent_learnings),
+        "recent_scars_count": len(recent_scars),
+    }
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    if daemon_block.get("reachable"):
+        uptime = int(daemon_block.get("uptime_seconds") or 0)  # type: ignore[arg-type]
+        print(
+            f"Daemon: running (v{daemon_block.get('version', '?')}, "
+            f"up {uptime // 3600}h {(uptime % 3600) // 60}m, "
+            f"{daemon_block.get('requests_served', 0)} reqs)"
+        )
+    else:
+        print("Daemon: stopped (degraded to read-only SQLite)")
+
+    stats = daemon_block.get("stats") if isinstance(daemon_block.get("stats"), dict) else {}
+    if stats:
+        print(
+            f"Store:  {stats.get('documents', 0)} docs, "
+            f"{stats.get('learnings', 0)} learnings, "
+            f"{stats.get('events', 0)} events"
+        )
+    print(
+        f"Scope:  {workspace_filter or f'all workspaces (cwd={detected_ws})'} "
+        f"| window={hours:g}h | pending candidates={payload['pending_candidates']}"
+    )
+
+    print(f"\nActive Threads ({len(active_threads)}):")
+    if not active_threads:
+        print("  (none)")
+    else:
+        for t in active_threads:
+            title_part = f" — {t['title']}" if t.get("title") else ""
+            print(
+                f"  - [{t.get('workspace_id')}] {t.get('plan_id')} "
+                f"({t.get('agent_id')}, {t.get('status')}){title_part}"
+            )
+
+    print(
+        f"\nRecent Accepted Learnings & Scars (last {hours:g}h: "
+        f"{len(recent_learnings)} learnings, {len(recent_scars)} scars):"
+    )
+    if not by_workspace:
+        print("  (no recent accepted learnings or scars in window)")
+    else:
+        ordered_ws = sorted(
+            by_workspace.keys(),
+            key=lambda k: (0 if k == detected_ws else 1, k),
+        )
+        for ws_key in ordered_ws:
+            bucket = by_workspace[ws_key]
+            w_learns = bucket["learnings"]
+            w_scars = bucket["scars"]
+            print(
+                f"  [{ws_key}] ({len(w_learns)} learnings, {len(w_scars)} scars)"
+            )
+            for l_item in w_learns[:10]:
+                snippet = str(l_item.get("content") or "")
+                if len(snippet) > 140:
+                    snippet = snippet[:137] + "..."
+                print(
+                    f"    * learning#{l_item.get('learning_id')} "
+                    f"[{l_item.get('category')}]: {snippet}"
+                )
+            for s_item in w_scars[:5]:
+                s_text = str(s_item.get("summary") or "")
+                if len(s_text) > 140:
+                    s_text = s_text[:137] + "..."
+                label = (
+                    f"plan:{s_item['plan_id']}"
+                    if s_item.get("plan_id")
+                    else f"scar ({s_item.get('category', 'scar')})"
+                )
+                print(f"    ! {label}: {s_text}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="minni",
         description="Run and check the Minni memory daemon.")
-    parser.add_argument("--socket", "-s", default=str(DEFAULT_SOCKET),
-                        help="Unix socket path (default: %(default)s)")
+    parser.add_argument("--socket", "-s", default=None,
+                        help=f"Unix socket path (default: {DEFAULT_SOCKET})")
     sub = parser.add_subparsers(dest="command")
 
     up = sub.add_parser("up", help="start the daemon in the background")
@@ -711,6 +1571,48 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="daemon and engine health, plain language")
     sub.add_parser("doctor",
                    help="check local install health (does not run CI home-isolation checks)")
+
+    recall_p = sub.add_parser(
+        "recall",
+        help="search project-scoped and global memories via the daemon")
+    recall_p.add_argument("query", nargs="+", help="search query")
+    recall_p.add_argument("--workspace", "-w",
+                          help="workspace scope (default: auto-detected from git root)")
+    recall_p.add_argument("--mode", choices=["fast", "hybrid"],
+                          help="retrieval mode (fast lexical/trie or full hybrid)")
+    recall_p.add_argument("--limit", "-n", type=int, default=5,
+                          help="maximum results to return (default: %(default)s)")
+    recall_p.add_argument("--agent", "-a",
+                          help="explicit caller agent_id (default: omitted -> main)")
+    recall_p.add_argument("--json", action="store_true",
+                          help="print raw JSON response")
+
+    learn_p = sub.add_parser(
+        "learn",
+        help="stage or durably record (--accept) a project/global lesson")
+    learn_p.add_argument("content", nargs="+", help="lesson text to record")
+    learn_p.add_argument("--title", "-t",
+                         help="optional short title prepended to content")
+    learn_p.add_argument("--category", "-c", default="general",
+                         help="lesson category (default: %(default)s)")
+    learn_p.add_argument("--workspace", "-w",
+                         help="workspace id (default: auto-detected from git root)")
+    learn_p.add_argument("--accept", action="store_true",
+                         help="immediately accept a proposed candidate into durable learnings")
+    learn_p.add_argument("--agent", "-a",
+                         help="explicit caller agent_id (default: omitted -> main)")
+    learn_p.add_argument("--json", action="store_true",
+                         help="print raw JSON response")
+
+    activity_p = sub.add_parser(
+        "activity",
+        help="read-only summary of daemon health, pending candidates, active threads, and recent lessons")
+    activity_p.add_argument("--hours", type=float, default=24.0,
+                            help="lookback window in hours (default: %(default)s)")
+    activity_p.add_argument("--workspace", "-w",
+                            help="filter output to a specific workspace")
+    activity_p.add_argument("--json", action="store_true",
+                            help="emit structured JSON")
 
     wire = sub.add_parser("wire", help="wire plugin payload to an agent platform")
     wire.add_argument("platform", help="codex, claude-code, kilocode, grok, gemini, "
@@ -795,6 +1697,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="poll interval in seconds (default: %(default)s)")
 
     args = parser.parse_args(argv)
+    if args.socket is None:
+        args.socket = str(_default_socket_path())
     if not args.command:
         parser.print_help()
         return 0
@@ -810,8 +1714,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     dispatch = {"up": cmd_up, "down": cmd_down,
-                "status": cmd_status, "doctor": cmd_doctor, "wire": cmd_wire,
-                "wire-adopt": cmd_wire_adopt, "sync": cmd_sync, "watch": cmd_watch}
+                "status": cmd_status, "doctor": cmd_doctor,
+                "recall": cmd_recall, "learn": cmd_learn, "activity": cmd_activity,
+                "wire": cmd_wire, "wire-adopt": cmd_wire_adopt,
+                "sync": cmd_sync, "watch": cmd_watch}
     return dispatch[args.command](args)
 
 

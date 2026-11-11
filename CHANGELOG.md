@@ -12,6 +12,10 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Added
 
+- **Wave 2 project-scoped storage, Repo-First recall & first-class CLI:**
+  - Migration `025_workspace_scoping.sql` and idempotent `MinniDB` schema initialization adding `workspace_id` + indexes onto `documents` and `learnings`, backfilling `learnings.workspace_id` from accepted `candidate_packets`, and preserving `workspace_id` across candidate staging/acceptance, forced learns, AFM durable promotion, YAML frontmatter indexing, and `_durable/` hydration.
+  - Repo-First 3-tier recall ranking (`workspace_id` query context without narrowing `can_read_document` ACL scope), post-rerank confidence floor enforcement across FTS single-word overlap and HyDE enrichment, high cross-repo confidence bar for explicit foreign-repo hits, and blank `<EVIDENCE>` stripping across Python retrieval and TypeScript plugin surfaces.
+  - First-class stdlib-only CLI commands (`minni recall`, `minni learn --accept`, and `minni activity` with read-only SQLite fallback, active Thread discovery, and workspace-grouped learnings/scars) plus `minnid_client` parity.
 - **Multi-session principal isolation (`H4`, `H6`, `R1`, `R2`):**
   - Per-session identity bridge (`<vault>/.runtime/active-session-<agent>-<hostPid>.json`) recording `session_id`, `session_key`, and `process_start_marker` even outside git repositories (`R1`), retaining live-process session records past 30 minutes, and trusting host session environment variables strictly for the matching agent principal (`R2`).
   - Per-session active thread pointers (`<vault>/.runtime/active-thread.d/<sessionKey>.json`) and `minni_thread_create({ activate })`, giving concurrent windows independent active plans with a clean-slate one-line sibling heads-up on `SessionStart` (`Q1`).

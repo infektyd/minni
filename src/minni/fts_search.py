@@ -25,17 +25,27 @@ _FTS_CHUNK_TEXT_EXPR = """COALESCE(
 
 def _strip_leading_frontmatter(text: str) -> str:
     """Drop a leading closed ``---`` YAML block from FTS/chunk body text."""
-    if not text or not text.startswith("---"):
+    if not text:
         return text
-    end = text.find("\n---", 3)
+    norm = text.replace("\r\n", "\n")
+    stripped_lead = norm.lstrip()
+    if not stripped_lead.startswith("---"):
+        return text
+    end = stripped_lead.find("\n---", 3)
     if end != -1:
-        rest = text[end + 4 :]
+        rest = stripped_lead[end + 4 :]
         if rest.startswith("\n"):
             rest = rest[1:]
+        elif not rest.strip():
+            return ""
+        else:
+            nl = rest.find("\n")
+            if nl != -1 and not rest[:nl].strip():
+                rest = rest[nl + 1 :]
         return rest
-    collapsed = re.match(r"^---\s+.+?\s+---\s*", text, flags=re.DOTALL)
+    collapsed = re.match(r"^---\s+.+?\s+---\s*", stripped_lead, flags=re.DOTALL)
     if collapsed:
-        return text[collapsed.end() :]
+        return stripped_lead[collapsed.end() :]
     return text
 
 
@@ -123,6 +133,12 @@ class FtsSearchMixin:
                 )
                 scope_params.extend(skip)
 
+            doc_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            ws_sel = "d.workspace_id" if "workspace_id" in doc_cols else "'' AS workspace_id"
+
             def _match(match_expr: str):
                 return _ret._fts_execute_with_retry(
                     c,
@@ -130,7 +146,7 @@ class FtsSearchMixin:
                     SELECT m.doc_id, m.path, m.agent, m.sigil,
                            m.bm25_rank, m.decay_score,
                            m.page_status, m.privacy_level, m.page_type,
-                           m.evidence_refs, m.indexed_at, m.layer,
+                           m.evidence_refs, m.indexed_at, m.layer, m.workspace_id,
                            COALESCE(
                                (SELECT ce.chunk_text FROM chunk_embeddings ce
                                 WHERE ce.doc_id = m.doc_id
@@ -141,7 +157,7 @@ class FtsSearchMixin:
                         SELECT f.doc_id, f.content, d.path, d.agent, d.sigil,
                                rank AS bm25_rank, d.decay_score,
                                d.page_status, d.privacy_level, d.page_type,
-                               d.evidence_refs, d.indexed_at, d.layer
+                               d.evidence_refs, d.indexed_at, d.layer, {ws_sel}
                         FROM vault_fts f
                         JOIN documents d ON d.doc_id = f.doc_id
                         WHERE vault_fts MATCH ?
@@ -175,6 +191,9 @@ class FtsSearchMixin:
                     rows = _match(" OR ".join(lowered))
 
             for row in rows:
+                clean_chunk = _ret._strip_leading_frontmatter(row["chunk_text"] or "")
+                if not clean_chunk.strip():
+                    continue
                 results.append({
                     "doc_id": row["doc_id"],
                     "path": row["path"],
@@ -188,7 +207,8 @@ class FtsSearchMixin:
                     "evidence_refs": row["evidence_refs"],
                     "indexed_at": row["indexed_at"],
                     "layer": row["layer"] or "knowledge",
-                    "chunk_text": _ret._strip_leading_frontmatter(row["chunk_text"] or ""),
+                    "workspace_id": str(row["workspace_id"] or ""),
+                    "chunk_text": clean_chunk,
                 })
 
         return results
@@ -357,6 +377,12 @@ class FtsSearchMixin:
             filter_params.extend(skip)
 
         with self.db.cursor() as c:
+            doc_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            ws_sel = "d.workspace_id" if "workspace_id" in doc_cols else "'' AS workspace_id"
+
             def _match(match_expr: str):
                 return _ret._fts_execute_with_retry(
                     c,
@@ -366,7 +392,7 @@ class FtsSearchMixin:
                            ce.heading_context,
                            d.path, d.agent, d.sigil, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
-                           d.evidence_refs, d.indexed_at,
+                           d.evidence_refs, d.indexed_at, {ws_sel},
                            COALESCE(ce.layer, d.layer, 'knowledge') AS layer,
                            COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
                     FROM vault_fts f
@@ -384,8 +410,12 @@ class FtsSearchMixin:
             if not rows and len(terms) > 1:
                 rows = _match(" OR ".join(t.lower() for t in terms))
 
-        return [
-            {
+        out_chrono: List[Dict] = []
+        for row in rows:
+            clean_chunk = _ret._strip_leading_frontmatter(row["chunk_text"] or "")
+            if not clean_chunk.strip():
+                continue
+            out_chrono.append({
                 "doc_id": row["doc_id"],
                 "chunk_id": row["chunk_id"],
                 "path": row["path"],
@@ -395,7 +425,7 @@ class FtsSearchMixin:
                 "rrf_score": None,
                 "fts_rank": None,
                 "sem_rank": None,
-                "chunk_text": _ret._strip_leading_frontmatter(row["chunk_text"] or ""),
+                "chunk_text": clean_chunk,
                 "heading_context": row["heading_context"] or "",
                 "decay_score": row["decay_score"] or 1.0,
                 "page_status": row["page_status"] or "candidate",
@@ -405,9 +435,9 @@ class FtsSearchMixin:
                 "indexed_at": row["indexed_at"],
                 "created_at": row["created_at"],
                 "layer": row["layer"] or "knowledge",
-            }
-            for row in rows
-        ]
+                "workspace_id": str(row["workspace_id"] or ""),
+            })
+        return out_chrono
 
     def search_episodic(
         self,
@@ -474,9 +504,11 @@ class FtsSearchMixin:
         limit: int = 10,
         source: str = "retrieval.search_learnings",
         update_access: bool = True,
+        query_workspace: str = "",
     ) -> List[Dict]:
         """Search write-back learnings via FTS5 and record learning_reads."""
         import minni.retrieval as _ret
+        from minni.config import is_concrete_project_workspace, normalize_workspace_scope
 
         safe_q = self._sanitize_fts_query(query)
         if not safe_q:
@@ -490,15 +522,25 @@ class FtsSearchMixin:
         else:
             scope = []
 
+        norm_qws = normalize_workspace_scope(query_workspace, default="")
+        concrete_qws = is_concrete_project_workspace(norm_qws)
+        fetch_limit = max(limit * 3, 20) if concrete_qws else limit
+
         def _match(match_q: str) -> List[Dict]:
             rows = []
             with self.db.cursor() as c:
+                l_cols = {
+                    r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                    for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+                }
+                ws_sel = "l.workspace_id" if "workspace_id" in l_cols else "'default' AS workspace_id"
                 if scope:
                     placeholders = ",".join("?" * len(scope))
                     c.execute(
                         f"""
                         SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
-                               l.confidence, l.created_at, l.access_count
+                               l.confidence, l.created_at, l.access_count,
+                               {ws_sel}, rank AS bm25_rank
                         FROM learnings_fts lf
                         JOIN learnings l ON l.learning_id = lf.learning_id
                         WHERE learnings_fts MATCH ? AND lf.agent_id IN ({placeholders})
@@ -507,13 +549,14 @@ class FtsSearchMixin:
                         ORDER BY rank
                         LIMIT ?
                         """,
-                        [match_q, *scope, limit],
+                        [match_q, *scope, fetch_limit],
                     )
                 else:
                     c.execute(
-                        """
+                        f"""
                         SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
-                               l.confidence, l.created_at, l.access_count
+                               l.confidence, l.created_at, l.access_count,
+                               {ws_sel}, rank AS bm25_rank
                         FROM learnings_fts lf
                         JOIN learnings l ON l.learning_id = lf.learning_id
                         WHERE learnings_fts MATCH ?
@@ -522,10 +565,15 @@ class FtsSearchMixin:
                         ORDER BY rank
                         LIMIT ?
                         """,
-                        (match_q, limit),
+                        (match_q, fetch_limit),
                     )
                 for row in c.fetchall():
-                    rows.append(dict(row))
+                    item = dict(row)
+                    clean_body = _ret._strip_leading_frontmatter(item.get("content") or "")
+                    if not clean_body.strip():
+                        continue
+                    item["workspace_id"] = str(item.get("workspace_id") or "default")
+                    rows.append(item)
             return rows
 
         terms = safe_q.split()
@@ -548,6 +596,41 @@ class FtsSearchMixin:
                 results = _match(" OR ".join(selective))
             if not results:
                 results = _match(" OR ".join(lowered))
+
+        if results and concrete_qws:
+            q_toks = [t for t in lowered if len(t) >= 2]
+            repo_filtered: List[Dict] = []
+            for item in results:
+                l_ws = normalize_workspace_scope(item.get("workspace_id"), default="default")
+                if is_concrete_project_workspace(l_ws) and l_ws != norm_qws:
+                    conf = float(item.get("confidence") if item.get("confidence") is not None else 1.0)
+                    bm25 = abs(float(item.get("bm25_rank") or 0.0))
+                    body_low = str(item.get("content") or "").lower()
+                    matched_toks = sum(1 for tok in set(q_toks) if tok in body_low)
+                    if conf < 0.60:
+                        continue
+                    if len(set(q_toks)) >= 2:
+                        if matched_toks < 2 or bm25 < 1.0:
+                            continue
+                    else:
+                        if matched_toks < 1 or bm25 < 2.0 or conf < 0.80:
+                            continue
+                repo_filtered.append(item)
+
+            def _learning_tier(item: Dict) -> int:
+                l_ws = normalize_workspace_scope(item.get("workspace_id"), default="default")
+                if l_ws == norm_qws:
+                    return 0
+                if not is_concrete_project_workspace(l_ws):
+                    return 1
+                return 2
+
+            repo_filtered.sort(key=_learning_tier)
+            results = repo_filtered
+
+        for item in results:
+            item.pop("bm25_rank", None)
+        results = results[:limit]
 
         if results:
             try:

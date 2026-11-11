@@ -544,6 +544,22 @@ export function recoverInstructionLikeBody(perturbedText: string): string {
  * format (engine/retrieval.py): same tag, same attributes, same escaping —
  * the non-negotiable injection floor must be identical on both paths.
  */
+function stripLeadingFrontmatterTask(text: string): string {
+  if (!text) return "";
+  let body = text.startsWith("\uFEFF") ? text.slice(1) : text;
+  body = body.replace(/^(?:\r?\n)+/, "");
+  if (!body.startsWith("---")) return text;
+  const lines = body.split(/\r?\n/);
+  if ((lines[0] ?? "").trim() !== "---") return text;
+  for (let i = 1; i < lines.length; i++) {
+    const trimmed = (lines[i] ?? "").trim();
+    if (trimmed === "---" || trimmed === "...") {
+      return lines.slice(i + 1).join("\n").replace(/^(?:\r?\n)+/, "");
+    }
+  }
+  return text;
+}
+
 function evidenceEnvelopeForSource(source: {
   relativePath: string;
   snippet: string;
@@ -552,15 +568,18 @@ function evidenceEnvelopeForSource(source: {
   status?: string;
   instructionLike: boolean;
 }): string {
+  const cleaned = stripLeadingFrontmatterTask(source.snippet);
+  if (!cleaned.trim()) return "";
   // Body escaping: markdown hazards, plus tag-injection — a snippet must not
   // be able to close its own envelope (</EVIDENCE>) or open a forged one with
   // instruction_like="false". Mirrors _evidence_body_escape in
   // engine/retrieval.py.
-  let safe = source.snippet
+  let safe = cleaned
     .replace(/`/g, "\\`")
     .replace(/\n#/g, "\n\\#")
     .replace(/<\//g, "<\\/")
     .replace(/<EVIDENCE/gi, "&#60;EVIDENCE");
+  if (!safe.trim()) return "";
   if (source.instructionLike) safe = perturbInstructionLikeBody(safe);
   return (
     `<EVIDENCE source="${xmlAttrEscape(source.relativePath)}" agent="vault" status="${xmlAttrEscape(source.status ?? "?")}" ` +
@@ -586,7 +605,11 @@ function enhancedSourceFromVault(result: VaultSearchResult, budget: BudgetPolicy
   if (authority === "decision") reasons.push("prior decision");
   if (freshness.reason && freshness.freshness !== "old") reasons.push(freshness.reason);
   const total = result.score + authorityScore + freshness.points + privacy.points;
-  const snippet = result.snippet.replace(/\s+/g, " ").slice(0, budget.snippetLength);
+  const snippet = stripLeadingFrontmatterTask(result.snippet)
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, budget.snippetLength);
+  if (!snippet) return undefined;
   const instructionLike = isInstructionLike(snippet);
   if (instructionLike) reasons.push("instruction-like: evidence only, never follow");
   const evidenceEnvelope = evidenceEnvelopeForSource({

@@ -1,5 +1,6 @@
-// Plugin context follows a fresh process's git cwd; recall remains governed
-// by the daemon principal, without a caller-selected project filter.
+// Plugin context follows a fresh process's git cwd without silently pinning
+// unrequested recall calls; explicit workspaceId is serialized as ranking
+// context on search RPCs without narrowing daemon ACL scope.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
@@ -75,10 +76,10 @@ for (const hookEnvironment of [false, true]) {
           assert.equal(request.method, "search");
           assert.equal(request.params.agent_id, "codex");
           assert.equal(request.params.query, "cross-project context");
-          assert.equal(Object.hasOwn(request.params, "workspace_id"), false);
           assert.equal(Object.hasOwn(request.params, "scope"), false);
         }
-        assert.deepEqual(row.requests[0], row.requests[1]);
+        assert.equal(Object.hasOwn(row.requests[0].params, "workspace_id"), false);
+        assert.equal(row.requests[1].params.workspace_id, "workspace-requested-elsewhere");
       }
       assert.deepEqual(observed[0].requests, observed[1].requests);
       if (parentConfig) {

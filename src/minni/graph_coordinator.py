@@ -152,6 +152,7 @@ class LearningFields:
     supersedes: Optional[int] = None
     content_hash: Optional[str] = None
     status: Optional[str] = None
+    workspace_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -983,6 +984,7 @@ def _payload_digest(payload: PreparedLearningCommit) -> str:
             "supersedes": payload.learning_fields.supersedes,
             "content_hash": payload.learning_fields.content_hash,
             "status": payload.learning_fields.status,
+            "workspace_id": payload.learning_fields.workspace_id,
         },
         "prepared_at": payload.prepared_at,
     }
@@ -1000,6 +1002,7 @@ def _insert_learning(
     embedding: Optional[bytes],
     now: float,
     fields: LearningFields,
+    workspace_id: str = "default",
 ) -> int:
     """Learnings INSERT: wrapper columns plus any provided optional fields."""
     from minni.writeback import CATEGORIES
@@ -1021,6 +1024,7 @@ def _insert_learning(
         ("contradicts_id", fields.contradicts_id),
         ("content_hash", fields.content_hash),
         ("status", fields.status),
+        ("workspace_id", fields.workspace_id),
     )
     for name, value in optional:
         if value is None:
@@ -1032,6 +1036,9 @@ def _insert_learning(
             )
         cols.append(name)
         vals.append(value)
+    if fields.workspace_id is None and "workspace_id" in present:
+        cols.append("workspace_id")
+        vals.append(str(workspace_id or "default").strip() or "default")
     c.execute(
         f"INSERT INTO learnings ({', '.join(cols)}) VALUES ({', '.join('?' * len(vals))})",
         vals,
@@ -1325,15 +1332,19 @@ def commit_prepared_learning(
     ):
         raise _Abort("canonical_restricted",
                      "canonical node is lifecycle-closed/restricted")
+    effective_ws = str(
+        prepared.learning_fields.workspace_id or prepared.workspace or "default"
+    ).strip() or "default"
     learning_id = _insert_learning(
         c, agent_id=prepared.principal.agent_id, category=prepared.category,
         content=prepared.content, embedding=prepared.learning_vector,
         now=prepared.prepared_at, fields=prepared.learning_fields,
+        workspace_id=effective_ws,
     )
     doc_id = ensure_canonical_learning_node(
         c, learning_id=learning_id, agent_id=prepared.principal.agent_id,
         content=prepared.content, vault_path=prepared.vault_path,
-        created_at=prepared.prepared_at,
+        created_at=prepared.prepared_at, workspace_id=effective_ws,
     )
     if doc_id is None:
         raise _Abort("canonical_failed", "canonical node commit refused")

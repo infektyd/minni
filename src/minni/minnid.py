@@ -364,7 +364,13 @@ def _durable_doc_path(
 _UNSET = object()
 
 
-def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> bool:
+def _index_durable_learning(
+    agent_id: str,
+    content: str,
+    key: str,
+    db=_UNSET,
+    workspace_id: str = "",
+) -> bool:
     """Semantically index a just-stored durable learning (FAIL-OPEN).
 
     Hook for BOTH durable-store socket paths (_resolve_candidate(accept) and
@@ -436,6 +442,28 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
         from minni.durable_projection import durable_metadata
 
         metadata = durable_metadata(content)
+        resolved_ws = str(workspace_id or "").strip()
+        if not resolved_ws and isinstance(key, str) and key.startswith("learning:"):
+            try:
+                lid_int = int(key.split(":", 1)[1])
+                with db.cursor() as c:
+                    l_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+                    }
+                    if "workspace_id" in l_cols:
+                        lrow = c.execute(
+                            "SELECT workspace_id FROM learnings WHERE learning_id = ?",
+                            (lid_int,),
+                        ).fetchone()
+                        if lrow is not None:
+                            resolved_ws = str(
+                                (lrow["workspace_id"] if hasattr(lrow, "keys") else lrow[0]) or ""
+                            ).strip()
+            except Exception:
+                pass
+        if resolved_ws:
+            metadata["workspace_id"] = resolved_ws
         result = engine.index_durable_document(
             content=content,
             path=_durable_doc_path(

@@ -390,18 +390,56 @@ def promote_candidate_durable(
 
             raw_cat = str(cand.get("category") or "general").strip().lower()
             cand_category = raw_cat if raw_cat in CATEGORIES else "general"
-            c.execute(
-                """
-                INSERT INTO learnings
-                (agent_id, category, content, source_doc_ids, source_query,
-                 confidence, embedding, created_at,
-                 assertion, applies_when, evidence_doc_ids, contradicts_id, status,
-                 content_hash)
-                VALUES (?, ?, ?, NULL, 'afm-consolidation',
-                        ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
-                """,
-                (agent_id, cand_category, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
-            )
+            cand_ws = str(cand.get("workspace_id") or "default").strip() or "default"
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            if "workspace_id" in l_cols:
+                c.execute(
+                    """
+                    INSERT INTO learnings
+                    (agent_id, category, content, source_doc_ids, source_query,
+                     confidence, embedding, created_at,
+                     assertion, applies_when, evidence_doc_ids, contradicts_id, status,
+                     content_hash, workspace_id)
+                    VALUES (?, ?, ?, NULL, 'afm-consolidation',
+                            ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?, ?)
+                    """,
+                    (
+                        agent_id,
+                        cand_category,
+                        content,
+                        0.9,
+                        emb_bytes,
+                        now,
+                        cand.get("evidence_refs"),
+                        chash,
+                        cand_ws,
+                    ),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO learnings
+                    (agent_id, category, content, source_doc_ids, source_query,
+                     confidence, embedding, created_at,
+                     assertion, applies_when, evidence_doc_ids, contradicts_id, status,
+                     content_hash)
+                    VALUES (?, ?, ?, NULL, 'afm-consolidation',
+                            ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
+                    """,
+                    (
+                        agent_id,
+                        cand_category,
+                        content,
+                        0.9,
+                        emb_bytes,
+                        now,
+                        cand.get("evidence_refs"),
+                        chash,
+                    ),
+                )
             lid = c.lastrowid
             # Atomic canonical identity: the node + join share this cursor.
             # Owner is the candidate's existing owner (agent_id), matching the
@@ -426,6 +464,7 @@ def promote_candidate_durable(
                     content=content,
                     vault_path=vault_path,
                     created_at=now,
+                    workspace_id=cand_ws,
                 )
             resolved_by = (
                 f"afm-judge({getattr(judge_verdict, 'model', 'native')})"
@@ -475,7 +514,16 @@ def promote_candidate_durable(
         )
     else:
         try:
-            indexed = deliver(agent_id, content, key=f"learning:{lid}", db=wb.db)
+            try:
+                indexed = deliver(
+                    agent_id,
+                    content,
+                    key=f"learning:{lid}",
+                    db=wb.db,
+                    workspace_id=cand_ws,
+                )
+            except TypeError:
+                indexed = deliver(agent_id, content, key=f"learning:{lid}", db=wb.db)
             if indexed is not True and indexed is not None:
                 context.logger.warning(
                     "AFM consolidation promoted candidate #%d -> learning #%d "
@@ -491,7 +539,7 @@ def promote_candidate_durable(
 
     try:
         if wb_config is not None and wb_config.writeback_enabled:
-            wb._write_to_disk(lid, agent_id, "general", content, now)
+            wb._write_to_disk(lid, agent_id, cand_category, content, now, workspace_id=cand_ws)
     except Exception as exc:
         context.logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
 

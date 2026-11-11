@@ -47,6 +47,7 @@ def durable_metadata(content):
         # Never accept model-supplied ownership or a cross-agent-readable type.
         "page_type": "learning",
         "layer": meta["layer"],
+        "workspace_id": meta.get("workspace_id", ""),
     }
 
 

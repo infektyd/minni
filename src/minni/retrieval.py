@@ -27,7 +27,13 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
-from minni.config import DEFAULT_CONFIG, MinniConfig, correction_class_page_types
+from minni.config import (
+    DEFAULT_CONFIG,
+    MinniConfig,
+    correction_class_page_types,
+    is_concrete_project_workspace,
+    normalize_workspace_scope,
+)
 from minni.db import MinniDB
 from minni.episodic import NON_MEMORY_EVENT_TYPES as _NON_MEMORY_EVENT_TYPES
 from minni.faiss_index import FAISSIndex
@@ -802,9 +808,23 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         if not durable_rows:
             return after_stat
 
+        return self._hydrate_durable_learning_docs(
+            after_stat, durable_rows, vault_path=vault_path
+        )
+
+    def _hydrate_durable_learning_docs(
+        self,
+        after_stat: List[Dict],
+        durable_rows: List[Dict],
+        *,
+        vault_path: Any = None,
+    ) -> List[Dict]:
+        """Filter retired durable projections and hydrate learnings.workspace_id."""
         mapped_doc_ids: set[int] = set()
         active_doc_ids: set[int] = set()
+        mapped_doc_ws: Dict[int, str] = {}
         active_durable_paths: set[str] = set()
+        active_path_ws: Dict[str, str] = {}
         try:
             with self.db.cursor() as c:
                 tables = {
@@ -816,6 +836,12 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 if "learnings" not in tables:
                     return after_stat
 
+                l_cols = {
+                    r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                    for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+                }
+                has_l_ws = "workspace_id" in l_cols
+
                 doc_ids = [
                     int(r["doc_id"])
                     for r in durable_rows
@@ -823,12 +849,22 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 ]
                 if "learning_documents" in tables and doc_ids:
                     placeholders = ",".join("?" for _ in doc_ids)
+                    ws_expr = (
+                        "MAX(CASE WHEN l.learning_id IS NOT NULL "
+                        "AND l.superseded_by IS NULL "
+                        "AND (l.status IS NULL OR l.status NOT IN ('rejected', 'expired', 'superseded')) "
+                        "AND l.workspace_id IS NOT NULL AND l.workspace_id NOT IN ('', 'default') "
+                        "THEN l.workspace_id ELSE '' END) AS active_ws"
+                        if has_l_ws
+                        else "'' AS active_ws"
+                    )
                     for row in c.execute(
                         f"""SELECT jd.doc_id,
                                    MAX(CASE WHEN l.learning_id IS NOT NULL
                                              AND l.superseded_by IS NULL
                                              AND (l.status IS NULL OR l.status NOT IN ('rejected', 'expired', 'superseded'))
-                                            THEN 1 ELSE 0 END) AS has_active
+                                            THEN 1 ELSE 0 END) AS has_active,
+                                   {ws_expr}
                             FROM learning_documents jd
                             LEFT JOIN learnings l ON l.learning_id = jd.learning_id
                             WHERE jd.doc_id IN ({placeholders})
@@ -839,9 +875,14 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                         has_act = bool(
                             row["has_active"] if hasattr(row, "keys") else row[1]
                         )
+                        act_ws = str(
+                            (row["active_ws"] if hasattr(row, "keys") else row[2]) or ""
+                        ).strip()
                         mapped_doc_ids.add(did)
                         if has_act:
                             active_doc_ids.add(did)
+                            if act_ws:
+                                mapped_doc_ws[did] = act_ws
 
                 unmapped = [
                     r
@@ -856,8 +897,9 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     )
                     if agents:
                         ag_placeholders = ",".join("?" for _ in agents)
+                        ws_col_sql = "workspace_id" if has_l_ws else "'' AS workspace_id"
                         for lrow in c.execute(
-                            f"""SELECT agent_id, content
+                            f"""SELECT agent_id, content, {ws_col_sql}
                                 FROM learnings
                                 WHERE agent_id IN ({ag_placeholders})
                                   AND superseded_by IS NULL
@@ -870,10 +912,18 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                             cnt = str(
                                 lrow["content"] if hasattr(lrow, "keys") else lrow[1]
                             )
+                            lws = str(
+                                (lrow["workspace_id"] if hasattr(lrow, "keys") else lrow[2]) or ""
+                            ).strip()
                             dp = durable_doc_path(ag, "", str(vault_path), cnt)
                             active_durable_paths.add(dp)
+                            if lws and lws != "default":
+                                active_path_ws[dp] = lws
                             try:
-                                active_durable_paths.add(str(Path(dp).resolve()))
+                                resolved_dp = str(Path(dp).resolve())
+                                active_durable_paths.add(resolved_dp)
+                                if lws and lws != "default":
+                                    active_path_ws[resolved_dp] = lws
                             except Exception:
                                 pass
         except Exception:
@@ -888,6 +938,9 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             did = int(r["doc_id"]) if r.get("doc_id") is not None else None
             if did is not None and did in mapped_doc_ids:
                 if did in active_doc_ids:
+                    if not str(r.get("workspace_id") or "").strip() or r.get("workspace_id") == "default":
+                        if did in mapped_doc_ws:
+                            r["workspace_id"] = mapped_doc_ws[did]
                     out.append(r)
                 continue
             raw_path = str(r.get("path") or r.get("source") or "")
@@ -897,6 +950,10 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             except Exception:
                 pass
             if raw_path in active_durable_paths or resolved_raw in active_durable_paths:
+                if not str(r.get("workspace_id") or "").strip() or r.get("workspace_id") == "default":
+                    hydrated_ws = active_path_ws.get(raw_path) or active_path_ws.get(resolved_raw)
+                    if hydrated_ws:
+                        r["workspace_id"] = hydrated_ws
                 out.append(r)
         return out
 
@@ -938,6 +995,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         page_status: str = "accepted",
         page_type: Optional[str] = None,
         layer: str = "knowledge",
+        workspace_id: str = "",
         whole_document: int = 0,
         model_name: Optional[str] = None,
         repair_projection: bool = False,
@@ -1010,23 +1068,44 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 if embed_failed:
                     prepared_chunks = []
 
+            effective_ws = str(workspace_id or "").strip()
             with self.db.transaction() as c:
+                doc_cols = {
+                    r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                    for r in c.execute("PRAGMA table_info(documents)").fetchall()
+                }
+                has_doc_ws = "workspace_id" in doc_cols
                 if repair_projection:
                     from minni.durable_projection import ACTIVE_LEARNING_SQL
 
+                    l_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+                    }
+                    ws_sel = "workspace_id" if "workspace_id" in l_cols else "'' AS workspace_id"
                     active = c.execute(
-                        f"SELECT 1 FROM learnings WHERE agent_id=? AND content=? "
+                        f"SELECT 1, {ws_sel} FROM learnings WHERE agent_id=? AND content=? "
                         f"AND {ACTIVE_LEARNING_SQL} LIMIT 1",
                         (agent, content),
                     ).fetchone()
                     if not active:
                         return {"status": "skipped", "reason": "learning_changed"}
+                    if not effective_ws:
+                        effective_ws = str(
+                            (active["workspace_id"] if hasattr(active, "keys") else active[1]) or ""
+                        ).strip()
                 c.execute(
                     "SELECT doc_id, agent, sigil, page_status, privacy_level,"
-                    " layer FROM documents WHERE path = ?",
+                    f" layer{', workspace_id' if has_doc_ws else ''} FROM documents WHERE path = ?",
                     (path,),
                 )
                 row = c.fetchone()
+                if row and has_doc_ws and not effective_ws:
+                    existing_ws = str(
+                        (row["workspace_id"] if hasattr(row, "keys") else row[6]) or ""
+                    ).strip()
+                    if existing_ws:
+                        effective_ws = existing_ws
                 fill_placeholder = False
                 if row and repair_projection:
                     fts = c.execute(
@@ -1045,26 +1124,53 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                         agent, sigil = row["agent"], row["sigil"]
                         if row["layer"]:
                             layer = row["layer"]
+                        if has_doc_ws and effective_ws:
+                            c.execute(
+                                "UPDATE documents SET workspace_id = ? WHERE doc_id = ?",
+                                (effective_ws, doc_id),
+                            )
                     else:
-                        c.execute(
-                            """UPDATE documents
-                               SET agent=?, sigil=?, last_modified=?, indexed_at=?,
-                                   page_status=?, privacy_level=?, page_type=?,
-                                   layer=?, whole_document=?
-                               WHERE doc_id=?""",
-                            (
-                                agent,
-                                sigil,
-                                now,
-                                now,
-                                page_status,
-                                privacy_level,
-                                page_type,
-                                layer,
-                                whole_document,
-                                doc_id,
-                            ),
-                        )
+                        if has_doc_ws:
+                            c.execute(
+                                """UPDATE documents
+                                   SET agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?,
+                                       layer=?, whole_document=?, workspace_id=?
+                                   WHERE doc_id=?""",
+                                (
+                                    agent,
+                                    sigil,
+                                    now,
+                                    now,
+                                    page_status,
+                                    privacy_level,
+                                    page_type,
+                                    layer,
+                                    whole_document,
+                                    effective_ws,
+                                    doc_id,
+                                ),
+                            )
+                        else:
+                            c.execute(
+                                """UPDATE documents
+                                   SET agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?,
+                                       layer=?, whole_document=?
+                                   WHERE doc_id=?""",
+                                (
+                                    agent,
+                                    sigil,
+                                    now,
+                                    now,
+                                    page_status,
+                                    privacy_level,
+                                    page_type,
+                                    layer,
+                                    whole_document,
+                                    doc_id,
+                                ),
+                            )
                     old_chunk_ids = [
                         r["chunk_id"]
                         for r in c.execute(
@@ -1077,25 +1183,47 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                     c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                 else:
-                    c.execute(
-                        """INSERT INTO documents
-                           (path, agent, sigil, last_modified, indexed_at,
-                            page_status, privacy_level, page_type, layer,
-                            whole_document)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            path,
-                            agent,
-                            sigil,
-                            now,
-                            now,
-                            page_status,
-                            privacy_level,
-                            page_type,
-                            layer,
-                            whole_document,
-                        ),
-                    )
+                    if has_doc_ws:
+                        c.execute(
+                            """INSERT INTO documents
+                               (path, agent, sigil, last_modified, indexed_at,
+                                page_status, privacy_level, page_type, layer,
+                                whole_document, workspace_id)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                path,
+                                agent,
+                                sigil,
+                                now,
+                                now,
+                                page_status,
+                                privacy_level,
+                                page_type,
+                                layer,
+                                whole_document,
+                                effective_ws,
+                            ),
+                        )
+                    else:
+                        c.execute(
+                            """INSERT INTO documents
+                               (path, agent, sigil, last_modified, indexed_at,
+                                page_status, privacy_level, page_type, layer,
+                                whole_document)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                path,
+                                agent,
+                                sigil,
+                                now,
+                                now,
+                                page_status,
+                                privacy_level,
+                                page_type,
+                                layer,
+                                whole_document,
+                            ),
+                        )
                     doc_id = c.lastrowid
 
                 c.execute(
@@ -1145,6 +1273,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 evidence_refs=None,
                 indexed_at=now,
                 layer=layer,
+                workspace_id=effective_ws,
             )
             elig_cache = getattr(self, "_foreign_vault_elig_cache", None)
             if isinstance(elig_cache, dict):
@@ -1394,6 +1523,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 "attribution_score": result.get("attribution_score"),
                 "attribution_model": result.get("attribution_model"),
             }
+            if result.get("workspace_id"):
+                fields["workspace_id"] = result.get("workspace_id")
             if result.get("full_provenance") is not None:
                 fields["full_provenance"] = result.get("full_provenance")
             if result.get("evidence_envelope") is not None:
@@ -1423,6 +1554,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 "wikilink": result.get("wikilink"),
                 "depth": "headline",
             }
+            if result.get("workspace_id"):
+                out["workspace_id"] = result["workspace_id"]
             if result.get("provenance") is not None:
                 out["provenance"] = result["provenance"]
             return out
@@ -1430,32 +1563,36 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         if depth == "snippet":
             raw_body = result.get("raw_chunk_text")
             if isinstance(raw_body, str):
-                snippet_body = (
-                    raw_body[:_SNIPPET_MAX_CHARS] + "…"
-                    if len(raw_body) > _SNIPPET_MAX_CHARS
-                    else raw_body
-                )
-                text = build_evidence_envelope(
-                    source=result.get("source")
-                    or result.get("path")
-                    or result.get("filename")
-                    or "?",
-                    agent=result.get("agent", "?"),
-                    status=result.get("review_state")
-                    or result.get("page_status")
-                    or "?",
-                    privacy=result.get("privacy_level", "?"),
-                    score=float(result.get("score") or 0),
-                    instruction_like=bool(result.get("instruction_like")),
-                    visibility=result.get("visibility", "authorized"),
-                    text=snippet_body,
-                    attribution=result.get("attribution"),
-                    perturbation_enabled=getattr(
-                        getattr(self, "config", None),
-                        "instruction_body_perturbation_enabled",
-                        True,
-                    ),
-                )
+                clean_raw_body = _strip_leading_frontmatter(raw_body)
+                if not clean_raw_body.strip():
+                    text = ""
+                else:
+                    snippet_body = (
+                        clean_raw_body[:_SNIPPET_MAX_CHARS] + "…"
+                        if len(clean_raw_body) > _SNIPPET_MAX_CHARS
+                        else clean_raw_body
+                    )
+                    text = build_evidence_envelope(
+                        source=result.get("source")
+                        or result.get("path")
+                        or result.get("filename")
+                        or "?",
+                        agent=result.get("agent", "?"),
+                        status=result.get("review_state")
+                        or result.get("page_status")
+                        or "?",
+                        privacy=result.get("privacy_level", "?"),
+                        score=float(result.get("score") or 0),
+                        instruction_like=bool(result.get("instruction_like")),
+                        visibility=result.get("visibility", "authorized"),
+                        text=snippet_body,
+                        attribution=result.get("attribution"),
+                        perturbation_enabled=getattr(
+                            getattr(self, "config", None),
+                            "instruction_body_perturbation_enabled",
+                            True,
+                        ),
+                    )
             else:
                 text = result.get("chunk_text", "")
                 if (
@@ -1466,12 +1603,23 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     open_end = text.find(">")
                     open_tag = text[: open_end + 1]
                     close_tag = "</EVIDENCE>"
-                    inner = text[open_end + 1 : -len(close_tag)]
-                    if len(inner) > _SNIPPET_MAX_CHARS:
-                        inner = inner[:_SNIPPET_MAX_CHARS] + "…"
-                    text = f"{open_tag}{inner}{close_tag}"
-                elif len(text) > _SNIPPET_MAX_CHARS:
-                    text = text[:_SNIPPET_MAX_CHARS] + "…"
+                    inner = _strip_leading_frontmatter(
+                        text[open_end + 1 : -len(close_tag)]
+                    )
+                    if not inner.strip():
+                        text = ""
+                    else:
+                        if len(inner) > _SNIPPET_MAX_CHARS:
+                            inner = inner[:_SNIPPET_MAX_CHARS] + "…"
+                        text = f"{open_tag}{inner}{close_tag}"
+                else:
+                    clean_text = _strip_leading_frontmatter(str(text or ""))
+                    if not clean_text.strip():
+                        text = ""
+                    elif len(clean_text) > _SNIPPET_MAX_CHARS:
+                        text = clean_text[:_SNIPPET_MAX_CHARS] + "…"
+                    else:
+                        text = clean_text
             out = {
                 "text": text,
                 "source": result.get("source", ""),
@@ -1572,10 +1720,17 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             )
             rows = c.fetchall()
             if rows:
-                return "\n".join(row["chunk_text"] for row in rows)
+                joined = "\n".join(
+                    _strip_leading_frontmatter(str(row["chunk_text"] or ""))
+                    for row in rows
+                )
+                return joined if joined.strip() else None
             c.execute("SELECT content FROM vault_fts WHERE doc_id = ?", (doc_id,))
             fts_row = c.fetchone()
-        return fts_row["content"] if fts_row and fts_row["content"] else None
+        if not fts_row or not fts_row["content"]:
+            return None
+        cleaned = _strip_leading_frontmatter(str(fts_row["content"]))
+        return cleaned if cleaned.strip() else None
 
     def _resolve_query_variants(self, query: str, expand) -> List[str]:
         if expand is False or expand is None:
@@ -1790,6 +1945,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         document_agent_filter: Optional[Sequence[str]] = None,
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
+        query_workspace: str = "",
         deadline_monotonic: Optional[float] = None,
         mode: Optional[str] = None,
         _state: Optional[RetrievalCallState] = None,
@@ -1824,6 +1980,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 document_agent_filter=document_agent_filter,
                 principal=principal,
                 workspace=workspace,
+                query_workspace=query_workspace,
                 deadline_monotonic=deadline_monotonic,
                 mode=mode,
             )
@@ -1871,10 +2028,12 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         document_agent_filter: Optional[Sequence[str]] = None,
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
+        query_workspace: str = "",
         deadline_monotonic: Optional[float] = None,
         mode: Optional[str] = None,
     ) -> List[Dict]:
         """Hybrid retrieval pipeline: FTS5 + FAISS/Trie + RRF + Cross-Encoder + Depth projection."""
+        norm_query_ws = normalize_workspace_scope(query_workspace, default="")
         claim_text = str(claim or "").strip()
         effective_fast = mode == "fast" or (
             mode is None
@@ -1945,6 +2104,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 document_agent_filter=document_agent_filter,
                 principal=principal,
                 workspace=workspace,
+                query_workspace=norm_query_ws,
                 deadline_monotonic=deadline_monotonic,
                 mode=mode,
             )
@@ -2004,6 +2164,16 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 for r in rows
                 if (r.get("page_status") or "candidate") not in skip_statuses
                 and (r.get("privacy_level") or "safe") != "blocked"
+                and bool(
+                    _strip_leading_frontmatter(
+                        str(
+                            r.get("chunk_text")
+                            or r.get("full_document_text")
+                            or r.get("content")
+                            or ""
+                        )
+                    ).strip()
+                )
                 and classify_durability({"content": r.get("chunk_text") or ""}).get("rule_id")
                 not in (
                     "noise.envelope_system_reminder",
@@ -2222,11 +2392,36 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             extra_backend_results = [_eligible(rows) for rows in extra_backend_results]
 
             if extra_backend_results:
-                merged = self._rrf_merge_multi(
-                    fts_results, semantic_results, extra_backend_results, rerank_k
-                )
+                if norm_query_ws:
+                    try:
+                        merged = self._rrf_merge_multi(
+                            fts_results,
+                            semantic_results,
+                            extra_backend_results,
+                            rerank_k,
+                            query_workspace=norm_query_ws,
+                        )
+                    except TypeError:
+                        merged = self._rrf_merge_multi(
+                            fts_results, semantic_results, extra_backend_results, rerank_k
+                        )
+                else:
+                    merged = self._rrf_merge_multi(
+                        fts_results, semantic_results, extra_backend_results, rerank_k
+                    )
             else:
-                merged = self._rrf_merge(fts_results, semantic_results, rerank_k)
+                if norm_query_ws:
+                    try:
+                        merged = self._rrf_merge(
+                            fts_results,
+                            semantic_results,
+                            rerank_k,
+                            query_workspace=norm_query_ws,
+                        )
+                    except TypeError:
+                        merged = self._rrf_merge(fts_results, semantic_results, rerank_k)
+                else:
+                    merged = self._rrf_merge(fts_results, semantic_results, rerank_k)
             trace["rrf"] = {
                 "k": self.config.rrf_k,
                 "fts_weight": self.config.fts_weight,
@@ -2246,26 +2441,55 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             merged = _eligible(merged)
 
             if effective_fast:
-                merged = merged[:limit]
+                merged = self._filter_unreranked_cross_repo(
+                    query, merged, norm_query_ws
+                )[:limit]
             elif merged and self.config.reranker_enabled:
                 if past_search_deadline(deadline_monotonic):
                     self.last_rerank_degraded = "search deadline; skipped rerank"
-                    merged = merged[:limit]
+                    merged = self._filter_unreranked_cross_repo(
+                        query, merged, norm_query_ws
+                    )[:limit]
                 elif self.reranker:
                     ce_t0 = time.perf_counter()
-                    merged = self._rerank(query, merged)
+                    if norm_query_ws:
+                        try:
+                            merged = self._rerank(
+                                query, merged, query_workspace=norm_query_ws
+                            )
+                        except TypeError:
+                            merged = self._rerank(query, merged)
+                    else:
+                        merged = self._rerank(query, merged)
                     timing["ce_ms"] = round((time.perf_counter() - ce_t0) * 1000, 3)
                     trace["cross_encoder_scores"] = [
                         {"doc_id": r.get("doc_id"), "score": r.get("rerank_score")}
                         for r in merged
                     ]
-                    merged = self._apply_post_rerank_confidence_floor(
-                        merged, fts_results, limit
-                    )
+                    if norm_query_ws:
+                        try:
+                            merged = self._apply_post_rerank_confidence_floor(
+                                merged,
+                                fts_results,
+                                limit,
+                                query_workspace=norm_query_ws,
+                            )
+                        except TypeError:
+                            merged = self._apply_post_rerank_confidence_floor(
+                                merged, fts_results, limit
+                            )
+                    else:
+                        merged = self._apply_post_rerank_confidence_floor(
+                            merged, fts_results, limit
+                        )
                 else:
-                    merged = merged[:limit]
+                    merged = self._filter_unreranked_cross_repo(
+                        query, merged, norm_query_ws
+                    )[:limit]
             else:
-                merged = merged[:limit]
+                merged = self._filter_unreranked_cross_repo(
+                    query, merged, norm_query_ws
+                )[:limit]
 
             hyde_enabled = (
                 False
@@ -2287,6 +2511,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     trace=trace,
                     eligible_fn=_eligible,
                     collect_eligible_fn=_collect_eligible,
+                    query_workspace=norm_query_ws,
                 )
 
         merged = self._apply_feedback_demotions(merged, query, agent_id)
@@ -2317,14 +2542,24 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                     principal, ws, list(denied_by_scope.values())
                 )
 
+        non_empty_merged = []
         for r in merged:
-            txt = str(
-                r.get("chunk_text")
-                or r.get("full_document_text")
-                or r.get("content")
-                or ""
+            txt = _strip_leading_frontmatter(
+                str(
+                    r.get("chunk_text")
+                    or r.get("full_document_text")
+                    or r.get("content")
+                    or ""
+                )
             )
+            if not txt.strip():
+                continue
             r["raw_chunk_text"] = txt
+            non_empty_merged.append(r)
+        merged = non_empty_merged
+
+        for r in merged:
+            txt = r["raw_chunk_text"]
             r["instruction_like"] = bool(is_instruction_like(txt))
             attribution = (
                 self._score_attribution(claim_text, txt)
@@ -2452,6 +2687,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         document_agent_filter: Optional[Sequence[str]],
         principal: Optional[EffectivePrincipal],
         workspace: str,
+        query_workspace: str = "",
         deadline_monotonic: Optional[float],
         mode: Optional[str],
     ) -> List[Dict]:
@@ -2491,6 +2727,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 document_agent_filter=document_agent_filter,
                 principal=principal,
                 workspace=workspace,
+                query_workspace=query_workspace,
                 deadline_monotonic=deadline_monotonic,
                 mode=mode,
                 _state=variant_states[index],
@@ -2682,6 +2919,46 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             self.last_trace_id = None
         return results
 
+    def _filter_unreranked_cross_repo(
+        self, query: str, rows: List[Dict], query_workspace: str = ""
+    ) -> List[Dict]:
+        """Enforce high lexical/confidence bar on Tier 3 cross-repo hits when unreranked."""
+        norm_qws = normalize_workspace_scope(query_workspace, default="")
+        if not is_concrete_project_workspace(norm_qws) or not rows:
+            return rows
+        from minni.scoring import raw_confidence
+
+        q_tokens = set(_tokenize_trie_text(query))
+        kept: List[Dict] = []
+        for r in rows:
+            doc_ws = normalize_workspace_scope(r.get("workspace_id"), default="")
+            if is_concrete_project_workspace(doc_ws) and doc_ws != norm_qws:
+                doc_tokens = set(
+                    _tokenize_trie_text(
+                        f"{r.get('heading_context') or ''} {r.get('chunk_text') or ''}"
+                    )
+                )
+                matched = sum(1 for qt in q_tokens if qt in doc_tokens)
+                conf_raw = raw_confidence(
+                    r.get("rrf_score"),
+                    None,
+                    r.get("decay_applied", r.get("decay_score")),
+                )
+                bm25 = r.get("bm25_rank")
+                strong_bm25 = bm25 is not None and float(bm25) <= -3.5
+                if len(q_tokens) >= 2:
+                    if matched < 2 or (matched / len(q_tokens)) < 0.5:
+                        continue
+                    if conf_raw < 0.60 and not strong_bm25:
+                        continue
+                elif len(q_tokens) == 1:
+                    if matched < 1 or (conf_raw < 0.75 and not strong_bm25):
+                        continue
+                else:
+                    continue
+            kept.append(r)
+        return kept
+
     def _run_hyde_enrichment(
         self,
         *,
@@ -2695,6 +2972,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         trace: Dict,
         eligible_fn,
         collect_eligible_fn,
+        query_workspace: str = "",
     ) -> List[Dict]:
         """Execute HyDE hypothetical document generation and second-pass merge."""
         try:
@@ -2808,9 +3086,22 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                                 hyde_apply = False
                             if hyde_apply:
                                 hyde_semantic = eligible_fn(hyde_semantic)
-                                hyde_merged = self._rrf_merge(
-                                    hyde_fts, hyde_semantic, rerank_k
-                                )
+                                if query_workspace:
+                                    try:
+                                        hyde_merged = self._rrf_merge(
+                                            hyde_fts,
+                                            hyde_semantic,
+                                            rerank_k,
+                                            query_workspace=query_workspace,
+                                        )
+                                    except TypeError:
+                                        hyde_merged = self._rrf_merge(
+                                            hyde_fts, hyde_semantic, rerank_k
+                                        )
+                                else:
+                                    hyde_merged = self._rrf_merge(
+                                        hyde_fts, hyde_semantic, rerank_k
+                                    )
                                 hyde_merged = eligible_fn(hyde_merged)
                                 if self.config.reranker_enabled:
                                     if past_search_deadline(deadline_monotonic):
@@ -2821,9 +3112,21 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                                         trace["hyde"]["skipped"] = "deadline"
                                         hyde_apply = False
                                     elif self.reranker:
-                                        hyde_merged = self._rerank(
-                                            query, hyde_merged
-                                        )
+                                        if query_workspace:
+                                            try:
+                                                hyde_merged = self._rerank(
+                                                    query,
+                                                    hyde_merged,
+                                                    query_workspace=query_workspace,
+                                                )
+                                            except TypeError:
+                                                hyde_merged = self._rerank(
+                                                    query, hyde_merged
+                                                )
+                                        else:
+                                            hyde_merged = self._rerank(
+                                                query, hyde_merged
+                                            )
                                         rerank_flag = self.last_rerank_degraded
                                         if (
                                             rerank_flag
@@ -2837,16 +3140,34 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                                             trace["hyde"]["skipped"] = "deadline"
                                             hyde_apply = False
                                         else:
-                                            hyde_merged = hyde_merged[
-                                                : max(
-                                                    self.config.reranker_final_k,
+                                            if query_workspace:
+                                                try:
+                                                    hyde_merged = self._apply_post_rerank_confidence_floor(
+                                                        hyde_merged,
+                                                        hyde_fts,
+                                                        limit,
+                                                        query_workspace=query_workspace,
+                                                    )
+                                                except TypeError:
+                                                    hyde_merged = self._apply_post_rerank_confidence_floor(
+                                                        hyde_merged,
+                                                        hyde_fts,
+                                                        limit,
+                                                    )
+                                            else:
+                                                hyde_merged = self._apply_post_rerank_confidence_floor(
+                                                    hyde_merged,
+                                                    hyde_fts,
                                                     limit,
                                                 )
-                                            ]
                                     else:
-                                        hyde_merged = hyde_merged[:limit]
+                                        hyde_merged = self._filter_unreranked_cross_repo(
+                                            query, hyde_merged, query_workspace
+                                        )[:limit]
                                 else:
-                                    hyde_merged = hyde_merged[:limit]
+                                    hyde_merged = self._filter_unreranked_cross_repo(
+                                        query, hyde_merged, query_workspace
+                                    )[:limit]
                             if hyde_apply and (
                                 past_search_deadline(deadline_monotonic)
                                 or self._deadline_skipped_vector()
@@ -2909,7 +3230,12 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             ag = r.get("agent", "?")
             st = r.get("page_status", "?")
             pr = r.get("privacy_level", "?")
-            raw_txt = str(r.get("raw_chunk_text") or r.get("chunk_text") or "")
+            raw_txt = _strip_leading_frontmatter(
+                str(r.get("raw_chunk_text") or r.get("chunk_text") or "")
+            )
+            if not raw_txt.strip():
+                continue
+            r["raw_chunk_text"] = raw_txt
             r["evidence_envelope"] = build_evidence_envelope(
                 source=src,
                 agent=ag,
@@ -3041,6 +3367,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
                 "attribution_score": r.get("attribution_score"),
                 "attribution_model": r.get("attribution_model"),
             }
+            if r.get("workspace_id"):
+                raw["workspace_id"] = r.get("workspace_id")
             if r.get("full_provenance") is not None:
                 raw["full_provenance"] = r.get("full_provenance")
 
@@ -3199,6 +3527,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
         if row is None:
             return None
 
+        cleaned_chunk = _strip_leading_frontmatter(str(row["chunk_text"] or ""))
         raw = {
             "doc_id": row["doc_id"],
             "chunk_id": row["chunk_id"],
@@ -3213,7 +3542,8 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             "rrf_score": None,
             "rerank_score": None,
             "decay_score": row["decay_score"],
-            "chunk_text": row["chunk_text"],
+            "chunk_text": cleaned_chunk,
+            "raw_chunk_text": cleaned_chunk,
             "heading_context": row["heading_context"] or "",
             "token_count": 0,
             "confidence": None,
@@ -3229,6 +3559,12 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             except RequestDeadlineExceeded:
                 self._stamp_document_hydration_degraded(raw)
 
+        effective_body = _strip_leading_frontmatter(
+            str(raw.get("full_document_text") or raw.get("chunk_text") or "")
+        )
+        if not effective_body.strip():
+            return None
+
         if update_access:
             with self.db.cursor() as c:
                 c.execute(
@@ -3242,7 +3578,7 @@ class RetrievalEngine(TrieIndexMixin, FtsSearchMixin, SemanticRerankMixin):
             ws = workspace or getattr(principal, "workspace_id", "default")
             if not can_read_document(principal, ws, raw):
                 return None
-            txt = str(raw.get("full_document_text") or raw.get("chunk_text") or "")
+            txt = effective_body
             raw["instruction_like"] = bool(is_instruction_like(txt))
             attribution = self._score_attribution(claim, txt)
             if attribution is not None:

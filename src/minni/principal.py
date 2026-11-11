@@ -852,19 +852,25 @@ def can_read_document(
         _page_type_early == "session" and _agent_early.lower() == "unknown"
     )
 
-    # Workspace scoping (doc or call can use '*' for shared cross-ws).
+    # Workspace scoping (doc or call can use '*' or 'global' for shared cross-ws;
+    # an unpinned call workspace of 'default'/'' leaves repo relevance to ranking
+    # while owner/privacy/session/vault-root ACLs below remain enforced).
     # An EMPTY/missing doc workspace is a legacy unstamped row — treat it as
     # owner-wildcard: the writing agent can still recall it from any named
-    # workspace, but it is NOT '*' for foreign readers.
+    # workspace, but it is NOT '*' for foreign readers when call_ws is pinned.
     doc_ws_raw = (
         doc_metadata.get("workspace_id")
         or doc_metadata.get("workspace")
         or doc_metadata.get("ws")
     )
-    doc_ws = str(doc_ws_raw or "default")
-    call_ws = str(workspace or "default")
-    if doc_ws != "*" and call_ws != "*" and doc_ws != call_ws:
-        if not (same_agent and not doc_ws_raw):
+    doc_ws = str(doc_ws_raw or "default").strip() or "default"
+    call_ws = str(workspace or "default").strip() or "default"
+    if (
+        doc_ws not in ("*", "global")
+        and call_ws not in ("*", "default")
+        and doc_ws != call_ws
+    ):
+        if not (same_agent and (not doc_ws_raw or doc_ws == "default")):
             return False
 
     # Foreign sessions are denied independently of their filesystem location.

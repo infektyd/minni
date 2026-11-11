@@ -452,3 +452,365 @@ def test_rpc_connection_refused_kickstart_hint(monkeypatch, tmp_path):
     with pytest.raises(minni_cli.RpcError, match="launchctl kickstart"):
         minni_cli._rpc(tmp_path / "daemon.sock", "ping")
 
+
+def test_minni_cli_preserves_stdlib_only_import_invariant():
+    """Importing minni.minni_cli in a fresh interpreter must NOT pull in heavy ML modules."""
+    import os
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_root / "src")
+    probe = (
+        "import sys, minni.minni_cli; "
+        "banned = ('torch', 'faiss', 'sentence_transformers', 'numpy', 'minni.retrieval'); "
+        "loaded = [m for m in sys.modules if m == 'numpy' or any(m.startswith(b) for b in banned)]; "
+        "assert not loaded, f'Forbidden imports loaded by minni_cli: {loaded}'"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_cli_workspace_autodetect_precedence_and_agent_omission(monkeypatch, tmp_path, capsys):
+    repo_dir = tmp_path / "My-Cool-Repo"
+    nested_dir = repo_dir / "src" / "pkg"
+    nested_dir.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+
+    no_git_dir = tmp_path / "plain_folder"
+    no_git_dir.mkdir()
+
+    monkeypatch.delenv("MINNI_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("MINNI_AGENT_ID", raising=False)
+
+    assert minni_cli._detect_cli_workspace("Explicit-Repo", cwd=nested_dir) == "workspace-explicit-repo"
+    assert minni_cli._detect_cli_workspace(None, cwd=nested_dir) == "workspace-my-cool-repo"
+    assert minni_cli._detect_cli_workspace(None, cwd=no_git_dir) == "default"
+
+    monkeypatch.setenv("MINNI_WORKSPACE_ID", "env-override")
+    assert minni_cli._detect_cli_workspace(None, cwd=nested_dir) == "workspace-env-override"
+    assert minni_cli._detect_cli_workspace("flag-wins", cwd=nested_dir) == "workspace-flag-wins"
+
+    # Verify recall/learn omit agent_id unless --agent or MINNI_AGENT_ID is explicitly provided
+    monkeypatch.delenv("MINNI_WORKSPACE_ID", raising=False)
+    monkeypatch.chdir(nested_dir)
+    captured_calls: list[tuple[str, dict]] = []
+
+    def fake_rpc(_sock, method, params=None, timeout=30.0):
+        captured_calls.append((method, dict(params or {})))
+        if method == "search":
+            return {"results": [], "learnings": [], "count": 0}
+        if method == "learn":
+            return {"status": "proposed", "candidate_id": 42}
+        if method == "resolve_candidate":
+            return {"status": "accepted", "learning_id": 7}
+        return {}
+
+    monkeypatch.setattr(minni_cli, "_rpc", fake_rpc)
+
+    rc = minni_cli.main(["--socket", str(tmp_path / "s.sock"), "recall", "schema", "check"])
+    assert rc == 0
+    assert "No strong match found." in capsys.readouterr().out
+    assert captured_calls[0][0] == "search"
+    assert captured_calls[0][1]["workspace_id"] == "workspace-my-cool-repo"
+    assert "agent_id" not in captured_calls[0][1]
+
+    rc = minni_cli.main(
+        [
+            "--socket",
+            str(tmp_path / "s.sock"),
+            "learn",
+            "Always backfill workspace_id cleanly",
+            "--title",
+            "Wave 2 Rule",
+            "--category",
+            "architecture",
+            "--accept",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Recorded durable learning #7" in out
+    assert captured_calls[1][0] == "learn"
+    assert captured_calls[1][1]["content"] == "Wave 2 Rule: Always backfill workspace_id cleanly"
+    assert captured_calls[1][1]["workspace_id"] == "workspace-my-cool-repo"
+    assert "agent_id" not in captured_calls[1][1]
+    assert captured_calls[2][0] == "resolve_candidate"
+    assert captured_calls[2][1] == {
+        "candidate_id": 42,
+        "decision": "accept",
+        "reason": "cli --accept",
+    }
+
+    # Explicit --agent DOES populate agent_id
+    rc = minni_cli.main(
+        ["--socket", str(tmp_path / "s.sock"), "recall", "probe", "--agent", "gemini"]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    assert captured_calls[3][1]["agent_id"] == "gemini"
+
+
+def test_live_minnid_subprocess_cli_learn_accept_recall_and_activity():
+    """Real end-to-end subprocess test exercising `minni learn --accept`, `minni recall`,
+    and `minni activity` against a live `minnid` Unix socket + post-stop SQLite fallback.
+    """
+    import os
+    import subprocess
+    import time
+
+    repo_root = Path(__file__).resolve().parents[1]
+    td = Path(tempfile.mkdtemp(prefix="minni-w2-", dir="/tmp"))
+    td.chmod(0o700)
+    sock_path = td / "run" / "minnid.sock"
+    (td / "run").mkdir(parents=True, exist_ok=True)
+    (td / "home").mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_root / "src")
+    env["HOME"] = str(td / "home")
+    env["MINNI_HOME"] = str(td)
+    env["MINNI_SOCKET_PATH"] = str(sock_path)
+    env["MINNI_WARMUP"] = "off"
+    env["MINNI_BACKFILL"] = "off"
+    env["MINNI_DECAY"] = "off"
+    env["MINNI_VAULT_WATCH"] = "off"
+    env["MINNI_AFM_LOOP"] = "off"
+    env["MINNI_AFM_PROVIDER_MODE"] = "disabled"
+    env.pop("MINNI_AGENT_ID", None)
+    env.pop("MINNI_WORKSPACE_ID", None)
+
+    daemon_log = td / "daemon.log"
+    daemon_proc: subprocess.Popen | None = None
+    log_fh = daemon_log.open("w", encoding="utf-8")
+    try:
+        daemon_proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "minni.minnid", "--socket", str(sock_path)],
+            env=env,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            cwd=str(repo_root),
+        )
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if daemon_proc.poll() is not None:
+                log_fh.flush()
+                pytest.fail(
+                    f"minnid exited early ({daemon_proc.returncode}):\n"
+                    f"{daemon_log.read_text(encoding='utf-8', errors='replace')}"
+                )
+            if minni_cli._daemon_alive(sock_path):
+                break
+            time.sleep(0.05)
+        else:
+            log_fh.flush()
+            pytest.fail(
+                f"minnid failed to bind socket within 20s:\n"
+                f"{daemon_log.read_text(encoding='utf-8', errors='replace')}"
+            )
+
+        def run_cli(*cli_args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, "-m", "minni.minni_cli", "--socket", str(sock_path), *cli_args],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+
+        # 1. `minni learn ... --accept` promotes durably in one command
+        learn_acc = run_cli(
+            "learn",
+            "Always run migration 025 idempotently across existing SQLite columns",
+            "--title",
+            "Migration 025 Invariant",
+            "--category",
+            "architecture",
+            "--workspace",
+            "workspace-alpha",
+            "--accept",
+        )
+        assert learn_acc.returncode == 0, learn_acc.stderr
+        assert "Recorded durable learning #" in learn_acc.stdout
+        assert "(workspace-alpha)" in learn_acc.stdout
+
+        # Stage a proposed candidate in workspace-beta (unaccepted) + an accepted scar in workspace-alpha
+        learn_prop = run_cli(
+            "learn",
+            "Pending beta proposal awaiting review",
+            "--category",
+            "decision",
+            "--workspace",
+            "workspace-beta",
+        )
+        assert learn_prop.returncode == 0, learn_prop.stderr
+        assert "Staged candidate #" in learn_prop.stdout
+
+        learn_scar = run_cli(
+            "learn",
+            "Never emit blank EVIDENCE envelopes on frontmatter-only notes",
+            "--category",
+            "scar",
+            "--workspace",
+            "workspace-alpha",
+            "--accept",
+        )
+        assert learn_scar.returncode == 0, learn_scar.stderr
+
+        # 2. `minni recall` finds the accepted workspace-alpha learning and prints empty state on miss
+        rec_hit = run_cli(
+            "recall",
+            "Migration 025 Invariant SQLite columns",
+            "--workspace",
+            "workspace-alpha",
+            "--mode",
+            "fast",
+        )
+        assert rec_hit.returncode == 0, rec_hit.stderr
+        assert "workspace-alpha" in rec_hit.stdout
+        assert "Migration 025 Invariant" in rec_hit.stdout
+
+        rec_json = run_cli(
+            "recall",
+            "Migration 025 Invariant SQLite columns",
+            "--workspace",
+            "workspace-alpha",
+            "--mode",
+            "fast",
+            "--json",
+        )
+        assert rec_json.returncode == 0, rec_json.stderr
+        rec_payload = json.loads(rec_json.stdout)
+        assert rec_payload["workspace_id"] == "workspace-alpha"
+
+        rec_miss = run_cli(
+            "recall",
+            "zyxwvutsrq_nonexistent_token_991122",
+            "--workspace",
+            "workspace-alpha",
+            "--mode",
+            "fast",
+        )
+        assert rec_miss.returncode == 0, rec_miss.stderr
+        assert rec_miss.stdout.strip() == "No strong match found."
+
+        # 3. Seed active Thread pointers (_active_plan.json + .runtime/active-thread.d/*.json)
+        gemini_vault = td / "gemini-vault"
+        plan_note = gemini_vault / "wiki" / "artifacts" / "plan-w2.md"
+        plan_note.parent.mkdir(parents=True, exist_ok=True)
+        plan_note.write_text(
+            "---\ntitle: Wave 2 Storage Thread\nstatus: in_progress\nworkspace_id: workspace-alpha\n---\n\n# Wave 2 Storage Thread\n",
+            encoding="utf-8",
+        )
+        (gemini_vault / "wiki" / "artifacts" / "_active_plan.json").write_text(
+            json.dumps(
+                {
+                    "plan_id": "thread-wave2-main",
+                    "notePath": "wiki/artifacts/plan-w2.md",
+                    "host_pid": os.getpid(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        sess_dir = td / "codex-vault" / ".runtime" / "active-thread.d"
+        sess_dir.mkdir(parents=True, exist_ok=True)
+        (sess_dir / "0123456789abcdef.json").write_text(
+            json.dumps(
+                {
+                    "plan_id": "thread-session-beta",
+                    "title": "Beta Session Slice",
+                    "status": "active",
+                    "workspace_id": "workspace-beta",
+                    "host_pid": os.getpid(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # 4. `minni activity` against LIVE daemon
+        act_live = run_cli("activity", "--hours", "24", "--json")
+        assert act_live.returncode == 0, act_live.stderr
+        act_data = json.loads(act_live.stdout)
+        assert act_data["daemon"]["reachable"] is True
+        assert act_data["pending_candidates"] == 1
+        plan_ids = {t["plan_id"] for t in act_data["active_threads"]}
+        assert {"thread-wave2-main", "thread-session-beta"} <= plan_ids
+        assert "workspace-alpha" in act_data["by_workspace"]
+        assert len(act_data["by_workspace"]["workspace-alpha"]["learnings"]) >= 2
+        assert len(act_data["by_workspace"]["workspace-alpha"]["scars"]) >= 1
+
+        # 5. Stop daemon and prove graceful read-only SQLite fallback on `minni activity`
+        daemon_proc.terminate()
+        daemon_proc.wait(timeout=10)
+        daemon_proc = None
+
+        act_offline = run_cli("activity", "--hours", "24")
+        assert act_offline.returncode == 0, act_offline.stderr
+        assert "Daemon: stopped (degraded to read-only SQLite)" in act_offline.stdout
+        assert "thread-wave2-main" in act_offline.stdout
+        assert "[workspace-alpha]" in act_offline.stdout
+    finally:
+        if daemon_proc is not None and daemon_proc.poll() is None:
+            daemon_proc.terminate()
+            try:
+                daemon_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon_proc.kill()
+                daemon_proc.wait(timeout=5)
+        log_fh.close()
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def test_activity_reads_episodic_events_created_at_and_normalizes_workspace_default(
+    tmp_path: Path,
+) -> None:
+    """Cassandra regression (BUG-20/21): episodic_events uses created_at, and workspace-default/global canonicalize."""
+    import time
+
+    from minni.config import MinniConfig
+    from minni.db import MinniDB
+
+    assert minni_cli._normalize_cli_workspace("workspace-default") == "default"
+    assert minni_cli._normalize_cli_workspace("workspace-global") == "global"
+
+    cfg = MinniConfig(
+        db_path=tmp_path / "minni.db",
+        vault_path=tmp_path / "vault",
+        faiss_index_path=tmp_path / "faiss.index",
+        writeback_path=tmp_path / "learnings",
+    )
+    db = MinniDB(cfg)
+    now = time.time()
+    with db.transaction() as c:
+        c.execute(
+            """INSERT INTO episodic_events (agent_id, event_type, content, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                "claude-code",
+                "thread_scar",
+                "Never query episodic_events.timestamp when schema uses created_at",
+                json.dumps({"workspace_id": "workspace-alpha"}),
+                now,
+            ),
+        )
+    db.close()
+
+    snap = minni_cli._read_sqlite_activity(tmp_path / "minni.db", cutoff_epoch=now - 3600.0)
+    assert snap.get("db_error") is None
+    assert any(
+        s["category"] == "thread_scar"
+        and s["workspace_id"] == "workspace-alpha"
+        and "created_at" in s["summary"]
+        for s in snap["recent_scars"]
+    )
+
+
+

@@ -98,6 +98,7 @@ class WriteBackMemory:
         evidence_doc_ids: Optional[List[int]] = None,
         confidence: float = 1.0,
         supersedes: Optional[int] = None,
+        workspace_id: str = "default",
     ) -> int:
         """
         Store a new learning.
@@ -111,13 +112,17 @@ class WriteBackMemory:
             evidence_doc_ids: PR-6 structured evidence document IDs
             confidence: How confident (0-1) the agent is
             supersedes: learning_id this replaces (versioning)
+            workspace_id: Project workspace scope (default 'default')
 
         Returns:
             learning_id
         """
+        from minni.config import normalize_workspace_scope
+
         category = str(category or "general").strip().lower()
         if category not in CATEGORIES:
             category = "general"
+        ws = normalize_workspace_scope(workspace_id, default="default")
 
         now = time.time()
         doc_ids_json = json.dumps(source_doc_ids) if source_doc_ids else None
@@ -137,15 +142,30 @@ class WriteBackMemory:
         # failure rolls everything back (no partial durable state). Model
         # encoding stays outside the transaction, per the write-path contract.
         with self.db.cursor() as c:
-            c.execute("""
-                INSERT INTO learnings
-                (agent_id, category, content, source_doc_ids, source_query,
-                 confidence, embedding, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                agent_id, category, content, doc_ids_json, source_query,
-                confidence, emb_bytes, now,
-            ))
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            if "workspace_id" in l_cols:
+                c.execute("""
+                    INSERT INTO learnings
+                    (agent_id, category, content, source_doc_ids, source_query,
+                     confidence, embedding, created_at, workspace_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    agent_id, category, content, doc_ids_json, source_query,
+                    confidence, emb_bytes, now, ws,
+                ))
+            else:
+                c.execute("""
+                    INSERT INTO learnings
+                    (agent_id, category, content, source_doc_ids, source_query,
+                     confidence, embedding, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    agent_id, category, content, doc_ids_json, source_query,
+                    confidence, emb_bytes, now,
+                ))
             learning_id = c.lastrowid
 
             # Mark superseded learning
@@ -162,6 +182,7 @@ class WriteBackMemory:
                 content=content,
                 vault_path=self.config.vault_path,
                 created_at=now,
+                workspace_id=ws,
             )
 
             self.add_derived_from_edges(
@@ -182,7 +203,7 @@ class WriteBackMemory:
 
         # Write to disk as markdown (for Obsidian integration)
         if self.config.writeback_enabled:
-            self._write_to_disk(learning_id, agent_id, category, content, now)
+            self._write_to_disk(learning_id, agent_id, category, content, now, workspace_id=ws)
 
         return learning_id
 
@@ -358,10 +379,15 @@ class WriteBackMemory:
         fts_query = " ".join(words)
 
         with self.db.cursor() as c:
-            sql = """
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            ws_select = "l.workspace_id" if "workspace_id" in l_cols else "'default' AS workspace_id"
+            sql = f"""
                 SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
                        l.confidence, l.created_at, l.access_count,
-                       l.source_query, l.source_doc_ids
+                       l.source_query, l.source_doc_ids, {ws_select}
                 FROM learnings_fts lf
                 JOIN learnings l ON l.learning_id = lf.learning_id
                 WHERE learnings_fts MATCH ?
@@ -392,6 +418,7 @@ class WriteBackMemory:
                         "created_at": datetime.fromtimestamp(row["created_at"]).isoformat(),
                         "access_count": row["access_count"],
                         "source_query": row["source_query"],
+                        "workspace_id": str(row["workspace_id"] or "default"),
                     })
             except Exception as e:
                 logger.warning("Learning FTS search failed: %s", e)
@@ -443,9 +470,14 @@ class WriteBackMemory:
 
         results = []
         with self.db.cursor() as c:
-            sql = """
+            l_cols = {
+                r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                for r in c.execute("PRAGMA table_info(learnings)").fetchall()
+            }
+            ws_select = "workspace_id" if "workspace_id" in l_cols else "'default' AS workspace_id"
+            sql = f"""
                 SELECT learning_id, agent_id, category, content, confidence,
-                       created_at, access_count, source_query, embedding
+                       created_at, access_count, source_query, embedding, {ws_select}
                 FROM learnings
                 WHERE superseded_by IS NULL AND embedding IS NOT NULL
                       AND (status IS NULL OR status NOT IN ('rejected','expired','superseded'))
@@ -479,6 +511,7 @@ class WriteBackMemory:
                     "created_at": datetime.fromtimestamp(row["created_at"]).isoformat(),
                     "access_count": row["access_count"],
                     "source_query": row["source_query"],
+                    "workspace_id": str(row["workspace_id"] or "default"),
                     "similarity": round(sim, 4),
                 })
 
@@ -491,6 +524,7 @@ class WriteBackMemory:
         category: str,
         content: str,
         timestamp: float,
+        workspace_id: str = "",
     ) -> None:
         """Write learning as a markdown file to the writeback directory."""
         try:
@@ -507,11 +541,13 @@ class WriteBackMemory:
                 )
                 return
 
+            ws_clean = str(workspace_id or "").replace("\r", "").replace("\n", "").strip()
+            ws_line = f"workspace_id: {ws_clean}\n" if ws_clean else ""
             md_content = f"""---
 learning_id: {learning_id}
 agent: {agent_id}
 category: {category}
-created: {dt.isoformat()}
+{ws_line}created: {dt.isoformat()}
 ---
 
 # {category.title()}: {content[:80]}

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from minni.afm_review_markers import supersede_afm_review
+from minni.config import normalize_workspace_scope
 from minni.db import MinniDB
 from minni.durability import durability_of
 from minni.durable_projection import (
@@ -46,6 +47,38 @@ from .redaction import redact_value
 # so a per-connection cache never hits and only retains closed connections.
 def _check_allows_dns_log_only(conn: Any) -> bool:
     return _candidate_status_check_allows_dns_log_only(conn)
+
+
+def _learnings_has_workspace_col(c: Any) -> bool:
+    try:
+        rows = c.execute("PRAGMA table_info(learnings)").fetchall()
+        return any(
+            (r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]) == "workspace_id"
+            for r in rows
+        )
+    except Exception:
+        return False
+
+
+def _call_index_durable_learning(
+    context: Any,
+    agent_id: str,
+    content: str,
+    *,
+    key: str,
+    db: Any,
+    workspace_id: str = "default",
+) -> Any:
+    try:
+        return context.index_durable_learning(
+            agent_id,
+            content,
+            key=key,
+            db=db,
+            workspace_id=workspace_id,
+        )
+    except TypeError:
+        return context.index_durable_learning(agent_id, content, key=key, db=db)
 
 
 logger = logging.getLogger("minnid")
@@ -307,6 +340,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                         request_id,
                     )
 
+            ws = normalize_workspace_scope(params.get("workspace_id"), default="default")
             _cols = (
                 "agent_id, category, content, source_doc_ids, source_query, "
                 "confidence, embedding, created_at, "
@@ -330,6 +364,9 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
             if _have_hash_col:
                 _cols += ", content_hash"
                 _vals.append(_chash)
+            if _learnings_has_workspace_col(c):
+                _cols += ", workspace_id"
+                _vals.append(ws)
             c.execute(
                 f"INSERT INTO learnings ({_cols}) VALUES ({', '.join('?' * len(_vals))})",
                 _vals,
@@ -352,6 +389,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
                 content=content,
                 vault_path=wb.config.vault_path,
                 created_at=now,
+                workspace_id=ws,
             )
 
             wb.add_derived_from_edges(
@@ -401,10 +439,10 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         )
 
         if wb.config.writeback_enabled:
-            wb._write_to_disk(lid, agent_id, category, content, now)
+            wb._write_to_disk(lid, agent_id, category, content, now, workspace_id=ws)
 
-        indexed = context.index_durable_learning(
-            agent_id, content, key=f"learning:{lid}", db=wb.db
+        indexed = _call_index_durable_learning(
+            context, agent_id, content, key=f"learning:{lid}", db=wb.db, workspace_id=ws
         )
 
         result = {
@@ -412,6 +450,7 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
             "learning_id": lid,
             "agent_id": agent_id,
             "category": category,
+            "workspace_id": ws,
         }
         if indexed is False:
             result["indexed"] = False
@@ -588,10 +627,14 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         # M4: (agent_id, content) of each superseded learning, captured inside the
         # txn so we can purge their now-stale synthetic docs after commit.
         superseded_docs: list[tuple[str, str]] = []
+        resolved_ws = normalize_workspace_scope(params.get("workspace_id"), default="")
         with wb.db.transaction() as c:
+            _has_ws_col = _learnings_has_workspace_col(c)
             for sid in supersede_ids:
                 c.execute(
-                    "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
+                    "SELECT agent_id, content, workspace_id FROM learnings WHERE learning_id = ?"
+                    if _has_ws_col
+                    else "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
                     (sid,),
                 )
                 srow = c.fetchone()
@@ -601,6 +644,10 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                     ))
                 owner = str(srow["agent_id"] or "")
                 superseded_docs.append((owner, str(srow["content"] or "")))
+                if not resolved_ws and _has_ws_col and "workspace_id" in srow.keys():
+                    cand_sup_ws = str(srow["workspace_id"] or "").strip()
+                    if cand_sup_ws and cand_sup_ws != "default":
+                        resolved_ws = cand_sup_ws
                 if owner != agent_id and not explicitly_allowed_operator(principal):
                     raise ResolveRejected(context.make_error(
                         -32004,
@@ -610,6 +657,7 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                         "explicitly allowed operator)",
                         request_id,
                     ))
+            resolved_ws = resolved_ws or "default"
             _cols = ("agent_id, category, content, source_doc_ids, source_query, "
                      "confidence, embedding, created_at, assertion, applies_when, "
                      "evidence_doc_ids, status")
@@ -621,6 +669,9 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
             if _have_hash_col:
                 _cols += ", content_hash"
                 _vals.append(_chash)
+            if _has_ws_col:
+                _cols += ", workspace_id"
+                _vals.append(resolved_ws)
             c.execute(
                 f"INSERT INTO learnings ({_cols}) VALUES "
                 f"({', '.join('?' * len(_vals))})",
@@ -655,7 +706,9 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                 context.purge_durable_learning(sup_agent, sup_content, db=wb.db)
 
         if wb.config.writeback_enabled:
-            wb._write_to_disk(new_lid, agent_id, category, new_content, now)
+            wb._write_to_disk(
+                new_lid, agent_id, category, new_content, now, workspace_id=resolved_ws
+            )
 
         return context.make_response({
             "status": "ok",
@@ -858,6 +911,7 @@ def settle_accepted_candidate(
     agent_id: str,
     content: str,
     learning_id: int,
+    workspace_id: str = "default",
 ) -> bool:
     """Post-COMMIT side effects. Returns whether indexing succeeded.
 
@@ -868,8 +922,13 @@ def settle_accepted_candidate(
     """
     indexed_ok = True
     try:
-        indexed = context.index_durable_learning(
-            agent_id, content, key=f"learning:{learning_id}", db=db
+        indexed = _call_index_durable_learning(
+            context,
+            agent_id,
+            content,
+            key=f"learning:{learning_id}",
+            db=db,
+            workspace_id=workspace_id,
         )
         # Production returns an explicit bool, including its fail-open paths.
         # Older injected adapters returned None after a successful call; keep
@@ -1088,7 +1147,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     stored_content = content[:200000]
 
     now = time.time()
-    ws = params.get("workspace_id") or "default"
+    ws = normalize_workspace_scope(params.get("workspace_id"), default="default")
     ev = json.dumps(params.get("evidence_refs") or params.get("evidence_doc_ids") or [])
     raw_df = params.get("derived_from")
     if isinstance(raw_df, dict):
@@ -1277,18 +1336,32 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         auto_accept = False
                         withheld = ["duplicate of an existing learning"]
                 if auto_accept:
-                    c.execute(
-                        """
-                        INSERT INTO learnings
-                        (agent_id, category, content, created_at, embedding,
-                         content_hash, status)
-                        VALUES (?, ?, ?, ?, ?, ?, 'active')
-                        """,
-                        (
-                            principal.agent_id, category, stored_content, now,
-                            emb_bytes, chash,
-                        ),
-                    )
+                    if _learnings_has_workspace_col(c):
+                        c.execute(
+                            """
+                            INSERT INTO learnings
+                            (agent_id, category, content, created_at, embedding,
+                             content_hash, status, workspace_id)
+                            VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+                            """,
+                            (
+                                principal.agent_id, category, stored_content, now,
+                                emb_bytes, chash, ws,
+                            ),
+                        )
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO learnings
+                            (agent_id, category, content, created_at, embedding,
+                             content_hash, status)
+                            VALUES (?, ?, ?, ?, ?, ?, 'active')
+                            """,
+                            (
+                                principal.agent_id, category, stored_content, now,
+                                emb_bytes, chash,
+                            ),
+                        )
                     lid = c.lastrowid
                     try:
                         ensure_canonical_learning_node(
@@ -1298,6 +1371,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                             content=stored_content,
                             vault_path=wb.config.vault_path,
                             created_at=now,
+                            workspace_id=ws,
                         )
                     except Exception as exc:
                         raise _CanonicalCommitFailed(exc)
@@ -1369,6 +1443,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
         if lid is not None:
             indexed_ok = settle_accepted_candidate(
                 context, db, cid, principal.agent_id, stored_content, lid,
+                workspace_id=ws,
             )
             context.logger.warning(
                 "AUTO_ACCEPT_OWN candidate=%s learning=%s principal=%s "
@@ -1835,6 +1910,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                         )
                     else:
                         break
+                cand_ws = str(rowd.get("workspace_id") or "default").strip() or "default"
                 ins_cols = ["agent_id", "category", "content", "created_at"]
                 ins_vals: list[Any] = [author_agent, cat, content, now]
                 if _have_status_col:
@@ -1843,6 +1919,9 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 if _have_hash_col:
                     ins_cols.append("content_hash")
                     ins_vals.append(_chash)
+                if "workspace_id" in l_cols:
+                    ins_cols.append("workspace_id")
+                    ins_vals.append(cand_ws)
                 c.execute(
                     f"INSERT INTO learnings ({', '.join(ins_cols)}) "
                     f"VALUES ({', '.join('?' * len(ins_vals))})",
@@ -1860,6 +1939,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     content=content,
                     vault_path=db.config.vault_path,
                     created_at=now,
+                    workspace_id=cand_ws,
                 )
                 near_dups = find_near_duplicate_active_learning(
                     c,
@@ -1947,10 +2027,12 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     pass
 
         indexed_ok = True
+        cand_ws_resolved = str(rowd.get("workspace_id") or "default").strip() or "default"
         if lid is not None:
             indexed_ok = settle_accepted_candidate(
                 context, db, cid, author_agent,
                 str(rowd.get("content") or ""), lid,
+                workspace_id=cand_ws_resolved,
             )
         else:
             # A non-accept resolution still archives its inbox source.

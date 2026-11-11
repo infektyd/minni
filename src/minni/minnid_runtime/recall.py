@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from minni.config import DEFAULT_CONFIG
+from minni.config import (
+    DEFAULT_CONFIG,
+    is_concrete_project_workspace,
+    normalize_workspace_scope,
+)
 from minni.db import MinniDB
 from minni.timestamps import parse_epoch_or_report
 from minni.principal import (
@@ -155,6 +159,7 @@ def result_identity(row: dict) -> tuple:
 
 _QTY_ENGINE_KEY = "_qty_engine"
 _DEADLINE_POISONED_KEY = "_deadline_poisoned"
+_WS_BOOSTED_KEY = "_ws_boosted"
 
 
 def _ranking_deadline_poisoned(retrieval_engine: Any) -> bool:
@@ -215,6 +220,7 @@ def _strip_private_search_keys(results: list) -> None:
             continue
         row.pop(_QTY_ENGINE_KEY, None)
         row.pop(_DEADLINE_POISONED_KEY, None)
+        row.pop(_WS_BOOSTED_KEY, None)
 
 
 def _normalize_caller_visible_results(results: list) -> list:
@@ -279,7 +285,15 @@ def _gather_leg_results(callables: list, deadline_monotonic) -> list:
     return [fn() for fn in callables]
 
 
-def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
+def merge_document_results(
+    result_sets: list,
+    limit: int,
+    *,
+    prefer_personal: bool = False,
+    query_workspace: str = "",
+) -> list:
+    norm_qws = normalize_workspace_scope(query_workspace, default="")
+    concrete_qws = is_concrete_project_workspace(norm_qws)
     has_healthy = any(
         isinstance(row, dict) and not row.get(_DEADLINE_POISONED_KEY)
         for rows in result_sets
@@ -298,6 +312,48 @@ def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bo
             )
         else:
             merged.extend(rows)
+    if concrete_qws:
+        scoped_merged = []
+        for row in merged:
+            if not isinstance(row, dict):
+                scoped_merged.append(row)
+                continue
+            doc_ws = normalize_workspace_scope(row.get("workspace_id"), default="")
+            already_boosted = bool(row.get(_WS_BOOSTED_KEY))
+            if not already_boosted:
+                if is_concrete_project_workspace(doc_ws) and doc_ws != norm_qws:
+                    base_score = float(row.get("score") or 0.0)
+                    conf = row.get("confidence")
+                    has_ce = (
+                        row.get("rerank_score") is not None
+                        or (
+                            isinstance(row.get("provenance"), dict)
+                            and row["provenance"].get("cross_encoder_score") is not None
+                        )
+                        or base_score < 0.0
+                    )
+                    if has_ce and base_score < 0.0:
+                        continue
+                    if not has_ce and conf is not None and float(conf) < 0.60:
+                        continue
+                elif doc_ws == norm_qws:
+                    row = dict(row)
+                    base_score = float(row.get("score") or 0.0)
+                    has_ce = (
+                        row.get("rerank_score") is not None
+                        or (
+                            isinstance(row.get("provenance"), dict)
+                            and row["provenance"].get("cross_encoder_score") is not None
+                        )
+                        or base_score < 0.0
+                    )
+                    row["score"] = round(
+                        base_score + 1.5 if has_ce else (base_score * 1.35 + 0.005),
+                        4,
+                    )
+                    row[_WS_BOOSTED_KEY] = True
+            scoped_merged.append(row)
+        merged = scoped_merged
     if prefer_personal:
         deduped = {}
         for row in merged:
@@ -327,8 +383,16 @@ def merge_document_results(result_sets: list, limit: int, *, prefer_personal: bo
     return sorted(
         merged,
         key=lambda row: (
-            float(row.get("score") or 0.0),
-            1 if prefer_personal and row.get("src") == "p" else 0,
+            float(row.get("score") or 0.0) if isinstance(row, dict) else 0.0,
+            (
+                1
+                if concrete_qws
+                and isinstance(row, dict)
+                and normalize_workspace_scope(row.get("workspace_id"), default="")
+                == norm_qws
+                else 0
+            ),
+            1 if prefer_personal and isinstance(row, dict) and row.get("src") == "p" else 0,
         ),
         reverse=True,
     )[:limit]
@@ -594,6 +658,14 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
     summarize_neighborhood = bool(params.get("summarize_neighborhood", False))
     claim = str(params.get("claim", "")).strip() or None
     mode = str(params.get("mode") or "").strip().lower() or None
+    query_workspace = normalize_workspace_scope(
+        params.get("workspace_id"), default=""
+    )
+    echo_workspace = query_workspace or (
+        principal.workspace_id
+        if principal is not None and getattr(principal, "workspace_id", None)
+        else "default"
+    )
 
     if depth == "auto":
         depth = "snippet"
@@ -718,6 +790,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
             """
             nonlocal personal_snapshot
             reused = False
+            passed_qws = bool(query_workspace)
             if (
                 not shared
                 and not personal
@@ -773,7 +846,16 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                         and "retrieve" not in getattr(retrieval_engine, "__dict__", {})
                     ):
                         retrieve_kwargs["mode"] = "fast"
-                    rows = retrieval_engine.retrieve(**retrieve_kwargs)
+                    if query_workspace:
+                        try:
+                            rows = retrieval_engine.retrieve(
+                                **retrieve_kwargs, query_workspace=query_workspace
+                            )
+                        except TypeError:
+                            passed_qws = False
+                            rows = retrieval_engine.retrieve(**retrieve_kwargs)
+                    else:
+                        rows = retrieval_engine.retrieve(**retrieve_kwargs)
                 except RequestDeadlineExceeded:
                     # A database deadline is request degradation, not an index
                     # failure. In particular, do not claim an FTS-only result
@@ -846,6 +928,8 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 if not isinstance(row, dict):
                     continue
                 row[_QTY_ENGINE_KEY] = retrieval_engine
+                if passed_qws:
+                    row[_WS_BOOSTED_KEY] = True
                 if poisoned:
                     row[_DEADLINE_POISONED_KEY] = True
             return tagged, ops, trace_id if not reused else None
@@ -1152,7 +1236,12 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 vault_legs
             )
             _replay_leg_ops(combined_ops)
-            return merge_document_results(result_sets, limit), tail_trace
+            return (
+                merge_document_results(
+                    result_sets, limit, query_workspace=query_workspace
+                ),
+                tail_trace,
+            )
 
         # Lazy engine singletons resolve HERE, on the gathering thread, in the
         # same order and multiplicity as the serial code (personal scope never
@@ -1207,9 +1296,16 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
                 both_combined_vaults
             )
             _replay_leg_ops(combined_ops)
-            combined_rows = merge_document_results(combined_sets, limit)
+            combined_rows = merge_document_results(
+                combined_sets, limit, query_workspace=query_workspace
+            )
             result_sets = [personal_rows, combined_rows]
-            results = merge_document_results(result_sets, limit, prefer_personal=True)
+            results = merge_document_results(
+                result_sets,
+                limit,
+                prefer_personal=True,
+                query_workspace=query_workspace,
+            )
             # Serial last-shared-leg-wins: combined's tail ran after personal's
             # fallback, so it wins when it ran (a ran-and-failed tail is None
             # and selects None — never the handler slot); else personal's
@@ -1407,14 +1503,24 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         # Skip after expiry regardless of hybrid vs poisoned ranking.
         if stage_open("learnings"):
             try:
-                learnings = engine.search_learnings(
-                    query,
+                learn_kwargs = dict(
                     agent_id=agent_id,
                     cross_agent=learnings_cross_agent,
                     limit=limit,
                     source="minnid.search",
                     update_access=not (skip_score_record or is_fast_reflex or is_passive),
                 )
+                if query_workspace:
+                    try:
+                        learnings = engine.search_learnings(
+                            query,
+                            **learn_kwargs,
+                            query_workspace=query_workspace,
+                        )
+                    except TypeError:
+                        learnings = engine.search_learnings(query, **learn_kwargs)
+                else:
+                    learnings = engine.search_learnings(query, **learn_kwargs)
             except Exception as exc:
                 context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
             finally:
@@ -1490,6 +1596,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
         response_payload = {
             "query": query,
             "agent_id": agent_id,
+            "workspace_id": echo_workspace,
             "depth": depth,
             "count": len(results),
             "backend": backend_badge(resolved_backend),
@@ -1536,6 +1643,7 @@ def _handle_search(params: dict, request_id: Any, context: RecallContext) -> dic
             {
                 "query": query,
                 "agent_id": agent_id,
+                "workspace_id": locals().get("echo_workspace") or "default",
                 "depth": locals().get("depth") or "snippet",
                 "count": len(partial),
                 "backend": backend_badge(locals().get("resolved_backend")),

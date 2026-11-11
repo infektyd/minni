@@ -9,11 +9,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 def _strip_frontmatter(text: str) -> str:
     if not text:
         return ""
-    if text.startswith("---"):
-        end = text.find("\n---", 3)
+    norm = text.replace("\r\n", "\n")
+    stripped_lead = norm.lstrip()
+    if stripped_lead.startswith("---"):
+        end = stripped_lead.find("\n---", 3)
         if end != -1:
-            nl = text.find("\n", end + 4)
-            return text[nl + 1 :].lstrip() if nl != -1 else ""
+            rest = stripped_lead[end + 4 :]
+            if rest.startswith("\n"):
+                return rest[1:].lstrip()
+            if not rest.strip():
+                return ""
+            nl = rest.find("\n")
+            if nl != -1 and not rest[:nl].strip():
+                return rest[nl + 1 :].lstrip()
     return text
 
 
@@ -51,6 +59,7 @@ class TrieIndexMixin:
         evidence_refs: Any,
         indexed_at: Any,
         layer: str,
+        workspace_id: str = "",
     ) -> None:
         import minni.retrieval as _ret
 
@@ -60,6 +69,7 @@ class TrieIndexMixin:
         if lock is None:
             lock = threading.Lock()
             self._trie_lock = lock
+        clean_body = self._strip_frontmatter(chunk_text or "")[:1200]
         with lock:
             entry = {
                 "doc_id": doc_id,
@@ -67,7 +77,7 @@ class TrieIndexMixin:
                 "agent": agent or "",
                 "sigil": sigil or "❓",
                 "decay_score": float(decay_score if decay_score is not None else 1.0),
-                "chunk_text": self._strip_frontmatter(chunk_text or "")[:1200],
+                "chunk_text": clean_body,
                 "heading_context": heading_context or "",
                 "page_status": page_status or "candidate",
                 "privacy_level": privacy_level or "safe",
@@ -75,9 +85,10 @@ class TrieIndexMixin:
                 "evidence_refs": evidence_refs,
                 "indexed_at": indexed_at,
                 "layer": layer or "knowledge",
+                "workspace_id": str(workspace_id or ""),
             }
             self._trie_docs[doc_id] = entry
-            header_text = f"{path or ''} {heading_context or ''} {(chunk_text or '')[:600]}"
+            header_text = f"{path or ''} {heading_context or ''} {clean_body[:600]}"
             tokens = set(self._tokenize_trie_text(header_text))
             for tok in tokens:
                 self._trie_token_map.setdefault(tok, set()).add(doc_id)
@@ -167,12 +178,17 @@ class TrieIndexMixin:
                     self._trie_doc_count = doc_count
                     if doc_count == 0:
                         return
+                    doc_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(documents)").fetchall()
+                    }
+                    ws_sel = "d.workspace_id" if "workspace_id" in doc_cols else "'' AS workspace_id"
                     if doc_count < 50:
                         c.execute(
-                            """
+                            f"""
                             SELECT d.doc_id, d.path, d.agent, d.sigil, d.decay_score,
                                    d.page_status, d.privacy_level, d.page_type,
-                                   d.evidence_refs, d.indexed_at, d.layer,
+                                   d.evidence_refs, d.indexed_at, d.layer, {ws_sel},
                                    COALESCE(
                                        (SELECT ce.chunk_text FROM chunk_embeddings ce
                                         WHERE ce.doc_id = d.doc_id
@@ -195,10 +211,10 @@ class TrieIndexMixin:
                         )
                     else:
                         c.execute(
-                            """
+                            f"""
                             SELECT d.doc_id, d.path, d.agent, d.sigil, d.decay_score,
                                    d.page_status, d.privacy_level, d.page_type,
-                                   d.evidence_refs, d.indexed_at, d.layer,
+                                   d.evidence_refs, d.indexed_at, d.layer, {ws_sel},
                                    COALESCE(ce.chunk_text, '') AS chunk_text,
                                    COALESCE(ce.heading_context, '') AS heading_context
                             FROM documents d
@@ -240,6 +256,7 @@ class TrieIndexMixin:
                     "evidence_refs": r["evidence_refs"],
                     "indexed_at": r["indexed_at"],
                     "layer": r["layer"] or "knowledge",
+                    "workspace_id": str(r["workspace_id"] or ""),
                 }
                 header_text = f"{path_str} {heading_str} {clean_text[:300]}"
                 tokens = set(self._tokenize_trie_text(header_text))
@@ -305,6 +322,8 @@ class TrieIndexMixin:
         for did, sc in scores.items():
             doc = trie_docs.get(did)
             if doc is None:
+                continue
+            if not str(doc.get("chunk_text") or "").strip():
                 continue
             if (doc.get("page_status") or "candidate") in excluded:
                 continue

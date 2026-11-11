@@ -62,6 +62,7 @@ def ensure_canonical_learning_node(
     content: str,
     vault_path: str,
     created_at: float,
+    workspace_id: str = "",
 ) -> Optional[int]:
     """Find-or-create the canonical document node for a learning.
 
@@ -96,30 +97,58 @@ def ensure_canonical_learning_node(
 
     path = durable_doc_path(agent_id, f"learning:{learning_id}", vault_path, content)
     meta = durable_metadata(content)
+    doc_cols = {
+        row[1] for row in cur.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    has_doc_ws = "workspace_id" in doc_cols
+    effective_ws = str(workspace_id or meta.get("workspace_id") or "").strip()
     row = cur.execute(
         "SELECT doc_id, agent, page_status, privacy_level, superseded_by FROM documents WHERE path = ?", (path,)
     ).fetchone()
     if row is None:
-        cur.execute(
-            """
-            INSERT INTO documents
-            (path, agent, sigil, last_modified, indexed_at, page_status,
-             privacy_level, page_type, layer, memory_kind, memory_uri)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'learning', ?)
-            """,
-            (
-                path,
-                agent_id,
-                meta["sigil"],
-                created_at,
-                created_at,
-                meta["page_status"],
-                meta["privacy_level"],
-                meta["page_type"],
-                meta["layer"],
-                f"learning://{learning_id}",
-            ),
-        )
+        if has_doc_ws:
+            cur.execute(
+                """
+                INSERT INTO documents
+                (path, agent, sigil, last_modified, indexed_at, page_status,
+                 privacy_level, page_type, layer, memory_kind, memory_uri, workspace_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'learning', ?, ?)
+                """,
+                (
+                    path,
+                    agent_id,
+                    meta["sigil"],
+                    created_at,
+                    created_at,
+                    meta["page_status"],
+                    meta["privacy_level"],
+                    meta["page_type"],
+                    meta["layer"],
+                    f"learning://{learning_id}",
+                    effective_ws,
+                ),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO documents
+                (path, agent, sigil, last_modified, indexed_at, page_status,
+                 privacy_level, page_type, layer, memory_kind, memory_uri)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'learning', ?)
+                """,
+                (
+                    path,
+                    agent_id,
+                    meta["sigil"],
+                    created_at,
+                    created_at,
+                    meta["page_status"],
+                    meta["privacy_level"],
+                    meta["page_type"],
+                    meta["layer"],
+                    f"learning://{learning_id}",
+                ),
+            )
         doc_id = int(cur.lastrowid)
     else:
         doc_id = int(row[0])
@@ -132,11 +161,18 @@ def ensure_canonical_learning_node(
             )
             return None
         _reconcile_new_active_mapping(cur, row, learning_id, agent_id, content, meta, path)
-        cur.execute(
-            "UPDATE documents SET memory_kind = 'learning', memory_uri = ?"
-            " WHERE doc_id = ?",
-            (f"learning://{learning_id}", doc_id),
-        )
+        if has_doc_ws and effective_ws and effective_ws != "default":
+            cur.execute(
+                "UPDATE documents SET memory_kind = 'learning', memory_uri = ?, workspace_id = ?"
+                " WHERE doc_id = ?",
+                (f"learning://{learning_id}", effective_ws, doc_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE documents SET memory_kind = 'learning', memory_uri = ?"
+                " WHERE doc_id = ?",
+                (f"learning://{learning_id}", doc_id),
+            )
     cur.execute(
         """INSERT OR IGNORE INTO learning_documents (learning_id, doc_id, created_at)
            VALUES (?, ?, ?)""",

@@ -85,11 +85,17 @@ def search(
     limit: int = 5,
     depth: str = "snippet",
     socket_path: str = DEFAULT_SOCKET,
+    workspace_id: str = None,
+    mode: str = None,
 ) -> list:
     """Programmatic search helper used by verification scripts."""
     params = {"query": query, "limit": limit, "depth": depth}
     if agent_id:
         params["agent_id"] = agent_id
+    if workspace_id:
+        params["workspace_id"] = workspace_id
+    if mode:
+        params["mode"] = mode
     result = _rpc(socket_path, "search", params)
     trace_id = result.get("trace_id")
     results = result.get("results", [])
@@ -145,36 +151,74 @@ def _cmd_status(args):
     print()
 
 
+def _resolve_client_workspace(explicit_workspace: str | None = None) -> str:
+    from minni.minni_cli import _detect_cli_workspace
+
+    return _detect_cli_workspace(explicit_workspace)
+
+
+def _explicit_client_agent(args) -> str | None:
+    arg_agent = getattr(args, "agent", None)
+    if isinstance(arg_agent, str) and arg_agent.strip():
+        return arg_agent.strip()
+    env_agent = (os.environ.get("MINNI_AGENT_ID") or "").strip()
+    return env_agent or None
+
+
 def _cmd_search(args):
+    ws = _resolve_client_workspace(getattr(args, "workspace", None))
     params = {
         "query": " ".join(args.query),
         "limit": args.limit,
+        "workspace_id": ws,
     }
-    if args.agent:
-        params["agent_id"] = args.agent
+    if getattr(args, "mode", None):
+        params["mode"] = args.mode
+    agent_id = _explicit_client_agent(args)
+    if agent_id:
+        params["agent_id"] = agent_id
 
     result = _rpc(args.socket, "search", params)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return
 
-    count = result.get("count", 0)
-    print(f"Search: {params['query']}  ({count} results)")
+    docs = result.get("results", []) or []
+    learnings = result.get("learnings", []) or []
+    if not docs and not learnings:
+        print("No strong match found.")
+        return
+
+    count = result.get("count", len(docs))
+    print(f"Search: {params['query']}  ({count} results, {len(learnings)} learnings)")
     print("─" * 50)
 
-    for r in result.get("results", []):
+    for r in docs:
         heading = r.get("heading", "")
         source = r.get("source", "")
-        header = source
+        hit_ws = r.get("workspace_id") or ws
+        header = f"[{hit_ws}] {source}"
         if heading:
             header += f" — {heading}"
-        header += f"  (score={r['score']:.3f})"
+        header += f"  (score={float(r.get('score') or 0.0):.3f})"
         print(f"\n{header}")
         print(r.get("text", "")[:500])
+    for item in learnings:
+        learn_ws = item.get("workspace_id") or "default"
+        print(
+            f"\n[{learn_ws}] learning#{item.get('learning_id', '?')} "
+            f"[{item.get('category', 'general')}]  "
+            f"(conf={float(item.get('confidence') or 0.0):.2f})"
+        )
+        print(str(item.get("content", ""))[:500])
     print()
 
 
 def _cmd_read(args):
     params = {"limit": args.limit}
-    if args.agent:
-        params["agent_id"] = args.agent
+    agent_id = _explicit_client_agent(args)
+    if agent_id:
+        params["agent_id"] = agent_id
 
     result = _rpc(args.socket, "read", params)
     print(result.get("context", "No context."))
@@ -182,23 +226,67 @@ def _cmd_read(args):
 
 
 def _cmd_learn(args):
+    body = " ".join(args.text).strip()
+    title = (getattr(args, "title", None) or "").strip()
+    content = (
+        f"{title}: {body}"
+        if title and not body.lower().startswith(f"{title.lower()}:")
+        else body
+    )
+    ws = _resolve_client_workspace(getattr(args, "workspace", None))
     params = {
-        "content": " ".join(args.text),
+        "content": content,
         "category": getattr(args, "category", "general") or "general",
+        "workspace_id": ws,
     }
-    if args.agent:
-        params["agent_id"] = args.agent
+    agent_id = _explicit_client_agent(args)
+    if agent_id:
+        params["agent_id"] = agent_id
 
     result = _rpc(args.socket, "learn", params)
+    if (
+        getattr(args, "accept", False)
+        and result.get("status") == "proposed"
+        and result.get("candidate_id") is not None
+    ):
+        resolve_params = {
+            "candidate_id": result["candidate_id"],
+            "decision": "accept",
+            "reason": "cli --accept",
+        }
+        if agent_id:
+            resolve_params["agent_id"] = agent_id
+        resolved = _rpc(args.socket, "resolve_candidate", resolve_params)
+        result["resolution"] = resolved
+        result["status"] = resolved.get("status", "accepted")
+        if resolved.get("learning_id") is not None:
+            result["learning_id"] = resolved["learning_id"]
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return
+
     # Proposal-first path: the daemon stages a candidate for review instead of
     # writing a durable learning. Say so, or the staging reads as a failure.
     if result.get("status") == "proposed":
-        print(f"Staged candidate #{result.get('candidate_id', '?')} for review  "
-              "(not yet durable — approve with resolve_candidate)")
+        print(
+            f"Staged candidate #{result.get('candidate_id', '?')} for review ({ws})  "
+            "(not yet durable — approve with resolve_candidate or --accept)"
+        )
     else:
-        print(f"Stored learning #{result.get('learning_id', '?')}  "
-              f"[{result.get('category', '?')}]")
+        print(
+            f"Stored learning #{result.get('learning_id', '?')}  "
+            f"[{result.get('category', params['category'])}] ({ws})"
+        )
     print()
+
+
+def _cmd_activity(args):
+    from minni.minni_cli import cmd_activity
+
+    rc = cmd_activity(args)
+    if rc != 0:
+        sys.exit(rc)
 
 
 def _cmd_log(args):
@@ -230,7 +318,10 @@ def main():
     sp = sub.add_parser("search", aliases=["recall"], help="Search memory")
     sp.add_argument("query", nargs="+")
     sp.add_argument("--limit", type=int, default=5)
+    sp.add_argument("--workspace", "-w")
+    sp.add_argument("--mode", choices=["fast", "hybrid"])
     sp.add_argument("--agent", "-a")
+    sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("read", help="Agent startup context")
     sp.add_argument("--agent", "-a")
@@ -238,8 +329,17 @@ def main():
 
     sp = sub.add_parser("learn", help="Store a learning")
     sp.add_argument("text", nargs="+")
+    sp.add_argument("--title", "-t")
     sp.add_argument("--category", "-c", default="general")
+    sp.add_argument("--workspace", "-w")
+    sp.add_argument("--accept", action="store_true")
     sp.add_argument("--agent", "-a")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("activity", help="Daemon, threads, and recent workspace activity")
+    sp.add_argument("--hours", type=float, default=24.0)
+    sp.add_argument("--workspace", "-w")
+    sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("log", help="Log an episodic event")
     sp.add_argument("event", choices=[
@@ -262,6 +362,7 @@ def main():
         "recall": _cmd_search,
         "read": _cmd_read,
         "learn": _cmd_learn,
+        "activity": _cmd_activity,
         "log": _cmd_log,
         "ping": _cmd_ping,
     }

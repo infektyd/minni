@@ -264,6 +264,7 @@ class VaultIndexer:
                 "privacy_level": "safe",
                 "page_type": None,
                 "layer": "knowledge",
+                "workspace_id": "",
             }
 
         yaml_block = match.group(1)
@@ -332,7 +333,11 @@ class VaultIndexer:
             order = ["safe", "local-only", "private", "blocked"]
             privacy = max(recognized, key=order.index)
 
+        from minni.config import normalize_workspace_scope
+
         layer = VaultIndexer._infer_layer(agent=agent, page_type=page_type)
+        raw_ws = _str(data.get("workspace_id") or data.get("workspace"), "")
+        workspace_id = normalize_workspace_scope(raw_ws, default="") if raw_ws else ""
 
         return {
             "agent": agent,
@@ -341,6 +346,7 @@ class VaultIndexer:
             "privacy_level": privacy,
             "page_type": page_type,
             "layer": layer,
+            "workspace_id": workspace_id,
         }
 
     @staticmethod
@@ -648,24 +654,46 @@ class VaultIndexer:
                         prepared.append((chunk, emb.astype(np.float32).tobytes()))
 
                 layer = meta.get("layer", "knowledge")
+                doc_ws = meta.get("workspace_id", "")
                 stale_chunk_ids: List[int] = []
                 with self.db.transaction() as c:
+                    doc_cols = {
+                        r["name"] if isinstance(r, dict) or hasattr(r, "keys") else r[1]
+                        for r in c.execute("PRAGMA table_info(documents)").fetchall()
+                    }
+                    has_doc_ws = "workspace_id" in doc_cols
                     if row:
                         doc_id = row["doc_id"]
                         # path=? normalizes a row adopted under a non-canonical
                         # spelling, so the next pass matches it exactly.
-                        c.execute(
-                            """UPDATE documents
-                               SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
-                                   page_status=?, privacy_level=?, page_type=?, layer=?
-                               WHERE doc_id=?""",
-                            (path, meta["agent"], meta["sigil"], mtime, now,
-                             meta.get("page_status", "candidate"),
-                             meta.get("privacy_level", "safe"),
-                             meta.get("page_type"),
-                             layer,
-                             doc_id),
-                        )
+                        if has_doc_ws:
+                            c.execute(
+                                """UPDATE documents
+                                   SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?, layer=?,
+                                       workspace_id=?
+                                   WHERE doc_id=?""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer,
+                                 doc_ws,
+                                 doc_id),
+                            )
+                        else:
+                            c.execute(
+                                """UPDATE documents
+                                   SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
+                                       page_status=?, privacy_level=?, page_type=?, layer=?
+                                   WHERE doc_id=?""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer,
+                                 doc_id),
+                            )
                         c.execute(
                             "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
                             (doc_id,),
@@ -674,16 +702,29 @@ class VaultIndexer:
                         c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                         c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                     else:
-                        c.execute(
-                            """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
-                                   page_status, privacy_level, page_type, layer)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (path, meta["agent"], meta["sigil"], mtime, now,
-                             meta.get("page_status", "candidate"),
-                             meta.get("privacy_level", "safe"),
-                             meta.get("page_type"),
-                             layer),
-                        )
+                        if has_doc_ws:
+                            c.execute(
+                                """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
+                                       page_status, privacy_level, page_type, layer, workspace_id)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer,
+                                 doc_ws),
+                            )
+                        else:
+                            c.execute(
+                                """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
+                                       page_status, privacy_level, page_type, layer)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (path, meta["agent"], meta["sigil"], mtime, now,
+                                 meta.get("page_status", "candidate"),
+                                 meta.get("privacy_level", "safe"),
+                                 meta.get("page_type"),
+                                 layer),
+                            )
                         doc_id = c.lastrowid
 
                     # FTS5 insert (full content for keyword search)
